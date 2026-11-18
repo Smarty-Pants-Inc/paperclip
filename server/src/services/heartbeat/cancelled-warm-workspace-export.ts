@@ -63,6 +63,40 @@ export function hasCleanStoppedSessionClose(run: Pick<typeof heartbeatRuns.$infe
     && proof.companyId === run.companyId && proof.issueId === run.nativeIssueId && proof.clean === true;
 }
 
+const RETAINED_IDLE_SCHEMA = "paperclip.native-retained-idle-checkpoint.v1";
+/** adopt-stopu-proof: how often the boundary re-reads the run row while it
+ * waits (inside the export's one bound) for NSE's retained/closed decision. */
+export const STOPPED_TURN_DECISION_POLL_MS = 250;
+
+/** adopt-stopu-proof: NSE's RETAINED decision for THIS run (the person's Stop
+ * returned the warm session to idle: activeTurnId null, no pending requests,
+ * clean cancellation; native-session-executor.ts retainCancelledSession, the
+ * receipt written in the cancellation settle transaction). */
+export function hasRetainedIdleReceipt(run: Pick<typeof heartbeatRuns.$inferSelect,
+  "id" | "companyId" | "nativeIssueId" | "runnerProfileJson">): boolean {
+  const receipt = record(record(run.runnerProfileJson).nativeRetainedIdleCheckpoint);
+  return receipt.schema === RETAINED_IDLE_SCHEMA && receipt.runId === run.id
+    && receipt.companyId === run.companyId && receipt.issueId === run.nativeIssueId
+    && typeof receipt.sessionId === "string" && receipt.sessionId.length > 0;
+}
+
+/** NSE's CLOSED decision for THIS run, clean or not (any close record). */
+function closeRecord(run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "nativeIssueId" | "runnerProfileJson">) {
+  const proof = record(record(run.runnerProfileJson).nativeStoppedSessionClose);
+  return proof.schema === STOPPED_SESSION_CLOSE_SCHEMA && proof.runId === run.id
+    && proof.companyId === run.companyId && proof.issueId === run.nativeIssueId ? proof : null;
+}
+
+export type StoppedTurnSessionDecision = "retained" | "closed_clean" | "closed_unclean" | null;
+/** Which way NSE decided the stopped session, from the run row (null: not yet). */
+export function stoppedTurnSessionDecision(run: Pick<typeof heartbeatRuns.$inferSelect,
+  "id" | "companyId" | "nativeIssueId" | "runnerProfileJson">): StoppedTurnSessionDecision {
+  if (hasRetainedIdleReceipt(run)) return "retained";
+  const close = closeRecord(run);
+  if (!close) return null;
+  return close.clean === true ? "closed_clean" : "closed_unclean";
+}
+
 /** adopt-stopu (U1): the settled person's Stop. NSE settles an acknowledged
  * Stop by moving the run's coordinator to terminal_failure /
  * native_retry_cancelled (native-session-executor.ts, the cancellation settle
@@ -117,20 +151,45 @@ export async function finishCancelledWarmWorkspaceExport(input: {
   if (input.settledBy === "terminal_cancelled_run"
     ? !(run.status === "cancelled" && hasAcknowledgedNativeRunStopRequest(run))
     : !await hasSettledPersonStop(input.db, run)) return { outcome: "not_settled" };
-  // pl/r4-work3 (rf-4 F13), taken into U: U has no retained-idle branch, so
-  // every person's Stop here is the CLOSED case, at the Stop and at the
-  // release-site guard alike.
-  if (!hasCleanStoppedSessionClose(run)) {
+  // adopt-stopu-proof (rf-3 + rf-4 + RFL 01:08-01:10Z): U DOES retain. NSE's
+  // retainCancelledSession (native-session-executor.ts) keeps the warm session
+  // after a clean Stop and writes nativeRetainedIdleCheckpoint in the settle
+  // transaction; only a CLOSED session writes nativeStoppedSessionClose (after
+  // releaseWarmNativeSession's close ladder). So branch on the executor's own
+  // decision. If neither record exists yet at this boundary (the release site
+  // can run before NSE settles, as on run 4f211436), WAIT for one of them by
+  // re-reading the run row, inside this export's one bound. Either way the
+  // turn's processes must ALSO be proven gone on the box
+  // (noStoppedTurnProcessRemains): the receipt/close ladder says nothing about
+  // the turn's foreground command or a writer that escaped Pi.
+  const timeoutMs = input.timeoutMs ?? CANCELLED_WARM_EXPORT_TIMEOUT_MS;
+  const boundStartedAt = Date.now();
+  let decided = stoppedTurnSessionDecision(run);
+  let current = run;
+  while (decided === null && Date.now() - boundStartedAt + STOPPED_TURN_DECISION_POLL_MS < timeoutMs) {
+    await new Promise(resolve => setTimeout(resolve, STOPPED_TURN_DECISION_POLL_MS));
+    const [again] = await input.db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId))).limit(1);
+    if (!again) break;
+    current = again;
+    decided = stoppedTurnSessionDecision(current);
+  }
+  // adopt-stopu-round: proof5's branch on NSE's decision gates; the process-gone
+  // proof itself is ugate2's ONE implementation (noStoppedTurnProcessRemains,
+  // stopped-turn-process-gone.ts), run below inside the export's ownership and
+  // its one bound, in BOTH branches (retained: the retained Pi RPC session is spared).
+  if (decided !== "retained" && decided !== "closed_clean") {
     // No export, no box command: the descriptor stays `prepared`, so the box
     // stays a protected export source, and the person reads the true line.
     await recordCancelledWarmExportOutcome(input.db, run, {
       reason: TOOLS_NOT_PROVEN_STOPPED, detail: null, timeoutMs: null, line: TOOLS_NOT_PROVEN_LINE });
-    logger.warn({ runId: input.runId, reason: TOOLS_NOT_PROVEN_STOPPED },
-      "Stopped warm turn's session close is not proven clean; its workspace is not exported and the box is kept");
+    logger.warn({ runId: input.runId, reason: TOOLS_NOT_PROVEN_STOPPED, decided },
+      "Stopped warm turn's session is neither retained nor cleanly closed; its workspace is not exported and the box is kept");
     return { outcome: "unproven", reason: TOOLS_NOT_PROVEN_STOPPED };
   }
 
-  const timeoutMs = input.timeoutMs ?? CANCELLED_WARM_EXPORT_TIMEOUT_MS;
+  // The export gets what is left of the one bound (the wait above shares it).
+  const exportTimeoutMs = Math.max(1, timeoutMs - (Date.now() - boundStartedAt));
   // pl/cancel-finalize2: ONE aggregate bound for the whole export. At the
   // deadline the signal aborts: the ownership callback returns at once (so the
   // finalization lock session is released at the deadline, not when a held
@@ -168,7 +227,8 @@ export async function finishCancelledWarmWorkspaceExport(input: {
       // Raced with the same abort as the export, so a box that never answers
       // cannot hold the finalization lock past the bound.
       const proving = (async () => noStoppedTurnProcessRemains(input.stoppedTurnBox
-        ? await input.stoppedTurnBox(controller.signal).catch(() => null) : null, run.startedAt))();
+        ? await input.stoppedTurnBox(controller.signal).catch(() => null) : null, current.startedAt,
+        { retainedSession: decided === "retained", runId: run.id }))();
       proving.catch(() => undefined);
       const proof = await Promise.race([proving, aborted]);
       if (!proof.proven) throw new StoppedTurnProcessesNotProvenGoneError(
@@ -180,7 +240,7 @@ export async function finishCancelledWarmWorkspaceExport(input: {
     });
   work.catch(() => undefined);
   const deadline = new Promise<"timed_out">((resolve) => {
-    timer = setTimeout(() => { controller.abort(timedOut); resolve("timed_out"); }, timeoutMs);
+    timer = setTimeout(() => { controller.abort(timedOut); resolve("timed_out"); }, exportTimeoutMs);
     timer.unref?.();
   });
   let reason: string | null = null;

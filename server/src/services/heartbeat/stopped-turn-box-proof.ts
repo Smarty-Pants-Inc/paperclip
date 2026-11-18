@@ -3,6 +3,7 @@ import { environmentLeases, environments, heartbeatRuns, nativeRunFinalizations,
 import { resolveEnvironmentExecutionTarget } from "../environment-execution-target.js";
 import type { environmentRuntimeService } from "../environment-runtime.js";
 import { STOPPED_SESSION_CLOSE_SCHEMA } from "./cancelled-warm-workspace-export.js";
+import { noStoppedTurnProcessRemains } from "./stopped-turn-process-gone.js";
 
 /**
  * adopt-stopu-compose8 (rf-4 00:43Z, row 20, binding): the CRASH path.
@@ -21,29 +22,8 @@ import { STOPPED_SESSION_CLOSE_SCHEMA } from "./cancelled-warm-workspace-export.
  * its whole process group when the group is the turn's alone, and the scan is
  * repeated until none remain.
  */
-export const STOPPED_TURN_KILL_AND_VERIFY_SCRIPT = [
-  "const fs=require('fs');const runId=process.argv[1];const NUL=String.fromCharCode(0);",
-  "const self=new Set([process.pid,process.ppid]);",
-  "function scan(){let entries;try{entries=fs.readdirSync('/proc')}catch{return null}",
-  "if(!fs.existsSync('/proc/self/stat'))return null;const all=[];let unreadable=0;",
-  "for(const d of entries){if(String(Number(d))!==d)continue;const pid=Number(d);if(self.has(pid))continue;",
-  "let st;try{const s=fs.readFileSync('/proc/'+d+'/stat','utf8');st=s.slice(s.lastIndexOf(')')+2).split(' ')}catch{continue}",
-  "if(st[0]==='Z'||st[0]==='X')continue;let env=null;",
-  "try{env=fs.readFileSync('/proc/'+d+'/environ','utf8').split(NUL)}catch(e){if(e.code!=='ENOENT'&&e.code!=='ESRCH')unreadable++}",
-  "all.push({pid,pgid:Number(st[2]),turn:env!==null&&env.includes('PAPERCLIP_RUN_ID='+runId)})}",
-  "return{all,unreadable}}",
-  "const first=scan();if(!first){process.stdout.write(JSON.stringify({procfs:false}));process.exit(2)}",
-  "const turn=first.all.filter(p=>p.turn);const groups=[...new Set(turn.map(p=>p.pgid))]",
-  ".filter(g=>g>1&&first.all.every(p=>p.pgid!==g||p.turn));const killedGroups=[],killedPids=[];",
-  "for(const g of groups){try{process.kill(-g,'SIGKILL');killedGroups.push(g)}catch{}}",
-  "for(const p of turn){try{process.kill(p.pid,'SIGKILL');killedPids.push(p.pid)}catch{}}",
-  "const until=Date.now()+2000;let last=first;",
-  "const done=()=>{const remaining=last.all.filter(p=>p.turn).map(p=>p.pid);",
-  "process.stdout.write(JSON.stringify({procfs:true,found:turn.map(p=>p.pid),killedGroups,killedPids,remaining,unreadable:last.unreadable}));",
-  "process.exit(remaining.length?3:0)};",
-  "const tick=()=>{last=scan()||last;if(!last.all.some(p=>p.turn)||Date.now()>=until)return done();setTimeout(tick,100)};",
-  "turn.length?setTimeout(tick,50):done();",
-].join("");
+// adopt-stopu-round: the former STOPPED_TURN_KILL_AND_VERIFY_SCRIPT is replaced
+// by the ONE check, noStoppedTurnProcessRemains (stopped-turn-process-gone.ts).
 
 export type StoppedTurnBoxProof =
   | { outcome: "proven"; found: number[]; killedGroups: number[]; killedPids: number[]; unreadable: number }
@@ -94,17 +74,19 @@ export async function proveStoppedTurnGoneOnBox(input: {
     if (!target || target.kind !== "remote" || !("runner" in target) || !target.runner)
       return { outcome: "unanswered", reason: "box_unreachable_target" };
     stage = "box_unreachable_probe";
-    const result = await target.runner.execute({ command: "sh",
-      args: ["-c", 'exec node -e "$1" "$2"', "paperclip-stopped-turn-kill", STOPPED_TURN_KILL_AND_VERIFY_SCRIPT, run.id],
-      cwd: "/", bypassSession: true, timeoutMs }).catch(() => null);
-    if (!result || result.timedOut) return { outcome: "unanswered", reason: "box_unreachable_probe" };
-    let parsed: Record<string, unknown> | null = null;
-    try { parsed = JSON.parse(String(result.stdout ?? "").trim()) as Record<string, unknown>; } catch { parsed = null; }
-    if (result.exitCode !== 0 || !parsed || parsed.procfs !== true || !Array.isArray(parsed.remaining) || parsed.remaining.length)
-      return { outcome: "not_proven", reason: `stopped_turn_kill_unproven: exit=${result.exitCode} ${String(result.stdout ?? "").slice(0, 200)}` };
-    const ints = (value: unknown) => Array.isArray(value) ? value.filter((v): v is number => Number.isSafeInteger(v)) : [];
-    return { outcome: "proven", found: ints(parsed.found), killedGroups: ints(parsed.killedGroups),
-      killedPids: ints(parsed.killedPids), unreadable: Number(parsed.unreadable) || 0 };
+    // adopt-stopu-round: ONE check. The crash path runs ugate2's
+    // noStoppedTurnProcessRemains (stopped-turn-process-gone.ts) on the kept
+    // box, with the run id so the turn's PAPERCLIP_RUN_ID processes are found.
+    const proof = await noStoppedTurnProcessRemains({ runner: target.runner, remoteCwd: target.remoteCwd }, run.startedAt,
+      { runId: run.id, timeoutMs, bypassSession: true });
+    if (proof.proven) {
+      const killed = proof.killed.map(Number).filter(Number.isSafeInteger);
+      return { outcome: "proven", found: killed, killedGroups: [], killedPids: killed, unreadable: 0 };
+    }
+    if (proof.detail === "process_check_timed_out" || proof.detail.startsWith("process_check_failed:")
+      && !proof.detail.startsWith("process_check_failed:ERR"))
+      return { outcome: "unanswered", reason: "box_unreachable_probe" };
+    return { outcome: "not_proven", reason: `stopped_turn_kill_unproven: ${proof.detail}${proof.remaining?.length ? `:${proof.remaining.join(",")}` : ""}`.slice(0, 300) };
   };
   const outcome = await bounded(attempt(), timeoutMs);
   // By line: the bound passed while resolving the box (target) or while the

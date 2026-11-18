@@ -7,7 +7,8 @@ import { admittedNativeResourceDisposition } from "../native-runtime/native-fail
 import { readNativeWorkspaceSyncReference, resumeNativeWorkspaceSync } from "../native-runtime/native-workspace-sync.js";
 import { nativeWorkspaceExportPendingForLease } from "../native-runtime/native-workspace-finalization-state.js";
 import { tryLockNativeWorkspaceFinalization } from "../native-runtime/native-workspace-finalization-ownership.js";
-import { finishCancelledWarmWorkspaceExport, hasCleanStoppedSessionClose, type CancelledWarmExportOutcome } from "./cancelled-warm-workspace-export.js";
+import { finishCancelledWarmWorkspaceExport, stoppedTurnSessionDecision, type CancelledWarmExportOutcome } from "./cancelled-warm-workspace-export.js";
+import { noStoppedTurnProcessRemains } from "./stopped-turn-process-gone.js";
 import { PERSON_STOP_BOUND_KEY, PERSON_STOP_PROBE_TIMEOUT_MS, PERSON_STOP_WITHOUT_FILES_LINE, readPersonStopBoundDecision, personStopExportBoundAt,
   type PersonStopBoundDecision } from "./person-stop-export-bound.js";
 export { PERSON_STOP_EXPORT_BOUND_MS, PERSON_STOP_WITHOUT_FILES_LINE, personStopExportBoundAt, personStopKeptBoxForSuccessor,
@@ -76,9 +77,14 @@ export async function decidePersonStopExportAtBound(input: {
     const boundAt = personStopExportBoundAt(lease.metadata);
     if (boundAt === null || (input.now ?? Date.now()) < boundAt) return null;
   }
+  // adopt-stopu-proof: NSE's own decision, retained (the idle receipt) or a
+  // clean close (or compose8's after-the-fact proof in its place); then the
+  // probe IS the process-gone proof on the kept box (ugate2's one check):
+  // close-success alone never makes 'same box' (adopt-stopu-round, ugate2 limit (i)).
+  const decided = stoppedTurnSessionDecision(run);
   if (reason !== null) {
     // decided on the crash path above
-  } else if (!hasCleanStoppedSessionClose(run)) reason = "tools_not_proven_stopped";
+  } else if (decided !== "retained" && decided !== "closed_clean") reason = "tools_not_proven_stopped";
   else {
     const environment = environmentRow;
     const probe = async () => {
@@ -87,9 +93,9 @@ export async function decidePersonStopExportAtBound(input: {
         environment, leaseId: lease.id, leaseMetadata: lease.metadata, lease: lease as never, environmentRuntime })
         .catch(() => null);
       if (!target || target.kind !== "remote" || !("runner" in target) || !target.runner) return "box_unreachable_target";
-      const result = await target.runner.execute({ command: "true", args: [], cwd: target.remoteCwd, timeoutMs: input.probeTimeoutMs ?? PERSON_STOP_PROBE_TIMEOUT_MS })
-        .catch(() => null);
-      return result && result.exitCode === 0 && !result.timedOut ? "box_reachable_tools_stopped" : "box_unreachable_probe";
+      return await noStoppedTurnProcessRemains({ runner: target.runner, remoteCwd: target.remoteCwd }, run.startedAt,
+        { retainedSession: decided === "retained", runId: run.id, timeoutMs: input.probeTimeoutMs ?? PERSON_STOP_PROBE_TIMEOUT_MS })
+        .then(proof => proof.proven ? "box_reachable_tools_stopped" : "box_unreachable_probe");
     };
     const probed = await withTimeout(probe(), input.probeTimeoutMs ?? PERSON_STOP_PROBE_TIMEOUT_MS);
     reason = probed === "timed_out" ? "box_unreachable_probe" : probed;
