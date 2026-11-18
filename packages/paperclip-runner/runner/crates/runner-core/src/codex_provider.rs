@@ -1860,14 +1860,26 @@ impl CodexProvider {
             // notifications for the already-settled turn may be discarded: a new
             // turn, provider request, process exit, or mismatched turn remains a
             // fail-closed attachment error.
-            let deadline = std::time::Instant::now() + WARM_ATTACHMENT_DRAIN_DEADLINE;
+            //
+            // A resumed (thawed) box can deliver the settled turn's tail as a
+            // paced burst longer than the 100 ms clock. Settled-tail frames are
+            // history, so each one renews the clock: the burst is bounded by the
+            // frame limit, and a settled session gets one more bounded round
+            // before the attachment fails closed (which forks the session).
+            let mut deadline = std::time::Instant::now() + WARM_ATTACHMENT_DRAIN_DEADLINE;
             let mut quiet_since: Option<std::time::Instant> = None;
             let mut drained = 0usize;
+            let mut settled_retry_available = true;
             loop {
                 if buffer_only && self.pending_messages.is_empty() {
                     return Ok(());
                 }
                 if std::time::Instant::now() >= deadline {
+                    if std::mem::take(&mut settled_retry_available) {
+                        deadline = std::time::Instant::now() + WARM_ATTACHMENT_DRAIN_DEADLINE;
+                        drained = 0;
+                        continue;
+                    }
                     return Err(LocalRunnerError::invalid(
                         "Codex warm run attachment tail did not become quiescent",
                     ));
@@ -1877,9 +1889,13 @@ impl CodexProvider {
                         quiet_since = None;
                         drained = drained.saturating_add(1);
                         if drained > WARM_ATTACHMENT_TAIL_DRAIN_LIMIT {
-                            return Err(LocalRunnerError::invalid(
-                                "Codex warm run attachment tail exceeded its bounded frame limit",
-                            ));
+                            if std::mem::take(&mut settled_retry_available) {
+                                drained = 1;
+                            } else {
+                                return Err(LocalRunnerError::invalid(
+                                    "Codex warm run attachment tail exceeded its bounded frame limit",
+                                ));
+                            }
                         }
                         let names_other_turn =
                             notification_turn_id(&params).is_some_and(|turn_id| {
@@ -1897,6 +1913,8 @@ impl CodexProvider {
                                 bounded_method(&method)
                             )));
                         }
+                        // Only a settled-turn tail frame renews the clock.
+                        deadline = std::time::Instant::now() + WARM_ATTACHMENT_DRAIN_DEADLINE;
                         if matches!(
                             method.as_str(),
                             "thread/tokenUsage/updated"
