@@ -30,7 +30,7 @@ export const instanceGeneralSettingsSchema = z.object({
   backupRetention: backupRetentionPolicySchema.default(DEFAULT_BACKUP_RETENTION),
   // Task and project lists show agent-created tasks until a person picks
   // otherwise in the list's Filters menu. Off keeps the hidden default.
-  taskListsShowAgentCreatedByDefault: z.boolean().default(false),
+  taskListsShowAgentCreatedByDefault: z.boolean().default(true),
   // Execution policy. Absent/"any" = unrestricted; "kubernetes" forces the
   // Kubernetes sandbox provider and denies local/ssh execution (cloud_tenant).
   executionMode: z.enum(["kubernetes", "any"]).optional(),

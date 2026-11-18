@@ -56,11 +56,26 @@ async function readPreference(collectionKey: string, settingOn: boolean): Promis
 }
 
 describe("useShowAgentCreatedTasks instance default", () => {
+  it.each(COLLECTIONS)("shows tasks before settings load and with no instance setting in %s", async (collectionKey) => {
+    mockInstanceSettingsApi.getGeneral.mockResolvedValue({ censorUsernameInLogs: false });
+    function Probe() {
+      return <span data-testid="value">{String(useShowAgentCreatedTasks(COMPANY, collectionKey))}</span>;
+    }
+    act(() => root.render(<QueryClientProvider client={queryClient}><Probe /></QueryClientProvider>));
+    expect(container.textContent).toBe("true");
+    await act(async () => { await Promise.resolve(); });
+    expect(container.textContent).toBe("true");
+  });
+
+  it.each(COLLECTIONS)("resets the old explicit show=false preference to shown in %s", async (collectionKey) => {
+    writeV1Envelope(collectionKey, { showAgentCreatedTasks: false, showAgentCreatedTasksExplicit: true });
+    expect(await readPreference(collectionKey, true)).toBe("true");
+  });
   it.each(COLLECTIONS)("shows agent-created tasks by default in %s when the setting is on", async (collectionKey) => {
     expect(await readPreference(collectionKey, true)).toBe("true");
   });
 
-  it.each(COLLECTIONS)("keeps the upstream hidden default in %s when the setting is off", async (collectionKey) => {
+  it.each(COLLECTIONS)("honors an instance admin's opt-out in %s", async (collectionKey) => {
     expect(await readPreference(collectionKey, false)).toBe("false");
   });
 
@@ -74,8 +89,10 @@ describe("useShowAgentCreatedTasks instance default", () => {
     expect(await readPreference("paperclip:issues-view", true)).toBe("true");
   });
 
-  it.each(COLLECTIONS)("keeps an explicit choice in %s over the setting", async (collectionKey) => {
-    writeV1Envelope(collectionKey, { showAgentCreatedTasks: false, showAgentCreatedTasksExplicit: true });
+  it.each(COLLECTIONS)("keeps a new explicit Hide choice in %s over the setting", async (collectionKey) => {
+    writeV1Envelope(collectionKey, { hideAgentCreatedTasks: true, hideAgentCreatedTasksExplicit: true });
     expect(await readPreference(collectionKey, true)).toBe("false");
+    writeV1Envelope(collectionKey, { hideAgentCreatedTasks: false, hideAgentCreatedTasksExplicit: true });
+    expect(await readPreference(collectionKey, false)).toBe("true");
   });
 });

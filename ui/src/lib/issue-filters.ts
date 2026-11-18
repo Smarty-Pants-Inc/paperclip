@@ -36,15 +36,15 @@ export type IssueFilterState = {
    *   - `none`           — issues with zero external objects
    */
   externalObjectStatuses: string[];
-  showAgentCreatedTasks: boolean;
+  hideAgentCreatedTasks: boolean;
   /** Include hidden tasks so they can be found and un-hidden. Off by default. */
   showHiddenTasks?: boolean;
   /**
-   * True only after the person toggles Show agent-created tasks. Without it a
-   * stored `showAgentCreatedTasks` (from before the instance default existed)
-   * is not a choice, and the list uses the instance default instead.
+   * True only after the person toggles Hide agent-created tasks. Legacy
+   * `showAgentCreatedTasks` and its explicit marker are deliberately ignored:
+   * an old hidden preference must not silently survive the control inversion.
    */
-  showAgentCreatedTasksExplicit?: boolean;
+  hideAgentCreatedTasksExplicit?: boolean;
   routineTasksOnly?: boolean;
 };
 
@@ -58,11 +58,11 @@ export const defaultIssueFilterState: IssueFilterState = {
   workspaces: [],
   liveOnly: false,
   externalObjectStatuses: [],
-  showAgentCreatedTasks: false,
+  hideAgentCreatedTasks: false,
   showHiddenTasks: false,
   // Present (as undefined) so merging the defaults, as Clear filters does,
   // also drops an explicit choice.
-  showAgentCreatedTasksExplicit: undefined,
+  hideAgentCreatedTasksExplicit: undefined,
   routineTasksOnly: false,
 };
 
@@ -131,9 +131,9 @@ export function normalizeIssueFilterState(value: unknown): IssueFilterState {
     workspaces: normalizeIssueFilterValueArray(candidate.workspaces),
     liveOnly: candidate.liveOnly === true,
     externalObjectStatuses: normalizeIssueFilterValueArray(candidate.externalObjectStatuses),
-    showAgentCreatedTasks: candidate.showAgentCreatedTasks === true,
+    hideAgentCreatedTasks: candidate.hideAgentCreatedTasks === true,
     showHiddenTasks: candidate.showHiddenTasks === true,
-    showAgentCreatedTasksExplicit: candidate.showAgentCreatedTasksExplicit === true ? true : undefined,
+    hideAgentCreatedTasksExplicit: candidate.hideAgentCreatedTasksExplicit === true ? true : undefined,
     routineTasksOnly: candidate.routineTasksOnly === true,
   };
 }
@@ -143,12 +143,12 @@ export function normalizeIssueFilterState(value: unknown): IssueFilterState {
  * `taskListsShowAgentCreatedByDefault`) unless the person chose explicitly.
  */
 export function resolveAgentCreatedTasksDefault<
-  T extends Pick<IssueFilterState, "showAgentCreatedTasks" | "showAgentCreatedTasksExplicit">,
->(state: T, instanceDefault: boolean): T {
-  const showAgentCreatedTasks = state.showAgentCreatedTasksExplicit === true
-    ? state.showAgentCreatedTasks === true
-    : instanceDefault;
-  return state.showAgentCreatedTasks === showAgentCreatedTasks ? state : { ...state, showAgentCreatedTasks };
+  T extends Pick<IssueFilterState, "hideAgentCreatedTasks" | "hideAgentCreatedTasksExplicit">,
+>(state: T, instanceDefault = true): T {
+  const hideAgentCreatedTasks = state.hideAgentCreatedTasksExplicit === true
+    ? state.hideAgentCreatedTasks === true
+    : !instanceDefault;
+  return state.hideAgentCreatedTasks === hideAgentCreatedTasks ? state : { ...state, hideAgentCreatedTasks };
 }
 
 export function toggleIssueFilterValue(values: string[], value: string): string[] {
@@ -242,14 +242,14 @@ function issueMatchesExternalObjectStatusFilter(
 
 /** Keep creation visibility and routine origin consistent across collection reads. */
 export function issueCreationRequestFilters(
-  state: Pick<IssueFilterState, "routineTasksOnly" | "showAgentCreatedTasks">,
+  state: Pick<IssueFilterState, "routineTasksOnly" | "hideAgentCreatedTasks">,
   enableAgentCreatedVisibilityFilter = false,
 ) {
   if (state.routineTasksOnly) {
     return { originKind: "routine_execution", includeRoutineExecutions: true, includeAgentCreatedTasks: true };
   }
   return enableAgentCreatedVisibilityFilter
-    ? { includeRoutineExecutions: true, includeAgentCreatedTasks: state.showAgentCreatedTasks }
+    ? { includeRoutineExecutions: true, includeAgentCreatedTasks: !state.hideAgentCreatedTasks }
     : {};
 }
 
@@ -272,7 +272,7 @@ export function applyIssueFilters(
   if (!state.showHiddenTasks) {
     result = result.filter((issue) => !issue.hiddenAt);
   }
-  if (enableAgentCreatedVisibilityFilter && !state.showAgentCreatedTasks && !state.routineTasksOnly) {
+  if (enableAgentCreatedVisibilityFilter && state.hideAgentCreatedTasks && !state.routineTasksOnly) {
     result = result.filter((issue) => !isAgentCreatedIssue(issue));
   }
   if (state.statuses.length > 0) result = result.filter((issue) => state.statuses.includes(issue.displayStatus ?? issue.status));
@@ -324,7 +324,7 @@ export function applyIssueFilters(
 export function countActiveIssueFilters(
   state: IssueFilterState,
   enableAgentCreatedVisibilityFilter = false,
-  agentCreatedTasksDefault = false,
+  agentCreatedTasksDefault = true,
 ): number {
   let count = 0;
   if (state.statuses.length > 0) count += 1;
@@ -337,7 +337,7 @@ export function countActiveIssueFilters(
   if (state.liveOnly) count += 1;
   if (state.routineTasksOnly) count += 1;
   if (state.externalObjectStatuses.length > 0) count += 1;
-  if (enableAgentCreatedVisibilityFilter && state.showAgentCreatedTasks !== agentCreatedTasksDefault) count += 1;
+  if (enableAgentCreatedVisibilityFilter && state.hideAgentCreatedTasks !== !agentCreatedTasksDefault) count += 1;
   if (state.showHiddenTasks) count += 1;
   return count;
 }

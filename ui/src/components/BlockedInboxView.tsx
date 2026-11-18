@@ -73,12 +73,12 @@ export function BlockedInboxView({
   const [collapsedVariants, setCollapsedVariants] = useState<Set<string>>(() => new Set());
 
   const blockedQuery = useQuery({
-    queryKey: [...queryKeys.issues.listBlockedAttention(companyId), "live-descendant-summary", issueFilters.showAgentCreatedTasks],
+    queryKey: [...queryKeys.issues.listBlockedAttention(companyId), "live-descendant-summary", issueFilters.hideAgentCreatedTasks],
     queryFn: () =>
       issuesApi.list(companyId, {
         attention: "blocked",
         includeRoutineExecutions: true,
-        includeAgentCreatedTasks: issueFilters.showAgentCreatedTasks,
+        includeAgentCreatedTasks: !issueFilters.hideAgentCreatedTasks,
         includeParticipatedTasks: true,
         includeBlockedInboxAttention: true,
         includeBlockedBy: true,
