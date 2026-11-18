@@ -156,7 +156,8 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         idempotencyKey: `native-status:${decision!.id}:retry`, payload: {} });
       const wakeContext = ((wake!.payload as Record<string, unknown>)._paperclipWakeContext ?? {}) as Record<string, unknown>;
       // ownInput=false: the pre-carry successor shape (no own pending input), for ancestry-only guards.
-      if (options.ownInput === false) { delete wakeContext.conversationReplyBoundaryCommentId; delete wakeContext.attributionCommentIds; }
+      if (options.ownInput === false) { delete wakeContext.conversationReplyBoundaryCommentId; delete wakeContext.attributionCommentIds;
+        delete wakeContext.attributionInteractionIds; }
       await db.update(heartbeatRuns).set({ contextSnapshot: { ...wakeContext, issueId, taskId: issueId, wakeReason: "issue_status_changed",
         source: "native_status_decision", statusDecisionSource: "native_status_decision", nativeStatusWakeIntentId: wake!.id } })
         .where(eq(heartbeatRuns.id, target));
@@ -2055,7 +2056,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       status: answerLink === "context" ? "delivered" : "fallback_queued",
       deliveryMode: answerLink === "context" ? "steered" : "wake_fallback" })
       .where(eq(issueQuestionResponseDeliveries.interactionId, card!.id));
-    const successor = await f.nativeSuccessor(resume);
+    // rf5 A2-real: the committer now attributes the carried card answer to its continuation (attributionInteractionIds),
+    // so this NO-own-input control strips it (ownInput=false); the paired positive below restores own input.
+    const successor = await f.nativeSuccessor(resume, "succeeded", { ownInput: false });
     await f.reply(successor);
     const cardAnswerState = () => db.select({ answered: completedPersonMessageAnswerSql({
       id: sql`${issueThreadInteractions.id}`, companyId: sql`${issueThreadInteractions.companyId}`,
@@ -2069,6 +2072,46 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     await f.sweep();
     expect(await f.visible()).toHaveLength(0);
+  });
+
+  // rf5 A2-real (03:20Z): the committer's native-status continuation carried only COMMENT ids, so a card answer the
+  // continuation answered with a final was not ANSWERED. attributionInteractionIds attributes it. c1x port: c1x's sweep
+  // has no card-answer duty (unansweredCardAnswerSql has no sweep caller), so the card is pinned on the ONE shared
+  // ANSWERED predicate (answered/owed), as the PV2b paired control above does, and not on a card notice.
+  it("attrcard: a failed card answer-resume, the committer's native-status continuation answers it: NO notice, attribution only", async () => {
+    const f = await fixture({ status: "in_progress" });
+    const m = await f.message("Ask me which scope first.");
+    const asker = await f.run({ commentId: m, status: "succeeded" });
+    await f.reply(asker);
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "pending", sourceRunId: asker, createdByAgentId: f.agentId,
+      addresseeUserId: f.userId, continuationPolicy: "none", createdAt: f.at(),
+      payload: { version: 1, questions: [{ id: "scope", prompt: "Which scope?", required: true,
+        selectionMode: "single", options: [{ id: "first", label: "First" }] }] } }).returning();
+    await issueThreadInteractionService(db).answerQuestions({ id: f.issueId, companyId: f.companyId }, card!.id,
+      { answers: [{ questionId: "scope", optionIds: ["first"] }] }, { userId: f.userId });
+    await db.update(issueThreadInteractions).set({ resolvedAt: f.at() }).where(eq(issueThreadInteractions.id, card!.id));
+    const root = await f.run({ status: "failed", errorCode: "native_run_failed" });
+    await carryInto(root, { interactionId: card!.id, interactionStatus: "answered", source: "issue.interaction.respond" });
+    await db.update(issueQuestionResponseDeliveries).set({ targetRunId: root, status: "fallback_queued", deliveryMode: "wake_fallback" })
+      .where(eq(issueQuestionResponseDeliveries.interactionId, card!.id));
+    expect(await readContinuationCommentInput(db, { ...f, runId: root })).toMatchObject({ interactionIds: [card!.id] });
+    const successor = await f.nativeSuccessor(root);
+    await f.reply(successor);
+    for (let pass = 0; pass < 3; pass++) { await settleUnansweredPersonMessage(db, f); await f.sweep(); }
+    const [state] = await db.select({ answered: completedPersonMessageAnswerSql({
+      id: sql`${issueThreadInteractions.id}`, companyId: sql`${issueThreadInteractions.companyId}`,
+      issueId: sql`${issueThreadInteractions.issueId}`, createdAt: sql`${issueThreadInteractions.resolvedAt}` }),
+      owed: unansweredCardAnswerSql("issue_thread_interactions") }).from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, card!.id));
+    expect(state, "the continuation's final answers the carried card answer").toMatchObject({ answered: true, owed: false });
+    expect(await f.visible()).toHaveLength(0);
+    const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor));
+    const context = row!.contextSnapshot as Record<string, unknown>;
+    expect(context).toMatchObject({ attributionInteractionIds: [card!.id] });
+    // Attribution only: no prompt field carries the card answer (runtime-selection.ts reads interactionId(s)).
+    for (const key of ["interactionId", "interactionIds", "wakeCommentId", "wakeCommentIds", "commentId", "firstTurnQueuedInput"])
+      expect(context, key).not.toHaveProperty(key);
   });
 
   it("supersedes(ANSWERED blob, RFL 21:28Z/22:41Z): PV2b chain: a final after multiple failed ancestors answers only with the message as its own input", async () => {
