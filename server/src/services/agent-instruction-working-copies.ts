@@ -455,14 +455,10 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
       if (isAgentDirectoryCopy(unavailable)) {
         await directories.release(await patch(unavailable, { processStoppedAt: unavailable.processStoppedAt ?? new Date() }));
       }
-    } else if (row.receipt?.warm === true) {
-      // A remote stop is not destruction. Files changed after the last
-      // checkpoint may exist only in the stopped sandbox: hold, do not release.
-      const stoppedAt = row.processStoppedAt ?? new Date();
+    } else if (row.receipt?.warm === true && !isAgentDirectoryCopy(row)) {
+      // A remote stop is not destruction: the stopped sandbox keeps the files.
       await patch(row, { state: "unavailable", errorCode: "AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE",
-        errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION, nextAttemptAt: retryAt, processStoppedAt: stoppedAt,
-        ...(isAgentDirectoryCopy(row) ? { receipt: { ...row.receipt, savePending: { since: stoppedAt.toISOString(), code: "AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE",
-          reason: "The remote provider stopped before files changed after the last checkpoint were collected.", failures: 1 } } } : {}) });
+        errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION, nextAttemptAt: retryAt, processStoppedAt: row.processStoppedAt ?? new Date() });
     } else if (isAgentDirectoryCopy(row)) {
       const result = await directories.recoverStoppedRemote(row);
       if (result && collectionCandidate(result) && !result.processStoppedAt && (result.nextAttemptAt?.getTime() ?? 0) < retryAt.getTime()) {
