@@ -2534,7 +2534,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   // card answer the real answer service resolved at wall time. A reply that predates the answer is not an answer
   // to it (person-message-answer.ts personMessageReplySql: a.created_at > the answer's resolved_at). The reply now
   // follows the answer, as a real answer-resume run's reply does. Same assertions: zero notices ever, one reply.
-  it.each([true, false])("supersedes(PV2 card-answer: no resend notice before, during or after one answer delivery (chat=%s); RFL record PENDING: fixture reply moved to a completed final answer under ANSWERED)", async chat => {
+  it.each([true, false])("supersedes(PV2 card-answer: no resend notice before, during or after one answer delivery (chat=%s); RFL record SUPERSEDE-TAMIN3-PV2-C2SB-1118)", async chat => {
     const f = await fixture({ chat, status: "in_review" });
     const messageId = await f.message("Build the landing page.");
     const sourceRunId = await f.run({ commentId: messageId, status: "running" });
@@ -3805,7 +3805,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     // The Retry it names is proven ADMITTED, and the message answered exactly once, through the real routes in
     // __tests__/c2s-held-supervision-retry-admit.test.ts. The row's own point is unchanged: the held text, never the
     // fenced-recovery line.
-    it("supersedes(c2s (b): supervision-exhausted on a HELD run stays held (not supervisionUnconfirmed): the held text, never the fenced-recovery Retry line; RFL record PENDING: held remedy follows decideRetryAuthority)", async () => {
+    it("supersedes(c2s (b): supervision-exhausted on a HELD run stays held (not supervisionUnconfirmed): the held text, never the fenced-recovery Retry line; RFL record SUPERSEDE-TAMIN3-PV2-C2SB-1118)", async () => {
       const f = await fixture();
       const messageId = await f.message("Please continue.");
       const runId = await f.run({ commentId: messageId, status: "failed", finishedAgoMs: 15 * 60_000,
