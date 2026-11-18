@@ -44,18 +44,18 @@ describeEmbeddedPostgres("a pending connection card and the person's next messag
     return { cardId: card.id, runA: await parks(runA), runB: await parks(runB) };
   }
 
-  it("R1 a message sent while a connection card is pending is answered by its run", async () => {
+  it("R1 pendingGovernedWaitCondition: a run whose injected wakeCommentIds hold a person message newer than an earlier run's connection card does not park on it", async () => {
     expect((await scenario("person_after")).runB).toBeNull();
   });
-  it("R2 the run that raised the card still parks", async () => {
+  it("R2 pendingGovernedWaitCondition: the run that raised the card still parks on it", async () => {
     const result = await scenario("person_after");
     expect(result.runA).toBe(result.cardId);
   });
-  it("R3 a later wake with no newer person message (status/automation) still parks", async () => {
+  it("R3 pendingGovernedWaitCondition: a later run with no injected person message still parks", async () => {
     const result = await scenario("none");
     expect(result.runB).toBe(result.cardId);
   });
-  it("R4 a person message older than the card still parks", async () => {
+  it("R4 pendingGovernedWaitCondition: an injected person message older than the card still parks", async () => {
     const result = await scenario("person_before");
     expect(result.runB).toBe(result.cardId);
   });
