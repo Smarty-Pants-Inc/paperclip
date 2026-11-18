@@ -8325,6 +8325,7 @@ async function failedPredecessorRunnerGone(input: { db: Db; execution: NativeExe
 
 /** The banner text for a conversation held behind an unfinished predecessor. */
 import { HELD_PREDECESSOR_NOTICE, PERSON_STOP_HELD_MESSAGE_TEXT } from "./held-predecessor-notice-text.js";
+import { heldConversationRemedy } from "../held-conversation-remedy.js";
 import { providerIdentityResetLine } from "./provider-identity-reset-notice.js";
 
 /**
@@ -8375,9 +8376,11 @@ export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution
     if (owner?.resultId) return;
     // S6: after a PERSON's Stop (not the Send's interrupt) the held message is
     // sent with the person's next message; "Send a new message to try again"
-    // would invite a retype that is answered twice. R3 then; H stays otherwise.
+    // would invite a retype that is answered twice. R3 then; otherwise the ONE
+    // remedy rule shared with the unanswered sweep's held family.
     const stop = (prior.resultJson ?? {}) as Record<string, unknown>;
     const personStop = prior.status === "cancelled" && stop.cancelledByActorType === "user" && !stop.queuedCommentInterruptQueueId;
+    const remedy = personStop ? null : await heldConversationRemedy(input.db, { companyId, issueId });
     await input.db.transaction(async tx => {
       const [issue] = await tx.select({ id: issues.id }).from(issues)
         .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId))).for("no key update");
@@ -8396,7 +8399,7 @@ export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution
         eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"),
         isNull(issueComments.deletedAt), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`)).limit(1);
       if (unanswered) return;
-      await issueService(input.db).addComment(issueId, personStop ? PERSON_STOP_HELD_MESSAGE_TEXT : HELD_PREDECESSOR_NOTICE, {}, { authorType: "system", presentation: {
+      await issueService(input.db).addComment(issueId, remedy ? remedy.body : PERSON_STOP_HELD_MESSAGE_TEXT, {}, { authorType: "system", presentation: {
         kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: true,
       }, metadata: { version: 1, authorizationReason: `${HELD_CONVERSATION_NOTICE_REASON_PREFIX}${normalizedSessionId}`,
         sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Held conversation" }] }] } }, tx);
