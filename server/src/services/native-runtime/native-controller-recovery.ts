@@ -81,8 +81,20 @@ export const NATIVE_RETAINED_OWNER_WAIT = "native_controller_recovery_waiting_fo
 
 export type NativeRetainedOwnerWait = { runId: string; controllerBootId: string };
 
+/** The deferral's words while a retained owner still holds its lease. */
+export const RETAINED_OWNER_LEASE_WAIT_MESSAGE = "Waiting for the retained native controller owner to release its lease.";
+/** The deferral's words while no lease of the stopped run is held and its
+ * tools are not yet proven exited (S095 rf-3). */
+export const STOPPED_RUN_TOOLS_WAIT_MESSAGE = "Waiting to confirm the stopped run's tools have exited.";
+
+/** heartbeat_runs.context_snapshot key of the successor's S095 wait:
+ * { stoppedRunId, deferrals, firstDeferredAt }. */
+export const STOPPED_RUN_TOOLS_WAIT_KEY = "stoppedRunToolsWait";
+
+export type NativeRecoveryWaitDetail = { message?: string; stoppedRunToolsWait?: { stoppedRunId: string } };
+
 export class NativeControllerRecoveryWaitingError extends Error {
-  constructor(readonly retryAt: Date, readonly owner?: NativeRetainedOwnerWait) {
+  constructor(readonly retryAt: Date, readonly owner?: NativeRetainedOwnerWait, readonly detail?: NativeRecoveryWaitDetail) {
     super(NATIVE_RETAINED_OWNER_WAIT);
     this.name = "NativeControllerRecoveryWaitingError";
   }
@@ -94,7 +106,8 @@ export class NativeControllerRecoveryWaitingError extends Error {
  * permissions and task ownership when this deadline arrives. */
 export async function deferNativeControllerRecovery(db: Db, input: {
   companyId: string; agentId: string; issueId: string; runId: string;
-  leaseOwner?: string; retryAt: Date; waitingForOwner?: NativeRetainedOwnerWait;
+  leaseOwner?: string; retryAt: Date; waitingForOwner?: NativeRetainedOwnerWait; message?: string;
+  stoppedRunToolsWait?: { stoppedRunId: string };
 }): Promise<void> {
   await db.transaction(async tx => {
     const [task] = await tx.select({ executionRunId: issues.executionRunId }).from(issues)
@@ -132,12 +145,23 @@ export async function deferNativeControllerRecovery(db: Db, input: {
       await tx.update(heartbeatRuns).set({ processPid: null, processGroupId: null, processStartedAt: null, updatedAt: new Date() })
         .where(eq(heartbeatRuns.id, input.runId));
     }
+    if (input.stoppedRunToolsWait) {
+      // S095 cap: the persisted cycle count and first-deferral time the
+      // successor's fence reads (STOPPED_RUN_TOOLS_* in native-session-executor).
+      const context = record(run.contextSnapshot), prior = record(context[STOPPED_RUN_TOOLS_WAIT_KEY]);
+      const same = prior.stoppedRunId === input.stoppedRunToolsWait.stoppedRunId;
+      await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context, [STOPPED_RUN_TOOLS_WAIT_KEY]: {
+        stoppedRunId: input.stoppedRunToolsWait.stoppedRunId,
+        deferrals: (same && typeof prior.deferrals === "number" ? prior.deferrals : 0) + 1,
+        firstDeferredAt: same && typeof prior.firstDeferredAt === "string" ? prior.firstDeferredAt : new Date(clock.now).toISOString(),
+      } }, updatedAt: new Date() }).where(eq(heartbeatRuns.id, input.runId));
+    }
     await notifyNativeFinalizationWork(tx, input);
     await tx.update(nativeRunFinalizations).set({
       phase: "retryable_failure", leaseOwner: null, leaseExpiresAt: null, controlDeadlineAt: null,
       nextAttemptAt: input.retryAt, recoveryState: "resuming_session", failureCode: NATIVE_RETAINED_OWNER_WAIT,
       failureDetail: { originalFailureCode: NATIVE_RETAINED_OWNER_WAIT,
-        message: "Waiting for the retained native controller owner to release its lease.",
+        message: input.message ?? RETAINED_OWNER_LEASE_WAIT_MESSAGE,
         recoveryMode: record(run.runnerProfileJson).sessionCheckpoint ? "same_session_resume" : "bootstrap_retry",
         providerSessionEstablished: false, providerEventsExist: false,
         ...(input.waitingForOwner ? { waitingForOwner: { runId: input.waitingForOwner.runId,

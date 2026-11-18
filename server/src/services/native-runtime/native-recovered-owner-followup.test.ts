@@ -16,11 +16,12 @@ import { createIsolatedTestHome } from "../../__tests__/helpers/isolated-test-ho
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { loadNativeRunnerCheckpoint, nativeRunnerCheckpointWriter } from "./native-runner-checkpoint.js";
-import { createNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
+import { createNativeControllerRecovery, NativeControllerRecoveryWaitingError, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
 import { currentNativeControllerIdentity, hasNativeExecutionStartEvidence } from "./native-restart-recovery.js";
 import { refusedAtPriorOwnerFenceBeforeLaunch } from "./native-provider-work-proof.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { readProcessStartedAt } from "../hot-restart.js";
+import { createLocalEncryptedCipher } from "../../secrets/local-encrypted-provider.js";
 import { recordTaskStopPending } from "../recovery/stop-pending.js";
 import { recoveryService } from "../recovery/service.js";
 import { nativeUserStopRecoveryHeld } from "./native-user-stop-settlement.js";
@@ -48,8 +49,9 @@ vi.mock("./current-wake-comments.js", async importOriginal => ({
   resolveCurrentWakeCommentsBinding: async () => null,
   assertCurrentWakeCommentsRead: async () => undefined,
 }));
-import { buildNativeHarnessBackupManifest, createRunnerdBackend, inspectFinishedPerTurnRunnerdOwner, quarantinedBootstrapOfOwnerHeldNoProviderWork, resolveNativeHarnessPersistenceProfile,
-  scopedRunnerdStateRoot } from "./native-session-executor.js";
+import { buildNativeHarnessBackupManifest, createRunnerdBackend, executePaperclipNativeSession, inspectFinishedPerTurnRunnerdOwner,
+  quarantinedBootstrapOfOwnerHeldNoProviderWork, resolveNativeHarnessPersistenceProfile, scopedRunnerdStateRoot,
+  NativeStoppedRunToolsUnconfirmedError, STOPPED_RUN_TOOLS_WAIT_CAP_MS, warmSessionReleaseWait } from "./native-session-executor.js";
 
 // Durable-root admission is the boundary under test. Reaching the run's tool
 // authority proves admission passed; no provider or runner process starts.
@@ -103,7 +105,9 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     | "failed-turn-start" | "rejected-turn-start" | "indeterminate-turn-start" | "unknown-outcome-turn-start"
     | "unsuperseded-unknown-outcome-turn-start" | "failed-suspend" | "pending-attach" | "pending-tool-result" = "settled",
     options: { controller?: { bootId: string; pid: number; processStartedAt: Date }; provider?: "codex" | "acpx" | "opencode" | "pi_rpc";
-      lifecycle?: "warm"; governedWait?: boolean; issueId?: string } = {}) {
+      lifecycle?: "warm"; governedWait?: boolean; issueId?: string;
+      /** Commands the controller journaled last and the Runner never acknowledged. */
+      pendingCommands?: string[] } = {}) {
     const issueId = options.issueId ?? randomUUID(), workspaceId = randomUUID(), runId = randomUUID();
     if (!options.issueId) await db.insert(issues).values({ id: issueId, companyId, title: "Continue after recovery", assigneeAgentId: agentId, status: "in_progress" });
     const [row] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
@@ -164,6 +168,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       // per-turn Runner that the Runner never acknowledged before its sandbox was
       // destroyed after the turn.
       if (control === "pending-attach") controller.queueCommand("run.attach", { provider: "fixture" });
+      for (const type of options.pendingCommands ?? []) controller.queueCommand(type);
       const toolInput = control === "unanswered-tool" || control === "pending-tool-result";
       if (control === "pending-tool-result") controller.queueCommand("semantic_tool.result", { sourceEventId: "unanswered-tool-input" });
       const event = (sourceSeq: number, sourceEventId: string, eventType: string) => ({ sourceSeq, sourceEventId, eventType,
@@ -1686,6 +1691,431 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(existsSync(join(root, "launch-preparation.json"))).toBe(false);
     expect(existsSync(join(root, "runtime-context.json"))).toBe(true);
     expect(followUp.logs.join("")).toContain(`Run ${prior.runId} finished without a saved runner checkpoint`);
+  }, 60_000);
+
+  /** S095 (rf-3; live run 7e625560, 11-17 01:44Z): the person's Stop of the
+   * owner is recorded (cancelled by the user, executionCancellation requested)
+   * but its acknowledgement is still pending (nativeCancellation.dispatchState
+   * "pending"). Returns the write that lands the acknowledgement. */
+  async function holdPersonStopAcknowledgement(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>) {
+    await stopSettledOwner(prior);
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    const acknowledged: Record<string, unknown> = { ...stopped.resultJson as Record<string, unknown>,
+      executionCancellation: { state: "requested", requestedAt: new Date().toISOString() } };
+    const { acknowledgementAuditId: _audit, ...intent } = acknowledged.nativeCancellation as Record<string, unknown>;
+    await db.update(heartbeatRuns).set({ resultJson: { ...acknowledged,
+      nativeCancellation: { ...intent, dispatchState: "pending", dispatched: false } } }).where(eq(heartbeatRuns.id, prior.runId));
+    return async () => { await db.update(heartbeatRuns).set({ resultJson: acknowledged }).where(eq(heartbeatRuns.id, prior.runId)); };
+  }
+
+  /** The Stop's own Runner acknowledged its turn commands: the controller's
+   * saved checkpoint now journals them completed. */
+  async function completeCheckpointCommands(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>, types: string[]) {
+    const cipher = createLocalEncryptedCipher("write");
+    const rows = await db.select().from(nativeRunnerCheckpoints).where(and(eq(nativeRunnerCheckpoints.runId, prior.runId),
+      sql`${nativeRunnerCheckpoints.part} like 'command:%'`));
+    let completed = 0;
+    for (const row of rows) {
+      const envelope = JSON.parse(cipher.decrypt(row.material));
+      const command = JSON.parse(envelope.contents);
+      if (!types.includes(command.type) || command.status !== "pending") continue;
+      envelope.contents = JSON.stringify({ ...command, status: "completed", result: { status: "completed" } });
+      await db.update(nativeRunnerCheckpoints).set({ material: cipher.encrypt(JSON.stringify(envelope)) })
+        .where(and(eq(nativeRunnerCheckpoints.runId, prior.runId), eq(nativeRunnerCheckpoints.part, row.part)));
+      completed++;
+    }
+    expect(completed).toBe(types.length);
+  }
+
+  /** The PRODUCTION entry (native-session-executor.ts executePaperclipNativeSession)
+   * for the live shape: a Boat remote sandbox created for the successor, a
+   * warm pi_rpc chat with its agent_files instruction working copy. */
+  async function executeFollowUp(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>,
+    followUp: Awaited<ReturnType<typeof admitFollowUp>>, timeoutMs: number) {
+    const bound = warmSessionReleaseWait.timeoutMs;
+    warmSessionReleaseWait.timeoutMs = timeoutMs;
+    const started = Date.now();
+    try {
+      const outcome = await executePaperclipNativeSession({ db, execution: prior.executionFor(followUp.runId),
+        runnerInstanceId: followUp.native.runnerInstanceId, useRunnerd: true,
+        onLog: async (_stream: "stdout" | "stderr", chunk: string) => { followUp.logs.push(chunk); },
+        instructionWorkingCopy: { runId: followUp.runId, root: join(stateDirectory, "agent-files", followUp.runId),
+          preparationKey: "agent-files", hasChanges: async () => false, collectStopped: async () => undefined },
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", providerKey: "boat", environmentId: followUp.environmentId,
+          leaseId: followUp.leaseId, remoteCwd: "/workspace", reusableLeaseConfigured: true,
+          runner: { execute: followUp.remoteExecute },
+          sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: followUp.providerLeaseId } } as never,
+      } as never).then(() => "completed" as unknown, (error: unknown) => error);
+      return { outcome, elapsedMs: Date.now() - started };
+    } finally {
+      warmSessionReleaseWait.timeoutMs = bound;
+    }
+  }
+
+  const failureText = (failure: unknown) => failure instanceof Error
+    ? [failure.message, (failure.cause as Error | undefined)?.message ?? ""].filter(Boolean).join(" | ") : String(failure);
+  const STOP_TURN_COMMANDS = ["turn.interrupt", "turn.stop"];
+  const STOP_TURN_REFUSAL = "journal_commands_unsettled(turn.interrupt.pending,turn.stop.pending)";
+  const WAITING_LINE = "waiting for the acknowledgement of the person's Stop of run";
+  /** Lands the acknowledgement as soon as the successor reports its wait. */
+  function landWhenWaiting(followUp: { logs: string[] }, land: () => Promise<void>) {
+    const timer = setInterval(() => {
+      if (!followUp.logs.join("").includes(WAITING_LINE)) return;
+      clearInterval(timer);
+      void land();
+    }, 10);
+    return () => clearInterval(timer);
+  }
+
+  it("S095: a person's Stop awaiting its acknowledgement with its own turn.interrupt + turn.stop pending (live 7e625560) "
+    + "defers at the production entry without a quarantined copy; once acknowledged and settled the next inspection admits", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm", pendingCommands: STOP_TURN_COMMANDS });
+    const followUp = await admitFollowUp(prior);
+    const landAcknowledgement = await holdPersonStopAcknowledgement(prior);
+    // Production entry while the acknowledgement is pending: the bound passes with it still pending.
+    const first = await executeFollowUp(prior, followUp, 300);
+    expect.soft(await quarantined(), "no quarantined copy after the pending-acknowledgement fence").toEqual([]);
+    expect.soft(failureText(first.outcome), "the fence's outcome").toBe(failureText(new NativeControllerRecoveryWaitingError(new Date())));
+    expect.soft(first.outcome).toBeInstanceOf(NativeControllerRecoveryWaitingError);
+    expect.soft(followUp.logs.join("")).toContain(`${WAITING_LINE} ${prior.runId}`);
+    const [finalization] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, followUp.runId));
+    expect.soft(finalization).toMatchObject({ phase: "retryable_failure", attempt: 0, failureCode: "native_controller_recovery_waiting_for_owner" });
+    expect(followUp.remoteExecute).not.toHaveBeenCalled();
+    // The acknowledgement lands and the Stop's own turn commands settle in the
+    // saved checkpoint. A copy from the first fence would hold them forever.
+    await landAcknowledgement();
+    await completeCheckpointCommands(prior, STOP_TURN_COMMANDS);
+    expect(await followUp.start(), "the next inspection after the acknowledgement").toBe(ADMITTED);
+    expect(await quarantined()).toEqual([]);
+    expect(await archivedOwners(await sessionRoot())).toEqual([prior.runId]);
+  }, 60_000);
+
+  it("S095: the acknowledgement landing during the wait hands the Stop's still-pending turn commands to today's refusal (the s6409-class refusal)",
+    async () => {
+      const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm", pendingCommands: STOP_TURN_COMMANDS });
+      const followUp = await admitFollowUp(prior);
+      const stop = landWhenWaiting(followUp, await holdPersonStopAcknowledgement(prior));
+      try {
+        const { outcome, elapsedMs } = await executeFollowUp(prior, followUp, 5_000);
+        expect(failureText(outcome)).toContain(stranded(STOP_TURN_REFUSAL));
+        expect(elapsedMs).toBeLessThan(5_000);
+      } finally {
+        stop();
+      }
+      expect(followUp.logs.join("")).toContain(`${WAITING_LINE} ${prior.runId}`);
+      expect(await quarantined()).toHaveLength(1);
+    }, 60_000);
+
+  it("S095: a foreign pending command still quarantines and refuses once the acknowledgement lands", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm", pendingCommands: ["turn.steer"] });
+    const followUp = await admitFollowUp(prior);
+    const stop = landWhenWaiting(followUp, await holdPersonStopAcknowledgement(prior));
+    try {
+      expect(failureText((await executeFollowUp(prior, followUp, 5_000)).outcome))
+        .toContain(stranded("journal_commands_unsettled(turn.steer.pending)"));
+    } finally {
+      stop();
+    }
+    expect(await quarantined()).toHaveLength(1);
+  }, 60_000);
+
+  it("S095: an owner without a pending person's Stop keeps today's quarantine and refusal, with no wait", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm", pendingCommands: STOP_TURN_COMMANDS });
+    const followUp = await admitFollowUp(prior);
+    await holdPersonStopAcknowledgement(prior);
+    // The Stop was not the person's: an agent's stop of the run.
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    await db.update(heartbeatRuns).set({ resultJson: { ...stopped.resultJson, cancelledByActorType: "agent" } })
+      .where(eq(heartbeatRuns.id, prior.runId));
+    const { outcome, elapsedMs } = await executeFollowUp(prior, followUp, 5_000);
+    expect(failureText(outcome)).toContain(stranded(STOP_TURN_REFUSAL));
+    expect(elapsedMs).toBeLessThan(5_000);
+    expect(await quarantined()).toHaveLength(1);
+    expect(followUp.logs.join("")).not.toContain(WAITING_LINE);
+  }, 60_000);
+
+  /** S095 turn (RFL 23:46Z + rf-3 23:48Z): the person's Stop of the owner,
+   * acknowledged, requested at `requestedAt` (before it issued the turn
+   * commands unless a test says otherwise). */
+  async function acknowledgePersonStop(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>, requestedAt: Date,
+    options: Parameters<typeof stopSettledOwner>[1] = {}) {
+    await stopSettledOwner(prior, options);
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    await db.update(heartbeatRuns).set({ resultJson: { ...stopped.resultJson as Record<string, unknown>,
+      executionCancellation: { state: "acknowledged", requestedAt: requestedAt.toISOString() } } }).where(eq(heartbeatRuns.id, prior.runId));
+  }
+
+  /** Boat's stop receipt on the stopped run's own (old) box, bound by remoteTerminationReceipt's shape. */
+  async function recordOldBoxStopReceipt(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>) {
+    const environmentId = randomUUID(), leaseId = randomUUID(), providerLeaseId = `sandbox-${prior.runId}`;
+    await db.insert(environments).values({ id: environmentId, name: `stopped-${environmentId}`, driver: "sandbox" });
+    await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, issueId: prior.issueId,
+      heartbeatRunId: prior.runId, provider: "boat", providerLeaseId, status: "released", releasedAt: new Date(),
+      cleanupStatus: "success", metadata: { remoteCwd: "/workspace", remoteExecutionTermination: {
+        schema: "paperclip.remote-termination.v1", companyId, runId: prior.runId, leaseId, provider: "boat", providerLeaseId,
+        state: "stopped", confirmedAt: new Date().toISOString() } } });
+  }
+
+  const TURN_EXEMPT_LINE = "its unanswered turn commands issued after the person's acknowledged Stop no longer hold this conversation";
+  const TURN_WAIT_LINE = "waiting for proof that the Runner of run";
+
+  async function stopTurnShape(options: { receipt?: boolean; preStop?: boolean; stop?: Parameters<typeof stopSettledOwner>[1];
+    actor?: string; between?: boolean } = {}) {
+    const stopRequestedAt = new Date(Date.now() - 1_000);
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm", pendingCommands: STOP_TURN_COMMANDS });
+    if (options.between) {
+      // Another run of this conversation, created after the stopped run.
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+      await db.insert(heartbeatRuns).values({ id: randomUUID(), companyId, agentId, status: "failed", runtimeMode: "native",
+        nativeIssueId: prior.issueId, nativeSessionId: prior.native.normalizedSessionId, contextSnapshot: { issueId: prior.issueId },
+        createdAt: new Date(stopped.createdAt.getTime() + 1) });
+    }
+    const followUp = await admitFollowUp(prior);
+    await acknowledgePersonStop(prior, options.preStop ? new Date(Date.now() + 1_000) : stopRequestedAt, options.stop);
+    if (options.actor) {
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+      await db.update(heartbeatRuns).set({ resultJson: { ...stopped.resultJson, cancelledByActorType: options.actor } })
+        .where(eq(heartbeatRuns.id, prior.runId));
+    }
+    if (options.receipt !== false) await recordOldBoxStopReceipt(prior);
+    return { prior, followUp };
+  }
+
+  it("S095 turn: live 7e625560 at the production entry: the acknowledged person's Stop's own pending turn.interrupt + turn.stop, "
+    + "the old box's Boat stop receipt, the successor on a created box -> admitted once, no quarantined copy, same provider session", async () => {
+    const { prior, followUp } = await stopTurnShape();
+    const { outcome, elapsedMs } = await executeFollowUp(prior, followUp, 5_000);
+    expect.soft(await quarantined(), "no quarantined copy").toEqual([]);
+    expect.soft(failureText(outcome)).not.toContain(STRANDED);
+    expect.soft(outcome).not.toBeInstanceOf(NativeControllerRecoveryWaitingError);
+    expect.soft(failureText(outcome), "admission reached tool authority").toContain(ADMITTED);
+    expect.soft(toolDefinitions).toHaveBeenCalledTimes(1);
+    expect.soft(elapsedMs).toBeLessThan(5_000);
+    expect.soft(followUp.logs.join("")).toContain(`run ${prior.runId}'s Runner is gone; ${TURN_EXEMPT_LINE}`);
+    expect.soft(followUp.logs.join("")).not.toContain(TURN_WAIT_LINE);
+    expect(await archivedOwners(await sessionRoot())).toEqual([prior.runId]);
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+    expect((successor.runnerProfileJson as { sessionCheckpoint?: { providerSessionId?: string } }).sessionCheckpoint?.providerSessionId)
+      .toBe("provider-session-before-recovery");
+  }, 60_000);
+
+  it("S095 turn: no Boat stop receipt and no holder retirement -> waits once, then the typed pre-claim deferral, never the quarantine",
+    async () => {
+      const { prior, followUp } = await stopTurnShape({ receipt: false });
+      const { outcome } = await executeFollowUp(prior, followUp, 300);
+      expect.soft(await quarantined()).toEqual([]);
+      expect.soft(outcome).toBeInstanceOf(NativeControllerRecoveryWaitingError);
+      expect.soft(followUp.logs.join("")).toContain(`${TURN_WAIT_LINE} ${prior.runId}`);
+      expect.soft(followUp.logs.join("")).not.toContain(TURN_EXEMPT_LINE);
+      const [finalization] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, followUp.runId));
+      expect.soft(finalization).toMatchObject({ phase: "retryable_failure", attempt: 0, failureCode: "native_controller_recovery_waiting_for_owner" });
+      expect(followUp.remoteExecute).not.toHaveBeenCalled();
+    }, 60_000);
+
+  /** The stopped run's old box, still held: an active lease without a stop receipt. */
+  async function holdOldBoxLease(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>) {
+    const environmentId = randomUUID(), leaseId = randomUUID();
+    await db.insert(environments).values({ id: environmentId, name: `held-${environmentId}`, driver: "sandbox" });
+    await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, issueId: prior.issueId,
+      heartbeatRunId: prior.runId, provider: "boat", providerLeaseId: `sandbox-${prior.runId}`, status: "active",
+      metadata: { remoteCwd: "/workspace" } });
+    return leaseId;
+  }
+
+  it.each([
+    ["no lease of the stopped run (NULL)", false, "Waiting to confirm the stopped run's tools have exited."],
+    ["the stopped run's lease still held", true, "Waiting for the retained native controller owner to release its lease."],
+  ])("S095 rf-3: the deferral's failureDetail tells the truth with %s (production entry)", async (_label, held, message) => {
+    const { prior, followUp } = await stopTurnShape({ receipt: false });
+    if (held) await holdOldBoxLease(prior);
+    const { outcome } = await executeFollowUp(prior, followUp, 300);
+    expect.soft(outcome).toBeInstanceOf(NativeControllerRecoveryWaitingError);
+    const [finalization] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, followUp.runId));
+    expect(finalization).toMatchObject({ failureCode: "native_controller_recovery_waiting_for_owner" });
+    expect((finalization.failureDetail as { message?: string }).message).toBe(message);
+  }, 60_000);
+
+  /** The existing retry owner re-claims the deferred run at its nextAttemptAt. */
+  async function retryOwnerClaims(runId: string) {
+    await db.update(nativeRunFinalizations).set({ phase: "observed", nextAttemptAt: null, recoveryState: null,
+      failureCode: null, failureDetail: null }).where(eq(nativeRunFinalizations.runId, runId));
+  }
+  async function oldBoxLease(leaseId: string) {
+    return (await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0];
+  }
+  /** The pending-cleanup sweep's provider stop lands: the bound Boat stop receipt on the old box. */
+  async function landStopReceipt(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>, leaseId: string) {
+    const providerLeaseId = `sandbox-${prior.runId}`;
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success",
+      metadata: { remoteCwd: "/workspace", remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId,
+        runId: prior.runId, leaseId, provider: "boat", providerLeaseId, state: "stopped", confirmedAt: new Date().toISOString() } } })
+      .where(eq(environmentLeases.id, leaseId));
+  }
+  const STOP_REQUEST_LINE = "requested the stop of run";
+  /** Deferral cycles of the successor at the production entry, each re-claimed by the retry owner. */
+  async function deferCycles(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>,
+    followUp: Awaited<ReturnType<typeof admitFollowUp>>, cycles: number) {
+    for (let cycle = 0; cycle < cycles; cycle++) {
+      const { outcome } = await executeFollowUp(prior, followUp, 300);
+      expect(outcome, `cycle ${cycle + 1}`).toBeInstanceOf(NativeControllerRecoveryWaitingError);
+      await retryOwnerClaims(followUp.runId);
+    }
+  }
+  async function waitFact(runId: string) {
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    return (run.contextSnapshot as Record<string, unknown>).stoppedRunToolsWait as
+      { stoppedRunId: string; deferrals: number; firstDeferredAt: string } | undefined;
+  }
+  /** The cap counts from the persisted first deferral: move it back (the clock moves on). */
+  async function ageFirstDeferral(runId: string, ms: number) {
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const context = run.contextSnapshot as Record<string, unknown>;
+    const wait = context.stoppedRunToolsWait as Record<string, unknown>;
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...context, stoppedRunToolsWait: { ...wait,
+      firstDeferredAt: new Date(Date.parse(String(wait.firstDeferredAt)) - ms).toISOString() } } }).where(eq(heartbeatRuns.id, runId));
+  }
+
+  it("S095 cap: no receipt -> after 2 deferral cycles the successor requests the stopped run's stop-and-retain -> receipt lands -> admitted",
+    async () => {
+      const { prior, followUp } = await stopTurnShape({ receipt: false });
+      const leaseId = await holdOldBoxLease(prior);
+      await deferCycles(prior, followUp, 2);
+      expect.soft(await waitFact(followUp.runId)).toMatchObject({ stoppedRunId: prior.runId, deferrals: 2 });
+      expect.soft((await oldBoxLease(leaseId)).status, "no stop requested in the first 2 cycles").toBe("active");
+      expect.soft(followUp.logs.join("")).not.toContain(STOP_REQUEST_LINE);
+      await deferCycles(prior, followUp, 1);
+      const requested = await oldBoxLease(leaseId);
+      expect.soft(followUp.logs.join("")).toContain(`${STOP_REQUEST_LINE} ${prior.runId}`);
+      expect.soft(requested.status).toBe("pending_cleanup");
+      expect.soft(requested.metadata?.sandboxStopAndRetain).toMatchObject({ schema: "paperclip.sandbox-stop-and-retain.v1",
+        runId: prior.runId, leaseId });
+      await landStopReceipt(prior, leaseId);
+      const { outcome } = await executeFollowUp(prior, followUp, 5_000);
+      expect.soft(outcome).not.toBeInstanceOf(NativeControllerRecoveryWaitingError);
+      expect.soft(failureText(outcome), "admitted once the receipt is recorded").toContain(ADMITTED);
+      expect.soft(followUp.logs.join("")).toContain(`run ${prior.runId}'s Runner is gone; ${TURN_EXEMPT_LINE}`);
+      expect(await quarantined()).toEqual([]);
+    }, 120_000);
+
+  it("S095 cap: no receipt even after the stop request -> at the cap the terminal note with Retry, not another deferral; "
+    + "Retry re-requests the stop first and is admitted once a receipt lands", async () => {
+    const { prior, followUp } = await stopTurnShape({ receipt: false });
+    const leaseId = await holdOldBoxLease(prior);
+    await deferCycles(prior, followUp, 3);
+    expect((await oldBoxLease(leaseId)).status).toBe("pending_cleanup");
+    await ageFirstDeferral(followUp.runId, STOPPED_RUN_TOOLS_WAIT_CAP_MS);
+    const capped = await executeFollowUp(prior, followUp, 300);
+    expect.soft(capped.outcome).toBeInstanceOf(NativeStoppedRunToolsUnconfirmedError);
+    expect.soft(failureText(capped.outcome)).toBe("Couldn't confirm the stopped run's tools exited. Your message is saved. Press Retry to try again.");
+    expect.soft((capped.outcome as { code?: string }).code).toBe("native_stopped_run_tools_unconfirmed");
+    const [finalization] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, followUp.runId));
+    expect.soft(finalization, "not deferred again: the run does not loop").toMatchObject({ phase: "observed", nextAttemptAt: null });
+    expect.soft(await waitFact(followUp.runId)).toMatchObject({ deferrals: 3 });
+    expect.soft(await quarantined(), "no quarantine").toEqual([]);
+    expect.soft(await oldBoxLease(leaseId), "nothing deleted").toBeDefined();
+    expect.soft(followUp.remoteExecute).not.toHaveBeenCalled();
+    // The heartbeat fails the capped run; the person presses Retry.
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, followUp.runId));
+    // The earlier stop request never landed; the sweep gave the lease back.
+    await db.update(environmentLeases).set({ status: "active", releasedAt: null, metadata: { remoteCwd: "/workspace" } })
+      .where(eq(environmentLeases.id, leaseId));
+    const retry = await admitFollowUp(prior);
+    await db.update(heartbeatRuns).set({ retryOfRunId: followUp.runId }).where(eq(heartbeatRuns.id, retry.runId));
+    const first = await executeFollowUp(prior, retry, 300);
+    expect.soft(first.outcome).toBeInstanceOf(NativeControllerRecoveryWaitingError);
+    expect.soft(retry.logs.join(""), "the Retry re-requests the stop on its first attempt").toContain(`${STOP_REQUEST_LINE} ${prior.runId}`);
+    expect.soft((await oldBoxLease(leaseId)).metadata?.sandboxStopAndRetain).toMatchObject({ runId: prior.runId, leaseId });
+    await retryOwnerClaims(retry.runId);
+    await landStopReceipt(prior, leaseId);
+    const { outcome } = await executeFollowUp(prior, retry, 5_000);
+    expect.soft(failureText(outcome), "the Retry is admitted once the receipt lands").toContain(ADMITTED);
+    expect(await quarantined()).toEqual([]);
+  }, 120_000);
+
+  /** S095 step 3: 2 deferral cycles, then the cap's terminal note; the heartbeat
+   * fails the run with the note's code as failureCause (run-completion.ts
+   * failureCauseFromError) and the person presses Retry. */
+  async function retryAfterCap(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>,
+    followUp: Awaited<ReturnType<typeof admitFollowUp>>, via: "retryOfRunId" | "task_retry_route" = "retryOfRunId") {
+    await deferCycles(prior, followUp, 2);
+    await ageFirstDeferral(followUp.runId, STOPPED_RUN_TOOLS_WAIT_CAP_MS);
+    const capped = await executeFollowUp(prior, followUp, 300);
+    expect(capped.outcome).toBeInstanceOf(NativeStoppedRunToolsUnconfirmedError);
+    expect(failureText(capped.outcome)).toBe("Couldn't confirm the stopped run's tools exited. Your message is saved. Press Retry to try again.");
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), errorCode: "adapter_failed",
+      error: failureText(capped.outcome), resultJson: { failureCause: "native_stopped_run_tools_unconfirmed" } })
+      .where(eq(heartbeatRuns.id, followUp.runId));
+    const retry = await admitFollowUp(prior);
+    // A failed chat run's Retry sets retryOfRunId; the task Retry route (POST
+    // /issues/:id/retry -> resumeTaskRetry) sets previousRunId with the person's
+    // receipt (heartbeat/queue.ts enqueueWakeup; heartbeat-native-stopped-run-tools-cap.test.ts).
+    await db.update(heartbeatRuns).set(via === "retryOfRunId" ? { retryOfRunId: followUp.runId } : {
+      contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({
+        wakeReason: "task_retry", previousRunId: followUp.runId, taskRetryRequestId: randomUUID() })}::jsonb` })
+      .where(eq(heartbeatRuns.id, retry.runId));
+    return retry;
+  }
+
+  it.each([
+    ["no lease of the stopped run (NULL)", false, "retryOfRunId"],
+    ["the stopped run's lease released without a receipt", true, "retryOfRunId"],
+    ["no lease of the stopped run (NULL), pressed through the task Retry route", false, "task_retry_route"],
+  ] as const)("S095 step 3: after the cap's terminal note, a Retry with %s is admitted once and answers", async (_label, released, via) => {
+    const { prior, followUp } = await stopTurnShape({ receipt: false });
+    if (released) {
+      await db.update(environmentLeases).set({ status: "released", releasedAt: new Date() })
+        .where(eq(environmentLeases.id, await holdOldBoxLease(prior)));
+    }
+    const retry = await retryAfterCap(prior, followUp, via);
+    const { outcome } = await executeFollowUp(prior, retry, 5_000);
+    expect.soft(outcome, "no further deferral").not.toBeInstanceOf(NativeControllerRecoveryWaitingError);
+    expect.soft(failureText(outcome), "the Retry is admitted").toContain(ADMITTED);
+    expect.soft(toolDefinitions, "admitted once").toHaveBeenCalledTimes(1);
+    expect.soft(retry.logs.join("")).toContain(`run ${prior.runId} holds no active box; admitting`);
+    expect(await quarantined()).toEqual([]);
+  }, 120_000);
+
+  it("S095 step 3: after the cap's terminal note, a Retry whose stopped run still holds an ACTIVE lease requests the stop and waits for the receipt",
+    async () => {
+      const { prior, followUp } = await stopTurnShape({ receipt: false });
+      const leaseId = await holdOldBoxLease(prior);
+      const retry = await retryAfterCap(prior, followUp);
+      // The cap's own cycle already requested the stop; the sweep gave the lease back.
+      await db.update(environmentLeases).set({ status: "active", releasedAt: null, metadata: { remoteCwd: "/workspace" } })
+        .where(eq(environmentLeases.id, leaseId));
+      const first = await executeFollowUp(prior, retry, 300);
+      expect.soft(first.outcome, "not admitted without the receipt").toBeInstanceOf(NativeControllerRecoveryWaitingError);
+      expect.soft(toolDefinitions).not.toHaveBeenCalled();
+      expect.soft(retry.logs.join("")).toContain(`${STOP_REQUEST_LINE} ${prior.runId}`);
+      expect.soft(retry.logs.join("")).not.toContain("holds no active box");
+      await retryOwnerClaims(retry.runId);
+      await landStopReceipt(prior, leaseId);
+      expect(failureText((await executeFollowUp(prior, retry, 5_000)).outcome), "admitted on the receipt").toContain(ADMITTED);
+    }, 120_000);
+
+  it("S095 rf-3: the acknowledgement wait's deferral with no lease of the stopped run does not claim a lease", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm", pendingCommands: STOP_TURN_COMMANDS });
+    const followUp = await admitFollowUp(prior);
+    await holdPersonStopAcknowledgement(prior);
+    const { outcome } = await executeFollowUp(prior, followUp, 300);
+    expect.soft(outcome).toBeInstanceOf(NativeControllerRecoveryWaitingError);
+    const [finalization] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, followUp.runId));
+    expect((finalization.failureDetail as { message?: string }).message).toBe("Waiting to confirm the stopped run's tools have exited.");
+  }, 60_000);
+
+  it.each([
+    ["an automatic (agent) Stop", { actor: "agent" }],
+    ["a Stop receipt of another run (foreign Stop)", { stop: { ack: "other-run" as const } }],
+    ["a successor that is not the direct one", { between: true }],
+    ["turn commands journaled before the person's Stop", { preStop: true }],
+  ])("S095 turn: keeps today's refusal and quarantine with %s", async (_label, options) => {
+    const { prior, followUp } = await stopTurnShape(options);
+    const { outcome, elapsedMs } = await executeFollowUp(prior, followUp, 5_000);
+    expect(failureText(outcome)).toContain(stranded(STOP_TURN_REFUSAL));
+    expect(elapsedMs).toBeLessThan(5_000);
+    expect(await quarantined()).toHaveLength(1);
+    expect(followUp.logs.join("")).not.toContain(TURN_EXEMPT_LINE);
+    expect(followUp.logs.join("")).not.toContain(TURN_WAIT_LINE);
   }, 60_000);
 
   it("keeps a finished owner held by an unclassified root entry and names it", async () => {
