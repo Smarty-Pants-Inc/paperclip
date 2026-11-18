@@ -357,6 +357,8 @@ const support = await getEmbeddedPostgresTestSupport();
     const f = await fixture({ release: "void", inspect: "active" });
     const { work, boundary, probeLease } = await firstPass(f);
     // A sibling closed setup-test lease on another box that Boat reads stopped.
+    // One ms later, so leases()' createdAt order never ties under the frozen Date.
+    vi.setSystemTime(new Date(Date.now() + 1));
     const runtime = environmentRuntimeService(db, { pluginWorkerManager: f.boat.worker });
     const sibling = await runtime.acquireRunLease({ companyId: f.companyId, agentId: f.agent.id, adapterType: "paperclip_runner",
       environment: f.environment as never, configuredEnvironment: f.environment as never, issueId: null, heartbeatRunId: null, persistedExecutionWorkspace: null } as never);
