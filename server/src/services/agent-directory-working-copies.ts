@@ -960,9 +960,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // that collector returns; only exact destruction proof settles it.
     if (held && row.location !== "local" && !transports.has(key(row)) && target?.kind !== "remote"
       && row.receipt?.warm === true) return recoverStoppedRemote(row);
-    // Upstream: save only while the box lease is active; a stopped box's copy stays pending_collection.
+    // Upstream: save only while the box is live; a stopped box's copy stays pending_collection.
     if (row.receipt?.warm === true && !settled(row)) {
-      if (row.location !== "local" && !leaseActive(await ownedRemoteLease(row))) return recoverStoppedRemote(row);
+      if (row.location !== "local" && !leaseLive(await ownedRemoteLease(row))) return recoverStoppedRemote(row);
       row = await checkpoint(row, target, true, signal);
       // Never release a stopped copy while retained aside copies are unsurfaced.
       if (row.errorCode === "AGENT_FILES_ASIDE_UNSURFACED") return row;
@@ -975,7 +975,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // mirror retries from that verified mirror; no live collector is needed.
     const mirrorHash = held ? (row.receipt?.savePending as { mirrorHash?: unknown } | undefined)?.mirrorHash : undefined;
     const fromMirror = held && row.location !== "local" && typeof mirrorHash === "string" && !transports.has(key(row)) && target?.kind !== "remote";
-    if (row.location !== "local" && !fromMirror && !leaseActive(await ownedRemoteLease(row))) {
+    const remoteLease = row.location !== "local" && !fromMirror ? await ownedRemoteLease(row) : null;
+    if (row.location !== "local" && !fromMirror && (!remoteLease
+      || remoteLease.releasedAt || remoteLease.status !== "active" || hasRemoteTerminationReceipt(remoteLease))) {
       live();
       return recoverStoppedRemote(row);
     }
@@ -1190,21 +1192,21 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (row.location !== `remote:${lease.environmentId}` && !destroyedWithoutEnvironment) return null;
     return lease;
   }
-  function leaseActive(lease: Awaited<ReturnType<typeof ownedRemoteLease>>) {
-    return Boolean(lease && !lease.releasedAt && lease.status === "active" && !hasRemoteTerminationReceipt(lease));
+  /** Live box: an active lease, or a warm box kept running (retained, not released, no termination receipt). */
+  function leaseLive(lease: Awaited<ReturnType<typeof ownedRemoteLease>>) {
+    return Boolean(lease && !lease.releasedAt && ["active", "retained"].includes(lease.status) && !hasRemoteTerminationReceipt(lease));
   }
   async function recoverStoppedRemote(row: Copy) {
     const lease = await ownedRemoteLease(row);
     const destroyed = lease && hasRemoteTerminationReceipt(lease)
       && (lease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed";
     if (!destroyed) {
-      if (agentFileSaveHeld(row) && leaseActive(lease)) return retryHeldSave(row);
+      if (agentFileSaveHeld(row)) return retryHeldSave(row);
       // execute (including bypassSession) may restart a stopped sandbox. Keep
       // the only remaining bytes; a stop receipt is not a destruction receipt.
       return patch(row, { state: "pending_collection", errorCode: lease ? "INSTRUCTION_STOPPED_REMOTE_COLLECTION_PENDING" : "INSTRUCTION_REMOTE_LEASE_UNVERIFIED",
         errorMessage: lease ? "The remote provider stopped with its agent directory retained. Safe stopped-file retrieval is unavailable; no save or discard is claimed."
-          : "The current remote lease could not be verified. Its agent directory is preserved; no retrieval, save or discard is claimed.", nextAttemptAt: new Date(Date.now() + 30_000),
-        ...(agentFileSaveHeld(row) ? { receipt: withoutSaveHold(row.receipt) } : {}) });
+          : "The current remote lease could not be verified. Its agent directory is preserved; no retrieval, save or discard is claimed.", nextAttemptAt: new Date(Date.now() + 30_000) });
     }
     // Exact destruction is proven: the remote bytes are already gone. A held
     // save without a verified mirror settles as a truthful loss receipt.

@@ -1914,7 +1914,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     let capped = 0;
     for (const row of rows) {
       if (pendingCleanupAttemptsInFlight.has(row.id)) continue;
-      if (await parkRetainedComputer(db, row)) continue; // C2: stop-and-retain, never destroy
+      if (!hasStopOnlyCleanup(row) && await parkRetainedComputer(db, row)) continue; // C2: proved stop + save hold: never destroy
       if (!hasStopOnlyCleanup(row) && hasNativeHarnessBackupMissing(row)) {
         await deferPendingCleanupLease(row.id);
         continue;
@@ -2038,7 +2038,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           // The durable attempt counter also preserves this bound on restart.
           const receipt = observedStop ? observation : endedStopAlreadyAttempted ? undefined
             : await environmentRuntime.retryPendingSandboxTeardown({ environment, lease });
-          const released = hasStopOnlyCleanup(lease)
+          // C2: a proved-stopped computer the provider answered "stopped" (it retains it) is parked.
+          const released = !hasStopOnlyCleanup(lease) && await parkRetainedComputer(db, row, receipt) ? null
+            : hasStopOnlyCleanup(lease)
             ? await settleStopOnlyCleanup(db, lease, { attemptId: claimed, receipt,
               ...(observedStop ? { receiptSource: "provider_inspection" as const } : {}) })
             : await environmentsSvc.releaseLease(lease.id, "expired", {

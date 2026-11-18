@@ -5,7 +5,8 @@ import { nativeWorkspaceExportPendingForLease } from "./native-runtime/native-wo
 import { abandonedWorkspaceFilesHeldOnLeaseRowSql } from "./remote-workspace-abandoned-files-hold.js";
 import type { OwnerProof } from "./owner-proof.js";
 import type { InProgressRecord, SettleOutcome } from "./recovery/ownership-registry.js";
-import { hasRecoveredCleanupStopReceipt, hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, ownLeaseTerminated } from "./remote-execution-termination.js";
+import { AGENT_FILE_DESTROY_REFUSED_MESSAGE, agentFileSaveHeldOnLease } from "./agent-file-save-hold.js";
 import { ORPHANED_SANDBOX_RECOVERY_KEY, prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
 import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "./reusable-sandbox-kept-marker.js";
 
@@ -160,24 +161,26 @@ export async function nextRetainedOrphanDueAt(db: Db, now: Date): Promise<Date |
   return row?.due ? new Date(row.due) : null;
 }
 
-/** C2: a pending destroy whose OWN carried Stop receipt (bound by
- * hasRecoveredCleanupStopReceipt) says "stopped", not "destroyed", is a
- * stop-and-retain computer: park it, never destroy it. No provider flag. */
-export function parkedCleanupDisposition(lease: Parameters<typeof hasRecoveredCleanupStopReceipt>[0], now: Date) {
-  const carried = (lease.metadata?.workspaceRecoveryCleanup as { stopReceipt?: { state?: unknown } } | undefined)?.stopReceipt;
-  return hasRecoveredCleanupStopReceipt(lease) && carried?.state === "stopped" ? { state: "parked",
-    code: "provider_retains_resource", observedAt: now.toISOString(), provider: lease.provider,
-    providerLeaseId: lease.providerLeaseId, sourcePolicyRef: "workspaceRecoveryCleanup.stopReceipt.state" } : undefined;
+/** C2, the one park key: a pending destroy whose stop is PROVED (own lease,
+ * carried receipt scope) is parked when the provider's destroy answer was
+ * "stopped" (it retains the computer) or a NEVER-OK agent-file save hold
+ * refuses its destroy claim (the debt stays visible). Never a provider flag. */
+export async function parkedCleanupDisposition(db: Db, lease: LeaseRow, now: Date, destroyAnswer?: unknown) {
+  if (!await ownLeaseTerminated(db, { companyId: lease.companyId, environmentId: lease.environmentId,
+    providerLeaseId: lease.providerLeaseId, runId: lease.heartbeatRunId, leaseId: lease.id }, { carriedCleanupStop: true })) return undefined;
+  const code = (destroyAnswer as { state?: unknown } | undefined)?.state === "stopped" ? "provider_retains_resource"
+    : await agentFileSaveHeldOnLease(db, lease) ? "held_for_unsaved_files" : undefined;
+  return code && { state: "parked", code, observedAt: now.toISOString(), provider: lease.provider, providerLeaseId: lease.providerLeaseId,
+    ...(code === "held_for_unsaved_files" ? { debt: AGENT_FILE_DESTROY_REFUSED_MESSAGE } : {}) };
 }
-/** The pending-destroy sweep parks such a row (CAS on its metadata) instead of claiming it. */
-export async function parkRetainedComputer(db: Db, lease: typeof environmentLeases.$inferSelect, now = new Date()) {
-  const cleanupDisposition = parkedCleanupDisposition(lease, now);
+/** The pending-destroy sweep parks such a row (CAS on its pending status) instead of destroying it. */
+export async function parkRetainedComputer(db: Db, lease: LeaseRow, destroyAnswer?: unknown, now = new Date()) {
+  const cleanupDisposition = await parkedCleanupDisposition(db, lease, now, destroyAnswer);
   if (!cleanupDisposition) return false;
-  await db.update(environmentLeases).set({ updatedAt: now,
+  const parked = await db.update(environmentLeases).set({ updatedAt: now,
     metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({ cleanupDisposition })}::jsonb` })
-    .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, "pending_cleanup"),
-      sql`${environmentLeases.metadata} = ${JSON.stringify(lease.metadata)}::jsonb`));
-  return true;
+    .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, "pending_cleanup"))).returning({ id: environmentLeases.id });
+  return parked.length > 0;
 }
 
 /**
@@ -233,16 +236,12 @@ export async function settleRetainedOrphanSandbox(db: Db, record: InProgressReco
     // The destroy is queued through the recognized stopped-cleanup contract
     // (`workspaceRecoveryCleanup` with the verified stop receipt), so admission
     // and Retry keep treating the sandbox as stopped while it waits.
-    const workspaceRecoveryCleanup = { runId, stopReceipt: lease.metadata?.remoteExecutionTermination,
-      reason: RETAINED_ORPHAN_RELEASED_REASON, releasedAt: now.toISOString(), ownerProof: context.proof.reason };
-    // C2: the own bound Stop receipt says "stopped" (stop-and-retain): park.
-    const cleanupDisposition = parkedCleanupDisposition({ ...lease, status: "pending_cleanup",
-      metadata: { workspaceRecoveryCleanup } }, now);
     const released = await writeEnvironmentCleanup(tx, write => write.update(environmentLeases).set({
       status: "pending_cleanup", cleanupStatus: "failed",
       failureReason: RETAINED_ORPHAN_RELEASED_REASON, updatedAt: now,
       metadata: sql`(${environmentLeases.metadata} - 'remoteExecutionTermination') || ${JSON.stringify({
-        workspaceRecoveryCleanup, ...(cleanupDisposition ? { cleanupDisposition } : {}),
+        workspaceRecoveryCleanup: { runId, stopReceipt: lease.metadata?.remoteExecutionTermination,
+          reason: RETAINED_ORPHAN_RELEASED_REASON, releasedAt: now.toISOString(), ownerProof: context.proof.reason },
         pendingCleanupInFlight: false, pendingCleanupRetryAfterMs: 0, pendingCleanupRetryAttempts: 0,
         pendingCleanupLeaseExpiresAtMs: 0 })}::jsonb`,
     }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.heartbeatRunId, runId),
