@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { LifecycleDriver, LifecycleStore, LifecycleFailure } from "./ports.js";
 import { isLifecycleWorkPending } from "../domain/policy.js";
-import { lifecycleFailureMessage, lifecycleVerificationNeedsRetry } from "./failure.js";
+import { lifecycleFailureCode, lifecycleFailureMessage, lifecycleVerificationNeedsRetry } from "./failure.js";
 
 /** Database leases protect each attempt across server processes. */
 export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDriver, reportFailure: (context: LifecycleFailure, error: unknown) => void, canRun = () => true) {
@@ -82,15 +82,20 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
         }
         if (changed && !isLifecycleWorkPending(changed.lifecycleState)) return;
       } catch (error) {
-        // Every failed host attempt may have allocated resources, even if no
-        // harness test ran. Claims deferred before the host do not spend it.
-        const verificationFailures = failureContext.stage === "host" && ["verifying", "resuming"].includes(agent.lifecycleState)
+        // Upstream budgets only a failed harness test in host verification.
+        // Unknown/environment failures must not strand a hire. Their independent
+        // backoff bounds probe starts without spending the verification budget.
+        const verificationHost = failureContext.stage === "host" && ["verifying", "resuming"].includes(agent.lifecycleState);
+        const verificationFailures = failureContext.stage === "host" && agent.lifecycleState === "verifying"
+          && lifecycleFailureCode(error) === "harness_test_failed"
           ? (agent.lifecycleOperation?.verificationFailures ?? 0) + 1 : undefined;
         failureContext = { ...failureContext, verificationFailures };
         const message = lifecycleFailureMessage(failureContext, error);
         const retryRequired = lifecycleVerificationNeedsRetry(failureContext, error);
-        if (!await runStep("defer", () => retryRequired || verificationFailures !== undefined
-          ? store.defer(agent, owner, message, new Date(), { retryRequired, ...(verificationFailures !== undefined ? { verificationFailures } : {}) })
+        const transientFailure = verificationHost && verificationFailures === undefined && !retryRequired;
+        if (!await runStep("defer", () => retryRequired || verificationFailures !== undefined || transientFailure
+          ? store.defer(agent, owner, message, new Date(), { retryRequired, ...(verificationFailures !== undefined ? { verificationFailures } : {}),
+            ...(transientFailure ? { transientFailure: true } : {}) })
           : store.defer(agent, owner, message, new Date()))) continue;
         return;
       } finally {

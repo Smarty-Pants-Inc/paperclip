@@ -1,4 +1,5 @@
 import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
+import { readHttpErrorCode } from "../../../lib/http-error-code.js";
 import { readAiConnectionConfigurationFailure } from "../../../lib/ai-connection-configuration-failure.js";
 import type { LifecycleFailure } from "./ports.js";
 
@@ -37,12 +38,14 @@ export function lifecycleVerificationNeedsRetry(context: LifecycleFailure, error
   const code = lifecycleFailureCode(error) ?? "";
   return ["verifying", "resuming"].includes(context.phase ?? "") && context.stage === "host"
     && (readAiConnectionConfigurationFailure(error) !== null || configurationFailures.has(code)
-      || (context.verificationFailures ?? 0) >= 3);
+      || (context.phase === "verifying" && code === "harness_test_failed" && (context.verificationFailures ?? 0) >= 3));
 }
 
 export function lifecycleFailureCode(error: unknown): string | undefined {
   const selectionFailure = readAiConnectionConfigurationFailure(error);
   if (selectionFailure) return selectionFailure;
+  const detailCode = readHttpErrorCode(error);
+  if (detailCode === "native_probe_cleanup_pending") return detailCode;
   const candidate = error as { code?: unknown; cause?: { code?: unknown } } | null;
   const codes = [candidate?.code, candidate?.cause?.code];
   if (codes.includes(PLUGIN_RPC_ERROR_CODES.TIMEOUT)) return "PLUGIN_RPC_TIMEOUT";
