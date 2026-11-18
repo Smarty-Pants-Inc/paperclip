@@ -272,4 +272,36 @@ describe("S124 fix: a parked Send whose held messages were carried by a run that
     await register(queue); await pastDeadline(queue,at);
     await expectRetired(f,wake.id,deps,queue,at);
   });
+  it.each(['running','queued','scheduled_retry'] as const)('row 5 carrier ACTIVE (%s) at the deadline: no note while it is live; it ends with no reply -> the one note on the next pass', async(status)=>{
+    const f=await fixture(),at=Date.now();
+    const deps=createHeartbeatQueueTestDependencies(db),queue=createHeartbeatQueue(db,deps);
+    const wake=await stopAndSend(f,at,[f.message.id]);
+    const [run]=await db.insert(heartbeatRuns).values({companyId:f.companyId,agentId:f.agent.id,issueId:f.issue.id,status,runtimeMode:'legacy',startedAt:status==='running'?new Date():null,responsibleUserId:f.actorId,contextSnapshot:{issueId:f.issue.id,wakeReason:'issue_commented',wakeCommentId:f.message.id,wakeCommentIds:[f.message.id]}}).returning();
+    await register(queue); await pastDeadline(queue,at);
+    for(let i=1;i<=2;i++) await tick(queue,at+DEADLINE_MS+5000+i*RETRY_MS);
+    const live=await view(f,wake.id);
+    expect(live.notes).toHaveLength(0);
+    expect(live.wake.status).toBe('deferred_issue_execution');
+    expect(live.wake.payload?.parkedNoticeAt).toBeUndefined();
+    await db.update(heartbeatRuns).set({status:'failed',finishedAt:new Date()}).where(eq(heartbeatRuns.id,run.id));
+    await tick(queue,Date.now()+RETRY_MS);
+    const after=await view(f,wake.id);
+    expect(after.notes).toHaveLength(1);
+    expect((after.notes[0]!.metadata as any)?.authorizationReason).toBe(`unanswered_message:${f.message.id}`);
+    expect(after.wake.status).toBe('deferred_issue_execution'); expect(heldIds(after.queue)).toEqual([f.message.id]);
+  });
+  it('row 6 LATEST carrier decides: an earlier carrier replied, the latest carrier FAILED with no reply -> not retired, one note', async()=>{
+    const f=await fixture(),at=Date.now();
+    const deps=createHeartbeatQueueTestDependencies(db),queue=createHeartbeatQueue(db,deps);
+    const wake=await stopAndSend(f,at,[f.message.id]);
+    await answer(f,[f.message.id]);
+    await step(Date.now()+2000);
+    await answer(f,[f.message.id],'failed');
+    await register(queue); await pastDeadline(queue,at);
+    const v=await view(f,wake.id);
+    expect(v.wake.status).toBe('deferred_issue_execution');
+    expect(v.notes).toHaveLength(1);
+    expect((v.notes[0]!.metadata as any)?.authorizationReason).toBe(`unanswered_message:${f.message.id}`);
+    expect(heldIds(v.queue)).toEqual([f.message.id]);
+  });
 });
