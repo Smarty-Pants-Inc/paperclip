@@ -21,7 +21,7 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
   const actual = await importOriginal<typeof import("../services/native-runtime/native-session-executor.js")>();
   return { ...actual, executePaperclipNativeSession: (async input => {
     providerTurns.push(input.execution.binding.runId);
-    throw new Error("row20_successor_provider_turn_reached");
+    return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "row20 successor answered" };
   }) as typeof actual.executePaperclipNativeSession };
 });
 
