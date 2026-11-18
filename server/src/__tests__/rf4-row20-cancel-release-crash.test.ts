@@ -83,7 +83,7 @@ describe.skipIf(!support.supported)("rf-4 row 20: crash after durable cancel bef
   // rf-4's RED used a synthetic descriptor ("a"x64), which no export can prove.
   // The U-shape row (adopt-stopu r2) seeds the same crash boundary with the
   // run's REAL prepared v3 descriptor: the edit exists only on the box.
-  it.each([["U shape: real prepared v3 descriptor", true], ["(superseded by replacement: kept + held with the true line up to the 5 min bound, then the successor resumes the SAME kept box with the edit (reachable, tools proven stopped), RFL record SUPERSEDE-U-UNPROVABLE-1117) GAP: rf-4 synthetic descriptor, no export provable", false]] as const)(
+  it.each([["U shape: real prepared v3 descriptor", true], ["(superseded by replacement: one bounded behaviour, same box first, RFL record SUPERSEDE-U-UNPROVABLE-1117) GAP: rf-4 synthetic descriptor, no export provable", false]] as const)(
     "the next person's comment runs within 10s, or offers an honest Retry; owed files are never destroyed (%s)", async (_label, realDescriptor) => {
     providerTurns.length = 0;
     const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), issueId = randomUUID();

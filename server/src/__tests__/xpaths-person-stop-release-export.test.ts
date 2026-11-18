@@ -93,7 +93,7 @@ describe.skipIf(!support.supported)("adopt-stopu-xpaths: a person's Stop never s
 
 
   const kases = [["r4/F10 shape: export finalizes 10 s after the Stop; a Send at +0.1 s", 10_000],
-    ["(superseded by replacement: kept + held + the true line only up to the 5 min bound; the box is unreachable, so the message then runs once without the files with the true line, the box still kept, RFL record SUPERSEDE-U-UNPROVABLE-1117) export never finishes (forced timeout): box kept, no stop", Infinity]] as const;
+    ["(superseded by replacement: one bounded behaviour, same box first, RFL record SUPERSEDE-U-UNPROVABLE-1117) export never finishes (forced timeout): box kept, no stop", Infinity]] as const;
   it.each(kases)("%s", async (_label, exportDelayMs) => {
     providerTurns.length = 0;
     const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), issueId = randomUUID();
