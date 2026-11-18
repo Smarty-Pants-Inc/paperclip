@@ -1,11 +1,8 @@
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
+import { normalizeAdapterExecutionTargetSessionIdentity } from "@paperclipai/adapter-utils/execution-target";
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
-}
-
-function readRecord(value: unknown): Record<string, unknown> | null {
-  return typeof value === "object" && value !== null && !Array.isArray(value) ? { ...(value as Record<string, unknown>) } : null;
 }
 
 export const sessionCodec: AdapterSessionCodec = {
@@ -15,7 +12,7 @@ export const sessionCodec: AdapterSessionCodec = {
     const runtimeSessionName = readString(record.runtimeSessionName);
     const acpSessionId = readString(record.acpSessionId);
     const agentSessionId = readString(record.agentSessionId);
-    const remoteExecution = readRecord(record.remoteExecution);
+    const remoteExecution = normalizeAdapterExecutionTargetSessionIdentity(record.remoteExecution);
     if (!runtimeSessionName && !acpSessionId && !agentSessionId) return null;
 
     return {

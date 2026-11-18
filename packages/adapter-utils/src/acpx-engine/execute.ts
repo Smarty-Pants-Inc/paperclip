@@ -25,6 +25,7 @@ import type {
 import {
   managedRemoteHomeEnvironment,
   adapterExecutionTargetSessionIdentity,
+  normalizeAdapterExecutionTargetSessionIdentity,
   describeAdapterExecutionTarget,
   adapterExecutionTargetDuplexObservabilityRecorder,
   adapterExecutionTargetEnablesSandboxDuplexBridge,
@@ -1611,8 +1612,10 @@ function isCompatibleSession(
   if (asString(params.mode, "") !== runtime.mode) return false;
   const savedCwd = asString(params.cwd, "");
   if (!savedCwd || path.resolve(savedCwd) !== path.resolve(runtime.cwd)) return false;
-  const savedRemote = parseObject(params.remoteExecution);
-  return stableJson(savedRemote) === stableJson(runtime.remoteExecutionIdentity ?? {});
+  // Normalize both sides: old saved rows can contain raw execution-target fields.
+  const savedRemote = normalizeAdapterExecutionTargetSessionIdentity(params.remoteExecution);
+  const currentRemote = normalizeAdapterExecutionTargetSessionIdentity(runtime.remoteExecutionIdentity);
+  return stableJson(savedRemote ?? {}) === stableJson(currentRemote ?? {});
 }
 
 function buildSessionParams(input: {

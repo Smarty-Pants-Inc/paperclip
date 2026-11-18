@@ -4753,6 +4753,67 @@ describe("ACPX engine remote managed-home seam (PR 2: per-adapter home seed)", (
     }
   });
 
+  // Keep reason: never-OK secret persistence and upgrade-safe session reuse.
+  it.each([
+    { transport: "ssh", legacy: false },
+    { transport: "sandbox", legacy: false },
+    { transport: "ssh", legacy: true },
+    { transport: "sandbox", legacy: true },
+  ])("ACPX codec normalizes $transport identity and resumes (legacy=$legacy)", async ({ transport, legacy }) => {
+    const { root, stateDir, localCwd, remoteCwd } = await setupRemoteSandbox();
+    const spec = { host: "ssh.example.test", port: 22, username: "agent", remoteCwd,
+      remoteWorkspacePath: remoteCwd, privateKey: "acpx-private-key-canary", knownHosts: null,
+      tailscaleSocket: "/acpx-socket-canary", strictHostKeyChecking: true };
+    const executionTarget = transport === "ssh"
+      ? { kind: "remote", transport, remoteCwd, spec }
+      : { kind: "remote", transport, remoteCwd, providerKey: "fake-plugin", environmentId: "env-1",
+          leaseId: "paperclip-lease-1", sandboxLeaseAcquisition: { providerLeaseId: " physical-sandbox-1 " },
+          runner: createLocalSandboxRunner() };
+    const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/execution-target")>("@paperclipai/adapter-utils/execution-target");
+    vi.mocked(prepareAdapterExecutionTargetRuntime).mockResolvedValue({ target: executionTarget as never,
+      workspaceRemoteDir: remoteCwd, runtimeRootDir: path.join(root, "runtime"), assetDirs: {},
+      additionalSourceDirs: {}, additionalSourceFailures: [], workspaceSyncSnapshot: null,
+      restoreWorkspace: async () => {} });
+    vi.mocked(startAdapterExecutionTargetPaperclipBridge).mockResolvedValue({ env: {}, stop: async () => {} });
+    vi.mocked(startAdapterExecutionTargetProcessSessionBridge).mockResolvedValue({ agentCommand: "fixture-acp-proxy", stop: async () => {} });
+    try {
+      const config = { agent: "custom", agentCommand: "fixture-acp-client", stateDir, cwd: localCwd,
+        paperclipSkillKeys: [], paperclipRuntimeSkills: [], mode: "persistent" };
+      const options = { authToken: "run-fixture", executionTarget };
+      const first = await runExecutor(config, options);
+      expect(first.result.sessionId).toBe("backend-session");
+      const expectedIdentity = transport === "ssh"
+        ? { transport, host: spec.host, port: spec.port, username: spec.username, remoteCwd }
+        : { transport, providerKey: "fake-plugin", environmentId: "env-1", providerLeaseId: "physical-sandbox-1", remoteCwd };
+      // Old rows stored raw objects. Inject canaries only; never a real key.
+      const raw = { ...first.result.sessionParams, remoteExecution: { ...first.result.sessionParams!.remoteExecution as object,
+        privateKey: spec.privateKey, tailscaleSocket: spec.tailscaleSocket, extraField: "discard-me" } };
+      const serialized = sessionCodec.serialize(raw);
+      const restored = sessionCodec.deserialize(JSON.parse(JSON.stringify(legacy ? raw : serialized)));
+      expect.soft(serialized?.remoteExecution).toEqual(expectedIdentity);
+      expect.soft(restored?.remoteExecution).toEqual(expectedIdentity);
+      for (const value of [serialized, restored]) {
+        expect.soft(JSON.stringify(value)).not.toContain(spec.privateKey);
+        expect.soft(JSON.stringify(value)).not.toContain(spec.tailscaleSocket);
+      }
+      // Bypass deserialize as well for old callers: compatibility must normalize
+      // the stored side itself, not depend on the codec having already run.
+      const resumed = await runExecutor(config, { ...options,
+        executionTarget: { ...executionTarget, ...(transport === "sandbox" ? { leaseId: "paperclip-lease-2" } : {}) },
+        runtime: { sessionParams: legacy ? raw : restored } });
+      expect(resumed.sessionInputs[0]?.resumeSessionId).toBe(first.result.sessionId);
+      expect(resumed.result.resultJson?.sessionReset).toBeUndefined();
+      if (legacy) {
+        const decodedResume = await runExecutor(config, { ...options, runtime: { sessionParams: restored } });
+        expect(decodedResume.sessionInputs[0]?.resumeSessionId).toBe(first.result.sessionId);
+      }
+    } finally {
+      vi.mocked(prepareAdapterExecutionTargetRuntime).mockReset().mockImplementation(actual.prepareAdapterExecutionTargetRuntime);
+      vi.mocked(startAdapterExecutionTargetPaperclipBridge).mockReset().mockImplementation(actual.startAdapterExecutionTargetPaperclipBridge);
+      vi.mocked(startAdapterExecutionTargetProcessSessionBridge).mockReset().mockImplementation(actual.startAdapterExecutionTargetProcessSessionBridge);
+    }
+  });
+
   it("test_remote_seam_receives_adapter_agnostic_context", async () => {
     const { stateDir, localCwd, remoteCwd, executionTarget } = await setupRemoteSandbox();
     let captured: Record<string, unknown> | null = null;
