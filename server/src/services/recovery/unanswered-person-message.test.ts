@@ -227,7 +227,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const notes = await f.visible();
     console.log("NORUN_1", JSON.stringify(notes.map(n => ({ id: n.id, body: n.body }))));
     expect(notes.map(n => n.body).join("\n")).not.toContain("no run started");
-    expect(notes, "a live carrying attempt is not a failure or a resend remedy").toHaveLength(0);
+    // Adapted to the stack's sweep: past the grace the true waiting line may stand (RFL (A)(ii): never silence at the
+    // bound); a live carrying attempt is never a failure note or a resend remedy.
+    expect(notes.map(n => n.body), "a live carrying attempt is not a failure or a resend remedy").toEqual([WAITING]);
   });
 
   it("NORUN (2) CONTROL: no own carrier ever started still gets the NO_RUN line", async () => {
@@ -540,8 +542,14 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
           payload: { kind: "agentMessage", text: "Section 1 of the report.\n".repeat(100) } } } },
         { seq: 2, payload: { prpEvent: { eventType: "turn.failed", turnId: "t", payload: { error: { code: "pi_provider_error" } } } } },
       ])!;
-      await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, body: cut.candidate.text,
-        authorType: "agent", authorAgentId: f.agentId, createdByRunId: runId, createdAt: f.at() });
+      const [reply] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, body: cut.candidate.text,
+        authorType: "agent", authorAgentId: f.agentId, createdByRunId: runId, createdAt: f.at() }).returning();
+      // compose (fam-long x ANSWERED): under ANSWERED a failed run's PROGRESS comment owes the one true notice
+      // (RFL F1). The posted streamed prefix is the cut run's FINAL reply, so the fixture now holds what
+      // publication records for it: the final comment receipt and the run's turn.failed event.
+      await db.update(heartbeatRuns).set({ resultJson: { presentationDecision: { commentId: reply!.id } } }).where(eq(heartbeatRuns.id, runId));
+      await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId, agentId: f.agentId, seq: 2, eventType: "turn.failed",
+        payload: { prpEvent: { eventType: "turn.failed", turnId: "t", payload: { error: { code: "pi_provider_error" } } } } });
     }
     await f.sweep();
     const notices = await f.visible();
@@ -1899,7 +1907,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(codeOf(notices[0]!)).toBe("provider_process_exited");
   });
 
-  it.each([false, true])("pause-stop guard: an answer %s after the resumed stop note supersedes it", async afterNotice => {
+  it.each([false, true])("supersedes(ANSWERED blob, RFL 21:28Z/22:41Z): pause-stop guard: a completed answer %s after the resumed stop note supersedes it", async afterNotice => {
     const f = await fixture();
     const commentId = await f.message();
     const stopped = await f.run({ commentId, status: "cancelled", errorCode: "agent_paused" });
@@ -1910,7 +1918,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await f.sweep();
       expect((await f.visible())[0]!.body).toBe("Managed Pi was paused before it answered your message. Send it again to continue.");
     }
-    await f.reply(stopped);
+    // ANSWERED (RFL F1/F2): only a COMPLETED run's final reply, through its own input, answers the message.
+    const answering = await f.run({ commentId, status: "succeeded" });
+    await f.reply(answering);
     await f.sweep();
     expect(await f.visible()).toHaveLength(0);
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
@@ -2067,9 +2077,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await f.owed()).toEqual([f.m14]);
     });
 
-    it("R-ONCE chain guard: the retry successor of M0014's OWN carrying run answers it, though its wake names only M0015", async () => {
+    // Reason: ANSWERED never attributes through ancestry (RFL F2). The retry successor answers M0014 only when it
+    // holds M0014 in its OWN input, as the real retry lanes seed it (attributionCommentIds).
+    it("supersedes(R-ONCE later-run-answered by ancestry; RFL F2 own-input attribution): R-ONCE chain guard: the retry successor of M0014's OWN carrying run answers it through its own input, though its wake names only M0015", async () => {
       const f = await liveCase((_m14, m15) => ({ wakeCommentId: m15 }));
       await db.update(heartbeatRuns).set({ retryOfRunId: f.carrying }).where(eq(heartbeatRuns.id, f.answering));
+      // Legacy control: linked only by retryOfRunId, M0014 not in its own input -> M0014 is NOT answered.
+      expect(await f.owed()).toEqual([f.m14]);
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentId: f.m15, attributionCommentIds: [f.m14] } })
+        .where(eq(heartbeatRuns.id, f.answering));
       expect(await f.owed()).toEqual([]);
       expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
       expect(await readContinuationCommentInput(db, { ...f, runId: f.carrying })).toEqual({});
@@ -2761,11 +2777,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         // The answer reached the agent's resume run (a pending delivery is still an attempt in progress).
         await db.update(issueQuestionResponseDeliveries).set({ targetRunId: id, status: "fallback_queued", deliveryMode: "wake_fallback" })
           .where(eq(issueQuestionResponseDeliveries.interactionId, cardId));
+      } else {
+        // compose (notices card duty x ANSWERED, RFL F2): a successor of the answer-resume run holds the still-pending
+        // card answer in its OWN input, as the real carry seeds it (readContinuationCommentInput: interactionIds).
+        await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, interactionIds: [cardId] } }).where(eq(heartbeatRuns.id, id));
       }
       return id;
     };
 
-    it("RED (rf5 RF5_ALL_FAILED_WITH_ANSWER): answer, failed answer-resume, failed successor: ONE true notice for the answer", async () => {
+    it("supersedes(R-ONCE later-run-answered by ancestry; RFL F2 own-input attribution): RED (rf5 RF5_ALL_FAILED_WITH_ANSWER): answer, failed answer-resume, failed successor: ONE true notice for the answer", async () => {
       const f = await fixture({ status: "in_progress" });
       const m = await f.message(); const root = await f.run({ commentId: m, status: "succeeded" });
       const card = await answeredCard(f, root);
@@ -2851,7 +2871,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     });
 
-    it("guard: answer, answer-resume fails, successor answers: no notice", async () => {
+    it("supersedes(R-ONCE later-run-answered by ancestry; RFL F2 own-input attribution): guard: answer, answer-resume fails, successor answers: no notice", async () => {
       const f = await fixture({ status: "in_progress" });
       const root = await f.run({ commentId: await f.message(), status: "succeeded" });
       const card = await answeredCard(f, root);
@@ -2861,7 +2881,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await cardNotices(f)).toHaveLength(0);
     });
 
-    it("guard: answer, answer-resume fails, successor answers with a new card: no notice", async () => {
+    it("supersedes(R-ONCE later-run-answered by ancestry; RFL F2 own-input attribution): guard: answer, answer-resume fails, successor answers with a new card: no notice", async () => {
       const f = await fixture({ status: "in_progress" });
       const root = await f.run({ commentId: await f.message(), status: "succeeded" });
       const card = await answeredCard(f, root);
@@ -3435,12 +3455,18 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         eq(activityLog.action, PENDING_WAIT_ACTION)))).toHaveLength(0);
     });
 
-    it("guard: a NON-held message past END keeps today's no-run notice", async () => {
+    // Reason: the message's own run STARTED, so "no run started" is false (norun-sweep, 5e). While the restored
+    // delivery is still pending the true waiting line stands; once it is cancelled, ONE true not-answered note.
+    it("supersedes(norun-sweep: no 'no run started' after an own start): guard: a NON-held started message past END keeps the waiting line while its delivery is pending, then gets the true failed-run note", async () => {
       const f = await conversation(false);
       await pendingRecovery(f);
       await sweep(f, 11 * 60_000);
       await sweep(f, 12 * 60_000);
-      expect((await oneSweepNotice(f)).body).toBe(NO_RUN);
+      const waiting = await oneSweepNotice(f);
+      expect(waiting.body).toBe(WAITING);
+      await db.update(agentWakeupRequests).set({ status: "cancelled" }).where(eq(agentWakeupRequests.agentId, f.agentId));
+      await sweep(f, 60 * 60_000);
+      expect((await oneSweepNotice(f)).body).toBe(NOT_ANSWERED);
     });
   });
 
