@@ -9,7 +9,7 @@ function classify(message:string, answer = false) {
  return o.forTerminal('turn',terminal);
 }
 describe('independent production classifier',()=>{
- for(const [name,text] of [['exact live 1',live1],['exact live 2',live2]]) it(name,()=>{const result=classify(text);console.log('JUDGE_CLASSIFIER',JSON.stringify({name,text,result}));expect(result?.errorCode).toBe('provider_policy_refusal');});
+ for(const [name,text] of [['exact live 1',live1],['exact live 2',live2]]) it('supersedes(rf2-refusal usage-policy wording; RFL record SUPERSEDE-RF2-REFUSAL-NOTE-1117.md) '+name,()=>{const result=classify(text);console.log('JUDGE_CLASSIFIER',JSON.stringify({name,text,result}));expect(result?.errorCode).toBe('provider_policy_refusal');expect(result?.errorMessage).not.toContain('usage policy');});
  for(const [name,text,answer] of [
  ['ordinary ToS account error','400 invalid_request_error: Your API key was rejected because your account has not accepted the Terms of Service.',false],
  ['ordinary ToS blocked account','400 invalid_request_error: Account blocked until Terms of Service are accepted.',false],

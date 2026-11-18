@@ -26,7 +26,7 @@ import { sql } from "drizzle-orm";
 
 // KEEP: never-OK guard against automatically repeating a provider policy refusal.
 // Inject at the real bound runner event port, not at a mocked classifier.
-const POLICY_NOTE = "The model provider refused this request under its usage policy; it won't be retried automatically.";
+const POLICY_NOTE = "The model provider refused this request under its policies; it won't be retried automatically.";
 const usagePolicyError = '400 {"type":"error","error":{"type":"invalid_request_error","message":"Your request was blocked by our usage policy."},"request_id":"fixture-request"}';
 
 describe("Pi policy refusal: persistence, retry, unanswered message and Stop intent", () => {
@@ -113,7 +113,7 @@ describe("Pi policy refusal: persistence, retry, unanswered message and Stop int
     ["The model refused to complete the request", "pi_provider_error", {}],
     ["This request would violate our usage policy.", "pi_provider_error", {}],
     ["The request was declined.", "provider_policy_refusal", {}],
-  ])("one true note and no retry for %s", async (message, code, details) => {
+  ])("supersedes(rf2-refusal usage-policy wording; RFL record SUPERSEDE-RF2-REFUSAL-NOTE-1117.md) one true note and no retry for %s", async (message, code, details) => {
     const f = await failTurn(message, code, details);
     const at = Date.now();
     for (const offset of [0, 180_000, 360_000]) await settleUnansweredPersonMessage(db, { companyId, issueId: f.issueId, now: new Date(at + offset) });
