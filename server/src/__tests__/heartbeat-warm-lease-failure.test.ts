@@ -6,6 +6,7 @@ import type { Environment } from "@paperclipai/shared";
 import { heartbeatService, resolveNativeSandboxLifecycle } from "../services/heartbeat.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { environmentService } from "../services/environments.js";
+import { hasConfirmedSandboxStopAndRetain } from "../services/sandbox-stop-and-retain.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -82,13 +83,11 @@ describe("heartbeat warm sandbox failure settlement", () => {
   it.each([
     { status: "failed", errorCode: "adapter_failed" },
     { status: "failed", errorCode: "native_session_interrupted" },
-    { status: "cancelled", errorCode: "cancelled" },
     { status: "interrupted", errorCode: null },
     { status: "succeeded", errorCode: null },
   ] as const)("hands off a warm sandbox after $status/$errorCode without stopping or physically resuming it", async ({ status, errorCode }) => {
     const f = await seed();
     await db.update(heartbeatRuns).set({ status, errorCode, finishedAt: new Date(),
-      ...(status === "cancelled" ? { resultJson: { cancelledByActorType: "user", cancelledByUserId: "board-operator" } } : {}),
     }).where(eq(heartbeatRuns.id, f.runId));
     await f.heartbeat.releaseEnvironmentLeasesForRun({ runId: f.runId, companyId: f.companyId,
       agentId: f.agentId, status, providerResourceDisposition: "keep_running" });
@@ -109,6 +108,21 @@ describe("heartbeat warm sandbox failure settlement", () => {
     expect(f.state()).toEqual({ running: true, starts: 1 });
     expect(f.call.mock.calls.map(call => call[1])).toEqual(["environmentAcquireLease", "environmentResumeLease"]);
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]).toMatchObject({ status, errorCode });
+  });
+
+  // Reason: c3 restores upstream's rule: a cancelled run stops and retains its box (stop_and_retain); a person's acknowledged Stop owes no restore.
+  it("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118): hands off a warm sandbox after cancelled/cancelled without stopping or physically resuming it", async () => {
+    const f = await seed();
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled", finishedAt: new Date(),
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board-operator" } }).where(eq(heartbeatRuns.id, f.runId));
+    await f.heartbeat.releaseEnvironmentLeasesForRun({ runId: f.runId, companyId: f.companyId,
+      agentId: f.agentId, status: "cancelled", providerResourceDisposition: "keep_running" });
+    const stopped = await environmentService(db).getLeaseById(f.acquired.lease.id);
+    expect(stopped).toMatchObject({ status: "released", cleanupStatus: "success", metadata: { sandboxStopAndRetainReceipt: expect.any(Object) } });
+    expect(hasConfirmedSandboxStopAndRetain(stopped!), "stop_and_retain receipt").toBe(true);
+    expect(f.state()).toEqual({ running: false, starts: 1 });
+    expect(f.call.mock.calls.map(call => call[1]), "stopped and retained, never destroyed").toEqual(["environmentAcquireLease", "environmentStopLease"]);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]).toMatchObject({ status: "cancelled", errorCode: "cancelled" });
   });
 
   async function finish(f: Awaited<ReturnType<typeof seed>>, runId: string, status: "failed" | "succeeded") {
