@@ -118,6 +118,43 @@ describe("optimistic task Retry", () => {
     await act(async () => settlements[0]({ requestId: "old", accepted: true, stale: false, presentation: null }));
     expect(container.textContent).toContain("Thinking");
   });
+  // fix17 (rf-3 smarty-dev#20787 c6966691438 (2)): an answer that admission refused (Backlog, reassigned)
+  // or an error must end the pending-Retry indicator at once. TaskChatThread paints 'Working' from
+  // this flag (retryPreparing), even while the task's other reads are still refreshing.
+  it.each([
+    ["Backlog", { requestId: null, accepted: false, stale: true, refused: { reason: "task_backlog",
+      message: "This task is in Backlog. Move it to To do to run it." } }],
+    ["another assignee", { requestId: null, accepted: false, stale: true, refused: { reason: "task_reassigned",
+      message: "This task is assigned to another agent. Reassign it to the previous agent to retry this attempt." } }],
+    ["a server error", new ApiError("Server unavailable", 503, { error: "Server unavailable" })],
+  ] as const)("ends Working at once when the Retry answer is %s", async (label, answer) => {
+    const before = { intentId: null, responsibility: "system" as const, state: "failed" as const, canRetry: true,
+      nextRetryAt: null, userAction: null, sourceRunIds: ["failed-run"], observedRunId: "failed-run" };
+    const refused = "refused" in answer ? answer.refused : null;
+    const presentation = refused ? { ...before, responsibility: "user" as const, state: "waiting_for_user" as const,
+      canRetry: false, notice: { code: refused.reason, text: refused.message }, retryWait: refused } : before;
+    const detailKey = queryKeys.issues.detail(issue.id);
+    client.setQueryData(detailKey, { ...issue, interruption: before });
+    // The task's own reads keep refreshing (a slow live-runs or detail read).
+    const queryFn = vi.fn(() => new Promise<Issue>(() => {}));
+    function Observed() {
+      const { data } = useQuery({ queryKey: detailKey, queryFn, staleTime: Infinity });
+      const retry = useTaskRetry(data);
+      return <>{retry.optimistic && <span>Working</span>}<ExecutionBlockerNotice presentation={data?.interruption} canRetry
+        onRetry={retry.retry} optimistic={retry.optimistic} takingLonger={retry.takingLonger} error={retry.error} /></>;
+    }
+    if (answer instanceof ApiError) vi.mocked(issuesApi.retryTask).mockRejectedValue(answer);
+    else vi.mocked(issuesApi.retryTask).mockResolvedValue({ ...answer, presentation } as Awaited<ReturnType<typeof issuesApi.retryTask>>);
+    await act(async () => root.render(<QueryClientProvider client={client}><Observed /></QueryClientProvider>));
+    await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="task-execution-retry"]')!.click());
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+    expect(container.textContent, `${label}: no Working`).not.toContain("Working");
+    expect(container.textContent, `${label}: no Thinking`).not.toContain("Thinking");
+    if (refused) {
+      expect(container.textContent, `${label}: the refusal line`).toContain(refused.message);
+      expect(container.querySelector('[data-testid="task-execution-retry"]'), `${label}: no Retry`).toBeNull();
+    } else expect(container.querySelector('[role="alert"]')?.textContent, `${label}: the error`).toContain("temporarily unavailable");
+  });
   it.each(["id", "identifier"])("reads a deferred Retry reason on the %s route and stops checking once explained", async route => {
     vi.useFakeTimers();
     const presentation = { intentId: "intent", responsibility: "system" as const, state: "failed" as const,
