@@ -62,7 +62,7 @@ async function runProviderTurnScenario(tokens: string, options: { agent?: "claud
   const background = join(root, "background");
   const binary = defaultCapabilityRunnerdBinary(), sidecar = resolve(import.meta.dirname, "../../runner/target/debug/fake-acpx-sidecar");
   await mkdir(join(root, "acpx"), { mode: 0o700 }); await mkdir(join(root, "diagnostics"), { mode: 0o700 });
-  await writeFile(script, "qualified fixture entry");
+  await writeFile(script, "qualified fixture entry", { mode: 0o755 });
   await writeFile(background, tokens);
   await writeFile(wrapper, `#!/bin/sh\nexec ${quote(sidecar)} --mode source-reconcile --profile-digest ${quote(QUALIFIED_ACPX_PROFILES[agent].commandDigest)} --journal ${quote(journal)} --source-fault ${quote(fault)} --background-tasks ${quote(background)} --spawn-owned-child\n`, { mode: 0o700 });
   let authority: DurablePrpControlPlane | null = null;
@@ -257,7 +257,7 @@ async function restartFixture(tokens: string, sidecarArgs = "", optIn = true) {
   const background = join(root, "background");
   const binary = defaultCapabilityRunnerdBinary(), sidecar = resolve(import.meta.dirname, "../../runner/target/debug/fake-acpx-sidecar");
   await mkdir(join(root, "acpx"), { mode: 0o700 }); await mkdir(join(root, "diagnostics"), { mode: 0o700 });
-  await writeFile(script, "qualified fixture entry");
+  await writeFile(script, "qualified fixture entry", { mode: 0o755 });
   await writeFile(background, tokens);
   await writeFile(wrapper, `#!/bin/sh\nexec ${quote(sidecar)} --mode source-reconcile --profile-digest ${quote(QUALIFIED_ACPX_PROFILES.claude.commandDigest)} --journal ${quote(journal)} --source-fault ${quote(fault)} --background-tasks ${quote(background)} --spawn-owned-child${sidecarArgs}\n`, { mode: 0o700 });
   let authority: DurablePrpControlPlane | null = null, registrations = 0;
