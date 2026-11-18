@@ -13,16 +13,19 @@ import { AsyncLocalStorage } from "node:async_hooks";
  *   synchronously and counted in flight until its promise settles.
  * - `cleanup(fn)` (via `hostCleanup`): always runs (releasing this work's own
  *   lock / removing its uniquely named temp), and is counted in flight too.
- * - `work(fn)` (via `hostWork`): always runs, and the WHOLE of fn (including
- *   its finally-block cleanup of private snapshots, temp files and the merge
- *   owner sidecar) is counted in flight until it settles. adopt-drain3: work
- *   that may still clean up after the owner's action returned (e.g. a restore
- *   the action raced against its deadline) joins the drain this way, so the
- *   drain is complete only when that cleanup has also finished.
- * - `close()`: no new `run` starts. Idempotent.
- * - `closeAndDrain(capMs)`: close, then wait until nothing is in flight or
+ * - `defer(fn)` (via `hostDeferredCleanup`): REGISTERS this work's own
+ *   cleanup (its private snapshot/temp dirs, its uniquely named temporaries,
+ *   its merge lock: owner sidecar + SQLite lock) and returns an idempotent
+ *   runner. The work calls the runner from its finally as before; if the drain
+ *   closes first, the DRAIN runs it, and the work's late call is a no-op.
+ * - `close()`: no new `run` starts, and the drain starts closing: it awaits the
+ *   in-flight host fs calls (never remote I/O), then runs the outstanding
+ *   registered cleanups itself (tracked, LIFO), and only then is drained.
+ *   Idempotent.
+ * - `closeAndDrain(capMs)`: close, then wait until that closing finished or
  *   `capMs` passes. Returns `{ drained: true }` or `{ drained: false, inFlight }`.
- *   `drained()` waits without a cap.
+ *   `drained()` waits without a cap (once closed: for the whole closing,
+ *   including the registered cleanups).
  *
  * The owner releases its ownership only after `closeAndDrain` (and, past the
  * cap, after `drained()`), so no host write of the old owner can land after
@@ -45,11 +48,16 @@ export type HostMutationDrain = {
   readonly inFlight: number;
   run<T>(fn: () => Promise<T>): Promise<T>;
   cleanup<T>(fn: () => Promise<T>): Promise<T>;
-  work<T>(fn: () => Promise<T>): Promise<T>;
+  defer(fn: () => Promise<void>): HostCleanupHandle;
   close(reason?: unknown): void;
   closeAndDrain(capMs: number, reason?: unknown): Promise<{ drained: true } | { drained: false; inFlight: number }>;
   drained(): Promise<void>;
 };
+
+/** adopt-drain4: an idempotent runner for a registered cleanup. Every call
+ * returns the same promise; the first call (by the work's finally, or by the
+ * closing drain) runs the cleanup. */
+export type HostCleanupHandle = () => Promise<void>;
 
 /** The default cap on how long an owner waits for in-flight host calls before
  * it reports that a host write is stuck (it still keeps ownership until the
@@ -60,7 +68,11 @@ export function createHostMutationDrain(): HostMutationDrain {
   let closed = false;
   let closeReason: unknown;
   let inFlight = 0;
+  let finished = false;
+  let closing: Promise<void> | undefined;
   let waiters: Array<() => void> = [];
+  // Registered cleanups not yet started, in registration order.
+  const pending = new Set<HostCleanupHandle>();
   const settle = () => {
     inFlight -= 1;
     if (inFlight === 0) { const ready = waiters; waiters = []; for (const wake of ready) wake(); }
@@ -71,8 +83,8 @@ export function createHostMutationDrain(): HostMutationDrain {
     try { promise = Promise.resolve(fn()); } catch (error) { settle(); return Promise.reject(error); }
     return promise.finally(settle);
   };
-  const drained = () => inFlight === 0 ? Promise.resolve() : new Promise<void>((resolve) => { waiters.push(resolve); });
-  return {
+  const idle = () => inFlight === 0 ? Promise.resolve() : new Promise<void>((resolve) => { waiters.push(resolve); });
+  const drain: HostMutationDrain = {
     get closed() { return closed; },
     get inFlight() { return inFlight; },
     run(fn) {
@@ -80,21 +92,55 @@ export function createHostMutationDrain(): HostMutationDrain {
       return track(fn);
     },
     cleanup: track,
-    work: track,
-    close(reason) { if (!closed) { closed = true; closeReason = reason; } },
+    defer(fn) {
+      let started: Promise<void> | undefined;
+      // Registered after the drain finished closing: nothing of this work can
+      // have been created through the drain since (every host mutation is
+      // refused), so this only releases non-host state; it runs untracked.
+      if (finished) return () => (started ??= Promise.resolve().then(fn));
+      const handle: HostCleanupHandle = () => {
+        if (!started) { pending.delete(handle); started = track(fn); }
+        return started;
+      };
+      pending.add(handle);
+      return handle;
+    },
+    close(reason) {
+      if (closed) return;
+      closed = true;
+      closeReason = reason;
+      closing = (async () => {
+        while (true) {
+          // 1. the in-flight host fs calls (never remote I/O) return.
+          await idle();
+          // Let the continuations of the calls that just returned register
+          // what they created (they run before the next macrotask).
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          if (inFlight > 0) continue;
+          if (pending.size === 0) break;
+          // 2. the drain itself runs the outstanding registered cleanups
+          // (innermost first), as tracked host mutations of this owner.
+          for (const handle of [...pending].reverse()) {
+            await store.run(drain, handle).catch(() => undefined);
+          }
+        }
+        finished = true;
+      })();
+    },
     async closeAndDrain(capMs, reason) {
-      this.close(reason);
-      if (inFlight === 0) return { drained: true };
+      drain.close(reason);
+      if (finished) return { drained: true };
       let timer: ReturnType<typeof setTimeout> | undefined;
       const capped = await Promise.race([
-        drained().then(() => false),
+        closing!.then(() => false),
         new Promise<true>((resolve) => { timer = setTimeout(() => resolve(true), capMs); }),
       ]);
       if (timer) clearTimeout(timer);
-      return capped && inFlight > 0 ? { drained: false, inFlight } : { drained: true };
+      return capped && !finished ? { drained: false, inFlight: Math.max(inFlight, 1) } : { drained: true };
     },
-    drained,
+    drained() { return closing ?? idle(); },
   };
+  return drain;
 }
 
 // One store per process even if this module is loaded twice (src + dist).
@@ -126,15 +172,16 @@ export function hostCleanup<T>(fn: () => Promise<T>): Promise<T> {
   return drain ? drain.cleanup(fn) : fn();
 }
 
-/** adopt-drain3: a unit of host work that owns private cleanup (its finally
- * blocks remove its own snapshots/temp files and its merge owner sidecar).
- * Under an owner's drain the whole unit is tracked, so `closeAndDrain()` /
- * `drained()` (and therefore the owner's release) wait until its cleanup has
- * finished, even when the owner's action stopped awaiting it (deadline race).
- * It is never refused: its host mutations inside still go through
- * `hostMutation` (refused once closed) and `hostCleanup` (always). Outside a
- * drain it is just `fn()`. */
-export function hostWork<T>(fn: () => Promise<T>): Promise<T> {
+/** adopt-drain4: register this work's own cleanup (private snapshot/temp
+ * dirs, uniquely named temporaries, its merge lock) with the current owner's
+ * drain BEFORE creating what it removes. Returns an idempotent runner: call it
+ * from the finally as before. If the owner's drain closes first (deadline,
+ * lock loss, action return), the drain runs it after the in-flight host calls
+ * returned and before the ownership is released; the late finally call is then
+ * a no-op. Outside a drain: a run-once wrapper of `fn`. */
+export function hostDeferredCleanup(fn: () => Promise<void>): HostCleanupHandle {
   const drain = store.getStore();
-  return drain ? drain.work(fn) : fn();
+  if (drain) return drain.defer(fn);
+  let started: Promise<void> | undefined;
+  return () => (started ??= Promise.resolve().then(fn));
 }
