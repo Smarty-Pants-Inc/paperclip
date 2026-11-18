@@ -17228,7 +17228,19 @@ export function issueRoutes(
             userResumedFromReviewToTodo) &&
           issue.assigneeAgentId
         ) {
-          addWakeup(issue.assigneeAgentId, {
+          // A person's status-only promotion starts the assignment, rather
+          // than re-poking a never-started run's old retry hold. Reuse the
+          // existing card eligibility and once-only queued replacement.
+          let replacedQueuedRun = false;
+          if (statusChangedFromBacklog && issue.status === "todo" && actor.actorType === "user" && !commentBody) {
+            const waiting = await taskInterruptionPresentation(db, issue);
+            if (waiting?.state === "failed" && waiting.canRetry && waiting.observedRunId) {
+              const { startPersonQueuedRunFresh } = await import("../services/task-retry.js");
+              replacedQueuedRun = Boolean(await startPersonQueuedRunFresh(db, heartbeat, {
+                companyId: issue.companyId, issueId: issue.id, runId: waiting.observedRunId, actorId: actor.actorId }));
+            }
+          }
+          if (!replacedQueuedRun) addWakeup(issue.assigneeAgentId, {
             source: "automation",
             triggerDetail: "system",
             reason: "issue_status_changed",
