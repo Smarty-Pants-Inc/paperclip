@@ -27,7 +27,8 @@ import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { isReplacedPreparation } from "./server-replacement-interruption.js";
-import { logActivity } from "./activity-log.js";
+import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
+import { clearTaskStopPendingForConfirmedRun } from "./recovery/stop-pending.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { issueService } from "./issues.js";
 import { isInterruptedNativePreparation, isInterruptedNativePreparationCandidate } from "./cancelled-native-startup.js";
@@ -478,7 +479,8 @@ export async function settleCancelledLegacyPreparation(
   if (input.providerDispatchStarted || input.run.runtimeMode !== "legacy" || input.run.status !== "cancelled") return null;
   const issueId = input.run.issueId ?? input.run.contextSnapshot?.issueId;
   if (typeof issueId !== "string") return null;
-  return db.transaction(async tx => {
+  const publications: ActivityPublication[] = [];
+  const result = await db.transaction(async tx => {
     const [task] = await tx.select().from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId))).for("update");
     // The dispatch gate writes this marker under the same run lock before
@@ -556,8 +558,13 @@ export async function settleCancelledLegacyPreparation(
         details: { reason: "legacy_cancelled_before_adapter", recoveryActionIds: resolved.map(r => r.id) },
       });
     }
+    // An older release's task Stop hold on this run ends with this confirmation.
+    await clearTaskStopPendingForConfirmedRun(tx as unknown as Db,
+      { companyId: run.companyId, issueId: task.id, runId: run.id }, publications);
     return settled;
   });
+  for (const publication of publications) publishActivity(publication);
+  return result;
 }
 
 /** Capture the required-file obligation before unrelated host writes. Keeps

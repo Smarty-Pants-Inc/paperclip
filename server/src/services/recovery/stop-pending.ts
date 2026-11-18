@@ -3,6 +3,7 @@ import { issueRecoveryActions, type Db } from "@paperclipai/db";
 import { logActivity, type ActivityPublication } from "../activity-log.js";
 import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
 import { notifyNativeRecoveryNotices } from "../native-recovery-notice-notifications.js";
+import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
 
 const STOP_PENDING_CODE = "execution_stop_pending";
 export const STOP_PENDING_SCHEMA = "paperclip.task-stop-pending.v1";
@@ -99,6 +100,18 @@ export async function recordTaskStopPending(tx: Db, input: TaskBinding & { sourc
     details: { code: STOP_PENDING_CODE, source: input.source, runIds, recoveryActionId: actionId,
       escalation: "board", automaticInspectionLimit: 1 },
   }, publications);
+}
+
+/** Upstream's confirmed preparation Stop (#21906) proves its run stopped. It
+ * discharges a hold bound to that run once every other bound run is proven too.
+ * Caller holds the task and run locks. */
+export async function clearTaskStopPendingForConfirmedRun(tx: Db,
+  input: { companyId: string; issueId: string; runId: string }, publications: ActivityPublication[]) {
+  const existing = await activeAction(tx, { ...input, runIds: [] });
+  const runIds = existing && stopPending(existing)?.runIds;
+  if (!runIds?.includes(input.runId)) return;
+  if (!await runExecutionsHaveStopped(tx, input.companyId, runIds.filter(id => id !== input.runId))) return;
+  await clearTaskStopPending(tx, { companyId: input.companyId, issueId: input.issueId, runIds }, publications);
 }
 
 /** Only the successful guarded release removes this diagnostic. Independent
