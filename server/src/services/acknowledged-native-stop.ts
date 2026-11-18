@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, ne, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { parseObject } from "../adapters/utils.js";
 import { resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
@@ -66,6 +66,54 @@ export function isAcknowledgedNativeReassignmentStop(run: Parameters<typeof hasA
 
 export function isAcknowledgedNativeStop(run: Parameters<typeof hasAcknowledgedNativeStopIntent>[0]): boolean {
   return run.status === "cancelled" && hasAcknowledgedNativeStopIntent(run);
+}
+
+/**
+ * Option S (ac067fa884): the chat owner's Send after an acknowledged person
+ * Stop takes the same ordinary admission as a typed message. ONE predicate:
+ * admission (explicit-native-continuation) decides with it, and the held bar
+ * (routes/issues.ts) shows "will be sent when you send your next message" only
+ * when it holds. It is the owner's Agent Chat, the sender is its owner, the
+ * agent's latest native turn is an acknowledged person Stop (not a non-person
+ * cancel) finished before the Send, and no reconciliation
+ * source or execution blocker stands.
+ */
+export function isOwnerSendAfterAcknowledgedPersonStop(input: {
+  task: { conversationAgentId?: string | null; conversationUserId?: string | null };
+  agentId: string;
+  senderId: unknown;
+  latest: (Parameters<typeof isAcknowledgedNativeStop>[0] & { finishedAt: Date | null }) | null | undefined;
+  sentAt: Date;
+  blockedOrReconciling: boolean;
+}): boolean {
+  const { task, latest } = input;
+  return !input.blockedOrReconciling && task.conversationAgentId === input.agentId
+    && input.senderId === task.conversationUserId && !!latest && isAcknowledgedNativeStop(latest)
+    // Narrowed Option S (6102b5d4): an operator Interrupt is not a person Stop.
+    && latest.resultJson?.operatorInterrupted !== true && !latest.resultJson?.queuedCommentInterruptQueueId
+    && !!latest.finishedAt && latest.finishedAt <= input.sentAt;
+}
+
+/** Option S-N (ebeb1bf9, moved here by call): Option S applies only when nothing
+ * else is active or queued on this chat (the same source as run-control
+ * resumeSavedComments); otherwise the Send takes the ordinary path. */
+export async function otherRunActiveOnChat(db: Db, input: {
+  companyId: string; agentId: string; issueId: string; excludeRunId: string;
+}): Promise<boolean> {
+  return (await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), ne(heartbeatRuns.id, input.excludeRunId),
+    sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`,
+    inArray(heartbeatRuns.status, ["running", "queued", "scheduled_retry"]),
+  )).limit(1)).length > 0;
+}
+
+/** The ONE Option S predicate, admission and the queued-comment GET alike:
+ * the pure terms first, then (only if they hold) the other-run check. */
+export async function ownerSendAfterAcknowledgedPersonStop(db: Db,
+  input: Parameters<typeof isOwnerSendAfterAcknowledgedPersonStop>[0] & { companyId: string; issueId: string }): Promise<boolean> {
+  if (!isOwnerSendAfterAcknowledgedPersonStop(input) || !input.latest) return false;
+  return !(await otherRunActiveOnChat(db, { companyId: input.companyId, agentId: input.agentId,
+    issueId: input.issueId, excludeRunId: (input.latest as { id: string }).id }));
 }
 
 /** API-owned execution has no Computer lease. Its provider terminal and retired
