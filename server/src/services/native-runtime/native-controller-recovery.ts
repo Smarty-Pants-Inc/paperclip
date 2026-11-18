@@ -83,8 +83,16 @@ export type NativeControllerRecoveryOutcome =
 
 export type NativeRetainedOwnerWait = { runId: string; controllerBootId: string };
 
+/** The deferral's words while a retained owner still holds its lease. */
+export const RETAINED_OWNER_LEASE_WAIT_MESSAGE = "Waiting for the retained native controller owner to release its lease.";
+/** The deferral's words while no lease of the stopped run is held and its
+ * tools are not yet proven exited (S095 rf-3). */
+export const STOPPED_RUN_TOOLS_WAIT_MESSAGE = "Waiting to confirm the stopped run's tools have exited.";
+
+export type NativeRecoveryWaitDetail = { message?: string; stoppedRunToolsWait?: { stoppedRunId: string } };
+
 export class NativeControllerRecoveryWaitingError extends Error {
-  constructor(readonly retryAt: Date, readonly owner?: NativeRetainedOwnerWait) {
+  constructor(readonly retryAt: Date, readonly owner?: NativeRetainedOwnerWait, readonly detail?: NativeRecoveryWaitDetail) {
     super(NATIVE_RETAINED_OWNER_WAIT);
     this.name = "NativeControllerRecoveryWaitingError";
   }
@@ -96,7 +104,7 @@ export class NativeControllerRecoveryWaitingError extends Error {
  * permissions and task ownership when this deadline arrives. */
 export async function deferNativeControllerRecovery(db: Db, input: {
   companyId: string; agentId: string; issueId: string; runId: string;
-  leaseOwner?: string; retryAt: Date; waitingForOwner?: NativeRetainedOwnerWait;
+  leaseOwner?: string; retryAt: Date; waitingForOwner?: NativeRetainedOwnerWait; message?: string;
 }): Promise<void> {
   await db.transaction(async tx => {
     const [task] = await tx.select({ executionRunId: issues.executionRunId }).from(issues)
@@ -139,7 +147,7 @@ export async function deferNativeControllerRecovery(db: Db, input: {
       phase: "retryable_failure", leaseOwner: null, leaseExpiresAt: null, controlDeadlineAt: null,
       nextAttemptAt: input.retryAt, recoveryState: "resuming_session", failureCode: NATIVE_RETAINED_OWNER_WAIT,
       failureDetail: { originalFailureCode: NATIVE_RETAINED_OWNER_WAIT,
-        message: "Waiting for the retained native controller owner to release its lease.",
+        message: input.message ?? RETAINED_OWNER_LEASE_WAIT_MESSAGE,
         recoveryMode: record(run.runnerProfileJson).sessionCheckpoint ? "same_session_resume" : "bootstrap_retry",
         providerSessionEstablished: false, providerEventsExist: false,
         ...(input.waitingForOwner ? { waitingForOwner: { runId: input.waitingForOwner.runId,
