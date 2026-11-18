@@ -108,6 +108,7 @@ export async function decidePersonStopExportAtBound(input: {
   // (native-workspace-sync.ts resumeNativeWorkspaceSync).
   const recorded = await db.transaction(async tx => {
     if (!await tryLockNativeWorkspaceFinalization(tx as unknown as Db, { companyId: run.companyId, runId: run.id })) return null;
+    if (await personStopCopybackOwnerUnjoined(tx as unknown as Db, run)) return null;
     return tx.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb)
       || ${JSON.stringify({ [PERSON_STOP_BOUND_KEY]: decision })}::jsonb` })
       .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, "active"),
@@ -133,6 +134,21 @@ export async function decidePersonStopExportAtBound(input: {
           summary: line, message: line } } } }).catch(() => undefined);
   }
   return { ...decision, decidedNow: true };
+}
+
+/**
+ * adopt-stopu-fvc8 (Q-B), never-OK: the advisory lock is free once the export's
+ * PostgreSQL session is lost, but the durable copyback owner record stays until
+ * that owner's action AND host-mutation drain have joined
+ * (withNativeWorkspaceFinalizationOwnership's finally). While it is present an
+ * already-dispatched host write may still land, so the bound must not decide:
+ * fail closed (keep the hold). The next export's takeover proves the owner gone
+ * (the finalization-owner join/stop proof) and clears the record.
+ */
+async function personStopCopybackOwnerUnjoined(db: Db, run: typeof heartbeatRuns.$inferSelect): Promise<boolean> {
+  const [row] = await db.select({ owner: sql<unknown>`${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceFinalizationOwner'` })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
+  return row?.owner !== null && row?.owner !== undefined;
 }
 
 /**
@@ -209,7 +225,12 @@ export async function personStopExportPendingHoldsAdmission(db: Db,
     if (!lease.provider || lease.provider === "local" || !hasAcknowledgedNativeRunStopRequest(run)) continue;
     // adopt-stopu-compose4: at the bound the hold ends (rf-4 22:53Z); the
     // decision is durable on the lease.
-    if (readPersonStopBoundDecision(lease.metadata)) continue;
+    if (readPersonStopBoundDecision(lease.metadata)) {
+      // adopt-stopu-fvc8 (Q-B): a decided bound still holds while the old
+      // copyback owner is unjoined (independent of the issue execution pointer).
+      if (run.runnerProfileJson?.nativeWorkspaceFinalizationOwner) return run.id;
+      continue;
+    }
     if (await nativeWorkspaceExportPendingForLease(db, lease, { destructive: false })) return run.id;
   }
   return null;
