@@ -1497,7 +1497,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         if (fenced && (options.stopAcceptance === "interrupt" || (options.stopAcceptance && fenced.runtimeMode === "native"))) await appendHeartbeatRunEvent(tx as unknown as Db, {
           companyId: fenced.companyId, runId, agentId: fenced.agentId, eventType: "lifecycle", stream: "system", level: "info",
           message: "run.stop.accepted", payload: { schema: "paperclip.stop-acceptance.v1", kind: options.stopAcceptance,
-            issueId: handoffIssueId, userId: attribution.cancelledByUserId ?? null, acceptedAt: requestedAt } });
+            issueId: handoffIssueId, userId: attribution.cancelledByUserId ?? null, acceptedAt: requestedAt }, keepRunUpdatedAt: true });
         // A board terminal request deliberately has no source run. It belongs
         // to the current task execution, not whichever historical run is stopped.
         // Queue admission may bind execution before adopting an old checkout.

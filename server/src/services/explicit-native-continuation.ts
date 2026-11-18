@@ -362,7 +362,8 @@ export async function admitExplicitNativeContinuation(input: {
       // the chat owner and a write before the run finished bind the row to the Stop route's acceptance (forgery.md).
       && ((rows: { payload: Record<string, unknown> | null; createdAt: Date }[]) => rows.length > 0 && rows.every(({ payload, createdAt }) =>
         Object.keys(payload ?? {}).sort().join() === "acceptedAt,issueId,kind,schema,userId" && payload!.schema === "paperclip.stop-acceptance.v1"
-        && payload!.kind === "person_stop" && payload!.userId === task.conversationUserId && createdAt <= latest.finishedAt!))(
+        && payload!.kind === "person_stop" && payload!.userId === task.conversationUserId && payload!.issueId === issueId
+        && typeof payload!.acceptedAt === "string" && Date.parse(payload!.acceptedAt) <= latest.finishedAt!.getTime() && createdAt <= latest.finishedAt!))(
         await db.select({ payload: heartbeatRunEvents.payload, createdAt: heartbeatRunEvents.createdAt }).from(heartbeatRunEvents)
           .where(and(eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, latest.id), stopAcceptanceEventSql())));
     if (latest?.runtimeMode === "native" && ["cancelled", "failed"].includes(latest.status) && !ownerSendAfterPersonStop &&
