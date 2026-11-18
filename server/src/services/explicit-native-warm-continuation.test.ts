@@ -11,6 +11,7 @@ import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasConfirmedSandboxStopAndRetain } from "./sandbox-stop-and-retain.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("explicit continuation after a warm preparation failure", () => {
@@ -117,7 +118,6 @@ describe.skipIf(!support.supported)("explicit continuation after a warm preparat
   });
 
   it.each([
-    { status: "cancelled", errorCode: "cancelled", providerWorkStarted: false },
     { status: "interrupted", errorCode: "native_session_interrupted", providerWorkStarted: false },
     { status: "failed", errorCode: "adapter_failed", providerWorkStarted: true },
     { status: "failed", errorCode: "adapter_failed", providerWorkStarted: undefined },
@@ -129,5 +129,14 @@ describe.skipIf(!support.supported)("explicit continuation after a warm preparat
     expect(settled).toMatchObject({ status: "retained", cleanupStatus: "success" });
     expect(f.call).not.toHaveBeenCalled();
     expect(hasRemoteTerminationReceipt(settled)).toBe(false);
+  });
+  // Reason: c3 restores upstream's rule: a cancelled run stops and retains its box (stop_and_retain); a person's acknowledged Stop owes no restore.
+  it("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118): preserves selected warm retention outside the exact failed-preparation case (cancelled/cancelled/false)", async () => {
+    const f = await seed({ status: "cancelled", errorCode: "cancelled", providerWorkStarted: false });
+    await f.runtime.releaseRunLeases(f.runId, "failed", undefined, "keep_running");
+    const [settled] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    expect(settled).toMatchObject({ status: "released", leasePolicy: "reuse_by_environment", cleanupStatus: "success" });
+    expect(f.call.mock.calls.map(call => call[1]), "stopped and retained, never destroyed").toEqual(["environmentStopLease"]);
+    expect(hasConfirmedSandboxStopAndRetain(settled), "stop_and_retain receipt").toBe(true);
   });
 });

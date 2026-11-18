@@ -396,7 +396,7 @@ describe("native environment release scheduling", () => {
     await start(); await flush(); expect(release).not.toHaveBeenCalled();
     expect((await environmentService(db).getLeaseById(acquired.id))?.status).toBe("retained"); await quiet();
   });
-  it.each(["failed", "cancelled"] as const)("retains a %s run's reusable sandbox under its selected warm policy", async status => {
+  it.each(["failed"] as const)("retains a %s run's reusable sandbox under its selected warm policy", async status => {
     const binding = await committed();
     await db.update(heartbeatRuns).set({ status, errorCode: status === "failed" ? "adapter_failed" : "cancelled",
       runnerProfileJson: { nativeResourceDisposition: "keep_running" } })
@@ -408,6 +408,22 @@ describe("native environment release scheduling", () => {
     expect(stopOnly).not.toHaveBeenCalled();
     expect((await environmentService(db).getLeaseById(acquired.id))?.status).toBe("retained");
     expect((await read(binding.runId)).status).toBe(status);
+    await quiet();
+  });
+  // Reason: c3 restores upstream's rule: a cancelled run stops and retains its box (stop_and_retain); a person's acknowledged Stop owes no restore.
+  it("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118): retains a cancelled run's reusable sandbox under its selected warm policy", async () => {
+    const binding = await committed();
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled",
+      runnerProfileJson: { nativeResourceDisposition: "keep_running" } })
+      .where(eq(heartbeatRuns.id, binding.runId));
+    const acquired = await environmentService(db).acquireLease({ companyId, environmentId, heartbeatRunId: binding.runId,
+      issueId: binding.issueId, leasePolicy: "reuse_by_environment", provider: "local", providerLeaseId: randomUUID() });
+    await start(); await flush();
+    expect(release, "released once, as stop_and_retain").toHaveBeenCalledOnce();
+    expect(release.mock.calls[0]![0]).toMatchObject({ lease: { id: acquired.id }, resourceDisposition: "stop_and_retain", status: "released" });
+    expect(stopOnly).not.toHaveBeenCalled();
+    expect((await environmentService(db).getLeaseById(acquired.id))?.status).toBe("released");
+    expect((await read(binding.runId)).status).toBe("cancelled");
     await quiet();
   });
   it.each([true, false])("delegates only periodic environment settlement, keeping manual behavior and other callbacks: %s", async delegated => {
