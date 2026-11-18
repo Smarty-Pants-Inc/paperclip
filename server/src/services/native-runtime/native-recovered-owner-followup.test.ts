@@ -1673,7 +1673,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
         state: "stopped", confirmedAt: new Date().toISOString() } } });
   }
 
-  const TURN_EXEMPT_LINE = "its person's Stop's unanswered turn commands no longer hold this conversation";
+  const TURN_EXEMPT_LINE = "turn commands issued after the person's acknowledged Stop no longer hold this conversation";
   const TURN_WAIT_LINE = "waiting for proof that the Runner of run";
 
   async function stopTurnShape(options: { receipt?: boolean; preStop?: boolean; stop?: Parameters<typeof stopSettledOwner>[1];
@@ -1728,6 +1728,40 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       expect.soft(finalization).toMatchObject({ phase: "retryable_failure", attempt: 0, failureCode: "native_controller_recovery_waiting_for_owner" });
       expect(followUp.remoteExecute).not.toHaveBeenCalled();
     }, 60_000);
+
+  /** The stopped run's own (old) box, still leased: no Boat stop receipt yet. */
+  async function recordOldBoxLeaseWithoutReceipt(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>) {
+    const environmentId = randomUUID();
+    await db.insert(environments).values({ id: environmentId, name: `stopped-${environmentId}`, driver: "sandbox" });
+    await db.insert(environmentLeases).values({ companyId, environmentId, issueId: prior.issueId, heartbeatRunId: prior.runId,
+      provider: "boat", providerLeaseId: `sandbox-${prior.runId}`, status: "active", metadata: { remoteCwd: "/workspace" } });
+  }
+
+  const LEASE_WAIT_WORDS = "Waiting for the retained native controller owner to release its lease.";
+  const TOOLS_EXIT_WAIT_WORDS = "Waiting to confirm the stopped run's tools have exited.";
+
+  it.each([
+    ["the generation proof wait, no lease of the stopped run", "generation", false, TOOLS_EXIT_WAIT_WORDS],
+    ["the generation proof wait, the stopped run's old box still leased", "generation", true, LEASE_WAIT_WORDS],
+    ["the acknowledgement wait, no lease of the stopped run", "acknowledgement", false, TOOLS_EXIT_WAIT_WORDS],
+    ["the acknowledgement wait, the stopped run's old box still leased", "acknowledgement", true, LEASE_WAIT_WORDS],
+  ] as const)("S095 words: the typed deferral's failureDetail says what it waits for: %s", async (_label, wait, leased, words) => {
+    let prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>, followUp: Awaited<ReturnType<typeof admitFollowUp>>;
+    if (wait === "generation") {
+      ({ prior, followUp } = await stopTurnShape({ receipt: false }));
+    } else {
+      prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm", pendingCommands: STOP_TURN_COMMANDS });
+      followUp = await admitFollowUp(prior);
+      await holdPersonStopAcknowledgement(prior);
+    }
+    if (leased) await recordOldBoxLeaseWithoutReceipt(prior);
+    const { outcome } = await executeFollowUp(prior, followUp, 300);
+    expect.soft(outcome).toBeInstanceOf(NativeControllerRecoveryWaitingError);
+    expect.soft(await quarantined()).toEqual([]);
+    const [finalization] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, followUp.runId));
+    expect.soft(finalization).toMatchObject({ phase: "retryable_failure", attempt: 0, failureCode: "native_controller_recovery_waiting_for_owner" });
+    expect((finalization.failureDetail as { message?: string } | null)?.message).toBe(words);
+  }, 60_000);
 
   it.each([
     ["an automatic (agent) Stop", { actor: "agent" }],
