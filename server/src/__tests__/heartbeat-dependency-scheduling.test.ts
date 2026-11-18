@@ -512,6 +512,14 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     // compose (unit 1 + u1b3): the one recovery after a cut is unit 1's recovery
     // run (a scheduled retry of the cut run), never the generic native-status
     // wake. R-ONCE still permits exactly that one: a partial reply is not ANSWERED.
+    // Generic native-status retries use issue_status_changed. Check persisted
+    // rows regardless of delivery state: a skipped/coalesced wake is still a bug.
+    const genericWakes = () => db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, f.companyId),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${f.issueId}`,
+      eq(agentWakeupRequests.reason, "issue_status_changed"),
+    ));
+    expect(await genericWakes()).toHaveLength(0);
     const dispatched = await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
     const recovery = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.failedRunId));
     const promoted = await heartbeat.promoteDueScheduledRetries(new Date(Date.now() + 1_000));
@@ -528,6 +536,26 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(await heartbeat.promoteDueScheduledRetries(new Date(Date.now() + 60_000))).toMatchObject({ promoted: 0 });
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(2);
     expect(mockAdapterExecute).toHaveBeenCalledOnce();
+    expect(await genericWakes()).toHaveLength(0);
+
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date(Date.now() + 60 * 60_000));
+      await heartbeat.sweepStaleIssueLocks({ companyId: f.companyId });
+      await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      await heartbeat.reconcileResolvedDependencyWakes({ companyId: f.companyId });
+      expect(await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId })).toMatchObject({ dispatched: 0 });
+      expect(await heartbeat.promoteDueScheduledRetries(new Date())).toMatchObject({ promoted: 0 });
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.failedRunId)))
+        .toMatchObject([{ id: recovery[0].id, status: "succeeded", scheduledRetryReason: "native_mid_stream_cut" }]);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(2);
+      expect(mockAdapterExecute).toHaveBeenCalledOnce();
+      expect(await genericWakes()).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it.each(["enqueue_continuation", "notify_owner"] as const)("R-ONCE F3 materializes the scoped effect receipt (%s)", async kind => {
