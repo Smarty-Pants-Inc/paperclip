@@ -2204,7 +2204,7 @@ describe("IssueDetail", () => {
     };
     if (kind !== "attachment") {
       await act(async () => { await props.onAdd("Clarify this goal"); });
-      expect(mockIssuesApi.addComment).toHaveBeenCalledWith(canonical.id, "Clarify this goal", undefined, undefined, undefined, expect.any(String));
+      expect(mockIssuesApi.addComment).toHaveBeenCalledWith(canonical.id, "Clarify this goal", undefined, undefined, undefined, expect.any(String), undefined);
       expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.issues.comments(canonical.id) });
     } else {
       const file = new File(["image"], "first.png", { type: "image/png" });
@@ -2256,7 +2256,7 @@ describe("IssueDetail", () => {
     expect(mockIssuesApi.getCore).toHaveBeenCalledWith(canonical.id, { cache: "no-store", fresh: true });
     expect(ensureIssue).toHaveBeenCalledOnce();
     expect(mockIssuesApi.update).toHaveBeenCalledWith(canonical.id, { assigneeAdapterOverrides: { useProjectWorkspace: true, adapterConfig: { chrome: true, command: "preserved-command", model: "gpt-6-astra", modelReasoningEffort: "high" } } });
-    expect(mockIssuesApi.addComment).toHaveBeenCalledWith(canonical.id, "Outline the launch", undefined, undefined, undefined, "model-message");
+    expect(mockIssuesApi.addComment).toHaveBeenCalledWith(canonical.id, "Outline the launch", undefined, undefined, undefined, "model-message", undefined);
     expect(calls).toEqual(["settings", "comment"]);
   });
 
@@ -3110,6 +3110,7 @@ describe("IssueDetail", () => {
           undefined,
           [id],
           expect.any(String),
+          undefined,
         );
         expect(mockIssuesApi.update).not.toHaveBeenCalled();
       }
@@ -5934,7 +5935,7 @@ describe("IssueDetail", () => {
     });
   });
 
-  it("does not rebind a queued message when another run becomes live before its request settles", async () => {
+  it("does not rebind a queued message when another run becomes live before its request settles, supersedes(does not rebind a queued message when another run becomes live before its request settles; RFL record SUPERSEDE-QUEUEUX-CONFLICT-WORDING-1118 (R1 /srv/scratch/paul/rfl-verdicts/SUPERSEDE-QUEUEUX-CONFLICT-WORDING-1118.md, in inputs/), spec ui/src/lib/issue-queued-comment-queue.ts:10-13 requires a neutral stale-queue update; every other assertion of the old row kept)", async () => {
     const postedComment = createDeferred<IssueComment>();
     mockIssuesApi.get.mockResolvedValue(
       createIssue({
@@ -6028,7 +6029,7 @@ describe("IssueDetail", () => {
     await act(async () => {
       await expect(replacementProps.onInterruptQueued(
         optimisticComment!.queueTargetRunId!,
-      )).rejects.toThrow("The queued messages changed");
+      )).rejects.toThrow(/^The queue changed\. Review it and try again\.$/);
     });
     expect(mockIssuesApi.interruptQueuedComments).not.toHaveBeenCalled();
     expect(mockHeartbeatsApi.cancel).not.toHaveBeenCalled();
@@ -7267,7 +7268,7 @@ describe("IssueDetail", () => {
         await composerProps().onAdd("Keep working");
       });
       expect(mockIssuesApi.addComment).toHaveBeenCalledWith(
-        "PAP-1", "Keep working", undefined, undefined, undefined, expect.any(String),
+        "PAP-1", "Keep working", undefined, undefined, undefined, expect.any(String), undefined,
       );
       expect(queryClient.getQueryState(treeControlKey)?.status).toBe("pending");
 
