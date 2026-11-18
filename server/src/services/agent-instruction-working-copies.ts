@@ -11,8 +11,8 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { and, asc, desc, eq, gt, inArray, lte, or, isNull, sql, type SQL } from "drizzle-orm";
-import { agents, heartbeatRuns, agentInstructionWorkingCopies as copies, databaseWorkScopeKey, type Db } from "@paperclipai/db";
+import { and, asc, desc, eq, gt, inArray, lte, or, isNull, sql, type AnyColumn, type SQL } from "drizzle-orm";
+import { agents, heartbeatRuns, agentInstructionWorkingCopies, agentInstructionWorkingCopies as copies, databaseWorkScopeKey, type Db } from "@paperclipai/db";
 import {
   prepareAdapterExecutionTargetRuntime,
   runAdapterExecutionTargetShellCommand,
@@ -98,6 +98,22 @@ export function instructionCollectionScript(root: string, entry: string) {
   ].join(";"))} ${quote(root)} ${quote(entry)} ${MAX_INSTRUCTION_BYTES}`;
 }
 
+
+export type CleanupPredicateTable = Record<"state" | "processStoppedAt" | "receipt" | "nextAttemptAt", AnyColumn>;
+/** The directory cleanup worker's own row predicate: a stopped settled agent
+ * directory copy whose leftover cleanup the worker keeps. The single source of
+ * truth for that debt; heartbeat agent status reuses it through a table alias
+ * (smarty-dev#21005). */
+export function directoryCleanupPredicate(copies: CleanupPredicateTable = agentInstructionWorkingCopies) {
+  return sql`${copies.state} IN ('saved', 'unchanged', 'resolved', 'unavailable')
+    AND ${copies.processStoppedAt} IS NOT NULL
+    AND ${copies.receipt}->>'schema' = 'paperclip.agent-files.v1'
+    AND coalesce(${copies.receipt}->>'retainedByRunId', '') = ''
+    AND NOT (${copies.state} = 'unavailable' AND ${copies.receipt} ? 'savePending')
+    AND ((${copies.receipt}->>'cleanupPending' = 'false' AND ${copies.nextAttemptAt} IS NOT NULL)
+      OR (${copies.receipt}->>'cleanupPending' IS DISTINCT FROM 'false'
+        AND (${copies.receipt} ? 'baseline' OR ${copies.receipt}->>'cleanupPending' = 'true')))`;
+}
 
 export function agentInstructionWorkingCopyService(db: Db, options: { environmentRuntime?: EnvironmentRuntimeService } = {}) {
   const revisions = agentInstructionRevisionService(db);
@@ -546,16 +562,6 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
       && (row.receipt?.cleanupPending === false ? row.nextAttemptAt !== null
         : Object.hasOwn(row.receipt!, "baseline") || row.receipt?.cleanupPending === true)
       ? { id: row.runId, companyId: row.companyId, dueAt: row.nextAttemptAt?.getTime() ?? 0 } : null;
-  }
-  function directoryCleanupPredicate() {
-    return sql`${copies.state} IN ('saved', 'unchanged', 'resolved', 'unavailable')
-      AND ${copies.processStoppedAt} IS NOT NULL
-      AND ${copies.receipt}->>'schema' = 'paperclip.agent-files.v1'
-      AND coalesce(${copies.receipt}->>'retainedByRunId', '') = ''
-      AND NOT (${copies.state} = 'unavailable' AND ${copies.receipt} ? 'savePending')
-      AND ((${copies.receipt}->>'cleanupPending' = 'false' AND ${copies.nextAttemptAt} IS NOT NULL)
-        OR (${copies.receipt}->>'cleanupPending' IS DISTINCT FROM 'false'
-          AND (${copies.receipt} ? 'baseline' OR ${copies.receipt}->>'cleanupPending' = 'true')))`;
   }
   async function loadDirectoryCleanup(scope: DirectoryCleanupScope | undefined, admitted: () => boolean) {
     const entries: DirectoryCleanupEntry[] = [];
