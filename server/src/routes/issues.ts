@@ -18150,6 +18150,19 @@ export function issueRoutes(
         // S8 order (Paul note 6): in a chat the press sends everything waiting,
         // in the order written. The person's plain messages from the oldest on
         // join this wake, as after a person's Stop (gatherPersonStoppedChatMessages).
+        // TODO(pl/s8-order phase 2, RFL F1 blocker; waits for app-lead's ANSWERED
+        // port, al-answered3's final person-message-answer.ts): B must never
+        // re-present consumed input. Exclude every message that is ANSWERED (a
+        // completed final), carriedInLiveRun or personStopped, through the ONE
+        // shared functions in services/person-message-answer.ts, never a local
+        // copy. Call sites, all inside this issue-locked transaction:
+        //   1. the `byId` issue_comments read below: filter by the shared SQL
+        //      predicates so a consumed message is known as excluded;
+        //   2. the `wakeIds.every(...)` check in the `for (const wake of waiting)`
+        //      loop: a waiting wake with a consumed message is not joined;
+        //   3. the joined id union passed to withQueuedCommentIdsInWakePayload
+        //      (pressedPayload), including locked.wake's own ids.
+        // Red until then: RFL's 'JUDGE a stopped' row (it.fails in phase 1).
         let pressedPayload = readObject(locked.wake.payload);
         if (issue.conversationAgentId) {
           const waiting = await tx.select().from(agentWakeupRequests).where(and(
