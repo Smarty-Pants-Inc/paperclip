@@ -169,6 +169,57 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       .where(eq(heartbeatRuns.id, runId));
   };
 
+  // KEEP: review-fleet-2 caught NO_RUN describing an earlier started attempt as never started.
+  it("NORUN (1): an earlier own carrier started and failed; the newest queued carrier never started", async () => {
+    const f = await fixture();
+    const m = await f.message();
+    const failed = await f.run({ commentId: m, status: "failed", errorCode: "adapter_failed" });
+    await db.update(heartbeatRuns).set({ startedAt: f.at(0) }).where(eq(heartbeatRuns.id, failed));
+    await f.run({ commentId: m, status: "queued" });
+    const start = new Date();
+    await settleUnansweredPersonMessage(db, { ...f, now: start });
+    await settleUnansweredPersonMessage(db, { ...f, now: new Date(start.getTime() + 60_000) });
+    await settleUnansweredPersonMessage(db, { ...f, now: new Date(start.getTime() + 3_600_000) });
+    const notes = await f.visible();
+    console.log("NORUN_1", JSON.stringify(notes.map(n => ({ id: n.id, body: n.body }))));
+    expect(notes.map(n => n.body).join("\n")).not.toContain("no run started");
+    expect(notes, "a live carrying attempt is not a failure or a resend remedy").toHaveLength(0);
+  });
+
+  it("NORUN (2) CONTROL: no own carrier ever started still gets the NO_RUN line", async () => {
+    const f = await fixture();
+    const m = await f.message();
+    // An ancestry-only started run is NOT evidence that this message started.
+    const ancestor = await f.run({ status: "failed", errorCode: "adapter_failed" });
+    await db.update(heartbeatRuns).set({ startedAt: f.at(0) }).where(eq(heartbeatRuns.id, ancestor));
+    await f.run({ commentId: m, status: "queued", retryOfRunId: ancestor });
+    const start = new Date();
+    await settleUnansweredPersonMessage(db, { ...f, now: start });
+    await settleUnansweredPersonMessage(db, { ...f, now: new Date(start.getTime() + 3_600_000) });
+    const notes = await f.visible();
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.body).toBe(NO_RUN);
+  });
+
+  it("NORUN (3): started then failed, nothing queued or due: one true note at +1h and no more at +2h", async () => {
+    const f = await fixture();
+    const m = await f.message();
+    const failed = await f.run({ commentId: m, status: "failed", errorCode: "adapter_failed" });
+    await db.update(heartbeatRuns).set({ startedAt: f.at(0) }).where(eq(heartbeatRuns.id, failed));
+    // A tool effect is deliberately present: absence of a final answer does not prove safe replay.
+    await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: failed, agentId: f.agentId,
+      seq: 1, eventType: "item.completed", stream: "system", level: "info", message: "Tool completed a write." });
+    const start = new Date();
+    await settleUnansweredPersonMessage(db, { ...f, now: new Date(start.getTime() + 3_600_000) });
+    const notes = await f.visible();
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.body).toContain("Your message wasn't answered.");
+    expect(notes[0]!.body).not.toMatch(/no run started|safe/i);
+    await settleUnansweredPersonMessage(db, { ...f, now: new Date(start.getTime() + 7_200_000) });
+    expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual(notes.map(n => ({ id: n.id, body: n.body })));
+    console.log("NORUN_3", JSON.stringify(notes.map(n => ({ id: n.id, body: n.body }))));
+  });
+
   it("JUDGE never-OK: a failed run's progress reply neither answers nor removes pending input", async () => {
     const f = await fixture();
     const m = await f.message("Finish the real requested work, not merely progress.");
@@ -3071,7 +3122,8 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const notes = await f.visible();
       expect(notes).toHaveLength(1);
       expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${steer}`);
-      expect(notes[0]!.body).toBe(NO_RUN);
+      // The acknowledged steer is OWN pending input (R-ONCE), even unread.
+      expect(notes[0]!.body).toBe(NOT_ANSWERED);
     });
 
     it("RED scope: the run's own message that the model had NOT read yet (no userMessage item) -> its notice stays", async () => {
@@ -3432,7 +3484,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       return notes[0]!;
     }
 
-    it("deferred continuation never starts: at END+10 min the same waiting note becomes the true held notice", async () => {
+    it("deferred continuation stays silent while pending; once cancelled its held notice settles exactly once", async () => {
       const f = await conversation();
       await pendingRecovery(f);
       await sweep(f, 20_000);
@@ -3442,21 +3494,26 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         await sweep(f, elapsed);
         expect((await f.visible()).map(n => n.body).join("\n")).not.toMatch(RESEND_ADVICE);
       }
-      const waiting = await oneSweepNotice(f);
-      expect(waiting.body).toBe(WAITING);
+      expect(await f.visible()).toHaveLength(0);
       await sweep(f, PENDING_WAIT_START_BOUND_MS);
+      expect(await f.visible()).toHaveLength(0);
+      await db.update(agentWakeupRequests).set({ status: "cancelled" }).where(eq(agentWakeupRequests.agentId, f.agentId));
       await sweep(f, PENDING_WAIT_START_BOUND_MS + 1_000);
       const note = await oneSweepNotice(f);
-      expect(note.id).toBe(waiting.id);
+      await sweep(f, PENDING_WAIT_START_BOUND_MS + 2_000);
+      expect((await oneSweepNotice(f)).id).toBe(note.id);
       expect(note.body).toBe(HELD);
       expect(codeOf(note)).toBe("runner_state_identity_mismatch");
       expect(JSON.stringify(note.metadata)).not.toContain("No action is needed; it will start by itself.");
     });
 
-    it("a first sweep at END+11 min cannot restart the automatic recovery clock or advise resending held input", async () => {
+    it("a first sweep at END+11 min waits for pending delivery, then uses the original automatic recovery clock", async () => {
       const f = await conversation();
       await pendingRecovery(f);
       await sweep(f, 11 * 60_000);
+      expect(await f.visible()).toHaveLength(0);
+      await db.update(agentWakeupRequests).set({ status: "cancelled" }).where(eq(agentWakeupRequests.agentId, f.agentId));
+      await sweep(f, 11 * 60_000 + 1_000);
       const first = await oneSweepNotice(f);
       expect(first.body).toBe(HELD);
       await sweep(f, 12 * 60_000);
@@ -3466,12 +3523,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         eq(activityLog.action, PENDING_WAIT_ACTION)))).toHaveLength(0);
     });
 
-    it("guard: a NON-held message past END keeps today's no-run notice", async () => {
+    it("guard: a NON-held started message stays silent while pending, then gets a true failed-run note", async () => {
       const f = await conversation(false);
       await pendingRecovery(f);
       await sweep(f, 11 * 60_000);
       await sweep(f, 12 * 60_000);
-      expect((await oneSweepNotice(f)).body).toBe(NO_RUN);
+      expect(await f.visible()).toHaveLength(0);
+      await db.update(agentWakeupRequests).set({ status: "cancelled" }).where(eq(agentWakeupRequests.agentId, f.agentId));
+      await sweep(f, 60 * 60_000);
+      expect((await oneSweepNotice(f)).body).toBe(NOT_ANSWERED);
     });
   });
 
