@@ -378,7 +378,8 @@ describe.each<Layer>(["production", "walker"])("structured values are masked (%s
     expectCleanLines(text);
     const [first] = records(text);
     expect(first.err.message).toBe("request failed ***REDACTED***");
-    expect(first.err.config.headers.Authorization).toBe("Bearer ***REDACTED***");
+    // Authorization is a sensitive key name: masked whole, by name (gap ii).
+    expect(first.err.config.headers.Authorization).toBe("[masked: sensitive key]");
     // The record is what the error's toJSON returns (as JSON.stringify would
     // write it at c2), masked: not a callable left for the serializer.
     expect(first.err.note).toBe(MASKED_LINE);
@@ -649,5 +650,125 @@ describe("a password in a URL's userinfo inside text is masked", () => {
     const [record] = records(output());
     expect(record.err.message).toBe(input);
     expect(record.msg).toBe(input);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gap (ii): a plain value under a sensitive KEY name. A custom API key header
+// has no credential shape, so the shape scanner passes it; the walker masks
+// it by name, at any depth, whatever its type.
+// ---------------------------------------------------------------------------
+
+const SHAPELESS_KEY = "Zq8vN3kL0pW5rT7yU2iO4aS6dF9gH1jK";
+const SENSITIVE_KEY_MARKER = "[masked: sensitive key]";
+
+// An axios-shape error: its toJSON returns the request config with headers,
+// one of them a custom API key header whose value has no recognizable shape.
+function apiKeyClientError(message: string) {
+  function AxiosLikeError(this: Error & Record<string, unknown>) {
+    this.message = message;
+    this.name = "AxiosError";
+    this.code = "ERR_BAD_RESPONSE";
+  }
+  AxiosLikeError.prototype = Object.create(Error.prototype);
+  AxiosLikeError.prototype.toJSON = function toJSON(this: Record<string, unknown>) {
+    return {
+      message: this.message,
+      name: this.name,
+      code: this.code,
+      config: {
+        url: "https://api.example.test/v1/x",
+        method: "post",
+        headers: { Accept: "application/json", "x-api-key": SHAPELESS_KEY, "User-Agent": "axios/1.7.9" },
+      },
+      status: 502,
+    };
+  };
+  return new (AxiosLikeError as unknown as new () => Error)();
+}
+
+describe.each<Layer>(["production", "walker"])("values under sensitive key names are masked at any depth (%s)", (layer) => {
+  it("masks config.headers['x-api-key'] of an axios-shape error through log.error({ err })", () => {
+    const { log, output } = captureLayer(layer);
+    log.error({ err: apiKeyClientError("Request failed with status code 502") }, "upstream failed");
+    const text = output();
+    expect(text).not.toContain(SHAPELESS_KEY);
+    const [record] = records(text);
+    expect(record.err.config.headers).toEqual({ Accept: "application/json", "x-api-key": SENSITIVE_KEY_MARKER, "User-Agent": "axios/1.7.9" });
+    expect(record.err.config.url).toBe("https://api.example.test/v1/x");
+    expect(record.err.message).toBe("Request failed with status code 502");
+  });
+
+  it("masks it through pino-http's req.log and the auto-5xx record", async () => {
+    const { log, output } = captureLayer(layer);
+    const app = express();
+    app.use(createHttpLogger(log));
+    app.get("/api/talk", (req, res) => {
+      req.log.error({ err: apiKeyClientError("client error") }, "client failed");
+      res.status(200).json({ ok: true });
+    });
+    app.get("/api/boom", () => { throw apiKeyClientError("upstream said no"); });
+    app.get("/api/unavailable", (_req, res) => {
+      (res as unknown as { err: unknown }).err = apiKeyClientError("busy");
+      res.status(503).json({ error: "unavailable" });
+    });
+    app.use(errorHandler);
+    await request(app).get("/api/talk");
+    expect((await request(app).get("/api/boom")).status).toBe(500);
+    expect((await request(app).get("/api/unavailable")).status).toBe(503);
+    const text = output();
+    expect(text).not.toContain(SHAPELESS_KEY);
+    const all = records(text);
+    expect(all[0].err.config.headers["x-api-key"]).toBe(SENSITIVE_KEY_MARKER);
+    const fiveHundreds = all.filter((record) => record.res?.statusCode >= 500);
+    expect(fiveHundreds).toHaveLength(2);
+    for (const record of fiveHundreds) expect(record.err.config.headers["x-api-key"]).toBe(SENSITIVE_KEY_MARKER);
+  });
+
+  it("masks `password` nested 6 deep, a Set-Cookie array, and values of any type", () => {
+    const { log, output } = captureLayer(layer);
+    const details = { a: { b: { c: { d: { e: { password: "plain-words-no-shape", user: "app" } } } } } };
+    log.error({ err: Object.assign(new Error("db login failed"), { details }) }, "db");
+    log.warn({ stderr: { headers: { "Set-Cookie": ["sid=f00dfeed1234; Path=/; HttpOnly", "csrf=abcd"], "Content-Type": "text/html" } } }, "cookie");
+    log.warn({ stdout: { X_API_KEY: 1234567890, "Client-Secret": { nested: "shapeless-client-secret" }, ACCESS_TOKEN: ["a", "b"], Passwd: true, private_key: null } }, "types");
+    const text = output();
+    for (const raw of ["plain-words-no-shape", "f00dfeed1234", "csrf=abcd", "1234567890", "shapeless-client-secret"]) expect(text).not.toContain(raw);
+    const [db, cookie, types] = records(text);
+    expect(db.err.details.a.b.c.d.e).toEqual({ password: SENSITIVE_KEY_MARKER, user: "app" });
+    expect(cookie.stderr.headers).toEqual({ "Set-Cookie": SENSITIVE_KEY_MARKER, "Content-Type": "text/html" });
+    expect(types.stdout).toEqual({
+      X_API_KEY: SENSITIVE_KEY_MARKER,
+      "Client-Secret": SENSITIVE_KEY_MARKER,
+      ACCESS_TOKEN: SENSITIVE_KEY_MARKER,
+      Passwd: SENSITIVE_KEY_MARKER,
+      private_key: SENSITIVE_KEY_MARKER,
+    });
+  });
+
+  it("masks a sensitive key on the error itself (an enumerable extra)", () => {
+    const { log, output } = captureLayer(layer);
+    log.error({ err: Object.assign(new Error("auth failed"), { authorization: "Basic-shapeless", secret: "s3" }) }, "x");
+    const [record] = records(output());
+    expect(record.err.authorization).toBe(SENSITIVE_KEY_MARKER);
+    expect(record.err.secret).toBe(SENSITIVE_KEY_MARKER);
+  });
+
+  it("matches the whole key only: near-miss names stay as written", () => {
+    const { log, output } = captureLayer(layer);
+    const kept = {
+      token_count: 5,
+      secretary: "Ms Smith",
+      passwordPolicy: "min 12 chars",
+      keyId: "k-1",
+      cookieConsent: true,
+      authorizationUrl: "https://auth.example.test/authorize",
+      apiKeyName: "billing",
+      passwords_rotated: 3,
+    };
+    log.warn({ stderr: kept }, "kept");
+    log.error({ err: Object.assign(new Error("x"), { details: kept }) }, "kept");
+    const [first, second] = records(output());
+    expect(first.stderr).toEqual(kept);
+    expect(second.err.details).toEqual(kept);
   });
 });

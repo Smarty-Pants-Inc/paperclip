@@ -1,17 +1,49 @@
+// Key names whose value is a credential whatever its shape. ONE list for both
+// layers: the logger's walker masks the value under any of these names, at any
+// depth and of any type (logger.ts, sensitiveLogKey), and the request-header
+// redact paths below are built from it. Matched case-insensitively against the
+// WHOLE key, with "-" and "_" treated alike: "X_API_KEY" and "Client-Secret"
+// match; "token_count", "secretary", "passwordPolicy" and "authorizationUrl" do
+// not. The same idea as Pino's own redact paths, applied by name.
+export const SENSITIVE_LOG_KEY_NAMES = [
+  "authorization",
+  "proxy-authorization",
+  "x-api-key",
+  "api-key",
+  "apikey",
+  "x-auth-token",
+  "cookie",
+  "set-cookie",
+  "password",
+  "passwd",
+  "secret",
+  "client-secret",
+  "client_secret",
+  "private-key",
+  "private_key",
+  "access-token",
+  "access_token",
+  "refresh-token",
+  "refresh_token",
+] as const;
+
+// `req.headers.cookie` for a plain identifier, `req.headers["set-cookie"]` else.
+// Incoming header names are lower-case, and every name above is.
+function requestHeaderPath(name: string): string {
+  return /^[a-z_$][a-z0-9_$]*$/.test(name) ? `req.headers.${name}` : `req.headers[${JSON.stringify(name)}]`;
+}
+
 export const HTTP_LOG_REDACT_PATHS = [
-  "req.headers.authorization",
+  // authorization, proxy-authorization, x-api-key, cookie, set-cookie, ...
+  ...SENSITIVE_LOG_KEY_NAMES.map(requestHeaderPath),
   'req.headers["x-paperclip-source-run-token"]',
   "res.headers.location",
-  'req.headers["proxy-authorization"]',
-  "req.headers.cookie",
-  // "set-cookie" is normally a response header; keep the request-side
-  // path as defensive coverage in case a proxy forwards it inbound.
-  'req.headers["set-cookie"]',
+  // "set-cookie" is normally a response header (the request-side path, from
+  // the list above, is defensive coverage in case a proxy forwards it inbound).
   'res.headers["set-cookie"]',
   // Credential- and session-paired headers with no debugging value.
   'req.headers["x-csrf-token"]',
   'req.headers["x-xsrf-token"]',
-  'req.headers["x-api-key"]',
   // Cloud proxy credentials and signed assertions authorize tenant access.
   'req.headers["x-paperclip-cloud-tenant-token"]',
   'req.headers["x-paperclip-cloud-session-id"]',

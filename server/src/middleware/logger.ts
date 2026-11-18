@@ -2,7 +2,7 @@ import pino from "pino";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Logger } from "pino";
 import { pinoHttp } from "pino-http";
-import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
+import { HTTP_LOG_REDACT_PATHS, SENSITIVE_LOG_KEY_NAMES } from "./http-log-redaction.js";
 import {
   isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
@@ -42,13 +42,26 @@ import { redactSensitiveText } from "../redaction.js";
  *   stderr, stdout and msg the walker decodes every binary value.
  * - A credential split across two fields, or across two log lines, is in no
  *   single string either layer scans.
- * - Masking is by credential shape. A plain value under a sensitive key name
- *   ({"x-api-key": "abc"}) is masked only where a redact path or
- *   redactSensitive covers that key.
+ * - The walker also masks by key name: a value of any type under a key in
+ *   SENSITIVE_LOG_KEY_NAMES (http-log-redaction.ts; whole key, any case, "-"
+ *   and "_" alike) becomes "[masked: sensitive key]", at any depth of err,
+ *   stderr, stdout, msg and errorContext. Elsewhere a plain value under such a
+ *   key ({"x-api-key": "abc"} in a field no serializer visits) is masked only
+ *   where a redact path or redactSensitive covers it: the backstop masks by
+ *   credential shape, not by key name.
  */
 const MAX_LOG_REDACTION_DEPTH = 8;
 const TRUNCATED_LOG_VALUE = `[masked: nested deeper than ${MAX_LOG_REDACTION_DEPTH}]`;
 const UNREADABLE_LOG_VALUE = "[masked: unreadable value]";
+const SENSITIVE_KEY_LOG_VALUE = "[masked: sensitive key]";
+
+// The sensitive key names (http-log-redaction.ts, the one list), normalised:
+// lower-case, "_" read as "-". A key matches only as a whole.
+const normaliseLogKey = (key: string) => key.toLowerCase().replace(/_/g, "-");
+const SENSITIVE_LOG_KEYS: ReadonlySet<string> = new Set(SENSITIVE_LOG_KEY_NAMES.map(normaliseLogKey));
+function sensitiveLogKey(key: string): boolean {
+  return SENSITIVE_LOG_KEYS.has(normaliseLogKey(key));
+}
 const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
 
 // Binary values (Buffer, Uint8Array and other typed arrays, DataView,
@@ -114,6 +127,13 @@ function redactLogObject(value: object, depth: number, ancestors: Set<object>): 
   if (Array.isArray(value)) return value.map((item) => redactLogValue(item, depth + 1, ancestors));
   const copy: Record<string, unknown> = {};
   for (const key of Object.keys(value)) {
+    // A value under a sensitive key name is a credential whatever its shape
+    // or type (an `x-api-key` header of 32 random characters): a fixed marker,
+    // never read.
+    if (sensitiveLogKey(key)) {
+      setLogField(copy, key, SENSITIVE_KEY_LOG_VALUE);
+      continue;
+    }
     let item: unknown;
     try {
       item = (value as Record<string, unknown>)[key];
@@ -237,7 +257,9 @@ export function redactedErrSerializer(err: unknown): unknown {
   if (typeof record.toJSON === "function") return redactLogValue(record);
   // The standard serializer returns a fresh object whose prototype carries the
   // non-enumerable `raw` reference; redact its own fields in place.
-  for (const key of Object.keys(record)) record[key] = redactLogValue(record[key]);
+  for (const key of Object.keys(record)) {
+    record[key] = sensitiveLogKey(key) ? SENSITIVE_KEY_LOG_VALUE : redactLogValue(record[key]);
+  }
   return record;
 }
 
