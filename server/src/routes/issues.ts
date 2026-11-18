@@ -63,7 +63,7 @@ import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractio
 import { deliverConversationComments, heldConversationComments, isConversation, isConversationReset } from "../services/agent-conversations.js";
 import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboarding-first-task-admission.js";
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
-import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
+import { issueRecoveryActionReadModel, projectPersonStopNotes } from "../services/issue-recovery-actions.js";
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
@@ -10442,7 +10442,7 @@ export function issueRoutes(
         actionId ? eq(issueRecoveryActions.id, actionId) : undefined,
       )).orderBy(desc(issueRecoveryActions.createdAt)).limit(actionId ? 1 : 20);
       if (actionId && !rows[0]) throw notFound("Recovery source not found.");
-      const actions = rows.map(issueRecoveryActionReadModel);
+      const actions = await projectPersonStopNotes(db, issue.companyId, rows.map(issueRecoveryActionReadModel));
       const sourceInspection = actionId ? await inspectWorkspaceSource(db, {
         companyId: issue.companyId, issueId: issue.id, runId, actionId,
       }) : undefined;
@@ -10465,8 +10465,8 @@ export function issueRoutes(
     )).orderBy(desc(issueRecoveryActions.createdAt));
     res.json({
       active,
-      actions: [...(active ? [active] : []), ...retainedHolds
-        .filter(action => action.id !== active?.id).map(issueRecoveryActionReadModel)],
+      actions: [...(active ? [active] : []), ...await projectPersonStopNotes(db, issue.companyId, retainedHolds
+        .filter(action => action.id !== active?.id).map(issueRecoveryActionReadModel))],
     });
   });
 
