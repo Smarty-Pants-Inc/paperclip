@@ -389,7 +389,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     }
   });
 
-  it("D10b SMAA-143 exhausted backup refusal gets exactly one factual unanswered notice", async () => {
+  it("supersedes(D10b SMAA-143 exhausted backup refusal gets exactly one factual unanswered notice; RFL record SUPERSEDE-HELDNOTE-RF2-NEWTASK-1118) D10b SMAA-143 exhausted backup refusal gets exactly one factual unanswered notice", async () => {
     const f = await fixture({ status: "blocked" });
     const id = await f.run({ commentId: await f.message(), status: "failed", errorCode: "native_session_interrupted",
       error: "runner_harness_state_mismatch: backup_without_reusable_lease" });
@@ -439,7 +439,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect((await f.visible())[0].body).toBe(NOT_ANSWERED);
   });
 
-  it("SMA-94 (live C8): adapter_failed 'Native session failed' under an ACTIVE board-owned native_continuation_requires_reconciliation hold -> exactly one notice", async () => {
+  it("supersedes(SMA-94 (live C8): adapter_failed 'Native session failed' under an ACTIVE board-owned native_continuation_requires_reconciliation hold -> exactly one notice; RFL record SUPERSEDE-HELDNOTE-RF2-NEWTASK-1118) SMA-94 (live C8): adapter_failed 'Native session failed' under an ACTIVE board-owned native_continuation_requires_reconciliation hold -> exactly one notice", async () => {
     const f = await fixture();
     const id = await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed", error: "Native session failed" });
     await f.boardHold("native_continuation_requires_reconciliation", id);
@@ -454,7 +454,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(rows.some(row => row.label === "Recovery action")).toBe(true);
   });
 
-  it("SMAA-1370 (REG-03 on Boat): 'runnerd transport closed during provider startup', blocked by the board -> exactly one notice", async () => {
+  it("supersedes(SMAA-1370 (REG-03 on Boat): 'runnerd transport closed during provider startup', blocked by the board -> exactly one notice; RFL record SUPERSEDE-HELDNOTE-RF2-NEWTASK-1118) SMAA-1370 (REG-03 on Boat): 'runnerd transport closed during provider startup', blocked by the board -> exactly one notice", async () => {
     const f = await fixture({ status: "blocked" });
     const id = await f.run({ commentId: await f.message(), status: "failed", errorCode: "native_session_retry_exhausted",
       error: "runnerd transport closed during provider startup" });
@@ -469,7 +469,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(codeOf(notices[0]!)).toBe("native_session_retry_exhausted");
   });
 
-  it("SMAA-501: a person comment with no run bound in 180 s on a task held by native_continuation_requires_reconciliation -> exactly one notice", async () => {
+  it("supersedes(SMAA-501: a person comment with no run bound in 180 s on a task held by native_continuation_requires_reconciliation -> exactly one notice; RFL record SUPERSEDE-HELDNOTE-RF2-NEWTASK-1118) SMAA-501: a person comment with no run bound in 180 s on a task held by native_continuation_requires_reconciliation -> exactly one notice", async () => {
     const f = await fixture({ status: "blocked" });
     const earlier = await f.run({ commentId: await f.message("first"), status: "failed", errorCode: "native_continuation_requires_reconciliation" });
     await f.boardHold("native_continuation_requires_reconciliation", earlier, "stranded_assigned_issue");
