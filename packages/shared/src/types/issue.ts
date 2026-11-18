@@ -1168,6 +1168,8 @@ export interface IssueQueuedCommentEntry {
   position: number;
   canEdit: boolean;
   canDiscard: boolean;
+  /** The message's stored mode: Steer joins the running turn, Queue waits for its end. A /new is always Queue. */
+  deliveryIntent?: "steer" | "queue";
   /** Agent Chat: a /new reset, or a message behind one. It waits for the turn boundary and never steers or interrupts. */
   behindReset?: boolean;
   /** Set when the message waits in a later wake than the queue's own (behind a /new); its own edits target it. */
@@ -1259,6 +1261,8 @@ export interface IssueCommentMetadataSection {
 
 export interface IssueCommentMetadata {
   version: 1;
+  /** A waiting person message's mode (Steer or Queue); set by its author, read by the queue. */
+  deliveryIntent?: "steer" | "queue";
   chatMessage?: {
     sourceTaskId: string;
     sourceTaskIdentifier: string;

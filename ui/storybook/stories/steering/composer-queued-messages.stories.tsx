@@ -209,9 +209,9 @@ export const AutoSteerCountdown: Story = {
   args: { autoSteer: true },
   play: async ({ canvasElement }) => {
     const page = within(canvasElement.ownerDocument.body);
-    await expect(page.getByTestId("task-chat-queued-auto-steer-queued-2")).toHaveTextContent(/Sending in \ds/);
+    await expect(page.getByTestId("task-chat-queued-auto-steer-queued-2")).toHaveTextContent(/Steers in \ds/);
     await userEvent.click(page.getByTestId("task-chat-queued-auto-steer-cancel-queued-2"));
-    await expect(page.getByTestId("task-chat-queued-steer-queued-2")).toBeVisible();
+    await expect(page.getByTestId("task-chat-queued-mode-queued-2")).toBeVisible();
   },
 };
 export const AutoSteerCountdownMobile: Story = {

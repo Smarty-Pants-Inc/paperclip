@@ -552,8 +552,8 @@
      leaves free, so Send stays on screen at every draft length. The composer root redeclares it
      with its measured input height and chat-column height; this is the unmeasured fallback. */
   --tc-interaction-card-max-h-mobile: calc(var(--mobile-chat-viewport-height, 100dvh) - var(--tc-composer-visible-nav-offset) - var(--tc-composer-editor-max-height));
-  /* About 3.5 queued rows, and less on short windows so the conversation stays visible. */
-  --tc-queued-list-max-h: min(calc(var(--spacing) * 40), 28dvh);
+  /* About eight queued rows (both sections), less on short windows so the conversation stays visible. */
+  --tc-queued-list-max-h: min(calc(var(--spacing) * 88), 45dvh); /* Paul NOTE 6: every waiting message stays visible; scroll, never collapse */
   --shadow-task-composer: 0 2px 8px -2px color-mix(in oklab, var(--foreground) 7%, transparent),
     0 12px 32px -8px color-mix(in oklab, var(--foreground) 12%, transparent);
   --profile-popover-width: 248px;

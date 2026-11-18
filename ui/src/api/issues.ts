@@ -53,6 +53,7 @@ import { api, ApiError, detachInflightGet, type RequestOptions } from "./client"
 import { CommentSubmissionUnknownError } from "../lib/comment-submit-result";
 import { classifySendFailure } from "../lib/pending-send";
 import { interactionResolutionErrorCode } from "../lib/interaction-resolution-error";
+import { QueuedMessagesChangedError } from "../lib/issue-queued-comment-queue";
 
 function hasCommentReceipt(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -586,17 +587,28 @@ export const issuesApi = {
     ),
   interruptQueuedComments: (
     id: string,
-    data: { queueId: string; targetRunId: string | null; revision: string },
+    data: { queueId: string; targetRunId: string | null; revision: string; commentId?: string },
   ) => api.post<IssueQueuedCommentQueue>(`/issues/${id}/queued-comments/interrupt`, data),
-  interruptLatestQueuedComments: async (id: string, expectedTargetRunId: string | null): Promise<IssueQueuedCommentQueue> => {
+  /** Interrupt; with a commentId, that one message goes first and the rest stay queued (never across a /new). */
+  interruptLatestQueuedComments: async (id: string, expectedTargetRunId: string | null, commentId?: string): Promise<IssueQueuedCommentQueue> => {
     const queue = await issuesApi.getQueuedComments(id);
-    if (!queue.queueId || (queue.targetRunId && queue.targetRunId !== expectedTargetRunId)) {
-      throw new Error("The queued messages changed. Refresh and try again.");
+    const entry = commentId ? queue.entries.find((candidate) => candidate.comment.id === commentId) : undefined;
+    const queueId = entry?.queueId ?? queue.queueId;
+    if (!queue.entries.length || !queueId ||
+        (queue.targetRunId && queue.targetRunId !== expectedTargetRunId && (!commentId || expectedTargetRunId !== null)) ||
+        (commentId && !entry)) {
+      // A wake can outlive its last message. Never POST a no-target/no-input
+      // interrupt and mistake a successful HTTP response for a new run.
+      throw new QueuedMessagesChangedError(queue);
     }
     return issuesApi.interruptQueuedComments(id, {
-      queueId: queue.queueId, revision: queue.revision, targetRunId: queue.targetRunId,
+      queueId, revision: entry?.queueRevision ?? queue.revision, targetRunId: queue.targetRunId,
+      ...(commentId ? { commentId } : {}),
     });
   },
+  /** A waiting message's mode, stored on the server (owner only). */
+  setQueuedCommentIntent: (id: string, commentId: string, intent: "steer" | "queue") =>
+    api.patch<IssueQueuedCommentQueue>(`/issues/${id}/queued-comments/${commentId}/intent`, { intent }),
   steerQueuedComment: (
     id: string,
     commentId: string,
@@ -734,11 +746,13 @@ export const issuesApi = {
     interrupt?: boolean,
     attachmentIds?: string[],
     clientRequestId?: string,
+    deliveryIntent?: "steer" | "queue",
   ) =>
     confirmedCommentResponse(
       api.post<IssueComment>(`/issues/${id}/comments`, {
         body,
         ...(clientRequestId ? { clientRequestId } : {}),
+        ...(deliveryIntent ? { deliveryIntent } : {}),
         ...(reopen === undefined ? {} : { reopen }),
         ...(interrupt === undefined ? {} : { interrupt }),
         ...(attachmentIds?.length ? { attachmentIds } : {}),
