@@ -6,12 +6,14 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
-  environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations,
+  environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations,
 } from "@paperclipai/db";
 import express from "express";
 import request from "supertest";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { agentRoutes } from "../routes/agents.js";
+import { isAcknowledgedNativeStop } from "../services/acknowledged-native-stop.js";
 import { issueService } from "../services/issues.js";
 import { deliverConversationComments } from "../services/agent-conversations.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -146,6 +148,7 @@ describe.skipIf(!support.supported)("optS-dd staged race (rf-4)", () => {
       next();
     });
     testApp.use("/api", issueRoutes(db, {} as any, {}));
+    testApp.use("/api", agentRoutes(db));
     testApp.use(errorHandler);
     return testApp;
   }
@@ -182,6 +185,9 @@ describe.skipIf(!support.supported)("optS-dd staged race (rf-4)", () => {
       turns.push({ runId, commentIds: ids });
     }
   }
+
+  const kinds = async (runId: string) => (await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runId),
+    eq(heartbeatRunEvents.message, "run.stop.accepted")))).map(row => (row.payload as any)?.kind).sort();
 
   async function heldThenStop(stopBy: "person" | "system" | "interrupt" = "person") {
     fixture.warm = true;
@@ -308,6 +314,8 @@ describe.skipIf(!support.supported)("optS-dd staged race (rf-4)", () => {
         wakes: wakes.map(w => ({ status: w.status, wait: (w.payload as any)?.executionWait })) });
       expect(turns, "an operator Interrupt must not dispatch a successor without its remote stop receipt").toEqual([]);
       expect(wakes.some(w => (w.payload as any)?.executionWait?.reason === "remote_cleanup")).toBe(true);
+      // optS-dd: the Interrupt's acceptance row survives the race's terminal writer (and the Send).
+      expect(await kinds(s.f.runId), "the interrupt row survives").toEqual(["interrupt"]);
     } finally { s.done(); }
   }, 120_000);
 

@@ -6,12 +6,14 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
-  environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations,
+  environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations,
 } from "@paperclipai/db";
 import express from "express";
 import request from "supertest";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { agentRoutes } from "../routes/agents.js";
+import { isAcknowledgedNativeStop } from "../services/acknowledged-native-stop.js";
 import { issueService } from "../services/issues.js";
 import { deliverConversationComments } from "../services/agent-conversations.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -146,6 +148,7 @@ describe.skipIf(!support.supported)("optS-dd staged race (rf-4)", () => {
       next();
     });
     testApp.use("/api", issueRoutes(db, {} as any, {}));
+    testApp.use("/api", agentRoutes(db));
     testApp.use(errorHandler);
     return testApp;
   }
@@ -183,7 +186,10 @@ describe.skipIf(!support.supported)("optS-dd staged race (rf-4)", () => {
     }
   }
 
-  async function heldThenStop(stopBy: "person" | "system" | "interrupt" = "person") {
+  const kinds = async (runId: string) => (await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runId),
+    eq(heartbeatRunEvents.message, "run.stop.accepted")))).map(row => (row.payload as any)?.kind).sort();
+
+  async function heldThenStop(stopBy: "person" | "system" | "interrupt" | "route" = "person") {
     fixture.warm = true;
     fixture.calls = [];
     turns.length = 0;
@@ -234,7 +240,8 @@ describe.skipIf(!support.supported)("optS-dd staged race (rf-4)", () => {
         const queue = await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
         return await request(client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
           .send({ queueId: queue.body.queueId ?? queue.body.id, targetRunId: runId, revision: queue.body.revision }).expect(200);
-      })() : heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+      })() : stopBy === "route" ? request(client).post(`/api/heartbeat-runs/${runId}/cancel`).send({})
+      : heartbeat.cancelRun(runId, "Cancelled by a board operator", {
         resultJson: stopBy === "person" ? { cancelledByActorType: "user", cancelledByUserId: userId }
           : { cancelledByActorType: "system" } });
       void stopping.catch(() => undefined);
@@ -242,7 +249,7 @@ describe.skipIf(!support.supported)("optS-dd staged race (rf-4)", () => {
         const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
         const value = row?.resultJson?.nativeCancellation as Record<string, unknown> | undefined;
         return (stopBy === "system" || value?.dispatchState === "acknowledged") &&
-          (fixture.recoveryRaceArmed && stopBy === "interrupt" || row?.status === "cancelled");
+          (fixture.recoveryRaceArmed && (stopBy === "interrupt" || stopBy === "route") || row?.status === "cancelled");
       });
       await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: "native_retry_cancelled",
         leaseOwner: null }).where(eq(nativeRunFinalizations.runId, runId));
@@ -293,6 +300,37 @@ describe.skipIf(!support.supported)("optS-dd staged race (rf-4)", () => {
         wakes: wakes.map(w => ({ status: w.status, wait: (w.payload as any)?.executionWait })) });
       expect(turns, "an operator Interrupt must not dispatch a successor without its remote stop receipt").toEqual([]);
       expect(wakes.some(w => (w.payload as any)?.executionWait?.reason === "remote_cleanup")).toBe(true);
+      // optS-dd: the Interrupt's acceptance row survives the race's terminal writer (and the Send).
+      expect(await kinds(s.f.runId), "the interrupt row survives").toEqual(["interrupt"]);
+    } finally { s.done(); }
+  }, 120_000);
+
+  // optS-dd "Recovery wins after Stop": the person's Stop through the real Stop route, held at its provider ACK
+  // while the executor's recovery wins the terminal write. Mutation: remove the append.
+  it("optS-dd recovery wins after a route Stop: person_stop row survives; S admits as S10 when the acknowledged term holds", async () => {
+    const s = await heldThenStop("route");
+    try {
+      await s.settle();
+      expect(turns).toEqual([]);
+      expect(fixture.recoveryRacePaused, "the race was forced: recovery terminalized while the Stop's ACK was held").toBe(true);
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, s.f.runId));
+      const acknowledged = isAcknowledgedNativeStop(stopped!);
+      const rowsBefore = await kinds(s.f.runId);
+      const pressedAt = Date.now();
+      const sent = await s.send();
+      await s.settle();
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, s.f.companyId));
+      await evidence("optS-dd-recovery-wins-after-route-stop", { send: sent.status, held: s.held, turns, acknowledged, rowsBefore,
+        rowsAfter: await kinds(s.f.runId), source: { status: stopped!.status, code: stopped!.errorCode, resultJson: stopped!.resultJson },
+        wakes: wakes.map(w => ({ status: w.status, wait: (w.payload as any)?.executionWait?.reason })) });
+      expect(rowsBefore, "the person_stop row survives the recovery's terminal write").toEqual(["person_stop"]);
+      expect(await kinds(s.f.runId)).toEqual(["person_stop"]);
+      expect(acknowledged, "the acknowledged-stop term holds after recovery wins").toBe(true);
+      expect(sent.status).toBe(200);
+      expect(turns).toHaveLength(1);
+      expect(turns[0]!.commentIds).toEqual(s.held);
+      expect([...s.answered().values()]).toEqual(s.held.map(() => 1));
+      expect(Date.now() - pressedAt).toBeLessThan(15_000);
     } finally { s.done(); }
   }, 120_000);
 

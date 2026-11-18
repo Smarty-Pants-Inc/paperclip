@@ -32,7 +32,21 @@ const fixture = vi.hoisted(() => ({
   calls: [] as string[],
   onFirst: undefined as undefined | ((input: { runId: string }) => Promise<void>),
   holdCancel: undefined as undefined | Promise<void>,
+  failAppend: false,
 }));
+
+// R12 (js_throw): the acceptance append fails in JS before any SQL, so only the transaction's own rollback
+// can undo the fence. A swallowed error then commits the acceptance without its row.
+vi.mock("../services/heartbeat-run-events.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../services/heartbeat-run-events.js")>();
+  return {
+    ...actual,
+    appendHeartbeatRunEvent: (async (db, input, ...rest) => {
+      if (fixture.failAppend && input.message === "run.stop.accepted") throw new Error("opts_dd_append_failed_js");
+      return actual.appendHeartbeatRunEvent(db, input, ...rest);
+    }) as typeof actual.appendHeartbeatRunEvent,
+  };
+});
 
 vi.mock("../services/heartbeat/runtime-selection.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../services/heartbeat/runtime-selection.js")>();
@@ -409,8 +423,9 @@ describe.skipIf(!support.supported)("optS-dd: default-DENY stop-acceptance row",
   }, 120_000);
 
   // R12 Atomic append. Mutation: swallow the append error.
-  it("R12 a failing append rolls back the Stop's acceptance", async () => {
-    await db.execute(sql.raw(`create or replace function opts_dd_fail() returns trigger language plpgsql as $$ begin
+  it.each(["js_throw", "db_trigger"] as const)("R12 a failing append (%s) rolls back the Stop's acceptance", async mode => {
+    if (mode === "js_throw") fixture.failAppend = true;
+    else await db.execute(sql.raw(`create or replace function opts_dd_fail() returns trigger language plpgsql as $$ begin
       if new.message = 'run.stop.accepted' then raise exception 'opts_dd_append_failed'; end if; return new; end $$;
       drop trigger if exists opts_dd_fail on heartbeat_run_events;
       create trigger opts_dd_fail before insert on heartbeat_run_events for each row execute function opts_dd_fail();`));
@@ -428,6 +443,7 @@ describe.skipIf(!support.supported)("optS-dd: default-DENY stop-acceptance row",
       expect(after?.status).toBe("running");
       expect(await acceptance(run!.id)).toEqual([]);
     } finally {
+      fixture.failAppend = false;
       await db.execute(sql.raw("drop trigger if exists opts_dd_fail on heartbeat_run_events"));
     }
   }, 120_000);

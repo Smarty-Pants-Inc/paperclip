@@ -14,6 +14,15 @@ import { executionStartedEventPredicate } from "../services/pre-dispatch-executi
 import { provesNoNativeRunProviderWork } from "../services/native-runtime/native-provider-work-proof.js";
 import { nativeRunLogSourceWhere } from "../services/native-runtime/native-run-log-export.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { activityService } from "../services/activity.js";
+
+// R13: capture the REAL activity classifier's evidence (activity.ts backfillMissingRunLivenessForIssue counts the
+// run's events and hands toolOrActionEventsCreated to classifyRunLiveness). The count itself is product SQL.
+const liveness = vi.hoisted(() => ({ inputs: [] as Array<{ runStatus: string; resultJson: unknown; evidence: Record<string, unknown> }> }));
+vi.mock("../services/run-liveness.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../services/run-liveness.js")>();
+  return { ...actual, classifyRunLiveness: ((input: any) => { liveness.inputs.push(input); return actual.classifyRunLiveness(input); }) as typeof actual.classifyRunLiveness };
+});
 
 const support = await getEmbeddedPostgresTestSupport();
 
@@ -74,15 +83,32 @@ describe.skipIf(!support.supported)("optS-dd rows: preservation, D2, readers", (
   // R13 reader check: the row is not runner evidence. Mutation: give it a source_event_id.
   it("R13 with the row present: no execution-started event, no provider work, no log-export source row", async () => {
     const run = await seed();
-    await seedRow(run);
+    const { row } = await seedRow(run);
+    // Mutation hooks for the reader check (OPTS_R13_MUTATION): give the row a source_event_id, or a non-lifecycle type.
+    if (process.env.OPTS_R13_MUTATION === "source_event_id") await db.update(heartbeatRunEvents).set({ sourceEventId: "server:stop-acceptance" }).where(eq(heartbeatRunEvents.id, row.id));
+    if (process.env.OPTS_R13_MUTATION === "type") await db.update(heartbeatRunEvents).set({ eventType: "run.stop.accepted" }).where(eq(heartbeatRunEvents.id, row.id));
     const started = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents)
       .where(and(eq(heartbeatRunEvents.runId, run.id), executionStartedEventPredicate()));
     expect(started).toEqual([]);
     expect(await provesNoNativeRunProviderWork(db, { companyId: run.companyId, runId: run.id })).toBe(true);
     expect(await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(nativeRunLogSourceWhere(run.companyId, run.id))).toEqual([]);
-    // Activity classifier (activity.ts:314) excludes lifecycle: the same filter counts 0 work events.
-    const [stats] = await db.select({ count: sql<number>`count(*) filter (where ${heartbeatRunEvents.eventType} not in ('lifecycle', 'adapter.invoke', 'error'))::int` })
-      .from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, run.id));
-    expect(stats!.count).toBe(0);
-  });
+    // Activity classifier: call the real activity service (runsForIssue schedules the liveness backfill, which
+    // counts tool/action events with activity.ts's own SQL). The run is terminal and unclassified, so it is a candidate.
+    const control = await seed();
+    await db.insert(heartbeatRunEvents).values({ companyId: control.companyId, runId: control.id, agentId: control.agentId, seq: 1,
+      eventType: "tool.call", stream: "system", level: "info", message: "control work event" });
+    for (const r of [run, control]) await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(),
+      resultJson: { marker: r.id } }).where(eq(heartbeatRuns.id, r.id));
+    const counted = async (r: typeof run) => {
+      await activityService(db).runsForIssue(r.companyId, r.issueId!);
+      const input = await vi.waitFor(() => {
+        const hit = liveness.inputs.find(i => (i.resultJson as any)?.marker === r.id);
+        if (!hit) throw new Error("liveness backfill has not classified the run yet");
+        return hit;
+      }, { timeout: 15_000, interval: 50 });
+      return input.evidence.toolOrActionEventsCreated;
+    };
+    expect(await counted(control), "control: the real count sees a non-lifecycle event").toBe(1);
+    expect(await counted(run), "the acceptance row is not counted as work by the real activity classifier").toBe(0);
+  }, 60_000);
 });

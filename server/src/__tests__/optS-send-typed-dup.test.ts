@@ -6,7 +6,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
-  environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations,
+  environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations,
 } from "@paperclipai/db";
 import express from "express";
 import request from "supertest";
@@ -317,6 +317,11 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
   it("r1306 RED: Send + typed together: a held message carried by a run must leave the held list", async () => {
     const s = await heldThenStop();
     try {
+      // optS-dd: the duplicate runs with a real person_stop row from the Stop route present, so only the kept
+      // other-run term (ebeb1bf9) can hold the second path.
+      const accepted = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, s.f.runId),
+        eq(heartbeatRunEvents.message, "run.stop.accepted")));
+      expect(accepted.map(row => (row.payload as any)?.kind)).toEqual(["person_stop"]);
       const [sent, typed] = await Promise.all([s.send(), s.post("M4 typed").expect(201)]);
       const m4 = typed.body.id;
       await s.settle();
