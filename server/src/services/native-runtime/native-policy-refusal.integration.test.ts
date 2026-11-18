@@ -152,7 +152,9 @@ describe("Pi policy refusal: persistence, retry, unanswered message and Stop int
     console.log("OVERLOAD_CONTROL", JSON.stringify({ runId: f.runId, errorCode: f.failedRun.errorCode, decision: f.decision.reasonCode, wakes: f.wakes.map(w => w.payload) }));
     expect(f.failedRun.errorCode).toBe("native_run_failed");
     expect(f.wakes).toHaveLength(1);
-    expect(f.wakes[0].payload).toMatchObject({ retryCause: "native_run_failed" });
+    // supersedes (mechanism only): exactly one automatic retry, through the cut lane, and no terminal refusal.
+    expect(f.wakes[0].payload).toMatchObject({ retryReason: "native_mid_stream_cut", retryOfRunId: f.runId });
+    expect(f.decision.reasonCode).not.toBe("provider_policy_refusal");
     expect(classifyContinuationFailure(f.failedRun).kind).not.toBe("non_retryable");
   });
 
