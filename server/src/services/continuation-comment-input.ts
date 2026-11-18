@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, issueComments, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { carryContinuationCommentInput } from "../modules/wake-queue/domain/continuation-comment-input.js";
 import { carriedInLiveRunSql, completedPersonMessageAnswerSql } from "./person-message-answer.js";
@@ -55,15 +55,24 @@ function senderStoppedCheck(db: Pick<Db, "select">, input: CarryInput) {
  * `agentId` is the predecessor run's agent, from trusted run state. */
 export async function pendingContinuationCommentInput(db: Pick<Db, "select">, input: CarryInput): Promise<Record<string, unknown>> {
   const answered = await pendingContinuationInteractionInput(db, input);
-  // An interaction-respond wake also names the asking turn's origin comment;
-  // carrying it makes the successor's contract re-request that turn and cuts its
-  // fresh history before the answer (upstream's seed carries no comment ids at all).
-  if (answered.interactionIds) return answered;
-  return pendingPersonCommentInput(db, input);
+  // C3-2 (rf-5): a predecessor with a pending CARD answer AND a typed batch carries BOTH. Each side keeps its own
+  // policy and live-owner fence (pendingContinuationInteractionInput / pendingPersonCommentInput); the card ids are
+  // the successor's own input beside the typed wake/comment ids, so a completed answer attributes to both and
+  // neither is noticed nor re-sent.
+  if (!answered.interactionIds) return pendingPersonCommentInput(db, input);
+  // An interaction-respond wake also names the asking turn's origin comment; carrying it makes the successor's
+  // contract re-request that turn and cuts its fresh history before the answer (upstream's seed carries no comment
+  // ids at all). So beside a card only typed input NEWER than the carried question rides: the asking turn's
+  // comment is older than the card it led to.
+  const [asked] = await db.select({ at: sql<Date | string | null>`min(${issueThreadInteractions.createdAt})` })
+    .from(issueThreadInteractions).where(and(eq(issueThreadInteractions.companyId, input.companyId),
+      eq(issueThreadInteractions.issueId, input.issueId), inArray(issueThreadInteractions.id, answered.interactionIds as string[])));
+  const typed = asked?.at ? await pendingPersonCommentInput(db, input, new Date(asked.at)) : {};
+  return { ...typed, ...answered };
 }
 
 /** Rebind the parent's wake comments and first-turn input ids, not its receipt. */
-async function pendingPersonCommentInput(db: Pick<Db, "select">, input: CarryInput): Promise<Record<string, unknown>> {
+async function pendingPersonCommentInput(db: Pick<Db, "select">, input: CarryInput, after?: Date): Promise<Record<string, unknown>> {
   const carried = carryContinuationCommentInput(input.contextSnapshot);
   const candidates = (carried.wakeCommentIds as string[] | undefined)?.filter(id => UUID.test(id)) ?? [];
   if (candidates.length === 0) return {};
@@ -71,6 +80,7 @@ async function pendingPersonCommentInput(db: Pick<Db, "select">, input: CarryInp
   const rows = await db.select({ id: issueComments.id, authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     inArray(issueComments.id, candidates), isNull(issueComments.deletedAt),
+    ...(after ? [gt(issueComments.createdAt, after)] : []),
     // Only still-pending input: carry unless ANSWERED. A message a completed run's final answer answered (attributed
     // through that run's own pending input) is never re-presented, or every continuation re-answers it (org 19:48Z).
     // A failed run's progress reply is DELIVERED only: the message is still carried (RFL F1, 21:28Z).
