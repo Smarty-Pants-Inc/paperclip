@@ -84,10 +84,16 @@ export async function ownLeaseTerminated(db: Db, owner: RemoteLeaseOwner,
     eq(environmentLeases.providerLeaseId, owner.providerLeaseId),
   ));
   const resolved = await Promise.all(leases.map(lease => resolveRemoteTerminationLease(db, lease)));
+  // Under ownLeaseOnly a run's EARLIER lease of this box (run -> other -> same
+  // run) is an earlier lifecycle: only the run's latest lease here is its own.
+  const ownRun = (lease: Lease) => owner.runId !== null && lease.heartbeatRunId === owner.runId;
+  const runLeases = leases.filter(ownRun);
+  const earlierOwn = (lease: Lease) => runLeases.length > 1 && runLeases.some(other => other.id !== lease.id &&
+    other.acquiredAt.getTime() > lease.acquiredAt.getTime());
   return resolved.some(lease => {
     if (!terminationReceipt(lease, owner.leaseId)) return false;
     const state = (lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined)?.state;
-    const ownLease = (owner.runId !== null && lease.heartbeatRunId === owner.runId)
+    const ownLease = (ownRun(lease) && !(scope.ownLeaseOnly === true && earlierOwn(lease)))
       || (owner.leaseId !== undefined && lease.id === owner.leaseId);
     return (state === "destroyed" && (ownLease || scope.ownLeaseOnly !== true))
       || (state === "stopped" && ownLease && scope.successorOnOwnerSandbox !== true);
