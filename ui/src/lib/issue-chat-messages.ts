@@ -341,7 +341,7 @@ export function latestSameRunHandoffTimestamp(args: {
     liveRuns,
   } = args;
   const handoffItems: SortBoundaryItem[] = [
-    ...comments.map((comment) => ({
+    ...comments.filter((comment) => comment.origin !== "fast_response").map((comment) => ({
       createdAtMs: toTimestamp(comment.createdAt),
       runId: comment.runId ?? null,
     })),
