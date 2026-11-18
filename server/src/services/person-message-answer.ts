@@ -14,6 +14,10 @@ const ownInputNamesSql = (id: SQL) => sql`(r.context_snapshot->>'wakeCommentId' 
   or r.context_snapshot->>'interactionId' = ${id}::text
   or coalesce(r.context_snapshot->'interactionIds', '[]'::jsonb) ? ${id}::text)`;
 
+/** SQL over card q: the person can still answer it, or has answered it (rulings 2, 3). The ONE copy. */
+const ANSWERABLE_CARD_SQL = sql`(q.status = 'pending' or (q.resolved_by_user_id is not null and (q.status in ('answered', 'accepted', 'rejected')
+  or (q.status = 'cancelled' and (q.result->>'outcome' in ('skipped', 'withdrawn') or q.result->>'cancelled' = 'true')))))`;
+
 /** ANSWERED, the ONE rule: a person message M is answered only by a published reply that comes after M from a run
  * that SUCCEEDED and whose OWN input names M, by an ANSWERABLE card (below), or M is imported history.
  * An ANSWERABLE card (RFL rulings 2, 3): a question or confirmation card the agent posted after M from a run whose
@@ -57,10 +61,22 @@ export function answeredPersonMessageSql(m: { id: SQL; companyId: SQL; issueId: 
       join ${heartbeatRuns} r on r.id = q.source_run_id and r.company_id = q.company_id
       where q.company_id = ${m.companyId} and q.issue_id = ${m.issueId} and q.created_by_agent_id = r.agent_id
         and q.created_at > ${m.createdAt}
-        and (q.status = 'pending' or (q.resolved_by_user_id is not null and (q.status in ('answered', 'accepted', 'rejected')
-          or (q.status = 'cancelled' and (q.result->>'outcome' in ('skipped', 'withdrawn') or q.result->>'cancelled' = 'true')))))
+        and ${ANSWERABLE_CARD_SQL}
         and ${ownInputNamesSql(m.id)})
     or ${importedPersonHistorySql(m)})`;
+}
+
+/** SQL: a card that WAS message m's response (the same card arm as answeredPersonMessageSql: posted after m by the
+ * agent from a run whose OWN input names m) ENDED unanswerable (expired, failed, cancelled by the system or the
+ * agent) at or after `since`. Ruling 3: m is owed again from then. The sweep reads it so a notice that was retired
+ * while the card stood does not count as m's notice any more (am5 gap 17). */
+export function messageCardEndedSinceSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }, since: SQL): SQL {
+  return sql`exists (select 1 from ${issueThreadInteractions} q
+    join ${heartbeatRuns} r on r.id = q.source_run_id and r.company_id = q.company_id
+    where q.company_id = ${m.companyId} and q.issue_id = ${m.issueId} and q.created_by_agent_id = r.agent_id
+      and q.created_at > ${m.createdAt} and not ${ANSWERABLE_CARD_SQL}
+      and coalesce(q.resolved_at, q.updated_at) >= ${since}
+      and ${ownInputNamesSql(m.id)})`;
 }
 
 /** A person's card answer whose delivery to the agent is still pending is a further attempt only this long after
