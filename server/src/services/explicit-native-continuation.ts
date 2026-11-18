@@ -350,7 +350,14 @@ export async function admitExplicitNativeContinuation(input: {
     const ownerSendAfterPersonStop = !blocker && !sourceChecks.length && task.conversationAgentId === agentId
       && interruptIntent?.actorId === task.conversationUserId && !!latest && isAcknowledgedNativeStop(latest)
       && latest.resultJson?.operatorInterrupted !== true && !latest.resultJson?.queuedCommentInterruptQueueId
-      && !!latest.finishedAt && latest.finishedAt <= interruptRequestedAt!;
+      && !!latest.finishedAt && latest.finishedAt <= interruptRequestedAt!
+      // Only when nothing else is active or queued on this chat (the same source as
+      // run-control resumeSavedComments); otherwise the Send takes the ordinary path.
+      && !(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId), ne(heartbeatRuns.id, latest.id),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+        inArray(heartbeatRuns.status, ["running", "queued", "scheduled_retry"]),
+      )).limit(1)).length;
     if (latest?.runtimeMode === "native" && ["cancelled", "failed"].includes(latest.status) && !ownerSendAfterPersonStop &&
         !sourceChecks.some(source => (source.evidence.runId ?? source.evidence.sourceRunId) === latest.id)) {
       sourceChecks.push({ cause: "native_continuation_requires_reconciliation", evidence: { runId: latest.id } });
