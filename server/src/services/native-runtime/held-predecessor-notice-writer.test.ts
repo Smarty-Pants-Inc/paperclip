@@ -8,6 +8,9 @@ import { HELD_PREDECESSOR_NOTICE, noticeHeldUnfinishedPredecessor } from "./nati
 import { readUnsupersededHeldConversationNotice } from "./pi-session-recovery-notice.js";
 import { HELD_PREDECESSOR_NEW_TASK_ACTION, HELD_PREDECESSOR_SEND_NOTICE } from "./held-predecessor-notice-text.js";
 import { settleUnansweredPersonMessagesForTask } from "../recovery/unanswered-person-message.js";
+import { heldConversationRemedy } from "../held-conversation-remedy.js";
+import { subscribeAllCompanyLiveEvents, subscribeCompanyLiveEvents, subscribeGlobalLiveEvents } from "../live-events.js";
+import { sql } from "drizzle-orm";
 
 it.each([
   "runner_harness_state_mismatch: backup_without_reusable_lease",
@@ -147,6 +150,40 @@ describe.skipIf(!support.supported)("held predecessor notice writer", () => {
       const notes = await writeHeld(await seedHeld(kind, "dead_pid"), "executor", "running");
       expect(notes.map(note => note.body)).toEqual([HELD_PREDECESSOR_NOTICE]);
     }
+  });
+
+  // RFL 14:28Z: the remedy decision is a pure read. Run as each writer runs it (the executor on the database, the
+  // sweep inside its own transaction), it leaves comments, wakes, queue entries, runs and their records byte-equal
+  // and publishes no live event, whether admission admits (Send) or refuses (the new task).
+  it("the remedy decision has no side effect: rows byte-equal before/after, no live event (both writers' paths)", async () => {
+    const dump = async (companyId: string) => {
+      const out: Record<string, string> = {};
+      for (const table of ["issue_comments", "agent_wakeup_requests", "heartbeat_runs", "heartbeat_run_events",
+        "issue_recovery_actions", "native_run_finalizations", "environment_leases", "issues", "activity_log"]) {
+        const rows = await db.execute<{ row: string }>(sql`select row_to_json(t)::text as row from ${sql.identifier(table)} t
+          where t.company_id = ${companyId} order by 1`);
+        out[table] = rows.map(r => r.row).join("\n");
+      }
+      return out;
+    };
+    const events: unknown[] = [];
+    const unsubscribe = [subscribeAllCompanyLiveEvents(e => events.push(e)), subscribeGlobalLiveEvents(e => events.push(e))];
+    try {
+      for (const path of ["executor", "sweep"] as const) for (const kind of ["chat", "task"] as const)
+        for (const state of ["dead_pid", "quarantined", "controller"] as const) {
+          const f = await seedHeld(kind, state);
+          const mine: unknown[] = [];
+          const off = subscribeCompanyLiveEvents(f.companyId, e => mine.push(e));
+          const before = await dump(f.companyId);
+          const remedy = path === "executor" ? await heldConversationRemedy(db, f)
+            : await db.transaction(async tx => heldConversationRemedy(tx as unknown as typeof db, f));
+          off();
+          expect(remedy.newMessageAdmitted, `${path} ${kind} ${state}`).toBe(state === "dead_pid");
+          expect(await dump(f.companyId), `${path} ${kind} ${state}: rows byte-equal`).toEqual(before);
+          expect(mine, `${path} ${kind} ${state}: no company live event`).toEqual([]);
+        }
+      expect(events, "no live event on any stream").toEqual([]);
+    } finally { for (const off of unsubscribe) off(); }
   });
 
   it("V02/V13 retire: the held banner stands until a later person message is REALLY answered (answeredPersonMessageSql)", async () => {
