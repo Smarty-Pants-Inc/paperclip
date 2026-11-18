@@ -1,0 +1,346 @@
+{
+ "shape": "plain",
+ "m1": "aa6cb3a5-23b6-4084-9057-ae607048dca9",
+ "m2": null,
+ "failedRunId": "b9e0128e-e449-430c-a92d-4cc3b50cb632",
+ "latestRunId": "b9e0128e-e449-430c-a92d-4cc3b50cb632",
+ "agentId": "04c8a370-97dd-4814-a4a9-78f3d6e20742",
+ "issue": {
+  "id": "35a1f1ff-a001-4ed9-9495-77184c859669",
+  "status": "blocked",
+  "displayStatus": "blocked",
+  "assigneeAgentId": "04c8a370-97dd-4814-a4a9-78f3d6e20742",
+  "conversationAgentId": "04c8a370-97dd-4814-a4a9-78f3d6e20742",
+  "conversationUserId": "orphan-person",
+  "conversationState": "active",
+  "interruption": {
+   "intentId": null,
+   "responsibility": "system",
+   "state": "failed",
+   "nextRetryAt": null,
+   "canRetry": true,
+   "userAction": null,
+   "sourceRunIds": [
+    "b9e0128e-e449-430c-a92d-4cc3b50cb632"
+   ],
+   "observedRunId": "b9e0128e-e449-430c-a92d-4cc3b50cb632"
+  },
+  "activeRecoveryAction": {
+   "id": "4ad7fe0f-ab4b-49dd-be07-97ea533ef1ed",
+   "companyId": "49374161-d20d-4712-91c3-b9f8a20d7028",
+   "sourceIssueId": "35a1f1ff-a001-4ed9-9495-77184c859669",
+   "recoveryIssueId": null,
+   "kind": "active_run_watchdog",
+   "status": "active",
+   "ownerType": "board",
+   "ownerAgentId": null,
+   "ownerUserId": null,
+   "previousOwnerAgentId": null,
+   "returnOwnerAgentId": "04c8a370-97dd-4814-a4a9-78f3d6e20742",
+   "cause": "native_continuation_requires_reconciliation",
+   "fingerprint": "native-continuation:b9e0128e-e449-430c-a92d-4cc3b50cb632",
+   "evidence": {
+    "runId": "b9e0128e-e449-430c-a92d-4cc3b50cb632",
+    "nativeFailureBlock": {
+     "runId": "b9e0128e-e449-430c-a92d-4cc3b50cb632",
+     "statusVersion": 2
+    },
+    "originalFailureCode": "adapter_failed"
+   },
+   "nextAction": "The run stopped before it finished. Paperclip continues the task from its last saved work.",
+   "wakePolicy": null,
+   "monitorPolicy": null,
+   "attemptCount": 1,
+   "maxAttempts": 3,
+   "timeoutAt": null,
+   "lastAttemptAt": "2026-11-18T13:30:36.917Z",
+   "outcome": null,
+   "resolutionNote": null,
+   "resolvedAt": null,
+   "createdAt": "2026-11-18T13:30:36.890Z",
+   "updatedAt": "2026-11-18T13:30:36.890Z"
+  },
+  "executionBlocker": {
+   "recoveryActionId": "4ad7fe0f-ab4b-49dd-be07-97ea533ef1ed",
+   "runId": "b9e0128e-e449-430c-a92d-4cc3b50cb632",
+   "agentId": "04c8a370-97dd-4814-a4a9-78f3d6e20742",
+   "cause": "native_continuation_requires_reconciliation",
+   "nextAction": "The run stopped before it finished. Paperclip continues the task from its last saved work. A person can use Retry on this task, or send it a new message, to continue once the previous execution has stopped. Agents cannot retry it for them.",
+   "runStatus": "failed",
+   "runError": "c3_orphan_provider_failed_once",
+   "canContinue": false,
+   "canRetry": true,
+   "savedMessageCount": 0
+  },
+  "successfulRunHandoff": null
+ },
+ "comments": [
+  {
+   "id": "a01af1f6-0a0b-4d32-9d9b-0a81ed108967",
+   "companyId": "49374161-d20d-4712-91c3-b9f8a20d7028",
+   "issueId": "35a1f1ff-a001-4ed9-9495-77184c859669",
+   "authorAgentId": null,
+   "authorUserId": null,
+   "onBehalfOfUserId": null,
+   "authorType": "system",
+   "createdByRunId": null,
+   "derivedAuthorAgentId": null,
+   "derivedCreatedByRunId": null,
+   "derivedAuthorSource": null,
+   "clientRequestId": null,
+   "conversationSessionGeneration": null,
+   "origin": "comment",
+   "fastResponseRequestId": null,
+   "body": "Your message wasn't answered. Check the task's recent history before trying again; the run may have taken actions.",
+   "presentation": {
+    "kind": "system_notice",
+    "tone": "warning",
+    "title": "Your message wasn't answered",
+    "detailsDefaultOpen": true
+   },
+   "metadata": {
+    "version": 1,
+    "recoveryResponsibility": "user",
+    "sourceRunId": "b9e0128e-e449-430c-a92d-4cc3b50cb632",
+    "authorizationReason": "unanswered_message:aa6cb3a5-23b6-4084-9057-ae607048dca9",
+    "sections": [
+     {
+      "title": "Recovery",
+      "rows": [
+       {
+        "type": "key_value",
+        "label": "Recovery action",
+        "value": "4ad7fe0f-ab4b-49dd-be07-97ea533ef1ed"
+       },
+       {
+        "type": "key_value",
+        "label": "Recovery owner",
+        "value": "Waiting for you"
+       },
+       {
+        "type": "key_value",
+        "label": "Next action",
+        "value": "Send the message again; if it fails again, assign this agent a new task."
+       }
+      ]
+     },
+     {
+      "title": "Run evidence",
+      "rows": [
+       {
+        "type": "run_link",
+        "label": "Source run",
+        "runId": "b9e0128e-e449-430c-a92d-4cc3b50cb632",
+        "agentId": "04c8a370-97dd-4814-a4a9-78f3d6e20742",
+        "title": "failed"
+       },
+       {
+        "type": "key_value",
+        "label": "Failure code",
+        "value": "unclassified_failure"
+       }
+      ]
+     }
+    ]
+   },
+   "deletedAt": null,
+   "deletedByType": null,
+   "deletedByAgentId": null,
+   "deletedByUserId": null,
+   "deletedByRunId": null,
+   "sourceTrust": null,
+   "createdAt": "2026-11-18T13:30:42.556Z",
+   "updatedAt": "2026-11-18T13:30:42.556Z"
+  },
+  {
+   "id": "aa6cb3a5-23b6-4084-9057-ae607048dca9",
+   "companyId": "49374161-d20d-4712-91c3-b9f8a20d7028",
+   "issueId": "35a1f1ff-a001-4ed9-9495-77184c859669",
+   "authorAgentId": null,
+   "authorUserId": "orphan-person",
+   "onBehalfOfUserId": null,
+   "authorType": "user",
+   "createdByRunId": null,
+   "derivedAuthorAgentId": null,
+   "derivedCreatedByRunId": null,
+   "derivedAuthorSource": null,
+   "clientRequestId": "1b4987dd-7b95-41c8-89c3-5a5b0edb9f60",
+   "conversationSessionGeneration": null,
+   "origin": "comment",
+   "fastResponseRequestId": null,
+   "body": "Typed: please answer this.",
+   "presentation": null,
+   "metadata": null,
+   "deletedAt": null,
+   "deletedByType": null,
+   "deletedByAgentId": null,
+   "deletedByUserId": null,
+   "deletedByRunId": null,
+   "sourceTrust": null,
+   "createdAt": "2026-11-18T13:30:35.987Z",
+   "updatedAt": "2026-11-18T13:30:35.987Z"
+  }
+ ],
+ "runs": [
+  {
+   "runId": "b9e0128e-e449-430c-a92d-4cc3b50cb632",
+   "runtimeMode": "native",
+   "wakeupRequestId": "e3faff1a-131b-47c0-bb7d-93922c0dd32b",
+   "status": "failed",
+   "agentId": "04c8a370-97dd-4814-a4a9-78f3d6e20742",
+   "adapterType": "paperclip_runner",
+   "startedAt": "2026-11-18T13:30:36.214Z",
+   "finishedAt": "2026-11-18T13:30:36.838Z",
+   "createdAt": "2026-11-18T13:30:36.017Z",
+   "invocationSource": "on_demand",
+   "responsibleUserId": "orphan-person",
+   "errorCode": "adapter_failed",
+   "error": null,
+   "usageJson": {},
+   "resultJson": {
+    "stopReason": "adapter_failed",
+    "timeoutFired": false,
+    "timeoutSource": "default",
+    "timeoutConfigured": false,
+    "effectiveTimeoutSec": 0
+   },
+   "failureCause": "Error",
+   "logBytes": 418,
+   "retryOfRunId": null,
+   "scheduledRetryAt": null,
+   "scheduledRetryAttempt": 0,
+   "scheduledRetryReason": null,
+   "livenessState": "failed",
+   "livenessReason": "Run ended with failed (adapter_failed)",
+   "continuationAttempt": 0,
+   "lastUsefulActionAt": null,
+   "nextAction": null,
+   "wakeCommentIds": [
+    "aa6cb3a5-23b6-4084-9057-ae607048dca9"
+   ],
+   "firstTurnCommentIds": null,
+   "queuedCommentSourceWakeIds": null,
+   "wakeCommentId": "aa6cb3a5-23b6-4084-9057-ae607048dca9",
+   "contextCommentId": "aa6cb3a5-23b6-4084-9057-ae607048dca9",
+   "contextIssueId": "35a1f1ff-a001-4ed9-9495-77184c859669",
+   "execution": {
+    "canStop": false,
+    "phase": "recovery_needed",
+    "label": "Recovery needed",
+    "cause": "native_continuation_requires_reconciliation",
+    "lastConfirmedActivityAt": "2026-11-18T13:30:36.569Z",
+    "retryAt": null,
+    "attempt": 0,
+    "maxAttempts": 3,
+    "recoveryOwner": "board",
+    "nextAction": "The run stopped before it finished. Paperclip continues the task from its last saved work.",
+    "permittedActions": [
+     "inspect_run",
+     "inspect_recovery"
+    ],
+    "predecessorRunId": null,
+    "successorRunId": null
+   },
+   "environment": {
+    "id": "8f543fb6-dcfb-42f1-9aa1-f7130f1996da",
+    "name": "Local",
+    "driver": "local"
+   },
+   "environmentLease": {
+    "id": "f20e2772-c9c3-4c77-b05a-4ef093797f41",
+    "status": "failed",
+    "leasePolicy": "ephemeral",
+    "provider": "local",
+    "providerLeaseId": null,
+    "executionWorkspaceId": "68c06d32-1705-46c4-b84f-c584c00e63d6",
+    "workspacePath": null,
+    "failureReason": null,
+    "cleanupStatus": null,
+    "acquiredAt": "2026-11-18T13:30:36.483Z",
+    "releasedAt": "2026-11-18T13:30:36.960Z"
+   },
+   "retryExhaustedReason": null
+  }
+ ],
+ "recentRuns": [
+  {
+   "runId": "b9e0128e-e449-430c-a92d-4cc3b50cb632",
+   "runtimeMode": "native",
+   "wakeupRequestId": "e3faff1a-131b-47c0-bb7d-93922c0dd32b",
+   "status": "failed",
+   "agentId": "04c8a370-97dd-4814-a4a9-78f3d6e20742",
+   "adapterType": "paperclip_runner",
+   "startedAt": "2026-11-18T13:30:36.214Z",
+   "finishedAt": "2026-11-18T13:30:36.838Z",
+   "createdAt": "2026-11-18T13:30:36.017Z",
+   "invocationSource": "on_demand",
+   "responsibleUserId": "orphan-person",
+   "errorCode": "adapter_failed",
+   "error": null,
+   "usageJson": {},
+   "resultJson": {
+    "stopReason": "adapter_failed",
+    "timeoutFired": false,
+    "timeoutSource": "default",
+    "timeoutConfigured": false,
+    "effectiveTimeoutSec": 0
+   },
+   "failureCause": "Error",
+   "logBytes": 418,
+   "retryOfRunId": null,
+   "scheduledRetryAt": null,
+   "scheduledRetryAttempt": 0,
+   "scheduledRetryReason": null,
+   "livenessState": "failed",
+   "livenessReason": "Run ended with failed (adapter_failed)",
+   "continuationAttempt": 0,
+   "lastUsefulActionAt": null,
+   "nextAction": null,
+   "wakeCommentIds": [
+    "aa6cb3a5-23b6-4084-9057-ae607048dca9"
+   ],
+   "firstTurnCommentIds": null,
+   "queuedCommentSourceWakeIds": null,
+   "wakeCommentId": "aa6cb3a5-23b6-4084-9057-ae607048dca9",
+   "contextCommentId": "aa6cb3a5-23b6-4084-9057-ae607048dca9",
+   "contextIssueId": "35a1f1ff-a001-4ed9-9495-77184c859669",
+   "execution": {
+    "canStop": false,
+    "phase": "recovery_needed",
+    "label": "Recovery needed",
+    "cause": "native_continuation_requires_reconciliation",
+    "lastConfirmedActivityAt": "2026-11-18T13:30:36.569Z",
+    "retryAt": null,
+    "attempt": 0,
+    "maxAttempts": 3,
+    "recoveryOwner": "board",
+    "nextAction": "The run stopped before it finished. Paperclip continues the task from its last saved work.",
+    "permittedActions": [
+     "inspect_run",
+     "inspect_recovery"
+    ],
+    "predecessorRunId": null,
+    "successorRunId": null
+   },
+   "environment": {
+    "id": "8f543fb6-dcfb-42f1-9aa1-f7130f1996da",
+    "name": "Local",
+    "driver": "local"
+   },
+   "environmentLease": {
+    "id": "f20e2772-c9c3-4c77-b05a-4ef093797f41",
+    "status": "failed",
+    "leasePolicy": "ephemeral",
+    "provider": "local",
+    "providerLeaseId": null,
+    "executionWorkspaceId": "68c06d32-1705-46c4-b84f-c584c00e63d6",
+    "workspacePath": null,
+    "failureReason": null,
+    "cleanupStatus": null,
+    "acquiredAt": "2026-11-18T13:30:36.483Z",
+    "releasedAt": "2026-11-18T13:30:36.960Z"
+   },
+   "retryExhaustedReason": null
+  }
+ ]
+}

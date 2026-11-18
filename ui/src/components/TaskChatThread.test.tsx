@@ -35,6 +35,9 @@ import type { HeartbeatRunEvent } from "@paperclipai/shared";
 import type { HeartbeatRun } from "@paperclipai/shared";
 import { waitForStoppedRuns } from "@/lib/wait-for-stopped-runs";
 import { findUIAdapter, registerUIAdapter } from "@/adapters/registry";
+import { buildRecentIssueRunWindow } from "@/lib/issue-chat-history-queries";
+import orphanM2HeldReplay from "@/fixtures/orphan-unanswered-notice-replay.m2-held.json";
+import orphanPlainReplay from "@/fixtures/orphan-unanswered-notice-replay.plain.json";
 
 const transcriptState = vi.hoisted(() => ({
   transcriptByRun: new Map(),
@@ -6791,9 +6794,29 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
       precedes("resend", "answer");
     });
 
-    it("(c) before the sweep supersedes it, the answering run already makes the notice historical (statusRelevance.isHistoricalNotice)", () => {
+    // This scenario IS the m2-held orphan (a failed run carried "person-message"; a later run of the same agent
+    // answered only another message; the server has not retired the notice because "person-message" is not
+    // ANSWERED). The old row pinned the notice hidden; the server's true notice must stay visible until the
+    // server retires it (the row above: deletedAt -> hidden).
+    it("supersedes((c) before the sweep supersedes it, the answering run already makes the notice historical (statusRelevance.isHistoricalNotice); RFL record PENDING: an unanswered-message notice is never historical)", () => {
       paint({
         comments: [personMessage("person-message", "Please continue.", 0), bPrimeNotice(5),
+          personMessage("resend", "Please continue (again).", 10), agentAnswer("answer", "Here is my answer.", 15, "answer-run")],
+        linkedRuns: [failedRun, linkedRun("answer-run", "succeeded", 11)],
+        issueStatus: "in_progress",
+      });
+      expect(anchor("bprime-notice")).not.toBeNull();
+      expect(anchor("bprime-notice")!.textContent).toContain(BPRIME_NOT_ANSWERED);
+      expect(container.textContent).toContain("Here is my answer.");
+      precedes("person-message", "bprime-notice");
+      precedes("person-message", "resend");
+      precedes("resend", "answer");
+    });
+
+    it("a genuinely superseded run notice (not the unanswered sweep's) stays hidden once the same agent has a newer run", () => {
+      const { authorizationReason: _unanswered, ...runNoticeMetadata } = bPrimeNotice(5).metadata;
+      paint({
+        comments: [personMessage("person-message", "Please continue.", 0), { ...bPrimeNotice(5), metadata: runNoticeMetadata },
           personMessage("resend", "Please continue (again).", 10), agentAnswer("answer", "Here is my answer.", 15, "answer-run")],
         linkedRuns: [failedRun, linkedRun("answer-run", "succeeded", 11)],
         issueStatus: "in_progress",
@@ -6801,8 +6824,73 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
       expect(anchor("bprime-notice")).toBeNull();
       expect(container.textContent).not.toContain(BPRIME_NOT_ANSWERED);
       expect(container.textContent).toContain("Here is my answer.");
-      precedes("person-message", "resend");
-      precedes("resend", "answer");
+    });
+  });
+});
+
+// review-fleet-5 condition (1) on tA-min (VISIBILITY). The server posts ONE true notice for the orphaned M1
+// (M1's run failed; in "m2-held" a later run of the same agent answered only M2). The fixtures are the REAL
+// responses of GET /issues/:id/comments, /issues/:id/runs and /issues/:id/runs?view=recent for that orphan,
+// serialized by server/src/__tests__/orphan-m2-held-retry-surface.test.ts (orphan-ui-replay-<shape>.json) and
+// replayed here through the real TaskChatThread, with the run sets IssueDetail builds from them.
+describe("orphan: the unanswered-message notice for M1 is a visible row (real server responses replayed)", () => {
+  const NOTICE_TITLE = "Your message wasn't answered";
+  const replays = { "m2-held": orphanM2HeldReplay, plain: orphanPlainReplay } as const;
+  type Replay = typeof orphanM2HeldReplay | typeof orphanPlainReplay;
+  const noticeOf = (replay: Replay) => replay.comments.filter(comment => comment.authorType === "system"
+    && comment.metadata?.authorizationReason === `unanswered_message:${replay.m1}`);
+  // IssueDetail.tsx timelineRuns: the run summaries, as the thread receives them.
+  const timeline = (runs: readonly Replay["runs"][number][]) => runs.map(run => ({ ...run, hasStoredOutput: (run.logBytes ?? 0) > 0 }));
+  // IssueDetail.tsx linkedRuns before the history is expanded: the recent window (cold open: the latest run)
+  // plus the summaries of the runs behind visible replies (observedRunIds: a comment's createdByRunId).
+  const coldWindow = (replay: Replay) => {
+    const observed = new Set(replay.comments.flatMap(comment => [comment.createdByRunId, comment.derivedCreatedByRunId]));
+    const window = buildRecentIssueRunWindow(replay.recentRuns as never).runs as unknown as Replay["runs"];
+    return [...new Map([...window, ...replay.runs.filter(run => observed.has(run.runId))].map(run => [run.runId, run])).values()];
+  };
+  const paint = (replay: Replay, conversationMode: boolean, runs: readonly Replay["runs"][number][],
+    extra: Partial<ComponentProps<typeof TaskChatThread>> = {}) => render(
+    <TaskChatThread issueId={replay.issue.id} conversationMode={conversationMode} currentUserId={replay.issue.conversationUserId}
+      onAdd={async () => {}} issueStatus={replay.issue.status} comments={replay.comments as never}
+      linkedRuns={timeline(runs) as never} {...extra} />,
+  );
+  const row = (id: string) => container.querySelector(`[data-thread-anchor="${id}"]`);
+
+  describe.each(["m2-held", "plain"] as const)("%s", (shape) => {
+    const replay: Replay = replays[shape];
+    it("the fixture is the orphan: one notice speaks for M1, sourced from M1's failed run", () => {
+      expect(noticeOf(replay)).toHaveLength(1);
+      expect(noticeOf(replay)[0].metadata?.sourceRunId).toBe(replay.failedRunId);
+      expect(replay.runs.find(run => run.runId === replay.failedRunId)?.status).toBe("failed");
+      if (shape === "m2-held") {
+        expect(replay.latestRunId).not.toBe(replay.failedRunId);
+        expect(replay.runs.find(run => run.runId === replay.latestRunId)?.status).toBe("succeeded");
+        expect(coldWindow(replay).map(run => run.runId)).toEqual([replay.latestRunId]);
+      }
+    });
+    describe.each([["chat view", true], ["task view", false]] as const)("%s", (_view, conversationMode) => {
+      it.each([
+        ["every run of the task (history expanded; the chat's observed window)", (r: Replay) => r.runs],
+        ["the cold-open recent window", coldWindow],
+      ] as const)("M1's notice is a visible row after M1, with %s", (_runs, runsOf) => {
+        paint(replay, conversationMode, runsOf(replay));
+        const notice = noticeOf(replay)[0];
+        expect(row(notice.id), "the notice row is in the DOM").not.toBeNull();
+        expect(row(notice.id)!.textContent).toContain(NOTICE_TITLE);
+        expect(row(notice.id)!.textContent).toContain(notice.body);
+        expect(row(replay.m1), "M1 is in the DOM").not.toBeNull();
+        expect(row(replay.m1)!.compareDocumentPosition(row(notice.id)!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      });
+      // The run summaries can lose the failed run's standing hold (execution.phase "recovery_needed" is what
+      // keeps the run current today): a reconnect, an older row, or a projection with no hold. The notice is
+      // the server's word that M1 is unanswered (it soft-deletes the notice when M1 is ANSWERED); a newer run
+      // of the same agent says nothing about M1.
+      it("M1's notice stays a visible row when the failed run's summary carries no standing hold", () => {
+        paint(replay, conversationMode, replay.runs.map(run => ({ ...run, execution: null })) as never);
+        const notice = noticeOf(replay)[0];
+        expect(row(notice.id), "the notice row is in the DOM").not.toBeNull();
+        expect(row(notice.id)!.textContent).toContain(NOTICE_TITLE);
+      });
     });
   });
 });
