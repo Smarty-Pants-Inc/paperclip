@@ -52,7 +52,14 @@ describePostgres("stranded agent status with a stopped copy's leftover remote cl
   });
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); });
 
-  type Shape = { state?: string; baseline?: boolean; processStoppedAt?: Date | null };
+  type Shape = {
+    state?: string; baseline?: boolean; processStoppedAt?: Date | null;
+    /** The box is running: the copy's cleanup lease is active and not released. */
+    boxRunning?: boolean;
+    /** Detach the lease from the agent's run, so only the copy clause can see it. */
+    leaseUnlinked?: boolean;
+    location?: string; cleanupPending?: boolean; receipt?: Record<string, unknown>;
+  };
 
   /** The live holder shape (HOLDERS-SAMPLE, fresh, 11-18): settled state, stopped,
    * no baseline, cleanupPending true, retry scheduled, lease stopped and retained. */
@@ -66,22 +73,24 @@ describePostgres("stranded agent status with a stopped copy's leftover remote cl
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId,
       invocationSource: "automation", status: "succeeded", runtimeMode: "legacy",
       startedAt: old(), finishedAt: old(), updatedAt: old(), createdAt: old() });
-    await db.insert(environmentLeases).values({ id: leaseId, companyId, heartbeatRunId: runId,
-      status: "expired", leasePolicy: "reuse_by_environment", provider: "daytona",
-      providerLeaseId: "stopped-box", cleanupStatus: "success", releasedAt: old(), metadata: {} });
+    await db.insert(environmentLeases).values({ id: leaseId, companyId,
+      heartbeatRunId: shape.leaseUnlinked ? null : runId,
+      status: shape.boxRunning ? "active" : "expired", leasePolicy: "reuse_by_environment", provider: "daytona",
+      providerLeaseId: shape.boxRunning ? "running-box" : "stopped-box", cleanupStatus: "success",
+      releasedAt: shape.boxRunning ? null : old(), metadata: {} });
     const remoteCwd = "/home/daytona/workspace";
     const state = shape.state ?? "unchanged";
     await db.insert(agentInstructionWorkingCopies).values({ companyId, agentId, runId,
       responsibleUserId: "test-user", entryFile: "AGENTS.md", baseHash: "test-hash",
       localRoot: `/tmp/agent-files/${runId}/root`,
       executionRoot: `${remoteCwd}/.paperclip-runtime/agent-files/${agentId}/${runId}`,
-      location: "remote:daytona", state,
+      location: shape.location ?? "remote:daytona", state,
       processStoppedAt: shape.processStoppedAt === undefined ? old() : shape.processStoppedAt,
       nextAttemptAt: new Date(Date.now() + 6 * 60 * 60_000), attempts: 0,
       receipt: { schema: "paperclip.agent-files.v1", state, appliedCandidateHash: null,
-        storageWarning: null, cleanupPending: true, materializationRunId: runId,
+        storageWarning: null, cleanupPending: shape.cleanupPending ?? true, materializationRunId: runId,
         pendingConflicts: [], cleanup: { leaseId },
-        ...(shape.baseline ? { baseline: { "AGENTS.md": "test-hash" } } : {}) } });
+        ...(shape.baseline ? { baseline: { "AGENTS.md": "test-hash" } } : {}), ...shape.receipt } });
     return { companyId, agentId, runId };
   }
 
@@ -107,7 +116,22 @@ describePostgres("stranded agent status with a stopped copy's leftover remote cl
     ["pending_commit", { state: "pending_commit" }],
     ["pending_collection", { state: "pending_collection" }],
     ["a live process (process_stopped_at NULL)", { processStoppedAt: null }],
-  ] as const)("keeps the agent running for a copy with %s", async (_label, shape) => {
+    // n1: the box is running (its cleanup lease is active, not released). The
+    // lease is detached from the agent's run so the lease clause cannot hold it:
+    // only the copy clause's box-stopped check does.
+    ["its box running (cleanup lease active, not released)", { boxRunning: true, leaseUnlinked: true }],
+    // n1 as the live row has it: the same active lease linked to the run.
+    ["its box running (active lease on its own run)", { boxRunning: true }],
+    // n2: a local copy is not a remote box's leftover dir.
+    ["location local", { location: "local" }],
+    // n3: another debt besides the delete.
+    ["a discard to apply", { receipt: { discard: { files: ["AGENTS.md"] } } }],
+    ["pending conflicts", { receipt: { pendingConflicts: [{ path: "AGENTS.md" }] } }],
+    ["a held save", { receipt: { savePending: { code: "held" } } }],
+    ["ownership retained by another run", { receipt: { retainedByRunId: "11111111-1111-4111-8111-111111111111" } }],
+    // n4: cleanup done (cleanupPending false) but a retry still scheduled.
+    ["cleanupPending false and a retry scheduled", { cleanupPending: false }],
+  ] as const satisfies readonly (readonly [string, Shape])[])("keeps the agent running for a copy with %s", async (_label, shape) => {
     const { agentId } = await seed(shape);
     expect(await reconcile()).toEqual([]);
     expect((await agent(agentId)).status).toBe("running");

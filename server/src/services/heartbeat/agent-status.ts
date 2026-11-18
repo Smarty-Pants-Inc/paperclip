@@ -50,10 +50,13 @@ export function settledAgentWorkCondition(liveRunIds: ReadonlySet<string>, now: 
   // ownership, finalization and cleanup obligations must still settle separately.
   // Superseded handoff receipts are aliases: the successor owns the shared tree,
   // so none of the predecessor's stale stop/retry/cleanup fields owns work.
-  // A settled, stopped copy without a baseline owes no save, collection or
-  // commit: a pending cleanup or retry (a leftover per-run dir on a stopped,
-  // retained box) is cleanup capacity kept by the copy's own retry worker,
-  // not agent execution (smarty-dev#21005).
+  // A pending cleanup or retry holds the agent, with one exception: a settled,
+  // stopped, baseline-less remote copy whose SOLE debt is the delete of its
+  // per-run dir on a box that is NOT running (release(): remoteUnavailable ->
+  // cleanupPending). That is cleanup capacity kept by the copy's own retry
+  // worker, not agent execution (smarty-dev#21005). Any other receipt debt
+  // (discard, pendingConflicts, savePending, retainedByRunId) or a box whose
+  // lease is still active keeps holding.
   return sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs r
       WHERE r.company_id = ${agents.companyId} AND r.agent_id = ${agents.id}
         AND r.status IN ('running', 'queued'))
@@ -82,7 +85,29 @@ export function settledAgentWorkCondition(liveRunIds: ReadonlySet<string>, now: 
         AND (c.state = 'superseded' AND jsonb_typeof(c.receipt->'successorRunId') = 'string'
           AND btrim(c.receipt->>'successorRunId') <> '') IS NOT TRUE
         AND (c.state NOT IN ('saved', 'unchanged', 'resolved', 'unavailable', 'conflict')
-          OR c.process_stopped_at IS NULL OR c.receipt ? 'baseline'))`;
+          OR c.process_stopped_at IS NULL OR c.receipt ? 'baseline'
+          OR ((c.next_attempt_at IS NOT NULL OR c.receipt->>'cleanupPending' = 'true')
+            AND (${sql.raw(stoppedBoxCleanupOnly("c"))}) IS NOT TRUE)))`;
+}
+
+/** The copy's only debt is the remote per-run dir delete, and the box that
+ * holds it is not running. Mirrors release() remoteUnavailable and
+ * ownedRemoteLease in agent-directory-working-copies.ts. */
+function stoppedBoxCleanupOnly(c: string): string {
+  const otherDebt = ["discard", "savePending", "retainedByRunId"]
+    .map(key => `COALESCE(jsonb_typeof(${c}.receipt->'${key}'), 'null') = 'null'`).join("\n      AND ");
+  const leaseId = `${c}.receipt->'cleanup'->>'leaseId'`;
+  return `${c}.receipt->>'cleanupPending' = 'true'
+      AND ${c}.location LIKE 'remote:%'
+      AND ${otherDebt}
+      AND (COALESCE(jsonb_typeof(${c}.receipt->'pendingConflicts'), 'null') = 'null'
+        OR ${c}.receipt->'pendingConflicts' = '[]'::jsonb)
+      AND NOT EXISTS (SELECT 1 FROM environment_leases box
+        WHERE box.company_id = ${c}.company_id
+          AND box.status = 'active' AND box.released_at IS NULL
+          AND CASE WHEN COALESCE(${leaseId}, '') <> '' THEN box.id::text = ${leaseId}
+            ELSE box.heartbeat_run_id = ${c}.run_id
+              AND box.environment_id::text = substring(${c}.location from 8) END)`;
 }
 
 export function createHeartbeatAgentStatus(db: Db) {
