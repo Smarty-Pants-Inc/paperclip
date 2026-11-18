@@ -351,6 +351,7 @@ export function agentRecordQueries(db: Db) {
       ...(lifecycleOperation?.handover ? { handover: lifecycleOperation.handover } : {}),
       // Past the pause bound: the old run's Stop is still unproved (PAUSING-DESIGN-R2 C/D).
       ...(lifecycleOperation?.stopPending ? { pauseStopPending: true } : {}),
+      ...(lifecycleOperation?.repairNeedsFreshResume ? { pauseNeedsFreshResume: true } : {}),
       permissions: normalizeAgentPermissions(row.permissions, { role: row.role }),
     });
   }
