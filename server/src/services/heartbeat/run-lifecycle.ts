@@ -2562,7 +2562,12 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     // failure text on the normal attributed reply, rather than leaving its
     // message unanswered or promising to continue a rejected request.
     const accountFailure = readNativeProviderAccountFailureCandidate(streamedRows);
-    if (accountFailure && (!selected || (cut && selected.seq >= cut.startSeq))) return accountFailure;
+    // compose: every other candidate here carries a reasonCode; this one has
+    // none (unchanged at runtime). Say so in the type, so the function's
+    // inferred result keeps `reasonCode` as a known property for its callers.
+    if (accountFailure && (!selected || (cut && selected.seq >= cut.startSeq))) {
+      return accountFailure as typeof accountFailure & { reasonCode?: string };
+    }
     if (cut && (!selected || selected.seq >= cut.startSeq)) return cut.candidate;
     if (selected) return selected;
     // dl-n5-cont2 item 3: the turn stopped at the output cap having streamed
