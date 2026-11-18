@@ -52,7 +52,9 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     return { companyId, agentId, issueId, userId, base, message, run, reply, notices, flags, sweep };
   }
 
-  for (const count of [2, 3]) it(`N1: ${count} messages before first prose; discovery and actual worker flag preserve latest message`, async () => {
+  // The sweep owes every unanswered message (joint rule): with 3 messages, the two the first run's reply does not
+  // answer EACH get their one notice. Old: the latest only (the middle message stayed silent). count = 2 is unchanged.
+  for (const count of [2, 3]) it(`supersedes(N1: ${count} messages before first prose; discovery and actual worker flag preserve latest message; RECORD PENDING: joint rule 'one owed set per task', rf-5's bar)`, async () => {
     const f = await fixture();
     const ids = [await f.message("Production version?", f.base)];
     const firstRun = await f.run(ids[0]!, f.base + 1_000);
@@ -67,8 +69,9 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.issueId));
     expect(await f.flags()).toEqual({ discovered: true, batched: true });
     await f.sweep(true); await f.sweep(true);
-    expect((await f.notices()).map(n => n.metadata?.authorizationReason)).toEqual([`unanswered_message:${ids.at(-1)}`]);
+    expect((await f.notices()).map(n => n.metadata?.authorizationReason).sort()).toEqual(ids.slice(1).map(id => `unanswered_message:${id}`).sort());
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
+    expect(await f.flags()).toEqual({ discovered: false, batched: false });
   });
 
   const keys = ["wakeCommentId", "wakeCommentIds", "commentId", "conversationReplyBoundaryCommentId", "firstTurnQueuedInput"] as const;
@@ -105,16 +108,21 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     expect(await f.flags()).toEqual({ discovered: false, batched: false });
   });
 
-  it("unrelated first-message prose must not supersede the second message's existing notice", async () => {
+  // The sweep owes every unanswered message (joint rule): before the first run's reply BOTH messages are owed and
+  // each has its one notice (old: the second only). The reply then answers the first message alone: it retires the
+  // first's notice and never the second's.
+  it("supersedes(unrelated first-message prose must not supersede the second message's existing notice; RECORD PENDING: joint rule 'one owed set per task', rf-5's bar)", async () => {
     const f = await fixture();
     const first = await f.message("Production version?", f.base);
     const run = await f.run(first, f.base + 1_000);
     const second = await f.message("Staging version?", f.base + 10_000);
     await f.sweep();
+    expect((await f.notices()).map(n => n.metadata?.authorizationReason).sort()).toEqual([first, second].map(id => `unanswered_message:${id}`).sort());
     await f.reply(run, f.base + 40_000);
-    expect(await f.flags()).toEqual({ discovered: false, batched: false });
+    expect(await f.flags()).toEqual({ discovered: true, batched: true }); // the first message's notice needs retiring
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
     expect((await f.notices()).map(n => n.metadata?.authorizationReason)).toEqual([`unanswered_message:${second}`]);
+    expect(await f.flags()).toEqual({ discovered: false, batched: false });
   });
 
   async function blockedResult(f: Awaited<ReturnType<typeof fixture>>, commentId: string, runId: string) {

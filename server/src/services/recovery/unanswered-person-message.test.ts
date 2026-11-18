@@ -1687,9 +1687,13 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${message}`);
   });
 
-  it("JUDGE: a question card from BEFORE the latest failed message does not answer that message", async () => {
+  // The sweep owes every unanswered message (joint rule). On this base the ONE answered function has no card
+  // carry (the B-line unit 'tA-min card carry', bb/tamin6 5cddd3d1), so the EARLIER message, whose run posted only a
+  // card that the person's next message made stale, is owed too and gets its own ONE notice. Old: 1 notice (latest only).
+  it("supersedes(JUDGE: a question card from BEFORE the latest failed message does not answer that message; " + "RECORD PENDING: joint rule 'one owed set per task', rf-5's bar" + ")", async () => {
     const f = await fixture({ status: "blocked" });
-    const prior = await f.run({ commentId: await f.message("Deploy it."), status: "succeeded" });
+    const earlier = await f.message("Deploy it.");
+    const prior = await f.run({ commentId: earlier, status: "succeeded" });
     await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, kind: "ask_user_questions",
       status: "pending", createdByAgentId: f.agentId, sourceRunId: prior, addresseeUserId: f.userId,
       payload: { version: 1, questions: [{ id: "region", prompt: "Which region?", selectionMode: "single",
@@ -1698,9 +1702,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const failed = await f.run({ commentId: message, status: "failed", errorCode: "adapter_failed" });
     await f.boardHold("native_continuation_requires_reconciliation", failed);
     await f.sweep();
+    await f.sweep();
     const notices = await f.visible();
-    expect(notices).toHaveLength(1);
-    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${message}`);
+    expect(notices.map(n => [n.metadata?.authorizationReason, n.body]).sort(), "ONE notice per owed message, never two for one").toEqual([
+      [`unanswered_message:${earlier}`, NO_REPLY], [`unanswered_message:${message}`, NOT_ANSWERED]].sort());
   });
 
   it("JUDGE: a newer board-created confirmation for someone else does not answer the latest failed message", async () => {
