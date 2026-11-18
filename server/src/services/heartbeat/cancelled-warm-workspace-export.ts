@@ -41,7 +41,7 @@ function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
-const STOPPED_SESSION_CLOSE_SCHEMA = "paperclip.native-stopped-session-close.v1";
+export const STOPPED_SESSION_CLOSE_SCHEMA = "paperclip.native-stopped-session-close.v1";
 const TOOLS_NOT_PROVEN_STOPPED = "tools_not_proven_stopped";
 const TOOLS_NOT_PROVEN_LINE = "Stopped, but the box's tools could not be proven stopped, so the workspace was not copied back. The box is kept.";
 

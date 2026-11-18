@@ -13,6 +13,7 @@ import { PERSON_STOP_BOUND_KEY, PERSON_STOP_PROBE_TIMEOUT_MS, PERSON_STOP_WITHOU
 export { PERSON_STOP_EXPORT_BOUND_MS, PERSON_STOP_WITHOUT_FILES_LINE, personStopExportBoundAt, personStopKeptBoxForSuccessor,
   readPersonStopBoundDecision } from "./person-stop-export-bound.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { proveStoppedTurnGoneOnBox, recordStoppedTurnCloseProof, stoppedTurnCloseOwedAfterCrash } from "./stopped-turn-box-proof.js";
 
 async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T | "timed_out"> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -51,13 +52,36 @@ export async function decidePersonStopExportAtBound(input: {
   if (!lease || !lease.provider || lease.provider === "local" || lease.providerLeaseId !== prepared.providerLeaseId) return null;
   const existing = readPersonStopBoundDecision(lease.metadata);
   if (existing) return existing;
-  const boundAt = personStopExportBoundAt(lease.metadata);
-  if (boundAt === null || (input.now ?? Date.now()) < boundAt) return null;
-  let reason = "box_reachable_tools_stopped";
-  if (!hasCleanStoppedSessionClose(run)) reason = "tools_not_proven_stopped";
+  const [environmentRow] = lease.environmentId ? await db.select().from(environments)
+    .where(eq(environments.id, lease.environmentId)).limit(1) : [];
+  // adopt-stopu-compose8 (rf-4 00:43Z, row 20): on the CRASH path the box is
+  // alive (the server crashed, not the box), so the clean-close proof F13 needs
+  // is established AFTER the fact, on the box, at once (no 5-minute hold):
+  // proven -> the same decision the bound makes for a reachable box with its
+  // tools gone (same_box; run-control still tries the bounded export first);
+  // the box does not answer within PERSON_STOP_PROBE_TIMEOUT_MS -> without_files
+  // NOW (the proof can never arrive), with the true line, the box kept.
+  let reason: string | null = null;
+  if (await stoppedTurnCloseOwedAfterCrash(db, run, input.now ?? Date.now())) {
+    const proof = await proveStoppedTurnGoneOnBox({ db, environmentRuntime, run, lease, environment: environmentRow,
+      timeoutMs: input.probeTimeoutMs ?? PERSON_STOP_PROBE_TIMEOUT_MS });
+    if (proof.outcome === "proven") {
+      if (!await recordStoppedTurnCloseProof(db, run, proof)) return null;
+      reason = "box_reachable_tools_stopped";
+    } else if (proof.outcome === "unanswered") reason = proof.reason;
+    // The box answered but the turn's processes are not proven gone: the
+    // existing bounded hold applies (tools_not_proven_stopped at the bound).
+    else return null;
+  }
+  if (reason === null) {
+    const boundAt = personStopExportBoundAt(lease.metadata);
+    if (boundAt === null || (input.now ?? Date.now()) < boundAt) return null;
+  }
+  if (reason !== null) {
+    // decided on the crash path above
+  } else if (!hasCleanStoppedSessionClose(run)) reason = "tools_not_proven_stopped";
   else {
-    const [environment] = lease.environmentId ? await db.select().from(environments)
-      .where(eq(environments.id, lease.environmentId)).limit(1) : [];
+    const environment = environmentRow;
     const probe = async () => {
       if (!environment) return "box_unreachable_target";
       const target = await resolveEnvironmentExecutionTarget({ db, companyId: run.companyId, adapterType: "paperclip_runner",
@@ -71,8 +95,9 @@ export async function decidePersonStopExportAtBound(input: {
     const probed = await withTimeout(probe(), input.probeTimeoutMs ?? PERSON_STOP_PROBE_TIMEOUT_MS);
     reason = probed === "timed_out" ? "box_unreachable_probe" : probed;
   }
+  const finalReason: string = reason;
   const decision: PersonStopBoundDecision = { schema: "paperclip.person-stop-export-bound.v1",
-    decision: reason === "box_reachable_tools_stopped" ? "same_box" : "without_files", reason,
+    decision: finalReason === "box_reachable_tools_stopped" ? "same_box" : "without_files", reason: finalReason,
     runId: run.id, providerLeaseId: lease.providerLeaseId!, decidedAt: new Date(input.now ?? Date.now()).toISOString() };
   // adopt-stopu-compose6 (c), never-OK: the decision is recorded ONLY under the
   // run's workspace-finalization lock (the same advisory key every export of
