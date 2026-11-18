@@ -12,12 +12,16 @@ const STOP_PENDING_FINDING = "Paperclip cannot confirm that the previous executi
 /** The card's own finding, for the person's held message. It names no wait
  * and promises no automatic start (adopt-stopu-bound2). */
 export const STOP_PENDING_PERSON_LINE = `Stop pending: ${STOP_PENDING_FINDING} Your message is saved.`;
-/** adopt-stopu-card2 (rf-4 F12): a person's Stop card says only what the code does.
- * Stop proof retires the card (recheckTaskStopPending -> clearTaskStopPending, every
- * sweep and the cleanup retry) and the held messages are then admitted once. It names
- * no board decision and no indefinite hold. */
+/** adopt-stopu-card5 (RFL ruling (a)): a person's Stop card says only what the code does.
+ * The card is written only after PERSON_STOP_CARD_AFTER_MS, by which time the stopped
+ * executor has exited (its in-memory gate, heartbeat/queue.ts predecessor_settling_in_process,
+ * is gone) and the release-site guard exported the box before releasing it. An ordinary new
+ * message is then admitted at once (no durable hold applies) on a fresh machine: the old
+ * box's lease is pending_cleanup, which the reuse filter excludes. While the export is
+ * unproven the box is never released, so person_stop_export_pending holds instead with
+ * its own line. Pre-Stop messages stay Send-only. Stop proof retires the card. */
 export const STOP_PENDING_PERSON_ACTION =
-  `Stop pending: ${STOP_PENDING_FINDING} New messages you send now are saved and will start once the stop is confirmed. Messages waiting from before Stop still need Send.`;
+  `Stop pending: ${STOP_PENDING_FINDING} New messages you send start now on a fresh machine; messages waiting from before the Stop still need Send.`;
 /** ONE bound for a person's Stop card, read by BOTH writers: the recovery sweep's
  * deferral (recovery/service.ts) and the cleanup retry (recordPersonStopCleanupPending,
  * called from heartbeat/recovery.ts). Measured from nativeCancellation.recordedAt. */
