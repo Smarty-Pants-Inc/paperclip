@@ -281,6 +281,9 @@ export async function personStopExportPendingHoldsAdmission(db: Db,
     // adopt-stopu-fvc8b (RFL 03:04Z liveness): the hold ENDS at the decision;
     // the bound decides only with a join proof of the old copyback owner.
     if (readPersonStopBoundDecision(lease.metadata)) continue;
+    // Before the decision: held while the old copyback owner is unjoined
+    // (its record present), whatever the issue execution pointer.
+    if (run.runnerProfileJson?.nativeWorkspaceFinalizationOwner) return run.id;
     if (await nativeWorkspaceExportPendingForLease(db, lease, { destructive: false })) return run.id;
   }
   return null;
