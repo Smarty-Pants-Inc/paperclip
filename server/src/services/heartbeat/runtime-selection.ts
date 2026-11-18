@@ -28,7 +28,7 @@ import type { buildExecutionContinuation } from "../execution-continuation.js";
 import type { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import { createHash, randomUUID } from "node:crypto";
 import { nativeSha256 } from "../native-runtime/canonical.js";
-import { selectFreshContinuationThread, selectPiConversation } from "../native-runtime/pi-conversation-record.js";
+import { selectPiConversation } from "../native-runtime/pi-conversation-record.js";
 import type { FailedNativePredecessorProbe } from "../native-runtime/native-provider-work-proof.js";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -552,11 +552,44 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
     const legacyRetrySessionId =
       compatibleLegacyRetrySource?.nativeSessionId;
     const resumableTaskSessionId = reseedPortableSession || isDotRun ? null : taskResumeSessionId ?? legacyRetrySessionId ?? null;
-    // Conversation C is durable; checkpoints and runner generations only attach
-    // to it. Framework forceFreshSession/config freshness is not New Conversation.
+    // Only a run that admits a new input projects its provider configuration.
+    const resolveNativeProviderConfig = () => {
+      const projectedNativeProviderConfig = nativeRuntimeResolution.profile.backend === "cursor_cloud_api"
+        || nativeRuntimeResolution.profile.backend === "pi_rpc"
+        || nativeRuntimeResolution.profile.backend === "codex_app_server"
+        || (nativeRuntimeResolution.profile.backend === "acpx_runtime" && ["claude_local", "grok_local"].includes(agentHarnessType(agent.adapterType, parseObject(agent.adapterConfig))))
+        || nativeRuntimeResolution.profile.backend === "opencode_server"
+        || (nativeRuntimeResolution.profile.backend === "acpx_runtime"
+          && parseObject(agent.adapterConfig).acpxAgent === "copilot")
+        ? projectPaperclipRunnerTaskConfig(
+            nativeRuntimeResolution.profile.backend,
+            agent.adapterConfig,
+            issueAssigneeOverrides?.adapterConfig,
+            managedAiRuntime ? readNonEmptyString(resolvedConfig.model) ?? undefined : undefined,
+          )
+        : agent.adapterConfig;
+      const runnerHomeMode = runtimeConfig.homeMode === "preconfigured" && executionTarget?.kind === "remote" && executionTarget.transport === "ssh"
+        && !supportsPaperclipRunnerPreconfiguredHome(projectedNativeProviderConfig, { companyId: agent.companyId })
+        ? "isolated" : runtimeConfig.homeMode;
+      const nativeProviderConfig = agent.adapterType === "paperclip_runner" && runnerHomeMode !== undefined
+        ? { ...parseObject(projectedNativeProviderConfig), homeMode: runnerHomeMode }
+        : projectedNativeProviderConfig;
+      return nativeProviderConfig;
+    };
+    // The Pi provider profile this run admits (a replay keeps its saved input).
+    const piProviderProfile = nativeRuntimeResolution.profile.backend === "pi_rpc" && !persistedNativeExecutionInput
+      ? resolvePaperclipRunnerNativeProviderInput({ companyId: agent.companyId, backend: "pi_rpc", adapterConfig: resolveNativeProviderConfig() })
+      : null;
+    // Conversation C is durable; checkpoints, runner generations and
+    // instruction changes only attach to it. A new recorded conversation,
+    // chained to the old one, only when the saved Runner state cannot be reused
+    // (pi-conversation-record piConversationRotationReason); the old Pi file is
+    // never touched.
     const piConversation = nativeRuntimeResolution.profile.backend === "pi_rpc"
       ? await selectPiConversation(db, {
           companyId: agent.companyId, agentId: agent.id, issueId: issueRef.id, runId: run.id,
+          forceFreshSession: context.forceFreshSession === true,
+          providerProfile: piProviderProfile?.provider === "pi_rpc" ? piProviderProfile : null,
           predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
           boundary: {
             provider: nativeRuntimeResolution.profile.backend,
@@ -577,11 +610,8 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
           },
         }) : null;
 
-    const freshThreadId = !piConversation ? await selectFreshContinuationThread(db, {
-      companyId: agent.companyId, agentId: agent.id, issueId: issueRef.id, runId: run.id,
-    }) : null;
     const requestedNativeSessionId =
-      run.nativeSessionId ?? piConversation?.id ?? freshThreadId ?? resumableTaskSessionId;
+      run.nativeSessionId ?? piConversation?.id ?? resumableTaskSessionId;
     // A task-session lastRunId can lag a failed turn or point at an older
     // normalized session. Find the newest exact-session authority instead.
     // Rows that already acquired provider authority are progress barriers,
@@ -609,7 +639,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         ? previousNativeRun.runnerInstanceId
         : (run.runnerInstanceId ?? randomUUID());
     let nativeSessionId =
-      run.nativeSessionId ?? piConversation?.id ?? freshThreadId ?? resumableTaskSessionId ?? randomUUID();
+      run.nativeSessionId ?? piConversation?.id ?? resumableTaskSessionId ?? randomUUID();
     let nativeResumeCheckpoint: ReturnType<
       typeof rebindNativeSessionCheckpoint
     > = null;
@@ -818,27 +848,8 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         instructionWorkingCopy: instructionCopy ? { rootPath: instructionCopy.executionRoot, entryPath: instructionCopy.entryFile, ...(isAgentDirectoryCopy(instructionCopy) ? { kind: "agent_files" as const } : {}) } : undefined,
       }));
       getNativeFreshSessionHandoff = nativeReviewRequest ? undefined : getFreshSessionHandoff;
-      const projectedNativeProviderConfig = nativeRuntimeResolution.profile.backend === "cursor_cloud_api"
-        || nativeRuntimeResolution.profile.backend === "pi_rpc"
-        || nativeRuntimeResolution.profile.backend === "codex_app_server"
-        || (nativeRuntimeResolution.profile.backend === "acpx_runtime" && ["claude_local", "grok_local"].includes(agentHarnessType(agent.adapterType, parseObject(agent.adapterConfig))))
-        || nativeRuntimeResolution.profile.backend === "opencode_server"
-        || (nativeRuntimeResolution.profile.backend === "acpx_runtime"
-          && parseObject(agent.adapterConfig).acpxAgent === "copilot")
-        ? projectPaperclipRunnerTaskConfig(
-            nativeRuntimeResolution.profile.backend,
-            agent.adapterConfig,
-            issueAssigneeOverrides?.adapterConfig,
-            managedAiRuntime ? readNonEmptyString(resolvedConfig.model) ?? undefined : undefined,
-          )
-        : agent.adapterConfig;
-      const runnerHomeMode = runtimeConfig.homeMode === "preconfigured" && executionTarget?.kind === "remote" && executionTarget.transport === "ssh"
-        && !supportsPaperclipRunnerPreconfiguredHome(projectedNativeProviderConfig, { companyId: agent.companyId })
-        ? "isolated" : runtimeConfig.homeMode;
-      const nativeProviderConfig = agent.adapterType === "paperclip_runner" && runnerHomeMode !== undefined
-        ? { ...parseObject(projectedNativeProviderConfig), homeMode: runnerHomeMode }
-        : projectedNativeProviderConfig;
-      const requestedNativeProvider = resolvePaperclipRunnerNativeProviderInput({
+      const nativeProviderConfig = resolveNativeProviderConfig();
+      const requestedNativeProvider = piProviderProfile ?? resolvePaperclipRunnerNativeProviderInput({
         companyId: agent.companyId,
         backend: nativeRuntimeResolution.profile.backend,
         adapterConfig: nativeProviderConfig, managedProfile, agentCoreProfile, dotBinding, museBinding,

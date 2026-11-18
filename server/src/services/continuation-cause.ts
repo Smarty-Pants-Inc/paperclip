@@ -89,11 +89,6 @@ export function nativeStartupNeverConnectedExhausted(coordinator: {
     && detail.providerSessionEstablished === false && detail.providerEventsExist === false && detail.checkpointExists === false;
 }
 
-/** The fresh continuation's note for that case: no "earlier thread" to restore. */
-export function nativeStartupNeverConnectedFreshRunNote(attempts: number): string {
-  return `Provider startup failed ${attempts} times before any work began; starting again in a fresh run.`;
-}
-
 export function continuationCauseIsSystemOwned(run: Pick<ClassifiedRun, "status" | "errorCode" | "error" | "runnerProfileJson">): boolean {
   if (!UNFINISHED_RUN_STATUSES.includes(run.status) || !isSystemOwnedFailureCode(run.errorCode)) return false;
   const provider = object(object(object(run.runnerProfileJson).nativeExecutionInput).provider).kind;

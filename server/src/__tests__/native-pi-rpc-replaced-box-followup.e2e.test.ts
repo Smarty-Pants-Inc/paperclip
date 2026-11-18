@@ -67,7 +67,6 @@ import { materializeAsset } from "../services/native-runtime/runtime-context.js"
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { HELD_PREDECESSOR_NOTICE } from "../services/native-runtime/held-predecessor-notice-text.js";
-import { FRESH_THREAD_STARTED_NOTE } from "../services/native-runtime/fresh-thread-stop-gate.js";
 
 const enabled = process.env.PAPERCLIP_PI_LEASE_E2E === "1";
 const WARM_IDLE_MS = 300_000;
@@ -979,7 +978,6 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
       // included: G1 none; G2 exactly the missing-file note.
       expect(notes.map(note => note.body), "the route's exact system-note set").toEqual(scenario.piConversationFile === "absent"
         ? ["My earlier conversation could not be restored: the saved Pi conversation file is missing on this computer. Starting a new one."] : []);
-      expect(notes.filter(note => note.body.includes(FRESH_THREAD_STARTED_NOTE))).toHaveLength(0);
     } else if (sameBoxCold) {
       // SB KEEP-GREEN TARGET: same normalized conversation, no replay and no
       // fresh-session history re-send even though both Runner and Pi were cold.

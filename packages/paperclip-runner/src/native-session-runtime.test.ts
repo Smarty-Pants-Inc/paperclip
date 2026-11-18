@@ -28,7 +28,7 @@ import {
   NativeSessionProtocolIntegrityError,
   nativeRestartContinuationInFlight, nativeRestartInterruptedTurnId,
 } from "./contracts/native-session-backend.js";
-import { runnerPrepareRefusalCode, NativeRunnerLaunchProfileMismatchError, PROVIDER_LAUNCH_PROFILE_MISMATCH, NativeRunnerRefreshRequiredError, PROVIDER_REFRESH_REQUIRED, PROVIDER_ATTACH_REFUSED, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE } from "./contracts/harness-driver.js";
+import { NativeRunnerLaunchProfileMismatchError, PROVIDER_LAUNCH_PROFILE_MISMATCH, PROVIDER_ATTACH_REFUSED, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE } from "./contracts/harness-driver.js";
 import type {
   PrpEvent,
   PrpStructuredRunResult,
@@ -6840,7 +6840,7 @@ describe("executeNativeSession recovery", () => {
     "native_controller_recovery_missing_evidence:retained_sandbox_binding",
   ] as const)("D10b preserves exact refusal through actual driver recovery (%s)", async refusalCode => {
     for (const providerRecoveryPolicy of ["same_session_only", "allow_replacement_after_resume_failure", "allow_replacement_after_governed_wait"] as const) {
-      for (const commandType of refusalCode === "runner_remote_state_unavailable" ? [null] : [null, "run.prepare", "run.attach"]) {
+      for (const commandType of [null] as Array<"run.prepare" | "run.attach" | null>) {
         const executionInput = { ...input, workspace: { ...input.workspace, cwd: WORKSPACE } };
         const transport = new FakeCodexTransport();
         transport.rejectMethods.set("initialize", Object.assign(new Error("opaque remote read failure"),
@@ -6862,15 +6862,11 @@ describe("executeNativeSession recovery", () => {
         }).catch((error: unknown) => error);
         // D-B2 (deletion toward upstream): the runner no longer turns a recovery result's
         // controller-authored refusal code into a typed error before upstream's own policy.
-        // Upstream's outcome per branch (observed): a runner-command refusal is the
-        // refresh-required error carrying the refusal as its prepare code; otherwise a
+        // Upstream's outcome per branch (observed): a
         // plain native_session_recovery_failed, except that the resume-failure policy first
         // makes ONE replacement attempt, whose transport fails the same way before any turn.
         const replacementAttempted = !commandType && providerRecoveryPolicy === "allow_replacement_after_resume_failure";
-        if (commandType) {
-          expect(failure).toMatchObject({ code: "native_runner_refresh_required" });
-          expect(runnerPrepareRefusalCode(failure)).toBe(refusalCode);
-        } else if (replacementAttempted) {
+        if (replacementAttempted) {
           expect(failure).toMatchObject({ code: refusalCode, message: "opaque remote read failure" });
         } else {
           expect(String((failure as Error)?.message ?? failure)).toMatch(/^native_session_recovery_failed: /);
@@ -6982,29 +6978,6 @@ describe("executeNativeSession recovery", () => {
       reason: refusal.reason, previousDriverSessionId: "driver-unclosed",
       previousProviderSessionId: "provider-unclosed", replacementProviderSessionId: "provider-replacement",
     }));
-  });
-
-  it.each([false, true])("preserves refresh turn waiting without runtime-owned replacement (waitForTurn=%s)", async waitForTurn => {
-    for (const providerRecoveryPolicy of ["same_session_only", "allow_replacement_after_resume_failure", "allow_replacement_after_governed_wait"] as const) {
-      const checkpoint: PersistedNativeSession = { backendKind: "mock", sessionId: "earlier-driver", identity,
-        providerSessionId: "earlier-provider", providerRecoveryPolicy, cursor: "0", activeTurnId: null,
-        pendingRuntimeRequests: [], lineage: [] };
-      const openRun = vi.fn(), openSession = vi.fn(), openReplacementSession = vi.fn();
-      const backend: NativeSessionBackend = { descriptor: async () => ({ kind: "mock", name: "refresh", version: "1",
-        capabilities: { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true } }),
-        openSession, openReplacementSession, recoverSession: async () => ({ recovered: false,
-          failureClass: PROVIDER_REFRESH_REQUIRED, reason: "opaque authenticated refusal", ...(waitForTurn ? { refreshWaitForTurn: true as const } : {}) }) };
-      const port: ControlPlanePort = { openRun, appendEvent: vi.fn(), completeRun: vi.fn(),
-        loadSessionCheckpoint: async () => structuredClone(checkpoint),
-        replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }) };
-      const failure = await executeNativeSession({ input, backend, controlPlane: port,
-        runnerInstanceId: "runner-refresh", controlPlaneInstanceId: "control-refresh" }).catch((error: unknown) => error);
-      expect(failure, providerRecoveryPolicy).toBeInstanceOf(NativeRunnerRefreshRequiredError);
-      expect(failure).toMatchObject({ code: "native_runner_refresh_required", waitForTurn });
-      expect(openRun).not.toHaveBeenCalled();
-      expect(openSession).not.toHaveBeenCalled();
-      expect(openReplacementSession).not.toHaveBeenCalled();
-    }
   });
 
   // Staging class P after #20757: a follow-up after a governed (approval) wait

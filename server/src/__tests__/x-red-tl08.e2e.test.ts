@@ -58,7 +58,6 @@ import { materializeAsset } from "../services/native-runtime/runtime-context.js"
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { HELD_PREDECESSOR_NOTICE } from "../services/native-runtime/held-predecessor-notice-text.js";
-import { FRESH_THREAD_STARTED_NOTE } from "../services/native-runtime/fresh-thread-stop-gate.js";
 
 const enabled = process.env.PAPERCLIP_PI_LEASE_E2E === "1";
 // The +5 min row must NOT accidentally expire the in-memory owner. Paul's
@@ -234,10 +233,7 @@ function noteWriter(note: typeof issueComments.$inferSelect) {
     return { writer, caller: writer, authorizationReason: reason };
   }
   const shared = sourceLine("../services/native-runtime/pi-session-recovery-notice.ts", "const next = await issueService(db).addComment");
-  const caller = reason.startsWith("fresh_provider_thread_pending:")
-    ? sourceLine("../services/native-runtime/fresh-thread-stop-gate.ts", "await writePiSessionHistoryLossNotice(tx, tx as never")
-    : shared;
-  return { writer: shared, caller, authorizationReason: reason };
+  return { writer: shared, caller: shared, authorizationReason: reason };
 }
 
 const runScenario = async (scenario: Scenario) => {
@@ -931,8 +927,7 @@ const runScenario = async (scenario: Scenario) => {
       // check vacuous on the composed head). RFL 16:07Z: pin the EXACT set: an answered terminal row
       // writes no system note, so any stray note, a reintroduced stopping note included, fails.
       expect(notes.map(note => note.body), "answered terminal row: the route's exact system-note set").toEqual([]);
-      expect(notes.filter(note => note.body.includes(FRESH_THREAD_STARTED_NOTE)
-        || String(record(note.metadata).authorizationReason ?? "").startsWith("fresh_provider_thread_pending:"))).toEqual([]);
+      expect(notes.filter(note => String(record(note.metadata).authorizationReason ?? "").startsWith("fresh_provider_thread_pending:"))).toEqual([]);
       expect(notes.filter(note => note.body === HELD_PREDECESSOR_NOTICE)).toEqual([]);
     }
     // Every promise on BOTH routes must be followed by an answer, not merely
@@ -1002,8 +997,7 @@ const runScenario = async (scenario: Scenario) => {
       expect(allNotes.length).toBeLessThanOrEqual(1);
       // RFL 16:07Z exact set (Cut B deletes the stopping note): the second answer leaves no system note.
       expect(allNotes.map(note => note.body), "second answer: the route's exact system-note set").toEqual([]);
-      expect(allNotes.filter(note => note.body.includes(FRESH_THREAD_STARTED_NOTE)
-        || String(record(note.metadata).authorizationReason ?? "").startsWith("fresh_provider_thread_pending:")
+      expect(allNotes.filter(note => String(record(note.metadata).authorizationReason ?? "").startsWith("fresh_provider_thread_pending:")
         || note.body === HELD_PREDECESSOR_NOTICE)).toEqual([]);
       expect(JSON.stringify(secondEvidence)).not.toContain("native_predecessor_retirement_unproven");
       await secondOptions.sync.restoreWorkspace();

@@ -4,7 +4,6 @@
 // modules that import this one. This module only recognises runs from before
 // that notice existed.
 import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/held-predecessor-notice-text.js";
-import { isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
 
 /** The action shown for a refused conversation: the held notice's one wording. */
 export const NATIVE_CONTINUATION_REFUSED_ACTION = HELD_PREDECESSOR_NOTICE;
@@ -13,8 +12,9 @@ export const NATIVE_CONTINUATION_REFUSED_ACTION = HELD_PREDECESSOR_NOTICE;
 // Runner when a conversation's prior owner cannot be proven gone or its saved
 // controller state cannot be read. Each fails the same way on every later
 // message:
-// - a retained sandbox whose binding cannot be proven;
-// - a saved controller format outside the D10 fresh-history family;
+// - a saved controller format other than metadata_format (that one, like a
+//   retained sandbox whose binding cannot be proven, is continued by
+//   upstream's fresh-continuation fallback);
 // - a completed turn whose cleanup is quarantined;
 // - a Runner process whose termination was never confirmed;
 // - a warm attachment whose Runner exited;
@@ -22,8 +22,7 @@ export const NATIVE_CONTINUATION_REFUSED_ACTION = HELD_PREDECESSOR_NOTICE;
 //   indeterminate, still active, scope mismatch, ...). These are the same
 //   prefixes the executor holds behind its notice (HELD_PREDECESSOR_REFUSAL).
 const REFUSAL = new RegExp("(?:^|[\\s:])(?:"
-  + "native_controller_recovery_missing_evidence:retained_sandbox_binding\\b"
-  + "|native_controller_recovery_unsupported:\\S"
+  + "native_controller_recovery_unsupported:(?!metadata_format\\b)\\S"
   + "|native_session_cleanup_quarantined\\b"
   + "|runner_process_termination_unconfirmed\\b"
   + "|native_runner_warm_attachment_runner_exited\\b"
@@ -40,8 +39,5 @@ const REFUSAL = new RegExp("(?:^|[\\s:])(?:"
 export function isNativeContinuationRefusal(
   run: { error?: string | null; errorCode?: string | null; resultJson?: Record<string, unknown> | null } | null | undefined,
 ): boolean {
-  // D10 has an automatic, physically fenced end. A broader legacy permanent
-  // refusal must not hide that owner or turn its next message into a dead end.
-  if (run && isFreshThreadRefusal(run)) return false;
   return [run?.error, run?.errorCode].some(value => typeof value === "string" && REFUSAL.test(value));
 }

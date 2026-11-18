@@ -104,7 +104,7 @@ import {
   reconcileNativeFinalizations,
   reconcileRetainedNativeSessionCleanup,
 } from "../native-runtime/index.js";
-import { settleStoppedRemoteNativeOwner, settleUnstartedNativeSessionResume } from "../native-runtime/native-failed-run-owner-release.js";
+import { settleUnstartedNativeSessionResume } from "../native-runtime/native-failed-run-owner-release.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { parseObject } from "../../adapters/utils.js";
 import {
@@ -2594,21 +2594,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     // that owner until the owner claims it, stops (then it is recovered like
     // any run whose controller is gone), or does not claim it within the grace.
     const preparingOwnerAlive = new Set<string>();
-    const stoppedNativeRunIds = new Set<string>();
     for (const { run, nativeCoordinatorPhase, nativeControllerBootId, nativeLeaseOwner } of activeRuns) {
-      // Physical proof precedes exact recovery's startup/observed-owner refusal.
-      // Reuse this inventory and the existing terminal owner, never a new scan.
-      if (run.runtimeMode === "native" && nativeCoordinatorPhase === "observed"
-        && run.errorCode === NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE
-        && !activeRunExecutions.has(run.id) && !runningProcesses.has(run.id)
-        && await settleStoppedRemoteNativeOwner(db, run.id, now,
-          environmentRuntime.inspectLeaseResource
-            ? leaseId => environmentRuntime.inspectLeaseResource(leaseId, { freshThreadStop: true }) : undefined)) {
-        const settled = await getRun(run.id);
-        if (settled) await releaseIssueExecutionAndPromote(settled);
-        stoppedNativeRunIds.add(run.id);
-        continue;
-      }
       if (run.runtimeMode !== "native" || nativeCoordinatorPhase !== "observed" || nativeControllerBootId
         || nativeLeaseOwner || activeRunExecutions.has(run.id) || runningProcesses.has(run.id)) continue;
       const owner = readControllerProcess(run.controllerProcess);
@@ -2627,7 +2613,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       run.runtimeMode === "native" && nativeCoordinatorPhase === "observed"
       && (!nativeControllerLeaseExpiresAt || nativeControllerLeaseExpiresAt <= now)
       && !isNativeRunnerOwnershipHeld(run) && !preparingOwnerAlive.has(run.id)
-      && !stoppedNativeRunIds.has(run.id) && !activeRunExecutions.has(run.id) && !runningProcesses.has(run.id),
+      && !activeRunExecutions.has(run.id) && !runningProcesses.has(run.id),
     ).map(({ run }) => run.id);
     const earlyStartupRunIds = activeRuns.filter(row => expiredNativeRunIds.includes(row.run.id) &&
       readNativeStartupContext(row.run, { leaseOwner: row.nativeLeaseOwner, controllerGeneration: row.nativeControllerGeneration ?? 0,
@@ -2671,7 +2657,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       ]),
     );
 
-    const reaped: string[] = [...stoppedNativeRunIds];
+    const reaped: string[] = [];
     const currentNativeController = await currentNativeControllerIdentity();
 
     for (const {
@@ -2685,7 +2671,6 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       nativeControllerLeaseExpiresAt,
       nativeWorkspaceFinalizationPending,
     } of activeRuns) {
-      if (stoppedNativeRunIds.has(run.id)) continue;
       if (run.runtimeMode === "native" && readNativeStartupCleanup(run)) continue;
       if (run.runtimeMode === "legacy" && isRunHandedOffForShutdown(run.id)) continue;
       if (parseObject(run.contextSnapshot).nativeQuestionCancellation) continue;

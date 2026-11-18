@@ -66,7 +66,6 @@ import { issueService } from "../issues.js";
 import { FRESH_CONTINUATION_PENDING_BOUND_MS } from "../fresh-continuation-fallback.js";
 import { PROCESS_START_REQUESTED } from "../native-local-process-stop.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
-import { FRESH_THREAD_STARTED_NOTE } from "../native-runtime/fresh-thread-stop-gate.js";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
 import { resolveHeartbeatNativeRuntimeMode } from "../native-runtime/runtime-mode.js";
 import { closeIdleWarmNativeSessionsForRestart, executePaperclipNativeSession, scopedRunnerdStateRoot } from "../native-runtime/native-session-executor.js";
@@ -473,8 +472,6 @@ describeEmbeddedPostgres("follow-Paperclip n-fallback: real runner recovery on a
       // answered route's EXACT system-note set (none), so any stray note fails, a reintroduced
       // stopping note included.
       expect(notes.map(n => n.body), "answered path: the route's exact system-note set").toEqual([]);
-      expect(notes.filter(n => n.body.includes(FRESH_THREAD_STARTED_NOTE)),
-        "answered path: our fresh-thread gate is not entered (no FRESH_THREAD_STARTED note)").toHaveLength(0);
       const persisted = await persistedJson(current.id);
       expect(persisted, "no recoveryRefusalCode on the answered run").not.toContain("recoveryRefusalCode");
       expect(persisted, "no structured runner_remote_state_unavailable code").not.toMatch(/"(?:code|errorCode|prepareRefusalCode)":"runner_remote_state_unavailable"/);

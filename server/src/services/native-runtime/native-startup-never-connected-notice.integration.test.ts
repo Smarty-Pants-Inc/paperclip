@@ -42,7 +42,6 @@ import { executePaperclipNativeSession } from "./native-session-executor.js";
 import { buildNativeCompletionContract } from "./completion-contracts.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
 import { claimNativeSessionResumptions } from "./native-finalization-reconciler.js";
-import { FRESH_THREAD_STARTED_NOTE } from "./fresh-thread-stop-gate.js";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
 import {
   PENDING_WAIT_ACTION,
@@ -197,11 +196,8 @@ describe("a first start whose Runner never connected: what the person sees (rf4)
       await unanswered(seeded, new Date(Date.now() + 10 * 60_000));
       state = await read(seeded);
 
-      expect(state.notes.filter(note => note.body.includes(FRESH_THREAD_STARTED_NOTE))).toEqual([]);
       // SUPERSEDED (r104c, RULED RFL + org 11-16 11:11-11:17Z): the task
-      // continues automatically in a fresh run, as before r104b; its one
-      // truthful note is owed at thread selection
-      // (native-startup-never-connected-fresh-run.integration.test.ts).
+      // continues automatically in a fresh run, as before r104b.
       expect(state.continued).toHaveLength(1);
       expect(state.continued[0]!.details).toMatchObject({ failureCode: "runner_ingress_startup_failed" });
       // The executor posts no note of its own beside the continuation's.

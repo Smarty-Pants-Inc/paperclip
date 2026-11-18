@@ -7,7 +7,6 @@ describe("native continuation refusal", () => {
     "native_controller_recovery_unsupported:metadata_format",
     "native_controller_recovery_unsupported:supervisor_compatibility",
     "native_controller_recovery_unsupported:admitted_input_format",
-    "adapter_failed: native_controller_recovery_missing_evidence:retained_sandbox_binding",
     "native_session_cleanup_quarantined",
     "runner_process_termination_unconfirmed",
     "runner_process_termination_unconfirmed: runnerd process supervision failed",
