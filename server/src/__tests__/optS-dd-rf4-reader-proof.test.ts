@@ -92,7 +92,7 @@ describe("rf4 exact reader and real classifier", () => {
   console.log("RF4_ACTIVITY_BACKFILL", JSON.stringify({ runId: run.id, result: fields(backfilled) }));
   expect(fields(backfilled)).toEqual(fields(before));
   const chunks: string[] = [];
-  const exporter = createNativeRunLogExporter({ db, companyId: run.companyId, runId: run.id, enqueue: async (_cursor, chunk) => { chunks.push(chunk); }, flush: async () => {} });
+  const exporter = createNativeRunLogExporter({ db, companyId: run.companyId, runId: run.id, afterCursor: 0, enqueue: async (_cursor, chunk) => { chunks.push(chunk); }, flush: async () => {} });
   await exporter.recover(); expect(chunks).toEqual([]);
   const events = await createHeartbeatRunState(db).listEvents(run.id);
   expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ eventType: "lifecycle", stream: "system", message: "run.stop.accepted" })]));
