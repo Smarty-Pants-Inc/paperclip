@@ -76,6 +76,10 @@ export function settledAgentWorkCondition(liveRunIds: ReadonlySet<string>, now: 
       WHERE c.company_id = ${agents.companyId} AND c.agent_id = ${agents.id}
         AND (c.state = 'superseded' AND jsonb_typeof(c.receipt->'successorRunId') = 'string'
           AND btrim(c.receipt->>'successorRunId') <> '') IS NOT TRUE
+        -- A held save (receipt.savePending) after a recorded stop waits on a
+        -- retry or an operator, not on the agent: it never keeps it running.
+        AND (c.process_stopped_at IS NOT NULL AND c.receipt->>'schema' = 'paperclip.agent-files.v1'
+          AND c.receipt ? 'savePending') IS NOT TRUE
         AND (c.state NOT IN ('saved', 'unchanged', 'resolved', 'unavailable', 'conflict')
           OR c.process_stopped_at IS NULL OR c.next_attempt_at IS NOT NULL
           OR c.receipt ? 'baseline' OR c.receipt->>'cleanupPending' = 'true'))`;
