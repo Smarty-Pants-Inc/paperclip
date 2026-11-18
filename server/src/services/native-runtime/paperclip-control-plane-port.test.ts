@@ -13,6 +13,7 @@ import { ONBOARDING_FIRST_TASK_ORIGIN_KIND } from "@paperclipai/shared";
 import { readCompletedAssistantMessageCandidate, resolveHeartbeatRunResponse, selectHeartbeatRunFinalAgentMessage } from "../heartbeat-run-summary.js";
 import {
   activityLog,
+  agentRuntimeState,
   agentWakeupRequests,
   agents,
   assets,
@@ -318,6 +319,8 @@ describe("PaperclipControlPlanePort conformance", () => {
       await db.delete(completionContracts);
       await db.delete(issues);
       await db.delete(assets);
+      // Native finalization creates the agent's runtime last-run pointer.
+      await db.delete(agentRuntimeState);
       await db.delete(agents);
       await db.delete(companyMemberships);
       await db.delete(companies);
@@ -1228,7 +1231,9 @@ describe("PaperclipControlPlanePort conformance", () => {
     });
 
     it("(4) cursor, hash and sequence stay consistent across a redacted event and its retry", async () => {
-      const secret = `rm${randomUUID().replace(/-/g, "")}`;
+      // No 32-byte secret window starts with '1': the first delta must not
+      // buffer its ordinary '1\n' suffix as a possible split-secret prefix.
+      const secret = "rmabcdef0123456789abcdef0123456789";
       const { port, event, rows } = await openPort(["1", "v1", secret]);
       const sent = [event(1, "turn-1", "item-1", "item.delta", "before 1\n"), event(2, "turn-1", "item-1", "item.delta", `mid ${secret} v1\n`),
         event(3, "turn-1", "item-1", "item.delta", "after 1\n"), event(4, "turn-1", "item-1", "item.completed")];
