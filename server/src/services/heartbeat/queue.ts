@@ -69,7 +69,7 @@ import {
   undeliveredLegacyUserCommentIds,
 } from "../explicit-native-continuation.js";
 import { canRetryStoppedRun } from "../cancelled-native-startup.js";
-import { getExecutionBlocker, hasPendingRunCleanup } from "../execution-blocker.js";
+import { getExecutionBlocker, hasPendingRunCleanup, restoreHoldPredicate } from "../execution-blocker.js";
 import { nativeManualAdmissionHoldsExecution } from "../native-runtime/native-runner-ownership.js";
 import { taskChatRetrySourceCleanupPending } from "../chat-channels/task-retry-authority.js";
 import { validateNativeWorkspaceReconstruction } from "../native-runtime/native-workspace-reconstruction.js";
@@ -4148,6 +4148,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 hasInteractionContinuationWakeContext(enrichedContextSnapshot) ||
                 readNonEmptyString(enrichedContextSnapshot.nativeStatusWakeIntentId)) {
               await notifyDeferredExecutionWork(tx, { companyId: agent.companyId });
+              // J1: a person's message saved behind a workspace restore hold
+              // (restoreHoldPredicate) also wakes workspace recovery, as a Retry
+              // does, so a hold whose own wake was lost is scanned again.
+              if (wakeCommentId && opts.requestedByActorType === "user" && executionBlocker.recoveryActionId) {
+                const [restoreHold] = await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+                  eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.id, executionBlocker.recoveryActionId),
+                  restoreHoldPredicate())).limit(1);
+                if (restoreHold)
+                  await notifyDeliveryWork(tx, DELIVERY_QUEUES.workspaceRecovery, JSON.stringify({ companyId: issue.companyId }));
+              }
               await tx.insert(agentWakeupRequests).values({
                 ...durableReceiptFields,
                 companyId: agent.companyId, agentId, source, triggerDetail, reason,
