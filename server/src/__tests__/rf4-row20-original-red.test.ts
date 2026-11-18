@@ -51,6 +51,7 @@ describe.skipIf(!support.supported)("rf-4 row 20: crash after durable cancel bef
     if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
     await db?.$client.end({ timeout: 1 });
     await temporary?.cleanup();
+    if (home) await new Promise(resolve => import("node:child_process").then(cp => cp.execFile("chmod", ["-R", "u+w", home!], resolve)));
     if (home) await fs.rm(home, { recursive: true, force: true });
   });
 
