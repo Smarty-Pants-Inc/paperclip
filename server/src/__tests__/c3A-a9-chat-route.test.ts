@@ -184,12 +184,9 @@ describe.skipIf(!support.supported)("a9 (E) rf-4 Q1/Q2 through the CHAT route", 
     expect(fixture.calls).toEqual([r.runId, successors[0]!.id]);
     expect(after.entries ?? []).toHaveLength(0);
   }, 180_000);
-  // .fails: red ONLY because of the twin admission gate a8 is fixing
-  // (acknowledged-native-stop.ts:123-124 still demands a sandbox stop receipt
-  // from the released LOCAL lease too, so run-control saves a recovery wait on
-  // the held message). Proven: with that gate patched like
-  // explicit-native-continuation.ts:573, this passes. Flip to it() after a8.
-  it.fails("a9 Q1 CHAT held list says the true Stop line, never a recovery wait (twin gate: a8)", async () => {
+  // Was it.fails until a8's twin admission gate (afabba6e, acknowledged-native-stop.ts)
+  // landed in this line: a released LOCAL lease no longer needs a sandbox stop receipt.
+  it("a9 Q1 CHAT held list says the true Stop line, never a recovery wait (twin gate: a8)", async () => {
     const r = await exercise("waiting", "q1-line");
     const queue = (await request(r.app).get(`/api/issues/${r.issueId}/queued-comments`)).body;
     await fs.writeFile(path.join(process.env.TASK_OUT!, "a9-chat-q1-line.json"), JSON.stringify(queue, null, 2));
