@@ -420,6 +420,31 @@ describe.skipIf(!support.supported)("the sender's own Stop and an answerable car
     expect(all[0]).toMatchObject({ deletedAt: null, body: UNANSWERED_MESSAGE_NO_REPLY_TEXT, metadata: { ...key(m), sourceRunId: run } });
   }, 60_000);
 
+  // Ruling (b), tightened (am7 gap 6): the skip counts only when the message's SENDER did it, by actor id. Another
+  // board user's skip of the card (the same REAL route, as that user) is not the sender's answer: M is owed.
+  it.each(["skip", "withdraw", "cancel"] as const)(
+    "ruling (b), sender only: ANOTHER board user's %s of the card (real route, their actor id) does not count -> M is owed: exactly 1 notice", async route => {
+      const f = await fixture();
+      const m = await f.send("M: deploy it.");
+      const run = await f.startRun(m);
+      const cardId = await f.card(run);
+      await f.end(run, "succeeded");
+      expect(await f.answered(m), "while the card is pending it answers M").toBe(true);
+      const response = await request(f.app(f.other)).post(`/api/issues/${f.issueId}/interactions/${cardId}/${route}`).send({});
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      const [row] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, cardId));
+      expect(row, "the route cancelled the card BY THE OTHER USER, not by the sender").toMatchObject({ status: "cancelled",
+        resolvedByUserId: f.other, resolvedByAgentId: null });
+      expect(f.other).not.toBe(f.sender);
+      expect(await f.answered(m), "another user's skip is not the sender's answer: M is owed").toBe(false);
+      const counts = [];
+      for (const minutes of [5, 11, 30]) counts.push((await f.sweep(minutes)).noticed);
+      expect(counts, "one notice on the first pass after the skip, never another").toEqual([1, 0, 0]);
+      const all = await f.notices();
+      expect(all, "exactly one notice, ever").toHaveLength(1);
+      expect(all[0]).toMatchObject({ deletedAt: null, body: UNANSWERED_MESSAGE_NO_REPLY_TEXT, metadata: { ...key(m), sourceRunId: run } });
+    }, 60_000);
+
   it("ruling 3, am5 gap 17: M's notice retired while a card answered M; the card then EXPIRES -> M gets its no_reply notice again", async () => {
     const f = await fixture();
     const m = await f.send("M: deploy it.");

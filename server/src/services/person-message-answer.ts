@@ -18,9 +18,17 @@ const ownInputNamesSql = (id: SQL) => sql`(r.context_snapshot->>'wakeCommentId' 
   or coalesce(r.context_snapshot->'interactionIds', '[]'::jsonb) ? ${id}::text
   or coalesce(r.context_snapshot->'attributionInteractionIds', '[]'::jsonb) ? ${id}::text)`;
 
-/** SQL over card q: the person can still answer it, or has answered it (rulings 2, 3). The ONE copy. */
-const ANSWERABLE_CARD_SQL = sql`(q.status = 'pending' or (q.resolved_by_user_id is not null and (q.status in ('answered', 'accepted', 'rejected')
-  or (q.status = 'cancelled' and (q.result->>'outcome' in ('skipped', 'withdrawn') or q.result->>'cancelled' = 'true')))))`;
+/** SQL: the SENDER of person input `id`, by actor id: the typed message's author, or (a card answer, whose id is
+ * the card's) the person who answered that card. */
+const inputSenderSql = (id: SQL) => sql`coalesce((select sender_m.author_user_id from ${issueComments} sender_m where sender_m.id = ${id}),
+  (select sender_q.resolved_by_user_id from ${issueThreadInteractions} sender_q where sender_q.id = ${id}))`;
+
+/** SQL over card q, for person input `id`: the person can still answer it, or has answered it (rulings 2, 3), or the
+ * input's SENDER closed it themselves (ruling (b), tightened: a skip, a withdrawal or a cancel counts only when
+ * resolved_by_user_id is the sender's own actor id; another user's skip leaves the sender's message owed). The ONE copy. */
+const answerableCardSql = (id: SQL) => sql`(q.status = 'pending' or (q.resolved_by_user_id is not null and (q.status in ('answered', 'accepted', 'rejected')
+  or (q.status = 'cancelled' and q.resolved_by_user_id = ${inputSenderSql(id)}
+    and (q.result->>'outcome' in ('skipped', 'withdrawn') or q.result->>'cancelled' = 'true')))))`;
 
 /** SQL over reply comment a and its run r: the run's ACCEPTED result, PUBLISHED ONCE (RFL 23:13Z, record
  * SUPERSEDE-ANSWERED-ACCEPTED-PUBLISHED-1118). Comment a is THE comment the run's presentation decision recorded
@@ -43,9 +51,9 @@ const ACCEPTED_RESULT_PUBLISHED_SQL = sql`(r.result_json#>>'{presentationDecisio
  * status (above), by an ANSWERABLE card (below), or M is imported history.
  * An ANSWERABLE card (RFL rulings 2, 3): a question or confirmation card the agent posted after M from a run whose
  * OWN input names M counts as M's response while the person can still answer it or has answered it (pending; or
- * answered, accepted or rejected by a person; or cancelled by a person's own skip or withdrawal), whatever that
- * run's later status. A card that EXPIRED unanswered, failed, or was cancelled by the system or the agent no
- * longer counts: the visible next step is gone, so M is owed again.
+ * answered, accepted or rejected by a person; or cancelled by M's SENDER's own skip, withdrawal or cancel, by actor
+ * id), whatever that run's later status. A card that EXPIRED unanswered, failed, or was cancelled by the system, the
+ * agent or ANOTHER user no longer counts: the visible next step is gone, so M is owed again.
  * A person's ANSWER to a card is person input too (the carry's interactionIds): m.id is then the card's id and
  * m.createdAt its answer time; it has no comment row, and the run that answers it names it as interactionId(s). Recovery input selection
  * (continuation-comment-input.ts) and the unanswered-person-message notice both call this; there is no second copy,
@@ -83,7 +91,7 @@ export function answeredPersonMessageSql(m: { id: SQL; companyId: SQL; issueId: 
       join ${heartbeatRuns} r on r.id = q.source_run_id and r.company_id = q.company_id
       where q.company_id = ${m.companyId} and q.issue_id = ${m.issueId} and q.created_by_agent_id = r.agent_id
         and q.created_at > ${m.createdAt}
-        and ${ANSWERABLE_CARD_SQL}
+        and ${answerableCardSql(m.id)}
         and ${ownInputNamesSql(m.id)})
     or ${importedPersonHistorySql(m)})`;
 }
@@ -96,7 +104,7 @@ export function messageCardEndedSinceSql(m: { id: SQL; companyId: SQL; issueId: 
   return sql`exists (select 1 from ${issueThreadInteractions} q
     join ${heartbeatRuns} r on r.id = q.source_run_id and r.company_id = q.company_id
     where q.company_id = ${m.companyId} and q.issue_id = ${m.issueId} and q.created_by_agent_id = r.agent_id
-      and q.created_at > ${m.createdAt} and not ${ANSWERABLE_CARD_SQL}
+      and q.created_at > ${m.createdAt} and not ${answerableCardSql(m.id)}
       and coalesce(q.resolved_at, q.updated_at) >= ${since}
       and ${ownInputNamesSql(m.id)})`;
 }
