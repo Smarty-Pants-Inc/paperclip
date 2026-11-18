@@ -96,6 +96,13 @@ export const UNANSWERED_MESSAGE_NO_RUN_TEXT =
   "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
 export const UNANSWERED_MESSAGE_WAITING_TEXT =
   "Your message is waiting for the agent to be free; it will start by itself.";
+/** SCREEN row 3 (RFL 06:40Z): a message held behind a PERSON's Stop. It is not a
+ * failed run, and "send a new message to try again" would invite a retype that
+ * gets answered twice (the held one is sent right after the next message). */
+export const PERSON_STOP_HELD_MESSAGE_TEXT =
+  "Stopped. This message is waiting and will be sent when you send your next message. Send it now, or delete it.";
+export const PERSON_STOP_HELD_MESSAGE_TITLE = "Stopped: your message is waiting";
+export const PERSON_STOP_HELD_MESSAGE_NEXT_ACTION = "Send it now, or delete it.";
 export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
   "This run finished without a reply to your message. Sending it again is safe.";
 /** The ONE bound (follow-Paperclip B-2, RFL 05:51Z): the fork's K=2 fresh-continuation chain cap. */
@@ -801,6 +808,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const since = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
   const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
     : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+    : heldByPersonStop ? PERSON_STOP_HELD_MESSAGE_TEXT
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
@@ -808,13 +816,15 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
-      title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",
+      title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start"
+        : heldByPersonStop ? PERSON_STOP_HELD_MESSAGE_TITLE : "Your message wasn't answered",
       body,
       tone: paused ? "warning" : waiting ? "info" : "warning",
       nextAction: policyRefused ? "Automatic retry is disabled for this request."
         : settingUp ? "No action is needed; your message is saved."
         : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : waiting ? "No action is needed; it will start by itself."
+        : heldByPersonStop ? PERSON_STOP_HELD_MESSAGE_NEXT_ACTION
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : held || boundReached ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
     },
