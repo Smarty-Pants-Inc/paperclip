@@ -246,7 +246,7 @@ export function createHttpLogger(baseLogger: Logger) {
         err?.message ||
         (res as any).err?.message ||
         "unknown error";
-      return `${req.method} ${stripSecretBearingUrlParts(req.url ?? "")} ${res.statusCode} — ${errMsg}`;
+      return `${req.method} ${stripSecretBearingUrlParts(req.url ?? "")} ${res.statusCode} — ${redactSensitiveText(String(errMsg))}`;
     },
     customErrorObject(req, _res, _err, value) {
       if (isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
@@ -293,7 +293,7 @@ export function createHttpLogger(baseLogger: Logger) {
             // for setup routes; the status, route, and redacted body remain.
             errorContext: secretSensitiveRoute
               ? { name: "Error" }
-              : redactSensitive(ctx.error),
+              : redactLogValue(redactSensitive(ctx.error)),
             reqBody: redactSensitive(ctx.reqBody),
             reqParams: redactSensitive(ctx.reqParams),
           };
