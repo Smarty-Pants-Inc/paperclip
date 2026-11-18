@@ -129,6 +129,9 @@ export function activityService(db: Db) {
       when ${heartbeatRuns.resultJson} is null then null
       else jsonb_strip_nulls(jsonb_build_object(
         'conversationReset', ${heartbeatRuns.resultJson} -> 'conversationReset',
+        /* Chat/task markers need only the actor kind, not private Stop receipts or identity. */
+        'cancelledByActorType', case when ${heartbeatRuns.resultJson} ->> 'cancelledByActorType' in ('user', 'agent', 'system')
+          then ${heartbeatRuns.resultJson} -> 'cancelledByActorType' end,
         'executionCancellation', case when ${heartbeatRuns.resultJson} ? 'executionCancellation'
           then jsonb_build_object('state', case
             when jsonb_typeof(${heartbeatRuns.resultJson} -> 'executionCancellation') = 'object'

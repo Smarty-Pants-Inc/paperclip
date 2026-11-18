@@ -8132,6 +8132,7 @@ async function failedPredecessorRunnerGone(input: { db: Db; execution: NativeExe
 
 /** The banner text for a conversation held behind an unfinished predecessor. */
 import { HELD_PREDECESSOR_NOTICE } from "./held-predecessor-notice-text.js";
+import { PERSON_STOP_HELD_MESSAGE_TEXT } from "../recovery/unanswered-person-message.js";
 import { providerIdentityResetLine } from "./provider-identity-reset-notice.js";
 
 /**
@@ -8171,7 +8172,10 @@ export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution
     const [current] = await input.db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
     if (!current) return;
-    const [prior] = await input.db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
+    const [prior] = await input.db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
+      cancelledByActorType: sql<string | null>`${heartbeatRuns.resultJson}->>'cancelledByActorType'`,
+      interruptQueueId: sql<string | null>`${heartbeatRuns.resultJson}->>'queuedCommentInterruptQueueId'`,
+    }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.nativeIssueId, issueId),
         eq(heartbeatRuns.nativeSessionId, normalizedSessionId), ne(heartbeatRuns.id, runId),
         lt(heartbeatRuns.createdAt, current.createdAt)))
@@ -8198,7 +8202,11 @@ export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution
         eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"),
         isNull(issueComments.deletedAt), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`)).limit(1);
       if (unanswered) return;
-      await issueService(input.db).addComment(issueId, HELD_PREDECESSOR_NOTICE, {}, { authorType: "system", presentation: {
+      // A person's Stop keeps the pending message; retry/retype advice would
+      // duplicate it. Operator Interrupt and failed predecessors keep H.
+      const notice = prior.status === "cancelled" && prior.cancelledByActorType === "user" && !prior.interruptQueueId
+        ? PERSON_STOP_HELD_MESSAGE_TEXT : HELD_PREDECESSOR_NOTICE;
+      await issueService(input.db).addComment(issueId, notice, {}, { authorType: "system", presentation: {
         kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: true,
       }, metadata: { version: 1, authorizationReason: `${HELD_CONVERSATION_NOTICE_REASON_PREFIX}${normalizedSessionId}`,
         sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Held conversation" }] }] } }, tx);
