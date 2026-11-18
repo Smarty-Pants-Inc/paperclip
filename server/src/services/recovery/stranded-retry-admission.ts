@@ -20,21 +20,34 @@ export async function decideStrandedRetryAdmission(db: Db, input: {
     assigneeAgentId: issues.assigneeAgentId, projectId: issues.projectId }).from(issues)
     .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).limit(1);
   const presentation = issue ? await taskInterruptionPresentation(db, issue) : null;
-  const admission = strandedRetryAdmissionFromPresentation(presentation, issue?.assigneeAgentId
-    ? (await db.select({ name: agents.name }).from(agents).where(and(eq(agents.companyId, input.companyId),
-      eq(agents.id, issue.assigneeAgentId))).limit(1))[0]?.name ?? null : null);
-  if (admission.admits || admission.refusal !== "none" || !issue) return admission;
-  // The task screen's execution blocker shows Paperclip recovering the saved
-  // work ("Recovering saved work…", workspaceRecoveryDisplay; or the hold's
-  // RECOVERING_SAVED_WORK_NEXT_ACTION) with no button.
-  // Say that; do not say nothing restarts it.
+  const admission = strandedRetryAdmissionFromPresentation(presentation, issue ? await assigneeOf(db, issue) : null);
+  if (admission.admits || !issue) return admission;
+  // r2f SD5: while Paperclip itself holds the saved-work recovery (the task
+  // screen's execution blocker shows "Recovering saved work…",
+  // workspaceRecoveryDisplay; or the hold's RECOVERING_SAVED_WORK_NEXT_ACTION),
+  // the system state wins over the person action workspace_repair_required
+  // would name: no "Press Recover saved files" while the system holds it.
+  if (admission.refusal !== "none" && admission.refusal !== "workspace_repair_required") return admission;
   const { getExecutionBlocker } = await import("../execution-blocker.js");
   const blocker = await getExecutionBlocker(db, issue.companyId, issue.id);
   const { RECOVERING_SAVED_WORK_NEXT_ACTION } = await import("../legacy-execution-recovery.js");
   if (blocker?.workspaceRecovery && ["queued", "recovering"].includes(blocker.workspaceRecovery.status)
     || blocker?.nextAction === RECOVERING_SAVED_WORK_NEXT_ACTION)
-    return { admits: false, refusal: "system_waiting", waitMessage: "Paperclip is recovering the saved work first. Your message is saved." };
+    return { admits: false, refusal: "saved_work_recovering" };
   return admission;
+}
+
+type Assignee = { name: string | null; maxDailyRuns: number | null; maxDailyCostCents: number | null };
+
+/** The assignee's name and daily limits (heartbeat/timer-policy.ts parseHeartbeatPolicy, the reader dispatch uses). */
+async function assigneeOf(db: Db, issue: { companyId: string; assigneeAgentId: string | null }): Promise<Assignee | null> {
+  if (!issue.assigneeAgentId) return null;
+  const [agent] = await db.select().from(agents).where(and(eq(agents.companyId, issue.companyId),
+    eq(agents.id, issue.assigneeAgentId))).limit(1);
+  if (!agent) return null;
+  const { parseHeartbeatPolicy } = await import("../heartbeat/timer-policy.js");
+  const policy = parseHeartbeatPolicy(agent);
+  return { name: agent.name ?? null, maxDailyRuns: policy.maxDailyRuns, maxDailyCostCents: policy.maxDailyCostCents };
 }
 
 type Presentation = Awaited<ReturnType<typeof taskInterruptionPresentation>>;
@@ -51,17 +64,43 @@ export async function executionBlockerFollowingPresentation<B extends { nextActi
   db: Db, issue: { companyId: string; assigneeAgentId: string | null }, blocker: B | null, presentation: Presentation,
 ): Promise<B | null> {
   if (!blocker?.canRetry || !presentation || presentation.canRetry) return blocker;
-  const agentName = issue.assigneeAgentId ? (await db.select({ name: agents.name }).from(agents).where(and(
-    eq(agents.companyId, issue.companyId), eq(agents.id, issue.assigneeAgentId))).limit(1))[0]?.name ?? null : null;
-  const admission = strandedRetryAdmissionFromPresentation(presentation, agentName);
-  if (admission.admits) return blocker;
-  const kept = (blocker.nextAction.match(/[^.!?]+[.!?]+(\s+|$)|[^.!?]+$/g) ?? [])
+  const nextAction = await textFollowingPresentation(db, issue, blocker.nextAction, presentation, true);
+  return nextAction === null ? blocker : { ...blocker, canRetry: false, nextAction };
+}
+
+/**
+ * r2f SD2: the same rule for the task's active recovery action
+ * (GET /issues/:id `activeRecoveryAction`), whose `nextAction`
+ * IssueRecoveryActionCard renders (IssueRecoveryActionCard.tsx, "Next action").
+ * The card says "Retry" only where `presentation.canRetry` offers it.
+ */
+export async function recoveryActionFollowingPresentation<A extends { nextAction?: string | null }>(
+  db: Db, issue: { companyId: string; assigneeAgentId: string | null }, action: A | null, presentation: Presentation,
+): Promise<A | null> {
+  if (!action?.nextAction || !presentation || presentation.canRetry) return action;
+  const nextAction = await textFollowingPresentation(db, issue, action.nextAction, presentation, false);
+  return nextAction === null ? action : { ...action, nextAction };
+}
+
+/**
+ * Where the projection withholds Retry, a text's sentences that offer Retry are
+ * dropped and the projection's own next action (the stranded notice's refusal
+ * copy) is said instead. `presentation.canRetry` is the only rule.
+ */
+async function textFollowingPresentation(db: Db, issue: { companyId: string; assigneeAgentId: string | null },
+  text: string, presentation: NonNullable<Presentation>, blockerSaysRetry: boolean): Promise<string | null> {
+  // null: unchanged. The blocker's canRetry=true is itself a Retry offer.
+  if (presentation.canRetry || !blockerSaysRetry && !/\bretry\b/i.test(text)) return null;
+  const admission = strandedRetryAdmissionFromPresentation(presentation, await assigneeOf(db, issue));
+  if (admission.admits) return null;
+  const kept = (text.match(/[^.!?]+[.!?]+(\s+|$)|[^.!?]+$/g) ?? [])
     .map(sentence => sentence.trim()).filter(sentence => sentence && !/\bretry\b/i.test(sentence));
-  return { ...blocker, canRetry: false, nextAction: [...kept, strandedRetryRefusalCopy(admission).nextAction].join(" ") };
+  return [...kept, strandedRetryRefusalCopy(admission).nextAction].join(" ");
 }
 
 /** Maps the screen's decision to notice copy. `canRetry` is the decision. */
-export function strandedRetryAdmissionFromPresentation(presentation: Presentation, agentName: string | null): StrandedRetryAdmission {
+export function strandedRetryAdmissionFromPresentation(presentation: Presentation, assignee: Assignee | string | null): StrandedRetryAdmission {
+  const agentName = typeof assignee === "string" ? assignee : assignee?.name ?? null;
   if (presentation?.canRetry) return { admits: true };
   if (presentation?.userAction === "resume") return { admits: false, refusal: "agent_paused", agentName };
   // Confirm it stopped is named only under the screen's own condition for its button
@@ -71,8 +110,11 @@ export function strandedRetryAdmissionFromPresentation(presentation: Presentatio
   if (presentation?.retryWait?.reason === "workspace_repair_required") return { admits: false, refusal: "workspace_repair_required" };
   if (presentation?.userAction === "budget" || presentation?.retryWait?.reason === "budget.blocked")
     return { admits: false, refusal: "budget_blocked" };
-  if (presentation?.retryWait?.reason === "heartbeat.daily_run_limit" || presentation?.retryWait?.reason === "heartbeat.daily_cost_limit")
-    return { admits: false, refusal: "daily_limit", agentName };
+  if (presentation?.retryWait?.reason === "heartbeat.daily_run_limit" || presentation?.retryWait?.reason === "heartbeat.daily_cost_limit") {
+    const kind = presentation.retryWait.reason === "heartbeat.daily_cost_limit" ? "cost" as const : "runs" as const;
+    const limit = typeof assignee === "object" && assignee ? kind === "cost" ? assignee.maxDailyCostCents : assignee.maxDailyRuns : null;
+    return { admits: false, refusal: "daily_limit", agentName, kind, limit };
+  }
   // Any other wait Paperclip owns: say what the screen says, with no button.
   if (presentation?.responsibility === "system" && !presentation.userAction && presentation.retryWait?.message)
     return { admits: false, refusal: "system_waiting", waitMessage: presentation.retryWait.message };

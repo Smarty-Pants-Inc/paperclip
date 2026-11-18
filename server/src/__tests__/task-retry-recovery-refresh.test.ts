@@ -14,6 +14,7 @@ import {
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { costRoutes } from "../routes/costs.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { closeProcessRunAdmission, resetProcessRunAdmissionForTests } from "../services/heartbeat/run-admission.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -72,6 +73,7 @@ describe("Task Retry recovery-card refresh", () => {
     app.use(express.json());
     app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId }; next(); });
     app.use("/api", issueRoutes(db, {} as never));
+    app.use("/api", costRoutes(db));
     app.use(errorHandler);
     return app;
   }
@@ -216,7 +218,9 @@ describe("Task Retry recovery-card refresh", () => {
     // r2d ST3: no row here proves the recovery then answers the message by
     // itself, so the notice no longer says "Nothing restarts it by itself"; it
     // says what the screen says (retryWait.message) and names no button.
-    expect(row).toMatchObject({ admits: false, refusal: "system_waiting", pressRetry: false, status: 202, runStarted: false });
+    expect(row).toMatchObject({ admits: false, refusal: "saved_work_recovering", pressRetry: false, status: 202, runStarted: false });
+    // r2f SD5: the system state wins; no person-action text while Paperclip holds it.
+    expect(JSON.stringify(notice)).not.toContain("Recover saved files");
     expect(notice.body).toContain("Your message is saved.");
     expect(JSON.stringify(notice)).not.toContain("Nothing restarts it by itself");
   });
@@ -353,11 +357,43 @@ describe("Task Retry recovery-card refresh", () => {
     expect(shown.executionBlocker.nextAction).not.toMatch(/\bRetry\b/);
     expect(shown.executionBlocker).toMatchObject({ canRetry: false,
       nextAction: "It continues once a board user records that the previous attempt stopped; there is no button for this on the task yet." });
+    // r2f SD2: the recovery card (IssueRecoveryActionCard renders activeRecoveryAction.nextAction)
+    // follows the same projection: no Retry sentence while presentation.canRetry is false.
+    console.info("JUDGE_CARD_SHOWN", JSON.stringify(shown.activeRecoveryAction));
+    if (shown.activeRecoveryAction?.nextAction) expect(shown.activeRecoveryAction.nextAction).not.toMatch(/\bRetry\b/);
     const row = await judge(f);
     expect(row.status).toBe(202);
     expect(row.pressRetry).toBe(row.runStarted);
     expect(row.screenCanRetry).toBe(row.runStarted);
     expect(/\bRetry\b/.test(shown.executionBlocker.nextAction)).toBe(row.runStarted);
+  }, 60_000);
+
+  // r2f SD2: the same process-agent row with the board's escalated stranded
+  // recovery (process_lost) active: IssueRecoveryActionCard renders
+  // activeRecoveryAction.nextAction ("Next action"), so it must follow the
+  // same Retry decision as the execution blocker and the notice.
+  it("JUDGE SD2 recovery card on the process row: its next action follows presentation.canRetry", async () => {
+    const f = await judgeFixture({ legacy: true });
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", ownerType: "board",
+      fingerprint: randomUUID(), status: "resolved", outcome: "blocked", nextAction: "Press Retry to continue.",
+      evidence: { runId: f.run.id, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } });
+    const { RETRY_FROM_SAVED_WORK_NEXT_ACTION } = await import("../services/recovery/stranded-notice.js");
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "stranded_assigned_issue", cause: "process_lost", ownerType: "board", fingerprint: randomUUID(),
+      status: "escalated", nextAction: RETRY_FROM_SAVED_WORK_NEXT_ACTION, evidence: { latestRunId: f.run.id } } as never);
+    const shown = (await request(appForBoard()).get(`/api/issues/${f.issueId}`).expect(200)).body;
+    const cardRow = { canRetry: shown.interruption?.canRetry ?? null, blocker: shown.executionBlocker?.nextAction ?? null,
+      card: shown.activeRecoveryAction?.nextAction ?? null, cardStatus: shown.activeRecoveryAction?.status ?? null };
+    console.info("JUDGE_CARD_SHOWN SD2", JSON.stringify(cardRow));
+    if (process.env.JUDGE_ROWS_FILE) appendFileSync(process.env.JUDGE_ROWS_FILE, `${JSON.stringify({ test: expect.getState().currentTestName, ...cardRow })}\n`);
+    expect(cardRow.cardStatus).toBe("escalated");
+    expect(cardRow.canRetry).toBe(false);
+    expect(cardRow.card).not.toMatch(/\bRetry\b/);
+    expect(cardRow.card).toBe("This attempt could not be finished. It continues once a board user records that the previous attempt stopped; there is no button for this on the task yet.");
+    // The press the card no longer offers starts nothing (route 202, no executor marker).
+    const row = await judge(f);
+    expect(row).toMatchObject({ status: 202, runStarted: false });
   }, 60_000);
 
   // r2d ST5: the agent is busy (its one concurrency slot is occupied by a
@@ -441,7 +477,16 @@ describe("Task Retry recovery-card refresh", () => {
     const row = await judge(f);
     expect(row).toMatchObject({ status: 202, runStarted: false });
     expect(row).toMatchObject({ admits: false, pressRetry: false, screenCanRetry: false });
-  }, 60_000);
+    // r2f SD1: the posted notice is never refreshed, so its words must stay true
+    // after the budget is raised through the real Costs route.
+    expect(row.body).not.toMatch(/can't start|does not allow/);
+    expect(row.nextAction).toContain("Raise the budget in Costs, then press Retry.");
+    await request(appForBoard()).post(`/api/companies/${f.companyId}/budgets/policies`)
+      .send({ scopeType: "agent", scopeId: f.agentId, amount: 100_000, hardStopEnabled: true }).expect(200);
+    const after = await judge(f);
+    if (process.env.JUDGE_ROWS_FILE) appendFileSync(process.env.JUDGE_ROWS_FILE, `${JSON.stringify({ test: "SD1 budget: the notice posted before the raise", body: row.body, nextAction: row.nextAction, afterRaise: { screenCanRetry: after.screenCanRetry, runStarted: after.runStarted, executorMarker: after.executorMarker } })}\n`);
+    expect(after).toMatchObject({ screenCanRetry: true, status: 202, runStarted: true });
+  }, 90_000);
 
   // (c) the agent's daily run cap (enqueueWakeup getHeartbeatDailyCapBlock).
   it("JUDGE (c) daily run cap reached: notice and screen agree with dispatch", async () => {
@@ -450,6 +495,40 @@ describe("Task Retry recovery-card refresh", () => {
     const row = await judge(f);
     expect(row).toMatchObject({ status: 202, runStarted: false });
     expect(row).toMatchObject({ admits: false, pressRetry: false, screenCanRetry: false });
+    // r2f SD1/SD4: words that stay true after the day rolls; no settings field is named.
+    expect(row.body).not.toMatch(/can't start/);
+    expect(row.nextAction).toContain("press Retry after 00:00 UTC");
+    expect(row.nextAction).toContain("the settings screen has no field for it");
+    // The rf-5 path: the notice is posted while the cap holds and nobody can
+    // press Retry (the screen withholds it); then the day rolls: the counted
+    // run moves to the previous UTC day.
+    const g = await judgeFixture({ heartbeat: { maxDailyRuns: 1 } });
+    await db.update(heartbeatRuns).set({ startedAt: new Date(), finishedAt: new Date() }).where(eq(heartbeatRuns.id, g.run.id));
+    const posted = buildStrandedRecoveryEscalationNotice({ retry: await decideStrandedRetryAdmission(db, { companyId: g.companyId, issueId: g.issueId, runId: g.run.id }),
+      recoveryCause: "stranded_assigned_issue", recoveryActionId: null, recoveryOwner: null,
+      sourceRun: { id: g.run.id, agentId: g.agentId, status: g.run.status, errorCode: g.run.errorCode } } as never);
+    expect((await taskInterruptionPresentation(db, await issueRow(g.issueId)))?.canRetry).toBe(false);
+    const yesterday = new Date(Date.now() - 24 * 3600_000);
+    await db.update(heartbeatRuns).set({ createdAt: yesterday, startedAt: yesterday, finishedAt: yesterday }).where(eq(heartbeatRuns.issueId, g.issueId));
+    const after = await judge(g);
+    const postedNext = JSON.stringify(posted.metadata.sections[0]!.rows.find(r => "label" in r && r.label === "Next action") ?? null);
+    if (process.env.JUDGE_ROWS_FILE) appendFileSync(process.env.JUDGE_ROWS_FILE, `${JSON.stringify({ test: "SD1 daily: the notice posted before the day rolled", body: posted.body, nextAction: postedNext, afterRoll: { screenCanRetry: after.screenCanRetry, runStarted: after.runStarted, executorMarker: after.executorMarker, successorStartedAt: after.successorStartedAt } })}\n`);
+    expect(posted.body).toBe(row.body);
+    expect(postedNext).toBe(row.nextAction);
+    expect(after).toMatchObject({ screenCanRetry: true, status: 202, runStarted: true });
+  }, 90_000);
+
+  // r2f SD4: a zero daily limit never resets, so no reset sentence.
+  it("JUDGE (c0) daily run cap 0: no reset sentence, no settings field named", async () => {
+    const f = await judgeFixture({ heartbeat: { maxDailyRuns: 0 } });
+    const screen = await taskInterruptionPresentation(db, await issueRow(f.issueId));
+    console.info("JUDGE_SCREEN c0", JSON.stringify(screen?.retryWait));
+    expect(screen?.retryWait?.message).toContain("The limit is 0, so it does not reset.");
+    const row = await judge(f);
+    expect(row).toMatchObject({ admits: false, refusal: "daily_limit", pressRetry: false, screenCanRetry: false, status: 202, runStarted: false });
+    expect(row.nextAction).not.toContain("00:00 UTC");
+    expect(row.nextAction).toContain("is set to 0, so it never resets");
+    expect(screen?.retryWait?.message).not.toContain("00:00 UTC");
   }, 60_000);
 
   it("quota-failure refresh creates no scheduled run, quota wake, comment, or hold mutation", async () => {

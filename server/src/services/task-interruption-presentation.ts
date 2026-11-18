@@ -181,8 +181,10 @@ const retryWaitMessages: Record<string, string> = {
   retry_authority_denied: "Retry could not start with the requesting user's access. Press Retry to start it with yours.",
   previous_execution_unverified: "Retry can't continue because Paperclip can't confirm that the previous attempt stopped before it started work. Your message is saved.",
   // The agent's per-day limits (heartbeat/timer-policy.ts getHeartbeatDailyCapBlock).
-  "heartbeat.daily_run_limit": "Retry can't start because the agent reached its daily run limit. Raise the limit in the agent's settings; it resets at 00:00 UTC. Your message is saved.",
-  "heartbeat.daily_cost_limit": "Retry can't start because the agent reached its daily cost limit. Raise the limit in the agent's settings; it resets at 00:00 UTC. Your message is saved.",
+  // r2f SD4: the settings screen has no field for these limits (AgentConfigForm.tsx), and a
+  // zero limit never resets; dailyCapWaitMessage adds the reset only where it happens.
+  "heartbeat.daily_run_limit": "Retry can't start because the agent reached its daily run limit. Your message is saved.",
+  "heartbeat.daily_cost_limit": "Retry can't start because the agent reached its daily cost limit. Your message is saved.",
   // An edited saved message can never be replayed; only new input continues.
   retry_source_changed: "Retry cannot continue because its saved message changed. Send a new message to continue from saved work.",
 };
@@ -995,7 +997,9 @@ async function withholdRetryDispatchRefuses(db: Db, companyId: string, selected:
       }
     }
     const cap = await createHeartbeatTimerPolicy(db).getHeartbeatDailyCapBlock(agent, parseHeartbeatPolicy(agent));
-    if (cap) withhold({ retryWait: { reason: cap.reason, message: retryWaitMessages[cap.reason]! } });
+    if (cap) withhold({ retryWait: { reason: cap.reason, message: cap.limit === 0
+      ? retryWaitMessages[cap.reason]!.replace(" Your message is saved.", " The limit is 0, so it does not reset. Your message is saved.")
+      : retryWaitMessages[cap.reason]!.replace(" Your message is saved.", " The count restarts at 00:00 UTC. Your message is saved.") } });
   }
 }
 

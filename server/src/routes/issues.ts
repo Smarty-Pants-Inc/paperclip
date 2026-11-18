@@ -14,7 +14,7 @@ import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { INBOX_MINE_ISSUE_STATUS_FILTER, latestFailedRunsByAgent } from "@paperclipai/shared";
 import { getHeartbeatRunReadDecisions, redactHeartbeatRunListRow } from "../services/heartbeat-run-privacy.js";
 import { taskInterruptionPresentation, taskInterruptionPresentations } from "../services/task-interruption-presentation.js";
-import { executionBlockerFollowingPresentation } from "../services/recovery/stranded-retry-admission.js";
+import { executionBlockerFollowingPresentation, recoveryActionFollowingPresentation } from "../services/recovery/stranded-retry-admission.js";
 import { parseObject } from "../adapters/utils.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
 import { ISSUE_SUMMARIES_MAX_IDS, issueChatBootstrapQuerySchema, issueSummariesQuerySchema, type IssueSummary } from "@paperclipai/shared";
@@ -10305,7 +10305,8 @@ export function issueRoutes(
       executionBlocker,
       interruption,
       scheduledRetry,
-      activeRecoveryAction: revalidatedActiveRecoveryAction,
+      // r2f SD2: the recovery card's next action follows the same Retry decision.
+      activeRecoveryAction: await recoveryActionFollowingPresentation(db, issue, revalidatedActiveRecoveryAction, interruption),
       // Always present, so a cleared stall replaces the cached list.
       stalledDependencies,
       blockedBy: visibleRelations.blockedBy,

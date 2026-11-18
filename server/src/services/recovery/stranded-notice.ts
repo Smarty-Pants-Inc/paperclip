@@ -49,8 +49,9 @@ export type StrandedRetryAdmission =
   | { admits: false; refusal: "confirm_run_stopped" }
   | { admits: false; refusal: "previous_execution_unverified" }
   | { admits: false; refusal: "system_waiting"; waitMessage: string }
+  | { admits: false; refusal: "saved_work_recovering" }
   | { admits: false; refusal: "budget_blocked" }
-  | { admits: false; refusal: "daily_limit"; agentName?: string | null }
+  | { admits: false; refusal: "daily_limit"; agentName?: string | null; kind?: "runs" | "cost"; limit?: number | null }
   | { admits: false; refusal: "none" };
 
 const MENTIONS_RETRY = /\bretry\b/i;
@@ -72,25 +73,37 @@ function withoutRetrySentences(seedBody: string | null, refusalBody: string, cau
   return [...kept, rest ? rest.charAt(0).toUpperCase() + rest.slice(1) : ""].filter(Boolean).join(" ");
 }
 
+/**
+ * r2f: a posted notice is never refreshed (recovery/service.ts escalation
+ * comments), so every refusal is worded to stay true after its gate clears:
+ * it says what held the task when it was posted (past tense) and the step
+ * that lets Retry start, never "Retry can't start it" in the present tense.
+ */
 export function strandedRetryRefusalCopy(retry: Exclude<StrandedRetryAdmission, { admits: true }>): { body: string; nextAction: string } {
   switch (retry.refusal) {
     case "agent_paused": {
       const name = retry.agentName?.trim() || "This agent";
       return {
-        body: `This attempt could not be finished automatically, and ${name} is paused, so Retry can't start it. Your message is saved.`,
-        nextAction: `Ask a board user or ${name}'s manager to resume ${name}.`,
+        body: `This attempt could not be finished automatically, and ${name} was paused. Your message is saved.`,
+        nextAction: `If ${name} is still paused, ask a board user or ${name}'s manager to resume ${name}, then press Retry.`,
       };
     }
     case "workspace_repair_required":
       return {
-        body: "This attempt could not be finished automatically, and its saved files must be recovered first, so Retry can't start it. Your message is saved.",
-        nextAction: "Press Recover saved files to recover the workspace.",
+        body: "This attempt could not be finished automatically, and its saved files had to be recovered before Retry could start it. Your message is saved.",
+        nextAction: "If the task still offers Recover saved files, press it; once the files are recovered, press Retry.",
+      };
+    // A system-owned saved-work recovery is queued or running: no person action.
+    case "saved_work_recovering":
+      return {
+        body: "This attempt could not be finished automatically, and Paperclip started recovering the saved work first. Your message is saved.",
+        nextAction: "Nothing is needed from you while Paperclip recovers the saved work; Retry is offered on the task once it finishes.",
       };
     // The screen shows its Confirm it stopped button only for this userAction
     // (ExecutionBlockerNotice.tsx: userAction === "confirm_run_stopped").
     case "confirm_run_stopped":
       return {
-        body: "This attempt could not be finished automatically. Paperclip can't confirm that the previous attempt stopped, so Retry can't continue from it. Your message is saved.",
+        body: "This attempt could not be finished automatically. Paperclip could not confirm that the previous attempt stopped, so Retry could not continue from it. Your message is saved.",
         nextAction: "Press Confirm it stopped once the previous attempt has stopped.",
       };
     // A retryWait with no userAction: the screen has no button for it, and the
@@ -99,7 +112,7 @@ export function strandedRetryRefusalCopy(retry: Exclude<StrandedRetryAdmission, 
     // or a fresh workspace is chosen (explicit-native-continuation.ts legacy gate).
     case "previous_execution_unverified":
       return {
-        body: "This attempt could not be finished automatically. Paperclip can't confirm that the previous attempt stopped, so Retry can't continue from it. Your message is saved.",
+        body: "This attempt could not be finished automatically. Paperclip could not confirm that the previous attempt stopped, so Retry could not continue from it. Your message is saved.",
         nextAction: "It continues once a board user records that the previous attempt stopped; there is no button for this on the task yet.",
       };
     // A system-owned wait the screen names itself (retryWait.message, no button).
@@ -110,14 +123,22 @@ export function strandedRetryRefusalCopy(retry: Exclude<StrandedRetryAdmission, 
       };
     case "budget_blocked":
       return {
-        body: "This attempt could not be finished automatically, and the budget does not allow new work, so Retry can't start it. Your message is saved.",
-        nextAction: "Raise the budget in Costs.",
+        body: "This attempt could not be finished automatically, and the budget did not allow new work. Your message is saved.",
+        nextAction: "Raise the budget in Costs, then press Retry.",
       };
     case "daily_limit": {
       const name = retry.agentName?.trim() || "This agent";
+      const what = retry.kind === "cost" ? "daily cost limit" : "daily run limit";
+      const field = retry.kind === "cost" ? "maxDailyCostCents" : "maxDailyRuns";
+      // A limit of 0 blocks every run (heartbeat/timer-policy.ts getHeartbeatDailyCapBlock), so it never resets.
+      const resets = retry.limit !== 0;
+      // The settings screen has no field for this limit (AgentConfigForm.tsx); it is
+      // runtimeConfig.heartbeat.<field>, changed through PATCH /api/agents/:id.
       return {
-        body: `This attempt could not be finished automatically, and ${name} reached its daily limit, so Retry can't start it now. Your message is saved.`,
-        nextAction: `Raise ${name}'s daily limit in its settings. The limit resets at 00:00 UTC.`,
+        body: `This attempt could not be finished automatically, and ${name} had reached its ${what}. Your message is saved.`,
+        nextAction: resets
+          ? `The ${what} counts the UTC day, so press Retry after 00:00 UTC. A board user can raise it sooner only through the agents API (runtimeConfig.heartbeat.${field}); the settings screen has no field for it.`
+          : `${name}'s ${what} is set to 0, so it never resets. A board user can raise it only through the agents API (runtimeConfig.heartbeat.${field}); the settings screen has no field for it. Then press Retry.`,
       };
     }
     default:
