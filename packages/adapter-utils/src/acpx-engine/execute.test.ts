@@ -31,6 +31,7 @@ import {
   buildAcpxRunSummary,
   createAcpxEngineExecutor,
   findAncestorBin,
+  isCompatibleSession,
   geminiVersionSupportsNativeAcpFlag,
   parseGeminiVersionParts,
   referencedSourceContentSignature,
@@ -3246,6 +3247,62 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(JSON.stringify(first.result.sessionParams)).not.toContain("token-one");
     expect(first.result.sessionParams?.configFingerprint).toBe(rotatedToken.result.sessionParams?.configFingerprint);
     expect(first.result.sessionParams?.configFingerprint).not.toBe(changedSet.result.sessionParams?.configFingerprint);
+  });
+});
+
+// Keep reason: never-OK cross-target resume; judge2/judge-probe.mts's three collisions.
+// Pure comparator rows hold fingerprint/session guards equal deliberately: those
+// independent guards must not hide a fail-open target comparison.
+describe("ACPX resume target comparison", () => {
+  const ssh = { transport: "ssh", host: "machine-A", port: 22, username: "fixture", remoteCwd: "/remote/task" };
+  const sandbox = { transport: "sandbox", providerKey: "fixture", environmentId: "env-1",
+    providerLeaseId: "physical-1", remoteCwd: "/remote/task" };
+  const malformed = { ...ssh, port: "22" };
+  const guards = { configFingerprint: "same-fingerprint", sessionKey: "same-key", agent: "custom",
+    cwd: "/remote/task", mode: "persistent" };
+  function matches(saved: unknown, current: unknown) {
+    return isCompatibleSession({ ...guards, remoteExecution: saved }, {
+      fingerprint: guards.configFingerprint, sessionKey: guards.sessionKey, acpxAgent: guards.agent,
+      cwd: guards.cwd, mode: "persistent", remoteExecutionIdentity: current as Record<string, unknown> | null,
+    });
+  }
+  it.each([
+    { name: "judge: distinct valid sandbox cwd bytes", saved: sandbox, current: { ...sandbox, remoteCwd: "/remote/task " } },
+    { name: "judge: malformed SSH machine A vs machine B", saved: malformed, current: { ...malformed, host: "machine-B" } },
+    { name: "judge: malformed nonempty SSH vs absent local", saved: malformed, current: null },
+    { name: "reverse cwd whitespace", saved: { ...sandbox, remoteCwd: "/remote/task " }, current: sandbox },
+    { name: "reverse malformed local", saved: undefined, current: malformed },
+    { name: "same malformed remote is still invalid", saved: malformed, current: malformed },
+    { name: "malformed vs empty local", saved: malformed, current: {} },
+    { name: "malformed vs valid remote", saved: malformed, current: ssh },
+    { name: "non-object raw identity", saved: "malformed", current: null },
+    { name: "array raw identity", saved: [malformed], current: null },
+    { name: "different host", saved: ssh, current: { ...ssh, host: "machine-B" } },
+    { name: "different port", saved: ssh, current: { ...ssh, port: 2222 } },
+    { name: "different user", saved: ssh, current: { ...ssh, username: "other" } },
+    { name: "different SSH cwd", saved: ssh, current: { ...ssh, remoteCwd: "/other" } },
+    { name: "different sandbox cwd", saved: sandbox, current: { ...sandbox, remoteCwd: "/other" } },
+    { name: "different provider lease", saved: sandbox, current: { ...sandbox, providerLeaseId: "physical-2" } },
+    { name: "sandbox vs SSH transport", saved: sandbox, current: ssh },
+    { name: "SSH vs sandbox transport", saved: ssh, current: sandbox },
+    { name: "remote vs local", saved: ssh, current: null },
+  ])("refuses $name", ({ saved, current }) => {
+    expect(matches(saved, current)).toBe(false);
+  });
+  it.each([
+    { name: "same SSH target", saved: ssh, current: ssh },
+    { name: "same sandbox target", saved: sandbox, current: sandbox },
+    { name: "same exact cwd including whitespace", saved: { ...sandbox, remoteCwd: "/remote/task " }, current: { ...sandbox, remoteCwd: "/remote/task " } },
+    { name: "absent local identities", saved: undefined, current: null },
+    { name: "empty local identities", saved: {}, current: {} },
+    { name: "absent vs empty local", saved: null, current: {} },
+    { name: "empty vs absent local", saved: {}, current: undefined },
+    { name: "legacy raw saved SSH", saved: { ...ssh, privateKey: "FAKE-KEY", tailscaleSocket: "/FAKE-SOCKET" }, current: ssh },
+    { name: "raw current SSH", saved: ssh, current: { ...ssh, privateKey: "FAKE-OTHER-KEY", tailscaleSocket: "/FAKE-OTHER-SOCKET" } },
+    { name: "same physical sandbox across lease rows", saved: { ...sandbox, leaseId: "paperclip-1" }, current: { ...sandbox, leaseId: "paperclip-2" } },
+    { name: "canonical physical lease", saved: sandbox, current: { ...sandbox, providerLeaseId: " physical-1 " } },
+  ])("accepts $name", ({ saved, current }) => {
+    expect(matches(saved, current)).toBe(true);
   });
 });
 
