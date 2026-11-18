@@ -1,6 +1,6 @@
 {
-  "id": "7078707e-c7ff-466d-8b04-400e4f80879e",
-  "prevId": "7c8788d2-1728-4bfa-8aa4-9947b3775801",
+  "id": "7c8788d2-1728-4bfa-8aa4-9947b3775801",
+  "prevId": "3cee42f4-19e3-4590-ba7e-8848a058b317",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -21959,6 +21959,153 @@
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.company_workload_identity_keys": {
+      "name": "company_workload_identity_keys",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "company_id": {
+          "name": "company_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "key_id": {
+          "name": "key_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "algorithm": {
+          "name": "algorithm",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "public_jwk": {
+          "name": "public_jwk",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "private_key_material": {
+          "name": "private_key_material",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "status_changed_at": {
+          "name": "status_changed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "company_workload_identity_keys_company_key_uq": {
+          "name": "company_workload_identity_keys_company_key_uq",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "key_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "company_workload_identity_keys_one_active_uq": {
+          "name": "company_workload_identity_keys_one_active_uq",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"company_workload_identity_keys\".\"status\" = 'active'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "company_workload_identity_keys_one_next_uq": {
+          "name": "company_workload_identity_keys_one_next_uq",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"company_workload_identity_keys\".\"status\" = 'next'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "company_workload_identity_keys_company_id_companies_id_fk": {
+          "name": "company_workload_identity_keys_company_id_companies_id_fk",
+          "tableFrom": "company_workload_identity_keys",
+          "tableTo": "companies",
+          "columnsFrom": [
+            "company_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "company_workload_identity_keys_algorithm_check": {
+          "name": "company_workload_identity_keys_algorithm_check",
+          "value": "\"company_workload_identity_keys\".\"algorithm\" = 'ES256'"
+        },
+        "company_workload_identity_keys_status_check": {
+          "name": "company_workload_identity_keys_status_check",
+          "value": "\"company_workload_identity_keys\".\"status\" in ('next', 'active', 'retiring', 'retired')"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.completion_contracts": {

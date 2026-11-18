@@ -149,6 +149,7 @@ import { z } from "zod";
 import { logger } from "../middleware/logger.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
+import { withTelemetryCompany } from "../telemetry-company-scope.js";
 import { authorizationService } from "./authorization.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
 import { resolveDeploymentMode } from "../config-file.js";
@@ -1799,7 +1800,7 @@ async function emitInteractionResolvedTelemetry(
       ? (roleByAgentId.get(interaction.createdByAgentId) ?? undefined)
       : undefined;
 
-    trackInteractionResolved(telemetryClient, {
+    withTelemetryCompany(interaction.companyId, () => trackInteractionResolved(telemetryClient, {
       interactionKind:
         interaction.kind === "connection_intent" || interaction.kind === "suggest_routine"
           || interaction.kind === "propose_responsibility_bar" || interaction.kind === "propose_automation"
@@ -1816,7 +1817,7 @@ async function emitInteractionResolvedTelemetry(
       }),
       legacyInheritedRestriction:
         interaction.resolverPolicyProvenance === "legacy_inherited_restriction",
-    });
+    }));
   } catch (error) {
     console.error(
       "[paperclip] Failed to emit interaction.resolved telemetry",
@@ -1825,7 +1826,8 @@ async function emitInteractionResolvedTelemetry(
   }
 }
 
-function emitInteractionCreatedTelemetry(args: {
+function emitInteractionCreatedTelemetry({ companyId, ...args }: {
+  companyId: string;
   interactionKind: IssueThreadInteractionKind;
   usedDeprecatedResolverPolicyAlias: boolean;
 }) {
@@ -1833,7 +1835,7 @@ function emitInteractionCreatedTelemetry(args: {
   if (!telemetryClient) return;
 
   try {
-    trackInteractionCreated(telemetryClient, {
+    withTelemetryCompany(companyId, () => trackInteractionCreated(telemetryClient, {
       ...args,
       interactionKind:
         args.interactionKind === "connection_intent" || args.interactionKind === "suggest_routine"
@@ -1841,7 +1843,7 @@ function emitInteractionCreatedTelemetry(args: {
           || args.interactionKind === "propose_dashboard_changes"
           ? "other"
           : args.interactionKind,
-    });
+    }));
   } catch (error) {
     console.error(
       "[paperclip] Failed to emit interaction.created telemetry",
@@ -3400,6 +3402,7 @@ export function issueThreadInteractionService(
 
       const interaction = hydrateInteraction(created) as ConnectionIntentInteraction;
       if (inserted) emitInteractionCreatedTelemetry({
+        companyId: issue.companyId,
         interactionKind: "connection_intent",
         usedDeprecatedResolverPolicyAlias: false,
       });
@@ -3592,6 +3595,7 @@ export function issueThreadInteractionService(
         return row!;
       });
       emitInteractionCreatedTelemetry({
+        companyId: issue.companyId,
         interactionKind: "suggest_routine",
         usedDeprecatedResolverPolicyAlias: false,
       });
@@ -3918,6 +3922,7 @@ export function issueThreadInteractionService(
         return { row: row!, replacedIds: replaced.map((entry) => entry.id) };
       });
       emitInteractionCreatedTelemetry({
+        companyId: issue.companyId,
         interactionKind: "propose_responsibility_bar",
         usedDeprecatedResolverPolicyAlias: false,
       });
@@ -4093,6 +4098,7 @@ export function issueThreadInteractionService(
         return { row: row!, replacedIds: replaced.map((entry) => entry.id) };
       });
       emitInteractionCreatedTelemetry({
+        companyId: issue.companyId,
         interactionKind: "propose_dashboard_changes",
         usedDeprecatedResolverPolicyAlias: false,
       });
@@ -4268,6 +4274,7 @@ export function issueThreadInteractionService(
         return { row: row!, replacedIds: replaced.map((entry) => entry.id) };
       });
       emitInteractionCreatedTelemetry({
+        companyId: issue.companyId,
         interactionKind: "propose_automation",
         usedDeprecatedResolverPolicyAlias: false,
       });
@@ -5504,6 +5511,7 @@ export function issueThreadInteractionService(
       }
       const interaction = hydrateInteraction(created);
       emitInteractionCreatedTelemetry({
+        companyId: issue.companyId,
         interactionKind: interaction.kind,
         usedDeprecatedResolverPolicyAlias,
       });

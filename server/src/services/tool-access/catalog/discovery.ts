@@ -1,5 +1,6 @@
 import { isGitHubAppConnection } from "../../github-app-credentials.js";
 import { assertSupportedConnection } from "../connections/setup-policy.js";
+import { isAwsMcpConnection } from "../../connectors/aws/mcp-credentials.js";
 import { usesClientCredentials } from "../oauth/client-credentials.js";
 import { vercelCredentialFor, vercelConnectResourcesFor } from "../vercel-credentials.js";
 import { connectionSetupUrl, connectionReconnectUrl } from "../identifiers.js";
@@ -355,6 +356,14 @@ export function createToolCatalogDiscovery(db: Db, { now, audit, secrets, creden
     }
     if (response.status === 401 && isGitHubAppConnection(connection)) {
       await response.body?.cancel().catch(() => undefined);
+      headers = {
+        ...projectedConnectionHeaders(connection),
+        ...(await resolveCredentialHeaders(connection, actor, { forceRefresh: true })),
+      };
+      response = await relistAfterCredentialRefresh();
+    }
+    if (response.status === 401 && isAwsMcpConnection(connection)) {
+      // A refused AWS token: mint a fresh one and list again (listing has no side effects).
       headers = {
         ...projectedConnectionHeaders(connection),
         ...(await resolveCredentialHeaders(connection, actor, { forceRefresh: true })),

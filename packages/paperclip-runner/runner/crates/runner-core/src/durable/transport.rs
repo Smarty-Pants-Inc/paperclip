@@ -933,6 +933,11 @@ pub(crate) struct AuthenticatedTransport {
     /// connection (server/src/realtime/runner-prp-ws.ts) gets no pings and
     /// may legitimately stay quiet for longer than the window.
     last_inbound: Option<Instant>,
+    /// Upstream #22088: the last frame of any kind, for the configurable
+    /// listener-mode `controller_silence` window (kept beside the fork's
+    /// fixed 120 s `last_inbound` window above).
+    controller_last_inbound: Instant,
+    controller_silence: Duration,
 }
 
 /// Clock for the inbound silence window; tests pause it per thread.
@@ -1127,6 +1132,8 @@ impl AuthenticatedTransport {
                 secure_channel,
                 max_frame_bytes: config.max_frame_bytes,
                 last_inbound,
+                controller_last_inbound: Instant::now(),
+                controller_silence: config.controller_silence,
             };
             // Ticket validation and lease persistence happen before the server
             // emits welcome. Give that durable admission the connection setup
@@ -1153,6 +1160,7 @@ impl AuthenticatedTransport {
                 expected_lease,
                 challenge.selected_version,
             )?;
+            transport.controller_last_inbound = Instant::now();
             // Authentication can wait longer for control-plane validation, but
             // the steady-state runner loop must return to provider polling
             // promptly when no control message is available.
@@ -1182,12 +1190,17 @@ impl AuthenticatedTransport {
     }
 
     pub(crate) fn receive_json(&mut self) -> Result<Option<Value>, DurableRunnerError> {
-        self.receive_json_until(None)
+        match self.receive_json_until(None)? {
+            None if self.listener_controller_silent() => Err(DurableRunnerError::invalid(
+                "controller sent no frame within the liveness window; listening for a new connection",
+            )),
+            message => Ok(message),
+        }
     }
 
     pub(crate) fn receive_queued_json(&mut self) -> Result<Option<Value>, DurableRunnerError> {
         self.set_runtime_read_timeout(QUEUED_CONTROL_READ_TIMEOUT)?;
-        let message = self.receive_json_until(None);
+        let message = self.receive_json();
         self.set_runtime_read_timeout(RUNTIME_READ_TIMEOUT)?;
         message
     }
@@ -1208,6 +1221,7 @@ impl AuthenticatedTransport {
             self.max_frame_bytes,
             deadline,
             &mut inbound,
+            Some(&mut self.controller_last_inbound),
         );
         if let Some(last_inbound) = self.last_inbound.as_mut() {
             // Read first, then judge: frames buffered while the loop was busy
@@ -1226,6 +1240,11 @@ impl AuthenticatedTransport {
             None => return Ok(None),
         };
         self.secure_channel.decrypt(&frame, false).map(Some)
+    }
+
+    fn listener_controller_silent(&self) -> bool {
+        matches!(self.socket, RunnerSocket::Listen(_))
+            && self.controller_last_inbound.elapsed() >= self.controller_silence
     }
 }
 
@@ -1654,16 +1673,27 @@ fn receive_plain_optional_until(
     max_frame_bytes: usize,
     deadline: Option<Instant>,
 ) -> Result<Option<Value>, DurableRunnerError> {
-    receive_plain_observed(socket, max_frame_bytes, deadline, &mut false)
+    receive_plain_optional_until_observed(socket, max_frame_bytes, deadline, None)
+}
+
+fn receive_plain_optional_until_observed(
+    socket: &mut (impl WebSocketMessages + ?Sized),
+    max_frame_bytes: usize,
+    deadline: Option<Instant>,
+    last_inbound: Option<&mut Instant>,
+) -> Result<Option<Value>, DurableRunnerError> {
+    receive_plain_observed(socket, max_frame_bytes, deadline, &mut false, last_inbound)
 }
 
 /// `inbound` becomes true when any complete WebSocket frame was read,
 /// including Ping/Pong control frames that never reach the caller.
+/// `last_inbound` (upstream #22088) records when such a frame was read.
 fn receive_plain_observed(
     socket: &mut (impl WebSocketMessages + ?Sized),
     max_frame_bytes: usize,
     deadline: Option<Instant>,
     inbound: &mut bool,
+    mut last_inbound: Option<&mut Instant>,
 ) -> Result<Option<Value>, DurableRunnerError> {
     loop {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -1677,6 +1707,9 @@ fn receive_plain_observed(
             return Err(DurableRunnerError::invalid(
                 "WebSocket authentication message deadline elapsed",
             ));
+        }
+        if let (Ok(_), Some(last_inbound)) = (&message, last_inbound.as_deref_mut()) {
+            *last_inbound = Instant::now();
         }
         match message {
             Ok(Message::Text(text)) => {
@@ -1823,6 +1856,7 @@ mod tests {
     include!("tests/listener_abandoned_flood.rs");
     include!("tests/indeterminate_terminal_ack.rs");
     include!("tests/inbound_liveness.rs");
+    include!("tests/listener_silent_controller.rs");
     include!("tests/loopback_nodelay.rs");
 
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
@@ -1860,6 +1894,7 @@ mod tests {
             reconnect_grace: None,
             max_runtime: Duration::from_secs(1),
             turn_scoped: false,
+            controller_silence: crate::durable::DEFAULT_CONTROLLER_SILENCE,
         }
     }
 

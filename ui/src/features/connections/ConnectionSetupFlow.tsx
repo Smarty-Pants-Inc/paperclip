@@ -380,7 +380,8 @@ function defaultGrantKindFor(method: ConnectionMethodDef | null, preferPersonal 
 }
 
 function defaultInstallChoiceFor(method: ConnectionMethodDef | null, requestedAgentId?: string): "specific" | "all" {
-  return requestedAgentId || method?.ai?.provider === "github" ? "specific" : "all";
+  // A dedicated agent identity belongs to exactly one chosen agent.
+  return requestedAgentId || method?.ai?.provider === "github" || defaultGrantKindFor(method) === "agent" ? "specific" : "all";
 }
 
 function configuredAgentIdentity(connection: ToolConnection): string | undefined {
@@ -1524,9 +1525,11 @@ function StandardConnectionSetupFlow({
     && (resumableOAuthConnection || reconnectConnection));
   const dedicatedAgentSelectionValid = (!retainedGitHubApp || Boolean(retainedAppGrant && retainedInstalls.data))
     && (effectiveGrantKind !== "agent" || (retainedGitHubApp ? Boolean(retainedAgentId) : preserveOAuthAgentAccess || installAgentIds.size === 1));
+  // A dedicated agent identity is never "all agents": keep the picker on so
+  // the connect request can name its one agent.
   useEffect(() => {
-    if (effectiveGrantKind === "agent") setInstallChoice("specific");
-  }, [effectiveGrantKind]);
+    if (effectiveGrantKind === "agent" && installChoice !== "specific") setInstallChoice("specific");
+  }, [effectiveGrantKind, installChoice]);
   // A connected result (from the link probe or machine sign-in) goes straight to
   // review with every discovered action enabled by default.
   function acceptConnectedResult(result: ConnectToolAppResult) {
@@ -2025,7 +2028,7 @@ function StandardConnectionSetupFlow({
       // The Access step asks one question about agent reach, so profile access
       // and installs are committed to the same target set instead of drifting
       // apart behind two separate wizard screens.
-      const selection: AppAccessSelection = installChoice === "all"
+      const selection: AppAccessSelection = installChoice === "all" && effectiveGrantKind !== "agent"
         ? "all_agents"
         : { agentIds: Array.from(installAgentIds) };
       const finished = await toolsApi.finishApp(selectedCompanyId!, connected.connectionId, {
@@ -2289,6 +2292,12 @@ function StandardConnectionSetupFlow({
         : "api_key";
   // PAP-659 C0: the resolved default is stated, not asked. `Change` opens the
   // same controls the deleted Access step owned, inline and never blocking.
+  // Reconnecting a signed-in account keeps its agent; any other dedicated
+  // agent identity must name exactly one agent before it can connect.
+  // Fork: a retained GitHub App keeps its agent, and only a method that signs
+  // in automatically preserves an OAuth agent (preserveOAuthAgentAccess).
+  const preservesAgentAccess = retainedGitHubApp || preserveOAuthAgentAccess || reconnectConnection?.connectionPurpose === "ai";
+  const dedicatedAgentMissing = effectiveGrantKind === "agent" && !requestedAgentId && !preservesAgentAccess && installAgentIds.size !== 1;
   const renderConnectionDefaults = step === "key" ? (
     (extra?: ReactNode, forceOpen?: boolean) => (
     <>
@@ -2311,7 +2320,7 @@ function StandardConnectionSetupFlow({
     <ConnectionAccessDefaults
       key="connection-defaults"
       extra={extra}
-      forceOpen={forceOpen || !dedicatedAgentSelectionValid}
+      forceOpen={forceOpen || !dedicatedAgentSelectionValid || dedicatedAgentMissing}
       companyId={selectedCompanyId}
       sentence={connectionDefaultSummarySentence({
         grantKind: effectiveGrantKind,
@@ -2345,7 +2354,7 @@ function StandardConnectionSetupFlow({
       capabilities={galleryQuery.data?.capabilities}
       githubIdentity={entry?.slug === "github"}
       identityLoading={Boolean(automaticOAuthEntry) && directOAuthLookupPending}
-      preserveAgentAccess={retainedGitHubApp || preserveOAuthAgentAccess || reconnectConnection?.connectionPurpose === "ai"}
+      preserveAgentAccess={preservesAgentAccess}
       disabled={connectMutation.isPending || oauthStartMutation.isPending || retainedGitHubApp}
     />
     {entry && instructionTemplate && instructionValue && <div className="mt-6"><ConnectionInstructionsEditor provider={entry.name} template={instructionTemplate} value={instructionValue} onChange={(value) => setInstructionDraft({ slug: entry.slug, value })} disabled={connectMutation.isPending || oauthStartMutation.isPending} /></div>}
@@ -2785,7 +2794,7 @@ function StandardConnectionSetupFlow({
         </div>
       ) : step === "key" && entry && credentialStep !== undefined ? credentialStep : step === "key" && entry ? (
         <KeyStep
-          settingsValid={additionalSettingsValid && instructionsValid && dedicatedAgentSelectionValid}
+          settingsValid={additionalSettingsValid && instructionsValid && dedicatedAgentSelectionValid && !dedicatedAgentMissing}
           entry={entry}
           error={connectMutation.error ? describeError(connectMutation.error).body : null}
           values={credentials}
@@ -4230,7 +4239,8 @@ export function AccessStepContent({
   // scope stays legible instead of quietly disappearing.
   const canSetCompanyInstall = capabilities?.canSetCompanyInstall ?? true;
   const canCreateOrganizationGrant = capabilities?.canCreateOrganizationGrant ?? true;
-  const needsIdentityChoice = authKind !== "none";
+  // A dedicated agent identity is an identity even without a credential.
+  const needsIdentityChoice = authKind !== "none" || grantKind === "agent";
   const allowedGrantKinds = grantKinds ?? (["user", "organization"] satisfies ConnectionGrantKind[]);
   const identityChoiceAllowed = !needsIdentityChoice
     || grantKind === "user"
@@ -4248,9 +4258,13 @@ export function AccessStepContent({
   const lockedAgentName = lockedAgentId
     ? allAgents.find((agent) => agent.id === lockedAgentId)?.name ?? "the requesting agent"
     : null;
-  const identityHeading = githubIdentity ? "Connect GitHub as" : "Which humans can use this credential?";
+  const identityHeading = githubIdentity
+    ? "Connect GitHub as"
+    : allowedGrantKinds.length === 1 && allowedGrantKinds[0] === "agent"
+      ? "Who this connection acts as"
+      : "Which humans can use this credential?";
   const agentAccessHeading = grantKind === "agent"
-    ? "Which agent owns this GitHub account?"
+    ? githubIdentity ? "Which agent owns this GitHub account?" : "Which agent uses this connection?"
     : githubIdentity && grantKind === "user"
       ? "Which agents may use your GitHub when you’re responsible?"
       : githubIdentity
@@ -4414,7 +4428,7 @@ export function AccessStepContent({
                 ]}
               />
             )}
-            {!preserveAgentAccess && !lockedAgentId && (grantKind === "agent" || installChoice === "specific") ? (
+            {!preserveAgentAccess && !lockedAgentId && (installChoice === "specific" || grantKind === "agent") ? (
               <div className="mt-3">
                 <AgentMultiSelect
                   agents={agents}
@@ -4479,6 +4493,8 @@ export function connectionDefaultSummarySentence(input: {
     ? "agent access stays as it is"
     : input.lockedAgentId
       ? "available to the agent that asked for it"
+      : input.grantKind === "agent"
+        ? input.installCount === 1 ? "available only to the chosen agent" : "choose the one agent that uses it"
       : input.installChoice === "all"
         ? "available to all agents"
         : input.installCount === 0
@@ -4573,7 +4589,7 @@ export function accessSummaryLines(input: {
   installCount: number;
   enabledCount: number;
 }): Array<{ label: string; value: string }> {
-  const identity = input.authKind === "none"
+  const identity = input.authKind === "none" && input.grantKind !== "agent"
     ? "No identity required"
     : input.grantKind === "user"
       ? "Your identity"
