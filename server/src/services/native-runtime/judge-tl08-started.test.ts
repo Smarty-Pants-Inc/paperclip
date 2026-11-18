@@ -11573,7 +11573,7 @@ describe("bounded stopped instruction collection", () => {
 describe("native warm session supervision", () => {
   // SUPERSEDE-ADOPT-REDBOTH-1118 C-C: claim-remove-entry is it.todo until smarty-dev#21229 (owner dev-lead) has a quiet re-run.
   // Its original body is the unchanged it.each below (the ending === "claim-remove-entry" branches); add it back to the list to run it.
-  it.todo("composes remote warm ownership with real DB successor leases and current-run collection: claim-remove-entry — smarty-dev#21229 (owner dev-lead; quiet re-run owed)");
+  it.todo("composes remote warm ownership with real DB successor leases and current-run collection: claim-remove-entry — SUPERSEDE-CLAIM-REMOVE-ENTRY-HELD-1118 (a deterministic stale test; tracking smarty-dev#21229)");
 
   it.each(["collect", "close-failure", "stopped", "destroyed", "missing-lease", "foreign-run", "foreign-environment", "deleted-environment", "claim-edit", "claim-add", "claim-remove", "claim-canonical", "claim-config", "claim-uncertain"])("composes remote warm ownership with real DB successor leases and current-run collection: %s", async ending => {
     const tables = await import("@paperclipai/db");
