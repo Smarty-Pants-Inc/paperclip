@@ -49,7 +49,7 @@ const FREE_TEXT_PATTERNS: RedactionPattern[] = [
   },
   {
     kind: "provider_api_key",
-    regex: /\bsk-(?:ant-)?[A-Za-z0-9_-]{12,}\b/g,
+    regex: /\bsk-(?:ant-)?[A-Za-z0-9_-]{12,}(?![A-Za-z0-9_-])/g,
     replacement: "[REDACTED_API_KEY]",
   },
   {
