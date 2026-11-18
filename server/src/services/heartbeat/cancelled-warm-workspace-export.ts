@@ -160,8 +160,12 @@ export async function finishCancelledWarmWorkspaceExport(input: {
       // adopt-stopu-ugate: close-success alone is NOT proof (an escaped
       // setsid/nohup writer survives it). No export unless the box's process
       // table shows no process of the stopped turn remains.
-      const box = input.stoppedTurnBox ? await input.stoppedTurnBox(controller.signal).catch(() => null) : null;
-      const proof = await noStoppedTurnProcessRemains(box, run.startedAt);
+      // Raced with the same abort as the export, so a box that never answers
+      // cannot hold the finalization lock past the bound.
+      const proving = (async () => noStoppedTurnProcessRemains(input.stoppedTurnBox
+        ? await input.stoppedTurnBox(controller.signal).catch(() => null) : null, run.startedAt))();
+      proving.catch(() => undefined);
+      const proof = await Promise.race([proving, aborted]);
       if (!proof.proven) throw new StoppedTurnProcessesNotProvenGoneError(
         `${proof.detail}${proof.remaining?.length ? `:${proof.remaining.join(",")}` : ""}`);
       await assertHeld();
