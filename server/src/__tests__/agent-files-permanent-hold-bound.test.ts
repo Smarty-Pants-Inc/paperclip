@@ -18,6 +18,7 @@ import { agentInstructionWorkingCopyService } from "../services/agent-instructio
 import { agentFileSaveHeld } from "../services/agent-directory-working-copies.js";
 import { agentFileCopiesToCollectOnLease, agentFileSaveHeldOnLease } from "../services/agent-file-save-hold.js";
 import * as fileStoreModule from "../services/agent-file-store.js";
+import * as holdModule from "../services/agent-file-save-hold.js";
 import { resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -42,8 +43,17 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
   const applyCalls = new Map<string, number>();
   const applyFailures: Array<{ agentId: string; status?: number; message: string }> = [];
   const transientAgentId = randomUUID();
+  // B0: "Paused" changes files but its source read is refused with the Boat
+  // plugin's LEASE-GONE message until its box is resumed; "Idle" changes nothing.
+  const leaseGoneAgentId = randomUUID(), unchangedAgentId = randomUUID();
+  const LEASE_GONE = "Boat sandbox lease is no longer active.";
+  // Set by Paused's run after it wrote its files: its stopped source read is refused.
+  let leaseGone = false;
+  const sourceReads = new Map<string, number>();
+  let leaseGoneRunId = "", unchangedRunId = "";
   const companyId = randomUUID(), userId = randomUUID(), permanentAgentId = randomUUID();
   let permanentRunId = "", transientRunId = "", heldRoot = "";
+  const runIdOf = new Map<string, string>();
   // The held candidate as the RUN wrote it (path -> sha256), recorded by the
   // adapter at stop time, independently of the server's own manifest.
   const candidate = new Map<string, string>();
@@ -63,6 +73,16 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
     process.env.PAPERCLIP_HOME = home;
     database = await startEmbeddedPostgresTestDatabase("held-save-bound-db-");
     db = createDb(database.connectionString);
+    // B0 boundary: the collector's read of the stopped source (retrieve ->
+    // inspectAgentDirectory) is refused while Paused's lease is gone.
+    const inspect = fileStoreModule.inspectAgentDirectory;
+    vi.spyOn(fileStoreModule, "inspectAgentDirectory").mockImplementation(async (root, ...rest) => {
+      for (const agentId of [leaseGoneAgentId, unchangedAgentId]) if (String(root).includes(agentId)) {
+        sourceReads.set(agentId, (sourceReads.get(agentId) ?? 0) + 1);
+        if (agentId === leaseGoneAgentId && leaseGone) throw new Error(LEASE_GONE);
+      }
+      return inspect(root, ...rest);
+    });
     const actual = fileStoreModule.agentFileStore;
     vi.spyOn(fileStoreModule, "agentFileStore").mockImplementation((...args) => {
       const store = actual(...args);
@@ -95,8 +115,11 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
           await fs.mkdir(path.join(path.dirname(entry), "notes"), { recursive: true });
           await fs.writeFile(path.join(path.dirname(entry), "notes", "plan.md"), "# Plan\nSecond held file in a subfolder\n");
           for (const file of ["unsaved-note.txt", "notes/plan.md"]) candidate.set(file, sha256(await fs.readFile(path.join(path.dirname(entry), file))));
-        } else {
+        } else if (input.agent.id === transientAgentId) {
           await fs.writeFile(path.join(path.dirname(entry), "transient-note.txt"), "Transient refusal bytes\n");
+        } else if (input.agent.id === leaseGoneAgentId) {
+          await fs.writeFile(path.join(path.dirname(entry), "paused-note.txt"), "Bytes written before the lease went away\n");
+          leaseGone = true;
         }
         await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, String(input.context.issueId)));
         await input.onProviderStopped?.();
@@ -109,8 +132,9 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
     await db.insert(companies).values({ id: companyId, name: "Held save bound", issuePrefix: `B${companyId.slice(0, 6)}`, defaultResponsibleUserId: userId });
     await db.insert(authUsers).values({ id: userId, name: "Owner", email: `${userId}@example.test`, createdAt: now, updatedAt: now });
     await db.insert(principalPermissionGrants).values({ companyId, principalType: "user", principalId: userId,
-      permissionKey: "agents:configure", scope: { agentIds: [permanentAgentId, transientAgentId] } });
-    for (const [agentId, name] of [[permanentAgentId, "Editor"], [transientAgentId, "Flaky"]] as const) {
+      permissionKey: "agents:configure", scope: { agentIds: [permanentAgentId, transientAgentId, leaseGoneAgentId, unchangedAgentId] } });
+    let issueNumber = 0;
+    for (const [agentId, name] of [[permanentAgentId, "Editor"], [transientAgentId, "Flaky"], [leaseGoneAgentId, "Paused"], [unchangedAgentId, "Idle"]] as const) {
       await db.insert(companyMemberships).values([
         ...(agentId === permanentAgentId ? [{ companyId, principalType: "user", principalId: userId, membershipRole: "operator" }] : []),
         { companyId, principalType: "agent", principalId: agentId, membershipRole: "member" },
@@ -124,12 +148,16 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
         runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } });
       const issueId = randomUUID();
       await db.insert(issues).values({ id: issueId, companyId, title: `${name} run`, status: "todo",
-        assigneeAgentId: agentId, responsibleUserId: userId, issueNumber: agentId === permanentAgentId ? 1 : 2 });
+        assigneeAgentId: agentId, responsibleUserId: userId, issueNumber: ++issueNumber });
       const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",
         payload: { issueId }, contextSnapshot: { issueId } });
       expect(run).not.toBeNull();
       await heartbeat.drainActiveRunExecutions();
-      if (agentId === permanentAgentId) permanentRunId = run!.id; else transientRunId = run!.id;
+      runIdOf.set(agentId, run!.id);
+      if (agentId === permanentAgentId) permanentRunId = run!.id;
+      else if (agentId === transientAgentId) transientRunId = run!.id;
+      else if (agentId === leaseGoneAgentId) leaseGoneRunId = run!.id;
+      else unchangedRunId = run!.id;
     }
     expect(applyFailures).toContainEqual({ agentId: permanentAgentId, status: 422, message: "The configured instruction entry cannot be deleted" });
   }, 120_000);
@@ -157,6 +185,79 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
 
   const notices = async () => (await db.select().from(activityLog)
     .where(and(eq(activityLog.runId, permanentRunId), eq(activityLog.action, "agent_files.save_held_permanent"))));
+
+  it("R0a: an UNCHANGED copy refused with LEASE-GONE is never held: it settles as nothing to save, no retry", async () => {
+    // Real producer: Idle's run changed nothing, and the real collector settled it unchanged.
+    const real = (await copies.get(companyId, unchangedRunId))!;
+    console.log("R0A_REAL", JSON.stringify({ runId: unchangedRunId, state: real.state, held: agentFileSaveHeld(real), nextAttemptAt: real.nextAttemptAt }));
+    expect(real.state).toBe("unchanged");
+    expect(agentFileSaveHeld(real)).toBe(false);
+    // PLANTED beside it: Paul's live shape (run 035deeb8): a warm checkpoint recorded
+    // checkpointState unchanged with 0 copied files (candidate == base, no conflicts),
+    // then the stopped collection was refused with LEASE-GONE and the copy was HELD,
+    // retrying every <= 6 h. The local adapter has no warm sandbox checkpoint, so the
+    // held receipt is planted on Idle's real row.
+    const stoppedAt = new Date(Date.now() - 12 * HOUR);
+    await db.update(agentInstructionWorkingCopies).set({ state: "unavailable", processStoppedAt: stoppedAt,
+      candidateHash: real.baseHash, errorCode: "AGENT_FILES_SAVE_FAILED", nextAttemptAt: new Date(Date.now() - 1_000),
+      receipt: { ...real.receipt, warm: true, checkpointState: "unchanged", conflicts: [], pendingConflicts: [],
+        checkpointStats: { copiedFiles: 0, copiedBytes: 0 },
+        savePending: { since: stoppedAt.toISOString(), code: "AGENT_FILES_SAVE_FAILED", reason: LEASE_GONE, failures: 3 } } })
+      .where(and(eq(agentInstructionWorkingCopies.companyId, companyId), eq(agentInstructionWorkingCopies.runId, unchangedRunId)));
+    expect(agentFileSaveHeld(await copies.get(companyId, unchangedRunId))).toBe(true);
+    const readsBefore = sourceReads.get(unchangedAgentId) ?? 0, applyBefore = applyCalls.get(unchangedAgentId) ?? 0;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      for (const ahead of [0, 7, 30]) { vi.setSystemTime(Date.now() + ahead * HOUR); await copies.recoverStopped(); }
+    } finally { vi.useRealTimers(); }
+    const after = (await copies.get(companyId, unchangedRunId))!;
+    console.log("R0A_PLANTED", JSON.stringify({ state: after.state, held: agentFileSaveHeld(after), errorCode: after.errorCode,
+      nextAttemptAt: after.nextAttemptAt, savePending: after.receipt?.savePending ?? null,
+      sourceReads: (sourceReads.get(unchangedAgentId) ?? 0) - readsBefore, applies: (applyCalls.get(unchangedAgentId) ?? 0) - applyBefore }));
+    expect(agentFileSaveHeld(after)).toBe(false);
+    expect(after.state).toBe("unchanged");
+    expect(after.receipt?.savePending).toBeUndefined();
+    expect(after.nextAttemptAt).toBeNull();
+    expect((applyCalls.get(unchangedAgentId) ?? 0) - applyBefore).toBe(0);
+  }, 60_000);
+
+  it("R0b: a CHANGED copy refused with LEASE-GONE stays held, stops time-polling, and is retried when its lease is active again", async () => {
+    const held = (await copies.get(companyId, leaseGoneRunId))!;
+    const pending = held.receipt?.savePending as Record<string, unknown> | undefined;
+    console.log("R0B_HOLD", JSON.stringify({ runId: leaseGoneRunId, state: held.state, nextAttemptAt: held.nextAttemptAt, savePending: pending }));
+    expect(agentFileSaveHeld(held)).toBe(true);
+    expect(pending).toMatchObject({ reason: LEASE_GONE, retryOn: "lease_active" });
+    expect(pending?.permanent).toBeUndefined();
+    expect(held.nextAttemptAt).toBeNull();
+    // No timer retry: sweeps at any age never read the source again.
+    const readsBefore = sourceReads.get(leaseGoneAgentId) ?? 0;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      for (const ahead of [0, 1, 7, 30]) { vi.setSystemTime(Date.now() + ahead * HOUR); await copies.recoverStopped(); }
+    } finally { vi.useRealTimers(); }
+    const parked = (await copies.get(companyId, leaseGoneRunId))!;
+    const timerReads = (sourceReads.get(leaseGoneAgentId) ?? 0) - readsBefore;
+    console.log("R0B_NO_TIMER", JSON.stringify({ timerReads, held: agentFileSaveHeld(parked), nextAttemptAt: parked.nextAttemptAt }));
+    expect(timerReads).toBe(0);
+    expect(agentFileSaveHeld(parked)).toBe(true);
+    // Resume: the box's lease is active again (PLANTED lease row: the local adapter has no sandbox).
+    const [environment] = await db.insert(environments).values({ name: "Planted resumed sandbox", driver: "sandbox" }).returning();
+    const [lease] = await db.insert(environmentLeases).values({ companyId, environmentId: environment!.id,
+      heartbeatRunId: leaseGoneRunId, status: "active", leasePolicy: "reuse_by_environment", provider: "daytona",
+      providerLeaseId: randomUUID(), metadata: { driver: "sandbox" } }).returning();
+    leaseGone = false;
+    const rearm = (holdModule as unknown as Record<string, unknown>).rearmAgentFileHoldsOnLeaseActive as
+      undefined | ((db: unknown, lease: unknown) => Promise<string[]>);
+    expect(typeof rearm).toBe("function");
+    const rearmed = await rearm!(db, { id: lease!.id, companyId, providerLeaseId: lease!.providerLeaseId, heartbeatRunId: leaseGoneRunId });
+    await copies.recoverStopped();
+    const after = (await copies.get(companyId, leaseGoneRunId))!;
+    console.log("R0B_RESUMED", JSON.stringify({ rearmed, state: after.state, held: agentFileSaveHeld(after),
+      resumeReads: (sourceReads.get(leaseGoneAgentId) ?? 0) - readsBefore - timerReads }));
+    expect(rearmed).toEqual([leaseGoneRunId]);
+    expect(after.state).toBe("saved");
+    expect(agentFileSaveHeld(after)).toBe(false);
+  }, 60_000);
 
   it("R1: a permanent 422 hold is marked permanent and schedules no further retry", async () => {
     const held = (await copies.get(companyId, permanentRunId))!;
