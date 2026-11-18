@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { retiredReusableLeasePredecessors } from "./environment-lease-handoff.js";
 import { OWN_PROCESS_START_EVENT_TYPES } from "./native-process-start-events.js";
@@ -39,6 +39,21 @@ export const PREDECESSOR_LONG_STOP_MS = 15 * 60_000;
 export const RESUME_FENCED_PREDECESSOR_RUN_STATUSES: ReadonlySet<string> =
   new Set(["cancelled", "failed", "timed_out", "interrupted"]);
 
+/** P's run as the fence reads it: its status and who cancelled it. */
+export type ResumeFencePredecessorRun = { status: string; cancelledByActorType: string | null };
+
+/** Whether a PERSON stopped P: status 'cancelled' with the Stop route's
+ * attribution. routes/agents.ts POST /heartbeat-runs/:runId/cancel passes
+ * resultJson.cancelledByActorType "user" (a managing agent's Stop passes
+ * "agent" with errorCode operator_interrupted); cancelRun merges it into the
+ * run (run-control.ts runCancellationFenceSql). Recovery reads a person's Stop
+ * the same way, "user" or "board" (recovery/service.ts). The errorCode alone
+ * ('cancelled', run-control.ts cancelRun) is not a person's mark: the control
+ * plane's own cancels write it too. */
+export function personStoppedRun(run: ResumeFencePredecessorRun | null | undefined): boolean {
+  return run?.status === "cancelled" && (run.cancelledByActorType === "user" || run.cancelledByActorType === "board");
+}
+
 /** B1 (fence a, the judges' joint line, smarty-dev#4605 comment 6992985316):
  * a released lease whose typed termination receipt is "stopped" or
  * "destroyed" (alike, as ownLeaseTerminated reads them) may still hold its
@@ -46,23 +61,29 @@ export const RESUME_FENCED_PREDECESSOR_RUN_STATUSES: ReadonlySet<string> =
  * with memory and processes alive (environment-execution-target.ts, Boat's
  * memory window). When (B) P's run (the lease's heartbeatRunId) ended NOT
  * succeeded, NO other run may resume that box, whoever it is (the same
- * conversation's later run too), until PREDECESSOR_LONG_STOP_MS after the
- * receipt was confirmed. Only P's own run is exempt. Window-only: c1 records
- * no typed, lease-bound proof that the Runner was gone before the box froze.
- * `predecessorRunStatus` is P's run status as the caller read it (selection
- * reads all candidates' runs in one query: loadResumeFencePredecessorRunStatuses).
- * Selection (reusableLeaseCanBeResumed) and the handoff (environments
- * acquireLease replacesReusableLeaseId) both use this one predicate. */
+ * conversation's later run too):
+ * - P stopped by a PERSON (personStoppedRun): never, no window (org purple
+ *   cut (2), 2026-11-18 23:11Z: never reuse the fenced box);
+ * - any other not-succeeded ending: until PREDECESSOR_LONG_STOP_MS after the
+ *   receipt was confirmed (RFL). Window-only: c1 records no typed,
+ *   lease-bound proof that the Runner was gone before the box froze.
+ * Only P's own run is exempt. `predecessorRun` is P's run as the caller read
+ * it (selection reads all candidates' runs in one query:
+ * loadResumeFencePredecessorRuns). Selection (reusableLeaseCanBeResumed) and
+ * the handoff (environments acquireLease replacesReusableLeaseId) both use
+ * this one predicate. */
 export function stoppedReceiptFencesOtherRunResume(input: {
   lease: { heartbeatRunId: string | null; metadata: Record<string, unknown> | null };
   heartbeatRunId: string | null;
-  predecessorRunStatus: string | null | undefined;
+  predecessorRun: ResumeFencePredecessorRun | null | undefined;
   now?: number;
 }): boolean {
   if (input.heartbeatRunId !== null && input.lease.heartbeatRunId === input.heartbeatRunId) return false;
   if (!hasResumeFenceReceipt(input.lease)) return false;
   // (B) only a run that did not succeed.
-  if (!input.predecessorRunStatus || !RESUME_FENCED_PREDECESSOR_RUN_STATUSES.has(input.predecessorRunStatus)) return false;
+  if (!input.predecessorRun || !RESUME_FENCED_PREDECESSOR_RUN_STATUSES.has(input.predecessorRun.status)) return false;
+  // A person's Stop: never, at any age.
+  if (personStoppedRun(input.predecessorRun)) return true;
   const receipt = input.lease.metadata!.remoteExecutionTermination as { confirmedAt?: unknown };
   const confirmedAt = typeof receipt.confirmedAt === "string" ? Date.parse(receipt.confirmedAt) : Number.NaN;
   // A receipt without a readable confirmation time proves no window ended.
@@ -76,17 +97,24 @@ export function hasResumeFenceReceipt(lease: { metadata: Record<string, unknown>
   return state === "stopped" || state === "destroyed";
 }
 
-/** P's run status for every candidate lease that carries a fence receipt, in
- * ONE query (no round trip per candidate). Keyed by run id. */
-export async function loadResumeFencePredecessorRunStatuses(
+/** The fence's columns of P's run: its status and only the attribution field
+ * of resultJson (not the whole document). */
+export const resumeFencePredecessorRunColumns = {
+  status: heartbeatRuns.status,
+  cancelledByActorType: sql<string | null>`${heartbeatRuns.resultJson}->>'cancelledByActorType'`,
+};
+
+/** P's run for every candidate lease that carries a fence receipt, in ONE
+ * query (no round trip per candidate). Keyed by run id. */
+export async function loadResumeFencePredecessorRuns(
   db: Db,
   leases: ReadonlyArray<{ companyId: string; heartbeatRunId: string | null; metadata: Record<string, unknown> | null }>,
-): Promise<Map<string, string>> {
+): Promise<Map<string, ResumeFencePredecessorRun>> {
   const runIds = [...new Set(leases.filter(hasResumeFenceReceipt).flatMap(lease => lease.heartbeatRunId ? [lease.heartbeatRunId] : []))];
   if (runIds.length === 0) return new Map();
-  const rows = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
+  const rows = await db.select({ id: heartbeatRuns.id, ...resumeFencePredecessorRunColumns }).from(heartbeatRuns)
     .where(inArray(heartbeatRuns.id, runIds));
-  return new Map(rows.map(row => [row.id, row.status]));
+  return new Map(rows.map(({ id, ...run }) => [id, run]));
 }
 
 type ReceiptLease = LeaseIdentity & {

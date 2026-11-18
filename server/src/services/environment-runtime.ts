@@ -41,7 +41,7 @@ import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/nati
 import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareInspectedSourceSandboxStop, preparePreviousBootClosedTipStop, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
-import { hasBoundRemoteStopReceipt, loadResumeFencePredecessorRunStatuses, ownLeaseTerminated, remoteTerminationReceipt, stoppedReceiptFencesOtherRunResume } from "./remote-execution-termination.js";
+import { hasBoundRemoteStopReceipt, loadResumeFencePredecessorRuns, ownLeaseTerminated, remoteTerminationReceipt, type ResumeFencePredecessorRun, stoppedReceiptFencesOtherRunResume } from "./remote-execution-termination.js";
 import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -1222,13 +1222,14 @@ async function waitForSettlingReusableLease(db: Db, input: {
 function reusableLeaseCanBeResumed(input: {
   lease: Pick<EnvironmentLease, "status" | "heartbeatRunId" | "metadata">;
   heartbeatRunId: string | null;
-  /** P's run statuses (loadResumeFencePredecessorRunStatuses), keyed by run id. */
-  predecessorRunStatuses: ReadonlyMap<string, string>;
+  /** P's runs (loadResumeFencePredecessorRuns), keyed by run id. */
+  predecessorRuns: ReadonlyMap<string, ResumeFencePredecessorRun>;
 }): boolean {
   if (abandonedWorkspaceFilesParked(input.lease)) return false;
-  // B1: a stopped or failed run's box may still hold its processes in memory.
+  // B1: a stopped or failed run's box may still hold its processes in memory;
+  // a box a person stopped is never resumed by another run.
   if (stoppedReceiptFencesOtherRunResume({ lease: input.lease, heartbeatRunId: input.heartbeatRunId,
-    predecessorRunStatus: input.lease.heartbeatRunId ? input.predecessorRunStatuses.get(input.lease.heartbeatRunId) : null })) return false;
+    predecessorRun: input.lease.heartbeatRunId ? input.predecessorRuns.get(input.lease.heartbeatRunId) : null })) return false;
   if (input.lease.status === "released" || input.lease.status === "retained") return true;
   return input.lease.status === "active" && input.heartbeatRunId !== null && input.lease.heartbeatRunId === input.heartbeatRunId;
 }
@@ -2246,11 +2247,11 @@ function createSandboxEnvironmentDriver(
           input.agentId !== null
           ? await (async () => {
               const leases = await environmentsSvc.listLeases(input.environment.id);
-              const predecessorRunStatuses = await loadResumeFencePredecessorRunStatuses(db, leases);
+              const predecessorRuns = await loadResumeFencePredecessorRuns(db, leases);
               return leases.filter((lease) =>
                 lease.leasePolicy === "reuse_by_environment" &&
                 !reusableSandboxKeptAfterReplacement(lease) &&
-                reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId, predecessorRunStatuses }) &&
+                reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId, predecessorRuns }) &&
                 lease.executionWorkspaceId === input.executionWorkspaceId &&
                 (input.executionWorkspaceId !== null || lease.issueId === input.issueId) &&
                 lease.metadata?.agentId === input.agentId,
@@ -2689,11 +2690,11 @@ function createSandboxEnvironmentDriver(
         input.agentId !== null
           ? await (async () => {
               const leases = await environmentsSvc.listLeases(input.environment.id);
-              const predecessorRunStatuses = await loadResumeFencePredecessorRunStatuses(db, leases);
+              const predecessorRuns = await loadResumeFencePredecessorRuns(db, leases);
               return leases.filter((lease) =>
                 lease.leasePolicy === "reuse_by_environment" &&
                 !reusableSandboxKeptAfterReplacement(lease) &&
-                reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId, predecessorRunStatuses }) &&
+                reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId, predecessorRuns }) &&
                 lease.executionWorkspaceId === input.executionWorkspaceId &&
                 (input.executionWorkspaceId !== null || lease.issueId === input.issueId) &&
                 lease.metadata?.agentId === input.agentId,
