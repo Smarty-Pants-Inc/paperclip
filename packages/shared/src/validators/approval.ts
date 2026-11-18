@@ -1,0 +1,43 @@
+import { z } from "zod";
+import { APPROVAL_TYPES } from "../constants.js";
+import { multilineTextSchema } from "./text.js";
+
+export const createApprovalSchema = z.object({
+  type: z.enum(APPROVAL_TYPES),
+  requestedByAgentId: z.string().guid().optional().nullable(),
+  payload: z.record(z.string(), z.unknown()),
+  issueIds: z.array(z.string().guid()).optional(),
+});
+
+export type CreateApproval = z.infer<typeof createApprovalSchema>;
+
+export const resolveApprovalSchema = z.object({
+  decisionNote: multilineTextSchema.optional().nullable(),
+});
+
+export type ResolveApproval = z.infer<typeof resolveApprovalSchema>;
+
+export const requestApprovalRevisionSchema = z.object({
+  decisionNote: multilineTextSchema.optional().nullable(),
+});
+
+export type RequestApprovalRevision = z.infer<typeof requestApprovalRevisionSchema>;
+
+/** Withdraw an open approval because it is out of date. Never an approval. */
+export const cancelApprovalSchema = z.object({
+  reason: z.string().trim().max(4000).optional().nullable(),
+}).strict();
+
+export type CancelApproval = z.infer<typeof cancelApprovalSchema>;
+
+export const resubmitApprovalSchema = z.object({
+  payload: z.record(z.string(), z.unknown()).optional(),
+});
+
+export type ResubmitApproval = z.infer<typeof resubmitApprovalSchema>;
+
+export const addApprovalCommentSchema = z.object({
+  body: multilineTextSchema.pipe(z.string().min(1)),
+});
+
+export type AddApprovalComment = z.infer<typeof addApprovalCommentSchema>;

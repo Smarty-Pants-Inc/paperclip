@@ -1,0 +1,629 @@
+import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { agents, companies, companyMemberships, connectionGrantMembers, connectionGrants, createDb, issues, toolConnections, toolConnectionInstalls, type Db } from "@paperclipai/db";
+import { githubCredentialsFixture } from "./helpers/github-credentials-fixture.js";
+import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+
+const appFixture = vi.hoisted(() => ({
+  secret: vi.fn(async () => ({ value: "fixture-private-key", latestVersion: 1 })),
+  acquire: vi.fn(async () => ({ token: "fixture-app-token", expiresAt: Date.now() + 3_600_000,
+    github: { userId: "123", login: "fixture[bot]", installationCount: 1, repositoryCount: 1,
+      repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"] } })),
+}));
+vi.mock("../services/connection-credentials.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../services/connection-credentials.js")>(),
+  resolveConnectionGrantSecret: appFixture.secret,
+}));
+vi.mock("../services/github-app-client.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../services/github-app-client.js")>(),
+  createGitHubAppClient: () => ({ acquire: appFixture.acquire }),
+}));
+import * as appCredentials from "../services/github-app-credentials.js";
+import {
+  DEFAULT_GITHUB_TOKEN_SECRET_NAMES,
+  GIT_CREDENTIAL_TOKEN_ENV_KEY,
+  buildGitAuthInvocation,
+  createGitRemoteAuthProvider,
+  createIssueGitRemoteAuthProvider,
+  describeGitAuthFailure,
+  isGitHubHttpsRemoteUrl,
+  resolveGitHubApiCredential,
+  scrubGitCredentialText,
+  resolveManagedGitHubIdentitySelection,
+  resolveManagedGitHubCredential,
+} from "../services/git-credentials.ts";
+
+const fakeDb = null as unknown as Db;
+afterEach(() => vi.restoreAllMocks());
+
+function buildSecretsFake(byName: Record<string, string | Error>) {
+  const getByName = vi.fn(async (_companyId: string, name: string) => {
+    if (!(name in byName)) return null;
+    return { id: `secret-${name}` };
+  });
+  const resolveSecretValue = vi.fn(async (_companyId: string, secretId: string) => {
+    const name = secretId.replace(/^secret-/, "");
+    const value = byName[name];
+    if (value instanceof Error) throw value;
+    return value ?? "";
+  });
+  return { getByName, resolveSecretValue };
+}
+
+describe("isGitHubHttpsRemoteUrl", () => {
+  it("accepts https github.com and www.github.com URLs", () => {
+    expect(isGitHubHttpsRemoteUrl("https://github.com/example/repo.git")).toBe(true);
+    expect(isGitHubHttpsRemoteUrl("https://www.github.com/example/repo.git")).toBe(true);
+  });
+
+  it("rejects ssh, http, enterprise hosts, other providers, userinfo URLs, and non-URLs", () => {
+    expect(isGitHubHttpsRemoteUrl("git@github.com:example/repo.git")).toBe(false);
+    expect(isGitHubHttpsRemoteUrl("ssh://git@github.com/example/repo.git")).toBe(false);
+    expect(isGitHubHttpsRemoteUrl("http://github.com/example/repo.git")).toBe(false);
+    expect(isGitHubHttpsRemoteUrl("https://github.enterprise.example/org/repo.git")).toBe(false);
+    expect(isGitHubHttpsRemoteUrl("https://gitlab.com/example/repo.git")).toBe(false);
+    expect(isGitHubHttpsRemoteUrl("https://alice:token@github.com/example/repo.git")).toBe(false);
+    expect(isGitHubHttpsRemoteUrl("/local/path/repo.git")).toBe(false);
+  });
+});
+
+describe("resolveGitHubApiCredential", () => {
+  it("prefers a company secret over the server environment and marks it company-scoped", async () => {
+    const secrets = buildSecretsFake({ GH_TOKEN: "gh-token" });
+    const credential = await resolveGitHubApiCredential(fakeDb, "company-1", {
+      secrets,
+      env: { GITHUB_TOKEN: "env-token" },
+    });
+    expect(credential).toEqual({ token: "gh-token", source: "company_secret", secretName: "GH_TOKEN" });
+  });
+
+  it("falls back to the server environment and marks it server_env so callers can restrict it", async () => {
+    const secrets = buildSecretsFake({});
+    const credential = await resolveGitHubApiCredential(fakeDb, "company-1", {
+      secrets,
+      env: { GITHUB_TOKEN: "env-token" },
+    });
+    expect(credential).toEqual({ token: "env-token", source: "server_env", secretName: null });
+  });
+
+  it("returns null when neither a secret nor the environment provides a token", async () => {
+    const secrets = buildSecretsFake({});
+    const credential = await resolveGitHubApiCredential(fakeDb, "company-1", { secrets, env: {} });
+    expect(credential).toBeNull();
+  });
+});
+
+describe("GitHub App ownership and agent reach", () => {
+  it.each(["user", "organization"] as const)("selects %s ownership for multiple and all agents without crossing a personal owner", async kind => {
+    const connection = { id: "app", enabled: true, status: "active", credentialPolicy: kind === "user" ? "per_user" : "shared",
+      config: { sourceTemplateKey: "github", connectionMethodKey: "app-installation" } };
+    const grant = { id: "grant", connectionId: "app", kind, subjectUserId: kind === "user" ? "owner" : null, status: "active", credentialSecretRefs: [], createdAt: new Date() };
+    let audience: Array<{ grantId: string; subjectId: string }> = [];
+    let installs = ["a", "b"].map(targetId => ({ connectionId: "app", targetType: "agent", targetId }));
+    const db = { select: () => ({ from: (table: unknown) => ({ where: () => {
+      const rows = table === toolConnections ? [connection]
+        : table === toolConnectionInstalls ? installs
+        : table === connectionGrants ? [grant]
+        : table === connectionGrantMembers ? audience
+        : table === companyMemberships ? [{ id: "member" }] : [];
+      return Object.assign(Promise.resolve(rows), { limit: async () => rows });
+    } }) }) } as unknown as Db;
+    for (const agentId of ["a", "b"]) {
+      expect((await resolveManagedGitHubIdentitySelection(db, "company", { agentId, responsibleUserId: "owner" })).grant).toBe(grant);
+    }
+    expect(await resolveManagedGitHubIdentitySelection(db, "company", { agentId: "c", responsibleUserId: "owner" })).toEqual({ configured: false });
+    const otherOwner = await resolveManagedGitHubIdentitySelection(db, "company", { agentId: "a", responsibleUserId: "other" });
+    expect(otherOwner.grant).toBe(kind === "user" ? undefined : grant);
+    installs = [{ connectionId: "app", targetType: "company", targetId: "company" }];
+    expect((await resolveManagedGitHubIdentitySelection(db, "company", { agentId: "new", responsibleUserId: "owner" })).grant).toBe(grant);
+    if (kind === "organization") {
+      audience = [{ grantId: "grant", subjectId: "owner" }];
+      expect((await resolveManagedGitHubIdentitySelection(db, "company", { agentId: "a", responsibleUserId: "other" })).grant).toBeUndefined();
+      expect((await resolveManagedGitHubIdentitySelection(db, "company", { agentId: "a", allowStandingDelegation: false })).grant).toBeUndefined();
+      vi.spyOn(appCredentials, "resolveGitHubAppCredential").mockImplementationOnce(async () => {
+        audience = [{ grantId: "grant", subjectId: "other" }];
+        return { token: "installation-token", expiresAt: Date.now() + 3_600_000,
+          github: { userId: "123", login: "app[bot]", installationCount: 1, repositoryCount: 1,
+            repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"] } };
+      });
+      const changed = await resolveManagedGitHubCredential(db, buildSecretsFake({}), "company", { agentId: "a", responsibleUserId: "owner" });
+      expect(changed.credential).toBeUndefined();
+      expect(changed.error).toBeDefined();
+      audience = [];
+    }
+    grant.status = "revoked";
+    expect((await resolveManagedGitHubIdentitySelection(db, "company", { agentId: "a", responsibleUserId: "owner" })).grant).toBeUndefined();
+  });
+});
+
+describe("RF2: person-authored Git work without an agent", () => {
+  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  let db: ReturnType<typeof createDb>;
+  beforeAll(async () => {
+    database = await startEmbeddedPostgresTestDatabase("paperclip-null-agent-");
+    db = createDb(database.connectionString);
+  }, 30_000);
+  afterAll(async () => {
+    await db?.$client.end({ timeout: 1 });
+    await database?.cleanup();
+  }, 60_000);
+  const { grant: seedGrant } = githubCredentialsFixture(() => db);
+
+  async function fixture(kind: "agent" | "user" | "organization", personal: boolean, assigned: boolean) {
+    const input = { companyId: randomUUID(), agentId: randomUUID(), issueId: randomUUID(), runId: randomUUID() };
+    await db.insert(companies).values({ id: input.companyId, name: "RF2", issuePrefix: input.companyId.slice(0, 8) });
+    await db.insert(agents).values({ id: input.agentId, companyId: input.companyId, name: "App agent", role: "engineer", adapterType: "codex_local" });
+    await db.insert(companyMemberships).values({ companyId: input.companyId, principalType: "user", principalId: "owner", status: "active", membershipRole: "member" });
+    // A real issue can have a responsible person but no assigned agent. Do not
+    // manufacture a null-agent heartbeat: heartbeat_runs.agent_id is NOT NULL.
+    await db.insert(issues).values({ id: input.issueId, companyId: input.companyId, title: "Person-authored work",
+      responsibleUserId: "owner", assigneeAgentId: assigned ? input.agentId : null });
+    const app = await seedGrant(input, "owner", kind !== "user");
+    await db.update(toolConnections).set({ credentialPolicy: kind === "agent" ? "per_agent" : kind === "user" ? "per_user" : "shared",
+      config: { sourceTemplateKey: "github", connectionMethodKey: "app-installation", methodConfig: {
+        appId: "1", installationId: "456", repositories: "owner/repo", permissionProfile: "read",
+      } } }).where(eq(toolConnections.id, app.connectionId));
+    await db.update(connectionGrants).set({ kind, subjectAgentId: kind === "agent" ? input.agentId : null,
+      subjectUserId: kind === "user" ? "owner" : null,
+      credentialSecretRefs: [{ configPath: "credentials.privateKey", secretId: app.secretId, versionSelector: "latest" }],
+    }).where(eq(connectionGrants.id, app.id));
+    const own = personal ? await seedGrant(input, "owner") : null;
+    if (own) await db.update(toolConnectionInstalls).set({ targetType: "company", targetId: input.companyId })
+      .where(eq(toolConnectionInstalls.connectionId, own.connectionId));
+    const secrets = { ...buildSecretsFake({}), resolveUserSecretValue: vi.fn(async () => ({ value: "fixture-personal-token",
+      manifestEntry: { configPath: "oauth.access_token", envKey: null, secretId: own?.secretId ?? "", secretKey: "fixture-personal-token",
+        version: 1, provider: "local_encrypted" as const, outcome: "success" as const },
+    })) };
+    const resolveApp = vi.spyOn(appCredentials, "resolveGitHubAppCredential");
+    appFixture.secret.mockClear();
+    appFixture.acquire.mockClear();
+    const create = ((_db, companyId, context) => createGitRemoteAuthProvider(_db, companyId, context, { secrets, env: {} })) as typeof createGitRemoteAuthProvider;
+    const provider = createIssueGitRemoteAuthProvider(db, input.companyId, input.issueId, create);
+    return { input, app, own, secrets, resolveApp, provider };
+  }
+
+  it.each(["agent", "user", "organization"] as const)("(a) null agent uses the person's grant, never an agent-installed %s App", async kind => {
+    const { provider, secrets, resolveApp } = await fixture(kind, true, false);
+    const invocation = await provider("https://github.com/owner/repo.git");
+    expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("fixture-personal-token");
+    expect(invocation?.env.GIT_AUTHOR_NAME).toBe("owner");
+    expect(secrets.resolveUserSecretValue).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ responsibleUserId: "owner" }), expect.any(Object));
+    expect(resolveApp).not.toHaveBeenCalled();
+    expect(appFixture.secret).not.toHaveBeenCalled();
+    expect(appFixture.acquire).not.toHaveBeenCalled();
+    expect(secrets.getByName).not.toHaveBeenCalled();
+  });
+
+  it.each(["agent", "user", "organization"] as const)("(b) null agent without a personal grant gets no agent-installed %s App token", async kind => {
+    const { provider, secrets, resolveApp } = await fixture(kind, false, false);
+    await expect(provider("https://github.com/owner/repo.git")).resolves.toBeNull();
+    expect(resolveApp).not.toHaveBeenCalled();
+    expect(appFixture.secret).not.toHaveBeenCalled();
+    expect(appFixture.acquire).not.toHaveBeenCalled();
+    expect(secrets.resolveUserSecretValue).not.toHaveBeenCalled();
+    expect(secrets.resolveSecretValue).not.toHaveBeenCalled();
+  });
+
+  it.each(["agent", "user", "organization"] as const)("(c) assigned agent gets its agent-installed %s App token", async kind => {
+    const { input, app, provider, secrets, resolveApp } = await fixture(kind, false, true);
+    expect((await provider("https://github.com/owner/repo.git"))?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("fixture-app-token");
+    expect(resolveApp).toHaveBeenCalledWith(db, expect.objectContaining({ id: app.connectionId }), expect.objectContaining({ id: app.id }), false, false, input.agentId);
+    expect(appFixture.secret).toHaveBeenCalledTimes(1);
+    expect(appFixture.acquire).toHaveBeenCalledTimes(1);
+    expect(secrets.getByName).not.toHaveBeenCalled();
+    expect(secrets.resolveUserSecretValue).not.toHaveBeenCalled();
+  });
+});
+
+describe("createGitRemoteAuthProvider", () => {
+  const githubUrl = "https://github.com/example/repo.git";
+
+  it.each([false, true])("rechecks an App credential for each operation and fails closed (revoked: %s)", async (revoked) => {
+    const connection = {
+      id: "app-connection", companyId: "company-1", enabled: true, status: "active",
+      config: { sourceTemplateKey: "github", connectionMethodKey: "app-installation" },
+    };
+    const dedicated = {
+      id: "app-grant", connectionId: connection.id, kind: "agent", subjectAgentId: "agent-1",
+      status: "active", credentialSecretRefs: [{ configPath: "credentials.privateKey", secretId: "pem" }],
+    };
+    const db = { select: () => ({ from: (table: unknown) => ({ where: async () => {
+      if (table === toolConnections) return [connection];
+      if (table === toolConnectionInstalls) return [{ connectionId: connection.id, targetType: "agent", targetId: "agent-1" }];
+      if (table === connectionGrants) return [dedicated, {
+        id: "personal-grant", connectionId: connection.id, kind: "user", subjectUserId: "user-1",
+      }];
+      throw new Error("Unexpected credential lookup");
+    } }) }) } as unknown as Db;
+    const acquire = vi.spyOn(appCredentials, "resolveGitHubAppCredential")
+      .mockResolvedValue({ token: "installation-token", expiresAt: Date.now() + 3_600_000,
+        github: { userId: "123", login: "app[bot]", installationCount: 1, repositoryCount: 1,
+          repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"] } });
+    const secrets = buildSecretsFake({ GITHUB_TOKEN: "legacy-token" });
+    const provider = createGitRemoteAuthProvider(db, "company-1", {
+      agentId: "agent-1", responsibleUserId: "user-1",
+    }, { secrets, env: { GH_TOKEN: "environment-token" } });
+
+    expect((await provider(githubUrl))?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("installation-token");
+    if (revoked) {
+      acquire.mockRejectedValueOnce(new Error("revoked App grant"));
+      await expect(provider(githubUrl)).rejects.toThrow("GitHub credentials are temporarily unavailable");
+    } else {
+      expect((await provider(githubUrl))?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("installation-token");
+    }
+    expect(acquire).toHaveBeenCalledTimes(2);
+    expect(acquire).toHaveBeenCalledWith(db, connection, dedicated, false, false, "agent-1");
+    expect(secrets.getByName).not.toHaveBeenCalled();
+    expect(secrets.resolveSecretValue).not.toHaveBeenCalled();
+  });
+
+  it("prefers company secrets in declared order", async () => {
+    const secrets = buildSecretsFake({ GH_TOKEN: "gh-token", PAPERCLIP_GITHUB_TOKEN: "pc-token" });
+    const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
+      secrets,
+      env: { GITHUB_TOKEN: "env-token" },
+    });
+    const invocation = await provider(githubUrl);
+    expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("gh-token");
+    expect(invocation?.source).toBe("company_secret");
+    expect(invocation?.secretName).toBe("GH_TOKEN");
+    // GITHUB_TOKEN is probed first even though only GH_TOKEN exists.
+    expect(secrets.getByName.mock.calls.map((call) => call[1])).toEqual(["GITHUB_TOKEN", "GH_TOKEN"]);
+  });
+
+  it("falls back to the server env, GITHUB_TOKEN before GH_TOKEN", async () => {
+    const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
+      secrets: buildSecretsFake({}),
+      env: { GITHUB_TOKEN: "env-github", GH_TOKEN: "env-gh" },
+    });
+    const invocation = await provider(githubUrl);
+    expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("env-github");
+    expect(invocation?.source).toBe("server_env");
+    expect(invocation?.secretName).toBeNull();
+  });
+
+  it("returns null when no token is available anywhere", async () => {
+    const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
+      secrets: buildSecretsFake({}),
+      env: {},
+    });
+    await expect(provider(githubUrl)).resolves.toBeNull();
+  });
+
+  it("accepts GitHub SSH remotes for process-scoped HTTPS rewriting", async () => {
+    const secrets = buildSecretsFake({ GITHUB_TOKEN: "token" });
+    const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
+      secrets,
+      env: {},
+    });
+    const invocation = await provider("git@github.com:example/repo.git");
+    expect(invocation?.env.GIT_CONFIG_VALUE_3).toBe("git@github.com:");
+    expect(invocation?.env.GIT_CONFIG_KEY_3).toBe("url.https://github.com/.insteadOf");
+  });
+
+  it("returns null for non-GitHub URLs without touching the secret store", async () => {
+    const secrets = buildSecretsFake({ GITHUB_TOKEN: "token" });
+    const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
+      secrets,
+      env: {},
+    });
+    await expect(provider("https://gitlab.com/example/repo.git")).resolves.toBeNull();
+    expect(secrets.getByName).not.toHaveBeenCalled();
+  });
+
+  it("memoizes the credential lookup across calls", async () => {
+    const secrets = buildSecretsFake({ GITHUB_TOKEN: "token" });
+    const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
+      secrets,
+      env: {},
+    });
+    await provider(githubUrl);
+    await provider(githubUrl);
+    await provider("https://github.com/example/another.git");
+    expect(secrets.getByName).toHaveBeenCalledTimes(1);
+    expect(secrets.resolveSecretValue).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes a system access context so resolution is audited", async () => {
+    const secrets = buildSecretsFake({ GITHUB_TOKEN: "token" });
+    const provider = createGitRemoteAuthProvider(
+      fakeDb,
+      "company-1",
+      { issueId: "issue-1", heartbeatRunId: "run-1" },
+      { secrets, env: {} },
+    );
+    await provider(githubUrl);
+    expect(secrets.resolveSecretValue).toHaveBeenCalledWith("company-1", "secret-GITHUB_TOKEN", "latest", {
+      accessContext: expect.objectContaining({
+        consumerType: "system",
+        consumerId: "workspace-git-credential",
+        actorType: "system",
+        issueId: "issue-1",
+        heartbeatRunId: "run-1",
+      }),
+    });
+  });
+
+  it("continues down the chain when one secret fails to resolve", async () => {
+    const secrets = buildSecretsFake({
+      GITHUB_TOKEN: new Error("provider outage"),
+      GH_TOKEN: "gh-token",
+    });
+    const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
+      secrets,
+      env: {},
+    });
+    const invocation = await provider(githubUrl);
+    expect(invocation?.secretName).toBe("GH_TOKEN");
+  });
+
+  it("ignores a managed connection installed only for another agent", async () => {
+    const query = (rows: unknown[]) => ({
+      from: () => ({ where: async () => rows }),
+    });
+    const db = {
+      select: vi.fn()
+        .mockReturnValueOnce(query([{
+          id: "github-connection",
+          companyId: "company-1",
+          enabled: true,
+          status: "active",
+          config: { sourceTemplateKey: "github" },
+        }]))
+        .mockReturnValueOnce(query([{
+          connectionId: "github-connection",
+          companyId: "company-1",
+          targetType: "agent",
+          targetId: "agent-a",
+        }])),
+    } as unknown as Db;
+    const secrets = buildSecretsFake({ GH_TOKEN: "agent-b-legacy-token" });
+    const provider = createGitRemoteAuthProvider(db, "company-1", { agentId: "agent-b" }, {
+      secrets,
+      env: {},
+    });
+
+    const invocation = await provider(githubUrl);
+
+    expect(invocation?.source).toBe("company_secret");
+    expect(invocation?.secretName).toBe("GH_TOKEN");
+    expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("agent-b-legacy-token");
+    expect(db.select).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("buildGitAuthInvocation", () => {
+  it("keeps the token out of argv and installs the helper URL-scoped to github.com", () => {
+    const invocation = buildGitAuthInvocation({
+      token: "super-secret-token",
+      source: "company_secret",
+      secretName: "GITHUB_TOKEN",
+    });
+    expect(invocation.configArgs.join(" ")).not.toContain("super-secret-token");
+    expect(invocation.configArgs[0]).toBe("-c");
+    expect(invocation.configArgs[1]).toBe("credential.helper=");
+    expect(invocation.configArgs[3]).toContain("credential.https://github.com.helper=");
+    expect(invocation.configArgs[3]).toContain("x-access-token");
+    expect(invocation.configArgs[5]).toContain("credential.https://www.github.com.helper=");
+    expect(invocation.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("super-secret-token");
+    expect(invocation.env.GH_TOKEN).toBe("super-secret-token");
+    expect(invocation.env.GITHUB_TOKEN).toBe("super-secret-token");
+    expect(invocation.env.GIT_TERMINAL_PROMPT).toBe("0");
+    expect(invocation.env).not.toHaveProperty("HOME");
+  });
+
+  it("sets GitHub's stable noreply commit identity without exposing the token in config", () => {
+    const invocation = buildGitAuthInvocation({
+      token: "super-secret-token",
+      source: "managed_connection",
+      secretName: null,
+      githubIdentity: { userId: "12345", login: "octocat" },
+    });
+    expect(invocation.env.GIT_CONFIG_KEY_7).toBe("user.name");
+    expect(invocation.env.GIT_CONFIG_VALUE_7).toBe("octocat");
+    expect(invocation.env.GIT_CONFIG_KEY_8).toBe("user.email");
+    expect(invocation.env.GIT_CONFIG_VALUE_8).toBe("12345+octocat@users.noreply.github.com");
+    expect(invocation.env.GIT_AUTHOR_NAME).toBe("octocat");
+    expect(invocation.env.GIT_AUTHOR_EMAIL).toBe("12345+octocat@users.noreply.github.com");
+    expect(invocation.env.GIT_COMMITTER_NAME).toBe("octocat");
+    expect(invocation.env.GIT_COMMITTER_EMAIL).toBe("12345+octocat@users.noreply.github.com");
+    expect(Object.values(invocation.env).filter((value) => value.includes("super-secret-token"))).toHaveLength(3);
+  });
+});
+
+describe("credential helper execution (real git, no network)", () => {
+  async function runCredentialFill(description: string) {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-cred-fill-"));
+    try {
+      const invocation = buildGitAuthInvocation({
+        token: "abc123",
+        source: "company_secret",
+        secretName: "GITHUB_TOKEN",
+      });
+      return await new Promise<{ code: number | null; stdout: string; stderr: string }>(
+        (resolve, reject) => {
+          const child = spawn("git", [...invocation.configArgs, "credential", "fill"], {
+            cwd,
+            env: { ...process.env, ...invocation.env },
+            stdio: ["pipe", "pipe", "pipe"],
+          });
+          let stdout = "";
+          let stderr = "";
+          child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+          child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+          child.on("error", reject);
+          child.on("close", (code) => resolve({ code, stdout, stderr }));
+          child.stdin.write(description);
+          child.stdin.end();
+        },
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  }
+
+  it("answers a github.com https request with the env-carried token", async () => {
+    const result = await runCredentialFill("protocol=https\nhost=github.com\n\n");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("username=x-access-token");
+    expect(result.stdout).toContain("password=abc123");
+  });
+
+  it("never hands the token to another host, even if git asks", async () => {
+    // Simulates a request whose effective host changed after our pre-invocation URL check
+    // (for example a repository-local url.<base>.insteadOf rewrite): the URL-scoped helper
+    // config keeps git from consulting the helper, prompts are disabled, so the fill fails
+    // and the token is never emitted.
+    const result = await runCredentialFill("protocol=https\nhost=evil.example\n\n");
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).not.toContain("abc123");
+  });
+
+  it("never answers plain-http requests for github.com", async () => {
+    const result = await runCredentialFill("protocol=http\nhost=github.com\n\n");
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).not.toContain("abc123");
+  });
+});
+
+describe("scrubGitCredentialText", () => {
+  it("masks URL userinfo", () => {
+    expect(scrubGitCredentialText("https://x-access-token:ghp_secret@github.com/a/b.git")).toBe(
+      "https://***@github.com/a/b.git",
+    );
+    expect(scrubGitCredentialText(
+      'fatal: unable to access "https://x-access-token:ghp_abc123@github.com/example/repo.git"',
+    )).toBe('fatal: unable to access "https://***@github.com/example/repo.git"');
+    expect(scrubGitCredentialText(
+      "clone https://alice@github.com/a.git then http://token@internal.example/b.git",
+    )).toBe("clone https://***@github.com/a.git then http://***@internal.example/b.git");
+  });
+
+  it("masks userinfo on non-HTTP schemes, leaving scp-style remotes alone", () => {
+    expect(scrubGitCredentialText("ssh://deploy:hunter2@internal.example/repo.git")).toBe(
+      "ssh://***@internal.example/repo.git",
+    );
+    expect(scrubGitCredentialText("git@github.com:example/repo.git")).toBe(
+      "git@github.com:example/repo.git",
+    );
+    expect(scrubGitCredentialText(
+      "fatal: cannot clone ssh://deploy:hunter2@internal.example/repo.git or git+ssh://bob@host/x.git",
+    )).toBe("fatal: cannot clone ssh://***@internal.example/repo.git or git+ssh://***@host/x.git");
+    expect(scrubGitCredentialText("fetch from git@github.com:example/repo.git failed")).toBe(
+      "fetch from git@github.com:example/repo.git failed",
+    );
+  });
+
+  it("masks entire URL query strings regardless of parameter names", () => {
+    expect(scrubGitCredentialText("https://github.com/a/b.git?access_token=ghs_secret&ref=main")).toBe(
+      "https://github.com/a/b.git?***",
+    );
+    expect(scrubGitCredentialText("https://host.example/r.git?obscure_cred_name=secret")).toBe(
+      "https://host.example/r.git?***",
+    );
+    expect(scrubGitCredentialText(
+      "fatal: unable to access 'https://github.com/example/repo.git?access_token=ghs_secret&ref=main'",
+    )).toBe("fatal: unable to access 'https://github.com/example/repo.git?***'");
+    expect(scrubGitCredentialText(
+      "clone https://gitlab.example/repo.git?anything=glpat-123 failed",
+    )).toBe("clone https://gitlab.example/repo.git?*** failed");
+  });
+
+  it("leaves credential-free text unchanged", () => {
+    expect(scrubGitCredentialText("fatal: repository not found")).toBe("fatal: repository not found");
+    const text = 'Failed to clone "https://github.com/example/repo.git": exit code 128';
+    expect(scrubGitCredentialText(text)).toBe(text);
+    const plain = "git clone failed with exit code=128 at key step ref=main";
+    expect(scrubGitCredentialText(plain)).toBe(plain);
+  });
+});
+
+describe("describeGitAuthFailure", () => {
+  it("names the company secret when a stored credential was used", () => {
+    expect(describeGitAuthFailure({
+      error: "fatal: Authentication failed",
+      used: { source: "company_secret", secretName: "GH_TOKEN" },
+    })).toContain("the GH_TOKEN company-secret GitHub credential");
+  });
+
+  it("names the server environment when an env credential was used", () => {
+    expect(describeGitAuthFailure({
+      error: "fatal: Authentication failed",
+      used: { source: "server_env", secretName: null },
+    })).toContain("server-environment GitHub credential");
+  });
+
+  it("points at Settings → Secrets for auth-looking failures without a credential", () => {
+    expect(describeGitAuthFailure({
+      error: "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+      used: null,
+    })).toContain("add a GITHUB_TOKEN or GH_TOKEN company secret");
+  });
+
+  it("stays silent for non-auth failures without a credential", () => {
+    expect(describeGitAuthFailure({
+      error: "fatal: unable to resolve host example.invalid",
+      used: null,
+    })).toBeNull();
+  });
+
+  it("stays silent for non-auth failures even when a credential was used", () => {
+    // A credential present during an unrelated failure (network outage, target-path
+    // collision) must not be blamed for it.
+    expect(describeGitAuthFailure({
+      error: "fatal: destination path '/x/y' already exists and is not an empty directory.",
+      used: { source: "company_secret", secretName: "GH_TOKEN" },
+    })).toBeNull();
+  });
+});
+
+describe("DEFAULT_GITHUB_TOKEN_SECRET_NAMES", () => {
+  it("keeps the shared name order stable", () => {
+    expect([...DEFAULT_GITHUB_TOKEN_SECRET_NAMES]).toEqual([
+      "GITHUB_TOKEN",
+      "GH_TOKEN",
+      "PAPERCLIP_GITHUB_TOKEN",
+    ]);
+  });
+});
+
+describe("createIssueGitRemoteAuthProvider", () => {
+  const githubUrl = "https://github.com/paperclipai/private-repo.git";
+  function issueDb(rows: unknown[]) {
+    const where = vi.fn(async () => rows);
+    return { db: { select: vi.fn(() => ({ from: () => ({ where }) })) } as unknown as Db, where };
+  }
+
+  it("resolves credentials with the issue's responsible user and assigned agent", async () => {
+    const { db } = issueDb([{ responsibleUserId: "user-1", assigneeAgentId: "agent-1" }]);
+    const inner = vi.fn(async () => ({ env: {}, configArgs: [], source: "managed_connection" }));
+    const create = vi.fn(() => inner) as unknown as typeof createGitRemoteAuthProvider;
+    const provider = createIssueGitRemoteAuthProvider(db, "company-1", "issue-1", create);
+    await expect(provider(githubUrl)).resolves.toMatchObject({ source: "managed_connection" });
+    expect(create).toHaveBeenCalledWith(db, "company-1", { issueId: "issue-1", responsibleUserId: "user-1", agentId: "agent-1" });
+    expect(inner).toHaveBeenCalledWith(githubUrl);
+  });
+
+  it("looks the issue up once across calls", async () => {
+    const { db } = issueDb([{ responsibleUserId: "user-1", assigneeAgentId: null }]);
+    const inner = vi.fn(async () => null);
+    const create = vi.fn(() => inner) as unknown as typeof createGitRemoteAuthProvider;
+    const provider = createIssueGitRemoteAuthProvider(db, "company-1", "issue-1", create);
+    await provider(githubUrl); await provider(githubUrl);
+    expect(db.select).toHaveBeenCalledTimes(1);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(inner).toHaveBeenCalledTimes(2);
+  });
+
+  it("falls back to the issue-only context when the issue is missing", async () => {
+    const { db } = issueDb([]);
+    const create = vi.fn(() => vi.fn(async () => null)) as unknown as typeof createGitRemoteAuthProvider;
+    await createIssueGitRemoteAuthProvider(db, "company-1", "issue-1", create)(githubUrl);
+    expect(create).toHaveBeenCalledWith(db, "company-1", { issueId: "issue-1", responsibleUserId: null, agentId: null });
+  });
+});

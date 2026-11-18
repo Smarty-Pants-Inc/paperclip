@@ -1,0 +1,129 @@
+import { createHash } from "node:crypto";
+import { buildGitAuthInvocation } from "./git-credentials.js";
+import type { EnvironmentLease } from "@paperclipai/shared";
+import { githubLauncherSource, githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
+import { cleanupGitHubOperationLaunchers, githubOperationLauncherDirectory, prepareGitHubOperationLaunchers, prepareGitHubExecutionEnvironment } from "@paperclipai/adapter-utils/execution-target";
+
+/** Delay only managed, read-only context discovery on concurrent direct runners.
+ * The callback returns derived keys, never an old PATH or credential snapshot. */
+export async function prepareHeartbeatGitHubEnvironment(input: Parameters<typeof prepareGitHubExecutionEnvironment>[0] & { defer: boolean }) {
+  const remote = input.target?.kind === "remote" && input.target.transport === "sandbox" ? input.target : null;
+  if (!input.defer || input.hostCredentials || !remote?.runner || remote.runnerTask || remote.runner.allowConcurrentSyncOperations !== true) {
+    return { env: await prepareGitHubExecutionEnvironment(input), prepare: undefined };
+  }
+  return {
+    env: { ...input.env, PAPERCLIP_GIT_METADATA_ROOTS: "[]", PAPERCLIP_RUNNER_NETWORK_ROOTS: "[]",
+      PAPERCLIP_GITHUB_AUTH_MODE: "managed", PAPERCLIP_RUNNER_NETWORK_ACCESS: input.networkAccess ? "enabled" : "disabled" },
+    prepare: () => prepareGitHubExecutionEnvironment({ ...input, env: {} }),
+  };
+}
+
+type LauncherInput = Parameters<typeof prepareGitHubOperationLaunchers>[0];
+
+// Persist only non-secret layout fields, never an invocation's credentials.
+const LAYOUT_KEYS = ["PATH", "ZDOTDIR", "BASH_ENV", "GH_CONFIG_DIR", "PAPERCLIP_GITHUB_LAUNCHER_DIR"] as const;
+export interface AnonymousGitHubLauncherReceipt {
+  key: string;
+  leaseId: string;
+  layout: Record<string, string>;
+}
+
+
+export async function prepareHeartbeatGitHubLaunchers(
+  input: LauncherInput & {
+    native: boolean;
+    githubConfigured: boolean;
+    agentId: string;
+    brokerUrl: string;
+    createBrokerToken: () => string;
+    preparation?: {
+      lease: EnvironmentLease;
+      configuration: unknown;
+      save: (receipt: AnonymousGitHubLauncherReceipt | null) => Promise<void>;
+    };
+  },
+  prepareLaunchers = prepareGitHubOperationLaunchers,
+  cleanupLaunchers = cleanupGitHubOperationLaunchers,
+) {
+  if (input.env.PAPERCLIP_GITHUB_AUTH_MODE === "agent_env") {
+    // This controller-owned mode receives only this agent's resolved bindings.
+    // Keep ambient helper/SSH isolation, but do not mint a managed capability or
+    // install wrappers that would strip the explicitly selected token again.
+    const env = githubBrokerEnvironment(input.env, { url: "", token: "" });
+    // No image/shared gh login may become a fallback, including when no token is
+    // bound. An absent run-owned config directory is safe for gh to read.
+    env.GH_CONFIG_DIR = `${githubOperationLauncherDirectory(input)}/gh-config`;
+    const token = input.env.GH_TOKEN?.trim() || input.env.GITHUB_TOKEN?.trim();
+    if (token) Object.assign(env, buildGitAuthInvocation({ token, source: "agent_env", secretName: null }).env);
+    return { env, cleanupLocation: null };
+  }
+  if (input.target?.kind === "remote" && input.target.transport === "sandbox" && input.target.runnerTask) {
+    // Provider-owned tasks decide their own runtime layout and command environment.
+    return { env: githubBrokerEnvironment(input.env, {
+      url: input.githubConfigured ? input.brokerUrl : "",
+      token: input.githubConfigured ? input.createBrokerToken() : "",
+    }), cleanupLocation: null };
+  }
+  // Native configured access is owned by the provider session supervisor.
+  // Defer staging until it has acquired that session; never mutate a live
+  // process's authorization from heartbeat preparation.
+  if (input.native && input.githubConfigured) {
+    return { env: githubBrokerEnvironment(input.env, { url: "", token: "" }), cleanupLocation: null };
+  }
+  // An unconfigured sandbox has no managed GitHub identity to broker. Its
+  // token-free wrappers still isolate image credentials, but may live as long
+  // as the workspace so a warm provider never inherits a deleted run path.
+  // Other adapter paths retain their run-scoped capability/retirement rules.
+  const anonymous = input.native && !input.githubConfigured &&
+    input.target?.kind === "remote" && input.target.transport === "sandbox";
+  const location = {
+    runId: anonymous
+      ? `anonymous-${input.agentId}-${createHash("sha256").update(input.env.PATH ?? "").digest("hex").slice(0, 16)}`
+      : input.runId,
+    target: input.target,
+  };
+  const env = githubBrokerEnvironment(input.env, {
+    url: anonymous ? "" : input.brokerUrl,
+    token: anonymous ? "" : input.createBrokerToken(),
+  });
+  const lease = input.preparation?.lease;
+  const eligible = anonymous && lease?.status === "active" && !lease.releasedAt && !lease.cleanupStatus
+    && lease.providerLeaseId && input.target?.kind === "remote" && input.target.leaseId === lease.id
+    && (!lease.expiresAt || new Date(lease.expiresAt).getTime() > Date.now());
+  const key = eligible ? createHash("sha256").update(JSON.stringify({
+    version: 2, launcher: githubLauncherSource(), staging: prepareGitHubOperationLaunchers.toString(),
+    agentId: input.agentId, companyId: lease.companyId,
+    providerLeaseId: lease.providerLeaseId, environmentId: lease.environmentId,
+    configuration: input.preparation!.configuration, cwd: input.cwd,
+    remoteCwd: input.target?.kind === "remote" ? input.target.remoteCwd : null,
+    path: env.PATH ?? "",
+  })).digest("hex") : null;
+  const saved = lease?.metadata?.anonymousGitHubLaunchers as Partial<AnonymousGitHubLauncherReceipt> | undefined;
+  if (key && saved?.key === key && saved.leaseId === lease?.id && saved.layout && LAYOUT_KEYS.every(name => typeof saved.layout![name] === "string")) {
+    return { env: { ...env, ...Object.fromEntries(LAYOUT_KEYS.map(name => [name, saved.layout![name]!])) }, cleanupLocation: null };
+  }
+  try {
+    // A failed miss may have partially overwritten the old layout. Retire its
+    // proof before touching files, so a later config rollback cannot reuse it.
+    if (saved) {
+      await input.preparation!.save(null);
+      lease!.metadata = { ...lease!.metadata, anonymousGitHubLaunchers: null };
+    }
+    const prepared = await prepareLaunchers({ ...location, cwd: input.cwd, env });
+    if (key && LAYOUT_KEYS.every(name => typeof prepared[name] === "string")) {
+      const receipt = { key, leaseId: lease!.id, layout: Object.fromEntries(LAYOUT_KEYS.map(name => [name, prepared[name]!])) };
+      await input.preparation!.save(receipt);
+      lease!.metadata = { ...lease!.metadata, anonymousGitHubLaunchers: receipt };
+    }
+    return {
+      env: prepared,
+      cleanupLocation: anonymous ? null : location,
+    };
+  } catch (error) {
+    // The caller cannot retain a cleanup location until staging returns. Clean
+    // partial run-specific files here, preserving the original staging failure.
+    // Anonymous files may still belong to a live warm provider; never delete them.
+    if (!anonymous) await cleanupLaunchers(location).catch(() => undefined);
+    throw error;
+  }
+}

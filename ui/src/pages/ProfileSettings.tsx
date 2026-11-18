@@ -1,0 +1,441 @@
+import { useEffect, useId, useRef, useState, type ChangeEvent } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Camera, KeyRound, LoaderCircle, Save, Trash2, UserRoundPen } from "lucide-react";
+import type { AuthSession, CurrentUserProfile, UpdateCurrentUserProfile } from "@paperclipai/shared";
+import { AuthApiError, authApi } from "@/api/auth";
+import { useAccountBoundMutation } from "@/hooks/useAccountBoundMutation";
+import { assetsApi } from "@/api/assets";
+import { QueryErrorState, useQueryView } from "@/components/QueryView";
+import { useBreadcrumbs } from "../context/BreadcrumbContext";
+import { useCompany } from "../context/CompanyContext";
+import { queryKeys } from "../lib/queryKeys";
+import { InboxAgentPolicyControl } from "@/components/InboxAgentPolicyControl";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { Card } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { describeError } from "@/api/errors";
+
+// Better Auth's defaults; server/src/auth/better-auth.ts does not override
+// `emailAndPassword.minPasswordLength` / `maxPasswordLength`.
+const MIN_PASSWORD_LENGTH = 8;
+const MAX_PASSWORD_LENGTH = 128;
+
+function changePasswordProblem(current: string, next: string, confirm: string): string | null {
+  if (!current) return "Enter your current password.";
+  if (next.length < MIN_PASSWORD_LENGTH) return `Use at least ${MIN_PASSWORD_LENGTH} characters.`;
+  if (next.length > MAX_PASSWORD_LENGTH) return `Use at most ${MAX_PASSWORD_LENGTH} characters.`;
+  if (next === current) return "Choose a new password that differs from your current one.";
+  if (next !== confirm) return "The new passwords don't match.";
+  return null;
+}
+
+function changePasswordErrorCopy(error: unknown): string {
+  if (error instanceof AuthApiError) {
+    if (error.code === "INVALID_PASSWORD") return "Your current password is wrong.";
+    if (error.code === "PASSWORD_TOO_SHORT") return `Use at least ${MIN_PASSWORD_LENGTH} characters.`;
+    if (error.code === "PASSWORD_TOO_LONG") return `Use at most ${MAX_PASSWORD_LENGTH} characters.`;
+    if (error.code === "CREDENTIAL_ACCOUNT_NOT_FOUND") return "This account signs in without a password, so there is none to change.";
+  }
+  return describeError(error).body;
+}
+
+/**
+ * Change password through Better Auth's documented endpoint with
+ * `revokeOtherSessions: true`: other devices are signed out and this browser
+ * keeps a fresh session.
+ */
+function ChangePasswordSection() {
+  const queryClient = useQueryClient();
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [problem, setProblem] = useState<string | null>(null);
+  const [changed, setChanged] = useState(false);
+
+  const changePasswordMutation = useAccountBoundMutation({
+    mutationFn: (input: { currentPassword: string; newPassword: string }) =>
+      authApi.changePassword({ ...input, revokeOtherSessions: true }),
+    onSuccess: () => {
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      setProblem(null);
+      setChanged(true);
+      // Better Auth replaced this browser's session; re-read it.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.auth.session });
+    },
+    onError: (error) => {
+      setChanged(false);
+      setProblem(changePasswordErrorCopy(error));
+    },
+  });
+
+  function edit(setter: (value: string) => void) {
+    return (event: ChangeEvent<HTMLInputElement>) => {
+      setter(event.target.value);
+      setChanged(false);
+      setProblem(null);
+    };
+  }
+
+  return (
+    <section className="space-y-4" aria-labelledby="change-password-heading">
+      <div className="space-y-1">
+        <div className="flex items-center gap-2">
+          <KeyRound className="h-5 w-5 text-muted-foreground" />
+          <h2 id="change-password-heading" className="text-base font-semibold">Change password</h2>
+        </div>
+        <p className="max-w-2xl text-sm text-muted-foreground">
+          Changing your password signs you out on every other device. You stay signed in here.
+        </p>
+      </div>
+
+      <form
+        className="grid max-w-2xl gap-4"
+        noValidate
+        onSubmit={(event) => {
+          event.preventDefault();
+          const found = changePasswordProblem(currentPassword, newPassword, confirmPassword);
+          setChanged(false);
+          setProblem(found);
+          if (found) return;
+          changePasswordMutation.mutate({ currentPassword, newPassword });
+        }}
+      >
+        <div className="space-y-2">
+          <Label htmlFor="current-password">Current password</Label>
+          <Input
+            id="current-password"
+            type="password"
+            autoComplete="current-password"
+            value={currentPassword}
+            onChange={edit(setCurrentPassword)}
+          />
+        </div>
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="space-y-2">
+            <Label htmlFor="new-password">New password</Label>
+            <Input
+              id="new-password"
+              type="password"
+              autoComplete="new-password"
+              value={newPassword}
+              onChange={edit(setNewPassword)}
+              aria-describedby="new-password-hint"
+            />
+            <p id="new-password-hint" className="text-xs text-muted-foreground">
+              At least {MIN_PASSWORD_LENGTH} characters.
+            </p>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="confirm-new-password">Confirm new password</Label>
+            <Input
+              id="confirm-new-password"
+              type="password"
+              autoComplete="new-password"
+              value={confirmPassword}
+              onChange={edit(setConfirmPassword)}
+            />
+          </div>
+        </div>
+
+        {problem ? (
+          <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+            {problem}
+          </div>
+        ) : null}
+        {changed ? (
+          <div role="status" className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-foreground">
+            Password changed. Other devices were signed out.
+          </div>
+        ) : null}
+
+        <div className="flex justify-end">
+          <Button type="submit" disabled={changePasswordMutation.isPending}>
+            {changePasswordMutation.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <KeyRound className="size-4" />}
+            {changePasswordMutation.isPending ? "Changing password..." : "Change password"}
+          </Button>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+function deriveInitials(name: string) {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) return `${parts[0]?.[0] ?? ""}${parts[parts.length - 1]?.[0] ?? ""}`.toUpperCase();
+  return name.slice(0, 2).toUpperCase();
+}
+
+export function ProfileSettings() {
+  const { setBreadcrumbs } = useBreadcrumbs();
+  const { selectedCompanyId, selectedCompany } = useCompany();
+  const queryClient = useQueryClient();
+  const avatarInputId = useId();
+  const avatarInputRef = useRef<HTMLInputElement | null>(null);
+  const [name, setName] = useState("");
+  const [image, setImage] = useState("");
+  const [actionError, setActionError] = useState<string | null>(null);
+  const sessionQuery = useQuery({
+    queryKey: queryKeys.auth.session,
+    queryFn: () => authApi.getSession(),
+  });
+  const sessionView = useQueryView(sessionQuery);
+
+  useEffect(() => {
+    setBreadcrumbs([
+      { label: "Settings", href: "/company/settings" },
+      { label: "Profile" },
+    ]);
+  }, [setBreadcrumbs]);
+
+  useEffect(() => {
+    const session = sessionQuery.data;
+    if (!session) return;
+    setName(session.user.name ?? "");
+    setImage(session.user.image ?? "");
+  }, [sessionQuery.data]);
+
+  function syncSessionProfile(profile: CurrentUserProfile) {
+    queryClient.setQueryData<AuthSession | null>(queryKeys.auth.session, (current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        user: {
+          ...current.user,
+          ...profile,
+        },
+      };
+    });
+  }
+
+  // A restored session can show one account while the cookie belongs to
+  // another, and the server saves for the cookie's user. Account-bound
+  // mutations wait for a verified session and abort if the user changed.
+  async function persistProfile(input: UpdateCurrentUserProfile, assertCurrentAccount: () => void) {
+    assertCurrentAccount();
+    const profile = await authApi.updateProfile(input);
+    assertCurrentAccount();
+    syncSessionProfile(profile);
+    return profile;
+  }
+
+  function resolveProfileName() {
+    return name.trim() || sessionQuery.data?.user.name || "Board";
+  }
+
+  const updateMutation = useAccountBoundMutation({
+    mutationFn: (input: UpdateCurrentUserProfile, { assertCurrentAccount }) => persistProfile(input, assertCurrentAccount),
+    onSuccess: (profile) => {
+      setActionError(null);
+      setName(profile.name ?? "");
+      setImage(profile.image ?? "");
+    },
+    onError: (error) => {
+      setActionError(describeError(error).body);
+    },
+  });
+
+  const uploadAvatarMutation = useAccountBoundMutation({
+    mutationFn: async (file: File, { assertCurrentAccount }) => {
+      if (!selectedCompanyId) {
+        throw new Error("Select an organization before uploading a profile avatar.");
+      }
+
+      const asset = await assetsApi.uploadImage(
+        selectedCompanyId,
+        file,
+        `profiles/${sessionQuery.data?.user.id ?? "board-user"}`,
+      );
+      return persistProfile({ name: resolveProfileName(), image: asset.contentPath }, assertCurrentAccount);
+    },
+    onSuccess: (profile) => {
+      setActionError(null);
+      setName(profile.name ?? "");
+      setImage(profile.image ?? "");
+    },
+    onError: (error) => {
+      setActionError(describeError(error).body);
+    },
+  });
+
+  const removeAvatarMutation = useAccountBoundMutation({
+    mutationFn: (_input, { assertCurrentAccount }) => persistProfile({ name: resolveProfileName(), image: null }, assertCurrentAccount),
+    onSuccess: (profile) => {
+      setActionError(null);
+      setName(profile.name ?? "");
+      setImage(profile.image ?? "");
+    },
+    onError: (error) => {
+      setActionError(describeError(error).body);
+    },
+  });
+
+  if (sessionQuery.isLoading || sessionView.kind === "reconnecting") {
+    return <div className="text-sm text-muted-foreground">Loading profile...</div>;
+  }
+
+  if (sessionView.kind === "error") {
+    return (
+      <QueryErrorState
+        size="page"
+        error={sessionQuery.error}
+        action="load your profile"
+        onRetry={sessionView.retry}
+        retrying={sessionView.isFetching}
+      />
+    );
+  }
+
+  if (!sessionQuery.data) {
+    return <div className="text-sm text-destructive">Failed to load profile.</div>;
+  }
+
+  const currentName = name.trim() || sessionQuery.data.user.name || "Board";
+  const currentImage = image.trim() || null;
+  const initials = deriveInitials(currentName);
+  const isSavingProfile = updateMutation.isPending || uploadAvatarMutation.isPending || removeAvatarMutation.isPending;
+  const uploadHint = selectedCompany
+    ? `Stored in Paperclip file storage for ${selectedCompany.name}.`
+    : "Select an organization to upload an avatar into Paperclip storage.";
+
+  return (
+    <div className="max-w-6xl space-y-6">
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <UserRoundPen className="h-5 w-5 text-muted-foreground" />
+          <h1 className="text-lg font-semibold">Profile</h1>
+        </div>
+        <p className="text-sm text-muted-foreground">
+          Control how your account appears in the sidebar and other board surfaces.
+        </p>
+      </div>
+
+      {actionError ? (
+        <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+          {actionError}
+        </div>
+      ) : null}
+
+      <section className="space-y-8">
+        <Card className="block relative overflow-hidden rounded-(--rad-28) border-border/70">
+          <div className="absolute inset-x-0 top-0 h-32 bg-(image:--gradient-extract-26)" />
+          <div className="absolute inset-0 bg-(image:--gradient-extract-7)" />
+          <div className="relative p-6 pt-10">
+            <div className="flex flex-wrap items-end gap-5 rounded-(--rad-24) border border-border/70 bg-background/92 p-5 shadow-(--shadow-extract-18) backdrop-blur-sm">
+              <div className="space-y-3">
+                <label
+                  htmlFor={avatarInputId}
+                  className="group relative block cursor-pointer rounded-full focus-within:outline-none focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:ring-offset-background"
+                >
+                  <input
+                    ref={avatarInputRef}
+                    id={avatarInputId}
+                    type="file"
+                    accept="image/*"
+                    className="sr-only"
+                    disabled={!selectedCompanyId || isSavingProfile}
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      if (!file) return;
+                      uploadAvatarMutation.mutate(file);
+                      event.target.value = "";
+                    }}
+                  />
+                  <span className="absolute inset-0 z-10 rounded-full bg-black/0 transition-colors group-hover:bg-black/14 group-focus-within:bg-black/14" />
+                  <span className="absolute bottom-1 right-1 z-20 flex size-9 items-center justify-center rounded-full border border-background bg-primary text-primary-foreground shadow-sm">
+                    {uploadAvatarMutation.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <Camera className="size-4" />}
+                  </span>
+                  <Avatar size="lg" className="data-[size=lg]:size-24 ring-4 ring-background shadow-xl">
+                    {currentImage ? <AvatarImage src={currentImage} alt={currentName} /> : null}
+                    <AvatarFallback>{initials}</AvatarFallback>
+                  </Avatar>
+                </label>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    onClick={() => avatarInputRef.current?.click()}
+                    disabled={!selectedCompanyId || isSavingProfile}
+                  >
+                    {uploadAvatarMutation.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <Camera className="size-4" />}
+                    {currentImage ? "Change photo" : "Upload photo"}
+                  </Button>
+                  {currentImage ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => removeAvatarMutation.mutate()}
+                      disabled={isSavingProfile}
+                    >
+                      {removeAvatarMutation.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                      Remove
+                    </Button>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="min-w-0 flex-1 space-y-2 pb-1">
+                <div>
+                  <h2 className="truncate text-2xl font-semibold text-foreground">{currentName}</h2>
+                  <p className="truncate text-sm text-muted-foreground">{sessionQuery.data.user.email ?? "No email"}</p>
+                </div>
+                <p className="max-w-2xl text-sm leading-6 text-muted-foreground">
+                  Click the avatar to upload a new image. {uploadHint}
+                </p>
+              </div>
+            </div>
+          </div>
+        </Card>
+
+        <form
+          className="grid gap-6 md:grid-cols-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            updateMutation.mutate({ name: resolveProfileName(), image: image.trim() || null });
+          }}
+        >
+          <div className="space-y-2">
+            <Label htmlFor="profile-name">Display name</Label>
+            <Input
+              id="profile-name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              maxLength={120}
+              placeholder="Board"
+            />
+            <p className="text-xs text-muted-foreground">
+              Shown in the sidebar account footer and comment author surfaces.
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="profile-email">Email</Label>
+            <Input
+              id="profile-email"
+              value={sessionQuery.data.user.email ?? ""}
+              readOnly
+              disabled
+            />
+            <p className="text-xs text-muted-foreground">
+              Email is managed by your auth session and is read-only here.
+            </p>
+          </div>
+
+          <div className="md:col-span-2 flex justify-end">
+            <Button type="submit" disabled={isSavingProfile || !name.trim()}>
+              {updateMutation.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
+              {updateMutation.isPending ? "Saving..." : "Save profile"}
+            </Button>
+          </div>
+        </form>
+
+        <ChangePasswordSection />
+
+        <InboxAgentPolicyControl companyId={selectedCompanyId} />
+      </section>
+    </div>
+  );
+}

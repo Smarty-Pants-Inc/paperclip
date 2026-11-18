@@ -1,0 +1,553 @@
+import { createHash } from "node:crypto";
+import { posix } from "node:path";
+import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, nativeRunnerCheckpoints, type Db } from "@paperclipai/db";
+import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
+import { captureLegacyDurablePrpCheckpoint, parseNativeExecutionInput, type DurablePrpCheckpoint, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
+import { notifyNativeFinalizationWork } from "../native-finalization-notifications.js";
+import { readRunCancellation } from "../run-cancellation.js";
+import { OWN_PROCESS_START_EVENT_TYPES } from "../native-process-start-events.js";
+import { nativeSha256 } from "./canonical.js";
+import { findNativeSessionResumeRun, isNativeSessionId, isUnusedNativeSessionBootstrap, nativeSessionProviderEvidence } from "./native-session-resume.js";
+import { insertMigratedNativeRunnerCheckpoint, loadNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
+import { offlineMigrationExecutionWhere } from "../offline-migration-execution.js";
+import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
+import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
+import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
+import { isQuiescentRetainedPiSource, readStoppedRemotePiSource } from "./native-retained-pi-source.js";
+import type { FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
+import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
+import { nativeUserStopRecoveryHeld, stopJournalLeftUndeliveredTool, userStopLeftUncertainty } from "./native-user-stop-settlement.js";
+import { probePiSessionResumeFile } from "./pi-session-file-repair.js";
+import { nativeReconciliationError } from "./runner-reconciliation-refusal.js";
+
+export const NATIVE_CONTROLLER_RECOVERY_MAX_BYTES = 4 * 1024;
+
+/** Private run-profile metadata. No credentials or controller-local paths. */
+export interface NativeControllerRecovery {
+  schema: "paperclip.native-controller-recovery.v1";
+  snapshotSha256: string;
+  configDigest: string;
+  processConfigDigest: string | null;
+  checkpoint: {
+    runId: string;
+    runnerInstanceId: string;
+    normalizedSessionId: string;
+  } | null;
+}
+
+export type NativeControllerCompatibility = Pick<NativeControllerRecovery, "configDigest" | "processConfigDigest">;
+
+export function createNativeControllerRecovery(
+  snapshot: PersistedNativeSession,
+  compatibility: NativeControllerCompatibility,
+  checkpoint: NativeControllerRecovery["checkpoint"],
+): NativeControllerRecovery {
+  const value: NativeControllerRecovery = {
+    schema: "paperclip.native-controller-recovery.v1",
+    snapshotSha256: nativeSha256(snapshot),
+    configDigest: compatibility.configDigest,
+    processConfigDigest: compatibility.processConfigDigest,
+    checkpoint,
+  };
+  if (Buffer.byteLength(JSON.stringify(value)) > NATIVE_CONTROLLER_RECOVERY_MAX_BYTES) {
+    throw new Error("native_controller_recovery_metadata_too_large");
+  }
+  return value;
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+export function readNativeControllerRecovery(value: unknown, snapshot: unknown): NativeControllerRecovery | null {
+  const envelope = record(value), checkpoint = record(envelope.checkpoint);
+  if (Buffer.byteLength(JSON.stringify(value) ?? "null") > NATIVE_CONTROLLER_RECOVERY_MAX_BYTES
+    || envelope.schema !== "paperclip.native-controller-recovery.v1"
+    || typeof envelope.snapshotSha256 !== "string" || envelope.snapshotSha256 !== nativeSha256(snapshot)
+    || typeof envelope.configDigest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(envelope.configDigest)
+    || !(envelope.processConfigDigest === null || (typeof envelope.processConfigDigest === "string" && /^[a-f0-9]{64}$/.test(envelope.processConfigDigest)))
+    || ![checkpoint.runId, checkpoint.runnerInstanceId, checkpoint.normalizedSessionId].every(v => typeof v === "string" && v.length > 0)) return null;
+  return envelope as unknown as NativeControllerRecovery;
+}
+
+export type NativeControllerRecoveryOutcome =
+  | { kind: "recoverable"; snapshot: PersistedNativeSession; metadata: NativeControllerRecovery; checkpoint: DurablePrpCheckpoint }
+  | { kind: "waiting_for_owner"; deadline: Date }
+  | { kind: "missing_evidence" | "unsupported" | "dependency_unavailable"; reason: string; cause?: unknown }
+  | { kind: "no_prior_execution" };
+
+export const NATIVE_RETAINED_OWNER_WAIT = "native_controller_recovery_waiting_for_owner";
+
+export type NativeRetainedOwnerWait = { runId: string; controllerBootId: string };
+
+export class NativeControllerRecoveryWaitingError extends Error {
+  constructor(readonly retryAt: Date, readonly owner?: NativeRetainedOwnerWait) {
+    super(NATIVE_RETAINED_OWNER_WAIT);
+    this.name = "NativeControllerRecoveryWaitingError";
+  }
+}
+
+/** Admission has not crossed the provider boundary. Retain this same business
+ * run on the existing retry owner; never turn an ownership wait into a failure
+ * or invent a new provider attempt. The usual resumption gates recheck Stop,
+ * permissions and task ownership when this deadline arrives. */
+export async function deferNativeControllerRecovery(db: Db, input: {
+  companyId: string; agentId: string; issueId: string; runId: string;
+  leaseOwner?: string; retryAt: Date; waitingForOwner?: NativeRetainedOwnerWait;
+}): Promise<void> {
+  await db.transaction(async tx => {
+    const [task] = await tx.select({ executionRunId: issues.executionRunId }).from(issues)
+      .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).for("update");
+    const [owner] = await tx.select().from(nativeRunFinalizations).where(and(
+      eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.issueId, input.issueId),
+      eq(nativeRunFinalizations.runId, input.runId))).for("update");
+    const [run] = await tx.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId))).for("update");
+    const [authority] = await tx.select({ runId: nativeRunnerCheckpoints.runId }).from(nativeRunnerCheckpoints)
+      .where(and(eq(nativeRunnerCheckpoints.companyId, input.companyId), eq(nativeRunnerCheckpoints.runId, input.runId))).limit(1);
+    const progress = await nativeSessionProviderEvidence(tx as unknown as Db, [input.runId]);
+    const cancellation = record(run?.resultJson?.nativeCancellation);
+    const stop = readRunCancellation(run?.resultJson);
+    const [clock] = await tx.execute<{ now: Date }>(sql`select clock_timestamp() as now`);
+    const hasProcessIdentity = Boolean(run?.processPid || run?.processGroupId || run?.processStartedAt);
+    const inheritedProcessIdentity = hasProcessIdentity
+      && typeof record(run?.runnerProfileJson).inheritedProcessIdentityRunId === "string"
+      && !(await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+        eq(heartbeatRunEvents.companyId, input.companyId), eq(heartbeatRunEvents.runId, input.runId),
+        isNull(heartbeatRunEvents.sourceEventId),
+        inArray(heartbeatRunEvents.eventType, [...OWN_PROCESS_START_EVENT_TYPES]))).limit(1)).length;
+    if (!run || run.runtimeMode !== "native" || run.status !== "running" || task?.executionRunId !== input.runId
+      || !owner || owner.phase !== "observed" || owner.resultId || owner.attempt !== 0
+      || owner.controllerGeneration !== 0 || owner.leaseOwner !== (input.leaseOwner ?? null)
+      || (input.leaseOwner && (!owner.leaseExpiresAt || owner.leaseExpiresAt <= new Date(clock.now)))
+      || (hasProcessIdentity && !inheritedProcessIdentity) || authority || progress.size
+      || !record(run.runnerProfileJson).nativeExecutionInput || run.resultJson?.startupCancellation
+      || (stop?.source === "operator" && stop.expected)
+      || (["run", "issue"].includes(String(cancellation.scope)) && ["pending", "acknowledged"].includes(String(cancellation.dispatchState)))) {
+      throw new Error("native_controller_recovery_wait_authority_changed");
+    }
+    if (inheritedProcessIdentity) {
+      await tx.update(heartbeatRuns).set({ processPid: null, processGroupId: null, processStartedAt: null, updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, input.runId));
+    }
+    await notifyNativeFinalizationWork(tx, input);
+    await tx.update(nativeRunFinalizations).set({
+      phase: "retryable_failure", leaseOwner: null, leaseExpiresAt: null, controlDeadlineAt: null,
+      nextAttemptAt: input.retryAt, recoveryState: "resuming_session", failureCode: NATIVE_RETAINED_OWNER_WAIT,
+      failureDetail: { originalFailureCode: NATIVE_RETAINED_OWNER_WAIT,
+        message: "Waiting for the retained native controller owner to release its lease.",
+        recoveryMode: record(run.runnerProfileJson).sessionCheckpoint ? "same_session_resume" : "bootstrap_retry",
+        providerSessionEstablished: false, providerEventsExist: false,
+        ...(input.waitingForOwner ? { waitingForOwner: { runId: input.waitingForOwner.runId,
+          controllerBootId: input.waitingForOwner.controllerBootId } } : {}) },
+      updatedAt: new Date(),
+    }).where(eq(nativeRunFinalizations.runId, input.runId));
+  });
+}
+
+export const NATIVE_AGENT_DIRECTORY_BUSY_WAIT = "agent_directory_operation_busy";
+
+export async function deferNativeRunForBusyAgentDirectory(db: Db, input: {
+  companyId: string; runId: string; leaseOwner?: string; retryAt: Date; maxDeferrals: number;
+}): Promise<"deferred" | "pre_admission" | "refused"> {
+  return db.transaction(async tx => {
+    const [current] = await tx.select({ issueId: heartbeatRuns.nativeIssueId }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)));
+    const [existing] = await tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations)
+      .where(and(eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.runId, input.runId)));
+    if (!current?.issueId || !existing) return "pre_admission";
+    const [task] = await tx.select({ executionRunId: issues.executionRunId }).from(issues)
+      .where(and(eq(issues.companyId, input.companyId), eq(issues.id, current.issueId))).for("update");
+    const [owner] = await tx.select().from(nativeRunFinalizations).where(and(
+      eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.issueId, current.issueId),
+      eq(nativeRunFinalizations.runId, input.runId))).for("update");
+    const [run] = await tx.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.nativeIssueId, current.issueId))).for("update");
+    const cancellation = record(run?.resultJson?.nativeCancellation);
+    const stop = readRunCancellation(run?.resultJson);
+    const context = record(run?.contextSnapshot);
+    const deferrals = typeof context.agentDirectoryBusyDeferrals === "number" ? context.agentDirectoryBusyDeferrals : 0;
+    const [clock] = await tx.execute<{ now: Date }>(sql`select clock_timestamp() as now`);
+    if (!run || run.runtimeMode !== "native" || run.status !== "running" || task?.executionRunId !== input.runId
+      || !owner || owner.resultId || owner.phase !== "observed"
+      || owner.leaseOwner !== (input.leaseOwner ?? null)
+      || (input.leaseOwner && (!owner.leaseExpiresAt || owner.leaseExpiresAt <= new Date(clock.now)))
+      || run.resultJson?.startupCancellation || stop
+      || (["run", "issue"].includes(String(cancellation.scope)) && ["pending", "acknowledged"].includes(String(cancellation.dispatchState)))
+      || deferrals >= input.maxDeferrals) return "refused";
+    await notifyNativeFinalizationWork(tx, { companyId: input.companyId, issueId: current.issueId, runId: input.runId });
+    await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context, agentDirectoryBusyDeferrals: deferrals + 1 }, updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, input.runId));
+    const detail = record(owner.failureDetail);
+    await tx.update(nativeRunFinalizations).set({
+      phase: "retryable_failure", leaseOwner: null, leaseExpiresAt: null, controlDeadlineAt: null,
+      nextAttemptAt: input.retryAt, recoveryState: "resuming_session", failureCode: NATIVE_AGENT_DIRECTORY_BUSY_WAIT,
+      failureDetail: {
+        recoveryMode: record(run.runnerProfileJson).sessionCheckpoint ? "same_session_resume" : "bootstrap_retry",
+        providerSessionEstablished: false, providerEventsExist: false,
+        ...detail,
+        originalFailureCode: detail.originalFailureCode ?? NATIVE_AGENT_DIRECTORY_BUSY_WAIT,
+        message: "Waiting for another run of this agent to finish with its files.",
+      },
+      updatedAt: new Date(),
+    }).where(eq(nativeRunFinalizations.runId, input.runId));
+    return "deferred";
+  });
+}
+
+/** The retained Runner keeps its state under the directory its own lease
+ * recorded. A workspace can move to a new allocation of the SAME sandbox: its
+ * prior epoch was abandoned, so the last save was restored into a fresh root
+ * named for the new lease. Both roots are canonical siblings under the
+ * sandbox's `.paperclip-workspaces` and carry the same execution-workspace ID.
+ * Anything else (another workspace, another parent, a non-canonical path) is
+ * not the retained allocation and stays refused. */
+function sameSandboxWorkspaceAllocation(recorded: string, current: string): boolean {
+  if (recorded === current) return true;
+  const canonical = (path: string) => posix.isAbsolute(path) && posix.normalize(path) === path && !path.endsWith("/");
+  if (!canonical(recorded) || !canonical(current)) return false;
+  const parent = posix.dirname(recorded);
+  if (posix.basename(parent) !== ".paperclip-workspaces" || posix.dirname(current) !== parent) return false;
+  const workspace = WORKSPACE_ALLOCATION.exec(posix.basename(recorded))?.[1];
+  return Boolean(workspace && WORKSPACE_ALLOCATION.exec(posix.basename(current))?.[1] === workspace);
+}
+
+/** The published allocation names (remote-workspaces publishedWorkspaceDirectory):
+ * exactly `<workspaceId>`, or `<workspaceId>-<epoch>-<leaseId>`. */
+const UUID = "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}";
+const WORKSPACE_ALLOCATION = new RegExp(`^(${UUID})(?:-[1-9][0-9]*-${UUID})?$`);
+
+type RetainedSandboxBindingInput = {
+  companyId: string; issueId: string; runId: string;
+  agentId?: string; successorRunId?: string; normalizedSessionId?: string;
+  target: Extract<AdapterExecutionTarget, { kind: "remote" }>;
+  /** The executor's marker probe of `target`'s box (remoteRunnerGenerationLost):
+   * true only when the named Runner's process is absent (45) or of another
+   * generation (47) on that box. */
+  sourceRunnerGenerationLost?: (probe: { remoteCwd: string; identity: Record<string, unknown> }) => Promise<boolean>;
+};
+
+/** Runner lifecycle maintenance that only the stopped source Runner itself
+ * could complete: the same lifecycle set the finished-owner fence ignores for
+ * a stopped Runner (native-session-executor.ts LOCAL_RUNNER_LIFECYCLE_COMMANDS).
+ * A Stop that stopped the box leaves Core's idle drain/suspend pending. They
+ * say nothing about the conversation, but only once that Runner's generation
+ * is proven dead on this same box. Every other pending command (turn.*, tool
+ * results, attachments, session reads) is conversation state and refuses. */
+const STOPPED_SOURCE_MAINTENANCE_COMMANDS: ReadonlySet<string> = new Set(["runner.drain", "runner.suspend", "runner.shutdown"]);
+
+/** A cancelled business run may still leave a good conversation checkpoint.
+ * Compose existing lease termination/handoff and runnerd lineage evidence; do
+ * not manufacture a committed result or replace Goal1's authority retirement. */
+async function stoppedRetainedPiSource(db: Db, input: RetainedSandboxBindingInput,
+  owner: typeof nativeRunFinalizations.$inferSelect, sourceLease: typeof environmentLeases.$inferSelect): Promise<boolean> {
+  const { target, agentId, successorRunId, normalizedSessionId } = input;
+  if (target.transport !== "sandbox" || !target.runner || !agentId || !successorRunId || !normalizedSessionId || successorRunId === input.runId
+    || owner.phase !== "terminal_failure" || owner.resultId !== null || owner.leaseOwner !== null || owner.recoveryState !== null) return false;
+  const physicallyStopped = hasRemoteTerminationReceipt(sourceLease)
+    && record(sourceLease.metadata?.remoteExecutionTermination).state === "stopped";
+  const history = await db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.provider, target.providerKey!), eq(environmentLeases.providerLeaseId, target.sandboxLeaseAcquisition!.providerLeaseId)));
+  const successor = history.find(lease => lease.id === target.leaseId);
+  if (!successor || successor.companyId !== input.companyId || successor.environmentId !== target.environmentId
+    || successor.issueId !== input.issueId || successor.heartbeatRunId !== successorRunId || successor.status !== "active"
+    || successor.releasedAt !== null || successor.metadata?.agentId !== agentId
+    || !retiredReusableLeasePredecessors(successor, history.filter(lease => lease.id !== successor.id))
+      ?.some(lease => lease.id === sourceLease.id)) return false;
+  const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.nativeIssueId, input.issueId),
+    eq(heartbeatRuns.nativeSessionId, normalizedSessionId), inArray(heartbeatRuns.id, [input.runId, successorRunId])));
+  const source = runs.find(run => run.id === input.runId), current = runs.find(run => run.id === successorRunId);
+  const [task] = await db.select({ executionRunId: issues.executionRunId }).from(issues).where(and(
+    eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
+  if (!source || !current || source.runtimeMode !== "native" || current.runtimeMode !== "native"
+    || current.status !== "running" || task?.executionRunId !== successorRunId || !source.finishedAt) return false;
+  const profile = record(source.runnerProfileJson), snapshot = record(profile.sessionCheckpoint), binding = record(snapshot.identity);
+  // This receipt is issued only after Pi's clean cancellation/child cleanup
+  // and idle snapshot. It grants checkpoint maintenance, not a result or LOSS.
+  const idle = record(profile.nativeRetainedIdleCheckpoint);
+  const retainedUserStop = source.status === "cancelled" && owner.failureCode === "native_retry_cancelled"
+    && hasAcknowledgedNativeStopIntent(source) && idle.schema === "paperclip.native-retained-idle-checkpoint.v1"
+    && idle.companyId === input.companyId && idle.issueId === input.issueId && idle.runId === source.id
+    && idle.sessionId === normalizedSessionId && idle.bootId === owner.controllerBootId && idle.generation === owner.controllerGeneration;
+  if (!physicallyStopped && !retainedUserStop) return false;
+  const metadata = readNativeControllerRecovery(profile.nativeControllerRecovery, snapshot);
+  const admitted = parseNativeExecutionInput(profile.nativeExecutionInput);
+  if (admitted.provider.kind !== "pi_rpc" || admitted.binding.runId !== source.id || admitted.binding.companyId !== input.companyId
+    || admitted.binding.agentId !== agentId || admitted.binding.issueId !== input.issueId
+    || admitted.session.normalizedSessionId !== normalizedSessionId
+    || binding.companyId !== input.companyId || binding.agentId !== agentId || binding.issueId !== input.issueId
+    || binding.runId !== source.id || binding.sessionId !== normalizedSessionId
+    || snapshot.activeTurnId !== null || !Array.isArray(snapshot.pendingRuntimeRequests) || snapshot.pendingRuntimeRequests.length !== 0
+    || !metadata?.checkpoint || metadata.checkpoint.runId !== source.id || metadata.checkpoint.runnerInstanceId !== source.runnerInstanceId
+    || metadata.checkpoint.normalizedSessionId !== normalizedSessionId || typeof snapshot.providerSessionId !== "string") return false;
+  const checkpoint = await loadNativeRunnerCheckpoint(db, { companyId: input.companyId, issueId: input.issueId, runId: source.id });
+  if (!checkpoint || checkpoint.recoveryEvidence.runnerInstanceId !== source.runnerInstanceId
+    || checkpoint.recoveryEvidence.normalizedSessionId !== normalizedSessionId) return false;
+  const header = record(JSON.parse(checkpoint.records.get("header") ?? "null"));
+  const identity = record(record(header.state).identity);
+  const pending = [...checkpoint.records].filter(([key]) => key.startsWith("command:"))
+    .map(([, bytes]) => record(JSON.parse(bytes))).filter(command => command.status !== "completed");
+  if (identity.runId !== source.id
+    || identity.runnerInstanceId !== source.runnerInstanceId || identity.normalizedSessionId !== normalizedSessionId
+    || pending.some(command => !STOPPED_SOURCE_MAINTENANCE_COMMANDS.has(String(command.type)))) return false;
+  // Pending maintenance only: ignored only for a user-Stopped source whose
+  // Runner generation the marker probe proves dead on this same box (the
+  // binding chain above fixed the box: the successor's providerLeaseId).
+  if (pending.length > 0 && (!retainedUserStop || !input.sourceRunnerGenerationLost
+    || !await input.sourceRunnerGenerationLost({ remoteCwd: sourceLease.metadata!.remoteCwd as string,
+      identity: { runnerInstanceId: source.runnerInstanceId, normalizedSessionId } }))) return false;
+  const stopControlBytes = () => JSON.stringify({
+    commands: [...checkpoint.records].filter(([key]) => key.startsWith("command:")).map(([, bytes]) => JSON.parse(bytes)),
+    committedEvents: [...checkpoint.records].filter(([key]) => key.startsWith("event:")).map(([, bytes]) => JSON.parse(bytes)),
+  });
+  if (retainedUserStop) {
+    // A warm Runner's physical lease can predate the stopped business turn.
+    // Accept it only within the already verified same-sandbox handoff chain.
+    const origin = history.find(lease => lease.id === identity.environmentLeaseId);
+    if (admitted.session.lifecyclePolicy.mode !== "warm" || !origin || origin.acquiredAt > sourceLease.acquiredAt
+      || typeof origin.metadata?.remoteCwd !== "string"
+      || !sameSandboxWorkspaceAllocation(origin.metadata.remoteCwd, sourceLease.metadata!.remoteCwd as string)) return false;
+    const controlBytes = stopControlBytes();
+    if (stopJournalLeftUndeliveredTool(controlBytes) || await userStopLeftUncertainty(db, source)
+      || await nativeUserStopRecoveryHeld(db, input, { controlBytes })) return false;
+    // Use the pack's existing no-follow, owner/cwd/native-header validator.
+    // This is only a read of retained history, not process death evidence.
+    const packRoot = posix.join(sourceLease.metadata!.remoteCwd as string, ".paperclip-runtime", "paperclip-runner", "provider-pack");
+    const directory = posix.join(sourceLease.metadata!.remoteCwd as string, ".paperclip-runtime", "paperclip-runner", "sessions",
+      createHash("sha256").update(normalizedSessionId).digest("hex"), "filesystem", "pi");
+    if (await probePiSessionResumeFile({ runner: target.runner, node: posix.join(packRoot, "node_modules", "node", "bin", "node"),
+      providerPackRoot: packRoot, directory, filename: `${normalizedSessionId}.jsonl`, normalizedSessionId,
+      providerSessionId: snapshot.providerSessionId, providerBackendSessionId: null,
+      workingDirectory: sourceLease.metadata!.remoteCwd as string }) !== "valid") return false;
+  } else {
+    if (identity.environmentLeaseId !== sourceLease.id) return false;
+    const measured = await readStoppedRemotePiSource({ runner: target.runner, remoteCwd: sourceLease.metadata!.remoteCwd as string,
+      normalizedSessionId, runnerInstanceId: source.runnerInstanceId! });
+    if (!measured || !isQuiescentRetainedPiSource({ owner, runStatus: source.status, terminationReceipt: true, leaseHandoff: true,
+      identity: identity as Record<string, string>, providerSessionId: snapshot.providerSessionId,
+      checkpointRecords: checkpoint.records, ...measured })) return false;
+  }
+  // Measurements await a remote read. Recheck the exact source and current
+  // ownership before accepting them; changed durable bytes keep the refusal.
+  const [freshOwner] = await db.select().from(nativeRunFinalizations).where(and(
+    eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.runId, input.runId)));
+  const freshHistory = await db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.provider, target.providerKey!), eq(environmentLeases.providerLeaseId, target.sandboxLeaseAcquisition!.providerLeaseId)));
+  const freshRuns = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
+    inArray(heartbeatRuns.id, [input.runId, successorRunId])));
+  const [freshTask] = await db.select({ executionRunId: issues.executionRunId }).from(issues).where(and(
+    eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
+  const sorted = <T extends { id: string }>(rows: T[]) => [...rows].sort((left, right) => left.id.localeCompare(right.id));
+  const freshCheckpoint = await loadNativeRunnerCheckpoint(db, { companyId: input.companyId, issueId: input.issueId, runId: source.id });
+  const parts = (value: DurablePrpCheckpoint) => [...value.records].sort(([left], [right]) => left.localeCompare(right));
+  if (retainedUserStop && (await userStopLeftUncertainty(db, source) || await nativeUserStopRecoveryHeld(db, input, { controlBytes: stopControlBytes() }))) return false;
+  return freshCheckpoint !== null && nativeSha256(parts(freshCheckpoint)) === nativeSha256(parts(checkpoint))
+    && nativeSha256(freshOwner) === nativeSha256(owner)
+    && nativeSha256(sorted(freshHistory)) === nativeSha256(sorted(history))
+    && nativeSha256(sorted(freshRuns)) === nativeSha256(sorted(runs)) && freshTask?.executionRunId === successorRunId;
+}
+
+/** Bind a read of retained Runner lifecycle to the surviving sandbox and
+ * return the directory that Runner wrote under. The ordinary admission owner
+ * still checks current permissions before execution. */
+export async function assertNativeRetainedSandboxBinding(db: Db, input: RetainedSandboxBindingInput): Promise<{ remoteCwd: string }> {
+  const { target } = input;
+  if (target.transport !== "sandbox" || target.sandboxLeaseAcquisition?.outcome !== "resumed"
+    || !target.providerKey || !target.environmentId || !target.leaseId) {
+    throw new Error("native_controller_recovery_dependency_unavailable:retained_sandbox");
+  }
+  const [owner] = await db.select().from(nativeRunFinalizations).where(and(
+    eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.issueId, input.issueId),
+    eq(nativeRunFinalizations.runId, input.runId)));
+  const leases = await db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.issueId, input.issueId),
+    eq(environmentLeases.heartbeatRunId, input.runId), eq(environmentLeases.environmentId, target.environmentId),
+    eq(environmentLeases.provider, target.providerKey), eq(environmentLeases.providerLeaseId, target.sandboxLeaseAcquisition.providerLeaseId)));
+  const recordedCwd = leases.length === 1 ? leases[0].metadata?.remoteCwd : undefined;
+  if (!owner || owner.recoveryState || typeof recordedCwd !== "string"
+    || !sameSandboxWorkspaceAllocation(recordedCwd, target.remoteCwd)
+    || !["active", "released", "expired"].includes(leases[0].status)) {
+    throw nativeReconciliationError("native_controller_recovery_missing_evidence:retained_sandbox_binding");
+  }
+  if (!owner.resultId) {
+    // A failed or missing observation must retain the existing refusal, never
+    // degrade into the committed-source lane or an implicit fresh session.
+    if (await stoppedRetainedPiSource(db, input, owner, leases[0]).catch(() => false)) return { remoteCwd: recordedCwd };
+    throw nativeReconciliationError("native_controller_recovery_missing_evidence:retained_sandbox_binding");
+  }
+  if (owner.leaseOwner && owner.leaseExpiresAt && owner.leaseExpiresAt > new Date()) {
+    throw new NativeControllerRecoveryWaitingError(owner.leaseExpiresAt);
+  }
+  if (owner.leaseOwner || owner.phase !== "committed") {
+    throw nativeReconciliationError("native_controller_recovery_missing_evidence:retained_sandbox_binding");
+  }
+  return { remoteCwd: recordedCwd };
+}
+
+/** Only the existing bounded selector chooses history. Never search backwards
+ * again when its selected record is incomplete or incompatible. This operation
+ * reads evidence; it grants neither command nor acknowledgement authority. */
+export async function resolveNativeControllerRecovery(db: Db, input: {
+  companyId: string; agentId: string; issueId: string; normalizedSessionId: string; currentRunId: string;
+  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
+}): Promise<NativeControllerRecoveryOutcome> {
+  if (!isNativeSessionId(input.normalizedSessionId)) return { kind: "missing_evidence", reason: "session_binding" };
+  const [current] = await db.select({ createdAt: heartbeatRuns.createdAt, processPid: heartbeatRuns.processPid,
+    processGroupId: heartbeatRuns.processGroupId, processStartedAt: heartbeatRuns.processStartedAt,
+    runnerProfileJson: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id, input.currentRunId), eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId),
+    eq(heartbeatRuns.nativeSessionId, input.normalizedSessionId)));
+  if (!current) return { kind: "missing_evidence", reason: "current_binding" };
+  const source = await findNativeSessionResumeRun(db, { ...input, beforeCreatedAt: current.createdAt, includeProgressBarrier: true });
+  if (!source) {
+    // An exhausted candidate window is unknown history, not fresh-bootstrap
+    // proof. Read only IDs, and retain the selector's existing 32-row boundary.
+    const prior = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      ne(heartbeatRuns.id, input.currentRunId), eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId),
+      eq(heartbeatRuns.nativeSessionId, input.normalizedSessionId))).limit(33);
+    if (prior.length > 32) return { kind: "missing_evidence", reason: "candidate_window_exhausted" };
+    const progress = await nativeSessionProviderEvidence(db, [input.currentRunId]);
+    if (!isUnusedNativeSessionBootstrap(current, progress.has(input.currentRunId))) {
+      return { kind: "missing_evidence", reason: "current_execution_progress" };
+    }
+    // The normal admission and remote untouched-session claim still execute.
+    return { kind: "no_prior_execution" };
+  }
+  const [owner] = await db.select({ leaseOwner: nativeRunFinalizations.leaseOwner, leaseExpiresAt: nativeRunFinalizations.leaseExpiresAt }).from(nativeRunFinalizations)
+    .where(and(eq(nativeRunFinalizations.runId, source.id), eq(nativeRunFinalizations.companyId, input.companyId),
+      eq(nativeRunFinalizations.issueId, input.issueId)));
+  if (owner?.leaseOwner && owner.leaseExpiresAt && owner.leaseExpiresAt.getTime() > Date.now()) {
+    return { kind: "waiting_for_owner", deadline: owner.leaseExpiresAt };
+  }
+  if (source.runtimeMode !== "native" || !["succeeded", "failed", "cancelled", "interrupted", "timed_out"].includes(source.status)
+    || source.createdAt > current.createdAt) return { kind: "missing_evidence", reason: "newer_progress_barrier" };
+  const profile = record(source.runnerProfileJson), snapshot = record(profile.sessionCheckpoint);
+  const identity = record(snapshot.identity);
+  if (identity.companyId !== input.companyId || identity.agentId !== input.agentId
+    || identity.issueId !== input.issueId || identity.runId !== source.id || identity.sessionId !== input.normalizedSessionId) {
+    return { kind: "missing_evidence", reason: "snapshot_binding" };
+  }
+  if (record(profile.nativeControllerRecovery).schema !== "paperclip.native-controller-recovery.v1") {
+    return { kind: "unsupported", reason: "metadata_format" };
+  }
+  const metadata = readNativeControllerRecovery(profile.nativeControllerRecovery, snapshot);
+  if (!metadata?.checkpoint || metadata.checkpoint.runId !== source.id
+    || metadata.checkpoint.normalizedSessionId !== input.normalizedSessionId
+    || metadata.checkpoint.runnerInstanceId !== source.runnerInstanceId) {
+    return { kind: "missing_evidence", reason: "snapshot_digest_or_checkpoint_binding" };
+  }
+  let checkpoint: DurablePrpCheckpoint | null;
+  try {
+    checkpoint = await loadNativeRunnerCheckpoint(db, { companyId: input.companyId, issueId: input.issueId, runId: source.id });
+  } catch (cause) {
+    return { kind: "dependency_unavailable", reason: "checkpoint_authority_unreadable", cause };
+  }
+  if (!checkpoint || checkpoint.recoveryEvidence.runnerInstanceId !== metadata.checkpoint.runnerInstanceId
+    || checkpoint.recoveryEvidence.normalizedSessionId !== input.normalizedSessionId) {
+    return { kind: "missing_evidence", reason: "checkpoint_binding" };
+  }
+  return { kind: "recoverable", snapshot: snapshot as unknown as PersistedNativeSession, metadata, checkpoint };
+}
+
+/** Bounded internal migration of ONE retained source while its disk is available.
+ * The migration owner supplies compatibility computed from the admitted input.
+ * This never repairs/replaces the saved snapshot or claims a live execution. */
+export async function importNativeControllerRecovery(db: Db, input: {
+  companyId: string; agentId: string; issueId: string; runId: string; normalizedSessionId: string;
+  expectedConfigDigest: string;
+  supervisor?: unknown;
+  offline?: { writersStopped: true; legacyControllerState?: string; legacyRunnerArtifact?: { version: string; digest: string } };
+  legacyCheckpoint?: { legacyControllerState?: string; legacyRunnerArtifact?: { version: string; digest: string } };
+}): Promise<{ kind: "imported" | "unchanged" } | Exclude<NativeControllerRecoveryOutcome, { kind: "recoverable" } | { kind: "no_prior_execution" }>> {
+  if (input.offline && input.legacyCheckpoint) throw new Error("Conflicting native controller migration authority");
+  const legacy = input.offline ?? input.legacyCheckpoint;
+  const supervisor = record(input.supervisor);
+  if (input.supervisor !== undefined && (supervisor.schema !== "paperclip.native-session-supervisor.v1" || supervisor.configDigest !== input.expectedConfigDigest)) {
+    return { kind: "unsupported", reason: "supervisor_compatibility" };
+  }
+  return db.transaction(async tx => {
+    const [task] = await tx.select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId }).from(issues)
+      .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).for("share");
+    const [owner] = await tx.select().from(nativeRunFinalizations).where(and(
+      eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.issueId, input.issueId),
+      eq(nativeRunFinalizations.runId, input.runId))).for("update");
+    if (!task || !owner) return { kind: "missing_evidence" as const, reason: "owner_binding" };
+    if (input.offline) {
+      const [active] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(offlineMigrationExecutionWhere()).limit(1);
+      if (!input.offline.writersStopped || active) return { kind: "missing_evidence" as const, reason: "offline_writers_required" };
+    }
+    const [clock] = await tx.execute<{ now: Date }>(sql`select clock_timestamp() as now`);
+    const liveOwner = owner.leaseOwner && (!owner.leaseExpiresAt || owner.leaseExpiresAt > new Date(clock.now));
+    if (input.offline ? liveOwner : owner.leaseOwner || task.executionRunId) {
+      return owner.leaseExpiresAt && owner.leaseExpiresAt > new Date(clock.now)
+        ? { kind: "waiting_for_owner" as const, deadline: owner.leaseExpiresAt }
+        : { kind: "missing_evidence" as const, reason: "normal_ownership_recovery_required" };
+    }
+    if (!input.offline && (!(owner.phase === "committed" && owner.resultId) || owner.recoveryState)) {
+      return { kind: "missing_evidence" as const, reason: "pending_finalization" };
+    }
+    if (input.legacyCheckpoint) {
+      const [active] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.status, ["queued", "running"]),
+        or(eq(heartbeatRuns.nativeIssueId, input.issueId), eq(heartbeatRuns.issueId, input.issueId),
+          eq(heartbeatRuns.nativeSessionId, input.normalizedSessionId)))).limit(1);
+      if (task.checkoutRunId || active) return { kind: "missing_evidence" as const, reason: "legacy_source_active" };
+    }
+    const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.runId),
+      eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId),
+      eq(heartbeatRuns.nativeIssueId, input.issueId), eq(heartbeatRuns.nativeSessionId, input.normalizedSessionId))).for("update");
+    const profile = record(run?.runnerProfileJson), snapshot = record(profile.sessionCheckpoint), identity = record(snapshot.identity);
+    if (run?.runtimeMode !== "native" || !(run.status === "succeeded" || input.legacyCheckpoint && run.status === "failed"
+      || input.offline && ["failed", "cancelled", "interrupted", "timed_out"].includes(run.status)) || !run.finishedAt
+      || identity.runId !== input.runId || identity.companyId !== input.companyId || identity.issueId !== input.issueId
+      || identity.agentId !== input.agentId || identity.sessionId !== input.normalizedSessionId
+      || input.supervisor !== undefined && nativeSha256(snapshot) !== nativeSha256(redactRunnerApiPayloads(supervisor.snapshot))) {
+      return { kind: "missing_evidence" as const, reason: "stale_supervisor_snapshot" };
+    }
+    let checkpoint = await loadNativeRunnerCheckpoint(tx, input);
+    if (input.supervisor === undefined) {
+      try {
+        const admitted = parseNativeExecutionInput(profile.nativeExecutionInput);
+        if (!legacy || (!checkpoint && admitted.session.lifecyclePolicy.mode !== "per_turn")
+          || admitted.session.normalizedSessionId !== input.normalizedSessionId
+          || admitted.binding.runId !== input.runId || admitted.binding.companyId !== input.companyId
+          || admitted.binding.agentId !== input.agentId || admitted.binding.issueId !== input.issueId) {
+          return { kind: "missing_evidence" as const, reason: "admitted_per_turn_binding" };
+        }
+      } catch { return { kind: "unsupported" as const, reason: "admitted_input_format" }; }
+    }
+    const importing = !checkpoint && legacy?.legacyControllerState !== undefined;
+    if (importing) {
+      if (!run.runnerInstanceId) return { kind: "missing_evidence" as const, reason: "checkpoint_binding" };
+      checkpoint = captureLegacyDurablePrpCheckpoint(legacy!.legacyControllerState!, {
+        runId: input.runId, runnerInstanceId: run.runnerInstanceId, normalizedSessionId: input.normalizedSessionId,
+      }, legacy!.legacyRunnerArtifact);
+    }
+    if (!checkpoint || checkpoint.recoveryEvidence.normalizedSessionId !== input.normalizedSessionId
+      || checkpoint.recoveryEvidence.runnerInstanceId !== run.runnerInstanceId) {
+      return { kind: "missing_evidence" as const, reason: "checkpoint_binding" };
+    }
+    const metadata = createNativeControllerRecovery(snapshot as unknown as PersistedNativeSession, {
+      configDigest: input.expectedConfigDigest,
+      processConfigDigest: typeof supervisor.processConfigDigest === "string" ? supervisor.processConfigDigest : null,
+    }, { runId: input.runId, runnerInstanceId: checkpoint.recoveryEvidence.runnerInstanceId, normalizedSessionId: input.normalizedSessionId });
+    if (!readNativeControllerRecovery(metadata, snapshot)) return { kind: "unsupported" as const, reason: "metadata_format" };
+    if (profile.nativeControllerRecovery) {
+      if (nativeSha256(profile.nativeControllerRecovery) !== nativeSha256(metadata)) {
+        return { kind: "missing_evidence" as const, reason: "existing_metadata_conflict" };
+      }
+      if (importing) await insertMigratedNativeRunnerCheckpoint(tx, input, checkpoint);
+      return { kind: importing ? "imported" as const : "unchanged" as const };
+    }
+    if (importing) await insertMigratedNativeRunnerCheckpoint(tx, input, checkpoint);
+    await tx.update(heartbeatRuns).set({ runnerProfileJson: { ...profile, nativeControllerRecovery: metadata }, updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, input.runId));
+    return { kind: "imported" as const };
+  });
+}

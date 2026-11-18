@@ -1,0 +1,680 @@
+import { agentIdentityRedactionVectors, pemBodyWindows, pemTransformForms } from "../../__tests__/fixtures/agent-identity-redaction-vectors.js";
+import { NativeSessionDiagnostics } from "../native-runtime/native-session-diagnostics.js";
+import { withS3FailureDiagnostics } from "../../storage/s3-failure.js";
+import { objectLogFixture } from "./__tests__/object-log-fixture.js";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { Readable } from "node:stream";
+import type { Db, heartbeatRuns } from "@paperclipai/db";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDurableRunLogStore } from "../run-log-store.js";
+import type { StorageProvider } from "../../storage/types.js";
+import { createHeartbeatRunOutput, isNewRunLog } from "./run-output.js";
+import { addRunSecretMaterial, createAgentIdentityRedactor } from "../agent-identity-redaction.js";
+import { formatNativeRunLogEvent } from "../native-runtime/native-run-log-export.js";
+import { generateKeyPairSync } from "node:crypto";
+import { reportStorageOutageWaitsTo, runInOwnStorageScope } from "../../storage/storage-unavailable.js";
+import { clearAllHeartbeatRunRuntimeStatuses, getHeartbeatRunRuntimeStatus } from "../heartbeat-run-runtime-status.js";
+import { createStorageWaitNotice, STORAGE_WAIT_PHASE } from "./storage-wait-notice.js";
+
+vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
+
+type Run = typeof heartbeatRuns.$inferSelect;
+
+function createMemoryProvider() {
+  const objects = new Map<string, Buffer>();
+  const calls = { head: 0, get: 0 };
+  const provider: StorageProvider = {
+    id: "s3",
+    async putObject(input) {
+      const chunks: Buffer[] = [];
+      for await (const chunk of Readable.from(input.body)) chunks.push(Buffer.from(chunk));
+      objects.set(input.objectKey, Buffer.concat(chunks));
+    },
+    async getObject(input) {
+      calls.get++;
+      const buf = objects.get(input.objectKey)!;
+      return { stream: Readable.from(buf), contentLength: buf.length };
+    },
+    async headObject(input) {
+      calls.head++;
+      const buf = objects.get(input.objectKey);
+      return buf ? { exists: true, contentLength: buf.length } : { exists: false };
+    },
+    async deleteObject(input) {
+      objects.delete(input.objectKey);
+    },
+  };
+  return { provider, objects, calls };
+}
+
+// The recorder persists the handle with update().set().where(); capture it the
+// way the run row would carry it into a later attempt.
+function createRunRowDb(row: Partial<Run>) {
+  return {
+    async transaction<T>(write: (tx: Db) => Promise<T>): Promise<T> { return write(this as unknown as Db); },
+    update: () => ({
+      set: (values: Partial<Run>) => ({
+        where: async () => {
+          Object.assign(row, values);
+        },
+      }),
+    }),
+  } as unknown as Db;
+}
+
+const newRunRow = {
+  id: "run-1",
+  companyId: "company-1",
+  agentId: "agent-1",
+  status: "running",
+  logStore: null,
+  logRef: null,
+  logBytes: null,
+  lastOutputSeq: 0,
+  lastOutputAt: null,
+} as Partial<Run>;
+
+describe("claiming the run log during a storage outage (storage chaos ST1)", () => {
+  const outage = () => withS3FailureDiagnostics("put_object", async () => {
+    throw Object.assign(new Error("Injected storage outage"), { name: "ServiceUnavailable", $metadata: { httpStatusCode: 503 } });
+  });
+  const output = (begin: () => Promise<never | { store: "s3_segments"; logRef: string }>, signal?: AbortSignal) =>
+    createHeartbeatRunOutput(createRunRowDb({ ...newRunRow }), { run: newRunRow as Run, runId: "run-1", issueId: null,
+      runLogStore: { begin, append: async () => 0, enqueue: async () => ({ committed: Promise.resolve(0) }), flush: async () => undefined },
+      identityRedactor: { chunk: (_stream, chunk) => chunk, redact: value => value }, secretKeys: new Set(),
+      appendRunEvent: vi.fn(), getCurrentUserRedactionOptions: async () => ({ enabled: false }), signal });
+
+  it("claims the log once the store is back instead of failing the run", async () => {
+    let calls = 0;
+    const begin = vi.fn(async () => (++calls < 2 ? outage() : { store: "s3_segments" as const, logRef: "company/agent/run" }));
+    await output(begin).begin({ ...newRunRow } as Run);
+    expect(begin).toHaveBeenCalledTimes(2);
+  }, 30_000);
+
+  it("shows the wait as live status and writes nothing to the run while its log claim waits", async () => {
+    clearAllHeartbeatRunRuntimeStatuses();
+    const row = { ...newRunRow, contextSnapshot: { issueId: "issue-1" } } as Partial<Run>;
+    const writes: Partial<Run>[] = [];
+    const db = createRunRowDb(row);
+    const update = db.update.bind(db);
+    (db as { update: unknown }).update = (table: unknown) => {
+      const pending = (update as (t: unknown) => { set: (v: Partial<Run>) => unknown })(table);
+      return { set: (values: Partial<Run>) => { writes.push(values); return pending.set(values); } };
+    };
+    const appendRunEvent = vi.fn(async (_run: unknown, _event: { payload?: { reason?: string } }) => undefined);
+    const authority = vi.fn(async () => undefined);
+    const seen: Array<{ writes: number; events: number; phase: string | undefined; message: string | undefined }> = [];
+    let calls = 0;
+    const begin = vi.fn(async (input: { assertWriterAuthority?: () => Promise<void> }) => {
+      const status = getHeartbeatRunRuntimeStatus("run-1", { companyId: "company-1", agentId: "agent-1" });
+      seen.push({ writes: writes.length, events: appendRunEvent.mock.calls.length, phase: status?.phase, message: status?.message });
+      if (++calls < 3) return outage();
+      await input.assertWriterAuthority?.();
+      return { store: "s3_segments" as const, logRef: "company/agent/run" };
+    });
+    const recorder = createHeartbeatRunOutput(db, { run: row as Run, runId: "run-1", issueId: "issue-1",
+      runLogStore: { begin, append: async () => 0, enqueue: async () => ({ committed: Promise.resolve(0) }), flush: async () => undefined },
+      identityRedactor: { chunk: (_stream, chunk) => chunk, redact: value => value }, secretKeys: new Set(),
+      appendRunEvent: appendRunEvent as never, getCurrentUserRedactionOptions: async () => ({ enabled: false }),
+      assertWriterAuthority: authority });
+    await runInOwnStorageScope(async () => {
+      reportStorageOutageWaitsTo(createStorageWaitNotice({ run: row as Run, appendRunEvent: appendRunEvent as never }));
+      await recorder.begin(row as Run);
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(begin).toHaveBeenCalledTimes(3);
+    expect(authority).toHaveBeenCalledTimes(1);
+    expect(seen.slice(1)).toEqual([
+      expect.objectContaining({ writes: 0, events: 0, phase: STORAGE_WAIT_PHASE, message: expect.stringContaining("before starting the run log") }),
+      expect.objectContaining({ writes: 0, events: 0, phase: STORAGE_WAIT_PHASE }),
+    ]);
+    expect(writes).toEqual([expect.objectContaining({ logStore: "s3_segments", logRef: "company/agent/run" })]);
+    expect(appendRunEvent).toHaveBeenCalledTimes(1);
+    expect(appendRunEvent).toHaveBeenCalledWith(row, expect.objectContaining({ eventType: "lifecycle",
+      message: expect.stringMatching(/^Waited \d+s for file storage before starting the run log\.$/),
+      payload: expect.objectContaining({ reason: "storage_outage_wait", recovered: true }) }));
+    expect(getHeartbeatRunRuntimeStatus("run-1", { companyId: "company-1", agentId: "agent-1" })?.phase).toBe("run_activity");
+  }, 30_000);
+
+  it("stops waiting as soon as the run is stopped", async () => {
+    const stop = new AbortController();
+    const begin = vi.fn(async () => outage());
+    setTimeout(() => stop.abort(new Error("Stopped by a board operator")), 100);
+    const startedAt = Date.now();
+    await expect(output(begin, stop.signal).begin({ ...newRunRow } as Run)).rejects.toBeTruthy();
+    expect(Date.now() - startedAt).toBeLessThan(1_500);
+  }, 30_000);
+});
+
+async function beginAttempt(store: ReturnType<typeof createDurableRunLogStore>, row: Partial<Run>) {
+  const output = createHeartbeatRunOutput(createRunRowDb(row), {
+    run: row as Run,
+    runId: row.id!,
+    issueId: null,
+    runLogStore: store,
+    identityRedactor: { chunk: (_stream, chunk) => chunk, redact: (value) => value },
+    secretKeys: new Set(),
+    appendRunEvent: vi.fn(),
+    getCurrentUserRedactionOptions: async () => ({ enabled: false }),
+  });
+  const { onLog } = await output.begin({ ...row } as Run);
+  return { output, onLog };
+}
+
+let baseDir: string;
+beforeEach(async () => {
+  baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "run-output-test-"));
+});
+afterEach(async () => {
+  await fs.rm(baseDir, { recursive: true, force: true });
+});
+
+describe("heartbeat run output log recovery", () => {
+  it("keeps active diagnostic identity and current-user redaction while idle retention stays content-free", async () => {
+    const row = { ...newRunRow }, store = objectLogFixture(), idle = vi.fn();
+    const owner = { companyId: row.companyId!, runId: row.id!, sessionScope: "synthetic-session" };
+    const events = vi.fn(async () => undefined);
+    const output = createHeartbeatRunOutput(createRunRowDb(row), { run: row as Run, runId: row.id!, issueId: null,
+      runLogStore: store, identityRedactor: createAgentIdentityRedactor("SYNTHETIC_PRIVATE_KEY"), secretKeys: new Set(), appendRunEvent: events,
+      getCurrentUserRedactionOptions: async () => ({ enabled: true, userNames: ["synthetic-user"], homeDirs: ["/home/synthetic-user"] }) });
+    const handlers = await output.begin(row as Run);
+    const channel = new NativeSessionDiagnostics(owner, owner, idle, vi.fn());
+    const lease = channel.activate(owner, handlers.onLog);
+    const text = "diagnostic SYNTHETIC_PRIVATE_KEY /home/synthetic-user/data synthetic-user\n";
+    channel.record(text);
+    lease.retire();
+    const summary = await store.finalize(output.handle!);
+    const before = await store.read(output.handle!, { limitBytes: 65536 });
+    expect(summary.bytes).toBe(Buffer.byteLength(before.content));
+    expect(before.content).toContain("diagnostic");
+    for (const value of ["SYNTHETIC_PRIVATE_KEY", "synthetic-user"]) expect(before.content).not.toContain(value);
+    channel.record(text);
+    expect(idle).toHaveBeenCalledWith(owner, "session_diagnostic");
+    expect(JSON.stringify(idle.mock.calls)).not.toContain("synthetic-user");
+    expect(JSON.stringify(idle.mock.calls)).not.toContain("SYNTHETIC_PRIVATE_KEY");
+    expect((await store.read(output.handle!, { limitBytes: 65536 })).content).toBe(before.content);
+    expect(events).not.toHaveBeenCalled();
+  });
+
+  it.each(["enqueue", "progress", "export"] as const)("still warns for a genuine %s failure", async phase => {
+    const row = { ...newRunRow }, events = vi.fn(async () => undefined);
+    const base = createRunRowDb(row);
+    const db = { ...base,
+      select: () => { throw new Error("synthetic canonical-source read failure"); },
+      update: () => ({ set: (values: Partial<Run>) => ({ where: async () => {
+        if (phase === "progress" && values.lastOutputSeq !== undefined) throw new Error("synthetic progress write failure");
+        Object.assign(row, values);
+      } }) }),
+    } as unknown as Db;
+    const output = createHeartbeatRunOutput(db, { run: row as Run, runId: row.id!, issueId: null,
+      runLogStore: { begin: async () => ({ store: "s3_segments", logRef: "synthetic-company/agent/run" }),
+        append: async () => 10, enqueue: async () => {
+          if (phase === "enqueue") throw new Error("synthetic object admission failure");
+          return { committed: Promise.resolve(10) };
+        }, flush: async () => undefined },
+      identityRedactor: { chunk: (_stream, chunk) => chunk, redact: value => value }, secretKeys: new Set(),
+      appendRunEvent: events, getCurrentUserRedactionOptions: async () => ({ enabled: false }) });
+    const handlers = await output.begin(row as Run);
+    if (phase === "export") await handlers.onPersistedNativeLog!(1, "synthetic canonical source");
+    else {
+      const owner = { companyId: row.companyId!, runId: row.id!, sessionScope: "synthetic-session" };
+      const channel = new NativeSessionDiagnostics(owner, owner, vi.fn(), vi.fn());
+      const lease = channel.activate(owner, handlers.onLog);
+      channel.record("accepted active diagnostic");
+      lease.retire();
+    }
+    await vi.waitFor(() => expect(events).toHaveBeenCalledWith(expect.objectContaining({ id: row.id, companyId: row.companyId }),
+      expect.objectContaining({ level: "warn", payload: { reason: "object_log_persistence_failed" } })));
+  });
+
+  it("treats only a run row with no recorded log or output as new", () => {
+    expect(isNewRunLog({ logStore: null, logRef: null, logBytes: null, lastOutputSeq: 0 })).toBe(
+      true,
+    );
+    expect(
+      isNewRunLog({
+        logStore: "local_file",
+        logRef: "c/a/r.ndjson",
+        logBytes: null,
+        lastOutputSeq: 0,
+      }),
+    ).toBe(false);
+    expect(
+      isNewRunLog({ logStore: null, logRef: "c/a/r.ndjson", logBytes: null, lastOutputSeq: 0 }),
+    ).toBe(false);
+    expect(isNewRunLog({ logStore: null, logRef: null, logBytes: null, lastOutputSeq: 3 })).toBe(
+      false,
+    );
+    expect(isNewRunLog({ logStore: null, logRef: null, logBytes: 120, lastOutputSeq: 0 })).toBe(
+      false,
+    );
+  });
+
+  it("makes no remote log recovery request for a new run", async () => {
+    const { provider, calls } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const row = { ...newRunRow };
+    const { onLog } = await beginAttempt(store, row);
+    await onLog("stdout", "hello\n");
+    expect(calls).toEqual({ head: 0, get: 0 });
+    expect(row.logRef).toBe(path.join("company-1", "agent-1", "run-1.ndjson"));
+  });
+
+  it("restores an existing attempt's durable log after local state is lost", async () => {
+    const { provider, objects, calls } = createMemoryProvider();
+    const row = { ...newRunRow };
+    const firstStore = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const first = await beginAttempt(firstStore, row);
+    await first.onLog("stdout", "attempt one\n");
+    await firstStore.finalize(first.output.handle!);
+    expect(calls).toEqual({ head: 0, get: 0 });
+
+    // Process restart on a new pod: local logs and in-memory state are gone,
+    // but the run row still records the earlier attempt's log.
+    await fs.rm(baseDir, { recursive: true, force: true });
+    const restartedStore = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const second = await beginAttempt(restartedStore, row);
+    expect(calls).toEqual({ head: 1, get: 1 });
+    await second.onLog("stdout", "attempt two\n");
+    await restartedStore.finalize(second.output.handle!);
+
+    const lines = objects
+      .get(row.logRef!)!
+      .toString()
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(lines.map((line) => line.chunk)).toEqual(["attempt one\n", "attempt two\n"]);
+    expect(lines.map((line) => line.seq)).toEqual([1, 2]);
+  });
+});
+
+describe("transformed identity material at the object-log boundary (#20832)", () => {
+  const fixture = agentIdentityRedactionVectors();
+  const cases = fixture.vectors.flatMap(vector => (["diagnostic", "native export"] as const).map(path => ({ ...vector, path })));
+
+  it.each(cases)("redacts $name through $path before storage", async ({ chunks, path: entryPath }) => {
+    const row = { ...newRunRow } as Run;
+    const store = objectLogFixture();
+    const db = createRunRowDb(row) as Db & { select: () => unknown };
+    db.select = (() => ({ from: () => ({ where: () => ({ orderBy: () => ({ limit: async () => [] }) }) }) })) as typeof db.select;
+    const output = createHeartbeatRunOutput(db, {
+      run: row, runId: row.id, issueId: null, runLogStore: store,
+      identityRedactor: createAgentIdentityRedactor(fixture.privateKeyPem), secretKeys: new Set(),
+      appendRunEvent: vi.fn(), getCurrentUserRedactionOptions: async () => ({ enabled: false }),
+    });
+    const handlers = await output.begin(row);
+    // The leading precision controls are outside all PEM/key-body context.
+    const allChunks = [fixture.precision.join("\n") + "\n", ...chunks, "\n", fixture.precision.join("\n") + "\n"];
+    let cursor = 0;
+    for (const chunk of allChunks) {
+      if (entryPath === "diagnostic") await handlers.onLog("stdout", chunk);
+      else await handlers.onPersistedNativeLog!(++cursor, formatNativeRunLogEvent({
+        schema: "paperclip.prp.event.v1", schemaVersion: 1, runId: row.id,
+        sourceEventId: `source:${cursor}`, sourceInstanceId: "source", sourceKind: "runner",
+        sourceSeq: cursor, normalizedSessionId: "session", eventType: "item.delta", priority: 2,
+        emittedAt: new Date().toISOString(), payload: { text: chunk },
+      }));
+    }
+    await store.finalize(output.handle!);
+    const content = (await store.read(output.handle!, { limitBytes: 128 * 1024 })).content;
+    const stored = content.trim().split("\n").map(line => {
+      const chunk = JSON.parse(line).chunk as string;
+      return entryPath === "diagnostic" ? chunk : JSON.parse(chunk).event.payload.text as string;
+    }).join("");
+    for (const window of fixture.windows) expect(stored, "32-character key-body window survived").not.toContain(window);
+    expect(stored).not.toMatch(/-----BEGIN[^\r\n]*PRIVATE KEY-----|-----END[^\r\n]*PRIVATE KEY-----/);
+    for (const value of fixture.precision) {
+      expect(value).toHaveLength(44);
+      expect(stored).toContain(value);
+    }
+  });
+});
+
+// Gate 5 row 5.5: a run secret PEM printed through shell transforms. The run
+// secret joins the identity redactor the way live preparation adds it.
+describe("transformed run-secret and identity PEMs at the object-log boundary", () => {
+  const fixture = agentIdentityRedactionVectors();
+  const runSecretPem = generateKeyPairSync("rsa", { modulusLength: 2048 })
+    .privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+  const cases = [["run secret", runSecretPem], ["agent identity", fixture.privateKeyPem]].flatMap(([key, pem]) =>
+    pemTransformForms(pem!).flatMap(form => (["diagnostic", "native export"] as const).map(entryPath =>
+      ({ key, pem: pem!, form: form.name, text: form.text, entryPath }))));
+
+  it.each(cases)("redacts the $key through $form via $entryPath before storage", async ({ pem, text, entryPath }) => {
+    const row = { ...newRunRow } as Run;
+    const store = objectLogFixture();
+    const db = createRunRowDb(row) as Db & { select: () => unknown };
+    db.select = (() => ({ from: () => ({ where: () => ({ orderBy: () => ({ limit: async () => [] }) }) }) })) as typeof db.select;
+    const identityRedactor = createAgentIdentityRedactor(fixture.privateKeyPem);
+    identityRedactor.values.push(...createAgentIdentityRedactor(runSecretPem).values);
+    identityRedactor.values.sort((left, right) => right.length - left.length);
+    const output = createHeartbeatRunOutput(db, {
+      run: row, runId: row.id, issueId: null, runLogStore: store, identityRedactor, secretKeys: new Set(),
+      appendRunEvent: vi.fn(), getCurrentUserRedactionOptions: async () => ({ enabled: false }),
+    });
+    const handlers = await output.begin(row);
+    const allChunks = [fixture.precision.join("\n") + "\n", text, "\n", fixture.precision.join("\n") + "\n"];
+    let cursor = 0;
+    for (const chunk of allChunks) {
+      if (entryPath === "diagnostic") await handlers.onLog("stdout", chunk);
+      else await handlers.onPersistedNativeLog!(++cursor, formatNativeRunLogEvent({
+        schema: "paperclip.prp.event.v1", schemaVersion: 1, runId: row.id,
+        sourceEventId: `source:${cursor}`, sourceInstanceId: "source", sourceKind: "runner",
+        sourceSeq: cursor, normalizedSessionId: "session", eventType: "item.delta", priority: 2,
+        emittedAt: new Date().toISOString(), payload: { text: chunk },
+      }));
+    }
+    await store.finalize(output.handle!);
+    const content = (await store.read(output.handle!, { limitBytes: 512 * 1024 })).content;
+    const stored = content.trim().split("\n").map(line => {
+      const chunk = JSON.parse(line).chunk as string;
+      return entryPath === "diagnostic" ? chunk : JSON.parse(chunk).event.payload.text as string;
+    }).join("");
+    const compact = stored.replace(/\s+/g, "");
+    const windows = pemBodyWindows(pem);
+    const leaked = windows.filter(window => compact.includes(window));
+    expect(leaked.length, `${leaked.length}/${windows.length} key-body windows survived`).toBe(0);
+    expect(stored.replace(/\r?\n/g, "")).not.toMatch(/(?:BEGIN|END)[A-Z ]*PRIVATE KEY/);
+    for (const value of fixture.precision) expect(stored).toContain(value);
+  });
+});
+
+describe("object-backed diagnostic recording", () => {
+  it.each(["legacy", "native"])("applies identity redaction before S3 admission when output begins in %s mode", async (runtimeMode) => {
+    const privateKeyPem = generateKeyPairSync("ed25519")
+      .privateKey.export({ type: "pkcs8", format: "pem" })
+      .toString();
+    const row = { ...newRunRow, runtimeMode } as Run;
+    const db = createRunRowDb(row) as Db & { select: () => unknown };
+    db.select = (() => ({
+      from: () => ({ where: () => ({ orderBy: () => ({ limit: async () => [] }) }) }),
+    })) as typeof db.select;
+    const chunks: string[] = [];
+    const output = createHeartbeatRunOutput(db, {
+      run: row,
+      runId: row.id,
+      issueId: null,
+      secretKeys: new Set(),
+      identityRedactor: createAgentIdentityRedactor(privateKeyPem),
+      runLogStore: {
+        begin: async () => ({
+          store: "s3_segments",
+          logRef: "company/agent/run",
+          initialSourceCursor: 0,
+        }),
+        append: async () => 0,
+        enqueue: async (_handle, event) => {
+          chunks.push(event.chunk);
+          return { committed: Promise.resolve(100) };
+        },
+        flush: async () => undefined,
+      },
+      appendRunEvent: vi.fn(),
+      getCurrentUserRedactionOptions: async () => ({ enabled: false }),
+    });
+    const handlers = await output.begin(row);
+    await handlers.onPersistedNativeLog!(
+      1,
+      formatNativeRunLogEvent({
+        schema: "paperclip.prp.event.v1",
+        schemaVersion: 1,
+        runId: row.id,
+        sourceEventId: "source:1",
+        sourceInstanceId: "source",
+        sourceKind: "runner",
+        sourceSeq: 1,
+        normalizedSessionId: "session",
+        eventType: "harness.diagnostic",
+        priority: 1,
+        emittedAt: new Date().toISOString(),
+        payload: { text: privateKeyPem },
+      }),
+    );
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]).not.toContain(privateKeyPem.split("\n")[1]!);
+    expect(chunks[0]).toContain("REDACTED");
+  });
+  it("admits a burst without serial network waits, publishes after receipts, and coalesces progress", async () => {
+    const { publishLiveEvent } = await import("../live-events.js");
+    vi.mocked(publishLiveEvent).mockClear();
+    const row = { ...newRunRow };
+    const writes: Array<Partial<Run>> = [];
+    const db = {
+      async transaction<T>(write: (tx: Db) => Promise<T>): Promise<T> { return write(this as unknown as Db); },
+      update: () => ({
+        set: (values: Partial<Run>) => ({
+          where: async () => {
+            writes.push(values);
+            Object.assign(row, values);
+          },
+        }),
+      }),
+    } as unknown as Db;
+    const commit: Array<() => void> = [];
+    const recorder = createHeartbeatRunOutput(db, {
+      run: row as Run,
+      runId: row.id!,
+      issueId: null,
+      runLogStore: {
+        begin: async () => ({
+          store: "s3_segments",
+          logRef: "company/agent/run",
+          initialBytes: 0,
+          initialSequence: 10,
+        }),
+        append: () => new Promise<number>((resolve) => commit.push(() => resolve(100))),
+      },
+      identityRedactor: { chunk: (_stream, chunk) => chunk, redact: (value) => value },
+      secretKeys: new Set(),
+      appendRunEvent: vi.fn(),
+      getCurrentUserRedactionOptions: async () => ({ enabled: false }),
+    });
+    const { onLog } = await recorder.begin(row as Run);
+    for (let i = 0; i < 100; i++) await onLog("stdout", `line ${i}\n`);
+    expect(commit).toHaveLength(100);
+    expect(publishLiveEvent).not.toHaveBeenCalled();
+    for (const resolve of commit) resolve();
+    await vi.waitFor(() =>
+      expect(
+        vi
+          .mocked(publishLiveEvent)
+          .mock.calls.filter(([event]) => event.type === "heartbeat.run.log"),
+      ).toHaveLength(100),
+    );
+    await recorder.flushOutputProgress({ force: true });
+    expect(row.lastOutputSeq).toBe(110);
+    expect(row.lastOutputBytes).toBe(10000);
+    expect(writes.filter((write) => write.lastOutputSeq !== undefined)).toHaveLength(2);
+  });
+
+  it.each(["succeeds", "fails"] as const)("holds the log's finalization until a reattach's deferred re-verification %s", async (outcome) => {
+    const row = { ...newRunRow, runtimeMode: "native", logStore: "s3_segments", logRef: "company/agent/run", lastOutputSeq: 4 } as Run;
+    const db = createRunRowDb(row);
+    let releaseRead!: () => void;
+    const read = vi.fn(async () => {
+      await new Promise<void>(resolve => { releaseRead = resolve; });
+      if (outcome === "fails") throw new Error("object store read failed");
+      return { content: "", nextOffset: 0, eof: true };
+    });
+    const appendRunEvent = vi.fn(async (_run: unknown, _event: { payload?: { reason?: string } }) => undefined);
+    const output = createHeartbeatRunOutput(db, {
+      run: row, runId: row.id, issueId: null, secretKeys: new Set(),
+      identityRedactor: { chunk: (_stream, chunk) => chunk, redact: value => value },
+      runLogStore: {
+        begin: async () => ({ store: "s3_segments", logRef: "company/agent/run", initialBytes: 4_000_000, initialSequence: 4,
+          initialSourceCursor: 900 }),
+        append: async () => 0, enqueue: async () => ({ committed: Promise.resolve(0) }), flush: async () => undefined,
+        read: read as never,
+      },
+      appendRunEvent: appendRunEvent as never, getCurrentUserRedactionOptions: async () => ({ enabled: false }),
+      deferNativeLogRecovery: true,
+    });
+    await output.begin(row);
+    await vi.waitFor(() => expect(read).toHaveBeenCalled());
+    let settled = false;
+    const settling = output.settleDeferredLogRecovery().then(() => { settled = true; });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+    releaseRead();
+    await settling;
+    expect(settled).toBe(true);
+    if (outcome === "fails") expect(appendRunEvent.mock.calls.some(([, event]) => event.payload?.reason === "object_log_persistence_failed")).toBe(true);
+  });
+
+  it("settles at once when no log re-verification was deferred", async () => {
+    const row = { ...newRunRow } as Run;
+    const output = createHeartbeatRunOutput(createRunRowDb(row), {
+      run: row, runId: row.id, issueId: null, secretKeys: new Set(),
+      identityRedactor: { chunk: (_stream, chunk) => chunk, redact: value => value },
+      runLogStore: { begin: async () => ({ store: "local_file", logRef: "run.ndjson" }), append: async () => 0 } as never,
+      appendRunEvent: vi.fn(async () => undefined) as never, getCurrentUserRedactionOptions: async () => ({ enabled: false }),
+    });
+    await expect(output.settleDeferredLogRecovery()).resolves.toBeUndefined();
+  });
+
+  it.each([false, true])("lets a reattach start before its existing log is re-verified (deferred %s)", async (deferNativeLogRecovery) => {
+    const row = { ...newRunRow, runtimeMode: "native", logStore: "s3_segments", logRef: "company/agent/run", lastOutputSeq: 4 } as Run;
+    const db = createRunRowDb(row);
+    let releaseRead!: () => void;
+    const readStarted = vi.fn();
+    const read = vi.fn(async () => {
+      readStarted();
+      await new Promise<void>(resolve => { releaseRead = resolve; });
+      return { content: "", nextOffset: 0, eof: true };
+    });
+    const output = createHeartbeatRunOutput(db, {
+      run: row, runId: row.id, issueId: null, secretKeys: new Set(),
+      identityRedactor: { chunk: (_stream, chunk) => chunk, redact: value => value },
+      runLogStore: {
+        begin: async () => ({ store: "s3_segments", logRef: "company/agent/run", initialBytes: 4_000_000, initialSequence: 4,
+          initialSourceCursor: 900 }),
+        append: async () => 0, enqueue: async () => ({ committed: Promise.resolve(0) }), flush: async () => undefined,
+        read: read as never,
+      },
+      appendRunEvent: vi.fn(async () => undefined) as never, getCurrentUserRedactionOptions: async () => ({ enabled: false }),
+      deferNativeLogRecovery,
+    });
+    let begun = false;
+    const beginning = output.begin(row).then(() => { begun = true; });
+    await vi.waitFor(() => expect(readStarted).toHaveBeenCalled());
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(begun).toBe(deferNativeLogRecovery);
+    releaseRead();
+    await beginning.catch(() => undefined);
+  });
+});
+
+// receipt-stamp: a tool event whose stream holds a possible secret prefix is
+// committed only when its stream's next event arrives, so stored seq order is
+// not the adapter's order. Each stored adapter event carries the receipt stamp
+// payload.receivedAt / payload.adapterEventIndex, assigned when it is received.
+describe("adapter event receipt stamp", () => {
+  type StoredEvent = { seq: number; eventType: string; message?: string; payload?: Record<string, unknown> };
+  async function recorder(secrets: string[]) {
+    const row = { ...newRunRow } as Run;
+    const stored: StoredEvent[] = [];
+    const identityRedactor = createAgentIdentityRedactor();
+    addRunSecretMaterial(identityRedactor, secrets);
+    const output = createHeartbeatRunOutput(createRunRowDb(row), {
+      run: row, runId: row.id, issueId: null, secretKeys: new Set(), identityRedactor,
+      runLogStore: { begin: async () => ({ store: "local_file", logRef: "synthetic/run-1" }), append: async () => 0,
+        enqueue: async () => ({ committed: Promise.resolve(0) }), flush: async () => undefined } as never,
+      appendRunEvent: (async (_run: Run, event: Omit<StoredEvent, "seq">) => {
+        stored.push({ seq: stored.length + 1, ...structuredClone(event) });
+      }) as never,
+      getCurrentUserRedactionOptions: async () => ({ enabled: false }),
+    });
+    return { stored, handlers: await output.begin(row) };
+  }
+  const stamp = (event: StoredEvent) => ({
+    receivedAt: event.payload?.receivedAt, adapterEventIndex: event.payload?.adapterEventIndex,
+  });
+  const byIndex = (events: StoredEvent[]) =>
+    [...events].sort((left, right) => Number(left.payload?.adapterEventIndex) - Number(right.payload?.adapterEventIndex));
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("(1) review-fleet-4: A1 held, N1, B1, A2 sort back to adapter order by adapterEventIndex, whatever their seq", async () => {
+    const secret = "synthetic-secret-token-0001"; // test-only
+    const { stored, handlers } = await recorder([secret]);
+    await handlers.onAdapterEvent({ eventType: "tool.output", stream: "stdout", message: "A1",
+      payload: { toolCallId: "A", output: "A1 then synthetic-secret" } });
+    await handlers.onAdapterEvent({ eventType: "assistant.message", stream: "stdout", message: "N1", payload: { text: "N1\n" } });
+    await handlers.onAdapterEvent({ eventType: "tool.output", stream: "stdout", message: "B1",
+      payload: { toolCallId: "B", output: "B1 done\n" } });
+    await handlers.onAdapterEvent({ eventType: "tool.output", stream: "stdout", message: "A2",
+      payload: { toolCallId: "A", output: "-token-0001 A2 done\n" } });
+    await handlers.finishAdapterEvents();
+    expect(stored).toHaveLength(4);
+    // The held A1 is committed after N1 and B1: seq order alone is not adapter order.
+    expect(stored.map(event => event.message)).toEqual(["N1", "B1", "A1", "A2"]);
+    expect(byIndex(stored).map(event => event.message)).toEqual(["A1", "N1", "B1", "A2"]);
+    for (const event of stored) {
+      expect(typeof event.payload?.adapterEventIndex, event.message).toBe("number");
+      expect(new Date(String(event.payload?.receivedAt)).toISOString(), event.message).toBe(event.payload?.receivedAt);
+    }
+    expect(new Set(stored.map(event => event.payload?.adapterEventIndex)).size).toBe(4);
+    expect(JSON.stringify(stored)).not.toContain(secret);
+  });
+
+  it("(2) the stamp survives the redactor when a secret is a digit string of the index or timestamp", async () => {
+    const dateSecret = "20261116"; // test-only
+    const pin = "482916375"; // test-only
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const { stored, handlers } = await recorder([dateSecret, pin]);
+    const times = ["2026-11-16T20:26:11.116Z", "2026-11-16T20:26:11.200Z", "2026-11-16T20:26:12.300Z"];
+    const pieces = ["pin 4829", `16375 day ${dateSecret} `, "id 2026111 end\n"];
+    for (const [index, piece] of pieces.entries()) {
+      vi.setSystemTime(new Date(times[index]!));
+      await handlers.onAdapterEvent({ eventType: "tool.output", stream: "stdout", message: piece,
+        payload: { toolCallId: "pin", output: piece, step: 482916375 } });
+      vi.setSystemTime(new Date("2026-11-16T23:59:59.999Z"));
+    }
+    await handlers.finishAdapterEvents();
+    const tools = byIndex(stored.filter(event => event.eventType === "tool.output"));
+    expect(tools).toHaveLength(3);
+    expect(tools.map(stamp)).toEqual(times.map((receivedAt, index) => ({ receivedAt, adapterEventIndex: index + 1 })));
+    const joined = tools.map(event => String(event.payload?.output ?? "")).join("");
+    expect(joined).toBe("pin ***REDACTED*** day ***REDACTED*** id 2026111 end\n");
+    for (const value of [pin, dateSecret]) expect(JSON.stringify(tools.map(event => event.message))).not.toContain(value);
+  });
+
+  it("(3) a replay (same sourceEventId) gets a new, larger index; the first keeps its index; both rows are stored as before", async () => {
+    const secret = "synthetic-secret-token-0003"; // test-only
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const { stored, handlers } = await recorder([secret]);
+    const deliver = async (at: string, event: Parameters<typeof handlers.onAdapterEvent>[0]) => {
+      vi.setSystemTime(new Date(at));
+      await handlers.onAdapterEvent(structuredClone(event));
+    };
+    const a1 = { eventType: "tool.output", stream: "stdout" as const, message: "A1",
+      payload: { sourceEventId: "src-a1", toolCallId: "A", output: "A1 synthetic-secret" } };
+    const b1 = { eventType: "tool.output", stream: "stdout" as const, message: "B1",
+      payload: { sourceEventId: "src-b1", toolCallId: "B", output: "B1 done\n" } };
+    const n1 = { eventType: "assistant.message", stream: "stdout" as const, message: "N1",
+      payload: { sourceEventId: "src-n1", text: "N1\n" } };
+    await deliver("2026-11-16T19:00:01.000Z", a1);
+    await deliver("2026-11-16T19:00:02.000Z", b1);
+    await deliver("2026-11-16T19:00:03.000Z", n1);
+    await deliver("2026-11-16T19:00:04.000Z", a1); // replay while A1 is still held
+    await deliver("2026-11-16T19:00:05.000Z", b1); // replay after B1 was committed
+    await deliver("2026-11-16T19:00:06.000Z", n1); // non-tool replay
+    await deliver("2026-11-16T19:00:07.000Z", { eventType: "tool.output", stream: "stdout", message: "A2",
+      payload: { sourceEventId: "src-a2", toolCallId: "A", output: "-token-0003 A2\n" } });
+    await handlers.finishAdapterEvents();
+    expect(stored).toHaveLength(7);
+    expect(stored.map(event => event.message).sort()).toEqual(["A1", "A1", "A2", "B1", "B1", "N1", "N1"]);
+    expect(byIndex(stored).map(event => [event.message, stamp(event)])).toEqual([
+      ["A1", { receivedAt: "2026-11-16T19:00:01.000Z", adapterEventIndex: 1 }],
+      ["B1", { receivedAt: "2026-11-16T19:00:02.000Z", adapterEventIndex: 2 }],
+      ["N1", { receivedAt: "2026-11-16T19:00:03.000Z", adapterEventIndex: 3 }],
+      ["A1", { receivedAt: "2026-11-16T19:00:04.000Z", adapterEventIndex: 4 }],
+      ["B1", { receivedAt: "2026-11-16T19:00:05.000Z", adapterEventIndex: 5 }],
+      ["N1", { receivedAt: "2026-11-16T19:00:06.000Z", adapterEventIndex: 6 }],
+      ["A2", { receivedAt: "2026-11-16T19:00:07.000Z", adapterEventIndex: 7 }],
+    ]);
+    expect(JSON.stringify(stored)).not.toContain(secret);
+  });
+});

@@ -1,0 +1,54 @@
+import type { LifecycleFailure } from "../application/ports.js";
+import type { Db } from "@paperclipai/db";
+import type { agents, budgetPolicies } from "@paperclipai/db";
+import type { AgentLifecycleRequester } from "@paperclipai/shared";
+import type { CreateAgentData, CreateAgentOptions, AgentConfigurationPatch, AgentConfigurationRecord, AgentHireRecord, UpdateAgentOptions } from "../../../lib/agent-records.js";
+import type { ActivityPublication } from "../../../types/activity-publication.js";
+
+/** Services supply integrations; lifecycle owns the transaction and state writes. */
+export interface LifecycleEffects {
+  setupRequiresPreparation(db: Db, companyId: string, environmentId: string | null | undefined,
+    profile: Pick<CreateAgentData, "adapterType" | "adapterConfig">): Promise<boolean>;
+  environmentRequiresNewPlugin(db: Db, environmentId: string | null | undefined, selectedPluginIds: string[] | null): Promise<boolean>;
+  notifyWork(db: Db): Promise<void>;
+  /** The calling controller process, stamped on a lifecycle lease so restart recovery can settle a dead holder. */
+  leaseHolder?(): Record<string, unknown> | null;
+  beforeStatusChange(db: Db, companyId: string, agentId: string, before: string, after: string, publications?: ActivityPublication[]): Promise<void>;
+  beforeConnectionEligibilityRestore?(db: Db, companyId: string, agentId: string): Promise<void>;
+  /** Who asks for a termination through this lifecycle instance; saved on the operation. */
+  requestActor?: AgentLifecycleRequester;
+  /** Runs in the terminal (complete -> terminated) transaction, after the row carries its hand-over marker. */
+  completeTermination?(db: Db, agent: typeof agents.$inferSelect, publications?: ActivityPublication[]): Promise<void>;
+  reportFailure(context: LifecycleFailure, error: unknown): void;
+  deleteDependencies(db: Db, companyId: string, agentId: string): Promise<void>;
+  lockConfigurationInteractions(db: Db, id: string, data: AgentConfigurationPatch, options?: UpdateAgentOptions): Promise<UpdateAgentOptions | undefined>;
+  prepareConfiguration(db: Db, current: AgentConfigurationRecord, data: AgentConfigurationPatch, options?: UpdateAgentOptions): Promise<AgentConfigurationPatch>;
+  completeConfiguration(db: Db, before: AgentConfigurationRecord, after: AgentConfigurationRecord, patch: AgentConfigurationPatch, options: UpdateAgentOptions | undefined, publications: ActivityPublication[]): Promise<void>;
+  transaction<T>(db: Db, companyId: string, work: (tx: Db, publications: ActivityPublication[]) => Promise<T>): Promise<T>;
+  policyBlocks(db: Db, policy: typeof budgetPolicies.$inferSelect): Promise<boolean>;
+  setAgentBudget(db: Db, publications: ActivityPublication[], companyId: string, agentId: string, amount: number, userId: string | null, isActive?: boolean): Promise<unknown>;
+  recordCreation(db: Db, companyId: string, agentId: string): Promise<void>;
+  recordStatus(db: Db, companyId: string, agentId: string, before: string, after: string): Promise<void>;
+  clearPrimary(db: Db, companyId: string, agentId: string, publications?: ActivityPublication[]): Promise<unknown>;
+  prepareHire(db: Db, companyId: string, data: CreateAgentData, options?: CreateAgentOptions): Promise<CreateAgentData>;
+  initializeHire(db: Db, agent: AgentHireRecord, options?: CreateAgentOptions, publications?: ActivityPublication[]): Promise<void>;
+  prepareHireApproval(db: Db, agent: AgentHireRecord, payload?: Record<string, unknown> | null): Promise<AgentConfigurationPatch>;
+  completeHireApproval(db: Db, agent: AgentHireRecord, previous: AgentHireRecord, publications?: ActivityPublication[]): Promise<void>;
+}
+
+/** Run a nested lifecycle transaction (a savepoint inside the caller's root
+ * transaction) against the caller's root post-commit `publications`. The
+ * nested work stages its activities and hands them to the root buffer only
+ * when it completes, so they publish once, after the root commit, and never
+ * from a rolled-back attempt or savepoint. */
+export function joinLifecycleTransaction(effects: LifecycleEffects, publications: ActivityPublication[]): LifecycleEffects {
+  return {
+    ...effects,
+    transaction: (db, companyId, work) => effects.transaction(db, companyId, async tx => {
+      const staged: ActivityPublication[] = [];
+      const result = await work(tx, staged);
+      publications.push(...staged);
+      return result;
+    }),
+  };
+}

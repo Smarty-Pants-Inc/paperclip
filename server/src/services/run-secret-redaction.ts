@@ -1,0 +1,254 @@
+import { createHash } from "node:crypto";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
+import type { Db } from "@paperclipai/db";
+import { heartbeatRuns } from "@paperclipai/db";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
+import { getSecretProvider } from "../secrets/provider-registry.js";
+import type { StoredSecretVersionMaterial } from "../secrets/types.js";
+import { credentialAccessConnectionNameSql } from "./credential-access-visibility.js";
+import { readRunFailureCause, withoutSqlStatementText } from "@paperclipai/shared";
+import { addRunSecretMaterial } from "./agent-identity-redaction.js";
+
+/**
+ * A run row's `error` without SQL statement text. Rows saved before run errors
+ * were cleaned at settlement can still carry a Drizzle `Failed query:` statement
+ * and its parameters; every run read that passes through here drops them.
+ */
+function withoutSqlRunError<T>(value: T): T {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  if (typeof record.error !== "string") return value;
+  const error = withoutSqlStatementText(record.error, readRunFailureCause(record.resultJson));
+  return error === record.error ? value : { ...record, error } as T;
+}
+
+const REGISTRY_KEY = "paperclipSecretRedactions";
+// Project only the registry: run contexts can contain megabytes of prompt data.
+const registrySnapshot = sql`jsonb_build_object('paperclipSecretRedactions', ${heartbeatRuns.contextSnapshot} -> 'paperclipSecretRedactions')`;
+// Read identity scalars alongside the registry, never the full prompt snapshot.
+// Filter each run's values against its own ids before combining issue registries.
+const registryIdentifiers = sql<Array<string | null>>`jsonb_build_array(
+  ${heartbeatRuns.id}, ${heartbeatRuns.agentId}, ${heartbeatRuns.companyId}, ${heartbeatRuns.nativeIssueId},
+  ${heartbeatRuns.contextSnapshot} ->> 'issueId',
+  ${heartbeatRuns.contextSnapshot} -> 'paperclipIssue' ->> 'id',
+  ${heartbeatRuns.contextSnapshot} -> 'paperclipEnvironment' ->> 'id'
+)`;
+const registryColumns = { contextSnapshot: registrySnapshot, identifiers: registryIdentifiers };
+
+type RegistryRow = { contextSnapshot: unknown; identifiers?: Array<string | null> };
+
+function indexedRunSecretValues(values: Iterable<string>, identifiers: Iterable<string | null | undefined>) {
+  const index = { values: [] as string[] };
+  // Use the live index's minimum length, known-id, and derived-material rules.
+  // The exact-value replacer below also serves identity/compatibility callers
+  // with an already prepared list; it deliberately does not impose this policy.
+  addRunSecretMaterial(index, values, identifiers);
+  return index.values;
+}
+
+type RegistryEntry = {
+  fingerprintSha256: string;
+  material: StoredSecretVersionMaterial;
+};
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function registryEntries(contextSnapshot: unknown): RegistryEntry[] {
+  const context = asRecord(contextSnapshot);
+  const raw = context?.[REGISTRY_KEY];
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((value) => {
+    const entry = asRecord(value);
+    const material = asRecord(entry?.material);
+    return typeof entry?.fingerprintSha256 === "string" && material
+      ? [{ fingerprintSha256: entry.fingerprintSha256, material }]
+      : [];
+  });
+}
+
+/** An all-digit secret: masked only where it is a whole number. */
+export const isDigitValue = (value: string) => /^[0-9]+$/.test(value);
+
+function redactText(input: string, values: string[]) {
+  return values.reduce(
+    (result, value) => value.length === 0 ? result
+      // A numeric secret must not mask every longer number that contains it
+      // (timestamps, ids); it is masked where no digit touches it on either side.
+      : isDigitValue(value) ? result.replace(new RegExp(`(?<![0-9])${value}(?![0-9])`, "g"), REDACTED_EVENT_VALUE)
+      : result.split(value).join(REDACTED_EVENT_VALUE),
+    input,
+  );
+}
+
+export function redactRegisteredSecretValues<T>(input: T, values: string[], credentialConnectionName: string | null = null): T {
+  if (typeof input === "string") return redactText(input, values) as T;
+  if (Array.isArray(input)) return input.map((value) => redactRegisteredSecretValues(value, values, credentialConnectionName)) as T;
+  // Dates carry no redactable text; rebuilding them via Object.entries would
+  // collapse them to `{}` and break every timestamp in redacted responses.
+  if (input instanceof Date) return input;
+  const record = asRecord(input);
+  if (!record) return input;
+  return Object.fromEntries(
+    Object.entries(record)
+      .filter(([key]) => key !== REGISTRY_KEY && key !== "nativeControllerRecovery" && key !== "nativeTaskSessionPublication" && key !== "legacyProcessSettlement")
+      .map(([key, value]) => [key, key === "credentialAccess"
+        ? (credentialConnectionName ? { connectionName: redactText(credentialConnectionName, values) } : {})
+        : redactRegisteredSecretValues(value, values, credentialConnectionName)]),
+  ) as T;
+}
+
+type LiveRunRedactor = { values: string[] };
+type LiveRunAttachment = { redactor: WeakRef<LiveRunRedactor>; identifiers: Array<string | null | undefined> };
+// In-process only: the run's live output redactors (the heartbeat's and the
+// native control-plane port's), keyed by company and run. Plaintext stays in
+// the redactors themselves; this map holds them weakly so a finished run's
+// redactor is never kept alive here.
+const liveRunRedactors = new Map<string, Set<LiveRunAttachment>>();
+const liveRunKey = (companyId: string, runId: string) => `${companyId}:${runId}`;
+
+function liveRunAttachments(key: string) {
+  const attachments = liveRunRedactors.get(key);
+  if (!attachments) return [];
+  for (const attachment of attachments) if (!attachment.redactor.deref()) attachments.delete(attachment);
+  if (attachments.size === 0) liveRunRedactors.delete(key);
+  return [...attachments];
+}
+
+/**
+ * Let a run's live output redactor gain secrets registered for the run after it
+ * was built (a value the agent fetches mid-run). `identifiers` are the run's own
+ * ids, applied exactly as at construction. Output committed earlier is never
+ * rewritten. Returns a detach function.
+ */
+export function attachLiveRunSecretRedactor(companyId: string, runId: string, redactor: LiveRunRedactor,
+  identifiers: Iterable<string | null | undefined> = []) {
+  for (const key of [...liveRunRedactors.keys()]) liveRunAttachments(key);
+  const key = liveRunKey(companyId, runId);
+  const attachment: LiveRunAttachment = { redactor: new WeakRef(redactor), identifiers: [...identifiers] };
+  liveRunRedactors.set(key, (liveRunRedactors.get(key) ?? new Set()).add(attachment));
+  return () => {
+    liveRunRedactors.get(key)?.delete(attachment);
+    liveRunAttachments(key);
+  };
+}
+
+/** Same rules as every other run-secret index: addRunSecretMaterial. */
+function addLiveRunSecretValue(companyId: string, runId: string, value: string) {
+  for (const attachment of liveRunAttachments(liveRunKey(companyId, runId))) {
+    const redactor = attachment.redactor.deref();
+    if (redactor) addRunSecretMaterial(redactor, [value], attachment.identifiers);
+  }
+}
+
+export function createRunSecretRedactionRegistry(db: Db) {
+  const provider = getSecretProvider("local_encrypted");
+
+  async function valuesForRuns(rows: RegistryRow[], identifiers: string[]) {
+    const resolved = new Map<string, Promise<string>>();
+    const perRun = await Promise.all(rows.map(async (row) => {
+      const values = await Promise.all(registryEntries(row.contextSnapshot).map((entry) => {
+        let value = resolved.get(entry.fingerprintSha256);
+        if (!value) {
+          value = provider.resolveVersion({ material: entry.material, externalRef: null });
+          resolved.set(entry.fingerprintSha256, value);
+        }
+        return value;
+      }));
+      return indexedRunSecretValues(values, [...identifiers, ...row.identifiers ?? []]);
+    }));
+    return [...new Set(perRun.flat())].sort((left, right) => right.length - left.length);
+  }
+
+  async function valuesForRun(companyId: string, runId: string, viewerUserId: string | null) {
+    const rows = await db.select({ ...registryColumns, credentialConnectionName: credentialAccessConnectionNameSql(viewerUserId) })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
+    return { values: await valuesForRuns(rows, [companyId, runId]), credentialConnectionName: rows[0]?.credentialConnectionName ?? null };
+  }
+
+  async function valuesForIssue(companyId: string, issueId: string) {
+    const rows = await db.select(registryColumns)
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        or(
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`${heartbeatRuns.contextSnapshot} -> 'paperclipIssue' ->> 'id' = ${issueId}`,
+        ),
+      ));
+    return valuesForRuns(rows, [companyId, issueId]);
+  }
+
+  return {
+    redactionValuesForRun: async (companyId: string, runId: string) => valuesForRuns(await db
+      .select(registryColumns).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId))), [companyId, runId]),
+    register: async (companyId: string, runId: string, value: string) => {
+      // The run's live output redactors mask the value from now on, before the
+      // caller can hand it to the agent.
+      addLiveRunSecretValue(companyId, runId, value);
+      const fingerprintSha256 = createHash("sha256").update(value).digest("hex");
+      await db.transaction(async (tx) => {
+        const row = await tx.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!row) throw new Error("Heartbeat run redaction registration failed");
+        if (registryEntries(row.contextSnapshot).some((entry) => entry.fingerprintSha256 === fingerprintSha256)) {
+          return;
+        }
+        const prepared = await provider.createSecret({ value });
+        const entry: RegistryEntry = { fingerprintSha256, material: prepared.material };
+        const contextSnapshot = asRecord(row.contextSnapshot) ?? {};
+        const currentEntries = Array.isArray(contextSnapshot[REGISTRY_KEY])
+          ? contextSnapshot[REGISTRY_KEY]
+          : [];
+        await tx.update(heartbeatRuns)
+          .set({
+            contextSnapshot: { ...contextSnapshot, [REGISTRY_KEY]: [...currentEntries, entry] },
+            updatedAt: new Date(),
+          })
+          .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
+      });
+    },
+    redactForRuns: async <T extends { id: string }>(companyId: string, runs: T[], viewerUserId: string | null = null): Promise<T[]> => {
+      if (runs.length === 0) return [];
+      const rows = await db.select({ id: heartbeatRuns.id, ...registryColumns, credentialConnectionName: credentialAccessConnectionNameSql(viewerUserId) })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, runs.map((run) => run.id))));
+      // Resolve each encrypted value once per request, but apply only each run's
+      // own registry. Do not retain plaintext secrets across requests.
+      const resolved = new Map<string, Promise<string>>();
+      const valuesByRun = new Map(await Promise.all(rows.map(async (row) => {
+        const values = await Promise.all(registryEntries(row.contextSnapshot).map((entry) => {
+          let value = resolved.get(entry.fingerprintSha256);
+          if (!value) {
+            value = provider.resolveVersion({ material: entry.material, externalRef: null });
+            resolved.set(entry.fingerprintSha256, value);
+          }
+          return value;
+        }));
+        return [row.id, { values: indexedRunSecretValues(values, [companyId, row.id, ...row.identifiers ?? []]), credentialConnectionName: row.credentialConnectionName ?? null }] as const;
+      })));
+      return runs.map((run) => {
+        const disclosure = valuesByRun.get(run.id);
+        return redactRegisteredSecretValues(withoutSqlRunError(run), disclosure?.values ?? [], disclosure?.credentialConnectionName ?? null);
+      });
+    },
+    redactorForRun: async (companyId: string, runId: string, viewerUserId: string | null = null) => {
+      const disclosure = await valuesForRun(companyId, runId, viewerUserId);
+      return <T>(value: T): T => redactRegisteredSecretValues(withoutSqlRunError(value), disclosure.values, disclosure.credentialConnectionName);
+    },
+    redactForRun: async <T>(companyId: string, runId: string, value: T, viewerUserId: string | null = null): Promise<T> => {
+      const disclosure = await valuesForRun(companyId, runId, viewerUserId);
+      return redactRegisteredSecretValues(withoutSqlRunError(value), disclosure.values, disclosure.credentialConnectionName);
+    },
+    redactForIssue: async <T>(companyId: string, issueId: string, value: T): Promise<T> =>
+      redactRegisteredSecretValues(value, await valuesForIssue(companyId, issueId)),
+  };
+}

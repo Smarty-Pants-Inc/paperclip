@@ -1,0 +1,262 @@
+import { z } from "zod";
+import {
+  AGENT_ADAPTER_TYPES,
+  HUMAN_COMPANY_MEMBERSHIP_ROLES,
+  INVITE_JOIN_TYPES,
+  JOIN_REQUEST_STATUSES,
+  JOIN_REQUEST_TYPES,
+  PERMISSION_KEYS,
+} from "../constants.js";
+import { optionalAgentAdapterTypeSchema } from "../adapter-type.js";
+
+export const createCompanyInviteSchema = z.object({
+  allowedJoinTypes: z.enum(INVITE_JOIN_TYPES).default("both"),
+  humanRole: z.enum(HUMAN_COMPANY_MEMBERSHIP_ROLES).optional().nullable(),
+  defaultsPayload: z.record(z.string(), z.unknown()).optional().nullable(),
+  agentMessage: z.string().max(4000).optional().nullable(),
+});
+
+export type CreateCompanyInvite = z.infer<typeof createCompanyInviteSchema>;
+
+export const createOpenClawInvitePromptSchema = z.object({
+  agentMessage: z.string().max(4000).optional().nullable(),
+});
+
+export type CreateOpenClawInvitePrompt = z.infer<
+  typeof createOpenClawInvitePromptSchema
+>;
+
+export const acceptInviteSchema = z.object({
+  requestType: z.enum(JOIN_REQUEST_TYPES),
+  agentName: z.string().min(1).max(120).optional(),
+  adapterType: optionalAgentAdapterTypeSchema,
+  capabilities: z.string().max(4000).optional().nullable(),
+  agentDefaultsPayload: z.record(z.string(), z.unknown()).optional().nullable(),
+  // OpenClaw join compatibility fields accepted at top level.
+  responsesWebhookUrl: z.string().max(4000).optional().nullable(),
+  responsesWebhookMethod: z.string().max(32).optional().nullable(),
+  responsesWebhookHeaders: z.record(z.string(), z.unknown()).optional().nullable(),
+  paperclipApiUrl: z.string().max(4000).optional().nullable(),
+  webhookAuthHeader: z.string().max(4000).optional().nullable(),
+});
+
+export type AcceptInvite = z.infer<typeof acceptInviteSchema>;
+
+export const listJoinRequestsQuerySchema = z.object({
+  status: z.enum(JOIN_REQUEST_STATUSES).optional(),
+  requestType: z.enum(JOIN_REQUEST_TYPES).optional(),
+});
+
+export type ListJoinRequestsQuery = z.infer<typeof listJoinRequestsQuerySchema>;
+
+export const listCompanyInvitesQuerySchema = z.object({
+  state: z.enum(["active", "revoked", "accepted", "expired"]).optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional().default(20),
+  offset: z.coerce.number().int().min(0).optional().default(0),
+});
+
+export type ListCompanyInvitesQuery = z.infer<typeof listCompanyInvitesQuerySchema>;
+
+export const claimJoinRequestApiKeySchema = z.object({
+  claimSecret: z.string().min(16).max(256),
+});
+
+export type ClaimJoinRequestApiKey = z.infer<typeof claimJoinRequestApiKeySchema>;
+
+export const boardCliAuthAccessLevelSchema = z.enum([
+  "board",
+  "instance_admin_required",
+]);
+
+export type BoardCliAuthAccessLevel = z.infer<typeof boardCliAuthAccessLevelSchema>;
+
+export const createCliAuthChallengeSchema = z.object({
+  command: z.string().min(1).max(240),
+  clientName: z.string().max(120).optional().nullable(),
+  requestedAccess: boardCliAuthAccessLevelSchema.default("board"),
+  requestedCompanyId: z.string().guid().optional().nullable(),
+});
+
+export type CreateCliAuthChallenge = z.infer<typeof createCliAuthChallengeSchema>;
+
+export const resolveCliAuthChallengeSchema = z.object({
+  token: z.string().min(16).max(256),
+});
+
+export type ResolveCliAuthChallenge = z.infer<typeof resolveCliAuthChallengeSchema>;
+
+export const createBoardApiKeySchema = z.object({
+  name: z.string().trim().min(1).max(120).default("paperclipai cli"),
+  expiresAt: z.coerce.date().optional().nullable(),
+  requestedCompanyId: z.string().guid().optional().nullable(),
+});
+
+export type CreateBoardApiKey = z.infer<typeof createBoardApiKeySchema>;
+
+export const updateMemberPermissionsSchema = z.object({
+  grants: z.array(
+    z.object({
+      permissionKey: z.enum(PERMISSION_KEYS),
+      scope: z.record(z.string(), z.unknown()).optional().nullable(),
+    }),
+  ),
+});
+
+export type UpdateMemberPermissions = z.infer<typeof updateMemberPermissionsSchema>;
+
+// Keep grant writes fail-closed: authorization treats unknown scope metadata as
+// unconstrained. Only expose understood agent constraints, never arbitrary JSON.
+const agentPermissionGrantScopeSchema = z.object({
+  subtreeRootAgentId: z.string().guid().optional(),
+  agentIds: z.array(z.string().guid()).min(1).max(100).optional(),
+  allow: z.array(z.string().refine((value) => {
+    const match = /^(subtree|agent):(.+)$/.exec(value);
+    return match !== null && z.string().guid().safeParse(match[2]).success;
+  }, "Expected subtree:<agent UUID> or agent:<agent UUID>")).min(1).max(100).optional(),
+}).strict().refine((scope) => Object.keys(scope).length > 0, "Use null for an unscoped grant");
+
+export const updateAgentPermissionGrantSchema = z.object({
+  permissionKey: z.enum(PERMISSION_KEYS),
+  enabled: z.boolean(),
+  // Omitted: preserve an existing scope. Null: explicitly make it unscoped.
+  scope: agentPermissionGrantScopeSchema.nullable().optional(),
+}).strict();
+
+export type UpdateAgentPermissionGrant = z.infer<typeof updateAgentPermissionGrantSchema>;
+
+const editableMembershipStatuses = ["pending", "active", "suspended"] as const;
+
+export const updateCompanyMemberSchema = z.object({
+  membershipRole: z.enum(HUMAN_COMPANY_MEMBERSHIP_ROLES).optional().nullable(),
+  status: z.enum(editableMembershipStatuses).optional(),
+}).refine((value) => value.membershipRole !== undefined || value.status !== undefined, {
+  message: "membershipRole or status is required",
+});
+
+export type UpdateCompanyMember = z.infer<typeof updateCompanyMemberSchema>;
+
+export const updateCompanyMemberWithPermissionsSchema = z.object({
+  membershipRole: z.enum(HUMAN_COMPANY_MEMBERSHIP_ROLES).optional().nullable(),
+  status: z.enum(editableMembershipStatuses).optional(),
+  grants: updateMemberPermissionsSchema.shape.grants.default([]),
+}).refine((value) => value.membershipRole !== undefined || value.status !== undefined, {
+  message: "membershipRole or status is required",
+});
+
+export type UpdateCompanyMemberWithPermissions = z.infer<typeof updateCompanyMemberWithPermissionsSchema>;
+
+export const archiveCompanyMemberSchema = z.object({
+  reassignment: z
+    .object({
+      assigneeAgentId: z.string().guid().optional().nullable(),
+      assigneeUserId: z.string().guid().optional().nullable(),
+    })
+    .optional()
+    .nullable(),
+}).superRefine((value, ctx) => {
+  if (value.reassignment?.assigneeAgentId && value.reassignment.assigneeUserId) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Choose either an agent or user reassignment target",
+      path: ["reassignment"],
+    });
+  }
+});
+
+export type ArchiveCompanyMember = z.infer<typeof archiveCompanyMemberSchema>;
+
+export const updateUserCompanyAccessSchema = z.object({
+  companyIds: z.array(z.string().guid()).default([]),
+});
+
+export type UpdateUserCompanyAccess = z.infer<typeof updateUserCompanyAccessSchema>;
+
+export const searchAdminUsersQuerySchema = z.object({
+  query: z.string().trim().max(120).optional().default(""),
+});
+
+export type SearchAdminUsersQuery = z.infer<typeof searchAdminUsersQuerySchema>;
+
+const profileImageAssetPathPattern = /^\/api\/assets\/[^/?#]+\/content(?:\?[^#]*)?(?:#.*)?$/;
+
+function isValidProfileImage(value: string): boolean {
+  if (profileImageAssetPathPattern.test(value)) return true;
+
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+const profileImageSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(4000)
+  .refine(isValidProfileImage, { message: "Invalid profile image URL" });
+
+export const currentUserProfileSchema = z.object({
+  id: z.string().min(1),
+  email: z.preprocess(
+    (v) => (typeof v === "string" && v.trim() === "" ? null : v),
+    z.string().email().nullable(),
+  ),
+  name: z.preprocess(
+    (v) => (typeof v === "string" && v.trim() === "" ? null : v),
+    z.string().min(1).max(120).nullable(),
+  ),
+  image: profileImageSchema.nullable(),
+});
+
+export type CurrentUserProfile = z.infer<typeof currentUserProfileSchema>;
+
+/**
+ * Browser performance tracing settings for a hosted Paperclip Cloud instance.
+ * The server sends a value only when the instance is cloud managed and an
+ * operator configured an endpoint; see `doc/browser-performance-tracing.md`.
+ * `ingestKey` is a Honeycomb ingest-only key (or null for a collector that
+ * needs no key); it is never a configuration key.
+ */
+export const browserTracingConfigSchema = z.object({
+  tracesUrl: z.string().url(),
+  ingestKey: z.string().min(1).nullable(),
+  serviceName: z.string().min(1),
+  environment: z.string().min(1).nullable(),
+  sampleRate: z.number().gt(0).max(1),
+});
+
+export type BrowserTracingConfig = z.infer<typeof browserTracingConfigSchema>;
+
+export const authSessionSchema = z.object({
+  session: z.object({
+    id: z.string().min(1),
+    userId: z.string().min(1),
+  }),
+  user: currentUserProfileSchema,
+  // The front-end Sentry DSN for the current instance, or `null` when the
+  // operator has set neither `SENTRY_DSN_FRONTEND` nor the legacy
+  // `SENTRY_DSN`. Required, not optional: a missing value must fail the
+  // response schema instead of silently disabling browser error
+  // monitoring. The browser reads this value to open its own Sentry gate —
+  // see `ui/src/lib/sentry.ts`.
+  sentryDsn: z.string().min(1).nullable(),
+  // Optional for browser/server version skew; null leaves the SDK default.
+  sentryEnvironment: z.string().nullable().optional(),
+  // Null or absent leaves browser performance tracing off. Optional for
+  // browser/server version skew.
+  browserTracing: browserTracingConfigSchema.nullable().optional(),
+});
+
+export type AuthSession = z.infer<typeof authSessionSchema>;
+
+export const updateCurrentUserProfileSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  image: z
+    .union([profileImageSchema, z.literal(""), z.null()])
+    .optional()
+    .transform((value) => value === "" ? null : value),
+});
+
+export type UpdateCurrentUserProfile = z.infer<typeof updateCurrentUserProfileSchema>;

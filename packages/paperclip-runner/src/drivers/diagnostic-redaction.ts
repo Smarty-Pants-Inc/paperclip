@@ -1,0 +1,38 @@
+/** Redact diagnostic text without importing the provider process or its credentials. */
+export function redactProviderDiagnostic(message: string): string {
+  const sanitized = message
+    .replaceAll(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, "Bearer [REDACTED]")
+    .replace(/Basic\s+([A-Za-z0-9+/=]+)/gi, (match, encoded: string) => {
+      try {
+        // Only redact an actual RFC 7617 credential. Ordinary prose such as
+        // “Basic API” must remain readable.
+        const decoded = Buffer.from(encoded, "base64").toString("utf8");
+        return decoded.includes(":") ? "Basic [REDACTED]" : match;
+      } catch {
+        return match;
+      }
+    });
+  // A long ordinary tool-output word otherwise causes a quadratic failed
+  // scheme search. The literal is required by the same regex, so this guard
+  // changes no redaction result and keeps bounded Pi display previews cheap.
+  const urls = sanitized.includes("://")
+    ? sanitized.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@")
+    : sanitized;
+  return urls.replace(
+      /([?&](?:api[_-]?key|token|secret|password)=)[^&#\s]+/gi,
+      "$1[REDACTED]",
+    )
+    .replace(
+      /(["'](?:api[_-]?key|token|secret|password|authorization)["']\s*:\s*["'])[^"']+/gi,
+      "$1[REDACTED]",
+    )
+    .replace(
+      /(api[_-]?key|token|secret|password)\s*[=:]\s*[^\s,;]+/gi,
+      "$1=[REDACTED]",
+    )
+    .replace(
+      /((?:[A-Z][A-Z0-9]*_)+API_KEY)=[^\s]+/g,
+      "$1=[REDACTED]",
+    );
+}

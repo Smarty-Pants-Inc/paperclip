@@ -1,0 +1,10 @@
+{"type":"set_auto_retry","enabled":false,"id":"capture-1"}
+{"type":"set_auto_compaction","enabled":false,"id":"capture-2"}
+{"type":"get_state","id":"capture-3"}
+{"type":"set_model","provider":"paperclip","modelId":"neutral/vendor-model-not-in-bundled-catalog","id":"capture-4"}
+{"type":"get_available_thinking_levels","id":"capture-5"}
+{"type":"set_thinking_level","level":"off","id":"capture-6"}
+{"type":"get_state","id":"capture-7"}
+{"type":"prompt","message":"scenario:abort","id":"capture-8"}
+{"type":"clear_queue","id":"capture-9"}
+{"type":"abort","id":"capture-10"}

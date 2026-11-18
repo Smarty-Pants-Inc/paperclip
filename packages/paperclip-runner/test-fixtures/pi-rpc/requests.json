@@ -1,0 +1,92 @@
+[
+  {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "model": "neutral/vendor-model-not-in-bundled-catalog",
+    "scenario": "text",
+    "round": 1,
+    "roles": [
+      "system",
+      "user"
+    ],
+    "tools": [
+      "bash"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "model": "neutral/vendor-model-not-in-bundled-catalog",
+    "scenario": "tool-success",
+    "round": 1,
+    "roles": [
+      "system",
+      "user",
+      "assistant",
+      "user"
+    ],
+    "tools": [
+      "bash"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "model": "neutral/vendor-model-not-in-bundled-catalog",
+    "scenario": "tool-success",
+    "round": 2,
+    "roles": [
+      "system",
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+      "tool"
+    ],
+    "tools": [
+      "bash"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "model": "neutral/vendor-model-not-in-bundled-catalog",
+    "scenario": "tool-error",
+    "round": 1,
+    "roles": [
+      "system",
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+      "tool",
+      "assistant",
+      "user"
+    ],
+    "tools": [
+      "bash"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "model": "neutral/vendor-model-not-in-bundled-catalog",
+    "scenario": "tool-error",
+    "round": 2,
+    "roles": [
+      "system",
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+      "tool",
+      "assistant",
+      "user",
+      "assistant",
+      "tool"
+    ],
+    "tools": [
+      "bash"
+    ]
+  }
+]

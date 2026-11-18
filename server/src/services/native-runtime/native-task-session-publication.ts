@@ -1,0 +1,197 @@
+import { and, eq } from "drizzle-orm";
+import { agentTaskSessions, heartbeatRuns, nativeRunResults, type Db, type issues } from "@paperclipai/db";
+import { validatePrpStructuredRunResult, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
+import { nativeSha256 } from "./canonical.js";
+import type { PaperclipControlPlaneBinding } from "./paperclip-control-plane-port.js";
+import { readRunCancellation } from "../run-cancellation.js";
+import { preservePiConversation } from "./pi-conversation-record.js";
+import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
+
+/** Prepared once by heartbeat; never copied into recovery metadata or receipts. */
+export interface NativeTaskSessionPublicationContext {
+  taskKey: string;
+  adapterType: string;
+  sessionParamsJson: Record<string, unknown> | null;
+  /** Pi reopens its own file with session.open, including after interruption. */
+  providerKind?: "pi_rpc";
+}
+
+export const NATIVE_TASK_SESSION_PUBLICATION_KEY = "nativeTaskSessionPublication";
+type Transaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+type Outcome = "published" | "suppressed_reset" | "suppressed_newer" | "suppressed_authority" | "missing_stub" | "unsupported";
+interface Receipt {
+  schema: "paperclip.native-task-session-publication.v1";
+  companyId: string;
+  issueId: string;
+  agentId: string;
+  runId: string;
+  taskKey: string;
+  adapterType: string;
+  sessionId: string;
+  resultId: string;
+  outcome: Outcome;
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+const uuid = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value);
+const outcomes: readonly string[] = ["published", "suppressed_reset", "suppressed_newer", "suppressed_authority", "missing_stub", "unsupported"];
+
+function receiptFromProfile(profile: unknown): Receipt | null {
+  const root = record(profile), value = record(root[NATIVE_TASK_SESSION_PUBLICATION_KEY]);
+  if (value.schema !== "paperclip.native-task-session-publication.v1"
+      || ![value.companyId, value.issueId, value.agentId, value.runId, value.sessionId, value.resultId].every(uuid)
+      || typeof value.taskKey !== "string" || value.taskKey.length > 512
+      || typeof value.adapterType !== "string" || !value.adapterType.length || value.adapterType.length > 128
+      || !outcomes.includes(String(value.outcome)) || Object.keys(value).length !== 10) return null;
+  const snapshot = record(root.sessionCheckpoint), identity = record(snapshot.identity);
+  if (identity.runId !== value.runId || identity.companyId !== value.companyId || identity.issueId !== value.issueId
+      || identity.agentId !== value.agentId || identity.sessionId !== value.sessionId) return null;
+  return value as unknown as Receipt;
+}
+
+/** Only the exact server-written outcome may suppress heartbeat's late fallback. */
+export function nativeTaskSessionPublicationHandled(profile: unknown, binding: {
+  companyId: string; agentId: string; runId: string; taskKey: string; adapterType: string;
+}): boolean {
+  const receipt = receiptFromProfile(profile);
+  return !!receipt && receipt.companyId === binding.companyId && receipt.agentId === binding.agentId
+    && receipt.runId === binding.runId && receipt.taskKey === binding.taskKey
+    && receipt.adapterType === binding.adapterType && ["published", "suppressed_reset", "suppressed_newer", "suppressed_authority", "missing_stub"].includes(receipt.outcome);
+}
+
+export function eligibleNativeTaskSessionPublication(snapshot: PersistedNativeSession): boolean {
+  return snapshot.goal == null && snapshot.semanticResult != null && snapshot.terminal?.runTerminalState === "succeeded"
+    && snapshot.activeTurnId == null && !(snapshot.pendingRuntimeRequests?.length);
+}
+
+export type NativeTaskSessionPublicationRun = Pick<typeof heartbeatRuns.$inferSelect,
+  "id" | "companyId" | "agentId" | "nativeIssueId" | "nativeSessionId" | "status" | "resultJson" | "contextSnapshot" | "startedAt" | "createdAt" | "runnerProfileJson">;
+export type NativeTaskSessionPublicationIssue = Pick<typeof issues.$inferSelect,
+  "id" | "companyId" | "executionRunId" | "conversationAgentId" | "conversationSessionGeneration">;
+
+type PointerPublicationInput = {
+  binding: PaperclipControlPlaneBinding;
+  context: NativeTaskSessionPublicationContext;
+  snapshot: PersistedNativeSession;
+  run: NativeTaskSessionPublicationRun;
+  issue: NativeTaskSessionPublicationIssue | null;
+  recoveryReady?: boolean;
+};
+
+/** Caller holds coordinator → issue NO KEY UPDATE → run. This helper owns only
+ * the task-row lock and UPDATE; never starts a transaction or creates a stub. */
+export async function publishNativeTaskSessionInTransaction(tx: Transaction, input: PointerPublicationInput & {
+  resultId: string | null;
+}): Promise<Receipt> {
+  const { binding, context, snapshot, run } = input;
+  const existingReceipt = receiptFromProfile(run.runnerProfileJson);
+  if (existingReceipt) {
+    if (existingReceipt.companyId !== binding.companyId || existingReceipt.issueId !== binding.issueId
+        || existingReceipt.agentId !== binding.agentId || existingReceipt.runId !== binding.runId
+        || existingReceipt.sessionId !== snapshot.identity.sessionId || existingReceipt.taskKey !== context.taskKey
+        || existingReceipt.adapterType !== context.adapterType || existingReceipt.resultId !== input.resultId) {
+      throw new Error("native_task_session_publication_receipt_mismatch");
+    }
+    return existingReceipt;
+  }
+  if (record(run.runnerProfileJson)[NATIVE_TASK_SESSION_PUBLICATION_KEY] !== undefined) {
+    throw new Error("native_task_session_publication_receipt_invalid");
+  }
+  if (!input.resultId) throw new Error("native_task_session_publication_result_missing");
+  const [accepted] = await tx.select({ id: nativeRunResults.id, canonicalSha256: nativeRunResults.canonicalSha256,
+    turnId: nativeRunResults.turnId }).from(nativeRunResults).where(and(
+    eq(nativeRunResults.id, input.resultId), eq(nativeRunResults.runId, binding.runId),
+    eq(nativeRunResults.companyId, binding.companyId), eq(nativeRunResults.issueId, binding.issueId),
+    eq(nativeRunResults.completionContractId, binding.completionContractId), eq(nativeRunResults.schemaStatus, "accepted"),
+  )).limit(1);
+  const validated = validatePrpStructuredRunResult(snapshot.semanticResult);
+  if (!accepted || !validated.ok || accepted.canonicalSha256 !== nativeSha256({
+    binding, result: validated.result, terminal: snapshot.terminal, turnId: accepted.turnId ?? null,
+  })) throw new Error("native_task_session_publication_result_mismatch");
+  const receipt = (outcome: Outcome): Receipt => ({ schema: "paperclip.native-task-session-publication.v1",
+    companyId: binding.companyId, issueId: binding.issueId, agentId: binding.agentId, runId: binding.runId,
+    taskKey: context.taskKey, adapterType: context.adapterType, sessionId: snapshot.identity.sessionId,
+    resultId: accepted.id, outcome });
+  return receipt(await publishTaskSessionPointer(tx, input));
+}
+
+/** Save Pi's conversation identity before a turn can be stopped. This is not a
+ * result/publication receipt: successful-result acceptance remains unchanged.
+ * The same lease, reset, cancellation and newer-owner fences protect both. */
+export async function publishPiConversationInTransaction(tx: Transaction, input: PointerPublicationInput,
+  options?: { retainedCancelledOwner: true }): Promise<Outcome> {
+  const provider = record(record(record(input.run.runnerProfileJson).nativeExecutionInput).provider);
+  if (input.context.providerKind !== "pi_rpc" || provider.kind !== "pi_rpc" || !input.snapshot.providerSessionId)
+    return "unsupported";
+  // The executor alone supplies this after proving clean interrupt cleanup and
+  // retaining the exact live owner. It is conversation bookkeeping, never a
+  // result receipt; every reset, epoch and newer-owner fence below still applies.
+  const retained = options?.retainedCancelledOwner === true;
+  if (retained ? !["running", "cancelled"].includes(input.run.status) || !hasAcknowledgedNativeStopIntent(input.run)
+      || input.snapshot.identity.runId !== input.binding.runId || input.snapshot.identity.sessionId !== input.run.nativeSessionId
+      || input.snapshot.semanticResult !== null || input.snapshot.terminal?.runTerminalState !== "cancelled"
+      || input.snapshot.terminal.turnTerminalState !== "cancelled" || input.snapshot.activeTurnId !== null
+      || !Array.isArray(input.snapshot.pendingRuntimeRequests) || input.snapshot.pendingRuntimeRequests.length !== 0
+    : input.run.status !== "running") return "suppressed_authority";
+  return publishTaskSessionPointer(tx, input, retained);
+}
+
+async function publishTaskSessionPointer(tx: Transaction, input: PointerPublicationInput, retainedCancelledOwner = false): Promise<Outcome> {
+  const { binding, context, snapshot, run, issue } = input;
+  if (context.taskKey !== binding.issueId || input.recoveryReady === false) return "unsupported";
+  const cancellation = record(run.resultJson?.nativeCancellation), stop = readRunCancellation(run.resultJson);
+  if (!issue || issue.companyId !== binding.companyId
+      // The Stop route records this even for a turn already running. Only the
+      // explicitly post-selection marker can coexist with a retained live owner.
+      || (run.resultJson?.startupCancellation && (!retainedCancelledOwner
+        || record(run.resultJson.startupCancellation).beforeNativeSelection !== false))
+      || (!retainedCancelledOwner && (["cancelled", "interrupted", "failed", "timed_out"].includes(run.status)
+        || (stop?.source === "operator" && stop.expected)
+        || (["run", "issue"].includes(String(cancellation.scope)) && ["pending", "acknowledged"].includes(String(cancellation.dispatchState)))))
+      || (issue.conversationAgentId && issue.conversationAgentId !== binding.agentId)) return "suppressed_authority";
+  if (issue.conversationAgentId
+      && run.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return "suppressed_reset";
+  if (issue.executionRunId && issue.executionRunId !== binding.runId) return "suppressed_newer";
+  const [session] = await tx.select({ id: agentTaskSessions.id, goalSourceId: agentTaskSessions.goalSourceId,
+    lastRunId: agentTaskSessions.lastRunId, sessionParamsJson: agentTaskSessions.sessionParamsJson }).from(agentTaskSessions).where(and(
+    eq(agentTaskSessions.companyId, binding.companyId), eq(agentTaskSessions.agentId, binding.agentId),
+    eq(agentTaskSessions.adapterType, context.adapterType), eq(agentTaskSessions.taskKey, context.taskKey),
+  )).for("update").limit(1);
+  // Supported native turns synchronously project a stub before this terminal
+  // snapshot. Absence can be an operator deletion; never recreate it later.
+  if (!session) return "missing_stub";
+  const sources = [binding.sourceInstanceId, binding.controlPlaneSourceInstanceId]
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
+  const ownsGoalSource = (runId: string) => sources.some(source => session.goalSourceId === `${source}:${runId}`);
+  // A warm-attached turn need not emit a new goal snapshot before Stop. Use
+  // its acknowledged current-run authority, not the lagging goal epoch. Both
+  // the goal owner and pointer owner must be completed predecessors in this
+  // exact source/conversation; consecutive Stops can leave the goal even older.
+  const currentGoalSource = ownsGoalSource(binding.runId);
+  const retainedGoalRunId = !currentGoalSource && retainedCancelledOwner && session.lastRunId
+    && session.sessionParamsJson?.sessionId === run.nativeSessionId
+    ? sources.flatMap(source => session.goalSourceId?.startsWith(`${source}:`)
+      ? [session.goalSourceId.slice(source.length + 1)] : []).find(uuid) : undefined;
+  if (!currentGoalSource && !retainedGoalRunId) return "suppressed_newer";
+  const priorRunIds = new Set([session.lastRunId, retainedGoalRunId]
+    .filter((id): id is string => !!id && id !== binding.runId));
+  for (const priorRunId of priorRunIds) {
+    const [prior] = await tx.select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+      issueId: heartbeatRuns.issueId, nativeIssueId: heartbeatRuns.nativeIssueId, finishedAt: heartbeatRuns.finishedAt,
+      nativeSessionId: heartbeatRuns.nativeSessionId, status: heartbeatRuns.status,
+    }).from(heartbeatRuns).where(eq(heartbeatRuns.id, priorRunId)).limit(1);
+    if (!prior || prior.companyId !== binding.companyId || prior.agentId !== binding.agentId
+        || (prior.nativeIssueId ?? prior.issueId) !== binding.issueId || !prior.finishedAt || !run.startedAt
+        || prior.finishedAt > run.startedAt
+        || (retainedGoalRunId && (prior.nativeSessionId !== run.nativeSessionId
+          || !["succeeded", "failed", "cancelled", "timed_out"].includes(prior.status)))) return "suppressed_newer";
+  }
+  await tx.update(agentTaskSessions).set({
+    sessionParamsJson: preservePiConversation(session.sessionParamsJson, { ...context.sessionParamsJson, sessionId: snapshot.identity.sessionId }),
+    sessionDisplayId: snapshot.providerSessionId ?? snapshot.sessionId, lastRunId: binding.runId,
+    lastError: null, updatedAt: new Date(),
+  }).where(eq(agentTaskSessions.id, session.id));
+  return "published";
+}

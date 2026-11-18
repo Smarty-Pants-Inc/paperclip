@@ -1,0 +1,281 @@
+{
+  "schemaVersion": 1,
+  "slug": "github",
+  "name": "GitHub",
+  "description": "Connect GitHub repository access or authenticate GitHub Copilot agents.",
+  "categories": [
+    "developer",
+    "ai"
+  ],
+  "featured": true,
+  "branding": {
+    "logoUrl": "/brands/apps/github.svg",
+    "darkLogoUrl": "/brands/apps/github-dark.svg"
+  },
+  "urlPatterns": [
+    "https://api.githubcopilot.com/mcp/*",
+    "https://github.com/*"
+  ],
+  "methods": [
+    {
+      "key": "managed",
+      "transport": "mcp_remote",
+      "auth": "oauth",
+      "ownershipModes": [
+        "platform_shared"
+      ],
+      "whenToUse": "Connect your GitHub account for durable MCP, shell Git, gh, and repository access.",
+      "defaults": {
+        "serverUrl": "https://api.githubcopilot.com/mcp/"
+      },
+      "guidanceMd": "Authorize Paperclip, then choose selected repositories in GitHub. You can edit repository access later from GitHub's installation settings.",
+      "riskTier": "S3",
+      "label": "Connect GitHub",
+      "purpose": "tool",
+      "oauthStrategy": "paperclip_cloud_connector",
+      "connectorProfile": "github.code",
+      "grantKinds": [
+        "user",
+        "agent"
+      ],
+      "warnings": [
+        "Shell Git and gh receive this identity for the run and are not constrained by per-tool Ask-first controls."
+      ],
+      "requiredResourceFilters": [
+        "organization",
+        "repository"
+      ]
+    },
+    {
+      "key": "mcp-key",
+      "transport": "mcp_remote",
+      "auth": "api_key",
+      "ownershipModes": [
+        "customer"
+      ],
+      "whenToUse": "Use the provider-hosted connection for the quickest setup.",
+      "defaults": {
+        "serverUrl": "https://api.githubcopilot.com/mcp/"
+      },
+      "guidanceMd": "Create a fine-grained token limited to the repositories agents should use.",
+      "riskTier": "S3",
+      "label": "Personal access token (advanced)",
+      "purpose": "tool",
+      "credentialFields": [
+        {
+          "key": "authorization",
+          "label": "GitHub token",
+          "type": "password",
+          "required": true,
+          "placeholder": "github_pat_...",
+          "secret": true,
+          "helperMd": "Repository contents, issues, pull requests and other granted toolsets; selected repos and installation/PAT permissions apply. Create a key with read and write permissions for these actions; Paperclip cannot increase an existing key\u2019s permissions."
+        }
+      ],
+      "keyPlacement": {
+        "location": "header",
+        "name": "Authorization",
+        "prefix": "Bearer "
+      },
+      "requiredResourceFilters": [
+        "organization",
+        "repository"
+      ]
+    },
+    {
+      "key": "copilot-token",
+      "label": "GitHub Copilot personal access token",
+      "purpose": "ai",
+      "transport": "runtime_auth",
+      "auth": "api_key",
+      "ai": {
+        "provider": "github",
+        "method": "api_key"
+      },
+      "grantKinds": [
+        "user",
+        "organization"
+      ],
+      "ownershipModes": [
+        "customer"
+      ],
+      "whenToUse": "Authenticate the GitHub Copilot agent runtime with a personal or explicitly shared account.",
+      "guidanceMd": "Create a personal fine-grained token with the Copilot Requests permission. Copilot authentication is separate from repository and MCP access. [GitHub authentication instructions](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/authenticate-copilot-cli).",
+      "riskTier": "S3",
+      "credentialFields": [
+        {
+          "key": "apiKey",
+          "label": "Personal access token",
+          "type": "password",
+          "required": true,
+          "placeholder": "github_pat_...",
+          "secret": true,
+          "helperMd": "Use a personal fine-grained token with Copilot Requests permission."
+        }
+      ],
+      "keyPlacement": {
+        "location": "env",
+        "name": "COPILOT_GITHUB_TOKEN"
+      }
+    },
+    {
+      "key": "own-oauth",
+      "label": "Use your own GitHub App",
+      "transport": "mcp_remote",
+      "auth": "oauth",
+      "purpose": "tool",
+      "oauthClientSecretRequired": true,
+      "grantKinds": [
+        "user",
+        "agent"
+      ],
+      "ownershipModes": [
+        "customer"
+      ],
+      "whenToUse": "Sign in through your organization's own GitHub App or OAuth App, so tokens go directly between GitHub and this Paperclip.",
+      "defaults": {
+        "serverUrl": "https://api.githubcopilot.com/mcp/",
+        "authorizationEndpoint": "https://github.com/login/oauth/authorize",
+        "tokenEndpoint": "https://github.com/login/oauth/access_token",
+        "scopesHint": [
+          "repo",
+          "read:org",
+          "read:user"
+        ]
+      },
+      "guidanceMd": "Add Paperclip's callback URL to your GitHub App, generate a client secret, and paste the client ID and secret here. A GitHub App uses its own permissions and ignores scopes; keep user token expiration on so access tokens renew every 8 hours.",
+      "consoleLinks": {
+        "register": "https://github.com/settings/apps/new",
+        "docs": "https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app"
+      },
+      "riskTier": "S3",
+      "warnings": [
+        "Shell Git and gh receive this identity for the run and are not constrained by per-tool Ask-first controls."
+      ],
+      "requiredResourceFilters": [
+        "organization",
+        "repository"
+      ]
+    },
+    {
+      "key": "app-installation",
+      "label": "Custom GitHub App",
+      "purpose": "tool",
+      "transport": "mcp_remote",
+      "defaults": {
+        "serverUrl": "https://api.githubcopilot.com/mcp/"
+      },
+      "auth": "api_key",
+      "credentialExchange": "github_app_installation",
+      "ownershipModes": [
+        "customer"
+      ],
+      "grantKinds": [
+        "user",
+        "organization",
+        "agent"
+      ],
+      "whenToUse": "Use your own GitHub App to give agents a bot identity for GitHub tools, Git and gh.",
+      "guidanceMd": "Create a GitHub App in your user or organization settings, then install it on the repositories you want to connect. Webhooks and OAuth callbacks are not required. Enter its IDs, repository access and private key below.",
+      "riskTier": "S3",
+      "tenantFields": [
+        {
+          "key": "version",
+          "label": "Credential version",
+          "type": "text",
+          "hidden": true,
+          "defaultValue": "1",
+          "validation": {
+            "pattern": "^1$"
+          }
+        },
+        {
+          "key": "appId",
+          "placeholder": "123456",
+          "label": "App ID or Client ID",
+          "type": "text",
+          "required": true,
+          "validation": {
+            "pattern": "^(?:[1-9][0-9]*|Iv[0-9][A-Za-z0-9.]{1,97})$"
+          },
+          "helperMd": "In GitHub, open Settings \u2192 Developer settings \u2192 GitHub Apps \u2192 your App. Copy the App ID or Client ID from its settings page."
+        },
+        {
+          "key": "installationId",
+          "placeholder": "12345678",
+          "label": "Installation ID",
+          "type": "text",
+          "required": true,
+          "validation": {
+            "pattern": "^[1-9][0-9]*$"
+          },
+          "helperMd": "In your App settings, open Install App, then Configure for the target account. Copy the number after /installations/ in the URL."
+        },
+        {
+          "key": "repositories",
+          "placeholder": "acme/backend, acme/frontend",
+          "label": "Repositories",
+          "type": "textarea",
+          "required": true,
+          "helperMd": "Enter owner/repository names separated by commas. Each repository must be included in this App installation."
+        },
+        {
+          "key": "permissionProfile",
+          "placeholder": "read",
+          "label": "GitHub permissions",
+          "type": "select",
+          "required": true,
+          "defaultValue": "read",
+          "options": [
+            {
+              "value": "read",
+              "label": "Read: contents, pull requests and issues"
+            },
+            {
+              "value": "author",
+              "label": "Author: write contents and pull requests, read issues"
+            },
+            {
+              "value": "reviewer",
+              "label": "Reviewer: read contents and issues, write pull requests"
+            },
+            {
+              "value": "custom",
+              "label": "Custom permissions"
+            }
+          ],
+          "helperMd": "Grant these permissions in the App\u2019s GitHub settings, then approve any changes for its installation. Paperclip cannot grant permissions the installation does not have."
+        },
+        {
+          "key": "customPermissions",
+          "label": "Custom permissions (JSON)",
+          "type": "textarea",
+          "placeholder": "{\"contents\":\"read\",\"pull_requests\":\"write\",\"checks\":\"write\"}",
+          "validation": {
+            "maxLength": 10000
+          },
+          "helperMd": "Use GitHub API permission names with read, write or admin levels, for example: {\"contents\":\"read\",\"checks\":\"write\"}. This replaces the preset; only the permissions you enter are requested."
+        }
+      ],
+      "credentialFields": [
+        {
+          "key": "privateKey",
+          "placeholder": "-----BEGIN RSA PRIVATE KEY-----",
+          "label": "App private key (PEM)",
+          "type": "textarea",
+          "secret": true,
+          "required": true,
+          "helperMd": "In your App\u2019s GitHub settings, under Private keys, choose Generate a private key. Open the downloaded .pem file and paste its entire contents, including the BEGIN and END lines. Paperclip encrypts the saved key."
+        }
+      ],
+      "warnings": [
+        "Git and gh use this bot\u2019s repository access and GitHub permissions. Paperclip\u2019s per-tool Ask-first controls do not apply to Git or gh.",
+        "Existing tokens can remain usable until GitHub expires or revokes them. Use separate Apps for author and reviewer identities."
+      ],
+      "consoleLinks": {
+        "register": "https://github.com/settings/apps/new",
+        "docs": "https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation"
+      }
+    }
+  ]
+}

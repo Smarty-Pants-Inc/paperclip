@@ -1,0 +1,742 @@
+import { randomUUID } from "node:crypto";
+import { mkdirSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import express from "express";
+import request from "supertest";
+import { and, eq, sql } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import {
+  activityLog,
+  agents,
+  companies,
+  companyMemberships,
+  companySecretBindings,
+  companySecretProviderConfigs,
+  companySecretVersions,
+  companySecrets,
+  createDb,
+  environments,
+  approvals,
+  principalPermissionGrants,
+  userSecretDeclarations,
+  userSecretDefinitions,
+} from "@paperclipai/db";
+import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { expectNoTokenLeak } from "./helpers/token-leak.js";
+import { errorHandler } from "../middleware/index.js";
+import { agentRoutes } from "../routes/agents.js";
+import { secretService } from "../services/secrets.js";
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping agent-hire credential inheritance route tests on this host: ${
+      embeddedPostgresSupport.reason ?? "unsupported environment"
+    }`,
+  );
+}
+
+type Db = ReturnType<typeof createDb>;
+
+// The fixed Claude Code OAuth binding. It is a user-secret reference to the
+// fixed key. Any other shape is a replacement or a weaker binding.
+const FIXED_CLAUDE_OAUTH_BINDING = { type: "user_secret_ref", key: "CLAUDE_CODE_OAUTH_TOKEN" } as const;
+const FIXTURE_CLAUDE_OAUTH_TOKEN = "sk-ant-oat01-fixture-hire-oauth-0123456789abcdef";
+
+// Keep reason: #20816, a never-OK credential leak across the hire response boundary.
+// Each planted response must trip the same assertion used on the real route.
+describe("hire response token-leak guard controls", () => {
+  it.each([
+    ["seeded OAuth value", FIXTURE_CLAUDE_OAUTH_TOKEN],
+    ["exact value without a token prefix", "fixture-unprefixed-secret"],
+    ["unseeded Claude API shape", "sk-ant-api03-planted-0123456789abcdefghijkl"],
+    ["unseeded Claude OAuth shape", "sk-ant-oat01-planted-0123456789abcdefghijkl"],
+    ["unseeded OpenAI project shape", "sk-proj-planted-0123456789abcdefghijkl"],
+  ])("rejects a planted %s in a response object", (_label, token) => {
+    expect(() => expectNoTokenLeak(
+      { agent: { metadata: { leakedToken: token } } },
+      [FIXTURE_CLAUDE_OAUTH_TOKEN, "fixture-unprefixed-secret"],
+    )).toThrow();
+  });
+
+  it("accepts instructions paths containing sl-task-", () => {
+    expect(() => expectNoTokenLeak({ agent: { adapterConfig: {
+      instructionsFilePath: "/tmp/sl-task-0123456789abcdefghijkl/instructions/AGENTS.md",
+      instructionsRootPath: "/tmp/sl-task-0123456789abcdefghijkl/instructions",
+    } } }, [FIXTURE_CLAUDE_OAUTH_TOKEN])).not.toThrow();
+  });
+});
+
+function agentActor(companyId: string, agentId: string): Express.Request["actor"] {
+  return { type: "agent", agentId, companyId, source: "agent_jwt" };
+}
+
+// The local implicit board actor always passes authorization, so it stands in
+// for a user actor without needing a seeded company membership.
+function userActor(): Express.Request["actor"] {
+  return { type: "board", userId: "local-board", source: "local_implicit" };
+}
+
+function createApp(db: Db, actor: Express.Request["actor"]) {
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    req.actor = actor;
+    next();
+  });
+  app.use("/api", agentRoutes(db));
+  app.use(errorHandler);
+  return app;
+}
+
+describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
+  let db!: Db;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  const previousKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+  const secretsTmpDir = path.join(os.tmpdir(), `paperclip-agent-hire-auth-inheritance-${randomUUID()}`);
+
+  beforeAll(async () => {
+    mkdirSync(secretsTmpDir, { recursive: true });
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsTmpDir, "master.key");
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-agent-hire-auth-inheritance-");
+    db = createDb(tempDb.connectionString);
+  }, 60_000);
+
+  afterEach(async () => {
+    await db.delete(approvals);
+    await db.delete(activityLog);
+    await db.delete(userSecretDeclarations);
+    await db.delete(companySecretBindings);
+    await db.delete(companySecretVersions);
+    await db.delete(companySecrets);
+    await db.delete(userSecretDefinitions);
+    await db.delete(companySecretProviderConfigs);
+    await db.delete(principalPermissionGrants);
+    await db.delete(companyMemberships);
+    await db.delete(agents);
+    await db.delete(environments);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+    if (previousKeyFile === undefined) {
+      delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    } else {
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKeyFile;
+    }
+    rmSync(secretsTmpDir, { recursive: true, force: true });
+  });
+
+  async function seedCompany() {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: `Auth Inheritance Co ${companyId.slice(0, 8)}`,
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    return companyId;
+  }
+
+  async function seedParentAgent(companyId: string, adapterType: string, env: Record<string, unknown>) {
+    const [row] = await db
+      .insert(agents)
+      .values({
+        companyId,
+        name: `Parent ${randomUUID().slice(0, 8)}`,
+        role: "engineer",
+        adapterType,
+        adapterConfig: { env },
+        runtimeConfig: {},
+        permissions: { canCreateAgents: true },
+      })
+      .returning();
+    return row!;
+  }
+
+  async function createCompanySecret(companyId: string, value: string) {
+    return secretService(db).create(companyId, {
+      name: `cred-${randomUUID()}`,
+      provider: "local_encrypted",
+      value,
+    });
+  }
+
+  function secretRef(secretId: string, extra: Record<string, unknown> = {}) {
+    return { type: "secret_ref" as const, secretId, ...extra };
+  }
+
+  function hire(actor: Express.Request["actor"], companyId: string, payload: Record<string, unknown>) {
+    const app = createApp(db, actor);
+    return request(app).post(`/api/companies/${companyId}/agent-hires`).send(payload);
+  }
+
+  function childEnvOf(res: request.Response): Record<string, unknown> {
+    return ((res.body.agent?.adapterConfig as { env?: Record<string, unknown> } | undefined)?.env) ?? {};
+  }
+
+  // These are real route/transaction read-backs, not access-service mock calls.
+  // Keep reason: #20805 grant atomicity and the pending/low-trust authorization boundary.
+  it.each([
+    { label: "standard direct", route: "agents", pending: false, lowTrust: false },
+    { label: "pending-approval", route: "agent-hires", pending: true, lowTrust: false },
+    { label: "low-trust", route: "agent-hires", pending: false, lowTrust: true },
+  ])("grant replacement audit: $label hire keeps exactly one active membership and stamped tasks:assign", async ({ route, pending, lowTrust }) => {
+    // SUPERSEDED BY REPLACEMENT (#20805 F2, review-fleet-2 + RFL 08:40Z 11-16): grant now inside the hire transaction
+    const companyId = await seedCompany();
+    if (pending) await db.update(companies).set({ requireBoardApprovalForNewAgents: true }).where(eq(companies.id, companyId));
+    const res = await request(createApp(db, userActor()))
+      .post(`/api/companies/${companyId}/${route}`)
+      .send({ name: "Grant Audit Child", role: "engineer", adapterType: "process", adapterConfig: {},
+        ...(lowTrust ? { permissions: { trustPreset: "low_trust_review" } } : {}) });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const child = route === "agents" ? res.body : res.body.agent;
+    expect(child.id).toEqual(expect.any(String));
+    // This fixture has no running lifecycle worker; non-pending process hires are paused.
+    expect(child.status).toBe(pending ? "pending_approval" : "paused");
+    if (lowTrust) {
+      const [stored] = await db.select().from(agents).where(eq(agents.id, child.id));
+      expect(stored!.permissions).toMatchObject({ trustPreset: "low_trust_review" });
+    }
+    const membership = await db.select({ companyId: companyMemberships.companyId,
+      principalType: companyMemberships.principalType, principalId: companyMemberships.principalId,
+      membershipRole: companyMemberships.membershipRole, status: companyMemberships.status })
+      .from(companyMemberships).where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.principalId, child.id)));
+    expect(membership).toEqual([{ companyId, principalType: "agent", principalId: child.id, membershipRole: "member", status: "active" }]);
+    const assign = await db.select({ companyId: principalPermissionGrants.companyId,
+      principalType: principalPermissionGrants.principalType, principalId: principalPermissionGrants.principalId,
+      permissionKey: principalPermissionGrants.permissionKey, scope: principalPermissionGrants.scope,
+      grantedByUserId: principalPermissionGrants.grantedByUserId })
+      .from(principalPermissionGrants).where(and(eq(principalPermissionGrants.companyId, companyId),
+        eq(principalPermissionGrants.principalId, child.id), eq(principalPermissionGrants.permissionKey, "tasks:assign")));
+    expect(assign).toEqual([{ companyId, principalType: "agent", principalId: child.id,
+      permissionKey: "tasks:assign", scope: null, grantedByUserId: "local-board" }]);
+  });
+
+  it.each(["agents", "agent-hires"])("grant replacement audit: exhausted /%s hire keeps zero agents, memberships, and grants", async route => {
+    // SUPERSEDED BY REPLACEMENT (#20805 F2, review-fleet-2 + RFL 08:40Z 11-16): grant now inside the hire transaction
+    const companyId = await seedCompany();
+    const fault = `grant_audit_${companyId.replaceAll("-", "")}`;
+    await db.execute(sql.raw(`CREATE SEQUENCE ${fault}_n;
+      CREATE FUNCTION ${fault}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+        IF NEW.company_id = '${companyId}' AND NEW.principal_type = 'agent' THEN
+          PERFORM nextval('${fault}_n');
+          RAISE EXCEPTION 'grant audit contention' USING ERRCODE = '40P01';
+        END IF; RETURN NEW; END $$;
+      CREATE TRIGGER ${fault} BEFORE INSERT ON company_memberships FOR EACH ROW EXECUTE FUNCTION ${fault}();`));
+    try {
+      const res = await request(createApp(db, userActor())).post(`/api/companies/${companyId}/${route}`)
+        .send({ name: "No Partial Grant Child", role: "engineer", adapterType: "process", adapterConfig: {} });
+      expect(res.status, JSON.stringify(res.body)).toBe(503);
+      expect(res.body.code).toBe("agent_hire_grant_contention");
+      const attempts = await db.execute<{ count: string }>(sql.raw(`SELECT last_value::text AS count FROM ${fault}_n`));
+      expect(Number(attempts[0]!.count)).toBe(5);
+      expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toEqual([]);
+      expect(await db.select().from(companyMemberships).where(eq(companyMemberships.companyId, companyId))).toEqual([]);
+      expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId))).toEqual([]);
+    } finally {
+      await db.execute(sql.raw(`DROP TRIGGER ${fault} ON company_memberships; DROP FUNCTION ${fault}(); DROP SEQUENCE ${fault}_n;`));
+    }
+  });
+
+  it("inherits the parent secret_ref for a codex_local hire with no env, and derives the child binding", async () => {
+    const companyId = await seedCompany();
+    const secret = await createCompanySecret(companyId, "sk-openai-parent");
+    const parent = await seedParentAgent(companyId, "codex_local", {
+      OPENAI_API_KEY: secretRef(secret.id),
+    });
+
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Codex Child",
+      role: "engineer",
+      adapterType: "codex_local",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(childEnvOf(res).OPENAI_API_KEY).toMatchObject({ type: "secret_ref", secretId: secret.id });
+
+    const bindings = await db
+      .select()
+      .from(companySecretBindings)
+      .where(
+        and(
+          eq(companySecretBindings.companyId, companyId),
+          eq(companySecretBindings.targetType, "agent"),
+          eq(companySecretBindings.targetId, res.body.agent.id),
+        ),
+      );
+    expect(bindings).toHaveLength(1);
+    expect(bindings[0]).toMatchObject({
+      configPath: "env.OPENAI_API_KEY",
+      secretId: secret.id,
+      versionSelector: "latest",
+    });
+  });
+
+  it("keeps a pinned version selector on the copied reference and its derived binding", async () => {
+    const companyId = await seedCompany();
+    const secret = await createCompanySecret(companyId, "sk-openai-pinned");
+    const parent = await seedParentAgent(companyId, "codex_local", {
+      OPENAI_API_KEY: secretRef(secret.id, { version: 3 }),
+    });
+
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Codex Pinned Child",
+      role: "engineer",
+      adapterType: "codex_local",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(childEnvOf(res).OPENAI_API_KEY).toMatchObject({ type: "secret_ref", secretId: secret.id, version: 3 });
+
+    const bindings = await db
+      .select()
+      .from(companySecretBindings)
+      .where(
+        and(
+          eq(companySecretBindings.companyId, companyId),
+          eq(companySecretBindings.targetId, res.body.agent.id),
+        ),
+      );
+    expect(bindings[0]?.versionSelector).toBe("3");
+  });
+
+  it("retains version, required, and allowMissingOverride on a copied user_secret_ref", async () => {
+    const companyId = await seedCompany();
+    await secretService(db).createUserSecretDefinition(companyId, {
+      key: "openai_shared_key",
+      name: "Shared OpenAI key",
+      provider: "local_encrypted",
+    });
+    const parent = await seedParentAgent(companyId, "codex_local", {
+      OPENAI_API_KEY: {
+        type: "user_secret_ref",
+        key: "openai_shared_key",
+        version: 2,
+        required: false,
+        allowMissingOverride: true,
+      },
+    });
+
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Codex User Secret Child",
+      role: "engineer",
+      adapterType: "codex_local",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(childEnvOf(res).OPENAI_API_KEY).toMatchObject({
+      type: "user_secret_ref",
+      key: "openai_shared_key",
+      version: 2,
+      required: false,
+      allowMissingOverride: true,
+    });
+  });
+
+  it("inherits a grok_local parent's XAI_API_KEY reference", async () => {
+    const companyId = await seedCompany();
+    const secret = await createCompanySecret(companyId, "xai-parent-key");
+    const parent = await seedParentAgent(companyId, "grok_local", {
+      XAI_API_KEY: secretRef(secret.id),
+    });
+
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Grok Child",
+      role: "engineer",
+      adapterType: "grok_local",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(childEnvOf(res).XAI_API_KEY).toMatchObject({ type: "secret_ref", secretId: secret.id });
+  });
+
+  it("inherits a native OpenCode parent's OPENROUTER_API_KEY reference when the hire inherits the caller runtime", async () => {
+    const companyId = await seedCompany();
+    await db.update(companies).set({ requireBoardApprovalForNewAgents: true }).where(eq(companies.id, companyId));
+    const secret = await createCompanySecret(companyId, "openrouter-parent-key");
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    await db.update(agents).set({ adapterConfig: {
+      provider: "opencode", model: "openrouter/deepseek/deepseek-v4.1-flash-1017", opencodePermissionMode: "allow",
+      env: { OPENROUTER_API_KEY: secretRef(secret.id, { version: "latest" }), OPENCODE_CONFIG_CONTENT: "{\"provider\":{}}" },
+    } }).where(eq(agents.id, parent.id));
+
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "OpenCode Child", role: "qa", adapterType: "paperclip_runner", inheritRuntimeFrom: "caller",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.agent.status).toBe("pending_approval");
+    const [child] = await db.select().from(agents).where(eq(agents.id, res.body.agent.id));
+    const env = (child!.adapterConfig as { env?: Record<string, unknown> }).env ?? {};
+    expect(env.OPENROUTER_API_KEY).toMatchObject({ type: "secret_ref", secretId: secret.id, version: "latest" });
+    expect(env.OPENCODE_CONFIG_CONTENT).toBeUndefined();
+  });
+
+  it.each(["create", "hire"] as const)("blocks native Claude credential redirection before %s inheritance", async mode => {
+    const companyId = await seedCompany();
+    const secret = await createCompanySecret(companyId, "fixture-parent-credential");
+    const parent = await seedParentAgent(companyId, "paperclip_runner", { ANTHROPIC_API_KEY: secretRef(secret.id) });
+    await db.update(agents).set({ adapterConfig: { provider: "acpx", acpxAgent: "claude", env: { ANTHROPIC_API_KEY: secretRef(secret.id) } } }).where(eq(agents.id, parent.id));
+    const app = createApp(db, agentActor(companyId, parent.id));
+    const res = await request(app).post(`/api/companies/${companyId}/${mode === "hire" ? "agent-hires" : "agents"}`).send({
+      name: "Redirected child", role: "engineer", adapterType: "paperclip_runner",
+      adapterConfig: { provider: "acpx", acpxAgent: "claude", env: { ANTHROPIC_BASE_URL: "https://untrusted.example.test" } },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("host-executed local adapter settings");
+    expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(1);
+  });
+
+  it("still inherits Claude credential references for an ordinary native hire", async () => {
+    const companyId = await seedCompany();
+    const secret = await createCompanySecret(companyId, "fixture-parent-credential");
+    const parent = await seedParentAgent(companyId, "claude_local", { ANTHROPIC_API_KEY: secretRef(secret.id) });
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Native child", role: "engineer", adapterType: "paperclip_runner",
+      adapterConfig: { provider: "acpx", acpxAgent: "claude" },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.agent.adapterType).toBe("paperclip_runner");
+    expect(childEnvOf(res).ANTHROPIC_API_KEY).toMatchObject({ type: "secret_ref", secretId: secret.id });
+  });
+
+  it("inherits a claude_local parent's ANTHROPIC_API_KEY reference", async () => {
+    const companyId = await seedCompany();
+    const secret = await createCompanySecret(companyId, "ant-parent-key");
+    const parent = await seedParentAgent(companyId, "claude_local", {
+      ANTHROPIC_API_KEY: secretRef(secret.id),
+    });
+
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Claude Child",
+      role: "engineer",
+      adapterType: "claude_local",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(childEnvOf(res).ANTHROPIC_API_KEY).toMatchObject({ type: "secret_ref", secretId: secret.id });
+  });
+
+  it("keeps the child-supplied ANTHROPIC_API_KEY and inherits no Claude credential at all", async () => {
+    const companyId = await seedCompany();
+    const childSecret = await createCompanySecret(companyId, "ant-child-key");
+    // The parent holds the fixed Claude OAuth binding, which is normally
+    // inheritable, but the child already supplies its own Claude credential.
+    const parent = await seedParentAgent(companyId, "claude_local", {
+      CLAUDE_CODE_OAUTH_TOKEN: { ...FIXED_CLAUDE_OAUTH_BINDING },
+    });
+
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Claude Child With Own Key",
+      role: "engineer",
+      adapterType: "claude_local",
+      adapterConfig: { env: { ANTHROPIC_API_KEY: secretRef(childSecret.id) } },
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const childEnv = childEnvOf(res);
+    expect(childEnv.ANTHROPIC_API_KEY).toMatchObject({ type: "secret_ref", secretId: childSecret.id });
+    expect(childEnv.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+  });
+
+  it("does not inherit a plain environment value", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "grok_local", {
+      XAI_API_KEY: "xai-plain-value",
+    });
+
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Grok Plain Value Child",
+      role: "engineer",
+      adapterType: "grok_local",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(childEnvOf(res).XAI_API_KEY).toBeUndefined();
+  });
+
+  it("does not inherit across a mismatched adapter type", async () => {
+    const companyId = await seedCompany();
+    const secret = await createCompanySecret(companyId, "sk-openai-mismatch");
+    const parent = await seedParentAgent(companyId, "codex_local", {
+      OPENAI_API_KEY: secretRef(secret.id),
+    });
+
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Claude Child From Codex Parent",
+      role: "engineer",
+      adapterType: "claude_local",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(Object.keys(childEnvOf(res))).toHaveLength(0);
+  });
+
+  it("does not inherit a codex_local credential from a hiring agent in another company", async () => {
+    const parentCompanyId = await seedCompany();
+    const targetCompanyId = await seedCompany();
+    const secret = await createCompanySecret(parentCompanyId, "sk-openai-other-company");
+    const parent = await seedParentAgent(parentCompanyId, "codex_local", {
+      OPENAI_API_KEY: secretRef(secret.id),
+    });
+
+    // The actor claims the target company, but the named hiring agent belongs
+    // to a different company. The route must reject the request and must
+    // never copy the other company's credential reference.
+    const res = await hire(agentActor(targetCompanyId, parent.id), targetCompanyId, {
+      name: "Codex Cross-Company Child",
+      role: "engineer",
+      adapterType: "codex_local",
+    });
+
+    expect(res.status).toBe(403);
+    const children = await db.select().from(agents).where(eq(agents.companyId, targetCompanyId));
+    expect(children).toHaveLength(0);
+  });
+
+  it("does not inherit a grok_local credential from a hiring agent in another company", async () => {
+    const parentCompanyId = await seedCompany();
+    const targetCompanyId = await seedCompany();
+    const secret = await createCompanySecret(parentCompanyId, "xai-other-company");
+    const parent = await seedParentAgent(parentCompanyId, "grok_local", {
+      XAI_API_KEY: secretRef(secret.id),
+    });
+
+    const res = await hire(agentActor(targetCompanyId, parent.id), targetCompanyId, {
+      name: "Grok Cross-Company Child",
+      role: "engineer",
+      adapterType: "grok_local",
+    });
+
+    expect(res.status).toBe(403);
+    const children = await db.select().from(agents).where(eq(agents.companyId, targetCompanyId));
+    expect(children).toHaveLength(0);
+  });
+
+  it("does not inherit a claude_local credential, including the fixed OAuth binding, from a hiring agent in another company", async () => {
+    const parentCompanyId = await seedCompany();
+    const targetCompanyId = await seedCompany();
+    const parent = await seedParentAgent(parentCompanyId, "claude_local", {
+      ANTHROPIC_API_KEY: secretRef((await createCompanySecret(parentCompanyId, "ant-other-company")).id),
+      CLAUDE_CODE_OAUTH_TOKEN: { ...FIXED_CLAUDE_OAUTH_BINDING, version: 1 },
+    });
+
+    const res = await hire(agentActor(targetCompanyId, parent.id), targetCompanyId, {
+      name: "Claude Cross-Company Child",
+      role: "engineer",
+      adapterType: "claude_local",
+    });
+
+    expect(res.status).toBe(403);
+    const children = await db.select().from(agents).where(eq(agents.companyId, targetCompanyId));
+    expect(children).toHaveLength(0);
+  });
+
+  it("carves out a per-agent CODEX_HOME when the child inherits OPENAI_API_KEY", async () => {
+    const companyId = await seedCompany();
+    const secret = await createCompanySecret(companyId, "sk-openai-isolated");
+    const parent = await seedParentAgent(companyId, "codex_local", {
+      OPENAI_API_KEY: secretRef(secret.id),
+    });
+
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Codex Isolated Child",
+      role: "engineer",
+      adapterType: "codex_local",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const childEnv = childEnvOf(res);
+    // A bare environment string persists as a `plain` binding.
+    const codexHome = childEnv.CODEX_HOME as { type: string; value: string } | undefined;
+    expect(codexHome?.type).toBe("plain");
+    expect(codexHome?.value.length ?? 0).toBeGreaterThan(0);
+  });
+
+  it("keeps the shared company Codex home when the child inherits no key", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "codex_local", {});
+
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Codex Shared Home Child",
+      role: "engineer",
+      adapterType: "codex_local",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(childEnvOf(res).CODEX_HOME).toBeUndefined();
+  });
+
+  it("adds no home override for a grok_local child with no inherited key", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "grok_local", {});
+
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Grok No Key Child",
+      role: "engineer",
+      adapterType: "grok_local",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const childEnv = childEnvOf(res);
+    expect(childEnv.GROK_HOME).toBeUndefined();
+    expect(childEnv.XAI_API_KEY).toBeUndefined();
+  });
+
+  it("inherits nothing for a user actor hire", async () => {
+    const companyId = await seedCompany();
+    // No hiring-agent context exists for a user actor. The merge must not run
+    // at all, so an otherwise-inheritable key is simply never considered.
+    const res = await hire(userActor(), companyId, {
+      name: "User Hired Child",
+      role: "engineer",
+      adapterType: "claude_local",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(Object.keys(childEnvOf(res))).toHaveLength(0);
+  });
+
+  it("rejects native runtime inheritance for a board actor", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    const res = await hire(userActor(), companyId, {
+      name: "Board Inheritance Attempt", role: "engineer", adapterType: "paperclip_runner", inheritRuntimeFrom: "caller",
+    });
+    expect(res.status).toBe(403);
+    expect(parent.adapterType).toBe("paperclip_runner");
+  });
+
+  it("rejects inheritance from a legacy caller", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "codex_local", {});
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Legacy Inheritance Attempt", role: "engineer", adapterType: "paperclip_runner", inheritRuntimeFrom: "caller",
+    });
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("paperclip_runner adapter");
+  });
+
+  it("rejects native runtime inheritance across companies", async () => {
+    const parentCompanyId = await seedCompany();
+    const targetCompanyId = await seedCompany();
+    const parent = await seedParentAgent(parentCompanyId, "paperclip_runner", { provider: "codex", model: "gpt-5.6-sol" });
+    const res = await hire(agentActor(targetCompanyId, parent.id), targetCompanyId, {
+      name: "Cross Company Inheritance Attempt", role: "engineer", adapterType: "paperclip_runner", inheritRuntimeFrom: "caller",
+    });
+    expect(res.status).toBe(403);
+    expect(await db.select().from(agents).where(eq(agents.companyId, targetCompanyId))).toHaveLength(0);
+  });
+
+  it("records only inherited safe settings in an approval snapshot", async () => {
+    const companyId = await seedCompany();
+    await db.update(companies).set({ requireBoardApprovalForNewAgents: true }).where(eq(companies.id, companyId));
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    await db.update(agents).set({ adapterConfig: {
+      provider: "acpx", acpxAgent: "claude", model: "claude-sonnet-5", acpxPermissionMode: "approve-all",
+      env: { PRIVATE_PARENT_TOKEN: secretRef("parent-secret") }, cwd: "/private/parent",
+      invocationLimits: { maxIterations: 3, credentials: "never-copy" },
+    } }).where(eq(agents.id, parent.id));
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Approval Snapshot Child", role: "engineer", adapterType: "paperclip_runner", inheritRuntimeFrom: "caller",
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.agent.status).toBe("pending_approval");
+    expect(res.body.approval.payload.inheritRuntimeFrom).toBeUndefined();
+    expect(res.body.approval.payload.adapterConfig).toMatchObject({ provider: "acpx", acpxAgent: "claude", acpxPermissionMode: "approve-all" });
+    expect(res.body.approval.payload.adapterConfig.env).toBeUndefined();
+    expect(res.body.approval.payload.adapterConfig.cwd).toBeUndefined();
+    expect(res.body.approval.payload.adapterConfig.invocationLimits).toEqual({ maxIterations: 3 });
+  });
+
+  it.each([
+    ["claude_managed", "managedProfileId", "managedAgentsRetentionAcknowledged", "Managed Agent"],
+    ["aws_agentcore", "agentCoreProfileId", "agentCoreRetentionAcknowledged", "Remote Agent"],
+  ])("revalidates the inherited %s company profile before creating a hire", async (provider, profileKey, retentionKey, label) => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    await db.update(agents).set({ adapterConfig: {
+      provider, [profileKey]: randomUUID(), [retentionKey]: true,
+    } }).where(eq(agents.id, parent.id));
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Missing Profile Child", role: "engineer", adapterType: "paperclip_runner", inheritRuntimeFrom: "caller",
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(res.body.error).toBe(`${label} profile not found`);
+    expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(1);
+  });
+
+  it("validates and preserves an inherited caller default environment", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    const environmentId = randomUUID();
+    await db.insert(environments).values({ id: environmentId, name: `Local ${environmentId}`, driver: "local" });
+    await db.update(agents).set({ defaultEnvironmentId: environmentId }).where(eq(agents.id, parent.id));
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Invalid Environment Child", role: "engineer", adapterType: "paperclip_runner", inheritRuntimeFrom: "caller",
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.agent.defaultEnvironmentId).toBe(environmentId);
+  });
+
+  it("inherits the fixed Claude OAuth binding, keeps its version, and leaks no token value", async () => {
+    const companyId = await seedCompany();
+    const svc = secretService(db);
+    const definition = await svc.ensureClaudeOAuthUserSecretDefinition(companyId);
+    const secret = await svc.createCurrentUserSecretValue(companyId, "local-board", {
+      definitionId: definition.id,
+      value: FIXTURE_CLAUDE_OAUTH_TOKEN,
+    });
+    // Seed the actual encrypted value behind the pinned version, not just a ref.
+    for (let version = 2; version <= 3; version += 1) {
+      await svc.rotateCurrentUserSecretValue(companyId, "local-board", secret.id, {
+        value: FIXTURE_CLAUDE_OAUTH_TOKEN,
+      });
+    }
+    const parent = await seedParentAgent(companyId, "claude_local", {
+      CLAUDE_CODE_OAUTH_TOKEN: { ...FIXED_CLAUDE_OAUTH_BINDING, version: 3 },
+    });
+
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Claude OAuth Child",
+      role: "engineer",
+      adapterType: "claude_local",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const childAgentId = res.body.agent.id as string;
+    expect(childEnvOf(res).CLAUDE_CODE_OAUTH_TOKEN).toMatchObject({
+      type: "user_secret_ref",
+      key: "CLAUDE_CODE_OAUTH_TOKEN",
+      version: 3,
+    });
+    // The response body carries the reference only, never a token value. (superseded by replacement: #20816 F6, RFL record 19:12Z)
+    expectNoTokenLeak(res.body, [FIXTURE_CLAUDE_OAUTH_TOKEN]);
+
+    const declarations = await db
+      .select()
+      .from(userSecretDeclarations)
+      .where(eq(userSecretDeclarations.targetId, childAgentId));
+    expect(declarations).toHaveLength(1);
+    expect(declarations[0]).toMatchObject({
+      envKey: "CLAUDE_CODE_OAUTH_TOKEN",
+      configPath: "env.CLAUDE_CODE_OAUTH_TOKEN",
+      versionSelector: "3",
+    });
+
+    const hireActivity = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "agent.hire_created")));
+    expect(hireActivity).toHaveLength(1);
+    const detailsText = JSON.stringify(hireActivity[0]!.details);
+    expect(detailsText).not.toContain("adapterConfig");
+    expect(detailsText).not.toContain("CLAUDE_CODE_OAUTH_TOKEN");
+  });
+});

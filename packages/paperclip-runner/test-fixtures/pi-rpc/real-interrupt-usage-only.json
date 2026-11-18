@@ -1,0 +1,1136 @@
+{
+  "sourceRun": "54a1eaaa",
+  "sourceSha256": "b114e212618a6867b22f041817e0bcb749cb3cbbaeaaebcd8ea9e3bb202a6e8e",
+  "receipts": [
+    {
+      "seq": 112,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 2,
+            "outputTokens": 399,
+            "activeSeconds": 0,
+            "cacheReadTokens": 68095,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 8036
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 2,
+            "outputTokens": 399,
+            "activeSeconds": 0,
+            "cacheReadTokens": 68095,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 8036
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 134,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 4,
+            "outputTokens": 666,
+            "activeSeconds": 0,
+            "cacheReadTokens": 144226,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 12027
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 4,
+            "outputTokens": 666,
+            "activeSeconds": 0,
+            "cacheReadTokens": 144226,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 12027
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 158,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 6,
+            "outputTokens": 829,
+            "activeSeconds": 0,
+            "cacheReadTokens": 224348,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 15804
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 6,
+            "outputTokens": 829,
+            "activeSeconds": 0,
+            "cacheReadTokens": 224348,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 15804
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 172,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 8,
+            "outputTokens": 1393,
+            "activeSeconds": 0,
+            "cacheReadTokens": 308247,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 17292
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 8,
+            "outputTokens": 1393,
+            "activeSeconds": 0,
+            "cacheReadTokens": 308247,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 17292
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 196,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 10,
+            "outputTokens": 1835,
+            "activeSeconds": 0,
+            "cacheReadTokens": 393634,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 18846
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 10,
+            "outputTokens": 1835,
+            "activeSeconds": 0,
+            "cacheReadTokens": 393634,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 18846
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 215,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 12,
+            "outputTokens": 2241,
+            "activeSeconds": 0,
+            "cacheReadTokens": 480575,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 19711
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 12,
+            "outputTokens": 2241,
+            "activeSeconds": 0,
+            "cacheReadTokens": 480575,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 19711
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 228,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 14,
+            "outputTokens": 4674,
+            "activeSeconds": 0,
+            "cacheReadTokens": 568381,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 21847
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 14,
+            "outputTokens": 4674,
+            "activeSeconds": 0,
+            "cacheReadTokens": 568381,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 21847
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 240,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 16,
+            "outputTokens": 5432,
+            "activeSeconds": 0,
+            "cacheReadTokens": 658323,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 24587
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 16,
+            "outputTokens": 5432,
+            "activeSeconds": 0,
+            "cacheReadTokens": 658323,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 24587
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 249,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 18,
+            "outputTokens": 6705,
+            "activeSeconds": 0,
+            "cacheReadTokens": 751005,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 26295
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 18,
+            "outputTokens": 6705,
+            "activeSeconds": 0,
+            "cacheReadTokens": 751005,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 26295
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 261,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 20,
+            "outputTokens": 9770,
+            "activeSeconds": 0,
+            "cacheReadTokens": 845395,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 29273
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 20,
+            "outputTokens": 9770,
+            "activeSeconds": 0,
+            "cacheReadTokens": 845395,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 29273
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 278,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 22,
+            "outputTokens": 10110,
+            "activeSeconds": 0,
+            "cacheReadTokens": 942763,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 32971
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 22,
+            "outputTokens": 10110,
+            "activeSeconds": 0,
+            "cacheReadTokens": 942763,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 32971
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 291,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 24,
+            "outputTokens": 25508,
+            "activeSeconds": 0,
+            "cacheReadTokens": 1043829,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 36235
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 24,
+            "outputTokens": 25508,
+            "activeSeconds": 0,
+            "cacheReadTokens": 1043829,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 36235
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 301,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 26,
+            "outputTokens": 27747,
+            "activeSeconds": 0,
+            "cacheReadTokens": 1148159,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 51666
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 26,
+            "outputTokens": 27747,
+            "activeSeconds": 0,
+            "cacheReadTokens": 1148159,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 51666
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 315,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 28,
+            "outputTokens": 28125,
+            "activeSeconds": 0,
+            "cacheReadTokens": 1267920,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 55333
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 28,
+            "outputTokens": 28125,
+            "activeSeconds": 0,
+            "cacheReadTokens": 1267920,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 55333
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 324,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 30,
+            "outputTokens": 28675,
+            "activeSeconds": 0,
+            "cacheReadTokens": 1391348,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 56503
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 30,
+            "outputTokens": 28675,
+            "activeSeconds": 0,
+            "cacheReadTokens": 1391348,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 56503
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 340,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 32,
+            "outputTokens": 29729,
+            "activeSeconds": 0,
+            "cacheReadTokens": 1515946,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 57380
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 32,
+            "outputTokens": 29729,
+            "activeSeconds": 0,
+            "cacheReadTokens": 1515946,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 57380
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 352,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 34,
+            "outputTokens": 30128,
+            "activeSeconds": 0,
+            "cacheReadTokens": 1641421,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 59105
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 34,
+            "outputTokens": 30128,
+            "activeSeconds": 0,
+            "cacheReadTokens": 1641421,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 59105
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 358,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 36,
+            "outputTokens": 31517,
+            "activeSeconds": 0,
+            "cacheReadTokens": 1768621,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 63797
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 36,
+            "outputTokens": 31517,
+            "activeSeconds": 0,
+            "cacheReadTokens": 1768621,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 63797
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 369,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 38,
+            "outputTokens": 32169,
+            "activeSeconds": 0,
+            "cacheReadTokens": 1900513,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 65311
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 38,
+            "outputTokens": 32169,
+            "activeSeconds": 0,
+            "cacheReadTokens": 1900513,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 65311
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 379,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 40,
+            "outputTokens": 36169,
+            "activeSeconds": 0,
+            "cacheReadTokens": 2033919,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 66054
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 40,
+            "outputTokens": 36169,
+            "activeSeconds": 0,
+            "cacheReadTokens": 2033919,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 66054
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 394,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 42,
+            "outputTokens": 36357,
+            "activeSeconds": 0,
+            "cacheReadTokens": 2168068,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 70336
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 42,
+            "outputTokens": 36357,
+            "activeSeconds": 0,
+            "cacheReadTokens": 2168068,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 70336
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 408,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 44,
+            "outputTokens": 37843,
+            "activeSeconds": 0,
+            "cacheReadTokens": 2306499,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 73179
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 44,
+            "outputTokens": 37843,
+            "activeSeconds": 0,
+            "cacheReadTokens": 2306499,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 73179
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 423,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 46,
+            "outputTokens": 38635,
+            "activeSeconds": 0,
+            "cacheReadTokens": 2447773,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 75432
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 46,
+            "outputTokens": 38635,
+            "activeSeconds": 0,
+            "cacheReadTokens": 2447773,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 75432
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 445,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 48,
+            "outputTokens": 39832,
+            "activeSeconds": 0,
+            "cacheReadTokens": 2591300,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 76433
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 48,
+            "outputTokens": 39832,
+            "activeSeconds": 0,
+            "cacheReadTokens": 2591300,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 76433
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 508,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 50,
+            "outputTokens": 40824,
+            "activeSeconds": 0,
+            "cacheReadTokens": 2735828,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 77891
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 50,
+            "outputTokens": 40824,
+            "activeSeconds": 0,
+            "cacheReadTokens": 2735828,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 77891
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 589,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 52,
+            "outputTokens": 42050,
+            "activeSeconds": 0,
+            "cacheReadTokens": 2881814,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 99959
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 52,
+            "outputTokens": 42050,
+            "activeSeconds": 0,
+            "cacheReadTokens": 2881814,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 99959
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "seq": 599,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "interrupt_acknowledgement",
+        "status": "acknowledged"
+      }
+    },
+    {
+      "seq": 600,
+      "eventType": "item.completed",
+      "payload": {
+        "kind": "usage",
+        "usage": {
+          "total": {
+            "requests": 0,
+            "inputTokens": 52,
+            "outputTokens": 42050,
+            "activeSeconds": 0,
+            "cacheReadTokens": 2881814,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 99959
+          },
+          "runDelta": {
+            "requests": 0,
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "activeSeconds": 0,
+            "cacheReadTokens": 0,
+            "providerCostUsd": 0,
+            "cacheWriteTokens": 0
+          },
+          "runDeltaComplete": false
+        }
+      }
+    },
+    {
+      "seq": 602,
+      "eventType": "turn.cancelled",
+      "payload": {
+        "status": "cancelled"
+      }
+    },
+    {
+      "seq": 607,
+      "eventType": "run.terminal",
+      "payload": {}
+    }
+  ],
+  "nativeReplay": [
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-112",
+        "usage": {
+          "input": 2,
+          "output": 399,
+          "cacheRead": 68095,
+          "cacheWrite": 8036
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-134",
+        "usage": {
+          "input": 2,
+          "output": 267,
+          "cacheRead": 76131,
+          "cacheWrite": 3991
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-158",
+        "usage": {
+          "input": 2,
+          "output": 163,
+          "cacheRead": 80122,
+          "cacheWrite": 3777
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-172",
+        "usage": {
+          "input": 2,
+          "output": 564,
+          "cacheRead": 83899,
+          "cacheWrite": 1488
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-196",
+        "usage": {
+          "input": 2,
+          "output": 442,
+          "cacheRead": 85387,
+          "cacheWrite": 1554
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-215",
+        "usage": {
+          "input": 2,
+          "output": 406,
+          "cacheRead": 86941,
+          "cacheWrite": 865
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-228",
+        "usage": {
+          "input": 2,
+          "output": 2433,
+          "cacheRead": 87806,
+          "cacheWrite": 2136
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-240",
+        "usage": {
+          "input": 2,
+          "output": 758,
+          "cacheRead": 89942,
+          "cacheWrite": 2740
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-249",
+        "usage": {
+          "input": 2,
+          "output": 1273,
+          "cacheRead": 92682,
+          "cacheWrite": 1708
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-261",
+        "usage": {
+          "input": 2,
+          "output": 3065,
+          "cacheRead": 94390,
+          "cacheWrite": 2978
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-278",
+        "usage": {
+          "input": 2,
+          "output": 340,
+          "cacheRead": 97368,
+          "cacheWrite": 3698
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-291",
+        "usage": {
+          "input": 2,
+          "output": 15398,
+          "cacheRead": 101066,
+          "cacheWrite": 3264
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-301",
+        "usage": {
+          "input": 2,
+          "output": 2239,
+          "cacheRead": 104330,
+          "cacheWrite": 15431
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-315",
+        "usage": {
+          "input": 2,
+          "output": 378,
+          "cacheRead": 119761,
+          "cacheWrite": 3667
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-324",
+        "usage": {
+          "input": 2,
+          "output": 550,
+          "cacheRead": 123428,
+          "cacheWrite": 1170
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-340",
+        "usage": {
+          "input": 2,
+          "output": 1054,
+          "cacheRead": 124598,
+          "cacheWrite": 877
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-352",
+        "usage": {
+          "input": 2,
+          "output": 399,
+          "cacheRead": 125475,
+          "cacheWrite": 1725
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-358",
+        "usage": {
+          "input": 2,
+          "output": 1389,
+          "cacheRead": 127200,
+          "cacheWrite": 4692
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-369",
+        "usage": {
+          "input": 2,
+          "output": 652,
+          "cacheRead": 131892,
+          "cacheWrite": 1514
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-379",
+        "usage": {
+          "input": 2,
+          "output": 4000,
+          "cacheRead": 133406,
+          "cacheWrite": 743
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-394",
+        "usage": {
+          "input": 2,
+          "output": 188,
+          "cacheRead": 134149,
+          "cacheWrite": 4282
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-408",
+        "usage": {
+          "input": 2,
+          "output": 1486,
+          "cacheRead": 138431,
+          "cacheWrite": 2843
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-423",
+        "usage": {
+          "input": 2,
+          "output": 792,
+          "cacheRead": 141274,
+          "cacheWrite": 2253
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-445",
+        "usage": {
+          "input": 2,
+          "output": 1197,
+          "cacheRead": 143527,
+          "cacheWrite": 1001
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-508",
+        "usage": {
+          "input": 2,
+          "output": 992,
+          "cacheRead": 144528,
+          "cacheWrite": 1458
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "receipt-589",
+        "usage": {
+          "input": 2,
+          "output": 1226,
+          "cacheRead": 145986,
+          "cacheWrite": 22068
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "responseId": "parked-final",
+        "stopReason": "aborted"
+      }
+    }
+  ],
+  "expected": {
+    "inputTokens": 100011,
+    "outputTokens": 42050,
+    "cachedInputTokens": 2881814,
+    "cacheWriteTokens": 99959
+  }
+}

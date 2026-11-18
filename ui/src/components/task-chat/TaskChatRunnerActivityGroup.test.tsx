@@ -1,0 +1,476 @@
+// @vitest-environment jsdom
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TaskChatThreadView } from "./TaskChatThreadView";
+import { ThemeProvider } from "@/context/ThemeContext";
+import { MemoryRouter } from "@/lib/router";
+import { TaskChatRunnerActivityGroup } from "./TaskChatRunnerActivityGroup";
+import { TaskChatBubble } from "./TaskChatBubble";
+import { nativeRunEventsToTranscript } from "../transcript/native-run-events";
+import { transcriptToTaskChatItems } from "./transcript-adapter";
+import type { HeartbeatRunEvent } from "@paperclipai/shared";
+import { TaskChatExpansionState } from "./expansion-state";
+import type {
+  TaskChatActivityPhaseItem,
+  TaskChatProviderActivityItem,
+  TaskChatToolItem,
+} from "./task-chat-model";
+
+vi.mock("@/context/CompanyContext", () => ({ useCompany: () => ({ selectedCompany: { issuePrefix: "PAP" } }), useOptionalCompany: () => null }));
+const motion = vi.hoisted(() => ({ reduced: false }));
+vi.mock("motion/react", async (original) => ({
+  ...(await original<typeof import("motion/react")>()),
+  useReducedMotion: () => motion.reduced,
+}));
+
+const tool = (
+  id: string,
+  status: TaskChatToolItem["status"] = "in_progress",
+): TaskChatToolItem => ({
+  id,
+  kind: "tool",
+  name: "exec_command",
+  target: `command-${id}`,
+  status,
+  detail: `output-${id}`,
+});
+
+const providerItem = (
+  id: string,
+  family: TaskChatProviderActivityItem["family"],
+  status: TaskChatProviderActivityItem["status"],
+  details: TaskChatProviderActivityItem["details"],
+  extra: Partial<TaskChatProviderActivityItem> = {},
+): TaskChatProviderActivityItem => ({
+  id,
+  kind: "protocol",
+  surface: "provider_activity",
+  family,
+  eventType: `${family}.activity`,
+  status,
+  title: family,
+  details,
+  steps: [],
+  links: [],
+  children: [],
+  ...extra,
+});
+
+describe("TaskChatRunnerActivityGroup", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+  let memory: Map<string, boolean>;
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    memory = new Map();
+    motion.reduced = false;
+  });
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+  });
+  const render = (
+    items: TaskChatActivityPhaseItem["items"],
+    host = "live",
+    active = true,
+  ) =>
+    act(() =>
+      root.render(
+        <TaskChatExpansionState.Provider value={memory}>
+          <TaskChatRunnerActivityGroup
+            key={host}
+            item={{
+              id: "commentary:phase",
+              kind: "activity_phase",
+              items,
+              active,
+              summary: "",
+            }}
+          />
+        </TaskChatExpansionState.Provider>,
+      ),
+    );
+  it("judge: grouped activity must preserve the saved-run link supplied by the adapter", () => {
+    act(() => root.render(<MemoryRouter><ThemeProvider>
+      <TaskChatRunnerActivityGroup defaultExpanded item={{ id: "phase", kind: "activity_phase", active: false, summary: "", items: [{ id: "edit", kind: "tool", name: "apply_patch", rawName: "apply_patch", target: "a.txt", status: "completed", runLogHref: "/agents/a/runs/r", diff: { path: "a.txt", added: 1, removed: 0, lines: [{ kind: "add", text: "hello" }], truncated: true } }] }} />
+    </ThemeProvider></MemoryRouter>));
+    act(() => container.querySelector<HTMLButtonElement>('[data-activity-item-id="edit"] button')!.click());
+    expect(container.textContent).toContain("runner saved only part");
+    expect(container.querySelector('a[href*="/agents/a/runs/r"]')).not.toBeNull();
+  });
+
+  it.each([true, false])("keeps spilled native tool output private in the expanded runner group (flag=%s)", (outputTruncated) => {
+    const output = "  NATIVE_FIRST\nNATIVE_LAST\t \n";
+    const event = {
+      id: 1, companyId: "c", agentId: "a", runId: "r", seq: 1, stream: null, level: null, color: null, message: null,
+      eventType: "tool.execution.completed", createdAt: new Date("2026-11-17T00:00:00Z"),
+      payload: { prpEvent: { schema: "paperclip.prp.event.v1", schemaVersion: 1, runId: "r", eventType: "tool.execution.completed", payload: {
+        schema: "paperclip.tool.execution.v1", executionId: "read-spill", transport: "builtin", operation: "read", name: "Read", status: "completed",
+        output: outputTruncated ? output : output + "[Full output: /tmp/native-spill.log (100000 bytes; sha256: abc123)]", outputTruncated,
+      } } },
+    } as HeartbeatRunEvent;
+    const items = transcriptToTaskChatItems(nativeRunEventsToTranscript([event]), { runId: "r", running: false, runLogHref: "/agents/a/runs/r" });
+    const item = items.find(candidate => candidate.kind === "tool");
+    if (item?.kind !== "tool") throw new Error("expected native tool row");
+    act(() => root.render(<MemoryRouter><ThemeProvider>
+      <TaskChatRunnerActivityGroup defaultExpanded item={{ id: "phase", kind: "activity_phase", active: false, summary: "", items: [item] }} />
+    </ThemeProvider></MemoryRouter>));
+    act(() => container.querySelector<HTMLButtonElement>(`[data-activity-item-id="${item.id}"] button`)!.click());
+    expect(container.querySelector("pre")?.textContent).toBe(output);
+    expect(container.textContent?.split("The full output is kept on the agent's machine while it runs.")).toHaveLength(2);
+    expect(container.textContent).not.toMatch(/\[Full output:|\/tmp\/native-spill|saved only part|truncated/i);
+    expect(container.querySelector('a[href*="/agents/a/runs/r"]')).not.toBeNull();
+  });
+
+  it("keeps a spilled edit result inspectable alongside its existing diff", () => {
+    act(() => root.render(<MemoryRouter><ThemeProvider>
+      <TaskChatRunnerActivityGroup defaultExpanded item={{ id: "edit-phase", kind: "activity_phase", active: false, summary: "", items: [{
+        ...tool("spilled-edit", "completed"), name: "apply_patch", rawName: "apply_patch", outputTruncated: true,
+        detail: "EDIT_RESULT\n[Full output: /tmp/edit-spill.log (100000 bytes; sha256: abc123)]",
+        diff: { path: "a.txt", added: 1, removed: 0, lines: [{ kind: "add", text: "hello" }] },
+      }] }} />
+    </ThemeProvider></MemoryRouter>));
+    act(() => container.querySelector<HTMLButtonElement>('[data-activity-item-id="spilled-edit"] button')!.click());
+    expect(container.querySelector('[data-testid="task-chat-diff-view"]')).not.toBeNull();
+    expect(container.querySelector("pre")?.textContent).toBe("EDIT_RESULT\n");
+    expect(container.textContent?.split("The full output is kept on the agent's machine while it runs.")).toHaveLength(2);
+    expect(container.innerHTML).not.toMatch(/\[Full output:|\/tmp\/edit-spill/);
+  });
+
+  it("does not invent a kept notice for an unflagged native tool row", () => {
+    act(() => root.render(<MemoryRouter><ThemeProvider>
+      <TaskChatRunnerActivityGroup defaultExpanded item={{ id: "whole", kind: "activity_phase", active: false, summary: "", items: [tool("whole", "completed")] }} />
+    </ThemeProvider></MemoryRouter>));
+    act(() => container.querySelector<HTMLButtonElement>('[data-activity-item-id="whole"] button')!.click());
+    expect(container.textContent).toContain("output-whole");
+    expect(container.textContent).not.toMatch(/full output is kept|saved only part/);
+  });
+
+  const toggle = () =>
+    container.querySelector<HTMLButtonElement>(
+      '[data-testid="task-chat-activity-phase-toggle"]',
+    )!;
+  const viewport = () =>
+    container.querySelector('[data-testid="task-chat-activity-viewport"]')!;
+
+  it("aligns runner commentary with the following agent reply", () => {
+    act(() => root.render(
+      <MemoryRouter>
+        <ThemeProvider>
+          <TaskChatRunnerActivityGroup item={{
+            id: "commentary:phase",
+            kind: "activity_phase",
+            interstitial: { id: "commentary", kind: "message", author: "agent", text: "First line" },
+            items: [],
+            active: false,
+            summary: "",
+          }} />
+          <TaskChatBubble item={{ id: "reply", kind: "message", author: "agent", text: "Later reply" }} />
+        </ThemeProvider>
+      </MemoryRouter>,
+    ));
+
+    const commentary = container.querySelector('[data-testid="task-chat-phase-interstitial"]');
+    const reply = container.querySelector('[data-testid="task-chat-agent-bubble"]');
+    expect(commentary?.classList.contains("px-1")).toBe(true);
+    expect(reply?.classList.contains("px-1")).toBe(true);
+  });
+
+  it("rolls to each new item once while status and token updates keep the current row mounted", () => {
+    render([tool("one")]);
+    const first = viewport().querySelector('[data-activity-row="one"]');
+    render([tool("one", "completed")]);
+    expect(viewport().querySelector('[data-activity-row="one"]')).toBe(first);
+    expect(container.querySelector(".runner-activity-roll-in")).toBeNull();
+    render([tool("one", "completed"), tool("two")]);
+    expect(viewport().querySelectorAll("[data-activity-row]")).toHaveLength(2);
+    const outgoing = container.querySelector(".runner-activity-roll-out")!;
+    expect(outgoing.getAttribute("aria-hidden")).toBe("true");
+    const current = container.querySelector(".runner-activity-roll-in");
+    render([
+      tool("one", "completed"),
+      { ...tool("two"), detail: "more output" },
+    ]);
+    expect(container.querySelector(".runner-activity-roll-in")).toBe(current);
+    act(() =>
+      outgoing.dispatchEvent(
+        new Event("webkitAnimationEnd", { bubbles: true }),
+      ),
+    );
+    expect(viewport().querySelectorAll("[data-activity-row]")).toHaveLength(1);
+    expect(viewport().textContent).toContain("command-two");
+  });
+
+  it("updates provider reasoning text in place without restarting motion", () => {
+    render([
+      {
+        id: "thought",
+        kind: "thinking",
+        lines: ["First", "Check"],
+        streaming: true,
+      },
+    ]);
+    const line = viewport().querySelector("[data-activity-row]");
+    render([
+      {
+        id: "thought",
+        kind: "thinking",
+        lines: ["First", "Checking the file"],
+        streaming: true,
+      },
+    ]);
+    expect(viewport().querySelector("[data-activity-row]")).toBe(line);
+    expect(viewport().textContent).toContain("Checking the file");
+    expect(viewport().textContent).not.toContain("First");
+    expect(container.querySelector(".runner-activity-roll-in")).toBeNull();
+  });
+
+  it("preserves expanded history and item detail across appends and live-to-history remount", () => {
+    render([tool("one", "completed")]);
+    act(() => toggle().click());
+    const row = container.querySelector<HTMLButtonElement>("li button")!;
+    act(() => row.click());
+    expect(container.textContent).toContain("output-one");
+    render([tool("one", "completed"), tool("two")]);
+    expect(container.querySelectorAll("li")).toHaveLength(2);
+    expect(container.querySelector("li button")).toBe(row);
+    render(
+      [tool("one", "completed"), tool("two", "completed")],
+      "history",
+      false,
+    );
+    expect(toggle().getAttribute("aria-expanded")).toBe("true");
+    expect(container.querySelectorAll("li")).toHaveLength(2);
+    expect(container.textContent).toContain("output-one");
+    act(() => toggle().click());
+    expect(toggle().textContent).toContain("Ran commands");
+    expect(container.textContent).not.toContain("command-two");
+  });
+
+  it("keeps failures discoverable after later activity, with neutral detail and no X", () => {
+    render([tool("failed", "failed"), tool("next")]);
+    expect(toggle().textContent).not.toMatch(/\d+ failed/);
+    act(() => toggle().click());
+    expect(container.querySelector("li")?.textContent).toContain("failed");
+    act(() => container.querySelector<HTMLButtonElement>("li button")!.click());
+    expect(container.textContent).toContain("output-failed");
+    expect(container.querySelector(".lucide-x, .text-destructive")).toBeNull();
+  });
+
+  it("uses the same group and expansion memory in the real persisted thread renderer", () => {
+    render([tool("one", "failed"), tool("two")]);
+    act(() => toggle().click());
+    act(() => container.querySelector<HTMLButtonElement>("li button")!.click());
+    act(() =>
+      root.render(
+        <TaskChatExpansionState.Provider value={memory}>
+          <MemoryRouter>
+            <ThemeProvider>
+              <TaskChatThreadView
+                scroll={false}
+                items={[
+                  {
+                    id: "saved",
+                    kind: "message",
+                    author: "agent",
+                    text: "Finished",
+                    attachedTurn: {
+                      id: "turn",
+                      kind: "turn",
+                      settled: true,
+                      standaloneHeader: true,
+                      summary: { toolCount: 2, added: 0, removed: 0 },
+                      items: [
+                        {
+                          id: "commentary:phase",
+                          kind: "activity_phase",
+                          active: false,
+                          summary: "Ran commands",
+                          items: [
+                            tool("one", "failed"),
+                            tool("two", "completed"),
+                          ],
+                        },
+                      ],
+                    },
+                  },
+                ]}
+              />
+            </ThemeProvider>
+          </MemoryRouter>
+        </TaskChatExpansionState.Provider>,
+      ),
+    );
+    expect(toggle().getAttribute("aria-expanded")).toBe("true");
+    expect(container.querySelectorAll("li")).toHaveLength(2);
+    expect(container.textContent).toContain("output-one");
+    expect(container.textContent).toContain("Finished");
+    expect(container.querySelector(".text-destructive,.lucide-x")).toBeNull();
+    act(() => toggle().click());
+    expect(toggle().textContent).toContain("Ran commands");
+    expect(container.textContent).not.toContain("command-two");
+    expect(toggle().textContent).not.toMatch(/\d+ failed/);
+  });
+
+  it("uses the compact runner group for a legacy persisted turn", () => {
+    act(() =>
+      root.render(
+        <TaskChatExpansionState.Provider value={memory}>
+          <MemoryRouter>
+            <ThemeProvider>
+              <TaskChatThreadView
+                scroll={false}
+                items={[{
+                  id: "legacy-turn",
+                  kind: "turn",
+                  settled: true,
+                  summary: { toolCount: 1, added: 0, removed: 0 },
+                  items: [{
+                    id: "legacy-phase",
+                    kind: "activity_phase",
+                    active: false,
+                    summary: "Ran a command",
+                    items: [tool("legacy", "completed")],
+                  }],
+                }]}
+              />
+            </ThemeProvider>
+          </MemoryRouter>
+        </TaskChatExpansionState.Provider>,
+      ),
+    );
+
+    act(() =>
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="task-chat-turn-summary"]')!
+        .click(),
+    );
+    expect(container.querySelector('[data-testid="task-chat-activity-phase-toggle"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-phase-summary"]')).toBeNull();
+    expect(container.textContent).toContain("Ran command");
+    expect(container.textContent).not.toContain("command-legacy");
+  });
+
+  it("does not offer empty disclosures for sparse activities", () => {
+    render([
+      { id: "thinking-empty", kind: "thinking", lines: [], streaming: true },
+      { id: "tool-empty", kind: "tool", name: "read", status: "completed" },
+      {
+        id: "provider-empty",
+        kind: "protocol",
+        surface: "provider_activity",
+        family: "wait",
+        status: "running",
+        title: "Wait",
+        eventType: "wait.started",
+        details: [],
+        steps: [],
+        links: [],
+        children: [],
+      },
+    ]);
+    act(() => toggle().click());
+    expect(container.querySelectorAll("li")).toHaveLength(3);
+    expect(
+      container.querySelectorAll(
+        "li button, li [aria-expanded], li [aria-controls]",
+      ),
+    ).toHaveLength(0);
+    expect(
+      container.querySelector(
+        '[data-testid="task-chat-runner-activity-detail"]',
+      ),
+    ).toBeNull();
+  });
+
+  it("settles to a summary and can resume without losing the current activity", () => {
+    const items = [tool("one", "failed"), tool("two", "completed")];
+    render(items);
+    expect(viewport().textContent).toContain("command-two");
+    render(items, "live", false);
+    expect(
+      container.querySelector('[data-testid="task-chat-activity-viewport"]'),
+    ).toBeNull();
+    expect(toggle().textContent).toBe("Ran commands");
+    expect(toggle().getAttribute("aria-label")).toContain("ran commands");
+    expect(container.textContent).not.toContain("command-two");
+    act(() => toggle().click());
+    expect(container.querySelectorAll("li")).toHaveLength(2);
+    expect(toggle().textContent).not.toMatch(/\d+ failed/);
+    act(() => toggle().click());
+    render([...items, tool("three")]);
+    expect(viewport().textContent).toContain("command-three");
+  });
+
+  it("replaces immediately with reduced motion", () => {
+    motion.reduced = true;
+    render([tool("one")]);
+    render([tool("one", "completed"), tool("two")]);
+    expect(viewport().querySelectorAll("[data-activity-row]")).toHaveLength(1);
+    expect(
+      container.querySelector(
+        ".runner-activity-roll-in, .runner-activity-roll-out",
+      ),
+    ).toBeNull();
+  });
+  it("shows research sources, check outcomes and a wait countdown in expanded history", () => {
+    const search = providerItem("search", "research", "completed", [
+      { label: "Action", value: "search" },
+      { label: "Query", value: "temporal week dates" },
+    ], {
+      links: [
+        { label: "MDN", href: "https://developer.mozilla.org/a" },
+        { label: "MDN again", href: "https://developer.mozilla.org/b" },
+        { label: "TC39", href: "https://tc39.es/c" },
+      ],
+    });
+    const passed = providerItem("check-1", "verification", "completed", [
+      { label: "Status", value: "passed" },
+      { label: "Detail", value: "6 tests passed" },
+    ], { summary: "node --test" });
+    const failed = providerItem("check-2", "verification", "failed", [
+      { label: "Status", value: "failed" },
+    ], { summary: "pnpm typecheck" });
+    const skipped = providerItem("check-3", "verification", "informational", [
+      { label: "Status", value: "not_run" },
+      { label: "Reason Code", value: "policy_restricted" },
+    ], { summary: "pnpm test:e2e" });
+    const longFailure = "x".repeat(300);
+    const failedLong = providerItem("check-4", "verification", "failed", [
+      { label: "Status", value: "failed" },
+      { label: "Detail", value: longFailure },
+    ], { summary: "pnpm typecheck" });
+    const wait = providerItem("wait", "wait", "running", [
+      { label: "Planned Duration Ms", value: "30000" },
+    ], { startedAt: new Date(Date.now() - 12_000).toISOString() });
+    render([search, passed, failed, skipped, failedLong, wait], "live", false);
+    act(() => toggle().click());
+
+    const strip = container.querySelector('[data-testid="task-chat-research-sources"]');
+    expect([...strip!.querySelectorAll("a")].map((link) => link.textContent)).toEqual(["developer.mozilla.org", "tc39.es"]);
+    expect(strip?.textContent).toContain("+1 more");
+    expect(container.textContent).toContain("Searched the web“temporal week dates”");
+
+    const passedRow = container.querySelector('[data-activity-row="check-1"]')!;
+    expect(passedRow.textContent).toContain("Check passed");
+    expect(passedRow.textContent).toContain("6 tests passed");
+    expect(passedRow.querySelector("[data-activity-icon] svg")?.getAttribute("class")).toContain("--status-task-icon-done");
+    const failedRow = container.querySelector('[data-activity-row="check-2"]')!;
+    expect(failedRow.textContent).toContain("Check failed");
+    expect(failedRow.querySelector("[data-activity-icon] svg")?.getAttribute("class")).toContain("text-destructive");
+    expect(failedRow.closest("button")).toBeNull();
+    expect(container.querySelector('[data-activity-row="check-3"]')?.textContent).toContain("Policy restricted");
+
+    const longRow = container.querySelector<HTMLButtonElement>('[data-activity-item-id="check-4"] button')!;
+    act(() => longRow.click());
+    const detail = container.querySelector('[data-activity-item-id="check-4"] [data-testid="task-chat-verification-details"]');
+    expect(detail?.textContent).toContain("pnpm typecheck");
+    expect(detail?.textContent).toContain(longFailure);
+
+    expect(container.querySelector('[data-activity-row="wait"]')?.textContent).toContain("Waiting 30s");
+    expect(container.querySelector('[data-testid="task-chat-wait-countdown"]')?.textContent).toMatch(/^1[78]s left$/);
+  });
+});

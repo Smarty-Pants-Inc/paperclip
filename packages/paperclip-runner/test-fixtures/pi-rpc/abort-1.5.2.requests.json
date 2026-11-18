@@ -1,0 +1,16 @@
+[
+  {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "model": "neutral/vendor-model-not-in-bundled-catalog",
+    "scenario": "abort",
+    "round": 1,
+    "roles": [
+      "system",
+      "user"
+    ],
+    "tools": [
+      "bash"
+    ]
+  }
+]

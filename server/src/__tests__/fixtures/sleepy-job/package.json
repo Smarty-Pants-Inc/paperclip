@@ -1,0 +1,7 @@
+{
+  "name": "@smarty-pants/paperclip-plugin-sleepy-job",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "paperclipPlugin": { "manifest": "./manifest.js", "worker": "./worker.js" }
+}

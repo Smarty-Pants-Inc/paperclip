@@ -1,0 +1,12816 @@
+use std::collections::{HashSet, VecDeque};
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::path::PathBuf;
+
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+use crate::codex_provider::{
+    CodexProvider, CodexProviderConfig, CodexProviderEvent, CodexSkillInput, CodexTurnOptions,
+    ProviderStartupObservation, ProviderStartupStage, RejectedAcceptedTurn,
+    MAX_SETTLED_PROVIDER_TURN_IDS,
+};
+use crate::codex_usage::CodexRunUsage;
+use crate::durable::{
+    create_private_temporary_file, current_unix_ms, open_private_regular_file, sanitize_value,
+    validate_semantic_tool_input, verify_private_directory, Command, CommandExecution,
+    CommandExecutor, CursorCloudLaunchProfile, DurableRunnerConfig, DurableRunnerError,
+    EventPriority, OpenCodeLaunchProfile, PolledEvent, TerminalDeliveryReconciliation,
+    PROVIDER_ATTACH_REFUSED, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE,
+};
+use crate::provider_bridge::{
+    authorized_tool_catalog_digest, semantic_value_digest, AuthorizedToolSet, DurableReplayFilter,
+    PendingToolCall, ProviderBridgeError, ProviderToolBridge, ToolResult, EXPIRED_RESULT_CODE,
+    MAX_PENDING_CALLS, TOOL_SET_SCHEMA, UNDELIVERABLE_RESULT_CODE,
+};
+use crate::provider_events::{
+    codex_context_usage, normalize_codex_notification, normalize_codex_notification_in,
+    normalize_pi_notification_in, normalized_codex_terminal_event_type, with_terminal_outcome,
+    NormalizedProviderEvent, MAX_PI_FINAL_TEXT_CHARS,
+};
+use crate::stable_identity::{is_stable_id, DURABLE_STABLE_ID_CHARS, SHORT_STABLE_ID_CHARS};
+
+const PROVIDER_STATE_SCHEMA: &str = "paperclip.runner.codex-provider-state.v1";
+pub const CODEX_PROVIDER_STATE_FILE: &str = "codex-provider-state.json";
+const MAX_PROVIDER_STATE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_EVENTS_PER_POLL: usize = 128;
+// One accepted semantic call can produce an input and a result event. Normal
+// traffic cannot consume the additional capacity required to diagnose a
+// receipt-limit stop, settle every retained call, and record the provider plus
+// run terminal events.
+const MAX_REGULAR_QUEUED_PROVIDER_EVENTS: usize = 2 * MAX_PENDING_CALLS + 3;
+const MAX_RECEIPT_LIMIT_TERMINAL_RESERVE: usize = MAX_PENDING_CALLS + 4;
+// During a receipt-limit stop, provider polling continues even when older
+// events remain unacknowledged so an already-buffered authoritative terminal
+// wins over the deadline fallback. Reserve one complete poll of cleanup events
+// in addition to the semantic-result and terminal envelopes.
+const MAX_TERMINAL_SETTLEMENT_EVENTS: usize = MAX_PENDING_CALLS + MAX_EVENTS_PER_POLL + 4;
+const MAX_QUEUED_PROVIDER_EVENTS: usize =
+    MAX_REGULAR_QUEUED_PROVIDER_EVENTS + MAX_TERMINAL_SETTLEMENT_EVENTS;
+const MAX_RECEIPT_LIMIT_INTERRUPT_ATTEMPTS: u8 = 3;
+const RECEIPT_LIMIT_INTERRUPT_TERMINAL_DEADLINE_MS: u64 = 2_000;
+const RECEIPT_LIMIT_ACCEPTED_TERMINAL_DEADLINE_MS: u64 = 30_000;
+// The same bounded settlement window used after an accepted interruption.
+// A Pi provider terminal is already observed; only controller results remain.
+const PI_DEFERRED_TERMINAL_DEADLINE_MS: u64 = RECEIPT_LIMIT_ACCEPTED_TERMINAL_DEADLINE_MS;
+const GENERIC_INVALID_TOOL_CALL_MESSAGE: &str = "Paperclip rejected this semantic tool call";
+
+fn invalid_tool_call_result(
+    call_id: String,
+    operation_id: String,
+    error: &ProviderBridgeError,
+) -> ToolResult {
+    ToolResult {
+        call_id,
+        operation_id,
+        result: json!({
+            "error": {
+                "code": "invalid_tool_call",
+                "message": error
+                    .safe_provider_message()
+                    .unwrap_or(GENERIC_INVALID_TOOL_CALL_MESSAGE),
+                "retryable": false,
+            },
+        }),
+        is_error: true,
+    }
+}
+
+fn serialize_provider_state(state: &CodexProviderState) -> Result<Vec<u8>, DurableRunnerError> {
+    let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
+        DurableRunnerError::invalid(format!("failed to serialize Codex provider state: {error}"))
+    })?;
+    if bytes.len() as u64 > MAX_PROVIDER_STATE_BYTES {
+        return Err(DurableRunnerError::invalid(
+            "Codex provider state exceeds the 16 MiB limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn receipt_limit_deadline_after(timeout_ms: u64) -> Result<u64, DurableRunnerError> {
+    current_unix_ms()?.checked_add(timeout_ms).ok_or_else(|| {
+        DurableRunnerError::invalid("Codex receipt-limit interruption deadline overflowed")
+    })
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderEventIdentity {
+    runner_instance_id: String,
+    run_id: String,
+    normalized_session_id: String,
+    turn_id: String,
+    item_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CodexAccountingOrigin {
+    identity: ProviderEventIdentity,
+    provider_turn_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderStartupCommand {
+    command_id: String,
+    controller_seq: u64,
+    command_type: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ProviderStartupTrigger {
+    Restore,
+    Ensure,
+    Rollover,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ProviderStartupPhase {
+    Intent,
+    Spawned,
+    InitializationFailed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderStartupAttempt {
+    schema: String,
+    launch_id: String,
+    phase: ProviderStartupPhase,
+    trigger: ProviderStartupTrigger,
+    attempted_process_generation: u64,
+    origin: Option<ProviderEventIdentity>,
+    command: Option<ProviderStartupCommand>,
+    configuration_fingerprint: String,
+    requested_thread_id: Option<String>,
+    authenticated_thread_id: Option<String>,
+    process_id: Option<u32>,
+    process_group_id: Option<u32>,
+    failed_stage: Option<ProviderStartupStage>,
+    direct_child_exit_observed: bool,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    process_tree_retired: bool,
+    /// True from intent until the launch reaches the process spawn. Facts
+    /// written before this field existed omit it and stay fenced; a runner
+    /// that predates it rejects it as unknown, which also fails closed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    before_spawn: bool,
+    /// Initialization failed because the provider never replied within the
+    /// request deadline (a stalled or frozen host), not because it rejected
+    /// the request or exited. Omitted when false, so state saved without a
+    /// timed-out fence stays readable by runners that predate the field; a
+    /// runner that predates it rejects a fact that carries it (fails closed).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    no_reply: bool,
+}
+
+impl ProviderStartupAttempt {
+    fn validate(&self) -> Result<(), DurableRunnerError> {
+        let identifier = |value: &str, limit: usize| {
+            !value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
+        };
+        let command_valid = self.command.as_ref().is_none_or(|command| {
+            // This is a summary of an already-validated command, not a new
+            // wire request. Goal commands require v2; reconstructing every
+            // summary as v1 rejects a legitimate provider restart on goal/get.
+            let schema = if command.command_type.starts_with("session.goal.") {
+                "paperclip.prp.command.v2"
+            } else {
+                "paperclip.prp.command.v1"
+            };
+            Command {
+                schema: schema.to_owned(),
+                command_id: command.command_id.clone(),
+                controller_seq: command.controller_seq,
+                command_type: command.command_type.clone(),
+                issued_at: "startup-origin".to_owned(),
+                deadline_at: None,
+                precondition: None,
+                payload: json!({}),
+            }
+            .validate()
+            .is_ok()
+        });
+        let has_process =
+            self.process_id.is_some_and(|pid| pid > 0) && self.process_id == self.process_group_id;
+        let no_process = self.process_id.is_none() && self.process_group_id.is_none();
+        let no_exit =
+            !self.direct_child_exit_observed && self.exit_code.is_none() && self.signal.is_none();
+        let exit_valid = if self.direct_child_exit_observed {
+            has_process
+                && (self.exit_code.is_some() ^ self.signal.is_some())
+                && self.signal.is_none_or(|signal| signal > 0)
+        } else {
+            no_exit
+        };
+        let phase_valid = match self.phase {
+            ProviderStartupPhase::Intent => no_process && no_exit && self.failed_stage.is_none(),
+            ProviderStartupPhase::Spawned => has_process && no_exit && self.failed_stage.is_none(),
+            ProviderStartupPhase::InitializationFailed => match self.failed_stage {
+                Some(ProviderStartupStage::Spawn) => no_process && no_exit,
+                Some(_) => has_process && exit_valid,
+                None => false,
+            },
+        };
+        // Only a provider that was running and silent through its request
+        // deadline, during initialization, can have given no reply.
+        let no_reply_valid = !self.no_reply
+            || (self.phase == ProviderStartupPhase::InitializationFailed
+                && matches!(
+                    self.failed_stage,
+                    Some(
+                        ProviderStartupStage::Initialize
+                            | ProviderStartupStage::ThreadOpen
+                            | ProviderStartupStage::ThreadRead
+                    )
+                ));
+        // Only an intent, or a launch whose checks failed before the spawn,
+        // can still be before the spawn.
+        let before_spawn_valid = !self.before_spawn
+            || self.phase == ProviderStartupPhase::Intent
+            || (self.phase == ProviderStartupPhase::InitializationFailed
+                && self.failed_stage == Some(ProviderStartupStage::Spawn));
+        if self.schema != "paperclip.provider_startup.v1"
+            || !before_spawn_valid
+            || !no_reply_valid
+            || uuid::Uuid::parse_str(&self.launch_id).is_err()
+            || self.attempted_process_generation == 0
+            || self.authenticated_thread_id.is_some()
+            || self.process_tree_retired
+            || !phase_valid
+            || !command_valid
+            || !self
+                .configuration_fingerprint
+                .strip_prefix("sha256:")
+                .is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                })
+            || self
+                .requested_thread_id
+                .as_ref()
+                .is_some_and(|id| !identifier(id, 240))
+            || self.origin.as_ref().is_some_and(|origin| {
+                !identifier(&origin.runner_instance_id, 512)
+                    || !is_stable_id(&origin.run_id, SHORT_STABLE_ID_CHARS)
+                    || !is_stable_id(&origin.normalized_session_id, SHORT_STABLE_ID_CHARS)
+                    || !is_stable_id(&origin.turn_id, DURABLE_STABLE_ID_CHARS)
+                    || !is_stable_id(&origin.item_id, DURABLE_STABLE_ID_CHARS)
+            })
+        {
+            return Err(DurableRunnerError::invalid(
+                "invalid provider startup ownership fence",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ProviderEventIdentity {
+    fn from_config(config: &DurableRunnerConfig) -> Self {
+        Self {
+            runner_instance_id: config.runner_instance_id.clone(),
+            run_id: config.run_id.clone(),
+            normalized_session_id: config.normalized_session_id.clone(),
+            turn_id: config.turn_id.clone(),
+            item_id: config.item_id.clone(),
+        }
+    }
+
+    fn source_event_id(&self, executor_event_id: &str) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"paperclip.executor-event.v1\0");
+        hasher.update(self.runner_instance_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(executor_event_id.as_bytes());
+        format!("event_executor_{:x}", hasher.finalize())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct CompletionContractBinding {
+    revision: String,
+    criterion_ids: Vec<String>,
+}
+
+fn initial_provider_event_seq() -> u64 {
+    1
+}
+
+fn provider_event_id(sequence: u64) -> String {
+    format!("codex_provider_{sequence:016}")
+}
+
+fn provider_event_sequence(event_id: &str) -> Option<u64> {
+    let sequence = event_id.strip_prefix("codex_provider_")?.parse().ok()?;
+    (provider_event_id(sequence) == event_id).then_some(sequence)
+}
+
+fn completion_contract(
+    payload: &Value,
+) -> Result<Option<CompletionContractBinding>, DurableRunnerError> {
+    let Some(value) = payload.get("completionContract") else {
+        return Ok(None);
+    };
+    let binding: CompletionContractBinding =
+        serde_json::from_value(value.clone()).map_err(|error| {
+            DurableRunnerError::invalid(format!(
+                "run.prepare completionContract is invalid: {error}"
+            ))
+        })?;
+    if binding.revision.is_empty()
+        || binding.revision.len() > 120
+        || binding.criterion_ids.is_empty()
+        || binding.criterion_ids.len() > 256
+        || binding.criterion_ids.iter().any(|criterion| {
+            criterion.is_empty() || criterion.len() > 240 || criterion.chars().any(char::is_control)
+        })
+    {
+        return Err(DurableRunnerError::invalid(
+            "run.prepare completionContract is malformed or oversized",
+        ));
+    }
+    Ok(Some(binding))
+}
+
+fn authorized_tool_set(payload: &Value) -> Result<AuthorizedToolSet, DurableRunnerError> {
+    if let Some(value) = payload.get("authorizedTools") {
+        return serde_json::from_value(value.clone()).map_err(|error| {
+            DurableRunnerError::invalid(format!("run.prepare authorizedTools is invalid: {error}"))
+        });
+    }
+    let operations = Vec::new();
+    let catalog_digest = authorized_tool_catalog_digest(&operations).map_err(|error| {
+        DurableRunnerError::invalid(format!("empty authorized tool set is invalid: {error}"))
+    })?;
+    Ok(AuthorizedToolSet {
+        schema: TOOL_SET_SCHEMA.to_owned(),
+        schema_version: 1,
+        catalog_digest,
+        operations,
+    })
+}
+
+fn mcp_permission_event(
+    identity: &ProviderEventIdentity,
+    request_id: String,
+    params: Value,
+) -> NormalizedProviderEvent {
+    NormalizedProviderEvent {
+        event_type: "runtime_request.created".to_owned(),
+        priority: EventPriority::P0,
+        payload: json!({"request":{
+            "schema":"paperclip.runtime_request.v2", "requestKind":"permission_approval", "type":"permission",
+            "requestId":request_id, "status":"pending", "turnId":identity.turn_id, "itemId":identity.item_id,
+            "prompt":params["message"],
+            "choices":[{"key":"accept","label":"Allow once"},{"key":"decline","label":"Deny"},{"key":"cancel","label":"Cancel"}],
+            "details":params,
+            "origin":{"adapter":"codex-app-server","provider":"codex","method":"mcpServer/elicitation/request"}
+        }}),
+    }
+}
+
+fn semantic_correlation(identity: &ProviderEventIdentity) -> Value {
+    json!({
+        "runId": identity.run_id,
+        "normalizedSessionId": identity.normalized_session_id,
+        "turnId": identity.turn_id,
+        "itemId": identity.item_id,
+    })
+}
+
+fn semantic_input_event(
+    identity: &ProviderEventIdentity,
+    call: &PendingToolCall,
+) -> Result<NormalizedProviderEvent, DurableRunnerError> {
+    let safe_input = validate_semantic_tool_input(&call.operation_id, &call.input)?;
+    Ok(NormalizedProviderEvent {
+        event_type: "semantic_tool.input".to_owned(),
+        priority: EventPriority::P0,
+        payload: json!({
+            "semantic_tool": {
+                "schema": "paperclip.prp.semantic_tool.v1",
+                "schemaVersion": 1,
+                "phase": "input",
+                "operationId": call.operation_id,
+                "callId": call.call_id,
+                "correlation": semantic_correlation(identity),
+                "idempotencyKey": Value::Null,
+                "content": {
+                    "digest": semantic_value_digest(&safe_input),
+                    "redactionDisposition": "digest_only",
+                    "references": [],
+                },
+                "input": safe_input,
+            },
+        }),
+    })
+}
+
+fn semantic_result_event(
+    identity: &ProviderEventIdentity,
+    result: &ToolResult,
+) -> NormalizedProviderEvent {
+    let safe_result = sanitize_value(&result.result);
+    let envelope = safe_result
+        .get("resultReceipt")
+        .filter(|receipt| {
+            receipt.get("schema").and_then(Value::as_str)
+                == Some("paperclip.prp.semantic_tool.v1")
+                && receipt.get("phase").and_then(Value::as_str) == Some("result")
+                && receipt.get("operationId").and_then(Value::as_str)
+                    == Some(result.operation_id.as_str())
+                && receipt.get("callId").and_then(Value::as_str) == Some(result.call_id.as_str())
+                && receipt.get("correlation") == Some(&semantic_correlation(identity))
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "schema": "paperclip.prp.semantic_tool.v1",
+                "schemaVersion": 1,
+                "phase": "result",
+                "operationId": result.operation_id,
+                "callId": result.call_id,
+                "correlation": semantic_correlation(identity),
+                "idempotencyKey": Value::Null,
+                "content": {
+                    "digest": semantic_value_digest(&safe_result),
+                    "redactionDisposition": "digest_only",
+                    "references": [],
+                },
+                "outcome": if result.is_error { "failed" } else { "succeeded" },
+                "code": if result.is_error { "semantic_tool_failed" } else { "semantic_tool_succeeded" },
+                "retryable": false,
+                "authorizationBoundary": "active_task",
+                "operationReceiptId": format!("operation_{}", result.call_id),
+            })
+        });
+    NormalizedProviderEvent {
+        event_type: "semantic_tool.result".to_owned(),
+        priority: EventPriority::P0,
+        payload: json!({"semantic_tool": envelope}),
+    }
+}
+
+/// Local Codex app-server and OpenCode server restart their own process and
+/// restore the same conversation after runner loss, so a turn that vanished
+/// meanwhile is a restart interruption the controller may continue once. A
+/// Cursor Cloud agent runs remotely; its lost turn is not a process restart.
+/// Pi RPC is excluded until its restore (thread_open after a runner loss) is
+/// proven on the real path (hq-test e8b1d929 failed it 3x).
+fn restart_lost_turn_is_continuable(provider: &str) -> bool {
+    matches!(provider, "codex" | "opencode")
+}
+
+/// True only when signal 0 reports that no such process (or process group)
+/// exists. A live process, a permission error, or an invalid id is not proof.
+#[cfg(unix)]
+fn local_process_definitely_gone(id: u32, group: bool) -> bool {
+    use rustix::process::{test_kill_process, test_kill_process_group, Pid};
+    let Some(pid) = i32::try_from(id).ok().and_then(Pid::from_raw) else {
+        return false;
+    };
+    let probe = if group {
+        test_kill_process_group(pid)
+    } else {
+        test_kill_process(pid)
+    };
+    matches!(probe, Err(rustix::io::Errno::SRCH))
+}
+
+#[cfg(not(unix))]
+fn local_process_definitely_gone(_id: u32, _group: bool) -> bool {
+    false
+}
+
+fn facade_provider_name(provider: &str) -> &'static str {
+    match provider {
+        "opencode" => "OpenCode",
+        "pi_rpc" => "Pi",
+        "cursor_cloud" => "Cursor Cloud",
+        _ => "Codex",
+    }
+}
+
+fn validate_proxy_run_result(
+    state: &CodexProviderState,
+    params: &Value,
+) -> Result<(Value, String, String), DurableRunnerError> {
+    if !matches!(state.config.provider.as_str(), "opencode" | "cursor_cloud") {
+        return Err(DurableRunnerError::invalid(
+            "paperclip/runResult is reserved for verified provider proxies",
+        ));
+    }
+    if state.lifecycle != "turn_active" || state.active_provider_turn_id.is_none() {
+        return Err(DurableRunnerError::invalid(format!(
+            "{} emitted paperclip/runResult without an active provider turn",
+            facade_provider_name(&state.config.provider)
+        )));
+    }
+    if params.get("threadId").and_then(Value::as_str) != state.thread_id.as_deref()
+        || params.get("turnId").and_then(Value::as_str) != state.active_provider_turn_id.as_deref()
+    {
+        return Err(DurableRunnerError::invalid(format!(
+            "{} paperclip/runResult is not bound to the active provider turn",
+            facade_provider_name(&state.config.provider)
+        )));
+    }
+    let result = params.get("result").cloned().ok_or_else(|| {
+        DurableRunnerError::invalid(format!(
+            "{} paperclip/runResult omitted its result",
+            facade_provider_name(&state.config.provider)
+        ))
+    })?;
+    let (fingerprint, disposition) = validate_run_result(state, &result)?;
+    Ok((result, fingerprint, disposition))
+}
+
+fn validate_run_result(
+    state: &CodexProviderState,
+    result: &Value,
+) -> Result<(String, String), DurableRunnerError> {
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../../../protocol/schemas/result.schema.json"
+    ))
+    .map_err(|_| DurableRunnerError::invalid("embedded Paperclip result schema is invalid"))?;
+    let validator = jsonschema::validator_for(&schema).map_err(|_| {
+        DurableRunnerError::invalid("embedded Paperclip result schema cannot compile")
+    })?;
+    if !validator.is_valid(result) {
+        return Err(DurableRunnerError::invalid(
+            "provider semantic result failed the Paperclip result schema",
+        ));
+    }
+    let contract = state.completion_contract.as_ref().ok_or_else(|| {
+        DurableRunnerError::invalid(format!(
+            "{} paperclip/runResult has no bound completion contract",
+            facade_provider_name(&state.config.provider)
+        ))
+    })?;
+    let claim = result.get("completionClaim").ok_or_else(|| {
+        DurableRunnerError::invalid(format!(
+            "{} paperclip/runResult omitted its completion claim",
+            facade_provider_name(&state.config.provider)
+        ))
+    })?;
+    if claim.get("contractRevision").and_then(Value::as_str) != Some(contract.revision.as_str()) {
+        return Err(DurableRunnerError::invalid(format!(
+            "{} paperclip/runResult changed its completion contract revision",
+            facade_provider_name(&state.config.provider)
+        )));
+    }
+    let criteria = claim
+        .get("criteria")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            DurableRunnerError::invalid(format!(
+                "{} paperclip/runResult omitted its completion criteria",
+                facade_provider_name(&state.config.provider)
+            ))
+        })?;
+    let mut reported_criterion_ids = HashSet::new();
+    for criterion in criteria {
+        let criterion_id = criterion
+            .get("criterionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                DurableRunnerError::invalid(format!(
+                    "{} paperclip/runResult has an invalid completion criterion",
+                    facade_provider_name(&state.config.provider)
+                ))
+            })?;
+        if !reported_criterion_ids.insert(criterion_id) {
+            return Err(DurableRunnerError::invalid(format!(
+                "{} paperclip/runResult repeated a completion criterion",
+                facade_provider_name(&state.config.provider)
+            )));
+        }
+    }
+    if reported_criterion_ids.len() != contract.criterion_ids.len()
+        || !contract
+            .criterion_ids
+            .iter()
+            .all(|criterion_id| reported_criterion_ids.contains(criterion_id.as_str()))
+    {
+        return Err(DurableRunnerError::invalid(format!(
+            "{} paperclip/runResult changed its bound completion criteria",
+            facade_provider_name(&state.config.provider)
+        )));
+    }
+    let disposition = result
+        .get("reportedWorkDisposition")
+        .and_then(Value::as_str)
+        .expect("the validated result schema requires a disposition")
+        .to_owned();
+    let fingerprint = semantic_value_digest(result);
+    Ok((fingerprint, disposition))
+}
+
+fn admit_terminal_tool_authority(
+    state: &mut CodexProviderState,
+    operation_id: &str,
+    input: &Value,
+    result_is_error: bool,
+) -> Result<(), DurableRunnerError> {
+    if result_is_error {
+        state.record_terminal_tool_rejection(operation_id);
+        return Ok(());
+    }
+    if !matches!(operation_id, "paperclip_finish" | "paperclip_block") {
+        return Ok(());
+    }
+    // The correlated TypeScript semantic-tool handler validates the provider
+    // input against the operation schema, normalizes its defaults, and commits
+    // the accepted result before returning success. The bridge deliberately
+    // retains the original provider input, so validating that raw value against
+    // the stricter canonical result schema here would reject valid omitted
+    // defaults. Record the authenticated tool authority without trying to
+    // repeat the controller's normalization.
+    let reported_disposition = input
+        .get("reportedWorkDisposition")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            DurableRunnerError::invalid(format!("{operation_id} omitted its work disposition"))
+        })?;
+    let disposition = match reported_disposition {
+        "complete" | "completed" => "done",
+        other => other,
+    }
+    .to_owned();
+    let fingerprint = semantic_value_digest(input);
+    let disposition_matches_operation = match operation_id {
+        "paperclip_finish" => {
+            matches!(disposition.as_str(), "done" | "needs_review")
+                || (disposition == "yielded"
+                    && (input.get("continuation").map_or(true, Value::is_null)
+                        || matches!(
+                            input
+                                .get("continuation")
+                                .and_then(|continuation| continuation.get("kind"))
+                                .and_then(Value::as_str),
+                            Some("response_wake" | "monitor" | "case_handoff" | "same_agent")
+                        )))
+        }
+        "paperclip_block" => disposition == "blocked",
+        _ => false,
+    };
+    if !disposition_matches_operation {
+        return Err(DurableRunnerError::invalid(format!(
+            "{operation_id} supplied an incompatible work disposition"
+        )));
+    }
+    match (
+        state.active_provider_result_fingerprint.as_deref(),
+        state.active_provider_result_disposition.as_deref(),
+    ) {
+        (None, None) => {
+            // The TypeScript driver commits this exact tool input while
+            // servicing the correlated provider request. Retain only its
+            // digest and disposition here so runnerd does not synthesize a
+            // second, conflicting result when the provider turn terminates.
+            state.active_provider_result_fingerprint = Some(fingerprint);
+            state.active_provider_result_disposition = Some(disposition);
+            state.active_terminal_tool_rejected = false;
+            Ok(())
+        }
+        (Some(existing_fingerprint), Some(existing_disposition))
+            if existing_fingerprint == fingerprint && existing_disposition == disposition =>
+        {
+            Ok(())
+        }
+        _ => Err(DurableRunnerError::invalid(
+            "provider emitted conflicting terminal semantic tool results for one turn",
+        )),
+    }
+}
+
+fn normalize_provider_notification(
+    state: &mut CodexProviderState,
+    method: &str,
+    params: &Value,
+) -> Result<Vec<NormalizedProviderEvent>, DurableRunnerError> {
+    if state.config.provider == "pi_rpc"
+        && method == "warning"
+        && params.get("code").and_then(Value::as_str) == Some("pi_stdout_frame_rejected")
+    {
+        return Ok(vec![NormalizedProviderEvent {
+            event_type: "harness.diagnostic".to_owned(),
+            priority: EventPriority::P0,
+            payload: json!({
+                "provider": "pi_rpc",
+                "code": "pi_stdout_frame_rejected",
+                "severity": "warning",
+                "message": params.get("message").and_then(Value::as_str)
+                    .unwrap_or("Dropped an unattributable Pi stdout frame")
+                    .chars().take(4_000).collect::<String>(),
+                "attribution": "unknown",
+                "dropped": true,
+            }),
+        }]);
+    }
+    if state.config.provider == "codex" && method == "account/rateLimits/updated" {
+        // Account-scoped and sparse: merge into the last snapshot and report
+        // only a changed one, so repeated identical updates stay out of the log.
+        let Some(next) = crate::provider_rate_limits::codex_rate_limit_snapshot(
+            params,
+            state.codex_rate_limits.as_ref(),
+            &crate::provider_rate_limits::now_iso(),
+        ) else {
+            return Ok(Vec::new());
+        };
+        let changed = crate::provider_rate_limits::rate_limit_snapshot_changed(
+            state.codex_rate_limits.as_ref(),
+            &next,
+        );
+        state.codex_rate_limits = Some(next.clone());
+        if !changed {
+            return Ok(Vec::new());
+        }
+        state.rate_limit_notice_seq = state.rate_limit_notice_seq.saturating_add(1);
+        return Ok(vec![crate::provider_rate_limits::rate_limit_notice(
+            &next,
+            &format!("codex-rate-limits-{}", state.rate_limit_notice_seq),
+        )]);
+    }
+    if state.config.provider == "codex"
+        && ["thread/tokenUsage/updated", "paperclip/resumeUsageSnapshot"].contains(&method)
+    {
+        let historical = method == "paperclip/resumeUsageSnapshot";
+        let total = if historical {
+            params.get("total")
+        } else {
+            params.pointer("/tokenUsage/total")
+        }
+        .unwrap_or(&Value::Null);
+        let increases_known_usage = state
+            .codex_usage
+            .as_ref()
+            .is_some_and(|usage| usage.increases_known_usage(total));
+        let received_turn = params.get("turnId").and_then(Value::as_str);
+        let increases_prior_baseline = state.previous_accounting_origin.is_some()
+            && received_turn != state.completed_provider_turn_id.as_deref()
+            && state
+                .codex_usage
+                .as_ref()
+                .is_some_and(|usage| usage.increases_run_baseline(total));
+        if historical
+            && (increases_known_usage || increases_prior_baseline)
+            && received_turn != state.active_provider_turn_id.as_deref()
+        {
+            let owns_completed_turn = state.active_provider_turn_id.is_none()
+                && state.completed_provider_turn_id.is_some()
+                && received_turn == state.completed_provider_turn_id.as_deref();
+            if !owns_completed_turn {
+                // The usage happened and cannot be undone or billed to this run.
+                // Report the increment with its owner and keep working: Core
+                // posts it to the owning run. Moving both counters together
+                // keeps this run's own delta unchanged.
+                let late = state
+                    .codex_usage
+                    .get_or_insert_with(|| CodexRunUsage::new(true))
+                    .absorb_late_usage(total);
+                if late
+                    .as_object()
+                    .is_some_and(|late| late.values().all(|value| value.as_u64() == Some(0)))
+                {
+                    // Usage at or below the known total was already counted.
+                    return Ok(normalize_codex_notification(
+                        "paperclip/resumeUsageSnapshot",
+                        params,
+                    ));
+                }
+                let mut event = normalize_codex_notification(
+                    "thread/tokenUsage/updated",
+                    &json!({
+                        "threadId":params.get("threadId"), "model":state.config.model,
+                        "tokenUsage":{"total":total,"last":late}
+                    }),
+                )
+                .remove(0);
+                event.payload["runDeltaAvailable"] = json!(false);
+                event.payload["runDeltaBasis"] = json!("run");
+                event.payload["reconciliation"] = json!({"reason":"accounting_reconciliation_required",
+                    "receivedTurnId":params.get("turnId"),"cumulative":event.payload["cumulative"],
+                    "priorOrigin":state.previous_accounting_origin.as_ref()
+                        .filter(|origin| received_turn == Some(origin.provider_turn_id.as_str()))
+                        .map(|origin| &origin.identity)});
+                return Ok(vec![event]);
+            }
+        }
+        let had_baseline = state
+            .codex_usage
+            .as_ref()
+            .is_some_and(CodexRunUsage::has_baseline);
+        let (delta, complete) = state
+            .codex_usage
+            .get_or_insert_with(|| CodexRunUsage::new(true))
+            .observe(total, historical);
+        let context = if historical {
+            None
+        } else {
+            codex_context_usage(params)
+        };
+        let mut normalized_params = params.clone();
+        let emit_usage = !historical || (had_baseline && increases_known_usage);
+        if historical && emit_usage {
+            normalized_params = json!({"threadId": params.get("threadId"), "turnId": params.get("turnId"),
+                "tokenUsage":{"total":total,"last":delta}});
+        } else if !historical {
+            normalized_params["tokenUsage"]["last"] = delta;
+        }
+        let mut events = normalize_codex_notification(
+            if emit_usage {
+                "thread/tokenUsage/updated"
+            } else {
+                method
+            },
+            &normalized_params,
+        );
+        for event in &mut events {
+            if event.event_type == "usage.reported" {
+                event.payload["runDeltaAvailable"] = json!(complete);
+                event.payload["runDeltaBasis"] = json!("run");
+                if let Some(context) = &context {
+                    event.payload["context"] = context.clone();
+                }
+            }
+        }
+        return Ok(events);
+    }
+    if state.config.provider == "pi_rpc" && method == "thread/tokenUsage/updated" {
+        return Ok(crate::provider_events::normalize_pi_usage_notification(
+            params,
+        ));
+    }
+    if method != "paperclip/runResult" {
+        let events = if state.config.provider == "pi_rpc" {
+            normalize_pi_notification_in(method, params, Some(&state.config.cwd))
+        } else {
+            normalize_codex_notification_in(method, params, Some(&state.config.cwd))
+        };
+        return Ok(events
+            .into_iter()
+            .map(|event| relabel_provider_event(event, &state.config.provider))
+            .collect());
+    }
+    let (result, fingerprint, disposition) = validate_proxy_run_result(state, params)?;
+    match (
+        state.active_provider_result_fingerprint.as_deref(),
+        state.active_provider_result_disposition.as_deref(),
+    ) {
+        (None, None) => {
+            state.active_provider_result_fingerprint = Some(fingerprint);
+            state.active_provider_result_disposition = Some(disposition);
+            state.active_terminal_tool_rejected = false;
+            Ok(vec![NormalizedProviderEvent {
+                event_type: "run.result.proposed".to_owned(),
+                priority: EventPriority::P0,
+                payload: result,
+            }])
+        }
+        (Some(existing_fingerprint), Some(existing_disposition))
+            if existing_fingerprint == fingerprint && existing_disposition == disposition =>
+        {
+            Ok(Vec::new())
+        }
+        _ => Err(DurableRunnerError::invalid(format!(
+            "{} emitted conflicting paperclip/runResult notifications for one turn",
+            facade_provider_name(&state.config.provider)
+        ))),
+    }
+}
+
+fn terminal_completion_rejected(state: &CodexProviderState) -> bool {
+    state.active_terminal_tool_rejected && state.active_provider_result_fingerprint.is_none()
+}
+
+fn retain_goal_notification(
+    state: &mut CodexProviderState,
+    method: &str,
+    params: &Value,
+    working_now: bool,
+) -> Result<(), DurableRunnerError> {
+    let event_type = match method {
+        "thread/goal/updated" => {
+            state.goal = normalize_codex_goal(params, working_now);
+            "session.goal.updated"
+        }
+        "thread/goal/cleared" => {
+            state.goal = None;
+            "session.goal.cleared"
+        }
+        _ => return Ok(()),
+    };
+    state.goal_revision = state.goal_revision.saturating_add(1);
+    state.push_event(NormalizedProviderEvent {
+        event_type: event_type.to_owned(),
+        priority: EventPriority::P0,
+        payload: goal_event_payload(
+            state.goal.as_ref(),
+            state.goal_capability.as_ref(),
+            state.goal_revision,
+        ),
+    })
+}
+
+fn goal_continues_after_turn(state: &CodexProviderState, goal_active: bool) -> bool {
+    goal_active && !terminal_completion_rejected(state)
+}
+
+fn terminal_events(
+    state: &CodexProviderState,
+    event_type: &str,
+    goal_status: Option<&str>,
+) -> Vec<NormalizedProviderEvent> {
+    let rejected_completion = terminal_completion_rejected(state);
+    if goal_continues_after_turn(state, goal_status == Some("active")) {
+        return Vec::new();
+    }
+    let Some(contract) = state.completion_contract.as_ref() else {
+        return Vec::new();
+    };
+    let empty_facade_completion = matches!(state.config.provider.as_str(), "opencode" | "pi_rpc")
+        && event_type == "turn.completed"
+        && state.active_provider_result_fingerprint.is_none()
+        && state
+            .last_agent_message
+            .as_deref()
+            .is_none_or(|text| text.trim().is_empty());
+    if rejected_completion || empty_facade_completion {
+        return vec![
+            NormalizedProviderEvent {
+                event_type: "session.failed".to_owned(),
+                priority: EventPriority::P0,
+                payload: json!({
+                    "provider": state.config.provider,
+                    "code": if rejected_completion { "semantic_completion_rejected" } else { "opencode_empty_response" },
+                    "message": if rejected_completion {
+                        "The turn ended without correcting its rejected completion report.".to_owned()
+                    } else {
+                        format!("{} ended without a final answer or an accepted completion report.", facade_provider_name(&state.config.provider))
+                    },
+                    "recoverable": false,
+                }),
+            },
+            NormalizedProviderEvent {
+                event_type: "run.terminal".to_owned(),
+                priority: EventPriority::P0,
+                payload: json!({
+                    "schema": "paperclip.prp.terminal.v1",
+                    "provider": state.config.provider,
+                    "turnTerminalState": "failed",
+                    "runTerminalState": "failed",
+                    "reportedWorkDisposition": "needs_review",
+                }),
+            },
+        ];
+    }
+    // Once the correlated semantic-tool result has been accepted, Paperclip's
+    // bounded controller finalizer may interrupt the provider after the result
+    // proposal. That provider terminal closes the exact turn; it does not
+    // revoke the already-authoritative semantic outcome.
+    let succeeded = goal_status == Some("complete")
+        || (goal_status.is_none()
+            && ((event_type == "turn.completed" && state.config.provider != "cursor_cloud")
+                || state.active_provider_result_fingerprint.is_some()));
+    let cancelled = matches!(event_type, "turn.cancelled" | "turn.interrupted");
+    let disposition = match goal_status {
+        Some("blocked") => "blocked",
+        Some("paused" | "limited" | "usage_limited" | "budget_limited") => "yielded",
+        Some("complete") => "done",
+        _ => state
+            .active_provider_result_disposition
+            .as_deref()
+            .unwrap_or(if succeeded { "done" } else { "needs_review" }),
+    };
+    let provider = state.config.provider.as_str();
+    let provider_name = facade_provider_name(provider);
+    let summary = state.last_agent_message.clone().unwrap_or_else(|| {
+        if succeeded {
+            format!("{provider_name} completed the requested work.")
+        } else if cancelled {
+            format!("The {provider_name} run stopped before it completed.")
+        } else {
+            format!("The {provider_name} run failed before it completed.")
+        }
+    });
+    let summary = if provider == "pi_rpc" {
+        summary.chars().take(MAX_PI_FINAL_TEXT_CHARS).collect()
+    } else {
+        summary
+    };
+    let evidence_ref = format!("provider:{provider}:agent-message");
+    let criteria = contract
+        .criterion_ids
+        .iter()
+        .map(|criterion_id| {
+            json!({
+                "criterionId": criterion_id,
+                "status": if succeeded { "satisfied" } else { "unknown" },
+                "evidenceRefs": if succeeded { vec![evidence_ref.as_str()] } else { Vec::<&str>::new() },
+            })
+        })
+        .collect::<Vec<_>>();
+    let result = json!({
+        "schema": "paperclip.run_result.v1",
+        "reportedWorkDisposition": disposition,
+        "summary": summary,
+        "completionClaim": {
+            "contractRevision": contract.revision,
+            "objectiveSatisfied": succeeded,
+            "criteria": criteria,
+            "remainingWork": if succeeded { Vec::<Value>::new() } else { vec![json!({
+                "description": if disposition == "yielded" {
+                    "Resume the durable Codex goal when execution can continue.".to_owned()
+                } else if disposition == "blocked" {
+                    "Resolve the blocker before resuming the durable Codex goal.".to_owned()
+                } else {
+                    format!("Review the stopped {provider_name} run and continue the task.")
+                },
+                "blocksCompletion": true,
+            })] },
+        },
+        "evidence": if succeeded { vec![json!({ "ref": evidence_ref })] } else { Vec::<Value>::new() },
+        "verification": [],
+        "attentionRequests": if succeeded { Vec::<Value>::new() } else { vec![json!({
+            "kind": "review",
+            "summary": format!("Review the stopped {provider_name} run before continuing."),
+            "ownerClass": "human",
+        })] },
+        "artifacts": [],
+    });
+    let turn_terminal_state = if succeeded
+        || (state.config.provider == "cursor_cloud" && event_type == "turn.completed")
+    {
+        "completed"
+    } else if event_type == "turn.interrupted" {
+        "interrupted"
+    } else if cancelled {
+        "cancelled"
+    } else {
+        "failed"
+    };
+    let terminal = json!({
+        "schema": "paperclip.prp.terminal.v1",
+        "provider": provider,
+        "turnTerminalState": turn_terminal_state,
+        "runTerminalState": if succeeded { "succeeded" } else if cancelled || disposition == "yielded" { "cancelled" } else { "failed" },
+        "reportedWorkDisposition": disposition,
+    });
+    let mut events = Vec::new();
+    if state.active_provider_result_fingerprint.is_none() {
+        events.push(NormalizedProviderEvent {
+            event_type: "run.result.proposed".to_owned(),
+            priority: EventPriority::P0,
+            payload: result,
+        });
+    }
+    events.push(NormalizedProviderEvent {
+        event_type: "run.terminal".to_owned(),
+        priority: EventPriority::P0,
+        payload: terminal,
+    });
+    events
+}
+
+fn relabel_provider_event(
+    mut event: NormalizedProviderEvent,
+    provider: &str,
+) -> NormalizedProviderEvent {
+    if provider == "codex" {
+        return event;
+    }
+    fn relabel(value: &mut Value, provider: &str) {
+        match value {
+            Value::Object(object) => {
+                if object.get("provider").and_then(Value::as_str) == Some("codex") {
+                    object.insert("provider".to_owned(), json!(provider));
+                }
+                for value in object.values_mut() {
+                    relabel(value, provider);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    relabel(value, provider);
+                }
+            }
+            _ => {}
+        }
+    }
+    relabel(&mut event.payload, provider);
+    event
+}
+
+fn default_goal_revision() -> u64 {
+    0
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct SessionGoalCapability {
+    availability: String,
+    actions: Vec<String>,
+    autonomous_updates: bool,
+    persistent_across_resume: bool,
+    max_objective_chars: u64,
+    token_budget_control: bool,
+    usage_reporting: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl SessionGoalCapability {
+    fn codex_available() -> Self {
+        Self {
+            availability: "available".to_owned(),
+            actions: vec![
+                "set".to_owned(),
+                "pause".to_owned(),
+                "resume".to_owned(),
+                "clear".to_owned(),
+            ],
+            autonomous_updates: true,
+            persistent_across_resume: true,
+            max_objective_chars: 4_000,
+            token_budget_control: true,
+            usage_reporting: true,
+            reason_code: None,
+            reason: None,
+        }
+    }
+
+    fn unavailable(availability: &str, reason_code: &str) -> Self {
+        Self {
+            availability: availability.to_owned(),
+            actions: Vec::new(),
+            autonomous_updates: false,
+            persistent_across_resume: false,
+            max_objective_chars: 4_000,
+            token_budget_control: false,
+            usage_reporting: false,
+            reason_code: Some(reason_code.to_owned()),
+            reason: Some(
+                match availability {
+                    "policy_disabled" => "Session goals are disabled by the Codex provider policy.",
+                    _ => "This Codex app-server does not expose session goals.",
+                }
+                .to_owned(),
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct SessionGoalSnapshot {
+    objective: String,
+    status: String,
+    token_budget: Option<u64>,
+    tokens_used: u64,
+    elapsed_seconds: u64,
+    iterations: u64,
+    #[serde(default)]
+    last_reason: Option<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    #[serde(default)]
+    completed_at: Option<String>,
+    working_now: bool,
+}
+
+fn normalize_goal_status(status: &str) -> Option<&'static str> {
+    match status {
+        "active" => Some("active"),
+        "paused" => Some("paused"),
+        "blocked" => Some("blocked"),
+        "limited" => Some("limited"),
+        "usageLimited" | "usage_limited" => Some("usage_limited"),
+        "budgetLimited" | "budget_limited" => Some("budget_limited"),
+        "complete" => Some("complete"),
+        _ => None,
+    }
+}
+
+fn codex_goal_status(status: &str) -> Option<&'static str> {
+    match status {
+        "active" => Some("active"),
+        "paused" => Some("paused"),
+        "blocked" => Some("blocked"),
+        "usage_limited" => Some("usageLimited"),
+        "budget_limited" => Some("budgetLimited"),
+        "complete" => Some("complete"),
+        _ => None,
+    }
+}
+
+fn goal_timestamp(value: Option<&Value>) -> Option<String> {
+    use aws_smithy_types::{date_time::Format, DateTime};
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        return DateTime::from_str(text, Format::DateTime)
+            .ok()?
+            .fmt(Format::DateTime)
+            .ok();
+    }
+    let timestamp = value.as_i64().filter(|value| *value > 0)?;
+    let date = if timestamp < 10_000_000_000 {
+        DateTime::from_secs(timestamp)
+    } else {
+        DateTime::from_millis(timestamp)
+    };
+    date.fmt(Format::DateTime).ok()
+}
+
+fn normalize_codex_goal(value: &Value, working_now: bool) -> Option<SessionGoalSnapshot> {
+    let goal = value.get("goal").unwrap_or(value);
+    if goal.is_null() {
+        return None;
+    }
+    let objective = goal.get("objective")?.as_str()?.trim();
+    let status = normalize_goal_status(goal.get("status")?.as_str()?)?;
+    if objective.is_empty() || objective.chars().count() > 4_000 {
+        return None;
+    }
+    Some(SessionGoalSnapshot {
+        objective: objective.to_owned(),
+        status: status.to_owned(),
+        token_budget: goal.get("tokenBudget").and_then(Value::as_u64),
+        tokens_used: goal.get("tokensUsed").and_then(Value::as_u64).unwrap_or(0),
+        elapsed_seconds: goal
+            .get("timeUsedSeconds")
+            .or_else(|| goal.get("elapsedSeconds"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        iterations: goal.get("iterations").and_then(Value::as_u64).unwrap_or(0),
+        last_reason: goal
+            .get("lastReason")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.chars().take(1_000).collect()),
+        created_at: goal_timestamp(goal.get("createdAt")),
+        updated_at: goal_timestamp(goal.get("updatedAt")),
+        completed_at: goal_timestamp(goal.get("completedAt").or_else(|| {
+            (status == "complete")
+                .then(|| goal.get("updatedAt"))
+                .flatten()
+        })),
+        working_now,
+    })
+}
+
+fn codex_goal_is_dormant(value: &Value) -> bool {
+    [value.get("workingNow"), value.pointer("/goal/workingNow")]
+        .into_iter()
+        .flatten()
+        .all(|working| working.as_bool() == Some(false))
+        && (value.get("goal") == Some(&Value::Null)
+            || normalize_codex_goal(value, false).is_some_and(|goal| goal.status != "active"))
+}
+
+fn goal_event_payload(
+    goal: Option<&SessionGoalSnapshot>,
+    capability: Option<&SessionGoalCapability>,
+    revision: u64,
+) -> Value {
+    json!({
+        "schema": "paperclip.session_goal.snapshot.v1",
+        "goal": goal,
+        "sessionGoals": capability,
+        "workingNow": goal.is_some_and(|goal| goal.working_now),
+        "revision": revision,
+    })
+}
+
+fn goal_control_event_payload(
+    goal: Option<&SessionGoalSnapshot>,
+    capability: Option<&SessionGoalCapability>,
+    revision: u64,
+    request_id: Option<&str>,
+) -> Value {
+    let mut payload = goal_event_payload(goal, capability, revision);
+    if let Some(request_id) = request_id.filter(|value| !value.is_empty()) {
+        payload["requestId"] = json!(request_id);
+    }
+    payload
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct CodexProviderState {
+    schema: String,
+    lifecycle: String,
+    // The provider session can outlive a run. Older snapshots have no owner
+    // and keep the strict contract check until prepare or attach binds one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_identity: Option<ProviderEventIdentity>,
+    config: CodexProviderConfig,
+    // Pi binds this run-scoped payload separately from its immutable profile.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pi_runtime_context: Value,
+    #[serde(default)]
+    pi_launch_profile_digest: Option<String>,
+    /// SHA-256 of the qualified Pi executable: the release that owns the
+    /// saved conversation. As for OpenCode below, the launch-profile digest
+    /// also covers controller bytes (Node command, proxy bundle) that a
+    /// rebuild or deploy replaces; this field lets a settled Pi session tell
+    /// those apart (#20736, #20787).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pi_release_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    opencode_launch_profile_digest: Option<String>,
+    /// SHA-256 of the qualified OpenCode executable: the upstream release that
+    /// owns the saved conversation. The launch-profile digest also covers the
+    /// controller's Node command and proxy bundle, which a rebuild or deploy
+    /// replaces; this field lets a settled session tell those apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    opencode_release_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cursor_cloud_launch_profile_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_termination_receipt: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cursor_cloud_terminal_receipt: Option<Value>,
+    #[serde(default)]
+    codex_usage: Option<CodexRunUsage>,
+    /// Latest Codex account rate-limit snapshot, merged across sparse updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_rate_limits: Option<Value>,
+    #[serde(default)]
+    rate_limit_notice_seq: u64,
+    #[serde(default)]
+    previous_accounting_origin: Option<CodexAccountingOrigin>,
+    #[serde(default)]
+    completion_contract: Option<CompletionContractBinding>,
+    #[serde(default)]
+    tool_bridge: ProviderToolBridge,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    provider_session_id: Option<String>,
+    #[serde(default)]
+    active_provider_turn_id: Option<String>,
+    #[serde(default)]
+    ambiguous_turn_start_pending: bool,
+    #[serde(default)]
+    completed_turn_authoritative: bool,
+    #[serde(default)]
+    provider_process_generation: u64,
+    #[serde(default)]
+    startup_attempt: Option<ProviderStartupAttempt>,
+    #[serde(default)]
+    completed_turn_process_generation: Option<u64>,
+    #[serde(default)]
+    completed_provider_turn_id: Option<String>,
+    // Unlike the live provider process, the durable run survives restarts.
+    // Terminal identities stay exact for one process-generation epoch. At the
+    // bound, an idle process is reaped before this epoch is rotated.
+    #[serde(default)]
+    settled_provider_turn_ids: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    descendant_thread_ids: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    settled_provider_turn_filter: DurableReplayFilter,
+    #[serde(default)]
+    receipt_limit_diagnostic_emitted: bool,
+    #[serde(default)]
+    receipt_limit_interrupt_pending: bool,
+    #[serde(default)]
+    receipt_limit_interrupt_accepted: bool,
+    #[serde(default)]
+    receipt_limit_interrupt_attempts: u8,
+    #[serde(default)]
+    receipt_limit_interrupt_deadline_unix_ms: Option<u64>,
+    #[serde(default)]
+    active_provider_result_fingerprint: Option<String>,
+    #[serde(default)]
+    active_provider_result_disposition: Option<String>,
+    #[serde(default)]
+    active_terminal_tool_rejected: bool,
+    // A Pi client waiter can expire before the dispatched operation settles.
+    // Retain its provider terminal fact across runner restarts, but do not
+    // finalize the run as success or invent an operation result while an effect is pending.
+    // Older journals have no deferred outcome and deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pi_deferred_terminal: Option<String>,
+    // Older journals without this field receive one bounded window on first
+    // maintenance, persisted before returning. Restart never renews that window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pi_deferred_terminal_deadline_unix_ms: Option<u64>,
+    last_agent_message: Option<String>,
+    #[serde(default)]
+    goal_capability: Option<SessionGoalCapability>,
+    #[serde(default)]
+    goal: Option<SessionGoalSnapshot>,
+    #[serde(default = "default_goal_revision")]
+    goal_revision: u64,
+    #[serde(default)]
+    pending_events: VecDeque<PolledEvent>,
+    #[serde(default)]
+    queued_events: VecDeque<PolledEvent>,
+    #[serde(default = "initial_provider_event_seq")]
+    next_provider_event_seq: u64,
+}
+
+#[derive(Debug, PartialEq)]
+enum ToolCallAdmission {
+    CompletedReplay(ToolResult),
+    PendingReplay,
+    Pending(PendingToolCall),
+}
+
+fn settled_provider_turn_contains(
+    identities: &std::collections::BTreeSet<String>,
+    _filter: &DurableReplayFilter,
+    provider_turn_id: &str,
+) -> bool {
+    identities.contains(provider_turn_id)
+}
+
+fn remember_settled_provider_turn(
+    identities: &mut std::collections::BTreeSet<String>,
+    _filter: &mut DurableReplayFilter,
+    provider_turn_id: String,
+) -> Result<(), DurableRunnerError> {
+    if identities.contains(&provider_turn_id) {
+        return Ok(());
+    }
+    if identities.len() >= MAX_SETTLED_PROVIDER_TURN_IDS {
+        return Err(DurableRunnerError::invalid(
+            "Codex provider turn identity epoch reached its exact capacity",
+        ));
+    }
+    identities.insert(provider_turn_id);
+    Ok(())
+}
+
+impl CodexProviderState {
+    fn new(
+        config: CodexProviderConfig,
+        completion_contract: Option<CompletionContractBinding>,
+        tool_bridge: ProviderToolBridge,
+    ) -> Self {
+        let thread_id = config.provider_session_id.clone();
+        let codex_usage =
+            (config.provider == "codex").then(|| CodexRunUsage::new(thread_id.is_some()));
+        Self {
+            schema: PROVIDER_STATE_SCHEMA.to_owned(),
+            lifecycle: "prepared".to_owned(),
+            run_identity: None,
+            config,
+            pi_runtime_context: Value::Null,
+            pi_launch_profile_digest: None,
+            pi_release_digest: None,
+            opencode_launch_profile_digest: None,
+            opencode_release_digest: None,
+            cursor_cloud_launch_profile_digest: None,
+            provider_termination_receipt: None,
+            cursor_cloud_terminal_receipt: None,
+            codex_usage,
+            codex_rate_limits: None,
+            rate_limit_notice_seq: 0,
+            previous_accounting_origin: None,
+            completion_contract,
+            tool_bridge,
+            thread_id,
+            provider_session_id: None,
+            active_provider_turn_id: None,
+            ambiguous_turn_start_pending: false,
+            completed_turn_authoritative: false,
+            provider_process_generation: 0,
+            startup_attempt: None,
+            completed_turn_process_generation: None,
+            completed_provider_turn_id: None,
+            settled_provider_turn_ids: std::collections::BTreeSet::new(),
+            descendant_thread_ids: std::collections::BTreeSet::new(),
+            settled_provider_turn_filter: DurableReplayFilter::default(),
+            receipt_limit_diagnostic_emitted: false,
+            receipt_limit_interrupt_pending: false,
+            receipt_limit_interrupt_accepted: false,
+            receipt_limit_interrupt_attempts: 0,
+            receipt_limit_interrupt_deadline_unix_ms: None,
+            active_provider_result_fingerprint: None,
+            active_provider_result_disposition: None,
+            active_terminal_tool_rejected: false,
+            pi_deferred_terminal: None,
+            pi_deferred_terminal_deadline_unix_ms: None,
+            last_agent_message: None,
+            goal_capability: None,
+            goal: None,
+            goal_revision: default_goal_revision(),
+            pending_events: VecDeque::new(),
+            queued_events: VecDeque::new(),
+            next_provider_event_seq: initial_provider_event_seq(),
+        }
+    }
+
+    fn is_settled_for_run_rebinding(&self) -> bool {
+        self.is_settled_except_retained_events()
+            && self.pending_events.is_empty()
+            && self.queued_events.is_empty()
+    }
+
+    fn is_settled_for_run_attachment(&self) -> bool {
+        self.is_settled_except_retained_events()
+            && self
+                .pending_events
+                .iter()
+                .chain(self.queued_events.iter())
+                .all(|event| {
+                    // Restore's admission notices are history, not provider work.
+                    // Unknown diagnostics and substantive retained facts still fence
+                    // prepare; attachment retains the admitted notices for draining.
+                    event.event_type == "session.resumed"
+                        || (event.event_type == "session.reconciled"
+                            && event
+                                .payload
+                                .get("previousProviderTurnId")
+                                .is_some_and(Value::is_null)
+                            && event
+                                .payload
+                                .get("activeProviderTurnId")
+                                .is_some_and(Value::is_null))
+                        || (event.event_type == "harness.diagnostic"
+                            && matches!(
+                                event.payload.get("code").and_then(Value::as_str),
+                                Some("provider_startup_ownership" | "provider_startup_retired")
+                            ))
+                })
+    }
+
+    fn is_settled_except_retained_events(&self) -> bool {
+        matches!(
+            self.lifecycle.as_str(),
+            "prepared" | "session_open" | "provider_exited"
+        ) && self.active_provider_turn_id.is_none()
+            && !self.ambiguous_turn_start_pending
+            && self.startup_attempt.is_none()
+            && !self.receipt_limit_interrupt_pending
+            && self.tool_bridge.pending_calls().next().is_none()
+            && self
+                .goal
+                .as_ref()
+                .is_none_or(|goal| goal.status != "active" && !goal.working_now)
+    }
+
+    fn retain_cursor_cloud_terminal_delivery(
+        &mut self,
+        delivery: &crate::cursor_cloud_proxy::TerminalDelivery,
+        identity: Option<&ProviderEventIdentity>,
+        process_generation: u64,
+    ) -> Result<(), DurableRunnerError> {
+        let invalid = || {
+            DurableRunnerError::invalid(
+                "Cursor Cloud terminal delivery conflicts with durable ownership",
+            )
+        };
+        if self.config.provider != "cursor_cloud"
+            || self.thread_id.as_deref() != Some(delivery.thread_id.as_str())
+        {
+            return Err(invalid());
+        }
+        let receipt = delivery.receipt();
+        if self
+            .cursor_cloud_terminal_receipt
+            .as_ref()
+            .is_some_and(|saved| {
+                saved.get("turnId").and_then(Value::as_str) == Some(delivery.turn_id.as_str())
+            })
+        {
+            if self.cursor_cloud_terminal_receipt.as_ref() != Some(&receipt)
+                || self.active_provider_turn_id.as_deref() == Some(delivery.turn_id.as_str())
+                || !settled_provider_turn_contains(
+                    &self.settled_provider_turn_ids,
+                    &self.settled_provider_turn_filter,
+                    &delivery.turn_id,
+                )
+            {
+                return Err(invalid());
+            }
+            return Ok(());
+        }
+        if self.active_provider_turn_id.as_deref() != Some(delivery.turn_id.as_str())
+            || settled_provider_turn_contains(
+                &self.settled_provider_turn_ids,
+                &self.settled_provider_turn_filter,
+                &delivery.turn_id,
+            )
+            || self
+                .last_agent_message
+                .as_ref()
+                .is_some_and(|text| delivery.result.as_ref() != Some(text))
+        {
+            return Err(invalid());
+        }
+        if self.last_agent_message.is_none() {
+            if let Some(text) = &delivery.result {
+                let events = normalize_provider_notification(
+                    self,
+                    "item/completed",
+                    &delivery.final_params(),
+                )?;
+                self.extend_terminal_events(events)?;
+                self.last_agent_message = Some(text.clone());
+            }
+        }
+        let normalized =
+            normalize_provider_notification(self, delivery.method(), &delivery.terminal_params())?;
+        self.settle_active_provider_turn_identity()?;
+        let settled = self
+            .tool_bridge
+            .settle_turn("provider_turn_terminated")
+            .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        for result in settled {
+            let identity = identity.ok_or_else(|| {
+                DurableRunnerError::invalid(
+                    "Cursor Cloud terminal tool settlement has no durable identity",
+                )
+            })?;
+            self.push_terminal_event(semantic_result_event(identity, &result))?;
+        }
+        self.active_provider_turn_id = None;
+        self.ambiguous_turn_start_pending = false;
+        self.completed_turn_authoritative = delivery.method() == "turn/completed"
+            || self.active_provider_result_fingerprint.is_some();
+        self.completed_turn_process_generation = self
+            .completed_turn_authoritative
+            .then_some(process_generation);
+        self.completed_provider_turn_id = self
+            .completed_turn_authoritative
+            .then(|| delivery.turn_id.clone());
+        self.receipt_limit_diagnostic_emitted = false;
+        self.receipt_limit_interrupt_pending = false;
+        self.receipt_limit_interrupt_accepted = false;
+        self.receipt_limit_interrupt_attempts = 0;
+        self.receipt_limit_interrupt_deadline_unix_ms = None;
+        self.lifecycle = "session_open".to_owned();
+        let event_type = delivery.method().replace('/', ".");
+        let outcome = terminal_events(self, &event_type, None);
+        self.extend_terminal_events(with_terminal_outcome(normalized, outcome))?;
+        self.cursor_cloud_terminal_receipt = Some(receipt);
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), DurableRunnerError> {
+        if let Some(attempt) = &self.startup_attempt {
+            attempt.validate()?;
+        }
+        self.config
+            .validate()
+            .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        self.tool_bridge.validate_recovered().map_err(|error| {
+            DurableRunnerError::invalid(format!("Codex semantic tool state is invalid: {error}"))
+        })?;
+        if let Some(receipt) = &self.cursor_cloud_terminal_receipt {
+            let turn_id = receipt
+                .get("turnId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let receipt_id = receipt
+                .get("receiptId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let digest = receipt
+                .get("batchDigest")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if self.config.provider != "cursor_cloud"
+                || turn_id.is_empty()
+                || turn_id.len() > 240
+                || receipt_id.is_empty()
+                || receipt_id.len() > 240
+                || !digest.strip_prefix("sha256:").is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                || !settled_provider_turn_contains(
+                    &self.settled_provider_turn_ids,
+                    &self.settled_provider_turn_filter,
+                    turn_id,
+                )
+            {
+                return Err(DurableRunnerError::invalid(
+                    "Cursor Cloud retained terminal receipt is invalid",
+                ));
+            }
+        }
+        if self
+            .codex_usage
+            .as_ref()
+            .is_some_and(|usage| !usage.is_valid())
+        {
+            return Err(DurableRunnerError::invalid("invalid Codex usage baseline"));
+        }
+        let mut pending_event_ids = HashSet::new();
+        if self.descendant_thread_ids.len() > crate::codex_provider::MAX_DESCENDANT_THREAD_IDS
+            || self
+                .descendant_thread_ids
+                .iter()
+                .any(|id| id.is_empty() || id.len() > 240)
+            || self.schema != PROVIDER_STATE_SCHEMA
+            || self.run_identity.as_ref().is_some_and(|identity| {
+                identity.runner_instance_id.is_empty()
+                    || identity.runner_instance_id.len() > 512
+                    || identity.runner_instance_id.chars().any(char::is_control)
+                    || !is_stable_id(&identity.run_id, SHORT_STABLE_ID_CHARS)
+                    || !is_stable_id(&identity.normalized_session_id, SHORT_STABLE_ID_CHARS)
+                    || !is_stable_id(&identity.turn_id, DURABLE_STABLE_ID_CHARS)
+                    || !is_stable_id(&identity.item_id, DURABLE_STABLE_ID_CHARS)
+            })
+            || !matches!(
+                self.lifecycle.as_str(),
+                "prepared"
+                    | "session_open"
+                    | "turn_active"
+                    | "provider_exited"
+                    | "reconciliation_required"
+                    | "closed"
+            )
+            || self
+                .thread_id
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > 240)
+            || self
+                .provider_session_id
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > 240)
+            || self
+                .active_provider_turn_id
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > 240)
+            || self
+                .completed_provider_turn_id
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > 240)
+            || self.completion_contract.as_ref().is_some_and(|contract| {
+                contract.revision.is_empty()
+                    || contract.revision.len() > 120
+                    || contract.criterion_ids.is_empty()
+                    || contract.criterion_ids.len() > 256
+                    || contract.criterion_ids.iter().any(|criterion| {
+                        criterion.is_empty()
+                            || criterion.len() > 240
+                            || criterion.chars().any(char::is_control)
+                    })
+            })
+            || self
+                .last_agent_message
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > 1_000_000)
+            || self.goal.as_ref().is_some_and(|goal| {
+                goal.objective.trim().is_empty()
+                    || goal.objective.chars().count() > 4_000
+                    || normalize_goal_status(&goal.status).is_none()
+            })
+            || (self.thread_id.is_none()
+                && (self.provider_session_id.is_some()
+                    || self.active_provider_turn_id.is_some()
+                    || matches!(self.lifecycle.as_str(), "session_open" | "turn_active")))
+            || (self.lifecycle == "turn_active" && self.active_provider_turn_id.is_none())
+            || (self.ambiguous_turn_start_pending
+                && (self.thread_id.is_none()
+                    || self.active_provider_turn_id.is_some()
+                    || matches!(
+                        self.lifecycle.as_str(),
+                        "prepared" | "turn_active" | "closed"
+                    )))
+            || (self.completed_turn_authoritative && self.active_provider_turn_id.is_some())
+            || (!self.completed_turn_authoritative
+                && (self.completed_turn_process_generation.is_some()
+                    || self.completed_provider_turn_id.is_some()))
+            || self.settled_provider_turn_ids.len() > MAX_SETTLED_PROVIDER_TURN_IDS
+            || self.settled_provider_turn_filter.validate().is_err()
+            || self
+                .settled_provider_turn_ids
+                .iter()
+                .any(|provider_turn_id| {
+                    provider_turn_id.is_empty()
+                        || provider_turn_id.len() > 240
+                        || provider_turn_id.chars().any(char::is_control)
+                })
+            || self
+                .active_provider_turn_id
+                .as_ref()
+                .is_some_and(|provider_turn_id| {
+                    settled_provider_turn_contains(
+                        &self.settled_provider_turn_ids,
+                        &self.settled_provider_turn_filter,
+                        provider_turn_id,
+                    )
+                })
+            || self
+                .completed_turn_process_generation
+                .is_some_and(|generation| generation > self.provider_process_generation)
+            || (self.receipt_limit_diagnostic_emitted && self.active_provider_turn_id.is_none())
+            || (self.receipt_limit_interrupt_pending
+                && (!self.receipt_limit_diagnostic_emitted
+                    || self.active_provider_turn_id.is_none()))
+            || (self.receipt_limit_interrupt_accepted && !self.receipt_limit_interrupt_pending)
+            || self.receipt_limit_interrupt_attempts > MAX_RECEIPT_LIMIT_INTERRUPT_ATTEMPTS
+            || (!self.receipt_limit_interrupt_pending && self.receipt_limit_interrupt_attempts != 0)
+            || self
+                .receipt_limit_interrupt_deadline_unix_ms
+                .is_some_and(|deadline| deadline == 0 || !self.receipt_limit_interrupt_pending)
+            || self.active_provider_result_fingerprint.is_some()
+                != self.active_provider_result_disposition.is_some()
+            || self
+                .active_provider_result_fingerprint
+                .as_ref()
+                .is_some_and(|fingerprint| {
+                    fingerprint.len() != 71
+                        || !fingerprint.starts_with("sha256:")
+                        || !fingerprint[7..]
+                            .chars()
+                            .all(|character| character.is_ascii_hexdigit())
+                })
+            || self
+                .active_provider_result_disposition
+                .as_deref()
+                .is_some_and(|disposition| {
+                    !matches!(disposition, "done" | "blocked" | "needs_review" | "yielded")
+                        || !matches!(
+                            self.config.provider.as_str(),
+                            "codex" | "opencode" | "cursor_cloud" | "pi_rpc"
+                        )
+                })
+            || self
+                .pi_deferred_terminal
+                .as_deref()
+                .is_some_and(|event_type| {
+                    self.config.provider != "pi_rpc"
+                        || !matches!(
+                            event_type,
+                            "turn.completed"
+                                | "turn.failed"
+                                | "turn.interrupted"
+                                | "turn.cancelled"
+                        )
+                        || !self.tool_bridge.turn_closed()
+                        || self.tool_bridge.pending_calls().next().is_none()
+                        || self.active_provider_turn_id.is_some()
+                })
+            || self
+                .pi_deferred_terminal_deadline_unix_ms
+                .is_some_and(|deadline| deadline == 0 || self.pi_deferred_terminal.is_none())
+            || (matches!(
+                self.lifecycle.as_str(),
+                "prepared" | "session_open" | "closed"
+            ) && self.active_provider_turn_id.is_some())
+            || self.next_provider_event_seq == 0
+            || self.pending_events.len() > MAX_EVENTS_PER_POLL + 3
+            || self.queued_events.len() > MAX_QUEUED_PROVIDER_EVENTS
+            || self
+                .pending_events
+                .iter()
+                .chain(self.queued_events.iter())
+                .any(|event| {
+                    provider_event_sequence(&event.executor_event_id)
+                        .is_none_or(|sequence| sequence >= self.next_provider_event_seq)
+                        || !pending_event_ids.insert(event.executor_event_id.as_str())
+                        || event.event_type.is_empty()
+                        || event.event_type.len() > 160
+                        || event.event_type.chars().any(char::is_control)
+                        || !event.payload.is_object()
+                })
+        {
+            return Err(DurableRunnerError::invalid(
+                "Codex provider state is malformed or inconsistent",
+            ));
+        }
+        Ok(())
+    }
+
+    fn push_event_with_limit(
+        &mut self,
+        event: NormalizedProviderEvent,
+        max_queued_events: usize,
+    ) -> Result<(), DurableRunnerError> {
+        let queue_event =
+            !self.queued_events.is_empty() || self.pending_events.len() >= MAX_EVENTS_PER_POLL;
+        if queue_event && self.queued_events.len() >= max_queued_events {
+            return Err(DurableRunnerError::invalid(
+                "Codex provider event backlog exceeds its durable limit",
+            ));
+        }
+        let sequence = self.next_provider_event_seq;
+        self.next_provider_event_seq = sequence
+            .checked_add(1)
+            .ok_or_else(|| DurableRunnerError::invalid("provider event sequence exhausted"))?;
+        let event = PolledEvent {
+            executor_event_id: provider_event_id(sequence),
+            event_type: event.event_type,
+            priority: event.priority,
+            payload: event.payload,
+        };
+        if queue_event {
+            self.queued_events.push_back(event);
+        } else {
+            self.pending_events.push_back(event);
+        }
+        Ok(())
+    }
+
+    fn begin_receipt_limit_stop(
+        &mut self,
+        call_id: String,
+        operation_id: String,
+        deadline_unix_ms: u64,
+    ) -> Result<bool, DurableRunnerError> {
+        if self.receipt_limit_diagnostic_emitted {
+            return Ok(self.receipt_limit_interrupt_pending);
+        }
+        self.push_terminal_event(NormalizedProviderEvent {
+            event_type: "harness.diagnostic".to_owned(),
+            priority: EventPriority::P0,
+            payload: json!({
+                "provider": self.config.provider,
+                "code": "semantic_tool_turn_receipt_limit",
+                "operationId": operation_id,
+                "callId": call_id,
+                "message": "The active provider turn reached its durable semantic-tool receipt limit and was interrupted",
+                "paperclipExecuted": false,
+            }),
+        })?;
+        self.receipt_limit_diagnostic_emitted = true;
+        self.receipt_limit_interrupt_pending = true;
+        self.receipt_limit_interrupt_attempts = 0;
+        self.receipt_limit_interrupt_deadline_unix_ms = Some(deadline_unix_ms);
+        Ok(true)
+    }
+
+    fn record_receipt_limit_interrupt_attempt(&mut self) -> Result<(), DurableRunnerError> {
+        if self.receipt_limit_interrupt_attempts >= MAX_RECEIPT_LIMIT_INTERRUPT_ATTEMPTS {
+            return Err(DurableRunnerError::invalid(
+                "Codex receipt-limit interruption exceeded its durable retry bound",
+            ));
+        }
+        self.receipt_limit_interrupt_attempts += 1;
+        Ok(())
+    }
+
+    fn mark_receipt_limit_interrupt_accepted(&mut self, accepted_deadline_unix_ms: u64) {
+        // Provider restoration can reconcile the active turn as already
+        // settled while an interruption command is in flight. In that case
+        // `interrupt_turn` returns `already_settled` and recovery has already
+        // cleared the durable retry marker. Do not recreate an accepted state
+        // without a pending interruption or active turn.
+        if !self.receipt_limit_interrupt_pending || self.active_provider_turn_id.is_none() {
+            return;
+        }
+        if !self.receipt_limit_interrupt_accepted {
+            self.receipt_limit_interrupt_deadline_unix_ms = Some(
+                self.receipt_limit_interrupt_deadline_unix_ms
+                    .unwrap_or_default()
+                    .max(accepted_deadline_unix_ms),
+            );
+        }
+        self.receipt_limit_interrupt_accepted = true;
+    }
+
+    fn push_event(&mut self, event: NormalizedProviderEvent) -> Result<(), DurableRunnerError> {
+        self.push_event_with_limit(event, MAX_REGULAR_QUEUED_PROVIDER_EVENTS)
+    }
+
+    fn push_terminal_event(
+        &mut self,
+        event: NormalizedProviderEvent,
+    ) -> Result<(), DurableRunnerError> {
+        self.push_event_with_limit(event, MAX_QUEUED_PROVIDER_EVENTS)
+    }
+
+    fn push_receipt_limit_cleanup_event(
+        &mut self,
+        event: NormalizedProviderEvent,
+    ) -> Result<(), DurableRunnerError> {
+        let queue_event =
+            !self.queued_events.is_empty() || self.pending_events.len() >= MAX_EVENTS_PER_POLL;
+        if queue_event
+            && self.queued_events.len()
+                >= MAX_QUEUED_PROVIDER_EVENTS - MAX_RECEIPT_LIMIT_TERMINAL_RESERVE
+        {
+            // Continue draining the provider so an authoritative terminal can
+            // still be observed, but never let cleanup chatter consume the
+            // semantic-result and terminal-event reserve.
+            return Ok(());
+        }
+        self.push_terminal_event(event)
+    }
+
+    fn refill_pending_events(&mut self) {
+        while self.pending_events.len() < MAX_EVENTS_PER_POLL {
+            let Some(event) = self.queued_events.pop_front() else {
+                break;
+            };
+            self.pending_events.push_back(event);
+        }
+    }
+
+    fn extend_events(
+        &mut self,
+        events: impl IntoIterator<Item = NormalizedProviderEvent>,
+    ) -> Result<(), DurableRunnerError> {
+        for event in events {
+            self.push_event(event)?;
+        }
+        Ok(())
+    }
+
+    fn defer_pi_terminal_outcome(
+        &mut self,
+        event_type: &str,
+        outcome: Vec<NormalizedProviderEvent>,
+    ) -> Result<Vec<NormalizedProviderEvent>, DurableRunnerError> {
+        if self.config.provider == "pi_rpc"
+            && self.tool_bridge.turn_closed()
+            && self.tool_bridge.pending_calls().next().is_some()
+        {
+            // The provider terminal closes delivery, not the operation's
+            // authority. Wait for the correlated controller result, but bound
+            // that wait independently of a healthy, now-idle Pi process.
+            if self.pi_deferred_terminal_deadline_unix_ms.is_none() {
+                self.pi_deferred_terminal_deadline_unix_ms = Some(receipt_limit_deadline_after(
+                    PI_DEFERRED_TERMINAL_DEADLINE_MS,
+                )?);
+            }
+            self.pi_deferred_terminal = Some(event_type.to_owned());
+            Ok(Vec::new())
+        } else {
+            Ok(outcome)
+        }
+    }
+
+    fn settle_deferred_pi_terminal(&mut self) -> Result<(), DurableRunnerError> {
+        if self.tool_bridge.pending_calls().next().is_none() {
+            if let Some(event_type) = self.pi_deferred_terminal.take() {
+                self.pi_deferred_terminal_deadline_unix_ms = None;
+                let outcome = terminal_events(self, &event_type, None);
+                self.extend_terminal_events(outcome)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn admit_tool_call(
+        &mut self,
+        call_id: &str,
+        operation_id: &str,
+        input: &Value,
+    ) -> Result<ToolCallAdmission, ProviderBridgeError> {
+        let replay = if self.config.provider == "pi_rpc" {
+            self.tool_bridge.first_held_result(call_id, operation_id)
+        } else {
+            self.tool_bridge.replay_result(call_id, operation_id, input)
+        };
+        let replay = replay.map_err(|error| {
+            self.record_terminal_tool_rejection(operation_id);
+            error
+        })?;
+        if let Some(result) = replay {
+            // An exact completed replay is a transport retry. Its input and
+            // result receipts are already durable, so recording another event
+            // would make an otherwise idempotent replay consume bounded event
+            // capacity and could prevent returning the stored result.
+            return Ok(ToolCallAdmission::CompletedReplay(result));
+        }
+
+        let pending_replay = self
+            .tool_bridge
+            .pending_calls()
+            .any(|pending| pending.call_id == call_id);
+        let call =
+            self.tool_bridge
+                .begin_call(call_id.to_owned(), operation_id.to_owned(), input.clone());
+        let call = call.map_err(|error| {
+            self.record_terminal_tool_rejection(operation_id);
+            error
+        })?;
+        if pending_replay {
+            // The first input receipt is already durable. An exact pending
+            // replay is only the provider re-establishing its request after a
+            // process restart; appending another event would make the retry
+            // consume bounded backlog capacity without adding information.
+            Ok(ToolCallAdmission::PendingReplay)
+        } else {
+            Ok(ToolCallAdmission::Pending(call))
+        }
+    }
+
+    fn record_terminal_tool_rejection(&mut self, operation_id: &str) {
+        if matches!(operation_id, "paperclip_finish" | "paperclip_block")
+            && self.active_provider_result_fingerprint.is_none()
+            && self
+                .tool_bridge
+                .authorized_tools()
+                .any(|tool| tool.operation_id == operation_id)
+        {
+            self.active_terminal_tool_rejected = true;
+        }
+    }
+
+    fn reconcile_active_provider_turn(&mut self, active_provider_turn_id: Option<String>) {
+        if active_provider_turn_id.is_some()
+            && self.active_provider_turn_id != active_provider_turn_id
+        {
+            self.active_terminal_tool_rejected = false;
+        }
+        self.active_provider_turn_id = active_provider_turn_id;
+        if self.active_provider_turn_id.is_some() {
+            // A newly discovered turn supersedes completion authority from the
+            // prior turn. Persisting both would make the recovered state
+            // invalid and could misclassify a later provider exit.
+            self.completed_turn_authoritative = false;
+            self.completed_turn_process_generation = None;
+            self.completed_provider_turn_id = None;
+            self.ambiguous_turn_start_pending = false;
+            self.active_provider_result_fingerprint = None;
+            self.active_provider_result_disposition = None;
+            self.last_agent_message = None;
+        }
+        self.lifecycle = if self.active_provider_turn_id.is_some() {
+            "turn_active".to_owned()
+        } else {
+            "session_open".to_owned()
+        };
+    }
+
+    fn settle_active_provider_turn_identity(&mut self) -> Result<(), DurableRunnerError> {
+        let provider_turn_id = self.active_provider_turn_id.clone().ok_or_else(|| {
+            DurableRunnerError::invalid("Codex terminal omitted its active provider turn identity")
+        })?;
+        remember_settled_provider_turn(
+            &mut self.settled_provider_turn_ids,
+            &mut self.settled_provider_turn_filter,
+            provider_turn_id,
+        )?;
+        Ok(())
+    }
+
+    fn recovered_settled_provider_turn_ids(
+        &self,
+    ) -> Result<(std::collections::BTreeSet<String>, DurableReplayFilter), DurableRunnerError> {
+        let mut settled_provider_turn_ids = self.settled_provider_turn_ids.clone();
+        let mut settled_provider_turn_filter = self.settled_provider_turn_filter.clone();
+        // State written before the durable set was introduced retained only
+        // the latest completed identity. Fold that legacy authority into the
+        // new ledger before the provider is allowed to accept replacement work.
+        if let Some(provider_turn_id) = self.completed_provider_turn_id.clone() {
+            remember_settled_provider_turn(
+                &mut settled_provider_turn_ids,
+                &mut settled_provider_turn_filter,
+                provider_turn_id,
+            )?;
+        }
+        Ok((settled_provider_turn_ids, settled_provider_turn_filter))
+    }
+
+    fn extend_terminal_events(
+        &mut self,
+        events: impl IntoIterator<Item = NormalizedProviderEvent>,
+    ) -> Result<(), DurableRunnerError> {
+        for event in events {
+            self.push_terminal_event(event)?;
+        }
+        Ok(())
+    }
+}
+
+struct NormalizationTrace {
+    frame_id: u64,
+    rule_id: String,
+    mapped: bool,
+    emitted_event_ids: Vec<String>,
+}
+
+pub struct CodexCommandExecutor {
+    state_dir: PathBuf,
+    state: Option<CodexProviderState>,
+    provider: Option<CodexProvider>,
+    event_identity: Option<ProviderEventIdentity>,
+    restore_checked: bool,
+    restore_error: Option<DurableRunnerError>,
+    prepare_input_refusal_code: Option<&'static str>,
+    pi_launch_profile: Option<OpenCodeLaunchProfile>,
+    opencode_launch_profile: Option<OpenCodeLaunchProfile>,
+    cursor_cloud_launch_profile: Option<CursorCloudLaunchProfile>,
+    startup_command: Option<ProviderStartupCommand>,
+    startup_evidence_error: Option<DurableRunnerError>,
+    recovery_pending_effects: Option<usize>,
+    // A contender has no authority to restore, poll or stop its predecessor.
+    // Derived again from the saved identities after restart; never persisted
+    // into the predecessor's provider state.
+    refresh_admission: Option<&'static str>,
+    unsaved_frame_state: std::cell::Cell<bool>,
+    unsaved_trace_interpretations: Vec<NormalizationTrace>,
+    #[cfg(test)]
+    persist_count: std::cell::Cell<usize>,
+}
+
+impl CodexCommandExecutor {
+    pub fn new(state_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            state_dir: state_dir.into(),
+            state: None,
+            provider: None,
+            event_identity: None,
+            restore_checked: false,
+            restore_error: None,
+            prepare_input_refusal_code: None,
+            pi_launch_profile: None,
+            opencode_launch_profile: None,
+            cursor_cloud_launch_profile: None,
+            startup_command: None,
+            startup_evidence_error: None,
+            recovery_pending_effects: None,
+            refresh_admission: None,
+            unsaved_frame_state: std::cell::Cell::new(false),
+            unsaved_trace_interpretations: Vec::new(),
+            #[cfg(test)]
+            persist_count: std::cell::Cell::new(0),
+        }
+    }
+
+    pub fn with_runner_config(state_dir: impl Into<PathBuf>, config: &DurableRunnerConfig) -> Self {
+        let mut executor = Self::new(state_dir);
+        executor.event_identity = Some(ProviderEventIdentity::from_config(config));
+        executor.pi_launch_profile = config.pi_launch_profile.clone();
+        executor.opencode_launch_profile = config.opencode_launch_profile.clone();
+        executor.cursor_cloud_launch_profile = config.cursor_cloud_launch_profile.clone();
+        executor
+    }
+
+    pub(crate) fn observe_recovery_state(&mut self, state: &crate::durable::DurableState) {
+        self.recovery_pending_effects = Some(state.recovery_pending_effects());
+    }
+
+    fn cold_predecessor_pending(&mut self) -> Result<bool, DurableRunnerError> {
+        if self.provider.is_some() || self.restore_checked {
+            return Ok(false);
+        }
+        // Unopened polling must not restore an unreadable checkpoint. Prepare
+        // still performs the normal strict read before any provider admission.
+        if self.state.is_none() && self.load_state_without_provider().is_err() {
+            return Ok(false);
+        }
+        Ok(self.state.as_ref().is_some_and(|state| {
+            state
+                .run_identity
+                .as_ref()
+                .zip(self.event_identity.as_ref())
+                .is_some_and(|(saved, next)| saved.run_id != next.run_id)
+        }))
+    }
+
+    /// Read-only admission, before restore can reconcile or relaunch old work.
+    /// A prepare receipt is NOT an attachment or permission to open a session.
+    /// The controller must wait for the old turn, prove its execution ended,
+    /// then use the existing fresh-history owner rather than mutate this state.
+    fn skill_refresh_admission(
+        &mut self,
+        payload: &Value,
+    ) -> Result<Option<CommandExecution>, DurableRunnerError> {
+        if !self.cold_predecessor_pending()? {
+            return Ok(None);
+        }
+        let state = self.state.as_ref().expect("loaded predecessor");
+        let Some(provider) = payload.get("provider") else {
+            return Ok(None);
+        };
+        let mut next: CodexProviderConfig =
+            serde_json::from_value(provider.clone()).map_err(|error| {
+                DurableRunnerError::invalid(format!("run.prepare provider is invalid: {error}"))
+            })?;
+        if next.provider != "codex" {
+            next.include_skill_instructions = None;
+        }
+        next.validate()
+            .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        if !matches!(next.provider.as_str(), "codex" | "pi_rpc")
+            || state.thread_id.is_none()
+            || next.instructions == state.config.instructions
+        {
+            return Ok(None);
+        }
+        next.instructions = state.config.instructions.clone();
+        // Immutable profile changes keep the ordinary strict refusal.
+        if next != state.config {
+            return Ok(None);
+        }
+        // This is a refusal, not a tool grant. Do not reconcile the old tool
+        // bridge; normal admitted preparation still validates its full set.
+        let active = state.active_provider_turn_id.is_some()
+            || state.pi_deferred_terminal.is_some()
+            || state.ambiguous_turn_start_pending
+            || state.startup_attempt.is_some()
+            || state.tool_bridge.pending_calls().next().is_some();
+        let descendants = !state.descendant_thread_ids.is_empty();
+        let goal = state
+            .goal
+            .as_ref()
+            .is_some_and(|goal| goal.status == "active" || goal.working_now);
+        let changed_contract = state.completion_contract != completion_contract(payload)?;
+        if active || descendants {
+            let prepare_refusal_code = if active {
+                "provider_active_turn"
+            } else {
+                "provider_live_descendants"
+            };
+            self.refresh_admission = Some("refresh_wait");
+            return Ok(Some(CommandExecution::result(
+                json!({ "status": "refresh_wait",
+                "refusalCode": "provider_refresh_required", "prepareRefusalCode": prepare_refusal_code,
+                "waitForTurn": active }),
+            )));
+        }
+        if !goal && !changed_contract {
+            return Ok(None);
+        }
+
+        // An idle instruction refresh is an admitted fresh-history boundary,
+        // not a provider refusal. Use the existing close path and commit its
+        // session.closed receipt with run.prepare before session.open can start.
+        // If close cannot be confirmed, retain the strict D10 refresh refusal.
+        let close = match self
+            .retain_superseded_checkpoint()
+            .and_then(|()| self.close_session())
+        {
+            Ok(close) => close,
+            Err(_) => {
+                let prepare_refusal_code = if goal {
+                    "provider_active_goal"
+                } else {
+                    "provider_contract_changed"
+                };
+                self.refresh_admission = Some("refresh_fresh");
+                return Ok(Some(CommandExecution::result(
+                    json!({ "status": "refresh_fresh",
+                    "refusalCode": "provider_refresh_required", "prepareRefusalCode": prepare_refusal_code,
+                    "waitForTurn": false }),
+                )));
+            }
+        };
+        // The old session is now closed. Its task history belongs to the server;
+        // build a new provider state rather than attaching the old goal/thread.
+        self.state = None;
+        let mut prepared = self.prepare_with_legacy_attachment(payload, true)?;
+        let mut events = close.events;
+        events.append(&mut prepared.events);
+        prepared.events = events;
+        Ok(Some(prepared))
+    }
+
+    fn bind_opencode_launch_profile(
+        &self,
+        config: &CodexProviderConfig,
+    ) -> Result<Option<String>, DurableRunnerError> {
+        if config.provider != "opencode" {
+            return Ok(None);
+        }
+        let profile = self.opencode_launch_profile.as_ref().ok_or_else(|| {
+            DurableRunnerError::invalid(
+                "OpenCode runner startup omitted its qualified launch profile",
+            )
+        })?;
+        let proxy_script = profile.proxy_script.path.to_string_lossy();
+        if config.command != profile.command.path
+            || config.args.as_slice() != [proxy_script.as_ref()]
+        {
+            return Err(DurableRunnerError::launch_profile_mismatch(
+                "OpenCode run.prepare launch does not match the runner-owned qualified profile",
+            ));
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"paperclip.runner.opencode-launch-profile.v1\0");
+        for artifact in [&profile.command, &profile.proxy_script, &profile.executable] {
+            digest.update(artifact.path.to_string_lossy().as_bytes());
+            digest.update(b"\0");
+            digest.update(artifact.sha256.as_bytes());
+            digest.update(b"\0");
+        }
+        Ok(Some(format!("sha256:{:x}", digest.finalize())))
+    }
+
+    fn bind_pi_launch_profile(
+        &self,
+        config: &CodexProviderConfig,
+    ) -> Result<Option<String>, DurableRunnerError> {
+        if config.provider != "pi_rpc" {
+            return Ok(None);
+        }
+        let profile = self.pi_launch_profile.as_ref().ok_or_else(|| {
+            DurableRunnerError::invalid("Pi runner startup omitted its qualified launch profile")
+        })?;
+        let proxy_script = profile.proxy_script.path.to_string_lossy();
+        if config.command != profile.command.path
+            || config.args.as_slice() != [proxy_script.as_ref()]
+        {
+            return Err(DurableRunnerError::launch_profile_mismatch(
+                "Pi run.prepare launch does not match the runner-owned qualified profile",
+            ));
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"paperclip.runner.pi-rpc-launch-profile.v1\0");
+        for artifact in [&profile.command, &profile.proxy_script, &profile.executable] {
+            digest.update(artifact.path.to_string_lossy().as_bytes());
+            digest.update(b"\0");
+            digest.update(artifact.sha256.as_bytes());
+            digest.update(b"\0");
+        }
+        Ok(Some(format!("sha256:{:x}", digest.finalize())))
+    }
+
+    fn opencode_release_digest(&self, config: &CodexProviderConfig) -> Option<String> {
+        if config.provider != "opencode" {
+            return None;
+        }
+        self.opencode_launch_profile
+            .as_ref()
+            .map(|profile| profile.executable.sha256.clone())
+    }
+
+    // The launch-profile digest binds every artifact by path and bytes. Only
+    // the OpenCode executable owns the saved conversation; the Node command
+    // and proxy bundle are controller runtime that a rebuild or deploy
+    // replaces between a hard kill and recovery. The proxy keeps no state of
+    // its own. Re-bind a saved session to the current profile only when:
+    // - The saved release digest equals this startup's executable digest.
+    //   State written before that field existed stays exact.
+    // - The saved config names this startup's command and proxy paths
+    //   (bind_opencode_launch_profile has already checked this).
+    // - No provider work is in flight: no active or ambiguous turn, startup
+    //   attempt, receipt-limit interrupt, pending tool call, undelivered event
+    //   or working goal. The next launch only loads the conversation. An
+    //   observed provider exit with nothing in flight qualifies, because
+    //   restore restarts that provider the same way.
+    // Session start still verifies every artifact and the restored provider
+    // identity.
+    fn rebinds_settled_opencode_session(&self, state: &CodexProviderState) -> bool {
+        state.opencode_release_digest.is_some()
+            && state.opencode_release_digest == self.opencode_release_digest(&state.config)
+            && state.is_settled_for_run_rebinding()
+    }
+
+    fn pi_release_digest(&self, config: &CodexProviderConfig) -> Option<String> {
+        if config.provider != "pi_rpc" {
+            return None;
+        }
+        self.pi_launch_profile
+            .as_ref()
+            .map(|profile| profile.executable.sha256.clone())
+    }
+
+    // The OpenCode rule above, for native Pi (#20736, #20787). A server restart
+    // or deploy that leaves a Pi chat unclosed hands its saved state to a
+    // runner whose Node command or proxy bundle changed. Pi keeps the
+    // conversation in its own session JSONL, keyed by the session id, not by
+    // the controller bytes. Re-bind only when the saved Pi release equals this
+    // startup's executable (legacy state without the field stays exact), and
+    // nothing is in flight: the settled rule plus no deferred Pi terminal and
+    // no live descendant. A changed Pi release or work in flight fails closed.
+    fn rebinds_settled_pi_session(&self, state: &CodexProviderState) -> bool {
+        state.pi_release_digest.is_some()
+            && state.pi_release_digest == self.pi_release_digest(&state.config)
+            && state.is_settled_for_run_rebinding()
+            && state.pi_deferred_terminal.is_none()
+            && state.descendant_thread_ids.is_empty()
+    }
+
+    fn bind_cursor_cloud_launch_profile(
+        &self,
+        config: &CodexProviderConfig,
+    ) -> Result<Option<String>, DurableRunnerError> {
+        if config.provider != "cursor_cloud" {
+            return Ok(None);
+        }
+        let profile = self.cursor_cloud_launch_profile.as_ref().ok_or_else(|| {
+            DurableRunnerError::invalid(
+                "Cursor Cloud runner startup omitted its qualified launch profile",
+            )
+        })?;
+        let proxy_script = profile.proxy_script.path.to_string_lossy();
+        if config.command != profile.command.path
+            || config.args.as_slice() != [proxy_script.as_ref()]
+        {
+            return Err(DurableRunnerError::launch_profile_mismatch(
+                "Cursor Cloud run.prepare launch does not match the runner-owned qualified profile",
+            ));
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"paperclip.runner.cursor-cloud-launch-profile.v1\0");
+        for artifact in [&profile.command, &profile.proxy_script] {
+            digest.update(artifact.path.to_string_lossy().as_bytes());
+            digest.update(b"\0");
+            digest.update(artifact.sha256.as_bytes());
+            digest.update(b"\0");
+        }
+        Ok(Some(format!("sha256:{:x}", digest.finalize())))
+    }
+
+    fn state_path(&self) -> PathBuf {
+        self.state_dir.join(CODEX_PROVIDER_STATE_FILE)
+    }
+
+    /// Retain the exact persisted predecessor checkpoint before close_session
+    /// rewrites the canonical state path with its closed receipt. The archived
+    /// file stays beside the active checkpoint in the same private owned tree.
+    fn retain_superseded_checkpoint(&self) -> Result<(), DurableRunnerError> {
+        verify_private_directory(&self.state_dir)?;
+        let mut source = open_private_regular_file(&self.state_path()).map_err(|error| {
+            DurableRunnerError::invalid(format!(
+                "failed to read superseded Codex provider checkpoint: {error}"
+            ))
+        })?;
+        let mut bytes = Vec::new();
+        source.read_to_end(&mut bytes).map_err(|error| {
+            DurableRunnerError::invalid(format!(
+                "failed to read superseded Codex provider checkpoint: {error}"
+            ))
+        })?;
+        let retained_path = self.state_dir.join(format!(
+            "{CODEX_PROVIDER_STATE_FILE}.retained-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut retained = options.open(&retained_path).map_err(|error| {
+            DurableRunnerError::invalid(format!(
+                "failed to create retained Codex provider checkpoint: {error}"
+            ))
+        })?;
+        let saved = (|| -> std::io::Result<()> {
+            retained.write_all(&bytes)?;
+            retained.sync_all()?;
+            drop(retained);
+            #[cfg(unix)]
+            File::open(&self.state_dir)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = saved {
+            let _ = fs::remove_file(&retained_path);
+            return Err(DurableRunnerError::invalid(format!(
+                "failed to retain superseded Codex provider checkpoint: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn assert_startup_admitted(&self) -> Result<(), DurableRunnerError> {
+        if let Some(error) = &self.startup_evidence_error {
+            return Err(error.clone());
+        }
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.startup_attempt.is_some())
+        {
+            return Err(DurableRunnerError::invalid(
+                "provider startup ownership remains unadmitted",
+            ));
+        }
+        Ok(())
+    }
+
+    fn save_startup_fact(&mut self) -> Result<(), DurableRunnerError> {
+        self.save_startup_state(true)
+    }
+
+    /// Persists the startup fence. `report` also queues the ownership
+    /// diagnostic; the spawn-start mark is internal and only needs fsync.
+    fn save_startup_state(&mut self, report: bool) -> Result<(), DurableRunnerError> {
+        let outcome = (|| {
+            let state = self
+                .state
+                .as_mut()
+                .ok_or_else(|| DurableRunnerError::invalid("provider startup state missing"))?;
+            let attempt = state
+                .startup_attempt
+                .clone()
+                .ok_or_else(|| DurableRunnerError::invalid("provider startup intent missing"))?;
+            if report {
+                state.push_terminal_event(NormalizedProviderEvent {
+                    event_type: "harness.diagnostic".to_owned(),
+                    priority: EventPriority::P0,
+                    payload: json!({"code":"provider_startup_ownership", "startup": attempt}),
+                })?;
+            }
+            self.save_state()
+        })();
+        if let Err(error) = &outcome {
+            self.startup_evidence_error = Some(error.clone());
+        }
+        outcome
+    }
+
+    fn begin_startup(
+        &mut self,
+        trigger: ProviderStartupTrigger,
+        generation: u64,
+    ) -> Result<(), DurableRunnerError> {
+        self.assert_startup_admitted()?;
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| DurableRunnerError::invalid("provider startup state missing"))?;
+        let configuration = serde_json::to_vec(&state.config).map_err(|_| {
+            DurableRunnerError::invalid("provider startup configuration serialization failed")
+        })?;
+        state.startup_attempt = Some(ProviderStartupAttempt {
+            schema: "paperclip.provider_startup.v1".to_owned(),
+            launch_id: uuid::Uuid::new_v4().to_string(),
+            phase: ProviderStartupPhase::Intent,
+            trigger,
+            attempted_process_generation: generation,
+            origin: self.event_identity.clone(),
+            command: self.startup_command.clone(),
+            configuration_fingerprint: format!("sha256:{:x}", Sha256::digest(configuration)),
+            requested_thread_id: state.thread_id.clone(),
+            authenticated_thread_id: None,
+            process_id: None,
+            process_group_id: None,
+            failed_stage: None,
+            direct_child_exit_observed: false,
+            exit_code: None,
+            signal: None,
+            process_tree_retired: false,
+            before_spawn: true,
+            no_reply: false,
+        });
+        self.save_startup_fact()
+    }
+
+    fn observe_startup(
+        &mut self,
+        observation: ProviderStartupObservation,
+    ) -> Result<(), DurableRunnerError> {
+        let attempt = self
+            .state
+            .as_mut()
+            .and_then(|state| state.startup_attempt.as_mut())
+            .ok_or_else(|| DurableRunnerError::invalid("provider startup intent missing"))?;
+        let report = !matches!(observation, ProviderStartupObservation::SpawnStarting);
+        match observation {
+            ProviderStartupObservation::SpawnStarting => {
+                if attempt.phase != ProviderStartupPhase::Intent || !attempt.before_spawn {
+                    return Err(DurableRunnerError::invalid(
+                        "provider spawn began outside its startup intent",
+                    ));
+                }
+                attempt.before_spawn = false;
+            }
+            ProviderStartupObservation::Spawned {
+                process_id,
+                process_group_id,
+            } => {
+                attempt.before_spawn = false;
+                attempt.phase = ProviderStartupPhase::Spawned;
+                attempt.process_id = Some(process_id);
+                attempt.process_group_id = Some(process_group_id);
+            }
+            ProviderStartupObservation::Failed {
+                stage,
+                child_exit,
+                no_reply,
+            } => {
+                attempt.phase = ProviderStartupPhase::InitializationFailed;
+                attempt.failed_stage = Some(stage);
+                attempt.no_reply = no_reply;
+                attempt.direct_child_exit_observed = child_exit.is_some();
+                attempt.exit_code = child_exit.as_ref().and_then(|fact| fact.exit_code);
+                attempt.signal = child_exit.as_ref().and_then(|fact| fact.signal);
+            }
+        }
+        self.save_startup_state(report)
+    }
+
+    fn start_observed_provider(
+        &mut self,
+        trigger: ProviderStartupTrigger,
+        generation: u64,
+    ) -> Result<CodexProvider, DurableRunnerError> {
+        let mut state = self
+            .state
+            .clone()
+            .ok_or_else(|| DurableRunnerError::invalid("provider startup state missing"))?;
+        let profile = if state.config.provider == "pi_rpc" {
+            self.pi_launch_profile.clone()
+        } else {
+            self.opencode_launch_profile.clone()
+        };
+        let cursor_cloud_profile = self.cursor_cloud_launch_profile.clone();
+        if state.config.provider == "codex" {
+            let args = &mut state.config.args;
+            let attachment_args =
+                crate::attachment_download::codex_attachment_read_args(args, &self.state_dir);
+            let position = args
+                .iter()
+                .position(|arg| arg == "app-server")
+                .unwrap_or(args.len());
+            args.splice(position..position, attachment_args);
+        }
+        self.begin_startup(trigger, generation)?;
+        CodexProvider::start_with_tools_observed(
+            &state.config,
+            state.tool_bridge.authorized_tools().cloned(),
+            state.thread_id.as_deref(),
+            generation,
+            profile.as_ref(),
+            cursor_cloud_profile.as_ref(),
+            state.completion_contract.as_ref().map(|contract| {
+                (
+                    contract.revision.as_str(),
+                    contract.criterion_ids.as_slice(),
+                )
+            }),
+            &mut |observation| {
+                self.observe_startup(observation).map_err(|error| {
+                    crate::local_runner::LocalRunnerError::invalid(error.to_string())
+                })
+            },
+        )
+        .and_then(|mut provider| {
+            if state.config.provider == "pi_rpc" {
+                provider.set_pi_runtime_context(state.pi_runtime_context.clone());
+            }
+            provider.restore_descendant_thread_identities(&state.descendant_thread_ids);
+            if state.config.provider == "cursor_cloud" && state.active_provider_turn_id.is_none() {
+                if let Some(receipt) = &state.cursor_cloud_terminal_receipt {
+                    let acknowledged = (|| {
+                        if let Some(delivery) = provider.cursor_cloud_terminal_delivery()? {
+                            if delivery.receipt() != *receipt {
+                                return Err(crate::local_runner::LocalRunnerError::invalid("Cursor Cloud retained terminal delivery changed across attachment"));
+                            }
+                            let _ = provider.acknowledge_cursor_cloud_terminal(&delivery);
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = acknowledged {
+                        self.fail_started_provider(&mut provider);
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(provider)
+        })
+        .map_err(|error| {
+            DurableRunnerError::invalid(format!(
+                "failed to start {} provider: {error}",
+                state.config.provider
+            ))
+            .with_provider_failure(error.provider_failure())
+        })
+    }
+
+    fn commit_startup_admission(&mut self) -> Result<(), DurableRunnerError> {
+        // Never clear the live fence until the authenticated provider state is
+        // fsynced. Failed persistence leaves the exact attempt unadmitted.
+        let mut next = self
+            .state
+            .clone()
+            .ok_or_else(|| DurableRunnerError::invalid("provider startup state missing"))?;
+        next.startup_attempt = None;
+        self.persist_state(&next)?;
+        self.state = Some(next);
+        Ok(())
+    }
+
+    fn fail_started_provider(&mut self, provider: &mut CodexProvider) {
+        let child_exit = provider.retire_failed_startup();
+        let _ = self.observe_startup(ProviderStartupObservation::Failed {
+            stage: ProviderStartupStage::Admission,
+            child_exit,
+            no_reply: false,
+        });
+    }
+
+    fn restore(&mut self) -> Result<(), DurableRunnerError> {
+        if let Some(error) = self.restore_error.as_ref() {
+            return Err(error.clone());
+        }
+        self.assert_startup_admitted()?;
+        if self.restore_checked {
+            return Ok(());
+        }
+        match self.restore_once() {
+            Ok(()) => {
+                self.assert_startup_admitted()?;
+                self.restore_checked = true;
+                Ok(())
+            }
+            Err(error) => {
+                self.restore_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    fn restore_once(&mut self) -> Result<(), DurableRunnerError> {
+        self.load_state_without_provider()?;
+        self.retire_orphaned_startup_attempt(
+            &|pid| local_process_definitely_gone(pid, false),
+            &|group| local_process_definitely_gone(group, true),
+        )?;
+        self.restore_provider_if_needed()
+    }
+
+    /// A runner killed during a provider launch leaves an unadmitted startup
+    /// fence in durable state while the session is still restorable. The
+    /// executor that loads that state owns no provider process. The fence is
+    /// retired, with a diagnostic, when nothing can still act for it:
+    ///
+    /// - an intent still marked before the spawn (the runner died while
+    ///   checking the launch, so no process was ever started); or
+    /// - a `spawned` launch whose recorded process and process group have
+    ///   both exited; or
+    /// - an initialization that failed only because the provider gave no
+    ///   reply within the request deadline (`noReply`), whose recorded process
+    ///   and process group have both exited.
+    ///
+    /// Restore then relaunches the provider through the normal resume path.
+    /// Every other fence stays closed: an intent that reached the spawn or
+    /// predates the before-spawn mark, a provider whose process or group may
+    /// still run, a startup that failed spawn or was rejected by the provider
+    /// (a real provider failure that needs reconciliation), and a session that
+    /// recovery deliberately closed.
+    fn retire_orphaned_startup_attempt(
+        &mut self,
+        process_gone: &dyn Fn(u32) -> bool,
+        group_gone: &dyn Fn(u32) -> bool,
+    ) -> Result<(), DurableRunnerError> {
+        if self.provider.is_some() || self.startup_evidence_error.is_some() {
+            return Ok(());
+        }
+        let Some(state) = self.state.as_ref() else {
+            return Ok(());
+        };
+        let Some(attempt) = state.startup_attempt.clone() else {
+            return Ok(());
+        };
+        // A prepared state that already holds a provider thread is the
+        // settled checkpoint that run.attach restores (see attach_run): the
+        // launch that a kill cut off was restoring that saved thread.
+        let restorable = matches!(
+            state.lifecycle.as_str(),
+            "session_open" | "turn_active" | "provider_exited"
+        ) || (state.lifecycle == "prepared"
+            && state.thread_id.is_some()
+            && state.provider_process_generation > 0);
+        let orphaned = match attempt.phase {
+            // The runner died while checking the launch, before any spawn.
+            ProviderStartupPhase::Intent => attempt.before_spawn,
+            ProviderStartupPhase::Spawned => match (attempt.process_id, attempt.process_group_id) {
+                (Some(pid), Some(group)) => process_gone(pid) && group_gone(group),
+                _ => false,
+            },
+            // A provider that never replied within the deadline (a stalled or
+            // frozen host) is not a provider failure; once it is provably gone
+            // it is relaunched like a cut-off launch. A provider that rejected
+            // its startup or exited, and every fact saved before `noReply`
+            // existed, stays fenced.
+            ProviderStartupPhase::InitializationFailed if attempt.no_reply => {
+                match (attempt.process_id, attempt.process_group_id) {
+                    (Some(pid), Some(group)) => process_gone(pid) && group_gone(group),
+                    _ => false,
+                }
+            }
+            ProviderStartupPhase::InitializationFailed => false,
+        };
+        if !restorable || !orphaned {
+            return Ok(());
+        }
+        let mut next = self
+            .state
+            .clone()
+            .ok_or_else(|| DurableRunnerError::invalid("provider startup state missing"))?;
+        next.startup_attempt = None;
+        next.push_terminal_event(NormalizedProviderEvent {
+            event_type: "harness.diagnostic".to_owned(),
+            priority: EventPriority::P0,
+            payload: json!({"code":"provider_startup_retired", "startup": attempt}),
+        })?;
+        self.persist_state(&next)?;
+        self.state = Some(next);
+        Ok(())
+    }
+
+    fn load_state_without_provider(&mut self) -> Result<(), DurableRunnerError> {
+        let path = self.state_path();
+        let mut file = match open_private_regular_file(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(DurableRunnerError::invalid(format!(
+                    "failed to open private Codex provider state: {error}"
+                )))
+            }
+        };
+        let metadata = file.metadata().map_err(|error| {
+            DurableRunnerError::invalid(format!("failed to inspect Codex provider state: {error}"))
+        })?;
+        if metadata.len() > MAX_PROVIDER_STATE_BYTES {
+            return Err(DurableRunnerError::invalid(
+                "Codex provider state must be a bounded regular file",
+            ));
+        }
+        let mut input = Vec::with_capacity(metadata.len() as usize);
+        file.read_to_end(&mut input).map_err(|error| {
+            DurableRunnerError::invalid(format!("failed to read Codex provider state: {error}"))
+        })?;
+        let mut state: CodexProviderState = serde_json::from_slice(&input).map_err(|error| {
+            DurableRunnerError::invalid(format!("Codex provider state is malformed: {error}"))
+        })?;
+        state.tool_bridge.attach_existing_run().map_err(|error| {
+            DurableRunnerError::invalid(format!(
+                "Codex semantic tool state could not be reattached: {error}"
+            ))
+        })?;
+        state.validate()?;
+        // Capture before restore_provider_if_needed can settle the old turn.
+        // This field labels errors only; it never participates in admission.
+        self.prepare_input_refusal_code = if state.active_provider_turn_id.is_some()
+            || state.pi_deferred_terminal.is_some()
+            || state.ambiguous_turn_start_pending
+        {
+            Some("provider_active_turn")
+        } else if !state.descendant_thread_ids.is_empty() {
+            Some("provider_live_descendants")
+        } else if state
+            .goal
+            .as_ref()
+            .is_some_and(|g| g.status == "active" || g.working_now)
+        {
+            Some("provider_active_goal")
+        } else {
+            None
+        };
+        let expected_pi_profile_digest = self.bind_pi_launch_profile(&state.config)?;
+        if state.pi_launch_profile_digest != expected_pi_profile_digest
+            && self.rebinds_settled_pi_session(&state)
+        {
+            state.pi_launch_profile_digest = expected_pi_profile_digest.clone();
+        }
+        if state.pi_launch_profile_digest != expected_pi_profile_digest {
+            return Err(DurableRunnerError::launch_profile_mismatch(
+                "Pi runner launch profile changed across durable recovery",
+            )
+            .with_classification(PROVIDER_STATE_INCOMPATIBLE));
+        }
+        let expected_launch_profile_digest = self.bind_opencode_launch_profile(&state.config)?;
+        if state.opencode_launch_profile_digest != expected_launch_profile_digest
+            && self.rebinds_settled_opencode_session(&state)
+        {
+            state.opencode_launch_profile_digest = expected_launch_profile_digest.clone();
+        }
+        if state.opencode_launch_profile_digest != expected_launch_profile_digest {
+            return Err(DurableRunnerError::launch_profile_mismatch(
+                "OpenCode runner launch profile changed across durable recovery",
+            )
+            .with_classification(PROVIDER_STATE_INCOMPATIBLE));
+        }
+        let expected_cursor_cloud_profile_digest =
+            self.bind_cursor_cloud_launch_profile(&state.config)?;
+        if state.cursor_cloud_launch_profile_digest != expected_cursor_cloud_profile_digest {
+            return Err(DurableRunnerError::launch_profile_mismatch(
+                "Cursor Cloud runner launch profile changed across durable recovery",
+            )
+            .with_classification(PROVIDER_STATE_INCOMPATIBLE));
+        }
+        self.state = Some(state);
+        Ok(())
+    }
+
+    fn restore_provider_if_needed(&mut self) -> Result<(), DurableRunnerError> {
+        self.assert_startup_admitted()?;
+        let Some(state) = self.state.clone() else {
+            return Ok(());
+        };
+        if self.provider.is_some()
+            || !matches!(
+                state.lifecycle.as_str(),
+                "session_open" | "turn_active" | "provider_exited"
+            )
+        {
+            return Ok(());
+        }
+        let expected_dormant = state.config.provider == "codex"
+            && self
+                .recovery_pending_effects
+                .as_ref()
+                .is_some_and(|count| *count == 0)
+            && state.completed_turn_authoritative
+            && state.active_provider_turn_id.is_none()
+            && !state.ambiguous_turn_start_pending
+            && state.startup_attempt.is_none()
+            && !state.receipt_limit_interrupt_pending
+            && state.tool_bridge.pending_calls().next().is_none()
+            && state
+                .goal
+                .as_ref()
+                .is_none_or(|goal| goal.status != "active" && !goal.working_now);
+        let provider_label = state.config.provider.clone();
+        let provider_name = facade_provider_name(&provider_label);
+        let provider_had_exited = state.lifecycle == "provider_exited";
+        state.thread_id.as_ref().ok_or_else(|| {
+            DurableRunnerError::invalid(format!(
+                "recoverable {provider_name} state omitted its thread id"
+            ))
+        })?;
+        let previous_active_turn_id = state.active_provider_turn_id.clone();
+        let process_generation = state
+            .provider_process_generation
+            .checked_add(1)
+            .ok_or_else(|| {
+                DurableRunnerError::invalid(format!("{provider_name} process generation exhausted"))
+            })?;
+        let completed_turn_authoritative = state.completed_turn_authoritative;
+        let completed_turn_process_generation = state.completed_turn_process_generation;
+        let completed_provider_turn_id = state.completed_provider_turn_id.clone();
+        let active_provider_result_authoritative =
+            state.active_provider_result_fingerprint.is_some();
+        let ambiguous_turn_start_pending = state.ambiguous_turn_start_pending;
+        let tool_replay_history_blocks_admission =
+            state.tool_bridge.replay_history_blocks_admission();
+        let tool_receipt_epoch_has_active_receipts = state.tool_bridge.has_active_receipts();
+        let (settled_provider_turn_ids, settled_provider_turn_filter) =
+            state.recovered_settled_provider_turn_ids()?;
+        let provider_epoch_requires_rollover = settled_provider_turn_ids.len()
+            >= MAX_SETTLED_PROVIDER_TURN_IDS
+            || !settled_provider_turn_filter.is_empty();
+        let mut provider = self
+            .start_observed_provider(ProviderStartupTrigger::Restore, process_generation)
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to resume {provider_name} provider: {error}"
+                ))
+                .with_provider_failure(error.provider_failure())
+            })?;
+        let thread_id = provider.thread_id().to_owned();
+        let admission = (|| -> Result<(), DurableRunnerError> {
+            provider.enable_durable_tool_call_replays();
+            provider
+                .restore_settled_turn_identities(
+                    settled_provider_turn_ids.iter().cloned(),
+                    settled_provider_turn_filter.clone(),
+                )
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "failed to restore local provider turn identities: {error}"
+                    ))
+                })?;
+            if let Some(delivery) = provider
+                .cursor_cloud_terminal_delivery()
+                .map_err(|error| DurableRunnerError::invalid(error.to_string()))?
+            {
+                if provider.active_provider_turn_id().is_some() {
+                    return Err(DurableRunnerError::invalid(
+                        "Cursor Cloud terminal delivery also reports active remote work",
+                    ));
+                }
+                let identity = self.event_identity.clone();
+                let state = self.state.as_mut().expect("provider state remains loaded");
+                state.provider_process_generation = process_generation;
+                state.provider_session_id = provider.provider_session_id().map(str::to_owned);
+                state.retain_cursor_cloud_terminal_delivery(
+                    &delivery,
+                    identity.as_ref(),
+                    process_generation,
+                )?;
+                provider
+                    .restore_settled_turn_identities(
+                        state.settled_provider_turn_ids.iter().cloned(),
+                        state.settled_provider_turn_filter.clone(),
+                    )
+                    .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+                provider
+                    .restore_completed_turn_authority(
+                        state.completed_turn_authoritative,
+                        state.completed_turn_process_generation,
+                        state.completed_provider_turn_id.as_deref(),
+                    )
+                    .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+                self.commit_startup_admission()?;
+                let _ = provider.acknowledge_cursor_cloud_terminal(&delivery);
+                return Ok(());
+            }
+            let recovered_active_turn_id = provider.active_provider_turn_id().map(str::to_owned);
+            if expected_dormant && recovered_active_turn_id.is_some() {
+                return Err(DurableRunnerError::invalid(
+                    "saved dormant Codex session resumed unexpected active work",
+                ));
+            }
+            if expected_dormant {
+                let live_goal = provider.get_goal().map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "dormant recovery goal probe failed: {error}"
+                    ))
+                })?;
+                if !codex_goal_is_dormant(&live_goal) {
+                    return Err(DurableRunnerError::invalid(
+                        "saved dormant Codex session resumed an active or unknown goal",
+                    ));
+                }
+                let live_thread = provider
+                    .read_thread_after_recovery_goal(codex_goal_is_dormant)
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "dormant recovery thread probe failed: {error}"
+                        ))
+                    })?;
+                if live_thread
+                    .pointer("/thread/status/type")
+                    .and_then(Value::as_str)
+                    != Some("idle")
+                {
+                    return Err(DurableRunnerError::invalid(
+                        "saved dormant Codex session resumed unexpected active work",
+                    ));
+                }
+            }
+            let recovered_turn_ended_with_result = active_provider_result_authoritative
+                && previous_active_turn_id.is_some()
+                && recovered_active_turn_id.is_none();
+            let legacy_epoch_is_ambiguous = (provider_epoch_requires_rollover
+                && (ambiguous_turn_start_pending || recovered_active_turn_id.is_some()))
+                || (tool_replay_history_blocks_admission
+                    && (ambiguous_turn_start_pending
+                        || recovered_active_turn_id.is_some()
+                        || (previous_active_turn_id.is_some()
+                            && tool_receipt_epoch_has_active_receipts)));
+            if legacy_epoch_is_ambiguous {
+                // A saturated legacy epoch cannot prove that recovered work can
+                // be identified and settled exactly. Reap the resumed process
+                // generation and close the run instead of risking duplicate work.
+                let provider_reported_active = recovered_active_turn_id.is_some();
+                let provider_shutdown_failed = provider.shutdown().is_err();
+                let state = self
+                    .state
+                    .as_mut()
+                    .expect("Codex state remains available during legacy recovery");
+                state.provider_process_generation = process_generation;
+                state.settled_provider_turn_ids = settled_provider_turn_ids;
+                state.settled_provider_turn_filter = settled_provider_turn_filter;
+                state.active_provider_turn_id = None;
+                state.ambiguous_turn_start_pending = false;
+                state.completed_turn_authoritative = false;
+                state.completed_turn_process_generation = None;
+                state.completed_provider_turn_id = None;
+                state.receipt_limit_diagnostic_emitted = false;
+                state.receipt_limit_interrupt_pending = false;
+                state.receipt_limit_interrupt_accepted = false;
+                state.receipt_limit_interrupt_attempts = 0;
+                state.receipt_limit_interrupt_deadline_unix_ms = None;
+                state.active_provider_result_fingerprint = None;
+                state.active_provider_result_disposition = None;
+                state.active_terminal_tool_rejected = false;
+                state.last_agent_message = None;
+                state.lifecycle = "closed".to_owned();
+                let _ = state.push_terminal_event(NormalizedProviderEvent {
+                event_type: "harness.diagnostic".to_owned(),
+                priority: EventPriority::P0,
+                payload: json!({
+                    "provider": provider_label,
+                    "code": "legacy_provider_turn_epoch_ambiguous",
+                    "message": format!("{provider_name} recovery could not safely identify and settle active work from a saturated legacy replay epoch; Paperclip terminated the provider and closed the durable run"),
+                    "paperclipAccepted": false,
+                    "providerReportedActive": provider_reported_active,
+                    "ambiguousStartPending": ambiguous_turn_start_pending,
+                    "providerShutdownFailed": provider_shutdown_failed,
+                }),
+            });
+                self.save_state()?;
+                return Ok(());
+            }
+            if let Some(reused_provider_turn_id) = recovered_active_turn_id
+                .as_ref()
+                .filter(|provider_turn_id| {
+                    settled_provider_turn_contains(
+                        &settled_provider_turn_ids,
+                        &settled_provider_turn_filter,
+                        provider_turn_id,
+                    )
+                })
+                .cloned()
+            {
+                // The durable terminal ledger is authoritative. A resumed provider
+                // that reports one of those identities as active is contradictory
+                // and may still be mutating the workspace. Terminate that process
+                // generation and persist the run closed before exposing recovery
+                // to the controller; otherwise this path would reopen settled work.
+                let provider_shutdown_failed = provider.shutdown().is_err();
+                let state = self
+                    .state
+                    .as_mut()
+                    .expect("Codex state remains available during recovery");
+                state.provider_process_generation = process_generation;
+                state.settled_provider_turn_ids = settled_provider_turn_ids;
+                state.settled_provider_turn_filter = settled_provider_turn_filter;
+                state.active_provider_turn_id = None;
+                state.ambiguous_turn_start_pending = false;
+                state.completed_turn_authoritative = false;
+                state.completed_turn_process_generation = None;
+                state.completed_provider_turn_id = None;
+                state.receipt_limit_diagnostic_emitted = false;
+                state.receipt_limit_interrupt_pending = false;
+                state.receipt_limit_interrupt_accepted = false;
+                state.receipt_limit_interrupt_attempts = 0;
+                state.receipt_limit_interrupt_deadline_unix_ms = None;
+                state.active_provider_result_fingerprint = None;
+                state.active_provider_result_disposition = None;
+                state.active_terminal_tool_rejected = false;
+                state.last_agent_message = None;
+                state.lifecycle = "closed".to_owned();
+                // Closing the provider is the safety boundary. Preserve that
+                // durable transition even when an already-full event backlog has
+                // no room for an additional diagnostic.
+                let _ = state.push_terminal_event(NormalizedProviderEvent {
+                event_type: "harness.diagnostic".to_owned(),
+                priority: EventPriority::P0,
+                payload: json!({
+                    "provider": provider_label,
+                    "code": "provider_turn_identity_reused",
+                    "providerTurnId": reused_provider_turn_id,
+                    "message": format!("{provider_name} recovery reported a previously settled turn identity as active; Paperclip terminated the provider and closed the durable run"),
+                    "paperclipAccepted": false,
+                    "providerReportedActive": true,
+                    "providerShutdownFailed": provider_shutdown_failed,
+                }),
+            });
+                self.save_state()?;
+                return Ok(());
+            }
+            // A process loss can hide whether an in-flight turn/start reached
+            // Codex. When the resumed thread has no active turn and its history
+            // ends at a turn Paperclip already settled, Codex never created the
+            // turn: the start is settled as not started, and the controller
+            // may start it once. Any other evidence keeps it ambiguous.
+            let ambiguous_start_never_created = ambiguous_turn_start_pending
+                && recovered_active_turn_id.is_none()
+                && previous_active_turn_id.is_none()
+                && provider
+                    .ambiguous_turn_start_never_created_a_turn(&settled_provider_turn_ids)
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "ambiguous {provider_name} turn start history probe failed: {error}"
+                        ))
+                    })?;
+            let ambiguous_turn_start_pending =
+                ambiguous_turn_start_pending && !ambiguous_start_never_created;
+            if ambiguous_turn_start_pending {
+                let recovered_turn_id = recovered_active_turn_id.as_deref().ok_or_else(|| {
+                DurableRunnerError::invalid(
+                    format!("cannot safely recover an ambiguous {provider_name} turn start without an active replacement turn"),
+                )
+            })?;
+                if completed_provider_turn_id.as_deref() == Some(recovered_turn_id) {
+                    return Err(DurableRunnerError::invalid(
+                    format!("ambiguous {provider_name} turn recovery reused the previously completed turn identity"),
+                ));
+                }
+            }
+            if let Some(ended_turn_id) = previous_active_turn_id
+                .as_ref()
+                .filter(|_| recovered_active_turn_id.is_none() && !provider_epoch_requires_rollover)
+            {
+                // Recovery settles the turn that ended while the runner was
+                // offline in the durable ledger below. The live provider must
+                // know it too: a resumed thread can report that turn's usage
+                // after it accepts the restart continuation, which is history,
+                // not a foreign turn that fails the continuation.
+                provider
+                    .restore_settled_turn_identities(
+                        std::iter::once(ended_turn_id.clone()),
+                        settled_provider_turn_filter.clone(),
+                    )
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "failed to restore the ended provider turn identity: {error}"
+                        ))
+                    })?;
+            }
+            provider
+                .restore_completed_turn_authority(
+                    (completed_turn_authoritative || recovered_turn_ended_with_result)
+                        && recovered_active_turn_id.is_none()
+                        && !ambiguous_turn_start_pending,
+                    if recovered_turn_ended_with_result {
+                        Some(process_generation)
+                    } else {
+                        completed_turn_process_generation
+                    },
+                    if recovered_turn_ended_with_result {
+                        previous_active_turn_id.as_deref()
+                    } else {
+                        completed_provider_turn_id.as_deref()
+                    },
+                )
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "failed to restore local provider completion authority: {error}"
+                    ))
+                })?;
+            if active_provider_result_authoritative
+                && recovered_active_turn_id.is_some()
+                && recovered_active_turn_id == previous_active_turn_id
+            {
+                provider
+                .mark_active_turn_result_authoritative()
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "failed to restore semantic result authority for the active {provider_name} turn: {error}"
+                    ))
+                })?;
+            }
+            let resumed_thread_id = provider.thread_id().to_owned();
+            let resumed_provider_session_id = provider.provider_session_id().map(str::to_owned);
+            let resumed_process_id = provider.process_id();
+            {
+                let state = self
+                    .state
+                    .as_mut()
+                    .expect("Codex state remains available during recovery");
+                state.provider_process_generation = process_generation;
+                state.thread_id = Some(resumed_thread_id.clone());
+                state.provider_session_id = resumed_provider_session_id.clone();
+                state.thread_id = Some(thread_id.clone());
+                state.settled_provider_turn_ids = settled_provider_turn_ids;
+                state.settled_provider_turn_filter = settled_provider_turn_filter;
+                if ambiguous_start_never_created {
+                    state.ambiguous_turn_start_pending = false;
+                    state.push_event(NormalizedProviderEvent {
+                        event_type: "harness.diagnostic".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({
+                            "provider": provider_label,
+                            "code": "ambiguous_turn_start_not_created",
+                            "message": format!("{provider_name} recovery proved from the resumed thread's history that the turn start a process loss interrupted never created a turn"),
+                            "paperclipAccepted": false,
+                        }),
+                    })?;
+                }
+                let mut resumed_payload = json!({
+                    "provider": provider_label,
+                    "providerSessionId": resumed_thread_id,
+                    "providerAccountSessionId": resumed_provider_session_id,
+                    "processId": resumed_process_id,
+                });
+                if state.config.provider == "pi_rpc" {
+                    // Recovery must carry the same live admission receipt as
+                    // session.open; the controller must not trust stale state
+                    // or relax exact model/effort checks after runner loss.
+                    resumed_payload["providerDescriptor"] = json!({
+                        "driver": state.config.driver,
+                        "providerVersion": state.config.provider_version,
+                        "effectiveModel": provider.observed_model(),
+                        "piNativeAdmission": provider.observed_pi_admission(),
+                    });
+                }
+                state.push_terminal_event(NormalizedProviderEvent {
+                    event_type: "session.resumed".to_owned(),
+                    priority: EventPriority::P0,
+                    payload: resumed_payload,
+                })?;
+            }
+            if provider_had_exited
+                || ambiguous_turn_start_pending
+                || recovered_active_turn_id != previous_active_turn_id
+            {
+                let recovered_turn_ended =
+                    previous_active_turn_id.is_some() && recovered_active_turn_id.is_none();
+                let identity = self.event_identity.clone();
+                let state = self
+                    .state
+                    .as_mut()
+                    .expect("Codex state remains available during recovery");
+                if recovered_turn_ended {
+                    if !provider_epoch_requires_rollover {
+                        state.settle_active_provider_turn_identity()?;
+                    }
+                    let settled = state
+                        .tool_bridge
+                        .settle_turn("provider_turn_terminated")
+                        .map_err(|error| {
+                            DurableRunnerError::invalid(format!(
+                                "failed to settle semantic tools during recovery: {error}"
+                            ))
+                        })?;
+                    if !settled.is_empty() {
+                        let identity = identity.as_ref().ok_or_else(|| {
+                            DurableRunnerError::invalid(
+                                "Codex semantic tool events require the durable runner identity",
+                            )
+                        })?;
+                        for result in settled {
+                            state.push_terminal_event(semantic_result_event(identity, &result))?;
+                        }
+                    }
+                    state.receipt_limit_diagnostic_emitted = false;
+                    state.receipt_limit_interrupt_pending = false;
+                    state.receipt_limit_interrupt_accepted = false;
+                    state.receipt_limit_interrupt_attempts = 0;
+                    state.receipt_limit_interrupt_deadline_unix_ms = None;
+                    if recovered_turn_ended_with_result {
+                        state.completed_turn_authoritative = true;
+                        state.completed_turn_process_generation = Some(process_generation);
+                        state.completed_provider_turn_id = previous_active_turn_id.clone();
+                    }
+                }
+                state.reconcile_active_provider_turn(recovered_active_turn_id.clone());
+                let reconciled = NormalizedProviderEvent {
+                    event_type: "session.reconciled".to_owned(),
+                    priority: EventPriority::P0,
+                    payload: json!({
+                        "provider": provider_label,
+                        "providerSessionId": thread_id,
+                        "previousProviderTurnId": previous_active_turn_id.clone(),
+                        "activeProviderTurnId": recovered_active_turn_id.clone(),
+                    }),
+                };
+                if recovered_turn_ended {
+                    state.push_terminal_event(reconciled)?;
+                    if recovered_turn_ended_with_result {
+                        // The durable correlated tool receipt proves Paperclip
+                        // accepted this exact turn's semantic result before the
+                        // runner stopped observing provider output. Resume
+                        // finalization without inventing another provider turn.
+                        let outcome = terminal_events(
+                            state,
+                            "turn.completed",
+                            state.goal.as_ref().map(|goal| goal.status.as_str()),
+                        );
+                        let outcome = state.defer_pi_terminal_outcome("turn.completed", outcome)?;
+                        state.extend_terminal_events(outcome)?;
+                    } else {
+                        // A turn that disappeared while runnerd was offline has no
+                        // trustworthy success notification to replay. Terminate it
+                        // conservatively so the controller cannot wait forever or
+                        // mistake an unknown outcome for success.
+                        let restart_continuable = restart_lost_turn_is_continuable(&provider_label);
+                        let provider_terminal = NormalizedProviderEvent {
+                            event_type: "turn.failed".to_owned(),
+                            priority: EventPriority::P0,
+                            payload: json!({
+                                "provider": provider_label,
+                                "providerTurnId": previous_active_turn_id,
+                                "status": "failed",
+                                "providerTerminalObserved": false,
+                                "error": if restart_continuable { json!({
+                                    "code": "provider_turn_lost_on_restore",
+                                    "recoverable": true,
+                                    "message": "The runner restored the conversation after process loss, but the previous turn is no longer active.",
+                                }) } else if provider_label == "pi_rpc" {
+                                    // Pi has no native session recovery yet: fail the
+                                    // lost turn with a typed, non-recoverable cause.
+                                    json!({
+                                        "code": "provider_turn_lost_on_restore",
+                                        "recoverable": false,
+                                        "message": "The runner lost the Pi process; Pi RPC session recovery is not available, so the turn cannot continue.",
+                                    })
+                                } else { Value::Null },
+                            }),
+                        };
+                        if restart_continuable && !state.active_terminal_tool_rejected {
+                            // No provider result was observed. Preserve the lost
+                            // turn as a fact, but leave the run open for the
+                            // controller's bounded same-conversation recovery.
+                            state.defer_pi_terminal_outcome("turn.failed", Vec::new())?;
+                            state.push_terminal_event(provider_terminal)?;
+                        } else {
+                            let outcome = terminal_events(
+                                state,
+                                "turn.failed",
+                                state.goal.as_ref().map(|goal| goal.status.as_str()),
+                            );
+                            let outcome =
+                                state.defer_pi_terminal_outcome("turn.failed", outcome)?;
+                            state.extend_terminal_events(with_terminal_outcome(
+                                vec![provider_terminal],
+                                outcome,
+                            ))?;
+                        }
+                    }
+                } else {
+                    state.push_event(reconciled)?;
+                }
+            }
+            if self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.lifecycle == "closed")
+            {
+                return Ok(());
+            }
+            self.commit_startup_admission()
+        })();
+        if admission.is_err()
+            || self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.lifecycle == "closed")
+        {
+            self.fail_started_provider(&mut provider);
+        } else {
+            self.recovery_pending_effects = None;
+            self.provider = Some(provider);
+        }
+        admission
+    }
+
+    fn save_state(&self) -> Result<(), DurableRunnerError> {
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider state is unavailable"))?;
+        self.persist_state(state)?;
+        self.unsaved_frame_state.set(false);
+        Ok(())
+    }
+
+    fn save_unsaved_frame_state(&self) -> Result<(), DurableRunnerError> {
+        if !self.unsaved_frame_state.get() {
+            return Ok(());
+        }
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider state is unavailable"))?;
+        let bytes = serialize_provider_state(state)?;
+        if fs::read(self.state_path()).is_ok_and(|saved| saved == bytes) {
+            self.unsaved_frame_state.set(false);
+            return Ok(());
+        }
+        state.validate()?;
+        self.write_state_bytes(&bytes)?;
+        self.unsaved_frame_state.set(false);
+        Ok(())
+    }
+
+    fn record_saved_trace_interpretations(&mut self) {
+        let traces = std::mem::take(&mut self.unsaved_trace_interpretations);
+        let Some(provider) = self.provider.as_mut() else {
+            return;
+        };
+        for trace in traces {
+            provider.record_provider_trace_interpretation(
+                trace.frame_id,
+                &trace.rule_id,
+                if trace.mapped { "mapped" } else { "ignored" },
+                trace.emitted_event_ids,
+                if trace.mapped {
+                    "Provider notification normalized into durable PRP events"
+                } else {
+                    "Provider notification did not produce a durable PRP event"
+                },
+            );
+        }
+    }
+
+    fn save_before_provider_writes(
+        &mut self,
+        still_polling: bool,
+    ) -> Result<(), DurableRunnerError> {
+        self.save_unsaved_frame_state()?;
+        self.record_saved_trace_interpretations();
+        if let Some(provider) = self.provider.as_mut() {
+            provider.release_courtesy_responses(still_polling);
+        }
+        Ok(())
+    }
+
+    fn persist_state(&self, state: &CodexProviderState) -> Result<(), DurableRunnerError> {
+        state.validate()?;
+        let bytes = serialize_provider_state(state)?;
+        self.write_state_bytes(&bytes)
+    }
+
+    fn write_state_bytes(&self, bytes: &[u8]) -> Result<(), DurableRunnerError> {
+        fs::create_dir_all(&self.state_dir).map_err(|error| {
+            DurableRunnerError::invalid(format!(
+                "failed to create provider state directory: {error}"
+            ))
+        })?;
+        #[cfg(unix)]
+        fs::set_permissions(&self.state_dir, fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to protect provider state directory: {error}"
+                ))
+            },
+        )?;
+        verify_private_directory(&self.state_dir)?;
+        let path = self.state_path();
+        let (temporary, mut file) = create_private_temporary_file(&path)?;
+        let result = (|| -> std::io::Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            crate::durable::replace_file_from_temporary(&temporary, &path)?;
+            #[cfg(unix)]
+            File::open(&self.state_dir)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_file(&temporary);
+            return Err(DurableRunnerError::invalid(format!(
+                "failed to replace provider state atomically: {error}"
+            )));
+        }
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+            DurableRunnerError::invalid(format!("failed to protect provider state: {error}"))
+        })?;
+        #[cfg(test)]
+        self.persist_count.set(self.persist_count.get() + 1);
+        Ok(())
+    }
+
+    fn prepare(&mut self, payload: &Value) -> Result<CommandExecution, DurableRunnerError> {
+        self.prepare_with_legacy_attachment(payload, false)
+    }
+
+    fn prepare_with_legacy_attachment(
+        &mut self,
+        payload: &Value,
+        allow_legacy_attachment: bool,
+    ) -> Result<CommandExecution, DurableRunnerError> {
+        let mut config: CodexProviderConfig = serde_json::from_value(
+            payload
+                .get("provider")
+                .cloned()
+                .ok_or_else(|| DurableRunnerError::invalid("run.prepare requires provider"))?,
+        )
+        .map_err(|error| {
+            DurableRunnerError::invalid(format!("run.prepare provider is invalid: {error}"))
+        })?;
+        // This field used to be discarded for every facade. Keep non-Codex
+        // persisted profiles unchanged even when an older controller sends it.
+        if config.provider != "codex" {
+            config.include_skill_instructions = None;
+        }
+        config
+            .validate()
+            .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        let pi_runtime_context = if config.provider == "pi_rpc" {
+            payload
+                .pointer("/provider/runtimeContext")
+                .cloned()
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        let provider_name = config.provider.clone();
+        let driver = config.driver.clone();
+        let pi_launch_profile_digest = self.bind_pi_launch_profile(&config)?;
+        let opencode_launch_profile_digest = self.bind_opencode_launch_profile(&config)?;
+        let cursor_cloud_launch_profile_digest = self.bind_cursor_cloud_launch_profile(&config)?;
+        let completion_contract = completion_contract(payload)?;
+        let tool_set = authorized_tool_set(payload)?;
+        if let Some(state) = self.state.as_ref() {
+            let different_run = state
+                .run_identity
+                .as_ref()
+                .zip(self.event_identity.as_ref())
+                .is_some_and(|(saved, current)| saved.run_id != current.run_id);
+            // Only the public command path, after restoring the durable provider
+            // and under its authenticated current authority, may attach C8 state
+            // with no saved owner. The private preparation helper stays strict:
+            // changed contracts alone are never evidence of a different owner.
+            let legacy_attachment = allow_legacy_attachment
+                && state.run_identity.is_none()
+                && self.event_identity.is_some();
+            let rebind_run = (different_run || legacy_attachment)
+                && state.is_settled_for_run_attachment()
+                && state.pi_deferred_terminal.is_none()
+                && state.descendant_thread_ids.is_empty()
+                && self.provider.as_ref().is_none_or(|provider| {
+                    provider.run_attachment_live_work().is_empty()
+                        && !provider.has_active_goal()
+                        && !provider.has_known_descendants()
+                });
+            // Instructions belong to the attaching invocation, not the saved
+            // conversation. Pi refreshes them in place; Codex checkpoints and
+            // resumes the same thread with current developer instructions.
+            // Same-run, live-work and every other profile fence stay strict.
+            let mut stable_config = config.clone();
+            if rebind_run
+                && state.config.provider == config.provider
+                && matches!(config.provider.as_str(), "pi_rpc" | "codex")
+            {
+                stable_config.instructions = state.config.instructions.clone();
+            }
+            if state.config != stable_config
+                || (state.completion_contract != completion_contract && !rebind_run)
+                || ((different_run || legacy_attachment) && !rebind_run)
+            {
+                // Additive diagnostics only: retain the exact refusal predicate
+                // and priority above. No restore/replacement decision changes.
+                let code = if state.active_provider_turn_id.is_some()
+                    || state.pi_deferred_terminal.is_some()
+                    || state.ambiguous_turn_start_pending
+                    || state.startup_attempt.is_some()
+                    || self
+                        .provider
+                        .as_ref()
+                        .is_some_and(|p| !p.run_attachment_live_work().is_empty())
+                {
+                    "provider_active_turn"
+                } else if !state.descendant_thread_ids.is_empty()
+                    || self
+                        .provider
+                        .as_ref()
+                        .is_some_and(|p| p.has_known_descendants())
+                {
+                    "provider_live_descendants"
+                } else if state
+                    .goal
+                    .as_ref()
+                    .is_some_and(|g| g.status == "active" || g.working_now)
+                    || self.provider.as_ref().is_some_and(|p| p.has_active_goal())
+                {
+                    "provider_active_goal"
+                } else if state.tool_bridge.pending_calls().next().is_some() {
+                    "provider_pending_tool_calls"
+                } else if state.lifecycle == "reconciliation_required" {
+                    "provider_reconciliation_required"
+                } else if state.config != stable_config {
+                    "provider_config_changed"
+                } else if state.completion_contract != completion_contract {
+                    "provider_contract_changed_same_run"
+                } else {
+                    "provider_prepare_refused"
+                };
+                return Err(DurableRunnerError::invalid(
+                    "Codex provider or completion contract changed across the durable run",
+                )
+                .with_refusal_code(code));
+            }
+            if state.pi_launch_profile_digest != pi_launch_profile_digest {
+                return Err(DurableRunnerError::launch_profile_mismatch(
+                    "Pi runner launch profile changed across the durable run",
+                ));
+            }
+            if state.opencode_launch_profile_digest != opencode_launch_profile_digest {
+                return Err(DurableRunnerError::launch_profile_mismatch(
+                    "OpenCode runner launch profile changed across the durable run",
+                ));
+            }
+            if state.cursor_cloud_launch_profile_digest != cursor_cloud_launch_profile_digest {
+                return Err(DurableRunnerError::launch_profile_mismatch(
+                    "Cursor Cloud runner launch profile changed across the durable run",
+                ));
+            }
+            if state.lifecycle == "closed" {
+                return Err(DurableRunnerError::invalid(
+                    "Codex provider session is already closed",
+                )
+                .with_refusal_code("provider_session_closed"));
+            }
+            if rebind_run && state.thread_id.is_some() {
+                let refresh_pi_process =
+                    config.provider == "pi_rpc" && state.pi_runtime_context != pi_runtime_context;
+                if config.provider == "pi_rpc" && state.lifecycle == "session_open" {
+                    // Idle suspend can stop Pi without restarting this executor.
+                    // restore_once is then already checked, so explicitly resume
+                    // the saved session before attachment's live-work fences.
+                    // Keep this after new-run settlement and profile admission.
+                    self.restore_provider_if_needed()?;
+                }
+                // Reuse attachment's tool/accounting reset and live-provider
+                // contract update; changing only the saved binding is not enough.
+                let mut attachment_payload = payload.clone();
+                // prepare binds this invocation; only run.attach may nominate
+                // a different target authority through the warm protocol.
+                attachment_payload
+                    .as_object_mut()
+                    .expect("validated prepare payload")
+                    .remove("paperclipNextAuthority");
+                self.attach_run_with_provider_refresh(&attachment_payload, refresh_pi_process)?;
+            } else {
+                let state = self.state.as_mut().expect("checked prepared state");
+                let mut changed = false;
+                if state.tool_bridge.has_catalog() {
+                    state
+                        .tool_bridge
+                        .verify_tool_set(&tool_set)
+                        .map_err(|error| {
+                            DurableRunnerError::invalid(format!(
+                                "run.prepare tool contract changed: {error}"
+                            ))
+                        })?;
+                } else {
+                    state.tool_bridge.prepare(tool_set).map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "run.prepare tool contract rejected: {error}"
+                        ))
+                    })?;
+                    changed = true;
+                }
+                if rebind_run {
+                    // A prepared session with no thread has never started work.
+                    // Adopt the admitted instructions before its first session.open.
+                    state.config.instructions = config.instructions.clone();
+                    state.completion_contract = completion_contract;
+                    changed = true;
+                }
+                if self.event_identity.is_some() && state.run_identity != self.event_identity {
+                    state.run_identity = self.event_identity.clone();
+                    changed = true;
+                }
+                if changed {
+                    self.save_state()?;
+                }
+            }
+        } else {
+            let mut tool_bridge = ProviderToolBridge::default();
+            tool_bridge.prepare(tool_set).map_err(|error| {
+                DurableRunnerError::invalid(format!("run.prepare tool contract rejected: {error}"))
+            })?;
+            let mut state = CodexProviderState::new(config, completion_contract, tool_bridge);
+            state.run_identity = self.event_identity.clone();
+            state.pi_runtime_context = pi_runtime_context.clone();
+            state.pi_launch_profile_digest = pi_launch_profile_digest;
+            state.pi_release_digest = self.pi_release_digest(&state.config);
+            state.opencode_launch_profile_digest = opencode_launch_profile_digest;
+            state.opencode_release_digest = self.opencode_release_digest(&state.config);
+            state.cursor_cloud_launch_profile_digest = cursor_cloud_launch_profile_digest;
+            self.state = Some(state);
+            self.save_state()?;
+        }
+        if self.state.as_ref().is_some_and(|state| {
+            state.config.provider == "pi_rpc" && state.pi_runtime_context != pi_runtime_context
+        }) {
+            let state = self.state.as_ref().expect("prepared state exists");
+            let goal_active = self.provider.is_some()
+                && state
+                    .goal
+                    .as_ref()
+                    .is_some_and(|goal| goal.status == "active");
+            if state.lifecycle == "reconciliation_required"
+                || state.active_provider_turn_id.is_some()
+                || state.ambiguous_turn_start_pending
+                || state.tool_bridge.pending_calls().next().is_some()
+                || goal_continues_after_turn(state, goal_active)
+                || self
+                    .provider
+                    .as_ref()
+                    .is_some_and(|provider| !provider.run_attachment_live_work().is_empty())
+            {
+                let code = if state.active_provider_turn_id.is_some()
+                    || state.ambiguous_turn_start_pending
+                {
+                    "provider_active_turn"
+                } else if state.tool_bridge.pending_calls().next().is_some() {
+                    "provider_pending_tool_calls"
+                } else if goal_continues_after_turn(state, goal_active) {
+                    "provider_active_goal"
+                } else if state.lifecycle == "reconciliation_required" {
+                    "provider_reconciliation_required"
+                } else {
+                    "provider_prepare_refused"
+                };
+                return Err(DurableRunnerError::invalid(
+                    "run.prepare Pi context refresh requires a settled provider session",
+                )
+                .with_refusal_code(code));
+            }
+            if let Some(provider) = self.provider.as_mut() {
+                let (accounting, drained) =
+                    provider.drain_completed_turn_tail_for_warm_attachment();
+                self.persist_completed_accounting_tail(accounting, drained.is_err())?;
+                drained.map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "failed to checkpoint Pi context refresh: {error}"
+                    ))
+                })?;
+            }
+            // Context is run-scoped, not an immutable provider profile. Reuse
+            // run.attach's cold checkpoint path so startup skills are reloaded
+            // while the Pi session/thread and completion authority stay intact.
+            self.checkpoint_provider_for_run_refresh()?;
+            let state = self.state.as_mut().expect("prepared state exists");
+            state.pi_runtime_context = pi_runtime_context;
+            state.lifecycle = "prepared".to_owned();
+            self.save_state()?;
+        }
+        Ok(CommandExecution::result(json!({
+            "status": "prepared",
+            "provider": provider_name,
+            "driver": driver,
+        })))
+    }
+
+    fn checkpoint_provider_for_run_refresh(&mut self) -> Result<(), DurableRunnerError> {
+        if let Some(provider) = self.provider.as_mut() {
+            provider.shutdown().map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to checkpoint Codex before attaching a new run: {error}"
+                ))
+            })?;
+        }
+        self.provider = None;
+        Ok(())
+    }
+
+    fn ensure_provider(&mut self) -> Result<&mut CodexProvider, DurableRunnerError> {
+        self.restore_provider_if_needed()?;
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.lifecycle == "reconciliation_required")
+        {
+            return Err(DurableRunnerError::invalid(
+                "Codex provider session requires explicit reconciliation and a fresh session",
+            ));
+        }
+        if self.provider.is_none() {
+            let state = self.state.clone().ok_or_else(|| {
+                DurableRunnerError::invalid("Codex provider has not been prepared")
+            })?;
+            if state.lifecycle == "closed" {
+                return Err(DurableRunnerError::invalid(
+                    "Codex provider session is closed",
+                ));
+            }
+            let process_generation = state
+                .provider_process_generation
+                .checked_add(1)
+                .ok_or_else(|| DurableRunnerError::invalid("Codex process generation exhausted"))?;
+            let (settled_provider_turn_ids, settled_provider_turn_filter) =
+                state.recovered_settled_provider_turn_ids()?;
+            let mut provider = self
+                .start_observed_provider(ProviderStartupTrigger::Ensure, process_generation)
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!("failed to start Codex provider: {error}"))
+                        .with_provider_failure(error.provider_failure())
+                })?;
+            let admission = (|| -> Result<(), DurableRunnerError> {
+                provider.enable_durable_tool_call_replays();
+                provider
+                    .restore_settled_turn_identities(
+                        settled_provider_turn_ids.iter().cloned(),
+                        settled_provider_turn_filter.clone(),
+                    )
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "failed to restore Codex provider turn identities: {error}"
+                        ))
+                    })?;
+                if state.lifecycle == "prepared" && provider.active_provider_turn_id().is_some() {
+                    // A stopped checkpoint has no active work to inherit. Inspect
+                    // the actual resumed thread before publishing this process or
+                    // accepting any of its buffered tool calls under new authority.
+                    let provider_shutdown_failed = provider.shutdown().is_err();
+                    let state = self
+                        .state
+                        .as_mut()
+                        .expect("prepared state remains available after provider start");
+                    state.provider_process_generation = process_generation;
+                    state.lifecycle = "closed".to_owned();
+                    let _ = state.push_terminal_event(NormalizedProviderEvent {
+                        event_type: "harness.diagnostic".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({
+                            "code": "prepared_provider_checkpoint_has_active_work",
+                            "paperclipAccepted": false,
+                            "providerReportedActive": true,
+                            "providerShutdownFailed": provider_shutdown_failed,
+                        }),
+                    });
+                    self.save_state()?;
+                    return Err(DurableRunnerError::invalid(
+                        "prepared provider checkpoint resumed unexpected active work",
+                    ));
+                }
+                provider
+                    .restore_completed_turn_authority(
+                        state.completed_turn_authoritative
+                            && provider.active_provider_turn_id().is_none(),
+                        state.completed_turn_process_generation,
+                        state.completed_provider_turn_id.as_deref(),
+                    )
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "failed to restore Codex completion authority: {error}"
+                        ))
+                    })?;
+                {
+                    let state = self
+                        .state
+                        .as_mut()
+                        .expect("Codex state remains available after provider start");
+                    state.provider_process_generation = process_generation;
+                    state.thread_id = Some(provider.thread_id().to_owned());
+                    state.provider_session_id = provider.provider_session_id().map(str::to_owned);
+                    state.lifecycle = "session_open".to_owned();
+                    state.settled_provider_turn_ids = settled_provider_turn_ids;
+                    state.settled_provider_turn_filter = settled_provider_turn_filter;
+                }
+                self.commit_startup_admission()
+            })();
+            if let Err(error) = admission {
+                self.fail_started_provider(&mut provider);
+                return Err(error);
+            }
+            self.provider = Some(provider);
+        }
+        self.provider
+            .as_mut()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider is unavailable"))
+    }
+
+    // Only the authenticated controller can rebind these run-scoped launch
+    // settings: per-run filesystem and shell-environment entries, and Codex
+    // feature toggles (`--enable`/`--disable`). The controller recomputes the
+    // toggles from Paperclip policy for every launch, so a saved thread must
+    // follow a release that turns a feature on or off rather than become
+    // impossible to resume. Executable, model, instructions, approval mode,
+    // sandbox, permission profile, subcommand, and all other flags remain part
+    // of the immutable durable provider profile.
+    fn stable_launch_args(args: &[String]) -> Vec<String> {
+        let mut stable = Vec::new();
+        let mut index = 0;
+        while index < args.len() {
+            if (args[index] == "--enable" || args[index] == "--disable") && index + 1 < args.len() {
+                index += 2;
+                continue;
+            }
+            if args[index].starts_with("--enable=") || args[index].starts_with("--disable=") {
+                index += 1;
+                continue;
+            }
+            if args[index] == "-c" && index + 1 < args.len() {
+                let key = args[index + 1].split('=').next().unwrap_or("");
+                if matches!(
+                    key,
+                    "permissions.paperclip-runner-workspace-only.filesystem"
+                        | "permissions.paperclip-runner-workspace-read-only.filesystem"
+                        | "permissions.paperclip-runner-workspace-only.network.enabled"
+                        | "permissions.paperclip-runner-workspace-read-only.network.enabled"
+                        | "shell_environment_policy.inherit"
+                        | "shell_environment_policy.ignore_default_excludes"
+                        | "shell_environment_policy.include_only"
+                        | "shell_environment_policy.set"
+                ) {
+                    index += 2;
+                    continue;
+                }
+            }
+            stable.push(args[index].clone());
+            index += 1;
+        }
+        stable
+    }
+
+    fn persist_completed_accounting_tail(
+        &mut self,
+        tail: Vec<(String, Value)>,
+        failed: bool,
+    ) -> Result<(), DurableRunnerError> {
+        if !tail.is_empty() || failed {
+            let state = self.state.as_mut().ok_or_else(|| {
+                DurableRunnerError::invalid("Codex provider has not been prepared")
+            })?;
+            for (method, params) in tail {
+                retain_goal_notification(state, &method, &params, false)?;
+                let events = normalize_provider_notification(state, &method, &params)?;
+                state.extend_events(events)?;
+            }
+            if failed {
+                state.lifecycle = "reconciliation_required".to_owned();
+            }
+            self.save_state()?;
+        }
+        Ok(())
+    }
+
+    fn retain_completed_accounting_tail(&mut self) -> Result<(), DurableRunnerError> {
+        let (tail, result) = self
+            .provider
+            .as_mut()
+            .map(CodexProvider::drain_completed_turn_tail_for_warm_attachment)
+            .unwrap_or_else(|| (Vec::new(), Ok(())));
+        self.persist_completed_accounting_tail(tail, result.is_err())?;
+        result.map_err(|error| {
+            DurableRunnerError::invalid(format!(
+                "failed to retain completed Codex accounting: {error}"
+            ))
+        })
+    }
+
+    // A readiness drain is fail-closed for reuse, but must not discard the
+    // completed run or turn a provider-local tail failure into a runner exit.
+    // The caller saves this diagnostic with the terminal (or park refusal)
+    // before retiring the unsafe provider process.
+    fn retain_completed_accounting_tail_for_poll(&mut self) -> Result<bool, DurableRunnerError> {
+        let Err(error) = self.retain_completed_accounting_tail() else {
+            return Ok(true);
+        };
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider has not been prepared"))?;
+        state.lifecycle = "reconciliation_required".to_owned();
+        state.push_terminal_event(NormalizedProviderEvent {
+            event_type: "harness.diagnostic".to_owned(),
+            priority: EventPriority::P0,
+            payload: sanitize_value(&json!({
+                "provider": state.config.provider,
+                "code": "provider_completed_tail_drain_failed",
+                "severity": "warning",
+                "message": error.to_string().chars().take(2048).collect::<String>(),
+            })),
+        })?;
+        self.unsaved_frame_state.set(true);
+        Ok(false)
+    }
+
+    /// Returns the calls a closed turn left pending that this attachment
+    /// settled as expired.
+    fn attach_run(&mut self, payload: &Value) -> Result<Vec<ToolResult>, DurableRunnerError> {
+        self.attach_run_with_provider_refresh(payload, false)
+    }
+
+    fn attach_run_with_provider_refresh(
+        &mut self,
+        payload: &Value,
+        refresh_provider: bool,
+    ) -> Result<Vec<ToolResult>, DurableRunnerError> {
+        self.retain_completed_accounting_tail()?;
+        let mut next_state = self
+            .state
+            .clone()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider has not been prepared"))?;
+        // Evaluate the predecessor before attachment clears run-scoped receipt
+        // flags; a reset must not manufacture settlement of an exited session.
+        let settled_exited_checkpoint = next_state.lifecycle == "provider_exited"
+            && next_state.is_settled_except_retained_events()
+            && next_state.pi_deferred_terminal.is_none()
+            && next_state.descendant_thread_ids.is_empty();
+        // execute() restores the durable provider before dispatching run.attach.
+        // Attachment asks one question: is anything live or waiting right now?
+        // Pending events describe the past, so they never block it. They stay in
+        // the retained FIFO, and the runner commits them before rotating authority.
+        let mut blockers = self
+            .provider
+            .as_ref()
+            .map(CodexProvider::run_attachment_live_work)
+            .unwrap_or_default();
+        if next_state.thread_id.is_none() {
+            blockers.push("no_provider_thread");
+        }
+        if next_state.lifecycle == "closed" {
+            blockers.push("session_closed");
+        }
+        if next_state.lifecycle == "reconciliation_required" {
+            blockers.push("reconciliation_required");
+        }
+        if next_state.active_provider_turn_id.is_some() {
+            blockers.push("durable_active_turn");
+        }
+        if next_state.ambiguous_turn_start_pending {
+            blockers.push("durable_ambiguous_turn_start");
+        }
+        // A call left pending by a closed provider turn can never be answered:
+        // the provider stopped waiting when its turn ended, and the new run's
+        // controller never delivers the old run's results. Record it as an
+        // expired failure with an unknown outcome so the session continues.
+        // A call the live provider still waits on keeps blocking attachment.
+        let expired_tool_calls = if blockers.is_empty() {
+            next_state
+                .tool_bridge
+                .expire_closed_turn_calls()
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "run.attach could not settle tool calls left by a closed turn: {error}"
+                    ))
+                })?
+        } else {
+            Vec::new()
+        };
+        if !expired_tool_calls.is_empty() {
+            // Expiry settles the old call as an unknown-outcome failure, just
+            // as a recorded result releases Pi's deferred provider terminal.
+            // Retain that terminal in the predecessor FIFO before rebinding.
+            next_state.settle_deferred_pi_terminal()?;
+        }
+        if next_state.tool_bridge.pending_calls().next().is_some() {
+            blockers.push("durable_pending_tool_calls");
+        }
+        // An active goal lets a running provider start its next turn at any moment.
+        // A stopped provider starts nothing, and `working_now` can be stale after a
+        // stop, so only the goal's status with a live process counts.
+        let goal_active = self.provider.is_some()
+            && next_state
+                .goal
+                .as_ref()
+                .is_some_and(|goal| goal.status == "active");
+        if goal_continues_after_turn(&next_state, goal_active) {
+            blockers.push("durable_active_goal");
+        }
+        if !blockers.is_empty() {
+            let code = if next_state.active_provider_turn_id.is_some()
+                || next_state.ambiguous_turn_start_pending
+            {
+                "provider_active_turn"
+            } else if !next_state.descendant_thread_ids.is_empty()
+                || self
+                    .provider
+                    .as_ref()
+                    .is_some_and(|p| p.has_known_descendants())
+            {
+                "provider_live_descendants"
+            } else if goal_continues_after_turn(&next_state, goal_active) {
+                "provider_active_goal"
+            } else if blockers.contains(&"durable_pending_tool_calls") {
+                "provider_pending_tool_calls"
+            } else if next_state.lifecycle == "closed" {
+                "provider_session_closed"
+            } else if next_state.lifecycle == "reconciliation_required" {
+                "provider_reconciliation_required"
+            } else {
+                "provider_prepare_refused"
+            };
+            let error = DurableRunnerError::invalid(format!(
+                "run.attach requires a settled Codex provider session: {}",
+                blockers.join(", ")
+            ))
+            .with_refusal_code(code);
+            // A pending tool call is a side effect without a recorded result.
+            // The controller must not replace this session to get past it.
+            return Err(if blockers.contains(&"durable_pending_tool_calls") {
+                error.with_classification(PROVIDER_SIDE_EFFECT_PENDING)
+            } else {
+                error
+            });
+        }
+        let runtime_launch_args: Option<Vec<String>> = payload
+            .get("runtimeLaunchArgs")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|_| {
+                DurableRunnerError::invalid("run.attach runtime launch arguments are invalid")
+            })?;
+        let next_run_identity: Option<ProviderEventIdentity> = payload
+            .pointer("/paperclipNextAuthority/identity")
+            .map(|identity| {
+                serde_json::from_value(json!({
+                    "runnerInstanceId": identity["runnerInstanceId"],
+                    "runId": identity["runId"],
+                    "normalizedSessionId": identity["normalizedSessionId"],
+                    "turnId": identity["turnId"],
+                    "itemId": identity["itemId"],
+                }))
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "run.attach provider run identity is invalid: {error}"
+                    ))
+                })
+            })
+            .transpose()?
+            .or_else(|| self.event_identity.clone())
+            .or_else(|| next_state.run_identity.clone());
+        let different_run = next_run_identity.as_ref().is_some_and(|next| {
+            next_state
+                .run_identity
+                .as_ref()
+                .is_none_or(|saved| saved.run_id != next.run_id)
+        });
+        let mut upgraded_skill_config = false;
+        let mut refreshed_codex_instructions = false;
+        if let Some(provider) = payload.get("provider") {
+            let mut config: CodexProviderConfig = serde_json::from_value(provider.clone())
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!("run.attach provider is invalid: {error}"))
+                })?;
+            if config.provider != "codex" {
+                config.include_skill_instructions = None;
+            }
+            config
+                .validate()
+                .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+            if runtime_launch_args.is_some()
+                && config.provider == "codex"
+                && Self::stable_launch_args(&config.args)
+                    == Self::stable_launch_args(&next_state.config.args)
+            {
+                config.args = next_state.config.args.clone();
+            }
+            // Pre-fix checkpoints dropped this field. A fresh settled run may
+            // adopt the explicit controller setting once, then must reopen the
+            // same thread so the provider receives it. Known settings remain
+            // immutable within this profile, like the other durable fields.
+            if next_state.config.provider == "codex"
+                && next_state.config.include_skill_instructions.is_none()
+                && config.include_skill_instructions.is_some()
+            {
+                next_state.config.include_skill_instructions = config.include_skill_instructions;
+                upgraded_skill_config = true;
+            }
+            if next_state.config.provider == "cursor_cloud"
+                && config.provider == "cursor_cloud"
+                && self.provider.is_none()
+                && next_state.lifecycle == "prepared"
+            {
+                next_state.config.instructions = config.instructions.clone();
+            }
+            if different_run
+                && next_state.config.provider == "codex"
+                && config.provider == "codex"
+                && next_state.descendant_thread_ids.is_empty()
+                && next_state.pi_deferred_terminal.is_none()
+                && self
+                    .provider
+                    .as_ref()
+                    .is_none_or(|provider| !provider.has_known_descendants())
+                && next_state.config.instructions != config.instructions
+            {
+                // Codex has no Pi-style run.attach instruction RPC. Reopen the
+                // saved thread so developerInstructions reaches the provider;
+                // retaining its process here would silently keep stale text.
+                next_state.config.instructions = config.instructions.clone();
+                refreshed_codex_instructions = true;
+            }
+            if next_state.config.provider == "pi_rpc" && config.provider == "pi_rpc" {
+                // Only run instructions/context may refresh; equality below
+                // still fences model, release, command, permissions and mode.
+                next_state.config.instructions = config.instructions.clone();
+                if let Some(context) = provider.get("runtimeContext") {
+                    next_state.pi_runtime_context = context.clone();
+                }
+            }
+            if config != next_state.config {
+                return Err(DurableRunnerError::invalid(
+                    "run.attach cannot change the durable Codex provider profile",
+                )
+                .with_classification(PROVIDER_ATTACH_REFUSED));
+            }
+        }
+        let runtime_launch_changed = if let Some(args) = runtime_launch_args {
+            if next_state.config.provider != "codex"
+                || Self::stable_launch_args(&args)
+                    != Self::stable_launch_args(&next_state.config.args)
+            {
+                return Err(DurableRunnerError::invalid(
+                    "run.attach cannot change protected launch arguments",
+                )
+                .with_classification(PROVIDER_ATTACH_REFUSED));
+            }
+            let changed = args != next_state.config.args;
+            next_state.config.args = args;
+            next_state
+                .config
+                .validate()
+                .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+            changed
+        } else {
+            false
+        };
+        let completion_contract = completion_contract(payload)?;
+        let tool_set = authorized_tool_set(payload)?;
+        next_state
+            .tool_bridge
+            .attach_run(tool_set)
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "run.attach tool contract could not be rebound: {error}"
+                ))
+            })?;
+        if let Some(usage) = next_state.codex_usage.as_mut() {
+            usage.begin_run();
+        }
+        next_state.previous_accounting_origin = next_state
+            .run_identity
+            .clone()
+            .or_else(|| self.event_identity.clone())
+            .zip(next_state.completed_provider_turn_id.clone())
+            .map(|(identity, provider_turn_id)| CodexAccountingOrigin {
+                identity,
+                provider_turn_id,
+            });
+        next_state.run_identity = next_run_identity;
+        next_state.completion_contract = completion_contract;
+        next_state.completed_turn_authoritative = false;
+        next_state.completed_turn_process_generation = None;
+        next_state.completed_provider_turn_id = None;
+        next_state.receipt_limit_diagnostic_emitted = false;
+        next_state.receipt_limit_interrupt_pending = false;
+        next_state.receipt_limit_interrupt_accepted = false;
+        next_state.receipt_limit_interrupt_attempts = 0;
+        next_state.receipt_limit_interrupt_deadline_unix_ms = None;
+        next_state.active_provider_result_fingerprint = None;
+        next_state.active_provider_result_disposition = None;
+        next_state.active_terminal_tool_rejected = false;
+        next_state.last_agent_message = None;
+        let pi_run_id = if next_state.config.provider == "pi_rpc" {
+            payload
+                .pointer("/paperclipNextAuthority/identity/runId")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    self.event_identity
+                        .as_ref()
+                        .map(|identity| identity.run_id.as_str())
+                })
+        } else {
+            None
+        };
+        let pi_attachment = if next_state.config.provider == "pi_rpc" && self.provider.is_some() {
+            Some((
+                next_state.config.instructions.as_str(),
+                &next_state.pi_runtime_context,
+                pi_run_id.ok_or_else(|| {
+                    DurableRunnerError::invalid("Pi run attachment omitted run identity")
+                })?,
+            ))
+        } else {
+            None
+        };
+        let mut attachment_accounting = Vec::new();
+        let retention = if let Some(provider) = self.provider.as_mut() {
+            if refresh_provider
+                || runtime_launch_changed
+                || upgraded_skill_config
+                || refreshed_codex_instructions
+            {
+                // prepare's changed Pi startup context must reload company skills,
+                // even when an ordinary warm run.attach could refresh in place.
+                // The predecessor's tail was retained before cloning next_state.
+                Ok(false)
+            } else {
+                provider
+                    .attach_run_in_place(
+                        next_state.tool_bridge.authorized_tools().cloned(),
+                        next_state.completion_contract.as_ref().map(|contract| {
+                            (
+                                contract.revision.as_str(),
+                                contract.criterion_ids.as_slice(),
+                            )
+                        }),
+                        pi_attachment,
+                        &mut attachment_accounting,
+                    )
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "failed to retain Codex for warm run attachment: {error}"
+                        ))
+                    })
+            }
+        } else if next_state.provider_process_generation > 0
+            && (next_state.lifecycle == "prepared" || settled_exited_checkpoint)
+        {
+            // turn.stop and an observed idle provider exit both retain a
+            // settled thread with no process left to attach. Rebind only its
+            // validated run-scoped settings here; open_session then restores
+            // that same thread under the new authority. Never restart during
+            // drain/suspend or require the stopped process to still exist.
+            Ok(false)
+        } else {
+            return Err(DurableRunnerError::invalid(
+                "run.attach requires the restored Codex provider process",
+            ));
+        };
+        self.persist_completed_accounting_tail(attachment_accounting, retention.is_err())?;
+        let retained_provider = match retention {
+            Ok(retained) => retained,
+            Err(error) => return Err(error),
+        };
+        if !retained_provider {
+            self.checkpoint_provider_for_run_refresh()?;
+        }
+        // Pending facts remain owned by their original authority. The runner
+        // must commit this retained FIFO before rotating authority; only the
+        // superseded restore notice is discarded.
+        next_state
+            .pending_events
+            .retain(|event| event.event_type != "session.resumed");
+        next_state.lifecycle = if retained_provider {
+            "session_open".to_owned()
+        } else {
+            // The next provider command restores the same checkpointed session
+            // with the rotated tool/completion authority.
+            "prepared".to_owned()
+        };
+        self.persist_state(&next_state)?;
+        self.state = Some(next_state);
+        Ok(expired_tool_calls)
+    }
+
+    fn open_session(&mut self) -> Result<CommandExecution, DurableRunnerError> {
+        self.restore_provider_if_needed()?;
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.lifecycle == "turn_active")
+        {
+            return Err(DurableRunnerError::invalid(
+                "cannot open a new Codex session while a provider turn is active",
+            ));
+        }
+        let resumed = self
+            .state
+            .as_ref()
+            .and_then(|state| state.thread_id.as_ref())
+            .is_some();
+        let cloud_proxy = self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.config.provider == "cursor_cloud");
+        let (
+            thread_id,
+            provider_session_id,
+            process_id,
+            active_provider_turn_id,
+            goal_probe,
+            observed_model,
+            observed_pi_admission,
+        ) = {
+            let provider = self.ensure_provider()?;
+            (
+                provider.thread_id().to_owned(),
+                provider.provider_session_id().map(str::to_owned),
+                provider.process_id(),
+                provider.active_provider_turn_id().map(str::to_owned),
+                if cloud_proxy {
+                    None
+                } else {
+                    Some(provider.get_goal())
+                },
+                provider.observed_model().map(str::to_owned),
+                provider.observed_pi_admission().cloned(),
+            )
+        };
+        let (goal_capability, goal) = match goal_probe {
+            None => (
+                SessionGoalCapability::unavailable("unsupported", "provider_goals_unavailable"),
+                None,
+            ),
+            Some(Ok(snapshot)) => (
+                SessionGoalCapability::codex_available(),
+                normalize_codex_goal(&snapshot, active_provider_turn_id.is_some()),
+            ),
+            Some(Err(error)) => {
+                let message = error.to_string().to_ascii_lowercase();
+                if message.contains("policy")
+                    || message.contains("disabled")
+                    || message.contains("feature")
+                {
+                    (
+                        SessionGoalCapability::unavailable(
+                            "policy_disabled",
+                            "codex_goal_policy_disabled",
+                        ),
+                        None,
+                    )
+                } else {
+                    (
+                        SessionGoalCapability::unavailable(
+                            "unsupported",
+                            if message.contains("-32601") || message.contains("unknown method") {
+                                "codex_goal_unknown_method"
+                            } else {
+                                "codex_goal_probe_failed"
+                            },
+                        ),
+                        None,
+                    )
+                }
+            }
+        };
+        let (provider_name, driver, provider_version, goal_revision) = {
+            let state = self
+                .state
+                .as_mut()
+                .expect("Codex state exists after provider start");
+            state.thread_id = Some(thread_id.clone());
+            state.provider_session_id = provider_session_id.clone();
+            state.active_provider_turn_id = active_provider_turn_id.clone();
+            state.receipt_limit_diagnostic_emitted = false;
+            state.receipt_limit_interrupt_pending = false;
+            state.receipt_limit_interrupt_accepted = false;
+            state.receipt_limit_interrupt_attempts = 0;
+            state.receipt_limit_interrupt_deadline_unix_ms = None;
+            state.lifecycle = if active_provider_turn_id.is_some() {
+                "turn_active".to_owned()
+            } else {
+                "session_open".to_owned()
+            };
+            state.goal_capability = Some(goal_capability.clone());
+            state.goal = goal.clone();
+            state.goal_revision = state.goal_revision.saturating_add(1);
+            (
+                state.config.provider.clone(),
+                state.config.driver.clone(),
+                state.config.provider_version.clone(),
+                state.goal_revision,
+            )
+        };
+        self.save_state()?;
+        Ok(CommandExecution {
+            result: json!({
+                "status": if resumed { "resumed" } else { "started" },
+                "provider": provider_name,
+                "driver": driver,
+                "providerVersion": provider_version,
+                "providerSessionId": thread_id,
+                "processId": process_id,
+            }),
+            events: vec![
+                (
+                    if resumed {
+                        "session.resumed"
+                    } else {
+                        "session.started"
+                    }
+                    .to_owned(),
+                    EventPriority::P0,
+                    json!({
+                        "provider": provider_name,
+                        "providerSessionId": thread_id,
+                        "providerAccountSessionId": provider_session_id,
+                        "processId": process_id,
+                        "providerDescriptor": { "driver": driver, "providerVersion": provider_version, "effectiveModel": observed_model, "piNativeAdmission": observed_pi_admission },
+                    }),
+                ),
+                (
+                    "session.capabilities.updated".to_owned(),
+                    EventPriority::P0,
+                    json!({"sessionGoals": goal_capability}),
+                ),
+                (
+                    "session.goal.snapshot".to_owned(),
+                    EventPriority::P0,
+                    goal_event_payload(goal.as_ref(), Some(&goal_capability), goal_revision),
+                ),
+            ],
+        })
+    }
+
+    fn close_after_rejected_provider_acceptance(
+        &mut self,
+        rejected_accepted_turn: &RejectedAcceptedTurn,
+    ) -> Result<(), DurableRunnerError> {
+        let provider_process_generation = self
+            .provider
+            .as_ref()
+            .map(CodexProvider::process_generation);
+        // The provider has already been terminated. Drop its quarantined
+        // handle before persisting the closure so recovery can never resume
+        // work that Codex accepted without Paperclip accepting its identity.
+        self.provider = None;
+        let state = self
+            .state
+            .as_mut()
+            .expect("Codex state remains available after rejected provider acceptance");
+        if let Some(provider_process_generation) = provider_process_generation {
+            state.provider_process_generation = provider_process_generation;
+        }
+        state.active_provider_turn_id = None;
+        state.ambiguous_turn_start_pending = false;
+        state.completed_turn_authoritative = false;
+        state.completed_turn_process_generation = None;
+        state.completed_provider_turn_id = None;
+        state.receipt_limit_diagnostic_emitted = false;
+        state.receipt_limit_interrupt_pending = false;
+        state.receipt_limit_interrupt_accepted = false;
+        state.receipt_limit_interrupt_attempts = 0;
+        state.receipt_limit_interrupt_deadline_unix_ms = None;
+        state.active_provider_result_fingerprint = None;
+        state.active_provider_result_disposition = None;
+        state.active_terminal_tool_rejected = false;
+        state.last_agent_message = None;
+        state.lifecycle = "closed".to_owned();
+        let provider_label = state.config.provider.clone();
+        let provider_name = facade_provider_name(&provider_label);
+        // Closure is the safety boundary. Preserve it even if a saturated
+        // event queue cannot retain this additional diagnostic.
+        let _ = state.push_terminal_event(NormalizedProviderEvent {
+            event_type: "harness.diagnostic".to_owned(),
+            priority: EventPriority::P0,
+            payload: json!({
+                "provider": provider_label,
+                "code": match rejected_accepted_turn {
+                    RejectedAcceptedTurn::ReusedIdentity(_) => "provider_turn_identity_reused",
+                    RejectedAcceptedTurn::InvalidIdentity => "provider_turn_identity_invalid",
+                },
+                "providerTurnId": match rejected_accepted_turn {
+                    RejectedAcceptedTurn::ReusedIdentity(provider_turn_id) => json!(provider_turn_id),
+                    RejectedAcceptedTurn::InvalidIdentity => Value::Null,
+                },
+                "message": match rejected_accepted_turn {
+                    RejectedAcceptedTurn::ReusedIdentity(_) => format!("{provider_name} accepted work with a previously settled turn identity; Paperclip terminated the provider and closed the durable run"),
+                    RejectedAcceptedTurn::InvalidIdentity => format!("{provider_name} accepted work without a valid bounded turn identity; Paperclip terminated the provider and closed the durable run"),
+                },
+                "paperclipAccepted": false,
+                "providerAccepted": true,
+            }),
+        });
+        self.save_state()
+    }
+
+    fn rollover_provider_identity_epochs_if_needed(&mut self) -> Result<(), DurableRunnerError> {
+        let tool_rollover_required = self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.tool_bridge.replay_history_blocks_admission());
+        let rollover_required = self.state.as_ref().is_some_and(|state| {
+            state.settled_provider_turn_ids.len() >= MAX_SETTLED_PROVIDER_TURN_IDS
+                || !state.settled_provider_turn_filter.is_empty()
+                || tool_rollover_required
+        });
+        if !rollover_required {
+            return Ok(());
+        }
+        let rollover_is_safe = self.state.as_ref().is_some_and(|state| {
+            state.active_provider_turn_id.is_none()
+                && !state.ambiguous_turn_start_pending
+                && state.lifecycle == "session_open"
+        });
+        if !rollover_is_safe {
+            return Err(DurableRunnerError::invalid(
+                "Codex provider identity epoch cannot rotate while work is active",
+            ));
+        }
+
+        let next_generation = self
+            .state
+            .as_ref()
+            .and_then(|state| state.provider_process_generation.checked_add(1))
+            .ok_or_else(|| DurableRunnerError::invalid("provider process generation exhausted"))?;
+        self.begin_startup(ProviderStartupTrigger::Rollover, next_generation)?;
+        let (restart_result, process_generation, rejected_accepted_turn) = {
+            let mut provider = self.provider.take().ok_or_else(|| {
+                DurableRunnerError::invalid(
+                    "Codex provider identity epoch cannot rotate without an attached process",
+                )
+            })?;
+            let restart_result =
+                provider.restart_idle_identity_epoch_observed(&mut |observation| {
+                    self.observe_startup(observation).map_err(|error| {
+                        crate::local_runner::LocalRunnerError::invalid(error.to_string())
+                    })
+                });
+            let result = (
+                restart_result,
+                provider.process_generation(),
+                provider.take_rejected_accepted_turn(),
+            );
+            self.provider = Some(provider);
+            result
+        };
+        if let Err(error) = restart_result {
+            if let Some(rejected_accepted_turn) = rejected_accepted_turn {
+                let failure_kind = match &rejected_accepted_turn {
+                    RejectedAcceptedTurn::ReusedIdentity(_) => "accepted identity reuse",
+                    RejectedAcceptedTurn::InvalidIdentity => "an invalid accepted identity",
+                };
+                self.close_after_rejected_provider_acceptance(&rejected_accepted_turn)?;
+                return Err(DurableRunnerError::invalid(format!(
+                    "Codex identity epoch rollover failed closed after {failure_kind}: {error}"
+                )));
+            }
+            return Err(DurableRunnerError::invalid(format!(
+                "failed to rotate the completed Codex identity epoch: {error}"
+            )));
+        };
+        let admission = (|| {
+            let state = self
+                .state
+                .as_mut()
+                .expect("Codex state remains available during identity epoch rollover");
+            state.provider_process_generation = process_generation;
+            state.settled_provider_turn_ids.clear();
+            if let Some(completed_provider_turn_id) = state.completed_provider_turn_id.clone() {
+                // The replacement process restored this still-authoritative
+                // terminal into its fresh epoch. Mirror that one tombstone in the
+                // durable ledger until accepting replacement work revokes the
+                // completion authority.
+                state
+                    .settled_provider_turn_ids
+                    .insert(completed_provider_turn_id);
+            }
+            state.settled_provider_turn_filter = DurableReplayFilter::default();
+            if tool_rollover_required {
+                state
+                    .tool_bridge
+                    .rollover_replay_epoch_after_provider_restart()
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "failed to rotate Codex semantic tool replay authority: {error}"
+                        ))
+                    })?;
+            }
+            self.commit_startup_admission()
+        })();
+        if let Err(error) = admission {
+            if let Some(mut provider) = self.provider.take() {
+                self.fail_started_provider(&mut provider);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn start_turn(&mut self, payload: &Value) -> Result<CommandExecution, DurableRunnerError> {
+        // Validate before recovery or marking dispatch ambiguous: malformed
+        // selections must not launch a provider or poison a durable session.
+        let local_image_paths: Vec<String> = serde_json::from_value(
+            payload
+                .get("localImagePaths")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )
+        .map_err(|error| {
+            DurableRunnerError::invalid(format!("invalid turn.start localImagePaths: {error}"))
+        })?;
+        crate::codex_provider::pi_local_image_input(
+            self.state
+                .as_ref()
+                .map_or("", |state| state.config.provider.as_str()),
+            &local_image_paths,
+        )
+        .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        let skills: Vec<CodexSkillInput> =
+            serde_json::from_value(payload.get("skills").cloned().unwrap_or_else(|| json!([])))
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!("invalid turn.start skills: {error}"))
+                })?;
+        if skills.len() > 64 {
+            return Err(DurableRunnerError::invalid("too many turn.start skills"));
+        }
+        for skill in &skills {
+            skill
+                .validate()
+                .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        }
+        let reasoning_mode = match payload.get("reasoningMode") {
+            None => None,
+            Some(Value::String(mode)) if matches!(mode.as_str(), "default" | "disabled") => {
+                Some(mode.as_str())
+            }
+            Some(_) => return Err(DurableRunnerError::invalid("invalid turn.reasoningMode")),
+        };
+        // `compact` starts the provider's on-demand context compaction as
+        // this turn. It carries no user text, skills, or reasoning overrides.
+        let compact = match payload.get("compact") {
+            None | Some(Value::Bool(false)) => false,
+            Some(Value::Bool(true)) => true,
+            Some(_) => {
+                return Err(DurableRunnerError::invalid(
+                    "turn.start compact must be a boolean",
+                ))
+            }
+        };
+        if compact
+            && (!skills.is_empty()
+                || !local_image_paths.is_empty()
+                || reasoning_mode.is_some()
+                || payload.get("text").is_some())
+        {
+            return Err(DurableRunnerError::invalid(
+                "a compaction turn.start cannot carry text, skills, or a reasoning mode",
+            ));
+        }
+        self.restore_provider_if_needed()?;
+        if reasoning_mode.is_some()
+            && self
+                .state
+                .as_ref()
+                .is_none_or(|state| state.config.provider != "opencode")
+        {
+            return Err(DurableRunnerError::invalid(
+                "turn.reasoningMode requires OpenCode",
+            ));
+        }
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.lifecycle == "closed")
+        {
+            return Err(DurableRunnerError::invalid(
+                "Codex provider session is closed",
+            ));
+        }
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.active_provider_turn_id.is_some())
+        {
+            return Err(DurableRunnerError::invalid(
+                "Codex already has an active provider turn",
+            ));
+        }
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.ambiguous_turn_start_pending)
+        {
+            return Err(DurableRunnerError::invalid(
+                "Codex has an unresolved ambiguous provider turn start",
+            ));
+        }
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.queued_events.len() >= MAX_REGULAR_QUEUED_PROVIDER_EVENTS)
+        {
+            return Err(DurableRunnerError::invalid(
+                "cannot start a new Codex turn until terminal events are acknowledged",
+            ));
+        }
+        self.state
+            .as_mut()
+            .expect("Codex state remains available before turn receipt preparation")
+            .tool_bridge
+            .prepare_turn()
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "Codex semantic tool receipts could not prepare the next turn: {error}"
+                ))
+            })?;
+        self.rollover_provider_identity_epochs_if_needed()?;
+        let text = if compact {
+            ""
+        } else {
+            payload
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DurableRunnerError::invalid("turn.start payload.text is required"))?
+        };
+        if compact
+            && self
+                .state
+                .as_ref()
+                .is_some_and(|state| !matches!(state.config.provider.as_str(), "codex" | "pi_rpc"))
+        {
+            return Err(DurableRunnerError::invalid(
+                "on-demand context compaction requires Codex or native Pi",
+            ));
+        }
+        let cwd = self
+            .state
+            .as_ref()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider is not prepared"))?
+            .config
+            .cwd
+            .clone();
+        if !skills.is_empty()
+            && self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.config.provider != "codex")
+        {
+            return Err(DurableRunnerError::invalid("explicit skills require Codex"));
+        }
+        self.ensure_provider()?;
+        {
+            let state = self
+                .state
+                .as_mut()
+                .expect("Codex state remains available before turn/start dispatch");
+            state.ambiguous_turn_start_pending = true;
+        }
+        self.save_state()?;
+        let run_id = self
+            .event_identity
+            .as_ref()
+            .map(|identity| identity.run_id.clone());
+        let (
+            start_result,
+            completion_authority_retained,
+            ambiguous_turn_start_pending,
+            rejected_accepted_turn,
+        ) = {
+            let provider = self.ensure_provider()?;
+            let result = if compact {
+                provider.start_compaction_turn()
+            } else {
+                provider.start_turn_with_options_and_effort(
+                    text,
+                    &cwd,
+                    CodexTurnOptions {
+                        skills: &skills,
+                        reasoning_mode,
+                        local_image_paths: &local_image_paths,
+                    },
+                    payload.get("effort"),
+                    run_id.as_deref(),
+                )
+            };
+            (
+                result,
+                provider.completed_turn_authority().is_some(),
+                provider.ambiguous_turn_start_pending(),
+                provider.take_rejected_accepted_turn(),
+            )
+        };
+        if let Err(error) = start_result {
+            if let Some(rejected_accepted_turn) = rejected_accepted_turn {
+                // Codex accepted this work before disclosing a usable durable
+                // identity. The provider has already been terminated; close
+                // this run before returning so recovery cannot resume the
+                // untracked turn from the provider's thread snapshot.
+                self.close_after_rejected_provider_acceptance(&rejected_accepted_turn)?;
+                let failure_kind = match &rejected_accepted_turn {
+                    RejectedAcceptedTurn::ReusedIdentity(_) => "accepted identity reuse",
+                    RejectedAcceptedTurn::InvalidIdentity => "an invalid accepted identity",
+                };
+                return Err(DurableRunnerError::invalid(format!(
+                    "Codex turn/start failed closed after {failure_kind}: {error}"
+                )));
+            }
+            let state = self
+                .state
+                .as_mut()
+                .expect("Codex state remains available after turn/start failure");
+            state.ambiguous_turn_start_pending = ambiguous_turn_start_pending;
+            if !completion_authority_retained && !ambiguous_turn_start_pending {
+                state.completed_turn_authoritative = false;
+                state.completed_turn_process_generation = None;
+                state.completed_provider_turn_id = None;
+                state.active_provider_result_fingerprint = None;
+                state.active_provider_result_disposition = None;
+                state.active_terminal_tool_rejected = false;
+                state.last_agent_message = None;
+            }
+            self.save_state()?;
+            return Err(DurableRunnerError::invalid(format!(
+                "Codex turn/start failed: {error}"
+            )));
+        }
+        let (provider_turn_id, thread_id) = {
+            let provider = self
+                .provider
+                .as_ref()
+                .expect("Codex provider remains available after turn/start acceptance");
+            (
+                provider
+                    .active_provider_turn_id()
+                    .ok_or_else(|| {
+                        DurableRunnerError::invalid("Codex turn/start omitted its turn identity")
+                    })?
+                    .to_owned(),
+                provider.thread_id().to_owned(),
+            )
+        };
+        let state = self
+            .state
+            .as_mut()
+            .expect("Codex state exists after turn start");
+        state.active_provider_turn_id = Some(provider_turn_id.clone());
+        state.provider_termination_receipt = None;
+        state.ambiguous_turn_start_pending = false;
+        state.completed_turn_authoritative = false;
+        state.completed_turn_process_generation = None;
+        state.completed_provider_turn_id = None;
+        state.receipt_limit_diagnostic_emitted = false;
+        state.receipt_limit_interrupt_pending = false;
+        state.receipt_limit_interrupt_accepted = false;
+        state.receipt_limit_interrupt_attempts = 0;
+        state.receipt_limit_interrupt_deadline_unix_ms = None;
+        state.active_provider_result_fingerprint = None;
+        state.active_provider_result_disposition = None;
+        state.active_terminal_tool_rejected = false;
+        state.last_agent_message = None;
+        state.lifecycle = "turn_active".to_owned();
+        let provider_label = state.config.provider.clone();
+        self.save_state()?;
+        Ok(CommandExecution {
+            result: json!({"status": "accepted", "providerTurnId": provider_turn_id}),
+            events: vec![(
+                "turn.accepted".to_owned(),
+                EventPriority::P0,
+                json!({"provider": provider_label, "providerSessionId": thread_id, "providerTurnId": provider_turn_id}),
+            )],
+        })
+    }
+
+    fn interrupt_turn(&mut self, reason: &str) -> Result<CommandExecution, DurableRunnerError> {
+        self.restore_provider_if_needed()?;
+        let provider_turn_id = self
+            .state
+            .as_ref()
+            .and_then(|state| state.active_provider_turn_id.clone());
+        if provider_turn_id.is_none() {
+            return Ok(CommandExecution::result(json!({
+                "status": "already_settled",
+                "reason": reason,
+            })));
+        }
+        let mut next_state = self
+            .state
+            .clone()
+            .expect("Codex state remains available during interruption");
+        next_state
+            .tool_bridge
+            .cancel_pending_calls("provider_turn_stopped")
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to stop semantic tool admission: {error}"
+                ))
+            })?;
+        next_state.push_terminal_event(NormalizedProviderEvent {
+            event_type: "harness.diagnostic".to_owned(),
+            priority: EventPriority::P0,
+            payload: json!({
+                "code": "provider_interrupt_requested",
+                "reason": reason,
+                "providerTurnId": provider_turn_id,
+                "pendingCallIds": next_state.tool_bridge.pending_calls().map(|call| call.call_id.clone()).collect::<Vec<_>>(),
+            }),
+        })?;
+        // Record cause and pending identities before touching the provider.
+        self.persist_state(&next_state)?;
+        self.state = Some(next_state);
+        self.ensure_provider()?.interrupt_turn().map_err(|error| {
+            DurableRunnerError::invalid(format!("Codex turn interrupt failed: {error}"))
+        })?;
+        Ok(CommandExecution::result(json!({
+            "status": "interrupt_requested",
+            "reason": reason,
+            "providerTurnId": provider_turn_id,
+        })))
+    }
+
+    fn stop_turn_for_suspension(
+        &mut self,
+        reason: &str,
+    ) -> Result<CommandExecution, DurableRunnerError> {
+        self.restore_provider_if_needed()?;
+        let state = self.state.as_ref();
+        // An unprepared or permanently closed executor cannot become a
+        // successor checkpoint merely because the controller asks it to stop.
+        if state.is_none_or(|state| state.lifecycle == "closed") {
+            return Ok(CommandExecution::result(json!({
+                "status": "already_settled",
+                "reason": reason,
+            })));
+        }
+        let provider_turn_id = state.and_then(|state| state.active_provider_turn_id.clone());
+
+        // Unlike turn.interrupt, turn.stop is the definitive physical cleanup
+        // boundary. A courtesy RPC can wait longer than the controller's close
+        // budget, especially after an earlier interrupt already aborted the
+        // provider turn but its terminal frame has not been polled. Terminate
+        // the exact owned generation without another cooperative interrupt.
+        // Resume may discover that the old turn already ended; its newly
+        // resumed process still needs the same exit and prepared-state proof.
+        self.stop_owned_provider().map_err(|error| {
+            DurableRunnerError::invalid(format!(
+                "failed to prove provider termination at the suspension boundary: {error}"
+            ))
+        })?;
+
+        let identity = self.event_identity()?;
+        let state = self
+            .state
+            .as_mut()
+            .expect("Codex state remains available after provider termination");
+        if state.active_provider_turn_id.is_some() {
+            state.settle_active_provider_turn_identity()?;
+        }
+        let settled = state
+            .tool_bridge
+            .settle_turn("provider_turn_stopped_for_suspension")
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to settle semantic tools at the suspension boundary: {error}"
+                ))
+            })?;
+        for result in settled {
+            state.push_terminal_event(semantic_result_event(&identity, &result))?;
+        }
+        state.active_provider_turn_id = None;
+        state.ambiguous_turn_start_pending = false;
+        state.completed_turn_authoritative = false;
+        state.completed_turn_process_generation = None;
+        state.completed_provider_turn_id = None;
+        state.receipt_limit_diagnostic_emitted = false;
+        state.receipt_limit_interrupt_pending = false;
+        state.receipt_limit_interrupt_accepted = false;
+        state.receipt_limit_interrupt_attempts = 0;
+        state.receipt_limit_interrupt_deadline_unix_ms = None;
+        state.active_provider_result_fingerprint = None;
+        state.active_provider_result_disposition = None;
+        state.active_terminal_tool_rejected = false;
+        state.last_agent_message = None;
+        // Do not let the runner.drain command that follows turn.stop restore a
+        // fresh provider process. `prepared` retains the durable thread while
+        // deferring the only authorized restart to the successor run.attach.
+        state.lifecycle = "prepared".to_owned();
+        let provider_termination_receipt = state.provider_termination_receipt.clone();
+        self.save_state()?;
+        let mut result = json!({
+            "status": if provider_turn_id.is_some() { "stopped" } else { "already_settled" },
+            "providerTurnId": provider_turn_id,
+            "reason": reason,
+            "interruptAccepted": false,
+            "providerExitConfirmed": true,
+        });
+        if let Some(receipt) = provider_termination_receipt {
+            result["providerTerminationReceipt"] = receipt;
+        }
+        Ok(CommandExecution::result(result))
+    }
+
+    fn steer_turn(&mut self, payload: &Value) -> Result<CommandExecution, DurableRunnerError> {
+        if payload
+            .get("mode")
+            .is_some_and(|mode| mode.as_str() != Some("steer"))
+        {
+            return Err(DurableRunnerError::invalid(
+                "Codex does not expose queued follow-up through turn.steer",
+            ));
+        }
+        let text = payload
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DurableRunnerError::invalid("turn.steer payload.text is required"))?;
+        let local_image_paths: Vec<String> = serde_json::from_value(
+            payload
+                .get("localImagePaths")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )
+        .map_err(|error| {
+            DurableRunnerError::invalid(format!("invalid turn.steer localImagePaths: {error}"))
+        })?;
+        crate::codex_provider::pi_local_image_input(
+            self.state
+                .as_ref()
+                .map_or("", |state| state.config.provider.as_str()),
+            &local_image_paths,
+        )
+        .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        self.ensure_provider()?
+            .steer_turn_with_images(text, &local_image_paths)
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!("Codex turn steer failed: {error}"))
+            })?;
+        Ok(CommandExecution::result(json!({"status": "steered"})))
+    }
+
+    fn ensure_goal_available(&self) -> Result<(), DurableRunnerError> {
+        if self
+            .state
+            .as_ref()
+            .and_then(|state| state.goal_capability.as_ref())
+            .is_some_and(|capability| capability.availability == "available")
+        {
+            Ok(())
+        } else {
+            Err(DurableRunnerError::invalid(
+                "Codex session goals are unavailable for this provider session",
+            ))
+        }
+    }
+
+    fn get_goal(&mut self) -> Result<CommandExecution, DurableRunnerError> {
+        self.restore_provider_if_needed()?;
+        self.ensure_goal_available()?;
+        let (snapshot, working_now) = {
+            let provider = self.ensure_provider()?;
+            let snapshot = provider.get_goal().map_err(|error| {
+                DurableRunnerError::invalid(format!("Codex thread/goal/get failed: {error}"))
+            })?;
+            (snapshot, provider.active_provider_turn_id().is_some())
+        };
+        let goal = normalize_codex_goal(&snapshot, working_now);
+        let (capability, revision) = {
+            let state = self
+                .state
+                .as_mut()
+                .expect("Codex state exists while reading its goal");
+            state.goal = goal.clone();
+            state.goal_revision = state.goal_revision.saturating_add(1);
+            (state.goal_capability.clone(), state.goal_revision)
+        };
+        self.save_state()?;
+        let payload = goal_event_payload(goal.as_ref(), capability.as_ref(), revision);
+        Ok(CommandExecution {
+            result: payload.clone(),
+            events: vec![(
+                "session.goal.snapshot".to_owned(),
+                EventPriority::P0,
+                payload,
+            )],
+        })
+    }
+
+    fn set_goal(&mut self, payload: &Value) -> Result<CommandExecution, DurableRunnerError> {
+        self.restore_provider_if_needed()?;
+        self.ensure_goal_available()?;
+        let objective = payload
+            .get("objective")
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty() && value.chars().count() <= 4_000)
+                    .ok_or_else(|| {
+                        DurableRunnerError::invalid(
+                        "session.goal.set objective must be nonblank and at most 4000 characters",
+                    )
+                    })
+            })
+            .transpose()?;
+        let status = payload
+            .get("status")
+            .map(|value| {
+                let status = value.as_str().ok_or_else(|| {
+                    DurableRunnerError::invalid("session.goal.set status must be a string")
+                })?;
+                codex_goal_status(status).ok_or_else(|| {
+                    DurableRunnerError::invalid("session.goal.set status is not supported by Codex")
+                })
+            })
+            .transpose()?;
+        let token_budget = if let Some(value) = payload.get("tokenBudget") {
+            if value.is_null() {
+                Some(None)
+            } else {
+                Some(Some(value.as_u64().filter(|value| *value > 0).ok_or_else(
+                    || {
+                        DurableRunnerError::invalid(
+                            "session.goal.set tokenBudget must be null or a positive integer",
+                        )
+                    },
+                )?))
+            }
+        } else {
+            None
+        };
+        if objective.is_none() && status.is_none() && token_budget.is_none() {
+            return Err(DurableRunnerError::invalid(
+                "session.goal.set requires objective, status, or tokenBudget",
+            ));
+        }
+        let (result, working_now) = {
+            let provider = self.ensure_provider()?;
+            let result = provider
+                .set_goal(objective, status, token_budget)
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!("Codex thread/goal/set failed: {error}"))
+                })?;
+            (result, provider.active_provider_turn_id().is_some())
+        };
+        let snapshot = if normalize_codex_goal(&result, working_now).is_some() {
+            result
+        } else {
+            self.ensure_provider()?.get_goal().map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "Codex thread/goal/get after set failed: {error}"
+                ))
+            })?
+        };
+        let goal = normalize_codex_goal(&snapshot, working_now).ok_or_else(|| {
+            DurableRunnerError::invalid("Codex thread/goal/set omitted a valid goal snapshot")
+        })?;
+        let (capability, revision) = {
+            let state = self
+                .state
+                .as_mut()
+                .expect("Codex state exists while setting its goal");
+            state.goal = Some(goal.clone());
+            state.goal_revision = state.goal_revision.saturating_add(1);
+            (state.goal_capability.clone(), state.goal_revision)
+        };
+        self.save_state()?;
+        let event = goal_control_event_payload(
+            Some(&goal),
+            capability.as_ref(),
+            revision,
+            payload.get("requestId").and_then(Value::as_str),
+        );
+        Ok(CommandExecution {
+            result: json!({"status": "accepted", "snapshot": event}),
+            events: vec![("session.goal.updated".to_owned(), EventPriority::P0, event)],
+        })
+    }
+
+    fn clear_goal(&mut self, payload: &Value) -> Result<CommandExecution, DurableRunnerError> {
+        self.restore_provider_if_needed()?;
+        self.ensure_goal_available()?;
+        let result = self.ensure_provider()?.clear_goal().map_err(|error| {
+            DurableRunnerError::invalid(format!("Codex thread/goal/clear failed: {error}"))
+        })?;
+        let (capability, revision, working_now) = {
+            let working_now = self
+                .provider
+                .as_ref()
+                .is_some_and(|provider| provider.active_provider_turn_id().is_some());
+            let state = self
+                .state
+                .as_mut()
+                .expect("Codex state exists while clearing its goal");
+            state.goal = None;
+            state.goal_revision = state.goal_revision.saturating_add(1);
+            (
+                state.goal_capability.clone(),
+                state.goal_revision,
+                working_now,
+            )
+        };
+        self.save_state()?;
+        let event = json!({
+            "schema": "paperclip.session_goal.snapshot.v1",
+            "goal": Value::Null,
+            "sessionGoals": capability,
+            "workingNow": working_now,
+            "revision": revision,
+            "cleared": result.get("cleared").and_then(Value::as_bool).unwrap_or(true),
+            "requestId": payload.get("requestId").and_then(Value::as_str),
+        });
+        Ok(CommandExecution {
+            result: json!({"status": "accepted", "snapshot": event}),
+            events: vec![("session.goal.cleared".to_owned(), EventPriority::P0, event)],
+        })
+    }
+
+    fn resolve_request(&mut self, payload: &Value) -> Result<CommandExecution, DurableRunnerError> {
+        let request_id = payload
+            .get("requestId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DurableRunnerError::invalid("request.resolve requires requestId"))?;
+        let provider_label = self
+            .state
+            .as_ref()
+            .map(|state| state.config.provider.clone())
+            .unwrap_or_else(|| "codex".to_owned());
+        let provider_name = facade_provider_name(&provider_label);
+        if self
+            .state
+            .as_ref()
+            .is_none_or(|state| state.active_provider_turn_id.is_none())
+        {
+            return Err(DurableRunnerError::invalid(format!(
+                "cannot resolve a {provider_name} runtime request outside an active turn"
+            )));
+        }
+        if payload
+            .get("turnId")
+            .and_then(Value::as_str)
+            .is_some_and(|turn| {
+                self.event_identity
+                    .as_ref()
+                    .is_none_or(|identity| turn != identity.turn_id)
+            })
+        {
+            return Err(DurableRunnerError::invalid(
+                "Codex runtime response belongs to a stale turn",
+            ));
+        }
+        let response = payload
+            .get("response")
+            .or_else(|| payload.get("resolution"))
+            .ok_or_else(|| {
+                DurableRunnerError::invalid("request.resolve requires response or resolution")
+            })?;
+        self.ensure_provider()?
+            .resolve_runtime_request(request_id, response)
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "{provider_name} runtime response failed: {error}"
+                ))
+            })?;
+        Ok(CommandExecution {
+            result: json!({"status": "delivered", "requestId": request_id}),
+            events: vec![(
+                "runtime_request.resolved".to_owned(),
+                EventPriority::P0,
+                json!({"provider": provider_label, "requestId": request_id, "status": "delivered"}),
+            )],
+        })
+    }
+
+    fn event_identity(&self) -> Result<ProviderEventIdentity, DurableRunnerError> {
+        self.event_identity.clone().ok_or_else(|| {
+            DurableRunnerError::invalid(
+                "Codex semantic tool events require the durable runner identity",
+            )
+        })
+    }
+
+    fn reject_tool_call(
+        &mut self,
+        call_id: String,
+        operation_id: String,
+        error: ProviderBridgeError,
+    ) -> Result<(), DurableRunnerError> {
+        let reason = error.to_string();
+        let state = self
+            .state
+            .as_mut()
+            .expect("Codex state remains available for a rejected tool call");
+        state.record_terminal_tool_rejection(&operation_id);
+        let mut payload = json!({
+            "provider": state.config.provider,
+            "code": "semantic_tool_denied",
+            "operationId": operation_id,
+            "callId": call_id,
+            "message": reason,
+            "paperclipExecuted": false,
+        });
+        if let Some(guidance) = error.safe_provider_message() {
+            payload["inputSchemaGuidance"] = json!(guidance);
+        }
+        let event = NormalizedProviderEvent {
+            event_type: "harness.diagnostic".to_owned(),
+            priority: EventPriority::P0,
+            payload,
+        };
+        if state.receipt_limit_interrupt_pending {
+            state.push_receipt_limit_cleanup_event(event)?;
+        } else {
+            state.push_event(event)?;
+        }
+        self.save_state()?;
+        let rejection = invalid_tool_call_result(call_id, operation_id, &error);
+        self.provider
+            .as_mut()
+            .expect("provider remains present while rejecting its tool call")
+            .deliver_tool_rejection(&rejection)
+            .map_err(|delivery_error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to return the semantic tool rejection: {delivery_error}"
+                ))
+            })
+    }
+
+    fn stop_turn_at_tool_receipt_limit(
+        &mut self,
+        call_id: String,
+        operation_id: String,
+    ) -> Result<(), DurableRunnerError> {
+        self.save_before_provider_writes(true)?;
+        let deadline_unix_ms =
+            receipt_limit_deadline_after(RECEIPT_LIMIT_INTERRUPT_TERMINAL_DEADLINE_MS)?;
+        let state = self
+            .state
+            .as_mut()
+            .expect("Codex state remains available at its tool receipt limit");
+        let interrupt_pending = state.begin_receipt_limit_stop(
+            call_id.clone(),
+            operation_id.clone(),
+            deadline_unix_ms,
+        )?;
+        let first_interrupt_attempt =
+            interrupt_pending && state.receipt_limit_interrupt_attempts == 0;
+        if interrupt_pending {
+            self.save_state()?;
+        }
+        // The durable diagnostic owns the turn-level failure, while every
+        // buffered JSON-RPC call still receives an explicit provider error.
+        // Deliver the rejection before requesting interruption: Codex may
+        // close the transport as part of the interrupt, and a failed courtesy
+        // RPC must never abort runnerd's terminal polling loop.
+        let rejection = ToolResult {
+            call_id,
+            operation_id,
+            result: json!({
+                "error": {
+                    "code": "semantic_tool_turn_receipt_limit",
+                    "message": "Paperclip stopped this turn at its durable semantic-tool receipt limit",
+                    "retryable": false,
+                },
+            }),
+            is_error: true,
+        };
+        if let Some(provider) = self.provider.as_mut() {
+            let _ = provider.deliver_tool_result(&rejection);
+        }
+        if first_interrupt_attempt {
+            // Keep the durable retry marker until a terminal notification is
+            // observed. Provider acceptance acknowledges only this RPC; it
+            // does not prove that the turn stopped. Later buffered calls may
+            // therefore retry the idempotent interruption instead of leaving
+            // a still-active receipt-exhausted turn permanently unstopped.
+            self.state
+                .as_mut()
+                .expect("Codex state remains available before receipt-limit interruption")
+                .record_receipt_limit_interrupt_attempt()?;
+            self.save_state()?;
+            self.save_before_provider_writes(false)?;
+            let interrupted = self.interrupt_turn("semantic_tool_turn_receipt_limit");
+            if let Some(provider) = self.provider.as_mut() {
+                provider.hold_courtesy_responses();
+            }
+            match interrupted {
+                Ok(_) => {
+                    let accepted_deadline_unix_ms =
+                        receipt_limit_deadline_after(RECEIPT_LIMIT_ACCEPTED_TERMINAL_DEADLINE_MS)?;
+                    self.state
+                        .as_mut()
+                        .expect("Codex state remains available after receipt-limit interruption")
+                        .mark_receipt_limit_interrupt_accepted(accepted_deadline_unix_ms);
+                    self.save_state()?;
+                }
+                // The first interruption attempt is also best-effort. Its
+                // durable retry marker is already saved, and propagating the
+                // transport error here would terminate runnerd before it can
+                // poll the provider's terminal notification.
+                Err(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn settle_receipt_limit_interrupt_after_deadline(&mut self) -> Result<(), DurableRunnerError> {
+        let provider_shutdown_failed = self
+            .provider
+            .as_mut()
+            .is_some_and(|provider| provider.shutdown().is_err());
+        self.settle_receipt_limit_after_shutdown(provider_shutdown_failed)
+    }
+
+    fn settle_receipt_limit_after_shutdown(
+        &mut self,
+        provider_shutdown_failed: bool,
+    ) -> Result<(), DurableRunnerError> {
+        self.provider = None;
+        let interrupt_accepted = self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.receipt_limit_interrupt_accepted);
+        let identity = self.event_identity()?;
+        let state = self
+            .state
+            .as_mut()
+            .expect("Codex state remains available at its receipt-limit retry bound");
+        state.settle_active_provider_turn_identity()?;
+        let settled = state
+            .tool_bridge
+            .settle_turn("semantic_tool_turn_receipt_limit")
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to settle semantic tools at the receipt-limit retry bound: {error}"
+                ))
+            })?;
+        for result in settled {
+            state.push_terminal_event(semantic_result_event(&identity, &result))?;
+        }
+        state.active_provider_turn_id = None;
+        state.completed_turn_authoritative = false;
+        state.receipt_limit_diagnostic_emitted = false;
+        state.receipt_limit_interrupt_pending = false;
+        state.receipt_limit_interrupt_accepted = false;
+        state.receipt_limit_interrupt_attempts = 0;
+        state.receipt_limit_interrupt_deadline_unix_ms = None;
+        // Deadline settlement retires this run permanently. Polling its terminal
+        // outbox must not reopen a provider that still reports the stopped turn.
+        state.lifecycle = "closed".to_owned();
+        let terminal_event_type = if interrupt_accepted {
+            "turn.interrupted"
+        } else {
+            "turn.failed"
+        };
+        let provider_label = state.config.provider.clone();
+        let provider_name = facade_provider_name(&provider_label);
+        let provider_terminal = NormalizedProviderEvent {
+            event_type: terminal_event_type.to_owned(),
+            priority: EventPriority::P0,
+            payload: json!({
+                "provider": provider_label,
+                "code": if interrupt_accepted {
+                    "semantic_tool_turn_receipt_limit_interrupt_deadline"
+                } else {
+                    "semantic_tool_turn_receipt_limit_interrupt_unconfirmed"
+                },
+                "message": if interrupt_accepted {
+                    format!("{provider_name} accepted the receipt-limit interruption but did not emit its terminal before the bounded shutdown deadline")
+                } else {
+                    format!("{provider_name} did not confirm terminal state after the bounded receipt-limit interruption attempts")
+                },
+                "interruptAccepted": interrupt_accepted,
+                "providerTerminalObserved": false,
+                "providerShutdownFailed": provider_shutdown_failed,
+            }),
+        };
+        let terminal = terminal_events(state, terminal_event_type, None);
+        let terminal = state.defer_pi_terminal_outcome(terminal_event_type, terminal)?;
+        state.extend_terminal_events(with_terminal_outcome(vec![provider_terminal], terminal))?;
+        self.save_state()
+    }
+
+    fn receipt_limit_interrupt_deadline(&mut self) -> Result<Option<u64>, DurableRunnerError> {
+        let Some(state) = self.state.as_ref().filter(|state| {
+            state.receipt_limit_interrupt_pending && state.active_provider_turn_id.is_some()
+        }) else {
+            return Ok(None);
+        };
+        if let Some(deadline) = state.receipt_limit_interrupt_deadline_unix_ms {
+            return Ok(Some(deadline));
+        }
+        // Preserve the existing legacy-journal window, once, without retrying a provider RPC.
+        let timeout = if state.receipt_limit_interrupt_accepted {
+            RECEIPT_LIMIT_ACCEPTED_TERMINAL_DEADLINE_MS
+        } else {
+            RECEIPT_LIMIT_INTERRUPT_TERMINAL_DEADLINE_MS
+        };
+        let deadline = receipt_limit_deadline_after(timeout)?;
+        self.state
+            .as_mut()
+            .expect("pending interruption has state")
+            .receipt_limit_interrupt_deadline_unix_ms = Some(deadline);
+        self.save_state()?;
+        Ok(Some(deadline))
+    }
+
+    fn retry_receipt_limit_interrupt(&mut self) -> Result<(), DurableRunnerError> {
+        let Some(deadline_unix_ms) = self.receipt_limit_interrupt_deadline()? else {
+            return Ok(());
+        };
+        let attempts = self
+            .state
+            .as_ref()
+            .expect("pending interruption has state")
+            .receipt_limit_interrupt_attempts;
+        let now_unix_ms = current_unix_ms()?;
+        // Attempts bound network traffic, while the durable wall-clock deadline
+        // gives an accepted asynchronous interruption time to deliver its
+        // authoritative terminal. The provider is always polled once more below
+        // before an elapsed deadline is converted into the conservative fallback.
+        if attempts >= MAX_RECEIPT_LIMIT_INTERRUPT_ATTEMPTS || now_unix_ms >= deadline_unix_ms {
+            return Ok(());
+        }
+        // Polling is the autonomous recovery path until a terminal notification
+        // clears the durable marker. RPC acceptance alone does not establish
+        // that Codex stopped the turn, so accepted-but-unsettled interruptions
+        // remain idempotently retryable across polls and process restarts.
+        self.state
+            .as_mut()
+            .expect("Codex state remains available before receipt-limit retry")
+            .record_receipt_limit_interrupt_attempt()?;
+        self.save_state()?;
+        if self
+            .interrupt_turn("semantic_tool_turn_receipt_limit_retry")
+            .is_ok()
+            && self.state.as_ref().is_some_and(|state| {
+                state.receipt_limit_interrupt_pending && state.active_provider_turn_id.is_some()
+            })
+        {
+            let accepted_deadline_unix_ms =
+                receipt_limit_deadline_after(RECEIPT_LIMIT_ACCEPTED_TERMINAL_DEADLINE_MS)?;
+            self.state
+                .as_mut()
+                .expect("Codex state remains available after receipt-limit retry")
+                .mark_receipt_limit_interrupt_accepted(accepted_deadline_unix_ms);
+            self.save_state()?;
+        }
+        Ok(())
+    }
+
+    fn settle_receipt_limit_interrupt_if_deadline_elapsed(
+        &mut self,
+    ) -> Result<(), DurableRunnerError> {
+        let deadline = self.state.as_ref().and_then(|state| {
+            (state.receipt_limit_interrupt_pending && state.active_provider_turn_id.is_some())
+                .then_some(state.receipt_limit_interrupt_deadline_unix_ms)
+                .flatten()
+        });
+        let Some(deadline) = deadline else {
+            return Ok(());
+        };
+        if current_unix_ms()? >= deadline {
+            if self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.config.provider == "codex")
+            {
+                if let Some(provider) = self.provider.as_mut() {
+                    // A bounded poll may leave a real terminal behind its raw
+                    // prefix. Fence now, but drain it across poll/ACK batches
+                    // before a missing-terminal fallback can replace evidence.
+                    let drained = provider
+                        .fence_local_receipt_limit()
+                        .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+                    if drained.output_empty {
+                        self.settle_receipt_limit_after_shutdown(false)?;
+                    }
+                    return Ok(());
+                }
+            }
+            self.settle_receipt_limit_interrupt_after_deadline()?;
+        }
+        Ok(())
+    }
+
+    fn handle_tool_call(
+        &mut self,
+        call_id: String,
+        operation_id: String,
+        input: Value,
+    ) -> Result<(), DurableRunnerError> {
+        let pi_held_replay = self.state.as_ref().is_some_and(|state| {
+            state.config.provider == "pi_rpc" && state.tool_bridge.has_completed_call(&call_id)
+        });
+        // A held Pi call has already passed input validation and executed. A
+        // retry's changed evidence cannot replace that input or dispatch work.
+        if !pi_held_replay {
+            if let Err(error) = validate_semantic_tool_input(&operation_id, &input) {
+                return self.reject_tool_call(
+                    call_id,
+                    operation_id,
+                    ProviderBridgeError::invalid(error.to_string()),
+                );
+            }
+        }
+        let identity = self.event_identity()?;
+        let admission = self
+            .state
+            .as_mut()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider is not prepared"))?
+            .admit_tool_call(&call_id, &operation_id, &input);
+        match admission {
+            Ok(ToolCallAdmission::CompletedReplay(result)) => {
+                self.save_before_provider_writes(true)?;
+                self.provider
+                    .as_mut()
+                    .expect("provider remains present while handling its tool call")
+                    .deliver_tool_result(&result)
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "failed to replay a durable semantic tool result: {error}"
+                        ))
+                    })?;
+                return Ok(());
+            }
+            Ok(ToolCallAdmission::PendingReplay) => return Ok(()),
+            Err(error) => {
+                if error.is_active_turn_receipt_limit() {
+                    return self.stop_turn_at_tool_receipt_limit(call_id, operation_id);
+                }
+                return self.reject_tool_call(call_id, operation_id, error);
+            }
+            Ok(ToolCallAdmission::Pending(call)) => {
+                self.state
+                    .as_mut()
+                    .expect("Codex state remains available while accepting a tool call")
+                    .push_event(semantic_input_event(&identity, &call)?)?;
+                self.save_state()
+            }
+        }
+    }
+
+    fn deliver_semantic_result(
+        &mut self,
+        payload: &Value,
+    ) -> Result<CommandExecution, DurableRunnerError> {
+        let result: ToolResult = serde_json::from_value(payload.clone()).map_err(|error| {
+            DurableRunnerError::invalid(format!("semantic tool result is invalid: {error}"))
+        })?;
+        let identity = self.event_identity()?;
+        let was_completed = self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.tool_bridge.has_completed_call(&result.call_id));
+        let mut next_state = self
+            .state
+            .clone()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider is not prepared"))?;
+        let delivery_detached = next_state.tool_bridge.turn_closed();
+        let terminal_tool_input = next_state
+            .tool_bridge
+            .pending_calls()
+            .find(|call| call.call_id == result.call_id)
+            .map(|call| (call.operation_id.clone(), call.input.clone()));
+        // A recorded result that this bridge rejects must still settle its
+        // pending call. Otherwise the provider waits until its own client
+        // times out, and the call blocks every later turn and run.
+        let mut undeliverable = None;
+        let result = match next_state.tool_bridge.apply_result(result.clone()) {
+            Ok(_) => result,
+            Err(error) => {
+                let rejected = DurableRunnerError::invalid(format!(
+                    "semantic tool result was rejected for call {} operation {}: {error}",
+                    result.call_id, result.operation_id
+                ));
+                if was_completed {
+                    // An exact replay of a delivery whose result was already
+                    // rejected and settled (for example after a crash before
+                    // the command finished) is a duplicate, not a conflict.
+                    if next_state
+                        .tool_bridge
+                        .is_settled_undeliverable_replay(&result)
+                    {
+                        return Ok(CommandExecution {
+                            result: json!({ "status": "duplicate", "callId": result.call_id }),
+                            events: vec![(
+                                "harness.diagnostic".to_owned(),
+                                EventPriority::P0,
+                                json!({
+                                    "code": "semantic_tool_result_duplicate", "severity": "warning",
+                                    "callId": result.call_id, "operationId": result.operation_id,
+                                    "resultDigest": semantic_value_digest(&result.result),
+                                }),
+                            )],
+                        });
+                    }
+                    return Err(rejected);
+                }
+                match next_state.tool_bridge.settle_undeliverable_result(&result) {
+                    Ok(Some(settlement)) => {
+                        undeliverable = Some(json!({
+                            "code": UNDELIVERABLE_RESULT_CODE, "severity": "warning",
+                            "callId": result.call_id, "operationId": settlement.operation_id,
+                            "reason": error.to_string(),
+                            "resultDigest": semantic_value_digest(&result.result),
+                        }));
+                        settlement
+                    }
+                    _ => return Err(rejected),
+                }
+            }
+        };
+        if was_completed {
+            return Ok(CommandExecution {
+                result: json!({ "status": "duplicate", "callId": result.call_id }),
+                events: vec![(
+                    "harness.diagnostic".to_owned(),
+                    EventPriority::P0,
+                    json!({
+                        "code": "semantic_tool_result_duplicate", "severity": "warning",
+                        "callId": result.call_id, "operationId": result.operation_id,
+                        "resultDigest": semantic_value_digest(&result.result),
+                    }),
+                )],
+            });
+        }
+        let terminal_tool_authoritative =
+            terminal_tool_input
+                .as_ref()
+                .is_some_and(|(operation_id, _)| {
+                    !result.is_error
+                        && matches!(
+                            operation_id.as_str(),
+                            "paperclip_finish" | "paperclip_block"
+                        )
+                });
+        if let Some((operation_id, input)) = terminal_tool_input {
+            admit_terminal_tool_authority(&mut next_state, &operation_id, &input, result.is_error)?;
+        }
+        next_state.push_event(semantic_result_event(&identity, &result))?;
+        next_state.settle_deferred_pi_terminal()?;
+        self.persist_state(&next_state)?;
+        self.state = Some(next_state);
+        let diagnostics = undeliverable
+            .map(|diagnostic| {
+                (
+                    "harness.diagnostic".to_owned(),
+                    EventPriority::P0,
+                    diagnostic,
+                )
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        if delivery_detached {
+            return Ok(CommandExecution {
+                result: json!({
+                    "status": "settled_after_turn",
+                    "callId": result.call_id,
+                }),
+                events: diagnostics,
+            });
+        }
+        let provider = self.ensure_provider()?;
+        if terminal_tool_authoritative {
+            provider
+                .mark_active_turn_result_authoritative()
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "failed to bind semantic result to the active Codex turn: {error}"
+                    ))
+                })?;
+        }
+        provider.deliver_tool_result(&result).map_err(|error| {
+            DurableRunnerError::invalid(format!(
+                "failed to return semantic tool result to Codex: {error}"
+            ))
+        })?;
+        Ok(CommandExecution {
+            result: json!({
+                "status": "delivered",
+                "callId": result.call_id,
+            }),
+            events: diagnostics,
+        })
+    }
+
+    fn stop_owned_provider(&mut self) -> Result<(), DurableRunnerError> {
+        let cloud_proxy = self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.config.provider == "cursor_cloud");
+        if self.provider.is_none() {
+            if cloud_proxy
+                && self.state.as_ref().is_some_and(|state| {
+                    state.active_provider_turn_id.is_some()
+                        || state.ambiguous_turn_start_pending
+                        || state.lifecycle == "reconciliation_required"
+                })
+            {
+                return Err(DurableRunnerError::invalid(
+                    "Cursor Cloud remote termination is unconfirmed",
+                ));
+            }
+            return Ok(());
+        }
+        let mut provider = self.provider.take().expect("provider is present");
+        let stopped = if cloud_proxy {
+            provider.shutdown_with_cursor_cloud_delivery(|delivery| {
+                let mut next = self.state.clone().expect("provider state is present");
+                let generation = next.provider_process_generation;
+                next.retain_cursor_cloud_terminal_delivery(
+                    delivery,
+                    self.event_identity.as_ref(),
+                    generation,
+                )
+                .map_err(|error| {
+                    crate::local_runner::LocalRunnerError::invalid(error.to_string())
+                })?;
+                self.persist_state(&next).map_err(|error| {
+                    crate::local_runner::LocalRunnerError::invalid(error.to_string())
+                })?;
+                self.state = Some(next);
+                Ok(true)
+            })
+        } else {
+            provider.shutdown()
+        };
+        let receipt = provider.provider_termination_receipt().cloned();
+        if !cloud_proxy && stopped.is_err() {
+            self.provider = Some(provider);
+        }
+        stopped.map_err(|error| {
+            DurableRunnerError::invalid(format!("failed to stop provider: {error}"))
+        })?;
+        if cloud_proxy {
+            let receipt = receipt.ok_or_else(|| {
+                DurableRunnerError::invalid("Cursor Cloud remote termination receipt is missing")
+            })?;
+            let mut next = self.state.clone().expect("provider state is present");
+            next.provider_termination_receipt = Some(receipt);
+            if next.lifecycle == "session_open"
+                && next.active_provider_turn_id.is_none()
+                && !next.ambiguous_turn_start_pending
+            {
+                next.lifecycle = "prepared".to_owned();
+            }
+            self.persist_state(&next)?;
+            self.state = Some(next);
+        }
+        Ok(())
+    }
+
+    fn close_session(&mut self) -> Result<CommandExecution, DurableRunnerError> {
+        self.stop_owned_provider()?;
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider is not prepared"))?;
+        state.active_provider_turn_id = None;
+        state.ambiguous_turn_start_pending = false;
+        state.receipt_limit_diagnostic_emitted = false;
+        state.receipt_limit_interrupt_pending = false;
+        state.receipt_limit_interrupt_accepted = false;
+        state.receipt_limit_interrupt_attempts = 0;
+        state.receipt_limit_interrupt_deadline_unix_ms = None;
+        state.active_provider_result_fingerprint = None;
+        state.active_provider_result_disposition = None;
+        state.active_terminal_tool_rejected = false;
+        state.lifecycle = "closed".to_owned();
+        let thread_id = state.thread_id.clone();
+        let provider_name = state.config.provider.clone();
+        let provider_termination_receipt = state.provider_termination_receipt.clone();
+        self.save_state()?;
+        let mut result = json!({"status": "closed", "providerSessionId": thread_id});
+        if let Some(receipt) = provider_termination_receipt {
+            result["providerTerminationReceipt"] = receipt;
+        }
+        Ok(CommandExecution {
+            result,
+            events: vec![(
+                "session.closed".to_owned(),
+                EventPriority::P0,
+                json!({"provider": provider_name, "providerSessionId": thread_id}),
+            )],
+        })
+    }
+
+    fn snapshot(&mut self, payload: &Value) -> Result<CommandExecution, DurableRunnerError> {
+        self.restore_provider_if_needed()?;
+        let quiesce_for_warm_attach = payload
+            .get("quiesceForWarmAttach")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if quiesce_for_warm_attach {
+            self.retain_completed_accounting_tail()?;
+        }
+        let mut warm_attach_blockers = self
+            .provider
+            .as_mut()
+            .map(|provider| provider.warm_run_attachment_blockers())
+            .transpose()
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to inspect Codex warm attachment readiness: {error}"
+                ))
+            })?
+            .unwrap_or_else(|| vec!["provider_unavailable"]);
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider is not prepared"))?;
+        if state.active_provider_turn_id.is_some() {
+            warm_attach_blockers.push("durable_active_turn");
+        }
+        if state.ambiguous_turn_start_pending {
+            warm_attach_blockers.push("durable_ambiguous_turn_start");
+        }
+        if !state.pending_events.is_empty() {
+            warm_attach_blockers.push("durable_pending_events");
+        }
+        if !state.queued_events.is_empty() {
+            warm_attach_blockers.push("durable_queued_events");
+        }
+        if state.lifecycle == "reconciliation_required" {
+            warm_attach_blockers.push("reconciliation_required");
+        }
+        let warm_attach_ready = warm_attach_blockers.is_empty();
+        Ok(CommandExecution::result(json!({
+            "status": state.lifecycle,
+            "provider": state.config.provider,
+            "driver": state.config.driver,
+            "driverSessionId": state.thread_id,
+            "providerSessionId": state.thread_id,
+            "sessionId": state.provider_session_id,
+            "providerAccountSessionId": state.provider_session_id,
+            "activeProviderTurnId": state.active_provider_turn_id,
+            "sessionGoals": state.goal_capability,
+            "goal": state.goal,
+            "goalRevision": state.goal_revision,
+            "warmAttachReady": warm_attach_ready,
+            "warmAttachBlockers": warm_attach_blockers,
+            "cwd": state.config.cwd,
+        })))
+    }
+
+    fn maintain_deferred_pi_terminal(&mut self) -> Result<Option<u64>, DurableRunnerError> {
+        let Some(state) = self.state.as_ref().filter(|state| {
+            state.config.provider == "pi_rpc" && state.pi_deferred_terminal.is_some()
+        }) else {
+            return Ok(None);
+        };
+        let now = current_unix_ms()?;
+        let legacy = state.pi_deferred_terminal_deadline_unix_ms.is_none();
+        let deadline = match state.pi_deferred_terminal_deadline_unix_ms {
+            Some(deadline) => deadline,
+            None => now
+                .checked_add(PI_DEFERRED_TERMINAL_DEADLINE_MS)
+                .ok_or_else(|| {
+                    DurableRunnerError::invalid("Pi deferred terminal deadline overflowed")
+                })?,
+        };
+        if now < deadline && !legacy {
+            return Ok(Some(deadline));
+        }
+        let mut next = state.clone();
+        next.pi_deferred_terminal_deadline_unix_ms = Some(deadline);
+        if now < deadline {
+            if legacy {
+                self.persist_state(&next)?;
+                self.state = Some(next);
+            }
+            return Ok(Some(deadline));
+        }
+        let abandoned = next
+            .tool_bridge
+            .abandon_closed_turn_pending_calls()
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to release expired Pi tool waiters: {error}"
+                ))
+            })?;
+        next.pi_deferred_terminal = None;
+        next.pi_deferred_terminal_deadline_unix_ms = None;
+        // Never synthesize semantic_tool.result or a completion claim: a timed
+        // out dispatcher may still commit its effect. The run requires review.
+        for call in abandoned {
+            next.push_terminal_event(NormalizedProviderEvent {
+                event_type: "harness.diagnostic".to_owned(),
+                priority: EventPriority::P0,
+                payload: json!({
+                    "provider": "pi_rpc", "code": "pi_deferred_terminal_timeout",
+                    "callId": call.call_id, "operationId": call.operation_id,
+                    "operationOutcome": "unknown", "retryable": false,
+                    "message": "Stopped waiting for a controller result after the Pi turn ended; the operation may have executed",
+                }),
+            })?;
+        }
+        next.push_terminal_event(NormalizedProviderEvent {
+            event_type: "session.failed".to_owned(),
+            priority: EventPriority::P0,
+            payload: json!({
+                "provider": "pi_rpc", "code": "pi_deferred_terminal_timeout",
+                "message": "Pi terminal settlement exceeded its bounded controller-result deadline",
+                "recoverable": true,
+            }),
+        })?;
+        next.push_terminal_event(NormalizedProviderEvent {
+            event_type: "run.terminal".to_owned(),
+            priority: EventPriority::P0,
+            payload: json!({
+                "schema": "paperclip.prp.terminal.v1", "provider": "pi_rpc",
+                "code": "pi_deferred_terminal_timeout",
+                "turnTerminalState": "failed", "runTerminalState": "failed",
+                "reportedWorkDisposition": "needs_review",
+            }),
+        })?;
+        self.persist_state(&next)?;
+        self.state = Some(next);
+        Ok(None)
+    }
+
+    fn poll_provider(&mut self) -> Result<(), DurableRunnerError> {
+        self.restore()?;
+        // `restore_checked` records that the durable file was loaded even when
+        // provider recovery failed. Retry the provider reconciliation here so
+        // an ambiguous-start failure cannot degrade into an empty successful
+        // poll on the same executor.
+        self.restore_provider_if_needed()?;
+        self.poll_current_provider()
+    }
+
+    fn poll_current_provider(&mut self) -> Result<(), DurableRunnerError> {
+        self.poll_current_provider_with_control(true)
+    }
+
+    fn poll_current_provider_with_control(
+        &mut self,
+        allow_control: bool,
+    ) -> Result<(), DurableRunnerError> {
+        self.maintain_deferred_pi_terminal()?;
+        // Receipt-limit interruption is autonomous recovery. It must advance
+        // even while older durable events await acknowledgement, otherwise a
+        // slow or disconnected controller can keep an exhausted provider turn
+        // alive forever. Terminal settlement uses the reserved event capacity.
+        self.retry_receipt_limit_interrupt()?;
+        let receipt_limit_terminal_poll = self.state.as_ref().is_some_and(|state| {
+            state.receipt_limit_interrupt_pending && state.active_provider_turn_id.is_some()
+        });
+        let local_deadline = self
+            .state
+            .as_ref()
+            .filter(|state| receipt_limit_terminal_poll && state.config.provider == "codex")
+            .and_then(|state| state.receipt_limit_interrupt_deadline_unix_ms);
+        if let Some(deadline) = local_deadline {
+            if current_unix_ms()? >= deadline {
+                if let Some(provider) = self.provider.as_mut() {
+                    // Verify EOF into bounded raw storage before slow per-event
+                    // persistence can exhaust the ordinary process-exit grace.
+                    let fenced = provider
+                        .fence_local_receipt_limit()
+                        .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+                    if !fenced.stdout_drained {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if !receipt_limit_terminal_poll
+            && self
+                .state
+                .as_ref()
+                .is_some_and(|state| !state.pending_events.is_empty())
+        {
+            return Ok(());
+        }
+        if self.provider.is_none() {
+            return self.settle_receipt_limit_interrupt_if_deadline_elapsed();
+        }
+        if let Some(provider) = self.provider.as_mut() {
+            provider.hold_courtesy_responses();
+        }
+        let polled = self.poll_provider_frames(allow_control, receipt_limit_terminal_poll);
+        let saved = self.save_before_provider_writes(false);
+        polled?;
+        saved?;
+        // Check the durable deadline only after a complete provider poll. A
+        // terminal that arrived after interruption acceptance but before this
+        // observation remains authoritative even when several fast controller
+        // polls have already exhausted the interruption-attempt budget.
+        self.settle_receipt_limit_interrupt_if_deadline_elapsed()
+    }
+
+    fn poll_provider_frames(
+        &mut self,
+        allow_control: bool,
+        receipt_limit_terminal_poll: bool,
+    ) -> Result<(), DurableRunnerError> {
+        for _ in 0..MAX_EVENTS_PER_POLL {
+            let provider = self
+                .provider
+                .as_mut()
+                .expect("provider remains present while polling");
+            let event = (if allow_control {
+                provider.poll()
+            } else {
+                provider.poll_disconnected()
+            })
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!("Codex provider failed: {error}"))
+            })?;
+            let Some(event) = event else { break };
+            let trace_frame_id = self
+                .provider
+                .as_mut()
+                .and_then(CodexProvider::take_provider_trace_frame_id);
+            match event {
+                CodexProviderEvent::ToolCall {
+                    call_id,
+                    operation_id,
+                    input,
+                } => {
+                    self.handle_tool_call(call_id, operation_id, input)?;
+                }
+                CodexProviderEvent::ProtocolFailure { diagnostic }
+                | CodexProviderEvent::ResourceLimit { diagnostic } => {
+                    let resource_capacity = diagnostic["classification"] == "resource_capacity";
+                    let state = self
+                        .state
+                        .as_mut()
+                        .expect("Codex state available while polling");
+                    // Neither an integrity failure nor a full lineage ledger can
+                    // safely reopen this provider session, even after event ACK.
+                    state.lifecycle = "reconciliation_required".to_owned();
+                    state.completed_turn_authoritative = false;
+                    state.completed_turn_process_generation = None;
+                    state.completed_provider_turn_id = None;
+                    if state.active_provider_turn_id.is_some() {
+                        state.settle_active_provider_turn_identity()?;
+                    }
+                    state.active_provider_turn_id = None;
+                    state.push_terminal_event(NormalizedProviderEvent {
+                        event_type: "harness.diagnostic".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: diagnostic.clone(),
+                    })?;
+                    let provider_terminal = NormalizedProviderEvent {
+                        event_type: "turn.failed".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({ "provider": state.config.provider, "status": "failed",
+                            "code": diagnostic["code"], "recoverable": false,
+                            "message": diagnostic["message"], "error": diagnostic }),
+                    };
+                    let outcome = terminal_events(state, "turn.failed", None);
+                    let outcome = state.defer_pi_terminal_outcome("turn.failed", outcome)?;
+                    state.extend_terminal_events(with_terminal_outcome(
+                        vec![provider_terminal],
+                        outcome,
+                    ))?;
+                    // Commit the authoritative failure before best-effort provider cleanup.
+                    self.save_state()?;
+                    self.record_saved_trace_interpretations();
+                    if let Some(mut provider) = self.provider.take() {
+                        if let Some(frame_id) = trace_frame_id {
+                            provider.record_provider_trace_interpretation(
+                                frame_id,
+                                if resource_capacity { "codex.resource_capacity" } else { "codex.identity.invalid_authoritative" },
+                                "rejected",
+                                Vec::new(),
+                                if resource_capacity { "Provider resource capacity requires explicit reconciliation" } else { "Rejected provider authority outside the root execution identity" },
+                            );
+                        }
+                        let _ = provider.shutdown();
+                    }
+                    break;
+                }
+                CodexProviderEvent::DescendantNotification { method, params } => {
+                    // Do not normalize a child's turn/completed as a root terminal.
+                    // Retain bounded lineage evidence without credential-bearing payloads.
+                    let child = params
+                        .get("threadId")
+                        .or_else(|| params.pointer("/thread/id"))
+                        .and_then(Value::as_str)
+                        .map(|id| id.chars().take(256).collect::<String>());
+                    let root_thread = self
+                        .provider
+                        .as_ref()
+                        .map(|provider| provider.thread_id().to_owned());
+                    let root_turn = self
+                        .provider
+                        .as_ref()
+                        .and_then(CodexProvider::active_provider_turn_id)
+                        .map(str::to_owned);
+                    let child_turn = params
+                        .get("turnId")
+                        .or_else(|| params.pointer("/turn/id"))
+                        .and_then(Value::as_str)
+                        .map(|id| id.chars().take(256).collect::<String>());
+                    let state = self
+                        .state
+                        .as_mut()
+                        .expect("Codex state remains available while polling");
+                    if let Some(id) = child.as_ref() {
+                        state.descendant_thread_ids.insert(id.clone());
+                    }
+                    state.extend_events(vec![NormalizedProviderEvent {
+                        event_type: "harness.diagnostic".to_owned(),
+                        priority: EventPriority::P1,
+                        payload: json!({ "code": "provider_notification_identity", "classification": "descendant",
+                            "method": method.chars().take(128).collect::<String>(), "receivedThreadId": child, "expectedThreadId": root_thread,
+                            "receivedTurnId": child_turn, "expectedTurnId": root_turn }),
+                    }])?;
+                    self.unsaved_frame_state.set(true);
+                    if let (Some(frame_id), Some(provider)) =
+                        (trace_frame_id, self.provider.as_mut())
+                    {
+                        provider.record_provider_trace_interpretation(frame_id,
+                            "codex.identity.descendant", "mapped", Vec::new(),
+                            "Provider-confirmed descendant progress has no root terminal or tool authority");
+                    }
+                }
+                CodexProviderEvent::Notification { method, params } => {
+                    let active_provider_turn_id = if method == "turn/started" {
+                        self.provider
+                            .as_ref()
+                            .and_then(CodexProvider::active_provider_turn_id)
+                            .map(str::to_owned)
+                    } else {
+                        None
+                    };
+                    let normalized_terminal_type =
+                        normalized_codex_terminal_event_type(&method, &params);
+                    if normalized_terminal_type.is_some() {
+                        self.save_before_provider_writes(true)?;
+                    }
+                    let cursor_cloud_delivery = if self
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.config.provider == "cursor_cloud")
+                        && normalized_terminal_type.is_some()
+                    {
+                        params.get("cursorCloudTerminalDelivery").map(|value| {
+                            let state = self.state.as_ref().expect("provider state remains loaded");
+                            let delivery = crate::cursor_cloud_proxy::TerminalDelivery::parse(value, state.thread_id.as_deref().unwrap_or_default())
+                                .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+                            if state.active_provider_turn_id.as_deref() != Some(delivery.turn_id.as_str())
+                                || delivery.method() != method
+                                || state.last_agent_message.as_ref() != delivery.result.as_ref() {
+                                return Err(DurableRunnerError::invalid("Cursor Cloud terminal notification changed its retained delivery"));
+                            }
+                            Ok(delivery)
+                        }).transpose()?
+                    } else {
+                        None
+                    };
+                    let result_authoritative = normalized_terminal_type.is_some()
+                        && self.state.as_ref().is_some_and(|state| {
+                            state.active_provider_result_fingerprint.is_some()
+                        });
+                    let completed_turn_authority = if normalized_terminal_type
+                        == Some("turn.completed")
+                        || result_authoritative
+                    {
+                        self.provider
+                            .as_ref()
+                            .and_then(CodexProvider::completed_turn_authority)
+                            .map(|(generation, turn_id)| (generation, turn_id.to_owned()))
+                    } else {
+                        None
+                    };
+                    let terminal_event_type = normalized_terminal_type.map(str::to_owned);
+                    let goal_reconciliation = if terminal_event_type.is_some()
+                        && self
+                            .state
+                            .as_ref()
+                            .and_then(|state| state.goal_capability.as_ref())
+                            .is_some_and(|capability| capability.availability == "available")
+                    {
+                        Some(
+                            self.provider
+                                .as_mut()
+                                .expect("provider remains present during goal reconciliation")
+                                .get_goal()
+                                .map_err(|error| error.to_string()),
+                        )
+                    } else {
+                        None
+                    };
+                    let goal_remains_active = match &goal_reconciliation {
+                        Some(Ok(snapshot)) => normalize_codex_goal(snapshot, false)
+                            .is_some_and(|goal| goal.status == "active"),
+                        _ => self
+                            .state
+                            .as_ref()
+                            .and_then(|state| state.goal.as_ref())
+                            .is_some_and(|goal| goal.status == "active"),
+                    };
+                    let run_continues = self
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| goal_continues_after_turn(state, goal_remains_active));
+                    let tail_drain_failed = terminal_event_type.as_deref()
+                        == Some("turn.completed")
+                        && !run_continues
+                        && !self.retain_completed_accounting_tail_for_poll()?;
+                    let working_now = self
+                        .provider
+                        .as_ref()
+                        .is_some_and(|provider| provider.active_provider_turn_id().is_some());
+                    let identity = self.event_identity.clone();
+                    let state = self
+                        .state
+                        .as_mut()
+                        .expect("Codex state remains available while polling");
+                    if method == "item/completed" {
+                        let item = params.get("item").unwrap_or(&params);
+                        if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
+                            state.last_agent_message = item
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .filter(|text| !text.is_empty())
+                                .map(|text| text.chars().take(1_000_000).collect());
+                        }
+                    }
+                    if method == "turn/started" {
+                        let provider_turn_id = active_provider_turn_id.ok_or_else(|| {
+                            DurableRunnerError::invalid(
+                                "Codex turn start notification omitted active turn authority",
+                            )
+                        })?;
+                        state.reconcile_active_provider_turn(Some(provider_turn_id));
+                        if let Some(goal) = state.goal.as_mut() {
+                            goal.working_now = true;
+                            state.goal_revision = state.goal_revision.saturating_add(1);
+                            state.push_event(NormalizedProviderEvent {
+                                event_type: "session.goal.updated".to_owned(),
+                                priority: EventPriority::P0,
+                                payload: goal_event_payload(
+                                    state.goal.as_ref(),
+                                    state.goal_capability.as_ref(),
+                                    state.goal_revision,
+                                ),
+                            })?;
+                        }
+                    }
+                    let normalized = normalize_provider_notification(state, &method, &params)?;
+                    let normalized_event_count = normalized.len();
+                    let mut terminal_goal_events = Vec::new();
+                    if terminal_event_type.is_some() {
+                        state.settle_active_provider_turn_identity()?;
+                        let settled = state
+                            .tool_bridge
+                            .settle_turn("provider_turn_terminated")
+                            .map_err(|error| {
+                                DurableRunnerError::invalid(format!(
+                                    "failed to settle semantic tools at turn termination: {error}"
+                                ))
+                            })?;
+                        if !settled.is_empty() {
+                            let identity = identity.as_ref().ok_or_else(|| {
+                                DurableRunnerError::invalid(
+                                    "Codex semantic tool events require the durable runner identity",
+                                )
+                            })?;
+                            for result in settled {
+                                state.push_terminal_event(semantic_result_event(
+                                    identity, &result,
+                                ))?;
+                            }
+                        }
+                        state.active_provider_turn_id = None;
+                        if terminal_event_type.as_deref() == Some("turn.completed")
+                            || result_authoritative
+                        {
+                            let (process_generation, provider_turn_id) = completed_turn_authority
+                                .ok_or_else(|| {
+                                DurableRunnerError::invalid(
+                                    "Codex completion omitted process and turn authority",
+                                )
+                            })?;
+                            state.completed_turn_authoritative = true;
+                            state.completed_turn_process_generation = Some(process_generation);
+                            state.completed_provider_turn_id = Some(provider_turn_id);
+                        } else {
+                            state.completed_turn_authoritative = false;
+                            state.completed_turn_process_generation = None;
+                            state.completed_provider_turn_id = None;
+                        }
+                        state.receipt_limit_diagnostic_emitted = false;
+                        state.receipt_limit_interrupt_pending = false;
+                        state.receipt_limit_interrupt_accepted = false;
+                        state.receipt_limit_interrupt_attempts = 0;
+                        state.receipt_limit_interrupt_deadline_unix_ms = None;
+                        state.ambiguous_turn_start_pending = false;
+                        if state.lifecycle != "reconciliation_required" {
+                            state.lifecycle = "session_open".to_owned();
+                        }
+                        if let Some(goal) = state.goal.as_mut() {
+                            goal.working_now = false;
+                            state.goal_revision = state.goal_revision.saturating_add(1);
+                            terminal_goal_events.push(NormalizedProviderEvent {
+                                event_type: "session.goal.updated".to_owned(),
+                                priority: EventPriority::P0,
+                                payload: goal_event_payload(
+                                    state.goal.as_ref(),
+                                    state.goal_capability.as_ref(),
+                                    state.goal_revision,
+                                ),
+                            });
+                        }
+                    }
+                    retain_goal_notification(state, &method, &params, working_now)?;
+                    if let Some(reconciliation) = goal_reconciliation {
+                        match reconciliation {
+                            Ok(snapshot) => {
+                                let next_goal = normalize_codex_goal(&snapshot, false);
+                                if next_goal != state.goal {
+                                    state.goal = next_goal;
+                                    state.goal_revision = state.goal_revision.saturating_add(1);
+                                    terminal_goal_events.push(NormalizedProviderEvent {
+                                        event_type: "session.goal.snapshot".to_owned(),
+                                        priority: EventPriority::P0,
+                                        payload: goal_event_payload(
+                                            state.goal.as_ref(),
+                                            state.goal_capability.as_ref(),
+                                            state.goal_revision,
+                                        ),
+                                    });
+                                }
+                            }
+                            Err(_) => {
+                                terminal_goal_events.push(NormalizedProviderEvent {
+                                    event_type: "provider.notice.recorded".to_owned(),
+                                    priority: EventPriority::P0,
+                                    payload: json!({
+                                        "schema": "paperclip.provider.notice.v1",
+                                        "noticeId": "codex-goal-reconcile-failed",
+                                        "severity": "warning",
+                                        "category": "goal_reconciliation",
+                                        "scope": "session",
+                                        "recoverable": true,
+                                        "userActionable": false,
+                                        "summary": "Codex goal state could not be reconciled after the turn; Paperclip retained the last durable snapshot.",
+                                    }),
+                                });
+                            }
+                        }
+                    }
+                    let trace_first_event_sequence = state.next_provider_event_seq;
+                    if let Some(ref event_type) = terminal_event_type {
+                        let goal_status = state.goal.as_ref().map(|goal| goal.status.as_str());
+                        let outcome = terminal_events(state, event_type, goal_status);
+                        let outcome = state.defer_pi_terminal_outcome(event_type, outcome)?;
+                        terminal_goal_events.extend(normalized);
+                        state.extend_terminal_events(with_terminal_outcome(
+                            terminal_goal_events,
+                            outcome,
+                        ))?;
+                    } else if receipt_limit_terminal_poll {
+                        for event in normalized {
+                            state.push_receipt_limit_cleanup_event(event)?;
+                        }
+                    } else {
+                        state.extend_events(normalized)?;
+                    }
+                    if let Some(delivery) = &cursor_cloud_delivery {
+                        state.cursor_cloud_terminal_receipt = Some(delivery.receipt());
+                    }
+                    let trace_last_event_sequence = state.next_provider_event_seq;
+                    let trace_emitted_event_ids = identity
+                        .as_ref()
+                        .map(|identity| {
+                            (trace_first_event_sequence..trace_last_event_sequence)
+                                .map(provider_event_id)
+                                .map(|event_id| identity.source_event_id(&event_id))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let reconciliation_required = state.lifecycle == "reconciliation_required";
+                    if terminal_event_type.is_some()
+                        || cursor_cloud_delivery.is_some()
+                        || reconciliation_required
+                    {
+                        self.save_state()?;
+                    } else {
+                        self.unsaved_frame_state.set(true);
+                    }
+                    if tail_drain_failed {
+                        // The terminal and warning are durable before cleanup.
+                        // Do not poll a broken reader again on the next loop.
+                        if let Some(mut provider) = self.provider.take() {
+                            let _ = provider.shutdown();
+                        }
+                    }
+                    if reconciliation_required {
+                        break;
+                    }
+                    if let (Some(delivery), Some(provider)) =
+                        (cursor_cloud_delivery.as_ref(), self.provider.as_mut())
+                    {
+                        let _ = provider.acknowledge_cursor_cloud_terminal(delivery);
+                    }
+                    if let Some(frame_id) = trace_frame_id {
+                        self.unsaved_trace_interpretations.push(NormalizationTrace {
+                            frame_id,
+                            rule_id: format!("codex.normalize.{}", method.replace('/', ".")),
+                            mapped: normalized_event_count > 0,
+                            emitted_event_ids: trace_emitted_event_ids,
+                        });
+                    }
+                    if !self.unsaved_frame_state.get() {
+                        self.record_saved_trace_interpretations();
+                    }
+                }
+                CodexProviderEvent::McpPermissionRequest { request_id, params } => {
+                    let identity = self.event_identity()?;
+                    let state = self
+                        .state
+                        .as_mut()
+                        .expect("Codex state remains available while polling");
+                    let event = mcp_permission_event(&identity, request_id, params);
+                    if receipt_limit_terminal_poll {
+                        state.push_receipt_limit_cleanup_event(event)?;
+                    } else {
+                        state.push_event(event)?;
+                    }
+                    self.save_state()?;
+                }
+                CodexProviderEvent::RuntimeRequest {
+                    request_id,
+                    question_set,
+                } => {
+                    let prompt = question_set
+                        .get("title")
+                        .or_else(|| question_set.pointer("/questions/0/prompt"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("Codex needs your input");
+                    let state = self
+                        .state
+                        .as_mut()
+                        .expect("Codex state remains available while polling");
+                    let event = NormalizedProviderEvent {
+                        event_type: "runtime_request.created".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({
+                            "request": {
+                                "schema": "paperclip.runtime_request.v2",
+                                "requestKind": "runtime",
+                                "requestId": request_id,
+                                "type": "input",
+                                "status": "pending",
+                                "prompt": prompt,
+                                "input": question_set,
+                                "origin": {
+                                    "adapter": match state.config.provider.as_str() { "opencode" => "opencode-server", "pi_rpc" => "pi-rpc", "cursor_cloud" => "cursor-cloud-api", _ => "codex-app-server" },
+                                    "provider": state.config.provider,
+                                    "method": "item/tool/requestUserInput",
+                                },
+                            },
+                        }),
+                    };
+                    if receipt_limit_terminal_poll {
+                        state.push_receipt_limit_cleanup_event(event)?;
+                    } else {
+                        state.push_event(event)?;
+                    }
+                    self.save_state()?;
+                }
+                CodexProviderEvent::Exited {
+                    exit_code,
+                    success,
+                    completed_turn_authoritative,
+                    completed_turn_observed_by_process,
+                    completion_reconciles_exit,
+                    process_generation,
+                    completed_turn_process_generation,
+                } => {
+                    self.save_unsaved_frame_state()?;
+                    self.record_saved_trace_interpretations();
+                    self.provider = None;
+                    if !success {
+                        let state = self
+                            .state
+                            .as_mut()
+                            .expect("Codex state remains available while polling");
+                        // The durable terminal remains the run outcome. Use the
+                        // provider's generation correlation only to decide
+                        // whether this separate session exit belongs to that
+                        // completion or is a later idle-provider failure.
+                        state.lifecycle = "provider_exited".to_owned();
+                        state.push_terminal_event(NormalizedProviderEvent {
+                            // A completed turn remains authoritative, while the
+                            // reusable provider session independently becomes
+                            // unavailable. Avoid emitting session.failed for
+                            // already successful work, but never leave the
+                            // durable lifecycle open after a nonzero exit.
+                            event_type: if completion_reconciles_exit {
+                                "session.reconciled"
+                            } else {
+                                "session.failed"
+                            }
+                            .to_owned(),
+                            priority: EventPriority::P0,
+                            payload: json!({
+                                "provider": state.config.provider,
+                                "code": "provider_exited",
+                                "exitCode": exit_code,
+                                "expected": success,
+                                "previousTurnCompleted": completed_turn_authoritative,
+                                "completedByExitedProcess": completed_turn_observed_by_process,
+                                "processGeneration": process_generation,
+                                "completedTurnProcessGeneration": completed_turn_process_generation,
+                                "activeProviderTurnId": Value::Null,
+                            }),
+                        })?;
+                    }
+                    self.save_state()?;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CommandExecutor for CodexCommandExecutor {
+    fn host_park_ready(&mut self) -> Result<bool, DurableRunnerError> {
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? {
+            return Ok(false);
+        }
+        self.save_before_provider_writes(false)?;
+        let Some(state) = self.state.as_ref() else {
+            return Ok(false);
+        };
+        if !matches!(
+            (state.config.provider.as_str(), state.config.driver.as_str()),
+            ("codex", "codex_app_server") | ("pi_rpc", "pi_rpc")
+        ) || self.provider.is_none()
+            || !state.completed_turn_authoritative
+            || state.completed_turn_process_generation != Some(state.provider_process_generation)
+            || state.completed_provider_turn_id.is_none()
+            || state.active_provider_turn_id.is_some()
+            || state.ambiguous_turn_start_pending
+            || state.startup_attempt.is_some()
+            || state.receipt_limit_interrupt_pending
+            || state
+                .goal
+                .as_ref()
+                .is_some_and(|goal| goal.status == "active" || goal.working_now)
+            || state.tool_bridge.pending_calls().next().is_some()
+            || !state.descendant_thread_ids.is_empty()
+            || !state.pending_events.is_empty()
+            || !state.queued_events.is_empty()
+            || state.lifecycle == "reconciliation_required"
+        {
+            return Ok(false);
+        }
+        if !self.retain_completed_accounting_tail_for_poll()? {
+            self.save_state()?;
+            if let Some(mut provider) = self.provider.take() {
+                let _ = provider.shutdown();
+            }
+            return Ok(false);
+        }
+        let state = self
+            .state
+            .as_ref()
+            .expect("surviving native provider state");
+        if !state.pending_events.is_empty() || !state.queued_events.is_empty() {
+            return Ok(false);
+        }
+        let provider = self
+            .provider
+            .as_mut()
+            .expect("checked surviving native provider");
+        // Tail draining can consume a late goal update before the executor
+        // journal sees it. Check the live provider after that drain.
+        if provider.has_active_goal()
+            || provider.has_known_descendants()
+            || provider.observed_completed_turn_authority() != provider.completed_turn_authority()
+            || provider.completed_turn_authority()
+                != state
+                    .completed_turn_process_generation
+                    .zip(state.completed_provider_turn_id.as_deref())
+        {
+            return Ok(false);
+        }
+        let locally_ready = provider
+            .warm_run_attachment_blockers()
+            .map_err(|_| DurableRunnerError::invalid("native Codex parking proof failed"))?
+            .is_empty();
+        if locally_ready && state.config.provider == "pi_rpc" {
+            return provider
+                .pi_host_park_ready()
+                .map_err(|_| DurableRunnerError::invalid("native Pi parking proof failed"));
+        }
+        Ok(locally_ready)
+    }
+    fn can_reconcile_result_delivery(&mut self) -> Result<bool, DurableRunnerError> {
+        // ProviderToolBridge persists the exact call/result and rejects changed
+        // receipts. Delivery cannot execute a server-side semantic operation.
+        Ok(true)
+    }
+
+    fn execute(&mut self, command: &Command) -> Result<CommandExecution, DurableRunnerError> {
+        // Restore can settle an old turn before prepare inspects the changed
+        // contract. Preserve its input blocker for the additive refusal channel;
+        // do not change restore, admission, or the replacement decision.
+        self.prepare_input_refusal_code = self.state.as_ref().and_then(|state| {
+            if state.active_provider_turn_id.is_some()
+                || state.pi_deferred_terminal.is_some()
+                || state.ambiguous_turn_start_pending
+            {
+                Some("provider_active_turn")
+            } else if !state.descendant_thread_ids.is_empty() {
+                Some("provider_live_descendants")
+            } else if state
+                .goal
+                .as_ref()
+                .is_some_and(|g| g.status == "active" || g.working_now)
+            {
+                Some("provider_active_goal")
+            } else {
+                None
+            }
+        });
+        self.startup_command = Some(ProviderStartupCommand {
+            command_id: command.command_id.clone(),
+            controller_seq: command.controller_seq,
+            command_type: command.command_type.clone(),
+        });
+        let outcome = (|| {
+            if command.command_type == "run.prepare" {
+                if let Some(admission) = self.skill_refresh_admission(&command.payload)? {
+                    return Ok(admission);
+                }
+            }
+            if self.refresh_admission.is_some() {
+                return match command.command_type.as_str() {
+                    "runner.drain" | "runner.suspend" | "runner.shutdown" | "session.close" => {
+                        Ok(CommandExecution::result(json!({"status": "completed"})))
+                    }
+                    _ => Err(DurableRunnerError::refresh_required(
+                        "prepare did not admit a provider session",
+                    )),
+                };
+            }
+            self.save_before_provider_writes(false)?;
+            self.restore()?;
+            self.maintain_deferred_pi_terminal()?;
+            if self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.lifecycle == "reconciliation_required")
+                && !matches!(
+                    command.command_type.as_str(),
+                    "session.snapshot"
+                        | "session.close"
+                        | "session.destroy"
+                        | "runner.drain"
+                        | "runner.suspend"
+                        | "runner.shutdown"
+                        | "turn.interrupt"
+                        | "run.cancel"
+                        | "turn.stop"
+                )
+            {
+                return Err(DurableRunnerError::invalid(
+                    "Codex provider session requires explicit reconciliation and a fresh session",
+                ));
+            }
+            match command.command_type.as_str() {
+                "run.prepare" => self.prepare_with_legacy_attachment(&command.payload, true),
+                "run.attach" => {
+                    let expired =
+                        if self.state.is_none() && command.payload.get("provider").is_some() {
+                            self.prepare(&command.payload)?;
+                            Vec::new()
+                        } else {
+                            self.attach_run(&command.payload)?
+                        };
+                    let mut execution = self.open_session()?;
+                    if !expired.is_empty() {
+                        execution.events.push((
+                            "harness.diagnostic".to_owned(),
+                            EventPriority::P0,
+                            json!({
+                                "code": EXPIRED_RESULT_CODE, "severity": "warning",
+                                "calls": expired.iter().map(|call| json!({
+                                    "callId": call.call_id, "operationId": call.operation_id,
+                                })).collect::<Vec<_>>(),
+                            }),
+                        ));
+                    }
+                    let provider = self
+                        .state
+                        .as_ref()
+                        .map(|state| state.config.provider.clone())
+                        .unwrap_or_else(|| "codex".to_owned());
+                    execution.events.push((
+                        "run.attached".to_owned(),
+                        EventPriority::P0,
+                        json!({"provider": provider}),
+                    ));
+                    Ok(execution)
+                }
+                "session.open" => self.open_session(),
+                "turn.start" => self.start_turn(&command.payload),
+                "turn.steer" => self.steer_turn(&command.payload),
+                "session.goal.get" => self.get_goal(),
+                "session.goal.set" => self.set_goal(&command.payload),
+                "session.goal.clear" => self.clear_goal(&command.payload),
+                "turn.interrupt" | "run.cancel" => self.interrupt_turn(
+                    command
+                        .payload
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&command.command_type),
+                ),
+                "turn.stop" => self.stop_turn_for_suspension(&command.command_type),
+                "request.resolve" => self.resolve_request(&command.payload),
+                "semantic_tool.result" => self.deliver_semantic_result(&command.payload),
+                "session.snapshot" => self.snapshot(&command.payload),
+                "session.close" | "session.destroy" => self.close_session(),
+                "runner.drain" | "runner.suspend" | "runner.shutdown" => {
+                    Ok(CommandExecution::result(json!({"status": "completed"})))
+                }
+                _ => Ok(CommandExecution::result(json!({
+                    "status": "rejected",
+                    "code": "provider_command_unavailable",
+                    "message": "the Codex provider does not implement this command in the current layer",
+                }))),
+            }
+        })();
+        self.startup_command = None;
+        outcome.map_err(|error: DurableRunnerError| {
+            if !matches!(command.command_type.as_str(), "run.prepare" | "run.attach") {
+                return error;
+            }
+            if let Some(blocker) = self.prepare_input_refusal_code {
+                if matches!(
+                    error.refusal_code(),
+                    None | Some("provider_prepare_refused")
+                        | Some("provider_config_changed")
+                        | Some("provider_contract_changed_same_run")
+                ) {
+                    return error.with_refusal_code(blocker);
+                }
+            }
+            if error.refusal_code().is_some() {
+                return error;
+            }
+            // Restore may refuse before prepare reaches its own fences. Carry
+            // the durable blocker without changing restore, its error, or any
+            // classification/replacement decision.
+            let code = self
+                .state
+                .as_ref()
+                .map(|state| {
+                    if state.active_provider_turn_id.is_some()
+                        || state.pi_deferred_terminal.is_some()
+                        || state.ambiguous_turn_start_pending
+                    {
+                        "provider_active_turn"
+                    } else if !state.descendant_thread_ids.is_empty() {
+                        "provider_live_descendants"
+                    } else if state
+                        .goal
+                        .as_ref()
+                        .is_some_and(|g| g.status == "active" || g.working_now)
+                    {
+                        "provider_active_goal"
+                    } else if state.tool_bridge.pending_calls().next().is_some() {
+                        "provider_pending_tool_calls"
+                    } else if state.lifecycle == "reconciliation_required" {
+                        "provider_reconciliation_required"
+                    } else {
+                        "provider_prepare_refused"
+                    }
+                })
+                .unwrap_or("provider_prepare_refused");
+            error.with_refusal_code(code)
+        })
+    }
+
+    fn rotate_authority(&mut self, config: &DurableRunnerConfig) {
+        self.recovery_pending_effects = None;
+        self.event_identity = Some(ProviderEventIdentity::from_config(config));
+    }
+
+    fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? {
+            return Ok(Vec::new());
+        }
+        self.poll_provider()?;
+        self.retained_events()
+    }
+
+    fn poll_disconnected_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? {
+            return Ok(Vec::new());
+        }
+        self.maintain_deferred_pi_terminal()?;
+        // Only an already-admitted local Codex process can supply passive
+        // output. Recovery, facades and cleanup retain their connected path.
+        if self.provider.is_some()
+            && self.state.as_ref().is_some_and(|state| {
+                state.config.provider == "codex"
+                    && state.startup_attempt.is_none()
+                    && !state.receipt_limit_interrupt_pending
+            })
+        {
+            self.poll_current_provider_with_control(false)?;
+        }
+        self.retained_events()
+    }
+
+    fn retained_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? {
+            return Ok(Vec::new());
+        }
+        if let Some(error) = &self.startup_evidence_error {
+            return Err(error.clone());
+        }
+        self.save_before_provider_writes(false)?;
+        Ok(self
+            .state
+            .as_ref()
+            .into_iter()
+            .flat_map(|state| state.pending_events.iter())
+            .cloned()
+            .collect())
+    }
+
+    fn maintain_disconnected_provider(
+        &mut self,
+    ) -> Result<Option<std::time::Instant>, DurableRunnerError> {
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? {
+            return Ok(None);
+        }
+        if let Some(deadline) = self.maintain_deferred_pi_terminal()? {
+            let remaining = deadline.saturating_sub(current_unix_ms()?);
+            return std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(remaining))
+                .map(Some)
+                .ok_or_else(|| {
+                    DurableRunnerError::invalid("Pi terminal deadline is outside the local clock")
+                });
+        }
+        // Local Codex ownership cannot prove termination of a remote facade.
+        // Never restore a provider merely to service its cleanup deadline.
+        if self.provider.is_none()
+            || !self.state.as_ref().is_some_and(|state| {
+                state.config.provider == "codex" && state.startup_attempt.is_none()
+            })
+        {
+            return Ok(None);
+        }
+        let Some(deadline) = self.receipt_limit_interrupt_deadline()? else {
+            return Ok(None);
+        };
+        let remaining = deadline.saturating_sub(current_unix_ms()?);
+        if remaining > 0 {
+            return std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(remaining))
+                .map(Some)
+                .ok_or_else(|| {
+                    DurableRunnerError::invalid(
+                        "Codex receipt-limit deadline is outside the local clock",
+                    )
+                });
+        }
+        let drained = self
+            .provider
+            .as_mut()
+            .expect("local provider remains owned")
+            .fence_local_receipt_limit()
+            .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        // FIFO evidence may contain a real terminal. Keep it for ordinary
+        // connected processing instead of manufacturing a conflicting fallback.
+        if drained.output_empty {
+            self.settle_receipt_limit_after_shutdown(false)?;
+        }
+        Ok(drained.next_drain_deadline)
+    }
+
+    fn provider_poll_is_live(&self) -> bool {
+        self.provider.is_some()
+            && self.state.as_ref().is_some_and(|state| {
+                state.startup_attempt.is_none() && state.lifecycle != "reconciliation_required"
+            })
+    }
+
+    fn maintain_backpressured_provider(&mut self) -> Result<(), DurableRunnerError> {
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? {
+            return Ok(());
+        }
+        self.maintain_deferred_pi_terminal()?;
+        if self.state.as_ref().is_some_and(|state| {
+            state.receipt_limit_interrupt_pending && state.active_provider_turn_id.is_some()
+        }) {
+            // Reuse the bounded receipt-limit cleanup poll, including reserved
+            // terminal storage and terminal-before-deadline ordering. Do not
+            // restore/start a provider or ingest ordinary output under ACK debt.
+            self.poll_current_provider()?;
+        }
+        Ok(())
+    }
+
+    fn acknowledge_events(&mut self, count: usize) -> Result<(), DurableRunnerError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let mut next_state = self
+            .state
+            .clone()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider state is unavailable"))?;
+        if count > next_state.pending_events.len() {
+            return Err(DurableRunnerError::invalid(
+                "provider event acknowledgement exceeded the pending prefix",
+            ));
+        }
+        next_state.pending_events.drain(..count);
+        next_state.refill_pending_events();
+        self.persist_state(&next_state)?;
+        self.state = Some(next_state);
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), DurableRunnerError> {
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? {
+            return Ok(());
+        }
+        // Terminal-result recovery can invoke shutdown on a fresh executor.
+        // Loading the durable provider identity here ensures that cleanup is
+        // attempted against the persisted session instead of reporting a
+        // successful no-op from an empty in-memory provider slot.
+        self.restore()?;
+        self.stop_owned_provider()?;
+        Ok(())
+    }
+
+    fn reconcile_terminal_delivery(
+        &mut self,
+    ) -> Result<TerminalDeliveryReconciliation, DurableRunnerError> {
+        // A fresh terminal-delivery process has no provider handle. Validate
+        // its retained state without starting a provider merely to stop it.
+        // If this process already owns a handle, stop only that exact handle.
+        self.stop_owned_provider()?;
+        if self.state.is_none() {
+            self.load_state_without_provider()?;
+        }
+        self.assert_startup_admitted()?;
+        let state = self.state.as_ref().ok_or_else(|| {
+            DurableRunnerError::invalid(
+                "terminal delivery reconciliation requires retained provider state",
+            )
+        })?;
+        state.validate()?;
+        Ok(
+            if state.lifecycle == "prepared" && state.active_provider_turn_id.is_none() {
+                TerminalDeliveryReconciliation::CleanupCompleted
+            } else {
+                TerminalDeliveryReconciliation::ProviderCleanupPending
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn restart_lost_turns_continue_only_for_locally_restored_providers() {
+        assert!(super::restart_lost_turn_is_continuable("codex"));
+        assert!(super::restart_lost_turn_is_continuable("opencode"));
+        for provider in ["pi_rpc", "acpx", "claude_managed", "unknown"] {
+            assert!(!super::restart_lost_turn_is_continuable(provider));
+        }
+        assert!(!super::restart_lost_turn_is_continuable("cursor_cloud"));
+    }
+
+    #[test]
+    fn mcp_permission_requests_use_durable_turn_and_item_identity() {
+        let identity = ProviderEventIdentity {
+            runner_instance_id: "runner".into(),
+            run_id: "run".into(),
+            normalized_session_id: "session".into(),
+            turn_id: "durable-turn".into(),
+            item_id: "durable-item".into(),
+        };
+        let params = json!({"threadId":"provider-thread", "turnId":"provider-turn",
+            "itemId":"provider-item", "message":"Allow tool?", "serverName":"assigned"});
+        let event = mcp_permission_event(&identity, "request-1".into(), params.clone());
+        let request = &event.payload["request"];
+        assert_eq!(event.event_type, "runtime_request.created");
+        assert_eq!(request["requestKind"], "permission_approval");
+        assert_eq!(request["turnId"], identity.turn_id);
+        assert_eq!(request["itemId"], identity.item_id);
+        assert_eq!(request["details"], params);
+    }
+
+    #[test]
+    fn startup_evidence_save_failure_cannot_become_an_empty_drain_or_admission() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-startup-write-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut executor = CodexCommandExecutor::new(&directory);
+        let mut state = opencode_result_state();
+        state.config.provider = "codex".to_owned();
+        state.config.driver = "codex_app_server".to_owned();
+        state.config.command = PathBuf::from("codex");
+        state.active_provider_turn_id = None;
+        state.lifecycle = "prepared".to_owned();
+        executor.state = Some(state);
+        executor
+            .begin_startup(ProviderStartupTrigger::Ensure, 1)
+            .unwrap();
+        let path = executor.state_path();
+        fs::rename(&path, directory.join("preserved-intent.json")).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(executor
+            .observe_startup(ProviderStartupObservation::Spawned {
+                process_id: 123,
+                process_group_id: 123
+            })
+            .is_err());
+        assert!(executor.retained_events().is_err());
+        assert!(executor.assert_startup_admitted().is_err());
+        let intent: Value =
+            serde_json::from_slice(&fs::read(directory.join("preserved-intent.json")).unwrap())
+                .unwrap();
+        assert_eq!(intent["startupAttempt"]["phase"], "intent");
+        assert_eq!(intent["startupAttempt"]["processId"], Value::Null);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn goal_command_can_persist_provider_restart_ownership() {
+        for command_type in ["session.goal.get", "session.goal.set", "session.goal.clear"] {
+            let directory = std::env::temp_dir()
+                .join(format!("paperclip-goal-startup-{}", uuid::Uuid::new_v4()));
+            let mut executor = CodexCommandExecutor::new(&directory);
+            executor.state = Some(opencode_result_state());
+            executor.startup_command = Some(ProviderStartupCommand {
+                command_id: "command-goal-recovery".to_owned(),
+                controller_seq: 12,
+                command_type: command_type.to_owned(),
+            });
+            executor
+                .begin_startup(ProviderStartupTrigger::Ensure, 4)
+                .unwrap();
+            executor
+                .observe_startup(ProviderStartupObservation::Spawned {
+                    process_id: 123,
+                    process_group_id: 123,
+                })
+                .unwrap();
+            let saved: CodexProviderState =
+                serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+            saved.validate().unwrap();
+            assert_eq!(
+                saved.startup_attempt.unwrap().command.unwrap().command_type,
+                command_type
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_phase_fields_are_closed_and_coherent() {
+        let mut attempt = ProviderStartupAttempt {
+            schema: "paperclip.provider_startup.v1".to_owned(),
+            launch_id: uuid::Uuid::new_v4().to_string(),
+            phase: ProviderStartupPhase::Intent,
+            trigger: ProviderStartupTrigger::Ensure,
+            attempted_process_generation: 1,
+            origin: None,
+            command: None,
+            configuration_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            requested_thread_id: None,
+            authenticated_thread_id: None,
+            process_id: None,
+            process_group_id: None,
+            failed_stage: None,
+            direct_child_exit_observed: false,
+            exit_code: None,
+            signal: None,
+            process_tree_retired: false,
+            before_spawn: false,
+            no_reply: false,
+        };
+        attempt.validate().unwrap();
+        // `noReply` belongs only to an initialization that failed silently.
+        attempt.no_reply = true;
+        assert!(attempt.validate().is_err());
+        attempt.no_reply = false;
+        attempt.before_spawn = true;
+        attempt.validate().unwrap();
+        attempt.before_spawn = false;
+        attempt.process_id = Some(123);
+        attempt.process_group_id = Some(123);
+        assert!(attempt.validate().is_err());
+        attempt.phase = ProviderStartupPhase::Spawned;
+        attempt.validate().unwrap();
+        attempt.before_spawn = true;
+        assert!(
+            attempt.validate().is_err(),
+            "a spawned launch is past the spawn"
+        );
+        attempt.before_spawn = false;
+        attempt.direct_child_exit_observed = true;
+        assert!(attempt.validate().is_err());
+        attempt.phase = ProviderStartupPhase::InitializationFailed;
+        attempt.failed_stage = Some(ProviderStartupStage::Initialize);
+        assert!(attempt.validate().is_err());
+        attempt.signal = Some(15);
+        attempt.validate().unwrap();
+        attempt.exit_code = Some(0);
+        assert!(attempt.validate().is_err());
+        attempt.exit_code = None;
+        attempt.direct_child_exit_observed = false;
+        assert!(attempt.validate().is_err());
+        attempt.signal = None;
+        attempt.validate().unwrap(); // Unknown cleanup is truthful, not retirement.
+        attempt.origin = Some(ProviderEventIdentity {
+            runner_instance_id: "r".repeat(512),
+            run_id: "r".repeat(SHORT_STABLE_ID_CHARS),
+            normalized_session_id: "s".repeat(SHORT_STABLE_ID_CHARS),
+            turn_id: "t".repeat(DURABLE_STABLE_ID_CHARS),
+            item_id: "i".repeat(DURABLE_STABLE_ID_CHARS),
+        });
+        attempt.requested_thread_id = Some("t".repeat(240));
+        attempt.validate().unwrap();
+        attempt.origin.as_mut().unwrap().turn_id.push('x');
+        assert!(attempt.validate().is_err());
+        attempt.origin.as_mut().unwrap().turn_id.pop();
+        attempt.requested_thread_id.as_mut().unwrap().push('x');
+        assert!(attempt.validate().is_err());
+    }
+
+    #[test]
+    fn failed_authenticated_identity_commit_keeps_the_durable_startup_fence() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-startup-identity-commit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut executor = CodexCommandExecutor::new(&directory);
+        let mut state = opencode_result_state();
+        state.config.provider = "codex".to_owned();
+        state.config.driver = "codex_app_server".to_owned();
+        state.config.command = PathBuf::from("codex");
+        state.thread_id = None;
+        state.active_provider_turn_id = None;
+        state.lifecycle = "prepared".to_owned();
+        executor.state = Some(state);
+        executor
+            .begin_startup(ProviderStartupTrigger::Ensure, 1)
+            .unwrap();
+        // The unadmitted provider is still running, so a restarted executor
+        // must keep the fence closed.
+        #[cfg(unix)]
+        let mut live_provider = orphaned_startup::process_group_leader();
+        #[cfg(unix)]
+        let live_pid = live_provider.id();
+        #[cfg(not(unix))]
+        let live_pid = 123;
+        executor
+            .observe_startup(ProviderStartupObservation::Spawned {
+                process_id: live_pid,
+                process_group_id: live_pid,
+            })
+            .unwrap();
+        let path = executor.state_path();
+        let preserved = directory.join("preserved-spawn.json");
+        fs::rename(&path, &preserved).unwrap();
+        fs::create_dir(&path).unwrap();
+        let state = executor.state.as_mut().unwrap();
+        state.thread_id = Some("authenticated-thread".to_owned());
+        state.provider_session_id = Some("authenticated-account".to_owned());
+        state.provider_process_generation = 1;
+        state.lifecycle = "session_open".to_owned();
+        assert!(executor.commit_startup_admission().is_err());
+        assert!(executor.assert_startup_admitted().is_err());
+        fs::remove_dir(&path).unwrap();
+        fs::rename(preserved, &path).unwrap();
+        let mut restarted = CodexCommandExecutor::new(&directory);
+        let error = restarted.poll_events().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("provider startup ownership remains unadmitted"));
+        assert_eq!(restarted.state.as_ref().unwrap().thread_id, None);
+        assert_eq!(
+            restarted
+                .state
+                .as_ref()
+                .unwrap()
+                .provider_process_generation,
+            0
+        );
+        assert_eq!(
+            restarted
+                .state
+                .as_ref()
+                .unwrap()
+                .startup_attempt
+                .as_ref()
+                .unwrap()
+                .phase,
+            ProviderStartupPhase::Spawned
+        );
+        #[cfg(unix)]
+        {
+            let _ = live_provider.kill();
+            let _ = live_provider.wait();
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    mod orphaned_startup {
+        use super::*;
+
+        /// A child that leads its own process group, as provider launches do.
+        pub(super) fn process_group_leader() -> std::process::Child {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("spawn a process group leader")
+        }
+
+        /// A runner killed after spawning a provider and before admitting it.
+        fn orphaned_startup_fixture(
+            prefix: &str,
+            lifecycle: &str,
+            observe: impl FnOnce(&mut CodexCommandExecutor),
+        ) -> PathBuf {
+            let directory =
+                std::env::temp_dir().join(format!("paperclip-{prefix}-{}", uuid::Uuid::new_v4()));
+            let mut executor = CodexCommandExecutor::new(&directory);
+            let mut state = opencode_result_state();
+            state.config.provider = "codex".to_owned();
+            state.config.driver = "codex_app_server".to_owned();
+            state.config.command = PathBuf::from("codex");
+            state.lifecycle = lifecycle.to_owned();
+            state.provider_process_generation = 1;
+            if lifecycle != "turn_active" {
+                state.active_provider_turn_id = None;
+            }
+            executor.state = Some(state);
+            executor
+                .begin_startup(ProviderStartupTrigger::Restore, 2)
+                .unwrap();
+            observe(&mut executor);
+            drop(executor);
+            directory
+        }
+
+        fn spawned(pid: u32) -> impl FnOnce(&mut CodexCommandExecutor) {
+            move |executor| {
+                executor
+                    .observe_startup(ProviderStartupObservation::Spawned {
+                        process_id: pid,
+                        process_group_id: pid,
+                    })
+                    .unwrap();
+            }
+        }
+
+        /// Loads the fixture as a new runner process would and applies the real
+        /// process probes.
+        fn reload_and_retire(directory: &std::path::Path) -> CodexCommandExecutor {
+            let mut restarted = CodexCommandExecutor::new(directory);
+            restarted.load_state_without_provider().unwrap();
+            restarted
+                .retire_orphaned_startup_attempt(
+                    &|pid| local_process_definitely_gone(pid, false),
+                    &|group| local_process_definitely_gone(group, true),
+                )
+                .unwrap();
+            restarted
+        }
+
+        fn exited_process_group() -> u32 {
+            let mut provider = process_group_leader();
+            let pid = provider.id();
+            provider.kill().unwrap();
+            provider.wait().unwrap();
+            pid
+        }
+
+        #[test]
+        fn restart_retires_a_spawned_startup_whose_provider_process_exited() {
+            for lifecycle in ["turn_active", "session_open", "provider_exited", "prepared"] {
+                let pid = exited_process_group();
+                let directory =
+                    orphaned_startup_fixture("orphaned-startup-exited", lifecycle, spawned(pid));
+                let mut restarted = reload_and_retire(&directory);
+                assert!(restarted.assert_startup_admitted().is_ok(), "{lifecycle}");
+                let events = restarted.retained_events().unwrap();
+                assert!(events.iter().any(|event| {
+                    event.event_type == "harness.diagnostic"
+                        && event.payload["code"] == "provider_startup_retired"
+                        && event.payload["startup"]["processId"] == pid
+                        && event.payload["startup"]["phase"] == "spawned"
+                }));
+                let saved: CodexProviderState =
+                    serde_json::from_slice(&fs::read(restarted.state_path()).unwrap()).unwrap();
+                assert!(saved.startup_attempt.is_none());
+                assert_eq!(saved.lifecycle, lifecycle);
+                fs::remove_dir_all(directory).unwrap();
+            }
+        }
+
+        #[test]
+        fn restart_keeps_the_fence_for_a_prepared_state_without_a_saved_thread() {
+            // Only a prepared state over a saved thread is a settled checkpoint.
+            let pid = exited_process_group();
+            let directory =
+                orphaned_startup_fixture("orphaned-startup-unopened", "prepared", |executor| {
+                    executor.state.as_mut().unwrap().thread_id = None;
+                    spawned(pid)(executor);
+                });
+            assert!(reload_and_retire(&directory)
+                .assert_startup_admitted()
+                .is_err());
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[test]
+        fn restart_keeps_the_fence_for_a_startup_that_failed() {
+            for (stage, child) in [
+                (ProviderStartupStage::Spawn, None),
+                (
+                    ProviderStartupStage::Admission,
+                    Some(exited_process_group()),
+                ),
+            ] {
+                let directory =
+                    orphaned_startup_fixture("failed-startup", "turn_active", |executor| {
+                        if let Some(pid) = child {
+                            spawned(pid)(executor);
+                        }
+                        executor
+                            .observe_startup(ProviderStartupObservation::Failed {
+                                stage,
+                                child_exit: None,
+                                no_reply: false,
+                            })
+                            .unwrap();
+                    });
+                let restarted = reload_and_retire(&directory);
+                assert!(restarted.assert_startup_admitted().is_err());
+                fs::remove_dir_all(directory).unwrap();
+            }
+        }
+
+        fn failed_without_reply(
+            pid: u32,
+            stage: ProviderStartupStage,
+            no_reply: bool,
+        ) -> impl FnOnce(&mut CodexCommandExecutor) {
+            move |executor| {
+                spawned(pid)(executor);
+                executor
+                    .observe_startup(ProviderStartupObservation::Failed {
+                        stage,
+                        child_exit: None,
+                        no_reply,
+                    })
+                    .unwrap();
+            }
+        }
+
+        #[test]
+        fn restart_retires_an_initialization_that_got_no_reply_once_its_provider_exited() {
+            for stage in [
+                ProviderStartupStage::Initialize,
+                ProviderStartupStage::ThreadOpen,
+                ProviderStartupStage::ThreadRead,
+            ] {
+                let pid = exited_process_group();
+                let directory = orphaned_startup_fixture(
+                    "no-reply-startup-exited",
+                    "turn_active",
+                    failed_without_reply(pid, stage, true),
+                );
+                let mut restarted = reload_and_retire(&directory);
+                assert!(restarted.assert_startup_admitted().is_ok());
+                assert!(restarted.retained_events().unwrap().iter().any(|event| {
+                    event.payload["code"] == "provider_startup_retired"
+                        && event.payload["startup"]["noReply"] == true
+                }));
+                fs::remove_dir_all(directory).unwrap();
+            }
+        }
+
+        #[test]
+        fn restart_keeps_a_no_reply_fence_while_its_provider_may_run() {
+            let mut live = process_group_leader();
+            let directory = orphaned_startup_fixture(
+                "no-reply-startup-live",
+                "turn_active",
+                failed_without_reply(live.id(), ProviderStartupStage::ThreadOpen, true),
+            );
+            assert!(reload_and_retire(&directory)
+                .assert_startup_admitted()
+                .is_err());
+            let _ = live.kill();
+            let _ = live.wait();
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[test]
+        fn restart_keeps_a_rejected_or_previously_saved_initialization_fence() {
+            // A provider that answered with a rejection (no `noReply`), and a
+            // fact saved by a runner that predates the field, stay fenced.
+            let pid = exited_process_group();
+            let directory = orphaned_startup_fixture(
+                "rejected-startup",
+                "turn_active",
+                failed_without_reply(pid, ProviderStartupStage::ThreadOpen, false),
+            );
+            let saved: Value = serde_json::from_slice(
+                &fs::read(directory.join(CODEX_PROVIDER_STATE_FILE)).unwrap(),
+            )
+            .unwrap();
+            assert!(saved["startupAttempt"].get("noReply").is_none());
+            assert!(reload_and_retire(&directory)
+                .assert_startup_admitted()
+                .is_err());
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[test]
+        fn restart_retires_an_intent_that_never_reached_the_spawn() {
+            // The runner died while it was still checking the launch.
+            let directory =
+                orphaned_startup_fixture("orphaned-startup-intent", "turn_active", |_| {});
+            let saved: Value = serde_json::from_slice(
+                &fs::read(directory.join(CODEX_PROVIDER_STATE_FILE)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(saved["startupAttempt"]["phase"], "intent");
+            assert_eq!(saved["startupAttempt"]["beforeSpawn"], true);
+            let mut restarted = reload_and_retire(&directory);
+            assert!(restarted.assert_startup_admitted().is_ok());
+            assert!(restarted.retained_events().unwrap().iter().any(|event| {
+                event.payload["code"] == "provider_startup_retired"
+                    && event.payload["startup"]["phase"] == "intent"
+            }));
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[test]
+        fn restart_keeps_the_fence_for_an_intent_that_reached_the_spawn() {
+            // The spawn began: a process may exist that no record names.
+            let directory =
+                orphaned_startup_fixture("orphaned-startup-spawning", "turn_active", |executor| {
+                    executor
+                        .observe_startup(ProviderStartupObservation::SpawnStarting)
+                        .unwrap();
+                });
+            let saved: Value = serde_json::from_slice(
+                &fs::read(directory.join(CODEX_PROVIDER_STATE_FILE)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(saved["startupAttempt"]["phase"], "intent");
+            assert!(saved["startupAttempt"].get("beforeSpawn").is_none());
+            assert!(reload_and_retire(&directory)
+                .assert_startup_admitted()
+                .is_err());
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[test]
+        fn restart_keeps_the_fence_for_an_intent_without_the_before_spawn_mark() {
+            // An intent written before the mark existed cannot prove anything.
+            let directory =
+                orphaned_startup_fixture("orphaned-startup-legacy", "turn_active", |_| {});
+            let path = directory.join(CODEX_PROVIDER_STATE_FILE);
+            let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            saved["startupAttempt"]
+                .as_object_mut()
+                .unwrap()
+                .remove("beforeSpawn");
+            fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+            assert!(reload_and_retire(&directory)
+                .assert_startup_admitted()
+                .is_err());
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[test]
+        fn a_spawn_cannot_begin_twice_or_outside_its_intent() {
+            let directory =
+                orphaned_startup_fixture("spawn-starting-twice", "turn_active", |executor| {
+                    executor
+                        .observe_startup(ProviderStartupObservation::SpawnStarting)
+                        .unwrap();
+                    assert!(executor
+                        .observe_startup(ProviderStartupObservation::SpawnStarting)
+                        .is_err());
+                });
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[test]
+        fn restart_keeps_the_fence_for_a_session_recovery_closed() {
+            let directory = orphaned_startup_fixture(
+                "orphaned-startup-closed",
+                "closed",
+                spawned(exited_process_group()),
+            );
+            let restarted = reload_and_retire(&directory);
+            assert!(restarted.assert_startup_admitted().is_err());
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[test]
+        fn restart_keeps_the_fence_while_the_provider_may_still_run() {
+            let mut provider = process_group_leader();
+            let pid = provider.id();
+            let directory =
+                orphaned_startup_fixture("orphaned-startup-live", "turn_active", spawned(pid));
+            assert!(reload_and_retire(&directory)
+                .assert_startup_admitted()
+                .is_err());
+            provider.kill().unwrap();
+            provider.wait().unwrap();
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[test]
+        fn restart_keeps_the_fence_while_a_child_survives_its_exited_leader() {
+            use std::io::{BufRead, BufReader};
+            use std::os::unix::process::CommandExt;
+            // The leader starts a child in its own process group, reports the
+            // child pid, and is then killed and reaped. The child keeps the group
+            // as an orphan, which is held apart from a reap that must verify.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let orphans = crate::process_lineage::host_orphans::may_orphan();
+            let mut leader = std::process::Command::new("sh")
+                .args(["-c", "sleep 30 & echo $!; wait"])
+                .process_group(0)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn a provider stand-in with a child");
+            let group = leader.id();
+            let mut line = String::new();
+            BufReader::new(leader.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let child: u32 = line.trim().parse().unwrap();
+            leader.kill().unwrap();
+            leader.wait().unwrap();
+            assert!(local_process_definitely_gone(group, false));
+            assert!(!local_process_definitely_gone(group, true));
+
+            let directory =
+                orphaned_startup_fixture("orphaned-startup-group", "turn_active", spawned(group));
+            assert!(reload_and_retire(&directory)
+                .assert_startup_admitted()
+                .is_err());
+
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &child.to_string()])
+                .status();
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                crate::process_lineage::host_orphans::wait_until_group_gone(
+                    i32::try_from(group).unwrap(),
+                );
+                drop(orphans);
+            }
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn runtime_launch_rebinding_preserves_protected_arguments() {
+        let before: Vec<String> = vec![
+            "-c",
+            "default_permissions=\"paperclip-runner-workspace-only\"",
+            "-c",
+            "shell_environment_policy.set={PATH=\"/run/a\"}",
+            "--disable",
+            "image_generation",
+            "app-server",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let after: Vec<String> = vec![
+            "-c",
+            "default_permissions=\"paperclip-runner-workspace-only\"",
+            "-c",
+            "shell_environment_policy.set={PATH=\"/run/b\"}",
+            "-c",
+            "shell_environment_policy.include_only=[\"PAPERCLIP_GITHUB_BROKER_TOKEN\"]",
+            "--disable",
+            "image_generation",
+            "app-server",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(
+            CodexCommandExecutor::stable_launch_args(&before),
+            CodexCommandExecutor::stable_launch_args(&after)
+        );
+        let mut unsafe_args = after;
+        unsafe_args.push("--dangerously-bypass-approvals-and-sandbox".to_owned());
+        assert_ne!(
+            CodexCommandExecutor::stable_launch_args(&before),
+            CodexCommandExecutor::stable_launch_args(&unsafe_args)
+        );
+    }
+
+    #[test]
+    fn external_sandbox_planning_profile_rules_carry_saved_launches_forward() {
+        let launch = |filesystem: &str, network: &str| -> Vec<String> {
+            vec![
+                "-c".to_owned(),
+                "default_permissions=\"paperclip-runner-external-sandbox\"".to_owned(),
+                "-c".to_owned(),
+                format!("permissions.paperclip-runner-workspace-read-only.filesystem={filesystem}"),
+                "-c".to_owned(),
+                format!(
+                    "permissions.paperclip-runner-workspace-read-only.network.enabled={network}"
+                ),
+                "--dangerously-bypass-approvals-and-sandbox".to_owned(),
+                "app-server".to_owned(),
+            ]
+        };
+        let saved = launch(
+            "{\":root\"=\"none\",\":minimal\"=\"read\",\":tmpdir\"=\"none\",\"/home/daytona/.codex\"=\"none\",\":workspace_roots\"={\".\"=\"read\"}}",
+            "false",
+        );
+        let current = launch("{\":root\"=\"read\"}", "true");
+        assert_eq!(
+            CodexCommandExecutor::stable_launch_args(&saved),
+            CodexCommandExecutor::stable_launch_args(&current)
+        );
+    }
+    use super::*;
+
+    fn schema_rejection(operation_id: &str, input: Value) -> ToolResult {
+        let operation = crate::provider_bridge::AuthorizedTool {
+            operation_id: operation_id.to_owned(),
+            version: 1,
+            description: "Test operation.".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["requiredField"],
+                "properties": {"requiredField": {"type": "string"}},
+                "additionalProperties": false,
+            }),
+            response_schema: json!({"type": "object"}),
+        };
+        let mut bridge = ProviderToolBridge::default();
+        bridge
+            .prepare(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&operation))
+                    .unwrap(),
+                operations: vec![operation],
+            })
+            .unwrap();
+        let error = bridge
+            .begin_call("schema-call".to_owned(), operation_id.to_owned(), input)
+            .unwrap_err();
+        invalid_tool_call_result("schema-call".to_owned(), operation_id.to_owned(), &error)
+    }
+
+    #[test]
+    fn invalid_tool_results_expose_authorized_schema_guidance() {
+        let finish_result = schema_rejection(
+            "paperclip_finish",
+            json!({"secretSubmittedValue": "must-not-appear"}),
+        );
+        assert_eq!(finish_result.result["error"]["code"], "invalid_tool_call");
+        assert_eq!(finish_result.result["error"]["retryable"], false);
+        let finish_message = finish_result.result["error"]["message"].as_str().unwrap();
+        assert!(finish_message.contains(
+            "continuation must include kind=response_wake or monitor, summary, and idempotencyKey"
+        ));
+        assert!(finish_message.contains("/required (missing \"requiredField\")"));
+        assert!(finish_message.contains("/additionalProperties"));
+        assert!(!finish_message.contains("secretSubmittedValue"));
+        assert!(finish_message.len() <= 512);
+        assert!(!finish_message.chars().any(char::is_control));
+        assert!(!finish_result.result.to_string().contains("must-not-appear"));
+
+        let block_result = schema_rejection("paperclip_block", json!({}));
+        let block_message = block_result.result["error"]["message"].as_str().unwrap();
+        assert!(block_message
+            .contains("blocker must include reasonCode, owner, unblockAction, and scope"));
+        assert!(block_message.len() <= 512);
+        assert!(!block_message.chars().any(char::is_control));
+
+        let question_result = schema_rejection(
+            "request_human_input",
+            json!({"interactionKind": "questions", "PRIVATE_FIELD": "PRIVATE_VALUE"}),
+        );
+        let question_message = question_result.result["error"]["message"].as_str().unwrap();
+        assert!(question_message.contains("payload.questionSet"));
+        assert!(question_message.contains("Preserve question and option IDs"));
+        assert!(question_message.contains("/required (missing \"requiredField\")"));
+        assert!(!question_message.contains("PRIVATE_FIELD"));
+        assert!(!question_result.result.to_string().contains("PRIVATE_VALUE"));
+        assert!(question_message.len() <= 512);
+        assert_eq!(question_result.result["error"]["retryable"], false);
+        for kind in ["confirmation", "checkbox"] {
+            let proposal = schema_rejection(
+                "request_human_input",
+                json!({"interactionKind": kind, "PRIVATE_FIELD": "PRIVATE_VALUE"}),
+            );
+            let guidance = proposal.result["error"]["message"].as_str().unwrap();
+            assert!(guidance.contains("payload.version"));
+            assert!(guidance.contains("payload.supersedeOnUserComment"));
+            assert!(guidance.contains("confirmation or checkbox"));
+            assert!(!guidance.contains("payload.questionSet"));
+            assert!(!proposal.result.to_string().contains("PRIVATE_VALUE"));
+            assert!(guidance.len() <= 512);
+        }
+
+        let monitor_result = schema_rejection(
+            "set_task_monitor",
+            json!({"PRIVATE_FIELD": "PRIVATE_VALUE"}),
+        );
+        let monitor_message = monitor_result.result["error"]["message"].as_str().unwrap();
+        assert!(monitor_message.contains("Put all scheduling fields inside monitor"));
+        assert!(monitor_message.contains("Correct the arguments and retry"));
+        assert!(monitor_message.contains("/required (missing \"requiredField\")"));
+        assert!(!monitor_message.contains("PRIVATE_FIELD"));
+        assert!(!monitor_result.result.to_string().contains("PRIVATE_VALUE"));
+        assert!(monitor_message.len() <= 512);
+        assert!(!monitor_message.chars().any(char::is_control));
+        assert_eq!(monitor_result.result["error"]["code"], "invalid_tool_call");
+        assert_eq!(monitor_result.result["error"]["retryable"], false);
+
+        let ordinary_result = schema_rejection("get_task_context", json!({}));
+        let ordinary_message = ordinary_result.result["error"]["message"].as_str().unwrap();
+        assert!(ordinary_message.contains("Correct the arguments and retry"));
+        assert!(ordinary_message.contains("/required (missing \"requiredField\")"));
+
+        let unauthorized_error = ProviderToolBridge::default()
+            .begin_call(
+                "unauthorized-call".to_owned(),
+                "paperclip_finish".to_owned(),
+                json!({}),
+            )
+            .unwrap_err();
+        let unauthorized_result = invalid_tool_call_result(
+            "unauthorized-call".to_owned(),
+            "paperclip_finish".to_owned(),
+            &unauthorized_error,
+        );
+        assert_eq!(
+            unauthorized_result.result["error"]["message"],
+            GENERIC_INVALID_TOOL_CALL_MESSAGE
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnected_poll_never_restores_an_unopened_facade() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-offline-no-restore-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(CODEX_PROVIDER_STATE_FILE),
+            b"not a provider state",
+        )
+        .unwrap();
+        let mut executor = CodexCommandExecutor::new(&directory);
+        assert!(executor.poll_disconnected_events().unwrap().is_empty());
+        assert!(executor.maintain_disconnected_provider().unwrap().is_none());
+        assert!(!executor.restore_checked);
+        executor.state = Some(opencode_result_state());
+        assert!(executor.poll_disconnected_events().unwrap().is_empty());
+        assert!(executor.maintain_disconnected_provider().unwrap().is_none());
+        assert!(!executor.restore_checked);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnected_codex_output_is_durable_and_terminal_control_waits_for_reconnect() {
+        let directory =
+            std::env::temp_dir().join(format!("paperclip-offline-codex-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let goal_called = directory.join("goal-called");
+        let script = format!(
+            r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"thread-1"}}}}}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-1"}}}}}}'
+      printf '%s\n' '{{"method":"turn/started","params":{{"threadId":"thread-1","turn":{{"id":"turn-1","status":"inProgress"}}}}}}'
+      printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"threadId":"thread-1","turnId":"turn-1","delta":"retained offline output"}}}}'
+      printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread-1","turn":{{"id":"turn-1","status":"completed"}}}}}}' ;;
+    *'"method":"thread/goal/get"'*)
+      touch '{}'
+      printf '%s\n' '{{"id":4,"result":{{"goal":null}}}}' ;;
+  esac
+done
+"#,
+            goal_called.display()
+        );
+        let mut state = opencode_result_state();
+        state.config.provider = "codex".to_owned();
+        state.config.driver = "codex_app_server".to_owned();
+        state.config.command = PathBuf::from("/bin/sh");
+        state.config.args = vec!["-c".to_owned(), script];
+        state.config.model = None;
+        state.goal_capability = Some(SessionGoalCapability::codex_available());
+        let mut provider = CodexProvider::start(&state.config, None).unwrap();
+        provider.start_turn("Test", &state.config.cwd).unwrap();
+        state.provider_process_generation = provider.process_generation();
+        let mut executor = CodexCommandExecutor::new(&directory);
+        executor.state = Some(state);
+        executor.provider = Some(provider);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut observed = Vec::new();
+        loop {
+            assert!(std::time::Instant::now() < deadline);
+            let events = executor.poll_disconnected_events().unwrap();
+            if events.is_empty() {
+                continue;
+            }
+            let saved: CodexProviderState =
+                serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+            assert_eq!(saved.pending_events, events);
+            let count = events.len();
+            observed.extend(events);
+            executor.acknowledge_events(count).unwrap();
+            if observed
+                .iter()
+                .any(|event| event.payload["text"] == "retained offline output")
+            {
+                break;
+            }
+        }
+        let start = observed
+            .iter()
+            .position(|event| event.event_type == "turn.started")
+            .unwrap();
+        let text = observed
+            .iter()
+            .position(|event| event.payload["text"] == "retained offline output")
+            .unwrap();
+        assert!(start < text);
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            assert!(executor.poll_disconnected_events().unwrap().is_empty());
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!goal_called.exists());
+        assert_eq!(
+            executor
+                .state
+                .as_ref()
+                .unwrap()
+                .active_provider_turn_id
+                .as_deref(),
+            Some("turn-1")
+        );
+        let events = executor.poll_events().unwrap();
+        assert!(goal_called.exists());
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "turn.completed"));
+        executor.provider.as_mut().unwrap().shutdown().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn opencode_result_state() -> CodexProviderState {
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                profile: None,
+                provider: "opencode".to_owned(),
+                driver: "opencode_server".to_owned(),
+                provider_version: "1.18.34".to_owned(),
+                command: PathBuf::from("node"),
+                args: Vec::new(),
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: Some("openrouter/model".to_owned()),
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+            },
+            Some(CompletionContractBinding {
+                revision: "revision-1".to_owned(),
+                criterion_ids: vec!["criterion-1".to_owned()],
+            }),
+            ProviderToolBridge::default(),
+        );
+        state.thread_id = Some("thread-1".to_owned());
+        state.active_provider_turn_id = Some("turn-1".to_owned());
+        state.lifecycle = "turn_active".to_owned();
+        state
+    }
+
+    // Keep: provider receipt identity and billed cost cross the proxy/accounting
+    // trust boundary. Use the Pi projector + app-server proxy's wire shape.
+    #[test]
+    fn pi_facade_reasoning_dispatch_uses_only_the_pi_normalizer() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../test/fixtures/pi-facade-reasoning-delta.json"
+        ))
+        .unwrap();
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let events = normalize_provider_notification(
+            &mut state,
+            fixture["method"].as_str().unwrap(),
+            &fixture["params"],
+        )
+        .unwrap();
+        // A single dispatch selects Pi OR Codex; it never concatenates both.
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "item.delta");
+        assert_eq!(events[0].payload["provider"], "pi_rpc");
+        assert_eq!(events[0].payload["kind"], "reasoning");
+        assert_eq!(events[0].payload["text"], fixture["params"]["delta"]);
+    }
+
+    #[test]
+    fn pi_usage_keeps_receipt_identity_and_provider_cost() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let params = json!({
+            "provider": "pi_rpc", "model": "pi/model", "threadId": "pi-session",
+            "turnId": "pi-turn", "providerRequestId": "pi-receipt-1",
+            "tokenUsage": {
+                "total": {"inputTokens": 24, "outputTokens": 14, "cacheReadTokens": 6,
+                    "cacheWriteTokens": 2, "providerCostUsd": 0.021},
+                "last": {"inputTokens": 7, "outputTokens": 4, "cacheReadTokens": 2,
+                    "cacheWriteTokens": 1, "providerCostUsd": 0.004}
+            },
+            "runDeltaAvailable": true,
+            "runDelta": {"inputTokens": 7, "outputTokens": 4, "cacheReadTokens": 2,
+                "cacheWriteTokens": 1, "providerCostUsd": 0.004}
+        });
+        let events =
+            normalize_provider_notification(&mut state, "thread/tokenUsage/updated", &params)
+                .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "usage.reported");
+        assert_eq!(events[0].priority, EventPriority::P0);
+        // Check cost before identity: billed cost already survives the base;
+        // receipt identity is the regression, not a catalog-price conversion.
+        assert_eq!(events[0].payload["runDelta"]["providerCostUsd"], 0.004);
+        assert_eq!(events[0].payload["cumulative"]["providerCostUsd"], 0.021);
+        assert_eq!(events[0].payload["providerRequestId"], "pi-receipt-1");
+        assert_eq!(events[0].payload["provider"], "pi_rpc");
+        assert_eq!(events[0].payload["runDeltaAvailable"], true);
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../../protocol/schemas/usage.schema.json"
+        ))
+        .unwrap();
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(&events[0].payload)
+            .unwrap();
+    }
+
+    #[test]
+    fn non_pi_usage_ignores_pi_receipt_metadata_byte_for_byte() {
+        let params = json!({
+            "threadId": "provider-session", "turnId": "provider-turn", "model": "model",
+            "tokenUsage": {
+                "total": {"inputTokens": 24, "outputTokens": 14, "providerCostUsd": 0.021},
+                "last": {"inputTokens": 7, "outputTokens": 4, "providerCostUsd": 0.004}
+            }
+        });
+        let mut with_pi_metadata = params.clone();
+        with_pi_metadata["providerRequestId"] = json!("pi-receipt-1");
+        with_pi_metadata["childUsage"] = json!("unknown");
+        for provider in ["codex", "opencode", "cursor_cloud"] {
+            let mut plain_state = opencode_result_state();
+            plain_state.config.provider = provider.to_owned();
+            let mut metadata_state = plain_state.clone();
+            let plain = normalize_provider_notification(
+                &mut plain_state,
+                "thread/tokenUsage/updated",
+                &params,
+            )
+            .unwrap();
+            let enriched = normalize_provider_notification(
+                &mut metadata_state,
+                "thread/tokenUsage/updated",
+                &with_pi_metadata,
+            )
+            .unwrap();
+            assert_eq!(plain, enriched, "{provider}");
+            let bytes = serde_json::to_vec(&enriched[0].payload).unwrap();
+            assert_eq!(serde_json::to_vec(&plain[0].payload).unwrap(), bytes);
+            println!(
+                "B8_PROVIDER_BYTES {provider} {}",
+                String::from_utf8(bytes).unwrap()
+            );
+        }
+    }
+
+    // Keep: unknown child/subagent spend must survive the provider boundary;
+    // preserving the flag does not invent child token counts or billed cost.
+    #[test]
+    fn pi_child_usage_receipt_keeps_identity_and_provider_cost() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let events = normalize_provider_notification(
+            &mut state,
+            "thread/tokenUsage/updated",
+            &json!({
+                "provider": "pi_rpc", "threadId": "pi-session", "model": "pi/model",
+                "turnId": "pi-turn", "providerRequestId": "pi-receipt-with-child",
+                "childUsage": "unknown", "runDeltaAvailable": true,
+                "tokenUsage": {
+                    "total": {"inputTokens": 24, "outputTokens": 14, "providerCostUsd": 0.021},
+                    "last": {"inputTokens": 7, "outputTokens": 4, "providerCostUsd": 0.004}
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "usage.reported");
+        assert_eq!(events[0].payload["childUsage"], "unknown");
+        assert_eq!(
+            events[0].payload["providerRequestId"],
+            "pi-receipt-with-child"
+        );
+        assert_eq!(events[0].payload["runDelta"]["providerCostUsd"], 0.004);
+        assert_eq!(events[0].payload["cumulative"]["providerCostUsd"], 0.021);
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../../protocol/schemas/usage.schema.json"
+        ))
+        .unwrap();
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(&events[0].payload)
+            .unwrap();
+    }
+
+    #[test]
+    fn pi_child_usage_is_optional_and_typed() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let params = json!({"threadId": "pi-session", "tokenUsage": {
+            "total": {"inputTokens": 7, "outputTokens": 4}
+        }});
+        let original =
+            normalize_provider_notification(&mut state, "thread/tokenUsage/updated", &params)
+                .unwrap()
+                .remove(0)
+                .payload;
+        assert!(original.get("childUsage").is_none());
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../../protocol/schemas/usage.schema.json"
+        ))
+        .unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        validator.validate(&original).unwrap();
+        let mut valid = original.clone();
+        valid["childUsage"] = json!("unknown");
+        validator.validate(&valid).unwrap();
+        for invalid in [
+            Value::Null,
+            json!(true),
+            json!(3),
+            json!({}),
+            json!([]),
+            json!("included"),
+        ] {
+            let mut invalid_payload = original.clone();
+            invalid_payload["childUsage"] = invalid.clone();
+            assert!(!validator.is_valid(&invalid_payload), "{invalid}");
+            let mut invalid_params = params.clone();
+            invalid_params["childUsage"] = invalid;
+            let events = normalize_provider_notification(
+                &mut state,
+                "thread/tokenUsage/updated",
+                &invalid_params,
+            )
+            .unwrap();
+            assert_eq!(events[0].payload, original);
+        }
+    }
+
+    #[test]
+    fn codex_rate_limit_updates_emit_only_changed_account_notices() {
+        let mut state = opencode_result_state();
+        state.config.provider = "codex".to_owned();
+        let update = json!({"rateLimits": {"limitId": "codex",
+            "primary": {"usedPercent": 78, "windowDurationMins": 300, "resetsAt": 1_793_893_200_i64}}});
+        let first =
+            normalize_provider_notification(&mut state, "account/rateLimits/updated", &update)
+                .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].event_type, "provider.notice.recorded");
+        assert_eq!(first[0].payload["category"], "provider.rate_limits");
+        assert_eq!(first[0].payload["noticeId"], "codex-rate-limits-1");
+        assert!(
+            normalize_provider_notification(&mut state, "account/rateLimits/updated", &update)
+                .unwrap()
+                .is_empty()
+        );
+        let sparse = json!({"rateLimits": {"limitId": "codex",
+            "secondary": {"usedPercent": 41, "windowDurationMins": 10080, "resetsAt": null}}});
+        let second =
+            normalize_provider_notification(&mut state, "account/rateLimits/updated", &sparse)
+                .unwrap();
+        let snapshot: Value =
+            serde_json::from_str(second[0].payload["details"][0]["value"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(snapshot["windows"].as_array().unwrap().len(), 2);
+        assert_eq!(snapshot["windows"][0]["usedPercent"], 78.0);
+        // Restored checkpoints keep the merged snapshot.
+        let restored: CodexProviderState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert_eq!(restored.codex_rate_limits, state.codex_rate_limits);
+    }
+
+    fn valid_opencode_result() -> Value {
+        json!({
+            "schema": "paperclip.run_result.v1",
+            "reportedWorkDisposition": "done",
+            "summary": "Finished the requested work.",
+            "completionClaim": {
+                "contractRevision": "revision-1",
+                "objectiveSatisfied": true,
+                "criteria": [{
+                    "criterionId": "criterion-1",
+                    "status": "satisfied",
+                    "evidenceRefs": ["provider:opencode:agent-message"],
+                }],
+                "remainingWork": [],
+            },
+            "evidence": [{"ref": "provider:opencode:agent-message"}],
+            "verification": [],
+            "attentionRequests": [],
+            "artifacts": [],
+        })
+    }
+
+    #[test]
+    fn preserves_one_verified_opencode_result_before_its_terminal() {
+        let mut state = opencode_result_state();
+        state.active_terminal_tool_rejected = true;
+        let params = json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "semantic-result",
+            "result": valid_opencode_result(),
+        });
+
+        let result_events =
+            normalize_provider_notification(&mut state, "paperclip/runResult", &params).unwrap();
+        let replay_events =
+            normalize_provider_notification(&mut state, "paperclip/runResult", &params).unwrap();
+        let terminal = terminal_events(&state, "turn.completed", None);
+
+        assert_eq!(result_events.len(), 1);
+        assert_eq!(result_events[0].event_type, "run.result.proposed");
+        assert_eq!(result_events[0].priority, EventPriority::P0);
+        assert!(replay_events.is_empty());
+        assert!(!state.active_terminal_tool_rejected);
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].event_type, "run.terminal");
+        assert_eq!(terminal[0].payload["reportedWorkDisposition"], "done");
+        assert!(state.validate().is_ok());
+    }
+
+    fn cursor_cloud_result_state() -> CodexProviderState {
+        let mut state = opencode_result_state();
+        state.config.provider = "cursor_cloud".to_owned();
+        state.config.driver = "cursor_cloud_api".to_owned();
+        state.config.provider_version = "cursor-cloud-v1".to_owned();
+        state.config.model = Some("caller-selected-model".to_owned());
+        state
+    }
+
+    #[test]
+    fn cursor_cloud_terminal_receipts_reject_unowned_and_changed_delivery() {
+        let batch = json!({"schema":"paperclip.cursor-cloud.terminal-delivery.v1", "threadId":"thread-1", "turnId":"turn-1", "providerRunId":"run-provider", "receiptId":"receipt-1", "status":"FINISHED", "interrupted":false, "result":"Durable final"});
+        let delivery =
+            crate::cursor_cloud_proxy::TerminalDelivery::parse(&batch, "thread-1").unwrap();
+        let mut state = cursor_cloud_result_state();
+        state
+            .retain_cursor_cloud_terminal_delivery(&delivery, None, 1)
+            .unwrap();
+        let events = state.pending_events.clone();
+        state
+            .retain_cursor_cloud_terminal_delivery(&delivery, None, 2)
+            .unwrap();
+        assert_eq!(state.pending_events, events);
+        let mut changed = batch.clone();
+        changed["result"] = json!("Conflicting final");
+        let changed =
+            crate::cursor_cloud_proxy::TerminalDelivery::parse(&changed, "thread-1").unwrap();
+        assert!(state
+            .retain_cursor_cloud_terminal_delivery(&changed, None, 2)
+            .is_err());
+        let mut unowned = cursor_cloud_result_state();
+        unowned.active_provider_turn_id = None;
+        assert!(unowned
+            .retain_cursor_cloud_terminal_delivery(&delivery, None, 1)
+            .is_err());
+        let mut partial = cursor_cloud_result_state();
+        partial.last_agent_message = Some("Different persisted final".to_owned());
+        assert!(partial
+            .retain_cursor_cloud_terminal_delivery(&delivery, None, 1)
+            .is_err());
+    }
+
+    #[test]
+    fn cursor_cloud_native_completion_without_semantic_acceptance_requires_review() {
+        let state = cursor_cloud_result_state();
+        let events = terminal_events(&state, "turn.completed", None);
+        assert_eq!(events[0].event_type, "run.result.proposed");
+        assert_eq!(events[0].payload["reportedWorkDisposition"], "needs_review");
+        assert_eq!(
+            events[0].payload["completionClaim"]["objectiveSatisfied"],
+            false
+        );
+        assert_eq!(
+            events[0].payload["completionClaim"]["criteria"][0]["status"],
+            "unknown"
+        );
+        assert_eq!(events[1].payload["provider"], "cursor_cloud");
+        assert_eq!(events[1].payload["turnTerminalState"], "completed");
+        assert_eq!(events[1].payload["runTerminalState"], "failed");
+        assert!(events[0].payload["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Cursor Cloud"));
+    }
+
+    #[test]
+    fn cursor_cloud_correlated_proxy_result_is_preserved_once_and_fenced_to_the_active_turn() {
+        let mut state = cursor_cloud_result_state();
+        let params = json!({ "threadId": "thread-1", "turnId": "turn-1", "result": valid_opencode_result() });
+        let events =
+            normalize_provider_notification(&mut state, "paperclip/runResult", &params).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "run.result.proposed");
+        assert!(
+            normalize_provider_notification(&mut state, "paperclip/runResult", &params)
+                .unwrap()
+                .is_empty()
+        );
+        let terminal = terminal_events(&state, "turn.completed", None);
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].payload["provider"], "cursor_cloud");
+        assert_eq!(terminal[0].payload["runTerminalState"], "succeeded");
+        let mut wrong_turn = params.clone();
+        wrong_turn["turnId"] = json!("stale-turn");
+        assert!(
+            normalize_provider_notification(&mut state, "paperclip/runResult", &wrong_turn)
+                .is_err()
+        );
+        let mut changed = params;
+        changed["result"]["summary"] = json!("different completion");
+        assert!(
+            normalize_provider_notification(&mut state, "paperclip/runResult", &changed).is_err()
+        );
+    }
+
+    #[test]
+    fn cursor_cloud_accepted_terminal_tool_preserves_success_without_synthesizing_a_result() {
+        let mut state = cursor_cloud_result_state();
+        admit_terminal_tool_authority(
+            &mut state,
+            "paperclip_finish",
+            &valid_opencode_result(),
+            false,
+        )
+        .unwrap();
+        let terminal = terminal_events(&state, "turn.completed", None);
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].event_type, "run.terminal");
+        assert_eq!(terminal[0].payload["provider"], "cursor_cloud");
+        assert_eq!(terminal[0].payload["reportedWorkDisposition"], "done");
+        assert_eq!(terminal[0].payload["runTerminalState"], "succeeded");
+        state.validate().unwrap();
+    }
+
+    #[test]
+    fn stopped_prepared_checkpoint_rebinds_without_restarting_its_old_provider() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-provider-stopped-checkpoint-rebind-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let mut state = opencode_result_state();
+        state.config.provider = "codex".to_owned();
+        state.config.driver = "codex_app_server".to_owned();
+        state.config.command = PathBuf::from("must-not-start-during-attachment");
+        state.config.model = None;
+        state.active_provider_turn_id = None;
+        state.provider_process_generation = 1;
+        state.lifecycle = "prepared".to_owned();
+        state.active_terminal_tool_rejected = true;
+        let writer = CodexCommandExecutor::new(&directory);
+        writer.persist_state(&state).unwrap();
+        let mut executor = CodexCommandExecutor::new(&directory);
+        executor.restore().unwrap();
+        assert!(executor.provider.is_none());
+        executor.attach_run(&json!({})).unwrap();
+        assert!(executor.provider.is_none());
+        let rebound = executor.state.as_ref().unwrap();
+        assert_eq!(rebound.lifecycle, "prepared");
+        assert_eq!(rebound.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(rebound.provider_process_generation, 1);
+        assert!(rebound.pending_events.is_empty());
+        assert!(rebound.queued_events.is_empty());
+        assert!(!rebound.active_terminal_tool_rejected);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn prepare_contract_identity(run_id: &str) -> ProviderEventIdentity {
+        ProviderEventIdentity {
+            runner_instance_id: "contract-runner".to_owned(),
+            run_id: run_id.to_owned(),
+            normalized_session_id: "contract-session".to_owned(),
+            turn_id: format!("turn-{run_id}"),
+            item_id: format!("item-{run_id}"),
+        }
+    }
+
+    fn prepared_contract_checkpoint() -> (PathBuf, Value) {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-prepare-contract-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = opencode_result_state().config;
+        config.provider = "codex".to_owned();
+        config.driver = "codex_app_server".to_owned();
+        config.command = directory.join("must-not-start-during-prepare");
+        config.args = vec!["app-server".to_owned()];
+        config.model = None;
+        let payload = json!({
+            "provider": config,
+            "completionContract": {"revision": "contract-X", "criterionIds": ["issue-X"]},
+        });
+        let mut executor = CodexCommandExecutor::new(&directory);
+        executor.event_identity = Some(prepare_contract_identity("run-A"));
+        executor
+            .prepare(&payload)
+            .expect("run A prepares contract X");
+        // A stopped provider checkpoint, as retained by turn.stop. Preparation
+        // and recovery must not launch this deliberately nonexistent command.
+        let state = executor.state.as_mut().unwrap();
+        state.thread_id = Some("saved-contract-thread".to_owned());
+        state.provider_process_generation = 1;
+        executor.save_state().unwrap();
+        (directory, payload)
+    }
+
+    fn restore_contract_checkpoint(
+        directory: &std::path::Path,
+        run_id: &str,
+    ) -> CodexCommandExecutor {
+        let mut executor = CodexCommandExecutor::new(directory);
+        executor.event_identity = Some(prepare_contract_identity(run_id));
+        executor.load_state_without_provider().unwrap();
+        executor
+    }
+
+    // Keep: regression for SMAA-1618, where run 3b7e4a2d was refused solely
+    // because its issue's contract differed from the preceding settled run.
+    #[test]
+    fn prepare_new_run_adopts_its_completion_contract_on_a_settled_checkpoint() {
+        let (directory, mut payload) = prepared_contract_checkpoint();
+        payload["completionContract"] =
+            json!({"revision": "contract-Y", "criterionIds": ["issue-Y", "follow-up"]});
+        let mut executor = restore_contract_checkpoint(&directory, "run-B");
+        executor
+            .prepare(&payload)
+            .expect("a new run owns its contract, not the previous run's contract");
+        let expected = completion_contract(&payload).unwrap();
+        let state = executor.state.as_ref().unwrap();
+        assert_eq!(state.completion_contract, expected);
+        assert_eq!(state.thread_id.as_deref(), Some("saved-contract-thread"));
+        assert!(executor.provider.is_none());
+        let mut recovered = restore_contract_checkpoint(&directory, "run-B");
+        assert_eq!(
+            recovered.state.as_ref().unwrap().completion_contract,
+            expected
+        );
+        recovered
+            .prepare(&payload)
+            .expect("same-run replay is stable");
+        payload["completionContract"]["revision"] = json!("contract-Z");
+        let before = fs::read(executor.state_path()).unwrap();
+        assert!(
+            recovered.prepare(&payload).is_err(),
+            "run B is now bound to Y"
+        );
+        assert_eq!(fs::read(executor.state_path()).unwrap(), before);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepare_same_run_refuses_a_changed_completion_contract() {
+        let (directory, mut payload) = prepared_contract_checkpoint();
+        let mut executor = restore_contract_checkpoint(&directory, "run-A");
+        let before = fs::read(executor.state_path()).unwrap();
+        let before_state = executor.state.clone();
+        payload["completionContract"]["revision"] = json!("contract-Y");
+        let error = executor
+            .prepare(&payload)
+            .expect_err("same-run contract is immutable");
+        assert!(
+            error.to_string().contains("completion contract changed"),
+            "{error}"
+        );
+        assert_eq!(executor.state, before_state);
+        assert_eq!(fs::read(executor.state_path()).unwrap(), before);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepare_new_run_refuses_unsettled_state_without_mutation() {
+        for blocker in [
+            "active_turn",
+            "ambiguous_turn",
+            "pending_event",
+            "queued_event",
+            "goal",
+            "pending_tool",
+            "descendant",
+            "deferred_terminal",
+            "closed",
+            "reconciliation_required",
+        ] {
+            let (directory, mut executor, mut payload) = if blocker == "deferred_terminal" {
+                let (directory, mut executor, mut payload) =
+                    prepared_skill_checkpoint("pi_rpc", true);
+                payload["completionContract"] =
+                    json!({"revision": "contract-X", "criterionIds": ["issue-X"]});
+                let state = executor.state.as_mut().unwrap();
+                state.run_identity = Some(prepare_contract_identity("run-A"));
+                state.completion_contract = completion_contract(&payload).unwrap();
+                executor.event_identity = Some(prepare_contract_identity("run-A"));
+                (directory, executor, payload)
+            } else {
+                let (directory, payload) = prepared_contract_checkpoint();
+                let executor = restore_contract_checkpoint(&directory, "run-A");
+                (directory, executor, payload)
+            };
+            let state = executor.state.as_mut().unwrap();
+            match blocker {
+                "active_turn" => {
+                    state.active_provider_turn_id = Some("provider-turn-A".to_owned());
+                    state.lifecycle = "turn_active".to_owned();
+                }
+                "ambiguous_turn" => {
+                    state.ambiguous_turn_start_pending = true;
+                    state.lifecycle = "session_open".to_owned();
+                }
+                "pending_event" | "queued_event" => {
+                    state
+                        .push_event(NormalizedProviderEvent {
+                            event_type: "harness.diagnostic".to_owned(),
+                            priority: EventPriority::P0,
+                            payload: json!({"code": "uncommitted-old-run-fact"}),
+                        })
+                        .unwrap();
+                    if blocker == "queued_event" {
+                        state.queued_events = std::mem::take(&mut state.pending_events);
+                    }
+                }
+                "pending_tool" => {
+                    state.tool_bridge =
+                        tool_result_authority_state("codex", "get_task_context").tool_bridge;
+                    state
+                        .tool_bridge
+                        .begin_call(
+                            "pending-call-A".to_owned(),
+                            "get_task_context".to_owned(),
+                            json!({}),
+                        )
+                        .unwrap();
+                }
+                "descendant" => {
+                    state
+                        .descendant_thread_ids
+                        .insert("child-thread-A".to_owned());
+                }
+                "deferred_terminal" => {
+                    state.tool_bridge =
+                        tool_result_authority_state("pi_rpc", "get_task_context").tool_bridge;
+                    state
+                        .tool_bridge
+                        .begin_call(
+                            "deferred-call-A".to_owned(),
+                            "get_task_context".to_owned(),
+                            json!({}),
+                        )
+                        .unwrap();
+                    state.tool_bridge.settle_turn("turn_completed").unwrap();
+                    state.pi_deferred_terminal = Some("turn.completed".to_owned());
+                }
+                "closed" | "reconciliation_required" => state.lifecycle = blocker.to_owned(),
+                "goal" => {
+                    state.goal = Some(SessionGoalSnapshot {
+                        objective: "Continue the old run".to_owned(),
+                        status: "active".to_owned(),
+                        token_budget: None,
+                        tokens_used: 0,
+                        elapsed_seconds: 0,
+                        iterations: 0,
+                        last_reason: None,
+                        created_at: None,
+                        updated_at: None,
+                        completed_at: None,
+                        working_now: false,
+                    });
+                }
+                _ => unreachable!(),
+            }
+            executor
+                .save_state()
+                .unwrap_or_else(|error| panic!("{blocker}: {error}"));
+            let mut restored = CodexCommandExecutor::new(&directory);
+            restored.pi_launch_profile = executor.pi_launch_profile.clone();
+            restored.event_identity = Some(prepare_contract_identity("run-B"));
+            restored.load_state_without_provider().unwrap();
+            let mut executor = restored;
+            let before_state = executor.state.clone();
+            let before = fs::read(executor.state_path()).unwrap();
+            assert!(
+                executor.prepare(&payload).is_err(),
+                "{blocker}: even an identical contract cannot transfer unsettled work"
+            );
+            payload["completionContract"]["revision"] = json!("contract-Y");
+            let error = executor.prepare(&payload).expect_err(blocker);
+            assert!(
+                error.to_string().contains("completion contract changed"),
+                "{blocker}: {error}"
+            );
+            assert_eq!(executor.state, before_state, "{blocker}");
+            assert_eq!(
+                fs::read(executor.state_path()).unwrap(),
+                before,
+                "{blocker}"
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn prepare_new_run_still_refuses_a_changed_provider_config() {
+        let (directory, mut payload) = prepared_contract_checkpoint();
+        let mut executor = restore_contract_checkpoint(&directory, "run-B");
+        let before_state = executor.state.clone();
+        let before = fs::read(executor.state_path()).unwrap();
+        payload["provider"]["model"] = json!("different-model");
+        payload["completionContract"]["revision"] = json!("contract-Y");
+        let error = executor
+            .prepare(&payload)
+            .expect_err("provider config stays immutable");
+        assert!(
+            error
+                .to_string()
+                .contains("provider or completion contract changed"),
+            "{error}"
+        );
+        assert_eq!(executor.state, before_state);
+        assert_eq!(fs::read(executor.state_path()).unwrap(), before);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepare_new_run_can_rebind_before_any_provider_thread_exists() {
+        let (directory, mut payload) = prepared_contract_checkpoint();
+        let mut executor = restore_contract_checkpoint(&directory, "run-A");
+        let state = executor.state.as_mut().unwrap();
+        state.thread_id = None;
+        state.provider_process_generation = 0;
+        executor.save_state().unwrap();
+        let mut executor = restore_contract_checkpoint(&directory, "run-B");
+        payload["completionContract"]["revision"] = json!("contract-Y");
+        executor.prepare(&payload).unwrap();
+        let state = executor.state.as_ref().unwrap();
+        assert_eq!(
+            state.completion_contract,
+            completion_contract(&payload).unwrap()
+        );
+        assert_eq!(state.run_identity.as_ref().unwrap().run_id, "run-B");
+        assert!(state.thread_id.is_none());
+        assert!(executor.provider.is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepare_legacy_snapshot_never_guesses_the_owner_of_a_changed_contract() {
+        let (directory, mut payload) = prepared_contract_checkpoint();
+        let mut executor = restore_contract_checkpoint(&directory, "run-A");
+        let mut legacy = serde_json::to_value(executor.state.as_ref().unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("runIdentity");
+        executor.state = Some(serde_json::from_value(legacy).unwrap());
+        executor.save_state().unwrap();
+        let mut executor = restore_contract_checkpoint(&directory, "run-A");
+        let before_state = executor.state.clone();
+        let before = fs::read(executor.state_path()).unwrap();
+        payload["completionContract"]["revision"] = json!("contract-Y");
+        assert!(executor.prepare(&payload).is_err());
+        assert_eq!(executor.state, before_state);
+        assert_eq!(fs::read(executor.state_path()).unwrap(), before);
+        // An unchanged successful replay is enough to bind the old shape to A.
+        payload["completionContract"]["revision"] = json!("contract-X");
+        executor.prepare(&payload).unwrap();
+        assert_eq!(
+            executor
+                .state
+                .as_ref()
+                .unwrap()
+                .run_identity
+                .as_ref()
+                .unwrap()
+                .run_id,
+            "run-A"
+        );
+        let mut next = restore_contract_checkpoint(&directory, "run-B");
+        payload["completionContract"]["revision"] = json!("contract-Y");
+        next.prepare(&payload).unwrap();
+        assert_eq!(
+            next.state
+                .as_ref()
+                .unwrap()
+                .run_identity
+                .as_ref()
+                .unwrap()
+                .run_id,
+            "run-B"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepare_after_attach_uses_the_target_run_binding_and_preserves_accounting_origin() {
+        let (directory, mut payload) = prepared_contract_checkpoint();
+        let mut executor = restore_contract_checkpoint(&directory, "run-A");
+        let state = executor.state.as_mut().unwrap();
+        state.completed_turn_authoritative = true;
+        state.completed_turn_process_generation = Some(1);
+        state.completed_provider_turn_id = Some("provider-turn-A".to_owned());
+        state
+            .settled_provider_turn_ids
+            .insert("provider-turn-A".to_owned());
+        payload["completionContract"]["revision"] = json!("contract-Y");
+        payload["paperclipNextAuthority"] = json!({"identity": {
+            "runnerInstanceId": "contract-runner", "environmentLeaseId": "lease",
+            "runId": "run-B", "normalizedSessionId": "contract-session",
+            "turnId": "turn-run-B", "itemId": "item-run-B",
+        }});
+        executor.attach_run(&payload).unwrap();
+        let state = executor.state.as_ref().unwrap();
+        assert_eq!(
+            state.run_identity.as_ref().unwrap(),
+            &prepare_contract_identity("run-B")
+        );
+        assert_eq!(
+            state.previous_accounting_origin.as_ref().unwrap().identity,
+            prepare_contract_identity("run-A")
+        );
+        let mut next = restore_contract_checkpoint(&directory, "run-B");
+        payload["completionContract"]["revision"] = json!("contract-Z");
+        let before = fs::read(next.state_path()).unwrap();
+        assert!(
+            next.prepare(&payload).is_err(),
+            "B cannot replace its just-attached contract"
+        );
+        assert_eq!(fs::read(next.state_path()).unwrap(), before);
+        let mut next = restore_contract_checkpoint(&directory, "run-C");
+        // A stale attachment boundary cannot make prepare bind B instead of C.
+        next.prepare(&payload).unwrap();
+        assert_eq!(
+            next.state
+                .as_ref()
+                .unwrap()
+                .run_identity
+                .as_ref()
+                .unwrap()
+                .run_id,
+            "run-C"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    include!("provider_backend_tests/cross_run_base.rs");
+    include!("provider_backend_tests/cross_run_judge.rs");
+    include!("provider_backend_tests/cross_run_round2.rs");
+    include!("provider_backend_tests/reopen_done.rs");
+    include!("provider_backend_tests/reopen_suspended.rs");
+    include!("provider_backend_tests/replay_agent_home.rs");
+    include!("provider_backend_tests/skill_edit.rs");
+
+    fn prepared_skill_checkpoint(
+        provider: &str,
+        include_skill_instructions: bool,
+    ) -> (PathBuf, CodexCommandExecutor, Value) {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-provider-skill-normalization-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = opencode_result_state().config;
+        config.provider = provider.to_owned();
+        config.driver = if provider == "pi_rpc" {
+            "pi_rpc"
+        } else {
+            "codex_app_server"
+        }
+        .to_owned();
+        config.command = directory.join("must-not-start-during-attachment");
+        config.args = vec![directory.join("proxy.js").to_string_lossy().into_owned()];
+        config.instructions = "original instructions".to_owned();
+        config.include_skill_instructions = Some(include_skill_instructions);
+        let mut executor = CodexCommandExecutor::new(&directory);
+        if provider == "pi_rpc" {
+            config.provider_version = crate::generated_pi_rpc_profile::PI_RPC_VERSION.to_owned();
+            config.profile = Some(
+                serde_json::from_str(crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON).unwrap(),
+            );
+            let artifact = |path| crate::durable::QualifiedLaunchArtifact {
+                path,
+                sha256: format!("sha256:{:x}", Sha256::digest(b"normalization fixture")),
+            };
+            executor.pi_launch_profile = Some(OpenCodeLaunchProfile {
+                command: artifact(config.command.clone()),
+                proxy_script: artifact(directory.join("proxy.js")),
+                executable: artifact(directory.join("pi")),
+            });
+        }
+        let mut payload = json!({"provider": config});
+        if provider == "pi_rpc" {
+            payload["provider"]["runtimeContext"] = json!({"runId": "original-run"});
+        }
+        executor
+            .prepare(&payload)
+            .expect("real prepare accepts the controller payload");
+        let saved_json: Value =
+            serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+        if provider == "codex" {
+            assert_eq!(
+                saved_json["config"]["includeSkillInstructions"],
+                include_skill_instructions
+            );
+        } else {
+            assert!(saved_json["config"]
+                .get("includeSkillInstructions")
+                .is_none());
+            assert_eq!(
+                saved_json["piRuntimeContext"],
+                json!({"runId": "original-run"})
+            );
+        }
+        let mut saved: CodexProviderState = serde_json::from_value(saved_json).unwrap();
+        // Prepare alone has no thread to attach. Model only the stopped-thread
+        // lifecycle metadata; retain the exact prepared config and tool state.
+        saved.thread_id = Some("stopped-thread".to_owned());
+        saved.provider_process_generation = 1;
+        executor.persist_state(&saved).unwrap();
+        let mut restored = CodexCommandExecutor::new(&directory);
+        restored.pi_launch_profile = executor.pi_launch_profile.clone();
+        restored.restore().unwrap();
+        assert!(restored.provider.is_none());
+        (directory, restored, payload)
+    }
+
+    #[test]
+    fn prepare_refusals_have_specific_codes_without_changing_admission_or_saved_state() {
+        for (shape, code) in [
+            ("active_turn", "provider_active_turn"),
+            ("descendant", "provider_live_descendants"),
+            ("goal", "provider_active_goal"),
+            ("config", "provider_config_changed"),
+            ("contract", "provider_contract_changed_same_run"),
+        ] {
+            let (directory, mut executor, mut payload) = prepared_skill_checkpoint("codex", true);
+            let state = executor.state.as_mut().unwrap();
+            state.run_identity = Some(prepare_contract_identity("run-A"));
+            executor.event_identity = Some(prepare_contract_identity(if shape == "contract" {
+                "run-A"
+            } else {
+                "run-B"
+            }));
+            match shape {
+                "active_turn" => {
+                    state.active_provider_turn_id = Some("old-turn".to_owned());
+                    state.lifecycle = "turn_active".to_owned();
+                }
+                "descendant" => {
+                    state.descendant_thread_ids.insert("child".to_owned());
+                }
+                "goal" => {
+                    state.goal = Some(SessionGoalSnapshot {
+                        objective: "old".to_owned(),
+                        status: "active".to_owned(),
+                        token_budget: None,
+                        tokens_used: 0,
+                        elapsed_seconds: 0,
+                        iterations: 0,
+                        last_reason: None,
+                        created_at: None,
+                        updated_at: None,
+                        completed_at: None,
+                        working_now: false,
+                    });
+                }
+                "config" => {
+                    payload["provider"]["model"] = json!("new-model");
+                }
+                "contract" => {
+                    payload["completionContract"] =
+                        json!({"revision":"new", "criterionIds":["objective"]});
+                }
+                _ => unreachable!(),
+            }
+            if shape != "contract" {
+                payload["provider"]["instructions"] = json!("edited skill");
+            }
+            executor.save_state().unwrap();
+            let bytes = fs::read(executor.state_path()).unwrap();
+            for _ in 0..2 {
+                let error = executor.prepare(&payload).unwrap_err();
+                assert_eq!(error.refusal_code(), Some(code), "{shape}");
+                assert_eq!(fs::read(executor.state_path()).unwrap(), bytes, "{shape}");
+                assert!(executor.provider.is_none());
+            }
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn prepare_launch_drift_is_a_structured_refusal_without_rewriting_history() {
+        let (directory, mut executor, payload) = prepared_skill_checkpoint("pi_rpc", true);
+        executor.state.as_mut().unwrap().pi_launch_profile_digest =
+            Some("previous-profile".to_owned());
+        executor.save_state().unwrap();
+        let saved = fs::read(executor.state_path()).unwrap();
+        for _ in 0..2 {
+            let error = executor.prepare(&payload).unwrap_err();
+            assert_eq!(
+                error.refusal_code(),
+                Some("provider_launch_profile_mismatch")
+            );
+            assert_eq!(
+                error.to_string(),
+                "Pi runner launch profile changed across the durable run"
+            );
+            assert_eq!(fs::read(executor.state_path()).unwrap(), saved);
+            assert!(
+                executor.provider.is_none(),
+                "a refusal cannot start a provider"
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pi_prepare_refreshes_runtime_context_without_replacing_the_durable_conversation() {
+        // Keep reason: production run 25bba118 could not resume after a SKILL.md PUT.
+        for context in [
+            json!({
+                "runId": "fresh-run",
+                "instructions": {"text": "updated company instructions"},
+                "skills": [{"name": "smarty-base", "digest": "updated-skill"}],
+            }),
+            Value::Null,
+        ] {
+            let (directory, mut executor, mut payload) = prepared_skill_checkpoint("pi_rpc", true);
+            payload["completionContract"] = json!({
+                "revision": "existing-contract", "criterionIds": ["objective"],
+            });
+            executor.state.as_mut().unwrap().completion_contract =
+                completion_contract(&payload).unwrap();
+            executor.save_state().unwrap();
+            let before = executor.state.as_ref().unwrap().clone();
+            payload["provider"]["runtimeContext"] = context.clone();
+            executor
+                .prepare(&payload)
+                .expect("a changed Pi runtime context must refresh, not refuse the durable run");
+            let saved: CodexProviderState =
+                serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+            let mut expected = before;
+            expected.pi_runtime_context = context;
+            assert_eq!(
+                serde_json::to_value(&saved).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(executor.state.as_ref().unwrap()).unwrap(),
+                serde_json::to_value(&expected).unwrap(),
+            );
+            let mut restored = CodexCommandExecutor::new(&directory);
+            restored.pi_launch_profile = executor.pi_launch_profile.clone();
+            restored.restore().unwrap();
+            assert_eq!(
+                restored.state.as_ref().unwrap().pi_runtime_context,
+                expected.pi_runtime_context
+            );
+            assert_eq!(
+                restored.state.as_ref().unwrap().thread_id.as_deref(),
+                Some("stopped-thread")
+            );
+            assert!(restored.provider.is_none());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn pi_prepare_runtime_context_refresh_still_refuses_config_and_completion_contract_changes() {
+        for changed_field in ["instructions", "model", "completionContract"] {
+            let (directory, mut executor, mut payload) = prepared_skill_checkpoint("pi_rpc", true);
+            let before = fs::read(executor.state_path()).unwrap();
+            let before_state = serde_json::to_value(executor.state.as_ref().unwrap()).unwrap();
+            payload["provider"]["runtimeContext"] = json!({"runId": "fresh-run"});
+            match changed_field {
+                "completionContract" => {
+                    payload["completionContract"] = json!({
+                        "revision": "new-contract", "criterionIds": ["objective"],
+                    })
+                }
+                "model" => payload["provider"]["model"] = json!("other/model"),
+                _ => payload["provider"]["instructions"] = json!("changed immutable config"),
+            }
+            let error = executor.prepare(&payload).expect_err(
+                "runtime context refresh cannot relax the upstream config/contract guards",
+            );
+            assert!(
+                error.to_string().contains(
+                    "Codex provider or completion contract changed across the durable run"
+                ),
+                "{changed_field}: {error}"
+            );
+            assert_eq!(fs::read(executor.state_path()).unwrap(), before);
+            assert_eq!(
+                serde_json::to_value(executor.state.as_ref().unwrap()).unwrap(),
+                before_state
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn pi_prepare_runtime_context_refresh_does_not_rebind_unsettled_work() {
+        for ambiguous in [false, true] {
+            let (directory, mut executor, mut payload) = prepared_skill_checkpoint("pi_rpc", true);
+            let state = executor.state.as_mut().unwrap();
+            state.lifecycle = "turn_active".to_owned();
+            if ambiguous {
+                state.lifecycle = "session_open".to_owned();
+                state.ambiguous_turn_start_pending = true;
+            } else {
+                state.active_provider_turn_id = Some("active-turn".to_owned());
+            }
+            executor.save_state().unwrap();
+            let before = fs::read(executor.state_path()).unwrap();
+            payload["provider"]["runtimeContext"] = json!({"runId": "fresh-run"});
+            let error = executor
+                .prepare(&payload)
+                .expect_err("live work cannot be rebound");
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires a settled provider session"),
+                "{error}"
+            );
+            assert_eq!(fs::read(executor.state_path()).unwrap(), before);
+            assert_eq!(
+                executor.state.as_ref().unwrap().pi_runtime_context,
+                json!({"runId": "original-run"})
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_prepare_refresh_retires_the_settled_process_and_launches_with_the_new_context() {
+        let (directory, mut executor, mut payload) = prepared_skill_checkpoint("pi_rpc", true);
+        let requests = directory.join("requests.jsonl");
+        let proxy = directory.join("proxy.sh");
+        fs::write(&proxy, format!(r#"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{}'
+  id=${{line#*\"id\":}}; id=${{id%%,*}}
+  case "$line" in
+    *'"method":"initialize"'*) printf '{{"id":%s,"result":{{}}}}\n' "$id" ;;
+    *'"method":"thread/resume"'*) printf '{{"id":%s,"result":{{"thread":{{"id":"stopped-thread","sessionId":"saved-pi-session"}}}}}}\n' "$id" ;;
+    *'"method":"thread/read"'*) printf '{{"id":%s,"result":{{"thread":{{"id":"stopped-thread","turns":[]}}}}}}\n' "$id" ;;
+    *'"method":"turn/start"'*) printf '{{"id":%s,"result":{{"turn":{{"id":"fresh-turn"}}}}}}\n' "$id" ;;
+    *'"id":'*) printf '{{"id":%s,"result":true}}\n' "$id" ;;
+  esac
+done
+"#, requests.display())).unwrap();
+        fs::set_permissions(&proxy, fs::Permissions::from_mode(0o600)).unwrap();
+        let artifact = |path: PathBuf| crate::durable::QualifiedLaunchArtifact {
+            sha256: format!("sha256:{:x}", Sha256::digest(fs::read(&path).unwrap())),
+            path,
+        };
+        let command = fs::canonicalize("/bin/sh").unwrap();
+        executor.pi_launch_profile = Some(OpenCodeLaunchProfile {
+            command: artifact(command.clone()),
+            proxy_script: artifact(proxy.clone()),
+            executable: artifact(fs::canonicalize("/bin/true").unwrap()),
+        });
+        let state = executor.state.as_mut().unwrap();
+        state.config.command = command;
+        state.config.args = vec![proxy.to_string_lossy().into_owned()];
+        let config = state.config.clone();
+        payload["provider"] = serde_json::to_value(&config).unwrap();
+        payload["provider"]["runtimeContext"] = json!({"runId": "original-run"});
+        let digest = executor.bind_pi_launch_profile(&config).unwrap();
+        executor.state.as_mut().unwrap().pi_launch_profile_digest = digest;
+        executor.save_state().unwrap();
+        let old_pid = executor.ensure_provider().unwrap().process_id();
+        assert_eq!(
+            executor
+                .state
+                .as_ref()
+                .unwrap()
+                .provider_session_id
+                .as_deref(),
+            Some("saved-pi-session")
+        );
+        executor
+            .prepare(&payload)
+            .expect("unchanged context keeps the existing process");
+        assert_eq!(executor.provider.as_ref().unwrap().process_id(), old_pid);
+        let context = json!({"runId": "fresh-run", "skills": [{"name": "updated-company-skill"}]});
+        payload["provider"]["runtimeContext"] = context.clone();
+        executor
+            .prepare(&payload)
+            .expect("context refresh must checkpoint the settled Pi process");
+        assert!(
+            executor.provider.is_none(),
+            "the old Pi process must not retain stale startup skills"
+        );
+        assert!(local_process_definitely_gone(old_pid, false));
+        let saved = executor.state.as_ref().unwrap();
+        assert_eq!(saved.lifecycle, "prepared");
+        assert_eq!(saved.pi_runtime_context, context);
+        assert_eq!(saved.thread_id.as_deref(), Some("stopped-thread"));
+        let next_provider = executor.ensure_provider().unwrap();
+        assert_ne!(next_provider.process_id(), old_pid);
+        assert_eq!(next_provider.thread_id(), "stopped-thread");
+        assert_eq!(
+            next_provider.provider_session_id(),
+            Some("saved-pi-session")
+        );
+        next_provider
+            .start_turn_with_options_and_effort(
+                "Recall our earlier conversation",
+                &config.cwd,
+                CodexTurnOptions::default(),
+                None,
+                Some("fresh-run"),
+            )
+            .unwrap();
+        next_provider.shutdown().unwrap();
+        let frames = fs::read_to_string(&requests)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let turn = frames
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap();
+        assert_eq!(turn["params"]["runtimeContext"], context);
+        assert_eq!(turn["params"]["paperclipRunId"], "fresh-run");
+        assert_eq!(turn["params"]["threadId"], "stopped-thread");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pi_attachment_normalizes_older_controller_skill_flag_after_prepare() {
+        for include in [true, false] {
+            let (directory, mut executor, mut payload) =
+                prepared_skill_checkpoint("pi_rpc", include);
+            executor
+                .attach_run(&payload)
+                .expect("the same Pi payload accepted by prepare must attach");
+            payload["provider"]["instructions"] = json!("fresh run instructions");
+            payload["provider"]["runtimeContext"] = json!({"runId": "fresh-run"});
+            executor
+                .attach_run(&payload)
+                .expect("normalization must still allow Pi run context refresh");
+            let saved: CodexProviderState =
+                serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+            assert_eq!(saved.config.include_skill_instructions, None);
+            assert_eq!(saved.config.instructions, "fresh run instructions");
+            assert_eq!(saved.pi_runtime_context, json!({"runId": "fresh-run"}));
+            assert_eq!(saved.thread_id.as_deref(), Some("stopped-thread"));
+            assert!(executor.provider.is_none());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn codex_attachment_retains_prepared_skill_flag_and_refuses_changes() {
+        for include in [true, false] {
+            let (directory, mut executor, mut payload) =
+                prepared_skill_checkpoint("codex", include);
+            executor
+                .attach_run(&payload)
+                .expect("Codex preserves its explicit skill setting");
+            let before = fs::read(executor.state_path()).unwrap();
+            payload["provider"]["includeSkillInstructions"] = json!(!include);
+            let error = executor
+                .attach_run(&payload)
+                .expect_err("Codex skill setting remains immutable");
+            assert!(
+                error.to_string().contains("durable Codex provider profile"),
+                "{error}"
+            );
+            assert_eq!(fs::read(executor.state_path()).unwrap(), before);
+            assert_eq!(
+                executor
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .config
+                    .include_skill_instructions,
+                Some(include)
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn pi_attachment_refreshes_only_run_context_and_preserves_immutable_profiles() {
+        for provider in ["pi_rpc", "codex", "opencode"] {
+            let mut state = opencode_result_state();
+            state.config.provider = provider.to_owned();
+            state.config.driver = match provider {
+                "pi_rpc" => "pi_rpc",
+                "codex" => "codex_app_server",
+                _ => "opencode_server",
+            }
+            .to_owned();
+            if provider == "pi_rpc" {
+                state.config.provider_version =
+                    crate::generated_pi_rpc_profile::PI_RPC_VERSION.to_owned();
+                state.config.profile = Some(
+                    serde_json::from_str(crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON)
+                        .unwrap(),
+                );
+            }
+            state.config.instructions = "old run instructions".to_owned();
+            state.active_provider_turn_id = None;
+            state.provider_process_generation = 1;
+            state.lifecycle = "prepared".to_owned();
+            for changed_field in [
+                "run_context",
+                "model",
+                "command",
+                "args",
+                "readOnly",
+                "conversationMode",
+            ] {
+                let directory = std::env::temp_dir().join(format!(
+                    "paperclip-pi-attach-profile-{}",
+                    uuid::Uuid::new_v4()
+                ));
+                fs::create_dir_all(&directory).unwrap();
+                let mut config = serde_json::to_value(&state.config).unwrap();
+                config["instructions"] = json!("fresh run instructions");
+                config["runtimeContext"] = json!({"runId": "fresh-run"});
+                match changed_field {
+                    "model" => config["model"] = json!("other/model"),
+                    "command" => config["command"] = json!("different-command"),
+                    "args" => config["args"] = json!(["--different-argument"]),
+                    "readOnly" => config["readOnly"] = json!(true),
+                    "conversationMode" => config["conversationMode"] = json!("prepared"),
+                    _ => {}
+                }
+                let before = serde_json::to_value(&state).unwrap();
+                let mut executor = CodexCommandExecutor::new(&directory);
+                executor.state = Some(state.clone());
+                let result = executor.attach_run(&json!({"provider": config}));
+                if provider == "pi_rpc" && changed_field == "run_context" {
+                    result.expect("Pi instructions and runtime context are run-scoped");
+                    let rebound = executor.state.as_ref().unwrap();
+                    assert_eq!(rebound.config.instructions, "fresh run instructions");
+                    assert_eq!(
+                        serde_json::to_value(rebound).unwrap()["piRuntimeContext"],
+                        json!({"runId": "fresh-run"})
+                    );
+                    assert_eq!(rebound.thread_id, state.thread_id);
+                    assert!(executor.provider.is_none());
+                    let saved: CodexProviderState =
+                        serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+                    assert_eq!(saved.pi_runtime_context, json!({"runId": "fresh-run"}));
+                    let mut cleared = serde_json::to_value(&rebound.config).unwrap();
+                    cleared["runtimeContext"] = Value::Null;
+                    let mut restored = CodexCommandExecutor::new(&directory);
+                    restored.state = Some(saved);
+                    restored.attach_run(&json!({"provider": cleared})).unwrap();
+                    let saved: CodexProviderState =
+                        serde_json::from_slice(&fs::read(restored.state_path()).unwrap()).unwrap();
+                    assert!(saved.pi_runtime_context.is_null());
+                } else {
+                    let error = result.expect_err("other durable profile fields stay immutable");
+                    assert!(
+                        error.to_string().contains("durable Codex provider profile"),
+                        "{error}"
+                    );
+                    assert_eq!(
+                        serde_json::to_value(executor.state.as_ref().unwrap()).unwrap(),
+                        before
+                    );
+                }
+                fs::remove_dir_all(directory).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn saved_thread_adopts_the_controllers_current_codex_feature_policy() {
+        // A thread saved before a Paperclip upgrade carries that release's
+        // feature toggles. The controller recomputes them for every launch, so a
+        // changed toggle must not strand the saved thread. Sandbox, permission
+        // profile, and command changes stay protected.
+        let saved_args: Vec<String> = vec![
+            "-c",
+            "default_permissions=\"paperclip-runner-workspace-only\"",
+            "-c",
+            "shell_environment_policy.set={PATH=\"/run/a\"}",
+            "--disable",
+            "image_generation",
+            "app-server",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let current_args: Vec<String> = vec![
+            "-c",
+            "default_permissions=\"paperclip-runner-workspace-only\"",
+            "-c",
+            "shell_environment_policy.set={PATH=\"/run/b\"}",
+            "app-server",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let mut settled = opencode_result_state();
+        settled.config.provider = "codex".to_owned();
+        settled.config.driver = "codex_app_server".to_owned();
+        settled.config.command = PathBuf::from("must-not-start-during-attachment");
+        settled.config.model = None;
+        settled.config.args = saved_args.clone();
+        settled.active_provider_turn_id = None;
+        settled.provider_process_generation = 1;
+        settled.lifecycle = "prepared".to_owned();
+
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-provider-feature-policy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let mut executor = CodexCommandExecutor::new(&directory);
+        executor.state = Some(settled.clone());
+        executor
+            .attach_run(&json!({
+                "provider": settled.config.clone(),
+                "runtimeLaunchArgs": current_args.clone(),
+            }))
+            .expect("a saved thread must follow the current feature policy");
+        let rebound = executor.state.as_ref().unwrap();
+        assert_eq!(rebound.config.args, current_args);
+        assert_eq!(rebound.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(rebound.lifecycle, "prepared");
+        assert!(executor.provider.is_none());
+        fs::remove_dir_all(directory).unwrap();
+
+        // Tightening the policy follows the controller as well.
+        let mut tightened = settled.clone();
+        tightened.config.args = current_args.clone();
+        let mut disabled = current_args.clone();
+        disabled.splice(4..4, ["--disable".to_owned(), "memories".to_owned()]);
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-provider-feature-tightening-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let mut executor = CodexCommandExecutor::new(&directory);
+        executor.state = Some(tightened.clone());
+        executor
+            .attach_run(&json!({
+                "provider": tightened.config.clone(),
+                "runtimeLaunchArgs": disabled.clone(),
+            }))
+            .unwrap();
+        assert_eq!(executor.state.as_ref().unwrap().config.args, disabled);
+        fs::remove_dir_all(directory).unwrap();
+
+        // A release that turns a feature on is adopted too, in either flag form.
+        for enabled_form in [
+            vec!["--enable".to_owned(), "goals".to_owned()],
+            vec!["--enable=goals".to_owned()],
+        ] {
+            let mut enabled = current_args.clone();
+            enabled.splice(4..4, enabled_form);
+            let directory = std::env::temp_dir().join(format!(
+                "paperclip-provider-feature-enable-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            let mut executor = CodexCommandExecutor::new(&directory);
+            executor.state = Some(tightened.clone());
+            executor
+                .attach_run(&json!({
+                    "provider": tightened.config.clone(),
+                    "runtimeLaunchArgs": enabled.clone(),
+                }))
+                .unwrap();
+            let rebound = executor.state.as_ref().unwrap();
+            assert_eq!(rebound.config.args, enabled);
+            assert_eq!(rebound.thread_id.as_deref(), Some("thread-1"));
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        let mut sandbox_bypass = current_args.clone();
+        sandbox_bypass.insert(4, "--dangerously-bypass-approvals-and-sandbox".to_owned());
+        let mut permission_profile = current_args.clone();
+        permission_profile[1] =
+            "default_permissions=\"paperclip-runner-external-sandbox\"".to_owned();
+        let mut subcommand = current_args.clone();
+        subcommand[4] = "exec".to_owned();
+        for changed in [sandbox_bypass, permission_profile, subcommand] {
+            let before = serde_json::to_value(&settled).unwrap();
+            let mut executor = CodexCommandExecutor::new("unused-protected-launch-change");
+            executor.state = Some(settled.clone());
+            let error = executor
+                .attach_run(&json!({
+                    "provider": settled.config.clone(),
+                    "runtimeLaunchArgs": changed,
+                }))
+                .expect_err("protected launch arguments must stay immutable");
+            assert!(
+                error.to_string().contains("protected launch arguments"),
+                "{error}"
+            );
+            assert_eq!(
+                serde_json::to_value(executor.state.as_ref().unwrap()).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn stopped_checkpoint_rebinding_retains_undelivered_facts_for_the_prior_authority() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-provider-retained-facts-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let mut state = opencode_result_state();
+        state.config.provider = "codex".to_owned();
+        state.config.driver = "codex_app_server".to_owned();
+        state.config.command = PathBuf::from("must-not-start-during-attachment");
+        state.config.model = None;
+        state.active_provider_turn_id = None;
+        state.provider_process_generation = 1;
+        state.lifecycle = "prepared".to_owned();
+        state
+            .push_event(NormalizedProviderEvent {
+                event_type: "run.result.proposed".to_owned(),
+                priority: EventPriority::P0,
+                payload: json!({}),
+            })
+            .unwrap();
+        // A paused goal can keep a stale working flag after its provider stops.
+        for (status, working_now) in [("paused", true), ("active", false)] {
+            let mut stopped = state.clone();
+            stopped.goal = Some(SessionGoalSnapshot {
+                objective: "Keep working.".to_owned(),
+                status: status.to_owned(),
+                token_budget: None,
+                tokens_used: 0,
+                elapsed_seconds: 0,
+                iterations: 0,
+                last_reason: None,
+                created_at: None,
+                updated_at: None,
+                completed_at: None,
+                working_now,
+            });
+            let writer = CodexCommandExecutor::new(&directory);
+            writer.persist_state(&stopped).unwrap();
+            let mut executor = CodexCommandExecutor::new(&directory);
+            executor.restore().unwrap();
+            executor
+                .attach_run(&json!({}))
+                .expect("a stopped provider has nothing live");
+        }
+        let writer = CodexCommandExecutor::new(&directory);
+        writer.persist_state(&state).unwrap();
+        let mut executor = CodexCommandExecutor::new(&directory);
+        executor.restore().unwrap();
+        executor.attach_run(&json!({})).unwrap();
+        let rebound = executor.state.as_ref().unwrap();
+        assert_eq!(rebound.pending_events.len(), 1);
+        assert_eq!(rebound.pending_events[0].event_type, "run.result.proposed");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stopped_checkpoint_rebinding_keeps_unsettled_and_missing_process_fences() {
+        let mut settled = opencode_result_state();
+        settled.config.provider = "codex".to_owned();
+        settled.config.driver = "codex_app_server".to_owned();
+        settled.config.command = PathBuf::from("must-not-start-during-attachment");
+        settled.config.model = None;
+        settled.active_provider_turn_id = None;
+        settled.provider_process_generation = 1;
+        settled.lifecycle = "prepared".to_owned();
+        for change in [
+            "closed",
+            "session_open",
+            "active",
+            "ambiguous",
+            "thread_missing",
+            "generation_missing",
+            "profile_changed",
+        ] {
+            let mut state = settled.clone();
+            let mut payload = json!({});
+            match change {
+                "closed" | "session_open" => state.lifecycle = change.to_owned(),
+                "active" => state.active_provider_turn_id = Some("still-active".to_owned()),
+                "ambiguous" => state.ambiguous_turn_start_pending = true,
+                "thread_missing" => state.thread_id = None,
+                "generation_missing" => state.provider_process_generation = 0,
+                "profile_changed" => {
+                    let mut config = state.config.clone();
+                    config.model = Some("different-model".to_owned());
+                    payload = json!({"provider": config});
+                }
+                _ => unreachable!(),
+            }
+            let before = serde_json::to_value(&state).unwrap();
+            let mut executor =
+                CodexCommandExecutor::new(PathBuf::from("unused-rejected-attachment"));
+            executor.state = Some(state);
+            assert!(
+                executor.attach_run(&payload).is_err(),
+                "must reject {change}"
+            );
+            assert!(executor.provider.is_none());
+            assert_eq!(
+                serde_json::to_value(executor.state.as_ref().unwrap()).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_cloud_cold_attachment_refreshes_only_instructions() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-cloud-cold-instructions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let mut state = cursor_cloud_result_state();
+        state.active_provider_turn_id = None;
+        state.provider_process_generation = 1;
+        state.lifecycle = "prepared".to_owned();
+        state.config.instructions = "Previous instructions".to_owned();
+        let mut config = state.config.clone();
+        config.instructions = "Current instructions".to_owned();
+        let mut executor = CodexCommandExecutor::new(&directory);
+        executor.state = Some(state);
+        executor.attach_run(&json!({"provider": config})).unwrap();
+        let rebound = executor.state.as_ref().unwrap();
+        assert_eq!(rebound.config, config);
+        assert_eq!(rebound.lifecycle, "prepared");
+        assert_eq!(rebound.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(rebound.provider_process_generation, 1);
+        assert!(executor.provider.is_none());
+        let persisted: CodexProviderState =
+            serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+        assert_eq!(persisted.config, config);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cursor_cloud_missing_owned_process_cannot_manufacture_cold_readiness() {
+        for mode in [
+            "settled",
+            "active",
+            "ambiguous",
+            "closed",
+            "reconciliation_required",
+        ] {
+            let mut state = cursor_cloud_result_state();
+            state.active_provider_turn_id = None;
+            state.lifecycle = "session_open".to_owned();
+            state.provider_termination_receipt = Some(json!({"remoteStopped": true}));
+            match mode {
+                "active" => state.active_provider_turn_id = Some("still-active".to_owned()),
+                "ambiguous" => state.ambiguous_turn_start_pending = true,
+                "closed" | "reconciliation_required" => state.lifecycle = mode.to_owned(),
+                _ => (),
+            }
+            let before = serde_json::to_value(&state).unwrap();
+            let mut executor = CodexCommandExecutor::new("unused-cloud-no-owned-process");
+            executor.state = Some(state);
+            let result = executor.stop_owned_provider();
+            assert_eq!(result.is_ok(), mode == "settled" || mode == "closed");
+            assert_eq!(
+                serde_json::to_value(executor.state.as_ref().unwrap()).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_cloud_instruction_refresh_preserves_profile_and_settlement_fences() {
+        let mut settled = cursor_cloud_result_state();
+        settled.active_provider_turn_id = None;
+        settled.provider_process_generation = 1;
+        settled.lifecycle = "prepared".to_owned();
+        for change in [
+            "session_open",
+            "active",
+            "ambiguous",
+            "pending",
+            "queued",
+            "model",
+            "command",
+            "args",
+            "provider",
+            "non_cloud",
+            "cwd",
+            "provider_session",
+            "generation_missing",
+        ] {
+            let mut state = settled.clone();
+            let mut config = state.config.clone();
+            config.instructions = "Current instructions".to_owned();
+            match change {
+                "session_open" => state.lifecycle = "session_open".to_owned(),
+                "active" => state.active_provider_turn_id = Some("still-active".to_owned()),
+                "ambiguous" => state.ambiguous_turn_start_pending = true,
+                "pending" | "queued" => {
+                    let event = PolledEvent {
+                        executor_event_id: "undelivered-result".to_owned(),
+                        event_type: "run.result.proposed".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({}),
+                    };
+                    if change == "pending" {
+                        state.pending_events.push_back(event);
+                    } else {
+                        state.queued_events.push_back(event);
+                    }
+                }
+                "model" => config.model = Some("different-model".to_owned()),
+                "command" => config.command = PathBuf::from("different-command"),
+                "args" => config.args.push("different-argument".to_owned()),
+                "provider" => {
+                    config.provider = "codex".to_owned();
+                    config.driver = "codex_app_server".to_owned();
+                }
+                "non_cloud" => {
+                    state.config.provider = "codex".to_owned();
+                    state.config.driver = "codex_app_server".to_owned();
+                    config.provider = "codex".to_owned();
+                    config.driver = "codex_app_server".to_owned();
+                }
+                "cwd" => config.cwd = std::env::temp_dir().to_string_lossy().into_owned(),
+                "provider_session" => {
+                    config.provider_session_id = Some("foreign-session".to_owned())
+                }
+                "generation_missing" => state.provider_process_generation = 0,
+                _ => unreachable!(),
+            }
+            let before = serde_json::to_value(&state).unwrap();
+            let mut executor = CodexCommandExecutor::new("unused-cloud-rejected-attachment");
+            executor.state = Some(state);
+            assert!(
+                executor.attach_run(&json!({"provider": config})).is_err(),
+                "must reject {change}"
+            );
+            assert!(executor.provider.is_none());
+            assert_eq!(
+                serde_json::to_value(executor.state.as_ref().unwrap()).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_terminal_tool_suppresses_the_generated_terminal_fallback() {
+        let mut state = opencode_result_state();
+        let mut result = valid_opencode_result();
+        result["reportedWorkDisposition"] = json!("needs_review");
+        result.as_object_mut().unwrap().remove("attentionRequests");
+        result.as_object_mut().unwrap().remove("artifacts");
+
+        admit_terminal_tool_authority(&mut state, "paperclip_finish", &result, false).unwrap();
+        let terminal = terminal_events(&state, "turn.completed", None);
+
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].event_type, "run.terminal");
+        assert_eq!(
+            terminal[0].payload["reportedWorkDisposition"],
+            "needs_review"
+        );
+        assert!(state.validate().is_ok());
+    }
+
+    fn declared_finish_state() -> CodexProviderState {
+        let input_schema: Value = serde_json::from_slice(
+            &fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../../protocol/schemas/result.schema.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let operation = crate::provider_bridge::AuthorizedTool {
+            operation_id: "paperclip_finish".to_owned(),
+            version: 1,
+            description: "Report the completed turn.".to_owned(),
+            input_schema,
+            response_schema: json!({"type": "object"}),
+        };
+        let mut state = opencode_result_state();
+        state.config.provider = "codex".to_owned();
+        state.config.driver = "codex_app_server".to_owned();
+        state.config.provider_version = "test".to_owned();
+        state
+            .tool_bridge
+            .prepare(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&operation))
+                    .unwrap(),
+                operations: vec![operation],
+            })
+            .unwrap();
+        state
+    }
+
+    fn tool_result_authority_state(provider: &str, operation_id: &str) -> CodexProviderState {
+        let mut state = declared_finish_state();
+        if operation_id != "paperclip_finish" {
+            let operation = crate::provider_bridge::AuthorizedTool {
+                operation_id: operation_id.to_owned(),
+                version: 1,
+                description: "Read the task context".to_owned(),
+                input_schema: json!({"type":"object"}),
+                response_schema: json!({"type":"object"}),
+            };
+            state.tool_bridge = ProviderToolBridge::default();
+            state
+                .tool_bridge
+                .prepare(AuthorizedToolSet {
+                    schema: TOOL_SET_SCHEMA.to_owned(),
+                    schema_version: 1,
+                    catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(
+                        &operation,
+                    ))
+                    .unwrap(),
+                    operations: vec![operation],
+                })
+                .unwrap();
+        }
+        if provider == "pi_rpc" {
+            state.config.provider = provider.to_owned();
+            state.config.driver = provider.to_owned();
+            state.config.provider_version =
+                crate::generated_pi_rpc_profile::PI_RPC_VERSION.to_owned();
+            state.config.profile = Some(
+                serde_json::from_str(crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON).unwrap(),
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn pi_rpc_first_held_result_is_authoritative_in_completed_and_settled_state() {
+        // Data-safety boundary: changing evidence never authorizes a second
+        // dispatch. Codex retains its strict input equality contract.
+        for provider in ["pi_rpc", "codex"] {
+            for operation_id in ["paperclip_finish", "get_task_context"] {
+                for settled in [false, true] {
+                    for is_error in [false, true] {
+                        let mut state = tool_result_authority_state(provider, operation_id);
+                        let input = valid_opencode_result();
+                        state
+                            .admit_tool_call("first-call", operation_id, &input)
+                            .unwrap();
+                        let result = ToolResult {
+                            call_id: "first-call".to_owned(),
+                            operation_id: operation_id.to_owned(),
+                            result: json!({"receipt":"original"}),
+                            is_error,
+                        };
+                        state.tool_bridge.apply_result(result.clone()).unwrap();
+                        if settled {
+                            state
+                                .tool_bridge
+                                .settle_turn("provider_turn_terminated")
+                                .unwrap();
+                            state.active_provider_turn_id = None;
+                            state.lifecycle = "session_open".to_owned();
+                        }
+                        // This is also the previous-release state shape: absent
+                        // piDeferredTerminal defaults to None without a reset.
+                        let saved = serde_json::to_value(&state).unwrap();
+                        assert!(saved.get("piDeferredTerminal").is_none());
+                        let mut restored: CodexProviderState =
+                            serde_json::from_value(saved).unwrap();
+                        restored.tool_bridge.attach_existing_run().unwrap();
+                        restored.validate().unwrap();
+                        let before = serde_json::to_value(&restored.tool_bridge).unwrap();
+                        let mut changed = input;
+                        changed["summary"] = json!("different summary");
+                        changed["evidence"] = json!([{"ref":"different evidence"}]);
+                        let replay = restored.admit_tool_call("first-call", operation_id, &changed);
+                        if provider == "pi_rpc" {
+                            assert_eq!(replay.unwrap(), ToolCallAdmission::CompletedReplay(result));
+                            assert!(
+                                restored
+                                    .admit_tool_call("first-call", "another_operation", &changed)
+                                    .is_err(),
+                                "call identity must not authorize a different operation"
+                            );
+                        } else {
+                            assert!(replay.unwrap_err().to_string().contains("different input"));
+                        }
+                        assert_eq!(serde_json::to_value(&restored.tool_bridge).unwrap(), before);
+                        assert!(restored.pending_events.is_empty());
+                        assert!(restored.queued_events.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    // Keep reason: B5's durable effect/terminal boundary. Advance the persisted
+    // deadline instead of sleeping; the provider has already ended this turn.
+    #[test]
+    fn pi_rpc_deferred_terminal_deadline_fails_and_unblocks_the_next_turn() {
+        for path in [
+            "connected",
+            "disconnected",
+            "backpressured",
+            "deadline-wake",
+        ] {
+            let directory = std::env::temp_dir().join(format!(
+                "paperclip-pi-terminal-deadline-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let mut state = tool_result_authority_state("pi_rpc", "paperclip_finish");
+            state
+                .admit_tool_call(
+                    "missing-result",
+                    "paperclip_finish",
+                    &valid_opencode_result(),
+                )
+                .unwrap();
+            state
+                .tool_bridge
+                .settle_turn("provider_turn_terminated")
+                .unwrap();
+            state.active_provider_turn_id = None;
+            state.lifecycle = "session_open".to_owned();
+            let mut saved = serde_json::to_value(&state).unwrap();
+            saved["piDeferredTerminal"] = json!("turn.completed");
+            // Test clock: this durable absolute deadline is already elapsed.
+            saved["piDeferredTerminalDeadlineUnixMs"] = json!(1);
+            let mut state: CodexProviderState = serde_json::from_value(saved).unwrap();
+            state.tool_bridge.attach_existing_run().unwrap();
+            state.validate().unwrap();
+            let mut executor = CodexCommandExecutor::new(&directory);
+            executor.state = Some(state);
+            match path {
+                "connected" => executor.poll_current_provider().unwrap(),
+                "disconnected" => {
+                    executor.poll_disconnected_events().unwrap();
+                }
+                "backpressured" => executor.maintain_backpressured_provider().unwrap(),
+                "deadline-wake" => {
+                    assert!(executor.maintain_disconnected_provider().unwrap().is_none());
+                }
+                _ => unreachable!(),
+            }
+            let state = executor.state.as_mut().unwrap();
+            let events: Vec<_> = state
+                .pending_events
+                .iter()
+                .chain(state.queued_events.iter())
+                .collect();
+            let terminal = events.iter().find(|event| event.event_type == "run.terminal")
+                .expect("an elapsed deferred Pi deadline must produce a terminal, even with no provider handle");
+            assert_eq!(terminal.payload["runTerminalState"], "failed");
+            assert_eq!(terminal.payload["turnTerminalState"], "failed");
+            assert_eq!(terminal.payload["code"], "pi_deferred_terminal_timeout");
+            assert!(events
+                .iter()
+                .any(|event| event.event_type == "session.failed"
+                    && event.payload["code"] == "pi_deferred_terminal_timeout"));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event.event_type == "semantic_tool.result"),
+                "a deadline must not invent the outcome of a possibly executed effect"
+            );
+            assert!(!events
+                .iter()
+                .any(|event| event.event_type == "run.result.proposed"));
+            let diagnostic = events
+                .iter()
+                .find(|event| {
+                    event.event_type == "harness.diagnostic"
+                        && event.payload["callId"] == "missing-result"
+                })
+                .unwrap();
+            assert_eq!(diagnostic.payload["operationOutcome"], "unknown");
+            state.validate().unwrap();
+            state
+                .tool_bridge
+                .prepare_turn()
+                .expect("the next turn must no longer be blocked");
+            assert!(
+                state
+                    .admit_tool_call(
+                        "missing-result",
+                        "paperclip_finish",
+                        &valid_opencode_result()
+                    )
+                    .is_err(),
+                "an expired call id remains tombstoned; timeout never authorizes duplicate effects"
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn pi_rpc_deferred_terminal_deadline_is_bounded_for_legacy_journals() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-pi-terminal-legacy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut state = tool_result_authority_state("pi_rpc", "get_task_context");
+        state
+            .admit_tool_call("missing-result", "get_task_context", &json!({}))
+            .unwrap();
+        state
+            .tool_bridge
+            .settle_turn("provider_turn_terminated")
+            .unwrap();
+        state.active_provider_turn_id = None;
+        state.lifecycle = "session_open".to_owned();
+        let mut saved = serde_json::to_value(&state).unwrap();
+        saved["piDeferredTerminal"] = json!("turn.failed");
+        saved
+            .as_object_mut()
+            .unwrap()
+            .remove("piDeferredTerminalDeadlineUnixMs");
+        let mut executor = CodexCommandExecutor::new(&directory);
+        executor.state = Some(serde_json::from_value(saved).unwrap());
+        let before = current_unix_ms().unwrap();
+        executor.poll_current_provider_with_control(false).unwrap();
+        let saved: Value =
+            serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+        let deadline = saved["piDeferredTerminalDeadlineUnixMs"]
+            .as_u64()
+            .expect("old deferred journals acquire a durable bounded deadline");
+        assert!(deadline >= before && deadline <= current_unix_ms().unwrap() + 30_000);
+        assert!(
+            executor.maintain_disconnected_provider().unwrap().is_some(),
+            "the existing host lifecycle receives the actual pending deadline"
+        );
+        executor.poll_current_provider_with_control(false).unwrap();
+        assert_eq!(
+            serde_json::to_value(executor.state.as_ref().unwrap()).unwrap()
+                ["piDeferredTerminalDeadlineUnixMs"],
+            deadline
+        );
+        assert!(executor
+            .state
+            .as_ref()
+            .unwrap()
+            .tool_bridge
+            .pending_calls()
+            .next()
+            .is_some());
+        assert!(!executor
+            .state
+            .as_ref()
+            .unwrap()
+            .pending_events
+            .iter()
+            .any(|event| event.event_type == "run.terminal"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    // Keep reason: #21490's closed-turn expiry crosses P1's durable Pi
+    // terminal/result authority boundary. Exercise real attach and persistence,
+    // including the retained FIFO, rather than weakening its state validator.
+    #[test]
+    fn pi_rpc_attach_expiry_releases_the_deferred_terminal_and_persists_fifo() {
+        for event_type in [
+            "turn.completed",
+            "turn.failed",
+            "turn.interrupted",
+            "turn.cancelled",
+        ] {
+            let (directory, mut executor, mut payload) = prepared_skill_checkpoint("pi_rpc", true);
+            let authority = tool_result_authority_state("pi_rpc", "get_task_context");
+            let state = executor.state.as_mut().unwrap();
+            state.tool_bridge = authority.tool_bridge;
+            state.completion_contract = authority.completion_contract;
+            state.run_identity = Some(prepare_contract_identity("run-A"));
+            state.last_agent_message = Some("The previous run's final answer.".to_owned());
+            state
+                .admit_tool_call("expiry-probe", "get_task_context", &json!({}))
+                .unwrap();
+            state
+                .tool_bridge
+                .settle_turn("provider_turn_terminated")
+                .unwrap();
+            state.active_provider_turn_id = None;
+            // Fill both durable FIFO segments; the released predecessor terminal
+            // must follow them, not precede or overwrite retained facts.
+            for index in 0..MAX_EVENTS_PER_POLL + 2 {
+                state
+                    .push_event(NormalizedProviderEvent {
+                        event_type: "harness.diagnostic".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({"code": "retained-predecessor-fact", "index": index}),
+                    })
+                    .unwrap();
+            }
+            let expected = terminal_events(state, event_type, None);
+            assert!(!expected.is_empty());
+            let outcome = state
+                .defer_pi_terminal_outcome(event_type, expected.clone())
+                .unwrap();
+            assert!(outcome.is_empty());
+            state.extend_terminal_events(outcome).unwrap();
+            assert_eq!(state.pi_deferred_terminal.as_deref(), Some(event_type));
+            state
+                .validate()
+                .expect("P1 deferred-terminal state is valid before expiry");
+            let retained: Vec<_> = state
+                .pending_events
+                .iter()
+                .chain(state.queued_events.iter())
+                .cloned()
+                .collect();
+            let operations: Vec<_> = state.tool_bridge.authorized_tools().cloned().collect();
+            payload["authorizedTools"] = serde_json::to_value(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(&operations).unwrap(),
+                operations,
+            })
+            .unwrap();
+            payload["completionContract"] =
+                serde_json::to_value(&state.completion_contract).unwrap();
+            payload["completionContract"]["revision"] = json!("new-run-contract");
+            payload["paperclipNextAuthority"] = json!({"identity": {
+                "runnerInstanceId": "contract-runner", "environmentLeaseId": "lease",
+                "runId": "run-B", "normalizedSessionId": "contract-session",
+                "turnId": "turn-run-B", "itemId": "item-run-B",
+            }});
+            executor.save_state().unwrap();
+            let expired = executor
+                .attach_run(&payload)
+                .expect("attach expiry must leave the deferred Pi terminal persistable");
+            assert_eq!(expired.len(), 1);
+            assert_eq!(expired[0].call_id, "expiry-probe");
+            assert!(expired[0].is_error);
+            let state = executor.state.as_ref().unwrap();
+            assert!(state.tool_bridge.pending_calls().next().is_none());
+            assert!(state.pi_deferred_terminal.is_none());
+            assert!(state.pi_deferred_terminal_deadline_unix_ms.is_none());
+            assert_eq!(state.run_identity.as_ref().unwrap().run_id, "run-B");
+            assert_eq!(
+                state.completion_contract.as_ref().unwrap().revision,
+                "new-run-contract"
+            );
+            let events: Vec<_> = state
+                .pending_events
+                .iter()
+                .chain(state.queued_events.iter())
+                .cloned()
+                .collect();
+            assert_eq!(&events[..retained.len()], retained.as_slice());
+            let released = &events[retained.len()..];
+            assert_eq!(released.len(), expected.len());
+            for (actual, expected) in released.iter().zip(&expected) {
+                assert_eq!(actual.event_type, expected.event_type);
+                assert_eq!(actual.payload, expected.payload);
+            }
+            let terminal = released
+                .iter()
+                .find(|event| event.event_type == "run.terminal")
+                .unwrap();
+            assert_eq!(
+                terminal.payload["turnTerminalState"],
+                event_type.strip_prefix("turn.").unwrap()
+            );
+            state.validate().expect("attached state validates");
+            let persisted: CodexProviderState =
+                serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+            persisted
+                .validate()
+                .expect("persisted state validates after reload");
+            assert_eq!(&persisted, state);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn pi_rpc_deferred_terminal_waits_for_every_authoritative_result() {
+        for provider in ["pi_rpc", "codex"] {
+            for operation_id in ["paperclip_finish", "get_task_context"] {
+                for is_error in [false, true] {
+                    let mut state = tool_result_authority_state(provider, operation_id);
+                    let input = valid_opencode_result();
+                    for call_id in ["first-call", "second-call"] {
+                        state
+                            .admit_tool_call(call_id, operation_id, &input)
+                            .unwrap();
+                    }
+                    state
+                        .tool_bridge
+                        .settle_turn("provider_turn_terminated")
+                        .unwrap();
+                    state.active_provider_turn_id = None;
+                    state.lifecycle = "session_open".to_owned();
+                    let outcome = terminal_events(&state, "turn.failed", None);
+                    let outcome = state
+                        .defer_pi_terminal_outcome("turn.failed", outcome)
+                        .unwrap();
+                    state.extend_terminal_events(outcome).unwrap();
+                    let saved = serde_json::to_value(&state).unwrap();
+                    let mut state: CodexProviderState = serde_json::from_value(saved).unwrap();
+                    state.tool_bridge.attach_existing_run().unwrap();
+                    state.validate().unwrap();
+                    assert_eq!(state.pi_deferred_terminal.is_some(), provider == "pi_rpc");
+                    for (index, call_id) in ["first-call", "second-call"].into_iter().enumerate() {
+                        state
+                            .tool_bridge
+                            .apply_result(ToolResult {
+                                call_id: call_id.to_owned(),
+                                operation_id: operation_id.to_owned(),
+                                result: json!({"ok":!is_error}),
+                                is_error,
+                            })
+                            .unwrap();
+                        admit_terminal_tool_authority(&mut state, operation_id, &input, is_error)
+                            .unwrap();
+                        state.settle_deferred_pi_terminal().unwrap();
+                        state.validate().unwrap();
+                        let terminals: Vec<_> = state
+                            .pending_events
+                            .iter()
+                            .filter(|event| event.event_type == "run.terminal")
+                            .collect();
+                        assert_eq!(
+                            terminals.len(),
+                            usize::from(provider != "pi_rpc" || index == 1)
+                        );
+                    }
+                    assert!(state.pi_deferred_terminal.is_none());
+                    assert!(state.tool_bridge.pending_calls().next().is_none());
+                    assert!(
+                        serde_json::to_value(&state.tool_bridge).unwrap()["completed"]
+                            .as_object()
+                            .unwrap()
+                            .is_empty()
+                    );
+                    let terminals: Vec<_> = state
+                        .pending_events
+                        .iter()
+                        .filter(|event| event.event_type == "run.terminal")
+                        .collect();
+                    assert_eq!(terminals.len(), 1);
+                    let success =
+                        provider == "pi_rpc" && operation_id == "paperclip_finish" && !is_error;
+                    assert_eq!(
+                        terminals[0].payload["runTerminalState"],
+                        if success { "succeeded" } else { "failed" }
+                    );
+                    let before = state.pending_events.clone();
+                    state.settle_deferred_pi_terminal().unwrap();
+                    assert_eq!(
+                        state.pending_events, before,
+                        "draining a settled terminal is idempotent"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn controller_rejected_finish_cannot_become_a_successful_terminal_fallback() {
+        let mut state = declared_finish_state();
+        let input = valid_opencode_result();
+        assert!(matches!(
+            state
+                .admit_tool_call("rejected-finish", "paperclip_finish", &input)
+                .unwrap(),
+            ToolCallAdmission::Pending(_)
+        ));
+        state
+            .tool_bridge
+            .apply_result(ToolResult {
+                call_id: "rejected-finish".to_owned(),
+                operation_id: "paperclip_finish".to_owned(),
+                result: json!({"error": {"code": "deliverable_missing"}}),
+                is_error: true,
+            })
+            .unwrap();
+        admit_terminal_tool_authority(&mut state, "paperclip_finish", &input, true).unwrap();
+        state.last_agent_message =
+            Some("The required deliverable could not be published.".to_owned());
+
+        assert_rejected_finish_terminal(&state);
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn schema_rejected_finish_cannot_become_a_successful_terminal_fallback() {
+        let mut state = declared_finish_state();
+        assert!(state
+            .admit_tool_call("invalid-finish", "paperclip_finish", &json!({}))
+            .unwrap_err()
+            .to_string()
+            .contains("JSON Schema validation"));
+        assert_eq!(state.tool_bridge.pending_calls().count(), 0);
+
+        assert_rejected_finish_terminal(&state);
+        let active_goal_events = terminal_events(&state, "turn.completed", Some("active"));
+        assert_eq!(active_goal_events[0].event_type, "session.failed");
+        assert_eq!(active_goal_events[0].payload["recoverable"], false);
+        assert!(state.validate().is_ok());
+    }
+
+    fn assert_rejected_finish_terminal(state: &CodexProviderState) {
+        let events = with_terminal_outcome(
+            vec![NormalizedProviderEvent {
+                event_type: "turn.completed".to_owned(),
+                priority: EventPriority::P0,
+                payload: json!({"status": "completed"}),
+            }],
+            terminal_events(state, "turn.completed", None),
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["session.failed", "turn.completed", "run.terminal"],
+        );
+        assert_eq!(events[0].payload["code"], "semantic_completion_rejected");
+        assert_eq!(events[0].payload["recoverable"], false);
+        assert_eq!(events[1].payload["status"], "completed");
+        assert_eq!(events[2].payload["runTerminalState"], "failed");
+        assert_eq!(events[2].payload["reportedWorkDisposition"], "needs_review");
+        assert!(events
+            .iter()
+            .all(|event| event.payload.get("attentionRequests").is_none()));
+    }
+
+    #[test]
+    fn rejected_finish_survives_snapshot_restore_and_only_a_new_turn_clears_it() {
+        let mut state = declared_finish_state();
+        state
+            .admit_tool_call("invalid-finish", "paperclip_finish", &json!({}))
+            .unwrap_err();
+        let mut restored: CodexProviderState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert_rejected_finish_terminal(&restored);
+        restored.reconcile_active_provider_turn(Some("turn-1".to_owned()));
+        assert_rejected_finish_terminal(&restored);
+
+        restored.reconcile_active_provider_turn(Some("turn-2".to_owned()));
+
+        assert_eq!(
+            terminal_events(&restored, "turn.completed", None)[0].payload
+                ["reportedWorkDisposition"],
+            "done"
+        );
+        assert!(restored.validate().is_ok());
+    }
+
+    #[test]
+    fn legacy_snapshot_without_a_rejected_finish_marker_keeps_its_fallback() {
+        let mut encoded = serde_json::to_value(declared_finish_state()).unwrap();
+        assert!(encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("activeTerminalToolRejected")
+            .is_some());
+        let restored: CodexProviderState = serde_json::from_value(encoded).unwrap();
+
+        assert_eq!(
+            terminal_events(&restored, "turn.completed", None)[0].payload
+                ["reportedWorkDisposition"],
+            "done"
+        );
+        assert!(restored.validate().is_ok());
+    }
+
+    #[test]
+    fn an_undeclared_finish_rejection_does_not_change_terminal_authority() {
+        let mut state = opencode_result_state();
+        state.last_agent_message = Some("The requested answer is ready.".to_owned());
+        state
+            .admit_tool_call("undeclared-finish", "paperclip_finish", &json!({}))
+            .unwrap_err();
+
+        assert_eq!(
+            terminal_events(&state, "turn.completed", None)[0].payload["reportedWorkDisposition"],
+            "done"
+        );
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn rejected_finish_allows_a_later_accepted_finish_in_the_same_turn() {
+        let mut state = declared_finish_state();
+        let input = valid_opencode_result();
+        admit_terminal_tool_authority(&mut state, "paperclip_finish", &input, true).unwrap();
+        admit_terminal_tool_authority(&mut state, "paperclip_finish", &input, false).unwrap();
+
+        let events = terminal_events(&state, "turn.completed", None);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "run.terminal");
+        assert_eq!(events[0].payload["reportedWorkDisposition"], "done");
+        assert_eq!(events[0].payload["runTerminalState"], "succeeded");
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn ordinary_final_message_without_a_finish_attempt_keeps_its_fallback() {
+        let mut state = declared_finish_state();
+        state.last_agent_message = Some("The requested answer is ready.".to_owned());
+
+        let events = terminal_events(&state, "turn.completed", None);
+
+        assert_eq!(events[0].payload["reportedWorkDisposition"], "done");
+        assert_eq!(
+            events[0].payload["completionClaim"]["objectiveSatisfied"],
+            true
+        );
+        assert_eq!(
+            events[0].payload["summary"],
+            "The requested answer is ready."
+        );
+        assert_eq!(events[1].payload["runTerminalState"], "succeeded");
+        assert!(terminal_events(&state, "turn.completed", Some("active")).is_empty());
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn accepted_terminal_tool_preserves_an_explicit_response_wait() {
+        let mut state = opencode_result_state();
+        let mut result = valid_opencode_result();
+        result["reportedWorkDisposition"] = json!("yielded");
+        result["continuation"] = json!({
+            "kind": "response_wake",
+            "summary": "Wait for the next response.",
+            "idempotencyKey": "response-wake-1"
+        });
+
+        admit_terminal_tool_authority(&mut state, "paperclip_finish", &result, false).unwrap();
+        let terminal = terminal_events(&state, "turn.completed", None);
+
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].payload["reportedWorkDisposition"], "yielded");
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn accepted_terminal_tool_preserves_an_explicit_monitor_wait() {
+        let mut state = opencode_result_state();
+        let mut result = valid_opencode_result();
+        result["reportedWorkDisposition"] = json!("yielded");
+        result["continuation"] = json!({
+            "kind": "monitor",
+            "summary": "Wait for the scheduled check.",
+            "idempotencyKey": "monitor-1"
+        });
+
+        admit_terminal_tool_authority(&mut state, "paperclip_finish", &result, false).unwrap();
+        let terminal = terminal_events(&state, "turn.completed", None);
+
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].payload["reportedWorkDisposition"], "yielded");
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn terminal_tool_authority_preserves_controller_resolved_workspace_yields() {
+        for continuation in [
+            None,
+            Some(Value::Null),
+            Some(json!({
+                "kind": "same_agent",
+                "summary": "Continue the prepared repository.",
+                "idempotencyKey": "repository:task:receipt:run"
+            })),
+        ] {
+            let mut state = opencode_result_state();
+            let mut result = valid_opencode_result();
+            result["reportedWorkDisposition"] = json!("yielded");
+            if let Some(value) = continuation {
+                result["continuation"] = value;
+            }
+            admit_terminal_tool_authority(&mut state, "paperclip_finish", &result, false).unwrap();
+            assert_eq!(
+                state.active_provider_result_disposition.as_deref(),
+                Some("yielded")
+            );
+            assert_eq!(
+                state.active_provider_result_fingerprint.as_deref(),
+                Some(semantic_value_digest(&result).as_str())
+            );
+            assert!(state.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn terminal_tool_authority_does_not_record_a_controller_rejected_yield() {
+        let mut state = opencode_result_state();
+        let mut result = valid_opencode_result();
+        result["reportedWorkDisposition"] = json!("yielded");
+        result["continuation"] = json!({
+            "kind": "same_agent",
+            "summary": "Continue immediately.",
+            "idempotencyKey": "same-agent-1"
+        });
+
+        admit_terminal_tool_authority(&mut state, "paperclip_finish", &result, true).unwrap();
+        assert!(state.active_provider_result_fingerprint.is_none());
+        assert!(state.active_provider_result_disposition.is_none());
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn accepted_terminal_tool_remains_successful_after_controller_interrupt() {
+        let mut state = opencode_result_state();
+        let result = valid_opencode_result();
+
+        admit_terminal_tool_authority(&mut state, "paperclip_finish", &result, false).unwrap();
+        let terminal = terminal_events(&state, "turn.interrupted", None);
+
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].event_type, "run.terminal");
+        assert_eq!(terminal[0].payload["runTerminalState"], "succeeded");
+        assert_eq!(terminal[0].payload["turnTerminalState"], "completed");
+        assert_eq!(terminal[0].payload["reportedWorkDisposition"], "done");
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn pi_rpc_terminal_tool_authority_is_valid_durable_state() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        state.config.driver = "pi_rpc".to_owned();
+        state.config.provider_version = crate::generated_pi_rpc_profile::PI_RPC_VERSION.to_owned();
+        state.config.profile = Some(
+            serde_json::from_str(crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON).unwrap(),
+        );
+        admit_terminal_tool_authority(
+            &mut state,
+            "paperclip_finish",
+            &valid_opencode_result(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            state.active_provider_result_disposition.as_deref(),
+            Some("done")
+        );
+        state
+            .validate()
+            .expect("accepted Pi finish must persist without leaving a durable pending callback");
+        let saved = serde_json::to_vec(&state).unwrap();
+        let restored: CodexProviderState = serde_json::from_slice(&saved).unwrap();
+        restored.validate().unwrap();
+        let terminal = terminal_events(&restored, "turn.completed", None);
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].payload["runTerminalState"], "succeeded");
+        state.config.provider = "acpx".to_owned();
+        assert!(
+            state.validate().is_err(),
+            "do not widen terminal authority for other providers"
+        );
+    }
+
+    #[test]
+    fn codex_terminal_tool_authority_is_valid_durable_state() {
+        let mut state = opencode_result_state();
+        state.config.provider = "codex".to_owned();
+        state.config.driver = "codex_app_server".to_owned();
+        state.config.provider_version = "test".to_owned();
+
+        admit_terminal_tool_authority(
+            &mut state,
+            "paperclip_finish",
+            &valid_opencode_result(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.active_provider_result_disposition.as_deref(),
+            Some("done")
+        );
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn terminal_tool_authority_rejects_an_incompatible_disposition() {
+        let mut state = opencode_result_state();
+
+        assert!(admit_terminal_tool_authority(
+            &mut state,
+            "paperclip_block",
+            &valid_opencode_result(),
+            false,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("incompatible work disposition"));
+        assert!(state.active_provider_result_fingerprint.is_none());
+    }
+
+    #[test]
+    fn pi_rpc_keeps_proxy_results_reserved_and_rejects_invalid_finish_dispositions() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        state.config.driver = "pi_rpc".to_owned();
+        // Pi's current finish authority comes from the correlated semantic tool,
+        // not an independently emitted paperclip/runResult notification.
+        let params =
+            json!({"threadId":"thread-1", "turnId":"turn-1", "result":valid_opencode_result()});
+        assert!(
+            normalize_provider_notification(&mut state, "paperclip/runResult", &params)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved for verified provider proxies")
+        );
+        for disposition in ["blocked", "invalid"] {
+            let mut input = valid_opencode_result();
+            input["reportedWorkDisposition"] = json!(disposition);
+            assert!(
+                admit_terminal_tool_authority(&mut state, "paperclip_finish", &input, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("incompatible work disposition")
+            );
+            assert!(state.active_provider_result_fingerprint.is_none());
+            assert!(state.active_provider_result_disposition.is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_unbound_conflicting_or_spoofed_opencode_results() {
+        let params = |result: Value| {
+            json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "semantic-result",
+                "result": result,
+            })
+        };
+
+        let mut wrong_revision = opencode_result_state();
+        let mut result = valid_opencode_result();
+        result["completionClaim"]["contractRevision"] = json!("revision-2");
+        assert!(normalize_provider_notification(
+            &mut wrong_revision,
+            "paperclip/runResult",
+            &params(result),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("contract revision"));
+
+        let mut malformed = opencode_result_state();
+        assert!(normalize_provider_notification(
+            &mut malformed,
+            "paperclip/runResult",
+            &params(json!({"schema": "paperclip.run_result.v1"})),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("failed the Paperclip result schema"));
+
+        let mut wrong_criteria = opencode_result_state();
+        let mut result = valid_opencode_result();
+        result["completionClaim"]["criteria"][0]["criterionId"] = json!("criterion-2");
+        assert!(normalize_provider_notification(
+            &mut wrong_criteria,
+            "paperclip/runResult",
+            &params(result),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("bound completion criteria"));
+
+        let mut conflicting = opencode_result_state();
+        normalize_provider_notification(
+            &mut conflicting,
+            "paperclip/runResult",
+            &params(valid_opencode_result()),
+        )
+        .unwrap();
+        let mut result = valid_opencode_result();
+        result["summary"] = json!("A conflicting second result.");
+        assert!(normalize_provider_notification(
+            &mut conflicting,
+            "paperclip/runResult",
+            &params(result),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("conflicting"));
+
+        let mut spoofed = opencode_result_state();
+        spoofed.config.provider = "codex".to_owned();
+        assert!(normalize_provider_notification(
+            &mut spoofed,
+            "paperclip/runResult",
+            &params(valid_opencode_result()),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("reserved for verified provider proxies"));
+    }
+
+    // B7: the real Pi proxy carries `channel` beside `item`, not in `item.phase`.
+    // Keep these boundary checks: misclassification silently cuts the user's reply.
+    #[test]
+    fn b7_pi_final_channel_preserves_a_5000_character_answer() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let answer = "x".repeat(5_000);
+        let events = normalize_provider_notification(
+            &mut state,
+            "item/completed",
+            &json!({"threadId": "thread-1", "turnId": "turn-1", "channel": "final",
+                "item": {"id": "pi-message", "type": "agentMessage", "text": answer}}),
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "item.completed");
+        assert_eq!(events[0].payload["provider"], "pi_rpc");
+        assert_eq!(events[0].payload["channel"], "final");
+        assert_eq!(events[0].payload["text"], answer);
+        assert!(events[0].payload.get("providerPhase").is_none());
+
+        state.last_agent_message = Some(answer.clone());
+        let terminal = terminal_events(&state, "turn.completed", None);
+        assert_eq!(terminal[0].event_type, "run.result.proposed");
+        assert_eq!(terminal[0].payload["summary"], answer);
+    }
+
+    // ROW-4096 (pack-n5): run events showed Pi tool output cut at ~4,096
+    // characters with "…[truncated]". What Pi returned to the model for a
+    // builtin tool (its own <=50 KB page plus Pi's "Full output: PATH" footer)
+    // must reach the run events whole, with no cut marker of ours.
+    #[test]
+    fn row4096_pi_tool_output_reaches_run_events_whole() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let mut output: String = (0..800)
+            .map(|index| format!("out {index} {} é🦀\n", "z".repeat(60)))
+            .collect();
+        output.push_str("\n[Showing lines 1201-2000 of 2000. Full output: /tmp/pi-bash-0123.log]");
+        assert!(output.len() > 50_000 && output.chars().count() < 60_000);
+        let events = normalize_provider_notification(
+            &mut state,
+            "item/completed",
+            &json!({"threadId": "thread-1", "turnId": "turn-1", "itemId": "pi-tool-1",
+                "item": {"id": "pi-tool-1", "type": "builtinToolCall", "tool": "bash",
+                    "status": "completed", "output": output}}),
+        )
+        .unwrap();
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == "tool.execution.completed")
+            .expect("tool execution completed");
+        let text = completed.payload["output"].as_str().unwrap();
+        assert!(
+            !text.contains("…[truncated]"),
+            "cut to {} bytes",
+            text.len()
+        );
+        assert_eq!(text.as_bytes(), output.as_bytes());
+        assert_eq!(completed.payload["outputTruncated"], false);
+        for event in &events {
+            assert!(
+                !event.payload.to_string().contains("…[truncated]"),
+                "{} carries a cut marker",
+                event.event_type
+            );
+        }
+    }
+
+    // C4 (pack-n5): the person's final answer is never cut. A 40,000-character
+    // Pi final answer (as streamed: quotes, newlines, multi-byte text) must
+    // arrive whole, byte-equal to the text in the raw Pi JSONL record.
+    #[test]
+    fn c4_pi_final_answer_of_40000_characters_arrives_whole() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let unit = "Line \"quoted\" 🦀 naïve\n";
+        let mut answer = unit.repeat(40_000 / unit.chars().count() + 1);
+        answer = answer.chars().take(40_000).collect();
+        assert_eq!(answer.chars().count(), 40_000);
+        let raw_jsonl = serde_json::to_string(&json!({"threadId": "thread-1", "turnId": "turn-1",
+            "channel": "final", "item": {"id": "pi-message", "type": "agentMessage", "text": answer}}))
+        .unwrap();
+        let raw: Value = serde_json::from_str(&raw_jsonl).unwrap();
+        let raw_text = raw["item"]["text"].as_str().unwrap().to_owned();
+        let events = normalize_provider_notification(&mut state, "item/completed", &raw).unwrap();
+        assert_eq!(events[0].event_type, "item.completed");
+        assert_eq!(events[0].payload["channel"], "final");
+        let text = events[0].payload["text"].as_str().unwrap();
+        assert_eq!(text.chars().count(), 40_000);
+        assert_eq!(text.as_bytes(), raw_text.as_bytes());
+        assert!(!text.contains("[truncated]"));
+    }
+
+    #[test]
+    // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): replaces
+    // b7_pi_final_channel_is_bounded_at_12000_characters, which pinned the silent
+    // 12,000-character cut of the person's final answer. The final channel is
+    // whole; c4_pi_final_answer_of_40000_characters_arrives_whole is stricter.
+    fn b7_pi_final_channel_is_not_cut_at_12000_characters() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        for length in [12_000, 12_001, 33_000] {
+            let answer = "🦀".repeat(length);
+            let events = normalize_provider_notification(
+                &mut state,
+                "item/completed",
+                &json!({"channel": "final", "item": {
+                    "id": "pi-message", "type": "agentMessage", "text": answer}}),
+            )
+            .unwrap();
+            assert_eq!(events[0].payload["channel"], "final");
+            let text = events[0].payload["text"].as_str().unwrap();
+            assert_eq!(text.chars().count(), length, "input length {length}");
+            assert_eq!(text, "🦀".repeat(length));
+        }
+    }
+
+    #[test]
+    fn b7_pi_synthesized_summary_is_bounded_at_12000_characters() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        for length in [5_000, 12_000, 12_001, 33_000] {
+            let answer = "🦀".repeat(length);
+            state.last_agent_message = Some(answer);
+            let events = terminal_events(&state, "turn.completed", None);
+            assert_eq!(events[0].event_type, "run.result.proposed");
+            let summary = events[0].payload["summary"].as_str().unwrap();
+            assert_eq!(summary.chars().count(), length.min(12_000));
+            assert_eq!(summary, "🦀".repeat(length.min(12_000)));
+        }
+    }
+
+    #[test]
+    fn b7_channel_override_is_pi_only_and_progress_stays_bounded() {
+        for provider in ["codex", "opencode", "cursor_cloud", "pi_rpc"] {
+            let mut state = opencode_result_state();
+            state.config.provider = provider.to_owned();
+            for channel in ["final", "progress"] {
+                if provider == "pi_rpc" && channel == "final" {
+                    continue;
+                }
+                let params = json!({"channel": channel, "item": {
+                    "id": "message", "type": "agentMessage", "text": "x".repeat(5_000)}});
+                let expected = normalize_codex_notification_in(
+                    "item/completed",
+                    &params,
+                    Some(&state.config.cwd),
+                )
+                .into_iter()
+                .map(|event| relabel_provider_event(event, provider))
+                .collect::<Vec<_>>();
+                let actual =
+                    normalize_provider_notification(&mut state, "item/completed", &params).unwrap();
+                assert_eq!(actual[0].payload["channel"], "progress");
+                // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z):
+                // was assert_eq!(actual, expected) and a 4,000-character text
+                // ("…[truncated]") for every provider, pi_rpc included. A Pi
+                // progress message is shown in the person's task chat: it now
+                // arrives whole. Other providers keep the codex preview.
+                if provider == "pi_rpc" {
+                    assert_eq!(actual[0].payload["text"], "x".repeat(5_000));
+                    assert!(!actual[0].payload.to_string().contains("truncat"));
+                    continue;
+                }
+                assert_eq!(actual, expected, "{provider} {channel}");
+                assert_eq!(
+                    actual[0].payload["text"].as_str().unwrap().chars().count(),
+                    4_000
+                );
+            }
+            // Other providers keep their existing explicit phase semantics and 32K cap.
+            if provider != "pi_rpc" {
+                let answer = "x".repeat(13_000);
+                let events = normalize_provider_notification(
+                    &mut state,
+                    "item/completed",
+                    &json!({"channel": "progress", "item": {"id": "final", "type": "agentMessage",
+                        "phase": "final_answer", "text": answer}}),
+                )
+                .unwrap();
+                assert_eq!(events[0].payload["channel"], "final");
+                assert_eq!(events[0].payload["providerPhase"], "final_answer");
+                assert_eq!(events[0].payload["text"], answer);
+            }
+        }
+    }
+
+    #[test]
+    fn opencode_terminal_fallback_uses_its_actual_provider_identity() {
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                profile: None,
+                provider: "opencode".to_owned(),
+                driver: "opencode_server".to_owned(),
+                provider_version: "1.18.34".to_owned(),
+                command: PathBuf::from("node"),
+                args: Vec::new(),
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: Some("openrouter/model".to_owned()),
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+            },
+            Some(CompletionContractBinding {
+                revision: "revision-1".to_owned(),
+                criterion_ids: vec!["criterion-1".to_owned()],
+            }),
+            ProviderToolBridge::default(),
+        );
+        state.last_agent_message = Some("The actual final answer.".to_owned());
+
+        let events = terminal_events(&state, "turn.completed", None);
+
+        assert_eq!(events[0].payload["summary"], "The actual final answer.");
+        assert_eq!(
+            events[0].payload["evidence"][0]["ref"],
+            "provider:opencode:agent-message"
+        );
+        assert_eq!(events[1].payload["provider"], "opencode");
+        assert!(!events[0].payload.to_string().contains("Codex"));
+    }
+
+    #[test]
+    fn opencode_empty_terminal_does_not_fabricate_a_successful_answer() {
+        for message in [None, Some(" \n".to_owned())] {
+            let mut state = opencode_result_state();
+            state.last_agent_message = message;
+            let events = terminal_events(&state, "turn.completed", None);
+            assert!(!events
+                .iter()
+                .any(|event| event.event_type == "run.result.proposed"));
+            assert_eq!(events[0].event_type, "session.failed");
+            assert_eq!(events[0].payload["code"], "opencode_empty_response");
+            assert_eq!(events[1].payload["runTerminalState"], "failed");
+        }
+    }
+
+    fn pi_rpc_result_state() -> CodexProviderState {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        state.config.driver = "pi_rpc".to_owned();
+        state.config.provider_version = crate::generated_pi_rpc_profile::PI_RPC_VERSION.to_owned();
+        state.config.profile = Some(
+            serde_json::from_str(crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON).unwrap(),
+        );
+        state
+    }
+
+    // B6: provider completion is a trust boundary; an empty turn must not
+    // manufacture a successful result for the controller.
+    #[test]
+    fn pi_rpc_empty_terminal_does_not_fabricate_a_successful_answer() {
+        for message in [None, Some(String::new()), Some(" \t\n".to_owned())] {
+            let mut state = pi_rpc_result_state();
+            state.last_agent_message = message;
+
+            let events = terminal_events(&state, "turn.completed", None);
+
+            assert!(!events
+                .iter()
+                .any(|event| event.event_type == "run.result.proposed"));
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].event_type, "session.failed");
+            assert_eq!(events[0].payload["provider"], "pi_rpc");
+            assert_eq!(events[0].payload["code"], "opencode_empty_response");
+            assert_eq!(
+                events[0].payload["message"],
+                "Pi ended without a final answer or an accepted completion report."
+            );
+            assert_eq!(events[0].payload["recoverable"], false);
+            assert_eq!(events[1].event_type, "run.terminal");
+            assert_eq!(events[1].payload["provider"], "pi_rpc");
+            assert_eq!(events[1].payload["turnTerminalState"], "failed");
+            assert_eq!(events[1].payload["runTerminalState"], "failed");
+            assert_eq!(events[1].payload["reportedWorkDisposition"], "needs_review");
+        }
+    }
+
+    // F5: a mandatory native usage receipt is accounting, never an answer.
+    // Keep beside B6 so the downstream guard retains the same failure code.
+    #[test]
+    fn pi_rpc_usage_only_terminal_does_not_fabricate_a_successful_answer() {
+        let mut state = pi_rpc_result_state();
+        let usage = normalize_provider_notification(
+            &mut state,
+            "thread/tokenUsage/updated",
+            &json!({
+                "threadId": "native",
+                "turnId": "empty-with-mandatory-usage",
+                "tokenUsage": {
+                    "total": {"inputTokens": 11, "outputTokens": 1, "totalTokens": 12},
+                    "last": {"inputTokens": 11, "outputTokens": 1, "totalTokens": 12}
+                }
+            }),
+        )
+        .unwrap();
+        assert!(usage
+            .iter()
+            .any(|event| event.event_type == "usage.reported"));
+        assert!(state.last_agent_message.is_none());
+        assert!(state.active_provider_result_fingerprint.is_none());
+
+        let events = terminal_events(&state, "turn.completed", None);
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "run.result.proposed"));
+        assert_eq!(events[0].payload["code"], "opencode_empty_response");
+        assert_eq!(events[1].payload["runTerminalState"], "failed");
+    }
+
+    #[test]
+    fn pi_rpc_normal_terminal_preserves_the_successful_answer() {
+        let mut state = pi_rpc_result_state();
+        state.last_agent_message = Some("The actual final answer.".to_owned());
+
+        let events = terminal_events(&state, "turn.completed", None);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "run.result.proposed");
+        assert_eq!(events[0].payload["summary"], "The actual final answer.");
+        assert_eq!(events[0].payload["reportedWorkDisposition"], "done");
+        assert_eq!(
+            events[0].payload["completionClaim"]["objectiveSatisfied"],
+            true
+        );
+        assert_eq!(
+            events[0].payload["evidence"][0]["ref"],
+            "provider:pi_rpc:agent-message"
+        );
+        assert_eq!(events[1].event_type, "run.terminal");
+        assert_eq!(events[1].payload["provider"], "pi_rpc");
+        assert_eq!(events[1].payload["runTerminalState"], "succeeded");
+    }
+
+    // K2: the Pi facade emits turn/failed only after agent_settled when its
+    // final receipt is length-limited. Feed that terminal into B6's completion
+    // path: mandatory usage or partial text must not turn it back into success.
+    #[test]
+    fn pi_rpc_truncated_terminal_does_not_promote_a_partial_answer() {
+        for message in [None, Some("The answer was cut off mid-".to_owned())] {
+            let mut state = pi_rpc_result_state();
+            state.last_agent_message = message;
+
+            let events = terminal_events(&state, "turn.failed", None);
+
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].event_type, "run.result.proposed");
+            assert_eq!(
+                events[0].payload["completionClaim"]["objectiveSatisfied"],
+                false
+            );
+            assert_eq!(events[0].payload["reportedWorkDisposition"], "needs_review");
+            assert_eq!(events[1].event_type, "run.terminal");
+            assert_eq!(events[1].payload["provider"], "pi_rpc");
+            assert_eq!(events[1].payload["turnTerminalState"], "failed");
+            assert_eq!(events[1].payload["runTerminalState"], "failed");
+        }
+    }
+
+    #[test]
+    fn pi_rpc_empty_interrupted_terminal_remains_cancelled() {
+        let state = pi_rpc_result_state();
+
+        let events = terminal_events(&state, "turn.interrupted", None);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "run.result.proposed");
+        assert_eq!(
+            events[0].payload["completionClaim"]["objectiveSatisfied"],
+            false
+        );
+        assert_eq!(events[1].event_type, "run.terminal");
+        assert_eq!(events[1].payload["turnTerminalState"], "interrupted");
+        assert_eq!(events[1].payload["runTerminalState"], "cancelled");
+    }
+
+    #[test]
+    fn other_provider_empty_terminal_behavior_is_unchanged() {
+        for (provider, expected_terminal) in [("codex", "succeeded"), ("cursor_cloud", "failed")] {
+            let mut state = opencode_result_state();
+            state.config.provider = provider.to_owned();
+
+            let events = terminal_events(&state, "turn.completed", None);
+
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].event_type, "run.result.proposed");
+            assert_eq!(events[1].event_type, "run.terminal");
+            assert_eq!(events[1].payload["runTerminalState"], expected_terminal);
+        }
+    }
+
+    #[test]
+    fn goal_timestamps_normalize_seconds_milliseconds_and_iso() {
+        for value in [
+            json!(1_788_825_600),
+            json!(1_788_825_600_000_i64),
+            json!("2026-09-08T00:00:00.000Z"),
+        ] {
+            assert_eq!(
+                goal_timestamp(Some(&value)).as_deref(),
+                Some("2026-09-08T00:00:00Z")
+            );
+        }
+        assert_eq!(goal_timestamp(Some(&json!("invalid"))), None);
+        assert_eq!(goal_timestamp(Some(&Value::Null)), None);
+    }
+
+    #[test]
+    fn goal_snapshot_serializes_required_nullable_fields() {
+        let goal = SessionGoalSnapshot {
+            objective: "Finish the durable goal.".to_owned(),
+            status: "active".to_owned(),
+            token_budget: None,
+            tokens_used: 0,
+            elapsed_seconds: 0,
+            iterations: 0,
+            last_reason: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            working_now: true,
+        };
+
+        let payload = goal_event_payload(Some(&goal), None, 1);
+
+        for path in [
+            "/goal/tokenBudget",
+            "/goal/lastReason",
+            "/goal/createdAt",
+            "/goal/updatedAt",
+            "/goal/completedAt",
+        ] {
+            assert_eq!(payload.pointer(path), Some(&Value::Null), "{path}");
+        }
+    }
+
+    #[test]
+    fn rejects_inconsistent_provider_state() {
+        let state = CodexProviderState {
+            run_identity: None,
+            startup_attempt: None,
+            schema: PROVIDER_STATE_SCHEMA.to_owned(),
+            lifecycle: "turn_active".to_owned(),
+            config: CodexProviderConfig {
+                profile: None,
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: Vec::new(),
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+            },
+            pi_runtime_context: Value::Null,
+            pi_launch_profile_digest: None,
+            pi_release_digest: None,
+            opencode_launch_profile_digest: None,
+            opencode_release_digest: None,
+            cursor_cloud_launch_profile_digest: None,
+            provider_termination_receipt: None,
+            cursor_cloud_terminal_receipt: None,
+            codex_usage: Some(CodexRunUsage::new(false)),
+            codex_rate_limits: None,
+            rate_limit_notice_seq: 0,
+            previous_accounting_origin: None,
+            completion_contract: None,
+            tool_bridge: ProviderToolBridge::default(),
+            thread_id: Some("thread-1".to_owned()),
+            provider_session_id: None,
+            active_provider_turn_id: None,
+            ambiguous_turn_start_pending: false,
+            completed_turn_authoritative: false,
+            provider_process_generation: 0,
+            completed_turn_process_generation: None,
+            completed_provider_turn_id: None,
+            settled_provider_turn_ids: std::collections::BTreeSet::new(),
+            descendant_thread_ids: std::collections::BTreeSet::new(),
+            settled_provider_turn_filter: DurableReplayFilter::default(),
+            receipt_limit_diagnostic_emitted: false,
+            receipt_limit_interrupt_pending: false,
+            receipt_limit_interrupt_accepted: false,
+            receipt_limit_interrupt_attempts: 0,
+            receipt_limit_interrupt_deadline_unix_ms: None,
+            active_provider_result_fingerprint: None,
+            active_provider_result_disposition: None,
+            active_terminal_tool_rejected: false,
+            pi_deferred_terminal: None,
+            pi_deferred_terminal_deadline_unix_ms: None,
+            last_agent_message: None,
+            goal_capability: None,
+            goal: None,
+            goal_revision: default_goal_revision(),
+            pending_events: VecDeque::new(),
+            queued_events: VecDeque::new(),
+            next_provider_event_seq: initial_provider_event_seq(),
+        };
+        assert!(state.validate().is_err());
+    }
+
+    #[test]
+    fn recovered_active_turn_revokes_prior_completion_authority() {
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                profile: None,
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+            },
+            None,
+            ProviderToolBridge::default(),
+        );
+        state.thread_id = Some("thread-1".to_owned());
+        state.lifecycle = "session_open".to_owned();
+        state.completed_turn_authoritative = true;
+        state.provider_process_generation = 1;
+        state.completed_turn_process_generation = Some(1);
+        state.completed_provider_turn_id = Some("turn-1".to_owned());
+        state.last_agent_message = Some("old turn output".to_owned());
+
+        state.reconcile_active_provider_turn(Some("turn-2".to_owned()));
+
+        assert_eq!(state.lifecycle, "turn_active");
+        assert_eq!(state.active_provider_turn_id.as_deref(), Some("turn-2"));
+        assert!(!state.completed_turn_authoritative);
+        assert!(state.completed_turn_process_generation.is_none());
+        assert!(state.completed_provider_turn_id.is_none());
+        assert!(state.last_agent_message.is_none());
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn emits_a_structured_result_before_the_terminal_event() {
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                profile: None,
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+            },
+            Some(CompletionContractBinding {
+                revision: "1".to_owned(),
+                criterion_ids: vec!["objective".to_owned()],
+            }),
+            ProviderToolBridge::default(),
+        );
+        state.last_agent_message = Some("Finished the requested work.".to_owned());
+        let events = terminal_events(&state, "turn.completed", None);
+        assert_eq!(events[0].event_type, "run.result.proposed");
+        assert_eq!(events[0].payload["summary"], "Finished the requested work.");
+        assert_eq!(events[1].event_type, "run.terminal");
+        assert_eq!(events[1].payload["runTerminalState"], "succeeded");
+    }
+
+    #[test]
+    fn semantic_input_preserves_credential_arguments_for_the_harness() {
+        let identity = ProviderEventIdentity {
+            runner_instance_id: "runner-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            normalized_session_id: "session-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            item_id: "item-1".to_owned(),
+        };
+        let call = PendingToolCall {
+            call_id: "call-1".to_owned(),
+            operation_id: "get_task_context".to_owned(),
+            input: json!({"password": "do-not-persist", "safe": true}),
+        };
+        let event = semantic_input_event(&identity, &call).unwrap();
+        assert_eq!(event.payload["semantic_tool"]["input"], call.input);
+        assert_eq!(
+            event.payload["semantic_tool"]["content"]["digest"],
+            json!(semantic_value_digest(&call.input))
+        );
+    }
+
+    #[test]
+    fn semantic_finish_input_preserves_a_complete_long_summary() {
+        let identity = ProviderEventIdentity {
+            runner_instance_id: "runner-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            normalized_session_id: "session-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            item_id: "item-1".to_owned(),
+        };
+        let summary = format!(
+            "Answer: {} COMPLETE-LONG-SUMMARY",
+            "A complete paragraph for the user. ".repeat(180)
+        );
+        assert!(summary.len() > 4_096);
+        let call = PendingToolCall {
+            call_id: "call-1".to_owned(),
+            operation_id: "paperclip_finish".to_owned(),
+            input: json!({"summary": summary}),
+        };
+
+        let event = semantic_input_event(&identity, &call).unwrap();
+        let transmitted = &event.payload["semantic_tool"]["input"];
+        let transmitted_summary = transmitted["summary"].as_str().unwrap();
+        assert!(transmitted_summary.starts_with("Answer: "));
+        assert!(transmitted_summary.ends_with(" COMPLETE-LONG-SUMMARY"));
+        assert!(!transmitted_summary.contains("do-not-persist"));
+        assert!(!transmitted_summary.contains("late-provider-secret"));
+        assert_eq!(transmitted, &call.input);
+        assert!(!transmitted_summary.contains("…[truncated]"));
+        assert_eq!(
+            event.payload["semantic_tool"]["content"]["digest"],
+            semantic_value_digest(transmitted)
+        );
+    }
+
+    #[test]
+    fn receipt_limit_diagnostic_is_durable_and_turn_idempotent() {
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                profile: None,
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+            },
+            None,
+            ProviderToolBridge::default(),
+        );
+        state.thread_id = Some("thread-1".to_owned());
+        state.active_provider_turn_id = Some("turn-1".to_owned());
+        state.lifecycle = "turn_active".to_owned();
+
+        assert!(state
+            .begin_receipt_limit_stop("call-first".to_owned(), "tool.first".to_owned(), 10_000)
+            .unwrap());
+        state.mark_receipt_limit_interrupt_accepted(50_000);
+        assert!(state
+            .begin_receipt_limit_stop("call-second".to_owned(), "tool.second".to_owned(), 20_000)
+            .unwrap());
+        assert_eq!(state.pending_events.len(), 1);
+        assert_eq!(state.pending_events[0].payload["callId"], "call-first");
+        assert_eq!(state.receipt_limit_interrupt_deadline_unix_ms, Some(50_000));
+
+        let mut recovered: CodexProviderState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        recovered.validate().unwrap();
+        assert!(recovered.receipt_limit_interrupt_accepted);
+        assert_eq!(
+            recovered.receipt_limit_interrupt_deadline_unix_ms,
+            Some(50_000)
+        );
+        assert!(recovered
+            .begin_receipt_limit_stop(
+                "call-after-restart".to_owned(),
+                "tool.third".to_owned(),
+                30_000,
+            )
+            .unwrap());
+        assert_eq!(recovered.pending_events.len(), 1);
+        // Only a terminal notification clears the retry marker. Accepting an
+        // interrupt request does not prove that the provider stopped.
+        assert!(recovered
+            .begin_receipt_limit_stop(
+                "call-after-success".to_owned(),
+                "tool.fourth".to_owned(),
+                40_000,
+            )
+            .unwrap());
+        assert_eq!(recovered.pending_events.len(), 1);
+    }
+
+    #[test]
+    fn settled_receipt_limit_interrupt_cannot_be_marked_accepted() {
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                profile: None,
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+            },
+            None,
+            ProviderToolBridge::default(),
+        );
+        state.thread_id = Some("thread-1".to_owned());
+        state.active_provider_turn_id = Some("turn-1".to_owned());
+        state.lifecycle = "turn_active".to_owned();
+        state
+            .begin_receipt_limit_stop("call-1".to_owned(), "tool.one".to_owned(), 10_000)
+            .unwrap();
+        state.record_receipt_limit_interrupt_attempt().unwrap();
+
+        // Recovery observed that the turn ended before the interrupt RPC was
+        // issued and cleared the receipt-limit interruption state.
+        state.settle_active_provider_turn_identity().unwrap();
+        state.active_provider_turn_id = None;
+        state.lifecycle = "session_open".to_owned();
+        state.receipt_limit_diagnostic_emitted = false;
+        state.receipt_limit_interrupt_pending = false;
+        state.receipt_limit_interrupt_accepted = false;
+        state.receipt_limit_interrupt_attempts = 0;
+        state.receipt_limit_interrupt_deadline_unix_ms = None;
+
+        state.mark_receipt_limit_interrupt_accepted(50_000);
+
+        assert!(!state.receipt_limit_interrupt_accepted);
+        assert!(state.receipt_limit_interrupt_deadline_unix_ms.is_none());
+        state.validate().unwrap();
+    }
+
+    #[test]
+    fn regular_backlog_preserves_receipt_limit_and_terminal_settlement_capacity() {
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                profile: None,
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+            },
+            None,
+            ProviderToolBridge::default(),
+        );
+        let identity = ProviderEventIdentity {
+            runner_instance_id: "runner-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            normalized_session_id: "session-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            item_id: "item-1".to_owned(),
+        };
+        let ordinary_event = || NormalizedProviderEvent {
+            event_type: "harness.diagnostic".to_owned(),
+            priority: EventPriority::P1,
+            payload: json!({"code": "ordinary_backlog"}),
+        };
+        for _ in 0..(MAX_EVENTS_PER_POLL + MAX_REGULAR_QUEUED_PROVIDER_EVENTS) {
+            state.push_event(ordinary_event()).unwrap();
+        }
+        assert_eq!(state.pending_events.len(), MAX_EVENTS_PER_POLL);
+        assert_eq!(
+            state.queued_events.len(),
+            MAX_REGULAR_QUEUED_PROVIDER_EVENTS
+        );
+        assert!(state.push_event(ordinary_event()).is_err());
+
+        for _ in 0..MAX_EVENTS_PER_POLL {
+            state
+                .push_receipt_limit_cleanup_event(ordinary_event())
+                .unwrap();
+        }
+        let cleanup_boundary = state.queued_events.len();
+        state
+            .push_receipt_limit_cleanup_event(ordinary_event())
+            .expect("cleanup overflow is dropped while preserving terminal capacity");
+        assert_eq!(state.queued_events.len(), cleanup_boundary);
+
+        for index in 0..MAX_PENDING_CALLS {
+            state
+                .push_terminal_event(semantic_result_event(
+                    &identity,
+                    &ToolResult {
+                        call_id: format!("call-{index}"),
+                        operation_id: "get_task_context".to_owned(),
+                        result: json!({"error": {"code": "provider_turn_terminated"}}),
+                        is_error: true,
+                    },
+                ))
+                .unwrap();
+        }
+        for event_type in [
+            "harness.diagnostic",
+            "turn.completed",
+            "run.result.proposed",
+            "run.terminal",
+        ] {
+            state
+                .push_terminal_event(NormalizedProviderEvent {
+                    event_type: event_type.to_owned(),
+                    priority: EventPriority::P0,
+                    payload: json!({"terminal": true}),
+                })
+                .unwrap();
+        }
+
+        assert_eq!(state.pending_events.len(), MAX_EVENTS_PER_POLL);
+        assert_eq!(state.queued_events.len(), MAX_QUEUED_PROVIDER_EVENTS);
+        state.validate().unwrap();
+        assert!(state.push_terminal_event(ordinary_event()).is_err());
+        assert!(serde_json::to_vec(&state).unwrap().len() as u64 <= MAX_PROVIDER_STATE_BYTES);
+    }
+
+    #[test]
+    fn completed_replays_are_read_only_at_the_regular_event_boundary() {
+        let operation = crate::provider_bridge::AuthorizedTool {
+            operation_id: "get_task_context".to_owned(),
+            version: 1,
+            description: "Read the active task context.".to_owned(),
+            input_schema: json!({"type": "object"}),
+            response_schema: json!({"type": "object"}),
+        };
+        let mut bridge = ProviderToolBridge::default();
+        bridge
+            .prepare(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&operation))
+                    .unwrap(),
+                operations: vec![operation],
+            })
+            .unwrap();
+        bridge
+            .begin_call(
+                "call-replayed".to_owned(),
+                "get_task_context".to_owned(),
+                json!({}),
+            )
+            .unwrap();
+        let replayed_result = ToolResult {
+            call_id: "call-replayed".to_owned(),
+            operation_id: "get_task_context".to_owned(),
+            result: json!({"ok": true}),
+            is_error: false,
+        };
+        bridge.apply_result(replayed_result.clone()).unwrap();
+
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                profile: None,
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+            },
+            None,
+            bridge,
+        );
+        let identity = ProviderEventIdentity {
+            runner_instance_id: "runner-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            normalized_session_id: "session-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            item_id: "item-1".to_owned(),
+        };
+
+        // Keep the pending window occupied, then model the input and result
+        // receipts retained by the maximum 4,096 completed calls. Only three
+        // regular queued-event slots remain at this boundary.
+        for index in 0..MAX_EVENTS_PER_POLL {
+            state
+                .push_event(NormalizedProviderEvent {
+                    event_type: "provider.notice.recorded".to_owned(),
+                    priority: EventPriority::P1,
+                    payload: json!({"index": index}),
+                })
+                .unwrap();
+        }
+        for index in 0..MAX_PENDING_CALLS {
+            let call = PendingToolCall {
+                call_id: format!("call-{index}"),
+                operation_id: "get_task_context".to_owned(),
+                input: json!({}),
+            };
+            state
+                .push_event(semantic_input_event(&identity, &call).unwrap())
+                .unwrap();
+            state
+                .push_event(semantic_result_event(
+                    &identity,
+                    &ToolResult {
+                        call_id: call.call_id,
+                        operation_id: call.operation_id,
+                        result: json!({"ok": true}),
+                        is_error: false,
+                    },
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            MAX_REGULAR_QUEUED_PROVIDER_EVENTS - state.queued_events.len(),
+            3
+        );
+        let pending_len = state.pending_events.len();
+        let queued_len = state.queued_events.len();
+        let next_sequence = state.next_provider_event_seq;
+
+        for _ in 0..4 {
+            assert_eq!(
+                state
+                    .admit_tool_call("call-replayed", "get_task_context", &json!({}))
+                    .unwrap(),
+                ToolCallAdmission::CompletedReplay(replayed_result.clone())
+            );
+        }
+        assert_eq!(state.pending_events.len(), pending_len);
+        assert_eq!(state.queued_events.len(), queued_len);
+        assert_eq!(state.next_provider_event_seq, next_sequence);
+        state.validate().unwrap();
+    }
+
+    #[test]
+    fn pending_replays_are_read_only_at_the_regular_event_boundary() {
+        let operation = crate::provider_bridge::AuthorizedTool {
+            operation_id: "get_task_context".to_owned(),
+            version: 1,
+            description: "Read the active task context.".to_owned(),
+            input_schema: json!({"type": "object"}),
+            response_schema: json!({"type": "object"}),
+        };
+        let mut bridge = ProviderToolBridge::default();
+        bridge
+            .prepare(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&operation))
+                    .unwrap(),
+                operations: vec![operation],
+            })
+            .unwrap();
+        bridge
+            .begin_call(
+                "call-pending".to_owned(),
+                "get_task_context".to_owned(),
+                json!({}),
+            )
+            .unwrap();
+
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                profile: None,
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+            },
+            None,
+            bridge,
+        );
+        for index in 0..(MAX_EVENTS_PER_POLL + MAX_REGULAR_QUEUED_PROVIDER_EVENTS) {
+            state
+                .push_event(NormalizedProviderEvent {
+                    event_type: "provider.notice.recorded".to_owned(),
+                    priority: EventPriority::P1,
+                    payload: json!({"index": index}),
+                })
+                .unwrap();
+        }
+        assert_eq!(state.pending_events.len(), MAX_EVENTS_PER_POLL);
+        assert_eq!(
+            state.queued_events.len(),
+            MAX_REGULAR_QUEUED_PROVIDER_EVENTS
+        );
+        let next_sequence = state.next_provider_event_seq;
+
+        for _ in 0..4 {
+            assert_eq!(
+                state
+                    .admit_tool_call("call-pending", "get_task_context", &json!({}))
+                    .unwrap(),
+                ToolCallAdmission::PendingReplay
+            );
+        }
+        assert_eq!(state.pending_events.len(), MAX_EVENTS_PER_POLL);
+        assert_eq!(
+            state.queued_events.len(),
+            MAX_REGULAR_QUEUED_PROVIDER_EVENTS
+        );
+        assert_eq!(state.next_provider_event_seq, next_sequence);
+        state.validate().unwrap();
+    }
+
+    #[test]
+    fn exact_regular_backlog_capacity_rejects_turn_admission() {
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                profile: None,
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+            },
+            None,
+            ProviderToolBridge::default(),
+        );
+        state.lifecycle = "prepared".to_owned();
+        for _ in 0..(MAX_EVENTS_PER_POLL + MAX_REGULAR_QUEUED_PROVIDER_EVENTS) {
+            state
+                .push_event(NormalizedProviderEvent {
+                    event_type: "harness.diagnostic".to_owned(),
+                    priority: EventPriority::P1,
+                    payload: json!({"code": "admission_boundary"}),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            state.queued_events.len(),
+            MAX_REGULAR_QUEUED_PROVIDER_EVENTS,
+        );
+        let mut executor = CodexCommandExecutor::new(PathBuf::from("unused-test-state"));
+        executor.state = Some(state);
+        executor.restore_checked = true;
+
+        for mode in [
+            json!(null),
+            json!(false),
+            json!("bad"),
+            json!("disabled"),
+            json!("default"),
+        ] {
+            let error = executor
+                .start_turn(&json!({"text": "must not reach the provider", "reasoningMode": mode}))
+                .unwrap_err();
+            assert!(error.to_string().contains("reasoningMode"));
+            assert!(executor.provider.is_none());
+            assert!(
+                !executor
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .ambiguous_turn_start_pending
+            );
+        }
+
+        let error = executor
+            .start_turn(&json!({"text": "must not reach the provider"}))
+            .expect_err("the exact regular backlog limit must reject admission");
+        assert!(error
+            .to_string()
+            .contains("until terminal events are acknowledged"));
+        assert!(executor.provider.is_none());
+    }
+
+    #[test]
+    fn transient_receipt_limit_clears_before_a_later_turn() {
+        let operation = crate::provider_bridge::AuthorizedTool {
+            operation_id: "get_task_context".to_owned(),
+            version: 1,
+            description: "Read the active task context.".to_owned(),
+            input_schema: json!({"type": "object"}),
+            response_schema: json!({"type": "object"}),
+        };
+        let mut bridge = ProviderToolBridge::default();
+        bridge
+            .prepare(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&operation))
+                    .unwrap(),
+                operations: vec![operation],
+            })
+            .unwrap();
+        let mut encoded = serde_json::to_value(&bridge).unwrap();
+        encoded["durableRunReceiptLimitReached"] = Value::Bool(true);
+        let mut bridge: ProviderToolBridge = serde_json::from_value(encoded).unwrap();
+        bridge.attach_existing_run().unwrap();
+
+        assert!(bridge.durable_run_receipt_limit_reached());
+        bridge.prepare_turn().unwrap();
+        assert!(!bridge.durable_run_receipt_limit_reached());
+    }
+
+    #[test]
+    fn restore_reattaches_the_durable_tool_result_byte_counter() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-provider-tool-byte-restore-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let operation = crate::provider_bridge::AuthorizedTool {
+            operation_id: "get_task_context".to_owned(),
+            version: 1,
+            description: "Read the active task context.".to_owned(),
+            input_schema: json!({"type": "object"}),
+            response_schema: json!({"type": "object"}),
+        };
+        let mut bridge = ProviderToolBridge::default();
+        bridge
+            .prepare(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&operation))
+                    .unwrap(),
+                operations: vec![operation],
+            })
+            .unwrap();
+        bridge
+            .begin_call(
+                "call-1".to_owned(),
+                "get_task_context".to_owned(),
+                json!({}),
+            )
+            .unwrap();
+        bridge
+            .apply_result(ToolResult {
+                call_id: "call-1".to_owned(),
+                operation_id: "get_task_context".to_owned(),
+                result: json!({"ok": true}),
+                is_error: false,
+            })
+            .unwrap();
+        bridge.settle_turn("provider_turn_terminated").unwrap();
+        assert!(bridge.retained_result_bytes_for_test() > 0);
+
+        let state = CodexProviderState::new(
+            CodexProviderConfig {
+                profile: None,
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+            },
+            None,
+            bridge,
+        );
+        let writer = CodexCommandExecutor::new(&directory);
+        writer.persist_state(&state).unwrap();
+
+        let mut recovered = CodexCommandExecutor::new(&directory);
+        recovered.restore().unwrap();
+        assert!(
+            recovered
+                .state
+                .as_ref()
+                .unwrap()
+                .tool_bridge
+                .retained_result_bytes_for_test()
+                > 0
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn durable_provider_turn_ledger_backfills_legacy_completion_authority() {
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                profile: None,
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+            },
+            None,
+            ProviderToolBridge::default(),
+        );
+        state.completed_turn_authoritative = true;
+        state.completed_turn_process_generation = Some(1);
+        state.completed_provider_turn_id = Some("provider-turn-legacy".to_owned());
+        state.provider_process_generation = 1;
+
+        let (recovered, recovered_filter) = state.recovered_settled_provider_turn_ids().unwrap();
+
+        assert!(settled_provider_turn_contains(
+            &recovered,
+            &recovered_filter,
+            "provider-turn-legacy"
+        ));
+    }
+
+    #[test]
+    fn durable_provider_turn_ledger_never_evicts_within_an_epoch() {
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                profile: None,
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+            },
+            None,
+            ProviderToolBridge::default(),
+        );
+        state.thread_id = Some("thread-1".to_owned());
+        state.lifecycle = "turn_active".to_owned();
+        for index in 0..MAX_SETTLED_PROVIDER_TURN_IDS - 1 {
+            state
+                .settled_provider_turn_ids
+                .insert(format!("provider-turn-{index:04}"));
+        }
+        state.active_provider_turn_id = Some("provider-turn-final".to_owned());
+
+        state.settle_active_provider_turn_identity().unwrap();
+        state.active_provider_turn_id = None;
+        state.lifecycle = "session_open".to_owned();
+
+        assert_eq!(
+            state.settled_provider_turn_ids.len(),
+            MAX_SETTLED_PROVIDER_TURN_IDS
+        );
+        assert!(state.settled_provider_turn_filter.is_empty());
+        assert!(state
+            .settled_provider_turn_ids
+            .contains("provider-turn-final"));
+        assert!(state
+            .settled_provider_turn_ids
+            .contains("provider-turn-0000"));
+
+        state.lifecycle = "turn_active".to_owned();
+        state.active_provider_turn_id = Some("provider-turn-overflow".to_owned());
+        assert!(state.settle_active_provider_turn_identity().is_err());
+        assert!(!state
+            .settled_provider_turn_ids
+            .contains("provider-turn-overflow"));
+        state.active_provider_turn_id = None;
+        state.lifecycle = "session_open".to_owned();
+        state.validate().unwrap();
+        let recovered: CodexProviderState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(
+            recovered.settled_provider_turn_ids,
+            state.settled_provider_turn_ids
+        );
+        assert_eq!(
+            recovered.settled_provider_turn_filter,
+            state.settled_provider_turn_filter
+        );
+        recovered.validate().unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    type ReceiptLimitOrphans = crate::process_lineage::host_orphans::MayOrphan;
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    type ReceiptLimitOrphans = ();
+
+    /// The provider's `sleep` can be orphaned for a moment when its group is
+    /// killed, so the fixture holds it apart from a reap that must verify.
+    /// Bind the guard first, so it is released after the executor stops the
+    /// provider.
+    #[cfg(unix)]
+    fn disconnected_receipt_limit_fixture(
+        mode: &str,
+        deadline: u64,
+    ) -> (ReceiptLimitOrphans, CodexCommandExecutor, PathBuf, u64) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let orphans = crate::process_lineage::host_orphans::may_orphan();
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        let orphans = ();
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-offline-receipt-limit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let ready = directory.join("ready");
+        let script = r#"
+trap '' TERM
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-1"}}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-1"}}}'
+      case "$1" in prefix*) printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","delta":"predecessor output"}}' ;; esac
+      case "$1" in many*)
+        count=0
+        while [ "$count" -lt "$4" ]; do
+          printf '{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","delta":"prefix-%s"}}\n' "$count"
+          count=$((count + 1))
+        done ;;
+      esac
+      case "$1" in requests_terminal)
+        printf '%s\n' \
+          '{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"type":"collabAgentToolCall","tool":"spawnAgent","status":"completed","senderThreadId":"thread-1","receiverThreadIds":["child-thread"]}}}' \
+          '{"id":91,"method":"item/tool/call","params":{"threadId":"child-thread"}}' \
+          '{"id":92,"method":"item/tool/requestUserInput","params":{"threadId":"child-thread","questions":"malformed"}}' \
+          '{"id":93,"method":"mcpServer/elicitation/request","params":{"threadId":"child-thread","_meta":{"codex_approval_kind":"mcp_tool_call"}}}' \
+          '{"id":94,"method":"unsupported/withoutParams"}' \
+          '{"id":95,"method":"unsupported/malformedParams","params":"malformed"}' \
+          '{"id":96}' \
+          '{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","delta":"after denied child requests"}}'
+        ;;
+      esac
+      case "$1" in *terminal) printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}' ;; esac
+      printf ready > "$2"
+      while :; do sleep 1; done ;;
+    *'"id":'*) printf '%s\n' "$line" >> "$3" ;;
+  esac
+done
+"#;
+        let mut state = opencode_result_state();
+        state.config.provider = "codex".to_owned();
+        state.config.driver = "codex_app_server".to_owned();
+        state.config.command = PathBuf::from("/bin/sh");
+        state.config.args = vec![
+            "-c".to_owned(),
+            script.to_owned(),
+            "fixture".to_owned(),
+            mode.to_owned(),
+            ready.to_string_lossy().into_owned(),
+            directory
+                .join("unexpected-rpc")
+                .to_string_lossy()
+                .into_owned(),
+            (MAX_EVENTS_PER_POLL * 2 + 17).to_string(),
+        ];
+        state.config.model = None;
+        state.goal_capability = Some(SessionGoalCapability::codex_available());
+        let mut provider = CodexProvider::start(&state.config, None).unwrap();
+        provider.start_turn("Test", &state.config.cwd).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(std::time::Instant::now() < until);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        state.provider_process_generation = provider.process_generation();
+        state
+            .begin_receipt_limit_stop(
+                "limited-call".to_owned(),
+                "fixture-tool".to_owned(),
+                deadline,
+            )
+            .unwrap();
+        state.record_receipt_limit_interrupt_attempt().unwrap();
+        let mut executor = CodexCommandExecutor::new(&directory);
+        executor.event_identity = Some(ProviderEventIdentity {
+            runner_instance_id: "runner".to_owned(),
+            run_id: "run".to_owned(),
+            normalized_session_id: "session".to_owned(),
+            turn_id: "turn".to_owned(),
+            item_id: "item".to_owned(),
+        });
+        executor.state = Some(state);
+        executor.provider = Some(provider);
+        executor.save_state().unwrap();
+        (orphans, executor, directory, deadline)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnected_receipt_limit_preserves_a_future_deadline_without_rpc_or_facade_claims() {
+        let (_orphans, mut executor, directory, deadline) =
+            disconnected_receipt_limit_fixture("silent", current_unix_ms().unwrap() + 60_000);
+        for _ in 0..2 {
+            assert!(
+                executor.maintain_disconnected_provider().unwrap().unwrap()
+                    > std::time::Instant::now()
+            );
+            assert_eq!(
+                executor
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .receipt_limit_interrupt_deadline_unix_ms,
+                Some(deadline)
+            );
+            assert_eq!(
+                executor
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .receipt_limit_interrupt_attempts,
+                1
+            );
+            assert!(!executor
+                .provider
+                .as_mut()
+                .unwrap()
+                .process_exited()
+                .unwrap());
+        }
+        // A local proxy handle cannot attest that a remote provider was stopped.
+        executor.state.as_mut().unwrap().config.provider = "cursor_cloud".to_owned();
+        executor
+            .state
+            .as_mut()
+            .unwrap()
+            .receipt_limit_interrupt_deadline_unix_ms = Some(1);
+        assert!(executor.maintain_disconnected_provider().unwrap().is_none());
+        assert!(
+            executor
+                .state
+                .as_ref()
+                .unwrap()
+                .receipt_limit_interrupt_pending
+        );
+        assert!(!executor
+            .provider
+            .as_mut()
+            .unwrap()
+            .process_exited()
+            .unwrap());
+        assert!(!directory.join("unexpected-rpc").exists());
+        assert!(!executor.restore_checked);
+        executor
+            .provider
+            .as_mut()
+            .unwrap()
+            .fence_local_receipt_limit()
+            .unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnected_receipt_limit_stops_a_hanging_provider_at_its_original_deadline() {
+        for accepted in [false, true] {
+            let (_orphans, mut executor, directory, deadline) =
+                disconnected_receipt_limit_fixture("silent", 1);
+            executor
+                .state
+                .as_mut()
+                .unwrap()
+                .receipt_limit_interrupt_accepted = accepted;
+            assert_eq!(
+                executor
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .receipt_limit_interrupt_deadline_unix_ms,
+                Some(deadline)
+            );
+            let started = std::time::Instant::now();
+            executor.maintain_disconnected_provider().unwrap();
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
+            if let Some(provider) = executor.provider.as_mut() {
+                // The owned process is already dead even if the reader has not yet observed EOF.
+                assert!(provider.process_exited().unwrap());
+            }
+            while executor
+                .state
+                .as_ref()
+                .unwrap()
+                .receipt_limit_interrupt_pending
+            {
+                assert!(started.elapsed() < std::time::Duration::from_secs(1));
+                executor.maintain_disconnected_provider().unwrap();
+            }
+            let state = executor.state.as_ref().unwrap();
+            assert_eq!(state.lifecycle, "closed");
+            assert!(state.pending_events.iter().any(|event| event.event_type
+                == if accepted {
+                    "turn.interrupted"
+                } else {
+                    "turn.failed"
+                }));
+            assert!(!directory.join("unexpected-rpc").exists());
+            assert!(!executor.restore_checked);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnected_receipt_limit_preserves_terminal_and_its_fifo_prefix_for_reconnect() {
+        for mode in ["terminal", "prefix_terminal", "prefix_only"] {
+            let (_orphans, mut executor, directory, deadline) =
+                disconnected_receipt_limit_fixture(mode, 1);
+            let retained = executor.state.as_ref().unwrap().pending_events.clone();
+            assert!(executor.maintain_disconnected_provider().unwrap().is_none());
+            assert!(executor
+                .provider
+                .as_mut()
+                .unwrap()
+                .process_exited()
+                .unwrap());
+            let state = executor.state.as_ref().unwrap();
+            assert_eq!(state.pending_events, retained);
+            assert!(state.receipt_limit_interrupt_pending);
+            assert_eq!(state.receipt_limit_interrupt_attempts, 1);
+            assert_eq!(
+                state.receipt_limit_interrupt_deadline_unix_ms,
+                Some(deadline)
+            );
+            assert!(!directory.join("unexpected-rpc").exists());
+            // The ordinary connected path drains the exact prefix before it
+            // accepts a terminal or applies the honest missing-terminal fallback.
+            executor.restore_checked = true;
+            let events = executor.poll_events().unwrap();
+            let terminal = events
+                .iter()
+                .position(|event| {
+                    event.event_type
+                        == if mode == "prefix_only" {
+                            "turn.failed"
+                        } else {
+                            "turn.completed"
+                        }
+                })
+                .unwrap();
+            if mode.starts_with("prefix") {
+                let prefix = events
+                    .iter()
+                    .position(|event| {
+                        serde_json::to_string(&event.payload)
+                            .unwrap()
+                            .contains("predecessor output")
+                    })
+                    .unwrap();
+                assert!(prefix < terminal);
+            }
+            assert!(
+                !executor
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .receipt_limit_interrupt_pending
+            );
+            assert!(!directory.join("unexpected-rpc").exists());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fenced_receipt_limit_replays_child_and_unavailable_requests_before_root_terminal() {
+        let (_orphans, mut executor, directory, _) =
+            disconnected_receipt_limit_fixture("requests_terminal", 1);
+        executor.restore_checked = true;
+        let mut observed = Vec::new();
+        for _ in 0..10 {
+            let events = executor.poll_events().unwrap();
+            let count = events.len();
+            observed.extend(events);
+            executor.acknowledge_events(count).unwrap();
+            if !executor
+                .state
+                .as_ref()
+                .unwrap()
+                .receipt_limit_interrupt_pending
+            {
+                break;
+            }
+        }
+        let terminal = observed
+            .iter()
+            .position(|event| event.event_type == "turn.completed")
+            .expect("the real root terminal survives every queued courtesy rejection");
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| event.event_type == "turn.completed")
+                .count(),
+            1
+        );
+        assert!(!observed.iter().any(|event| matches!(
+            event.event_type.as_str(),
+            "turn.failed" | "turn.interrupted" | "semantic_tool.input" | "runtime_request.created"
+        )));
+        let prefix = observed
+            .iter()
+            .position(|event| event.payload["text"] == "after denied child requests")
+            .unwrap();
+        assert!(prefix < terminal);
+        assert!(
+            observed[..terminal]
+                .iter()
+                .filter(|event| {
+                    serde_json::to_string(&event.payload)
+                        .unwrap()
+                        .contains("unsupported Codex request")
+                        || serde_json::to_string(&event.payload)
+                            .unwrap()
+                            .contains("authorized only for the parent task")
+                })
+                .count()
+                >= 5
+        );
+        assert!(!directory.join("unexpected-rpc").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_disconnected_receipt_limit_drains_batches(mode: &str, has_terminal: bool) {
+        let (_orphans, mut executor, directory, _) = disconnected_receipt_limit_fixture(mode, 1);
+        executor.maintain_disconnected_provider().unwrap();
+        assert!(executor
+            .provider
+            .as_mut()
+            .unwrap()
+            .process_exited()
+            .unwrap());
+        executor.restore_checked = true;
+        let mut observed = Vec::new();
+        let mut batches = 0;
+        loop {
+            let events = executor.poll_events().unwrap();
+            assert!(events.len() <= MAX_EVENTS_PER_POLL + 3);
+            let count = events.len();
+            observed.extend(events);
+            executor.acknowledge_events(count).unwrap();
+            batches += 1;
+            assert!(batches <= 10);
+            let state = executor.state.as_ref().unwrap();
+            if !state.receipt_limit_interrupt_pending
+                && state.pending_events.is_empty()
+                && state.queued_events.is_empty()
+            {
+                break;
+            }
+        }
+        let texts = observed
+            .iter()
+            .filter(|event| event.event_type == "item.delta")
+            .map(|event| event.payload["text"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts.len(),
+            MAX_EVENTS_PER_POLL * 2 + 17,
+            "{mode}: {batches} batches, last={:?}",
+            texts.last()
+        );
+        assert!(batches >= 3);
+        assert_eq!(
+            texts,
+            (0..MAX_EVENTS_PER_POLL * 2 + 17)
+                .map(|index| format!("prefix-{index}"))
+                .collect::<Vec<_>>()
+        );
+        let ids = observed
+            .iter()
+            .map(|event| &event.executor_event_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), observed.len());
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| event.event_type
+                    == if has_terminal {
+                        "turn.completed"
+                    } else {
+                        "turn.failed"
+                    })
+                .count(),
+            1
+        );
+        assert!(!observed.iter().any(|event| event.event_type
+            == if has_terminal {
+                "turn.failed"
+            } else {
+                "turn.completed"
+            }));
+        let terminal = observed
+            .iter()
+            .position(|event| {
+                event.event_type
+                    == if has_terminal {
+                        "turn.completed"
+                    } else {
+                        "turn.failed"
+                    }
+            })
+            .unwrap();
+        assert!(
+            observed
+                .iter()
+                .rposition(|event| event.event_type == "item.delta")
+                .unwrap()
+                < terminal
+        );
+        assert!(!directory.join("unexpected-rpc").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnected_receipt_limit_drains_large_prefix_before_real_terminal() {
+        assert_disconnected_receipt_limit_drains_batches("many_terminal", true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnected_receipt_limit_drains_large_prefix_before_missing_terminal_fallback() {
+        assert_disconnected_receipt_limit_drains_batches("many_only", false);
+    }
+
+    #[test]
+    fn receipt_limit_deadline_settlement_preserves_unacknowledged_events() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-provider-receipt-deadline-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                profile: None,
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("/definitely-missing-receipt-deadline-provider"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+            },
+            None,
+            ProviderToolBridge::default(),
+        );
+        state.thread_id = Some("thread-1".to_owned());
+        state.active_provider_turn_id = Some("turn-1".to_owned());
+        state.lifecycle = "turn_active".to_owned();
+        state.receipt_limit_diagnostic_emitted = true;
+        state.receipt_limit_interrupt_pending = true;
+        state.receipt_limit_interrupt_attempts = MAX_RECEIPT_LIMIT_INTERRUPT_ATTEMPTS;
+        state.receipt_limit_interrupt_deadline_unix_ms = Some(1);
+        state
+            .push_event(NormalizedProviderEvent {
+                event_type: "provider.notice.recorded".to_owned(),
+                priority: EventPriority::P1,
+                payload: json!({"message": "awaiting acknowledgement"}),
+            })
+            .unwrap();
+        let mut executor = CodexCommandExecutor::new(&directory);
+        executor.state = Some(state);
+        executor.event_identity = Some(ProviderEventIdentity {
+            runner_instance_id: "runner-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            normalized_session_id: "session-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            item_id: "item-1".to_owned(),
+        });
+        executor.restore_checked = true;
+
+        // ACK debt must still advance an already-pending cleanup deadline,
+        // without restoring/starting a process or releasing retained events.
+        executor.maintain_backpressured_provider().unwrap();
+
+        let state = executor.state.as_ref().unwrap();
+        assert_eq!(state.lifecycle, "closed");
+        assert!(state.active_provider_turn_id.is_none());
+        assert!(!state.receipt_limit_interrupt_pending);
+        assert!(state.pending_events.iter().any(|event| {
+            event.event_type == "provider.notice.recorded"
+                && event.payload == json!({"message": "awaiting acknowledgement"})
+        }));
+        assert!(state
+            .pending_events
+            .iter()
+            .any(|event| event.event_type == "turn.failed"));
+        let settled = serde_json::to_value(state).unwrap();
+        executor.maintain_backpressured_provider().unwrap();
+        assert_eq!(
+            serde_json::to_value(executor.state.as_ref().unwrap()).unwrap(),
+            settled
+        );
+        assert!(executor.provider.is_none());
+        // Reading terminal evidence must not restart work whose interruption
+        // exhausted its deadline, even after a controller reconnects.
+        assert!(!executor.poll_events().unwrap().is_empty());
+        assert!(executor.provider.is_none());
+        let mut restarted = CodexCommandExecutor::new(&directory);
+        assert!(!restarted.poll_events().unwrap().is_empty());
+        assert!(restarted.provider.is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/provider_api_validation.rs"]
+mod api_validation_tests;
+
+#[cfg(test)]
+#[path = "tests/provider_frame_save_batching.rs"]
+mod frame_save_batching_tests;
+
+#[cfg(test)]
+#[path = "tests/provider_assigned_tool_validation.rs"]
+mod assigned_tool_validation_tests;

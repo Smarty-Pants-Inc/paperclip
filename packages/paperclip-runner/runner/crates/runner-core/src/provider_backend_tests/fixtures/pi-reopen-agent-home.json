@@ -1,0 +1,45 @@
+{
+  "state": {
+    "schema": "paperclip.runner.codex-provider-state.v1",
+    "lifecycle": "session_open",
+    "runIdentity": {
+      "runnerInstanceId": "fixture-runner",
+      "runId": "run-A",
+      "normalizedSessionId": "fixture-session",
+      "turnId": "turn-run-A",
+      "itemId": "item-run-A"
+    },
+    "config": {
+      "provider": "pi_rpc",
+      "driver": "pi_rpc",
+      "providerVersion": "1.5.2",
+      "command": "/fixture/node",
+      "args": ["/fixture/proxy"],
+      "cwd": "/fixture/workspace",
+      "model": "fixture/model",
+      "instructions": "/fixture/agent/run-A",
+      "conversationMode": "prepared"
+    },
+    "piRuntimeContext": {
+      "instructions": {"workingCopy": {"rootPath": "/fixture/agent/run-A"}},
+      "skills": [{"key": "fixture-skill", "digest": "before"}]
+    },
+    "completionContract": {"revision": "1", "criterionIds": ["objective"]},
+    "threadId": "fixture-thread",
+    "providerSessionId": "fixture-thread",
+    "completedTurnAuthoritative": true,
+    "providerProcessGeneration": 2,
+    "completedTurnProcessGeneration": 1,
+    "completedProviderTurnId": "fixture-completed-turn",
+    "settledProviderTurnIds": ["fixture-completed-turn"],
+    "activeProviderResultFingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "activeProviderResultDisposition": "done"
+  },
+  "successor": {
+    "completionContract": {"revision": "2", "criterionIds": ["objective"]},
+    "runtimeContext": {
+      "instructions": {"workingCopy": {"rootPath": "/fixture/agent/run-B"}},
+      "skills": [{"key": "fixture-skill", "digest": "after"}]
+    }
+  }
+}

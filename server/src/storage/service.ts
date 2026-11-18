@@ -1,0 +1,168 @@
+import { createHash, randomUUID } from "node:crypto";
+import path from "node:path";
+import { Readable } from "node:stream";
+import type { StorageService, StorageProvider, PutFileInput, PutFileResult, PutObjectReceipt } from "./types.js";
+import { badRequest, forbidden, unprocessable } from "../errors.js";
+import { cleanupStorageFailure } from "./failure-cleanup.js";
+
+const MAX_SEGMENT_LENGTH = 120;
+
+async function cancellable<T>(signal: AbortSignal | undefined, action: () => Promise<T>): Promise<T> {
+  signal?.throwIfAborted();
+  if (!signal) return action();
+  let abort: () => void = () => {};
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+  try { return await Promise.race([action(), cancelled]); }
+  finally { signal.removeEventListener("abort", abort); }
+}
+
+function sanitizeSegment(value: string): string {
+  const cleaned = value
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/_{2,}/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (!cleaned) return "file";
+  return cleaned.slice(0, MAX_SEGMENT_LENGTH);
+}
+
+function normalizeNamespace(namespace: string): string {
+  const normalized = namespace
+    .split("/")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+    .map((entry) => sanitizeSegment(entry));
+  if (normalized.length === 0) return "misc";
+  return normalized.join("/");
+}
+
+function splitFilename(filename: string | null): { stem: string; ext: string } {
+  if (!filename) return { stem: "file", ext: "" };
+  const base = path.basename(filename).trim();
+  if (!base) return { stem: "file", ext: "" };
+
+  const extRaw = path.extname(base);
+  const stemRaw = extRaw ? base.slice(0, base.length - extRaw.length) : base;
+  const stem = sanitizeSegment(stemRaw);
+  const ext = extRaw
+    .toLowerCase()
+    .replace(/[^a-z0-9.]/g, "")
+    .slice(0, 16);
+  return {
+    stem,
+    ext,
+  };
+}
+
+function ensureCompanyPrefix(companyId: string, objectKey: string): void {
+  const expectedPrefix = `${companyId}/`;
+  if (!objectKey.startsWith(expectedPrefix)) {
+    throw forbidden("Object does not belong to company");
+  }
+  if (objectKey.includes("..")) {
+    throw badRequest("Invalid object key");
+  }
+}
+
+function hashBuffer(input: Buffer): string {
+  return createHash("sha256").update(input).digest("hex");
+}
+
+function buildObjectKey(companyId: string, namespace: string, originalFilename: string | null): string {
+  const ns = normalizeNamespace(namespace);
+  const now = new Date();
+  const year = String(now.getUTCFullYear());
+  const month = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(now.getUTCDate()).padStart(2, "0");
+  const { stem, ext } = splitFilename(originalFilename);
+  const suffix = randomUUID();
+  const filename = `${suffix}-${stem}${ext}`;
+  return `${companyId}/${ns}/${year}/${month}/${day}/${filename}`;
+}
+
+function assertPutFileInput(input: PutFileInput): void {
+  if (!input.companyId || input.companyId.trim().length === 0) {
+    throw unprocessable("companyId is required");
+  }
+  if (!input.namespace || input.namespace.trim().length === 0) {
+    throw unprocessable("namespace is required");
+  }
+  if (!input.contentType || input.contentType.trim().length === 0) {
+    throw unprocessable("contentType is required");
+  }
+  if (!(input.body instanceof Buffer) && !(input.body instanceof Readable)) {
+    throw unprocessable("body must be a Buffer or Readable");
+  }
+  if (!Buffer.isBuffer(input.body) && (!("byteSize" in input) || !Number.isSafeInteger(input.byteSize) || input.byteSize < 0 || !/^[0-9a-f]{64}$/.test(input.sha256))) {
+    throw unprocessable("Streamed files require an exact byte size and SHA-256");
+  }
+  if (("byteSize" in input ? input.byteSize : input.body.length) <= 0) {
+    throw unprocessable("File is empty");
+  }
+}
+
+export function createStorageService(provider: StorageProvider): StorageService {
+  return {
+    provider: provider.id,
+    ...(provider.immutableObjectNamespace ? { immutableObjectNamespace: provider.immutableObjectNamespace } : {}),
+
+    async putFile(input: PutFileInput): Promise<PutFileResult> {
+      assertPutFileInput(input);
+      const objectKey = input.objectKey ?? buildObjectKey(input.companyId, input.namespace, input.originalFilename);
+      ensureCompanyPrefix(input.companyId, objectKey);
+      const byteSize = "byteSize" in input ? input.byteSize : input.body.length;
+      const contentType = input.contentType.trim().toLowerCase();
+      let receipt: void | PutObjectReceipt;
+      try {
+        receipt = await provider.putObject({
+          objectKey,
+          body: input.body,
+          contentType,
+          contentLength: byteSize,
+          signal: input.signal,
+          ...("sourceFile" in input && input.sourceFile ? { sourceFile: input.sourceFile } : {}),
+        });
+      } catch (error) {
+        await cleanupStorageFailure(signal => provider.deleteObject({ objectKey, signal }));
+        throw error;
+      } finally {
+        if (input.body instanceof Readable) input.body.destroy();
+      }
+
+      return {
+        provider: provider.id,
+        objectKey,
+        contentType,
+        byteSize,
+        sha256: "sha256" in input ? input.sha256 : hashBuffer(input.body),
+        originalFilename: input.originalFilename,
+        ...(receipt ? { integrity: receipt.integrity } : {}),
+      };
+    },
+
+    async getObject(companyId: string, objectKey: string, options) {
+      ensureCompanyPrefix(companyId, objectKey);
+      return provider.getObject({ objectKey, range: options?.range, signal: options?.signal });
+    },
+
+    async headObject(companyId: string, objectKey: string, options) {
+      ensureCompanyPrefix(companyId, objectKey);
+      return cancellable(options?.signal, () => provider.headObject({ objectKey, signal: options?.signal }));
+    },
+
+    async deleteObject(companyId: string, objectKey: string, options) {
+      ensureCompanyPrefix(companyId, objectKey);
+      await cancellable(options?.signal, () => provider.deleteObject({ objectKey, signal: options?.signal,
+        ...(options?.allVersions ? { allVersions: true } : {}) }));
+    },
+
+    async abortIncompleteUploads(companyId: string, objectKey: string, options) {
+      ensureCompanyPrefix(companyId, objectKey);
+      if (!provider.abortIncompleteUploads) return 0;
+      return cancellable(options?.signal, () => provider.abortIncompleteUploads!({ objectKey, signal: options?.signal }));
+    },
+  };
+}

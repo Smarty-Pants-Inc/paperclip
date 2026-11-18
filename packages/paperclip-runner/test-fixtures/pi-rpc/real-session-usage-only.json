@@ -1,0 +1,128 @@
+{
+  "sourceSha256": "992429d44591e3db733a9c45c379df99bf9fd43702dd65a41d2b3d37d1df03dd",
+  "events": [
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "usage": {
+          "input": 2,
+          "output": 300,
+          "cacheRead": 36426,
+          "cacheWrite": 13036,
+          "totalTokens": 49764
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "usage": {
+          "input": 2,
+          "output": 91,
+          "cacheRead": 49462,
+          "cacheWrite": 1644,
+          "totalTokens": 51199
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "usage": {
+          "input": 2,
+          "output": 104,
+          "cacheRead": 51106,
+          "cacheWrite": 6144,
+          "totalTokens": 57356
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "usage": {
+          "input": 2,
+          "output": 118,
+          "cacheRead": 57250,
+          "cacheWrite": 6156,
+          "totalTokens": 63526
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "usage": {
+          "input": 2,
+          "output": 122,
+          "cacheRead": 63406,
+          "cacheWrite": 6169,
+          "totalTokens": 69699
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "usage": {
+          "input": 2,
+          "output": 126,
+          "cacheRead": 69575,
+          "cacheWrite": 6176,
+          "totalTokens": 75879
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "usage": {
+          "input": 2,
+          "output": 130,
+          "cacheRead": 75751,
+          "cacheWrite": 6177,
+          "totalTokens": 82060
+        }
+      }
+    },
+    {
+      "type": "compaction_start"
+    },
+    {
+      "type": "compaction_end"
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "usage": {
+          "input": 2,
+          "output": 879,
+          "cacheRead": 36426,
+          "cacheWrite": 41948,
+          "totalTokens": 79255
+        }
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "usage": {
+          "input": 2,
+          "output": 19,
+          "cacheRead": 78374,
+          "cacheWrite": 1135,
+          "totalTokens": 79530
+        }
+      }
+    }
+  ]
+}

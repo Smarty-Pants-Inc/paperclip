@@ -1,0 +1,5 @@
+{
+  "sourceTest": "server/src/__tests__/judge-round3-server.test.ts",
+  "sourceCommit": "a01ca387a69bc9c58ea738dc51ee6d7c26c75ef0",
+  "sha256": "ad07cdb05fbd8a234f06f3d677887e4bee6e288a29946929b316d95aac0baa54"
+}

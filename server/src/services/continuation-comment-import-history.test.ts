@@ -1,0 +1,384 @@
+// Imported history (org decision 20:29Z, .local/IMPORT-ARRIVAL.md): person comments that ARRIVED by a company import
+// are history: answered, so never carried into a continuation and never noticed by B'. Live comments after the
+// task's arrival keep the normal rules, and a live run-less agent comment still never answers. Everything here goes
+// through the REAL companyPortabilityService import with SYNTHETIC bundles (no real bundle content).
+import { randomUUID } from "node:crypto";
+import { and, eq, sql } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { activityLog, agents, authUsers, createDb, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
+import type { CompanyPortabilityFileEntry, CompanyPortabilityImport } from "@paperclipai/shared";
+import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
+import { companyPortabilityService } from "./company-portability.js";
+import { logActivity } from "./activity-log.js";
+import { readContinuationCommentInput } from "./continuation-comment-input.js";
+import { settleUnansweredPersonMessage } from "./recovery/unanswered-person-message.js";
+import { issueService } from "./issues.js";
+import { createHeartbeatRunPreparation } from "./heartbeat/run-preparation.js";
+import { prepareHeartbeatTaskContext } from "./heartbeat/task-context.js";
+
+const support = await getEmbeddedPostgresTestSupport();
+
+// The importer's own block-YAML shape (as in company-import-comment-authorship.test.ts).
+const scalar = (value: unknown) => value === null ? "null" : typeof value === "boolean" || typeof value === "number" ? String(value) : JSON.stringify(value);
+function yaml(value: unknown, level = 0): string[] {
+  const pad = "  ".repeat(level);
+  if (Array.isArray(value)) return value.flatMap(entry => entry !== null && typeof entry === "object"
+    ? [`${pad}-`, ...yaml(entry, level + 1)] : [`${pad}- ${scalar(entry)}`]);
+  return Object.entries(value as Record<string, unknown>).flatMap(([key, entry]) => entry !== null && typeof entry === "object"
+    && !(Array.isArray(entry) && entry.length === 0) ? [`${pad}${key}:`, ...yaml(entry, level + 1)] : [`${pad}${key}: ${Array.isArray(entry) ? "[]" : scalar(entry)}`]);
+}
+
+type BundleComment = { body: string; authorType: "user" | "agent"; createdAt: string };
+function bundle(slug: string, comments: BundleComment[]) {
+  const files: Record<string, CompanyPortabilityFileEntry> = {
+    "COMPANY.md": ["---", 'schema: "agentcompanies/v1"', 'name: "Synthetic import history"', "---", "Synthetic fixture.", ""].join("\n"),
+    "agents/helper/AGENTS.md": ["---", 'slug: "helper"', 'name: "Helper"', "kind: agent", "---", "Synthetic agent.", ""].join("\n"),
+    [`tasks/${slug}/TASK.md`]: ["---", `name: "Synthetic task ${slug}"`, "kind: task", "---", "Synthetic task.", ""].join("\n"),
+  };
+  files[".paperclip.yaml"] = `${yaml({ schemaVersion: 7, agents: { helper: { role: "engineer" } }, tasks: { [slug]: {
+    status: "in_progress", priority: "medium", assigneeAgentSlug: "helper",
+    comments: comments.map(comment => ({ body: comment.body, authorType: comment.authorType,
+      authorAgentSlug: comment.authorType === "agent" ? "helper" : null, authorUserId: null, presentation: null, metadata: null,
+      createdAt: comment.createdAt })) } } }).join("\n")}\n`;
+  return { rootPath: `history-${slug}`, files };
+}
+
+describe.skipIf(!support.supported)("imported person comments are history: never carried, never noticed", () => {
+  let temp: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  let db: Db;
+  beforeAll(async () => { temp = await startEmbeddedPostgresTestDatabase("import-history-"); db = createDb(temp.connectionString); }, 60_000);
+  afterAll(async () => { await db?.$client.end(); await temp?.cleanup(); });
+
+  async function importer() {
+    const id = randomUUID(), now = new Date();
+    await db.insert(authUsers).values({ id, name: "Importer", email: `${id}@example.test`, createdAt: now, updatedAt: now });
+    return id;
+  }
+  async function runImport(userId: string, target: CompanyPortabilityImport["target"], slug: string, comments: BundleComment[]) {
+    const input = { source: { type: "inline" as const, ...bundle(slug, comments) },
+      include: { company: target.mode === "new_company", agents: true, projects: false, issues: true },
+      target, collisionStrategy: "rename" as const } as CompanyPortabilityImport;
+    const result = await companyPortabilityService(db).importBundle(input, userId);
+    // The route's audit row (routes/companies.ts logImportedCompanyActivity), written after a committed import.
+    await logActivity(db, { companyId: result.company.id, actorType: "user", actorId: userId, action: "company.imported",
+      entityType: "company", entityId: result.company.id, details: { companyAction: result.company.action } });
+    const imported = await db.select().from(issues).where(and(eq(issues.companyId, result.company.id), eq(issues.originKind, "company_import")))
+      .orderBy(issues.createdAt);
+    return { companyId: result.company.id, issue: imported.find(issue => issue.title === `Synthetic task ${slug}`)! };
+  }
+  const commentsOf = (issueId: string) => db.select().from(issueComments).where(eq(issueComments.issueId, issueId)).orderBy(issueComments.createdAt);
+  async function makeActionable(issue: typeof issues.$inferSelect) {
+    const [agent] = await db.select().from(agents).where(eq(agents.companyId, issue.companyId)).limit(1);
+    await db.update(agents).set({ status: "active", adapterType: "paperclip_runner" }).where(eq(agents.id, agent!.id));
+    await db.update(issues).set({ status: "in_progress", assigneeAgentId: agent!.id, assigneeUserId: null }).where(eq(issues.id, issue.id));
+    return agent!.id;
+  }
+  // A live continuation whose parent run carried the person comment.
+  async function carried(issue: typeof issues.$inferSelect, agentId: string, commentId: string) {
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: issue.companyId, agentId, status: "failed", runtimeMode: "native",
+      nativeIssueId: issue.id, contextSnapshot: { issueId: issue.id, wakeCommentId: commentId, wakeCommentIds: [commentId] },
+      createdAt: new Date(), finishedAt: new Date() }).returning();
+    return readContinuationCommentInput(db, { companyId: issue.companyId, issueId: issue.id, runId: run!.id });
+  }
+  const notice = async (issue: typeof issues.$inferSelect) => {
+    const settled = await settleUnansweredPersonMessage(db, { companyId: issue.companyId, issueId: issue.id, now: new Date(Date.now() + 30 * 60_000) });
+    const notes = (await commentsOf(issue.id)).filter(note => note.authorType === "system"
+      && String((note.metadata as Record<string, unknown> | null)?.authorizationReason ?? "").startsWith("unanswered_message:"));
+    return { kind: settled.kind, notes: notes.length };
+  };
+  const past = (minutesAgo: number) => new Date(Date.now() - minutesAgo * 60_000).toISOString();
+
+  // Consumer guards use only the real importer to create comments. Distinct source times
+  // make both chronological directions deterministic; bodies are small enough not to truncate.
+  const consumerHistory = (): BundleComment[] => [
+    { body: "Source person question.\n\nKeep **this Markdown** and café unchanged.", authorType: "user", createdAt: "2026-01-01T10:00:00.000Z" },
+    { body: "Source agent reply.\n- First finding\n- Second finding", authorType: "agent", createdAt: "2026-01-01T10:01:00.000Z" },
+    { body: "Source person follow-up — same thread.", authorType: "user", createdAt: "2026-01-01T10:02:00.000Z" },
+    { body: "Source agent final answer.", authorType: "agent", createdAt: "2026-01-01T10:03:00.000Z" },
+  ];
+
+  it("(RFL display) listComments returns every real-import comment with unchanged bodies, authors, order and import origin", async () => {
+    const userId = await importer();
+    const source = consumerHistory();
+    const { issue } = await runImport(userId, { mode: "new_company", newCompanyName: "History display guard" }, "display-guard", source);
+    const [agent] = await db.select().from(agents).where(eq(agents.companyId, issue.companyId));
+    expect(agent).toBeDefined();
+    const expected = source.map(comment => ({
+      body: comment.body,
+      authorType: comment.authorType,
+      authorAgentId: comment.authorType === "agent" ? agent!.id : null,
+      authorUserId: comment.authorType === "user" ? userId : null,
+      createdAt: comment.createdAt,
+      origin: "import",
+    }));
+    const svc = issueService(db);
+    const chronological = await svc.listComments(issue.id, { companyId: issue.companyId, order: "asc" });
+    expect(chronological).toHaveLength(source.length);
+    expect(chronological.map(comment => ({
+      body: comment.body, authorType: comment.authorType,
+      authorAgentId: comment.authorAgentId, authorUserId: comment.authorUserId,
+      createdAt: comment.createdAt.toISOString(), origin: comment.origin,
+    }))).toEqual(expected);
+    // The issue-comments route defaults to newest first; provenance must not change either order.
+    const newestFirst = await svc.listComments(issue.id, { companyId: issue.companyId });
+    expect(newestFirst.map(comment => comment.id)).toEqual(chronological.map(comment => comment.id).reverse());
+  });
+
+  it("(RFL task context) run preparation includes every real-import comment unchanged, without acknowledgement or fast_response labels", async () => {
+    const userId = await importer();
+    const source = consumerHistory();
+    const { issue } = await runImport(userId, { mode: "new_company", newCompanyName: "History task context guard" }, "task-context-guard", source);
+    const imported = await commentsOf(issue.id);
+    expect(imported).toHaveLength(source.length);
+    expect(imported.map(comment => comment.origin)).toEqual(source.map(() => "import"));
+    const [agent] = await db.select().from(agents).where(eq(agents.companyId, issue.companyId));
+    expect(agent).toBeDefined();
+    const preparation = createHeartbeatRunPreparation(db);
+    const issueContext = await preparation.getIssueExecutionContext(issue.companyId, issue.id);
+    expect(issueContext).not.toBeNull();
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId: issue.companyId, agentId: agent!.id, status: "queued", runtimeMode: "native", nativeIssueId: issue.id,
+    }).returning();
+    const context: Record<string, unknown> = {
+      issueId: issue.id, wakeCommentId: imported[0]!.id, wakeCommentIds: imported.map(comment => comment.id),
+    };
+    const prepared = await prepareHeartbeatTaskContext(db, {
+      run: run!, agent: agent!,
+      task: { issueRef: issueContext!, issueContext, context, taskSession: null },
+      policy: { trustPreset: { kind: "standard" }, experimentalInstanceSettings: {} },
+      services: { issuesSvc: issueService(db), getPinnedSkillTestContext: preparation.getPinnedSkillTestContext },
+    });
+    const comments = prepared.paperclipWakePayload!.comments;
+    expect(comments).toHaveLength(source.length);
+    expect(comments.map(comment => ({
+      id: comment.id, body: comment.body, authorType: comment.authorType,
+      author: comment.author, createdAt: comment.createdAt, bodyTruncated: comment.bodyTruncated,
+    }))).toEqual(source.map((comment, index) => ({
+      id: imported[index]!.id, body: comment.body, authorType: comment.authorType,
+      author: { type: comment.authorType, id: comment.authorType === "agent" ? agent!.id : userId },
+      createdAt: comment.createdAt, bodyTruncated: false,
+    })));
+    expect(prepared.safeWakeComments.map(comment => comment.body)).toEqual(source.map(comment => comment.body));
+    const markdown = String(context.paperclipTaskMarkdown);
+    for (const comment of source) expect(markdown).toContain(comment.body);
+    for (const body of [...comments.map(comment => String(comment.body)), ...prepared.safeWakeComments.map(comment => comment.body), markdown]) {
+      expect(body).not.toContain("[Paperclip acknowledgement; not agent work]");
+      expect(body).not.toContain("fast_response");
+    }
+  });
+
+  it("(R1) new_company import: an imported person comment + an imported run-less agent reply -> not carried, not noticed", async () => {
+    const userId = await importer();
+    const { issue } = await runImport(userId, { mode: "new_company", newCompanyName: "History R1" }, "r1",
+      [{ body: "Imported question.", authorType: "user", createdAt: past(600) }, { body: "Imported reply.", authorType: "agent", createdAt: past(590) }]);
+    const [person, reply] = await commentsOf(issue.id);
+    expect(person!.authorType).toBe("user");
+    expect(reply!.authorType).toBe("agent");
+    expect(reply!.createdByRunId, "the importer writes run-less replies").toBeNull();
+    const agentId = await makeActionable(issue);
+    expect.soft(await carried(issue, agentId, person!.id), "imported history is never carried").toEqual({});
+    const n = await notice(issue);
+    expect.soft(n.kind, "imported history is never noticed").not.toBe("noticed");
+    expect.soft(n.notes).toBe(0);
+  });
+
+  it("(R2) an imported person comment with NO reply -> not carried, not noticed", async () => {
+    const userId = await importer();
+    const { issue } = await runImport(userId, { mode: "new_company", newCompanyName: "History R2" }, "r2",
+      [{ body: "Imported question, never answered.", authorType: "user", createdAt: past(600) }]);
+    const [person] = await commentsOf(issue.id);
+    const agentId = await makeActionable(issue);
+    expect.soft(await carried(issue, agentId, person!.id)).toEqual({});
+    const n = await notice(issue);
+    expect.soft(n.kind).not.toBe("noticed");
+    expect.soft(n.notes).toBe(0);
+  });
+
+  it("(R3) a SECOND import (existing_company) whose messages are NEWER than the first import, with run-less replies -> not carried, not noticed", async () => {
+    const userId = await importer();
+    const first = await runImport(userId, { mode: "new_company", newCompanyName: "History R3" }, "r3-first",
+      [{ body: "First import question.", authorType: "user", createdAt: past(600) }]);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const afterFirst = new Date();
+    const newer = [{ body: "Newer question.", authorType: "user" as const, createdAt: new Date(afterFirst.getTime() + 2).toISOString() },
+      { body: "Newer reply.", authorType: "agent" as const, createdAt: new Date(afterFirst.getTime() + 4).toISOString() }];
+    // The second import starts after its messages were written at the source.
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const second = await runImport(userId, { mode: "existing_company", companyId: first.companyId }, "r3-second", newer);
+    const [person] = await commentsOf(second.issue.id);
+    expect(person!.createdAt.getTime(), "newer than the FIRST import").toBeGreaterThan(afterFirst.getTime());
+    const agentId = await makeActionable(second.issue);
+    expect.soft(await carried(second.issue, agentId, person!.id)).toEqual({});
+    const n = await notice(second.issue);
+    expect.soft(n.kind).not.toBe("noticed");
+    expect.soft(n.notes).toBe(0);
+  });
+
+  it("(R4) a LIVE person message on an imported task after its arrival, then a live run-less agent post -> carried AND noticed", async () => {
+    const userId = await importer();
+    const { issue } = await runImport(userId, { mode: "new_company", newCompanyName: "History R4" }, "r4",
+      [{ body: "Imported question.", authorType: "user", createdAt: past(600) }, { body: "Imported reply.", authorType: "agent", createdAt: past(590) }]);
+    const agentId = await makeActionable(issue);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const [live] = await db.insert(issueComments).values({ companyId: issue.companyId, issueId: issue.id, authorType: "user",
+      authorUserId: userId, body: "A live question after the import." }).returning();
+    await db.insert(issueComments).values({ companyId: issue.companyId, issueId: issue.id, authorType: "agent", authorAgentId: agentId,
+      createdByRunId: null, body: "A live run-less post.", createdAt: new Date(live!.createdAt.getTime() + 1_000) });
+    expect.soft(await carried(issue, agentId, live!.id)).toMatchObject({ wakeCommentIds: [live!.id] });
+    const n = await notice(issue);
+    expect.soft(n.kind, "a live message is still owed a notice").toBe("noticed");
+  });
+
+  it("(R5) an imported task with no arrival record and no company import row -> nothing is history (normal behaviour)", async () => {
+    const userId = await importer();
+    const input = { source: { type: "inline" as const, ...bundle("r5", [{ body: "Old question.", authorType: "user", createdAt: past(600) }]) },
+      include: { company: true, agents: true, projects: false, issues: true },
+      target: { mode: "new_company", newCompanyName: "History R5" }, collisionStrategy: "rename" as const } as CompanyPortabilityImport;
+    const result = await companyPortabilityService(db).importBundle(input, userId);
+    const [issue] = await db.select().from(issues).where(eq(issues.companyId, result.company.id));
+    // An import made before this image: neither record nor a comment-level provenance marker exists.
+    await db.update(issueComments).set({ origin: "comment" }).where(eq(issueComments.companyId, result.company.id));
+    await db.execute(sql`delete from activity_log where company_id = ${result.company.id} and action in ('issue.imported', 'company.imported')`);
+    const [person] = await commentsOf(issue!.id);
+    const agentId = await makeActionable(issue!);
+    expect.soft(await carried(issue!, agentId, person!.id)).toMatchObject({ wakeCommentIds: [person!.id] });
+    expect.soft((await notice(issue!)).kind).toBe("noticed");
+  });
+
+  // (R7) The company.imported FALLBACK (an import made before the per-task record): which row it reads.
+  async function preRecordImport(userId: string, name: string, slug: string) {
+    const result = await runImport(userId, { mode: "new_company", newCompanyName: name }, slug,
+      [{ body: "Imported question.", authorType: "user", createdAt: past(600) }]);
+    // Legacy imports predate both the per-task arrival record and the comment-level marker.
+    await db.update(issueComments).set({ origin: "comment" }).where(eq(issueComments.companyId, result.companyId));
+    await db.execute(sql`delete from activity_log where company_id = ${result.companyId} and action = 'issue.imported'`);
+    return result;
+  }
+  it("(R7) the fallback reads the company's FIRST company.imported row: a message between two import rows is live", async () => {
+    const userId = await importer();
+    const { companyId, issue } = await preRecordImport(userId, "History R7 first", "r7-first");
+    await db.execute(sql`update activity_log set created_at = ${past(300)}::timestamptz
+      where company_id = ${companyId} and action = 'company.imported'`);
+    await db.insert(activityLog).values({ companyId, actorType: "user", actorId: userId, action: "company.imported",
+      entityType: "company", entityId: companyId, createdAt: new Date(past(60)) });
+    const [old] = await commentsOf(issue.id);
+    const [live] = await db.insert(issueComments).values({ companyId, issueId: issue.id, authorType: "user", authorUserId: userId,
+      body: "Between the two imports.", createdAt: new Date(past(120)) }).returning();
+    const agentId = await makeActionable(issue);
+    expect.soft(await carried(issue, agentId, old!.id), "older than the FIRST import row: history").toEqual({});
+    expect.soft(await carried(issue, agentId, live!.id), "newer than the first row, older than the second: live")
+      .toMatchObject({ wakeCommentIds: [live!.id] });
+    expect.soft((await notice(issue)).kind).toBe("noticed");
+  });
+
+  it("(R7) ANOTHER company's company.imported row does not count for this company's tasks", async () => {
+    const userId = await importer();
+    const a = await preRecordImport(userId, "History R7 A", "r7-a");
+    await db.execute(sql`delete from activity_log where company_id = ${a.companyId} and action = 'company.imported'`);
+    const b = await runImport(userId, { mode: "new_company", newCompanyName: "History R7 B" }, "r7-b", []);
+    const [bRow] = await db.select().from(activityLog).where(and(eq(activityLog.companyId, b.companyId), eq(activityLog.action, "company.imported")));
+    expect(bRow!.createdAt.getTime(), "B's import row is newer than A's message").toBeGreaterThan(Date.parse(past(600)));
+    const [person] = await commentsOf(a.issue.id);
+    const agentId = await makeActionable(a.issue);
+    expect.soft(await carried(a.issue, agentId, person!.id)).toMatchObject({ wakeCommentIds: [person!.id] });
+    expect.soft((await notice(a.issue)).kind).toBe("noticed");
+  });
+
+  it.each(["new_company", "existing_company"] as const)("(M1.5) %s marks imported comments even when the source clock is ahead; destination comments stay live", async mode => {
+    const userId = await importer();
+    const base = mode === "existing_company"
+      ? await runImport(userId, { mode: "new_company", newCompanyName: "Marker base" }, "marker-base", []) : null;
+    const target = mode === "new_company" ? { mode, newCompanyName: "Marker new" } as const
+      : { mode, companyId: base!.companyId } as const;
+    // Provenance must not depend on either server's wall clock. Both preserved source timestamps
+    // are after this import's arrival record, so the pre-marker time rule cannot classify them.
+    const sourceAt = Date.now() + 5 * 60_000;
+    const { issue } = await runImport(userId, target, `marker-${mode.replaceAll("_", "-")}`, [
+      { body: "Imported question from a forward source clock.", authorType: "user", createdAt: new Date(sourceAt).toISOString() },
+      { body: "Imported run-less reply.", authorType: "agent", createdAt: new Date(sourceAt + 1_000).toISOString() },
+    ]);
+    const [person, reply] = await commentsOf(issue.id);
+    const [arrival] = await db.select().from(activityLog).where(and(eq(activityLog.companyId, issue.companyId),
+      eq(activityLog.action, "issue.imported"), eq(activityLog.entityId, issue.id)));
+    expect(person!.createdAt.getTime()).toBeGreaterThan(arrival!.createdAt.getTime());
+    expect.soft(person!.origin, "person provenance is persisted by the actual importer").toBe("import");
+    expect.soft(reply!.origin, "agent history is marked too").toBe("import");
+    expect(reply!.createdByRunId).toBeNull();
+    const agentId = await makeActionable(issue);
+    expect.soft(await carried(issue, agentId, person!.id), "marked history is never continuation input").toEqual({});
+    const importedNotice = await notice(issue);
+    expect.soft(importedNotice.kind, "marked history is never noticed by B'").not.toBe("noticed");
+    expect.soft(importedNotice.notes).toBe(0);
+
+    // The destination's ordinary insert still gets the database's existing 'comment' default.
+    const [live] = await db.insert(issueComments).values({ companyId: issue.companyId, issueId: issue.id,
+      authorType: "user", authorUserId: userId, body: "Live destination question after import.",
+      createdAt: new Date(sourceAt + 2_000) }).returning();
+    expect(live!.origin).toBe("comment");
+    expect.soft(await carried(issue, agentId, live!.id), "live destination input is still carried")
+      .toMatchObject({ wakeCommentIds: [live!.id] });
+    expect.soft((await notice(issue)).kind, "live destination input is still noticed").toBe("noticed");
+  });
+
+  it("(M1.5) RE-IMPORT of the same bundle carries a source person message written after the first import as marked history", async () => {
+    const userId = await importer();
+    const slug = "marker-reimport";
+    const first = await runImport(userId, { mode: "new_company", newCompanyName: "Marker re-import" }, slug,
+      [{ body: "Original source question.", authorType: "user", createdAt: past(60) }]);
+    const [firstArrival] = await db.select().from(activityLog).where(and(eq(activityLog.companyId, first.companyId),
+      eq(activityLog.action, "company.imported")));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const sourceAt = new Date().toISOString();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await runImport(userId, { mode: "existing_company", companyId: first.companyId }, slug, [
+      { body: "Original source question.", authorType: "user", createdAt: past(60) },
+      { body: "Source follow-up written after the destination's first import.", authorType: "user", createdAt: sourceAt },
+    ]);
+    const [person] = await db.select().from(issueComments).where(and(eq(issueComments.companyId, first.companyId),
+      eq(issueComments.body, "Source follow-up written after the destination's first import.")));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, person!.issueId));
+    // Current existing_company imports create a new task, not an update of the earlier task.
+    expect(issue!.id).not.toBe(first.issue.id);
+    expect(person!.createdAt.getTime()).toBeGreaterThan(firstArrival!.createdAt.getTime());
+    expect.soft(person!.origin, "the second import marks even post-first-import source messages").toBe("import");
+    const agentId = await makeActionable(issue!);
+    expect.soft(await carried(issue!, agentId, person!.id)).toEqual({});
+    expect.soft((await notice(issue!)).notes).toBe(0);
+    // Arrival records are only a legacy fallback: the insert-time marker remains sufficient without them.
+    await db.execute(sql`delete from activity_log where company_id = ${first.companyId}
+      and action in ('issue.imported', 'company.imported')`);
+    expect.soft(await carried(issue!, agentId, person!.id), "re-import provenance survives absent arrival records").toEqual({});
+    const n = await notice(issue!);
+    expect.soft(n.kind).not.toBe("noticed");
+    expect.soft(n.notes).toBe(0);
+  });
+
+  it.each(["new_company", "existing_company"] as const)("(R6) a %s import writes exactly ONE issue.imported row per created issue, in the import", async mode => {
+    const userId = await importer();
+    const base = mode === "existing_company" ? await runImport(userId, { mode: "new_company", newCompanyName: "History R6 base" }, "r6-base", []) : null;
+    const target = mode === "new_company" ? { mode, newCompanyName: "History R6" } as const : { mode, companyId: base!.companyId } as const;
+    const { issue } = await runImport(userId, target, `r6-${mode}`, [{ body: "Q.", authorType: "user", createdAt: past(60) }]);
+    const rows = await db.select().from(activityLog).where(and(eq(activityLog.companyId, issue.companyId), eq(activityLog.action, "issue.imported"),
+      eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issue.id)));
+    expect(rows, "one arrival record for the created issue").toHaveLength(1);
+  });
+
+  it("(R6) the import FAILS, leaving no task behind, if its arrival record cannot be written", async () => {
+    const userId = await importer();
+    await db.execute(sql`create or replace function refuse_issue_imported() returns trigger language plpgsql as $$
+      begin if new.action = 'issue.imported' then raise exception 'arrival record refused'; end if; return new; end $$`);
+    await db.execute(sql`create trigger refuse_issue_imported before insert on activity_log for each row execute function refuse_issue_imported()`);
+    try {
+      const input = { source: { type: "inline" as const, ...bundle("r6-fail", [{ body: "Q.", authorType: "user", createdAt: past(60) }]) },
+        include: { company: true, agents: true, projects: false, issues: true },
+        target: { mode: "new_company", newCompanyName: "History R6 refused" }, collisionStrategy: "rename" as const } as CompanyPortabilityImport;
+      let failed = false;
+      try { await companyPortabilityService(db).importBundle(input, userId); } catch { failed = true; }
+      const left = await db.select({ id: issues.id }).from(issues).where(eq(issues.title, "Synthetic task r6-fail"));
+      expect.soft(failed, "the import fails").toBe(true);
+      expect.soft(left, "and leaves no task").toHaveLength(0);
+    } finally {
+      await db.execute(sql`drop trigger refuse_issue_imported on activity_log`);
+    }
+  });
+});

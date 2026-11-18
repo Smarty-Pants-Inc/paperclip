@@ -1,0 +1,118 @@
+import { randomUUID } from "node:crypto";
+import { agentInstructionWorkingCopies, agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases,
+  heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { heartbeatService } from "../services/heartbeat.js";
+import { readIdleSleepSafety } from "../services/idle-sleep-safety.js";
+
+const support = await getEmbeddedPostgresTestSupport();
+const describePostgres = support.supported ? describe : describe.skip;
+if (!support.supported) console.warn(`Skipping assembled agent status recovery: ${support.reason}`);
+
+describePostgres("heartbeat recovery of a stranded agent", () => {
+  let db: Db;
+  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  beforeAll(async () => {
+    database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-agent-status-");
+    db = createDb(database.connectionString);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+  afterAll(async () => { await database?.cleanup(); });
+
+  it("repairs shutdown state through the existing reaper and permits a quiet idle proof", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID();
+    const old = new Date(Date.now() - 60 * 60_000);
+    await db.insert(companies).values({ id: companyId, name: "Recovery fixture", issuePrefix: "RCVR" });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Worker", role: "engineer",
+      status: "running", adapterType: "process", runtimeConfig: { heartbeat: { enabled: false } },
+      updatedAt: old, lastHeartbeatAt: null });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId,
+      status: "interrupted", runtimeMode: "legacy", invocationSource: "automation",
+      errorCode: "server_shutdown_interrupted", startedAt: old, finishedAt: old, updatedAt: old });
+    const now = Date.now();
+    const ownerId = randomUUID();
+    const drain = () => ({ ownerId, draining: true, startedAt: new Date(now - 1_000),
+      expiresAt: new Date(now + 60_000), activeRuns: 0, pendingWakes: 0 });
+    const inspect = () => readIdleSleepSafety(db, drain, () => now, ownerId, async () => "none");
+    expect(await inspect()).toEqual({ version: 1, backgroundWork: "present" });
+
+    const service = heartbeatService(db);
+    expect(await service.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+    expect(await db.select().from(agents).where(eq(agents.id, agentId)))
+      .toEqual([expect.objectContaining({ status: "idle", lastHeartbeatAt: null })]);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))
+      .toEqual([expect.objectContaining({ status: "interrupted", errorCode: "server_shutdown_interrupted" })]);
+    expect(await inspect()).toEqual({ version: 1, backgroundWork: "none" });
+
+    const replacement = heartbeatService(db);
+    expect(await replacement.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+    expect(await inspect()).toEqual({ version: 1, backgroundWork: "none" });
+  });
+
+  it("repairs a finished native run's status through the reaper without cooling its retained allocation", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), issueId = randomUUID();
+    const old = new Date(Date.now() - 60 * 60_000);
+    await db.insert(companies).values({ id: companyId, name: "Warm native recovery", issuePrefix: "WARM" });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Native worker", role: "engineer",
+      status: "running", adapterType: "process", runtimeConfig: { heartbeat: { enabled: false } },
+      updatedAt: old, lastHeartbeatAt: null });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Completed native work", status: "done" });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issueId,
+      status: "succeeded", runtimeMode: "native", invocationSource: "automation",
+      startedAt: old, finishedAt: old, updatedAt: old });
+    await db.insert(nativeRunFinalizations).values({ companyId, runId, issueId, phase: "committed", updatedAt: old });
+    const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: runId, issueId,
+      status: "retained", leasePolicy: "reuse_by_environment", provider: "daytona",
+      providerLeaseId: "warm-native-allocation", cleanupStatus: "success" }).returning();
+
+    const service = heartbeatService(db);
+    expect(await service.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+    expect(await db.select().from(agents).where(eq(agents.id, agentId)))
+      .toEqual([expect.objectContaining({ status: "idle", lastHeartbeatAt: null })]);
+    expect(await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease!.id)))
+      .toEqual([expect.objectContaining({ status: "retained", providerLeaseId: "warm-native-allocation", releasedAt: null })]);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))
+      .toEqual([expect.objectContaining({ status: "succeeded" })]);
+  });
+
+  it("reconciles a finished warm handoff through the reaper with the old retry still present", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), successorRunId = randomUUID();
+    const old = new Date(Date.now() - 60 * 60_000);
+    await db.insert(companies).values({ id: companyId, name: "Handed-off copy recovery", issuePrefix: "HDOF" });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Warm worker", role: "engineer",
+      status: "running", adapterType: "process", runtimeConfig: { heartbeat: { enabled: false } }, updatedAt: old });
+    await db.insert(heartbeatRuns).values([runId, successorRunId].map(id => ({ id, companyId, agentId,
+      status: "succeeded", runtimeMode: "legacy", invocationSource: "automation", startedAt: old, finishedAt: old, updatedAt: old })));
+    await db.insert(agentInstructionWorkingCopies).values({ companyId, agentId, runId,
+      responsibleUserId: "test-user", entryFile: "AGENTS.md", baseHash: "test-hash",
+      localRoot: "/tmp/shared-root", executionRoot: "/tmp/shared-root", location: "local", state: "superseded",
+      processStoppedAt: null, nextAttemptAt: new Date(Date.now() + 60_000),
+      receipt: { schema: "paperclip.agent-files.v1", warm: true, successorRunId } });
+    expect(await heartbeatService(db).reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+    expect(await db.select().from(agents).where(eq(agents.id, agentId)))
+      .toEqual([expect.objectContaining({ status: "idle", lastHeartbeatAt: null })]);
+    expect(await db.select().from(agentInstructionWorkingCopies).where(eq(agentInstructionWorkingCopies.runId, runId)))
+      .toEqual([expect.objectContaining({ state: "superseded", processStoppedAt: null, nextAttemptAt: expect.any(Date) })]);
+  });
+
+  it("keeps unrelated recovery available when the correction audit fails", async () => {
+    const companyId = randomUUID(), agentId = randomUUID();
+    const old = new Date(Date.now() - 60 * 60_000);
+    await db.insert(companies).values({ id: companyId, name: "Audit failure", issuePrefix: "ADTF" });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Worker", role: "engineer",
+      status: "running", adapterType: "process", updatedAt: old });
+    await db.execute(sql`ALTER TABLE activity_log ADD CONSTRAINT reject_status_repair CHECK (action <> 'agent.status_reconciled') NOT VALID`);
+    const service = heartbeatService(db);
+    try {
+      expect(await service.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+      expect(await db.select().from(agents).where(eq(agents.id, agentId)))
+        .toEqual([expect.objectContaining({ status: "running" })]);
+    } finally {
+      await db.execute(sql`ALTER TABLE activity_log DROP CONSTRAINT reject_status_repair`);
+    }
+    expect(await service.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+    expect(await db.select().from(agents).where(eq(agents.id, agentId)))
+      .toEqual([expect.objectContaining({ status: "idle" })]);
+  });
+});

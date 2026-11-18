@@ -1,0 +1,554 @@
+# Agent lifecycle
+
+The agent lifecycle module controls hiring, pause, resume, and termination.
+Its public entry point is `server/src/modules/agent-lifecycle/index.ts`.
+Use its commands to create an agent or change its lifecycle state.
+Do not pass a database transaction to a command.
+Each hire or transition command owns its transaction.
+
+## Application use
+
+Application code imports the configured factory from `services/agent-lifecycle.ts`.
+This service supplies the module dependencies. Use the root database connection.
+Apply the existing caller authorization checks before you call a command.
+
+```ts
+import { createAgentLifecycle } from "../services/agent-lifecycle.js";
+
+const lifecycle = createAgentLifecycle(db);
+await lifecycle.updateConfiguration(agentId, { title: "Engineer" });
+await lifecycle.pauseAgent(agentId);
+const state = await lifecycle.get(agentId);
+```
+
+The pause command records the request. The worker completes the external steps.
+Read `lifecycleState` to check progress.
+Configuration updates accept only the fields in `AGENT_CONFIGURATION_FIELDS`.
+They reject identity, company, accounting totals, timestamp, and lifecycle fields.
+The public update schema also rejects spend totals. Budget limit changes remain
+permitted through `budgetMonthlyCents`.
+
+Do not import module adapters or construct module dependencies in a caller.
+The company deletion service uses the separate deletion entry point.
+The listed configuration workflows use the restricted transaction service.
+These are the only transaction integrations. They are described below.
+
+## States
+
+| State | Meaning | Next state |
+| --- | --- | --- |
+| `pending_approval` | The hire needs board approval. | `preparing` or `rejected` |
+| `preparing` | Required plugins prepare the agent. | `verifying` |
+| `verifying` | The host tests the saved harness configuration. | `ready` |
+| `ready` | The lifecycle permits work. | `pausing` or `terminating` |
+| `pausing` | The host stops work. Required plugins stop their resources. | `paused` |
+| `paused` | A pause hold prevents work. | `resuming` or `terminating` |
+| `resuming` | Required plugins start their resources. | The state saved before pause |
+| `terminating` | The host revokes keys and stops work. | `cleaning_up` |
+| `cleaning_up` | Required plugins remove their resources. | `terminated` |
+| `terminated` | Termination is complete. | None |
+| `rejected` | The board rejected the hire. | None |
+
+Termination can start before preparation or verification completes.
+An old result cannot complete a newer operation.
+Deletion requires completed termination or a rejected hire.
+The existing restrictions for built-in agents and accounting still apply.
+
+Messages accepted during setup remain queued until verification completes.
+After the worker commits `ready`, its driver immediately asks the scheduler to
+dispatch that agent's saved work. The scheduler rechecks company scope,
+invokability, budgets, concurrency, and task ownership through normal admission.
+If dispatch fails, readiness remains committed and the periodic queue sweep
+retries; setup is not repeated because of a scheduler failure.
+
+Native OpenCode verification checks the selected model with the real hello
+probe. It validates the model identifier but does not first enumerate the full model
+catalog. Authentication failures, unavailable models, and probe timeouts still
+prevent readiness. Without an explicit local working directory, the native
+probe uses a temporary empty directory instead of the server's checkout.
+
+## Caller permissions
+
+An agent key can pause, resume, or terminate a strict reporting descendant when
+its direct `agents:configure` grant also covers that target. The routes use the same scoped
+`agent_config:update` authorization as configuration writes, including company,
+responsible-user, and trust restrictions. Read or suggest-only access does not
+permit lifecycle commands.
+
+The default configuration grant is rooted at the acting agent's reporting
+subtree. It permits lifecycle control of reports and transitive descendants,
+not a manager, sibling, or unrelated agent. Unlike configuration changes,
+lifecycle commands always exclude the acting agent itself, even when its grant
+covers the subtree root. Unscoped grants and grants naming an outside target do
+not override the strict descendant check. Scope and reporting changes are
+revalidated inside the company-locked writer transaction. A principal at the
+reporting-tree root can manage all its descendants through this same check;
+there is no agent grant exception. Board lifecycle controls remain unchanged.
+
+This applies to `POST /api/agents/:id/pause`, `/resume`, and `/terminate`, and to
+`PATCH /api/agents/:id` with lifecycle status changes. Activity entries retain
+the authenticated actor type and ID. Resume still enforces organization-chain
+health and does not remove budget or company holds. An agent cannot terminate a
+pending hire through either POST or PATCH status: both return 403 without changing
+the hire or approval. The saved pending state is also checked under the writer
+lock. Board hire rejection retains its existing approval path and real user ID.
+
+## Commands and transactions
+
+`requestHire` writes the agent record before preparation starts.
+An approved hire starts preparation after the transaction commits.
+A proposed hire waits for `approveHire`.
+`approveHire` and `rejectHire` accept an agent ID or `{ approvalId }`.
+Both forms use the same hire decision path. An agent ID also resolves its open
+hire approval. The approval and the agent change commit together.
+The existing company approval rules still apply.
+
+`pauseAgent`, `resumeAgent`, and `terminateAgent` record the requested change.
+They do not wait for external resource operations. A pause, including a budget
+pause, is not retirement. A termination request retains the target's execution
+holds, pause reason, task ownership and execution locks while Stop or cleanup
+is unconfirmed. Budget policies, limits, spending and company holds remain
+unchanged, and holds stay frozen on the terminated row (the hold policy check
+excludes agents in termination or a final state).
+
+A termination request is refused at request time, under the company lock and
+before any write, with `409 agent_has_live_reports` naming the reports when the
+target has live reports and either has no manager to hand them to (a root), or
+the caller could not change those reports' manager through the normal
+configuration route. The request records its caller on the lifecycle operation.
+POST termination and PATCH terminal status use the same request and
+durable-completion path.
+
+Retirement hands work over in two steps (#20389):
+
+1. The final transition (`cleaning_up` -> `terminated`) runs only after the
+   worker's durable host and required-plugin completion. In that one
+   transaction it writes the terminated state, ONE durable hand-over marker
+   (`lifecycleOperation.handover`, shown on agent reads as `handover` with the
+   code `agent_handover_pending`), and the `agent.terminated` activity row naming
+   the caller who asked, for POST and PATCH alike. It touches no task row and
+   takes no task lock, so it never meets a checkout's task-then-agent lock
+   order; it runs once, with no internal retry. A failure rolls all of it back
+   and the worker's next attempt completes it.
+2. The hand-over recovery worker (`services/agent-handover.ts`, delivery queue
+   `agent-handover`) is woken by that commit, and scans for marked retirements
+   on start. It moves each item in its own transaction that re-reads state:
+   an open task (lock the task, then the agents, as checkout does; ordinary
+   task assignment; `in_progress` returns as `todo`, other statuses and real
+   blockers are preserved; one `issue.reassigned` row), and a live report
+   (under the reporting-tree company lock; only `reportsTo` changes; one
+   `agent.reports_to_changed` row with the old and new manager). The target is
+   re-checked for every item: the nearest manager up the chain that is not
+   retired, retiring or pending. With none, or when the move would make a cycle,
+   the item stays where it is and is named in the marker. A failing item stays
+   assigned, is named in the marker with its attempts, and is retried with a
+   bounded backoff. The new manager receives one `agent.reports_received` row
+   per retirement. Active routines of the retired agent are paused with a
+   `routine.paused` row, not re-homed; the routine scheduler also skips a
+   retired default agent. An open budget incident for the agent is dismissed
+   and its pending override approval rejected, with one
+   `budget.incident_resolved` row. Each item's activity publishes after its
+   commit. The marker clears, with one `agent.handover_completed` row, when
+   no re-homable open task and no live report remain. That final row records
+   `conversationBoundCount` and `conversationBoundTaskIds` for the bound
+   conversations left with the retired agent. Re-running changes nothing.
+
+Terminal tasks retain their historical assignee. Conversation and
+external-channel tasks retain their fixed identity for a person to re-home;
+these intentionally retained tasks do not keep the hand-over marker pending
+or produce reassignment-failure activities. Agents retired before this worker
+existed carry no marker: the worker only logs a dry list (counts and ids) of them unless
+`PAPERCLIP_AGENT_HANDOVER_REPAIR_PRE_FIX=true`. The assigned-work sweep includes
+open tasks of retired assignees and hands them to the worker.
+
+Configuration secret-binding activities and hire and hire-decision activities
+(secret bindings, agent identity, primary-agent initialization and clearing)
+use the root transaction's activity-publication buffer, including writes from
+nested hire, approval, rejection and configure-then-transition savepoints,
+which join the root buffer: live events publish only after the commit, never
+from a rolled-back transaction. Reassignment cancels the task's human wake
+receipts, finished ones included: that is how a reassignment revokes the human
+direction (`human-directed-work.ts`).
+
+`retry` makes a failed step available for another attempt.
+`reconcilePolicyHolds` updates budget and company holds for the specified company.
+The background policy check processes at most 100 eligible agents each minute.
+It continues from the last agent ID and returns to the start after the last page.
+Pending hires and agents in termination or a final state are excluded.
+An explicit company or budget change still updates all affected agents immediately.
+`updateAndTransition` applies a configuration change and a lifecycle command
+in one transaction. A failed command does not save the configuration change.
+
+On the hire HTTP routes, a proven create-transaction rollback returns HTTP 503
+with code `agent_hire_create_contention` and retryable details. Create runs
+once; the database error remains only in the error's cause. Other lifecycle
+callers retain upstream's `AccountingContentionError` unchanged. The separate
+post-create grant step retains its existing five-attempt retry and error mapping.
+
+The onboarding and invitation services own their feature workflows.
+They commit the hire through `requestHire` before they save the other records.
+A separate database transaction holds only the workflow lock.
+It prevents concurrent requests for the same workflow.
+The hire command commits through its own connection and transaction.
+A failure in the lock transaction cannot undo a committed hire.
+If a later step fails, a retry uses the existing agent.
+The onboarding revision is saved only after its content and audit record commit.
+
+The approval service owns comments, revisions, and general approval records.
+The lifecycle module resolves a hire approval and changes the agent in one
+transaction. It retains the original credential owner when it approves a hire.
+
+The company deletion service owns the company data cascade.
+It requests agent termination before it starts that cascade.
+It locks the company in the deletion transaction and removes dependent records.
+It then calls `agentLifecycleCompanyDeletion.deleteCompanyData(tx, companyId)`
+through the module's separate `company-deletion.ts` entry point.
+This operation implements the shared `CompanyDeletionParticipant` interface.
+It locks the agent rows, checks their states, and deletes them.
+All agents must be terminated or rejected. Otherwise, it throws an error.
+The error rolls back all database changes in the deletion transaction.
+A concurrent hire makes deletion fail or waits until deletion ends.
+The module's delete statement also restricts removal to terminated or rejected agents.
+`purgeAgent` deletes a single agent. It owns the transaction and checks the agent
+state before it calls the service to remove dependent records.
+The service checks accounting holds. The module then deletes the agent record.
+An error rolls back both operations. Neither path permits incomplete termination.
+
+The ordinary agent service owns reads, permissions, and keys.
+The configuration service owns validation and configuration revisions.
+The lifecycle module owns the agent configuration write.
+Credential checks remain in the agent credential service.
+Secret proposal approval saves the secret before it applies the agent binding.
+If the binding fails, the secret remains approved and the binding remains pending.
+A retry uses the approved secret. It does not create another secret.
+The binding transaction checks authorization, expiry, and the current reporting
+structure again before it changes the agent.
+The hire service owns names, appearance, permissions, credential binding,
+connection installs, identity setup, and primary-agent selection.
+The module calls the hire service before and after the agent record write.
+These operations use the lifecycle transaction. A failed operation rolls back
+the hire and its dependent records.
+The module owns the initial state, approval transition, and lifecycle events.
+The service in `services/agent-lifecycle.ts` supplies these integrations to the
+module. The module does not import services or routes. Shared record queries
+and validation functions are in `lib/`. They do not call lifecycle commands.
+The application supplies the worker driver at startup.
+`updateConfiguration` owns the transaction for an ordinary configuration update.
+The module locks the agent. The configuration service validates and prepares the
+patch. The module saves it and invalidates an old verification result when
+execution configuration changes during setup. The service then updates dependent
+records and saves the configuration revision in the same transaction.
+There is no separate invalidation operation for callers.
+Configuration writes reject caller-supplied lifecycle fields.
+For `updateAndTransition`, lifecycle owns the transaction and calls the
+same configuration operation. Both changes commit together.
+
+Some workflows must save an agent reference and their own records together.
+The module exposes `configuration.ts` for these transactions. Only
+`services/agent-configuration-transaction.ts` can import it.
+This service supplies the module integrations. It cannot save a configuration
+without the module's invalidation check.
+Its permitted callers are secret binding approval, Connection adoption, runner
+pairing, avatar updates, instruction revisions, and skill reassignment.
+The boundary check lists these callers. Ordinary callers use the root command.
+Budget changes always use a root command so enforcement follows the commit.
+The transaction integration cannot approve, pause, resume, or terminate an agent.
+It does not start a worker before the caller commits. The periodic scan recovers
+pending setup work after the commit.
+
+Manual, budget, and company pause holds are independent.
+A manual resume does not remove a budget or company hold.
+Restoring a company does not remove a manual hold.
+Budget and company policy still prevent admission while the pause work runs.
+Startup scans, direct claims, and saved verification-wait recovery honor explicit
+`manual`, `budget`, `company_paused`, and `company_archived` stop markers in
+`pauseReason`, `lifecycleHolds`, or the saved `lifecycleOperation.pauseCause.holds`.
+These markers do not block stop or cleanup work. Legacy startup `status: paused`
+(including `pauseReason: setup`) is not itself a Stop and remains claimable;
+the wizard's separate setup hold still waits for setup completion. Resume clears
+the relevant holds through the existing command path. No status migration is needed.
+
+The legacy `status` field remains available to existing clients.
+It shows `paused` during preparation, verification, pause, and resume.
+It shows `terminated` as soon as termination starts.
+Execution code can change this field only when the lifecycle is `ready`.
+Use `lifecycleState` to distinguish the steps.
+The agent page shows preparation, verification, pause, resume, and cleanup
+progress from `lifecycleState`. Failed steps show the host error and a Retry
+action. The page refreshes pending steps every two seconds and other states
+every thirty seconds. The lifecycle query does not replace the agent record in
+editable forms, so background updates preserve unsaved settings. It does not
+query plugins for a separate readiness state.
+
+## Required plugin work
+
+A plugin can declare `agentLifecycle: true` in its manifest.
+It must also request `agents.lifecycle.manage`.
+The plugin implements `onAgentLifecycle` in the SDK.
+This method is separate from event delivery and event acknowledgment.
+
+The host selects the required plugins before the first lifecycle step.
+`setRequiredPlugins` stores their IDs on the agent.
+The host is not a plugin ID. Each operation records host completion and
+completed plugin IDs separately. The host step must finish before plugin calls.
+A disabled or removed plugin cannot silently release an existing requirement.
+Restore that plugin to complete the operation.
+A later plugin installation does not change an existing selection.
+
+A plugin with an environment driver that declares `requiresAgent: true` is
+selected only for an agent on that environment. The host uses the agent's default
+environment, or the instance default when the agent has none. Other lifecycle
+plugins are selected for all agents, including a sandbox provider that declares
+`requiresAgent: true`.
+
+When an agent moves to such an environment, the host adds the plugin at the next
+`preparing` or `resuming` step. Moving a `ready` agent to an environment that
+needs a new plugin automatically pauses execution, waits for the host and
+existing plugins to stop, resumes with the new plugin, and verifies the saved
+configuration before admitting work. The change and pause request commit
+together; retries and server restarts retain the pending operation. Manual,
+budget, and company holds still prevent automatic resume. An agent in
+`verifying` returns to `preparing`. An agent that moves away keeps the selection until it is terminated,
+so the plugin keeps its resources until then.
+
+The existing agent configuration permission authorizes this move, including its
+temporary system pause. That permission already controls environment selection
+and resource allocation. Separate permission to issue a manual pause is not
+required for the migration. Configuration and company access checks still run
+before the change; an unauthorized request cannot save the environment or pause
+the agent.
+
+Saving an environment or the instance default that gives such a plugin to `ready`
+or `verifying` agents without that selection returns a conflict. Pause those agents,
+save the change, and then resume them.
+
+Each request contains these fields:
+
+- `companyId` and `agentId` identify the agent.
+- `phase` identifies the lifecycle step.
+- `operationId` identifies the operation.
+- `version` identifies the state revision.
+
+Return the same `operationId` and `version` with `status: "complete"` or
+`status: "pending"`.
+Return `complete` only after the requested effect is complete.
+Return `pending` while external work continues.
+Throw an error when the step fails.
+
+The host stores a fixed error message. It does not store the provider error text.
+Server logs identify the failed step, phase, operation, and plugin when available.
+They include only known error codes. Unknown codes become `unclassified`.
+They do not include provider messages, stacks, or configuration values.
+A failure before the agent is read can have only a step and agent ID.
+A scan failure has no agent ID.
+
+Calls can repeat after a timeout or a server restart.
+A plugin must make repeated calls safe.
+It must retain the highest version for each company and agent.
+It must reject an older request after it accepts a newer version.
+It must also prevent an older operation from creating resources after cleanup.
+Serialize external effects or remove resources from a late completion.
+Do not treat a host timeout as cancellation of the external effect.
+
+### Local instance secrets
+
+Lifecycle requests include `instanceSecrets`, a map of this plugin's private
+credentials for this company and agent. A plugin can return an `instanceSecrets`
+map with its result to save values. A null value removes the key. Omitted keys
+remain unchanged. Writes are allowed during preparation and resume; removals can
+also occur during stop and cleanup. Use at most 16 keys per result, with names
+matching `[a-z][a-z0-9_]{0,63}` and values no larger than 64 KiB each.
+
+The tenant persists the changes before accepting the result. It locks the agent
+and checks its company, phase, operation, revision, required plugin selection,
+and the captured attempt's current lease owner and unexpired deadline.
+A stale reply or a failed secret write cannot complete preparation. Calls after
+a restart receive the saved values. Stop and cleanup requests receive an empty
+map, so a damaged credential cannot block removal. Return removals even while
+cleanup is pending. An older host omits the field; plugins that require durable
+credentials must reject that host before resource effects.
+
+This uses the existing secret service, `company_secrets`, secret versions, and
+`local_encrypted` provider. There is no new encryption system or remote API.
+The `instance` scope requires an owning agent and plugin. Agent/plugin deletion
+cascades the native secret records. These secrets are excluded from company
+catalogs, normal secret references, agent access, plugin state, and public agent
+records. The general SDK `ctx.secrets.resolve()` remains read-only. Company vault imports
+ignore instance-owned names and keys. Device-login cleanup checks instance-owned
+account-home claims privately and keeps the directory if a value cannot be read.
+
+Trusted server runtime code can resolve values with
+`agentInstanceSecretService(db).read({ companyId, agentId, pluginId })` after its
+normal execution admission checks. Use the installed plugin's database ID.
+Never place returned values in an agent environment, task payload, log, or UI
+response. Preserve the existing secret master key through restarts and backups.
+Migration `0339_luxuriant_iron_monger.sql` adds native secret ownership and its
+scope constraint; keep these columns when reverting application code.
+
+## Verification and recovery
+
+The harness verification service uses the existing environment-test code.
+It owns test configuration, credential selection, and test result checks.
+It tests the saved agent configuration and the selected environment.
+A failed login or an incomplete probe cannot complete verification.
+The lifecycle module receives completion, pending work, or failure through its
+driver. It owns the state transition and has no harness test rules.
+The current UI can also run a test before the hire.
+Some adapters can charge for these tests.
+It uses the saved responsible user for managed credentials.
+The host does not grant new credential access for this test.
+A connection pool selects an account for a separate lifecycle test operation.
+An external controller must complete its existing readiness test.
+
+Task requests can enter the durable run queue during preparation, verification,
+and resume. Execution waits for readiness. Queue recovery does not require
+periodic agent heartbeats to be enabled.
+
+Resume can remove the last hold while the agent is still `pausing`. The existing
+Stop operation must settle before the worker completes resume; removing a hold
+is not proof that an external stop or plugin cleanup was cancelled. During this
+hold-free transition, stranded-task recovery leaves assigned work in place
+instead of escalating it because the compatibility status is still `paused`.
+A never-run task remains `todo`; readiness notifies recovery to reconsider it
+through normal admission. Remaining manual, budget, and company holds retain
+their existing behavior.
+
+A cancelled run record does not prove that execution stopped.
+The host also checks process ownership, controller leases, and environment cleanup.
+Required plugin cleanup cannot start while these checks are incomplete.
+Stranded-task recovery uses the same Stop proof before clearing a task's checkout
+or execution owner. A paused or terminated assignee alone does not release those
+locks. Recovery checks both bound runs in the task's company under the task and
+run locks; unrelated runs of the same agent do not block a confirmed release.
+The stale-lock sweep uses this same proof before clearing either owner, even for
+terminal run records. It locks the task, then its bound runs in ID order, and
+rechecks Stop in the clear transaction. Missing or cross-company run evidence
+fails closed; no hold-release work is promoted when proof is incomplete.
+An accepted interaction keeps its existing retry or needs-attention disposition.
+Generic recovery does not create a replacement run while its executor cleans up.
+After cleanup, its saved needs-attention escalation repeats the Stop check.
+
+Task-scoped Stop checks are read-only. They do not settle a coordinator lease
+while holding run locks: native lease reacquisition locks the coordinator before
+the run. Expired coordinator settlement stays with the agent lifecycle owner.
+
+An unproven task Stop is not a silent or age-based hold. The first failed
+read-only inspection records `execution_stop_pending` in the task's existing
+`activeRecoveryAction`, visible through the issue API and recovery card, with the
+recovery source and both bound run IDs. Its automatic inspection budget is one:
+it immediately escalates to the board instead of starting another Stop worker.
+The board inspects the owning runs and uses the agent's existing Stop/cleanup
+controls (or its explicit Retry after inspecting parked Stop work). This
+inspection budget is separate from the lifecycle worker's five Stop attempts.
+Task status, assignment and claims are preserved; no replacement run is started.
+Repeated checks retain the same diagnostic without refreshing a budget or adding
+activity. Later positive Stop proof can release the claims and resolve this
+inspection record. A stronger existing recovery action retains its owner,
+evidence and budget; Stop adds a visible annotation and removes only that
+annotation after proof. Run, session, trace and prior recovery history remain.
+
+The worker starts after a committed command.
+A periodic scan recovers work after a process stops.
+A database lease permits one active attempt for each agent.
+The worker renews that lease during external calls.
+Only a host failure in `verifying` classified as `harness_test_failed` spends
+`verificationFailures`. Three such failed tests park the operation with
+`retryRequired: true` and the true, secret-safe reason. Known configuration or
+account failures still park immediately in verification or resume. Unknown host
+failures, allocation failures, `test_environment_unavailable`, and
+`native_probe_cleanup_pending` do not spend this budget and cannot trip its
+three-failure park, even when an earlier test count remains. This follows upstream
+01451fae's worker.ts:84–96 and failure.ts:34–38 (`fix-failed-paperclip-run`).
+
+Non-budgeted, non-configuration/account host failures during verification or
+resume save `retryAt` with backoff from the first failure: 60 seconds, 120 seconds,
+240 seconds, 480 seconds, then 900 seconds (15-minute cap). The independent
+`transientFailures` count survives restarts and counts failed host work, not
+claims deferred before that work. This is a deliberate cost-guard departure from
+upstream's fixed 60-second ordinary-error retry: every probe can consume a Boat
+start, and [Boat's documented daily start limits](https://docs.boat.dev/limits)
+make continuous one-minute retries across stuck hires unsafe. The limit is per
+operation, not a guarantee that fleet-wide starts fit any particular Boat plan.
+With instantaneous attempts, including the initial attempt and the endpoint,
+continuous failure makes 8 attempts over one hour and 12 over two hours.
+
+Lifecycle verification reconciles retained cleanup for the selected account
+before acquiring another test box or lease; no second probe starts until the
+original retirement and credential handoff complete. The verifier releases each
+acquired target in its `finally` block, including failed attempts; environment
+lease cleanup records its release receipt.
+The operation records the first consecutive non-budgeted host failure in
+`transientFailureSince`. Before ten minutes it shows no error line; at the first
+evaluation at or after ten minutes it shows one line in `lifecycleError`:
+“Waiting for its environment; retrying automatically”. The existing shared
+coordinator schedules that visibility deadline independently of the next probe;
+direct worker evaluations also surface it. Updating the line never changes
+`retryAt`, claims a lease, or spends a probe start. Retries continue. A
+budgeted/configuration failure, successful host step, configuration repair or
+explicit Retry resets that timestamp and backoff count; readiness clears the line.
+This uses the existing retry deadline, not a new timer. Other ordinary errors
+retain the 60-second retry. Budgeted tests retain the shared backoff (one minute,
+two minutes, four minutes, capped at five minutes); scans and direct claims honor
+the saved deadline. Host completion resets the verification counter. Retry or a
+configuration repair clears a parked operation's budget; a restart alone does not.
+Already-parked hires require the documented Retry API, not an automatic reset.
+
+Stop work (`pausing`, `terminating`, `cleaning_up`) counts incomplete host or
+required-plugin attempts in the saved operation's `stopFailures`. Both `pending`
+and failed attempts use the same growing backoff helper as verification. After
+five incomplete attempts the operation parks with `retryRequired: true`, no
+`retryAt`, and a visible `lifecycleError` naming the blocking invocation when the
+stop evidence identifies one, or the required plugin for pending plugin work.
+These parked Stop diagnostics include the stable code `lifecycle_stop_retry_required`.
+When no invocation can be identified, the error names the lifecycle operation
+and the unresolved stop/cleanup proof rather than inventing an invocation ID.
+The phase and all unfinished resources are retained; parking is not stop proof.
+Scans, direct claims, and coordinator deadlines exclude every parked lifecycle
+phase, including an operator's already-set `retryRequired` on stop work. Restart
+and later sweeps do not retry it. The existing bounded startup recovery pass
+fills in a missing or blank diagnostic on older operator-parked Stop rows,
+including those in paused or archived companies. It changes only the diagnostic,
+not the operation, phase, budget, lease, or deadline. Existing nonblank errors
+and a concurrent Retry or newer lifecycle revision are preserved. The diagnostic
+exposes the existing Retry action; parked Stop guidance never promises automatic
+retry. After checking the outstanding invocation or cleanup, the operator uses
+the existing Retry action to clear the park and its
+Stop budget. A successful stop then completes through the ordinary state path.
+A Retry racing an active attempt is retained; that old result cannot park over it.
+Claims deferred before external work do not consume a Stop attempt.
+
+Each result must match the current revision and lease owner.
+Shutdown waits for active work.
+
+The agent API returns `lifecycleState`, `lifecycleVersion`, and `lifecycleError`.
+A board user can retry through `POST /api/agents/:id/lifecycle/retry`.
+The route applies the existing company access checks.
+
+## Existing installations
+
+Migration `0320_daily_onslaught.sql` maps the current status of each agent.
+Active execution states become `ready`.
+Paused, pending, and terminated agents retain their current meaning.
+The migration retains each existing pause reason as a hold.
+It does not provision external resources or record a successful harness test.
+Resource backfill is a separate task.
+
+Run the normal database migration process before starting the new server.
+Stop older server processes during the change.
+An older process can write the legacy status without the new lifecycle checks.
+
+`pnpm check:module-boundaries` checks the module imports and agent writes.
+Tests and migration fixtures can write records directly.
+Production creation and lifecycle state writes must use the lifecycle module.
+Production record deletion must also use the lifecycle module.
+Execution configuration writes must use the module. The offline worktree seed
+command can disable timers in a copied database before the server starts.
+
+## Extension rules
+
+Add a lifecycle command to the module entry point. Put state transition rules in
+`domain/policy.ts`. Put database operations in the module adapters.
+Keep harness and provider rules in services. Supply external work through the
+worker driver. Report completion only after that work is complete.
+Add a test for a failed or repeated operation. Run `pnpm check:module-boundaries`
+to check the import and write boundaries.

@@ -1,0 +1,1 @@
+ALTER TABLE "agent_identity_keys" ADD COLUMN "revoked_at" timestamp with time zone;

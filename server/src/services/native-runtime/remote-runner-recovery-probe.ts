@@ -1,0 +1,100 @@
+import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
+import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
+import {
+  attachRemoteRunnerRecoveryDiagnostic,
+  RemoteRunnerRecoveryError,
+  RemoteRunnerSupervisionExhaustedError,
+  type RemoteRunnerRecoveryDiagnostic,
+} from "./remote-runner-recovery-diagnostics.js";
+
+export const REMOTE_RUNNER_RECOVERY_PROBE_BUDGET_MS = 30_000;
+export const REMOTE_RUNNER_PLUGIN_STALL_BUDGET_MS = 180_000;
+
+export function isPluginRpcTimeout(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current instanceof Error; depth++) {
+    if ((current as { code?: unknown }).code === PLUGIN_RPC_ERROR_CODES.TIMEOUT) return true;
+    current = current.cause;
+  }
+  return false;
+}
+
+export interface RemoteRunnerPluginStall {
+  deadline: number;
+  observed: boolean;
+}
+
+export function remoteRunnerPluginStall(cap = Number.POSITIVE_INFINITY): RemoteRunnerPluginStall {
+  return { deadline: Math.min(cap, Date.now() + REMOTE_RUNNER_PLUGIN_STALL_BUDGET_MS), observed: false };
+}
+
+export async function readRemoteRunnerRecoveryProbe(input: {
+  runner: CommandManagedRuntimeRunner;
+  request: Parameters<CommandManagedRuntimeRunner["execute"]>[0];
+  stage: RemoteRunnerRecoveryDiagnostic["stage"];
+  deadline: number;
+  readOnly: boolean;
+  stall?: RemoteRunnerPluginStall;
+}) {
+  return retryRemoteRunnerRecoveryAttempt({ ...input,
+    attempt: timeoutMs => input.runner.execute({ ...input.request, readOnlyProbe: input.readOnly, timeoutMs,
+      // Carry the remaining allowance through the existing plugin abort path;
+      // never grant provider transport grace beyond this probe's deadline.
+      commandTimeoutMs: Math.min(timeoutMs, input.request.commandTimeoutMs && input.request.commandTimeoutMs > 0
+        ? input.request.commandTimeoutMs : Infinity),
+    }) });
+}
+
+/**
+ * The bounded retry a recovery probe runs under: each attempt gets at most
+ * 10s and never more than the time left before the deadline; a timed-out
+ * attempt is probe_timeout, a thrown one probe_transport_failed.
+ */
+export async function retryRemoteRunnerRecoveryAttempt<T extends { timedOut: boolean }>(input: {
+  stage: RemoteRunnerRecoveryDiagnostic["stage"];
+  deadline: number;
+  readOnly: boolean;
+  stall?: RemoteRunnerPluginStall;
+  attempt: (timeoutMs: number) => Promise<T>;
+}): Promise<T> {
+  let lastError: unknown = new RemoteRunnerRecoveryError({
+    stage: input.stage, reason: "probe_timeout",
+  });
+  const deadline = () => input.readOnly && input.stall?.observed
+    ? Math.max(input.deadline, input.stall.deadline)
+    : input.deadline;
+  for (let attempt = 0; ; attempt++) {
+    const remaining = deadline() - Date.now();
+    if (!Number.isFinite(remaining) || remaining <= 0) break;
+    try {
+      const result = await input.attempt(Math.min(10_000, remaining));
+      if (!result.timedOut) return result;
+      lastError = new RemoteRunnerRecoveryError({ stage: input.stage, reason: "probe_timeout" });
+    } catch (error) {
+      if (input.readOnly && input.stall && isPluginRpcTimeout(error)) input.stall.observed = true;
+      lastError = attachRemoteRunnerRecoveryDiagnostic(error, {
+        stage: input.stage, reason: "probe_transport_failed",
+      });
+    }
+    const delayMs = Math.min(250 * 2 ** Math.min(attempt, 3), 2_000);
+    if (!input.readOnly || deadline() - Date.now() <= delayMs) break;
+    await new Promise<void>(resolve => setTimeout(resolve, delayMs));
+  }
+  // Only read-only supervision is safe to retry. Exhaustion is NOT an exit
+  // receipt, and must not leak a raw provider command outcome to recovery.
+  if (input.readOnly && input.stage === "process_verification" && isPossiblyRan(lastError)) {
+    throw new RemoteRunnerSupervisionExhaustedError(lastError);
+  }
+  throw lastError;
+}
+
+function isPossiblyRan(error: unknown): boolean {
+  for (let current = error, depth = 0; current instanceof Error && depth < 5; current = current.cause, depth++) {
+    if ((current as { code?: unknown }).code === "boat_command_possibly_ran") return true;
+    // The plugin worker serializes the provider's closed code into its typed
+    // RPC envelope. Ordinary provider diagnostic prose must not grant this.
+    if (current instanceof JsonRpcCallError && current.code === PLUGIN_RPC_ERROR_CODES.WORKER_ERROR
+      && current.message.startsWith("boat_command_possibly_ran: ")) return true;
+  }
+  return false;
+}

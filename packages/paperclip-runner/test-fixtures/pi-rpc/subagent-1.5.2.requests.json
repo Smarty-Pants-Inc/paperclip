@@ -1,0 +1,34 @@
+[
+  {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "model": "neutral/vendor-model-not-in-bundled-catalog",
+    "scenario": "subagent",
+    "round": 1,
+    "roles": [
+      "system",
+      "user"
+    ],
+    "tools": [
+      "bash",
+      "subagent"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "model": "neutral/vendor-model-not-in-bundled-catalog",
+    "scenario": "subagent",
+    "round": 2,
+    "roles": [
+      "system",
+      "user",
+      "assistant",
+      "tool"
+    ],
+    "tools": [
+      "bash",
+      "subagent"
+    ]
+  }
+]
