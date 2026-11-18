@@ -332,12 +332,31 @@ export async function readRetryAdmissionAuthority(db: Db, input: { companyId: st
   sourceRunId?: string | null }): Promise<RetryAuthority> {
   const [{ getExecutionBlocker }, { readRetryStopGate }] = await Promise.all([import("./execution-blocker.js"), import("./task-retry-stop-gate.js")]);
   const hold = await readRestoreHoldEvidence(db, input);
-  const restoreHold = hold && (await getExecutionBlocker(db, input.companyId, input.issueId))?.canRetry === false ? hold : null;
+  const withheld = hold && (await getExecutionBlocker(db, input.companyId, input.issueId))?.canRetry === false ? hold : null;
+  // fam-retry-c3fix item 4 (rf-5 finding 1): a failed-restore hold does not
+  // refuse a Retry whose source run that hold refused at dispatch. Paperclip's
+  // fresh-continuation fallback (fresh-continuation-fallback.ts ensureFreshContinuation,
+  // its `refused` run) continues that Retry in a fresh isolated workspace with
+  // the held files kept and not applied: "create a new task" would be false.
+  const restoreHold = withheld && !restoreHoldHoldsRetry(withheld)
+    && await sourceRunRefusedAtDispatch(db, input) ? null : withheld;
   const gate = input.sourceRunId
     ? (await readRetryStopGate(db, { companyId: input.companyId, issueId: input.issueId, sourceRunId: input.sourceRunId }))?.state : null;
   return decideRetryAuthority({ ...await readRetryAuthorityFacts(db, { companyId: input.companyId, issueId: input.issueId,
     sourceRunId: input.sourceRunId }), restoreHold,
     stopGate: gate === "expired" ? "expired" : null, retrySource: true });
+}
+/** The Retry's source run is a run of this task that dispatch refused behind
+ * an execution hold (never started; fresh-continuation-fallback.ts's `refused`). */
+async function sourceRunRefusedAtDispatch(db: Db, input: { companyId: string; issueId: string; sourceRunId?: string | null }) {
+  if (!input.sourceRunId) return false;
+  const [refused] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.sourceRunId),
+    or(eq(heartbeatRuns.nativeIssueId, input.issueId), eq(heartbeatRuns.issueId, input.issueId),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`),
+    eq(heartbeatRuns.status, "cancelled"), isNull(heartbeatRuns.startedAt),
+    eq(heartbeatRuns.errorCode, "execution_reconciliation_required"))).limit(1);
+  return Boolean(refused);
 }
 export function retryRefusedBeforeAdmissionReason(reason: string) { return REFUSED_BEFORE_ADMISSION.has(reason); }
 export async function retryRefusedBeforeAdmission(db: Db, input: { companyId: string; issueId: string;
