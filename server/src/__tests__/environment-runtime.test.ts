@@ -1120,8 +1120,20 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       expect(done.metadata).not.toHaveProperty("agentFileDestroyClaim");
     });
 
-    it("a release-method cleanup is not a destroy and is unchanged by the marker", async () => {
+    // On this image every no-environment plugin teardown that is not stop-only
+    // takes the destroy claim (cleanupPluginRunLease claimDestroy: a teardown
+    // retry can erase the box), so the allocation-wide marker refuses the
+    // release-method teardown too: no provider call, left for retry.
+    it("a release-method teardown takes the same claim and the marker refuses it", async () => {
       const { runId, call, service } = await seedNoEnvironmentPluginLeases({ method: "release", marked: true });
+      const errors: string[] = [];
+      await service.releaseRunLeases(runId, "released", (_id, error) => { errors.push((error as Error).message); });
+      expect(errors).toEqual(["Native harness backup is missing; destructive cleanup is forbidden."]);
+      expect(call.mock.calls.map(([, method]) => method)).toEqual([]);
+    });
+
+    it("a release-method teardown without a marker releases as today", async () => {
+      const { runId, call, service } = await seedNoEnvironmentPluginLeases({ method: "release", marked: false });
       const errors: unknown[] = [];
       await service.releaseRunLeases(runId, "released", (_id, error) => { errors.push(error); });
       expect(errors).toEqual([]);
