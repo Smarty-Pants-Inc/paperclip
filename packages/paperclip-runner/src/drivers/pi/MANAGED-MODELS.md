@@ -25,7 +25,15 @@ Resolution order:
    Pi's catalog order. Copy the whole winning definition, not a synthesized
    cross-provider consensus. Snapshot thinking-map keys override catalog keys,
    including explicit `null` caps.
-4. Unresolved fields use `contextWindow: 128000`, `maxTokens: 8192`, and
+   When no selected-installation catalog is available (the legacy ACPX
+   loopback bootstrap, or a native start whose installation catalog cannot be
+   loaded), still-missing `maxTokens`/`contextWindow` come from the runner's own
+   locked `@earendil-works/pi-ai` 1.5.2 catalog (exact id, canonical API owner
+   first). Only those two limits are taken; compat, dialect and thinking-map
+   metadata stay catalog-gated as described below. A model the fleet ships must
+   never run under an arbitrary fallback output cap: the provider's own ceiling
+   is the only ceiling.
+4. Fields still unresolved (an id no catalog knows) use `contextWindow: 128000`, `maxTokens: 8192`, and
    `reasoning: true`, with one bounded diagnostic at initial resolution. The
    existing all-level thinking-map fallback applies only when the catalog is
    unresolved AND the configured limits/reasoning tuple is incomplete; complete
@@ -97,7 +105,8 @@ The ACPX child bootstrap uses this same capability builder with the original
 pre-projection environment, even when the caller supplies only model/environment.
 It serializes the entire resolved model, not just its id. This legacy ACPX path
 has no selected 1.5.2 catalog handoff (its selected Pi is 1.0.0); it uses allowed
-original config and documented defaults, never an ambient Pi installation or an
+original config, then output/context limits from the runner's own locked Pi
+1.5.2 catalog, then documented defaults, never an ambient Pi installation or an
 unverified SDK. Catalog-only compat on that legacy path remains unproven and is
 not synthesized from model families, URLs, requested effort or another runtime.
 

@@ -30,7 +30,18 @@ export async function buildPiManagedModel(input: {
 }): Promise<PiManagedModel & RequiredPiModelLimits> {
   const messages = new Set<string>();
   try {
-    const configured = await configuredPiManagedModelSources(input.snapshot, input.id, input.originalModelsFile, input.api, message => messages.add(message));
+    let configured = await configuredPiManagedModelSources(input.snapshot, input.id, input.originalModelsFile, input.api, message => messages.add(message));
+    // Without a selected-installation catalog (legacy ACPX loopback, or a
+    // native start whose installation catalog could not be loaded), the
+    // provider's real output ceiling still comes from the runner's own pinned
+    // Pi 1.5.2 catalog. Limits only: dialect metadata stays catalog-gated.
+    // Configured fields keep winning; never fall back to an arbitrary cap.
+    if (!input.catalog && (configured.maxTokens === undefined || configured.contextWindow === undefined)) {
+      const limits = await pinnedPiModelLimits(input.id, input.api);
+      if (limits) configured = { ...configured,
+        ...(configured.contextWindow === undefined ? { contextWindow: limits.contextWindow } : {}),
+        ...(configured.maxTokens === undefined ? { maxTokens: limits.maxTokens } : {}) };
+    }
     return resolvePiManagedModel(configured, input.catalog, input.api, message => messages.add(message));
   } finally {
     reportDiagnostics(messages, input.warn ?? diagnose);
@@ -41,6 +52,31 @@ export interface PiBuiltinModelCatalog {
   getBuiltinModels(provider: string): Array<PiBindModel & { api?: string; contextWindow: number; maxTokens: number; reasoning: boolean }>;
 }
 export const PI_MANAGED_MODEL_DEFAULTS = { contextWindow: 128000, maxTokens: 8192, reasoning: true } as const;
+
+/** Exact-id output/context limits from the runner's own locked Pi 1.5.2 model
+ * data (pure JSON catalogs, so verified provider bundles stay self-contained),
+ * preferring the canonical API owner. Undefined for ids Pi does not know. */
+async function pinnedPiModelLimits(id: string, api?: PiBindProvider["api"]): Promise<{ contextWindow: number; maxTokens: number } | undefined> {
+  try {
+    const [{ ANTHROPIC_MODELS }, { OPENAI_MODELS }, { XAI_MODELS }] = await Promise.all([
+      import("@earendil-works/pi-ai/providers/anthropic.models"),
+      import("@earendil-works/pi-ai/providers/openai.models"),
+      import("@earendil-works/pi-ai/providers/xai.models"),
+    ]);
+    const byOwner: Record<string, Record<string, { contextWindow?: unknown; maxTokens?: unknown }>> = {
+      anthropic: ANTHROPIC_MODELS as never, openai: OPENAI_MODELS as never, xai: XAI_MODELS as never };
+    const owner = api === "anthropic-messages" ? "anthropic" : "openai";
+    for (const provider of [owner, ...Object.keys(byOwner).filter(name => name !== owner)]) {
+      const selected = Object.hasOwn(byOwner[provider], id) ? byOwner[provider][id] : undefined;
+      if (!selected) continue;
+      const { contextWindow, maxTokens } = selected;
+      if (typeof maxTokens !== "number" || !Number.isSafeInteger(maxTokens) || maxTokens <= 0
+        || typeof contextWindow !== "number" || !Number.isSafeInteger(contextWindow) || contextWindow <= 0) return undefined;
+      return { contextWindow, maxTokens };
+    }
+    return undefined;
+  } catch { return undefined; }
+}
 const fields = ["thinkingLevelMap", "contextWindow", "maxTokens", "reasoning"] as const;
 const levels: PiThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 // Negative routing list, deliberately NOT a capability allowlist. New Pi model
