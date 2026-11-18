@@ -61,6 +61,11 @@ const support = await getEmbeddedPostgresTestSupport();
   function boatWorker(pluginId: string, mode: { release: Release; inspect: Inspect; inspectBy?: Record<string, Inspect> }) {
     let boxes = 0;
     const calls: Array<{ method: string; providerLeaseId?: string }> = [];
+    // Boat's own admission fence (lease-gates.ts:23 Map, plugin.ts:138
+    // stoppedBoxes): IN MEMORY. A released box refuses execute with -32002;
+    // a worker restart empties it, and Boat then starts an archived box for a
+    // /commands or /files call (plugin.ts:753-760). `restart()` models that.
+    const closedInMemory = new Set<string>();
     const methods = ["environmentAcquireLease", "environmentReleaseLease", "environmentDestroyLease", "environmentRealizeWorkspace", "environmentExecute", "environmentInspectLease"];
     const worker = {
       isRunning: (id: string) => id === pluginId,
@@ -70,7 +75,11 @@ const support = await getEmbeddedPostgresTestSupport();
         calls.push({ method, providerLeaseId });
         if (method === "environmentAcquireLease") return { providerLeaseId: `boat-box-${++boxes}`, metadata: { provider: "boat", remoteCwd: "/home/user/paperclip-workspace" } };
         if (method === "environmentRealizeWorkspace") return { cwd: "/home/user/paperclip-workspace" };
+        if (method === "environmentExecute" && providerLeaseId && !closedInMemory.has(providerLeaseId)) {
+          return { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
+        }
         if (method === "environmentReleaseLease") {
+          if (providerLeaseId) closedInMemory.add(providerLeaseId);
           if (mode.release === "throws") throw new JsonRpcCallError({ code: -32002, message: "Boat stop did not complete" } as never);
           return mode.release === "void" ? undefined : { providerLeaseId, state: "stopped" };
         }
@@ -82,7 +91,7 @@ const support = await getEmbeddedPostgresTestSupport();
         throw new JsonRpcCallError({ code: -32002, message: BOAT_REFUSAL } as never);
       }),
     };
-    return { worker: worker as unknown as PluginWorkerManager, calls };
+    return { worker: worker as unknown as PluginWorkerManager, calls, restart: () => closedInMemory.clear() };
   }
 
   async function fixture(input: { release: Release; inspect: Inspect; reuseLease?: boolean }) {
@@ -115,10 +124,22 @@ const support = await getEmbeddedPostgresTestSupport();
    * runtime and plugin path, the retained owner and the lifecycle are real. The
    * first probe fails like gate 4: runner ingress refused during a Boat
    * slowdown, then the step "releasing original probe authority" fails. */
-  function probeBoundary(f: Fixture) {
+  function probeBoundary(f: Fixture, options: { retryRunsRm?: boolean } = {}) {
     let probes = 0;
     const cleanup = vi.fn(async () => {});
-    const retry = vi.fn(async () => { throw new Error("Native probe authority release remains unconfirmed"); });
+    // G3: the transport retry's "confirming credential handoff" step runs the
+    // probe's cleanup() (pi-runner-probe.ts:243 `rm -rf`) through the probe's
+    // OWN execution-target runner on its (now closed) lease.
+    let probeRunner: { execute: (input: Record<string, unknown>) => Promise<unknown> } | undefined;
+    const rmErrors: unknown[] = [];
+    const retry = vi.fn(async () => {
+      if (options.retryRunsRm) {
+        if (!probeRunner) throw new Error("G3 fixture: the probe's runner was not captured");
+        await probeRunner.execute({ command: "rm", args: ["-rf", "--", "/home/user/paperclip-workspace/.paperclip-runtime/setup-g3"], bypassSession: true, timeoutMs: 60_000 })
+          .catch(error => { rmErrors.push(error); throw error; });
+      }
+      throw new Error("Native probe authority release remains unconfirmed");
+    });
     const connections = aiConnections.aiConnectionService;
     vi.spyOn(aiConnections, "aiConnectionService").mockImplementation(database => ({ ...connections(database),
       select: async () => ({ connection: { credentialSecretRefs: [] }, grant: { id: f.accountKey, credentialSecretRefs: [] }, attribution: { grantId: f.accountKey, connectionId: f.accountKey } }) as never,
@@ -133,6 +154,7 @@ const support = await getEmbeddedPostgresTestSupport();
           probes += 1;
           expect(input.executionTarget).toMatchObject({ kind: "remote", transport: "sandbox", leaseId: expect.any(String) });
           if (probes === 1) {
+            probeRunner = (input.executionTarget as { runner?: typeof probeRunner }).runner;
             const retired = Promise.reject(new Error("Native probe authority release remains unconfirmed")); void retired.catch(() => undefined);
             const ingress = Object.assign(new Error("runner ingress refused"), { name: "NativeRunnerIngressAcquisitionError" });
             throw new NativeEnvironmentProbeCleanupError(retired, ingress, [new Error("Native setup probe authority release is unconfirmed; recovery state retained.")], retry);
@@ -152,7 +174,7 @@ const support = await getEmbeddedPostgresTestSupport();
         throw error;
       }
     });
-    return { probes: () => probes, cleanup, retry };
+    return { probes: () => probes, cleanup, retry, rmErrors };
   }
 
   function lifecycle(f: Fixture) {
@@ -179,8 +201,8 @@ const support = await getEmbeddedPostgresTestSupport();
   const after = (f: Fixture, index: number) => f.boat.calls.slice(index).map(call => call.method);
 
   /** First lifecycle pass: the probe fails, the verifier releases its lease. */
-  async function firstPass(f: Fixture) {
-    const boundary = probeBoundary(f);
+  async function firstPass(f: Fixture, options: { retryRunsRm?: boolean } = {}) {
+    const boundary = probeBoundary(f, options);
     const life = lifecycle(f);
     await life.work.process(f.agent.id);
     expect(boundary.probes()).toBe(1);
@@ -362,5 +384,104 @@ const support = await getEmbeddedPostgresTestSupport();
     await expect(runtime.execute({ environment: f.environment as never, lease: acquired.lease, command: "rm", args: ["-rf", "/tmp/x"] } as never))
       .rejects.toMatchObject({ code: "sandbox_lease_start_denied" });
     expect(after(f, mark), "no start reached Boat").toEqual([]);
+  });
+
+  // ---- probecleanup-g (RFL §G): the fence keys on the DB row ONLY. ----
+  /** Box-starting Boat methods: resume, commands, files, ingress, realize. */
+  const STARTS = ["environmentResumeLease", "environmentExecute", "environmentSyncIn", "environmentSyncOut", "environmentRunnerIngressEndpoint", "environmentRealizeWorkspace"];
+  async function setupTestLease(f: Fixture, close: boolean) {
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: f.boat.worker });
+    const acquired = await runtime.acquireRunLease({ companyId: f.companyId, agentId: f.agent.id, adapterType: "paperclip_runner",
+      environment: f.environment as never, configuredEnvironment: f.environment as never, issueId: null, heartbeatRunId: null, persistedExecutionWorkspace: null } as never);
+    if (close) await runtime.getDriver("sandbox")!.releaseRunLease({ environment: f.environment as never, lease: acquired.lease, status: "failed" });
+    // A fresh Boat worker: its in-memory admission is empty, so only the server's durable fence can refuse.
+    f.boat.restart();
+    return { runtime, lease: acquired.lease };
+  }
+  async function expectExecuteReachesBoat(f: Fixture, runtime: ReturnType<typeof environmentRuntimeService>, lease: { providerLeaseId: string | null }, why: string) {
+    const mark = f.boat.calls.length;
+    await expect(runtime.execute({ environment: f.environment as never, lease, command: "true", args: [] } as never), why).resolves.toMatchObject({ exitCode: 0 });
+    expect(f.boat.calls.slice(mark).filter(c => c.method === "environmentExecute" && c.providerLeaseId === lease.providerLeaseId), why).toHaveLength(1);
+  }
+
+  it("G2 RED closed RUN lease is NOT fenced: a closed one-off lease WITH a heartbeat run still starts (fence keys on no-run)", async () => {
+    const f = await fixture({ release: "void", inspect: "stopped" });
+    const { runtime, lease } = await setupTestLease(f, true);
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agent.id, invocationSource: "manual", status: "failed" } as never);
+    await db.update(environmentLeases).set({ heartbeatRunId: runId }).where(eq(environmentLeases.id, lease.id));
+    const [row0] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+    expect(row0).toMatchObject({ status: "failed", leasePolicy: "ephemeral", heartbeatRunId: runId, issueId: null });
+    await expectExecuteReachesBoat(f, runtime, lease, "a closed RUN lease is not a setup test");
+  });
+
+  it("G2 RED closed REUSABLE lease is NOT fenced: a closed reuse_by_environment lease with no run still starts (fence keys on non-reusable)", async () => {
+    const f = await fixture({ release: "void", inspect: "stopped" });
+    const { runtime, lease } = await setupTestLease(f, true);
+    await db.update(environmentLeases).set({ leasePolicy: "reuse_by_environment" }).where(eq(environmentLeases.id, lease.id));
+    const [row0] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+    expect(row0).toMatchObject({ status: "failed", leasePolicy: "reuse_by_environment", heartbeatRunId: null, issueId: null });
+    await expectExecuteReachesBoat(f, runtime, lease, "a closed REUSABLE lease is not a one-off setup test");
+  });
+
+  it("G2 RED OPEN probe lease is NOT fenced: the setup test's own active lease still runs its commands (fence keys on closed)", async () => {
+    const f = await fixture({ release: "void", inspect: "stopped" });
+    const { runtime, lease } = await setupTestLease(f, false);
+    const [row0] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+    expect(row0).toMatchObject({ status: "active", leasePolicy: "ephemeral", heartbeatRunId: null, issueId: null });
+    await expectExecuteReachesBoat(f, runtime, lease, "an OPEN probe lease runs");
+  });
+
+  it("G2 RED custody after a FRESH Boat worker: every box-starting call on a closed setup-test lease is denied before Boat (execute, files in/out, ingress, realize, resume)", async () => {
+    const f = await fixture({ release: "void", inspect: "stopped" });
+    const { lease } = await setupTestLease(f, true);
+    // The fresh worker advertises every box-starting method, so only the fence can refuse.
+    const advertised = [...STARTS, "environmentAcquireLease", "environmentReleaseLease", "environmentDestroyLease", "environmentStopLease", "environmentInspectLease"];
+    (f.boat.worker as unknown as { getWorker: () => unknown }).getWorker = () => ({ status: "running", supportedMethods: advertised,
+      openDuplexChannel: async () => { f.boat.calls.push({ method: "openDuplexChannel", providerLeaseId: lease.providerLeaseId ?? undefined }); throw new Error("reached Boat"); } });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: f.boat.worker });
+    const mark = f.boat.calls.length;
+    const env = f.environment as never;
+    const denied = { code: "sandbox_lease_start_denied" };
+    const driver = runtime.getDriver("sandbox")!;
+    const attempts: Array<[string, () => Promise<unknown>]> = [
+      ["commands (execute)", () => runtime.execute({ environment: env, lease, command: "rm", args: ["-rf", "/tmp/x"] } as never)],
+      ["files out (syncOut)", () => driver.syncOut!({ environment: env, lease, operations: [] } as never)],
+      ["files in (syncIn)", () => driver.syncIn!({ environment: env, lease, operations: [] } as never)],
+      ["runner ingress", () => driver.getRunnerIngressEndpoint!({ environment: env, lease, port: 7777, path: "/" } as never)],
+      ["realize workspace", () => driver.realizeWorkspace!({ environment: env, lease, workspace: { localPath: "/tmp", remotePath: "/home/user/paperclip-workspace" } } as never)],
+      ["resume", () => driver.resumeRunLease!({ environment: env, lease } as never)],
+      ["duplex channel", () => driver.openDuplexChannel!({ environment: env, lease, command: "sh" } as never)],
+    ];
+    for (const [name, start] of attempts) await expect(start(), name).rejects.toMatchObject(denied);
+    expect(f.boat.calls.slice(mark).filter(c => c.method === "openDuplexChannel"), "duplex never opened").toEqual([]);
+    expect(f.boat.calls.slice(mark).filter(c => c.providerLeaseId === lease.providerLeaseId && STARTS.includes(c.method)), "no start reached Boat").toEqual([]);
+  });
+
+  it("G3 RESTART ROW: a fresh Boat worker (in-memory blocks EMPTY), then the retained retry runs cleanup()'s rm: no Boat resume/command/files call for the probe box; the receipt comes from Boat's typed state; the hire verifies with no server restart", async () => {
+    const f = await fixture({ release: "void", inspect: "unknown" });
+    const { work, boundary, probeLease } = await firstPass(f, { retryRunsRm: true });
+    expect(probeLease).toMatchObject({ status: "failed", heartbeatRunId: null, issueId: null, leasePolicy: "ephemeral" });
+    f.boat.restart();
+    const mark = f.boat.calls.length;
+    // Retry 1: Boat cannot classify the box yet → no typed proof → the transport retry runs cleanup()'s rm on the closed lease.
+    await untilRetryAt(f.agent.id);
+    await work.process(f.agent.id);
+    expect(boundary.retry, "the retained retry ran the transport step (cleanup rm)").toHaveBeenCalledOnce();
+    expect(boundary.rmErrors, "the rm is refused by the server's durable fence").toEqual([expect.objectContaining({ code: "sandbox_lease_start_denied" })]);
+    expect((await row(f.agent.id)).lifecycleState).toBe("verifying");
+    // Retry 2: Boat reads the box archived → typed `stopped`.
+    f.mode.inspect = "stopped";
+    await untilRetryAt(f.agent.id);
+    await work.process(f.agent.id);
+    const [proved, successor] = await leases(f.environment.id);
+    expect(proved!.id).toBe(probeLease.id);
+    expect(proved!.metadata?.remoteExecutionTermination, "the receipt is written from the typed state")
+      .toMatchObject({ runId: null, leaseId: probeLease.id, providerLeaseId: probeLease.providerLeaseId, state: "stopped" });
+    expect(proved).toMatchObject({ status: "failed", cleanupStatus: "success" });
+    expect((await row(f.agent.id)).lifecycleState, "the hire verifies with no restart").not.toBe("verifying");
+    expect(successor!.providerLeaseId).not.toBe(probeLease.providerLeaseId);
+    expect(f.boat.calls.slice(mark).filter(c => c.providerLeaseId === probeLease.providerLeaseId && (STARTS.includes(c.method) || NEVER.includes(c.method))),
+      "the plugin's call log: NO resume/command/files (nor stop/destroy) for the probe box").toEqual([]);
   });
 });
