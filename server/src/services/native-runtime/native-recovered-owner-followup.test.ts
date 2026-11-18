@@ -1960,6 +1960,99 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(followUp.logs.join("")).not.toContain(TURN_WAIT_LINE);
   }, 60_000);
 
+  /** S095 receipt (live 7e625560, control-plane read 11-18): the predecessor
+   * d2f6b4fd ran out (status failed, setup_failed, no person's Stop, no
+   * cancellation) after journaling turn.interrupt + turn.stop it never had
+   * answered; Boat stopped its own box (lease released, cleanup success,
+   * remoteExecutionTermination stopped); the successor got a created box. */
+  const RECEIPT_EXEMPT_LINE = "its own lease carries Boat's stop receipt, so its unanswered turn.interrupt / turn.stop no longer hold this conversation";
+  async function timedOutOwnerShape(options: { pending?: string[]; receipt?: "own" | "other-run" | "successor-box" | "none";
+    state?: "stopped" | "destroyed"; status?: "failed" | "timed_out"; ownerFinalization?: "committed" | "terminal_failure" } = {}) {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm",
+      pendingCommands: options.pending ?? [...STOP_TURN_COMMANDS, "runner.suspend"] });
+    const followUp = await admitFollowUp(prior);
+    await db.update(heartbeatRuns).set({ status: options.status ?? "failed", errorCode: "setup_failed", resultJson: {},
+      finishedAt: new Date() }).where(eq(heartbeatRuns.id, prior.runId));
+    // The owner's last committed result stays (the seed's committed finalization) unless a row says its turn's
+    // finalization failed too (live d2f6b4fd: timed out mid-turn; its finalization row is not in the read).
+    if (options.ownerFinalization === "terminal_failure") {
+      await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: "native_session_timeout", resultId: null })
+        .where(eq(nativeRunFinalizations.runId, prior.runId));
+    }
+    const receipt = options.receipt ?? "own";
+    if (receipt !== "none") {
+      const environmentId = randomUUID(), leaseId = randomUUID();
+      const runId = receipt === "other-run" ? randomUUID() : prior.runId;
+      const providerLeaseId = receipt === "successor-box" ? followUp.providerLeaseId : `sandbox-${prior.runId}`;
+      if (receipt === "other-run") {
+        await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "failed", runtimeMode: "native",
+          contextSnapshot: {}, createdAt: new Date(Date.now() - 3_600_000) });
+        // The owner's own lease of that box: released, no receipt.
+        await db.insert(environments).values({ id: environmentId, name: `owner-${environmentId}`, driver: "sandbox" });
+        await db.insert(environmentLeases).values({ id: randomUUID(), companyId, environmentId, issueId: prior.issueId,
+          heartbeatRunId: prior.runId, provider: "boat", providerLeaseId, status: "released", releasedAt: new Date(),
+          cleanupStatus: "success", metadata: { remoteCwd: "/workspace" } });
+      } else {
+        await db.insert(environments).values({ id: environmentId, name: `stopped-${environmentId}`, driver: "sandbox" });
+      }
+      await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, issueId: prior.issueId,
+        heartbeatRunId: runId, provider: "boat", providerLeaseId, status: "released", releasedAt: new Date(),
+        cleanupStatus: "success", metadata: { remoteCwd: "/workspace", remoteExecutionTermination: {
+          schema: "paperclip.remote-termination.v1", companyId, runId, leaseId, provider: "boat", providerLeaseId,
+          state: options.state ?? "stopped", confirmedAt: new Date().toISOString() } } });
+    }
+    return { prior, followUp };
+  }
+
+  it("S095 receipt: live 7e625560 at the production entry: a timed-out owner's own pending turn.interrupt + turn.stop (no person's Stop), "
+    + "its own lease's Boat 'stopped' receipt, the successor on a created box -> admitted once, no quarantined copy, same provider session", async () => {
+    const { prior, followUp } = await timedOutOwnerShape();
+    const { outcome, elapsedMs } = await executeFollowUp(prior, followUp, 5_000);
+    expect.soft(await quarantined(), "no quarantined copy").toEqual([]);
+    expect.soft(failureText(outcome)).not.toContain(STRANDED);
+    expect.soft(outcome).not.toBeInstanceOf(NativeControllerRecoveryWaitingError);
+    expect.soft(failureText(outcome), "admission reached tool authority").toContain(ADMITTED);
+    expect.soft(toolDefinitions).toHaveBeenCalledTimes(1);
+    expect.soft(elapsedMs).toBeLessThan(5_000);
+    expect.soft(followUp.logs.join("")).toContain(`run ${prior.runId}'s Runner is gone; ${RECEIPT_EXEMPT_LINE}`);
+    expect.soft(followUp.logs.join("")).not.toContain(TURN_WAIT_LINE);
+    expect(await archivedOwners(await sessionRoot())).toEqual([prior.runId]);
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+    expect((successor.runnerProfileJson as { sessionCheckpoint?: { providerSessionId?: string } }).sessionCheckpoint?.providerSessionId)
+      .toBe("provider-session-before-recovery");
+  }, 60_000);
+
+  it("S095 receipt: the live shape whose owner finalization is terminal_failure clears the journal but meets today's owner-phase refusal", async () => {
+    const { prior, followUp } = await timedOutOwnerShape({ ownerFinalization: "terminal_failure" });
+    const { outcome } = await executeFollowUp(prior, followUp, 5_000);
+    expect(failureText(outcome)).toContain(stranded("owner_terminal_failure"));
+    expect(followUp.logs.join("")).toContain(RECEIPT_EXEMPT_LINE);
+    expect(followUp.remoteExecute).not.toHaveBeenCalled();
+  }, 60_000);
+
+  it("S095 receipt: a timed_out owner with a 'destroyed' receipt on its own lease is admitted", async () => {
+    const { prior, followUp } = await timedOutOwnerShape({ status: "timed_out", state: "destroyed", pending: STOP_TURN_COMMANDS });
+    const { outcome } = await executeFollowUp(prior, followUp, 5_000);
+    expect.soft(await quarantined()).toEqual([]);
+    expect(failureText(outcome)).toContain(ADMITTED);
+  }, 60_000);
+
+  it.each([
+    ["no receipt", { receipt: "none" as const }],
+    ["the receipt on another run's lease of the owner's box", { receipt: "other-run" as const }],
+    ["a 'stopped' receipt on the box the successor runs on", { receipt: "successor-box" as const }],
+    ["a pending non-lifecycle command (turn.steer)", { pending: [...STOP_TURN_COMMANDS, "turn.steer"] }],
+  ])("S095 receipt: keeps today's refusal and quarantine with %s", async (_label, options) => {
+    const { prior, followUp } = await timedOutOwnerShape(options);
+    const { outcome, elapsedMs } = await executeFollowUp(prior, followUp, 5_000);
+    expect(failureText(outcome)).toContain(STRANDED);
+    expect(failureText(outcome)).toContain("journal_commands_unsettled(");
+    expect(elapsedMs).toBeLessThan(5_000);
+    expect(await quarantined()).toHaveLength(1);
+    expect(followUp.logs.join("")).not.toContain(RECEIPT_EXEMPT_LINE);
+    expect(followUp.logs.join("")).not.toContain(TURN_WAIT_LINE);
+  }, 60_000);
+
   it("keeps a finished owner held by an unclassified root entry and names it", async () => {
     const prior = await seedRecoveredPriorRun();
     const followUp = await admitFollowUp(prior);
