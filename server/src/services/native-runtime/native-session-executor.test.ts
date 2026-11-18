@@ -15944,6 +15944,166 @@ describe("native warm session supervision", () => {
       });
     });
 
+    // c3 A-REPAIR4 REDs (adopt-c3-arepair4, org 07:11Z / 07:14Z). Live: abd1cb54
+    // (P9-1), R1-105. A person's Stop stops and retains the box
+    // (sandbox-stop-and-retain: lease `released`, its own bound stop receipt,
+    // state `stopped`), but the stopped run's warm owner stays registered. The
+    // successor runs on a NEW box; its retirement close reaches the stopped box
+    // and Boat refuses. Real executePaperclipNativeSession, real warm owner, real
+    // retirement path; only the provider turn, the close transport and the lease
+    // rows are scripted. Binding (07:14Z): ONLY a typed stop/destroy receipt on the
+    // owner's OWN lease proves it gone; never an error's text, a 503 or a timeout;
+    // 'stopped' proves gone only when the successor is NOT on that box.
+    describe("c3 A-REPAIR4: a person's Stop retained the box; the successor's retirement of its warm owner", () => {
+      type Receipt = "own-stopped" | "own-destroyed" | "none" | "foreign-stopped";
+      const boatInactive = () => new Error("Boat sandbox lease is no longer active.");
+      const scenario = async (kind: string, opts: { receipt?: Receipt; closeError?: () => Error; stoppedTurn?: Record<string, unknown> } = {}) => {
+        const receipt = opts.receipt ?? "own-stopped", closeError = opts.closeError ?? boatInactive;
+        const { base, next } = fixture(`c3-ar4-${kind}`);
+        const environmentId = `c3-ar4-env-${kind}`, stoppedBox = `bx_stopped_${kind}`;
+        const closeMs: number[] = [];
+        const close = vi.fn(async (): Promise<void> => {
+          const t = performance.now();
+          try { await new Promise(resolve => setTimeout(resolve, 5)); throw closeError(); } finally { closeMs.push(performance.now() - t); }
+        });
+        const turns: string[] = [];
+        let currentRunId = base.binding.runId;
+        state.execute.mockReset().mockImplementationOnce(async options => {
+          await options.onSession?.({ close }); turns.push(base.binding.runId);
+          return { ...result, ...opts.stoppedTurn, terminal: { runTerminalState: "cancelled" } };
+        }).mockImplementation(async () => { turns.push(currentRunId); return result; });
+        const leaseRunId = receipt === "foreign-stopped" ? "c3-ar4-earlier-run" : base.binding.runId;
+        const row = { id: `lease-${kind}`, companyId: base.binding.companyId, environmentId, heartbeatRunId: leaseRunId,
+          provider: "boat", providerLeaseId: stoppedBox, status: "released", releasedAt: new Date(), cleanupStatus: "success",
+          leasePolicy: "reuse_by_environment",
+          metadata: receipt === "none" ? { personStopRetained: true } : { remoteExecutionTermination: {
+            schema: "paperclip.remote-termination.v1", companyId: base.binding.companyId, runId: leaseRunId, leaseId: `lease-${kind}`,
+            provider: "boat", providerLeaseId: stoppedBox, state: receipt === "own-destroyed" ? "destroyed" : "stopped",
+            confirmedAt: new Date().toISOString() } } };
+        let leaseRows: unknown[] = [];
+        const ownerDb = leaseDb(base), select = ownerDb.select.bind(ownerDb);
+        ownerDb.select = ((fields?: Record<string, unknown>) => ({ from: (table: unknown) => {
+          if (table !== environmentLeases) return select(fields as never).from(table as never);
+          const query = { then: (...args: Parameters<Promise<unknown[]>["then"]>) => Promise.resolve(leaseRows).then(...args),
+            where: () => query, limit: () => query, for: () => query };
+          return query;
+        } })) as unknown as Db["select"];
+        const target = (providerLeaseId: string) => ({ kind: "remote" as const, transport: "sandbox" as const, environmentId,
+          remoteCwd: `/tmp/${environmentId}`, sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId } });
+        const runs: { runId: string; box: string; outcome: string; ms: number; closeAttempts: number; closeMs: number[] }[] = [];
+        const run = async (runId: string, box: string) => {
+          const execution = { ...next, binding: { ...next.binding, runId } };
+          const before = close.mock.calls.length, t = performance.now();
+          currentRunId = runId;
+          const outcome = await executePaperclipNativeSession({ db: leaseDb(execution), execution, runnerInstanceId: "runner", runnerExecutionTarget: target(box) })
+            .then(() => "answered", (error: Error & { code?: string }) => `${error.code ?? error.name}: ${error.message}`);
+          runs.push({ runId, box, outcome, ms: performance.now() - t, closeAttempts: close.mock.calls.length - before, closeMs: closeMs.slice(before) });
+          return outcome;
+        };
+        // The busy turn the person stops; (A) then releases its lease with the stop receipt.
+        await executePaperclipNativeSession({ db: ownerDb, execution: base, runnerInstanceId: "runner", runnerExecutionTarget: target(stoppedBox) });
+        leaseRows = [row];
+        const record = (extra: Record<string, unknown> = {}) => {
+          if (!process.env.TASK_OUT) return;
+          mkdirSync(`${process.env.TASK_OUT}/rows`, { recursive: true });
+          writeFileSync(`${process.env.TASK_OUT}/rows/ar4-${kind}-${process.env.AR4_LABEL ?? "run"}.json`, JSON.stringify({ kind, receipt,
+            stoppedBox, ownerRunId: base.binding.runId, runs, turns, ...extra }, null, 2));
+        };
+        return { base, stoppedBox, close, turns, runs, run, record };
+      };
+      const answerBoundMs = 60_000; // warm+60: the first answer lands inside 60 s of the Send / typed message.
+      afterEach(async () => { await closeIdleWarmNativeSessionsForRestart(); });
+      const unproven = /^native_predecessor_retirement_unproven/;
+
+      it("row 1 (abd1cb54): three held, Stop with its receipt, Send => ONE successor on a NEW box, succeeded, the held messages answered once, zero unproven", async () => {
+        const s = await scenario("row1-send-three-held");
+        // Send releases the three held messages as ONE successor run (the gathered held wake).
+        const sent = await s.run(`${s.base.binding.runId}-send`, "bx_new_send");
+        s.record({ held: ["held-m1", "held-m2", "held-m3"], firstAnswerMs: s.runs[0]?.ms, closeAttemptMs: s.runs[0]?.closeMs });
+        expect(sent).toBe("answered");
+        expect(s.runs.filter(r => unproven.test(r.outcome))).toHaveLength(0);
+        expect(s.runs).toHaveLength(1);
+        expect(s.runs[0]!.box).not.toBe(s.stoppedBox);
+        // The stopped turn once, the ONE successor turn once (it carries the held messages).
+        expect(s.turns).toEqual([s.base.binding.runId, `${s.base.binding.runId}-send`]);
+        expect(s.runs[0]!.closeAttempts).toBe(1);
+        expect(s.runs[0]!.ms).toBeLessThan(answerBoundMs);
+      });
+
+      it("row 2 (R1-105): one held before the Stop, Stop, a TYPED message => typed answered once, held once, nothing lost, no failed run", async () => {
+        const s = await scenario("row2-held-then-typed");
+        const typed = await s.run(`${s.base.binding.runId}-typed`, "bx_new_typed");
+        const held = await s.run(`${s.base.binding.runId}-held`, "bx_new_held");
+        s.record({ firstAnswerMs: s.runs[0]?.ms, closeAttemptMs: s.runs[0]?.closeMs });
+        expect({ typed, held }).toEqual({ typed: "answered", held: "answered" });
+        expect(s.runs.filter(r => r.outcome !== "answered"), "no failed run").toHaveLength(0);
+        expect(s.turns).toEqual([s.base.binding.runId, `${s.base.binding.runId}-typed`, `${s.base.binding.runId}-held`]);
+        // The stopped box's close is tried once (by the first successor), never replayed.
+        expect(s.runs.map(r => r.closeAttempts)).toEqual([1, 0]);
+        expect(s.runs[0]!.ms).toBeLessThan(answerBoundMs);
+      });
+
+      it("unit: owner's lease released + stop receipt on box A, successor on box B => retirement accepted at once", async () => {
+        const s = await scenario("unit-accept");
+        expect(await s.run(`${s.base.binding.runId}-b`, "bx_box_b")).toBe("answered");
+        // Owner forgotten: a later run on another box never meets it again.
+        expect(await s.run(`${s.base.binding.runId}-c`, "bx_box_c")).toBe("answered");
+        s.record();
+        expect(s.runs.map(r => r.closeAttempts)).toEqual([1, 0]);
+      });
+
+      it("unit: a DESTROY receipt on the owner's own lease proves it gone", async () => {
+        const s = await scenario("unit-destroyed", { receipt: "own-destroyed" });
+        expect(await s.run(`${s.base.binding.runId}-b`, "bx_box_b")).toBe("answered");
+        s.record();
+      });
+
+      it("control: the owner's lease released WITHOUT a stop receipt => still refused", async () => {
+        const s = await scenario("control-no-receipt", { receipt: "none" });
+        expect(await s.run(`${s.base.binding.runId}-b`, "bx_box_b")).toMatch(unproven);
+        s.record();
+        expect(s.turns).toEqual([s.base.binding.runId]);
+      });
+
+      it("control: a stop receipt on ANOTHER run's lease of that box (not the owner's own) => still refused", async () => {
+        const s = await scenario("control-foreign-receipt", { receipt: "foreign-stopped" });
+        expect(await s.run(`${s.base.binding.runId}-b`, "bx_box_b")).toMatch(unproven);
+        s.record();
+        expect(s.turns).toEqual([s.base.binding.runId]);
+      });
+
+      it("control: the successor on the SAME lease (box) as the stopped owner => 'stopped' does NOT prove the owner gone", async () => {
+        const s = await scenario("control-same-lease");
+        expect(await s.run(`${s.base.binding.runId}-same`, s.stoppedBox)).toMatch(unproven);
+        s.record();
+        expect(s.turns).toEqual([s.base.binding.runId]);
+      });
+
+      // rf-3 (i): an error's text, a 503 or a timeout is never proof; without the
+      // typed receipt on the owner's lease the retirement stays unproven (the
+      // caller waits inside its bound and retries).
+      it.each([
+        { label: "boat-inactive-text", closeError: boatInactive },
+        { label: "boat-503", closeError: () => Object.assign(new Error("Boat API 503 Service Unavailable"), { status: 503, statusCode: 503 }) },
+        { label: "timeout", closeError: () => Object.assign(new Error("warm Runner close timed out"), { name: "TimeoutError", code: "ETIMEDOUT" }) },
+      ])("rf-3 (i): close fails with only $label and NO typed receipt on the owner's lease => NOT proven gone", async ({ label, closeError }) => {
+        const s = await scenario(`rf3-i-${label}`, { receipt: "none", closeError });
+        expect(await s.run(`${s.base.binding.runId}-b`, "bx_box_b")).toMatch(unproven);
+        s.record();
+        expect(s.runs[0]!.closeAttempts).toBe(1);
+        expect(s.turns).toEqual([s.base.binding.runId]);
+      });
+
+      it("rf-3 (ii): the stopped turn HAD work (an accepted result) => the next message is still answered", async () => {
+        const s = await scenario("rf3-ii-with-work", { stoppedTurn: { result: { summary: "edited two files; result accepted before the Stop" },
+          nativeEventCount: 7, highestContiguousSourceSeq: 7 } });
+        const next = await s.run(`${s.base.binding.runId}-next`, "bx_new_next");
+        s.record();
+        expect(next).toBe("answered");
+        expect(s.turns).toEqual([s.base.binding.runId, `${s.base.binding.runId}-next`]);
+      });
+    });
+
     it.each([true, false])("TL08 retains preparation ownership until startup cleanup drains (%s)", async drained => {
       const { NativePredecessorRetirementUnprovenError } = await import("./predecessor-retirement.js");
       const { base } = fixture(`tl08-preparation-cleanup-${drained}`);
