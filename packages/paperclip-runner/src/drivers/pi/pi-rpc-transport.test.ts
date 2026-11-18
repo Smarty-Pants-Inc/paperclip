@@ -220,10 +220,16 @@ describe("PiRpcTransport large tool output and lagging consumers", () => {
     } finally { await child.close(); }
   });
 
+  // On gcp4, three focused runs at both 97feb9ef and ecfccc88 put each
+  // 64 MiB framing case at 25-30s (one 30s timeout per revision). Redaction
+  // alone took 111-183ms for 64 MiB and 1.3-2.1ms for a 300 KiB F1 answer;
+  // this transport-only case does not project. Give only this fixture a 45s
+  // ACK budget inside the 60s test budget: raising Vitest alone still hit the
+  // default 30s ACK deadline. Production redaction, bounds and deadlines stay.
   it.each([0, 1])("enforces the default 64 MiB record byte boundary (+%i)", async extra => {
     const limit = 64 * 1024 * 1024;
     const overhead = Buffer.byteLength(JSON.stringify({ type: "tool_execution_update", toolCallId: "boundary", text: "" }));
-    const child = emittingTransport(`await emit({ type: "tool_execution_update", toolCallId: "boundary", text: "x".repeat(${limit - overhead + extra}) });`);
+    const child = emittingTransport(`await emit({ type: "tool_execution_update", toolCallId: "boundary", text: "x".repeat(${limit - overhead + extra}) });`, { requestTimeoutMs: 45_000 });
     try {
       if (extra) await expect(child.request("emit")).rejects.toThrow(`record exceeded ${limit} bytes`);
       else {
@@ -233,7 +239,7 @@ describe("PiRpcTransport large tool output and lagging consumers", () => {
         expect((record.text as string).length).toBe(limit - overhead);
       }
     } finally { await child.close(); }
-  }, 30_000);
+  }, 60_000);
 
   it("counts UTF-8 bytes rather than UTF-16 units and splits only on LF, accepting CRLF", async () => {
     const record = { type: "message_end", text: "é😀\u2028\u2029".repeat(100) };
