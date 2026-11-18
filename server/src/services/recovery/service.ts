@@ -63,6 +63,7 @@ import {
   sql,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { decideStrandedRetryAdmission } from "./stranded-retry-admission.js";
 import {
   hasCommittedNativeBoardResponseWait,
   readNativeBoardResponseWaitSource,
@@ -4537,6 +4538,8 @@ export function recoveryService(
       });
     }
     const escalationNotice = buildStrandedRecoveryEscalationNotice({
+      retry: await decideStrandedRetryAdmission(tx as unknown as Db, {
+        companyId: input.issue.companyId, issueId: input.issue.id, runId: input.latestRun?.id }),
       seed: input.notice,
       fallbackBody: input.comment,
       recoveryCause,

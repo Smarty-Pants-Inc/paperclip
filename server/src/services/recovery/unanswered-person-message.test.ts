@@ -185,7 +185,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       nextAction: input.nextAction ?? "Press Retry to start it again from the saved work.",
       ...(input.wakePolicy ? { wakePolicy: input.wakePolicy } : {}) })
       .where(eq(issueRecoveryActions.id, actionId));
-    const notice = buildStrandedRecoveryEscalationNotice({
+    const notice = buildStrandedRecoveryEscalationNotice({ retry: { admits: true },
       seed: input.nextAction ? { title: "Recovery needed", body: input.nextAction, nextAction: input.nextAction, tone: "danger" }
         : buildNoRunningExecutionNoticeSeed({ status: "in_progress", attempts: input.attempts ?? 1 }),
       recoveryActionId: input.linkedActionId ?? actionId, recoveryOwner: null,

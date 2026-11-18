@@ -18,6 +18,7 @@ import {
   reviewPathConsumedRefFromRun,
 } from "./review-path-recovery.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
+import { decideStrandedRetryAdmission } from "./stranded-retry-admission.js";
 import { hasUnconsumedIssueMonitorPath } from "./issue-graph-liveness.js";
 
 /** A spent repair wake must leave an operator action, never another automatic wake. */
@@ -108,6 +109,7 @@ export async function escalateExhaustedIssueReviewPathRecovery(
         nextAction,
       },
       recoveryCause: ISSUE_REVIEW_PATH_LOST_WAKE_REASON,
+      retry: await decideStrandedRetryAdmission(tx as unknown as Db, { companyId: run.companyId, issueId, runId: run.id }),
       recoveryActionId: recoveryAction.id,
       recoveryOwner: null,
       sourceRun: { id: run.id, agentId: run.agentId, status: run.status },

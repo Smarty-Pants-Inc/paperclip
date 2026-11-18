@@ -7,6 +7,7 @@ import { insertIssueComment } from "../issue-comment-writes.js";
 import { getSameIssueDocumentConfirmationTargetRefusal } from "../issue-thread-interactions.js";
 import { agentLinkRow, keyValueRow, type NoticeMetadataRow } from "../recovery/notice-format.js";
 import { buildStrandedRecoveryEscalationNotice } from "../recovery/stranded-notice.js";
+import { decideStrandedRetryAdmission } from "../recovery/stranded-retry-admission.js";
 import { NativeAddressedInteractionAdmissionError, readNativeAddressedInteractionId,
   type NativeAddressedInteractionBinding, type NativeAddressedInteractionRefusal,
   type NativeAddressedInteractionRefusalReason } from "./native-addressed-interaction.js";
@@ -241,6 +242,8 @@ export async function appendNativeAddressedInteractionFailureNotice(db: Db, bind
         body: copy ? `For ${owner?.name ?? "the card creator"}, the card owner: Paperclip could not let ${responder?.name ?? "the responding agent"} answer this card${addressee?.name ? ` addressed to ${addressee.name}` : ""}. ${copy.cause} The card remains pending. Automatic retry is stopped. ${copy.action}`
           : NATIVE_ADDRESSED_INTERACTION_PENDING_FAILURE_MESSAGE,
         nextAction: copy?.action ?? NATIVE_ADDRESSED_INTERACTION_FAILURE_ACTION },
+      retry: await decideStrandedRetryAdmission(tx as unknown as Db, {
+        companyId: binding.companyId, issueId: binding.issueId, runId: binding.runId }),
       recoveryActionId: null, recoveryOwner: owner?.type === "agent" ? owner : null,
       recoveryResponsibility: "user", continuesAutomatically: false,
       sourceRun: { id: binding.runId, agentId: binding.agentId, status: "failed" },
