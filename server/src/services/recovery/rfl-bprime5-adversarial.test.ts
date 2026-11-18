@@ -63,9 +63,13 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     return { companyId, agentId, issueId, userId, base, message, run, reply, notices, flags, sweep, answerCounts, agentReplies };
   }
 
-  // The sweep owes every unanswered message (joint rule): with 3 messages, the two the first run's reply does not
-  // answer EACH get their one notice. Old: the latest only (the middle message stayed silent). count = 2 is unchanged.
-  for (const count of [2, 3]) it(`supersedes(N1: ${count} messages before first prose; discovery and actual worker flag preserve latest message; RECORD PENDING: joint rule 'one owed set per task', rf-5's bar)`, async () => {
+  // Record row 9 (N1: 3 messages). OLD: the latest message only was owed; its notice covered it alone, the middle
+  // message stayed silent. NEW: the first run's reply answers the first message only; the two later messages are
+  // one no-run batch and ONE notice covers both (keyed to the latest, its list names both). Ruling: every owed
+  // message keeps a true line until THAT message is answered; one notice per owed group (RFL ruling B).
+  // count = 2 is the row as it was (one owed message, a group of one).
+  for (const count of [2, 3]) it(count === 2 ? "N1: 2 messages before first prose; discovery and actual worker flag preserve latest message"
+    : "supersedes(N1: 3 messages before first prose; discovery and actual worker flag preserve latest message; RFL record SUPERSEDE-ANSWERED-MERGED-OLDRULE-ROWS-1118)", async () => {
     const f = await fixture();
     const ids = [await f.message("Production version?", f.base)];
     const firstRun = await f.run(ids[0]!, f.base + 1_000);
@@ -80,9 +84,16 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.issueId));
     expect(await f.flags()).toEqual({ discovered: true, batched: true });
     await f.sweep(true); await f.sweep(true);
-    expect((await f.notices()).map(n => n.metadata?.authorizationReason).sort()).toEqual(ids.slice(1).map(id => `unanswered_message:${id}`).sort());
+    expect(await f.answerCounts(...ids), "the first run's reply answers the first message only").toEqual(count === 2 ? [1, 0] : [1, 0, 0]);
+    const notices = await f.notices();
+    expect(notices.map(n => n.metadata?.authorizationReason), "exactly ONE notice, keyed to the latest message").toEqual([`unanswered_message:${ids.at(-1)}`]);
+    expect((notices[0]!.metadata as { unansweredMessageIds?: string[] }).unansweredMessageIds, "it covers every owed message").toEqual(count === 2 ? undefined : ids.slice(1));
+    expect(ids.map(id => notices.filter(n => n.metadata?.authorizationReason === `unanswered_message:${id}`
+      || ((n.metadata as { unansweredMessageIds?: string[] }).unansweredMessageIds ?? []).includes(id)).length),
+      "notices covering each message: the answered first 0, every owed one exactly 1").toEqual(count === 2 ? [0, 1] : [0, 1, 1]);
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
     expect(await f.flags()).toEqual({ discovered: false, batched: false });
+    expect(await f.agentReplies(), "one agent reply").toBe(1);
   });
 
   const keys = ["wakeCommentId", "wakeCommentIds", "commentId", "conversationReplyBoundaryCommentId", "firstTurnQueuedInput"] as const;
@@ -158,21 +169,25 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     expect(await f.flags()).toEqual({ discovered: false, batched: false });
   });
 
-  // The sweep owes every unanswered message (joint rule): before the first run's reply BOTH messages are owed and
-  // each has its one notice (old: the second only). The reply then answers the first message alone: it retires the
-  // first's notice and never the second's.
-  it("supersedes(unrelated first-message prose must not supersede the second message's existing notice; RECORD PENDING: joint rule 'one owed set per task', rf-5's bar)", async () => {
+  // Record row 10. OLD: before the first run's reply only the second (latest) message had a notice: 1 notice.
+  // NEW: both messages are owed, in two groups (the first's reply-less run; the second with no run): 2 notices,
+  // one each. The reply then answers the first message alone: it retires the first's notice, never the second's.
+  // Ruling: every owed message keeps a true line until THAT message is answered; one notice per owed group.
+  it("supersedes(unrelated first-message prose must not supersede the second message's existing notice; RFL record SUPERSEDE-ANSWERED-MERGED-OLDRULE-ROWS-1118)", async () => {
     const f = await fixture();
     const first = await f.message("Production version?", f.base);
     const run = await f.run(first, f.base + 1_000);
     const second = await f.message("Staging version?", f.base + 10_000);
     await f.sweep();
-    expect((await f.notices()).map(n => n.metadata?.authorizationReason).sort()).toEqual([first, second].map(id => `unanswered_message:${id}`).sort());
+    expect(await f.answerCounts(first, second), "both owed").toEqual([0, 0]);
+    expect((await f.notices()).map(n => n.metadata?.authorizationReason).sort(), "exactly two notices, one per message").toEqual([first, second].map(id => `unanswered_message:${id}`).sort());
     await f.reply(run, f.base + 40_000);
+    expect(await f.answerCounts(first, second), "the reply answers the first only").toEqual([1, 0]);
     expect(await f.flags()).toEqual({ discovered: true, batched: true }); // the first message's notice needs retiring
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
-    expect((await f.notices()).map(n => n.metadata?.authorizationReason)).toEqual([`unanswered_message:${second}`]);
+    expect((await f.notices()).map(n => n.metadata?.authorizationReason), "exactly one notice left: the second's").toEqual([`unanswered_message:${second}`]);
     expect(await f.flags()).toEqual({ discovered: false, batched: false });
+    expect(await f.agentReplies(), "one agent reply").toBe(1);
   });
 
   async function blockedResult(f: Awaited<ReturnType<typeof fixture>>, commentId: string, runId: string) {
