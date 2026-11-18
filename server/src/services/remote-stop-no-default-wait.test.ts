@@ -445,11 +445,13 @@ const support = await getEmbeddedPostgresTestSupport();
       // Never the old box: the only lease on bx_warm is the stopped run's own.
       expect(await boxesOf(f)).toEqual([{ id: old.id, heartbeatRunId: f.sourceRunId, status: "pending_cleanup" }]);
       expect((await wakeOf(next.wakeId)).runId).toBe(first.id);
-      expect((await admittedOrigins(f, first)).filter(id => id === next.commentId)).toHaveLength(1);
-      expect((await admittedOrigins(f, first)).filter(id => f.commentIds.includes(id))).toEqual([]);
+      // adopt-stopu-card6: the new successor's provider input is ONLY the new message.
+      expect(await admittedOrigins(f, first)).toEqual([next.commentId]);
       // Pre-Stop messages still need Send.
       expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
       const queueWhileSuccessorRuns = (await readQueue(f)).executionWait ?? null;
+      // adopt-stopu-card6 (card5 ii): the Send line stays while the new successor runs.
+      expect(queueWhileSuccessorRuns).toEqual({ reason: "stopped_by_person", message: STOP_LINE });
       const beforeReceipt = { successorRunId: first.id, successorStatus: first.status, oldLease: await boxesOf(f),
         postCardWake: await wakeOf(next.wakeId), preStopWake: await wakeOf(f.queueId), queueWhileSuccessorRuns };
       // The late receipt: the card retires; no duplicate successor, from either writer.
@@ -459,16 +461,39 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(calls.n).toBe(2);
       const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
       await heartbeatService(db).resumeRemoteStopComments(source);
+      // adopt-stopu-card6: the new message's successor finishes (its release drain
+      // runs), then the stranded pass and the receipt writer run again.
+      await vi.waitFor(async () => expect(["queued", "running", "scheduled_retry"])
+        .not.toContain((await successors(f)).find(run => run.id === first.id)?.status), { timeout: 15_000, interval: 100 });
       await new Promise(resolve => setTimeout(resolve, 1_500));
-      await evidence(`card5AfterReceipt ${JSON.stringify({ first: first.id, runs: (await successors(f)).map(run => ({ id: run.id, status: run.status,
+      await heartbeatService(db).resumeQueuedRuns();
+      await heartbeatService(db).resumeRemoteStopComments(source);
+      await new Promise(resolve => setTimeout(resolve, 1_000));
+      await evidence(`card6AfterReceipt ${JSON.stringify({ first: first.id, runs: (await successors(f)).map(run => ({ id: run.id, status: run.status,
         wake: run.wakeupRequestId ?? null, context: run.contextSnapshot })), preStopWake: await wakeOf(f.queueId), postWake: await wakeOf(next.wakeId) })}`);
       expect((await successors(f)).map(run => run.id)).toEqual([first.id]);
       expect((await wakeOf(next.wakeId)).runId).toBe(first.id);
       expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
       expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).map(c => c.status))
         .not.toContain("escalated");
-      await evidence(`card5PostCard ${JSON.stringify({ card: card.nextAction, beforeReceipt, afterReceipt: {
-        successors: (await successors(f)).map(run => run.id), lease: await boxesOf(f), receiptAttempts: calls.n } })}`);
+      // The pre-Stop messages are still waiting with the Send line; Send admits them once, in order.
+      const queue = await readQueue(f);
+      expect(queue.executionWait).toEqual({ reason: "stopped_by_person", message: STOP_LINE });
+      const sent = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
+        .send({ queueId: queue.queueId, revision: queue.revision, targetRunId: null });
+      expect(sent.status, JSON.stringify(sent.body)).toBeLessThan(300);
+      await vi.waitFor(async () => expect(await successors(f)).toHaveLength(2), { timeout: 15_000, interval: 200 });
+      const sendRun = (await successors(f)).find(run => run.id !== first.id)!;
+      const sendOrigins = await admittedOrigins(f, sendRun);
+      expect(sendOrigins.filter(id => f.commentIds.includes(id))).toEqual(f.commentIds);
+      expect(sendOrigins).not.toContain(next.commentId);
+      expect((await wakeOf(f.queueId)).runId).toBe(sendRun.id);
+      await heartbeatService(db).resumeRemoteStopComments(source);
+      await heartbeatService(db).resumeQueuedRuns();
+      expect(await successors(f)).toHaveLength(2);
+      await evidence(`card6PostCard ${JSON.stringify({ card: card.nextAction, beforeReceipt, afterReceipt: {
+        successors: (await successors(f)).map(run => run.id), lease: await boxesOf(f), receiptAttempts: calls.n },
+        send: { runId: sendRun.id, origins: sendOrigins, preStopIds: f.commentIds, newMessageId: next.commentId } })}`);
     } finally { vi.useRealTimers(); }
   }, 60_000);
 
@@ -513,8 +538,11 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await admittedOrigins(f, first)).filter(id => f.commentIds.includes(id))).toEqual([]);
     expect(await boxesOf(f)).toEqual([{ id: (await leaseOf(f)).id, heartbeatRunId: f.sourceRunId, status: "pending_cleanup" }]);
     expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
-    await evidence(`card5PreCardRestart ${JSON.stringify({ successorRunId: first.id, postWake: await wakeOf(next.wakeId), lease: await boxesOf(f),
-      queueWhileSuccessorRuns: (await readQueue(f)).executionWait ?? null })}`);
+    // adopt-stopu-card6 (card5 ii): the pre-Stop messages keep their Send line while the new successor runs.
+    const queueWhileSuccessorRuns = (await readQueue(f)).executionWait ?? null;
+    expect(queueWhileSuccessorRuns).toEqual({ reason: "stopped_by_person", message: STOP_LINE });
+    await evidence(`card6PreCardRestart ${JSON.stringify({ successorRunId: first.id, successorStatus: (await successors(f))[0]?.status,
+      postWake: await wakeOf(next.wakeId), lease: await boxesOf(f), queueWhileSuccessorRuns })}`);
   }, 60_000);
 
   it("U9 control: a non-person stop's cleanup escalation is unchanged (no card; capped at 5 attempts, then 30 min)", async () => {
