@@ -75,7 +75,10 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
   function carry(key: typeof keys[number], id: string) {
     return key === "wakeCommentIds" ? { [key]: [id] } : key === "firstTurnQueuedInput" ? { [key]: { commentIds: [id] } } : { [key]: id };
   }
-  for (const key of keys) it(`attribution by ${key} answers the carried later message, not semantic analysis of prose`, async () => {
+  for (const key of keys) it(`supersedes(ANSWERED blob, RFL 21:28Z/22:41Z): attribution by ${key} answers the carried later message, not semantic analysis of prose`, async () => {
+    // Reason: ANSWERED attributes a reply only through the replying run's OWN pending input (R-ONCE 18:19Z, RFL F2
+    // 22:41Z). The reply answers the carried later message; it no longer also answers the earlier message no run
+    // carried, so discovery still finds that earlier one. The latest message's settle and its notices are unchanged.
     const f = await fixture();
     await f.message("Production version?", f.base);
     const second = await f.message("Staging version?", f.base + 10_000);
@@ -86,12 +89,14 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     await settleConversationTurnForRun(db, f.companyId, run);
     const [native] = await db.select().from(issues).where(eq(issues.id, f.issueId));
     expect(native).toMatchObject({ status: "in_review", conversationState: "waiting" });
-    expect(await f.flags()).toEqual({ discovered: false, batched: false });
+    expect(await f.flags()).toEqual({ discovered: true, batched: true });
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     await f.sweep(); expect(await f.notices()).toHaveLength(0);
   });
 
-  it("supersession across a soft-deleted later carrying boundary uses the same predicate everywhere", async () => {
+  it("supersedes(ANSWERED blob, RFL 21:28Z/22:41Z): supersession across a soft-deleted later carrying boundary uses the same predicate everywhere", async () => {
+    // Reason: a reply by a run that carried only the later (now deleted) message never answers the first (R-ONCE
+    // 18:19Z, RFL F2 22:41Z: own pending input only). The first message's notice stands, the same way everywhere.
     const f = await fixture();
     const first = await f.message("Production version?", f.base);
     await f.sweep(); const [notice] = await f.notices(); expect(notice?.metadata?.authorizationReason).toBe(`unanswered_message:${first}`);
@@ -99,9 +104,9 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     const run = await f.run(second, f.base + 11_000, { conversationReplyBoundaryCommentId: second });
     await f.reply(run, f.base + 40_000);
     await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, second));
-    expect(await f.flags()).toEqual({ discovered: true, batched: true }); // notice needs retiring
-    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
-    expect(await f.notices()).toHaveLength(0);
+    expect(await f.flags()).toEqual({ discovered: false, batched: false }); // the notice is still true: nothing to retire
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
+    expect((await f.notices()).map(n => n.metadata?.authorizationReason)).toEqual([`unanswered_message:${first}`]);
     expect(await f.flags()).toEqual({ discovered: false, batched: false });
   });
 

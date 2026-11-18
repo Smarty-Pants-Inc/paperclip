@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql } from "../person-message-answer.js";
+import { completedPersonMessageAnswerSql } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -188,15 +188,17 @@ export function unansweredMessageCode(run: { status: string; error: string | nul
 const reasonOf = (column: AnyPgColumn) => sql<string>`${column}->>'authorizationReason'`;
 
 /**
- * SQL: an agent answer ATTRIBUTED to message m, the Paperclip way: a reply
- * written by a run on the chain carrying m or a later person input. Fresh
- * continuations and answered-interaction resumes need not copy comment ids.
- * A run-less comment, shared session or unrelated later run is not an answer.
+ * SQL: message m is ANSWERED (completedPersonMessageAnswerSql): a COMPLETED
+ * run's final reply, attributed only through that run's OWN pending input
+ * (RFL F2 22:41Z), a card from such a run, or imported history. A failed or
+ * cut run's progress reply is DELIVERED only and owes ONE true notice (RFL F1,
+ * 21:28Z). A run-less comment, shared session or unrelated later run is not an answer.
  */
 function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }): SQL {
   // The ONE shared definition (person-message-answer.ts), so B's notice and the continuation carry never
   // disagree on a message (RFL 20:22Z: run-less agent comments never answer; org 20:29Z: imported history).
-  return answeredPersonMessageSql(m);
+  // No run-status rule of its own here: ANSWERED already requires the completed final answer.
+  return completedPersonMessageAnswerSql(m);
 }
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
@@ -213,6 +215,7 @@ function inScopeSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }
       and coalesce(r.finished_at, r.updated_at) > ${since}::timestamptz
       and (r.context_snapshot->>'wakeCommentId' = ${m.id}::text or r.context_snapshot->>'commentId' = ${m.id}::text
         or r.context_snapshot->>'conversationReplyBoundaryCommentId' = ${m.id}::text
+        or coalesce(r.context_snapshot->'attributionCommentIds', '[]'::jsonb) ? ${m.id}::text
         or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text
         or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${m.id}::text))
     or exists (select 1 from ${agentWakeupRequests} w where w.company_id = ${m.companyId} and w.updated_at > ${since}::timestamptz
@@ -275,6 +278,15 @@ export type UnansweredMessageOutcome =
   | { kind: "pending"; recheckAt: number }
   | { kind: "noticed"; code: string; commentId: string };
 
+/** A native-status continuation carrying the message only as its attribution
+ * fields (conversationReplyBoundaryCommentId, attributionCommentIds), never as prompt input. */
+function carriesForAttributionOnly(contextSnapshot: unknown, messageId: string): boolean {
+  const context = (contextSnapshot ?? {}) as Record<string, unknown>;
+  return context.statusDecisionSource === "native_status_decision"
+    && runCarriesMessage(context, messageId)
+    && !runCarriesMessage({ ...context, conversationReplyBoundaryCommentId: undefined, attributionCommentIds: undefined }, messageId);
+}
+
 function runCarriesMessage(contextSnapshot: unknown, messageId: string): boolean {
   const context = (contextSnapshot ?? {}) as Record<string, unknown>;
   // A comment that arrived while the run prepared is delivered as its first-turn
@@ -284,6 +296,8 @@ function runCarriesMessage(contextSnapshot: unknown, messageId: string): boolean
   const ids = [
     ...(Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds : []),
     ...(Array.isArray(firstTurn.commentIds) ? firstTurn.commentIds : []),
+    // The native-status continuation's attribution-only ids (status-decision-committer.ts).
+    ...(Array.isArray(context.attributionCommentIds) ? context.attributionCommentIds : []),
     context.wakeCommentId, context.commentId, context.conversationReplyBoundaryCommentId,
   ];
   return ids.includes(messageId);
@@ -572,9 +586,15 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       // this message's attempt even when its context no longer copies m.
       // Keep the ordinary start bound, but a proven successor is waiting
       // work, not a reason to resend its predecessor's input.
-      const descendant = Boolean(messageRun && candidate.id !== messageRun.id
+      // The native-status continuation holds m for attribution only
+      // (status-decision-committer.ts nativeContinuationAttributionContext), so
+      // it is the newest carrier itself: prove it against the carrier before it.
+      const ancestor = candidate.id === messageRun?.id && carriesForAttributionOnly(candidate.contextSnapshot, message.id)
+        ? runs.find(other => other.id !== candidate.id && runCarriesMessage(other.contextSnapshot, message.id)) ?? null
+        : messageRun;
+      const descendant = Boolean(ancestor && candidate.id !== ancestor.id
         && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
-          runId: candidate.id, ancestorRunId: messageRun.id, includeAnswerLineage: true }));
+          runId: candidate.id, ancestorRunId: ancestor.id, includeAnswerLineage: true }));
       if (runCarriesMessage(candidate.contextSnapshot, message.id) || descendant) waitingToStart = true;
       if (descendant) { continuationWaiting = true; break; }
     }
