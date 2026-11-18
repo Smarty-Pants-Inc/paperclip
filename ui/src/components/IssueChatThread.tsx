@@ -698,6 +698,8 @@ interface IssueChatThreadProps {
     commentId: string,
     body: string,
     revision: string,
+    /** Capture the row's owning wake when editing begins, like discard. */
+    queueId?: string,
   ) => Promise<void>;
   onReorderQueuedComments?: (
     orderedCommentIds: string[],

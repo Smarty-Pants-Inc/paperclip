@@ -208,7 +208,6 @@ function SortableQueuedMessage({
   const immutableResponse = entry.source?.kind === "interaction";
   const reset = isResetEntry(entry);
   const behindReset = !reset && entry.behindReset === true;
-  const tail = Boolean(entry.queueId);
   const body = queuedMessageLabel(entry);
   const images = extractImageRefs(body).filter(image =>
     /^\/api\/(?:attachments|assets)\/[^/?#\\]+\/content(?:\?[^#\\]*)?$/.test(image.url));
@@ -234,11 +233,11 @@ function SortableQueuedMessage({
   const idleQueue = !queue.targetRunId;
   const interruptReason = !onInterrupt ? "Interrupt is unavailable here"
     : reset ? RESET_INTERRUPT_REASON
-      : behindReset || tail ? BEHIND_RESET_INTERRUPT_REASON
+      : behindReset ? BEHIND_RESET_INTERRUPT_REASON
         : !queue.queueId ? "Saving… try again in a moment"
           : null;
   const editReason = immutableResponse ? "A saved response can't be edited"
-    : tail ? "Edit it after /new starts"
+    : reset || behindReset ? "Edit it after /new starts"
       : !entry.canEdit ? "Only the author can edit this message" : null;
   const discardReason = !entry.canDiscard ? "Only the author can delete this message" : null;
 
@@ -554,7 +553,9 @@ export function TaskChatQueuedMessages({
       setVisibleError(
         queueActionErrorCode(error) === "queued_comment_revision_conflict"
           ? "The queue changed in another session. Its latest order has been restored."
-          : "Couldn’t reorder. Previous order restored.",
+          : queueActionErrorCode(error) === "queued_comment_stop_line_crossing"
+            ? "Messages sent before and after you pressed Stop can't swap places. Previous order restored."
+            : "Couldn’t reorder. Previous order restored.",
       );
     } finally {
       setReordering(false);

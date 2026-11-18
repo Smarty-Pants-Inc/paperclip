@@ -118,7 +118,7 @@ export async function chatQueueTail(
   let behindReset = input.headEntries.some((entry) => isConversationReset(entry.comment.body));
   const entries = input.headEntries.map((entry, index) => {
     const atOrBehind = input.headEntries.slice(0, index + 1).some((earlier) => isConversationReset(earlier.comment.body));
-    return { ...entry, behindReset: atOrBehind };
+    return { ...entry, behindReset: atOrBehind, canEdit: entry.canEdit && !atOrBehind };
   });
   for (const { wake, ids } of later) {
     const wakeComments = ids.flatMap((id) => comments.get(id) ?? []);
@@ -128,7 +128,7 @@ export async function chatQueueTail(
       entries.push({
         comment: queueEntryComment(comment) as unknown as IssueQueuedCommentEntry["comment"],
         position: entries.length,
-        canEdit: input.actorType === "user" && comment.authorUserId === input.actorId,
+        canEdit: !behindReset && input.actorType === "user" && comment.authorUserId === input.actorId,
         canDiscard: input.actorType === "user" && (comment.authorUserId === input.actorId || Boolean(comment.authorAgentId)),
         deliveryIntent: resolvedDeliveryIntent(comment),
         behindReset,
@@ -141,7 +141,7 @@ export async function chatQueueTail(
 }
 
 /** 409 when Agent Chat order puts this message at or behind a `/new`. */
-async function assertAheadOfReset(executor: Pick<Db, "select">, issue: IssueFacts, commentId: string) {
+export async function assertAheadOfReset(executor: Pick<Db, "select">, issue: IssueFacts, commentId: string) {
   if (!issue.conversationAgentId) return;
   const ids = (await pendingQueuedWakes(executor, issue)).flatMap((wake) => wake.ids);
   const index = ids.indexOf(commentId);
@@ -225,6 +225,17 @@ export async function sendQueuedCommentFirst(
   }
   const rest = ids.filter((id) => id !== input.commentId);
   const payload = withQueuedCommentIdsInWakePayload(input.wake.payload, [input.commentId]);
+  if (input.issue.conversationAgentId) {
+    const pending = await pendingQueuedWakes(executor, input.issue);
+    const earliest = pending[0]?.wake.requestedAt;
+    if (earliest && pending[0]!.wake.id !== input.wake.id) {
+      // Explicit Interrupt selects this input first; keep every other wake's
+      // relative order and immutable comment creation time untouched.
+      await executor.update(agentWakeupRequests).set({
+        requestedAt: new Date(earliest.getTime() - 1), updatedAt: new Date(),
+      }).where(eq(agentWakeupRequests.id, input.wake.id));
+    }
+  }
   if (rest.length === 0) return payload;
   const { id: _id, idempotencyKey: _key, ...wake } = input.wake;
   void _id; void _key;

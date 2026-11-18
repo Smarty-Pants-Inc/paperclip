@@ -773,6 +773,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     commentId: string;
     body: string;
     revision: string;
+    queueId?: string;
     stale?: boolean;
   } | null>(null);
 
@@ -785,7 +786,8 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
       setQueuedEdit({
         commentId,
         body: entry.comment.body,
-        revision: queuedMessageQueue.revision,
+        revision: entry.queueRevision ?? queuedMessageQueue.revision,
+        queueId: entry.queueId ?? queuedMessageQueue.queueId ?? undefined,
       });
     },
     [queuedMessageQueue],
@@ -803,7 +805,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
       if (!onEditQueuedComment)
         throw new Error("This queued message is no longer editable.");
       try {
-        await onEditQueuedComment(commentId, body, queuedEdit.revision);
+        await onEditQueuedComment(commentId, body, queuedEdit.revision, queuedEdit.queueId);
       } catch (error) {
         const payload =
           typeof error === "object" && error !== null
@@ -827,7 +829,8 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
         const stale =
           payload?.status === 409 &&
           (code === "queued_comment_stale_target" ||
-            code === "queued_comment_not_pending");
+            code === "queued_comment_not_pending" ||
+            code === "queued_comment_already_dispatching");
         if (stale) {
           setQueuedEdit((current) =>
             current?.commentId === commentId

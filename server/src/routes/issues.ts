@@ -7962,6 +7962,13 @@ export function issueRoutes(
       const current = await buildQueuedCommentQueue({ executor: tx, issue, activeRun, actor: input.actor });
       const wakeIdOf = (entry: IssueQueuedCommentQueue["entries"][number]) => entry.queueId ?? current.queueId!;
       const currentIds = current.entries.map((entry) => entry.comment.id);
+      // Older callers submit the complete side before /new rather than the
+      // complete displayed list. Keep that contract without moving the reset.
+      const resetIndex = current.entries.findIndex((entry) => isConversationReset(entry.comment.body));
+      if (resetIndex > 0 && input.orderedCommentIds.length === resetIndex &&
+          [...currentIds.slice(0, resetIndex)].sort().join() === [...input.orderedCommentIds].sort().join()) {
+        input.orderedCommentIds = [...input.orderedCommentIds, ...currentIds.slice(resetIndex)];
+      }
       if (current.queueId !== input.queueId || current.state !== "deferred" ||
           !current.entries.some((entry) => entry.queueId && entry.queueId !== current.queueId) ||
           currentIds.length !== input.orderedCommentIds.length ||
@@ -18197,8 +18204,9 @@ export function issueRoutes(
       const untargeted = !req.body.targetRunId;
       const nothingWaiting = () => conflict("Nothing is waiting.", {
         code: "queued_comment_not_pending", reason: "nothing_waiting" });
+      let interruptQueueId = req.body.queueId as string;
       const interruptPlan = await db.transaction(async (tx): Promise<{ firstTurnRunId: string } | { runToInterrupt: string | null }> => {
-        const locked = await lockQueuedCommentState({
+        let locked = await lockQueuedCommentState({
           tx, issue, actor, queueId: req.body.queueId, targetRunId: req.body.targetRunId ?? undefined,
           allowStoppedTarget: true,
         }).catch((error: unknown) => {
@@ -18217,6 +18225,16 @@ export function issueRoutes(
         }
         if (locked.activeRun?.status === "running" && locked.activeRun.id !== req.body.targetRunId) {
           throw conflict("The queued message targets a stale run", { code: "queued_comment_stale_target" });
+        }
+        if (issue.conversationAgentId && req.body.commentId) {
+          // The composer targets the displayed list's head revision. A row in
+          // another per-message wake still owns its own input and interrupt.
+          const selected = locked.queue.entries.find((entry) => entry.comment.id === req.body.commentId);
+          if (selected?.queueId && selected.queueId !== locked.wake.id) {
+            locked = await lockQueuedCommentState({ tx, issue, actor, queueId: selected.queueId,
+              targetRunId: req.body.targetRunId ?? undefined, allowStoppedTarget: true });
+          }
+          interruptQueueId = locked.wake.id;
         }
         if (req.body.commentId) {
           locked.wake.payload = await sendQueuedCommentFirst(tx as unknown as Db, {
@@ -18254,14 +18272,14 @@ export function issueRoutes(
       if (runToInterrupt) await heartbeat.cancelRun(runToInterrupt, "Interrupted to send queued messages", {
         ...options,
         suppressImmediateRecovery: true,
-        resultJson: { ...options.resultJson, queuedCommentInterruptQueueId: req.body.queueId },
+        resultJson: { ...options.resultJson, queuedCommentInterruptQueueId: interruptQueueId },
       });
-      if (!firstTurnRunId) await heartbeat.resumeQueuedCommentInterrupt(issue.companyId, req.body.queueId, { retryCleanup: true });
+      if (!firstTurnRunId) await heartbeat.resumeQueuedCommentInterrupt(issue.companyId, interruptQueueId, { retryCleanup: true });
       await logActivity(db, {
         companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
         agentId: actor.agentId, runId: actor.runId, agentApiKeyId: actor.agentApiKeyId,
         action: "issue.queued_comments_interrupted", entityType: "issue", entityId: issue.id,
-        details: { queueId: req.body.queueId, targetRunId: req.body.targetRunId,
+        details: { queueId: interruptQueueId, targetRunId: req.body.targetRunId,
           ...(firstTurnRunId ? { deliveredWithFirstTurnOfRunId: firstTurnRunId } : {}) },
       });
       const currentIssue = await svc.getById(issue.id);
@@ -18539,8 +18557,9 @@ export function issueRoutes(
           if (steeringIdentity)
             await acceptSteeredIdentity(tx, steeringIdentity);
           acknowledgedTurnId = acknowledgement.turnId;
-          const remainingIds = locked.queue.entries
-            .map((candidate) => candidate.comment.id)
+          // The visible chat list spans wakes; remove only from the owning
+          // wake, never copy later messages into it as additional input.
+          const remainingIds = queuedCommentIdsFromWakePayload(locked.wake.payload)
             .filter((candidateId) => candidateId !== commentId);
           const now = new Date();
           const nextWake =
@@ -18599,9 +18618,9 @@ export function issueRoutes(
             issue,
             activeRun: locked.activeRun,
             actor,
-            queueState: nextWake
-              ? { wake: nextWake, state: "deferred", queueRun: null }
-              : null,
+            ...(nextWake
+              ? { queueState: { wake: nextWake, state: "deferred" as const, queueRun: null } }
+              : issue.conversationAgentId ? {} : { queueState: null }),
           });
         });
       } catch (error) {

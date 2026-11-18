@@ -1,4 +1,5 @@
 import { assertQueuedCommentStopLinePreserved } from "../../../services/queued-comment-stop-line.js";
+import { assertAheadOfReset } from "../../../services/queued-comment-delivery-intent.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { assertAgentInteraction } from "../../../services/agent-interaction-policy.js";
 import { notifyExecutionRunWork } from "../../../services/execution-control-notifications.js";
@@ -69,6 +70,10 @@ function buildTransaction(tx: Db, companyId: string, issueId: string, deps: Queu
       await assertQueuedCommentStopLinePreserved(tx, { ...input, companyId, issueId, agentId: wakeAgentId });
     },
     async updateCommentBody({ issueId, commentId, body, updatedAt }) {
+      // The issue and owning wake are locked. A later wake is editable, but
+      // /new and its tail cannot be edited into the current conversation.
+      const [issue] = await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)));
+      if (issue?.conversationAgentId) await assertAheadOfReset(tx, issue, commentId);
       const [existing] = await tx.select({ body: issueComments.body }).from(issueComments).where(and(
         eq(issueComments.id, commentId), eq(issueComments.issueId, issueId), eq(issueComments.companyId, companyId)));
       if (!existing) return false;

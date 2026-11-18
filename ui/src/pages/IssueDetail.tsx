@@ -2367,8 +2367,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   );
 
   const editQueuedComment = useCallback(
-    async (commentId: string, body: string, revision: string) => {
-      const queueId = effectiveQueuedCommentQueue?.queueId;
+    async (commentId: string, body: string, revision: string, owningQueueId?: string) => {
+      const queueId = owningQueueId ?? effectiveQueuedCommentQueue?.queueId;
       if (!queueId)
         throw new Error(
           "The queued message is awaiting server acknowledgement.",
