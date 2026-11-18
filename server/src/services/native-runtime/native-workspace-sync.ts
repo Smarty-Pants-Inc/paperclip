@@ -8,7 +8,7 @@ import type { AdapterRuntimeEvent } from "@paperclipai/adapter-utils";
 import type { WorkspaceCheckpointMetrics } from "@paperclipai/adapter-utils/workspace-checkpoint";
 import type { RuntimeSpanRunner } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import fs from "node:fs/promises";
-import { hostCleanup, hostMutation, hostWork } from "@paperclipai/adapter-utils/host-mutation-drain";
+import { hostCleanup, hostDeferredCleanup, hostMutation } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { createReadStream } from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -286,13 +286,15 @@ async function writeDescriptor(
     throw new Error("native_workspace_sync_descriptor_digest_collision");
   }
   const tempPath = path.join(dir, `${DESCRIPTOR_NAME}.${randomUUID()}.tmp`);
+  // adopt-drain4: registered with the owner's drain before it is created.
+  const removeTemp = hostDeferredCleanup(() => hostCleanup(() => fs.rm(tempPath, { force: true }).catch(() => undefined)));
   try {
     if (existingBody === null) {
       await hostMutation(() => fs.writeFile(tempPath, body, { encoding: "utf8", mode: 0o600 }));
       await hostMutation(() => fs.rename(tempPath, finalPath));
     }
   } finally {
-    await hostCleanup(() => fs.rm(tempPath, { force: true }).catch(() => undefined));
+    await removeTemp();
   }
   return {
     schema: descriptor.schema,
@@ -402,6 +404,8 @@ async function persistSnapshotManifests(runId: string, snapshot: NonNullable<Pre
     // A shared reference may already have been updated by the baseline.
     if (path.dirname(oldPath) === descriptorDirectory(runId)) continue;
     const temporary = path.join(descriptorDirectory(runId), `manifest.${randomUUID()}.tmp`);
+    // adopt-drain4: registered with the owner's drain before it is created.
+    const removeTemporary = hostDeferredCleanup(() => hostCleanup(() => fs.rm(temporary, { force: true })));
     try {
       const sourceStat = await fs.lstat(oldPath);
       if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error("native_workspace_sync_manifest_invalid");
@@ -413,7 +417,7 @@ async function persistSnapshotManifests(runId: string, snapshot: NonNullable<Pre
       await hostMutation(() => fs.rename(temporary, target));
       copies.set(oldPath, target);
       manifest.filePath = target;
-    } finally { await hostCleanup(() => fs.rm(temporary, { force: true })); }
+    } finally { await removeTemporary(); }
   }
   // Ownership tracks original scratch directories, never the new durable path.
   await disposeDirectorySnapshot(snapshot.baseline);
@@ -1195,11 +1199,7 @@ export async function prepareNativeWorkspaceSync(input: {
     restoreWorkspace: async (assertOwnership, options) => {
       if (!restorePromise) {
         exportSignal = options?.signal;
-        // adopt-drain3: the whole restore, including its finally-block cleanup
-        // of private snapshots, temp files and the merge owner sidecar, joins
-        // the current owner's host-mutation drain, so the owner releases only
-        // after that cleanup finished (even if its action stopped awaiting it).
-        restorePromise = hostWork(() => finalizePreparedRuntime({
+        restorePromise = finalizePreparedRuntime({
           db: input.db,
           runId: input.runId,
           target,
@@ -1209,7 +1209,7 @@ export async function prepareNativeWorkspaceSync(input: {
           signal: options?.signal,
           onPhase: input.onPhase,
           onCheckpoint: input.onCheckpoint,
-        }))
+        })
           .then((finalizedReference) => {
             reference = finalizedReference;
           })

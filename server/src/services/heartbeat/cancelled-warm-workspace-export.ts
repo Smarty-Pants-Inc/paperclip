@@ -113,11 +113,7 @@ export async function finishCancelledWarmWorkspaceExport(input: {
         if (controller.signal.aborted) throw controller.signal.reason;
         await ownership.assertHeld();
       };
-      // adopt-drain3: the restore keeps running (and cleaning up its private
-      // snapshots, temporaries and merge owner sidecar) after the race below
-      // returns at the deadline. It joins the drain, so the ownership is
-      // released only after that cleanup finished.
-      const export_ = ownership.hostMutations.work(() => sync.restoreWorkspace(assertHeld, { signal: controller.signal }));
+      const export_ = sync.restoreWorkspace(assertHeld, { signal: controller.signal });
       export_.catch(() => undefined);
       await Promise.race([export_, aborted]);
     });
