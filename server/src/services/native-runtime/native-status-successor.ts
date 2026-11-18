@@ -1,8 +1,11 @@
-import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { heartbeatRuns, issueComments, issueRecoveryActions, statusDecisions, type Db } from "@paperclipai/db";
+import { and, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
+import { heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issueRecoveryActions, issueThreadInteractions, statusDecisions,
+  type Db } from "@paperclipai/db";
 import { carryContinuationCommentInput } from "../../modules/wake-queue/domain/continuation-comment-input.js";
 import { completedPersonMessageAnswerSql } from "../person-message-answer.js";
 import { freshContinuationSourceChainSql } from "../fresh-continuation-chain.js";
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type NativeStatusSuccessorSkipReason = "person_message_already_answered" | "failed_run_has_successor";
 
@@ -34,21 +37,41 @@ export async function nativeStatusSuccessorState(db: Db, input: {
   // During finalization the failed result can precede the heartbeat status write.
   if (!source || (!["failed", "timed_out"].includes(source.status) && typeof input.payload.retryCause !== "string")) return eligible;
 
-  const chain = await db.execute<{ context: Record<string, unknown> }>(sql`${freshContinuationSourceChainSql({
+  const chain = await db.execute<{ id: string; context: Record<string, unknown> }>(sql`${freshContinuationSourceChainSql({
     companyId: input.companyId, issueId: input.issueId, runId,
-  }, true)} select r.context_snapshot as context from source_chain c
+  }, true)} select r.id, r.context_snapshot as context from source_chain c
     join heartbeat_runs r on r.id = c.id and r.company_id = ${input.companyId}`);
   const ids = [...new Set([source.context, ...chain.map(row => row.context)].flatMap(context => {
     const carried = carryContinuationCommentInput(context);
     return [...(carried.wakeCommentIds as string[] | undefined ?? []),
       ...(typeof context?.conversationReplyBoundaryCommentId === "string" ? [context.conversationReplyBoundaryCommentId] : [])];
-  }))].filter(id => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id));
+  }))].filter(id => UUID.test(id));
   if (ids.length) {
     const messages = await db.select({ answered: sql<boolean>`${completedPersonMessageAnswerSql({ id: sql`${issueComments.id}`,
       companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}` })
       .from(issueComments).where(and(eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
         eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt), inArray(issueComments.id, ids)));
-    if (messages.length && messages.every(message => message.answered))
+    // compose (fam-long + ANSWERED): a person's answer to the agent's card is pending person input too
+    // (person-message-answer.ts). A failed answer-resume run still owes it, even when the typed message
+    // that led to the card is ANSWERED: the same one predicate, keyed by the card id and its answer time.
+    const contexts = [source.context, ...chain.map(row => row.context)];
+    const cardIds = [...new Set(contexts.flatMap(context => [context?.interactionId,
+      ...(Array.isArray(context?.interactionIds) ? context.interactionIds : [])]))]
+      .filter((id): id is string => typeof id === "string" && UUID.test(id));
+    const runIds = [...new Set([runId, ...chain.map(row => row.id)])].filter(id => UUID.test(id));
+    const cardAnswers = messages.length && messages.every(message => message.answered)
+      ? await db.select({ answered: sql<boolean>`${completedPersonMessageAnswerSql({ id: sql`${issueThreadInteractions.id}`,
+          companyId: sql`${issueThreadInteractions.companyId}`, issueId: sql`${issueThreadInteractions.issueId}`,
+          createdAt: sql`${issueThreadInteractions.resolvedAt}` })}` })
+        .from(issueThreadInteractions).where(and(eq(issueThreadInteractions.companyId, input.companyId),
+          eq(issueThreadInteractions.issueId, input.issueId), isNotNull(issueThreadInteractions.resolvedByUserId),
+          isNotNull(issueThreadInteractions.resolvedAt), inArray(issueThreadInteractions.status, ["answered", "accepted", "rejected"]),
+          or(...(cardIds.length ? [inArray(issueThreadInteractions.id, cardIds)] : []),
+            sql`exists (select 1 from ${issueQuestionResponseDeliveries} delivery where delivery.company_id = ${input.companyId}
+              and delivery.interaction_id = ${issueThreadInteractions.id}
+              and delivery.target_run_id in (${sql.join(runIds.map(id => sql`${id}::uuid`), sql`, `)}))`)))
+      : [];
+    if (messages.length && messages.every(message => message.answered) && cardAnswers.every(card => card.answered))
       return { failedRunId: runId, skipReason: "person_message_already_answered" };
   }
 
