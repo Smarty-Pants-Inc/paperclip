@@ -155,6 +155,9 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
   }
 
   const turns: Array<{ runId: string; commentIds: string[] }> = [];
+  const evidence = async (label: string, value: unknown) => {
+    if (process.env.OPTS_EVIDENCE) await fs.appendFile(process.env.OPTS_EVIDENCE, JSON.stringify({ label, value }) + "\n");
+  };
   // Successor provider turns: each run that reached the executor, with the
   // exact comment ids its wake delivered.
   async function readTurns() {
@@ -168,7 +171,7 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
     }
   }
 
-  async function heldThenStop() {
+  async function heldThenStop(stopBy: "person" | "system" = "person") {
     fixture.warm = true;
     fixture.calls = [];
     turns.length = 0;
@@ -216,12 +219,13 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
       for (const body of ["M1 held", "M2 held", "M3 held"])
         held.push((await post(body).expect(201)).body.id);
       stopping = heartbeat.cancelRun(runId, "Cancelled by a board operator", {
-        resultJson: { cancelledByActorType: "user", cancelledByUserId: userId } });
+        resultJson: stopBy === "person" ? { cancelledByActorType: "user", cancelledByUserId: userId }
+          : { cancelledByActorType: "system" } });
       void stopping.catch(() => undefined);
       await waitFor(async () => {
         const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
         const value = row?.resultJson?.nativeCancellation as Record<string, unknown> | undefined;
-        return value?.dispatchState === "acknowledged" && row?.status === "cancelled";
+        return (stopBy === "system" || value?.dispatchState === "acknowledged") && row?.status === "cancelled";
       });
       await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: "native_retry_cancelled",
         leaseOwner: null }).where(eq(nativeRunFinalizations.runId, runId));
@@ -236,7 +240,7 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
       await heartbeat.resumeQueuedRuns();
       await heartbeat.drainActiveRunExecutions();
       await stopping;
-    } finally { fixture.onFirst = undefined; }
+    } finally { fixture.onFirst = undefined; fixture.warm = false; }
     const settle = async () => {
       for (let i = 0; i < 3; i++) { await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions(); }
       await readTurns();
@@ -274,6 +278,7 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
       const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, s.f.companyId));
       console.log("OPTS WAKES", JSON.stringify(wakes.map(w => ({ id: w.id, status: w.status, wait: (w.payload as any)?.executionWait, ids: (w.payload as any)?._paperclipWakeContext?.wakeCommentIds }))));
       console.log("OPTS TURNS", JSON.stringify(turns));
+      await evidence("S10", { held: s.held, turns, ms: Date.now() - pressedAt, wakes: wakes.map(w => ({ status: w.status, wait: (w.payload as any)?.executionWait?.reason })) });
       expect(turns).toHaveLength(1);
       expect(turns[0]!.commentIds).toEqual(s.held);
       expect([...s.answered().values()]).toEqual([1, 1, 1]);
@@ -290,10 +295,20 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
       await s.settle();
       await s.settle();
       console.log("OPTS TYPED TURNS", JSON.stringify(turns));
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, s.f.companyId));
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, s.f.companyId));
+      await evidence("typed-after-Stop", { held: s.held, m4, turns,
+        runs: runs.map(r => ({ id: r.id, status: r.status, code: r.errorCode, err: r.error?.slice(0, 160) })),
+        wakes: wakes.map(w => ({ id: w.id, status: w.status, runId: w.runId, wait: (w.payload as any)?.executionWait, ids: (w.payload as any)?._paperclipWakeContext?.wakeCommentIds })) });
       expect(turns[0]?.commentIds).toEqual([m4]);
       const counts = s.answered();
       expect(counts.get(m4)).toBe(1);
+      // Never twice. FAKED EDGE: the scripted successor turn fails (it has no
+      // native finalization), so the existing release/promote of the three
+      // after M4 is refused here by the stop-proof check for that scripted
+      // run; "then the three by themselves" is not driven in this harness.
       for (const id of s.held) expect(counts.get(id) ?? 0).toBeLessThanOrEqual(1);
+      expect(turns.slice(1).flatMap(turn => turn.commentIds).filter(id => id === m4)).toEqual([]);
     } finally { s.done(); }
   }, 120_000);
 
@@ -306,7 +321,21 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
       await s.settle();
       await s.settle();
       console.log("OPTS BOTH TURNS", JSON.stringify(turns));
+      await evidence("send+typed", { held: s.held, send: sent.status, turns });
       for (const id of s.held) expect(s.answered().get(id) ?? 0).toBeLessThanOrEqual(1);
+    } finally { s.done(); }
+  }, 120_000);
+
+  it("control non-person cancel: Send still waits for the box's stop receipt (unchanged)", async () => {
+    const s = await heldThenStop("system");
+    try {
+      const sent = await s.send();
+      await s.settle();
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, s.f.companyId));
+      await evidence("non-person-cancel", { held: s.held, send: sent.status, turns,
+        wakes: wakes.map(w => ({ status: w.status, wait: (w.payload as any)?.executionWait?.reason })) });
+      expect(turns).toEqual([]);
+      expect(wakes.some(w => w.status === "deferred_issue_execution")).toBe(true);
     } finally { s.done(); }
   }, 120_000);
 });
