@@ -59,6 +59,8 @@ describePostgres("stranded agent status with a stopped copy's leftover remote cl
     /** Detach the lease from the agent's run, so only the copy clause can see it. */
     leaseUnlinked?: boolean;
     location?: string; cleanupPending?: boolean; receipt?: Record<string, unknown>;
+    /** Other copy columns as real rows carry them (errorCode, candidate content). */
+    columns?: Partial<typeof agentInstructionWorkingCopies.$inferInsert>;
   };
 
   /** The live holder shape (HOLDERS-SAMPLE, fresh, 11-18): settled state, stopped,
@@ -86,7 +88,7 @@ describePostgres("stranded agent status with a stopped copy's leftover remote cl
       executionRoot: `${remoteCwd}/.paperclip-runtime/agent-files/${agentId}/${runId}`,
       location: shape.location ?? "remote:daytona", state,
       processStoppedAt: shape.processStoppedAt === undefined ? old() : shape.processStoppedAt,
-      nextAttemptAt: new Date(Date.now() + 6 * 60 * 60_000), attempts: 0,
+      nextAttemptAt: new Date(Date.now() + 6 * 60 * 60_000), attempts: 0, ...shape.columns,
       receipt: { schema: "paperclip.agent-files.v1", state, appliedCandidateHash: null,
         storageWarning: null, cleanupPending: shape.cleanupPending ?? true, materializationRunId: runId,
         pendingConflicts: [], cleanup: { leaseId },
@@ -127,7 +129,8 @@ describePostgres("stranded agent status with a stopped copy's leftover remote cl
     // n3: another debt besides the delete.
     ["a discard to apply", { receipt: { discard: { files: ["AGENTS.md"] } } }],
     ["pending conflicts", { receipt: { pendingConflicts: [{ path: "AGENTS.md" }] } }],
-    ["a held save", { receipt: { savePending: { code: "held" } } }],
+    // A held save is agentFileSaveHeld: savePending on a not-completed state.
+    ["a held save", { state: "unavailable", receipt: { savePending: { code: "held" } } }],
     ["ownership retained by another run", { receipt: { retainedByRunId: "11111111-1111-4111-8111-111111111111" } }],
     // n4: cleanup done (cleanupPending false) but a retry still scheduled.
     ["cleanupPending false and a retry scheduled", { cleanupPending: false }],
@@ -136,6 +139,39 @@ describePostgres("stranded agent status with a stopped copy's leftover remote cl
     expect(await reconcile()).toEqual([]);
     expect((await agent(agentId)).status).toBe("running");
     expect(await reconciledEvents(agentId)).toEqual([]);
+  });
+
+  // The exemption reuses the cleanup worker's own predicate
+  // (directoryCleanupPredicate): rows it keeps settle, rows it excludes hold.
+  const candidate = { candidateBase64: Buffer.from("unsaved real instruction edit").toString("base64"),
+    candidateHash: "candidate-hash" };
+  const unavailable = { errorCode: "INSTRUCTION_COLLECTION_UNAVAILABLE",
+    errorMessage: "The exact remote sandbox was destroyed before its agent directory was retrieved. No instruction save is claimed.",
+    ...candidate };
+  it.each([
+    // (a) the real unavailable shape without a held save: the worker keeps the delete.
+    ["unavailable without savePending", { state: "unavailable", columns: unavailable }],
+    // (d) an applied candidate on a saved copy.
+    ["saved with an applied candidate", { state: "saved", columns: candidate,
+      receipt: { appliedCandidateHash: "candidate-hash" } }],
+  ] as const satisfies readonly (readonly [string, Shape])[])("settles a stopped copy the cleanup worker keeps: %s", async (_label, shape) => {
+    const { agentId } = await seed(shape);
+    expect(await reconcile()).toEqual([agentId]);
+    expect((await agent(agentId)).status).toBe("idle");
+  });
+
+  it.each([
+    // (b) unavailable WITH a held save (holdUnsaved): the worker excludes it.
+    ["unavailable with savePending", { state: "unavailable", columns: { ...unavailable, errorCode: "AGENT_FILES_SAVE_FAILED" },
+      receipt: { savePending: { since: new Date().toISOString(), code: "AGENT_FILES_SAVE_FAILED",
+        reason: "save failed", failures: 1 } } }],
+    // (c) a conflict copy with candidate content: the worker excludes the state.
+    ["a local conflict with a candidate", { state: "conflict", location: "local", cleanupPending: false, columns: candidate }],
+    ["a remote conflict with a candidate and cleanupPending", { state: "conflict", columns: candidate }],
+  ] as const satisfies readonly (readonly [string, Shape])[])("keeps the agent running for a copy the cleanup worker excludes: %s", async (_label, shape) => {
+    const { agentId } = await seed(shape);
+    expect(await reconcile()).toEqual([]);
+    expect((await agent(agentId)).status).toBe("running");
   });
 
   it("keeps the agent running while another run is running", async () => {
