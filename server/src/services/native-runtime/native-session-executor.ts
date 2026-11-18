@@ -1,3 +1,4 @@
+import { isRetryableTransactionError, withTransactionRetry } from "../transaction-retry.js";
 import { nativeReconciliationError, freshThreadRefusalCode, isFreshThreadRefusal, type FreshThreadRefusalCode,
   RESTORE_UNAVAILABLE_ON_NEW_BOX_CODE, RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON, restoreUnavailableOnNewBoxCode,
   LAUNCH_PROFILE_MISMATCH_CODE, LAUNCH_PROFILE_CHANGED_REASON } from "./runner-reconciliation-refusal.js";
@@ -285,6 +286,7 @@ import {
   issues,
   nativeHarnessBackups,
   nativeRunFinalizations,
+  nativeRunnerCheckpoints,
   nativeRunResults,
 } from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
@@ -8025,69 +8027,168 @@ async function restorePerTurnRunnerdController(input: {
 async function refreshFinishedPerTurnRunnerdProjection(
   input: Parameters<typeof restorePerTurnRunnerdController>[0], root: string, reference: RunnerdDurableIdentity, sourceRunId: string, external: boolean, referenceBytes: string,
 ): Promise<void> {
-  const refuse = (reason: string): never => { throw new Error(`native_runner_checkpoint_projection_held:${reason}`); };
-  await input.db.transaction(async tx => {
-    await lockSourceRecoveryCoordinators(tx, input.execution.binding.companyId,
-      [reference.runId, sourceRunId, input.execution.binding.runId]);
-    const recovered = await resolveNativeControllerRecovery(tx as unknown as Db, {
-      ...input.execution.binding, currentRunId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution),
-      predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
+  // PostgreSQL: "It is important to retry the complete transaction, including all
+  // logic that decides which SQL to issue and/or which values to use."
+  // https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html
+  // Deadlocks: "deadlocks can be handled on-the-fly by retrying transactions that abort due to deadlocks."
+  // https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-DEADLOCKS
+  // Retry the complete CAS, including fresh DB snapshots and read-only provider
+  // probes. Only private scratch is written before apply; referenceBytes and the
+  // final fenced re-read guard replacement. Active filesystem effects cannot be
+  // rolled back, so a failure after apply begins must be held, never replayed.
+  let applying = false;
+  const held = () => nativeReconciliationError("native_runner_checkpoint_projection_held:transaction_conflict");
+  try {
+    await withTransactionRetry(input.db, async () => {
+      try {
+        await refreshFinishedPerTurnRunnerdProjectionOnce(input, root, reference, sourceRunId, external, referenceBytes,
+          () => { applying = true; });
+      } catch (error) {
+        if (applying && isRetryableTransactionError(error)) throw held();
+        throw error;
+      }
     });
-    if (recovered.kind !== "recoverable" || recovered.checkpoint.runId !== sourceRunId) return refuse("source_changed");
-    const scratch = mkdtempSync(join(tmpdir(), "paperclip-controller-projection-"));
-    const sourceRoot = resolve(scratch, "source"), oldRoot = resolve(scratch, "prior");
-    try {
-      recovered.checkpoint.restoreSessionDirectory(sourceRoot);
-      const sourceIdentity = readRunnerdDurableIdentity(sourceRoot);
-      if (!durableIdentityMatchesSession(sourceIdentity, input.execution) || sourceIdentity.runId !== sourceRunId) return refuse("source_identity");
-      const statePath = resolve(root, "control-plane", "control-plane-state.json");
-      const sourceBytes = readBoundedNativeFile(resolve(sourceRoot, "control-plane", "control-plane-state.json"),
-        NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8");
-      const originalBytes = readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8");
-      if (originalBytes !== referenceBytes) return refuse("journal_changed");
-      if (!external && sourceRunId === reference.runId && originalBytes === sourceBytes) return;
-      let projectedControlBytes: string | undefined;
-      if (external) {
-        const marker = record(JSON.parse(originalBytes));
-        if (marker.schema !== "paperclip.runner.external-control-plane-state.v1" ||
-          ["runId", "runnerInstanceId", "environmentLeaseId", "normalizedSessionId", "turnId", "itemId"]
-            .some(key => record(marker.identity)[key] !== reference[key])) return refuse("prior_identity");
-        if (sourceRunId === reference.runId) {
-          if (["runId", "runnerInstanceId", "environmentLeaseId", "normalizedSessionId", "turnId", "itemId"]
-            .some(key => sourceIdentity[key] !== reference[key])) return refuse("prior_identity");
+  } catch (error) {
+    if (isRetryableTransactionError(error)) throw held();
+    throw error;
+  }
+}
+
+async function refreshFinishedPerTurnRunnerdProjectionOnce(
+  input: Parameters<typeof restorePerTurnRunnerdController>[0], root: string, reference: RunnerdDurableIdentity, sourceRunId: string, external: boolean, referenceBytes: string,
+  onApply: () => void,
+): Promise<void> {
+  const refuse = (reason: string): never => { throw new Error(`native_runner_checkpoint_projection_held:${reason}`); };
+  const { companyId } = input.execution.binding;
+  const runIds = [...new Set([reference.runId, sourceRunId, input.execution.binding.runId])];
+  // Compare PostgreSQL's canonical row text, including every timestamp at DB
+  // precision. ORM rows would silently truncate microseconds in JS Dates.
+  const leaseState = (db: Db) => db.select({ state: sql<string>`to_jsonb(${environmentLeases})::text` }).from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, runIds)))
+    .orderBy(environmentLeases.id);
+  const runState = (db: Db) => db.select({ state: sql<string>`to_jsonb(${heartbeatRuns})::text` }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, runIds)))
+    .orderBy(heartbeatRuns.id);
+  const decisionState = async (db: Db) => ({
+    coordinators: await db.select({ state: sql<string>`to_jsonb(${nativeRunFinalizations})::text` }).from(nativeRunFinalizations).where(and(
+      eq(nativeRunFinalizations.companyId, companyId), inArray(nativeRunFinalizations.runId, runIds)))
+      .orderBy(nativeRunFinalizations.runId),
+    runs: await runState(db),
+    leases: await leaseState(db),
+  });
+  const expectedState = await decisionState(input.db);
+  const recoveryInput = {
+    ...input.execution.binding, currentRunId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution),
+    predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
+  };
+  const recovered = await resolveNativeControllerRecovery(input.db, recoveryInput);
+  if (recovered.kind !== "recoverable" || recovered.checkpoint.runId !== sourceRunId) return refuse("source_changed");
+  const checkpointState = (checkpoint: NonNullable<Awaited<ReturnType<typeof loadNativeRunnerCheckpoint>>>) =>
+    nativeSha256([...checkpoint.records].sort(([a], [b]) => a.localeCompare(b)));
+  let previousCheckpoint: Awaited<ReturnType<typeof loadNativeRunnerCheckpoint>> = null;
+  const applyLocked = async (apply: () => Promise<void> | void) => input.db.transaction(async tx => {
+    await lockSourceRecoveryCoordinators(tx, companyId, runIds);
+    if (JSON.stringify(await decisionState(tx as unknown as Db)) !== JSON.stringify(expectedState)) return refuse("source_changed");
+    const current = await resolveNativeControllerRecovery(tx as unknown as Db, recoveryInput);
+    if (current.kind !== "recoverable" || current.checkpoint.runId !== sourceRunId
+      || nativeSha256(current.snapshot) !== nativeSha256(recovered.snapshot)
+      || nativeSha256(current.metadata) !== nativeSha256(recovered.metadata)
+      || checkpointState(current.checkpoint) !== checkpointState(recovered.checkpoint)) return refuse("source_changed");
+    if (previousCheckpoint) {
+      const previous = await loadNativeRunnerCheckpoint(tx as unknown as Db, { ...input.execution.binding, runId: reference.runId });
+      if (!previous || checkpointState(previous) !== checkpointState(previousCheckpoint)) return refuse("source_changed");
+    }
+    // Fence the compare-to-apply interval in the existing production lock order:
+    // coordinators (above) -> runs by id -> leases by id -> checkpoint parts
+    // (as settleWarmRetention, environment-warm-retention.ts, and the native
+    // coordinator -> run -> lease writers). The run locks also fence lease
+    // membership: inserting or re-parenting a lease onto these runs needs a
+    // foreign-key share lock on its run, which waits for these locks.
+    await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, runIds)))
+      .orderBy(heartbeatRuns.id).for("update");
+    await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, runIds)))
+      .orderBy(environmentLeases.id).for("update");
+    await tx.select({ part: nativeRunnerCheckpoints.part }).from(nativeRunnerCheckpoints).where(and(
+      eq(nativeRunnerCheckpoints.companyId, companyId), inArray(nativeRunnerCheckpoints.runId, runIds)))
+      .orderBy(nativeRunnerCheckpoints.runId, nativeRunnerCheckpoints.part).for("update");
+    // Final snapshot, only after every fence is held: the COMPLETE coordinator,
+    // run and lease sets (ids + canonical text), not just the rows locked above.
+    if (JSON.stringify(await decisionState(tx as unknown as Db)) !== JSON.stringify(expectedState)) {
+      return refuse("source_changed");
+    }
+    const lockedCheckpoint = await loadNativeRunnerCheckpoint(tx as unknown as Db, { ...input.execution.binding, runId: sourceRunId });
+    if (!lockedCheckpoint || checkpointState(lockedCheckpoint) !== checkpointState(recovered.checkpoint)) return refuse("source_changed");
+    if (previousCheckpoint) {
+      const previous = await loadNativeRunnerCheckpoint(tx as unknown as Db, { ...input.execution.binding, runId: reference.runId });
+      if (!previous || checkpointState(previous) !== checkpointState(previousCheckpoint)) return refuse("source_changed");
+    }
+    await apply();
+  });
+  const scratch = mkdtempSync(join(tmpdir(), "paperclip-controller-projection-"));
+  const sourceRoot = resolve(scratch, "source"), oldRoot = resolve(scratch, "prior");
+  try {
+    recovered.checkpoint.restoreSessionDirectory(sourceRoot);
+    const sourceIdentity = readRunnerdDurableIdentity(sourceRoot);
+    if (!durableIdentityMatchesSession(sourceIdentity, input.execution) || sourceIdentity.runId !== sourceRunId) return refuse("source_identity");
+    const statePath = resolve(root, "control-plane", "control-plane-state.json");
+    const sourceBytes = readBoundedNativeFile(resolve(sourceRoot, "control-plane", "control-plane-state.json"),
+      NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8");
+    const originalBytes = readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8");
+    if (originalBytes !== referenceBytes) return refuse("journal_changed");
+    if (!external && sourceRunId === reference.runId && originalBytes === sourceBytes) return;
+    let projectedControlBytes: string | undefined;
+    if (external) {
+      const marker = record(JSON.parse(originalBytes));
+      if (marker.schema !== "paperclip.runner.external-control-plane-state.v1" ||
+        ["runId", "runnerInstanceId", "environmentLeaseId", "normalizedSessionId", "turnId", "itemId"]
+          .some(key => record(marker.identity)[key] !== reference[key])) return refuse("prior_identity");
+      if (sourceRunId === reference.runId) {
+        if (["runId", "runnerInstanceId", "environmentLeaseId", "normalizedSessionId", "turnId", "itemId"]
+          .some(key => sourceIdentity[key] !== reference[key])) return refuse("prior_identity");
+        if (readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8") !== referenceBytes) {
+          return refuse("journal_changed");
+        }
+        await applyLocked(() => {
           if (readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8") !== referenceBytes) {
             return refuse("journal_changed");
           }
+          onApply();
           recovered.checkpoint.restoreSessionDirectory(root);
-          return;
-        }
-        const previous = await loadNativeRunnerCheckpoint(tx as unknown as Db, { ...input.execution.binding, runId: reference.runId });
-        if (!previous) return refuse("prior_checkpoint_missing");
-        previous.restoreSessionDirectory(oldRoot);
-        const previousIdentity = readRunnerdDurableIdentity(oldRoot);
-        if (["runId", "runnerInstanceId", "environmentLeaseId", "normalizedSessionId", "turnId", "itemId"]
-          .some(key => previousIdentity?.[key] !== reference[key])) return refuse("prior_identity");
-        projectedControlBytes = readBoundedNativeFile(resolve(oldRoot, "control-plane", "control-plane-state.json"),
-          NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8");
+        });
+        return;
       }
-      const oldProof = await inspectFinishedPerTurnRunnerdOwner({ ...input, db: tx as unknown as Db, root, identity: reference, projectedControlBytes });
-      if (!oldProof.finished) return refuse(oldProof.refused);
-      const sourceProof = await inspectFinishedPerTurnRunnerdOwner({ ...input, db: tx as unknown as Db, root: sourceRoot, identity: sourceIdentity });
-      if (!sourceProof.finished) return refuse(`source_${sourceProof.refused}`);
-      if (reference.runId !== sourceRunId && oldProof.run.createdAt >= sourceProof.run.createdAt) return refuse("source_not_newer");
-      for (const run of [oldProof.run, sourceProof.run]) {
-        let previous: NativeExecutionInput;
-        try { previous = parseNativeExecutionInput(record(run.runnerProfileJson).nativeExecutionInput); }
-        catch { return refuse("source_scope"); }
-        if (previous.binding.runId !== run.id || nativeSessionScopeKey(previous) !== nativeSessionScopeKey(input.execution)) {
-          return refuse("source_scope");
-        }
+      const previous = await loadNativeRunnerCheckpoint(input.db, { ...input.execution.binding, runId: reference.runId });
+      previousCheckpoint = previous;
+      if (!previous) return refuse("prior_checkpoint_missing");
+      previous.restoreSessionDirectory(oldRoot);
+      const previousIdentity = readRunnerdDurableIdentity(oldRoot);
+      if (["runId", "runnerInstanceId", "environmentLeaseId", "normalizedSessionId", "turnId", "itemId"]
+        .some(key => previousIdentity?.[key] !== reference[key])) return refuse("prior_identity");
+      projectedControlBytes = readBoundedNativeFile(resolve(oldRoot, "control-plane", "control-plane-state.json"),
+        NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8");
+    }
+    const oldProof = await inspectFinishedPerTurnRunnerdOwner({ ...input, root, identity: reference, projectedControlBytes });
+    if (!oldProof.finished) return refuse(oldProof.refused);
+    const sourceProof = await inspectFinishedPerTurnRunnerdOwner({ ...input, root: sourceRoot, identity: sourceIdentity });
+    if (!sourceProof.finished) return refuse(`source_${sourceProof.refused}`);
+    if (reference.runId !== sourceRunId && oldProof.run.createdAt >= sourceProof.run.createdAt) return refuse("source_not_newer");
+    for (const run of [oldProof.run, sourceProof.run]) {
+      let previous: NativeExecutionInput;
+      try { previous = parseNativeExecutionInput(record(run.runnerProfileJson).nativeExecutionInput); }
+      catch { return refuse("source_scope"); }
+      if (previous.binding.runId !== run.id || nativeSessionScopeKey(previous) !== nativeSessionScopeKey(input.execution)) {
+        return refuse("source_scope");
       }
+    }
+    await applyLocked(async () => {
       const sourceChanged = await sourceProof.recheck(), oldChanged = await oldProof.recheck();
       if (sourceChanged || oldChanged) return refuse(sourceChanged ?? oldChanged!);
       if (readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8") !== referenceBytes) {
         return refuse("journal_changed");
       }
+      onApply();
       const archiveParent = resolve(root, "continuity-breaks");
       mkdirSync(archiveParent, { recursive: true, mode: 0o700 });
       if (!isSafeNativeStateDirectory(archiveParent)) return refuse("archive_unsafe");
@@ -8096,10 +8197,10 @@ async function refreshFinishedPerTurnRunnerdProjection(
       renameSync(resolve(root, "control-plane"), resolve(archiveRoot, "control-plane"));
       recovered.checkpoint.restoreSessionDirectory(root);
       noteNativeRunnerEvidence(archivedAt);
-    } finally {
-      rmSync(scratch, { recursive: true, force: true });
-    }
-  });
+    });
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 }
 
 /** A predecessor with no committed result is gone only by the shared

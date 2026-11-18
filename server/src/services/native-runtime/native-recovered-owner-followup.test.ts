@@ -21,6 +21,7 @@ import { currentNativeControllerIdentity, hasNativeExecutionStartEvidence } from
 import { refusedAtPriorOwnerFenceBeforeLaunch } from "./native-provider-work-proof.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { readProcessStartedAt } from "../hot-restart.js";
+import { settleWarmRetention } from "../environment-warm-retention.js";
 import { freshThreadRefusalCode } from "./runner-reconciliation-refusal.js";
 import {
   buildNativeExecutionWithCheckpoint, findNativeSessionResumeRun, nativeToolContractFingerprintForTarget,
@@ -31,6 +32,17 @@ import {
 } from "./predecessor-retirement.js";
 
 const toolDefinitions = vi.hoisted(() => vi.fn());
+// RFL's real-PostgreSQL after-CAS race: only the checkpoint read boundary is
+// controlled; the competing lease write uses a separate database connection.
+const checkpointReadHook = vi.hoisted(() => ({ callback: null as null | (() => Promise<void>) }));
+vi.mock("./native-runner-checkpoint.js", async importOriginal => {
+  const original = await importOriginal<typeof import("./native-runner-checkpoint.js")>();
+  return { ...original, loadNativeRunnerCheckpoint: async (...args: Parameters<typeof original.loadNativeRunnerCheckpoint>) => {
+    const checkpoint = await original.loadNativeRunnerCheckpoint(...args);
+    await checkpointReadHook.callback?.();
+    return checkpoint;
+  } };
+});
 vi.mock("../../runtime-api.js", async importOriginal => ({ ...await importOriginal<typeof import("../../runtime-api.js")>(), resolveLocalRuntimeApiUrl: () => "http://127.0.0.1:43219" }));
 vi.mock("./paperclip-runner-tool-authority.js", () => ({
   PaperclipRunnerToolAuthority: class {
@@ -405,6 +417,524 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await quarantined()).toEqual([]);
     expect(followUp.logs.join("")).not.toContain("starting a new runner for this conversation");
   }, 60_000);
+
+  it.each([
+    ...[false, true].flatMap(external => ["no transaction", "coordinator changed", "coordinator timestamp changed",
+      "coordinator microsecond changed", "source run changed", "prior run changed", "source lease changed", "source checkpoint deleted"]
+      .map(scenario => ({ external, scenario }))),
+    { external: true, scenario: "lease changed after CAS" },
+    // S099d: membership phantom, real warm-retention deadlock, late write.
+    { external: true, scenario: "judge lease insert after lease guard" },
+    { external: true, scenario: "lease insert before run fence" },
+    { external: true, scenario: "judge real refresh deadlock" },
+    { external: true, scenario: "lease moved in after final snapshot" },
+  ])(
+    "probes a resumed projection before locking: $scenario (external=$external)", async ({ external, scenario }) => {
+      const fixture = await staleProjection("codex", external), { prior, latest, followUp, root, path } = fixture;
+      await recordPriorLeaseOnSameSandbox(prior, followUp);
+      const warmScenario = scenario === "judge real refresh deadlock";
+      await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId,
+        issueId: prior.issueId, heartbeatRunId: latest.runId, provider: "daytona", providerLeaseId: followUp.providerLeaseId,
+        status: warmScenario ? "active" : "released", leasePolicy: warmScenario ? "reuse_by_environment" : "ephemeral",
+        releasedAt: warmScenario ? null : new Date(), metadata: { remoteCwd: "/workspace" } });
+      // A lease of no run yet; the late-write case re-parents it onto a compared run.
+      const [detached] = await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId,
+        issueId: prior.issueId, heartbeatRunId: null, provider: "daytona", providerLeaseId: followUp.providerLeaseId,
+        status: "released", releasedAt: new Date(), metadata: { remoteCwd: "/workspace", s099dDetached: true } })
+        .returning({ id: environmentLeases.id });
+      if (scenario === "coordinator microsecond changed") {
+        // Keep the 1µs mutation inside one JS millisecond, deterministically.
+        await db.update(nativeRunFinalizations).set({ updatedAt: sql`date_trunc('milliseconds', ${nativeRunFinalizations.updatedAt}) + interval '123 microseconds'` })
+          .where(eq(nativeRunFinalizations.runId, latest.runId));
+      }
+      type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+      let active: Transaction | undefined, probes = 0, checks = 0, openProbeTransactions = 0, changed = false;
+      const raced = new Set(["judge lease insert after lease guard", "lease insert before run fence",
+        "judge real refresh deadlock", "lease moved in after final snapshot"]);
+      // Concurrent writers on their own connections. Each records whether it
+      // settled only after the projection-refresh transaction ended (= fenced).
+      let refreshEnded = false, refreshError: any;
+      const writers: Record<string, { settledAfterRefresh?: boolean; error?: string }> = {};
+      const pending: Promise<unknown>[] = [];
+      const startWriter = async (name: string, write: () => Promise<unknown>) => {
+        writers[name] = {};
+        const done = write().then(() => { writers[name]!.settledAfterRefresh = refreshEnded; },
+          (err: any) => { writers[name]!.error = String(err?.cause?.code ?? err?.code ?? err?.message ?? err); });
+        pending.push(done);
+        // Let an unblocked write commit before the refresh continues; a fenced one stays queued.
+        await Promise.race([done, new Promise(r => setTimeout(r, 750))]);
+      };
+      const insertLease = () => db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId,
+        issueId: prior.issueId, heartbeatRunId: latest.runId, provider: "daytona", providerLeaseId: followUp.providerLeaseId,
+        status: "released", releasedAt: new Date(), metadata: { remoteCwd: "/workspace", judgePhantom: true } });
+      let triggered = false;
+      // Observe each refresh-transaction SELECT by its SQL text (order-agnostic).
+      const onQuery = async (state: { refresh: boolean; runFenced: boolean }, text: string, phase: "before" | "after") => {
+        if (text.includes('to_jsonb("environment_leases")')) state.refresh = true;
+        if (!state.refresh || triggered) return;
+        const forUpdate = /for update/i.test(text);
+        const runLock = forUpdate && /from "heartbeat_runs"/.test(text);
+        const leaseLock = forUpdate && /from "environment_leases"/.test(text);
+        if (phase === "after" && runLock) state.runFenced = true;
+        if (scenario === "judge lease insert after lease guard" && phase === "after" && leaseLock) {
+          triggered = true; await startWriter("phantomInsert", insertLease);
+        } else if (scenario === "lease insert before run fence" && phase === "before" && runLock) {
+          triggered = true; await startWriter("phantomInsert", insertLease);
+        } else if (scenario === "lease moved in after final snapshot" && phase === "after"
+          && text.includes('to_jsonb("environment_leases")') && (forUpdate || state.runFenced)) {
+          // After the last lease snapshot the refresh compares: re-parent a lease
+          // into the compared set, and rewrite an already compared lease.
+          triggered = true;
+          await Promise.all([
+            startWriter("moveIn", () => db.update(environmentLeases).set({ heartbeatRunId: latest.runId })
+              .where(eq(environmentLeases.id, detached!.id))),
+            startWriter("rewrite", () => db.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || '{"lateWrite":true}'::jsonb` })
+              .where(eq(environmentLeases.heartbeatRunId, latest.runId))),
+          ]);
+        }
+      };
+      const instrument = (tx: Transaction) => {
+        const state = { refresh: false, runFenced: false };
+        const originalSelect = tx.select.bind(tx);
+        const wrap = (q: any): any => new Proxy(q, { get(target, key) {
+          if (key === "then" && typeof target.then === "function") return (resolve: any, reject: any) => {
+            let text = ""; try { text = target.toSQL().sql; } catch { /* not a query */ }
+            return onQuery(state, text, "before").then(() => target.then(async (rows: unknown) => {
+              await onQuery(state, text, "after"); return rows;
+            })).then(resolve, reject);
+          };
+          const value = Reflect.get(target, key, target);
+          if (typeof value !== "function" || typeof key === "symbol" || key === "constructor") return value;
+          return (...args: any[]) => {
+            const result = value.apply(target, args);
+            return result && typeof result === "object" && typeof result.then === "function" || result === target ? wrap(result) : result;
+          };
+        } });
+        (tx as any).select = (...args: any[]) => {
+          const builder = (originalSelect as any)(...args);
+          return new Proxy(builder, { get(target, key) {
+            const value = Reflect.get(target, key, target);
+            return key === "from" && typeof value === "function" ? (...args: any[]) => wrap(value.apply(target, args)) : value;
+          } });
+        };
+        return state;
+      };
+      const transaction = db.transaction.bind(db);
+      const spy = vi.spyOn(db, "transaction").mockImplementation((callback, config) => {
+        let state: { refresh: boolean } | undefined;
+        return transaction(async tx => {
+          active = tx;
+          if (raced.has(scenario)) state = instrument(tx);
+          try {
+            return await callback(tx);
+          } catch (err: any) {
+            if (state?.refresh && refreshError === undefined) refreshError = { code: err?.cause?.code ?? err?.code, message: err?.cause?.message ?? err?.message };
+            throw err;
+          } finally { active = undefined; }
+        }, config).finally(() => { if (state?.refresh) refreshEnded = true; });
+      });
+      if (scenario === "lease changed after CAS") checkpointReadHook.callback = async () => {
+        if (active && checks >= 2 && !changed) {
+          await db.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || '{"judgeChangedAfterCAS":true}'::jsonb` })
+            .where(eq(environmentLeases.heartbeatRunId, latest.runId));
+          changed = true;
+        }
+      };
+      let warmResult: Promise<{ status: string; code?: string; message?: string }> | undefined;
+      if (scenario === "judge real refresh deadlock") checkpointReadHook.callback = async () => {
+        if (active && checks >= 2 && !changed) {
+          changed = true;
+          const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, latest.runId));
+          let runLocked!: () => void;
+          const locked = new Promise<void>(r => { runLocked = r; });
+          // The real settleWarmRetention, inside a teardown that already owns the run.
+          warmResult = transaction(async tx => {
+            await tx.execute(sql`set local lock_timeout = '8s'`);
+            await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, latest.runId)).for("update");
+            runLocked();
+            await new Promise(r => setTimeout(r, 100));
+            await settleWarmRetention(tx as unknown as typeof db, lease!, "keep_running");
+          }).then(() => ({ status: "committed" }), (err: any) => ({ status: "rejected", code: err.cause?.code ?? err.code, message: err.cause?.message ?? err.message }));
+          await locked;
+        }
+      };
+      const execute = followUp.remoteExecute.getMockImplementation()!;
+      followUp.remoteExecute.mockImplementation(async request => {
+        const text = JSON.stringify(request);
+        if (text.includes("paperclip-runner-generation-")) {
+          probes++;
+          if (active) openProbeTransactions++;
+          if (scenario === "no transaction") expect(active, "remote probe must not hold a transaction").toBeUndefined();
+        }
+        if (text.includes("runner-state.json")) return { exitCode: 0, timedOut: false,
+          stdout: Buffer.from(JSON.stringify({ schema: "paperclip.runner.durable.state.v1", ...latest.identity,
+            lifecycle: "suspended", outbox: [], pendingTerminalDelivery: null, pendingProviderCleanup: null,
+            warmTransition: null })).toString("base64"), stderr: "" };
+        const result = await execute(request);
+        if (text.includes("paperclip-runner-generation-check") && ++checks === 2
+          && scenario !== "no transaction" && scenario !== "lease changed after CAS" && !raced.has(scenario)) {
+          if (scenario === "source run changed" || scenario === "prior run changed") {
+            await db.update(heartbeatRuns).set({ updatedAt: new Date(Date.now() + 60_000) })
+              .where(eq(heartbeatRuns.id, scenario === "source run changed" ? latest.runId : prior.runId));
+          } else if (scenario === "source lease changed") {
+            await db.update(environmentLeases).set({ metadata: { remoteCwd: "/workspace", changedBeforeCAS: true } })
+              .where(eq(environmentLeases.heartbeatRunId, latest.runId));
+          } else if (scenario === "source checkpoint deleted") {
+            await db.delete(nativeRunnerCheckpoints).where(eq(nativeRunnerCheckpoints.runId, latest.runId));
+          } else {
+            await (active ?? db).update(nativeRunFinalizations).set(scenario === "coordinator changed"
+              ? { controllerGeneration: 2 } : { updatedAt: scenario === "coordinator microsecond changed"
+                ? sql`${nativeRunFinalizations.updatedAt} + interval '1 microsecond'` : new Date(Date.now() + 60_000) })
+              .where(eq(nativeRunFinalizations.runId, latest.runId));
+          }
+          changed = true;
+        }
+        return result;
+      });
+      try {
+        const outcome = await followUp.start("resumed");
+        expect(probes).toBeGreaterThan(0);
+        if (raced.has(scenario)) {
+          await Promise.all(pending);
+          const warm = await warmResult;
+          const originalPreserved = await readFile(path, "utf8") === fixture.originalBytes;
+          const result = { scenario, outcome, writers, warm, refreshError, originalPreserved, archives: await archivedOwners(root) };
+          if (process.env.S099D_OUT) {
+            await writeFile(join(process.env.S099D_OUT, `${scenario.replaceAll(" ", "-")}-result.json`), JSON.stringify(result, null, 2));
+          }
+          const held = outcome === "native_runner_checkpoint_projection_held:source_changed" && originalPreserved
+            && result.archives.length === 0;
+          if (scenario === "judge real refresh deadlock") {
+            expect(changed).toBe(true);
+            expect(warm?.code, "warm retention must not be a deadlock victim").not.toBe("40P01");
+            expect(refreshError?.code, "projection refresh must not be a deadlock victim").not.toBe("40P01");
+            expect(warm?.status).toBe("committed");
+            // Warm retention rewrote the compared lease first; the refresh then waits and refuses.
+            expect(held).toBe(true);
+          } else {
+            expect(triggered).toBe(true);
+            expect(Object.keys(writers).length).toBeGreaterThan(0);
+            for (const [name, writer] of Object.entries(writers)) {
+              expect(writer.error, name).toBeUndefined();
+              // Blocked by the fence until the refresh ended, or detected by the final snapshot.
+              expect(writer.settledAfterRefresh === true || held, `${name} was neither fenced nor detected`).toBe(true);
+            }
+            if (scenario === "lease insert before run fence") expect(held).toBe(true);
+          }
+        } else if (scenario === "no transaction") {
+          expect(openProbeTransactions, "remote probe must not hold a transaction").toBe(0);
+          expect(outcome).toBe(ADMITTED);
+          expect(JSON.parse(await readFile(path, "utf8")).identity).toEqual(latest.identity);
+          expect(await archivedOwners(root)).toEqual([prior.runId]);
+        } else {
+          expect(changed).toBe(true);
+          expect(outcome).toBe("native_runner_checkpoint_projection_held:source_changed");
+          expect(await readFile(path, "utf8")).toBe(fixture.originalBytes);
+          expect(await archivedOwners(root)).toEqual([]);
+        }
+        await fixture.assertBackup();
+      } finally { checkpointReadHook.callback = null; spy.mockRestore(); await Promise.allSettled(pending); await warmResult; }
+    }, 60_000);
+
+  it.each([
+    ...[
+      { code: "40P01", failures: 1 }, { code: "40P01", failures: 3 },
+      { code: "40001", failures: 1 }, { code: "40001", failures: 3 },
+      { code: "55P03", failures: 1 },
+    ].map(row => ({ ...row, afterApply: false })),
+    { code: "40P01", failures: 1, afterApply: true },
+  ])("projection transaction retry: $code after $failures failures (afterApply=$afterApply)", async ({ code, failures, afterApply }) => {
+    const fixture = await staleProjection("codex", true);
+    const { prior, latest, followUp, root, path } = fixture;
+    const transaction = db.transaction.bind(db);
+    const attempts: { xid: string; checkpointReads: number }[] = [];
+    let checkpointReads = 0;
+    checkpointReadHook.callback = async () => { checkpointReads++; };
+    const spy = vi.spyOn(db, "transaction").mockImplementation((callback, config) => transaction(async tx => {
+      let refresh = false, injected = false;
+      const select = tx.select.bind(tx);
+      const wrap = (query: any): any => new Proxy(query, { get(target, key) {
+        if (key === "then") return (yes: any, no: any) => (async () => {
+          const text = target.toSQL().sql;
+          if (text.includes('to_jsonb("environment_leases")')) refresh = true;
+          if (refresh && !injected && text.includes('from "heartbeat_runs"') && /for update/i.test(text)) {
+            injected = true;
+            const [row] = await tx.execute(sql`select txid_current()::text as xid`);
+            attempts.push({ xid: String(row!.xid), checkpointReads });
+            if (!afterApply && attempts.length <= failures) {
+              // Real PostgreSQL abort/rollback, before the filesystem apply.
+              await tx.execute(sql.raw(`do $$ begin raise exception 'forced projection conflict' using errcode = '${code}'; end $$`));
+            }
+          }
+          return await target;
+        })().then(yes, no);
+        const value = Reflect.get(target, key, target);
+        if (typeof value !== "function" || typeof key === "symbol" || key === "constructor") return value;
+        return (...args: any[]) => {
+          const result = value.apply(target, args);
+          return result && typeof result === "object" && (result === target || typeof result.then === "function") ? wrap(result) : result;
+        };
+      } });
+      (tx as any).select = (...args: any[]) => {
+        const builder = (select as any)(...args);
+        return new Proxy(builder, { get(target, key) {
+          const value = Reflect.get(target, key, target);
+          return key === "from" ? (...args: any[]) => wrap(value.apply(target, args)) : value;
+        } });
+      };
+      const result = await callback(tx);
+      if (refresh && afterApply) {
+        await tx.execute(sql`do $$ begin raise exception 'forced projection commit conflict' using errcode = '40P01'; end $$`);
+      }
+      return result;
+    }, config));
+    try {
+      const outcome = await followUp.start();
+      const retryable = code === "40P01" || code === "40001";
+      expect(attempts).toHaveLength(retryable && !afterApply ? Math.min(failures + 1, 3) : 1);
+      expect(new Set(attempts.map(attempt => attempt.xid)).size).toBe(attempts.length);
+      for (let index = 1; index < attempts.length; index++) expect(attempts[index]!.checkpointReads).toBeGreaterThan(attempts[index - 1]!.checkpointReads);
+      if (retryable && failures === 1 && !afterApply) {
+        expect(outcome).toBe(ADMITTED);
+        expect(JSON.parse(await readFile(path, "utf8")).identity).toEqual(latest.identity);
+        expect(await archivedOwners(root)).toEqual([prior.runId]);
+      } else {
+        if (retryable) {
+          expect(outcome).toBe("native_runner_checkpoint_projection_held:transaction_conflict");
+          expect(followUp.failures.at(-1)).toHaveProperty("code", outcome);
+        }
+        if (afterApply) {
+          expect(JSON.parse(await readFile(path, "utf8")).identity).toEqual(latest.identity);
+          expect(await archivedOwners(root)).toEqual([prior.runId]);
+        } else {
+          expect(await readFile(path, "utf8")).toBe(fixture.originalBytes);
+          expect(await archivedOwners(root)).toEqual([]);
+        }
+      }
+      await fixture.assertBackup();
+      if (process.env.S099E_OUT) await writeFile(join(process.env.S099E_OUT, `retry-${code}-${failures}-${afterApply}.json`),
+        JSON.stringify({ code, failures, afterApply, attempts, outcome, backupReadableUnchanged: true }, null, 2));
+    } finally { checkpointReadHook.callback = null; spy.mockRestore(); }
+  }, 60_000);
+
+  // Independent RFL-S099D experiments. Only fixture construction/provider boundary
+  // are shared with the product test; SQL interleavings and acceptance are judge-owned.
+  it.each(["retire-order"])(
+    "independent S099D %s", async mode => {
+      const fixture = await staleProjection("codex", true);
+      const { prior, latest, followUp, root, path } = fixture;
+      await recordPriorLeaseOnSameSandbox(prior, followUp);
+      const [lease] = await db.insert(environmentLeases).values({ companyId,
+        environmentId: followUp.environmentId, issueId: prior.issueId, heartbeatRunId: latest.runId,
+        provider: "daytona", providerLeaseId: followUp.providerLeaseId,
+        status: mode === "warm-order" ? "active" : "released",
+        leasePolicy: mode === "warm-order" ? "reuse_by_environment" : "ephemeral",
+        releasedAt: mode === "warm-order" ? null : new Date(), metadata: { remoteCwd: "/workspace" }
+      }).returning();
+      const manifestBytes = await readFile(join(fixture.backupRoot, "manifest.json"), "utf8");
+      const actualManifest = JSON.parse(manifestBytes);
+      const retireProviderLeaseId = actualManifest.sourceProviderLeaseId;
+      const manifestSha256 = `sha256:${createHash("sha256").update(manifestBytes).digest("hex")}`;
+      const [retireLease] = await db.insert(environmentLeases).values({ companyId,
+        environmentId: followUp.environmentId, issueId: prior.issueId, heartbeatRunId: latest.runId,
+        provider: "daytona", providerLeaseId: retireProviderLeaseId, status: "released",
+        leasePolicy: "reuse_by_environment", releasedAt: new Date(), metadata: {
+          remoteCwd: "/workspace", sandboxState: "started", reusableSandboxLease: { version: 1, provider: "daytona" },
+          nativeHarnessBackup: { schema: "paperclip.native-harness-backup-stamp.v2",
+            normalizedSessionId: latest.identity.normalizedSessionId,
+            runnerInstanceId: latest.identity.runnerInstanceId, sessionScopeSha256: root.split("/").at(-1),
+            sourceProviderLeaseId: retireProviderLeaseId, authorizedProviderLeaseId: retireProviderLeaseId,
+            manifestSha256, completedAt: actualManifest.completedAt }
+        } }).returning();
+      type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+      const transaction = db.transaction.bind(db);
+      const evidence: any = { mode, events: [], locks: [], writes: [] };
+      let active: Tx | undefined, checks = 0, refreshPid = 0, didTrigger = false;
+      let refreshEnded = false, warmStarted = false, releaseWarm = () => {};
+      let warmResult: Promise<any> | undefined;
+      const pending: Promise<any>[] = [];
+      const activity = async (pid: number) => {
+        const rows: any = await db.execute(sql`select pid, state, wait_event_type, wait_event,
+          pg_blocking_pids(pid) as blockers, query from pg_stat_activity where pid = ${pid}`);
+        return rows[0];
+      };
+      const waitFor = async (fn: () => Promise<boolean>, ms = 2000) => {
+        const end = Date.now() + ms;
+        while (Date.now() < end) { if (await fn()) return true; await new Promise(r => setTimeout(r, 20)); }
+        return false;
+      };
+      const startWrite = async (name: string, write: (tx: Tx) => PromiseLike<unknown>, requireBlock: boolean) => {
+        const entry: any = { name }; evidence.writes.push(entry);
+        let ready!: () => void; const pidReady = new Promise<void>(r => { ready = r; });
+        let settled = false;
+        const done = transaction(async tx => {
+          await tx.execute(sql`set local lock_timeout = '6s'`);
+          entry.pid = Number((await tx.execute(sql`select pg_backend_pid() as pid`))[0]!.pid);
+          ready(); await write(tx);
+        }).then(() => { settled = true; entry.committed = true; entry.afterRefresh = refreshEnded; },
+          (err: any) => { settled = true; entry.error = err.cause?.code ?? err.code ?? String(err); ready(); });
+        pending.push(done); await pidReady;
+        if (requireBlock) {
+          entry.blocked = await waitFor(async () => {
+            if (settled) return false;
+            const row = await activity(entry.pid);
+            if (row?.wait_event_type === "Lock" && row.blockers?.includes(refreshPid)) {
+              entry.activity = row; return true;
+            }
+            return false;
+          }, 1000);
+          entry.settledInGap = settled;
+        } else await done;
+      };
+      const hook = async (state: any, text: string, phase: string) => {
+        if (text.includes('to_jsonb("environment_leases")')) state.refresh = true;
+        if (!state.refresh) return;
+        evidence.events.push({ phase, text });
+        const update = /for update/i.test(text);
+        const run = update && text.includes('from "heartbeat_runs"');
+        const leases = update && text.includes('from "environment_leases"');
+        const parts = update && text.includes('from "native_runner_checkpoints"');
+        if (phase === "after" && run) state.runLocked = true;
+        if (phase === "after" && parts) state.partsLocked = true;
+        if (didTrigger) return;
+        if (mode === "retire-order" && phase === "before" && run) {
+          didTrigger = true; evidence.trigger = "before refresh run lock";
+          // With R -> L retirement already owns R. Observe refresh waiting there
+          // before releasing it; with the old order it reaches L and deadlocks.
+          pending.push((async () => {
+            evidence.refreshBlocked = await waitFor(async () => {
+              const row = await activity(refreshPid);
+              if (row?.wait_event_type === "Lock") { evidence.locks.push(row); return true; }
+              return false;
+            });
+            releaseWarm();
+          })());
+        } else if (mode === "retire-order" && phase === "before" && leases) {
+          didTrigger = true; evidence.trigger = "before refresh lease lock";
+          const watcher = (async () => {
+            evidence.refreshLeaseBlocked = await waitFor(async () => {
+              const row = await activity(refreshPid);
+              if (row?.wait_event_type === "Lock") { evidence.locks.push(row); return true; }
+              return false;
+            }); releaseWarm();
+          })(); pending.push(watcher);
+        } else if (mode === "phantom-block" && phase === "after" && leases) {
+          didTrigger = true;
+          await startWrite("insert", tx => tx.insert(environmentLeases).values({ companyId,
+            environmentId: followUp.environmentId, issueId: prior.issueId, heartbeatRunId: latest.runId,
+            provider: "daytona", providerLeaseId: followUp.providerLeaseId, status: "released",
+            releasedAt: new Date(), metadata: { remoteCwd: "/workspace", independentPhantom: true } }), true);
+        } else if (mode === "phantom-before" && phase === "before" && run) {
+          didTrigger = true;
+          await startWrite("insert", tx => tx.insert(environmentLeases).values({ companyId,
+            environmentId: followUp.environmentId, issueId: prior.issueId, heartbeatRunId: latest.runId,
+            provider: "daytona", providerLeaseId: followUp.providerLeaseId, status: "released",
+            releasedAt: new Date(), metadata: { remoteCwd: "/workspace", independentPhantom: true } }), false);
+        } else if (mode === "late-lease-write" && phase === "after" && state.partsLocked
+          && text.includes('to_jsonb("environment_leases")')) {
+          didTrigger = true;
+          await startWrite("update", tx => tx.update(environmentLeases)
+            .set({ metadata: sql`${environmentLeases.metadata} || '{"independentLate":true}'::jsonb` })
+            .where(eq(environmentLeases.id, lease!.id)), true);
+        }
+      };
+      const spy = vi.spyOn(db, "transaction").mockImplementation((callback, config) => {
+        const state: any = { refresh: false };
+        return transaction(async tx => {
+          active = tx;
+          const select = tx.select.bind(tx);
+          const wrap = (q: any): any => new Proxy(q, { get(target, key) {
+            if (key === "then") return (yes: any, no: any) => {
+              let text = ""; try { text = target.toSQL().sql; } catch {}
+              return (async () => { await hook(state, text, "before");
+                const rows = await target; await hook(state, text, "after"); return rows; })().then(yes, no);
+            };
+            const val = Reflect.get(target, key, target);
+            if (typeof val !== "function" || typeof key === "symbol" || key === "constructor") return val;
+            return (...args: any[]) => { const r = val.apply(target, args);
+              return r && typeof r === "object" && (r === target || typeof r.then === "function") ? wrap(r) : r; };
+          } });
+          (tx as any).select = (...args: any[]) => {
+            const builder = (select as any)(...args);
+            return new Proxy(builder, { get(t, k) { const v = Reflect.get(t, k, t);
+              return k === "from" ? (...a: any[]) => wrap(v.apply(t, a)) : v; } });
+          };
+          refreshPid = Number((await tx.execute(sql`select pg_backend_pid() as pid`))[0]!.pid);
+          try { return await callback(tx); }
+          catch (err: any) { if (state.refresh) evidence.refreshError = { code: err.cause?.code ?? err.code,
+            message: err.cause?.message ?? err.message }; throw err; }
+          finally { active = undefined; }
+        }, config).finally(() => { if (state.refresh) refreshEnded = true; });
+      });
+      checkpointReadHook.callback = async () => {
+        if (mode !== "retire-order" || !active || checks < 2 || warmStarted) return;
+        warmStarted = true;
+        let ready!: () => void; const locked = new Promise<void>(r => { ready = r; });
+        const release = new Promise<void>(r => { releaseWarm = r; });
+        const { retiredSourceAuthorizesNativeBackupRestore } = await import("./native-retired-backup-source.js");
+        const restoreDb = new Proxy(db, { get(target, key) {
+          if (key === "transaction") return (callback: any, config: any) => transaction(async tx => {
+            await tx.execute(sql`set local lock_timeout = '8s'`);
+            evidence.retirePid = Number((await tx.execute(sql`select pg_backend_pid() as pid`))[0]!.pid);
+            const update = tx.update.bind(tx);
+            const wrapWrite = (q: any): any => new Proxy(q, { get(t, k) {
+              if (k === "then") return (yes: any, no: any) => (async () => {
+                const text = t.toSQL().sql; const rows = await t;
+                if (text.startsWith('update "environment_leases"')) {
+                  evidence.realLeaseUpdate = text; evidence.claimedRows = rows;
+                  ready(); await release;
+                }
+                return rows;
+              })().then(yes, no);
+              const v = Reflect.get(t, k, t);
+              if (typeof v !== "function" || typeof k === "symbol" || k === "constructor") return v;
+              return (...args: any[]) => { const r = v.apply(t, args);
+                return r && typeof r === "object" && (r === t || typeof r.then === "function") ? wrapWrite(r) : r; };
+            } });
+            (tx as any).update = (...args: any[]) => wrapWrite((update as any)(...args));
+            return callback(tx);
+          }, config);
+          const v = Reflect.get(target, key, target); return typeof v === "function" ? v.bind(target) : v;
+        } });
+        warmResult = retiredSourceAuthorizesNativeBackupRestore(restoreDb, { companyId,
+          currentRunId: followUp.runId, normalizedSessionId: latest.identity.normalizedSessionId,
+          manifest: { sourceProviderLeaseId: retireProviderLeaseId, runnerInstanceId: latest.identity.runnerInstanceId,
+            normalizedSessionId: latest.identity.normalizedSessionId }, manifestSha256,
+          targetProviderLeaseId: followUp.providerLeaseId,
+        }).then(authorized => ({ status: "committed", authorized }), (err: any) => ({ status: "rejected",
+          code: err.cause?.code ?? err.code, message: err.cause?.message ?? err.message }));
+        // A refusal before supersede has no row lock: fail rather than hang.
+        await Promise.race([locked, warmResult.then(result => { throw new Error(`restore never held lease: ${JSON.stringify(result)}`); })]);
+      };
+      const execute = followUp.remoteExecute.getMockImplementation()!;
+      followUp.remoteExecute.mockImplementation(async request => {
+        const text = JSON.stringify(request);
+        if (text.includes("runner-state.json")) return { exitCode: 0, timedOut: false, stderr: "",
+          stdout: Buffer.from(JSON.stringify({ schema: "paperclip.runner.durable.state.v1", ...latest.identity,
+            lifecycle: "suspended", outbox: [], pendingTerminalDelivery: null,
+            pendingProviderCleanup: null, warmTransition: null })).toString("base64") };
+        const result = await execute(request);
+        if (text.includes("paperclip-runner-generation-check")) checks++;
+        return result;
+      });
+      try {
+        evidence.outcome = await followUp.start("resumed");
+        releaseWarm(); await Promise.all(pending); evidence.warm = await warmResult;
+        evidence.triggered = didTrigger; evidence.originalPreserved = await readFile(path, "utf8") === fixture.originalBytes;
+        evidence.archives = await archivedOwners(root);
+        await fixture.assertBackup(); evidence.backupReadableUnchanged = true;
+        if (process.env.S099D_OUT) await writeFile(join(process.env.S099D_OUT, `independent-${mode}.json`), JSON.stringify(evidence, null, 2));
+        expect(didTrigger).toBe(true);
+        expect(evidence.claimedRows).toHaveLength(1);
+        expect(evidence.refreshError?.code, "refresh must not deadlock with real backup-source retirement").not.toBe("40P01");
+        expect(evidence.warm?.code, "real backup-source retirement must not deadlock with refresh").not.toBe("40P01");
+        expect(evidence.warm?.status).toBe("committed");
+        expect(evidence.warm?.authorized).toBe(true);
+        expect(evidence.outcome).toBe("native_runner_checkpoint_projection_held:source_changed");
+        expect(evidence.originalPreserved).toBe(true); expect(evidence.archives).toEqual([]);
+      } finally { releaseWarm(); checkpointReadHook.callback = null; spy.mockRestore();
+        await Promise.allSettled(pending); await warmResult; }
+    }, 60_000);
 
   it("starts an unclaimed remote follow-up from the previous owner's external marker under a bootstrap claim", async () => {
     const fixture = await staleProjection("codex", true);
