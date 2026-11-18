@@ -15908,12 +15908,14 @@ describe("native warm session supervision", () => {
     describe("c3 A-REPAIR4: a person's Stop retained the box; the successor's retirement of its warm owner", () => {
       type Receipt = "own-stopped" | "own-destroyed" | "none" | "foreign-stopped";
       const boatInactive = () => new Error("Boat sandbox lease is no longer active.");
+      let ar4Cleanup = false;
       const scenario = async (kind: string, opts: { receipt?: Receipt; closeError?: () => Error; stoppedTurn?: Record<string, unknown> } = {}) => {
         const receipt = opts.receipt ?? "own-stopped", closeError = opts.closeError ?? boatInactive;
         const { base, next } = fixture(`c3-ar4-${kind}`);
         const environmentId = `c3-ar4-env-${kind}`, stoppedBox = `bx_stopped_${kind}`;
         const closeMs: number[] = [];
         const close = vi.fn(async (): Promise<void> => {
+          if (ar4Cleanup) return; // afterEach: let the refused owners close so later tests start with none.
           const t = performance.now();
           try { await new Promise(resolve => setTimeout(resolve, 5)); throw closeError(); } finally { closeMs.push(performance.now() - t); }
         });
@@ -15963,7 +15965,10 @@ describe("native warm session supervision", () => {
         return { base, stoppedBox, close, turns, runs, run, record };
       };
       const answerBoundMs = 60_000; // warm+60: the first answer lands inside 60 s of the Send / typed message.
-      afterEach(async () => { await closeIdleWarmNativeSessionsForRestart(); });
+      afterEach(async () => {
+        ar4Cleanup = true;
+        try { await closeIdleWarmNativeSessionsForRestart(); } finally { ar4Cleanup = false; }
+      });
       const unproven = /^native_predecessor_retirement_unproven/;
       // The refusal rows: with the owner's lease row present the successor waits
       // up to warmSessionReleaseWait (30 s) for a typed receipt that never comes.
