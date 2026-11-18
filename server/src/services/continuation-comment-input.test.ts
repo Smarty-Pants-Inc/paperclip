@@ -243,9 +243,9 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
       liveOwner: { agentId: f.agentId, runId: f.run.id } });
     console.log("A3_CARD_EVIDENCE", JSON.stringify({ started, sourceRunId: f.run.id, stoppedCardId: card.id,
       unrelatedMessageId: next.id, input }));
-    // supersedes(c1x answer-first carry; C3-2 rf-5): the typed batch rides beside a carried card answer, so the
-    // unrelated typed input rides in both cases; only the stopped card's own exclusion depends on `started`.
-    expect(input.wakeCommentIds, "the unrelated typed input rides beside the card or alone").toEqual([next.id]);
+    // C3-2 supersedes the c1x card-only expectation: unrelated typed input always
+    // rides; only the card's own sender-Stop decision depends on answering started.
+    expect(input.wakeCommentIds, "the unrelated typed input always rides").toEqual([next.id]);
     expect(input.interactionIds ?? []).toEqual(started ? [] : [card.id]);
   });
 
@@ -255,6 +255,7 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     const t0 = f.message.createdAt.getTime();
     const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
       kind: "ask_user_questions", status: "answered", createdByAgentId: f.agentId, sourceRunId: f.run.id,
+      sourceCommentId: f.message.id, originCommentIds: [f.message.id],
       resolvedByUserId: "board", resolvedAt: new Date(t0 + 1_000), idempotencyKey: randomUUID(),
       payload: { version: 1, questions: [{ id: "q", prompt: "Continue?", selectionMode: "single", options: [{ id: "yes", label: "YES" }] }] },
       result: { version: 1, answers: [{ questionId: "q", optionIds: ["yes"] }] } } as never).returning();
@@ -305,57 +306,71 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     expect(await readContinuationCommentInput(db, { ...f, runId: source.id }), "ANSWERED is never re-carried").toEqual({});
   });
 
-  // C3-2 (rf-5): a predecessor with a pending CARD answer AND a typed batch carries BOTH into its successor's own
-  // input. RED on the card-first early return: the typed message M was dropped beside the card, so the successor's
-  // completed answer never attributed to M and the sweep posted a false notice for it.
-  it("C3-2: a mixed [typed M, card C] continuation carries both; answering both answers M by own input, no notice for M or C, M not re-sent", async () => {
-    const f = await fixture();
-    const t0 = f.message.createdAt.getTime();
-    const [asker] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
-      status: "succeeded", contextSnapshot: { issueId: f.issueId, wakeCommentId: f.message.id } }).returning();
+  // KEEP: C3-2 caught a dropped typed batch beside a card answer. Persisted PostgreSQL rows exercise
+  // the carry, the successor's OWN attribution and the actual notice sweep (no SQL-text assertions).
+  it.each(["direct", "firstTurn", "chain", "respondWake", "respondWakeContext"])("C3-2: mixed typed + card carry preserves both, not the asking origin (%s)", async (field) => {
+    const f = await fixture(), t0 = f.message.createdAt.getTime();
     const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
-      kind: "ask_user_questions", status: "answered", createdByAgentId: f.agentId, sourceRunId: asker.id,
-      resolvedByUserId: "board", resolvedAt: new Date(t0 + 1_000), idempotencyKey: randomUUID(),
+      // A legacy card may have recorded origins but no source run. Its origin
+      // must still be excluded, independently of the shared ANSWERED predicate.
+      kind: "ask_user_questions", status: "answered", createdByAgentId: f.agentId, sourceRunId: field === "direct" ? null : f.run.id,
+      // Exercise each documented origin spelling independently as well as both together.
+      sourceCommentId: field === "firstTurn" ? null : f.message.id,
+      originCommentIds: field === "direct" ? [] : [f.message.id], resolvedByUserId: "board",
+      resolvedAt: new Date(t0 + 1_000), idempotencyKey: randomUUID(),
       payload: { version: 1, questions: [{ id: "q", prompt: "Continue?", selectionMode: "single", options: [{ id: "yes", label: "YES" }] }] },
       result: { version: 1, answers: [{ questionId: "q", optionIds: ["yes"] }] } } as never).returning();
-    // The failed predecessor's own pending input: the typed message M (typed after the question) and the card
-    // answer C. The asking turn's own comment (f.message, older than the card) is named too and must not ride.
-    const [m] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "user",
-      authorUserId: "board", body: "Typed M beside the card answer" }).returning();
-    await db.update(heartbeatRuns).set({ finishedAt: new Date(t0 + 2_000),
-      contextSnapshot: { issueId: f.issueId, wakeCommentId: m.id, wakeCommentIds: [f.message.id, m.id], interactionId: card.id } })
-      .where(eq(heartbeatRuns.id, f.run.id));
-    const input = await readContinuationCommentInput(db, { ...f, runId: f.run.id });
-    expect(input.interactionIds, "the card answer rides").toEqual([card.id]);
-    expect(input.wakeCommentIds, "the typed batch rides beside the card; the asking turn's comment does not").toEqual([m.id]);
-    expect(input).toMatchObject({ interactionId: card.id, wakeCommentId: m.id, commentId: m.id, firstTurnQueuedInput: null });
-    // Each side keeps its own live-owner fence: a live run already owning the card blocks the card only.
-    const [liveCard] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
-      nativeIssueId: f.issueId, status: "running", contextSnapshot: { issueId: f.issueId, interactionIds: [card.id] } }).returning();
-    const fenced = await readContinuationCommentInput(db, { ...f, runId: f.run.id });
-    expect(fenced.interactionIds, "card live-owner fence").toBeUndefined();
-    expect(fenced.wakeCommentIds, "the typed batch is not fenced by a card owner").toEqual([m.id]);
-    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, liveCard.id));
+    const [typed] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: "board", body: "Also recall COBALT with YES", createdAt: new Date(t0 + 2_000) }).returning();
+    const [ancestor] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, status: "failed", retryOfRunId: f.run.id,
+      contextSnapshot: { issueId: f.issueId, firstTurnQueuedInput: { commentIds: [typed.id] } } }).returning();
+    const context = { issueId: f.issueId, wakeCommentId: f.message.id,
+      ...(field === "firstTurn" ? { firstTurnQueuedInput: { commentIds: [f.message.id, typed.id] } }
+        : field === "chain" ? {} : { wakeCommentIds: [f.message.id, typed.id] }),
+      ...(!field.startsWith("respondWake") ? { interactionId: card.id } : {}) };
+    const [source] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, status: "failed", retryOfRunId: field === "chain" ? ancestor.id : f.run.id,
+      contextSnapshot: context }).returning();
+    if (field.startsWith("respondWake")) {
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+        source: "on_demand", reason: "issue_interaction_responded", status: "completed", runId: source.id,
+        payload: { issueId: f.issueId, ...(field === "respondWake" ? { interactionId: card.id }
+          : { _paperclipWakeContext: { interactionId: card.id } }) } }).returning();
+      await db.update(heartbeatRuns).set({ wakeupRequestId: wake.id }).where(eq(heartbeatRuns.id, source.id));
+    }
+    const input = field === "direct"
+      ? await pendingContinuationCommentInput(db, { ...f, runId: source.id, contextSnapshot: context })
+      : await readContinuationCommentInput(db, { ...f, runId: source.id });
+    expect.soft(input.interactionIds).toEqual([card.id]);
+    expect.soft(input.wakeCommentIds, "the separate typed batch must survive beside the card").toEqual([typed.id]);
+    expect.soft([input.wakeCommentId, input.commentId, ...((input.wakeCommentIds as string[] | undefined) ?? [])],
+      "the asking turn's origin is not the person's new input").not.toContain(f.message.id);
     const [successor] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
-      nativeIssueId: f.issueId, status: "succeeded", retryOfRunId: f.run.id, finishedAt: new Date(t0 + 4_000),
+      nativeIssueId: f.issueId, status: "succeeded", retryOfRunId: source.id,
       contextSnapshot: { issueId: f.issueId, ...input } }).returning();
     const [reply] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
       authorType: "agent", authorAgentId: f.agentId, createdByRunId: successor.id,
-      body: "COBALT; acted on YES.", createdAt: new Date(t0 + 3_000) }).returning();
+      body: "YES; COBALT remembered.", createdAt: new Date(t0 + 3_000) }).returning();
     await db.update(heartbeatRuns).set({ resultJson: { presentationDecision: { commentAction: "create", commentId: reply.id } } })
       .where(eq(heartbeatRuns.id, successor.id));
-    const answered = async (id: string, at: Date) => (await db.select({ answered: completedPersonMessageAnswerSql({ id: sql`${id}::uuid`,
-      companyId: sql`${f.companyId}::uuid`, issueId: sql`${f.issueId}::uuid`,
-      createdAt: sql`${at.toISOString()}::timestamptz` }) }).from(issues).where(eq(issues.id, f.issueId)))[0].answered;
-    expect(await answered(m.id, m.createdAt), "M is ANSWERED through the successor's OWN input").toBe(true);
-    expect(await answered(card.id, card.resolvedAt!), "C is ANSWERED").toBe(true);
-    await settleUnansweredPersonMessage(db, { ...f, now: new Date(t0 + 20 * 60_000) });
-    await settleUnansweredPersonMessage(db, { ...f, now: new Date(t0 + 40 * 60_000) });
+    const states = [];
+    for (const message of [{ id: typed.id, at: typed.createdAt }, { id: card.id, at: card.resolvedAt! }]) {
+      const [state] = await db.select({ answered: completedPersonMessageAnswerSql({ id: sql`${message.id}::uuid`,
+        companyId: sql`${f.companyId}::uuid`, issueId: sql`${f.issueId}::uuid`, createdAt: sql`${message.at.toISOString()}::timestamptz` }) })
+        .from(issues).where(eq(issues.id, f.issueId));
+      states.push({ id: message.id, ...state });
+      expect.soft(state.answered, `OWN pending input is credited: ${message.id}`).toBe(true);
+    }
+    const sweep = await settleUnansweredPersonMessage(db, { ...f, now: new Date(t0 + 20 * 60_000) });
     const notices = await db.select({ id: issueComments.id, body: issueComments.body }).from(issueComments)
-      .where(and(eq(issueComments.issueId, f.issueId), sql`${issueComments.authorType} <> 'user'`, sql`${issueComments.id} <> ${reply.id}`));
-    expect(notices, "no notice for M or C").toEqual([]);
-    expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id }), "M and C are never re-sent").toEqual({});
-    expect(await readContinuationCommentInput(db, { ...f, runId: successor.id }), "nor from the successor").toEqual({});
+      .where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")));
+    console.log("C3_2_EVIDENCE", JSON.stringify({ field, originId: f.message.id, typedId: typed.id, cardId: card.id,
+      sourceRunId: source.id, successorRunId: successor.id, input, states, sweep, notices }));
+    expect.soft(sweep).toMatchObject({ kind: "answered" });
+    expect(notices).toHaveLength(0);
+    expect(await readContinuationCommentInput(db, { ...f, runId: source.id }),
+      "completed input is not re-carried, including the asking origin").toEqual({});
   });
 
   it("does not manufacture comment intent for ordinary work", async () => {
@@ -472,7 +487,8 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     const [i, j] = await db.insert(issues).values([{ companyId: c.id, title: "This task", status: "in_progress", assigneeAgentId: a.id },
       { companyId: c.id, title: "Other task", assigneeAgentId: a.id }]).returning();
     const [m] = await db.insert(issueComments).values({ companyId: c.id, issueId: i.id, authorType: "user", authorUserId: "board", body: "Old asking turn" }).returning();
-    const base = { companyId: c.id, issueId: i.id, kind: "ask_user_questions", status: "answered", createdByAgentId: a.id, resolvedByUserId: "board",
+    const base = { companyId: c.id, issueId: i.id, kind: "ask_user_questions", status: "answered", createdByAgentId: a.id,
+      sourceCommentId: m.id, originCommentIds: [m.id], resolvedByUserId: "board",
       resolvedAt: new Date(), title: "Continue?", payload: { version: 1, questions: [{ id: "q", prompt: "Continue?", required: true, selectionMode: "single",
         options: [{ id: "yes", label: "YES" }] }] }, result: { version: 1, answers: [{ questionId: "q", optionIds: ["yes"] }], summaryMarkdown: "YES" } };
     const [good, foreign, other, pending, stale, agentResolved] = await db.insert(issueThreadInteractions).values([
