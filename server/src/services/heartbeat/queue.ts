@@ -114,6 +114,7 @@ import {
   or,
   sql,
 } from "drizzle-orm";
+import { consumedQueuedCommentIds } from "../consumed-person-message.js";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -314,6 +315,34 @@ export function liveQueuedCommentInterruptSql(companyId: string, issueId: string
         and c.id::text in (select jsonb_array_elements_text(case
           when jsonb_typeof(agent_wakeup_requests.payload #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'
           then agent_wakeup_requests.payload #> '{_paperclipWakeContext,wakeCommentIds}' else '[]'::jsonb end))))`;
+}
+
+/**
+ * S8 order (RFL F1, fix A): the id of the agent's live queued-comment press on
+ * this issue (liveQueuedCommentInterruptSql) whose queue still holds a person's
+ * plain message that is NOT consumed (consumedQueuedCommentIds: ANSWERED,
+ * carriedInLiveRun or stopped by its own sender while answered). A press whose
+ * only remaining messages are consumed does not hold a new message back.
+ */
+export async function liveQueuedCommentPressId(q: Pick<Db, "select">, input: { companyId: string; agentId: string;
+  issueId: string }): Promise<string | null> {
+  const presses = await q.select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload })
+    .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, input.companyId),
+      eq(agentWakeupRequests.agentId, input.agentId), liveQueuedCommentInterruptSql(input.companyId, input.issueId)))
+    .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id)).limit(5);
+  for (const press of presses) {
+    const ids = queuedCommentIdsFromWakePayload(press.payload);
+    if (!ids.length) continue;
+    const plain = await q.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, input.companyId), sql`${issueComments.issueId}::text = ${input.issueId}`,
+      inArray(issueComments.id, ids.filter((id) => /^[0-9a-f-]{36}$/i.test(id))), isNull(issueComments.deletedAt),
+      isNotNull(issueComments.authorUserId), isNull(issueComments.authorAgentId)));
+    if (!plain.length) continue;
+    const consumed = await consumedQueuedCommentIds(q, { companyId: input.companyId, issueId: input.issueId,
+      agentId: input.agentId, commentIds: plain.map((c) => c.id) });
+    if (plain.some((c) => !consumed.has(c.id))) return press.id;
+  }
+  return null;
 }
 
 export const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
@@ -2117,9 +2146,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const issueId = String(wake.payload?.issueId);
       const key = `${wake.companyId}:${wake.agentId}:${issueId}`;
       if (!pressDead.has(key)) pressDead.set(key, (async () => {
-        const [live] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-          eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.agentId, wake.agentId),
-          liveQueuedCommentInterruptSql(wake.companyId, issueId))).limit(1);
+        const live = await liveQueuedCommentPressId(db, { companyId: wake.companyId, agentId: wake.agentId, issueId });
         if (live) return false;
         const [latest] = await db.select({ status: heartbeatRuns.status, finishedAt: heartbeatRuns.finishedAt })
           .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, wake.companyId),
@@ -4908,10 +4935,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // is not, releaseWakesBehindDeadPress promotes the held message.
           if (!activeExecutionRun && opts.requestedByActorType === "user" && wakeCommentId && !opts.queuedCommentInterruptId &&
               !executionWaitRequestId && !durableRequest?.failedRunRetry && !caseRequest && !reconciledSourceRunId) {
-            const [livePress] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-              eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
-              liveQueuedCommentInterruptSql(issue.companyId, issue.id),
-            )).limit(1);
+            const livePressId = await liveQueuedCommentPressId(tx as unknown as Db, { companyId: issue.companyId,
+              agentId, issueId: issue.id });
+            const livePress = livePressId ? { id: livePressId } : null;
             if (livePress) {
               await tx.insert(agentWakeupRequests).values({ ...durableReceiptFields,
                 companyId: agent.companyId, agentId, source, triggerDetail, reason,

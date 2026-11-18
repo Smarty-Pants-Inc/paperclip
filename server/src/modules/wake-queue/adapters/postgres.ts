@@ -12,6 +12,7 @@ import { notifyChatRunMilestones } from "../../../services/chat-run-milestone-no
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-work-notifications.js";
 import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
 import { readRunCancellation } from "../../../services/run-cancellation.js";
+import { consumedQueuedCommentIds } from "../../../services/consumed-person-message.js";
 import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition, isConversationReset } from "../../../services/agent-conversations.js";
@@ -287,6 +288,22 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           .then((rows) => rows[0] ?? null);
         if (!row) return null;
         const candidate = toDeferredWakeCandidate(row);
+        // S8 (rf-4 durable release): a person's saved wake whose messages are ALL
+        // consumed (consumedQueuedCommentIds: ANSWERED, carried by another live run,
+        // or stopped by their own sender while answered; the same rule as the
+        // Interrupt's batch) is never promoted; it is settled, never deleted (R-ONCE).
+        if (candidate.queuedCommentIds.length && row.requestedByActorType === "user") {
+          const consumed = await consumedQueuedCommentIds(tx as unknown as Db, { companyId, issueId, agentId: row.agentId,
+            commentIds: candidate.queuedCommentIds, excludeRunId: run.id });
+          if (candidate.queuedCommentIds.every(id => consumed.has(id))) {
+            const now = new Date();
+            await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: now, updatedAt: now,
+              error: "Already answered or stopped by its sender; not sent again" }).where(and(eq(agentWakeupRequests.id, row.id),
+              eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS)));
+            locallyExcludedWakeIds.push(row.id);
+            continue;
+          }
+        }
         const payload = candidate.payload;
         const context = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
         const pluginId = readNonEmptyString(payload.pluginId);
@@ -416,6 +433,9 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       // received would deliver them twice and can reopen finished work.
       const delivered = await deliveredQueuedCommentIds(tx, { companyId, issueId, agentId: wakeAgentId,
         commentIds: liveAndUnauthored });
+      // The same consumed rule as the promotion above (consumedQueuedCommentIds).
+      for (const id of await consumedQueuedCommentIds(tx as unknown as Db, { companyId, issueId, agentId: wakeAgentId,
+        commentIds: liveAndUnauthored.filter(id => !delivered.has(id)), excludeRunId: finishingRunId })) delivered.add(id);
       const liveNonSelfCommentIds = retainDeliveredCommentBindings
         ? liveAndUnauthored
         : liveAndUnauthored.filter(commentId => !delivered.has(commentId));
