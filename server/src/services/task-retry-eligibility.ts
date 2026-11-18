@@ -82,6 +82,14 @@ export type RetryAuthorityFacts = {
   restoreStopWait?: "copyback_stop_unconfirmed" | "agent_stop_unconfirmed" | null;
   /** An active restore hold's evidence (legacy-execution-recovery.ts owns its words). */
   restoreHold?: Record<string, unknown> | null;
+  /** rf-5 tA-min finding 1: Retry's source is a run that hold already refused at
+   * dispatch (cancelled, never started, execution_reconciliation_required), a
+   * later run than the hold's own, and no saved-work recovery can still put the
+   * files back. The fresh-continuation fallback leaves exactly that hold for a
+   * person's Retry and runs it in a new isolated workspace (held files kept,
+   * not applied), so the Retry is real: the failed-restore refusal and its
+   * "create a new task" would be false. */
+  restoreHoldRetryRunsIsolated?: boolean;
   /** The latest deferred Retry's recorded refusal reason. */
   heldRefusal?: string | null;
   /** Task Retry's own source check (canRetryStoppedRun, same assignee, task open) passes. */
@@ -157,7 +165,10 @@ export function decideRetryAuthority(facts: RetryAuthorityFacts): RetryAuthority
   // never a second mapping here. fam-retry2 (upstream wins): while Paperclip can
   // still put the files back, Retry is ACCEPTED and HELD (the hold's words: "your
   // message is kept and runs when it's back"); only a failed restore refuses.
-  if (facts.restoreHold) {
+  // A FAILED restore whose Retry the fresh-continuation fallback runs isolated
+  // (restoreHoldRetryRunsIsolated) is not refused here: it falls through to
+  // Retry's own source check, like a task with no restore hold.
+  if (facts.restoreHold && !(facts.restoreHoldRetryRunsIsolated && !restoreHoldHoldsRetry(facts.restoreHold))) {
     const text = workspaceRestoreHoldNextAction(facts.restoreHold);
     // fam-retry3 ITEM B: a restore_failed hold whose files Paperclip's workspace
     // recovery owns holds an ACCEPTED Retry; restore-card's "could not be put
@@ -299,6 +310,30 @@ export async function readRestoreHoldEvidence(db: Db, input: { companyId: string
   return hold?.evidence ?? null;
 }
 
+const EXACT_SAVED_WORK_RECOVERY_STATES = ["scheduled", "running", "awaiting_evidence"];
+/** The restoreHoldRetryRunsIsolated fact (rf-5 tA-min finding 1), in the terms
+ * fresh-continuation-fallback.ts ensureFreshContinuation reads: the Retry's
+ * source run was refused at dispatch behind the hold (cancelled, never started,
+ * execution_reconciliation_required) and is a later run than the hold's own,
+ * and the hold's saved-work recovery is not still working (its exact-recovery
+ * states keep their wait). Then a person's Retry is what that fallback waits
+ * for, and it continues the task in a fresh isolated workspace. */
+export async function readRestoreHoldRetryRunsIsolated(db: Db, input: { companyId: string; issueId: string;
+  sourceRunId?: string | null; restoreHold: Record<string, unknown> | null }) {
+  const holdRunId = input.restoreHold?.runId;
+  if (!input.sourceRunId || typeof holdRunId !== "string" || !UUID.test(holdRunId) || holdRunId === input.sourceRunId) return false;
+  if (EXACT_SAVED_WORK_RECOVERY_STATES.includes(readSystemRecovery(input.restoreHold)?.state ?? "")) return false;
+  const [refused] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.sourceRunId),
+    or(eq(heartbeatRuns.issueId, input.issueId), eq(heartbeatRuns.nativeIssueId, input.issueId),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`),
+    eq(heartbeatRuns.status, "cancelled"), isNull(heartbeatRuns.startedAt),
+    eq(heartbeatRuns.errorCode, "execution_reconciliation_required"),
+    sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (select held.created_at, held.id from ${heartbeatRuns} held
+      where held.company_id = ${input.companyId} and held.id = ${holdRunId}::uuid)`)).limit(1);
+  return Boolean(refused);
+}
+
 /**
  * Retry fold (judge R8, rf-3 A/B): the decisions a Retry is refused for before
  * anything is saved, on every Retry path (task Retry API and chat Retry):
@@ -337,6 +372,7 @@ export async function readRetryAdmissionAuthority(db: Db, input: { companyId: st
     ? (await readRetryStopGate(db, { companyId: input.companyId, issueId: input.issueId, sourceRunId: input.sourceRunId }))?.state : null;
   return decideRetryAuthority({ ...await readRetryAuthorityFacts(db, { companyId: input.companyId, issueId: input.issueId,
     sourceRunId: input.sourceRunId }), restoreHold,
+    restoreHoldRetryRunsIsolated: await readRestoreHoldRetryRunsIsolated(db, { ...input, restoreHold }),
     stopGate: gate === "expired" ? "expired" : null, retrySource: true });
 }
 export function retryRefusedBeforeAdmissionReason(reason: string) { return REFUSED_BEFORE_ADMISSION.has(reason); }
