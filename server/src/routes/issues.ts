@@ -66,6 +66,7 @@ import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboar
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
+import { assertQueuedCommentStopLinePreserved } from "../services/queued-comment-stop-line.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
@@ -8018,6 +8019,10 @@ export function issueRoutes(
       )).for("update");
       if (wakes.length !== order.length) throw new QueuedCommentMutationError("queued_comment_already_dispatching",
         "The queued message is already being dispatched");
+      await assertQueuedCommentStopLinePreserved(tx as unknown as Db, {
+        companyId: issue.companyId, issueId: issue.id, agentId: issue.assigneeAgentId,
+        comments: current.entries.map((entry) => entry.comment), orderedIds: input.orderedCommentIds,
+      });
       const slots = wakes.map((wake) => wake.requestedAt).sort((a, b) => a.getTime() - b.getTime());
       // Postgres send slots can differ only in microseconds, which Date drops.
       // Writing those back as ties would silently answer a different order.
