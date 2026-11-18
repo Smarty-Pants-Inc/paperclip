@@ -70,12 +70,19 @@ export function createChatPublicationAuthorization(db: Db, options: PublicationA
     // a slow Slack call must not leave a session idle in transaction holding
     // chat row locks. The transaction re-reads the inputs and requires the same
     // verified Slack target.
+    // Credentials resolve here too: a secrets provider can be remote. The caller
+    // holds the credential mutation lease, and the transaction re-asserts it and
+    // the runtime credential fingerprint, so changed refs are denied there.
     let verifiedSlackTarget: string | null = null;
-    if (input.endpoint.provider === "slack" && input.publication.commentId) {
+    let preCredentials: Record<string, string> | null = null;
+    let preCredentialsError: unknown = null;
+    if (input.endpoint.provider === "slack") {
+      try { preCredentials = await resolveCredentials(input.endpoint); } catch (error) { preCredentialsError = error; }
+    }
+    if (input.endpoint.provider === "slack" && input.publication.commentId && preCredentials) {
       const [preConversation] = await db.select().from(chatConversations)
         .where(eq(chatConversations.id, input.publication.conversationId));
       if (preConversation) {
-        const preCredentials = await resolveCredentials(input.endpoint);
         const target = await slackBoardPublicationCheck(db, input.endpoint, preConversation, input.publication, preCredentials.botToken ?? "");
         if (typeof target === "object") {
           if (!await verifySlackBoardChannel(input.endpoint, target, preCredentials.botToken ?? "", fetchImpl)) return null;
@@ -231,8 +238,9 @@ export function createChatPublicationAuthorization(db: Db, options: PublicationA
       }
       let authorizationActionId: string | null = null;
       if (endpoint.provider === "slack") {
-        const credentials = await resolveCredentials(endpoint, tx);
-        const target = await slackBoardPublicationCheck(tx, endpoint, conversation, input.publication, credentials.botToken ?? "");
+        if (preCredentialsError) throw preCredentialsError;
+        if (!preCredentials || endpoint.connectionId !== input.endpoint.connectionId) return null;
+        const target = await slackBoardPublicationCheck(tx, endpoint, conversation, input.publication, preCredentials.botToken ?? "");
         if (target === false || (typeof target === "object" && JSON.stringify(target) !== verifiedSlackTarget)) return null;
       }
       if (
