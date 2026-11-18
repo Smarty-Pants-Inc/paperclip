@@ -1879,6 +1879,15 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
   // smarty-dev#21194 tracks the fix, and this pin changes with it.
   const HELD_SEND_WAIT = { reason: "interrupt_handoff", message: "Sending your messages." };
   const R4 = "Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first.";
+  // Option Z (org 21:56Z; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118 amended): after a person's Stop the bar
+  // PREDICTS NOTHING. It is the ONE line (or, where the screen has the fact for free, the paused line); what
+  // Send does is told by the Send's own answer: admitted -> it runs; held -> the wait that Send's dispatch
+  // wrote (never "Sending your messages."); refused -> the refusal's own text.
+  const Z_BAR = { reason: "stopped_by_person", message: "Stopped. These messages are waiting: Send them, or delete any first." };
+  const PAUSED_BAR = { reason: "agent_paused", message: "This agent is paused. Resume it to send these messages." };
+  const IDENTITY_MISSING_WAIT = { reason: "process_identity_missing",
+    message: "The previous run has no verified stop record. Paperclip cannot start this message yet." };
+  const ACTIVE_RUN_WAIT = { reason: "execution_active", message: "Waiting for the current run. Your message is saved." };
   const RECOVERY_WAITS = {
     execution_recovery: "Waiting for execution recovery. Your message is saved.",
     remote_cleanup: "Waiting for the previous environment to stop. Your message will start automatically.",
@@ -1888,7 +1897,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     "no person stop", "acknowledged person stop + blocker", "acknowledged person stop + unrelated recovery action"] as const;
   const rows4b = (Object.keys(RECOVERY_WAITS) as Array<keyof typeof RECOVERY_WAITS>).flatMap(reason =>
     [true, false].flatMap(chat => SCENARIOS.map(scenario => [reason, chat ? "chat" : "task", scenario] as const)));
-  it.each(rows4b)("SCREEN row 4b: a %s wait on the %s after %s (no Option S on eee74ebb)", async (reason, surface, scenario) => {
+  it.each(rows4b)("supersedes(Stop bar predicts nothing, Option Z; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118) SCREEN row 4b: a %s wait on the %s after %s (no Option S on eee74ebb)", async (reason, surface, scenario) => {
     const f = await seedQueue();
     const stoppedAt = new Date("2026-08-22T15:05:00.000Z");
     const acknowledged = scenario.startsWith("acknowledged") || scenario === "interrupt stop";
@@ -1927,8 +1936,14 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     // tA-noS eee74ebb has no Option S: admission holds the owner's Send after a
     // native person Stop (nativeStopRequiresReconciliation), so no row here may
     // show R4 over a recovery wait; every recovery wait keeps its own text.
-    expect(queue.executionWait).toEqual(scenario === "person stop then Send" ? { reason: "interrupt_handoff", message: "Sending your messages." }
-        : wait);
+    // Option Z: after a person's Stop (the ONE reader, H2) the bar is the one line over any stored wait. A PLANTED
+    // pressed Send (queuedCommentInterrupt) on the held list shows the wait standing on the wake, never "Sending".
+    // A non-person cancel and the Send's interrupt stop keep their wait.
+    // The PLANTED "person stop then Send" is a Send that interrupted the turn (its cancel carries
+    // queuedCommentInterruptQueueId): not a Stop-held list, so its handoff wait is unchanged.
+    const personStop = scenario.startsWith("acknowledged person stop") || scenario === "unacknowledged person stop";
+    expect(queue.executionWait).toEqual(personStop ? Z_BAR : scenario === "person stop then Send" ? HELD_SEND_WAIT : wait);
+    expect(JSON.stringify(queue)).not.toContain(R4);
   });
 
   // SCREEN row 4b + S7-N (optS-N ebeb1bf9's term; no Option S wrapper on
@@ -1958,16 +1973,40 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
   const rowsN = (Object.keys(RECOVERY_WAITS) as Array<keyof typeof RECOVERY_WAITS>).flatMap(reason =>
     (["queued", "scheduled_retry", "running"] as const).map(other => [reason, other] as const))
     .filter(([reason, other]) => !(reason === "execution_recovery" && other === "running"));
-  it.each(rowsN)("SCREEN row 4b S7-N: a %s wait on the chat after an acknowledged owner Stop with a typed run %s keeps the wait, not the bar",
+  // Option Z + rf-4's keeper FOLLOWUP S7 (F4) re-pointed: with a typed run of this chat still queued or
+  // scheduled for retry, the bar is the one line (it predicts nothing). The REAL Send (POST
+  // queued-comments/interrupt) is HELD (resumeSavedComments returns before admission while that run is
+  // queued), and the press says the wait that REALLY applies at the press; later polls show what that Send
+  // WROTE on the wake (the press dropped the stale pre-press wait). No run starts. Behind a RUNNING typed run
+  // the person-Stop reader does not apply and the named wait keeps its own text.
+  it.each(rowsN)("supersedes(Stop bar predicts nothing, Option Z; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118) SCREEN row 4b S7-N: a %s wait on the chat after an acknowledged owner Stop with a typed run %s",
     async (reason, other) => {
       const { f, wait } = await ackOwnerStopOnChat(reason);
       await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "on_demand",
         triggerDetail: "typed message", status: other, runtimeMode: "native", createdAt: new Date("2026-08-22T14:59:00.000Z"),
         contextSnapshot: { issueId: f.issueId } });
-      const queue = (await request(app(f.companyId)).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
+      const client = app(f.companyId), path = `/api/issues/${f.issueId}/queued-comments`;
+      const queue = (await request(client).get(path).expect(200)).body;
       expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(f.commentIds);
-      expect(queue.executionWait).toEqual(wait);
+      expect(queue.executionWait).toEqual(other === "running" ? wait : Z_BAR);
       expect(queue.executionWait?.message).not.toBe(R4);
+      if (other === "running") return;
+      const runsBefore = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).length;
+      const sent = await request(client).post(`${path}/interrupt`).send({ queueId: f.wakeId, targetRunId: null, revision: queue.revision });
+      expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+      // The press: held, with the wait that applies at the press, never "Sending your messages.".
+      expect(sent.body.state).toBe("deferred");
+      expect(sent.body.executionWait).toEqual(ACTIVE_RUN_WAIT);
+      const [held] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+      expect(held.status).toBe("deferred_issue_execution");
+      expect((held.payload as Record<string, unknown>).executionWait).toEqual(ACTIVE_RUN_WAIT);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).length).toBe(runsBefore);
+      // Later polls: what that Send wrote, durable until the held list or the run changes.
+      for (let poll = 0; poll < 2; poll += 1) {
+        const later = (await request(client).get(path).expect(200)).body;
+        expect(later.executionWait).toEqual(ACTIVE_RUN_WAIT);
+        expect(later.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(f.commentIds);
+      }
     });
   // RFL record SUPERSEDE-C2B-S7N-RUNNING-CELL-1118 (rf-5's stricter form): behind
   // a RUNNING typed run the unnamed execution_recovery wait is the ordinary busy
@@ -2000,7 +2039,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     });
 
   it.each(Object.keys(RECOVERY_WAITS) as Array<keyof typeof RECOVERY_WAITS>)(
-    "supersedes(S7-N held Send without Option S; RFL record SUPERSEDE-SCREENONA-S7N-HELDSEND-1118) SCREEN row 4b S7-N: a %s wait on the chat after an acknowledged owner Stop with nothing else running keeps the wait; the Send is held with its exact wait text, and once the person confirms the stop exactly one run takes the held messages",
+    "supersedes(Stop bar predicts nothing, Option Z; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118) supersedes(S7-N held Send without Option S; RFL record SUPERSEDE-SCREENONA-S7N-HELDSEND-1118) SCREEN row 4b S7-N: a %s wait on the chat after an acknowledged owner Stop with nothing else running keeps the wait; the Send is held with its exact wait text, and once the person confirms the stop exactly one run takes the held messages",
     async reason => {
       const { f, wait } = await ackOwnerStopOnChat(reason);
       // The stopped run's launch was requested on this host (the runner's own
@@ -2015,13 +2054,14 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
         createdAt: new Date("2026-08-22T14:59:00.000Z"), contextSnapshot: { issueId: randomUUID() } });
       const client = app(f.companyId);
       const queue = (await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
-      // eee74ebb: admission holds this Send (nativeStopRequiresReconciliation adds
-      // native_continuation_requires_reconciliation), so the bar does not promise it.
-      expect(queue.executionWait).toEqual(wait);
+      // Option Z: the bar is the one line; it does not predict the Send.
+      expect(queue.executionWait).toEqual(Z_BAR);
       const successors = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
         .filter(run => run.id !== f.runId && run.contextSnapshot?.issueId === f.issueId);
-      await request(client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
+      const press = await request(client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
         .send({ queueId: f.wakeId, targetRunId: f.runId, revision: queue.revision }).expect(200);
+      // The press answers: HELD, with the wait its dispatch wrote (condition (b), gold #21194).
+      expect(press.body.executionWait).toEqual(IDENTITY_MISSING_WAIT);
       await heartbeatService(db).resumeQueuedCommentInterrupt(f.companyId, f.wakeId);
       await new Promise(resolve => setTimeout(resolve, 1000));
       // OBSERVED on eee74ebb: the Send stays held with admission's own wait; no run starts.
@@ -2029,10 +2069,11 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       expect(held?.status).toBe("deferred_issue_execution");
       expect((held?.payload as Record<string, unknown> | null)?.executionWait).toMatchObject({ reason: "process_identity_missing" });
       expect(await successors()).toHaveLength(0);
-      // (i) The GET right after the Send shows the exact wait text the person sees.
-      // Current behaviour, not truth: gold smarty-dev#21194 (see HELD_SEND_WAIT).
+      // (i) The GET right after the Send shows the exact wait text the person sees: the
+      // one true wait that Send's dispatch wrote, never "Sending your messages." (#21194).
       const afterSend = (await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
-      expect(afterSend.executionWait).toEqual(HELD_SEND_WAIT);
+      expect(afterSend.executionWait).toEqual(IDENTITY_MISSING_WAIT);
+      expect(afterSend.executionWait).not.toEqual(HELD_SEND_WAIT);
       // (ii) The recovery condition clears the real way: the person confirms the
       // stopped run's runner has stopped (routes/issues.ts confirm-run-stopped),
       // which records LOCAL_PROCESS_STOPPED; admission's process-identity gate
@@ -2095,6 +2136,216 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
         expect(await successors()).toHaveLength(1);
       } finally { await work.stop(); }
     });
+
+  // rf-4's 7 keepers (rf4/c4bar RESULT.md, judge-c4bar.keepers.test.ts.txt), RE-POINTED to Option Z (RFL record
+  // SUPERSEDE-C4-BAR-REAL-REFUSAL-1118 amended, condition (e)): the bar = the one line or the free fact; the
+  // press = the REAL Send outcome through the real GET + real Send. Routes/producers per row: GET
+  // /api/issues/:id/queued-comments, POST /api/issues/:id/queued-comments/interrupt (Send), POST
+  // /api/issues/:id/recovery-actions/confirm-run-stopped, POST /api/agents/:id/pause (pause), POST
+  // /api/issues/:id/comments (typed), heartbeat.cancelRun with a person's actor (the Stop route's cancel).
+  // PLANTED and named: ackOwnerStopOnChat's acknowledged Stop + stored wait (it sits beside the REAL rows).
+  async function zConfirm(f: Awaited<ReturnType<typeof seedQueue>>) {
+    await appendHeartbeatRunEvent(db, { companyId: f.companyId, runId: f.runId, agentId: f.agentId,
+      eventType: PROCESS_START_REQUESTED, stream: "system", level: "info", message: "launch requested",
+      payload: { hostname: os.hostname() } });
+    const admin = express(); admin.use(express.json());
+    admin.use((req, _res, next) => { (req as any).actor = { type: "board", userId: "stop-admin", source: "session",
+      companyIds: [f.companyId], memberships: [{ companyId: f.companyId, status: "active", membershipRole: "admin" }],
+      isInstanceAdmin: false }; next(); });
+    admin.use("/api", issueRoutes(db, {} as any, {})); admin.use(errorHandler);
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: "stop-admin",
+      status: "active", membershipRole: "admin" }).onConflictDoNothing();
+    await request(admin).post(`/api/issues/${f.issueId}/recovery-actions/confirm-run-stopped`)
+      .send({ runId: f.runId, stopEvidence: "The person checked this host: no runner for this run is running." }).expect(200);
+    return admin;
+  }
+  const zRuns = async (f: { companyId: string; issueId: string; runId: string }) =>
+    (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter(run => run.id !== f.runId && (run.contextSnapshot as Record<string, unknown> | null)?.issueId === f.issueId);
+  async function zRealStopOnChat(bodies: string[]) {
+    const f = await seedQueue();
+    // PLANTED: only the running turn the person stops. Messages, Stop and Send are the real producers.
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    await db.delete(issueComments).where(eq(issueComments.issueId, f.issueId));
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "queue-owner", conversationState: "active" })
+      .where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId, responsibleUserId: "queue-owner" }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: f.runId, phase: "observed" });
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", contextSnapshot: { issueId: randomUUID() } });
+    const client = app(f.companyId);
+    const ids: string[] = [];
+    for (const body of bodies) {
+      const sent = await request(client).post(`/api/issues/${f.issueId}/comments`).send({ body, clientRequestId: randomUUID(), deliveryIntent: "queue" });
+      expect(sent.status, JSON.stringify(sent.body)).toBe(201); ids.push(sent.body.id);
+    }
+    const hb = heartbeatService(db);
+    await hb.cancelRun(f.runId, "Cancelled by a board operator", { cancellationRequestId: randomUUID(), cancellationRequestedByUserId: "queue-owner",
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "queue-owner" } });
+    await hb.drainActiveRunExecutions();
+    return { f, ids, client, hb, path: `/api/issues/${f.issueId}/queued-comments` };
+  }
+
+  it(`${"supersedes(rf-4 keeper FOLLOWUP REAL PRODUCERS; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118) "}Z REAL Stop: comment POSTs, real Stop, the bar is the one line; the held press shows its dispatch's wait; after the stop is confirmed the Send runs once`, async () => {
+    const { f, ids, client, hb, path } = await zRealStopOnChat(["REAL first queued message", "REAL second queued message"]);
+    const before = (await request(client).get(path).expect(200)).body;
+    expect(before.entries.map((e: any) => e.comment.id)).toEqual(ids);
+    expect(before.executionWait).toEqual(Z_BAR);
+    const press = await request(client).post(`${path}/interrupt`).send({ queueId: before.queueId, targetRunId: null, revision: before.revision });
+    expect(press.status, JSON.stringify(press.body)).toBe(200);
+    const [held] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, before.queueId));
+    expect(held.status).toBe("deferred_issue_execution");
+    // Held: the press says the wait its dispatch wrote, exactly, never "Sending your messages.".
+    const written = (held.payload as any).executionWait;
+    expect(press.body.executionWait).toEqual({ reason: written.reason, message: written.message });
+    expect(press.body.executionWait).toEqual(IDENTITY_MISSING_WAIT);
+    expect((await request(client).get(path).expect(200)).body.executionWait).toEqual(IDENTITY_MISSING_WAIT);
+    expect(await zRuns(f)).toHaveLength(0);
+    await zConfirm(f);
+    await hb.resumeQueuedCommentInterrupt(f.companyId, before.queueId);
+    expect(await zRuns(f)).toHaveLength(1);
+  });
+  it.each(["queued", "scheduled_retry"] as const)(`${"supersedes(rf-4 keeper FOLLOWUP S7 isolated planted %s; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118) "}Z S7: the bar predicts nothing; the real Send's press shows the wait that applies, and the wake holds what that Send wrote`, async status => {
+    const { f } = await ackOwnerStopOnChat("remote_cleanup");
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status, runtimeMode: "native",
+      createdAt: new Date("2026-08-22T14:59:00Z"), contextSnapshot: { issueId: f.issueId } });
+    const client = app(f.companyId), path = `/api/issues/${f.issueId}/queued-comments`;
+    const before = (await request(client).get(path).expect(200)).body;
+    expect(before.executionWait).toEqual(Z_BAR);
+    const sent = await request(client).post(`${path}/interrupt`).send({ queueId: f.wakeId, targetRunId: null, revision: before.revision });
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    expect(sent.body.executionWait, "the press = the real Send's own wait").toEqual({ reason: (wake.payload as any).executionWait.reason,
+      message: (wake.payload as any).executionWait.message });
+    expect(sent.body.executionWait).toEqual(ACTIVE_RUN_WAIT);
+    expect((await request(client).get(path).expect(200)).body.executionWait, "later polls = what that Send wrote").toEqual(ACTIVE_RUN_WAIT);
+  });
+  it(`${"supersedes(rf-4 keeper FOLLOWUP RESET planted /new; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118) "}Z RESET planted: the bar is the one line; the real Send of a verified /new is admitted and runs`, async () => {
+    const { f } = await ackOwnerStopOnChat("execution_recovery");
+    await db.update(issueComments).set({ body: "/new" }).where(eq(issueComments.id, f.commentIds[1]));
+    const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    await db.update(agentWakeupRequests).set({ payload: withQueuedCommentIdsInWakePayload(saved.payload, [f.commentIds[1]]) }).where(eq(agentWakeupRequests.id, f.wakeId));
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId, kind: "active_run_watchdog",
+      cause: "legacy_execution_requires_reconciliation", fingerprint: f.runId, status: "active", nextAction: "Automatic recovery stopped.", evidence: { runId: f.runId } });
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", contextSnapshot: { issueId: randomUUID() } });
+    const client = app(f.companyId), path = `/api/issues/${f.issueId}/queued-comments`;
+    const before = (await request(client).get(path).expect(200)).body;
+    expect(before.executionWait, "the bar predicts nothing").toEqual(Z_BAR);
+    const sent = await request(client).post(`${path}/interrupt`).send({ queueId: f.wakeId, targetRunId: null, revision: before.revision });
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    console.log("Z_RESET_PRESS", JSON.stringify({ before: { queueId: before.queueId, wait: before.executionWait }, wakeId: f.wakeId, response: sent.body,
+      wakes: (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).map(w => ({ id: w.id, status: w.status, payload: w.payload })),
+      runs: (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).map(r => ({ id: r.id, status: r.status, ctx: r.contextSnapshot })) }));
+    // Admitted at the press: the press's own answer is that it runs (one run, never a wait).
+    expect(await zRuns(f), "admitted at the press: it runs").toHaveLength(1);
+    expect(sent.body.executionWait?.reason ?? null).not.toBe("stopped_by_person");
+    const [source] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    expect((source.payload as any).executionWait ?? null, "no wait is written on an admitted press").toBeNull();
+    await heartbeatService(db).resumeQueuedCommentInterrupt(f.companyId, f.wakeId);
+    expect(await zRuns(f), "and only once").toHaveLength(1);
+  });
+  it(`${"supersedes(rf-4 keeper FOLLOWUP REAL RESET producer; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118) "}Z REAL RESET: comment /new, real Stop, the bar is the one line; the real Send is admitted and runs`, async () => {
+    const { f, client, hb, path } = await zRealStopOnChat(["/new"]);
+    const before = (await request(client).get(path).expect(200)).body;
+    expect(before.entries.length, "the /new is held by the Stop").toBe(1);
+    expect(before.executionWait).toEqual(Z_BAR);
+    const sent = await request(client).post(`${path}/interrupt`).send({ queueId: before.queueId, targetRunId: null, revision: before.revision });
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    expect(await zRuns(f), "admitted at the press: it runs").toHaveLength(1);
+    expect(sent.body.executionWait?.reason ?? null).not.toBe("stopped_by_person");
+    await hb.resumeQueuedCommentInterrupt(f.companyId, before.queueId);
+    expect(await zRuns(f), "and only once").toHaveLength(1);
+  });
+  it.each(["chat", "task"] as const)(`${"supersedes(rf-4 keeper FOLLOWUP PAUSED; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118) "}Z PAUSED %s through the REAL pause route: the bar is the paused line with no Send promise; the press is the real Send's answer`, async surface => {
+    const { f } = await ackOwnerStopOnChat("remote_cleanup");
+    if (surface === "task") await db.update(issues).set({ conversationAgentId: null, conversationUserId: null, conversationState: null } as any).where(eq(issues.id, f.issueId));
+    await zConfirm(f);
+    const { agentRoutes } = await import("../routes/agents.js");
+    const { principalPermissionGrants } = await import("@paperclipai/db");
+    await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: "stop-admin", permissionKey: "agents:create", scope: {} });
+    const admin = express(); admin.use(express.json()); admin.use((req, _res, next) => { (req as any).actor = { type: "board", userId: "stop-admin", source: "session",
+      companyIds: [f.companyId], memberships: [{ companyId: f.companyId, status: "active", membershipRole: "admin" }], isInstanceAdmin: false }; next(); });
+    admin.use("/api", agentRoutes(db)); admin.use(errorHandler);
+    const pause = await request(admin).post(`/api/agents/${f.agentId}/pause`).send({}); expect(pause.status, JSON.stringify(pause.body)).toBe(200);
+    const client = app(f.companyId), path = `/api/issues/${f.issueId}/queued-comments`;
+    const before = (await request(client).get(path).expect(200)).body;
+    expect(before.executionWait, "the free fact: the paused line, never the Send promise").toEqual(PAUSED_BAR);
+    const sent = await request(client).post(`${path}/interrupt`).send({ queueId: before.queueId, targetRunId: null, revision: before.revision });
+    console.log("Z_PAUSED", JSON.stringify({ surface, line: before.executionWait, http: sent.status, response: sent.body }));
+    if (surface === "chat") {
+      // Refused: the refusal's own text (the route's paused preflight).
+      expect(sent.status).toBe(409);
+      expect(sent.body.error).toBe(PAUSED_BAR.message);
+    } else {
+      // A task's Send is refused by admission's invokability gate: the refusal's own text.
+      expect(sent.status, JSON.stringify(sent.body)).toBe(409);
+      expect(sent.body.error).toBe("Agent is not invokable in its current state");
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, before.queueId));
+      expect(wake.status, "the held list stays").toBe("deferred_issue_execution");
+    }
+    expect(await zRuns(f), "nothing runs while paused").toHaveLength(0);
+  });
+  it(`${"supersedes(rf-4 no-permission row; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118) "}Z NO PERMISSION: a person who is not the chat's owner gets the real Send's refusal (the screen has no Send for them)`, async () => {
+    const { f } = await ackOwnerStopOnChat("remote_cleanup");
+    const other = app(f.companyId, "other-operator"), path = `/api/issues/${f.issueId}/queued-comments`;
+    const before = (await request(other).get(path).expect(200)).body;
+    const sent = await request(other).post(`${path}/interrupt`).send({ queueId: before.queueId, targetRunId: null, revision: before.revision });
+    console.log("Z_NOPERM", JSON.stringify({ line: before.executionWait, http: sent.status, response: sent.body }));
+    expect(sent.status).toBe(403);
+    expect(sent.body.error).toBe("Only the conversation owner can interrupt a chat to send queued messages");
+    expect(await zRuns(f)).toHaveLength(0);
+  });
+  it.each([false, true])(`${"supersedes(rf-4 keeper FOLLOWUP PREPARED; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118) "}Z PREPARED Stop profile (realStop=%s): the bar is the one line; the real Send is admitted and runs`, async realStop => {
+    const f = realStop ? await seedQueue() : (await ackOwnerStopOnChat("remote_cleanup")).f;
+    if (realStop) {
+      await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId, responsibleUserId: "queue-owner" }).where(eq(heartbeatRuns.id, f.runId));
+      await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: f.runId, phase: "observed" });
+      await heartbeatService(db).cancelRun(f.runId, "Cancelled by a board operator", { cancellationRequestId: randomUUID(), cancellationRequestedByUserId: "queue-owner",
+        resultJson: { cancelledByActorType: "user", cancelledByUserId: "queue-owner" } });
+    }
+    // PLANTED provisioned workspace/terminated lease shape; receipt BUILT by the real exported producer helper.
+    const lease = { id: randomUUID(), companyId: f.companyId, heartbeatRunId: f.runId, provider: "daytona", providerLeaseId: randomUUID() };
+    await db.insert(environmentLeases).values({ ...lease, issueId: f.issueId, status: "released", leasePolicy: "ephemeral", releasedAt: new Date(), cleanupStatus: "success",
+      metadata: { remoteExecutionTermination: remoteTerminationReceipt(lease as any, { providerLeaseId: lease.providerLeaseId, state: "destroyed" } as any) } } as any);
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeWorkspaceSync: { schema: "paperclip.native-workspace-sync/v1", state: "prepared",
+      descriptorSha256: "a".repeat(64), baselineSha256: "b".repeat(64), finalHostSha256: null, workspaceId: randomUUID(), leaseId: lease.id,
+      providerLeaseId: lease.providerLeaseId, remoteCwd: "/work", resourceDisposition: "destroy" } } } as any).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", contextSnapshot: { issueId: randomUUID() } });
+    const client = app(f.companyId), path = `/api/issues/${f.issueId}/queued-comments`;
+    const before = (await request(client).get(path).expect(200)).body;
+    expect(before.executionWait, "the bar predicts nothing").toEqual(Z_BAR);
+    const sent = await request(client).post(`${path}/interrupt`).send({ queueId: before.queueId, targetRunId: null, revision: before.revision });
+    await heartbeatService(db).resumeQueuedCommentInterrupt(f.companyId, before.queueId);
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    expect(await zRuns(f), "admitted: it runs").toHaveLength(1);
+  });
+  // rf-5 (RFL record open condition (2), re-ruled ~21:00Z): 'person Stop -> typed -> its run fails', real routes.
+  // After the typed message's run is the latest turn the person-Stop reader no longer applies, and the GET
+  // shows what the wake STORES. Pinned EQUAL to base fdb32a01 (the line is not a c4 change). OPEN QUESTION
+  // (named, not folded into c4; filed as its own finding): is that stored line still true once the typed run
+  // has failed, or is it the stale class the record names (the stored executionWait shown as truth)?
+  it.each(["remote_cleanup", "execution_settling"] as const)(`${"supersedes(rf-5 typed probe pinned EQUAL to base; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118) "}Z TYPED probe: planted Stop %s, real typed POST, what the person sees`, async reason => {
+    const { f } = await ackOwnerStopOnChat(reason);
+    const client = app(f.companyId), path = `/api/issues/${f.issueId}/queued-comments`;
+    const typed = await request(client).post(`/api/issues/${f.issueId}/comments`).send({ body: "New typed direction", clientRequestId: randomUUID() });
+    expect(typed.status, JSON.stringify(typed.body)).toBe(201);
+    const hb = heartbeatService(db); await hb.drainActiveRunExecutions();
+    await new Promise(r => setTimeout(r, 500));
+    const after = (await request(client).get(path).expect(200)).body;
+    const runs = await zRuns(f);
+    console.log("Z_TYPED", JSON.stringify({ reason, line: after.executionWait ?? null, entries: after.entries?.map((e: any) => e.comment.id),
+      runs: runs.map(r => ({ id: r.id, status: r.status, error: r.errorCode })) }));
+    // EQUAL to base fdb32a01: the line is the wait STORED on the held wake (base's stored-wait path), or no
+    // line when nothing is held. Never the bar's old predicting text, never "Sending".
+    const [stored] = after.queueId ? await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, after.queueId)) : [];
+    const storedWait = (stored?.payload as any)?.executionWait;
+    expect(after.executionWait ?? null).toEqual(after.entries?.length && storedWait?.reason
+      ? { reason: storedWait.reason, message: storedWait.message } : null);
+    expect(JSON.stringify(after)).not.toContain(R4);
+    expect(JSON.stringify(after)).not.toContain("Sending your messages.");
+  });
 
   /** rf-5's completing peer (rf5-completing-peer.ts.txt), the provider-only
    * boundary: one turn that answers, then completes. */

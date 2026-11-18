@@ -4,7 +4,7 @@ import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteraction
 import { listStalledDependencies } from "../services/recovery/blocker-stall-wakeups.js";
 import { confirmMcpAttachmentCleanup, recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "../services/public-mcp/upload-cleanup.js";
 import { notifyDeferredExecutionWork } from "../services/deferred-execution-notifications.js";
-import { STOPPED_EXECUTION_WAIT, UNNAMED_EXECUTION_WAIT } from "../services/deferred-execution-wait.js";
+import { isWellFormedExecutionWait, STOPPED_EXECUTION_WAIT, UNNAMED_EXECUTION_WAIT, writeDeferredExecutionWait } from "../services/deferred-execution-wait.js";
 import { notifyNativeRecoveryNotices } from "../services/native-recovery-notice-notifications.js";
 import { notifyNativeStatusReassessment } from "../services/native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "../services/unsafe-workspace-export-notifications.js";
@@ -460,6 +460,17 @@ function queuedCommentDiscardDenial(issue: { identifier?: string | null }, comme
 
 const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
 const CHAT_STOPPED_BY_PERSON_MESSAGE = "Stopped. These messages are waiting: Send them, or delete any first.";
+/** Option Z (org 21:56Z): the Stop bar predicts nothing. Where the screen
+ * already has the fact for free (the assignee's status, read with its adapter
+ * type) a paused agent gets the paused line, with no Send promise: the Send
+ * route's own words for a paused agent. */
+const STOPPED_AGENT_PAUSED_REASON = "agent_paused";
+const STOPPED_AGENT_PAUSED_MESSAGE = "This agent is paused. Resume it to send these messages.";
+/** The wait a pressed Send on a Stop-held list is held by when dispatch did not
+ * reach admission because a run of the issue is still queued or running
+ * (run-control resumeSavedComments' early return): admission's own text for
+ * that gate (explicit-native-continuation.ts execution_active). */
+const PRESSED_SEND_ACTIVE_RUN_WAIT = { reason: "execution_active", message: "Waiting for the current run. Your message is saved." } as const;
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
   revision: z.string().min(1),
@@ -7852,7 +7863,7 @@ export function issueRoutes(
     )).filter((comment) => !claimedByFirstTurn.has(comment.id));
     const assignedAgent = input.issue.assigneeAgentId
       ? await input.executor
-          .select({ adapterType: agents.adapterType })
+          .select({ adapterType: agents.adapterType, status: agents.status })
           .from(agents)
           .where(
             and(
@@ -7914,9 +7925,24 @@ export function issueRoutes(
       // too) decides, with or without a saved wait on the held wake; the
       // person's Stop overrides a stale saved wait (execution_active,
       // execution_recovery, stopped_execution) that nothing clears after it.
+      // Option Z (org 21:56Z): the bar PREDICTS NOTHING. It is the one line,
+      // or the paused line where the agent's status (already read above) says
+      // so; what Send does is told by the Send's own answer.
       if (await readPersonStopHold(input.executor as Db, { companyId: input.issue.companyId, issueId: input.issue.id,
         agentId: input.issue.assigneeAgentId, wakeId: wake.id })) {
-        queue.executionWait = { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
+        queue.executionWait = assignedAgent?.status === "paused"
+          ? { reason: STOPPED_AGENT_PAUSED_REASON, message: STOPPED_AGENT_PAUSED_MESSAGE }
+          : { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
+      }
+    } else if (wake && queueState?.state === "deferred" && !input.activeRun && interruptHandoff && comments.length > 0 &&
+        input.issue.assigneeAgentId && !queuedInteractionId(wake.payload) && isWellFormedExecutionWait(savedWait)) {
+      // Option Z condition (b): a Send pressed on a Stop-held list that
+      // admission HELD shows the wait that Send's dispatch wrote on the wake
+      // (the press drops the stale pre-press wait), never "Sending your
+      // messages.". It stays until the held list or the run changes.
+      if (await readPersonStopHold(input.executor as Db, { companyId: input.issue.companyId, issueId: input.issue.id,
+        agentId: input.issue.assigneeAgentId, wakeId: wake.id, pressed: true })) {
+        queue.executionWait = { reason: savedWait.reason, message: savedWait.message };
       }
     }
     if (wake && queuedInteractionId(wake.payload)) {
@@ -18204,6 +18230,18 @@ export function issueRoutes(
       const nothingWaiting = () => conflict("Nothing is waiting.", {
         code: "queued_comment_not_pending", reason: "nothing_waiting" });
       let interruptQueueId = req.body.queueId as string;
+      // Option Z: a press on a list held by a person's Stop (the bar's own
+      // fact, the ONE reader). Its stale pre-press wait is dropped, so the wait
+      // the list shows after the press is the one this Send's dispatch wrote.
+      const stopHeld = issue.assigneeAgentId
+        ? await readPersonStopHold(db, { companyId: issue.companyId, issueId: issue.id, agentId: issue.assigneeAgentId })
+        : null;
+      let pressedOnStop = false as boolean;
+      const issueRunsNow = async () => issue.assigneeAgentId ? (await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, issue.assigneeAgentId),
+        or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`),
+        inArray(heartbeatRuns.status, ["running", "queued", "scheduled_retry"])))).map(run => run.id) : [];
+      const runsBeforePress = stopHeld ? await issueRunsNow() : [];
       const interruptPlan = await db.transaction(async (tx): Promise<{ firstTurnRunId: string } | { runToInterrupt: string | null }> => {
         let locked = await lockQueuedCommentState({
           tx, issue, actor, queueId: req.body.queueId, targetRunId: req.body.targetRunId ?? undefined,
@@ -18253,8 +18291,10 @@ export function issueRoutes(
         // The click is durable fresh user intent, including when the message
         // predates a failed run's stop. Keep its content and original attribution.
         await notifyDeferredExecutionWork(tx, { companyId: issue.companyId, requestId: locked.wake.id });
+        pressedOnStop = Boolean(stopHeld?.wakeIds.includes(locked.wake.id)) && locked.activeRun?.status !== "running";
+        const { executionWait: prePressWait, ...pressedPayload } = readObject(locked.wake.payload);
         await tx.update(agentWakeupRequests).set({
-          payload: { ...readObject(locked.wake.payload), queuedCommentInterrupt: {
+          payload: { ...pressedPayload, ...(pressedOnStop || prePressWait === undefined ? {} : { executionWait: prePressWait }), queuedCommentInterrupt: {
             actorId: actor.actorId, requestedAt: new Date().toISOString(),
             ...(locked.queue.protocol === "paperclip_runner_v1" && locked.activeRun?.status === "running"
               ? { targetRunId: locked.activeRun.id } : {}),
@@ -18274,6 +18314,23 @@ export function issueRoutes(
         resultJson: { ...options.resultJson, queuedCommentInterruptQueueId: interruptQueueId },
       });
       if (!firstTurnRunId) await heartbeat.resumeQueuedCommentInterrupt(issue.companyId, interruptQueueId, { retryCleanup: true });
+      if (pressedOnStop && !firstTurnRunId) {
+        // Option Z condition (b): the press answers. When dispatch HELD the
+        // Send without naming a wait (it never reached admission because a run
+        // of the issue is still queued or running), the list says so in
+        // admission's own words; otherwise its unnamed wait. Never "Sending".
+        const [pressed] = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.id, interruptQueueId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution")));
+        const runsAfterPress = pressed ? await issueRunsNow() : [];
+        // Admitted (this press started a run of the issue): it runs; nothing to say.
+        const admittedByPress = runsAfterPress.some(id => !runsBeforePress.includes(id));
+        if (pressed && !admittedByPress && readObject(pressed.payload).queuedCommentInterrupt != null &&
+            !isWellFormedExecutionWait(readObject(pressed.payload).executionWait)) {
+          await writeDeferredExecutionWait(db, { companyId: issue.companyId, requestId: interruptQueueId },
+            runsAfterPress.length ? PRESSED_SEND_ACTIVE_RUN_WAIT : UNNAMED_EXECUTION_WAIT);
+        }
+      }
       await logActivity(db, {
         companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
         agentId: actor.agentId, runId: actor.runId, agentApiKeyId: actor.agentApiKeyId,

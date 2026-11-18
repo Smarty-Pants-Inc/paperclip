@@ -174,6 +174,9 @@ function personStopWakeCarries(payload: unknown, issueId: string, messageId?: st
  */
 export async function readPersonStopHold(db: Db, input: {
   companyId: string; issueId: string; agentId: string; messageId?: string; wakeId?: string;
+  /** Option Z: the same fact AFTER the person pressed Send on the held list
+   * (the wake carries their queuedCommentInterrupt and is still held). */
+  pressed?: boolean;
 }): Promise<PersonStopHold | null> {
   const onIssue = or(eq(heartbeatRuns.nativeIssueId, input.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`);
   const [running] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
@@ -191,7 +194,7 @@ export async function readPersonStopHold(db: Db, input: {
         and(eq(agentWakeupRequests.status, "deferred"), wellFormedExecutionWaitSql(agentWakeupRequests.payload)))));
   const held = wakes.filter(wake => (!input.wakeId || wake.id === input.wakeId)
     && (wake.status === "deferred_issue_execution" || isWellFormedExecutionWait(parseObject(wake.payload).executionWait))
-    && parseObject(wake.payload).queuedCommentInterrupt == null
+    && (parseObject(wake.payload).queuedCommentInterrupt == null) !== Boolean(input.pressed)
     && personStopWakeCarries(wake.payload, input.issueId, input.messageId));
   return held.length ? { stoppedRunId: lastTurn.id, wakeIds: held.map(wake => wake.id) } : null;
 }

@@ -779,6 +779,89 @@ describe("TaskChatQueuedMessages", () => {
     expect(container.textContent).toContain("First queued message");
     expect(container.textContent).toContain("Second queued message");
   });
+  // Option Z (org 21:56Z; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118 amended): the bar predicts nothing; the
+  // press answers, durably on the held list until the list or the run changes (condition (a)); a held press
+  // shows the true wait, never "Sending your messages." (condition (b)); H2: no Steering/Queued headings in the
+  // stopped shape (condition (d)). The server rows (issue-queued-comments-routes "Z ...") give these exact
+  // answers through the real GET + real Send; here the screen shows them.
+  const Z_LINE = "Stopped. These messages are waiting: Send them, or delete any first.";
+  const zStopped = (): IssueQueuedCommentQueue => ({ ...queue, queueId: "queue-1", targetRunId: null, protocol: "legacy",
+    steeringDisposition: "unsupported", executionWait: { reason: "stopped_by_person", message: Z_LINE } });
+  const zLine = () => container.querySelector('[data-testid="task-chat-queued-stopped-line"]')?.textContent ?? null;
+  it("supersedes(Option Z; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118) Z durable refusal: a refused press keeps the refusal's own text on the held list until the list or the run changes", async () => {
+    const stopped = zStopped();
+    const refusal = Object.assign(new Error("Conflict"), { status: 409, body: {
+      error: "This agent is paused. Resume it to send these messages.", details: { code: "queued_comment_chat_paused" } } });
+    const onInterrupt = vi.fn().mockRejectedValue(refusal);
+    render({ queue: stopped, onInterrupt });
+    expect(zLine()).toBe(Z_LINE);
+    await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-stopped-send"]')!.click(); });
+    expect(zLine()).toBe("This agent is paused. Resume it to send these messages.");
+    // Polls of the same held list: the answer stays (never fades back to "Send them").
+    for (let poll = 0; poll < 3; poll += 1) { render({ queue: { ...stopped }, onInterrupt }); await act(async () => {}); }
+    expect(zLine()).toBe("This agent is paused. Resume it to send these messages.");
+    expect(container.textContent).not.toContain(Z_LINE);
+    expect(container.textContent).toContain("First queued message");
+    // A held-list change clears it.
+    render({ queue: { ...stopped, entries: stopped.entries.slice(1) }, onInterrupt });
+    await act(async () => {});
+    expect(zLine()).toBe(Z_LINE);
+    // So does a run change (same list, after a refusal again).
+    render({ queue: stopped, onInterrupt });
+    await act(async () => {});
+    await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-stopped-send"]')!.click(); });
+    expect(zLine()).toBe("This agent is paused. Resume it to send these messages.");
+    render({ queue: { ...stopped, targetRunId: "run-2" }, onInterrupt });
+    await act(async () => {});
+    render({ queue: stopped, onInterrupt });
+    await act(async () => {});
+    expect(zLine()).toBe(Z_LINE);
+  });
+  it("supersedes(Option Z; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118) Z held press: the true wait, never 'Sending your messages.', durable; later polls show what that Send wrote; no Steering/Queued headings", async () => {
+    const stopped = zStopped();
+    const held: IssueQueuedCommentQueue = { ...stopped, executionWait: { reason: "process_identity_missing",
+      message: "The previous run has no verified stop record. Paperclip cannot start this message yet." } };
+    const onInterrupt = vi.fn().mockResolvedValue(held);
+    render({ queue: stopped, onInterrupt });
+    await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-stopped-send"]')!.click(); });
+    expect(container.textContent).toContain("The previous run has no verified stop record. Paperclip cannot start this message yet.");
+    expect(container.textContent).not.toContain("Sending your messages.");
+    expect(container.textContent).toContain("First queued message");
+    render({ queue: held, onInterrupt });
+    await act(async () => {});
+    expect(container.textContent).toContain("The previous run has no verified stop record. Paperclip cannot start this message yet.");
+    expect(container.textContent).not.toContain("Sent after the agent finishes this turn");
+    expect(container.textContent).not.toContain("Always first. Delivered at the agent's next step");
+    // A later poll shows what the Send wrote (here: the wait admission rewrote on the wake).
+    const rewritten = { ...held, executionWait: { reason: "execution_active", message: "Waiting for the current run. Your message is saved." } };
+    render({ queue: rewritten, onInterrupt });
+    await act(async () => {});
+    expect(container.textContent).toContain("Waiting for the current run. Your message is saved.");
+    // The held list changes: the press answer is gone.
+    render({ queue: { ...rewritten, entries: rewritten.entries.slice(1) }, onInterrupt });
+    await act(async () => {});
+    expect(container.textContent).not.toContain("Waiting for the current run. Your message is saved.");
+  });
+  it("supersedes(Option Z; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118) Z paused / no permission: the free fact, with no Send anywhere; H2: no headings in the stopped shape", async () => {
+    const paused: IssueQueuedCommentQueue = { ...zStopped(), executionWait: { reason: "agent_paused",
+      message: "This agent is paused. Resume it to send these messages." } };
+    render({ queue: paused, onInterrupt: vi.fn() });
+    expect(zLine()).toBe("This agent is paused. Resume it to send these messages.");
+    expect([...container.querySelectorAll("button")].filter(button => button.textContent?.trim() === "Send")).toHaveLength(0);
+    expect(container.querySelector('[data-testid="task-chat-queued-stopped-send"]')).toBeNull();
+    expect(container.textContent).not.toContain("Sent after the agent finishes this turn");
+    // No permission (no Send handler: e.g. not the chat's owner): no Send button, no Send promise.
+    render({ queue: zStopped(), onInterrupt: undefined });
+    expect([...container.querySelectorAll("button")].filter(button => button.textContent?.trim() === "Send")).toHaveLength(0);
+    expect(container.textContent).not.toContain(Z_LINE);
+    expect(container.textContent).toContain("First queued message");
+    // H2: the one-line stopped shape has no Steering/Queued headings; an ordinary queue keeps them.
+    render({ queue: zStopped(), onInterrupt: vi.fn() });
+    expect(container.textContent).not.toContain("Sent after the agent finishes this turn");
+    expect(container.textContent).not.toContain("Always first. Delivered at the agent's next step");
+    render({ queue: { ...zStopped(), executionWait: null }, onInterrupt: vi.fn() });
+    expect(container.textContent).toContain("Sent after the agent finishes this turn");
+  });
   it.each([true, false])("shows a neutral queue update, not a delivery error, when Send has no current target (empty=%s)", async empty => {
     const latest = { ...queue, targetRunId: null, entries: empty ? [] : queue.entries.slice(1) };
     const onInterrupt = vi.fn().mockRejectedValue(new QueuedMessagesChangedError(latest));

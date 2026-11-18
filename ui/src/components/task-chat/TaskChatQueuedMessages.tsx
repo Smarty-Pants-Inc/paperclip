@@ -44,6 +44,15 @@ import { isQueuedInterruptHandoff, QueuedMessagesChangedError } from "@/lib/issu
 type QueueAction = "steer" | "interrupt" | "discard" | "intent" | null;
 export const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
 export const CHAT_STOPPED_BY_PERSON_LINE = "Stopped. These messages are waiting: Send them, or delete any first.";
+/** Option Z (org 21:56Z): after a person's Stop with the agent paused, the
+ * server's paused line (no Send promise) takes the bar, and there is no Send. */
+export const STOPPED_AGENT_PAUSED_REASON = "agent_paused";
+
+/** Option Z condition (a): the press answer belongs to ONE held list. Any
+ * change of the held list (its wake, its messages) or of the run clears it. */
+function heldListKey(queue: Pick<IssueQueuedCommentQueue, "queueId" | "state" | "targetRunId" | "entries">) {
+  return [queue.queueId ?? "", queue.state ?? "", queue.targetRunId ?? "", queue.entries.map(entry => entry.comment.id).join(",")].join("|");
+}
 
 /** Preserve the server's actionable refusal (for example, a paused chat). */
 function queueActionErrorText(error: unknown): string | null {
@@ -409,7 +418,11 @@ export function TaskChatQueuedMessages({
   const [announcement, setAnnouncement] = useState("");
   const [visibleError, setVisibleError] = useState<string | null>(null);
   const [deliveryNotice, setDeliveryNotice] = useState<string | null>(null);
-  const [deferredStatus, setDeferredStatus] = useState<{ queueId: string | null; message: string } | null>(null);
+  const [deferredStatus, setDeferredStatus] = useState<{ queueId: string | null; key: string; message: string; stopList?: boolean } | null>(null);
+  // Option Z (a): a refused press keeps the refusal's own text on the held
+  // list (never a toast that fades back to "Send them") until the list or run changes.
+  const [pressRefusal, setPressRefusal] = useState<{ key: string; text: string } | null>(null);
+  const currentHeldListKey = heldListKey(queue);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
     useSensor(KeyboardSensor, {
@@ -427,11 +440,15 @@ export function TaskChatQueuedMessages({
   useEffect(() => {
     setDeferredStatus(current => {
       if (!current) return null;
-      if (queue.state !== "deferred" || queue.queueId !== current.queueId || !queue.entries.length) return null;
+      // Option Z (a): the held press's wait stays until the held list or the run changes;
+      // later polls show what that Send wrote on the list.
+      if (queue.state !== "deferred" || queue.queueId !== current.queueId || !queue.entries.length
+        || current.key !== currentHeldListKey) return null;
       const message = queue.executionWait?.message ?? "Messages are still queued. They will send when the task is ready.";
       return current.message === message ? current : { ...current, message };
     });
-  }, [queue.state, queue.queueId, queue.entries.length, queue.executionWait?.message]);
+    setPressRefusal(current => current && current.key !== currentHeldListKey ? null : current);
+  }, [queue.state, queue.queueId, queue.entries.length, queue.executionWait?.message, currentHeldListKey]);
 
   const ids = useMemo(
     () => entries.map((entry) => entry.comment.id),
@@ -633,7 +650,10 @@ export function TaskChatQueuedMessages({
       ));
     }
     setPending({ commentId, action });
-    setVisibleError(null); setDeferredStatus(null);
+    setVisibleError(null); setDeferredStatus(null); setPressRefusal(null);
+    // The press on the Stop bar's held list: its answer is durable on that list.
+    const pressedStopList = action === "interrupt" && queue.executionWait?.reason === CHAT_STOPPED_BY_PERSON_REASON
+      ? heldListKey(queue) : null;
     setAnnouncement(
       action === "steer"
         ? "Steering queued message."
@@ -649,7 +669,8 @@ export function TaskChatQueuedMessages({
         if (updatedQueue?.state === "deferred" && !isQueuedInterruptHandoff(updatedQueue)) {
           for (const entry of updatedQueue.entries) optimisticDeliveryIds.current.delete(entry.comment.id);
           setEntries(updatedQueue.entries.filter(entry => !optimisticDeliveryIds.current.has(entry.comment.id)));
-          setDeferredStatus({ queueId: updatedQueue.queueId, message: updatedQueue.executionWait?.message ?? "Messages are still queued. They will send when the task is ready." });
+          setDeferredStatus({ queueId: updatedQueue.queueId, key: heldListKey(updatedQueue), stopList: Boolean(pressedStopList),
+            message: updatedQueue.executionWait?.message ?? "Messages are still queued. They will send when the task is ready." });
           setAnnouncement("Messages are still queued.");
           return;
         }
@@ -685,6 +706,11 @@ export function TaskChatQueuedMessages({
         return;
       }
       const code = queueActionErrorCode(error);
+      const refusal = action === "interrupt" ? queueActionErrorText(error) : null;
+      if (pressedStopList && refusal) {
+        setPressRefusal({ key: pressedStopList, text: refusal });
+        return;
+      }
       setVisibleError(
         code === "queued_comment_already_dispatching"
           ? "Too late to discard: this message is already being sent."
@@ -712,6 +738,16 @@ export function TaskChatQueuedMessages({
   const steeringRows = steeringCount(entries);
   const stoppedByPerson = queue.executionWait?.reason === CHAT_STOPPED_BY_PERSON_REASON &&
     Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0 && Boolean(onInterrupt);
+  // The paused line is a fact, not a promise: no Send on the bar or on a row.
+  const stoppedPaused = queue.executionWait?.reason === STOPPED_AGENT_PAUSED_REASON &&
+    Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0;
+  // No permission to Send (no Send handler here, e.g. not the chat's owner): no Send button anywhere.
+  const stoppedNoSend = queue.executionWait?.reason === CHAT_STOPPED_BY_PERSON_REASON &&
+    Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0 && !onInterrupt;
+  const shownPressRefusal = pressRefusal?.key === currentHeldListKey ? pressRefusal.text : null;
+  // H2 (c2b): in the stopped shape nothing is "sent after this turn"; the
+  // Steering / Queued headings are not drawn. A held press keeps that shape.
+  const stoppedShape = stoppedByPerson || stoppedPaused || stoppedNoSend || (Boolean(deferredStatus?.stopList) && !queue.targetRunId);
 
   return (
     <TaskChatComposerBar
@@ -740,16 +776,16 @@ export function TaskChatQueuedMessages({
                 data-testid={`task-chat-queued-section-${section}`}
                 className={cn("flex flex-col gap-0.5 px-1.5 py-1", section === "queued" && "mt-px")}
               >
-                {section === "queued" ? <div aria-hidden className="mx-1 mb-1 h-px bg-border/70" /> : null}
-                <h3 className="flex flex-wrap items-baseline gap-x-1.5 gap-y-1 px-1.5 pt-0.5 text-xs text-muted-foreground">
+                {section === "queued" && !stoppedShape ? <div aria-hidden className="mx-1 mb-1 h-px bg-border/70" /> : null}
+                {stoppedShape ? null : <h3 className="flex flex-wrap items-baseline gap-x-1.5 gap-y-1 px-1.5 pt-0.5 text-xs text-muted-foreground">
                   <span className="font-semibold text-foreground">{section === "steering" ? "Steering" : "Queued"}</span>
                   <span className="tabular-nums" data-testid={`task-chat-queued-count-${section}`}>{rows.length}</span>
                   {paused ? <span className="rounded-md bg-muted px-2 py-0.5 font-medium text-foreground" data-testid="task-chat-queued-steering-paused">{STEERING_PAUSED}</span>
                     : section === "queued" || rows.length > 0 ? <span className="font-normal max-sm:basis-full">{section === "steering"
                       ? "Always first. Delivered at the agent's next step, top first"
                       : "Sent after the agent finishes this turn, top first"}</span> : null}
-                </h3>
-                {rows.length === 0 ? (
+                </h3>}
+                {rows.length === 0 ? stoppedShape ? null : (
                   section === "steering" ? <EmptySteeringDropTarget
                     disabled={readOnly || !queue.queueId || !onSetIntent || Boolean(pending || reordering) || queue.steeringDisposition !== "available"}
                   >
@@ -776,7 +812,7 @@ export function TaskChatQueuedMessages({
                       pausedForEdit={section === "steering" && editingCommentId === entry.comment.id && autoSteerDelayMs !== null}
                       steeringAvailable={queue.steeringDisposition === "available"}
                       canSetIntent={Boolean(onSetIntent)}
-                      sendOnLine={stoppedByPerson}
+                      sendOnLine={stoppedByPerson || stoppedPaused || stoppedNoSend}
                       onCancelAutoSteer={() => {
                         setCancelledAutoSteer(current => new Set(current).add(entry.comment.id));
                         // Cancel keeps it queued everywhere, not only in this view.
@@ -798,7 +834,7 @@ export function TaskChatQueuedMessages({
       {statusMessage ? <p role="status" className="px-3 py-1.5 text-xs text-muted-foreground">{statusMessage}</p> : null}
       {stoppedByPerson ? (
         <div className="flex flex-wrap items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground" data-testid="task-chat-queued-stopped">
-          <p role="status" className="min-w-0 flex-1">{CHAT_STOPPED_BY_PERSON_LINE}</p>
+          <p role="status" className="min-w-0 flex-1" data-testid="task-chat-queued-stopped-line">{shownPressRefusal ?? CHAT_STOPPED_BY_PERSON_LINE}</p>
           {!readOnly ? <button
             type="button"
             className={ROW_BUTTON}
@@ -810,6 +846,10 @@ export function TaskChatQueuedMessages({
             {pending?.action === "interrupt" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : null}
             Send
           </button> : null}
+        </div>
+      ) : stoppedPaused ? (
+        <div className="flex flex-wrap items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground" data-testid="task-chat-queued-stopped">
+          <p role="status" className="min-w-0 flex-1" data-testid="task-chat-queued-stopped-line">{queue.executionWait!.message}</p>
         </div>
       ) : null}
       {deliveryNotice ? <p role="status" className="px-3 py-1.5 text-xs text-muted-foreground">{deliveryNotice}</p> : null}
