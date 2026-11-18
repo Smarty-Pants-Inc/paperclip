@@ -61,8 +61,15 @@ export async function mergedPiModelsJson(filePath: string, providerJson: string,
   const paperclip = ours.providers.paperclip;
   if (Array.isArray(paperclip?.models)) paperclip.models = paperclip.models.map(model => {
     const configured = configuredPiManagedModel(snapshot, model.id, paperclip.api, warn);
-    return { ...model, ...configured,
+    const merged = { ...model, ...configured,
       ...(model.thinkingLevelMap || configured.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap, ...configured.thinkingLevelMap } } : {}) };
+    // The two session-affinity flags are managed routing (MANAGED-MODELS.md):
+    // an agent HOME entry's compat, even an empty one, must not drop them.
+    const managedCompat = model.compat;
+    const routing = typeof managedCompat?.sendSessionAffinityHeaders === "boolean"
+      ? { sendSessionAffinityHeaders: managedCompat.sendSessionAffinityHeaders,
+        ...(managedCompat.sessionAffinityFormat !== undefined ? { sessionAffinityFormat: managedCompat.sessionAffinityFormat } : {}) } : undefined;
+    return routing ? { ...merged, compat: { ...merged.compat, ...routing } } : merged;
   });
   return `${JSON.stringify({ ...snapshot, providers: { ...providers, ...ours.providers } })}\n`;
 }
