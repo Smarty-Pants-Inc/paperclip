@@ -8,7 +8,8 @@ vi.mock("../../../../server/src/services/issues.js", () => ({ issueService: () =
 // Keep reason: recorded F1 catch. Exercise the production notice writer and
 // the actual task-chat relevance policy, not a parallel visibility heuristic.
 it.each(["missing", "invalid", "foreign", "legacy"] as const)("keeps the projected %s Pi history-loss notice after Done and the next turn", async reason => {
-  addComment.mockClear();
+  addComment.mockReset();
+  addComment.mockResolvedValue({ id: "notice" });
   const sessionId = "11111111-1111-4111-8111-111111111111";
   const runId = "22222222-2222-4222-8222-222222222222";
   const previousId = "33333333-3333-4333-8333-333333333333";
@@ -32,7 +33,8 @@ it.each(["missing", "invalid", "foreign", "legacy"] as const)("keeps the project
     const chain = { from: () => chain, where: () => chain, for: async () => result, limit: async () => result,
       then: (resolve: (value: unknown) => unknown) => Promise.resolve(result).then(resolve) };
     return chain;
-  }, update: () => ({ set: () => ({ where: async () => {} }) }) }) };
+  }, execute: async () => [{ id: "1001" }], // pg_current_xact_id() (6e0454bbb coalescing guard)
+  update: () => ({ set: () => ({ where: async () => {} }) }) }) };
   // Load the real server writer through Vitest, not the browser project's
   // static import graph (which must not typecheck the entire server).
   const { materializePiSessionRecoveryNotice } = await vi.importActual<{
