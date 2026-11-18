@@ -158,11 +158,13 @@ describe("TaskChatQueuedMessages", () => {
     }
     expect(props.onDiscard).not.toHaveBeenCalled();
     expect(container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-discard-comment-1"]')?.disabled).toBe(false);
-    expect([...container.querySelectorAll<HTMLButtonElement>('[aria-label^="Reorder queued message:"]')].every(button => button.disabled)).toBe(true);
+    // rf-5 F4: reorder is the one control a later wake keeps (the API reorders the chat's wakes).
+    expect([...container.querySelectorAll<HTMLButtonElement>('[aria-label^="Reorder queued message:"]')].every(button => !button.disabled)).toBe(true);
   });
 
-  it("does not offer a reorder across distinct chat wakes", () => {
-    const entries = [queue.entries[0], { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2" }];
+  it("offers no reorder for a queue holding a saved card response", () => {
+    const entries = [queue.entries[0], { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2",
+      source: { kind: "interaction" } as never }];
     expect(reorderQueuedMessageEntries(entries, "comment-1", "comment-2")).toBeNull();
   });
 

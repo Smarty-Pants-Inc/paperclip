@@ -35,7 +35,7 @@ describe("AUDIT notice scope", () => {
       authorUserId: authorType === "user" ? "user-1" : null,
       authorAgentId: authorType === "agent" ? "agent-1" : null,
       body: "", deletedAt: deleted ? new Date("2026-11-17T18:10:30Z") : null,
-      metadata: { authorizationReason: reason }, presentation: kind ? { kind: kind as any, title: name } : null })];
+      metadata: { authorizationReason: reason } as any, presentation: (kind ? { kind, title: name } : null) as any })];
     const messages = buildIssueChatMessages({ comments, timelineEvents: [], linkedRuns: [], liveRuns: [] });
     console.log("AUDIT NOTICE", JSON.stringify({ name, expected, shown: messages.map(m => m.id) }));
     expect(messages.map(m => m.id)).toEqual(expected ? ["audit-comment"] : []);
@@ -629,7 +629,8 @@ describe("buildIssueChatMessages", () => {
     const deletedAt = new Date("2026-11-17T18:10:30.000Z");
     const messages = buildIssueChatMessages({
       comments: [
-        createComment({ id: "notice", authorType: "system", authorUserId: null, body: "", deletedAt, createdAt: new Date("2026-11-17T18:10:03.000Z") }),
+        createComment({ id: "notice", authorType: "system", authorUserId: null, body: "", deletedAt, createdAt: new Date("2026-11-17T18:10:03.000Z"),
+          metadata: { version: 1, sections: [], authorizationReason: "unanswered_message:request-1" } }),
         createComment({ id: "person", body: "", deletedAt, deletedByType: "user", deletedByUserId: "user-1", createdAt: new Date("2026-11-17T18:10:04.000Z") }),
         createComment({ id: "agent", authorAgentId: "agent-1", authorUserId: null, body: "", deletedAt, createdAt: new Date("2026-11-17T18:10:05.000Z") }),
       ],
