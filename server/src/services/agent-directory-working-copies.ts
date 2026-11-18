@@ -519,12 +519,15 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           : await heldStep(() => unchangedCheckpoint(row), signal).then(() => ({
             storageWarning: typeof row.receipt?.storageWarning === "string" ? row.receipt.storageWarning : null, conflicts: [],
           }));
+        // pl/keepalive8: the combined held-lock signal is checked again AFTER the awaited save, immediately before
+        // the success receipt patch: a lock lost during the save writes no success receipt (the caller fails).
+        assertHeld(signal);
         row = await patch(row, { state: stopped ? (changed ? "saved" : "unchanged") : "warm_saved", baseHash: nextHash,
           candidateHash: nextHash, errorCode: null, errorMessage: null, attempts: 0, nextAttemptAt: null,
           ...(stopped ? { processStoppedAt: new Date() } : {}),
           receipt: { ...row.receipt, baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: captured.manifest,
             checkpointState: changed ? "saved" : "unchanged", checkpointStats: captured.stats, storageWarning, conflicts,
-            pendingConflicts: [...pendingConflicts(row), ...conflicts] } }); // (checked above by heldStep before the save)
+            pendingConflicts: [...pendingConflicts(row), ...conflicts] } });
         if (!stopped && row.location === "local" && conflicts.length && conflicts.every(item => item.currentKept !== false)) {
           // A successful save is already recorded above. Refresh only at this
           // idle turn boundary, under the canonical writer lock, and reject any
