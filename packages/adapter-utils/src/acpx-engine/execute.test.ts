@@ -31,6 +31,7 @@ import {
   buildAcpxRunSummary,
   createAcpxEngineExecutor,
   findAncestorBin,
+  isCompatibleSession,
   geminiVersionSupportsNativeAcpFlag,
   parseGeminiVersionParts,
   referencedSourceContentSignature,
@@ -3249,6 +3250,62 @@ describe("shared ACPX engine runtime behavior", () => {
   });
 });
 
+// Keep reason: never-OK cross-target resume; judge2/judge-probe.mts's three collisions.
+// Pure comparator rows hold fingerprint/session guards equal deliberately: those
+// independent guards must not hide a fail-open target comparison.
+describe("ACPX resume target comparison", () => {
+  const ssh = { transport: "ssh", host: "machine-A", port: 22, username: "fixture", remoteCwd: "/remote/task" };
+  const sandbox = { transport: "sandbox", providerKey: "fixture", environmentId: "env-1",
+    providerLeaseId: "physical-1", remoteCwd: "/remote/task" };
+  const malformed = { ...ssh, port: "22" };
+  const guards = { configFingerprint: "same-fingerprint", sessionKey: "same-key", agent: "custom",
+    cwd: "/remote/task", mode: "persistent" };
+  function matches(saved: unknown, current: unknown) {
+    return isCompatibleSession({ ...guards, remoteExecution: saved }, {
+      fingerprint: guards.configFingerprint, sessionKey: guards.sessionKey, acpxAgent: guards.agent,
+      cwd: guards.cwd, mode: "persistent", remoteExecutionIdentity: current as Record<string, unknown> | null,
+    });
+  }
+  it.each([
+    { name: "judge: distinct valid sandbox cwd bytes", saved: sandbox, current: { ...sandbox, remoteCwd: "/remote/task " } },
+    { name: "judge: malformed SSH machine A vs machine B", saved: malformed, current: { ...malformed, host: "machine-B" } },
+    { name: "judge: malformed nonempty SSH vs absent local", saved: malformed, current: null },
+    { name: "reverse cwd whitespace", saved: { ...sandbox, remoteCwd: "/remote/task " }, current: sandbox },
+    { name: "reverse malformed local", saved: undefined, current: malformed },
+    { name: "same malformed remote is still invalid", saved: malformed, current: malformed },
+    { name: "malformed vs empty local", saved: malformed, current: {} },
+    { name: "malformed vs valid remote", saved: malformed, current: ssh },
+    { name: "non-object raw identity", saved: "malformed", current: null },
+    { name: "array raw identity", saved: [malformed], current: null },
+    { name: "different host", saved: ssh, current: { ...ssh, host: "machine-B" } },
+    { name: "different port", saved: ssh, current: { ...ssh, port: 2222 } },
+    { name: "different user", saved: ssh, current: { ...ssh, username: "other" } },
+    { name: "different SSH cwd", saved: ssh, current: { ...ssh, remoteCwd: "/other" } },
+    { name: "different sandbox cwd", saved: sandbox, current: { ...sandbox, remoteCwd: "/other" } },
+    { name: "different provider lease", saved: sandbox, current: { ...sandbox, providerLeaseId: "physical-2" } },
+    { name: "sandbox vs SSH transport", saved: sandbox, current: ssh },
+    { name: "SSH vs sandbox transport", saved: ssh, current: sandbox },
+    { name: "remote vs local", saved: ssh, current: null },
+  ])("refuses $name", ({ saved, current }) => {
+    expect(matches(saved, current)).toBe(false);
+  });
+  it.each([
+    { name: "same SSH target", saved: ssh, current: ssh },
+    { name: "same sandbox target", saved: sandbox, current: sandbox },
+    { name: "same exact cwd including whitespace", saved: { ...sandbox, remoteCwd: "/remote/task " }, current: { ...sandbox, remoteCwd: "/remote/task " } },
+    { name: "absent local identities", saved: undefined, current: null },
+    { name: "empty local identities", saved: {}, current: {} },
+    { name: "absent vs empty local", saved: null, current: {} },
+    { name: "empty vs absent local", saved: {}, current: undefined },
+    { name: "legacy raw saved SSH", saved: { ...ssh, privateKey: "FAKE-KEY", tailscaleSocket: "/FAKE-SOCKET" }, current: ssh },
+    { name: "raw current SSH", saved: ssh, current: { ...ssh, privateKey: "FAKE-OTHER-KEY", tailscaleSocket: "/FAKE-OTHER-SOCKET" } },
+    { name: "same physical sandbox across lease rows", saved: { ...sandbox, leaseId: "paperclip-1" }, current: { ...sandbox, leaseId: "paperclip-2" } },
+    { name: "canonical physical lease", saved: sandbox, current: { ...sandbox, providerLeaseId: " physical-1 " } },
+  ])("accepts $name", ({ saved, current }) => {
+    expect(matches(saved, current)).toBe(true);
+  });
+});
+
 describe("findAncestorBin", () => {
   async function writeFakeBin(dir: string, name: string) {
     const binDir = path.join(dir, "node_modules", ".bin");
@@ -4550,6 +4607,67 @@ describe("ACPX engine remote managed-home seam (PR 2: per-adapter home seed)", (
     };
     return { root, stateDir, localCwd, remoteCwd, executionTarget };
   }
+
+  // Keep reason: never-OK secret persistence and upgrade-safe session reuse.
+  it.each([
+    { transport: "ssh", legacy: false },
+    { transport: "sandbox", legacy: false },
+    { transport: "ssh", legacy: true },
+    { transport: "sandbox", legacy: true },
+  ])("ACPX codec normalizes $transport identity and resumes (legacy=$legacy)", async ({ transport, legacy }) => {
+    const { root, stateDir, localCwd, remoteCwd } = await setupRemoteSandbox();
+    const spec = { host: "ssh.example.test", port: 22, username: "agent", remoteCwd,
+      remoteWorkspacePath: remoteCwd, privateKey: "acpx-private-key-canary", knownHosts: null,
+      tailscaleSocket: "/acpx-socket-canary", strictHostKeyChecking: true };
+    const executionTarget = transport === "ssh"
+      ? { kind: "remote", transport, remoteCwd, spec }
+      : { kind: "remote", transport, remoteCwd, providerKey: "fake-plugin", environmentId: "env-1",
+          leaseId: "paperclip-lease-1", sandboxLeaseAcquisition: { providerLeaseId: " physical-sandbox-1 " },
+          runner: createLocalSandboxRunner() };
+    const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/execution-target")>("@paperclipai/adapter-utils/execution-target");
+    vi.mocked(prepareAdapterExecutionTargetRuntime).mockResolvedValue({ target: executionTarget as never,
+      workspaceRemoteDir: remoteCwd, runtimeRootDir: path.join(root, "runtime"), assetDirs: {},
+      additionalSourceDirs: {}, additionalSourceFailures: [], workspaceSyncSnapshot: null,
+      restoreWorkspace: async () => {} });
+    vi.mocked(startAdapterExecutionTargetPaperclipBridge).mockResolvedValue({ env: {}, stop: async () => {} });
+    vi.mocked(startAdapterExecutionTargetProcessSessionBridge).mockResolvedValue({ agentCommand: "fixture-acp-proxy", stop: async () => {} });
+    try {
+      const config = { agent: "custom", agentCommand: "fixture-acp-client", stateDir, cwd: localCwd,
+        paperclipSkillKeys: [], paperclipRuntimeSkills: [], mode: "persistent" };
+      const options = { authToken: "run-fixture", executionTarget };
+      const first = await runExecutor(config, options);
+      expect(first.result.sessionId).toBe("backend-session");
+      const expectedIdentity = transport === "ssh"
+        ? { transport, host: spec.host, port: spec.port, username: spec.username, remoteCwd }
+        : { transport, providerKey: "fake-plugin", environmentId: "env-1", providerLeaseId: "physical-sandbox-1", remoteCwd };
+      // Old rows stored raw objects. Inject canaries only; never a real key.
+      const raw = { ...first.result.sessionParams, remoteExecution: { ...first.result.sessionParams!.remoteExecution as object,
+        privateKey: spec.privateKey, tailscaleSocket: spec.tailscaleSocket, extraField: "discard-me" } };
+      const serialized = sessionCodec.serialize(raw);
+      const restored = sessionCodec.deserialize(JSON.parse(JSON.stringify(legacy ? raw : serialized)));
+      expect.soft(serialized?.remoteExecution).toEqual(expectedIdentity);
+      expect.soft(restored?.remoteExecution).toEqual(expectedIdentity);
+      for (const value of [serialized, restored]) {
+        expect.soft(JSON.stringify(value)).not.toContain(spec.privateKey);
+        expect.soft(JSON.stringify(value)).not.toContain(spec.tailscaleSocket);
+      }
+      // Bypass deserialize as well for old callers: compatibility must normalize
+      // the stored side itself, not depend on the codec having already run.
+      const resumed = await runExecutor(config, { ...options,
+        executionTarget: { ...executionTarget, ...(transport === "sandbox" ? { leaseId: "paperclip-lease-2" } : {}) },
+        runtime: { sessionParams: legacy ? raw : restored } });
+      expect(resumed.sessionInputs[0]?.resumeSessionId).toBe(first.result.sessionId);
+      expect(resumed.result.resultJson?.sessionReset).toBeUndefined();
+      if (legacy) {
+        const decodedResume = await runExecutor(config, { ...options, runtime: { sessionParams: restored } });
+        expect(decodedResume.sessionInputs[0]?.resumeSessionId).toBe(first.result.sessionId);
+      }
+    } finally {
+      vi.mocked(prepareAdapterExecutionTargetRuntime).mockReset().mockImplementation(actual.prepareAdapterExecutionTargetRuntime);
+      vi.mocked(startAdapterExecutionTargetPaperclipBridge).mockReset().mockImplementation(actual.startAdapterExecutionTargetPaperclipBridge);
+      vi.mocked(startAdapterExecutionTargetProcessSessionBridge).mockReset().mockImplementation(actual.startAdapterExecutionTargetProcessSessionBridge);
+    }
+  });
 
   it("test_remote_seam_receives_adapter_agnostic_context", async () => {
     const { stateDir, localCwd, remoteCwd, executionTarget } = await setupRemoteSandbox();
