@@ -14,7 +14,7 @@ import { issueRoutes } from "../../routes/issues.js";
 import { heartbeatService } from "../heartbeat.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { answeredPersonMessageSql } from "../person-message-answer.js";
-import { settleUnansweredPersonMessagesForTask, UNANSWERED_CARD_ANSWER_NO_REPLY_TEXT, UNANSWERED_CARD_ANSWER_NO_RUN_TEXT,
+import { settleUnansweredPersonMessagesForTask, unansweredPersonMessageCommentCondition, UNANSWERED_CARD_ANSWER_NO_REPLY_TEXT, UNANSWERED_CARD_ANSWER_NO_RUN_TEXT,
   UNANSWERED_CARD_ANSWER_TEXT, UNANSWERED_MESSAGE_NO_REPLY_TEXT, UNANSWERED_MESSAGE_TEXT,
 } from "./unanswered-person-message.js";
 
@@ -163,8 +163,10 @@ describe.skipIf(!support.supported)("the sender's own Stop and an answerable car
         authorAgentId: agentId, createdByRunId: runId, createdAt: new Date(Date.now() + 1000) });
       return runId;
     };
+    /** The sweeps' clock: `minutes` after the fixture started. */
+    const at = (minutes: number) => new Date(startedAt + minutes * 60_000);
     return { companyId, agentId, issueId, sender, other, send, startRun, readRun, stop, end, card, cardStatus, sweep, answered, notices,
-      answer, resumeRun };
+      answer, resumeRun, at };
   }
   const key = (id: string) => ({ authorizationReason: `unanswered_message:${id}` });
   const PASSES = [1, 3, 11, 30];
@@ -351,6 +353,38 @@ describe.skipIf(!support.supported)("the sender's own Stop and an answerable car
     const all = await f.notices();
     expect(all, "exactly one notice, ever").toHaveLength(1);
     expect(all[0]).toMatchObject({ deletedAt: null, body: UNANSWERED_MESSAGE_NO_REPLY_TEXT, metadata: { ...key(m), sourceRunId: run } });
+  }, 60_000);
+
+  it("ruling 3, am5 gap 17: M's notice retired while a card answered M; the card then EXPIRES -> M gets its no_reply notice again", async () => {
+    const f = await fixture();
+    const m = await f.send("M: deploy it.");
+    const run1 = await f.startRun(m);
+    await f.end(run1, "failed");
+    expect((await f.sweep(1)).noticed, "M's failed run: its one notice").toBe(1);
+    // A later run takes M again and asks the person a question: the card answers M, so the notice retires.
+    const run2 = await f.startRun(m);
+    const cardId = await f.card(run2);
+    await f.end(run2, "succeeded");
+    expect(await f.answered(m)).toBe(true);
+    expect(await f.sweep(3)).toEqual({ noticed: 0, pending: 0 });
+    const retired = await f.notices();
+    expect(retired).toHaveLength(1);
+    expect(retired[0]!.deletedAt, "the notice retired while the card stood").not.toBeNull();
+    // The card expires unanswered, after the notice retired (on the sweeps' clock): M is owed again (ruling 3).
+    await issueThreadInteractionService(db).expirePendingInteractionsForTerminalIssue(
+      { id: f.issueId, companyId: f.companyId, status: "cancelled" }, { systemId: "expiry" } as never);
+    expect(await f.cardStatus(cardId)).toEqual({ status: "expired", resolvedByUserId: null });
+    await db.update(issueThreadInteractions).set({ resolvedAt: f.at(4), updatedAt: f.at(4) }).where(eq(issueThreadInteractions.id, cardId));
+    expect(await f.answered(m)).toBe(false);
+    expect(await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.id, m),
+      unansweredPersonMessageCommentCondition())), "discovery flags M again: the retired notice no longer stands").toHaveLength(1);
+    const counts = [];
+    for (const minutes of [5, 11, 30]) counts.push((await f.sweep(minutes)).noticed);
+    expect(counts, "one new notice on the first pass after the expiry, never another").toEqual([1, 0, 0]);
+    const all = (await f.notices()).sort((x, y) => Number(x.deletedAt === null) - Number(y.deletedAt === null));
+    expect(all, "the retired notice and the ONE live one").toHaveLength(2);
+    expect(all[0]!.deletedAt).not.toBeNull();
+    expect(all[1]).toMatchObject({ deletedAt: null, body: UNANSWERED_MESSAGE_NO_REPLY_TEXT, metadata: { ...key(m), sourceRunId: run2 } });
   }, 60_000);
 
   it("ruling 2 edge: a card posted for a LATER message, or before M, does not answer M -> M keeps its one notice", async () => {

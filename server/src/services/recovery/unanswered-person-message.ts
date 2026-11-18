@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql, unansweredCardAnswerSql } from "../person-message-answer.js";
+import { answeredPersonMessageSql, messageCardEndedSinceSql, unansweredCardAnswerSql } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -227,6 +227,11 @@ export const UNANSWERED_MESSAGE_GROUP_KEY = "unansweredMessageIds";
 const noticeCoversSql = (n: string, id: SQL) => sql`(substr(${sql.raw(n)}.metadata->>'authorizationReason',
     strpos(${sql.raw(n)}.metadata->>'authorizationReason', ':') + 1) = ${id}::text
   or coalesce(${sql.raw(n)}.metadata->${sql.raw(`'${UNANSWERED_MESSAGE_GROUP_KEY}'`)}, '[]'::jsonb) ? ${id}::text)`;
+/** SQL: notice row n (alias) still stands as message m's notice (NOTICE_REOWED_AFTER_CARD, am5 gap 17): it is live,
+ * or it was retired and m has not been owed AGAIN since by a card that stopped being answerable (ruling 3). A notice
+ * retired while a card answered m must not keep m silent after that card expired. */
+const noticeStandsSql = (n: string, m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }) =>
+  sql`(${sql.raw(n)}.deleted_at is null or not ${messageCardEndedSinceSql(m, sql`${sql.raw(n)}.deleted_at`)})`;
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
 
@@ -296,6 +301,7 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
         and not ${answeredSql(rawMessage("m"))}
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
           and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX}) and ${noticeCoversSql("n", sql.raw("m.id"))}
+          and ${noticeStandsSql("n", rawMessage("m"))}
           and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
     or exists (select 1 from ${issueComments} n
       join ${issueComments} m on m.company_id = n.company_id and m.issue_id = n.issue_id and ${noticeCoversSql("n", sql.raw("m.id"))}
@@ -340,6 +346,8 @@ export function unansweredPersonMessageCommentCondition(): SQL {
       and not exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
         and n.issue_id = ${issueComments.issueId}
         and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX}) and ${noticeCoversSql("n", sql`${issueComments.id}`)}
+        and ${noticeStandsSql("n", { id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+          issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}
         and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
     or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
       and starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
@@ -630,7 +638,11 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     .from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
-    noticeCoversSql(`"issue_comments"`, sql`${message.id}`))).limit(1);
+    noticeCoversSql(`"issue_comments"`, sql`${message.id}`),
+    // A notice retired while a card answered the message does not stand once that card ended (NOTICE_REOWED_AFTER_CARD).
+    cardAnswer ? undefined : noticeStandsSql(`"issue_comments"`, { id: sql`${message.id}::uuid`, companyId: sql`${issue.companyId}::uuid`,
+      issueId: sql`${issue.id}::uuid`, createdAt: sql`${message.createdAt.toISOString()}::timestamptz` })))
+    .orderBy(sql`${issueComments.deletedAt} is not null`).limit(1);
 
   // The run this message started (the latest run that carries it), if any.
   const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
