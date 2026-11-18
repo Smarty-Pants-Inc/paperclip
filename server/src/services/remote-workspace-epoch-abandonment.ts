@@ -1,7 +1,32 @@
 import { and, eq } from "drizzle-orm";
-import { executionWorkspaces, type Db } from "@paperclipai/db";
-import { readRemoteWorkspaceAuthority, type RemoteWorkspaceAuthority } from "@paperclipai/shared";
+import { executionWorkspaces, type heartbeatRuns, type Db } from "@paperclipai/db";
+import { readRemoteWorkspaceAuthority, remoteWorkspaceRunReferenceSchema, type RemoteWorkspaceAuthority } from "@paperclipai/shared";
 import { persistActivity } from "./activity-log.js";
+
+/** Abandons a source run's remote epoch only while it still owns it. Shared
+ * by fallback and admission; caller holds the company-scoped issue/run locks. */
+export async function fenceSourceWorkspace(tx: Db, run: typeof heartbeatRuns.$inferSelect) {
+  const parsed = remoteWorkspaceRunReferenceSchema.safeParse(run.runnerProfileJson?.remoteWorkspace);
+  if (!parsed.success || parsed.data.state !== "prepared") return null;
+  const reference = parsed.data;
+  const [workspace] = await tx.select({ metadata: executionWorkspaces.metadata }).from(executionWorkspaces).where(and(
+    eq(executionWorkspaces.companyId, run.companyId), eq(executionWorkspaces.id, reference.workspaceId)));
+  let authority;
+  try { authority = readRemoteWorkspaceAuthority(workspace?.metadata); } catch { return null; }
+  if (!authority?.location || authority.writerRunId !== run.id || authority.epoch !== reference.epoch) return null;
+  try {
+    const abandoned = await tx.transaction(savepoint => abandonUnverifiedRemoteWorkspaceEpoch(savepoint, {
+      companyId: run.companyId, workspaceId: reference.workspaceId, runId: run.id, epoch: authority.epoch,
+      snapshotId: authority.snapshotId, location: authority.location! }));
+    return { workspaceId: reference.workspaceId, abandonedEpoch: authority.epoch, epoch: abandoned.authority.epoch,
+      snapshotId: authority.snapshotId,
+      quarantine: { state: "retained_unapplied" as const, remoteCwd: authority.location.remoteCwd,
+        providerLeaseId: authority.location.providerLeaseId } };
+  } catch (error) {
+    if (error instanceof Error && error.message === "remote_workspace_authority_changed") return null;
+    throw error;
+  }
+}
 
 type Transaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 export const REMOTE_WORKSPACE_ABANDONED_EPOCH_SCHEMA = "paperclip.remote-workspace-abandoned-epoch.v1";

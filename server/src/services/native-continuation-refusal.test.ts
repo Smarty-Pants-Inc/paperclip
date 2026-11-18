@@ -77,6 +77,15 @@ describe("native continuation refusal", () => {
     } as Parameters<typeof isNativeContinuationRefusal>[0])).toBe(false);
   });
 
+  it("keeps an independent permanent refusal even beside recoverable supervision loss", () => {
+    const observation = "runner_process_termination_unconfirmed: runnerd process supervision failed: "
+      + "Boat POST /sandboxes/{sandboxId}/commands failed (unavailable): result_unconfirmed, evidence=unknown (possibly ran)";
+    expect(isNativeContinuationRefusal({ error: observation, errorCode: "runner_state_identity_mismatch: prior_owner_active" })).toBe(true);
+    expect(isNativeContinuationRefusal({ error: "runner_state_identity_mismatch: prior_owner_active", errorCode: observation })).toBe(true);
+    expect(isNativeContinuationRefusal({ error: `quoted ${observation}` })).toBe(true);
+    expect(isNativeContinuationRefusal({ error: "runner_process_termination_unconfirmed: runnerd process supervision failed: access denied" })).toBe(true);
+  });
+
   it("does not treat the no-replay hold code alone as a refusal", () => {
     // An ordinary recovered native hold carries this code and continues on the next message.
     expect(isNativeContinuationRefusal({ error: null, errorCode: "native_continuation_requires_reconciliation" })).toBe(false);
