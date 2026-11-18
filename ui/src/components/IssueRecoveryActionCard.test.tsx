@@ -1205,6 +1205,36 @@ it("G1: a system-held saved-work recovery card says Paperclip continues it, not 
   expect(text).not.toContain("Waiting for you");
 });
 
+// F2 (rf-5 onA): the WHOLE card, every text, from the real GET /issues/:id of
+// task-retry-recovery-refresh.test.ts at stranded-onA3 ("JUDGE workspace recovery" before any press,
+// whose same-GET blocker is "Recovering your saved work…"; and "JUDGE F1 foreign held source",
+// whose same-GET blocker is "Create a new task to continue the work."). A system-held or blocked
+// card never says the generic stranded description.
+const G1_SYSTEM_HELD_GET_ACTION_ONA3 = {"id": "9eecc364-3229-476b-a101-a40e2b59f6b0", "companyId": "86feeadc-5aae-40cc-a49d-2fd2913aec07", "sourceIssueId": "9a1e957a-8abc-455b-873b-11392275a00d", "recoveryIssueId": null, "kind": "stranded_assigned_issue", "status": "active", "ownerType": "board", "ownerAgentId": null, "ownerUserId": null, "previousOwnerAgentId": "6c317be3-479b-4d84-be98-02523ded6e7b", "returnOwnerAgentId": "6c317be3-479b-4d84-be98-02523ded6e7b", "cause": "stranded_assigned_issue", "fingerprint": "source_scoped_recovery:86feeadc-5aae-40cc-a49d-2fd2913aec07:9a1e957a-8abc-455b-873b-11392275a00d:stranded_assigned_issue", "evidence": {"latestRunId": "e5e8204e-4cf8-41da-8535-165680cf97fa", "retryReason": null, "sourceRunId": null, "recoveryCause": "stranded_assigned_issue", "routingPolicy": "board_escalation_no_takeover_v1", "sourceIssueId": "9a1e957a-8abc-455b-873b-11392275a00d", "failureSummary": "The failure details are kept with the run.", "handoffAttempt": null, "previousStatus": "in_progress", "correctiveRunId": null, "latestRunStatus": "failed", "sourceIdentifier": "RR86FEEA-1", "latestIssueStatus": "in_progress", "latestRunErrorCode": "adapter_failed", "maxHandoffAttempts": null, "missingDisposition": null}, "nextAction": "This attempt could not be finished. Nothing is needed from you while Paperclip recovers the saved work; Retry is offered on the task once it finishes.", "wakePolicy": {"type": "system_recovery", "reason": "stranded_assigned_issue", "preservesSourceAssignee": true, "retryWithheld": "saved_work_recovering"}, "monitorPolicy": null, "attemptCount": 1, "maxAttempts": null, "timeoutAt": null, "lastAttemptAt": "2026-11-18T16:19:28.950Z", "outcome": null, "resolutionNote": null, "resolvedAt": null, "createdAt": "2026-11-18T16:19:28.939Z", "updatedAt": "2026-11-18T16:19:28.939Z"} as unknown as IssueRecoveryAction;
+const F1_FOREIGN_GET_ACTION = {"id": "9e3442f2-1f47-43ce-b7ee-6609422960ef", "companyId": "aad4fb34-bb3f-4e55-b2ba-129e2d1fbd39", "sourceIssueId": "0469802a-a05a-49d3-9c7b-0b89a0032c83", "recoveryIssueId": null, "kind": "stranded_assigned_issue", "status": "active", "ownerType": "board", "ownerAgentId": null, "ownerUserId": null, "previousOwnerAgentId": "cdc64883-dcc8-4fa5-a1e1-cdda98fe7536", "returnOwnerAgentId": "cdc64883-dcc8-4fa5-a1e1-cdda98fe7536", "cause": "stranded_assigned_issue", "fingerprint": "source_scoped_recovery:aad4fb34-bb3f-4e55-b2ba-129e2d1fbd39:0469802a-a05a-49d3-9c7b-0b89a0032c83:stranded_assigned_issue", "evidence": {"latestRunId": "91acb493-3881-4f6b-abb8-e99f1bd77a8d", "retryReason": null, "sourceRunId": null, "recoveryCause": "stranded_assigned_issue", "routingPolicy": "board_escalation_no_takeover_v1", "sourceIssueId": "0469802a-a05a-49d3-9c7b-0b89a0032c83", "failureSummary": "The failure details are kept with the run.", "handoffAttempt": null, "previousStatus": "todo", "correctiveRunId": null, "latestRunStatus": "cancelled", "sourceIdentifier": null, "latestIssueStatus": "todo", "latestRunErrorCode": "execution_reconciliation_required", "maxHandoffAttempts": null, "missingDisposition": null}, "nextAction": "This attempt could not be finished. Create a new task to continue the work.", "wakePolicy": {"type": "board_escalation", "reason": "stranded_assigned_issue", "preservesSourceAssignee": true, "retryWithheld": "held_source_unbound"}, "monitorPolicy": null, "attemptCount": 1, "maxAttempts": null, "timeoutAt": null, "lastAttemptAt": "2026-11-18T16:19:31.406Z", "outcome": null, "resolutionNote": null, "resolvedAt": null, "createdAt": "2026-11-18T16:19:31.400Z", "updatedAt": "2026-11-18T16:19:31.400Z"} as unknown as IssueRecoveryAction;
+
+const GENERIC_STRANDED = /no queued run|next owner|choose what happens next|try the task again/i;
+function cardTexts(node: HTMLElement): string[] {
+  const texts: string[] = [];
+  const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) { const t = n.textContent?.trim(); if (t) texts.push(t); }
+  return texts;
+}
+it.each([
+  ["G1 system-held", G1_SYSTEM_HELD_GET_ACTION_ONA3, "Paperclip is handling the next step itself", "Nothing is needed from you while Paperclip recovers the saved work", "Paperclip continues it by itself"],
+  ["F1 foreign held source", F1_FOREIGN_GET_ACTION, "Retry cannot continue it now", "Create a new task to continue the work.", "Waiting for you"],
+] as const)("F2 whole card (%s): every text on the card agrees with the same GET's blocker", (_name, action, description, nextAction, follow) => {
+  const node = render(<IssueRecoveryActionCard action={action} agentMap={new Map([[ownerAgent.id, ownerAgent]])} onResolve={() => {}} />);
+  const texts = cardTexts(node);
+  console.info("F2_WHOLE_CARD", _name, JSON.stringify(texts));
+  for (const text of texts) expect(text, JSON.stringify(texts)).not.toMatch(GENERIC_STRANDED);
+  expect(texts.join(" ")).toContain(description);
+  expect(texts.join(" ")).toContain(nextAction);
+  expect(texts.join(" ")).toContain(follow);
+  expect(texts.join(" ")).not.toContain("Nothing restarts");
+  expect([...node.querySelectorAll("button")].map(b => b.textContent)).not.toContain("Retry");
+});
+
 it.each(["active", "escalated", "resolved"] as const)("does not show a historical unsafe-export repair card: %s", status => {
   const node = render(<IssueRecoveryActionCard action={buildAction({ status, kind: "active_run_watchdog",
     cause: "native_workspace_sync_out_unsafe_archive", ownerType: "board", nextAction: "Repair the unsafe link manually" })} onResolve={() => {}} />);

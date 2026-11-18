@@ -35,6 +35,21 @@ async function admissionFollowingPresentation(db: Db, issue: { id: string; compa
   presentation: Presentation): Promise<StrandedRetryAdmission> {
   const admission = strandedRetryAdmissionFromPresentation(presentation, await assigneeOf(db, issue));
   if (admission.admits) return admission;
+  // ONE precedence (rf-5 onA F1). #21914 (9c008635) first: the observed run is a
+  // stale-run gate's pre-start cancellation whose hold's source Retry cannot bind
+  // for the assignee (another agent's run). Whatever that hold shows (the screen's
+  // "Retry is waiting for execution checks", or its saved-work recovery
+  // "Recovering saved work…"), Retry on this task binds and admits nothing there
+  // (two real presses: 202, runs 2→2→2). The step that works is a new task. It is
+  // decided before the saved-work fallback, so the notice, blocker, card, wake-skip
+  // and heartbeat-context all say the same step before and after a press.
+  if ((admission.refusal === "system_waiting" || admission.refusal === "none"
+    || admission.refusal === "workspace_repair_required") && issue.assigneeAgentId && presentation?.observedRunId) {
+    const { preDispatchHeldSourceUnbound } = await import("../pre-dispatch-execution-wait.js");
+    if (await preDispatchHeldSourceUnbound(db, { companyId: issue.companyId, issueId: issue.id,
+      agentId: issue.assigneeAgentId, runId: presentation.observedRunId }))
+      return { admits: false, refusal: "held_source_unbound" };
+  }
   // r2f SD5: while Paperclip itself holds the saved-work recovery (the task
   // screen's execution blocker shows "Recovering saved work…",
   // workspaceRecoveryDisplay; or the hold's RECOVERING_SAVED_WORK_NEXT_ACTION),
@@ -47,18 +62,6 @@ async function admissionFollowingPresentation(db: Db, issue: { id: string; compa
     if (blocker?.workspaceRecovery && ["queued", "recovering"].includes(blocker.workspaceRecovery.status)
       || blocker?.nextAction === RECOVERING_SAVED_WORK_NEXT_ACTION)
       return { admits: false, refusal: "saved_work_recovering" };
-  }
-  // #21914 (9c008635): the observed run is a stale-run gate's pre-start
-  // cancellation whose hold's source Retry cannot bind for the assignee (another
-  // agent's run). The screen's wait ("Retry is waiting for execution checks")
-  // never ends in a run there: Retry binds and admits nothing. The step that
-  // works is a new task. An input of this one decision, not a second reading.
-  if ((admission.refusal === "system_waiting" || admission.refusal === "none") && issue.assigneeAgentId
-    && presentation?.observedRunId) {
-    const { preDispatchHeldSourceUnbound } = await import("../pre-dispatch-execution-wait.js");
-    if (await preDispatchHeldSourceUnbound(db, { companyId: issue.companyId, issueId: issue.id,
-      agentId: issue.assigneeAgentId, runId: presentation.observedRunId }))
-      return { admits: false, refusal: "held_source_unbound" };
   }
   return admission;
 }
@@ -94,9 +97,15 @@ type Presentation = Awaited<ReturnType<typeof taskInterruptionPresentation>>;
 export async function executionBlockerFollowingPresentation<B extends { nextAction: string; canRetry?: boolean }>(
   db: Db, issue: { id: string; companyId: string; assigneeAgentId: string | null }, blocker: B | null, presentation: Presentation,
 ): Promise<B | null> {
-  if (!blocker?.canRetry || !presentation || presentation.canRetry) return blocker;
-  const nextAction = textFollowingAdmission(blocker.nextAction,
-    await admissionFollowingPresentation(db, issue, presentation), true);
+  if (!blocker || !presentation || presentation.canRetry) return blocker;
+  const admission = await admissionFollowingPresentation(db, issue, presentation);
+  // F1: a blocker that offers no Retry still names a wait ("Recovering saved
+  // work…"). Where the one decision says that wait never ends in a run on this
+  // task (held_source_unbound), its words are replaced whole by the decision's
+  // step, so the blocker and wake-skip say what the notice and card say.
+  if (!blocker.canRetry) return !admission.admits && admission.refusal === "held_source_unbound"
+    ? { ...blocker, nextAction: strandedRetryRefusalCopy(admission).nextAction } : blocker;
+  const nextAction = textFollowingAdmission(blocker.nextAction, admission, true);
   return nextAction === null ? blocker : { ...blocker, canRetry: false, nextAction };
 }
 
@@ -114,8 +123,12 @@ export async function recoveryActionFollowingPresentation<A extends { nextAction
   const nextAction = textFollowingAdmission(action.nextAction, admission, false);
   // G1: while Paperclip itself holds the task, the card's wake line says the
   // system continues it, not the board escalation's "Waiting for you".
-  const wakePolicy = systemHolds(admission) && action.wakePolicy?.type === "board_escalation"
-    ? { ...action.wakePolicy, type: "system_recovery" } : action.wakePolicy;
+  // F2: the card's description follows the same decision (retryWithheld): a
+  // withheld Retry has a named next step, so the card never says there is no
+  // next owner or asks the person to choose (IssueRecoveryActionCard.tsx).
+  const wakePolicy = admission.admits ? action.wakePolicy
+    : { ...(action.wakePolicy ?? {}), retryWithheld: admission.refusal,
+      ...(systemHolds(admission) && action.wakePolicy?.type === "board_escalation" ? { type: "system_recovery" } : {}) };
   return nextAction === null && wakePolicy === action.wakePolicy ? action
     : { ...action, nextAction: nextAction ?? action.nextAction, wakePolicy };
 }

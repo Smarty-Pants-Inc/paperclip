@@ -636,6 +636,162 @@ describe("Task Retry recovery-card refresh", () => {
     }
   }, 90_000);
 
+  // F1 (rf-5 onA): the foreign held source of #21914 (held-source-comment-retry-21914.test.ts
+  // liveShape({ foreign: true }), the same production writers). Remedy (b): Retry on this task
+  // binds nothing (two real presses, 202, no new run), so every surface of the SAME GET, before and
+  // after a press, says the new-task step; and the new task for the same agent ANSWERS its message once.
+  it("JUDGE F1 foreign held source: all five surfaces say the new task before and after a press; the new task ANSWERS once", async () => {
+    const { recordNativeLocalProcessStop } = await import("../services/native-local-process-stop.js");
+    const { recordRequiredWorkspaceRestoreFailure } = await import("../services/legacy-execution-recovery.js");
+    const { adoptSystemRecovery } = await import("../services/system-recovery.js");
+    const { createPostgresRunDispatchAdapter } = await import("../modules/run-dispatch/adapters/postgres.js");
+    const { NEW_TASK_CONTINUE_ACTION } = await import("../services/execution-blocker.js");
+    const { executionWorkspaces, projects } = await import("@paperclipai/db");
+    const companyId = randomUUID(), agentId = randomUUID(), otherAgentId = randomUUID(), issueId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Foreign held source", defaultResponsibleUserId: userId,
+      issuePrefix: `FH${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "owner" });
+    await db.insert(agents).values([agentId, otherAgentId].map(id => ({ id, companyId, name: id === agentId ? "Parent" : "Former",
+      role: "engineer", adapterType: "paperclip_runner", status: "idle",
+      adapterConfig: { provider: "pi_rpc", model: "paperclip/faux", lifecycleMode: "cold" },
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true, maxConcurrentRuns: 1 } } })));
+    const [project] = await db.insert(projects).values({ companyId, name: "Repository" }).returning();
+    const root = mkdtempSync(path.join(tmpdir(), "f1-foreign-"));
+    const primary = path.join(root, "primary"), worktree = path.join(root, "worktree"), branchName = `TASK-${issueId.slice(0, 8)}`;
+    const git = (...args: string[]) => execFileSync("git", args, { encoding: "utf8" });
+    git("init", "--initial-branch=main", primary);
+    git("-C", primary, "-c", "user.email=t@example.com", "-c", "user.name=F1", "commit", "--allow-empty", "-m", "base");
+    git("-C", primary, "worktree", "add", "-b", branchName, worktree, "main");
+    await db.insert(issues).values({ id: issueId, companyId, projectId: project!.id, title: "Foreign held task", status: "in_progress",
+      assigneeAgentId: agentId, responsibleUserId: userId, executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: "isolated_workspace" } });
+    const [workspace] = await db.insert(executionWorkspaces).values({ companyId, projectId: project!.id, sourceIssueId: issueId,
+      mode: "isolated_workspace", strategyType: "git_worktree", name: branchName, status: "active", cwd: worktree,
+      providerType: "git_worktree", providerRef: worktree, baseRef: "main", branchName }).returning();
+    await db.update(issues).set({ executionWorkspaceId: workspace!.id }).where(eq(issues.id, issueId));
+    // The former assignee's native run, cancelled by the board's Done; its required saved-work hold.
+    const cancelledAt = new Date(Date.now() - 20_000);
+    const [native] = await db.insert(heartbeatRuns).values({ companyId, agentId: otherAgentId, issueId, nativeIssueId: issueId,
+      invocationSource: "assignment", triggerDetail: "system", runtimeMode: "native", status: "cancelled",
+      errorCode: "issue_terminalized", error: "Cancelled before issue terminalization", processPid: 999_999_999,
+      responsibleUserId: userId, startedAt: new Date(Date.now() - 80_000), finishedAt: cancelledAt,
+      contextSnapshot: { issueId, taskId: issueId, source: "issue.create", wakeReason: "issue_assigned" },
+      resultJson: { stopReason: "cancelled", cancelledByUserId: userId, cancelledByActorType: "user",
+        cancellation: { reason: "Cancelled before issue terminalization", source: "operator", expected: true,
+          initiator: { id: userId, type: "user" }, recordedAt: cancelledAt.toISOString() },
+        startupCancellation: { errorCode: "issue_terminalized", requestedAt: cancelledAt.toISOString(), beforeNativeSelection: false },
+        executionCancellation: { proof: "provider_termination_receipt", state: "acknowledged",
+          requestedAt: cancelledAt.toISOString(), acknowledgedAt: cancelledAt.toISOString() },
+        terminalizationStopConfirmed: true } }).returning();
+    const [lease] = await db.insert(environmentLeases).values({ companyId, issueId, heartbeatRunId: native!.id, provider: "local",
+      status: "expired", leasePolicy: "ephemeral", executionWorkspaceId: workspace!.id, releasedAt: cancelledAt, cleanupStatus: "success" }).returning();
+    expect(await db.transaction(tx => recordNativeLocalProcessStop(tx as never, native!))).toBe(true);
+    await db.update(heartbeatRuns).set({ processPid: null }).where(eq(heartbeatRuns.id, native!.id));
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, native!.id));
+    await recordRequiredWorkspaceRestoreFailure(db, stopped!, { ...stopped!.resultJson, workspaceRestoreFailure: "restore_failed",
+      workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [lease!.id] } });
+    const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    await adoptSystemRecovery(db, { companyId, issueId, runId: native!.id, actionId: hold!.id });
+    // The person's comment reopens it; the stale-run gate cancels its run before start.
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issueId));
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
+      body: "Person request on the held task." }).returning();
+    const [wakeRow] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", triggerDetail: "system",
+      reason: "issue_reopened_via_comment", status: "queued", requestedByActorType: "user", requestedByActorId: userId,
+      payload: { issueId, commentId: comment!.id, mutation: "comment", reopenedFrom: "done" } }).returning();
+    const [successor] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "automation",
+      triggerDetail: "system", status: "queued", runtimeMode: "legacy", wakeupRequestId: wakeRow!.id, responsibleUserId: userId,
+      contextSnapshot: { issueId, taskId: issueId, taskKey: issueId, commentId: comment!.id, wakeCommentId: comment!.id,
+        wakeCommentIds: [comment!.id], source: "issue.comment.reopen", reopenedFrom: "done", wakeReason: "issue_reopened_via_comment" } }).returning();
+    await db.update(agentWakeupRequests).set({ runId: successor!.id }).where(eq(agentWakeupRequests.id, wakeRow!.id));
+    expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ companyId, runId: successor!.id,
+      expectedStatus: "queued", now: new Date() })).toMatchObject({ outcome: "cancelled", errorCode: "execution_reconciliation_required" });
+    await recoveryService(db, { enqueueWakeup: heartbeatService(db).wakeup }).escalateStrandedAssignedIssue({
+      issue: await issueRow(issueId), previousStatus: "todo", latestRun: (await runRows(issueId)).find(run => run.id === successor!.id)! });
+
+    const app = appForBoard();
+    // The five surfaces of one GET (+ the wake-skip and heartbeat-context read at the same moment).
+    const surfaces = async () => {
+      const shown = (await request(app).get(`/api/issues/${issueId}`).expect(200)).body;
+      if (process.env.G1_GET_FILE) appendFileSync(process.env.G1_GET_FILE, `${JSON.stringify({ when: "f1-foreign",
+        activeRecoveryAction: shown.activeRecoveryAction, executionBlocker: shown.executionBlocker, interruption: shown.interruption })}\n`);
+      const context = (await request(app).get(`/api/issues/${issueId}/heartbeat-context`).expect(200)).body;
+      const wake = await request(app).post(`/api/agents/${agentId}/wakeup`).send({ source: "on_demand", reason: "f1_foreign", payload: { issueId } });
+      const notices = (await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"))))
+        .sort((a, b) => +a.createdAt - +b.createdAt);
+      return { canRetry: shown.interruption?.canRetry ?? null, notice: notices.at(-1)?.body ?? null,
+        blocker: shown.executionBlocker?.nextAction ?? null, card: shown.activeRecoveryAction?.nextAction ?? null,
+        wakeSkip: wake.body.message ?? null, heartbeatContext: context.issue?.activeRecoveryAction?.nextAction ?? null,
+        runs: (await runRows(issueId)).length };
+    };
+    const rows = [{ when: "before press", ...await surfaces() }];
+    resetProcessRunAdmissionForTests();
+    for (const press of [1, 2]) {
+      const retried = await request(app).post(`/api/issues/${issueId}/retry`).send({ observedRunId: successor!.id, idempotencyKey: randomUUID() });
+      expect(retried.status).toBe(202);
+      if (retried.body.requestId) await heartbeatService(db).resumeTaskRetry(companyId, retried.body.requestId);
+      await heartbeatService(db).drainActiveRunExecutions();
+      rows.push({ when: `after press ${press}`, ...await surfaces() });
+    }
+    closeProcessRunAdmission();
+    console.info("JUDGE_F1_FOREIGN_SURFACES", JSON.stringify(rows));
+    if (process.env.JUDGE_ROWS_FILE) appendFileSync(process.env.JUDGE_ROWS_FILE, `${JSON.stringify({ test: expect.getState().currentTestName, f1Foreign: rows })}\n`);
+    for (const row of rows) {
+      expect(row.canRetry, row.when).toBe(false);
+      expect(row.runs, row.when).toBe(rows[0]!.runs);
+      for (const surface of [row.notice, row.blocker, row.card, row.wakeSkip, row.heartbeatContext]) {
+        expect(surface, `${row.when}: ${JSON.stringify(row)}`).toContain(NEW_TASK_CONTINUE_ACTION);
+        expect(surface, row.when).not.toMatch(/Recovering saved work|Paperclip recovers the saved work/);
+      }
+    }
+
+    // The step shown WORKS: the new task for the same agent ANSWERS its message once.
+    const markerFile = path.join(markerDir, `f1-${agentId}.jsonl`);
+    const settings = instanceSettingsService(db);
+    await settings.updateExperimental({ enableNativeRunner: true });
+    const listener = createServer(app);
+    registerLocalRuntimeApiServer(listener);
+    await new Promise<void>(resolve => listener.listen(0, "127.0.0.1", resolve));
+    let hb: ReturnType<typeof heartbeatService> | null = null;
+    try {
+      const created = await request(app).post(`/api/companies/${companyId}/issues`)
+        .send({ title: "Same question, new task", description: "Please continue the held work.", assigneeAgentId: agentId, status: "todo" });
+      expect(created.status, JSON.stringify(created.body)).toBe(201);
+      const newIssueId = created.body.id as string;
+      const sent = await request(app).post(`/api/issues/${newIssueId}/comments`).send({ body: "Answer this NEW TASK message once.", clientRequestId: randomUUID() });
+      expect(sent.status, JSON.stringify(sent.body)).toBe(201);
+      await new Promise(resolve => setTimeout(resolve, 150));
+      resetProcessRunAdmissionForTests();
+      hb = heartbeatService(db, { nativeSessionBackendFactory: answeringPeer(markerFile) });
+      await hb.resumeQueuedRunsForAgent(companyId, agentId);
+      for (let i = 0; i < 400; i++) { if (hb.getTaskDrainStatus().quiescent) break; await new Promise(resolve => setTimeout(resolve, 50)); }
+      await hb.drainActiveRunExecutions();
+      const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+        .filter(run => run.issueId === newIssueId || run.nativeIssueId === newIssueId);
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, newIssueId));
+      const [answer] = await db.select({ answered: answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+        issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }) }).from(issueComments).where(eq(issueComments.id, sent.body.id));
+      const markers = existsSync(markerFile) ? readFileSync(markerFile, "utf8").trim().split("\n").map(line => JSON.parse(line) as { runId: string; marker: string }) : [];
+      const replies = comments.filter(c => c.authorType === "agent" && c.createdByRunId && !c.deletedAt && runs.some(run => run.id === c.createdByRunId));
+      const row = { newIssueId, messageId: sent.body.id, answered: answer?.answered ?? false, replyCount: replies.length,
+        replies: replies.map(c => ({ id: c.id, runId: c.createdByRunId, body: c.body.slice(0, 200) })),
+        runs: runs.map(run => ({ id: run.id, status: run.status, startedAt: run.startedAt?.toISOString() ?? null, error: `${run.errorCode ?? ""}:${run.error ?? ""}`.slice(0, 300) })),
+        executorMarkers: markers.map(m => `${m.marker}:${m.runId}`) };
+      console.info("JUDGE_F1_FOREIGN_NEW_TASK_ANSWERED", JSON.stringify(row));
+      if (process.env.JUDGE_ROWS_FILE) appendFileSync(process.env.JUDGE_ROWS_FILE, `${JSON.stringify({ test: expect.getState().currentTestName, f1NewTask: row })}\n`);
+      expect(row.answered).toBe(true);
+      expect(row.replyCount).toBe(1);
+      expect(markers.some(m => m.marker === "provider.startTurn" && m.runId === replies[0]!.createdByRunId)).toBe(true);
+    } finally {
+      if (hb) await hb.drainActiveRunExecutions();
+      await closeIdleWarmNativeSessionsForRestart();
+      closeProcessRunAdmission();
+      await new Promise<void>(resolve => listener.close(() => resolve()));
+      runtimeApiInternals.resetForTests();
+      await settings.updateExperimental({ enableNativeRunner: false });
+    }
+  }, 120_000);
+
   // r2d ST5: the agent is busy (its one concurrency slot is occupied by a
   // running run on another task). Record what Retry does at press time.
   it("JUDGE occupied slot (agent busy): Press Retry vs the executor at press time", async () => {

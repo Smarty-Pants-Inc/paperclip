@@ -163,6 +163,13 @@ const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
     "Paperclip could not find a clear next step for this open task. Choose whether to continue work, send it for review, mark it done, or record what is blocking it.",
 };
 
+/** A stranded task Paperclip itself holds (saved-work recovery, a system wait). */
+const STRANDED_SYSTEM_HELD_HEADLINE =
+  "Paperclip retried this task's last run, but it could not be finished. Paperclip is handling the next step itself; the next action below says when Retry is offered.";
+/** A stranded task whose Retry is withheld for a reason with a named step. */
+const STRANDED_RETRY_WITHHELD_HEADLINE =
+  "Paperclip retried this task's last run, but it could not be finished, and Retry cannot continue it now. The next action below names the step that does.";
+
 /** Shared shell for the retry-timing pill so every timing state reads as the same control. */
 const RETRY_PILL_CLASS =
   "rounded-md border border-border/50 bg-background/60 px-1.5 py-0.5 text-(length:--text-micro) text-muted-foreground";
@@ -1042,9 +1049,17 @@ export function IssueRecoveryActionCard({
     ) {
       return "This recovery needs a human decision. Review the recorded failure and choose the next step.";
     }
+    // The server's one Retry decision (wakePolicy.retryWithheld, stranded-retry-admission.ts)
+    // withheld Retry; it wins over the retry lineage's generic board headline. The task has a
+    // next step (a system hold or a named step), so the generic "no … next owner … choose what
+    // happens next" is not said.
+    if (action.kind === "stranded_assigned_issue" && readEvidenceString(action.wakePolicy?.retryWithheld)) {
+      return readEvidenceString(action.wakePolicy?.type) === "system_recovery"
+        ? STRANDED_SYSTEM_HELD_HEADLINE : STRANDED_RETRY_WITHHELD_HEADLINE;
+    }
     if (lineage) return lineageHeadline(lineage);
     return KIND_HEADLINE[action.kind] ?? KIND_HEADLINE.missing_disposition;
-  }, [action.kind, action.outcome, action.ownerType, cardState, lineage]);
+  }, [action.kind, action.outcome, action.ownerType, action.wakePolicy, cardState, lineage]);
 
   // A lane with no path left must not keep advertising a retry that will never run — whether
   // the budget ran out or the scheduled attempt simply never fired.
