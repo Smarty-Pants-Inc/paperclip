@@ -688,7 +688,12 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
     expect(failMutedNotice).toBe(false);
     expect(held.receipt?.savePending).toMatchObject({ permanent: true, permanentStatus: 422 });
     expect(before).toHaveLength(0);
+    // Delivery must come from the RECOVERY WORKER alone (no explicit collection).
     await copies.recoverStopped();
+    const recovered = await mutedNotices();
+    console.log("B3_OUTBOX_RECOVERED", JSON.stringify({ notices: recovered.length }));
+    expect(recovered).toHaveLength(1);
+    // Idempotent: more sweeps and a retirement collection post nothing more.
     await copies.recoverStopped();
     await copies.collectStopped({ companyId, runId });
     const after = await mutedNotices();
