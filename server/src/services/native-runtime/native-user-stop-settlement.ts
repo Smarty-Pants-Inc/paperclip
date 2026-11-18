@@ -1,6 +1,8 @@
 import { and, eq, inArray, or, sql } from "drizzle-orm";
-import { heartbeatRunEvents, issueRecoveryActions, type Db } from "@paperclipai/db";
+import { heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { completedWorkspaceRecoveryCondition } from "../workspace-recovery-receipt.js";
+import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
+import { hasTaskStopPending } from "../recovery/stop-pending.js";
 
 const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
   ? value as Record<string, unknown> : {};
@@ -41,12 +43,35 @@ export async function userStopLeftUncertainty(db: Db, run: { id: string; company
   }
 }
 
+/** H6's standalone Stop-pending card for this stopped run and nothing else:
+ * no stronger obligation (workspace, system or automatic recovery) shares it. */
+function onlyStopPendingFor(action: { cause: string; evidence: Record<string, unknown> }, runId: string): boolean {
+  if (action.cause !== "execution_stop_pending" || !hasTaskStopPending(action)) return false;
+  const pending = record(action.evidence.stopPending);
+  return pending.standalone === true && Array.isArray(pending.runIds) && pending.runIds.length > 0
+    && pending.runIds.every(id => id === runId) && Object.keys(action.evidence).every(key => key === "runId" || key === "stopPending");
+}
+
+/** The retirement fence's own settled-Stop proof (native-session-executor
+ * stoppedByUser and owner_stop_unsettled), read for this run. */
+async function userStopProvenSettled(db: Db, binding: { companyId: string; runId: string }, controlBytes: string): Promise<boolean> {
+  const [stopped] = await db.select({ run: heartbeatRuns, owner: nativeRunFinalizations }).from(heartbeatRuns)
+    .innerJoin(nativeRunFinalizations, and(eq(nativeRunFinalizations.runId, heartbeatRuns.id),
+      eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId)))
+    .where(and(eq(heartbeatRuns.id, binding.runId), eq(heartbeatRuns.companyId, binding.companyId))).limit(1);
+  return !!stopped && stopped.run.status === "cancelled" && stopped.owner.failureCode === "native_retry_cancelled"
+    && !stopped.owner.leaseOwner && hasAcknowledgedNativeStopIntent(stopped.run)
+    && !stopJournalLeftUndeliveredTool(controlBytes) && !await userStopLeftUncertainty(db, stopped.run);
+}
+
 /** A Stop receipt cannot close an open recovery action or substitute for the
- * existing workspace-recovery settlement receipts. */
+ * existing workspace-recovery settlement receipts. The one exception is H6's
+ * Stop-pending card: it guards an unproven Stop, so it stops holding once the
+ * caller's journal and the run's own receipts prove this Stop settled. */
 export async function nativeUserStopRecoveryHeld(db: Db, binding: {
   companyId: string; issueId: string; runId: string;
-}): Promise<boolean> {
-  const [held] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+}, settledStop?: { controlBytes: string }): Promise<boolean> {
+  const held = await db.select({ cause: issueRecoveryActions.cause, evidence: issueRecoveryActions.evidence }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, binding.companyId), eq(issueRecoveryActions.sourceIssueId, binding.issueId),
     or(sql`${issueRecoveryActions.evidence}->>'runId' = ${binding.runId}`,
       sql`${issueRecoveryActions.evidence}->>'sourceRunId' = ${binding.runId}`,
@@ -54,6 +79,8 @@ export async function nativeUserStopRecoveryHeld(db: Db, binding: {
     or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
       sql`(${issueRecoveryActions.evidence}#>>'{automaticRecovery,replay}' = 'blocked'
         and not coalesce((${completedWorkspaceRecoveryCondition(binding.runId)}), false))`),
-  )).limit(1);
-  return !!held;
+  ));
+  if (!held.length) return false;
+  if (!settledStop || held.some(action => !onlyStopPendingFor(action, binding.runId))) return true;
+  return !await userStopProvenSettled(db, binding, settledStop.controlBytes);
 }
