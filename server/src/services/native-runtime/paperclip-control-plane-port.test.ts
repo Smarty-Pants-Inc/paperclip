@@ -1212,7 +1212,10 @@ describe("PaperclipControlPlanePort conformance", () => {
     });
 
     it("(3) the same run secret inside an output field is still masked while the metadata carrying it stays intact", async () => {
-      const secret = `rm${randomUUID().replace(/-/g, "")}`; // 34 chars, test-only, not an identifier
+      // Fixed 34-character material: no 32-character window starts with 'e',
+      // so ordinary 'line\n' cannot buffer 'e\n' and copy the intentionally
+      // secret-bearing envelope itemId into payload.outputTails metadata.
+      const secret = "rmabcdef0123456789abcdef0123456789";
       const { port, event, rows } = await openPort([secret]);
       const sent = [event(1, `turn-${secret}`, `item-${secret}`, "item.delta", `token=${secret}\nordinary line\n`),
         event(2, `turn-${secret}`, `item-${secret}`, "item.completed")];
