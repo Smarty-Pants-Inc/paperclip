@@ -3447,14 +3447,18 @@ describe("persistent agent directories", () => {
     const factory = vi.spyOn(fileStoreModule, "agentFileStore").mockImplementation((...args) => {
       const store = actual(...args);
       vi.spyOn(store, "apply");
-      const locked = store.locked;
-      vi.spyOn(store, "locked").mockImplementation((async (...args: Parameters<typeof locked>) => {
-        try { return await locked(...args); }
+      vi.spyOn(store, "locked");
+      // Upstream #21457 uses saveUnchanged's write authorization without a row
+      // lock when the projection is current. Observe its real refusal, not a
+      // store.locked call that this path deliberately no longer makes.
+      const saveUnchanged = store.saveUnchanged;
+      vi.spyOn(store, "saveUnchanged").mockImplementation(async (...args) => {
+        try { return await saveUnchanged(...args); }
         catch (error) {
-          if (args[3]) await afterWriteDenied?.();
+          await afterWriteDenied?.();
           throw error;
         }
-      }) as typeof locked);
+      });
       stores.push(store);
       return store;
     });
@@ -3527,8 +3531,8 @@ describe("persistent agent directories", () => {
     await lowTrust();
     const copy = await run({ warm: true });
     const before = await snapshotAgentFiles(root);
-    // A real membership revocation after the write transaction has rejected,
-    // before a possible read transaction. No authorization decision is faked.
+    // A real membership revocation after saveUnchanged's write authorization
+    // has rejected, before the read fallback. No authorization decision is faked.
     let revocations = 0;
     const observed = observedStore(async () => {
       revocations++;
@@ -3543,16 +3547,18 @@ describe("persistent agent directories", () => {
       expect(revocations).toBe(1);
       expect(checkpoint).toMatchObject({ state: "prepared", errorCode: "AGENT_FILES_CHECKPOINT_UNSTABLE", candidateHash: null });
       expect(checkpoint?.receipt?.checkpointState).toBeUndefined();
-      // Base has no fallback; candidate must not turn a failed fallback into a
-      // successful receipt. Retain the actual attempt count as judge evidence.
-      console.info("b13 read-revocation observation", { readFallbackAttempts: read.mock.calls.length });
+      // The refused write must reach exactly one real read fallback, and the
+      // revoked reader must not receive a successful unchanged receipt.
+      expect(read).toHaveBeenCalledOnce();
+      expect(observed.stores.flatMap(store => vi.mocked(store.saveUnchanged).mock.calls)).toHaveLength(1);
+      expect(observed.stores.flatMap(store => vi.mocked(store.locked).mock.calls).map(call => call[3])).toEqual([false]);
       for (const result of read.mock.results) await expect(result.value).rejects.toMatchObject({ status: 403,
         details: { code: "RESPONSIBLE_USER_UNAVAILABLE" } });
       expect(lifecycle.getInstructionSave()).toMatchObject({ state: "pending_collection" });
       expect(await snapshotAgentFiles(root)).toEqual(before);
     } finally { read.mockRestore(); observed.restore(); }
   });
-  it("b13 GUARD: normal-trust unchanged warm checkpoint uses the write recheck with no read fallback", async () => {
+  it("b13 GUARD: normal-trust unchanged warm checkpoint uses the write recheck without a row lock or read fallback", async () => {
     const copy = await run({ warm: true });
     const observed = observedStore();
     const read = vi.spyOn(instructionAuthorization, "authorizeInstructionRead");
@@ -3563,7 +3569,9 @@ describe("persistent agent directories", () => {
       expect(saved).toMatchObject({ state: "warm_saved", errorCode: null, receipt: { checkpointState: "unchanged" } });
       expect(commit).toHaveBeenCalledOnce(); expect(read).not.toHaveBeenCalled();
       expect(observed.stores.flatMap(store => vi.mocked(store.apply).mock.calls)).toEqual([]);
-      expect(observed.stores.flatMap(store => vi.mocked(store.locked).mock.calls).map(call => call[3])).toEqual([true]);
+      // Upstream #21457 deliberately skips the row lock, not write authority.
+      expect(observed.stores.flatMap(store => vi.mocked(store.saveUnchanged).mock.calls)).toHaveLength(1);
+      expect(observed.stores.flatMap(store => vi.mocked(store.locked).mock.calls)).toEqual([]);
       expect(await snapshotAgentFiles(root)).toEqual(before);
     } finally { read.mockRestore(); commit.mockRestore(); observed.restore(); }
   });
