@@ -160,6 +160,7 @@ describePostgres("heartbeat provider usage limit wait", () => {
 
   it("recovers a wait whose retry was lost to a crash after its cancellation committed", async () => {
     const f = await seed([]);
+    // planted: hand-inserted cancelled run (no real producer); RFL record SUPERSEDE-HBPLW-STOPPROOF-FIXTURE-1118
     const [lost] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "cancelled",
       invocationSource: "automation", triggerDetail: "system", issueId: f.issueId, scopeKind: "issue",
       startedAt: new Date(Date.now() - 10 * 60_000), finishedAt: new Date(Date.now() - 9 * 60_000), errorCode: "provider_limit_wait",
@@ -167,6 +168,18 @@ describePostgres("heartbeat provider usage limit wait", () => {
       contextSnapshot: { issueId: f.issueId } }).returning();
     await db.update(issues).set({ status: "in_progress", executionRunId: lost.id, executionLockedAt: new Date(Date.now() - 9 * 60_000) })
       .where(eq(issues.id, f.issueId));
+    await heartbeat.sweepStaleIssueLocks();
+    await heartbeat.reconcileStrandedAssignedIssues();
+    await heartbeat.drainActiveRunExecutions();
+    // baefa0b994e: cancellation alone no longer proves execution Stop. A
+    // crash before settlement must retain the claim and start no successor.
+    expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, f.agentId))).toEqual([{ id: lost.id }]);
+    const [held] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(held.executionRunId).toBe(lost.id);
+    // Model the executor's durable, process-free settlement (heartbeat.ts
+    // finally), then let the same recovery path recover the missing retry.
+    await db.update(heartbeatRuns).set({ executionStage: "settled" }).where(eq(heartbeatRuns.id, lost.id));
     await heartbeat.sweepStaleIssueLocks();
     await heartbeat.reconcileStrandedAssignedIssues();
     await heartbeat.drainActiveRunExecutions();
