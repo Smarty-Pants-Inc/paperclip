@@ -1,9 +1,10 @@
-import { and, eq, isNull, sql, type SQLWrapper } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql, type SQLWrapper } from "drizzle-orm";
 import { anchorParkedWakePayloadSql, parkedWakeAnchor, parkedWakeNeedsAnchorSql, parkedWakeSql, personSendSql,
   type Payload } from "./parked-wake-anchor.js";
 import { agentWakeupRequests, issueComments, issues, type Db } from "@paperclipai/db";
 import { issueService } from "../issues.js";
-import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
+import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
+import { answeredPersonMessageSql } from "../person-message-answer.js";
 import { buildStrandedRecoveryEscalationNotice } from "../recovery/stranded-notice.js";
 import { PENDING_WAIT_BOUND_MS, UNANSWERED_MESSAGE_NO_RUN_CODE, UNANSWERED_MESSAGE_REASON_PREFIX,
   UNANSWERED_WAITING_ROW_JSON } from "../recovery/unanswered-person-message.js";
@@ -92,10 +93,25 @@ export async function noticeParkedWakeDeadline(db: Db, scope: { companyId: strin
         eq(agentWakeupRequests.status, "deferred_issue_execution"))).for("update");
     const anchor = parkedWakeAnchor(current?.payload);
     if (!current || anchor === null || anchor + parkedWakeDeadlineMs() > now.getTime() || parkedWakeNoticed(current.payload)) return false;
+    // A held message another run already ANSWERED (B's completed-answer rule,
+    // not carried/delivered) did not "not start": it leaves this wake. All
+    // answered: the wake is settled (cancelled, kept) and gets no note.
+    const held = queuedCommentIdsFromWakePayload(current.payload);
+    const answered = new Set(held.length === 0 ? [] : (await tx.select({ id: issueComments.id }).from(issueComments)
+      .where(and(eq(issueComments.companyId, scope.companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, held),
+        answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+          issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })))).map(row => row.id));
+    const open = held.filter(id => !answered.has(id));
+    if (held.length > 0 && open.length === 0) {
+      await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: now, updatedAt: now,
+        error: "parked_send_answered_elsewhere" }).where(eq(agentWakeupRequests.id, scope.requestId));
+      return false;
+    }
+    const payload = answered.size > 0 ? withQueuedCommentIdsInWakePayload(current.payload, open) : current.payload;
     await tx.update(agentWakeupRequests).set({
-      payload: sql`${agentWakeupRequests.payload} || ${JSON.stringify({ parkedNoticeAt: now.toISOString() })}::jsonb`,
+      payload: sql`${JSON.stringify(payload)}::jsonb || ${JSON.stringify({ parkedNoticeAt: now.toISOString() })}::jsonb`,
     }).where(eq(agentWakeupRequests.id, scope.requestId));
-    const messageId = queuedCommentIdsFromWakePayload(current.payload).at(-1) ?? scope.requestId;
+    const messageId = open.at(-1) ?? scope.requestId;
     const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${messageId}`;
     const notice = buildStrandedRecoveryEscalationNotice({
       seed: { title: "Your message did not start", body: PARKED_WAKE_NOT_STARTED_TEXT, tone: "warning",
