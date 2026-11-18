@@ -36,6 +36,9 @@ import { requestTaskRetry } from "./task-retry.js";
 import { readFreshContinuationSessionBoundary, recordRetryFreshProviderThread } from "./fresh-continuation-fallback.js";
 import { freshContinuationTimes, sharedContinuationAttempts } from "./recovery/continuation-ledger.js";
 import { taskAutomaticAttempts } from "./recovery/task-automatic-attempts.js";
+import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./execution-recovery-resolution.js";
+import { readContinuationCommentInput } from "./continuation-comment-input.js";
+import { settleUnansweredPersonMessage } from "./recovery/unanswered-person-message.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("native Retry routed to a fresh isolated workspace", () => {
@@ -523,5 +526,84 @@ const support = await getEmbeddedPostgresTestSupport();
     } finally {
       await settings.updateExperimental({ enableAgentChat: experimental.enableAgentChat });
     }
+  }, 90_000);
+
+  // h3-combine 5(a), the live (ii) duplicate shape (stack-lead famh3-retry-2, 19:50-19:52Z): after a
+  // person's Retry of a failed answer run, EXACTLY ONE successor answers, once. Only what this head
+  // controls: the recovery side (disposition pass, sweep, a second resume of the same Retry) and the
+  // carry side (readContinuationCommentInput from the answering run) add no second run carrying the
+  // card answer, and the answer is posted once. The generic native_status_decision successor that
+  // ran live after the answer (5b235ded, wakeReason issue_status_changed, no interaction ids) is
+  // barnbrain-lead's unit 1b and is not asserted here.
+  it("h3-combine (ii) live duplicate shape: after a person's Retry of a failed answer run exactly one successor answers, once", async () => {
+    const f = await seed("not_task_owned");
+    const person = `person-${randomUUID()}`;
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: person,
+      status: "active", membershipRole: "owner" });
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "answered", createdByAgentId: f.agentId, resolvedByUserId: person,
+      resolvedAt: new Date(Date.now() - 90_000), title: "TEST famh3-retry-2 person answer", idempotencyKey: randomUUID(), payload: { version: 1,
+        questions: [{ id: "answer", prompt: "Which should I use: ALDER-A or ALDER-B?", required: true, selectionMode: "single",
+          options: [{ id: "a", label: "ALDER-A" }, { id: "b", label: "ALDER-B" }] }] },
+      result: { version: 1, answers: [{ questionId: "answer", optionIds: ["b"] }], summaryMarkdown: "ALDER-B" } } as never).returning();
+    const contractId = randomUUID(), resultId = randomUUID();
+    await db.insert(completionContracts).values({ id: contractId, companyId: f.companyId, issueId: f.issueId, revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "standard", completionAuthority: "server_arbiter",
+      incompleteCriteriaPolicy: "preserve_non_terminal", contractJson: {}, canonicalSha256: contractId,
+      createdByActorType: "system", createdByActorId: "test" });
+    await db.update(heartbeatRuns).set({ errorCode: "native_run_failed", nativePhase: "committed", completionContractId: contractId,
+      invocationSource: "automation", triggerDetail: "system", responsibleUserId: person,
+      resultJson: { finalizationPhase: "committed", finalizationReasonCode: "run_failed_partial_evidence_preserved",
+        issueStatusAfter: "in_progress", prpRunTerminalState: "failed" },
+      contextSnapshot: { issueId: f.issueId, source: "issue.interaction.respond", mutation: "interaction",
+        wakeReason: "issue_commented", interactionId: card!.id, interactionKind: "ask_user_questions", interactionStatus: "answered" } })
+      .where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.insert(nativeRunResults).values({ id: resultId, companyId: f.companyId, issueId: f.issueId, runId: f.sourceRunId,
+      completionContractId: contractId, serverFingerprint: resultId, schemaStatus: "accepted", canonicalSha256: resultId,
+      resultJson: { schema: "paperclip.run_result.v1", summary: "The Pi run failed before it completed.",
+        terminal: { runTerminalState: "failed", turnTerminalState: "failed" } } });
+    await db.update(nativeRunFinalizations).set({ phase: "committed", resultId, attempt: 1, failureDetail: null })
+      .where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+    await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.issueId));
+    // Hold dispatch: the admitted successor is the assertion, not a live turn.
+    const [busy] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" }).returning();
+    const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: person,
+      actorSource: "session", idempotencyKey: randomUUID(), observedRunId: f.sourceRunId });
+    expect(receipt).toMatchObject({ accepted: true });
+    await heartbeatService(db).resumeTaskRetry(f.companyId, receipt.requestId!);
+    const carrying = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter(run => run.contextSnapshot?.issueId === f.issueId && run.id !== f.sourceRunId
+        && (run.contextSnapshot?.interactionId === card!.id
+          || (Array.isArray(run.contextSnapshot?.interactionIds) && (run.contextSnapshot!.interactionIds as string[]).includes(card!.id))));
+    const [successor, ...extra] = await carrying();
+    expect(extra, "one Retry successor carries the answer").toHaveLength(0);
+    expect(successor!.contextSnapshot).toMatchObject({ taskRetryRequestId: receipt.requestId, interactionIds: [card!.id] });
+    // The Retry successor runs and ANSWERS (the live dcce6481 reply, H3_FINAL ... ALDER-B), then ends.
+    await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, successor!.id));
+    expect((await materializeNativeInteractionResponses({ db, companyId: f.companyId, issueId: f.issueId, runId: successor!.id,
+      agentId: f.agentId, interactionIds: [card!.id], wakeReason: "task_retry" })).map(r => r.interactionId)).toEqual([card!.id]);
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
+      createdByRunId: successor!.id, body: "H3_FINAL famh3-retry-2 ALDER-B" });
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, successor!.id));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, busy!.id));
+    await db.update(issues).set({ executionRunId: null, executionLockedAt: null }).where(eq(issues.id, f.issueId));
+    // The recovery side, twice, as the server runs it; the same Retry resumed again.
+    for (let pass = 0; pass < 2; pass += 1) {
+      await settleUnrecoverableExecutions(db);
+      await deliverReconciledExecutions(db, heartbeatService(db).wakeup);
+      await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId });
+      await heartbeatService(db).resumeTaskRetry(f.companyId, receipt.requestId!);
+    }
+    expect((await carrying()).map(run => run.id), "no second successor carries the answer").toEqual([successor!.id]);
+    // The carry side: a seed from the answering run never carries the answered card again.
+    const seedInput = await readContinuationCommentInput(db, { companyId: f.companyId, issueId: f.issueId, runId: successor!.id });
+    expect(seedInput.interactionIds ?? [], "an answered card is not pending input for a later seed").not.toContain(card!.id);
+    // The answer is posted once, and the sweep owes the card nothing.
+    const posts = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent")));
+    expect(posts.map(post => post.body)).toEqual(["H3_FINAL famh3-retry-2 ALDER-B"]);
+    expect((await systemNotes(f)).filter(note => String(note.metadata?.authorizationReason ?? "").startsWith("unanswered_message:")))
+      .toHaveLength(0);
   }, 90_000);
 });
