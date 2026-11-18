@@ -223,7 +223,7 @@ describeEmbeddedPostgres("RF4 independent S8 acceptance", () => {
     const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id,f.wakeIds[0]));
     expect((wake.payload?._paperclipWakeContext as any)?.wakeCommentIds).toEqual([f.commentIds[0]]);
     const rest = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId,f.companyId));
-    expect(rest.filter(w=>f.wakeIds.slice(1).includes(w.id)).map(w=>w.status)).toEqual(['deferred_issue_execution','deferred_issue_execution']);
+    expect(rest.filter(w=>(f.wakeIds.slice(1) as string[]).includes(w.id)).map(w=>w.status)).toEqual(['deferred_issue_execution','deferred_issue_execution']);
   });
 
   it('double HTTP press while teardown waits preserves the exact input once', async () => {
