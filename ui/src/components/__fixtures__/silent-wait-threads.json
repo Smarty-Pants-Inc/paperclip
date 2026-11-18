@@ -1,15 +1,15 @@
 {
   "settling": {
-    "companyId": "be480865-9221-4844-9fd8-f06371cc6d57",
-    "issueId": "58895188-afe1-4e0e-a59f-8f824b0beec6",
-    "runId": "b7916050-3ddc-4acd-84c5-de0f02257cae",
-    "commentId": "26e1eb3f-769e-4ad7-8917-d5eb7132d583",
+    "companyId": "d31bce28-59f5-48cc-a319-94b58a4bc0e1",
+    "issueId": "a770469f-94a5-4b42-a95b-e7c5c8d47d14",
+    "runId": "40f50f39-ca93-4431-819f-c7b0dd61ee91",
+    "commentId": "3141e595-ca8d-49d0-951c-b8c3a1faa512",
     "snapshots": {
       "settling": [
         {
-          "id": "143d939b-e34a-475d-b694-7f1263433ff2",
-          "companyId": "be480865-9221-4844-9fd8-f06371cc6d57",
-          "issueId": "58895188-afe1-4e0e-a59f-8f824b0beec6",
+          "id": "43fd9a55-e9ec-40b6-808f-edd801e7f189",
+          "companyId": "d31bce28-59f5-48cc-a319-94b58a4bc0e1",
+          "issueId": "a770469f-94a5-4b42-a95b-e7c5c8d47d14",
           "authorAgentId": null,
           "authorUserId": null,
           "onBehalfOfUserId": null,
@@ -26,15 +26,15 @@
           "presentation": null,
           "metadata": {
             "version": 1,
-            "sourceRunId": "1c92cf44-842b-4b35-981d-871709ab2a09",
-            "authorizationReason": "native_session_cleanup_settling:1c92cf44-842b-4b35-981d-871709ab2a09",
+            "sourceRunId": "5ba8c557-2563-4077-b072-64ca4e85d378",
+            "authorizationReason": "native_session_cleanup_settling:5ba8c557-2563-4077-b072-64ca4e85d378",
             "sections": [
               {
                 "rows": [
                   {
                     "type": "run_link",
-                    "runId": "1c92cf44-842b-4b35-981d-871709ab2a09",
-                    "agentId": "e072c6ea-6d0e-481e-91fa-0f21bb2d0494",
+                    "runId": "5ba8c557-2563-4077-b072-64ca4e85d378",
+                    "agentId": "0eaacd4e-c1f7-44af-bf64-ce06fbc06571",
                     "title": "Held turn"
                   }
                 ]
@@ -47,13 +47,13 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:00.814Z",
-          "updatedAt": "2026-11-18T22:46:00.814Z"
+          "createdAt": "2026-11-18T23:26:21.924Z",
+          "updatedAt": "2026-11-18T23:26:21.924Z"
         },
         {
-          "id": "26e1eb3f-769e-4ad7-8917-d5eb7132d583",
-          "companyId": "be480865-9221-4844-9fd8-f06371cc6d57",
-          "issueId": "58895188-afe1-4e0e-a59f-8f824b0beec6",
+          "id": "3141e595-ca8d-49d0-951c-b8c3a1faa512",
+          "companyId": "d31bce28-59f5-48cc-a319-94b58a4bc0e1",
+          "issueId": "a770469f-94a5-4b42-a95b-e7c5c8d47d14",
           "authorAgentId": null,
           "authorUserId": "rf4-person",
           "onBehalfOfUserId": null,
@@ -62,7 +62,7 @@
           "derivedAuthorAgentId": null,
           "derivedCreatedByRunId": null,
           "derivedAuthorSource": null,
-          "clientRequestId": "373c4294-e284-48bc-a5e0-ff53f1e4d1f0",
+          "clientRequestId": "8716a335-5868-41f5-bc14-d15cb0be9d5a",
           "conversationSessionGeneration": null,
           "origin": "comment",
           "fastResponseRequestId": null,
@@ -75,15 +75,15 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:00.239Z",
-          "updatedAt": "2026-11-18T22:46:00.239Z"
+          "createdAt": "2026-11-18T23:26:21.615Z",
+          "updatedAt": "2026-11-18T23:26:21.615Z"
         }
       ],
       "settlingPoll": [
         {
-          "id": "143d939b-e34a-475d-b694-7f1263433ff2",
-          "companyId": "be480865-9221-4844-9fd8-f06371cc6d57",
-          "issueId": "58895188-afe1-4e0e-a59f-8f824b0beec6",
+          "id": "43fd9a55-e9ec-40b6-808f-edd801e7f189",
+          "companyId": "d31bce28-59f5-48cc-a319-94b58a4bc0e1",
+          "issueId": "a770469f-94a5-4b42-a95b-e7c5c8d47d14",
           "authorAgentId": null,
           "authorUserId": null,
           "onBehalfOfUserId": null,
@@ -100,15 +100,15 @@
           "presentation": null,
           "metadata": {
             "version": 1,
-            "sourceRunId": "1c92cf44-842b-4b35-981d-871709ab2a09",
-            "authorizationReason": "native_session_cleanup_settling:1c92cf44-842b-4b35-981d-871709ab2a09",
+            "sourceRunId": "5ba8c557-2563-4077-b072-64ca4e85d378",
+            "authorizationReason": "native_session_cleanup_settling:5ba8c557-2563-4077-b072-64ca4e85d378",
             "sections": [
               {
                 "rows": [
                   {
                     "type": "run_link",
-                    "runId": "1c92cf44-842b-4b35-981d-871709ab2a09",
-                    "agentId": "e072c6ea-6d0e-481e-91fa-0f21bb2d0494",
+                    "runId": "5ba8c557-2563-4077-b072-64ca4e85d378",
+                    "agentId": "0eaacd4e-c1f7-44af-bf64-ce06fbc06571",
                     "title": "Held turn"
                   }
                 ]
@@ -121,13 +121,13 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:00.814Z",
-          "updatedAt": "2026-11-18T22:46:00.814Z"
+          "createdAt": "2026-11-18T23:26:21.924Z",
+          "updatedAt": "2026-11-18T23:26:21.924Z"
         },
         {
-          "id": "26e1eb3f-769e-4ad7-8917-d5eb7132d583",
-          "companyId": "be480865-9221-4844-9fd8-f06371cc6d57",
-          "issueId": "58895188-afe1-4e0e-a59f-8f824b0beec6",
+          "id": "3141e595-ca8d-49d0-951c-b8c3a1faa512",
+          "companyId": "d31bce28-59f5-48cc-a319-94b58a4bc0e1",
+          "issueId": "a770469f-94a5-4b42-a95b-e7c5c8d47d14",
           "authorAgentId": null,
           "authorUserId": "rf4-person",
           "onBehalfOfUserId": null,
@@ -136,7 +136,7 @@
           "derivedAuthorAgentId": null,
           "derivedCreatedByRunId": null,
           "derivedAuthorSource": null,
-          "clientRequestId": "373c4294-e284-48bc-a5e0-ff53f1e4d1f0",
+          "clientRequestId": "8716a335-5868-41f5-bc14-d15cb0be9d5a",
           "conversationSessionGeneration": null,
           "origin": "comment",
           "fastResponseRequestId": null,
@@ -149,15 +149,15 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:00.239Z",
-          "updatedAt": "2026-11-18T22:46:00.239Z"
+          "createdAt": "2026-11-18T23:26:21.615Z",
+          "updatedAt": "2026-11-18T23:26:21.615Z"
         }
       ],
       "pending": [
         {
-          "id": "143d939b-e34a-475d-b694-7f1263433ff2",
-          "companyId": "be480865-9221-4844-9fd8-f06371cc6d57",
-          "issueId": "58895188-afe1-4e0e-a59f-8f824b0beec6",
+          "id": "43fd9a55-e9ec-40b6-808f-edd801e7f189",
+          "companyId": "d31bce28-59f5-48cc-a319-94b58a4bc0e1",
+          "issueId": "a770469f-94a5-4b42-a95b-e7c5c8d47d14",
           "authorAgentId": null,
           "authorUserId": null,
           "onBehalfOfUserId": null,
@@ -174,15 +174,15 @@
           "presentation": null,
           "metadata": {
             "version": 1,
-            "sourceRunId": "1c92cf44-842b-4b35-981d-871709ab2a09",
-            "authorizationReason": "native_session_cleanup_settling:1c92cf44-842b-4b35-981d-871709ab2a09",
+            "sourceRunId": "5ba8c557-2563-4077-b072-64ca4e85d378",
+            "authorizationReason": "native_session_cleanup_settling:5ba8c557-2563-4077-b072-64ca4e85d378",
             "sections": [
               {
                 "rows": [
                   {
                     "type": "run_link",
-                    "runId": "1c92cf44-842b-4b35-981d-871709ab2a09",
-                    "agentId": "e072c6ea-6d0e-481e-91fa-0f21bb2d0494",
+                    "runId": "5ba8c557-2563-4077-b072-64ca4e85d378",
+                    "agentId": "0eaacd4e-c1f7-44af-bf64-ce06fbc06571",
                     "title": "Held turn"
                   }
                 ]
@@ -195,13 +195,13 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:00.814Z",
-          "updatedAt": "2026-11-18T22:46:00.814Z"
+          "createdAt": "2026-11-18T23:26:21.924Z",
+          "updatedAt": "2026-11-18T23:26:21.924Z"
         },
         {
-          "id": "26e1eb3f-769e-4ad7-8917-d5eb7132d583",
-          "companyId": "be480865-9221-4844-9fd8-f06371cc6d57",
-          "issueId": "58895188-afe1-4e0e-a59f-8f824b0beec6",
+          "id": "3141e595-ca8d-49d0-951c-b8c3a1faa512",
+          "companyId": "d31bce28-59f5-48cc-a319-94b58a4bc0e1",
+          "issueId": "a770469f-94a5-4b42-a95b-e7c5c8d47d14",
           "authorAgentId": null,
           "authorUserId": "rf4-person",
           "onBehalfOfUserId": null,
@@ -210,7 +210,7 @@
           "derivedAuthorAgentId": null,
           "derivedCreatedByRunId": null,
           "derivedAuthorSource": null,
-          "clientRequestId": "373c4294-e284-48bc-a5e0-ff53f1e4d1f0",
+          "clientRequestId": "8716a335-5868-41f5-bc14-d15cb0be9d5a",
           "conversationSessionGeneration": null,
           "origin": "comment",
           "fastResponseRequestId": null,
@@ -223,15 +223,15 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:00.239Z",
-          "updatedAt": "2026-11-18T22:46:00.239Z"
+          "createdAt": "2026-11-18T23:26:21.615Z",
+          "updatedAt": "2026-11-18T23:26:21.615Z"
         }
       ],
       "operatorRequired": [
         {
-          "id": "11572d4e-dc70-4507-a95d-a05c723f997c",
-          "companyId": "be480865-9221-4844-9fd8-f06371cc6d57",
-          "issueId": "58895188-afe1-4e0e-a59f-8f824b0beec6",
+          "id": "a39ca6f4-4743-4473-b1ca-a7d6df4fcc20",
+          "companyId": "d31bce28-59f5-48cc-a319-94b58a4bc0e1",
+          "issueId": "a770469f-94a5-4b42-a95b-e7c5c8d47d14",
           "authorAgentId": null,
           "authorUserId": null,
           "onBehalfOfUserId": null,
@@ -248,15 +248,15 @@
           "presentation": null,
           "metadata": {
             "version": 1,
-            "sourceRunId": "1c92cf44-842b-4b35-981d-871709ab2a09",
-            "authorizationReason": "native_session_cleanup_operator_required:1c92cf44-842b-4b35-981d-871709ab2a09",
+            "sourceRunId": "5ba8c557-2563-4077-b072-64ca4e85d378",
+            "authorizationReason": "native_session_cleanup_operator_required:5ba8c557-2563-4077-b072-64ca4e85d378",
             "sections": [
               {
                 "rows": [
                   {
                     "type": "run_link",
-                    "runId": "1c92cf44-842b-4b35-981d-871709ab2a09",
-                    "agentId": "e072c6ea-6d0e-481e-91fa-0f21bb2d0494",
+                    "runId": "5ba8c557-2563-4077-b072-64ca4e85d378",
+                    "agentId": "0eaacd4e-c1f7-44af-bf64-ce06fbc06571",
                     "title": "Held turn"
                   }
                 ]
@@ -269,13 +269,13 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:06.518Z",
-          "updatedAt": "2026-11-18T22:46:06.518Z"
+          "createdAt": "2026-11-18T23:26:27.426Z",
+          "updatedAt": "2026-11-18T23:26:27.426Z"
         },
         {
-          "id": "143d939b-e34a-475d-b694-7f1263433ff2",
-          "companyId": "be480865-9221-4844-9fd8-f06371cc6d57",
-          "issueId": "58895188-afe1-4e0e-a59f-8f824b0beec6",
+          "id": "43fd9a55-e9ec-40b6-808f-edd801e7f189",
+          "companyId": "d31bce28-59f5-48cc-a319-94b58a4bc0e1",
+          "issueId": "a770469f-94a5-4b42-a95b-e7c5c8d47d14",
           "authorAgentId": null,
           "authorUserId": null,
           "onBehalfOfUserId": null,
@@ -292,15 +292,15 @@
           "presentation": null,
           "metadata": {
             "version": 1,
-            "sourceRunId": "1c92cf44-842b-4b35-981d-871709ab2a09",
-            "authorizationReason": "native_session_cleanup_settling:1c92cf44-842b-4b35-981d-871709ab2a09",
+            "sourceRunId": "5ba8c557-2563-4077-b072-64ca4e85d378",
+            "authorizationReason": "native_session_cleanup_settling:5ba8c557-2563-4077-b072-64ca4e85d378",
             "sections": [
               {
                 "rows": [
                   {
                     "type": "run_link",
-                    "runId": "1c92cf44-842b-4b35-981d-871709ab2a09",
-                    "agentId": "e072c6ea-6d0e-481e-91fa-0f21bb2d0494",
+                    "runId": "5ba8c557-2563-4077-b072-64ca4e85d378",
+                    "agentId": "0eaacd4e-c1f7-44af-bf64-ce06fbc06571",
                     "title": "Held turn"
                   }
                 ]
@@ -313,13 +313,13 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:00.814Z",
-          "updatedAt": "2026-11-18T22:46:00.814Z"
+          "createdAt": "2026-11-18T23:26:21.924Z",
+          "updatedAt": "2026-11-18T23:26:21.924Z"
         },
         {
-          "id": "26e1eb3f-769e-4ad7-8917-d5eb7132d583",
-          "companyId": "be480865-9221-4844-9fd8-f06371cc6d57",
-          "issueId": "58895188-afe1-4e0e-a59f-8f824b0beec6",
+          "id": "3141e595-ca8d-49d0-951c-b8c3a1faa512",
+          "companyId": "d31bce28-59f5-48cc-a319-94b58a4bc0e1",
+          "issueId": "a770469f-94a5-4b42-a95b-e7c5c8d47d14",
           "authorAgentId": null,
           "authorUserId": "rf4-person",
           "onBehalfOfUserId": null,
@@ -328,7 +328,7 @@
           "derivedAuthorAgentId": null,
           "derivedCreatedByRunId": null,
           "derivedAuthorSource": null,
-          "clientRequestId": "373c4294-e284-48bc-a5e0-ff53f1e4d1f0",
+          "clientRequestId": "8716a335-5868-41f5-bc14-d15cb0be9d5a",
           "conversationSessionGeneration": null,
           "origin": "comment",
           "fastResponseRequestId": null,
@@ -341,15 +341,15 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:00.239Z",
-          "updatedAt": "2026-11-18T22:46:00.239Z"
+          "createdAt": "2026-11-18T23:26:21.615Z",
+          "updatedAt": "2026-11-18T23:26:21.615Z"
         }
       ],
       "operatorRequiredPoll": [
         {
-          "id": "11572d4e-dc70-4507-a95d-a05c723f997c",
-          "companyId": "be480865-9221-4844-9fd8-f06371cc6d57",
-          "issueId": "58895188-afe1-4e0e-a59f-8f824b0beec6",
+          "id": "a39ca6f4-4743-4473-b1ca-a7d6df4fcc20",
+          "companyId": "d31bce28-59f5-48cc-a319-94b58a4bc0e1",
+          "issueId": "a770469f-94a5-4b42-a95b-e7c5c8d47d14",
           "authorAgentId": null,
           "authorUserId": null,
           "onBehalfOfUserId": null,
@@ -366,15 +366,15 @@
           "presentation": null,
           "metadata": {
             "version": 1,
-            "sourceRunId": "1c92cf44-842b-4b35-981d-871709ab2a09",
-            "authorizationReason": "native_session_cleanup_operator_required:1c92cf44-842b-4b35-981d-871709ab2a09",
+            "sourceRunId": "5ba8c557-2563-4077-b072-64ca4e85d378",
+            "authorizationReason": "native_session_cleanup_operator_required:5ba8c557-2563-4077-b072-64ca4e85d378",
             "sections": [
               {
                 "rows": [
                   {
                     "type": "run_link",
-                    "runId": "1c92cf44-842b-4b35-981d-871709ab2a09",
-                    "agentId": "e072c6ea-6d0e-481e-91fa-0f21bb2d0494",
+                    "runId": "5ba8c557-2563-4077-b072-64ca4e85d378",
+                    "agentId": "0eaacd4e-c1f7-44af-bf64-ce06fbc06571",
                     "title": "Held turn"
                   }
                 ]
@@ -387,13 +387,13 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:06.518Z",
-          "updatedAt": "2026-11-18T22:46:06.518Z"
+          "createdAt": "2026-11-18T23:26:27.426Z",
+          "updatedAt": "2026-11-18T23:26:27.426Z"
         },
         {
-          "id": "143d939b-e34a-475d-b694-7f1263433ff2",
-          "companyId": "be480865-9221-4844-9fd8-f06371cc6d57",
-          "issueId": "58895188-afe1-4e0e-a59f-8f824b0beec6",
+          "id": "43fd9a55-e9ec-40b6-808f-edd801e7f189",
+          "companyId": "d31bce28-59f5-48cc-a319-94b58a4bc0e1",
+          "issueId": "a770469f-94a5-4b42-a95b-e7c5c8d47d14",
           "authorAgentId": null,
           "authorUserId": null,
           "onBehalfOfUserId": null,
@@ -410,15 +410,15 @@
           "presentation": null,
           "metadata": {
             "version": 1,
-            "sourceRunId": "1c92cf44-842b-4b35-981d-871709ab2a09",
-            "authorizationReason": "native_session_cleanup_settling:1c92cf44-842b-4b35-981d-871709ab2a09",
+            "sourceRunId": "5ba8c557-2563-4077-b072-64ca4e85d378",
+            "authorizationReason": "native_session_cleanup_settling:5ba8c557-2563-4077-b072-64ca4e85d378",
             "sections": [
               {
                 "rows": [
                   {
                     "type": "run_link",
-                    "runId": "1c92cf44-842b-4b35-981d-871709ab2a09",
-                    "agentId": "e072c6ea-6d0e-481e-91fa-0f21bb2d0494",
+                    "runId": "5ba8c557-2563-4077-b072-64ca4e85d378",
+                    "agentId": "0eaacd4e-c1f7-44af-bf64-ce06fbc06571",
                     "title": "Held turn"
                   }
                 ]
@@ -431,13 +431,13 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:00.814Z",
-          "updatedAt": "2026-11-18T22:46:00.814Z"
+          "createdAt": "2026-11-18T23:26:21.924Z",
+          "updatedAt": "2026-11-18T23:26:21.924Z"
         },
         {
-          "id": "26e1eb3f-769e-4ad7-8917-d5eb7132d583",
-          "companyId": "be480865-9221-4844-9fd8-f06371cc6d57",
-          "issueId": "58895188-afe1-4e0e-a59f-8f824b0beec6",
+          "id": "3141e595-ca8d-49d0-951c-b8c3a1faa512",
+          "companyId": "d31bce28-59f5-48cc-a319-94b58a4bc0e1",
+          "issueId": "a770469f-94a5-4b42-a95b-e7c5c8d47d14",
           "authorAgentId": null,
           "authorUserId": "rf4-person",
           "onBehalfOfUserId": null,
@@ -446,7 +446,7 @@
           "derivedAuthorAgentId": null,
           "derivedCreatedByRunId": null,
           "derivedAuthorSource": null,
-          "clientRequestId": "373c4294-e284-48bc-a5e0-ff53f1e4d1f0",
+          "clientRequestId": "8716a335-5868-41f5-bc14-d15cb0be9d5a",
           "conversationSessionGeneration": null,
           "origin": "comment",
           "fastResponseRequestId": null,
@@ -459,23 +459,23 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:00.239Z",
-          "updatedAt": "2026-11-18T22:46:00.239Z"
+          "createdAt": "2026-11-18T23:26:21.615Z",
+          "updatedAt": "2026-11-18T23:26:21.615Z"
         }
       ]
     }
   },
   "pending": {
-    "companyId": "b722185f-d1f5-4650-b099-6f4c0327fcda",
-    "issueId": "7c3626ff-83bc-4c21-a2a1-8cb2f093ec2e",
-    "runId": "43d75610-ed69-48b7-9882-785ecc1c8716",
-    "commentId": "38582432-75d5-4c35-b32a-33ba24a217c2",
+    "companyId": "132d2381-a5b2-4a44-9287-0918b9a391de",
+    "issueId": "5b805362-2d49-445e-8753-22ebdb2371e2",
+    "runId": "c99b90f3-859e-421c-b616-4d7d6e2ef0e9",
+    "commentId": "044d4400-ef51-48e7-bbe2-9151a59307ad",
     "snapshots": {
       "pending": [
         {
-          "id": "73442d9a-276a-47b9-b49a-ee964c5f78e8",
-          "companyId": "b722185f-d1f5-4650-b099-6f4c0327fcda",
-          "issueId": "7c3626ff-83bc-4c21-a2a1-8cb2f093ec2e",
+          "id": "f3b1000b-644b-46ca-88ab-1331e8f1ad6e",
+          "companyId": "132d2381-a5b2-4a44-9287-0918b9a391de",
+          "issueId": "5b805362-2d49-445e-8753-22ebdb2371e2",
           "authorAgentId": null,
           "authorUserId": null,
           "onBehalfOfUserId": null,
@@ -492,15 +492,15 @@
           "presentation": null,
           "metadata": {
             "version": 1,
-            "sourceRunId": "f514c4f7-0209-4205-b211-1842700b0a46",
-            "authorizationReason": "native_session_cleanup_settling:f514c4f7-0209-4205-b211-1842700b0a46",
+            "sourceRunId": "0402538e-1d59-4ece-8ec6-a4421118ee00",
+            "authorizationReason": "native_session_cleanup_settling:0402538e-1d59-4ece-8ec6-a4421118ee00",
             "sections": [
               {
                 "rows": [
                   {
                     "type": "run_link",
-                    "runId": "f514c4f7-0209-4205-b211-1842700b0a46",
-                    "agentId": "ef3a675c-a9f7-4d10-9280-14bb6ca63637",
+                    "runId": "0402538e-1d59-4ece-8ec6-a4421118ee00",
+                    "agentId": "aafe2ab4-1e7e-4a06-97f4-30e09bf19877",
                     "title": "Held turn"
                   }
                 ]
@@ -513,13 +513,13 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:12.236Z",
-          "updatedAt": "2026-11-18T22:46:12.236Z"
+          "createdAt": "2026-11-18T23:26:29.780Z",
+          "updatedAt": "2026-11-18T23:26:29.780Z"
         },
         {
-          "id": "38582432-75d5-4c35-b32a-33ba24a217c2",
-          "companyId": "b722185f-d1f5-4650-b099-6f4c0327fcda",
-          "issueId": "7c3626ff-83bc-4c21-a2a1-8cb2f093ec2e",
+          "id": "044d4400-ef51-48e7-bbe2-9151a59307ad",
+          "companyId": "132d2381-a5b2-4a44-9287-0918b9a391de",
+          "issueId": "5b805362-2d49-445e-8753-22ebdb2371e2",
           "authorAgentId": null,
           "authorUserId": "rf4-person",
           "onBehalfOfUserId": null,
@@ -528,7 +528,7 @@
           "derivedAuthorAgentId": null,
           "derivedCreatedByRunId": null,
           "derivedAuthorSource": null,
-          "clientRequestId": "e31cb7a9-9406-4124-a469-5fd72c442624",
+          "clientRequestId": "19826351-9ce2-466f-9de4-41c520ecf8d7",
           "conversationSessionGeneration": null,
           "origin": "comment",
           "fastResponseRequestId": null,
@@ -541,15 +541,15 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:11.777Z",
-          "updatedAt": "2026-11-18T22:46:11.777Z"
+          "createdAt": "2026-11-18T23:26:29.486Z",
+          "updatedAt": "2026-11-18T23:26:29.486Z"
         }
       ],
       "operatorRequired": [
         {
-          "id": "092beb4a-04d0-40ea-822e-e8915b71554a",
-          "companyId": "b722185f-d1f5-4650-b099-6f4c0327fcda",
-          "issueId": "7c3626ff-83bc-4c21-a2a1-8cb2f093ec2e",
+          "id": "e6e32660-0d9b-465b-b501-f340fb2d5198",
+          "companyId": "132d2381-a5b2-4a44-9287-0918b9a391de",
+          "issueId": "5b805362-2d49-445e-8753-22ebdb2371e2",
           "authorAgentId": null,
           "authorUserId": null,
           "onBehalfOfUserId": null,
@@ -566,15 +566,15 @@
           "presentation": null,
           "metadata": {
             "version": 1,
-            "sourceRunId": "f514c4f7-0209-4205-b211-1842700b0a46",
-            "authorizationReason": "native_session_cleanup_operator_required:f514c4f7-0209-4205-b211-1842700b0a46",
+            "sourceRunId": "0402538e-1d59-4ece-8ec6-a4421118ee00",
+            "authorizationReason": "native_session_cleanup_operator_required:0402538e-1d59-4ece-8ec6-a4421118ee00",
             "sections": [
               {
                 "rows": [
                   {
                     "type": "run_link",
-                    "runId": "f514c4f7-0209-4205-b211-1842700b0a46",
-                    "agentId": "ef3a675c-a9f7-4d10-9280-14bb6ca63637",
+                    "runId": "0402538e-1d59-4ece-8ec6-a4421118ee00",
+                    "agentId": "aafe2ab4-1e7e-4a06-97f4-30e09bf19877",
                     "title": "Held turn"
                   }
                 ]
@@ -587,13 +587,13 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:16.361Z",
-          "updatedAt": "2026-11-18T22:46:16.361Z"
+          "createdAt": "2026-11-18T23:26:34.453Z",
+          "updatedAt": "2026-11-18T23:26:34.453Z"
         },
         {
-          "id": "73442d9a-276a-47b9-b49a-ee964c5f78e8",
-          "companyId": "b722185f-d1f5-4650-b099-6f4c0327fcda",
-          "issueId": "7c3626ff-83bc-4c21-a2a1-8cb2f093ec2e",
+          "id": "f3b1000b-644b-46ca-88ab-1331e8f1ad6e",
+          "companyId": "132d2381-a5b2-4a44-9287-0918b9a391de",
+          "issueId": "5b805362-2d49-445e-8753-22ebdb2371e2",
           "authorAgentId": null,
           "authorUserId": null,
           "onBehalfOfUserId": null,
@@ -610,15 +610,15 @@
           "presentation": null,
           "metadata": {
             "version": 1,
-            "sourceRunId": "f514c4f7-0209-4205-b211-1842700b0a46",
-            "authorizationReason": "native_session_cleanup_settling:f514c4f7-0209-4205-b211-1842700b0a46",
+            "sourceRunId": "0402538e-1d59-4ece-8ec6-a4421118ee00",
+            "authorizationReason": "native_session_cleanup_settling:0402538e-1d59-4ece-8ec6-a4421118ee00",
             "sections": [
               {
                 "rows": [
                   {
                     "type": "run_link",
-                    "runId": "f514c4f7-0209-4205-b211-1842700b0a46",
-                    "agentId": "ef3a675c-a9f7-4d10-9280-14bb6ca63637",
+                    "runId": "0402538e-1d59-4ece-8ec6-a4421118ee00",
+                    "agentId": "aafe2ab4-1e7e-4a06-97f4-30e09bf19877",
                     "title": "Held turn"
                   }
                 ]
@@ -631,13 +631,13 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:12.236Z",
-          "updatedAt": "2026-11-18T22:46:12.236Z"
+          "createdAt": "2026-11-18T23:26:29.780Z",
+          "updatedAt": "2026-11-18T23:26:29.780Z"
         },
         {
-          "id": "38582432-75d5-4c35-b32a-33ba24a217c2",
-          "companyId": "b722185f-d1f5-4650-b099-6f4c0327fcda",
-          "issueId": "7c3626ff-83bc-4c21-a2a1-8cb2f093ec2e",
+          "id": "044d4400-ef51-48e7-bbe2-9151a59307ad",
+          "companyId": "132d2381-a5b2-4a44-9287-0918b9a391de",
+          "issueId": "5b805362-2d49-445e-8753-22ebdb2371e2",
           "authorAgentId": null,
           "authorUserId": "rf4-person",
           "onBehalfOfUserId": null,
@@ -646,7 +646,7 @@
           "derivedAuthorAgentId": null,
           "derivedCreatedByRunId": null,
           "derivedAuthorSource": null,
-          "clientRequestId": "e31cb7a9-9406-4124-a469-5fd72c442624",
+          "clientRequestId": "19826351-9ce2-466f-9de4-41c520ecf8d7",
           "conversationSessionGeneration": null,
           "origin": "comment",
           "fastResponseRequestId": null,
@@ -659,15 +659,15 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:11.777Z",
-          "updatedAt": "2026-11-18T22:46:11.777Z"
+          "createdAt": "2026-11-18T23:26:29.486Z",
+          "updatedAt": "2026-11-18T23:26:29.486Z"
         }
       ],
       "operatorRequiredPoll": [
         {
-          "id": "092beb4a-04d0-40ea-822e-e8915b71554a",
-          "companyId": "b722185f-d1f5-4650-b099-6f4c0327fcda",
-          "issueId": "7c3626ff-83bc-4c21-a2a1-8cb2f093ec2e",
+          "id": "e6e32660-0d9b-465b-b501-f340fb2d5198",
+          "companyId": "132d2381-a5b2-4a44-9287-0918b9a391de",
+          "issueId": "5b805362-2d49-445e-8753-22ebdb2371e2",
           "authorAgentId": null,
           "authorUserId": null,
           "onBehalfOfUserId": null,
@@ -684,15 +684,15 @@
           "presentation": null,
           "metadata": {
             "version": 1,
-            "sourceRunId": "f514c4f7-0209-4205-b211-1842700b0a46",
-            "authorizationReason": "native_session_cleanup_operator_required:f514c4f7-0209-4205-b211-1842700b0a46",
+            "sourceRunId": "0402538e-1d59-4ece-8ec6-a4421118ee00",
+            "authorizationReason": "native_session_cleanup_operator_required:0402538e-1d59-4ece-8ec6-a4421118ee00",
             "sections": [
               {
                 "rows": [
                   {
                     "type": "run_link",
-                    "runId": "f514c4f7-0209-4205-b211-1842700b0a46",
-                    "agentId": "ef3a675c-a9f7-4d10-9280-14bb6ca63637",
+                    "runId": "0402538e-1d59-4ece-8ec6-a4421118ee00",
+                    "agentId": "aafe2ab4-1e7e-4a06-97f4-30e09bf19877",
                     "title": "Held turn"
                   }
                 ]
@@ -705,13 +705,13 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:16.361Z",
-          "updatedAt": "2026-11-18T22:46:16.361Z"
+          "createdAt": "2026-11-18T23:26:34.453Z",
+          "updatedAt": "2026-11-18T23:26:34.453Z"
         },
         {
-          "id": "73442d9a-276a-47b9-b49a-ee964c5f78e8",
-          "companyId": "b722185f-d1f5-4650-b099-6f4c0327fcda",
-          "issueId": "7c3626ff-83bc-4c21-a2a1-8cb2f093ec2e",
+          "id": "f3b1000b-644b-46ca-88ab-1331e8f1ad6e",
+          "companyId": "132d2381-a5b2-4a44-9287-0918b9a391de",
+          "issueId": "5b805362-2d49-445e-8753-22ebdb2371e2",
           "authorAgentId": null,
           "authorUserId": null,
           "onBehalfOfUserId": null,
@@ -728,15 +728,15 @@
           "presentation": null,
           "metadata": {
             "version": 1,
-            "sourceRunId": "f514c4f7-0209-4205-b211-1842700b0a46",
-            "authorizationReason": "native_session_cleanup_settling:f514c4f7-0209-4205-b211-1842700b0a46",
+            "sourceRunId": "0402538e-1d59-4ece-8ec6-a4421118ee00",
+            "authorizationReason": "native_session_cleanup_settling:0402538e-1d59-4ece-8ec6-a4421118ee00",
             "sections": [
               {
                 "rows": [
                   {
                     "type": "run_link",
-                    "runId": "f514c4f7-0209-4205-b211-1842700b0a46",
-                    "agentId": "ef3a675c-a9f7-4d10-9280-14bb6ca63637",
+                    "runId": "0402538e-1d59-4ece-8ec6-a4421118ee00",
+                    "agentId": "aafe2ab4-1e7e-4a06-97f4-30e09bf19877",
                     "title": "Held turn"
                   }
                 ]
@@ -749,13 +749,13 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:12.236Z",
-          "updatedAt": "2026-11-18T22:46:12.236Z"
+          "createdAt": "2026-11-18T23:26:29.780Z",
+          "updatedAt": "2026-11-18T23:26:29.780Z"
         },
         {
-          "id": "38582432-75d5-4c35-b32a-33ba24a217c2",
-          "companyId": "b722185f-d1f5-4650-b099-6f4c0327fcda",
-          "issueId": "7c3626ff-83bc-4c21-a2a1-8cb2f093ec2e",
+          "id": "044d4400-ef51-48e7-bbe2-9151a59307ad",
+          "companyId": "132d2381-a5b2-4a44-9287-0918b9a391de",
+          "issueId": "5b805362-2d49-445e-8753-22ebdb2371e2",
           "authorAgentId": null,
           "authorUserId": "rf4-person",
           "onBehalfOfUserId": null,
@@ -764,7 +764,7 @@
           "derivedAuthorAgentId": null,
           "derivedCreatedByRunId": null,
           "derivedAuthorSource": null,
-          "clientRequestId": "e31cb7a9-9406-4124-a469-5fd72c442624",
+          "clientRequestId": "19826351-9ce2-466f-9de4-41c520ecf8d7",
           "conversationSessionGeneration": null,
           "origin": "comment",
           "fastResponseRequestId": null,
@@ -777,215 +777,23 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:11.777Z",
-          "updatedAt": "2026-11-18T22:46:11.777Z"
+          "createdAt": "2026-11-18T23:26:29.486Z",
+          "updatedAt": "2026-11-18T23:26:29.486Z"
         }
       ]
     }
   },
   "confirmed": {
-    "companyId": "eaa32ab3-8aa6-4f91-b5ff-285b7e1432ae",
-    "issueId": "2d7d503d-847a-446c-bffc-7d52634391cd",
-    "runId": "efb1f013-ecc9-4002-8b7d-a00287e2c0a1",
-    "commentId": "710ab2d8-e24f-4600-b084-558df9b82eb8",
+    "companyId": "99328bb8-e750-4d9a-be6f-10ccdeb965db",
+    "issueId": "bec5c94a-6e70-4f5c-882a-36b409670bbc",
+    "runId": "27672e55-11f7-4108-93c6-8f7c28e36ad4",
+    "commentId": "675b52fa-7508-4bfc-9417-073bea6df2c9",
     "snapshots": {
-      "settling": [
-        {
-          "id": "ec5c8d07-9695-44c6-a3bf-63ea23a096dd",
-          "companyId": "eaa32ab3-8aa6-4f91-b5ff-285b7e1432ae",
-          "issueId": "2d7d503d-847a-446c-bffc-7d52634391cd",
-          "authorAgentId": null,
-          "authorUserId": null,
-          "onBehalfOfUserId": null,
-          "authorType": "system",
-          "createdByRunId": null,
-          "derivedAuthorAgentId": null,
-          "derivedCreatedByRunId": null,
-          "derivedAuthorSource": null,
-          "clientRequestId": null,
-          "conversationSessionGeneration": null,
-          "origin": "comment",
-          "fastResponseRequestId": null,
-          "body": "The previous session is still shutting down. Your work is saved, and Paperclip finishes the cleanup automatically. This turn starts when the old Runner is confirmed stopped. Paperclip is stopping it and keeps its files.",
-          "presentation": null,
-          "metadata": {
-            "version": 1,
-            "sourceRunId": "b3e9c91d-f353-4181-9736-b6f51a0d81ad",
-            "authorizationReason": "native_session_cleanup_settling:b3e9c91d-f353-4181-9736-b6f51a0d81ad",
-            "sections": [
-              {
-                "rows": [
-                  {
-                    "type": "run_link",
-                    "runId": "b3e9c91d-f353-4181-9736-b6f51a0d81ad",
-                    "agentId": "a20b5cf9-bf11-4510-a699-6cdbfed18594",
-                    "title": "Held turn"
-                  }
-                ]
-              }
-            ]
-          },
-          "deletedAt": null,
-          "deletedByType": null,
-          "deletedByAgentId": null,
-          "deletedByUserId": null,
-          "deletedByRunId": null,
-          "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:20.471Z",
-          "updatedAt": "2026-11-18T22:46:20.471Z"
-        },
-        {
-          "id": "710ab2d8-e24f-4600-b084-558df9b82eb8",
-          "companyId": "eaa32ab3-8aa6-4f91-b5ff-285b7e1432ae",
-          "issueId": "2d7d503d-847a-446c-bffc-7d52634391cd",
-          "authorAgentId": null,
-          "authorUserId": "rf4-person",
-          "onBehalfOfUserId": null,
-          "authorType": "user",
-          "createdByRunId": null,
-          "derivedAuthorAgentId": null,
-          "derivedCreatedByRunId": null,
-          "derivedAuthorSource": null,
-          "clientRequestId": "4a035e93-c0d3-4381-8e13-6993a4eb7618",
-          "conversationSessionGeneration": null,
-          "origin": "comment",
-          "fastResponseRequestId": null,
-          "body": "Please answer next.",
-          "presentation": null,
-          "metadata": null,
-          "deletedAt": null,
-          "deletedByType": null,
-          "deletedByAgentId": null,
-          "deletedByUserId": null,
-          "deletedByRunId": null,
-          "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:19.994Z",
-          "updatedAt": "2026-11-18T22:46:19.994Z"
-        }
-      ],
-      "settlingPoll": [
-        {
-          "id": "ec5c8d07-9695-44c6-a3bf-63ea23a096dd",
-          "companyId": "eaa32ab3-8aa6-4f91-b5ff-285b7e1432ae",
-          "issueId": "2d7d503d-847a-446c-bffc-7d52634391cd",
-          "authorAgentId": null,
-          "authorUserId": null,
-          "onBehalfOfUserId": null,
-          "authorType": "system",
-          "createdByRunId": null,
-          "derivedAuthorAgentId": null,
-          "derivedCreatedByRunId": null,
-          "derivedAuthorSource": null,
-          "clientRequestId": null,
-          "conversationSessionGeneration": null,
-          "origin": "comment",
-          "fastResponseRequestId": null,
-          "body": "The previous session is still shutting down. Your work is saved, and Paperclip finishes the cleanup automatically. This turn starts when the old Runner is confirmed stopped. Paperclip is stopping it and keeps its files.",
-          "presentation": null,
-          "metadata": {
-            "version": 1,
-            "sourceRunId": "b3e9c91d-f353-4181-9736-b6f51a0d81ad",
-            "authorizationReason": "native_session_cleanup_settling:b3e9c91d-f353-4181-9736-b6f51a0d81ad",
-            "sections": [
-              {
-                "rows": [
-                  {
-                    "type": "run_link",
-                    "runId": "b3e9c91d-f353-4181-9736-b6f51a0d81ad",
-                    "agentId": "a20b5cf9-bf11-4510-a699-6cdbfed18594",
-                    "title": "Held turn"
-                  }
-                ]
-              }
-            ]
-          },
-          "deletedAt": null,
-          "deletedByType": null,
-          "deletedByAgentId": null,
-          "deletedByUserId": null,
-          "deletedByRunId": null,
-          "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:20.471Z",
-          "updatedAt": "2026-11-18T22:46:20.471Z"
-        },
-        {
-          "id": "710ab2d8-e24f-4600-b084-558df9b82eb8",
-          "companyId": "eaa32ab3-8aa6-4f91-b5ff-285b7e1432ae",
-          "issueId": "2d7d503d-847a-446c-bffc-7d52634391cd",
-          "authorAgentId": null,
-          "authorUserId": "rf4-person",
-          "onBehalfOfUserId": null,
-          "authorType": "user",
-          "createdByRunId": null,
-          "derivedAuthorAgentId": null,
-          "derivedCreatedByRunId": null,
-          "derivedAuthorSource": null,
-          "clientRequestId": "4a035e93-c0d3-4381-8e13-6993a4eb7618",
-          "conversationSessionGeneration": null,
-          "origin": "comment",
-          "fastResponseRequestId": null,
-          "body": "Please answer next.",
-          "presentation": null,
-          "metadata": null,
-          "deletedAt": null,
-          "deletedByType": null,
-          "deletedByAgentId": null,
-          "deletedByUserId": null,
-          "deletedByRunId": null,
-          "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:19.994Z",
-          "updatedAt": "2026-11-18T22:46:19.994Z"
-        }
-      ],
       "pending": [
         {
-          "id": "ec5c8d07-9695-44c6-a3bf-63ea23a096dd",
-          "companyId": "eaa32ab3-8aa6-4f91-b5ff-285b7e1432ae",
-          "issueId": "2d7d503d-847a-446c-bffc-7d52634391cd",
-          "authorAgentId": null,
-          "authorUserId": null,
-          "onBehalfOfUserId": null,
-          "authorType": "system",
-          "createdByRunId": null,
-          "derivedAuthorAgentId": null,
-          "derivedCreatedByRunId": null,
-          "derivedAuthorSource": null,
-          "clientRequestId": null,
-          "conversationSessionGeneration": null,
-          "origin": "comment",
-          "fastResponseRequestId": null,
-          "body": "The previous session is still shutting down. Your work is saved, and Paperclip finishes the cleanup automatically. This turn starts when the old Runner is confirmed stopped. Paperclip is stopping it and keeps its files.",
-          "presentation": null,
-          "metadata": {
-            "version": 1,
-            "sourceRunId": "b3e9c91d-f353-4181-9736-b6f51a0d81ad",
-            "authorizationReason": "native_session_cleanup_settling:b3e9c91d-f353-4181-9736-b6f51a0d81ad",
-            "sections": [
-              {
-                "rows": [
-                  {
-                    "type": "run_link",
-                    "runId": "b3e9c91d-f353-4181-9736-b6f51a0d81ad",
-                    "agentId": "a20b5cf9-bf11-4510-a699-6cdbfed18594",
-                    "title": "Held turn"
-                  }
-                ]
-              }
-            ]
-          },
-          "deletedAt": null,
-          "deletedByType": null,
-          "deletedByAgentId": null,
-          "deletedByUserId": null,
-          "deletedByRunId": null,
-          "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:20.471Z",
-          "updatedAt": "2026-11-18T22:46:20.471Z"
-        },
-        {
-          "id": "710ab2d8-e24f-4600-b084-558df9b82eb8",
-          "companyId": "eaa32ab3-8aa6-4f91-b5ff-285b7e1432ae",
-          "issueId": "2d7d503d-847a-446c-bffc-7d52634391cd",
+          "id": "675b52fa-7508-4bfc-9417-073bea6df2c9",
+          "companyId": "99328bb8-e750-4d9a-be6f-10ccdeb965db",
+          "issueId": "bec5c94a-6e70-4f5c-882a-36b409670bbc",
           "authorAgentId": null,
           "authorUserId": "rf4-person",
           "onBehalfOfUserId": null,
@@ -994,7 +802,7 @@
           "derivedAuthorAgentId": null,
           "derivedCreatedByRunId": null,
           "derivedAuthorSource": null,
-          "clientRequestId": "4a035e93-c0d3-4381-8e13-6993a4eb7618",
+          "clientRequestId": "b7e97858-6cb0-4b23-b062-ff0e7d142fa6",
           "conversationSessionGeneration": null,
           "origin": "comment",
           "fastResponseRequestId": null,
@@ -1007,8 +815,8 @@
           "deletedByUserId": null,
           "deletedByRunId": null,
           "sourceTrust": null,
-          "createdAt": "2026-11-18T22:46:19.994Z",
-          "updatedAt": "2026-11-18T22:46:19.994Z"
+          "createdAt": "2026-11-18T23:26:36.675Z",
+          "updatedAt": "2026-11-18T23:26:36.675Z"
         }
       ]
     }
