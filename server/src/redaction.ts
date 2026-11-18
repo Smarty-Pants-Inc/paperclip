@@ -393,6 +393,22 @@ const ESCAPED_JSON_SECRET_FIELD_TEXT_RE = new RegExp(
   String.raw`((?:\\")?${SECRET_FIELD_NAME_START}${SECRET_FIELD_NAME_PATTERN}(?:\\")?\s*:\s*(?:\\"))[^\\\r\n]+((?:\\"))`,
   "gi",
 );
+/**
+ * The strict credential shapes `redactSensitiveText` masks. The scanner's
+ * own gate and token patterns read this table, and the native append path's
+ * streaming hold imports it to decide which trailing fragment may still become
+ * one of these shapes. Add a shape here, not in the hold.
+ */
+const GITHUB_FINE_GRAINED_PREFIX = "github_pat_";
+const AWS_ACCESS_KEY_ID_PREFIX = "AKIA";
+export const STRICT_CREDENTIAL_SHAPES = {
+  /** `Authorization: <scheme> <credential>` (also compound names such as proxyAuthorization). */
+  headerWord: "Authorization",
+  /** `<scheme> <credential>`; Basic counts only after the header word. */
+  schemeWords: ["Bearer", "Basic"],
+  /** Case-sensitive prefixes of bare tokens (provider keys, GitHub tokens, AWS key id, JWT). */
+  tokenPrefixes: ["sk-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", GITHUB_FINE_GRAINED_PREFIX, AWS_ACCESS_KEY_ID_PREFIX, "eyJ"],
+} as const;
 const SECRET_TEXT_HINTS = [
   "api",
   "key",
@@ -406,14 +422,15 @@ const SECRET_TEXT_HINTS = [
   "private",
   "cookie",
   "connectionstring",
-  "sk-",
-  "ghp_",
-  "gho_",
-  "ghu_",
-  "ghs_",
-  "ghr_",
+  ...STRICT_CREDENTIAL_SHAPES.tokenPrefixes.map((prefix) => prefix.toLowerCase()),
 ] as const;
 export const REDACTED_EVENT_VALUE = "***REDACTED***";
+// Bare token shapes the command scanner does not know. Built from the shape
+// table so the scanner and the streaming hold cannot name different prefixes.
+const GITHUB_FINE_GRAINED_TOKEN_RE = new RegExp(
+  String.raw`\b${GITHUB_FINE_GRAINED_PREFIX}[A-Za-z0-9_]{20,}\b`, "g");
+const AWS_ACCESS_KEY_ID_RE = new RegExp(
+  String.raw`\b${AWS_ACCESS_KEY_ID_PREFIX}[0-9A-Z]{16}\b`, "g");
 
 function maybeContainsSecretText(input: string) {
   const lower = input.toLowerCase();
@@ -711,7 +728,9 @@ function redactAuthorizationCredentials(input: string): string {
 }
 
 function redactStandaloneBearerCredentials(input: string): string {
-  const bearerWord = /\bBearer\b/gi;
+  // A terminal colour sequence ends in a letter, which hides the word
+  // boundary: `ESC[31mBearer <token>` is still a scheme word.
+  const bearerWord = /(?:\b|(?<=\u001b\[[0-?]*[ -\/]*[@-~]))Bearer\b/gi;
   const parts: string[] = [];
   let copiedThrough = 0;
   let match: RegExpExecArray | null;
@@ -1075,5 +1094,7 @@ export function redactSensitiveText(input: string): string {
         `$1${REDACTED_EVENT_VALUE}$2`,
       ),
     REDACTED_EVENT_VALUE,
-  );
+  )
+    .replace(GITHUB_FINE_GRAINED_TOKEN_RE, REDACTED_EVENT_VALUE)
+    .replace(AWS_ACCESS_KEY_ID_RE, REDACTED_EVENT_VALUE);
 }
