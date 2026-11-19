@@ -119,7 +119,7 @@ describe.skipIf(!support.supported)("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rea
   }
 
   for (const chat of [false, true]) for (const reason of reasons) {
-    it(`${chat ? "chat" : "task"}: ${reason}, real GET at +10s/+2m/+10m has one wait and no no-run notice`, async () => {
+    it(`${chat ? "chat" : "task"}: ${reason}, real GET at +10s/+2m/+599999ms/+10m/+11m has one bounded wait and no no-run notice`, async () => {
       const f = await plantedHistory(chat, reason === "execution_recovery");
       await stop(f);
       if (reason === "remote_cleanup" || reason === "execution_recovery" || reason === "agent.not_invokable") {
@@ -254,8 +254,9 @@ describe.skipIf(!support.supported)("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rea
         const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wake.id));
         expect(wake.status).toBe("cancelled");
         expect(wake.runId).toBeNull();
-        // Cancelled historical rows may retain audit input; there is NO active
-        // wake carrying M. Cleanup's actual consumer must never resurrect it.
+        expect(JSON.stringify(wake.payload)).not.toContain(f.message.id);
+        // There is NO wake input left for M, active or cancelled. Cleanup's
+        // actual consumer must never resurrect the deleted message.
         expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
           sql`${agentWakeupRequests.status} in ('queued','deferred_issue_execution','claimed')`,
           sql`${agentWakeupRequests.payload}::text like ${`%${f.message.id}%`}`))).toEqual([]);
@@ -266,7 +267,7 @@ describe.skipIf(!support.supported)("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rea
         expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
           .filter(run => JSON.stringify(run.contextSnapshot).includes(f.message.id))).toEqual([]);
         samples.push({ ...after, deleteRoute, deletion, beforeQueue: before.queue, beforeComments: before.comments, laterQueue: later.queue,
-          wakeStatus: wake.status, laterAdmittedRunCount: 0 });
+          wakeStatus: wake.status, wakePayload: wake.payload, laterAdmittedRunCount: 0 });
       });
     }
   }

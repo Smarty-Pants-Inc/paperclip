@@ -1788,8 +1788,8 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await settleUnansweredPersonMessage(db, { ...f, now: new Date(Date.now() + 180_000) }))
       .toMatchObject({ kind: "pending" });
     expect(await f.visible()).toHaveLength(0);
-    // A planted output-cap successor still queued beyond the former start
-    // bound retains the header, not permission to send duplicate input.
+    // The successor carrying the REAL producer's attribution stays queued
+    // beyond the former start bound: header, not permission to duplicate input.
     expect(await settleUnansweredPersonMessage(db, { ...f, now: new Date(Date.now() + 20 * 60_000) }))
       .toMatchObject({ kind: "pending" });
     expect(await f.visible()).toHaveLength(0);
