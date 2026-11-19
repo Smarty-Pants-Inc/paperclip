@@ -244,7 +244,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   }
 
   /** The turn publishes its reply, ends (succeeded by default), settles and is released. */
-  async function finishTurn(chat: Chat, options: { status?: "succeeded" | "failed"; log?: boolean } = {}) {
+  async function finishTurn(chat: Chat, options: { status?: "succeeded" | "failed" | "cancelled"; log?: boolean } = {}) {
     if (options.log !== false) await answeredLog(chat);
     await db.insert(issueComments).values({
       companyId: chat.companyId, issueId: chat.issue.id, authorType: "agent", authorAgentId: chat.agentId,
@@ -369,6 +369,9 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       { eventType: "item.started", kind: "agentMessage", itemId: "turn-1:old-text", text: "" },
       { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${response.body.id}` },
       { eventType: "item.started", kind: "userMessage", itemId: "turn-1:read-M" },
+      { eventType: "item.started", kind: "commandExecution", itemId: "turn-1:tool-after-read" },
+      { eventType: "tool.execution.started", itemId: "turn-1:tool-after-read" },
+      { eventType: "tool.execution.completed", itemId: "turn-1:tool-after-read" },
       { eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:old-text", text: "Old answer" },
       { eventType: "turn.completed", itemId: "turn-1:end" },
     ]);
@@ -487,7 +490,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     }
   }, 25_000);
 
-  it("A3 S9: the ONE answered predicate keeps a consumed steer owed after a tool and unrelated final", async () => {
+  it('A3 S9 re-pin, RFL 10:29Z: "Widening the window from m\'s read to the end of that turn matches v1"', async () => {
     const chat = await seedChat(); await attachSteerable(chat);
     const response = await postDefault(chat, "A3 S9 still owed").expect(201);
     await runLog(chat, [
@@ -501,9 +504,97 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       { eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:unrelated-final", text: "ORIGINAL_WORK_FINISHED" },
       { eventType: "turn.completed", itemId: "turn-1:end" },
     ]);
-    expect(await answered(response.body.id)).toBe(false);
     await finishTurn(chat, { log: false }); await releaseRun(chat);
+    expect(await answered(response.body.id)).toBe(true);
+    const carriers = await carriersOf(chat, response.body.id);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(0);
+  });
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21272
+  // RFL 10:29:57Z: "Widening the window from m's read to the end of that turn matches v1".
+  it.each(["answer", "no-text", "two-steers"] as const)("S-t: real Pi drivers and PG release keep the read-to-turn-end window (%s)", async shape => {
+    const expectsAnswer = shape !== "no-text";
+    const chat = await seedChat(); await attachSteerable(chat);
+    const root = await mkdtemp(join(tmpdir(), "chat-pi-turn-window-"));
+    const peer = await openPiSteeringPeer(root, chat.runId);
+    const events: PrpEvent[] = [];
+    const sent: string[] = [];
+    let port: PaperclipControlPlanePort | undefined;
+    let pumpError: unknown;
+    const pump = (async () => {
+      for await (const event of peer.session.events()) {
+        port ??= new PaperclipControlPlanePort(db, { companyId: chat.companyId, issueId: chat.issue.id,
+          runId: chat.runId, agentId: chat.agentId, sessionId: event.normalizedSessionId,
+          completionContractId: randomUUID(), completionContractSha256: `sha256:${"a".repeat(64)}`,
+          sourceInstanceId: event.sourceInstanceId, controlPlaneSourceInstanceId: event.sourceInstanceId });
+        await port.appendEvent(event); events.push(event);
+      }
+    })().catch(error => { pumpError = error; });
+    try {
+      const { turnId } = await peer.session.startTurn({ message: { role: "user", text: chat.first.body } });
+      await vi.waitFor(() => { if (pumpError) throw pumpError;
+        expect(events.some(event => event.eventType === "tool.execution.started")).toBe(true); });
+      mocks.probe.mockResolvedValue({ disposition: "available", activeTurnId: turnId });
+      mocks.steer.mockImplementation(async (input: { message: string; correlationId: string }) => {
+        await peer.session.steer!({ turnId, message: { role: "user", text: input.message }, correlationId: input.correlationId });
+        return { turnId };
+      });
+      sent.push((await postDefault(chat, "Also check what's in the README").expect(201)).body.id);
+      if (shape === "two-steers") sent.push((await postDefault(chat, "And explain the setup command").expect(201)).body.id);
+      peer.releaseBoundary(false); // Read M, then start another tool in the SAME turn.
+      peer.completeNextTool(shape !== "no-text", shape === "two-steers");
+      peer.endTurn();
+      await vi.waitFor(() => { if (pumpError) throw pumpError;
+        expect(events.some(event => event.eventType === "turn.completed")).toBe(true); }, { timeout: 5000 });
+      const reads = events.filter(event => event.eventType === "item.started" && event.payload.kind === "userMessage");
+      expect(reads).toHaveLength(sent.length + 1);
+      const tool = events.findIndex(event => event.eventType === "tool.execution.started" && events.indexOf(reads[1]!) < events.indexOf(event));
+      expect(tool).toBeGreaterThan(events.indexOf(reads[1]!));
+      const reply = events.findIndex(event => event.eventType === "item.started" && event.payload.kind === "agentMessage");
+      if (shape === "no-text") expect(reply).toBe(-1);
+      else expect(reply).toBeGreaterThan(events.indexOf(reads.at(-1)!));
+      await finishTurn(chat, { log: false });
+      await releaseRun(chat);
+      const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+      expect((ended!.contextSnapshot as any).answeredSteeredCommentIds ?? []).toEqual(expectsAnswer ? sent : []);
+      for (const id of sent) {
+        expect(await answered(id)).toBe(expectsAnswer);
+        const carriers = await carriersOf(chat, id);
+        expect(carriers.wakes.length + carriers.runs.length, "a completed answer must not create a second-answer carrier").toBe(expectsAnswer ? 0 : 1);
+        expect((ended!.resultJson as any).restoredSteeredCommentIds ?? []).toEqual(expectsAnswer ? [] : sent);
+      }
+      const outcome = await settleUnansweredPersonMessage(db, { companyId: chat.companyId, issueId: chat.issue.id });
+      expect(outcome.kind).not.toBe("noticed");
+      const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+        sql`${issueComments.metadata}->>'authorizationReason' like ${UNANSWERED_MESSAGE_REASON_PREFIX + "%"}`));
+      expect(notices).toHaveLength(0);
+      expect(peer.commands.filter(command => ["prompt", "steer", "abort", "follow_up"].includes(command.type)).map(command => command.type))
+        .toEqual(["prompt", ...sent.map(() => "steer")]);
+    } finally {
+      if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `S-t-${shape}.json`), JSON.stringify({
+        fixture: "production Pi RPC driver + app-server proxy + Codex facade + event ingestion + real PG release; controlled Pi RPC peer and native-session registry",
+        shape, sent, pumpError: pumpError ? String(pumpError) : null, commands: peer.commands, events,
+        runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId)),
+        wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId)),
+        comments: await db.select().from(issueComments).where(eq(issueComments.issueId, chat.issue.id)),
+      }, null, 2));
+      await peer.close(); await pump; await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it.each(["turn.failed", "turn.cancelled"] as const)("S-t bound F2: completed text in a %s turn leaves the steer owed", async terminal => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const response = await postDefault(chat, "Still owed if this turn fails or stops").expect(201);
+    await piRunLog(chat, [
+      ...PI.user("A", 1), { ack: response.body.id }, ...PI.user("M", 2),
+      ...PI.reply("README setup details", "reply-with-M", { streamed: true }),
+      ...PI.tool("read-readme", "request-with-M"),
+      { end: terminal },
+    ]);
+    await finishTurn(chat, { status: terminal === "turn.failed" ? "failed" : "cancelled", log: false }); await releaseRun(chat);
     expect(await answered(response.body.id)).toBe(false);
+    const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    expect((ended!.contextSnapshot as any).answeredSteeredCommentIds ?? []).toEqual([]);
     const carriers = await carriersOf(chat, response.body.id);
     expect(carriers.wakes.length + carriers.runs.length).toBe(1);
   });
@@ -1308,10 +1399,10 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       { eventType: "item.started", kind: "agentMessage", itemId: "turn-1:final", text: "" },
       { eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:final", text: "A: done." },
     ],
-    // THE LIVE SHAPE: Pi reads B at the tool boundary (seq 283), the model reasons
-    // (seq 290) and starts the next shell call (seq 294) with no reply text, then
-    // its final reply falsely claims B was answered.
-    "read-no-reply": (b: string) => [
+    // Re-pin, RFL 10:29Z: "Widening the window from m's read to the end of that turn matches v1".
+    // Formerly read-no-reply: this shape DOES contain started/completed final text
+    // after the tools. Its model request contained B, so the canonical rule counts it.
+    "read-tool-final": (b: string) => [
       { eventType: "item.started", kind: "commandExecution", itemId: "turn-1:tool-1" },
       { eventType: "tool.execution.started", itemId: "turn-1:tool-1" },
       { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${b}` },
@@ -1359,7 +1450,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
 
   it.each([
     ["unread", "succeeded"], ["unread", "failed"],
-    ["read-no-reply", "succeeded"], ["read-no-reply", "failed"],
+    ["read-tool-final", "succeeded"], ["read-tool-final", "failed"],
     ["read-answered", "succeeded"], ["read-answered", "failed"],
   ] as const)("at a run end, a steered message is answered only by reply text after its read (%s, %s)", async (shape, status) => {
     const chat = await seedChat();
@@ -1375,7 +1466,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     await finishTurn(chat, { status, log: false });
     const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
     const carriers = await carriersOf(chat, b!.id);
-    if (shape === "read-answered") {
+    if (shape === "read-answered" || shape === "read-tool-final") {
       expect(await answered(b!.id)).toBe(true);
       expect((ended!.contextSnapshot as any).answeredSteeredCommentIds).toEqual([b!.id]);
       // No second delivery.
