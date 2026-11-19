@@ -1242,12 +1242,72 @@ describe("narrow Bearer recognition at an immediate CSI boundary", () => {
   });
 
   it.each([
-    ["Bearer  ", token], ["Bearer\t", token], ["Bearer\n", token],
+    ["Bearer\n", token],
     ["minibearer ", token], ["Bearerish ", token],
-    ["Bearer ", "a".repeat(20) + "=="],
-  ])("does not broaden V2's scheme, spacing or padding: %j %j", (scheme, body) => {
+  ])("does not broaden V2's scheme or cross-line spacing: %j %j", (scheme, body) => {
     const input = `prefix\u001b[31m${scheme}${body}${reset}`;
     expect(redactSensitiveText(input)).toBe(input);
+  });
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21230
+  // Keep reason: RFL's two-space, tab and base64-padding credential leaks.
+  const grammarForms = [
+    { form: "two spaces", separator: "  ", padding: "" },
+    { form: "tab", separator: "\t", padding: "" },
+    { form: "double padding", separator: " ", padding: "==" },
+  ];
+  const grammarRows = grammarForms.flatMap(form => ["prefix", ""].flatMap(before =>
+    codes.map(code => ({ ...form, before, code }))));
+
+  it.each(grammarRows)("masks RFL $form after $before and $code", ({ separator, padding, before, code }) => {
+    for (const body of ["a".repeat(20), token]) {
+      const prefix = `${before}${code}bEaReR${separator}`;
+      expect(redactSensitiveText(`${prefix}${body}${padding}${reset} done`))
+        .toBe(`${prefix}${REDACTED_EVENT_VALUE}${reset} done`);
+    }
+  });
+
+  it.each(grammarRows)("retains the short-body exception band for $form after $before and $code", ({ separator, padding, before, code }) => {
+    const prefix = `${before}${code}Bearer${separator}`;
+    const body = "a".repeat(19);
+    const input = `${prefix}${body}${padding}${reset}`;
+    // V1 already masks short padded tokens at line start. The V2 exception
+    // must not undo that mask; a glued prefix leaves this short body untouched.
+    const expected = before === "" && padding !== ""
+      ? `${prefix}${REDACTED_EVENT_VALUE}${reset}` : input;
+    expect(redactSensitiveText(input)).toBe(expected);
+  });
+
+  it.each(codes)("keeps existing short numeric line-start masking after %j", code => {
+    for (const { separator, padding } of grammarForms) {
+      const prefix = `${code}Bearer${separator}`;
+      expect(redactSensitiveText(`${prefix}abc123def${padding}${reset}`))
+        .toBe(`${prefix}${REDACTED_EVENT_VALUE}${reset}`);
+      const glued = `prefix${prefix}abc123def${padding}${reset}`;
+      expect(redactSensitiveText(glued)).toBe(glued);
+    }
+  });
+
+  it.each(codes)("shares all inline whitespace and unlimited trailing padding with uncoloured Bearer after %j", code => {
+    for (const separator of ["   ", "\t\t", " \t "]) {
+      for (const padding of ["", "=", "==", "==="]) {
+        const prefix = `prefix${code}Bearer${separator}`;
+        expect(redactSensitiveText(`${prefix}${token}${padding}${reset}`))
+          .toBe(`${prefix}${REDACTED_EVENT_VALUE}${reset}`);
+      }
+    }
+    for (const separator of ["\r", "\n", "\v", "\f", "\u00a0"]) {
+      const input = `prefix${code}Bearer${separator}${token}${reset}`;
+      expect(redactSensitiveText(input)).toBe(input);
+    }
+  });
+
+  it("keeps the exact short-token witness and responsibilities prose byte-identical", () => {
+    for (const input of [
+      "standard\u001b[31mbearer abc123def\u001b[0m",
+      "bearer of the responsibilities",
+      ...codes.map(code => `standard${code}bearer of the responsibilities${reset}`),
+    ]) expect(redactSensitiveText(input)).toBe(input);
   });
 
   it("requires CSI immediately before the scheme, not merely earlier on the line", () => {
