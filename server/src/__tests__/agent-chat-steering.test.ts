@@ -754,7 +754,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       { eventType: "item.completed", itemId: `turn-1:steer:${response.body.id}`, payload: { kind: "steering_acknowledgement" } },
       { eventType: "item.started", itemId: "turn-1:read-M", payload: { kind: "userMessage" } },
       { eventType: "item.started", itemId: "turn-1:reply", payload: { kind: "agentMessage" } },
-      { eventType: "item.completed", itemId: "turn-1:reply", payload: { kind: "agentMessage", text: "Completed text before the terminal" } },
+      { eventType: "item.completed", itemId: "turn-1:reply", payload: { kind: "agentMessage", channel: "final", providerPhase: "final_answer", text: "Completed text before the terminal" } },
       { eventType: terminal, itemId: "turn-1:end", payload: { status: terminal === "turn.failed" ? "failed" : expectsAnswer ? "completed" : "cancelled" } },
     ];
     const receipts = events.map((event, index) => ({ schema: "paperclip.prp.event.v1",
@@ -959,7 +959,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       ...(retained ? [
         { eventType: "item.started", itemId: "turn-1:read", payload: { kind: "userMessage" } },
         { eventType: "item.started", itemId: "turn-1:reply", payload: { kind: "agentMessage" } },
-        { eventType: "item.completed", itemId: "turn-1:reply", payload: { kind: "agentMessage", text: "Answer survived" } },
+        { eventType: "item.completed", itemId: "turn-1:reply", payload: { kind: "agentMessage", channel: "final", providerPhase: "final_answer", text: "Answer survived" } },
       ] : []),
     ];
     for (const [index, event] of events.entries()) await port.appendEvent({ schema: "paperclip.prp.event.v1",
@@ -1407,7 +1407,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   });
 
   /** The runner's durable run log for the live turn (validated PRP events, in order). */
-  async function runLog(chat: Chat, events: Array<{ eventType: string; kind?: string; itemId: string; text?: string }>) {
+  async function runLog(chat: Chat, events: Array<{ eventType: string; kind?: string; itemId: string; text?: string; channel?: string }>) {
     // Allocate sequences as run-event ingestion does (heartbeat_runs.next_event_seq).
     const [allocated] = await db.update(heartbeatRuns)
       .set({ nextEventSeq: sql`${heartbeatRuns.nextEventSeq} + ${events.length}` })
@@ -1417,7 +1417,10 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       companyId: chat.companyId, runId: chat.runId, agentId: chat.agentId, seq: first + index,
       eventType: event.eventType, sourceEventId: randomUUID(),
       payload: { prpEvent: { turnId: "turn-1", itemId: event.itemId,
-        payload: event.kind ? { kind: event.kind, ...(event.text === undefined ? {} : { text: event.text }) } : {} } },
+        payload: event.kind ? { kind: event.kind,
+          ...(event.kind === "agentMessage" ? { channel: event.channel ?? "final",
+            providerPhase: event.channel === "progress" ? "commentary" : "final_answer" } : {}),
+          ...(event.text === undefined ? {} : { text: event.text }) } : {} } },
     })));
   }
 
@@ -1910,7 +1913,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
 
   // catch: five finals were stored but only the last was posted (run 130c114e).
   describe("native per-item final reply publication", () => {
-    async function multiFinal(count: number, options: { ownFinal?: boolean; restart?: boolean; sameText?: boolean; progress?: boolean } = {}) {
+    async function multiFinal(count: number, options: { ownFinal?: boolean; restart?: boolean; sameText?: boolean; progress?: boolean; commentaryOnly?: boolean } = {}) {
       const chat = await seedChat(); await attachSteerable(chat);
       const sessionId = randomUUID(), runnerId = randomUUID();
       const [contract] = await db.insert(completionContracts).values({ companyId: chat.companyId, issueId: chat.issue.id,
@@ -1947,10 +1950,11 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
           const response = await postDefault(chat, `Question ${i + 1}`).expect(201);
           sent.push(response.body.id); await waitForPendingCommentSteers();
           const text = options.sameText ? "Same answer." : `${100 + i} + 1 = ${101 + i}.`;
-          peer.answerNextSteer(text); expected.push(text);
+          const commentary = options.commentaryOnly;
+          peer.answerNextSteer(text, commentary); if (!commentary) expected.push(text);
           await vi.waitFor(() => { if (pumpError) throw pumpError;
             expect(events.filter(e => e.eventType === "item.completed" && e.payload.kind === "agentMessage"
-              && e.payload.channel === "final")).toHaveLength(expected.length); }, { timeout: 5000 });
+              && e.payload.text === text)).toHaveLength(i + 1 === count && options.sameText ? count : 1); }, { timeout: 5000 });
           // Recreate the production ingestion port from durable identity in the
           // middle of the run, then replay the exact event: no duplicate item.
           if (options.restart && i === 1) {
@@ -1979,13 +1983,14 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
         const replies = thread.body.filter((c: any) => c.authorType === "agent")
           .sort((a: any, b: any) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || a.id.localeCompare(b.id));
         const evidence = await readSteeredMessageAnswers(db, scope);
-        if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `m-${count}${options.ownFinal ? "-late" : ""}${options.restart ? "-restart" : ""}${options.sameText ? "-same" : ""}.json`),
+        if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `m-${count}${options.ownFinal ? "-late" : ""}${options.restart ? "-restart" : ""}${options.sameText ? "-same" : ""}${options.commentaryOnly ? "-commentary-only" : ""}.json`),
           JSON.stringify({ scope, sent, expected, replies, evidence, events, thread: thread.body }, null, 2));
         expect(replies.map((c: any) => c.body)).toEqual(expected);
         expect(thread.body.filter((c: any) => c.authorType === "system")).toEqual([]);
-        expect(evidence.answered).toEqual(sent); expect(new Set(evidence.answered).size).toBe(count);
-        for (const id of sent) expect(await answered(id)).toBe(true);
-        return { chat, scope, replies };
+        const expectedAnswered = options.commentaryOnly ? [] : sent;
+        expect(evidence.answered).toEqual(expectedAnswered); expect(new Set(evidence.answered).size).toBe(expectedAnswered.length);
+        for (const id of sent) expect(await answered(id)).toBe(expectedAnswered.includes(id));
+        return { chat, scope, replies, sent };
       } finally { await peer.close(); await pump; await rm(root, { recursive: true, force: true }); }
     }
     it("m-5: five steered questions keep five final answers in item order, no notes", async () => { await multiFinal(5); }, 30_000);
@@ -2010,5 +2015,43 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     it("m-same: equal text from different items remains two answers", async () => { await multiFinal(2, { sameText: true }); }, 30_000);
     it("m-12: more than ten steers keep every answer in order", async () => { await multiFinal(12); }, 60_000);
     it("m-commentary: commentary remains run activity, not posted replies", async () => { await multiFinal(2, { progress: true }); }, 30_000);
+
+    describe("St final-only accounting (separate patch)", () => {
+      it("st-final: a published final_answer answers the steer", async () => { await multiFinal(1); }, 30_000);
+      it("st-commentary: commentary after a read is not answered by an unrelated own final; one sweep card", async () => {
+        const { chat, scope, sent } = await multiFinal(1, { ownFinal: true, commentaryOnly: true });
+        for (const offset of [180_000, 240_000]) await settleUnansweredPersonMessage(db,
+          { ...scope, now: new Date(Date.now() + offset) });
+        const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+          sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + sent[0]}`));
+        expect(notices).toHaveLength(1); expect(await answered(sent[0]!)).toBe(false);
+      }, 30_000);
+      it("st-days-old: boot discovery, delivery and two sweeps preserve stored old commentary answers without a wake or card", async () => {
+        const { chat, scope, sent } = await multiFinal(1, { ownFinal: true, commentaryOnly: true });
+        const old = new Date(Date.now() - 3 * 24 * 60 * 60_000);
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+        // This is the PREVIOUS release's persisted projection, not a claim
+        // that this release would newly mark commentary as an answer.
+        await db.update(heartbeatRuns).set({ startedAt: new Date(old.getTime() - 60_000), finishedAt: old,
+          contextSnapshot: { ...run.contextSnapshot, answeredSteeredCommentIds: sent } }).where(eq(heartbeatRuns.id, chat.runId));
+        await db.update(issueComments).set({ createdAt: old, updatedAt: old }).where(eq(issueComments.issueId, chat.issue.id));
+        await db.update(issueComments).set({ createdAt: new Date(old.getTime() + 1000) })
+          .where(and(eq(issueComments.issueId, chat.issue.id), eq(issueComments.authorType, "agent")));
+        expect(await answered(sent[0]!)).toBe(true);
+        const beforeRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId));
+        const beforeWakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId));
+        // Reconstruct boot's durable presentation discovery and ordinary
+        // outbox delivery against saved data; never recompute old event logs.
+        expect(await nativeResponsePresentationWork(db).load(scope)).toEqual([]);
+        const [issue] = await db.select().from(issues).where(eq(issues.id, chat.issue.id));
+        await deliverConversationComments(db, issue!, heartbeatService(db).wakeup);
+        for (const offset of [180_000, 240_000]) await settleUnansweredPersonMessage(db,
+          { ...scope, now: new Date(Date.now() + offset) });
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId))).toHaveLength(beforeRuns.length);
+        expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId))).toHaveLength(beforeWakes.length);
+        expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id), eq(issueComments.authorType, "system")))).toEqual([]);
+        expect(await answered(sent[0]!)).toBe(true);
+      }, 30_000);
+    });
   });
 });

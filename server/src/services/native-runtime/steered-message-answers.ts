@@ -10,6 +10,9 @@ export interface SteerAnswerEvent {
   kind?: string | null;
   /** item.completed agentMessage only: the completed block carries non-empty text. */
   hasText?: boolean | null;
+  /** Canonical PRP channel; the Codex facade preserves phase as providerPhase. */
+  channel?: string | null;
+  providerPhase?: string | null;
   /** Durable pre-RPC custody, not a provider ACK. Never binds a prior read. */
   reservation?: boolean;
 }
@@ -26,7 +29,7 @@ const TURN_END = new Set(["turn.completed", "turn.cancelled", "turn.failed"]);
 /**
  * The answered rule for steered person messages (never-OK, live on PV2 s3).
  * A steered message B is ANSWERED by its run only when the run log shows an assistant
- * TEXT item (kind agentMessage; never reasoning, never a tool) with a real item.started
+ * FINAL text item (kind agentMessage, channel final; never commentary, reasoning or a tool) with a real item.started
  * after B's delivery userMessage and before that turn's end, whose same item then
  * COMPLETED (item.completed) with non-empty text in that window. Tool calls do not
  * close the window: every later model request in the Pi session contains B in its
@@ -89,7 +92,8 @@ export function steeredMessageAnswers(events: Iterable<SteerAnswerEvent>): {
       const item = textItems.get(event.itemId) ?? {};
       textItems.set(event.itemId, item);
       if (event.eventType === "item.started") item.start ??= event.seq;
-      else if (event.hasText && item.start !== undefined) item.completedAt = event.seq;
+      else if (event.hasText && event.channel === "final" && event.providerPhase !== "commentary"
+        && item.start !== undefined) item.completedAt = event.seq;
     } else if (TURN_END.has(event.eventType)) {
       boundaries.push({ seq: event.seq, eventType: event.eventType });
     }
@@ -141,6 +145,8 @@ export async function readSteeredMessageAnswers(db: Db, input: { companyId: stri
     turnId: sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId'`,
     itemId: sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId'`,
     kind,
+    channel: sql<string | null>`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,channel}'`,
+    providerPhase: sql<string | null>`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,providerPhase}'`,
     hasText: sql<boolean | null>`length(btrim(coalesce(${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'text', ''))) > 0`,
   }).from(heartbeatRunEvents).where(and(
     eq(heartbeatRunEvents.companyId, input.companyId),
