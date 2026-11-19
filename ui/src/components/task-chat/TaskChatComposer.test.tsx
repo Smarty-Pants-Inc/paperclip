@@ -3784,3 +3784,104 @@ describe("composer Stop", () => {
     expect(sendButton().disabled).toBe(failed);
   });
 });
+
+describe("steering by default: Send ▾ and its keys (Paul 11-19)", () => {
+  function chord(init: KeyboardEventInit & { altGraph?: boolean }) {
+    const event = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true, ...init });
+    if (init.altGraph) Object.defineProperty(event, "getModifierState", { value: (key: string) => key === "AltGraph" });
+    flushSync(() => { editable().dispatchEvent(event); });
+  }
+  function onMac(mac: boolean) {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue(mac ? "MacIntel" : "Linux x86_64");
+  }
+  afterEach(() => vi.restoreAllMocks());
+  const working = () => ({ onStop: vi.fn().mockResolvedValue(undefined) });
+
+  it.each([390, 1440])("while working, Enter sends with deliveryIntent omitted (the server steers by default) at %ipx", async (width) => {
+    onMac(true);
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" mobile={width < 640} {...working()} />);
+    typeText("look at the logs too");
+    expect(container.querySelector('[data-testid="task-chat-send"]')).not.toBeNull();
+    expect(sendButton().dataset.sendDefault).toBe("steer");
+    expect(sendButton().title).toBe("Send: steers while the agent works (Enter)");
+    pressKey("Enter");
+    await flushAsync();
+    expect(onAdd).toHaveBeenCalledTimes(1);
+    expect(onAdd.mock.calls[0]).toEqual(["look at the logs too", undefined, undefined, undefined, expect.any(String)]);
+    expect(onAdd.mock.calls[0][6]).toBeUndefined();
+  });
+
+  it.each([[390, true], [1440, true], [390, false], [1440, false]] as const)("the menu shows Steer, Queue and Interrupt with chords at %ipx (mac=%s)", async (width, mac) => {
+    onMac(mac);
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" mobile={width < 640} {...working()} />);
+    typeText("hold that for later");
+    const toggle = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-send-menu-toggle"]')!;
+    expect(toggle).not.toBeNull();
+    flushSync(() => toggle.click());
+    const items = ["steer", "queue", "interrupt"].map((intent) =>
+      container.querySelector<HTMLButtonElement>(`[data-testid="task-chat-send-menu-${intent}"]`));
+    expect(items.every(Boolean)).toBe(true);
+    expect(container.querySelectorAll('[role="menuitem"]')).toHaveLength(3);
+    const chordText = (intent: string) => container.querySelector(`[data-testid="task-chat-send-menu-${intent}-chord"]`)!.textContent;
+    expect(chordText("steer")).toBe("Enter");
+    expect(chordText("queue")).toBe(mac ? "Ctrl+⌘+Enter" : "Ctrl+Alt+Enter");
+    expect(chordText("interrupt")).toBe(mac ? "Shift+⌘+Enter" : "Shift+Ctrl+Enter");
+    expect(items[1]!.textContent).toContain("Sent after the agent finishes this turn.");
+    flushSync(() => items[1]!.click());
+    await flushAsync();
+    expect(onAdd).toHaveBeenCalledTimes(1);
+    expect(onAdd.mock.calls[0][6]).toBe("queue");
+  });
+
+  it.each([390, 1440])("Mac: Shift+Cmd+Enter interrupts, Ctrl+Cmd+Enter queues, Shift+Enter is a new line at %ipx", async (width) => {
+    onMac(true);
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" mobile={width < 640} {...working()} />);
+    typeText("line one");
+    pressKey("Enter", { shiftKey: true });
+    await flushAsync();
+    expect(onAdd).not.toHaveBeenCalled();
+    expect(editable().textContent).toBe("line one");
+    chord({ shiftKey: true, metaKey: true });
+    await flushAsync();
+    expect(onAdd.mock.calls[0][0]).toBe("line one");
+    expect(onAdd.mock.calls[0][6]).toBe("interrupt");
+    typeText("then this");
+    chord({ ctrlKey: true, metaKey: true });
+    await flushAsync();
+    expect(onAdd.mock.calls[1][0]).toBe("then this");
+    expect(onAdd.mock.calls[1][6]).toBe("queue");
+  });
+
+  it("Windows/Linux: Shift+Ctrl+Enter interrupts, Ctrl+Alt+Enter queues, and AltGr is ignored", async () => {
+    onMac(false);
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" {...working()} />);
+    typeText("stop and do this");
+    chord({ shiftKey: true, ctrlKey: true });
+    await flushAsync();
+    expect(onAdd.mock.calls[0][6]).toBe("interrupt");
+    typeText("after the turn");
+    chord({ ctrlKey: true, altKey: true });
+    await flushAsync();
+    expect(onAdd.mock.calls[1][6]).toBe("queue");
+    typeText("AltGr text");
+    chord({ ctrlKey: true, altKey: true, altGraph: true });
+    await flushAsync();
+    expect(onAdd).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([390, 1440])("idle: Enter is an ordinary send and there is no Send ▾ at %ipx", async (width) => {
+    onMac(true);
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" mobile={width < 640} />);
+    typeText("hello");
+    expect(container.querySelector('[data-testid="task-chat-send-menu-toggle"]')).toBeNull();
+    expect(sendButton().title).toBe("Send (Enter)");
+    pressKey("Enter");
+    await flushAsync();
+    expect(onAdd.mock.calls[0]).toEqual(["hello", undefined, undefined, undefined, expect.any(String)]);
+  });
+});
