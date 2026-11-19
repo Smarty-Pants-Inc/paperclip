@@ -100,7 +100,13 @@ async function waitingPersonComments(db: Db, issue: typeof issues.$inferSelect, 
 
 /** Existing accepted turn.started is the trigger; no polling or new dispatcher. */
 export async function drainFallbackPersonComments(db: Db, runId: string): Promise<void> {
-  const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+  // Empty turn-start observations must not put ordinary Sends (and their read
+  // events) behind an unnecessary issue-lock transaction. Admission rechecks
+  // attachment after publishing its wake, closing a race with this negative read.
+  const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId),
+    sql`exists (select 1 from ${activityLog} where ${activityLog.runId} = ${runId}
+      and ${activityLog.companyId} = ${heartbeatRuns.companyId} and ${activityLog.action} = ${FALLBACK_ACTION}
+      and ${activityLog.details}->>'eligibleForSteering' = 'true')`));
   const issueId = run?.nativeIssueId ?? run?.contextSnapshot?.issueId;
   if (!run || typeof issueId !== "string" || run.status !== "running") return;
   await db.transaction(async lock => {
@@ -191,7 +197,15 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
         eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${comment.id}`),
         inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution", "claimed", "coalesced", "completed"]),
       )).limit(1);
-      if (admitted.length) return true;
+      if (admitted.length) {
+        // The attach observer may have seen no fallback before this admission
+        // committed. Recheck once under the SAME issue lock, through the same
+        // custody owner; a still-unavailable turn leaves the ordinary wake owed.
+        // Do not give a drained input an onRejected callback: its consumed wake
+        // cannot authorize dropping custody after a later RPC refusal.
+        await trySteerPersonComment(db, comment, { lockHeld: true, fallbackWakeId: admitted[0]!.id });
+        return true;
+      }
     }
     return false;
   }
