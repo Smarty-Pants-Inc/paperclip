@@ -1,0 +1,536 @@
+{
+ "terminalMoment_head": {
+  "source": "live-none.json before (real routes; the moment R ended)",
+  "issue": {
+   "id": "9ec98cf6-7a7c-4ad8-9010-faf8c6e9a1bc",
+   "companyId": "1c9ef9ae-f119-4a85-aab9-cfaa47f27398",
+   "status": "blocked",
+   "interruption": {
+    "intentId": "ceff20e6-8df4-4843-a958-2158ca28ee10",
+    "responsibility": "system",
+    "state": "failed",
+    "nextRetryAt": null,
+    "canRetry": false,
+    "userAction": null,
+    "sourceRunIds": [
+     "bb4ea1e4-b1e2-4376-89b8-5f78890f7017"
+    ],
+    "observedRunId": "bb4ea1e4-b1e2-4376-89b8-5f78890f7017"
+   },
+   "executionBlocker": {
+    "recoveryActionId": "9ebd7bde-65f6-4e05-ae5d-080df72dd9c2",
+    "runId": "bb4ea1e4-b1e2-4376-89b8-5f78890f7017",
+    "agentId": "39e45583-781b-4369-9add-885e26adb6d7",
+    "cause": "native_workspace_sync_out_retry_exhausted",
+    "nextAction": "Your message is saved. The last reply's file changes couldn't be saved; it starts now on the project's files.",
+    "runStatus": "failed",
+    "runError": "Saving the workspace failed after 3 attempts. The agent's result is kept; follow the run's recovery action to repair the workspace.",
+    "canContinue": false,
+    "canRetry": false,
+    "workspaceRepairRequired": true,
+    "canRecordWorkspaceRepair": false,
+    "savedMessageCount": 1
+   },
+   "activeRecoveryAction": {
+    "id": "9ebd7bde-65f6-4e05-ae5d-080df72dd9c2",
+    "companyId": "1c9ef9ae-f119-4a85-aab9-cfaa47f27398",
+    "sourceIssueId": "9ec98cf6-7a7c-4ad8-9010-faf8c6e9a1bc",
+    "recoveryIssueId": null,
+    "kind": "active_run_watchdog",
+    "status": "active",
+    "ownerType": "board",
+    "ownerAgentId": null,
+    "ownerUserId": null,
+    "previousOwnerAgentId": null,
+    "returnOwnerAgentId": "39e45583-781b-4369-9add-885e26adb6d7",
+    "cause": "native_workspace_sync_out_retry_exhausted",
+    "fingerprint": "49f00e7acd074eacbe3a615b5252cac2a110d970da3055e44217f1fe0271c020",
+    "evidence": {
+     "runId": "bb4ea1e4-b1e2-4376-89b8-5f78890f7017",
+     "coordinatorAttempt": 0,
+     "originalFailureCode": "native_workspace_sync_out_failed",
+     "workspaceFinalizeAttempt": 3,
+     "workspaceFinalizationBlock": {
+      "runId": "bb4ea1e4-b1e2-4376-89b8-5f78890f7017",
+      "schema": "paperclip.native-workspace-finalization-block.v1",
+      "agentId": "39e45583-781b-4369-9add-885e26adb6d7",
+      "issueId": "9ec98cf6-7a7c-4ad8-9010-faf8c6e9a1bc",
+      "resultId": "b261b7da-fe48-426b-9bfc-09bca8b0713a",
+      "companyId": "1c9ef9ae-f119-4a85-aab9-cfaa47f27398",
+      "contractId": "8e5ae1f7-2e93-4cb5-9307-8f39931b4912",
+      "resultSha256": "50648f8a32175aac2c7e2957f74f70336ca627436d18ca575b4b0f96befa0e44",
+      "statusVersion": 4,
+      "contractSha256": "f9c262062eb76412e593aaa785ad2ab62472070023e77b8963d26b83a1f98cef",
+      "priorDecisionId": "2332a51f-4e93-4302-a5e9-ff49f3a17845",
+      "identityContextId": "1f624e97-0023-4e90-9927-240ae1b0a9fe",
+      "responsibleUserId": "classic-bound-person"
+     }
+    },
+    "nextAction": "Finalization retry budget exhausted. Retry workspace export and merge from the retained sandbox; do not submit another provider turn.",
+    "wakePolicy": null,
+    "monitorPolicy": null,
+    "attemptCount": 1,
+    "maxAttempts": 3,
+    "timeoutAt": null,
+    "lastAttemptAt": "2026-11-19T12:14:57.153Z",
+    "outcome": null,
+    "resolutionNote": null,
+    "resolvedAt": null,
+    "createdAt": "2026-11-19T12:14:57.105Z",
+    "updatedAt": "2026-11-19T12:14:57.105Z"
+   }
+  },
+  "comments": [
+   {
+    "id": "f26045f2-2142-429c-9605-6a8544801a12",
+    "body": "Done. I rewrote the report and added the notes file.",
+    "authorType": "agent",
+    "createdByRunId": "bb4ea1e4-b1e2-4376-89b8-5f78890f7017",
+    "createdAt": "2026-11-19T12:14:57.471Z"
+   },
+   {
+    "id": "d623ac3f-3ee3-42ae-9873-81025399d303",
+    "body": "Also add a summary section to the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T12:14:35.363Z"
+   },
+   {
+    "id": "65013940-0f9a-4c4a-b23f-978aa3dc9cfa",
+    "body": "Please rewrite the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T12:14:34.130Z"
+   },
+   {
+    "id": "61f48781-a479-4184-b3cd-9d92a1e33e41",
+    "body": "Done. I wrote the report.",
+    "authorType": "agent",
+    "createdByRunId": "15198e13-4703-452e-b270-38107033b1b3",
+    "createdAt": "2026-11-19T12:14:33.776Z"
+   },
+   {
+    "id": "b8cd59c9-6765-4f33-b7bb-d48801503ead",
+    "body": "Please write the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T12:14:31.844Z"
+   }
+  ],
+  "runs": [
+   {
+    "runId": "bb4ea1e4-b1e2-4376-89b8-5f78890f7017",
+    "status": "failed",
+    "createdAt": "2026-11-19T12:14:34.167Z",
+    "startedAt": "2026-11-19T12:14:34.336Z",
+    "finishedAt": "2026-11-19T12:14:57.105Z",
+    "replyFileLine": {
+     "state": "lost",
+     "commentId": "f26045f2-2142-429c-9605-6a8544801a12"
+    }
+   },
+   {
+    "runId": "15198e13-4703-452e-b270-38107033b1b3",
+    "status": "succeeded",
+    "createdAt": "2026-11-19T12:14:31.888Z",
+    "startedAt": "2026-11-19T12:14:32.064Z",
+    "finishedAt": "2026-11-19T12:14:33.703Z",
+    "replyFileLine": null
+   }
+  ],
+  "queue": {
+   "issueId": "9ec98cf6-7a7c-4ad8-9010-faf8c6e9a1bc",
+   "queueId": "ceff20e6-8df4-4843-a958-2158ca28ee10",
+   "state": "deferred",
+   "targetRunId": null,
+   "revision": "789736502afb69e2f6cb0aa518bfeefe",
+   "protocol": "paperclip_runner_v1",
+   "steeringDisposition": "temporarily_unavailable",
+   "entries": [
+    {
+     "comment": {
+      "id": "d623ac3f-3ee3-42ae-9873-81025399d303",
+      "companyId": "1c9ef9ae-f119-4a85-aab9-cfaa47f27398",
+      "issueId": "9ec98cf6-7a7c-4ad8-9010-faf8c6e9a1bc",
+      "authorAgentId": null,
+      "authorUserId": "classic-bound-person",
+      "onBehalfOfUserId": null,
+      "authorType": "user",
+      "createdByRunId": null,
+      "derivedAuthorAgentId": null,
+      "derivedCreatedByRunId": null,
+      "derivedAuthorSource": null,
+      "clientRequestId": "a6b61200-6ee0-4ea0-8157-305013b4ad5a",
+      "conversationSessionGeneration": null,
+      "origin": "comment",
+      "fastResponseRequestId": null,
+      "body": "Also add a summary section to the report.",
+      "presentation": null,
+      "metadata": null,
+      "deletedAt": null,
+      "deletedByType": null,
+      "deletedByAgentId": null,
+      "deletedByUserId": null,
+      "deletedByRunId": null,
+      "sourceTrust": null,
+      "createdAt": "2026-11-19T12:14:35.363Z",
+      "updatedAt": "2026-11-19T12:14:35.363Z"
+     },
+     "position": 0,
+     "canEdit": true,
+     "canDiscard": true
+    }
+   ]
+  },
+  "rRunId": "bb4ea1e4-b1e2-4376-89b8-5f78890f7017"
+ },
+ "parked_head_boxNotStopped": {
+  "source": "live-none.json after (real workers ran; R box not stopped)",
+  "issue": {
+   "id": "9ec98cf6-7a7c-4ad8-9010-faf8c6e9a1bc",
+   "companyId": "1c9ef9ae-f119-4a85-aab9-cfaa47f27398",
+   "status": "blocked",
+   "interruption": {
+    "intentId": "ceff20e6-8df4-4843-a958-2158ca28ee10",
+    "responsibility": "system",
+    "state": "failed",
+    "nextRetryAt": null,
+    "canRetry": true,
+    "userAction": null,
+    "sourceRunIds": [
+     "bb4ea1e4-b1e2-4376-89b8-5f78890f7017"
+    ],
+    "observedRunId": "bb4ea1e4-b1e2-4376-89b8-5f78890f7017"
+   },
+   "executionBlocker": {
+    "recoveryActionId": "9ebd7bde-65f6-4e05-ae5d-080df72dd9c2",
+    "runId": "bb4ea1e4-b1e2-4376-89b8-5f78890f7017",
+    "agentId": "39e45583-781b-4369-9add-885e26adb6d7",
+    "cause": "native_workspace_sync_out_retry_exhausted",
+    "nextAction": "Your message is saved. The last reply's file changes couldn't be saved; it starts now on the project's files.",
+    "workspaceRecovery": {
+     "status": "blocked",
+     "stage": "verifying_stop",
+     "canRetry": true,
+     "message": "Paperclip refused to recover the saved files: the recorded source of the saved files does not match the run that saved them. Automatic recovery does not repeat this check, because the same saved state gives the same result. Retry runs the check again. The agent's result is saved, and the agent will not repeat its work."
+    },
+    "runStatus": "failed",
+    "runError": "Saving the workspace failed after 3 attempts. The agent's result is kept; follow the run's recovery action to repair the workspace.",
+    "canContinue": false,
+    "canRetry": true,
+    "workspaceRepairRequired": true,
+    "canRecordWorkspaceRepair": false,
+    "savedMessageCount": 1
+   },
+   "activeRecoveryAction": {
+    "id": "9ebd7bde-65f6-4e05-ae5d-080df72dd9c2",
+    "companyId": "1c9ef9ae-f119-4a85-aab9-cfaa47f27398",
+    "sourceIssueId": "9ec98cf6-7a7c-4ad8-9010-faf8c6e9a1bc",
+    "recoveryIssueId": null,
+    "kind": "active_run_watchdog",
+    "status": "active",
+    "ownerType": "board",
+    "ownerAgentId": null,
+    "ownerUserId": null,
+    "previousOwnerAgentId": null,
+    "returnOwnerAgentId": "39e45583-781b-4369-9add-885e26adb6d7",
+    "cause": "native_workspace_sync_out_retry_exhausted",
+    "fingerprint": "49f00e7acd074eacbe3a615b5252cac2a110d970da3055e44217f1fe0271c020",
+    "evidence": {
+     "runId": "bb4ea1e4-b1e2-4376-89b8-5f78890f7017",
+     "systemRecovery": {
+      "phase": "verify_execution",
+      "state": "exhausted",
+      "schema": "paperclip.system-recovery.v1",
+      "failure": {
+       "code": "source_binding_invalid",
+       "retryClass": "service_required",
+       "sourceVerification": {
+        "reason": "lease_cwd_invalid"
+       },
+       "evidenceFingerprint": "f9b2544ab38d2de8efadacdeccde8344d3d28ab338ad014ccd48bbbe5f824d07"
+      },
+      "attempts": 1,
+      "intentId": null,
+      "revision": 2,
+      "attemptId": "06c1499b-d802-4fcb-b871-1bde93c181f2",
+      "deadlineAt": 1795092297816,
+      "retriesUsed": 0,
+      "sourceRunId": "bb4ea1e4-b1e2-4376-89b8-5f78890f7017",
+      "generationId": "ceaad7a1-8a72-4812-b5b1-b569739b06c4",
+      "nextAttemptAt": null,
+      "policyVersion": 1,
+      "firstFailureAt": 1795090497816,
+      "freshAttemptRunId": null,
+      "providerCooldownAt": null,
+      "capturePolicyVersion": 2,
+      "preservationOperationIds": []
+     },
+     "workspaceRecovery": {
+      "runId": "bb4ea1e4-b1e2-4376-89b8-5f78890f7017",
+      "stage": "verifying_stop",
+      "schema": "paperclip.workspace-recovery.v1",
+      "status": "blocked",
+      "attempt": 1,
+      "message": "Paperclip refused to recover the saved files: the recorded source of the saved files does not match the run that saved them. Automatic recovery does not repeat this check, because the same saved state gives the same result. Retry runs the check again. The agent's result is saved, and the agent will not repeat its work.",
+      "retryable": true,
+      "requestIds": [],
+      "attemptLimit": 6
+     },
+     "coordinatorAttempt": 0,
+     "originalFailureCode": "native_workspace_sync_out_failed",
+     "systemRecoveryActiveAt": 1795090497801,
+     "workspaceFinalizeAttempt": 3,
+     "previousWorkspaceRecovery": null,
+     "workspaceFinalizationBlock": {
+      "runId": "bb4ea1e4-b1e2-4376-89b8-5f78890f7017",
+      "schema": "paperclip.native-workspace-finalization-block.v1",
+      "agentId": "39e45583-781b-4369-9add-885e26adb6d7",
+      "issueId": "9ec98cf6-7a7c-4ad8-9010-faf8c6e9a1bc",
+      "resultId": "b261b7da-fe48-426b-9bfc-09bca8b0713a",
+      "companyId": "1c9ef9ae-f119-4a85-aab9-cfaa47f27398",
+      "contractId": "8e5ae1f7-2e93-4cb5-9307-8f39931b4912",
+      "resultSha256": "50648f8a32175aac2c7e2957f74f70336ca627436d18ca575b4b0f96befa0e44",
+      "statusVersion": 4,
+      "contractSha256": "f9c262062eb76412e593aaa785ad2ab62472070023e77b8963d26b83a1f98cef",
+      "priorDecisionId": "2332a51f-4e93-4302-a5e9-ff49f3a17845",
+      "identityContextId": "1f624e97-0023-4e90-9927-240ae1b0a9fe",
+      "responsibleUserId": "classic-bound-person"
+     }
+    },
+    "nextAction": "Paperclip refused to recover the saved files: the recorded source of the saved files does not match the run that saved them. Automatic recovery does not repeat this check, because the same saved state gives the same result. Retry runs the check again. The agent's result is saved, and the agent will not repeat its work.",
+    "wakePolicy": null,
+    "monitorPolicy": null,
+    "attemptCount": 1,
+    "maxAttempts": 3,
+    "timeoutAt": null,
+    "lastAttemptAt": "2026-11-19T12:14:57.153Z",
+    "outcome": null,
+    "resolutionNote": null,
+    "resolvedAt": null,
+    "createdAt": "2026-11-19T12:14:57.105Z",
+    "updatedAt": "2026-11-19T12:14:57.819Z"
+   }
+  },
+  "comments": [
+   {
+    "id": "f26045f2-2142-429c-9605-6a8544801a12",
+    "body": "Done. I rewrote the report and added the notes file.",
+    "authorType": "agent",
+    "createdByRunId": "bb4ea1e4-b1e2-4376-89b8-5f78890f7017",
+    "createdAt": "2026-11-19T12:14:57.471Z"
+   },
+   {
+    "id": "d623ac3f-3ee3-42ae-9873-81025399d303",
+    "body": "Also add a summary section to the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T12:14:35.363Z"
+   },
+   {
+    "id": "65013940-0f9a-4c4a-b23f-978aa3dc9cfa",
+    "body": "Please rewrite the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T12:14:34.130Z"
+   },
+   {
+    "id": "61f48781-a479-4184-b3cd-9d92a1e33e41",
+    "body": "Done. I wrote the report.",
+    "authorType": "agent",
+    "createdByRunId": "15198e13-4703-452e-b270-38107033b1b3",
+    "createdAt": "2026-11-19T12:14:33.776Z"
+   },
+   {
+    "id": "b8cd59c9-6765-4f33-b7bb-d48801503ead",
+    "body": "Please write the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T12:14:31.844Z"
+   }
+  ],
+  "runs": [
+   {
+    "runId": "bb4ea1e4-b1e2-4376-89b8-5f78890f7017",
+    "status": "failed",
+    "createdAt": "2026-11-19T12:14:34.167Z",
+    "startedAt": "2026-11-19T12:14:34.336Z",
+    "finishedAt": "2026-11-19T12:14:57.105Z",
+    "replyFileLine": {
+     "state": "lost",
+     "commentId": "f26045f2-2142-429c-9605-6a8544801a12"
+    }
+   },
+   {
+    "runId": "15198e13-4703-452e-b270-38107033b1b3",
+    "status": "succeeded",
+    "createdAt": "2026-11-19T12:14:31.888Z",
+    "startedAt": "2026-11-19T12:14:32.064Z",
+    "finishedAt": "2026-11-19T12:14:33.703Z",
+    "replyFileLine": null
+   }
+  ],
+  "queue": {
+   "issueId": "9ec98cf6-7a7c-4ad8-9010-faf8c6e9a1bc",
+   "queueId": "ceff20e6-8df4-4843-a958-2158ca28ee10",
+   "state": "deferred",
+   "targetRunId": null,
+   "revision": "789736502afb69e2f6cb0aa518bfeefe",
+   "protocol": "paperclip_runner_v1",
+   "steeringDisposition": "temporarily_unavailable",
+   "executionWait": {
+    "reason": "remote_cleanup",
+    "message": "Waiting for the previous environment to stop. Your message will start automatically."
+   },
+   "entries": [
+    {
+     "comment": {
+      "id": "d623ac3f-3ee3-42ae-9873-81025399d303",
+      "companyId": "1c9ef9ae-f119-4a85-aab9-cfaa47f27398",
+      "issueId": "9ec98cf6-7a7c-4ad8-9010-faf8c6e9a1bc",
+      "authorAgentId": null,
+      "authorUserId": "classic-bound-person",
+      "onBehalfOfUserId": null,
+      "authorType": "user",
+      "createdByRunId": null,
+      "derivedAuthorAgentId": null,
+      "derivedCreatedByRunId": null,
+      "derivedAuthorSource": null,
+      "clientRequestId": "a6b61200-6ee0-4ea0-8157-305013b4ad5a",
+      "conversationSessionGeneration": null,
+      "origin": "comment",
+      "fastResponseRequestId": null,
+      "body": "Also add a summary section to the report.",
+      "presentation": null,
+      "metadata": null,
+      "deletedAt": null,
+      "deletedByType": null,
+      "deletedByAgentId": null,
+      "deletedByUserId": null,
+      "deletedByRunId": null,
+      "sourceTrust": null,
+      "createdAt": "2026-11-19T12:14:35.363Z",
+      "updatedAt": "2026-11-19T12:14:35.363Z"
+     },
+     "position": 0,
+     "canEdit": true,
+     "canDiscard": true
+    }
+   ]
+  },
+  "rRunId": "bb4ea1e4-b1e2-4376-89b8-5f78890f7017"
+ },
+ "answered_head_boxStopped": {
+  "source": "live-stopped.json after (PLANTED BOX-STOPPED; real workers ran)",
+  "issue": {
+   "id": "248e62ad-ebde-4883-8d8c-6d64c3fb96a4",
+   "companyId": "1b6334bc-4162-4e03-afc9-5aa3c6a873f8",
+   "status": "in_progress",
+   "interruption": {
+    "intentId": null,
+    "responsibility": "system",
+    "state": "resolved",
+    "nextRetryAt": null,
+    "canRetry": false,
+    "userAction": null,
+    "sourceRunIds": [
+     "3b4e652d-a73b-444a-862a-ba79dbbdc5d5"
+    ],
+    "observedRunId": "3b4e652d-a73b-444a-862a-ba79dbbdc5d5"
+   },
+   "executionBlocker": null,
+   "activeRecoveryAction": null
+  },
+  "comments": [
+   {
+    "id": "00d2e82a-353a-4ac0-b4fe-420b9f805995",
+    "body": "next turn answered",
+    "authorType": "agent",
+    "createdByRunId": "3b4e652d-a73b-444a-862a-ba79dbbdc5d5",
+    "createdAt": "2026-11-19T12:12:31.750Z"
+   },
+   {
+    "id": "3e41314f-b285-4627-b68e-c6fa0556c1a0",
+    "body": "Your message is saved. The last reply's file changes couldn't be saved; it starts now on the project's files.",
+    "authorType": "system",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T12:12:30.054Z"
+   },
+   {
+    "id": "bc50abb9-b8df-4c5b-9688-35982ce57710",
+    "body": "Done. I rewrote the report and added the notes file.",
+    "authorType": "agent",
+    "createdByRunId": "dab52c49-11e1-4df5-b4f9-eeebf1047690",
+    "createdAt": "2026-11-19T12:12:29.303Z"
+   },
+   {
+    "id": "1f6a4a12-5853-4c25-8d8c-287e8e36051d",
+    "body": "Also add a summary section to the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T12:12:06.977Z"
+   },
+   {
+    "id": "cd9f6fe0-8dbe-4d6f-8017-c9118372442c",
+    "body": "Please rewrite the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T12:12:05.258Z"
+   },
+   {
+    "id": "7da3a765-062b-4da9-9803-50f1bfcbb846",
+    "body": "Done. I wrote the report.",
+    "authorType": "agent",
+    "createdByRunId": "b7605936-90a3-4429-9ee4-2668d5712d3b",
+    "createdAt": "2026-11-19T12:12:04.847Z"
+   },
+   {
+    "id": "8b52ff83-7549-45fc-a4c0-65f8b6995745",
+    "body": "Please write the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T12:12:02.128Z"
+   }
+  ],
+  "runs": [
+   {
+    "runId": "3b4e652d-a73b-444a-862a-ba79dbbdc5d5",
+    "status": "succeeded",
+    "createdAt": "2026-11-19T12:12:29.860Z",
+    "startedAt": "2026-11-19T12:12:30.181Z",
+    "finishedAt": "2026-11-19T12:12:31.683Z",
+    "replyFileLine": null
+   },
+   {
+    "runId": "dab52c49-11e1-4df5-b4f9-eeebf1047690",
+    "status": "failed",
+    "createdAt": "2026-11-19T12:12:05.318Z",
+    "startedAt": "2026-11-19T12:12:05.589Z",
+    "finishedAt": "2026-11-19T12:12:28.910Z",
+    "replyFileLine": {
+     "state": "lost",
+     "commentId": "bc50abb9-b8df-4c5b-9688-35982ce57710"
+    }
+   },
+   {
+    "runId": "b7605936-90a3-4429-9ee4-2668d5712d3b",
+    "status": "succeeded",
+    "createdAt": "2026-11-19T12:12:02.255Z",
+    "startedAt": "2026-11-19T12:12:02.601Z",
+    "finishedAt": "2026-11-19T12:12:04.727Z",
+    "replyFileLine": null
+   }
+  ],
+  "queue": {
+   "issueId": "248e62ad-ebde-4883-8d8c-6d64c3fb96a4",
+   "queueId": null,
+   "state": null,
+   "targetRunId": null,
+   "revision": "5e99497165f934b249e2d2ffb7532e93",
+   "protocol": "paperclip_runner_v1",
+   "steeringDisposition": "temporarily_unavailable",
+   "entries": []
+  },
+  "rRunId": "dab52c49-11e1-4df5-b4f9-eeebf1047690"
+ }
+}
