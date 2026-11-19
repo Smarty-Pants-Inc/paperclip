@@ -1701,7 +1701,10 @@ describe.skipIf(!existsSync("/proc/self/cmdline"))("remote runner launch stale s
       } else {
         expect(result.stdout).toBe("launched");
         expect((await readFile(join(root, "identity"), "utf8")).split("\n")[0]).toBe("nonce");
-        const sharedAtLaunch = await readFile(log, "utf8");
+        const sharedAtLaunch = await readFile(log, "utf8").catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return null; // The async copier has not created it yet.
+          throw error;
+        });
         const generation = await readFile(join(root, "diagnostics", `runnerd.launch-stderr.nonce.${result.pid}.log`), "utf8");
         if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `stale-holder-${kind.replaceAll(" ", "-")}.json`),
           JSON.stringify({ kind, stalePid: stale.pid, launchPid: result.pid, status: result.status, stdout: result.stdout, sharedAtLaunch, generation }));
