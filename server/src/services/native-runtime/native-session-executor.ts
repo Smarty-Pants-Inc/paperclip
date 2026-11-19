@@ -13040,6 +13040,10 @@ async function executePaperclipNativeSessionAttempt(
             piPid: typeof identity.piPid === "number" ? identity.piPid : null,
             piProcessStartTicks: typeof identity.piProcessStartTicks === "string" ? identity.piProcessStartTicks : null });
         }
+        if (event.eventType === "turn.started" && input.execution.provider.kind === "pi_rpc") {
+          const { drainFallbackPersonComments } = await import("../conversation-steering.js");
+          await drainFallbackPersonComments(input.db, input.execution.binding.runId);
+        }
         await controllerSteps.measure("recovery_notice", () => materializePiSessionRecoveryNotice({ db: input.db, execution: input.execution, event }));
         if (event.eventType === "run.result.proposed") {
           const at = Date.now();
