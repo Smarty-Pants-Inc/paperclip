@@ -79,7 +79,7 @@ import { createSandboxRunnerRetention, createSandboxRunnerSupervision, type Sand
 import { findNativeFailedBeforeProviderTurn, NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE, NativeFailedBeforeProviderTurnError } from "./failed-before-provider-turn.js";
 import { findNativePredecessorRetirementUnproven, NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE, NativePredecessorRetirementDirectoryBusyError, NativePredecessorRetirementUnprovenError } from "./predecessor-retirement.js";
 import {
-  inspectSandboxSessionRunner, retireSandboxRunnerPortHolders, sandboxSessionRunnerExited, type SandboxSessionRunnerInspection,
+  inspectSandboxSessionRunner, retireSandboxRunnerPortHolders, sandboxSessionRunnerExited, type SandboxRunnerHolder, type SandboxSessionRunnerInspection,
 } from "./sandbox-runner-port-holders.js";
 import { AgentDirectoryOperationBusyError } from "../agent-directory-working-copies.js";
 import { agentDirectoryBusyRetryDelayMs } from "../heartbeat/agent-directory-busy.js";
@@ -1400,16 +1400,21 @@ async function stopSessionRunnerAndProveExit(entry: WarmNativeSession, db: Db,
   const { runner, remoteCwd } = sandboxRunner;
   const runtimeRoot = posix.join(remoteCwd, ".paperclip-runtime", "paperclip-runner");
   const sessionDirectory = createHash("sha256").update(entry.normalizedSessionId).digest("hex");
+  // retire-bind: the exit proof is bound to the Runner generation the stop pass
+  // selected for THIS run (session directory + run id + marker identity).
+  const observed: SandboxRunnerHolder[] = [];
   try {
     await retireSandboxRunnerPortHolders({ db, companyId: entry.companyId, agentId: entry.agentId, runId: entry.runId,
       runner, runtimeRoot, ownSessionRoot: "", providerLeaseId: entry.providerLeaseId ?? null,
-      only: { sessionDirectory, runId: entry.runId }, retireInProcess: async () => false, ...warmRetainedRunnerStopWait });
+      only: { sessionDirectory, runId: entry.runId, observed: holder => { observed.push(holder); } },
+      retireInProcess: async () => false, ...warmRetainedRunnerStopWait });
   } catch (stopError) {
     logger.warn({ runId: entry.runId, providerLeaseId: entry.providerLeaseId ?? null, stopFailure: describeWarmCloseFailure(stopError) },
       "could not stop the retained Runner of a finished warm session");
     return false;
   }
-  return sandboxSessionRunnerExited({ runner, runtimeRoot, sessionDirectory });
+  return sandboxSessionRunnerExited({ runner, runtimeRoot, sessionDirectory, runId: entry.runId,
+    expected: observed.length === 1 ? observed[0] : null });
 }
 
 /** pl/s3-fence: a successor's retirement met the s3 fence's superseded refusal

@@ -14963,6 +14963,9 @@ describe("native warm session supervision", () => {
         { holder: "busy", delaySeconds: 0, answered: false, control: "interrupt", closeError: "unsuspended" },
         { holder: "exit-unproven", delaySeconds: 0, answered: false, control: "interrupt", closeError: "unsuspended" },
         { holder: "no-sandbox-runner", delaySeconds: 0, answered: false, control: "interrupt", closeError: "unsuspended" },
+        // retire-bind (rf-4 F1): this session's directory holds a DIFFERENT
+        // run's exited marker. It never proves THIS predecessor exited.
+        { holder: "wrong-run-marker", delaySeconds: 0, answered: false, control: "interrupt", closeError: "unsuspended" },
       ] as const)("pl/s3-fence $control -> message +$delaySeconds s, Runner $holder: answered on the first run = $answered",
         async (row) => {
           const { holder, delaySeconds, answered, control } = row;
@@ -15019,9 +15022,9 @@ describe("native warm session supervision", () => {
           const otherIdentityPath = `${remoteCwd}/.paperclip-runtime/paperclip-runner/sessions/${"f".repeat(64)}/runner/runner-process.identity`;
           const otherIdentity = ["nonce2", "4343", new Date().toISOString(), "other-runner"].join("\n");
           const otherState = { runId: otherRunId, runnerInstanceId: "other-runner", lifecycle: "running", outbox: [], pendingTerminalDelivery: null };
-          const runnerState = { runId: base.binding.runId, runnerInstanceId, lifecycle: "running",
+          const runnerState = { runId: holder === "wrong-run-marker" ? otherRunId : base.binding.runId, runnerInstanceId, lifecycle: "running",
             outbox: holder === "busy" ? [{ seq: 7, kind: "provider_delta" }] : [], pendingTerminalDelivery: null };
-          let runnerAlive = holder !== "already-exited" && holder !== "exit-proof-throws";
+          let runnerAlive = holder !== "wrong-run-marker" && holder !== "already-exited" && holder !== "exit-proof-throws";
           const signals: string[] = [];
           const remoteCommands: string[] = [];
           const remoteExecute = vi.fn(async (command: { command?: string; args?: string[] }) => {

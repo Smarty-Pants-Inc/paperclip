@@ -130,17 +130,22 @@ describeEmbeddedPostgres("a sandbox Runner port held by another session's Runner
     const runtimeRoot = join(base, ".paperclip-runtime", "paperclip-runner");
     const own = await startHolder({ runtimeRoot, session: "e".repeat(64), runId: owner.runId, port: await freePort() });
     const neighbour = await startHolder({ runtimeRoot, session: "f".repeat(64), runId: other.runId, port: await freePort() });
-    const exitedNow = () => sandboxSessionRunnerExited({ runner: confinedRunner(base) as never, runtimeRoot, sessionDirectory: "e".repeat(64) });
+    const observed: Parameters<typeof sandboxSessionRunnerExited>[0]["expected"][] = [];
+    const exitedNow = () => sandboxSessionRunnerExited({ runner: confinedRunner(base) as never, runtimeRoot, sessionDirectory: "e".repeat(64), runId: owner.runId, expected: observed[0] ?? null });
     expect(await exitedNow()).toBe(false);
     await expect(retireSandboxRunnerPortHolders({ db: owner.db, companyId: environment.current.companyId,
       agentId: environment.current.agentId, runId: owner.runId, runner: confinedRunner(base) as never, runtimeRoot,
-      ownSessionRoot: "", providerLeaseId: "sandbox-1", only: { sessionDirectory: "e".repeat(64), runId: owner.runId },
+      ownSessionRoot: "", providerLeaseId: "sandbox-1", only: { sessionDirectory: "e".repeat(64), runId: owner.runId, observed: holder => { observed.push(holder); } },
       retireInProcess: async () => false, waitMs: 3_000, pollMs: 100 })).resolves.toEqual([owner.runId]);
     expect(await exited(own)).toBe(true);
     expect(await exitedNow()).toBe(true);
+    // retire-bind: no stop-pass holder, or the run's directory alone, proves nothing.
+    expect(await sandboxSessionRunnerExited({ runner: confinedRunner(base) as never, runtimeRoot, sessionDirectory: "e".repeat(64), runId: owner.runId, expected: null })).toBe(false);
     expect(neighbour.exitCode).toBeNull();
-    expect(await sandboxSessionRunnerExited({ runner: confinedRunner(base) as never, runtimeRoot, sessionDirectory: "f".repeat(64) })).toBe(false);
-    expect(await sandboxSessionRunnerExited({ runner: confinedRunner(base) as never, runtimeRoot, sessionDirectory: "0".repeat(64) })).toBe(false);
+    expect(await sandboxSessionRunnerExited({ runner: confinedRunner(base) as never, runtimeRoot, sessionDirectory: "f".repeat(64), runId: other.runId, expected: null })).toBe(false);
+    expect(await sandboxSessionRunnerExited({ runner: confinedRunner(base) as never, runtimeRoot, sessionDirectory: "0".repeat(64), runId: owner.runId, expected: observed[0] ?? null })).toBe(false);
+    // retire-bind: an exited marker in the named directory proves nothing for another run.
+    expect(await sandboxSessionRunnerExited({ runner: confinedRunner(base) as never, runtimeRoot, sessionDirectory: "e".repeat(64), runId: other.runId, expected: observed[0] ?? null })).toBe(false);
   });
 
   it("ignores this run's own session, moved-aside roots and holders that already exited", async () => {
