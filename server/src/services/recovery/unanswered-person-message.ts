@@ -82,6 +82,8 @@ const WAITING_ROW_JSON = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL }] 
 export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";
 /** Setup completes by itself; a stalled setup gets one factual waiting note. */
 export const UNANSWERED_MESSAGE_AGENT_SETUP_CODE = "agent_setup";
+/** A resumed agent's own pause stopped this message's run, not a failure. */
+const PAUSE_STOPPED_CODE = "agent_pause_stopped";
 export const SETUP_WAIT_BOUND_MS = 10 * 60_000;
 /** A run whose OWN input carries the message is RUNNING: the agent is working
  * on it (the note a Resume's stale paused note becomes). Waiting-kind, so the
@@ -868,7 +870,11 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
           ...(t0 === null ? { recordDeferral: { runId: run.id, agentId: run.agentId, messageId: message.id } } : {}) };
       }
     }
-    code = run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
+    // An intentional pause cancellation (the pause route's cancelActiveForAgent,
+    // heartbeat.ts) is not an unanswered failed attempt. Resume does not replay
+    // it: give the true manual remedy, never the resend-is-safe text.
+    code = run.status === "cancelled" && run.errorCode === "agent_paused" ? PAUSE_STOPPED_CODE
+      : run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
   }
 
   // A recovery notice attached to this message's failed run already gives
@@ -922,13 +928,16 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     && run && TERMINAL.includes(run.status));
   // The ONE bound: the message's automatic lineage used its K=2 fresh
   // continuations and the last one failed. Nothing further starts by itself.
-  const boundReached = Boolean(!paused && !waiting && run && TERMINAL.includes(run.status) && run.status !== "succeeded"
+  const pauseStopped = code === PAUSE_STOPPED_CODE;
+  const boundReached = Boolean(!paused && !pauseStopped && !waiting && run && TERMINAL.includes(run.status) && run.status !== "succeeded"
     && (await freshContinuationChain(q as Db, { companyId: issue.companyId, issueId: issue.id, runId: run.id })).attempts
       >= FRESH_CONTINUATION_BOUND);
   // Server-local HH:MM: the instance's time zone, not an assumed UTC zone.
   const since = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
   const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
-    : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+    : paused ? agentPausedText(pausedName)
+    : pauseStopped ? `${pausedName} was paused before it answered your message. Send it again to continue.`
+    : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? (workingEnded ? UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT : UNANSWERED_MESSAGE_NO_REPLY_TEXT)
@@ -936,12 +945,14 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
       : held ? HELD_PREDECESSOR_NOTICE : workingEnded ? UNANSWERED_MESSAGE_STARTED_FAILED_TEXT : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
-      title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",
+      title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused`
+        : pauseStopped ? `${pausedName} was paused before it answered` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",
       body,
       tone: paused ? "warning" : waiting ? "info" : "warning",
       nextAction: policyRefused ? "Automatic retry is disabled for this request."
         : settingUp ? "No action is needed; your message is saved."
         : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
+        : pauseStopped ? "Send it again to continue."
         : waiting ? "No action is needed; it will start by itself."
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : held || boundReached ? "Send a new message to try again."
@@ -950,9 +961,9 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,
     recoveryResponsibility: "user",
-    sourceRun: run && !waiting ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: code } : null,
+    sourceRun: run && !waiting ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: pauseStopped ? null : code } : null,
     // A waiting note is not a failure: no "Failure code" row, a marker row instead.
-    failureCode: waiting ? undefined : run ? undefined : code,
+    failureCode: waiting || pauseStopped ? undefined : run ? undefined : code,
   });
   if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
   return { kind: "notice", reason, code, notice, ...(setupWaitRecord ? { recordWait: setupWaitRecord } : {}),
