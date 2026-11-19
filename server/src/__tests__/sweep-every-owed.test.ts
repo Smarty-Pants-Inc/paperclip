@@ -4,7 +4,7 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
-  heartbeatRuns, issueComments, issues,
+  assets, heartbeatRuns, issueAttachments, issueComments, issues,
 } from "@paperclipai/db";
 import express from "express";
 import request from "supertest";
@@ -276,7 +276,17 @@ describe.skipIf(!support.supported)("the sweep cards every owed person message, 
     const agentNote = randomUUID();
     await db.insert(issueComments).values({ id: agentNote, companyId: f.companyId, issueId: f.issueId, authorType: "agent",
       authorAgentId: f.agentId, body: "an agent note", createdAt: t(5.2), updatedAt: t(5.2) });
-    const ids = carried === "m1m2" ? [b, a] : [agentNote];
+    // adopt-naming-words: an attachment-only person message (empty body + a file) is named "(attachment)"; an
+    // empty body with no file is not a message.
+    const file = randomUUID(), blank = randomUUID();
+    await db.insert(issueComments).values({ id: file, companyId: f.companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: userId, body: "", createdAt: t(5.1), updatedAt: t(5.1) });
+    await db.insert(issueComments).values({ id: blank, companyId: f.companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: userId, body: "  ", createdAt: t(5.15), updatedAt: t(5.15) });
+    const [asset] = await db.insert(assets).values({ companyId: f.companyId, provider: "local_disk", objectKey: `nw/${file}`,
+      contentType: "image/png", byteSize: 1, sha256: "0".repeat(64), originalFilename: "screen.png" }).returning();
+    await db.insert(issueAttachments).values({ companyId: f.companyId, issueId: f.issueId, assetId: asset!.id, issueCommentId: file });
+    const ids = carried === "m1m2" ? [blank, file, b, a] : [agentNote];
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "on_demand",
       triggerDetail: "manual", status: "failed", runtimeMode: "native", startedAt: t(6), finishedAt: t(6.5),
       error: "adapter_failed: the provider exited", errorCode: "adapter_failed",
@@ -286,17 +296,19 @@ describe.skipIf(!support.supported)("the sweep cards every owed person message, 
     const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
     const presentation = await taskInterruptionPresentation(db, issue!);
     await evidence(`g1-naming-${carried}`, { a, b, runId: run!.id, presentation });
-    return { a, b, presentation };
+    return { a, b, file, presentation };
   }
 
   it("row G1-naming: a run carrying M1+M2 FAILS => its failure card quotes M1, M2 (oldest first)", async () => {
-    const { a, b, presentation } = await failedCarrier("m1m2");
+    const { a, b, file, presentation } = await failedCarrier("m1m2");
     expect(presentation?.state, JSON.stringify(presentation)).toBe("failed");
     expect(presentation?.responsibility).toBe("system");
     expect(presentation?.canRetry).toBe(true);
     expect(presentation?.carriedMessages, JSON.stringify(presentation)).toEqual([
       { id: a, quote: "Please rename the billing export to invoices.csv" },
-      { id: b, quote: "Also add a total row at the bottom of the sheet, with the currency in every cell, and keep the…" },
+      // adopt-naming-words: the person's own text, cut at ~60 characters with '…'.
+      { id: b, quote: "Also add a total row at the bottom of the sheet, with the…" },
+      { id: file, quote: "", attachmentOnly: true },
     ]);
   }, 120_000);
 

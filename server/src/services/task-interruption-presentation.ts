@@ -4,7 +4,7 @@ import { boundSetupCommandFailure, readSetupCommandFailure } from "./workspace-s
 import { and, desc, eq, inArray, isNull, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import { unidentifiedLocalLaunchRefusals } from "./native-local-process-stop.js";
 import { nativeSessionCleanupBlock } from "../vendor/paperclip-runner/index.js";
-import { agents, agentWakeupRequests, approvals, chatActions, companies, environmentLeases, heartbeatRuns, issueApprovals, issueComments, issueRecoveryActions,
+import { agents, agentWakeupRequests, approvals, chatActions, companies, environmentLeases, heartbeatRuns, issueApprovals, issueAttachments, issueComments, issueRecoveryActions,
   issues, issueTreeHoldMembers, issueTreeHolds, nativeRunFinalizations, projects, type Db } from "@paperclipai/db";
 import { unionAll } from "drizzle-orm/pg-core";
 import { EXECUTION_RECONCILIATION_CAUSES, HEARTBEAT_RUN_STATUSES, readProviderFailure, type TaskInterruptionPresentation } from "@paperclipai/shared";
@@ -999,8 +999,9 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
 }
 
 const CARRIED_MESSAGE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const CARRIED_MESSAGES_SHOWN = 10;
-const CARRIED_QUOTE_CHARS = 96;
+// adopt-naming-words: the person's own text, cut at about 60 characters with '…'. The card shows the first three
+// and counts the rest, so every unanswered carried message is listed (bounded by carriedIds).
+const CARRIED_QUOTE_CHARS = 60;
 
 /** A short quote of a person message: one line, at most CARRIED_QUOTE_CHARS characters, cut at a word. */
 export function carriedMessageQuote(body: string) {
@@ -1009,7 +1010,7 @@ export function carriedMessageQuote(body: string) {
   if (chars.length <= CARRIED_QUOTE_CHARS) return text;
   const head = chars.slice(0, CARRIED_QUOTE_CHARS - 1).join("");
   const space = head.lastIndexOf(" ");
-  return `${(space > 40 ? head.slice(0, space) : head).replace(/[\s,.;:]+$/, "")}…`;
+  return `${(space > 30 ? head.slice(0, space) : head).replace(/[\s,.;:]+$/, "")}…`;
 }
 
 /** The ids a run's own carry fields list (wakeCommentIds etc.), deduplicated, in field order. */
@@ -1044,18 +1045,21 @@ async function nameCarriedMessages(db: Db, companyId: string, result: Map<string
   try {
     const { answeredPersonMessageIds } = await import("./person-message-answer.js");
     // One read for every card's person messages; then the one answered predicate per task.
-    const comments = await db.select({ id: issueComments.id, issueId: issueComments.issueId, body: issueComments.body })
+    const comments = await db.select({ id: issueComments.id, issueId: issueComments.issueId, body: issueComments.body,
+      hasAttachment: sql<boolean>`exists (select 1 from ${issueAttachments} as carried_attachment
+        where carried_attachment.issue_comment_id = ${issueComments}.id)`.mapWith(Boolean) })
       .from(issueComments).where(and(eq(issueComments.companyId, companyId),
         inArray(issueComments.issueId, failedCards.map(card => card.issueId)),
         inArray(issueComments.id, [...new Set(failedCards.flatMap(card => card.ids))]),
         eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)))
       .orderBy(issueComments.createdAt, issueComments.id);
     for (const { issueId, presentation, ids } of failedCards) {
-      const rows = comments.filter(row => row.issueId === issueId && ids.includes(row.id) && row.body.trim());
+      // An attachment-only message (empty text + a file) is a message; an empty one without a file is not.
+      const rows = comments.filter(row => row.issueId === issueId && ids.includes(row.id) && (row.body.trim() || row.hasAttachment));
       if (!rows.length) continue;
       const answered = await answeredPersonMessageIds(db, { companyId, issueId, commentIds: rows.map(row => row.id) });
-      const named = rows.filter(row => !answered.has(row.id))
-        .slice(0, CARRIED_MESSAGES_SHOWN).map(row => ({ id: row.id, quote: carriedMessageQuote(row.body) }));
+      const named = rows.filter(row => !answered.has(row.id)).map(row => row.body.trim()
+        ? { id: row.id, quote: carriedMessageQuote(row.body) } : { id: row.id, quote: "", attachmentOnly: true as const });
       if (named.length) presentation.carriedMessages = named;
     }
   } catch (error) {
