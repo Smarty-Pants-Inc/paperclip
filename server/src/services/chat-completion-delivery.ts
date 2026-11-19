@@ -264,6 +264,11 @@ export async function prepareChatCompletionTurn(db: Db, run: Run): Promise<Run> 
   });
 }
 
+/** True when a completion turn found nothing current to deliver (a newer session or turn took it). */
+export function isChatCompletionSuperseded(error: unknown) {
+  return error instanceof Error && error.message === "chat_completion_superseded";
+}
+
 /** True when every completion this turn was woken for had already been reported. */
 export function chatCompletionAlreadyReported(run: Run) {
   const reported = run.contextSnapshot?.chatCompletionAlreadyReported;
