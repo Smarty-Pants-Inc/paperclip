@@ -46,6 +46,10 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * "box destroyed" test is reliable: the copy is kept unconditionally. This one
  * predicate gates the expiry (expireSession), the scheduler deadline
  * (reconcileBackup) and leftover settlement (settleLeftovers).
+ * BRIEF rotation-keep: rotation's superseded copies
+ * (failover-backups/superseded/<ms>-<uuid>, native-harness-backup-publication.ts)
+ * are kept the same way: no expiry path names that directory, and
+ * settleLeftovers handles only its .retiring-/.expired- names.
  */
 export const NATIVE_HARNESS_BACKUP_LOCAL_COPY_KEPT = "native_backup_local_copy_kept";
 /** BRIEF retention-keep: the same predicate keeps S3 mode's durable copy
