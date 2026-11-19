@@ -1,3 +1,6 @@
+import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../../../services/recovery/unanswered-person-message.js";
+import { readPersonStopHold } from "../../../services/acknowledged-native-stop.js";
+import { personMessageOwedSql } from "../../../services/person-message-answer.js";
 import { resolveExternalTestDatabaseUrl } from "../../../__tests__/helpers/external-test-database.js";
 import { DELIVERY_QUEUES } from "../../../services/delivery-work-notifications.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
@@ -10,6 +13,8 @@ import {
   activityLog,
   agentWakeupRequests,
   agents,
+  chatCompletionDeliveries,
+  chatTaskHandoffs,
   companies,
   createDb,
   environmentLeases,
@@ -1789,5 +1794,385 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
       const rows = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
       expect(rows).toHaveLength(0);
     });
+  });
+});
+
+// RFL 17:07Z stale-wake amendment: real persisted input, release drain and
+// per-message sweep. Provider execution is simulated; admission and custody are real.
+describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  const owner = "stale-wake-owner";
+  const deps: WakeQueuePostgresAdapterDeps = {
+    resolveResponsibleUserId: async () => owner,
+    getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+    resolveSessionBeforeForWakeup: async () => null,
+  };
+  const ago = (ms: number) => new Date(Date.now() - ms);
+  const day = 24 * 60 * 60_000;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-stale-deferred-wake-");
+    db = createDb(tempDb.connectionString);
+  }, 60_000);
+  afterEach(async () => { await db.execute(sql`TRUNCATE TABLE companies CASCADE`); });
+  afterAll(async () => { await db?.$client.end(); await tempDb?.cleanup(); });
+
+  async function seed() {
+    const [company] = await db.insert(companies).values({ name: "Paul's daily chat", issuePrefix: "SW",
+      requireBoardApprovalForNewAgents: false }).returning();
+    const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Daily agent", role: "engineer",
+      status: "idle", adapterType: "process" }).returning();
+    const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Daily chat", status: "in_review",
+      assigneeAgentId: agent.id, conversationAgentId: agent.id, conversationUserId: owner,
+      conversationState: "waiting" }).returning();
+    return { companyId: company.id, agentId: agent.id, issueId: issue.id };
+  }
+  type Chat = Awaited<ReturnType<typeof seed>>;
+
+  async function message(c: Chat, body: string, at: Date) {
+    const [m] = await db.insert(issueComments).values({ companyId: c.companyId, issueId: c.issueId,
+      authorType: "user", authorUserId: owner, body, createdAt: at, updatedAt: at }).returning();
+    return m;
+  }
+  async function wake(c: Chat, id: string, at: Date, status = "deferred_issue_execution") {
+    const [w] = await db.insert(agentWakeupRequests).values({ companyId: c.companyId, agentId: c.agentId,
+      source: "on_demand", triggerDetail: "manual", reason: "issue_commented", status, requestedAt: at,
+      requestedByActorType: "user", requestedByActorId: owner, idempotencyKey: `conversation-comment:${id}`,
+      payload: withQueuedCommentIdsInWakePayload({ issueId: c.issueId,
+        _paperclipWakeContext: { issueId: c.issueId, taskKey: c.issueId, wakeReason: "issue_commented" } }, [id]),
+    }).returning();
+    return w;
+  }
+  async function run(c: Chat, ids: string[], startedAt: Date, status = "succeeded", wakeupRequestId?: string) {
+    const [r] = await db.insert(heartbeatRuns).values({ companyId: c.companyId, agentId: c.agentId, status,
+      runtimeMode: "native", nativeIssueId: c.issueId, startedAt, createdAt: startedAt, finishedAt: ago(60_000),
+      wakeupRequestId, contextSnapshot: { issueId: c.issueId, taskKey: c.issueId, wakeCommentIds: ids } }).returning();
+    return r;
+  }
+  async function reply(c: Chat, runId: string, body = "Reply to the later turn") {
+    await db.insert(issueComments).values({ companyId: c.companyId, issueId: c.issueId, authorType: "agent",
+      authorAgentId: c.agentId, createdByRunId: runId, body });
+  }
+  async function drain(c: Chat, runId: string, resumeStrandedQueue = false) {
+    await db.update(issues).set({ executionRunId: runId, executionLockedAt: new Date() }).where(eq(issues.id, c.issueId));
+    return createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, deps), recovery: {
+      escalateStrandedAssignedIssue: async () => { throw new Error("unexpected automatic recovery"); },
+      escalateStrandedRecoveryIssueInPlace: async () => { throw new Error("unexpected automatic recovery"); },
+    } })({ companyId: c.companyId, runId, now: new Date(), ...(resumeStrandedQueue ? { resumeStrandedQueue: true } : {}) });
+  }
+  async function cards(c: Chat, id: string) {
+    return db.select().from(issueComments).where(and(eq(issueComments.companyId, c.companyId),
+      eq(issueComments.issueId, c.issueId), sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + id}`));
+  }
+  async function sweep(c: Chat) {
+    for (let pass = 0; pass < 2; pass++) await settleUnansweredPersonMessage(db, {
+      companyId: c.companyId, issueId: c.issueId, now: new Date(), olderOutcomes: [] });
+  }
+  async function noRunFor(id: string) {
+    return db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(sql`coalesce(${heartbeatRuns.contextSnapshot}->'wakeCommentIds', '[]'::jsonb) ? ${id}`);
+  }
+  async function movedChat(carried = false, cancelled = false, linkedOnly = false) {
+    const c = await seed();
+    const old = await message(c, "OLD: request held two days ago", ago(2 * day + 60_000));
+    const w = await wake(c, old.id, ago(2 * day), cancelled ? "cancelled" : undefined);
+    if (carried) {
+      const failed = await run(c, linkedOnly ? [] : [old.id], ago(2 * day - 60_000), "failed", linkedOnly ? w.id : undefined);
+      await db.update(heartbeatRuns).set({ finishedAt: new Date(failed.startedAt!.getTime() + 30_000) })
+        .where(eq(heartbeatRuns.id, failed.id));
+    }
+    const later = await message(c, "A later daily-work question", ago(day));
+    const r = await run(c, [later.id], ago(day - 60_000));
+    await reply(c, r.id);
+    return { c, old, w, r };
+  }
+
+  it("sw-1: old never-claimed wake is cancelled, never promoted; sweep writes exactly ONE true card", async () => {
+    const { c, old, w, r } = await movedChat();
+    const result = await drain(c, r.id);
+    const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id));
+    console.log("sw-1 drain", result.outcome.kind, "wake", saved.status, saved.error);
+    expect(saved).toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
+    expect(await noRunFor(old.id)).toEqual([]);
+    const [floor] = await db.select({ owed: personMessageOwedSql({ id: sql`${issueComments.id}`,
+      companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }) })
+      .from(issueComments).where(eq(issueComments.id, old.id));
+    console.log("sw-1 cancelled never-carried message owed for card", floor.owed);
+    await sweep(c);
+    const notices = await cards(c, old.id);
+    console.log("sw-1 sweep cards", notices.length, notices.map(n => n.body));
+    expect(notices).toHaveLength(1);
+    expect(notices[0].body).toContain("no run started for it");
+    expect(notices[0].body).toContain(`Your message is saved: "${old.body}".`);
+  });
+
+  it("sw-2: OLD was carried by a failed run; cancel with no re-send and NO late card", async () => {
+    const { c, old, w, r } = await movedChat(true);
+    await drain(c, r.id);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0])
+      .toMatchObject({ status: "cancelled", error: "The conversation moved on" });
+    expect(await noRunFor(old.id)).toHaveLength(1); // only the original failed carrier
+    await sweep(c);
+    console.log("sw-2 sweep cards", (await cards(c, old.id)).length);
+    expect(await cards(c, old.id)).toEqual([]);
+  });
+
+  it("st-stop (sw-3): Stop-held README survives the replied '9 + 10' marker and is answered ONCE afterwards", async () => {
+    const c = await seed();
+    const readme = await message(c, "README: update the project readme", ago(2 * day + 60_000));
+    const w = await wake(c, readme.id, ago(2 * day));
+    const stopped = await run(c, [], ago(2 * day + 120_000), "cancelled");
+    await db.update(heartbeatRuns).set({ finishedAt: ago(2 * day - 60_000),
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: owner,
+      nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: stopped.id, companyId: c.companyId,
+        issueId: c.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged",
+        dispatched: true, intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID() } } })
+      .where(eq(heartbeatRuns.id, stopped.id));
+    await drain(c, stopped.id); // real Stop release writes/keeps the held wake
+    const marker = await message(c, "9 + 10", ago(30 * 60_000));
+    const r = await run(c, [marker.id], ago(29 * 60_000));
+    await reply(c, r.id, "19");
+    expect(await readPersonStopHold(db, { ...c, messageId: readme.id })).toBeNull();
+    const result = await drain(c, r.id);
+    console.log("sw-3 marker drain", result.outcome.kind);
+    expect(result.outcome.kind).toBe("promoted");
+    const [promoted] = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, w.id)));
+    expect(promoted.contextSnapshot).toMatchObject({ wakeCommentIds: [readme.id] });
+    await db.update(heartbeatRuns).set({ status: "succeeded", startedAt: new Date(), finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, promoted.id));
+    await reply(c, promoted.id, "README updated");
+    await drain(c, promoted.id);
+    await sweep(c);
+    expect(await noRunFor(readme.id)).toHaveLength(1);
+    expect(await cards(c, readme.id)).toEqual([]);
+    console.log("sw-3 README carriers", (await noRunFor(readme.id)).length, "cards", (await cards(c, readme.id)).length);
+  });
+
+  it("sw-4: a fresh wake requested during the live turn promotes as today", async () => {
+    const c = await seed();
+    const r = await run(c, [], ago(60 * 60_000));
+    const fresh = await message(c, "Fresh daily-work input", ago(30 * 60_000));
+    const w = await wake(c, fresh.id, ago(29 * 60_000));
+    await reply(c, r.id);
+    const result = await drain(c, r.id);
+    expect(result.outcome.kind).toBe("promoted");
+    expect(await noRunFor(fresh.id)).toHaveLength(1);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0].runId).toBeTruthy();
+    console.log("sw-4 drain", result.outcome.kind);
+  });
+
+  it("sw-5: unclaimed CANCELLED wake fields are not delivery; ONE card remains owed", async () => {
+    const { c, old } = await movedChat(false, true);
+    await sweep(c);
+    console.log("sw-5 sweep cards", (await cards(c, old.id)).length);
+    expect(await cards(c, old.id)).toHaveLength(1);
+  });
+
+  it("sw-6: the run-to-wake claim link counts even without run-side message ids; NO late card", async () => {
+    const { c, old } = await movedChat(true, true, true);
+    await sweep(c);
+    expect(await cards(c, old.id)).toEqual([]);
+    console.log("sw-6 sweep cards", (await cards(c, old.id)).length);
+  });
+
+  async function finishQueued(c: Chat, w: typeof agentWakeupRequests.$inferSelect, text: string) {
+    const rows = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, w.id));
+    expect(rows).toHaveLength(1);
+    const r = rows[0];
+    await db.update(heartbeatRuns).set({ status: "succeeded", startedAt: new Date(), finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, r.id));
+    await reply(c, r.id, text);
+    await drain(c, r.id);
+    return r;
+  }
+
+  it("st-chain3: three plain messages in separate deferred wakes answer once, in order, without cards", async () => {
+    const c = await seed();
+    const first = await message(c, "First turn", ago(60 * 60_000));
+    const r = await run(c, [first.id], ago(59 * 60_000));
+    const messages = [], wakes = [];
+    for (let index = 0; index < 3; index++) {
+      const m = await message(c, `Default message ${index + 1}`, ago((30 - index) * 60_000));
+      messages.push(m); wakes.push(await wake(c, m.id, m.createdAt));
+    }
+    await reply(c, r.id);
+    expect((await drain(c, r.id)).outcome.kind).toBe("promoted");
+    for (let index = 0; index < 3; index++) {
+      const carrier = await finishQueued(c, wakes[index], `Answered ${index + 1}`);
+      expect(carrier.contextSnapshot).toMatchObject({ wakeCommentIds: [messages[index].id] });
+      expect(await noRunFor(messages[index].id)).toHaveLength(1);
+      await sweep(c);
+      expect(await cards(c, messages[index].id)).toEqual([]);
+    }
+    const replies = await db.select({ body: issueComments.body }).from(issueComments).where(and(
+      eq(issueComments.issueId, c.issueId), eq(issueComments.authorType, "agent"))).orderBy(issueComments.createdAt);
+    expect(replies.map(r => r.body)).toEqual(["Reply to the later turn", "Answered 1", "Answered 2", "Answered 3"]);
+    console.log("st-chain3 answered order", replies.map(r => r.body), "cards 0; one carrier each");
+  });
+
+  it("st-install-gap: six-minute server-down gap with no newer input answered preserves M2", async () => {
+    const c = await seed();
+    const first = await message(c, "S's own input", ago(20 * 60_000));
+    const m = await message(c, "M2 waiting across install", ago(10 * 60_000));
+    const w = await wake(c, m.id, ago(10 * 60_000));
+    // S was queued before M2, but only STARTS after M2. The six minutes
+    // without any intervening run represent a restart mid-chain, not a sleep.
+    const s = await run(c, [first.id], ago(9 * 60_000));
+    await db.update(heartbeatRuns).set({ finishedAt: ago(3 * 60_000) }).where(eq(heartbeatRuns.id, s.id));
+    await reply(c, s.id);
+    expect((await drain(c, s.id)).outcome.kind).toBe("promoted");
+    await finishQueued(c, w, "M2 answered after restart");
+    await sweep(c);
+    expect(await noRunFor(m.id)).toHaveLength(1); expect(await cards(c, m.id)).toEqual([]);
+    console.log("st-install-gap M2 promoted and answered once after 6 min; cards 0");
+  });
+
+  it("st-e39: stale completion wake supersedes D, names the finished task once, and starts no run", async () => {
+    const c = await seed();
+    const [task] = await db.insert(issues).values({ companyId: c.companyId, title: "Finish the README",
+      identifier: "SMA-611", status: "done", completedAt: ago(4 * 60 * 60_000) }).returning();
+    await db.insert(chatTaskHandoffs).values({ companyId: c.companyId, taskId: task.id, conversationId: c.issueId,
+      agentId: c.agentId, sessionGeneration: 0 });
+    const [delivery] = await db.insert(chatCompletionDeliveries).values({ companyId: c.companyId, taskId: task.id,
+      statusVersion: task.statusVersion, status: "queued" }).returning();
+    const [w] = await db.insert(agentWakeupRequests).values({ companyId: c.companyId, agentId: c.agentId,
+      source: "automation", reason: "chat_task_completed", requestedByActorType: "system",
+      status: "deferred_issue_execution", requestedAt: ago(4 * 60 * 60_000),
+      payload: { issueId: c.issueId, chatCompletionDeliveryIds: [delivery.id], _paperclipWakeContext: {
+        issueId: c.issueId, taskKey: c.issueId, wakeReason: "chat_task_completed", chatCompletionDeliveryIds: [delivery.id] } } }).returning();
+    const m = await message(c, "What is next today?", ago(3 * 60 * 60_000));
+    const s = await run(c, [m.id], ago(179 * 60_000)); await reply(c, s.id, "Today's answer");
+    for (let pass = 0; pass < 2; pass++) { await drain(c, s.id); await sweep(c); }
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0])
+      .toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
+    expect((await db.select().from(chatCompletionDeliveries).where(eq(chatCompletionDeliveries.id, delivery.id)))[0].status).toBe("superseded");
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, w.id))).toEqual([]);
+    const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, c.issueId), eq(issueComments.authorType, "system")));
+    expect(notes).toHaveLength(1);
+    expect(notes[0].body).toContain("SMA-611 — Finish the README finished.");
+    console.log("st-e39 cancelled; D superseded; no run; ONE note:", notes[0].body);
+  });
+
+  it("st-failed-newer: even a replying FAILED newer carrier cannot stale the live queue", async () => {
+    const c = await seed();
+    const old = await message(c, "Still my live request", ago(40 * 60_000));
+    const w = await wake(c, old.id, ago(39 * 60_000));
+    const later = await message(c, "Newer but failed", ago(20 * 60_000));
+    const failed = await run(c, [later.id], ago(19 * 60_000), "failed");
+    await reply(c, failed.id);
+    // A failed native run has its separate recovery gate. A settled, empty
+    // finalizer drains here; the only newer PERSON carrier is still FAILED.
+    const finalizer = await run(c, [], ago(10 * 60_000));
+    await reply(c, finalizer.id);
+    expect((await drain(c, finalizer.id)).outcome.kind).toBe("promoted");
+    await finishQueued(c, w, "Old live request answered"); await sweep(c);
+    expect(await noRunFor(old.id)).toHaveLength(1); expect(await cards(c, old.id)).toEqual([]);
+    console.log("st-failed-newer FAILED does not stale: promoted and answered once, cards 0");
+  });
+
+  it("st-busy: a six-minute busy-finalization early return does not age the waiting message", async () => {
+    const c = await seed();
+    const first = await message(c, "Current turn", ago(30 * 60_000));
+    const r = await run(c, [first.id], ago(29 * 60_000)); await reply(c, r.id);
+    const m = await message(c, "Wait behind finalization", ago(20 * 60_000));
+    const w = await wake(c, m.id, ago(20 * 60_000));
+    await db.insert(nativeRunFinalizations).values({ companyId: c.companyId, issueId: c.issueId, runId: r.id,
+      phase: "applied", updatedAt: ago(6 * 60_000) });
+    expect((await drain(c, r.id, true)).outcome.kind).toBe("released");
+    expect(await noRunFor(m.id)).toEqual([]);
+    await db.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, r.id));
+    expect((await drain(c, r.id, true)).outcome.kind).toBe("promoted");
+    await finishQueued(c, w, "Waiting request answered"); await sweep(c);
+    expect(await noRunFor(m.id)).toHaveLength(1); expect(await cards(c, m.id)).toEqual([]);
+    console.log("st-busy real finalization early return then promotion after >5 min; answer once, cards 0");
+  });
+
+  it.each(["cancelled", "failed"])("st-bpp: B''b carried by a %s run, then a newer answered person input: no card or new run", async status => {
+    const { c, old, w, r } = await movedChat(true);
+    await db.update(heartbeatRuns).set({ status }).where(and(eq(heartbeatRuns.companyId, c.companyId), sql`${heartbeatRuns.id} <> ${r.id}`));
+    await drain(c, r.id); await sweep(c);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0].status).toBe("cancelled");
+    expect(await noRunFor(old.id)).toHaveLength(1); expect(await cards(c, old.id)).toEqual([]);
+    console.log("st-bpp", status, "old carried input dropped; cards 0; no new run");
+  });
+
+  it("st-together: newer input claimed together with M answers both; no stale card or resend for M", async () => {
+    const c = await seed();
+    const m = await message(c, "M first", ago(40 * 60_000));
+    const w = await wake(c, m.id, ago(39 * 60_000));
+    const newer = await message(c, "Next together", ago(20 * 60_000));
+    const r = await run(c, [m.id, newer.id], ago(19 * 60_000));
+    await reply(c, r.id, "M answered first; next answered second");
+    await drain(c, r.id); await sweep(c);
+    expect(await noRunFor(m.id)).toHaveLength(1); expect(await noRunFor(newer.id)).toHaveLength(1);
+    expect(await cards(c, m.id)).toEqual([]); expect(await cards(c, newer.id)).toEqual([]);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0].status).toBe("cancelled");
+    console.log("st-together both input ids in ONE replying run; no card, no resend");
+  });
+
+  it.each(["wakeCommentIds", "commentId", "wakeCommentId", "firstTurnQueuedInput", "claimed-wake"])(
+    "st-claim: a succeeded reply with newer PERSON input in %s makes the old receipt stale", async field => {
+      const c = await seed();
+      const old = await message(c, "Old request never claimed", ago(40 * 60_000));
+      const w = await wake(c, old.id, ago(39 * 60_000));
+      const newer = await message(c, "Newer person input", ago(20 * 60_000));
+      const inputWake = field === "claimed-wake" ? await wake(c, newer.id, ago(19 * 60_000), "completed") : null;
+      const r = await run(c, [], ago(18 * 60_000), "succeeded", inputWake?.id);
+      const context = { issueId: c.issueId, ...(field === "wakeCommentIds" ? { wakeCommentIds: [newer.id] }
+        : field === "commentId" ? { commentId: newer.id } : field === "wakeCommentId" ? { wakeCommentId: newer.id }
+        : field === "firstTurnQueuedInput" ? { firstTurnQueuedInput: { commentIds: [newer.id] } } : {}) };
+      await db.update(heartbeatRuns).set({ contextSnapshot: context, ...(inputWake ? { nativeIssueId: null } : {}) })
+        .where(eq(heartbeatRuns.id, r.id));
+      await reply(c, r.id);
+      // Also exercise custody before promotion: a stale deferred receipt must
+      // not hide its never-claimed input from the real sweep.
+      await sweep(c); expect(await cards(c, old.id)).toHaveLength(1);
+      await drain(c, r.id); await sweep(c);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0])
+        .toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
+      expect(await cards(c, old.id)).toHaveLength(1); expect(await noRunFor(old.id)).toEqual([]);
+      console.log("st-claim", field, "stale before drain; one named card, no run");
+    });
+
+  it.each(["no-input", "reply-boundary-only", "unclaimed-wake", "no-reply", "deleted-reply"])(
+    "st-not-claim: %s does not move the live queue on", async shape => {
+      const c = await seed();
+      const old = await message(c, "Still waiting", ago(40 * 60_000));
+      const w = await wake(c, old.id, ago(39 * 60_000));
+      const newer = await message(c, "Newer but not answered", ago(20 * 60_000));
+      const r = await run(c, ["no-reply", "deleted-reply"].includes(shape) ? [newer.id] : [], ago(18 * 60_000));
+      if (shape === "reply-boundary-only") await db.update(heartbeatRuns).set({ contextSnapshot: {
+        issueId: c.issueId, conversationReplyBoundaryCommentId: newer.id } }).where(eq(heartbeatRuns.id, r.id));
+      if (shape === "unclaimed-wake") await wake(c, newer.id, ago(19 * 60_000), "cancelled");
+      if (shape !== "no-reply") await reply(c, r.id);
+      if (shape === "deleted-reply") await db.update(issueComments).set({ deletedAt: new Date() })
+        .where(eq(issueComments.createdByRunId, r.id));
+      await sweep(c); expect(await cards(c, old.id)).toEqual([]);
+      expect((await drain(c, r.id)).outcome.kind).toBe("promoted");
+      await finishQueued(c, w, "Waiting message answered");
+      await sweep(c); expect(await cards(c, old.id)).toEqual([]);
+      expect(await noRunFor(old.id)).toHaveLength(1);
+      console.log("st-not-claim", shape, "live custody, promoted and answered; no card");
+    });
+
+  it.each(["issue_monitor", "restored_run"])("st-system: stale %s names its held update once, with no run", async reason => {
+    const c = await seed();
+    const [held] = await db.insert(issueComments).values({ companyId: c.companyId, issueId: c.issueId,
+      authorType: "agent", authorAgentId: c.agentId, body: `${reason}: check the README result`, createdAt: ago(40 * 60_000) }).returning();
+    const w = await wake(c, held.id, ago(39 * 60_000));
+    await db.update(agentWakeupRequests).set({ requestedByActorType: "system", requestedByActorId: null,
+      reason, payload: withQueuedCommentIdsInWakePayload({ issueId: c.issueId,
+        _paperclipWakeContext: { issueId: c.issueId, taskKey: c.issueId, wakeReason: reason } }, [held.id]) })
+      .where(eq(agentWakeupRequests.id, w.id));
+    const newer = await message(c, "Person moved on", ago(20 * 60_000));
+    const r = await run(c, [newer.id], ago(19 * 60_000)); await reply(c, r.id);
+    for (let pass = 0; pass < 2; pass++) { await drain(c, r.id); await sweep(c); }
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0])
+      .toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, w.id))).toEqual([]);
+    const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, c.issueId), eq(issueComments.authorType, "system")));
+    expect(notes).toHaveLength(1); expect(notes[0].body).toContain(held.body);
+    console.log("st-system", reason, "ONE note:", notes[0].body);
   });
 });
