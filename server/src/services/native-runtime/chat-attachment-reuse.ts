@@ -51,6 +51,11 @@ const responseWaitContextKeys = ["source", "issueId", "wakeReason", "wakeComment
 const responseWaitRun = {
   id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
   nativeIssueId: heartbeatRuns.nativeIssueId, issueId: heartbeatRuns.issueId, status: heartbeatRuns.status,
+  // K12 (RFL 11-19): Retry export reopens an ended run's finalization suffix
+  // without making the run `running` again. While that suffix is open the run
+  // is treated here as it was when Retry export set it `running`.
+  exportRetryReopened: sql<boolean>`(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? 'workspaceExportRetry'
+    and ${heartbeatRuns.nativePhase} is distinct from 'terminal_failure' and ${heartbeatRuns.nativePhase} is distinct from 'committed')`,
   responsibleUserId: heartbeatRuns.responsibleUserId, activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
   contextSnapshot: sql<Record<string, unknown> | null>`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
     then (select coalesce(jsonb_object_agg(field.key, field.value), '{}'::jsonb)
@@ -907,12 +912,13 @@ export async function resolveExternalChatResponseWaitAuthorizationInTransaction(
   if (actor && lockMode !== "read" && !await holdCompanyAgentRuntimeShared(tx, binding.companyId, { noWait: lockMode === "nonblocking" })) {
     throw new ExternalChatWaitAuthorizationContentionError();
   }
-  const preserved = run && run.status !== "running"
+  const finalizing = Boolean(run && (run.status === "running" || run.exportRetryReopened));
+  const preserved = run && !finalizing
     ? await readPreservedNativeResultFinalization(tx, binding) : null;
   if (
     !issue ||
     !actor ||
-    (!preserved && run.status !== "running") ||
+    (!preserved && !finalizing) ||
     issue.assigneeAgentId !== binding.agentId ||
     (!preserved && issue.executionRunId !== binding.runId) ||
     ["paused", "terminated", "pending_approval", "error"].includes(
@@ -1034,7 +1040,7 @@ export async function readPublishedGitHubReviewCompletionContinuationInTransacti
     eq(heartbeatRuns.agentId, binding.agentId), eq(heartbeatRuns.nativeIssueId, binding.issueId),
     eq(heartbeatRuns.runtimeMode, "native"),
   )).limit(1);
-  if (!run || run.status !== "running" && !await readPreservedNativeResultFinalization(tx, binding)) return null;
+  if (!run || run.status !== "running" && !run.exportRetryReopened && !await readPreservedNativeResultFinalization(tx, binding)) return null;
   const wait = await readInheritedGitHubReviewWait(tx, run);
   if (wait?.kind !== "published") return null;
   if (wait.reviewRunId !== run.id) {
