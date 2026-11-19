@@ -49,10 +49,28 @@ export function agentFileSaveHeld(row: Pick<Copy, "state" | "receipt"> | null | 
 }
 /** Hold code for retained note-delivery aside copies that could not be surfaced. */
 export const AGENT_FILES_ASIDE_UNSURFACED = "AGENT_FILES_ASIDE_UNSURFACED";
+/**
+ * LATE-ABORT (RFL + rf-3): hold code of a stopped save whose abort came after
+ * store.apply passed the canonical commit boundary and whose write had not
+ * settled within AGENT_FILE_LATE_ABORT_SETTLE_MS. It is neither "cancelled"
+ * nor "saved": the collection keeps its lock, and the settling write replaces
+ * this hold with its real outcome (saved, or a failed-save hold).
+ */
+export const AGENT_FILES_SAVE_STILL_RUNNING = "AGENT_FILES_SAVE_STILL_RUNNING";
+export const AGENT_FILES_SAVE_STILL_RUNNING_INSTRUCTION = "Agent-file changes are still being saved. The stop came too late to cancel this save; it is recorded as saved or failed when it finishes. Do not discard or release this sandbox yet.";
+/** How long an aborted collection waits for a canonical write that already
+ * passed its commit boundary before it reports "still saving". Kept below the
+ * retirement deadline owner's own 1 s settle wait
+ * (AGENT_FILE_RETIREMENT_ABORT_SETTLE_MS), so that owner receives the
+ * collector's own report instead of writing a "not saved" hold over a save
+ * that is landing. */
+export const AGENT_FILE_LATE_ABORT_SETTLE_MS = 750;
 /** The one operator instruction for a held stopped copy, keyed on the hold's
  * own code (receipt.savePending.code), not on the row's last error. */
 export function agentFileHoldInstruction(row: Pick<Copy, "receipt" | "executionRoot" | "location"> | null | undefined): string {
-  if ((row?.receipt?.savePending as { code?: unknown } | undefined)?.code !== AGENT_FILES_ASIDE_UNSURFACED) return AGENT_FILES_SAVE_PENDING_INSTRUCTION;
+  const holdCode = (row?.receipt?.savePending as { code?: unknown } | undefined)?.code;
+  if (holdCode === AGENT_FILES_SAVE_STILL_RUNNING) return AGENT_FILES_SAVE_STILL_RUNNING_INSTRUCTION;
+  if (holdCode !== AGENT_FILES_ASIDE_UNSURFACED) return AGENT_FILES_SAVE_PENDING_INSTRUCTION;
   const asideRoot = path.posix.join(row!.executionRoot, ".paperclip-runtime", "notes-aside");
   return `Agent note copies retained during note delivery could not be checked, so this agent directory was not released. To keep them, copy ${asideRoot} from the sandbox (${row!.location}) into the agent's folder, and any ${path.posix.join(row!.executionRoot, ".paperclip-runtime", "notes-*", "aside")} a failed retention left behind.`;
 }
@@ -94,11 +112,16 @@ async function releaseOperationLock(dedicated: Db, lockKey: string): Promise<voi
   }
   if (!released) await dedicated.$client.end({ timeout: 0 }).catch(() => undefined);
 }
-export async function endLockSessionOnAbort<T>(db: Db, session: { pid: number; backendStart: string }, work: Promise<T>, signal: AbortSignal): Promise<T> {
+export async function endLockSessionOnAbort<T>(db: Db, session: { pid: number; backendStart: string }, work: Promise<T>, signal: AbortSignal,
+  tooLate?: () => boolean): Promise<T> {
   work.catch(() => undefined);
   let onAbort: (() => void) | undefined;
   const aborted = new Promise<never>((_resolve, reject) => {
     onAbort = () => {
+      // LATE-ABORT: the canonical write is past its commit boundary and lands
+      // (or fails) as a whole. The lock session stays until its outcome is
+      // recorded; settleLateAbort bounds how long the caller waits for it.
+      if (tooLate?.()) return;
       void withDedicatedDbConnection(db, async control => {
         const timer = setTimeout(() => { void control.$client.end({ timeout: 0 }); }, 1000);
         try {
@@ -117,6 +140,74 @@ export async function endLockSessionOnAbort<T>(db: Db, session: { pid: number; b
   } finally {
     if (onAbort) signal.removeEventListener("abort", onAbort);
   }
+}
+/** One stopped collection's canonical-write progress, shared by its steps and
+ * by the owner of its lock. `boundary`: store.apply passed the canonical
+ * commit boundary (set in the same tick as its last abort check), so an abort
+ * can no longer cancel the write. `recorded`: the collection is writing, or
+ * has written, the write's real outcome on its copy row after a too-late
+ * abort. `done`: that outcome (saved, or the failed-save hold) is on the row;
+ * what remains of the collection is cleanup. */
+export type AgentFileCanonicalWrite = { boundary: boolean; recorded: boolean; done: boolean };
+type LateAbort<T> = { write: AgentFileCanonicalWrite; settleMs: number;
+  /** The report at the bound: the durable "still saving" hold, or the saved
+   * record when the write was already recorded; undefined when the outcome is
+   * being recorded right now (the collection's own return is then awaited). */
+  stillSaving: () => Promise<T | undefined>;
+  /** The recorded outcome (write.done), marked `abortCameTooLate`. */
+  outcome: () => Promise<T> };
+/**
+ * LATE-ABORT (RFL + rf-3 agreed contract): an abort that arrives after the
+ * canonical commit boundary never rejects the collection as cancelled.
+ * `operation` (which owns the lock until it settles) is awaited for at most
+ * `settleMs` from the abort: within that bound the collection returns its real
+ * outcome (SAVED, marked `abortCameTooLate`). At the bound the collection
+ * returns the durable "still saving" report instead (or the saved record, if
+ * the write was already recorded), while `operation` keeps the lock, records
+ * SAVED (or the failure) when the write settles, and only then releases.
+ * Once that outcome is on the row (`write.done`) the lock is no longer kept:
+ * an abort during the remaining cleanup ends the lock session at once, as for
+ * any aborted collection (no lock across a provider call), and the collection
+ * returns the recorded outcome instead of "cancelled". An abort before the
+ * boundary is not handled here: it keeps its early rejection and nothing
+ * canonical has changed.
+ */
+export function settleLateAbort<T>(operation: Promise<T>, signal: AbortSignal, late: LateAbort<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let timer: NodeJS.Timeout | undefined;
+    let reported = false, settled = false;
+    const onAbort = () => {
+      if (!late.write.boundary) return;
+      if (late.write.done) {
+        // The write is on the row; only cleanup remains. That cleanup is
+        // abandoned like any aborted work; the recorded outcome is the answer.
+        reported = true;
+        trackAgentFileCheckpoint(operation).catch(() => undefined);
+        void late.outcome().then(resolve, reject);
+        return;
+      }
+      timer = setTimeout(() => {
+        void late.stillSaving().then(report => {
+          if (settled || report === undefined) return;
+          reported = true;
+          // The write still owns the lock: keep it joined for a graceful drain.
+          trackAgentFileCheckpoint(operation).catch(() => undefined);
+          resolve(report);
+        }, error => logger.warn({ err: error }, "Agent-file save is still running after a late abort; its report could not be written, waiting for the save itself"));
+      }, late.settleMs);
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(value => { settled = true; if (!reported) resolve(value); }, error => {
+      settled = true;
+      if (!reported) reject(error);
+      // After a report, the abort's own rejection of the abandoned cleanup is expected.
+      else if (error !== signal.reason) logger.warn({ err: error }, "Agent-file collection failed after its outcome was reported");
+    }).finally(() => {
+      if (timer) clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
 }
 /**
  * AF-ABORT: the same remote target, except that once `signal` aborts its
@@ -142,7 +233,9 @@ function settled(row: Copy): boolean {
   return completed.has(row.state) || row.state === "unavailable" && !agentFileSaveHeld(row);
 }
 function withoutSaveHold(receipt: Record<string, unknown> | null | undefined) {
-  const { savePending: _savePending, ...rest } = receipt ?? {};
+  // LATE-ABORT: `abortCameTooLate` describes the collection that wrote a
+  // record. A later record replaces it (and sets it again only for itself).
+  const { savePending: _savePending, abortCameTooLate: _abortCameTooLate, ...rest } = receipt ?? {};
   return rest;
 }
 const transports = new Map<string, PreparedAdapterExecutionTargetRuntime>();
@@ -303,8 +396,64 @@ process.stdout.write(JSON.stringify(out));`;
 function actor(row: Copy): AuthorizationActor {
   return { type: "agent", companyId: row.companyId, agentId: row.agentId, runId: row.runId, onBehalfOfUserId: row.responsibleUserId };
 }
-export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string, runId: string) => Promise<Copy | null>, patch: (row: Copy, values: Partial<typeof copies.$inferInsert>, condition?: SQL) => Promise<Copy>, environmentRuntime?: EnvironmentRuntimeService) {
+export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string, runId: string) => Promise<Copy | null>, patch: (row: Copy, values: Partial<typeof copies.$inferInsert>, condition?: SQL) => Promise<Copy>, environmentRuntime?: EnvironmentRuntimeService,
+  options: { /** LATE-ABORT bound; default AGENT_FILE_LATE_ABORT_SETTLE_MS. */ lateAbortSettleMs?: number } = {}) {
   const store = agentFileStore(db);
+  const lateAbortSettleMs = Number.isFinite(options.lateAbortSettleMs) && options.lateAbortSettleMs! > 0
+    ? options.lateAbortSettleMs! : AGENT_FILE_LATE_ABORT_SETTLE_MS;
+  /** LATE-ABORT: after the abort, the bound's "still saving" report or the
+   * deadline owner's hold may have replaced the row this collection read.
+   * Record the write's real outcome on the row as it is now, and confirm it. */
+  async function recordLate(row: Copy, values: (current: Copy) => Partial<typeof copies.$inferInsert>, recorded: (next: Copy) => boolean, condition?: SQL): Promise<Copy> {
+    let current = row;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      current = await get(row.companyId, row.runId) ?? current;
+      current = await patch(current, values(current), condition);
+      if (recorded(current)) break;
+    }
+    return current;
+  }
+  /** LATE-ABORT: the report at the bound (see settleLateAbort). While the
+   * write is still landing it is the durable "still saving" hold: the same
+   * hold a failed stopped save writes (receipt.savePending, under the
+   * destroy-claim lease row lock), so no destroy, expiry or deadline hold
+   * touches the source meanwhile. A write that was already recorded as saved
+   * (the collection is only cleaning up) is reported as that saved record,
+   * never relabelled. Never written over an outcome being recorded. */
+  async function holdStillSaving(row: Copy, write: AgentFileCanonicalWrite): Promise<Copy | undefined> {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const current = await get(row.companyId, row.runId);
+      if (!current) break;
+      const receiptUnchanged = sql`${copies.receipt} IS NOT DISTINCT FROM ${JSON.stringify(current.receipt)}::jsonb`;
+      if (completed.has(current.state)) {
+        if (current.receipt?.abortCameTooLate === true) return current;
+        const marked = await patch(current, { receipt: { ...current.receipt, abortCameTooLate: true } }, receiptUnchanged);
+        if (completed.has(marked.state) && marked.receipt?.abortCameTooLate === true) return marked;
+        continue;
+      }
+      if (write.recorded) break;
+      const stoppedAt = current.processStoppedAt ?? new Date();
+      const previous = current.receipt?.savePending as { since?: string; failures?: number } | undefined;
+      const since = typeof previous?.since === "string" ? new Date(previous.since) : stoppedAt;
+      const receipt = { ...current.receipt, abortCameTooLate: true, savePending: { since: since.toISOString(), code: AGENT_FILES_SAVE_STILL_RUNNING,
+        reason: "The stop came after the canonical write began; the write is still landing.", failures: previous?.failures ?? 0 } };
+      const next = await patch(current, { state: "unavailable", processStoppedAt: stoppedAt, errorCode: AGENT_FILES_SAVE_STILL_RUNNING,
+        errorMessage: agentFileHoldInstruction({ ...current, receipt }), nextAttemptAt: instructionCopyRetryAt(since), receipt },
+        sql`${receiptUnchanged} AND ${agentFileHoldWriteCondition}`);
+      if (next.errorCode === AGENT_FILES_SAVE_STILL_RUNNING && agentFileSaveHeld(next)) return next;
+    }
+    return undefined;
+  }
+  /** LATE-ABORT: the outcome this collection already recorded (write.done),
+   * marked `abortCameTooLate`, for an abort that arrives during its cleanup. */
+  async function recordedOutcome(row: Copy): Promise<Copy> {
+    let current = await get(row.companyId, row.runId) ?? row;
+    for (let attempt = 0; attempt < 3 && current.receipt?.abortCameTooLate !== true; attempt++) {
+      current = await patch(current, { receipt: { ...current.receipt, abortCameTooLate: true } },
+        sql`${copies.receipt} IS NOT DISTINCT FROM ${JSON.stringify(current.receipt)}::jsonb`);
+    }
+    return current;
+  }
   async function insertCopy(values: typeof copies.$inferInsert) {
     return db.transaction(async tx => {
       await notifyInstructionCollection(tx, { companyId: values.companyId, runId: values.runId });
@@ -870,17 +1019,21 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
    * pending_collection; the recovery sweep retries; the operator gets the one
    * aside instruction (agentFileHoldInstruction). Only a later verified save
    * with the copies surfaced and cleaned ends the hold. */
-  async function retainUnsurfaced(row: Copy): Promise<Copy> {
+  async function retainUnsurfaced(row: Copy, lateWrite?: AgentFileCanonicalWrite): Promise<Copy> {
     const asideRoot = path.posix.join(row.executionRoot, ".paperclip-runtime", "notes-aside");
     logger.error({ companyId: row.companyId, agentId: row.agentId, runId: row.runId, asideRoot },
       `Retained agent note copies could not be surfaced; the remote agent directory is kept and not released. To keep them, copy ${asideRoot} from the sandbox (${row.location}) into the agent's folder.`);
     return holdUnsaved(row, AGENT_FILES_ASIDE_UNSURFACED, "Retained note-delivery aside copies could not be surfaced",
-      (row.receipt?.storageWarning as string | null | undefined) ?? null, undefined, "pending_collection");
+      (row.receipt?.storageWarning as string | null | undefined) ?? null, undefined, "pending_collection", lateWrite);
   }
-  async function checkpoint(row: Copy, target?: AdapterExecutionTarget | null, stopped = false, early?: Precapture, signal?: AbortSignal): Promise<Copy> {
+  async function checkpoint(row: Copy, target?: AdapterExecutionTarget | null, stopped = false, early?: Precapture, signal?: AbortSignal,
+    write?: AgentFileCanonicalWrite): Promise<Copy> {
     // AF-ABORT: an aborted stopped collection starts no further remote command
     // and writes nothing (no save, no hold): the deadline owner writes the hold.
-    const live = () => signal?.throwIfAborted();
+    // LATE-ABORT: once store.apply passed the canonical commit boundary the
+    // abort is too late to cancel; the collection records the real outcome.
+    const live = () => { if (!write?.boundary) signal?.throwIfAborted(); };
+    const tooLate = () => write?.boundary === true && signal?.aborted === true;
     live();
     if (!await owns(row) || row.state === "superseded") return row;
     target ??= transports.get(key(row))?.target;
@@ -916,19 +1069,26 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         // when the durable head is already current for the local projection.
         live();
         const { storageWarning, conflicts } = changed
-          ? await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: path.join(captured.directory, "files"), baseline: baseline(row), checkpoint: captured.manifest }, actor(row), { signal })
+          ? await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: path.join(captured.directory, "files"), baseline: baseline(row), checkpoint: captured.manifest }, actor(row),
+            { signal, onCommitBoundary: () => { if (write) write.boundary = true; } })
           : await unchangedCheckpoint(row).then(() => ({
             storageWarning: typeof row.receipt?.storageWarning === "string" ? row.receipt.storageWarning : null, conflicts: [],
           }));
         live();
-        row = await patch(row, { state: stopped ? (changed ? "saved" : "unchanged") : "warm_saved", baseHash: nextHash,
+        const manifest = captured.manifest, stats = captured.stats;
+        const saved = (current: Copy): Partial<typeof copies.$inferInsert> => ({ state: stopped ? (changed ? "saved" : "unchanged") : "warm_saved", baseHash: nextHash,
           candidateHash: nextHash, errorCode: null, errorMessage: null, attempts: 0, nextAttemptAt: null,
           ...(stopped ? { processStoppedAt: new Date() } : {}),
           // A verified save ends any earlier failed save's hold. This warm
           // path and collectStopped's cold path both strip it.
-          receipt: { ...withoutSaveHold(row.receipt), baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: captured.manifest,
-            checkpointState: changed ? "saved" : "unchanged", checkpointStats: captured.stats, storageWarning, conflicts,
-            pendingConflicts: [...pendingConflicts(row), ...conflicts] } });
+          receipt: { ...withoutSaveHold(current.receipt), baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: manifest,
+            checkpointState: changed ? "saved" : "unchanged", checkpointStats: stats, storageWarning, conflicts,
+            pendingConflicts: [...pendingConflicts(current), ...conflicts], ...(tooLate() ? { abortCameTooLate: true } : {}) } });
+        if (tooLate()) {
+          write!.recorded = true;
+          row = await recordLate(row, saved, next => next.state === (changed ? "saved" : "unchanged") && next.candidateHash === nextHash);
+        } else row = await patch(row, saved(row));
+        if (write?.boundary) write.done = true;
         if (aside && !unsurfaced) {
           live();
           const remaining = await notesAsideRetried(row, aside, "clean");
@@ -937,7 +1097,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           // be read): at the stopped boundary that is unsurfaced bytes.
           else unsurfaced = true;
         }
-        if (stopped && unsurfaced) return retainUnsurfaced(row);
+        if (stopped && unsurfaced) return retainUnsurfaced(row, tooLate() ? write : undefined);
         // A same-note conflict leaves the live tree as the run wrote it: the
         // sibling's version stays canonical and this run's bytes are already
         // saved as the named conflict copy. Nothing is written into a live tree
@@ -953,6 +1113,12 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         failure = error;
         logger.warn({ err: error, runId: row.runId, attempt: attempt + 1, stopped }, "Agent file checkpoint failed");
         if (error instanceof HttpError && error.status < 500) break;
+        // LATE-ABORT: no further attempt after the abort; the failure is recorded as it is.
+        if (tooLate()) break;
+        // That write did not land and no abort is pending: the next attempt
+        // is before the commit boundary again, so an abort during its provider
+        // calls ends the lock session at once, as for any aborted collection.
+        if (write && !write.done) write.boundary = false;
       }
       finally {
         // An aborted collection leaves remote scratch to session retirement;
@@ -967,8 +1133,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const storageLimit = failure instanceof AgentFileLimitError || String(failure).includes("LIMIT_EXCEEDED");
     // Fail closed: the stopped tree is the only copy of these changes. Hold it
     // (no release, no lease destruction) and retry the save durably.
-    return holdUnsaved(row, storageLimit ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED", failure,
-      storageLimit ? agentStorageWarning(failure instanceof AgentFileLimitError ? failure.message : "Agent folder exceeds a storage limit") : null);
+    const held = await holdUnsaved(row, storageLimit ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED", failure,
+      storageLimit ? agentStorageWarning(failure instanceof AgentFileLimitError ? failure.message : "Agent folder exceeds a storage limit") : null,
+      undefined, "unavailable", tooLate() ? write : undefined);
+    if (write?.boundary) write.done = true;
+    return held;
   }
   /** Re-arms an existing hold (failed save OR unsurfaced aside copies) with the
    * shared instruction-copy backoff, keeping the hold's own operator text. */
@@ -981,23 +1150,37 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
    * (state unavailable) and unsurfaced aside copies (state pending_collection,
    * code AGENT_FILES_ASIDE_UNSURFACED) both write it here. */
   function holdUnsaved(row: Copy, errorCode: string, failure: unknown, storageWarning: string | null, mirrorHash?: string,
-    state: "unavailable" | "pending_collection" = "unavailable") {
-    const stoppedAt = row.processStoppedAt ?? new Date();
-    const previous = row.receipt?.savePending as { since?: string; failures?: number } | undefined;
-    const since = typeof previous?.since === "string" ? new Date(previous.since) : stoppedAt;
+    state: "unavailable" | "pending_collection" = "unavailable", lateWrite?: AgentFileCanonicalWrite) {
     const reason = failure instanceof HttpError || failure instanceof AgentFileLimitError || failure instanceof Error ? failure.message : String(failure);
-    const savePending = { since: since.toISOString(), code: errorCode, reason: reason.slice(0, 500),
-      failures: (previous?.failures ?? 0) + 1, ...(mirrorHash ? { mirrorHash } : {}) };
-    return patch(row, { state, processStoppedAt: stoppedAt, errorCode,
-      errorMessage: agentFileHoldInstruction({ ...row, receipt: { ...row.receipt, savePending } }),
-      nextAttemptAt: instructionCopyRetryAt(since),
-      receipt: { ...row.receipt, storageWarning, savePending } },
-      // Same lease row lock as every destroy claim; refused once a destroy is claimed.
-      agentFileHoldWriteCondition);
+    const held = (current: Copy): Partial<typeof copies.$inferInsert> => {
+      const stoppedAt = current.processStoppedAt ?? new Date();
+      const previous = current.receipt?.savePending as { since?: string; failures?: number } | undefined;
+      const since = typeof previous?.since === "string" ? new Date(previous.since) : stoppedAt;
+      const savePending = { since: since.toISOString(), code: errorCode, reason: reason.slice(0, 500),
+        failures: (previous?.failures ?? 0) + 1, ...(mirrorHash ? { mirrorHash } : {}) };
+      // LATE-ABORT: the marker belongs to the collection that writes this hold.
+      const { abortCameTooLate: _earlier, ...kept } = current.receipt ?? {};
+      return { state, processStoppedAt: stoppedAt, errorCode,
+        errorMessage: agentFileHoldInstruction({ ...current, receipt: { ...current.receipt, savePending } }),
+        nextAttemptAt: instructionCopyRetryAt(since),
+        receipt: { ...kept, storageWarning, savePending, ...(lateWrite ? { abortCameTooLate: true } : {}) } };
+    };
+    // Same lease row lock as every destroy claim; refused once a destroy is claimed.
+    if (!lateWrite) return patch(row, held(row), agentFileHoldWriteCondition);
+    // LATE-ABORT: the write failed after the abort; record that on the row as it is now.
+    lateWrite.recorded = true;
+    return recordLate(row, held, next => (next.receipt?.savePending as { code?: unknown } | undefined)?.code === errorCode, agentFileHoldWriteCondition);
   }
-  async function collectStopped(row: Copy, target?: AdapterExecutionTarget | null, signal?: AbortSignal) {
+  async function collectStopped(row: Copy, target?: AdapterExecutionTarget | null, signal?: AbortSignal, write?: AgentFileCanonicalWrite) {
     // AF-ABORT: re-checked before every remote command and every write.
-    const live = () => signal?.throwIfAborted();
+    // LATE-ABORT: once store.apply passed the canonical commit boundary the
+    // abort is too late to cancel. The collection then records the write's
+    // real outcome and takes no further step: no retry, no second apply, no
+    // release (the cleanup worker releases a saved copy from its receipt).
+    const live = () => { if (!write?.boundary) signal?.throwIfAborted(); };
+    const tooLate = () => write?.boundary === true && signal?.aborted === true;
+    const marked = async (current: Copy) => tooLate() && isAgentDirectoryCopy(current) && current.receipt?.abortCameTooLate !== true
+      ? patch(current, { receipt: { ...current.receipt, abortCameTooLate: true } }) : current;
     live();
     target = abortableExecutionTarget(target, signal);
     if (row.receipt?.retainedByRunId) return row;
@@ -1008,12 +1191,13 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (held && row.location !== "local" && !transports.has(key(row)) && target?.kind !== "remote"
       && row.receipt?.warm === true) return recoverStoppedRemote(row);
     if (row.receipt?.warm === true && !settled(row)) {
-      row = await checkpoint(row, target, true, undefined, signal);
+      row = await checkpoint(row, target, true, undefined, signal, write);
       // Never release a stopped copy while retained aside copies are unsurfaced.
       if (row.errorCode === "AGENT_FILES_ASIDE_UNSURFACED") return row;
       live();
+      if (tooLate()) return marked(row);
       await release(row, target);
-      return (await get(row.companyId, row.runId))!;
+      return marked((await get(row.companyId, row.runId))!);
     }
     if (settled(row)) { live(); await release(row); return (await get(row.companyId, row.runId))!; }
     // A held save whose exact tree was already retrieved into the controller
@@ -1052,26 +1236,45 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         if (candidateHash === row.baseHash) {
           row = await patch(row, { state: "unchanged", errorCode: null, errorMessage: null, nextAttemptAt: null });
         } else {
-          ({ storageWarning, conflicts } = await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row), { signal }));
+          ({ storageWarning, conflicts } = await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row),
+            { signal, onCommitBoundary: () => { if (write) write.boundary = true; } }));
+          if (tooLate()) {
+            // One confirmed record of the saved write, on the row as it is now.
+            write!.recorded = true;
+            row = await recordLate(row, current => ({ state: "saved", candidateHash, errorCode: null, errorMessage: null, nextAttemptAt: null,
+              receipt: { ...withoutSaveHold(current.receipt), storageWarning, conflicts, pendingConflicts: [...pendingConflicts(current), ...conflicts], abortCameTooLate: true } }),
+              next => next.state === "saved" && next.candidateHash === candidateHash);
+            write!.done = true;
+            break;
+          }
           row = await patch(row, { state: "saved", candidateHash, errorCode: null, errorMessage: null, nextAttemptAt: null });
         }
         row = await patch(row, { receipt: { ...withoutSaveHold(row.receipt), storageWarning, conflicts, pendingConflicts: [...pendingConflicts(row), ...conflicts] } });
+        if (write?.boundary) write.done = true;
         break;
       } catch (error) {
         live();
         const retryable = !(error instanceof HttpError) || error.status >= 500;
-        if (retryable && row.attempts < 3) continue;
+        // LATE-ABORT: no further attempt after the abort; the failure is recorded as it is.
+        if (retryable && row.attempts < 3 && !tooLate()) {
+          // That write did not land and no abort is pending: back before the commit boundary.
+          if (write && !write.done) write.boundary = false;
+          continue;
+        }
         // Fail closed: keep the stopped source, mirror, baseline, owner and
         // lease. The collection worker retries this save; nothing is discarded.
         row = await holdUnsaved(row, error instanceof AgentFileLimitError ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED", error,
           error instanceof AgentFileLimitError ? agentStorageWarning(error.message) : (row.receipt?.storageWarning as string | null | undefined) ?? null,
-          inspected ? directorySnapshotSha256(inspected.snapshot) : (typeof mirrorHash === "string" ? mirrorHash : undefined));
+          inspected ? directorySnapshotSha256(inspected.snapshot) : (typeof mirrorHash === "string" ? mirrorHash : undefined),
+          "unavailable", tooLate() ? write : undefined);
+        if (write?.boundary) write.done = true;
         break;
       }
     }
     live();
+    if (tooLate()) return marked(row);
     await release(row);
-    return (await get(row.companyId, row.runId))!;
+    return marked((await get(row.companyId, row.runId))!);
   }
   /**
    * A stopped collection pins its bound lease (same row lock as the destroy
@@ -1081,10 +1284,10 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
    * returned (saved, unchanged or held); a thrown collection keeps it (its
    * outcome is unknown) until this copy's next collection replaces it.
    */
-  async function pinnedCollectStopped(row: Copy, target?: AdapterExecutionTarget | null, signal?: AbortSignal) {
+  async function pinnedCollectStopped(row: Copy, target?: AdapterExecutionTarget | null, signal?: AbortSignal, write?: AgentFileCanonicalWrite) {
     signal?.throwIfAborted();
     const leaseId = (row.receipt?.cleanup as { leaseId?: unknown } | undefined)?.leaseId;
-    if (typeof leaseId !== "string" || !leaseId) return collectStopped(row, target, signal);
+    if (typeof leaseId !== "string" || !leaseId) return collectStopped(row, target, signal, write);
     const copyKey = `${row.companyId}:${row.runId}:${row.agentId}`;
     const pin = await pinLeaseForCollection(db, leaseId, copyKey);
     if (pin === null) {
@@ -1092,7 +1295,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       return row;
     }
     // An aborted collection throws: its pin stays (fail closed) like any thrown collection.
-    const collected = await collectStopped(row, target, signal);
+    const collected = await collectStopped(row, target, signal, write);
     if (pin !== "unbound") await unpinLeaseForCollection(db, leaseId, copyKey, pin);
     return collected;
   }
@@ -1185,6 +1388,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       }
       await patch(row, { receipt: { schema: AGENT_FILES_CONTRACT, state: row.state, appliedCandidateHash: row.candidateHash, storageWarning: row.receipt?.storageWarning ?? null, cleanupPending,
         ...(row.receipt?.discard ? { discard: row.receipt.discard } : {}),
+        // LATE-ABORT: the final receipt keeps that this save outran its abort.
+        ...(row.receipt?.abortCameTooLate === true ? { abortCameTooLate: true } : {}),
         materializationRunId: row.receipt?.materializationRunId ?? row.runId,
         // The final save receipt keeps any file kept from another writer.
         ...(Array.isArray(row.receipt?.conflicts) && row.receipt.conflicts.length ? { conflicts: row.receipt.conflicts } : {}),
@@ -1275,7 +1480,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       cwd: remoteCwd, env: {}, timeoutMs: 15_000, bypassSession: true });
     return result.exitCode === 0 && !result.timedOut;
   }
-  async function serial<T>(row: Copy, fn: (current: Copy) => Promise<T>, operation: DirectoryMergeLockOperation, signal?: AbortSignal): Promise<T> {
+  async function serial<T>(row: Copy, fn: (current: Copy) => Promise<T>, operation: DirectoryMergeLockOperation, signal?: AbortSignal, late?: LateAbort<T>): Promise<T> {
     signal?.throwIfAborted();
     const run = async () => {
       const lockRoot = path.resolve(disposableRemoteCopy(row) ? projectionRoot(row) : row.localRoot, "../../..");
@@ -1291,7 +1496,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         return fn(current);
       }, process.env, operation);
     };
-    if (!disposableRemoteCopy(row)) return run();
+    // LATE-ABORT: the directory merge lock is held by run() until it settles.
+    if (!disposableRemoteCopy(row)) return late && signal ? settleLateAbort(run(), signal, late) : run();
     // Different controllers have different cache roots. Serialize their active
     // collection/cleanup operations in Postgres, without holding row locks over I/O.
     // Test instrumentation only (disarmed in production): restart chaos fails the Nth attempt with the lock's own conflict.
@@ -1306,7 +1512,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // Same key space as before, so it conflicts with any transaction-level
     // lock on the same key.
     const lockKey = `agent-directory:${row.companyId}:${row.agentId}`;
-    return withDedicatedDbConnection(db, async dedicated => {
+    const held = withDedicatedDbConnection(db, async dedicated => {
       const [lock] = await dedicated.execute(sql`select pg_try_advisory_lock(hashtextextended(${lockKey}, 0)) as acquired,
         (select setting::bigint from pg_settings where name = 'idle_session_timeout') as idle_timeout_ms,
         pg_backend_pid() as pid, (select backend_start::text from pg_stat_activity where pid = pg_backend_pid()) as backend_start`);
@@ -1317,11 +1523,20 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         // pl/cancel-finalize2 pattern (5e0eac367): the lock session is released
         // at the abort, not when a held provider call returns; the abandoned
         // work re-checks the signal and writes nothing.
-        return await endLockSessionOnAbort(db, { pid: Number(lock.pid), backendStart: String(lock.backend_start) }, work, signal);
+        // LATE-ABORT: except while the canonical write, past its commit
+        // boundary, is landing or being recorded. Then this session keeps the
+        // lock (no other writer may take it meanwhile). Once the outcome is on
+        // the row the session ends at an abort again, so no lock is ever kept
+        // across the cleanup's provider calls.
+        return await endLockSessionOnAbort(db, { pid: Number(lock.pid), backendStart: String(lock.backend_start) }, work, signal,
+          () => late?.write.boundary === true && !late.write.done);
       } finally {
         await releaseOperationLock(dedicated, lockKey);
       }
     });
+    // The lock session above ends only when its work settled; the caller gets
+    // the bounded report (settleLateAbort).
+    return late && signal ? settleLateAbort(held, signal, late) : held;
   }
   async function claimConflictNotice(input: { companyId: string; agentId: string; runId: string; previousRunId?: string | null }): Promise<string | null> {
     // A restarted preparation repeats this run's sealed notice, not another
@@ -1374,7 +1589,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         await early?.captured.cleanup().catch(error => logger.warn({ err: error, runId: row.runId }, "Agent checkpoint scratch cleanup deferred to session retirement"));
       }
     })()),
-    collectStopped: (row: Copy, target?: AdapterExecutionTarget | null, signal?: AbortSignal) => trackAgentFileCheckpoint(serial(row, current => pinnedCollectStopped(current, target, signal), "agent_directory_collect", signal)),
+    collectStopped: (row: Copy, target?: AdapterExecutionTarget | null, signal?: AbortSignal) => {
+      const write: AgentFileCanonicalWrite = { boundary: false, recorded: false, done: false };
+      return trackAgentFileCheckpoint(serial(row, current => pinnedCollectStopped(current, target, signal, write), "agent_directory_collect", signal,
+        signal ? { write, settleMs: lateAbortSettleMs, stillSaving: () => holdStillSaving(row, write), outcome: () => recordedOutcome(row) } : undefined));
+    },
     release: async (row: Copy) => {
       let current = await get(row.companyId, row.runId);
       if (!current) return;

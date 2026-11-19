@@ -429,7 +429,11 @@ export function buildEnvironmentLeaseContext(input: {
  */
 export type AgentFileRetirementCollector = (input: { environment: Environment; lease: EnvironmentLease; runId: string;
   /** AF-ABORT: aborted at the aggregate deadline; the collection then starts no
-   * further remote command or write and ends its lock transaction at once. */
+   * further remote command or write and ends its lock transaction at once.
+   * LATE-ABORT: except when its canonical write already began. That write is
+   * not cancelled: the collection resolves with the real outcome (saved, or a
+   * held "still saving" report), marked `receipt.abortCameTooLate`, and keeps
+   * its lock until the write settled. */
   signal?: AbortSignal }) =>
   Promise<{ state: string; receipt?: Record<string, unknown> | null; processStoppedAt?: Date | null } | null>;
 
@@ -445,7 +449,8 @@ export type AgentFileRetirementCollector = (input: { environment: Environment; l
  */
 export const AGENT_FILE_RETIREMENT_COLLECTION_DEADLINE_MS = 60_000;
 /** AF-ABORT: after the abort, the stop waits this long at most for the aborted
- * collection to end (its lock transaction and session), then proceeds. */
+ * collection to end (its lock transaction and session), then proceeds. The
+ * collector's LATE-ABORT bound (AGENT_FILE_LATE_ABORT_SETTLE_MS) stays below it. */
 export const AGENT_FILE_RETIREMENT_ABORT_SETTLE_MS = 1_000;
 const RETIREMENT_COLLECTION_TIMED_OUT = Symbol("agent-file retirement collection deadline");
 /** Waits for `work` until the monotonic `deadlineAt` (performance.now()), with
@@ -1905,6 +1910,11 @@ function createSandboxEnvironmentDriver(
     // not abandoned. The abort lands before any stop is prepared, and the stop
     // waits (bounded) for the aborted work to end, so no collector transaction,
     // lock session or new remote call outlives the deadline + 1 s.
+    // LATE-ABORT (RFL + rf-3): one exception. A canonical write that already
+    // passed its commit boundary is not cancelled. The collector reports it
+    // inside this settle wait (saved, or a held "still saving" report whose
+    // savePending keeps the deadline hold below from being written over it)
+    // and keeps its lock session until that write settled.
     const collectionAbort = new AbortController();
     const abortCollection = async (work: Promise<unknown>) => {
       if (!collectionAbort.signal.aborted) collectionAbort.abort(new Error("agent-file retirement collection deadline expired"));

@@ -65,13 +65,17 @@ function serializeCopySave<T>(db: Db, companyId: string, runId: string, save: ()
 
 
 /** Finish only bounded immediate collection work; deferred ownership remains pending. */
-export async function collectStoppedInstructionCopyWithRetries<T extends Pick<Copy, "state" | "attempts" | "nextAttemptAt">>(collect: () => Promise<T | null>, signal?: AbortSignal): Promise<T | null> {
+export async function collectStoppedInstructionCopyWithRetries<T extends Pick<Copy, "state" | "attempts" | "nextAttemptAt"> & { receipt?: Copy["receipt"] }>(collect: () => Promise<T | null>, signal?: AbortSignal): Promise<T | null> {
   let saved: T | null = null;
   let previousAttempts = -1;
   for (let calls = 0; calls < MAX_COLLECTION_ATTEMPTS; calls++) {
     // AF-ABORT: an aborted collection makes no further attempt.
     signal?.throwIfAborted();
     saved = await collect();
+    // LATE-ABORT: this caller's abort came after the canonical write began.
+    // The collector's own report (saved, still saving, or failed) is the
+    // outcome: no further attempt, and never a "cancelled" in its place.
+    if (signal?.aborted && saved?.receipt?.abortCameTooLate === true) break;
     if (!saved || saved.state !== "pending_collection" || saved.nextAttemptAt === null
       || saved.attempts >= MAX_COLLECTION_ATTEMPTS || saved.attempts <= previousAttempts) break;
     previousAttempts = saved.attempts;
@@ -99,7 +103,9 @@ export function instructionCollectionScript(root: string, entry: string) {
 }
 
 
-export function agentInstructionWorkingCopyService(db: Db, options: { environmentRuntime?: EnvironmentRuntimeService } = {}) {
+export function agentInstructionWorkingCopyService(db: Db, options: { environmentRuntime?: EnvironmentRuntimeService;
+  /** LATE-ABORT bound for an agent-file save that outran its abort; default AGENT_FILE_LATE_ABORT_SETTLE_MS. */
+  agentFileLateAbortSettleMs?: number } = {}) {
   const revisions = agentInstructionRevisionService(db);
   const scope = (companyId: string, runId: string) => and(eq(copies.companyId, companyId), eq(copies.runId, runId));
   async function get(companyId: string, runId: string) {
@@ -139,7 +145,7 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
   function actorFor(row: Copy): AuthorizationActor {
     return { type: "agent", companyId: row.companyId, agentId: row.agentId, runId: row.runId, onBehalfOfUserId: row.responsibleUserId };
   }
-  const directories = agentDirectoryWorkingCopyService(db, get, patch, options.environmentRuntime);
+  const directories = agentDirectoryWorkingCopyService(db, get, patch, options.environmentRuntime, { lateAbortSettleMs: options.agentFileLateAbortSettleMs });
   async function recoverDirectoryCleanup(row: Copy, retryAt: Date, cleanup: () => Promise<unknown>) {
     try {
       await cleanup();
@@ -334,7 +340,11 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
 
   /** Caller must have joined the owned provider process before granting this proof. */
   /** `signal` (AF-ABORT): once aborted, the collection starts no further remote
-   * command or write and releases its operation-lock transaction at once. */
+   * command or write and releases its operation-lock transaction at once.
+   * LATE-ABORT: an abort that arrives after the canonical write began cannot
+   * cancel it. The collection then resolves with the real outcome, marked
+   * `receipt.abortCameTooLate`: saved, or (after a bounded wait) a held
+   * "still saving" report whose row is updated when the write settles. */
   function collectStopped(input: { companyId: string; runId: string; target?: AdapterExecutionTarget | null; signal?: AbortSignal }): Promise<Copy | null> {
     return trackAgentFileCheckpoint(serializeCopySave(db, input.companyId, input.runId, () => collectStoppedOnce(input)));
   }

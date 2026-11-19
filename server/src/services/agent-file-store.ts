@@ -394,9 +394,12 @@ export function agentFileStore(db: Db) {
         return { contentHash: incomingHash, changed: true };
       }, input.bytes && input.bytes.length <= MAX_INSTRUCTION_BYTES ? [input.bytes.toString("utf8")] : []),
     /** `signal`: once aborted, the save stops before its next step and, at the
-     * latest, at the canonical commit boundary (before the tree merge). */
+     * latest, at the canonical commit boundary (before the tree merge).
+     * `onCommitBoundary` runs in the same tick that last check passes: from
+     * then on the write lands or fails as a whole and an abort is too late,
+     * so the caller must wait for this call and report its real outcome. */
     apply: async (input: { companyId: string; agentId: string; sourceDir: string; baseline: DirectorySnapshot; checkpoint?: AgentFileManifest }, actor: AuthorizationActor,
-      options: { signal?: AbortSignal } = {}) => {
+      options: { signal?: AbortSignal; onCommitBoundary?: () => void } = {}) => {
       const { signal } = options;
       signal?.throwIfAborted();
       const incoming = input.checkpoint ? checkpointSnapshot(input.checkpoint) : await snapshotAgentFiles(input.sourceDir);
@@ -528,6 +531,7 @@ export function agentFileStore(db: Db) {
         // From the merge on, the write is not interrupted half-way: a rolled
         // back transaction would leave the merged tree on disk.
         signal?.throwIfAborted();
+        options.onCommitBoundary?.();
         await mergeDirectoryWithBaseline({ ...input, baseline: applyBaseline, targetDir: root,
           ...(input.checkpoint ? { snapshots: { source: incoming, current } } : {}) });
         for (const item of conflicts) if (item.conflictCopy) await writeConflictCopy(input.sourceDir, root, item, incoming.entries.get(item.path)!);
