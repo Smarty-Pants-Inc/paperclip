@@ -76,7 +76,7 @@ import {
 } from "@/hooks/useSharedPolling";
 import { ApiError } from "../api/client";
 import { issuesApi } from "../api/issues";
-import { readCommentDelivery, type CommentDeliveryIntent } from "../api/comment-delivery";
+import { readCommentDelivery, readSteeredIntoRunId, type CommentDeliveryIntent } from "../api/comment-delivery";
 import { classifySendFailure } from "../lib/pending-send";
 import { useUpdateIssueMutation } from "../hooks/useUpdateIssueMutation";
 import { describeInteractionResolutionFailure, interactionResolutionErrorMessage } from "../lib/interaction-resolution-error";
@@ -2072,7 +2072,9 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         locallyQueuedCommentRunIds.get(comment.id) ??
         nextComment.queueTargetRunId ??
         null;
-      if (inputPlacement) {
+      // The server steered it into the running turn (steering by default):
+      // it is sent, in the thread. No client rule may call it queued.
+      if (inputPlacement || readSteeredIntoRunId(nextComment)) {
         return {
           ...nextComment,
           clientStatus: undefined,
