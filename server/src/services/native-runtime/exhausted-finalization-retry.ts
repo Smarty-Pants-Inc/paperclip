@@ -62,6 +62,8 @@ export function savedResultRetryPendingCondition(): SQL<boolean> {
  */
 export async function rearmExhaustedNativeFinalization(tx: Db, input: {
   companyId: string; issueId: string; runId: string; generationId: string; actorId: string;
+  /** An agent's Retry (#21271) is recorded under the agent, never as a user. */
+  actorType?: "user" | "agent";
 }): Promise<{ kind: "rearmed" } | { kind: "joined"; generationId: string | null; finalizing: boolean }
   | { kind: "not_eligible" }> {
   const [eligible] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
@@ -104,7 +106,8 @@ export async function rearmExhaustedNativeFinalization(tx: Db, input: {
   await tx.update(nativeRunFinalizations).set({
     phase, nextAttemptAt, failureCode: null, failureDetail: null, updatedAt: now,
     recoveryHistory: [...coordinator.recoveryHistory, {
-      kind: EXHAUSTED_FINALIZATION_RETRY_KIND, generationId: input.generationId, requestedByUserId: input.actorId,
+      kind: EXHAUSTED_FINALIZATION_RETRY_KIND, generationId: input.generationId,
+      ...(input.actorType === "agent" ? { requestedByAgentId: input.actorId } : { requestedByUserId: input.actorId }),
       resultId: coordinator.resultId, previousFailureCode: coordinator.failureCode,
       previousFailureDetail: coordinator.failureDetail, at: now.toISOString(),
     }],

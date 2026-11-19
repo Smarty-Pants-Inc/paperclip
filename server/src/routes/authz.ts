@@ -47,7 +47,7 @@ const AGENT_PROFILE_TABS: Record<string, [string, string]> = {
 /** A board page as [label, path], where the path keeps <prefix> for the agent to fill. */
 export type BoardControlPage = [label: string, path: string];
 
-/** Budgets are board-only. These pages hold the budget controls behind any route that writes one. */
+/** Budget pages. Incident resolution is board-only; policy writes also admit an agent within its budget authority. These pages hold the budget controls. */
 export const COMPANY_BUDGETS_PAGE: BoardControlPage = ["budgets", "/<prefix>/activity/budgets"];
 /** Cost recording controls (such as retrying a run's saved-usage cost) are on the Costs page, not Budgets. */
 export const COMPANY_COSTS_PAGE: BoardControlPage = ["costs", "/<prefix>/activity/costs"];
@@ -140,7 +140,7 @@ export function boardAccessRequired(req: Request, controlPage?: BoardControlPage
     : "They can do it in the Paperclip web app or with their own board credentials. Link a page only if you already know its route; do not search for one.";
   return forbidden("Board access required", {
     code: BOARD_ACCESS_REQUIRED_CODE,
-    remediation: `This action is board-only by design and this denial is final: no agent credential, tool or other API route can do it, so do not search for one. Stop working on this step and reply now: tell the person that a board user must do it. ${scope}${where}`,
+    remediation: `This route is board-only and this denial is final for this action: your credential has no other API route to it, so do not search for one. Stop working on this step and reply now: tell the person that a board user must do it. ${scope}${where}`,
   });
 }
 

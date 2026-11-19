@@ -31,6 +31,18 @@ describe("ApprovalPayloadRenderer", () => {
     container.remove();
   });
 
+  it("shows a create organization card with its exact fields and says it can't be deleted on hq (#21271)", () => {
+    const root = createRoot(container);
+    act(() => root.render(<ApprovalPayloadRenderer type="create_company"
+      payload={{ name: "Launch Labs", description: "Research and marketing", ownerUserId: "user-1", budgetMonthlyCents: 5000 }} />));
+    expect(container.textContent).toContain("Launch Labs");
+    expect(container.textContent).toContain("Research and marketing");
+    expect(container.textContent).toContain("$50.00 / month");
+    expect(container.textContent).toContain("A new organization can't be deleted on hq.");
+    expect(approvalLabel("create_company", { title: "Launch Labs" })).toBe("Create Organization: Launch Labs");
+    act(() => root.unmount());
+  });
+
   it.each([0, 5000])("shows a configured %s-cent override limit while masking observed spend", (budgetAmount) => {
     const root = createRoot(container);
     act(() => root.render(<ApprovalPayloadRenderer type="budget_override_required"

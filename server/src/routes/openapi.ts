@@ -1464,11 +1464,9 @@ const mcpSkillsBoardOperations = [
 
 const BOARD_ONLY_OPERATIONS = new Set([
   "PATCH /api/agents/{id}/permission-grants",
-  // Budget changes are board-only (assertBoard in routes/costs.ts).
-  "POST /api/companies/{companyId}/budgets/policies",
+  // Budget incident resolution is board-only (assertBoard in routes/costs.ts). Budget policy
+  // writes also admit an agent within its budget authority, so they are not listed here.
   "POST /api/companies/{companyId}/budget-incidents/{incidentId}/resolve",
-  "PATCH /api/companies/{companyId}/budgets",
-  "PATCH /api/agents/{agentId}/budgets",
   // Approval decisions are board-only (assertBoard in routes/approvals.ts).
   "POST /api/approvals/{id}/approve",
   "POST /api/approvals/{id}/reject",
@@ -1488,7 +1486,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   // Cancelling a question is board-only (routes/issues.ts rejects agent actors). Withdraw is not listed here: its
   // route admits the card's creator agent and the task's assignee, so agents withdraw their own pending card there.
   "POST /api/issues/{id}/interactions/{interactionId}/cancel",
-  "POST /api/issues/{id}/retry",
+  // Task Retry is not listed: an agent may retry a non-chat task assigned to itself or to an agent it manages.
   "GET /api/companies/{companyId}/prompt-injection-prevention",
   "PUT /api/companies/{companyId}/prompt-injection-prevention",
   "GET /api/companies/{companyId}/prompt-injection-prevention/models",
@@ -5996,6 +5994,7 @@ registry.registerPath({
   path: "/api/companies/{companyId}/approvals",
   tags: ["approvals"],
   summary: "Create an approval",
+  description: "type create_company asks to create one new organization for a person: only that person's selected primary agent may file it, with payload name, description, ownerUserId (the person) and optional budgetMonthlyCents. The same request while the card is open returns the same card (200). An instance admin's approval creates the organization once; a new organization can't be deleted on hq.",
   request: {
     params: z.object({ companyId: z.string() }),
     body: jsonBody(createApprovalSchema),
@@ -6359,7 +6358,7 @@ registry.registerPath({
   path: "/api/agents/{agentId}/budgets",
   tags: ["costs"],
   summary: "Update agent budget",
-  description: "Board only: agent credentials get 403. A board user changes the limit on the agent's budget tab: link [Open budget](/<prefix>/agents/<agentId>/budgets) with this conversation's company prefix as <prefix>, and reply.",
+  description: "A board user, or an agent for another agent in its reporting subtree within its own budget authority (never its own budget); other agent calls get 403. A board user changes the limit on the agent's budget tab: link [Open budget](/<prefix>/agents/<agentId>/budgets) with this conversation's company prefix as <prefix>, and reply.",
   request: {
     params: z.object({ agentId: z.string() }),
     body: jsonBody(updateBudgetSchema),
@@ -11486,6 +11485,7 @@ registerCurrentRoute({
   path: "/api/issues/{id}/retry",
   tags: ["issues"],
   summary: "Request one durable task retry from current input and preserved results",
+  description: "A board user with task change access may retry a task (a chat task only by its owner). An agent may retry a non-chat task assigned to itself or to an agent it manages; the same budget, pause and hold gates apply and the failed attempt's evidence is kept.",
   body: taskRetrySchema,
   responses: { 200: r.ok(), 202: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
