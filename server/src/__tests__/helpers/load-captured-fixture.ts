@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { createDb } from "@paperclipai/db";
+import { vi } from "vitest";
+import * as controllerProcess from "../../services/controller-process-identity.js";
 
 type HarnessDb = Pick<ReturnType<typeof createDb>, "$client">;
 type Row = Record<string, unknown>;
@@ -33,6 +35,36 @@ export type ColumnMappingOverride = {
   /** Every changed table needs an explicit entry. null deliberately drops a column. */
   tables: Record<string, Record<string, string | null>>;
 };
+
+export type CapturedControllerIdentity = {
+  runId: string;
+  hostHash: string | null;
+  bootId: string | null;
+};
+export type CapturedIdentityFeed = "recorded" | "disabled" | "different";
+
+/** Test-only, scoped OS-identity seam already used by server recovery tests.
+ * Keep the replay's NEW controller boot: adopting the old controller boot would
+ * make proveOwnerGone report current_process, not prove the recorded owner gone.
+ * Do not stub PID observations, leases, or proveOwnerGone. Always restore even
+ * when replay throws; callers must await this scope and must not run it concurrently.
+ */
+export async function withCapturedControllerIdentity<T>(
+  identity: CapturedControllerIdentity, replay: () => Promise<T>,
+  feed: CapturedIdentityFeed = "recorded",
+): Promise<T> {
+  if (feed === "disabled") return replay();
+  if (!identity.hostHash || identity.hostHash === "unknown" || identity.hostHash === "operator_attested") {
+    throw new Error("Capture has no replayable controller process-space identity");
+  }
+  // Derive a distinct, readable PID-space hash without publishing captured values.
+  const different = createHash("sha256").update(`capture-control\0${identity.hostHash}`).digest("hex").slice(0, 32);
+  const hostHash = feed === "different" ? different : identity.hostHash;
+  if (feed === "different" && hostHash === identity.hostHash) throw new Error("Capture control identity collision");
+  const seam = vi.spyOn(controllerProcess, "currentProcessSpaceHash").mockReturnValue(hostHash);
+  try { return await replay(); }
+  finally { seam.mockRestore(); }
+}
 
 // JSON.parse's source reviver preserves arbitrary-precision JSON numbers. In particular,
 // bigint run-event primary keys must not silently round through JavaScript's Number.
@@ -110,8 +142,19 @@ export async function readCapturedFixture(dir: string) {
  */
 export async function loadCapturedFixture(
   db: HarnessDb, dir: string, options: { columnMapping?: ColumnMappingOverride } = {},
-): Promise<{ manifest: CapturedManifest; inserted: Record<string, number>; restoredEdges: number }> {
+): Promise<{ manifest: CapturedManifest; inserted: Record<string, number>; restoredEdges: number;
+  controllers: CapturedControllerIdentity[] }> {
   const { manifest, rows } = await readCapturedFixture(dir);
+  // These remain private, in memory only. Preserve the recorded owner boot on
+  // the row; only the current host/PID-space observation is fed to the seam.
+  const controllers = (rows.native_run_finalizations ?? []).map(row => {
+    if (typeof row.run_id !== "string"
+      || (row.controller_host_hash !== null && typeof row.controller_host_hash !== "string")
+      || (row.controller_boot_id !== null && typeof row.controller_boot_id !== "string")) {
+      throw new Error("Capture has malformed controller identity columns");
+    }
+    return { runId: row.run_id, hostHash: row.controller_host_hash, bootId: row.controller_boot_id };
+  });
   const tables = Object.keys(rows).sort();
   return db.$client.begin(async tx => {
     const columns = await tx.unsafe<Column[]>(columnSql, [tables]);
@@ -243,7 +286,7 @@ export async function loadCapturedFixture(
          WHERE ${primary.map(c => `t.${identifier(c)}=v.${identifier(c)}`).join(" AND ")}`,
         [serialize(node.original)]);
     }
-    return { manifest, inserted: manifest.row_counts, restoredEdges: [...patches.values()].reduce((n, columns) => n + columns.size, 0) };
+    return { manifest, inserted: manifest.row_counts, restoredEdges: [...patches.values()].reduce((n, columns) => n + columns.size, 0), controllers };
   });
 }
 

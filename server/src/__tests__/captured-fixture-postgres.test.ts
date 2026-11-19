@@ -6,9 +6,12 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createDb } from "@paperclipai/db";
+import { createDb, nativeRunFinalizations } from "@paperclipai/db";
+import { and, eq, isNotNull } from "drizzle-orm";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { assertCapturedRoundTrip, loadCapturedFixture, readCapturedFixture } from "./helpers/load-captured-fixture.js";
+import { assertCapturedRoundTrip, loadCapturedFixture, readCapturedFixture, withCapturedControllerIdentity,
+  type CapturedControllerIdentity } from "./helpers/load-captured-fixture.js";
+import * as controllerProcess from "../services/controller-process-identity.js";
 
 const syntheticDir = fileURLToPath(new URL("./fixtures/synthetic/capture-loader/", import.meta.url));
 const configuredDirs = process.env.PAPERCLIP_CAPTURE_DIRS;
@@ -46,6 +49,7 @@ for (const { fixture, dir, synthetic } of fixtures) {
     let db: ReturnType<typeof createDb>;
     let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
     let issue: string;
+    let controllers: CapturedControllerIdentity[];
     beforeAll(async () => {
       console.info(`HARNESS probing real PostgreSQL: ${fixture}`);
       const support = await getEmbeddedPostgresTestSupport();
@@ -56,6 +60,7 @@ for (const { fixture, dir, synthetic } of fixtures) {
       console.info(`HARNESS loading capture: ${fixture}`);
       const loaded = await loadCapturedFixture(db, dir);
       issue = loaded.manifest.issue;
+      controllers = loaded.controllers;
       console.info(`LOADED ${fixture}: ${Object.values(loaded.inserted).reduce((a, b) => a + b, 0)} rows; nullable FK columns restored=${loaded.restoredEdges}`);
     }, 120_000);
     afterAll(async () => {
@@ -70,6 +75,54 @@ for (const { fixture, dir, synthetic } of fixtures) {
         agent_wakeup_requests: 1, heartbeat_run_events: 1, issue_recovery_actions: 1,
       });
       console.info(`ROUND_TRIP PASS ${fixture}: ${JSON.stringify(counts)}`);
+    }, 60_000);
+
+    it.skipIf(synthetic)("replays controller host proof red / green / different-host control without changing captured rows", async () => {
+      const { evaluateNativeControllerTakeover } = await import("../services/native-runtime/native-restart-recovery.js");
+      // Use the production schema's timestamp codecs, not raw-driver strings.
+      const owners = await db.select().from(nativeRunFinalizations).where(and(
+        eq(nativeRunFinalizations.issueId, issue), isNotNull(nativeRunFinalizations.controllerPid),
+      )).orderBy(nativeRunFinalizations.runId);
+      expect(owners.length > 0, "private capture must contain a recorded controller").toBe(true);
+      const originalHost = controllerProcess.currentProcessSpaceHash();
+      const originalBoot = controllerProcess.currentControllerBootId();
+      const nextDecisions = new Set<string>();
+      for (const owner of owners) {
+        const identity = controllers.find(c => c.runId === owner.runId);
+        // Boolean assertions cannot leak captured identities on failure.
+        expect(identity !== undefined, "loaded owner must have a captured identity").toBe(true);
+        expect(identity!.hostHash === owner.controllerHostHash, "identity must come from this owner's captured row").toBe(true);
+        expect(identity!.bootId === owner.controllerBootId, "recorded owner boot must be preserved").toBe(true);
+        expect(originalBoot !== identity!.bootId, "replay must be a new controller boot").toBe(true);
+        const now = new Date();
+        // Approved takes include terminal rows whose leases have been cleared.
+        // Require stopped-controller proof even for these rows: otherwise the
+        // normal unowned shortcut never exercises the host check at all.
+        const replay = () => evaluateNativeControllerTakeover({ owner, now,
+          requireStoppedController: true, requireRecordedProcessSpace: true });
+        const red = await withCapturedControllerIdentity(identity!, replay, "disabled");
+        expect(red.allowed).toBe(false);
+        expect(red.reason).toBe("controller_host_unprovable");
+        const green = await withCapturedControllerIdentity(identity!, replay);
+        // A replay PID may belong to another local process. Passing the host
+        // check is NOT permission to bypass that next, real PID-identity check.
+        expect(["controller_process_dead", "expired_lease_controller_process_dead", "controller_pid_recycled",
+          "controller_pid_start_inconsistent", "controller_still_alive"].includes(green.reason),
+          "recorded PID space must reach the next real PID-identity decision").toBe(true);
+        nextDecisions.add(green.reason);
+        const control = await withCapturedControllerIdentity(identity!, replay, "different");
+        expect(control.allowed).toBe(false);
+        expect(control.reason).toBe("controller_host_unprovable");
+        expect(controllerProcess.currentProcessSpaceHash() === originalHost, "host seam must be restored").toBe(true);
+        expect(controllerProcess.currentControllerBootId() === originalBoot, "current boot must not be replaced").toBe(true);
+      }
+      // A failing callback must not leave the process pretending to be the capture host.
+      await expect(withCapturedControllerIdentity(controllers.find(c => c.runId === owners[0].runId)!, async () => {
+        throw new Error("capture replay failure sentinel");
+      })).rejects.toThrow("capture replay failure sentinel");
+      expect(controllerProcess.currentProcessSpaceHash() === originalHost, "throwing replay must restore host seam").toBe(true);
+      await assertCapturedRoundTrip(db, dir);
+      console.info(`HOSTID PASS ${fixture}: red=controller_host_unprovable; green=${[...nextDecisions].sort().join(",")}; control=controller_host_unprovable; owners=${owners.length}; rows unchanged`);
     }, 60_000);
 
     it.skipIf(synthetic)("keeps user IDs exact and synthesizes only the documented harness identity fields", async () => {
