@@ -18,7 +18,8 @@ export type QueuedCommentMutationErrorCode =
   | "queued_comment_already_dispatching"
   | "queued_comment_stale_queue"
   | "queued_comment_revision_conflict"
-  | "queued_comment_order_mismatch";
+  | "queued_comment_order_mismatch"
+  | "conversation_reset_requires_own_message";
 
 /** The route maps this 1:1 onto the `conflict(...)` HTTP error it threw before this move, using `code` and `message` unchanged. */
 export class QueuedCommentMutationError extends Error {
@@ -73,6 +74,12 @@ export type EditQueuedCommentInput = {
   revision: string;
   body: string;
   now: Date;
+  /**
+   * Agent Chat: the new body is a /new reset. A reset is detected from the
+   * wake's own comment and must start its own turn, so it can never share a
+   * merged wake with other messages; such an edit is refused, not repartitioned.
+   */
+  bodyIsConversationReset?: boolean;
 };
 
 export type EditQueuedCommentResult = {
@@ -92,6 +99,12 @@ export function createEditQueuedComment(deps: { issueLock: QueuedCommentIssueLoc
         }
         if (!entry.canEdit) {
           throw new QueuedCommentMutationForbiddenError("Only the queued message author can edit it");
+        }
+        if (input.bodyIsConversationReset && locked.queue.entries.length > 1) {
+          throw new QueuedCommentMutationError(
+            "conversation_reset_requires_own_message",
+            "A /new must be sent on its own: delete this message and send /new.",
+          );
         }
 
         const updated = await tx.updateCommentBody({
