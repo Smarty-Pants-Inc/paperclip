@@ -529,6 +529,7 @@ import {
   semanticProviderPlanMarkdown,
   sha256DirectoryTree,
   stageRemoteRunnerAssets,
+  createRemoteNativeArtifactPreparation,
   stageRemoteRunnerDirectory,
   stageRemoteRunnerFile,
   steerNativeSession,
@@ -3497,9 +3498,12 @@ describe("remote provider pack manifest", () => {
         inspectionResets--;
         throw Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
       }
-      const statePath = /^test -f '([^']+)'/.exec(script)?.[1];
-      if (statePath?.endsWith("/runner-state.json")) remoteStateFiles.set(statePath, Buffer.from(JSON.stringify(suspendedState)));
-      else if (statePath?.endsWith("/codex-provider-state.json")) remoteStateFiles.set(statePath, Buffer.from(JSON.stringify(providerState)));
+      // The combined existence probe names both files; a real target already
+      // has both. Populate the virtual filesystem for every checked path.
+      for (const [, statePath] of script.matchAll(/test -f '([^']+)'/g)) {
+        if (statePath!.endsWith("/runner-state.json")) remoteStateFiles.set(statePath!, Buffer.from(JSON.stringify(suspendedState)));
+        else if (statePath!.endsWith("/codex-provider-state.json")) remoteStateFiles.set(statePath!, Buffer.from(JSON.stringify(providerState)));
+      }
       return {
       exitCode: 0, signal: null, timedOut: false, stderr: "",
       stdout: script.includes("paperclip_sizes=$(find ")
@@ -21283,6 +21287,7 @@ describe("runnerd provider runtime wiring", () => {
     const assignedGate = new Promise<void>(resolve => { releaseAssigned = resolve; });
     const deactivate = vi.fn();
     const stop = vi.fn(async () => undefined);
+    const controllerEvents: AdapterRuntimeEvent[] = [];
     const activate = vi.fn(() => deactivate);
     githubAccess.create.mockImplementationOnce(async () => {
       await githubGate;
@@ -21300,6 +21305,7 @@ describe("runnerd provider runtime wiring", () => {
     let settled = false;
     const running = executePaperclipNativeSession({
       db: leaseDb(current), execution: current, runnerInstanceId: "runner-overlap-cleanup",
+      onEvent: async event => { controllerEvents.push(event); },
       useRunnerd: true, managedGitHub: true,
       runnerEnvironment: {
         PAPERCLIP_NATIVE_MCP_NAME: "paperclip-assigned",
@@ -21326,6 +21332,8 @@ describe("runnerd provider runtime wiring", () => {
       expect(state.createBackend).not.toHaveBeenCalled();
       if (failure === "assigned") {
         expect(activate).toHaveBeenCalledWith(current.binding);
+        expect(controllerEvents.some(event => event.eventType === "run.performance.span"
+          && event.payload?.span === "native.controller.github_activate")).toBe(true);
         expect(deactivate).toHaveBeenCalledOnce();
         expect(stop).toHaveBeenCalledOnce();
       }
@@ -25731,7 +25739,7 @@ describe("runnerd provider runtime wiring", () => {
       leaseOwner: "provider-owner", bootId: "backup-boot", generation: 1 }));
   });
 
-  it.each([true, false, "stamp-race"] as const)("S restores a migrated warm backup without overwriting current lease authority (matching: %s)", async mode => {
+  it.each([true, false, "stamp-race", "changed-checkpoint"] as const)("S restores a migrated warm backup without overwriting current lease authority (matching: %s)", async mode => {
     const matching = mode !== false;
     const targetLeaseId = randomUUID();
     const remoteCwd = join(isolatedStateDirectory, "remote");
@@ -25808,6 +25816,16 @@ describe("runnerd provider runtime wiring", () => {
         expect(file.targetPath.startsWith(`${remoteCwd}/`)).toBe(true);
         await mkdir(dirname(file.targetPath), { recursive: true });
         await cp(file.sourcePath, file.targetPath, { recursive: true });
+        if (mode === "changed-checkpoint" && file.sourcePath.endsWith("/runner")) {
+          const providerPath = join(file.targetPath, "codex-provider-state.json");
+          const state = JSON.parse(await readFile(providerPath, "utf8"));
+          await writeFile(providerPath, JSON.stringify({ ...state, threadId: "foreign-checkpoint" }));
+        }
+      }
+    });
+    const syncOut = vi.fn(async (operations: Array<{ files: Array<{ sourcePath: string; targetPath: string }> }>) => {
+      for (const op of operations) for (const file of op.files) {
+        await mkdir(dirname(file.targetPath), { recursive: true }); await cp(file.sourcePath, file.targetPath);
       }
     });
     await createRunnerdBackend({ db, execution: current, runnerInstanceId, runnerIngressAuthorized: true,
@@ -25815,7 +25833,7 @@ describe("runnerd provider runtime wiring", () => {
         leaseId: "lease-created", providerKey: "daytona", reusableLeaseConfigured: true,
         effectiveCapabilities: { runnerWebSocketIngress: true },
         sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: "sandbox-created" },
-        runner: { execute: remoteExecute, syncIn },
+        runner: { execute: remoteExecute, syncIn, syncOut },
       } as never,
     });
     state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
@@ -25835,8 +25853,17 @@ describe("runnerd provider runtime wiring", () => {
       backupRoot, execution: current, runnerInstanceId, sourceProviderLeaseId: "prior-sandbox",
       providerSessionIdentity: { providerSessionId: "retained-provider-thread", providerBackendSessionId: null, providerSessionIdentity: null },
     })));
-    if (matching) {
+    if (mode === "changed-checkpoint") {
+      await expect(options.prepareExternalRunnerState()).rejects.toThrow("runner_harness_state_mismatch: provider_identity_changed");
+      expect(syncIn).toHaveBeenCalledOnce();
+      expect(syncOut).toHaveBeenCalledOnce();
+    } else if (matching) {
       await expect(options.prepareExternalRunnerState()).resolves.toBeUndefined();
+      // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21267
+      expect(syncIn).toHaveBeenCalledOnce();
+      expect(syncIn.mock.calls[0]![0][0]!.files).toHaveLength(2);
+      expect(syncOut).toHaveBeenCalledOnce();
+      expect(syncOut.mock.calls[0]![0][0]!.files).toHaveLength(2);
       const remoteSession = join(remoteCwd, ".paperclip-runtime/paperclip-runner/sessions",
         createHash("sha256").update(current.session.normalizedSessionId!).digest("hex"));
       expect(JSON.parse(await readFile(join(remoteSession, "runner/runner-state.json"), "utf8"))).toEqual(runnerState);
@@ -27204,6 +27231,55 @@ describe("runnerd provider runtime wiring", () => {
     }
   });
 
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21267
+  it.each(["exact", "source-mismatch", "copied-mismatch", "bad-contract", "wrong-mode"] as const)("cold runner artifact transaction preserves bytes and admission (%s)", async mutation => {
+    const root = join(isolatedStateDirectory, `artifact-transaction-${mutation}`);
+    const home = join(root, "home"), bin = join(home, ".local/bin");
+    await mkdir(bin, { recursive: true });
+    const source = join(bin, "paperclip-runnerd"), controller = join(root, "controller-runnerd");
+    const target = join(root, "runtime/bin/paperclip-runnerd");
+    const metadata = { schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+      packageName: "@paperclipai/paperclip-runner", binaryContractVersion: mutation === "bad-contract" ? 1 : 2,
+      durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"],
+      prpTransportModes: [mutation === "wrong-mode" ? "dial_wss" : "listen_ws"],
+      providerPacks: [{ root: "/opt/allowed-pack", immutable: true }, { root: "/foreign-pack", immutable: true }] };
+    const bytes = `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify(metadata)}'\n`;
+    await writeFile(controller, bytes, { mode: 0o700 });
+    await writeFile(source, bytes + (mutation === "source-mismatch" ? "# changed source\n" : ""), { mode: 0o700 });
+    if (mutation === "copied-mismatch") {
+      await writeFile(join(bin, "cp"), '#!/bin/sh\n/bin/cp "$@" || exit $?\nfor last do :; done\nprintf tampered >> "$last"\n', { mode: 0o700 });
+    }
+    const execute = vi.fn(async (command: { command: string; args?: string[]; stdin?: string }) => {
+      try { return { exitCode: 0, timedOut: false, signal: null, stderr: "", stdout: execFileSync(command.command, command.args ?? [], {
+        input: command.stdin, encoding: "utf8", env: { ...process.env, HOME: home, PATH: `${bin}:/usr/bin:/bin` }, maxBuffer: 1024 * 1024 }) }; }
+      catch (error) { const e = error as { status?: number; stderr?: Buffer }; return { exitCode: e.status ?? 1,
+        timedOut: false, signal: null, stdout: "", stderr: String(e.stderr ?? "") }; }
+    });
+    const syncIn = vi.fn(async (operations: Array<{ files: Array<{ sourcePath: string; targetPath: string }> }>) => {
+      for (const op of operations) for (const file of op.files) {
+        await mkdir(dirname(file.targetPath), { recursive: true }); await cp(file.sourcePath, file.targetPath);
+      }
+    });
+    const runner = { execute, syncIn };
+    const preparation = createRemoteNativeArtifactPreparation({
+      target: { kind: "remote", transport: "sandbox", remoteCwd: root, runner } as never, runner: runner as never,
+      remoteBinary: target, controllerRunnerBinary: controller, remoteRuntimeRoot: join(root, "runtime"),
+      targetPlatformArtifactVerified: true, providerPackRoots: ["/opt/allowed-pack"],
+    });
+    if (mutation === "bad-contract" || mutation === "wrong-mode") {
+      await expect(preparation.prepare("listen_ws")).rejects.toThrow(mutation === "bad-contract"
+        ? "runner_remote_artifact_contract_incompatible" : "runner_remote_transport_capability_missing:listen_ws");
+    } else {
+      await preparation.prepare("listen_ws");
+      expect(await readFile(target)).toEqual(await readFile(controller));
+      expect(preparation.providerPackInventory()).toEqual([{ root: "/opt/allowed-pack", immutable: true }]);
+      if (mutation === "exact") {
+        expect(syncIn).not.toHaveBeenCalled();
+        expect(execute).toHaveBeenCalledTimes(1);
+      } else expect(syncIn).toHaveBeenCalledOnce();
+    }
+  });
+
   it("keeps an integrity conflict permanent when a runner exit wraps it", () => {
     expect(nativeSessionFailureSourceCode(new Error(
       "native_session_recovery_failed: runnerd exited unexpectedly: native_event_replay_conflict: failover backup is behind the controller cursor",
@@ -27235,6 +27311,19 @@ describe("runnerd provider runtime wiring", () => {
       async (command: { command: string; args?: string[] }) => {
         let stdout = "";
         const script = command.args?.[1] ?? "";
+        if (script.includes("# paperclip-runner-prepare/v1")) {
+          if (image === "missing" || image.endsWith("-error") || image.endsWith("-timeout")) {
+            return { exitCode: 1, timedOut: image.endsWith("-timeout"), stdout: "", stderr: "image transaction unavailable" };
+          }
+          const metadata = { schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+            packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+            durableSessionCapabilities: image === "stale" || retained ? [] : ["unlimited_runtime", "connection_lease_renewal"],
+            prpTransportModes: ["listen_ws"] };
+          const encoded = Buffer.from(JSON.stringify(metadata)).toString("base64");
+          const digest = (bad: boolean) => createHash("sha256").update(bad ? "stale artifact" : "fixture runner artifact").digest("hex");
+          return { exitCode: 0, timedOut: false, stderr: "", stdout: ["paperclip-runner-prepare/v1", "/usr/local/bin/paperclip-runnerd",
+            digest(image === "preinstalled-mismatch"), digest(image === "preinstalled-copied-mismatch"), encoded, encoded].join("\n") + "\n" };
+        }
         if (script.includes('sha256sum "$1"')) {
           const copied = image.startsWith("preinstalled-copied-");
           const fault = !image.startsWith("preinstalled-copy-") && (!copied || command.args?.[3]?.includes("/.paperclip-runtime/"));
@@ -27333,13 +27422,10 @@ describe("runnerd provider runtime wiring", () => {
     }
     if (!needsReplacement && !exactRetained) {
       expect(remoteExecute).toHaveBeenCalledWith(expect.objectContaining({
-        command: "sh", args: ["-c", expect.stringContaining("cp --preserve=mode")],
-        bypassSession: true, timeoutMs: 10_000,
+        command: "sh", args: ["-c", expect.stringContaining("# paperclip-runner-prepare/v1")],
+        bypassSession: true, timeoutMs: 30_000,
       }));
-      expect(remoteExecute.mock.calls.filter(([call]) => call.args?.[1]?.includes('sha256sum "$1"'))
-        .map(([call]) => call.args?.[3])).toEqual([
-          "/usr/local/bin/paperclip-runnerd", "/workspace/.paperclip-runtime/paperclip-runner/bin/paperclip-runnerd",
-        ]);
+      expect(remoteExecute.mock.calls.filter(([call]) => call.args?.[1]?.includes("# paperclip-runner-prepare/v1"))).toHaveLength(1);
     }
     if (exactRetained) {
       expect(remoteExecute.mock.calls.some(([call]) => call.args?.[1]?.includes("command -v paperclip-runnerd"))).toBe(false);
@@ -27388,7 +27474,12 @@ describe("runnerd provider runtime wiring", () => {
       async (command: { command: string; args?: string[] }) => {
         let stdout = "";
         const script = command.args?.[1] ?? "";
-        if (command.args?.[0] === "--build-metadata") {
+        if (script.includes("# paperclip-runner-prepare/v1")) {
+          const encoded = Buffer.from(JSON.stringify({ schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+            packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+            durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"] })).toString("base64");
+          stdout = ["paperclip-runner-prepare/v1", "/usr/local/bin/paperclip-runnerd", "unchecked", "unchecked", encoded, encoded].join("\n") + "\n";
+        } else if (command.args?.[0] === "--build-metadata") {
           stdout = JSON.stringify({
             schema: "paperclip-runner/runnerd-build-metadata/v1",
             binaryName: "paperclip-runnerd",
