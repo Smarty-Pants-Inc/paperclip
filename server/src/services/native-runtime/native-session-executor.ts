@@ -16757,14 +16757,17 @@ const REMOTE_RUNNER_IDENTITY_CHECK_SCRIPT =
  * Move the remote Runner state ($1) into its epoch archive directory ($2) as
  * $3, then print the archived snapshot. A retry succeeds when the state is
  * already archived, and when a byte-identical live copy sits beside the
- * archive (the same rules as the controller and the computer Launcher). Any
- * other live copy, or a host without `cmp`, fails closed.
+ * archive (the same rules as the controller and the computer Launcher). A host
+ * that holds neither copy (a new box) exits 3 and changes nothing, so the
+ * caller can stage the saved state first. Any other live copy, or a host
+ * without `cmp`, fails closed.
  */
 export const REMOTE_RUNNER_AUTHORITY_ARCHIVE_SCRIPT =
   'set -eu; if test -L "$2" || { test -e "$2" && test ! -d "$2"; }; then exit 1; fi; ' +
   'if test -f "$1" && test ! -L "$1" && test ! -e "$3" && test ! -L "$3"; then umask 077; install -d -m 0700 "$2"; mv -- "$1" "$3"; ' +
   'elif test ! -e "$1" && test ! -L "$1" && test -f "$3" && test ! -L "$3"; then :; ' +
   'elif test -f "$1" && test ! -L "$1" && test -f "$3" && test ! -L "$3" && command -v cmp >/dev/null 2>&1 && cmp -s "$1" "$3"; then rm -f -- "$1"; ' +
+  'elif test ! -e "$1" && test ! -L "$1" && test ! -e "$3" && test ! -L "$3"; then exit 3; ' +
   'else exit 1; fi; base64 < "$3"';
 
 /**
@@ -20195,6 +20198,11 @@ async function createRunnerdBackendWithinSessionClaim(
             bypassSession: true,
             timeoutMs: 10_000,
           });
+          // Neither copy is on this box: the transport stages the saved state
+          // through host preparation, then archives once more.
+          if (result.exitCode === 3 && !result.timedOut) {
+            throw new Error("runner_remote_authority_archive_absent");
+          }
           if (result.exitCode !== 0 || result.timedOut) {
             throw new Error("runner_remote_authority_archive_failed");
           }

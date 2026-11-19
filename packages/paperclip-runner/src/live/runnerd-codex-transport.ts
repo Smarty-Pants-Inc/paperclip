@@ -6828,7 +6828,19 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           throw Object.assign(new NativeRunnerResumeStateUnavailableError(), { cause: error });
         }
       },
-      archive: archiveExternalRunnerState,
+      // A resumed rotation archives without that preparation. A new box (a
+      // Retry after the prior box was lost) holds neither the live nor the
+      // archived copy, so stage the saved state there once and archive again.
+      // A box that holds either copy is never prepared first.
+      archive: async input => {
+        try { return await archiveExternalRunnerState(input); }
+        catch (error) {
+          if (prepareExternalRunnerState === undefined || !(error instanceof Error)
+            || !/^runner_remote_authority_archive_absent(?:\s|:|$)/.test(error.message)) throw error;
+          await prepareExternalRunnerState();
+          return archiveExternalRunnerState(input);
+        }
+      },
     };
   }
 

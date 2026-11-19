@@ -20706,7 +20706,7 @@ describe("runnerd provider runtime wiring", () => {
     ["returns state that is already archived", null, "archived", 0, "archived"],
     ["drops a byte-identical live copy beside the archive", "same", "same", 0, "same"],
     ["keeps a different live copy beside the archive", "live", "archived", 1, null],
-    ["fails when no state exists", null, null, 1, null],
+    ["names a box that holds neither copy (a new box) and changes nothing", null, null, 3, null],
   ] as const)("remote authority archive script %s", async (_name, live, archived, exitCode, printed) => {
     const root = await mkdtemp(join(tmpdir(), "paperclip-authority-archive-script-"));
     try {

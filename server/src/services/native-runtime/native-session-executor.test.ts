@@ -22821,7 +22821,7 @@ describe("runnerd provider runtime wiring", () => {
     ["returns state that is already archived", null, "archived", 0, "archived"],
     ["drops a byte-identical live copy beside the archive", "same", "same", 0, "same"],
     ["keeps a different live copy beside the archive", "live", "archived", 1, null],
-    ["fails when no state exists", null, null, 1, null],
+    ["names a box that holds neither copy (a new box) and changes nothing", null, null, 3, null],
   ] as const)("remote authority archive script %s", async (_name, live, archived, exitCode, printed) => {
     const root = await mkdtemp(join(tmpdir(), "paperclip-authority-archive-script-"));
     try {
@@ -22871,7 +22871,7 @@ describe("runnerd provider runtime wiring", () => {
       // the local directory that stands in for the sandbox filesystem.
       if (command.args?.[1]?.includes("base64")) {
         try { return { exitCode: 0, timedOut: false, stdout: execFileSync("sh", command.args, { encoding: "utf8" }), stderr: "" }; }
-        catch { return { exitCode: 1, timedOut: false, stdout: "", stderr: "" }; }
+        catch (error) { return { exitCode: (error as { status?: number }).status ?? 1, timedOut: false, stdout: "", stderr: "" }; }
       }
       return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
     });
@@ -22938,6 +22938,10 @@ describe("runnerd provider runtime wiring", () => {
     } else {
       // Without a completed rotation, missing live state still fails closed.
       await rm(join(remoteSession, "runner/runner-state.json"));
+      // smarty-dev#21273: a box with neither copy is named, not a generic
+      // archive failure, so the transport stages the saved state first.
+      await expect(options.archiveExternalRunnerState({ archiveKey, priorIdentity })).rejects.toThrow(/^runner_remote_authority_archive_absent$/);
+      await expect(lstat(join(remoteSession, "authority-epochs"))).rejects.toMatchObject({ code: "ENOENT" });
       await expect(options.prepareExternalRunnerState()).rejects.toThrow("runner_harness_state_mismatch: resumed_unavailable");
     }
   });
