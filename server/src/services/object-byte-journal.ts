@@ -364,6 +364,11 @@ export interface ObjectByteJournalOptions {
   provider: StorageProvider;
   prefix: string;
   readPriority?: ObjectJournalIOPriority;
+  /**
+   * false: every object is fetched from object storage, never served from this
+   * process's read cache. A custody read-back proves what the store holds now.
+   */
+  readCache?: false;
 
   encode?: (bytes: Buffer) => Promise<Buffer>;
   decode?: (bytes: Buffer) => Promise<Buffer>;
@@ -587,7 +592,7 @@ export function createObjectByteJournal(options: ObjectByteJournalOptions) {
     validateReference(ref);
     signal?.throwIfAborted();
     const cacheKey = `${cacheScope}${ref.key}`;
-    const cached = cachedObject(cacheKey);
+    const cached = options.readCache === false ? undefined : cachedObject(cacheKey);
     if (cached) return cached;
     let shared = readsInFlight.get(cacheKey);
     if (!shared) {
