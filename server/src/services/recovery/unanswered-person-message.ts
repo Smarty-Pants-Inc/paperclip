@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql, failedCarrierRunSql, personMessageOwedSql } from "../person-message-answer.js";
+import { answeredPersonMessageSql, deferredWakeIsStaleSql, failedCarrierRunSql, personMessageOwedSql } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -347,6 +347,15 @@ function wakeCarriesIssue(payload: unknown, issueId: string): boolean {
   return value.issueId === issueId || nested.issueId === issueId || value.taskId === issueId;
 }
 
+/** A stale deferred receipt cannot postpone its never-carried message's true
+ * card. Queued receipts keep their existing waiting semantics. */
+function nonStaleWakeCondition(issueId: string): SQL {
+  return sql`(${agentWakeupRequests.status} not in ('deferred', 'deferred_issue_execution') or not ${deferredWakeIsStaleSql({
+    companyId: sql`${agentWakeupRequests.companyId}`, agentId: sql`${agentWakeupRequests.agentId}`,
+    issueId: sql`${issueId}::uuid`, requestedAt: sql`${agentWakeupRequests.requestedAt}`, payload: sql`${agentWakeupRequests.payload}`,
+  })})`;
+}
+
 /** One task: answer, supersede or notice its person's last message. Idempotent. */
 /** The recovery service's own native blocked-request repair check (it publishes
  * the run's unblock request itself when it applies). */
@@ -551,6 +560,7 @@ async function decideCarriedSteerNotices(q: Db, issue: DecisionIssue, now: Date)
   const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
     inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+    nonStaleWakeCondition(issue.id),
     // A wake already promoted into a run is that run's: the run's own end decides.
     isNull(agentWakeupRequests.runId)));
   const notices: CarriedSteerNotice[] = [];
@@ -947,6 +957,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     const wakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status })
       .from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+        nonStaleWakeCondition(issue.id),
         or(inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
           and(eq(agentWakeupRequests.status, "deferred"), wellFormedExecutionWaitSql(agentWakeupRequests.payload)))));
     // Admission has saved a real further attempt for THIS message, not a

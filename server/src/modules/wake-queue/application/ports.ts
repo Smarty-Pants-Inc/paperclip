@@ -120,6 +120,8 @@ export interface WakeQueueTransaction {
   findNextDeferredWake(input: { companyId: string; issueId: string; excludedWakeIds?: string[] }): Promise<DeferredWakeCandidate | null>;
   getQueuedCommentLiveness(input: {
     companyId: string;
+    /** Deferred receipt whose requested boundary and durable Stop hold are rechecked. */
+    wakeId?: string;
     issueId: string;
     wakeAgentId: string;
     finishingRunId: string;
@@ -132,6 +134,8 @@ export interface WakeQueueTransaction {
     containedSelfAuthoredComment: boolean;
     /** Live comment ids a succeeded run of the wake's agent already received in its prompt. */
     deliveredCommentIds?: string[];
+    /** A later succeeded replying turn started after this deferred receipt. */
+    conversationMovedOn?: boolean;
   }>;
   /** Cancels the wake with `status = 'deferred_issue_execution'` as an atomic compare-and-set guard. */
   cancelDeferredWake(input: {
