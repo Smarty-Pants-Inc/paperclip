@@ -56,8 +56,11 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "finished"] as const)(`warm turnstop T1-F: %s (real Runner/Pi, two prior turns)`, async scenario => {
+it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "finished", "FILESTOP", "FILESTOP-fallback"] as const)(`warm turnstop T1-F: %s (real Runner/Pi, two prior turns)`, async scenario => {
   const stopTurn = 3;
+  const filestop = scenario === "FILESTOP" || scenario === "FILESTOP-fallback";
+  const fallback = scenario === "R-fallback" || scenario === "FILESTOP-fallback";
+  const fileBytes = Buffer.from("Paul's completed write survives Stop.\nFILESTOP utf8: café 🌱\n", "utf8");
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("responses");
   expect(process.env.TMPDIR, "dedicated test tmpdir is required").toBeTruthy();
@@ -73,7 +76,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
   };
   const bundles: Bundle[] = [];
   const fact = `TOOL_RESULT_${randomUUID()}`;
-  type ModelRequest = { at: number; firstTokenWrittenAt?: number; deliveredAt?: number; turn: number; completed: number[]; input: any[]; tools: string[]; model: unknown; reply?: string };
+  type ModelRequest = { fileBeforeTools?: { at: number; path: string; exists: boolean; base64: string | null }; at: number; firstTokenWrittenAt?: number; deliveredAt?: number; turn: number; completed: number[]; input: any[]; tools: string[]; model: unknown; reply?: string };
   const requests: ModelRequest[] = [];
   const barriers: ModelRequest[] = [];
   const observations: Record<string, unknown>[] = [];
@@ -190,26 +193,40 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         const completed = completedSteps(inputItems);
         const request: ModelRequest = { at: submittedAt, turn, completed, input: inputItems, model: parsed.model,
           tools: (parsed.tools ?? []).map((tool: { name?: string }) => tool.name ?? "") };
+        if (filestop && !warmup && turn === 1 && !requests.some(row => row.turn === 1)) {
+          // This request has not received any response/tool call yet: observe
+          // the real box workspace, not the server snapshot or a successor tool.
+          const path = join(remoteWorkspace, "filestop.txt");
+          request.fileBeforeTools = { at: Date.now(), path, exists: existsSync(path),
+            base64: existsSync(path) ? readFileSync(path).toString("base64") : null };
+          await writeFile(join(root, "file-before-successor-tools.json"), JSON.stringify(request.fileBeforeTools, null, 2));
+          stage("FILESTOP bytes before successor first tool", request.fileBeforeTools);
+        }
         if (!warmup) {
           requests.push(request);
           await writeFile(join(root, `model-request-${requests.length}.json`), JSON.stringify(parsed, null, 2));
           stage("actual Pi model request", { index: requests.length, turn, completed });
         }
-        const boundary = scenario === "R-double" ? (turn === 0 ? 1 : turn === 1 ? 2 : null) : turn === 0 ? 2 : null;
+        const boundary = scenario === "R-double" ? (turn === 0 ? 1 : turn === 1 ? 2 : null) : turn === 0 ? (filestop ? 1 : 2) : null;
         if (!warmup && scenario !== "finished" && boundary !== null && completed.includes(boundary)) {
           barriers.push(request);
           stage("completed-tool boundary reached", { turn, completed });
           await new Promise<void>(done => res.on("close", done));
           return;
         }
-        const step = [1, 2, 3, 4, 5, 6].find(value => !completed.includes(value));
+        const step = (filestop ? (turn === 0 ? [1] : [2]) : [1, 2, 3, 4, 5, 6]).find(value => !completed.includes(value));
         const plainQuestion = scenario === "R-stop" && turn === 1;
         const useTool = !warmup && scenario !== "finished" && !plainQuestion && step !== undefined;
         const reply = warmup ? `WARMUP_${warmupCount}` : plainQuestion ? "T1F_PLAIN_ANSWER: six is an even number."
           : useTool ? `Perform STEP${step}` : `T1F_SIX_STEPS_DONE_${turn}`;
         request.reply = reply;
         const message = { id: `msg-${randomUUID()}`, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: reply, annotations: [] }] };
-        const input = { command: `printf 'STEP${step}\\n' >> '${stepsPath}'; printf '${fact}_STEP${step}\\n'` };
+        const command = filestop && step === 1
+          ? `printf '%s' '${fileBytes.toString("base64")}' | base64 -d > filestop.txt; printf 'STEP1\\n' >> '${stepsPath}'; printf '${fact}_STEP1\\n'`
+          : filestop && step === 2
+            ? `cat filestop.txt; printf 'STEP2\\n' >> '${stepsPath}'; printf '${fact}_STEP2\\n'`
+            : `printf 'STEP${step}\\n' >> '${stepsPath}'; printf '${fact}_STEP${step}\\n'`;
+        const input = { command };
         const call = { id: `fc-${randomUUID()}`, type: "function_call", status: "completed", call_id: `call-${randomUUID()}`, name: "bash", arguments: JSON.stringify(input) };
         const response = { id: `resp-${randomUUID()}`, object: "response", status: "completed", model: "faux", output: useTool ? [message, call] : [message],
           usage: { input_tokens: 7, output_tokens: 4, total_tokens: 11, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } } };
@@ -315,6 +332,9 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
           heartbeatRunId: input.heartbeatRunId, executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId,
           provider: "boat", providerLeaseId: prior?.providerLeaseId ?? box, leasePolicy: "reuse_by_environment",
           ...(prior ? { replacesReusableLeaseId: prior.id } : {}), metadata: { remoteCwd: remoteWorkspace, agentId: input.agentId,
+            // Match the real sandbox driver's same-allocation metadata carry
+            // (environment-runtime.ts); dropping this stamp forces host_current.
+            ...(prior?.metadata?.nativeWorkspaceSync ? { nativeWorkspaceSync: prior.metadata.nativeWorkspaceSync } : {}),
             sandboxLeaseAcquisition: { outcome: prior ? "resumed" : "created", providerLeaseId: box } } });
         stage("allocation", { leaseId: lease.id, box: lease.providerLeaseId, runId: input.heartbeatRunId, warm: !!prior });
         return lease;
@@ -349,6 +369,18 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       import("../app.js"), import("../storage/service.js"), import("../storage/local-disk-provider.js"),
       import("../vendor/paperclip-runner/index.js"), import("../realtime/runner-prp-ws.js"), import("../services/live-events.js"),
     ]);
+    if (scenario === "FILESTOP-fallback") {
+      const realExecute = runner.executeNativeSession;
+      vi.spyOn(runner, "executeNativeSession").mockImplementation(options => realExecute({
+        ...options,
+        // Force only the clean-stop retention qualification off. Interrupt,
+        // provider closure, file collection and successor admission stay real.
+        retainCancelledSession: async () => {
+          stage("FILESTOP qualification forced off; normal retirement fallback");
+          return false;
+        },
+      }));
+    }
     const realFactory = runner.createRunnerdCodexTransport;
     // Observation only: every invocation enters the unmodified production
     // transport with its actual arguments and retains its actual process owner.
@@ -493,14 +525,26 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const boundary = await waitFor(`completed tool boundary ${press}`, async () => barriers[press - 1] ?? null);
       expect(requests[0]!.tools).toContain("bash");
       expect(requests[0]!.tools).toContain("paperclip_finish");
-      const expectedSteps = scenario === "R-double" ? [1, ...press === 2 ? [2] : []] : [1, 2];
+      const expectedSteps = filestop ? [1] : scenario === "R-double" ? [1, ...press === 2 ? [2] : []] : [1, 2];
       expect(boundary.completed).toEqual(expectedSteps);
       const beforeSteps = readFileSync(stepsPath, "utf8").trim().split("\n");
       expect(beforeSteps).toEqual(expectedSteps.map(step => `STEP${step}`));
       const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, current.id));
       expect(lease).toBeDefined();
-      const interrupt = scenario !== "R-stop";
-      const message = `T1F_INPUT_${press}: ${scenario === "R-stop" ? "What kind of number is six? This is a plain question, not permission to resume the stopped work." : "Continue the six steps without repeating completed tools."}`;
+      if (filestop) {
+        const done = await waitFor("file write's tool completion event visible before Stop", async () =>
+          (await db!.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, current.id)))
+            .find(event => event.eventType === "tool.execution.completed" && JSON.stringify(event.payload).includes(`${fact}_STEP1`)) ?? null);
+        await writeFile(join(root, "write-tool-completed-before-stop.json"), JSON.stringify(done, null, 2));
+        const beforeStop = { at: Date.now(), path: join(remoteWorkspace, "filestop.txt"),
+          base64: readFileSync(join(remoteWorkspace, "filestop.txt")).toString("base64"),
+          serverSnapshotExists: existsSync(join(workspace, "filestop.txt")) };
+        await writeFile(join(root, "file-before-stop.json"), JSON.stringify(beforeStop, null, 2));
+        expect(beforeStop.base64).toBe(fileBytes.toString("base64"));
+        stage("FILESTOP write tool completed before Stop", { eventId: done.id, seq: done.seq, createdAt: done.createdAt, ...beforeStop });
+      }
+      const interrupt = scenario !== "R-stop" && !filestop;
+      const message = filestop ? `T1F_INPUT_${press}: read filestop.txt` : `T1F_INPUT_${press}: ${scenario === "R-stop" ? "What kind of number is six? This is a plain question, not permission to resume the stopped work." : "Continue the six steps without repeating completed tools."}`;
       let successorCommentId: string;
       if (interrupt) successorCommentId = (await api("POST", `/issues/${issueId}/comments`, { body: message, deliveryIntent: "queue" }, 201)).id;
       const queue = interrupt ? await api("GET", `/issues/${issueId}/queued-comments`) : null;
@@ -517,8 +561,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const { hasRetainedNativeTurnStop } = await import("../services/native-runtime/native-session-executor.js");
       const [stoppedLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease!.id));
       const qualified = hasRetainedNativeTurnStop(stopped!, stoppedLease);
-      if (scenario !== "R-fallback") expect(qualified, "spike's exact stopped live owner + lease qualified").toBe(true);
-      else expect(qualified, "undelivered interrupt never qualifies").toBe(false);
+      if (!fallback) expect(qualified, "spike's exact stopped live owner + lease qualified").toBe(true);
+      else expect(qualified, "fallback fixture must not qualify for retained turn-stop").toBe(false);
       // Stop itself must dispatch nothing. The separate Send is new authority.
       if (!interrupt) expect(requests).toHaveLength(requestCountAtPress);
       const sendAt = interrupt ? pressAt : Date.now();
@@ -535,6 +579,12 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const commentBoundToSuccessor = next.contextSnapshot?.commentId === successorCommentId!
         || next.contextSnapshot?.wakeCommentId === successorCommentId!
         || Array.isArray(next.contextSnapshot?.wakeCommentIds) && next.contextSnapshot.wakeCommentIds.includes(successorCommentId!);
+      if (filestop) {
+        const syncEvents = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, next.id)))
+          .filter(event => typeof event.payload?.span === "string" && event.payload.span.startsWith("workspace_sync."));
+        await writeFile(join(root, "successor-workspace-sync-events.json"), JSON.stringify(syncEvents, null, 2));
+        stage("FILESTOP successor workspace sync", { spans: syncEvents.map(event => event.payload?.span) });
+      }
       const observation = { press, predecessorRunId: current.id, successorRunId: next.id, qualified,
         forceFreshSession: next.contextSnapshot?.forceFreshSession === true, originalIdentity, actualIdentity,
         successorCommentId: successorCommentId!, commentBoundToSuccessor,
@@ -547,10 +597,17 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       await writeFile(join(root, "observations.json"), JSON.stringify(observations, null, 2));
       expect(commentBoundToSuccessor, "the FIRST successor is bound to the newly authorized comment").toBe(true);
       expect(first.turn, "the FIRST successor input carries the newly authorized message").toBe(press);
-      if (scenario === "R-fallback") {
-        expect(observation.forceFreshSession).toBe(true);
-        expect(live.piPid).not.toBe(pid.piPid);
-        stage("FALLBACK GREEN", observation);
+      if (fallback) {
+        if (scenario === "FILESTOP-fallback") {
+          stage("FILESTOP FALLBACK OBSERVATION ONLY", { qualified, fileBeforeTools: first.fileBeforeTools,
+            fileSurvived: first.fileBeforeTools?.base64 === fileBytes.toString("base64"),
+            firstInputRetainsWrite: first.completed.includes(1), originalIdentity, actualIdentity });
+        }
+        if (scenario === "R-fallback") {
+          expect(observation.forceFreshSession).toBe(true);
+          expect(live.piPid).not.toBe(pid.piPid);
+          stage("FALLBACK GREEN", observation);
+        }
       } else {
         expect(first.completed, "FIRST successor model input retains completed tool RESULTS").toEqual(expectedSteps);
         for (const step of expectedSteps) {
@@ -562,6 +619,10 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         expect(actualIdentity).toEqual(originalIdentity);
         expect(nextLease?.providerLeaseId, "the same physical allocation, not merely a new durable lease").toBe(lease!.providerLeaseId);
         expect(stopCalls).toEqual([]);
+        if (filestop) {
+          expect(first.fileBeforeTools?.exists, "file exists on the box BEFORE successor's first tool").toBe(true);
+          expect(first.fileBeforeTools?.base64, "completed write survives Stop byte-for-byte before any successor tool").toBe(fileBytes.toString("base64"));
+        }
       }
       current = next;
     }
@@ -572,8 +633,17 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     const [final] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, current.id));
     expect(final?.status).toBe("succeeded");
     const actualSteps = readFileSync(stepsPath, "utf8").trim().split("\n");
-    if (scenario !== "R-fallback") expect(actualSteps, "finished steps are never rerun; Stop does not resume work")
-      .toEqual((scenario === "R-stop" ? [1, 2] : [1, 2, 3, 4, 5, 6]).map(step => `STEP${step}`));
+    if (!fallback) expect(actualSteps, "finished steps are never rerun; Stop does not resume work")
+      .toEqual((scenario === "R-stop" || filestop ? [1, 2] : [1, 2, 3, 4, 5, 6]).map(step => `STEP${step}`));
+    if (filestop) {
+      const readResult = requests.find(row => row.turn === 1 && row.completed.includes(2));
+      const readOutput = readResult?.input.find(item => item.type === "function_call_output" && JSON.stringify(item.output).includes(`${fact}_STEP2`));
+      if (!fallback) expect(readOutput?.output, "authorized successor really read the completed file").toContain(fileBytes.toString("utf8"));
+      await writeFile(join(root, "filestop-result.json"), JSON.stringify({ scenario, qualified: observations[0]?.qualified,
+        expectedBase64: fileBytes.toString("base64"), fileBeforeTools: requests.find(row => row.fileBeforeTools)?.fileBeforeTools,
+        fileSurvived: requests.find(row => row.fileBeforeTools)?.fileBeforeTools?.base64 === fileBytes.toString("base64"),
+        readOutput, observations }, null, 2));
+    }
     for (const observation of observations) {
       const request = requests.find(value => value.at === observation.requestAt)!;
       expect(request.firstTokenWrittenAt, "actual successor first-token socket write observed").toBeDefined();
