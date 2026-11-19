@@ -118,6 +118,8 @@ export type PromoteDeferredWakeInput = {
 export interface WakeQueueTransaction {
   findInvokableAgent(input: { companyId: string; agentId: string }): Promise<InvokableAgentSnapshot | null>;
   findNextDeferredWake(input: { companyId: string; issueId: string; excludedWakeIds?: string[] }): Promise<DeferredWakeCandidate | null>;
+  /** Stop means stop: this saved wake carries only messages a person's Stop holds (readPersonStopHold). */
+  isHeldByPersonStop(input: { companyId: string; issueId: string; agentId: string; wakeId: string }): Promise<boolean>;
   getQueuedCommentLiveness(input: {
     companyId: string;
     issueId: string;
