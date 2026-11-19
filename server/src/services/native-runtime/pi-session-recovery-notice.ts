@@ -242,6 +242,9 @@ export async function materializePiSessionRecoveryNotice(input: {
 /** J3-22 member (a): the person-visible line of a refused restore continued in a fresh thread. A
  * continuation, never a failure: the run goes on and answers. */
 export function restoreUnavailableContinuationNoticeBody(reason: string): string {
+  if (reason === "stop_acknowledgement_timeout") {
+    return "The agent didn't confirm the stop in time; your message is starting in a fresh session. Earlier action outcomes remain recorded, not replayed.";
+  }
   // Path-neutral and true on both opens: only a fresh OPEN sends the saved-
   // history handoff (NSR session === null); a fresh thread taken while
   // recovering the saved session gets this run's message only (the real-runner

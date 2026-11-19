@@ -11000,6 +11000,7 @@ async function performNativeCancellation(
   let auditId: string | null = null;
   let cancellationIntentId: string | null = null;
   let recoveringCancellationIntent = false;
+  let cleanupTimedOut = false;
   let priorCoordinatorDecisionIdAtIntent: string | null = null;
   if (options && decision && decisionContext) {
     const cancellationDecision = decision;
@@ -11288,6 +11289,14 @@ async function performNativeCancellation(
                 new Error("native session cancellation cleanup timed out"),
               );
               void cleanup.catch(() => undefined);
+              cleanupTimedOut = true;
+              active.cancellationCleanupTimedOut = true;
+              // Revoke the event iterator too: an undelivered interrupt has no
+              // terminal frame to wake executeNativeSession. Its existing
+              // finally owns the same idempotent close and all stop/checkpoint
+              // fences. Merely aborting the passive RPC leaves that owner (and
+              // every authorized successor) waiting forever.
+              void active.session.close({ reason: "native stop acknowledgement deadline expired" }).catch(() => undefined);
             }
           } else if (active.session.interrupt) {
             await active.session.interrupt({ reason });
@@ -11451,6 +11460,7 @@ async function performNativeCancellation(
                 acknowledgementAuditId,
                 acknowledgedAt: new Date().toISOString(),
                 ...(beforeProviderTurn ? { beforeProviderTurn: true } : {}),
+                ...(cleanupTimedOut ? { cleanupTimedOut: true } : {}),
               },
             },
             updatedAt: new Date(),
@@ -12820,6 +12830,10 @@ async function executePaperclipNativeSessionAttempt(
   const observeDeliverableText = createNativeDeliverableTextObservation();
   let providerUsageLimitObserved = false;
   let cancelledSessionRetained = false;
+  // The runtime deregisters a failed handle in onSession(null) before its
+  // error reaches this executor. Keep this invocation's exact cancellation
+  // owner so retirement cannot lose its Stop outcome in that interval.
+  let lastActiveSession: ActiveNativeSession | undefined;
   let retainedCancelledCheckpoint: PersistedNativeSession | undefined;
   let piCancellationUnsafe = false;
   const providerFailureObservation = createNativeProviderFailureObservation(input.execution.provider);
@@ -13848,6 +13862,18 @@ async function executePaperclipNativeSessionAttempt(
               issueId: input.execution.binding.issueId,
             })),
             onSessionAdmission: async () => {
+              if (!existingWarmSession && input.execution.provider.kind === "pi_rpc") {
+                const context = record(input.runContextSnapshot);
+                const previousRunId = context.previousRunId;
+                const [previous] = context.forceFreshSession === true && typeof previousRunId === "string"
+                  ? await input.db.select({ result: heartbeatRuns.resultJson }).from(heartbeatRuns)
+                  .where(and(eq(heartbeatRuns.id, previousRunId), eq(heartbeatRuns.companyId, input.execution.binding.companyId),
+                    eq(heartbeatRuns.nativeIssueId, input.execution.binding.issueId), eq(heartbeatRuns.agentId, input.execution.binding.agentId))).limit(1) : [];
+                if (record(record(previous?.result).nativeCancellation).cleanupTimedOut === true) {
+                  await writeRestoreUnavailableContinuationNotice(input.db, { ...input.execution.binding,
+                    code: "native_stop_acknowledgement_timeout", reason: "stop_acknowledgement_timeout" });
+                }
+              }
               if (existingWarmSession) runnerdBackend?.bindDiagnosticSession?.(existingWarmSession);
               // Invalidate prior stop evidence before a backend can spawn.
               await controllerSteps.measure("process_start_intent", () => appendHeartbeatRunEvent(input.db, {
@@ -14213,6 +14239,7 @@ async function executePaperclipNativeSessionAttempt(
                 const active: ActiveNativeSession = { session, cancelRequested: false, admissionAbort: new AbortController(),
                   cancellationCleanupGraceMs: input.execution.provider.kind === "pi_rpc"
                     ? PI_NATIVE_SESSION_CANCELLATION_CLEANUP_GRACE_MS : NATIVE_SESSION_CANCELLATION_CLEANUP_GRACE_MS };
+                lastActiveSession = active;
                 activeNativeSessions.set(input.execution.binding.runId, active);
                 const startup = nativeSessionStartups.get(input.execution.binding.runId);
                 const stopBeforeProviderTurn = startup?.stopRequested === true && startup.sessionPublished !== true
@@ -14482,7 +14509,7 @@ async function executePaperclipNativeSessionAttempt(
       }
       trace.activate(taskSettleScope);
       liveQuestions.close();
-      const activeAtFailure = activeNativeSessions.get(input.execution.binding.runId);
+      const activeAtFailure = activeNativeSessions.get(input.execution.binding.runId) ?? lastActiveSession;
       activeNativeSessions.delete(input.execution.binding.runId);
       clearSteeringDeliveries(input.execution.binding.runId);
       clearNativeRuntimeRequestResolutions(input.execution.binding.runId);
@@ -14495,7 +14522,8 @@ async function executePaperclipNativeSessionAttempt(
       // another turn to perform completion bookkeeping.
       const stoppedBeforeFirstTurn = error instanceof Error && error.message === "native_session_cancelled";
       if (!startupUnsettled && protocolIntegrityFailure === null && error instanceof Error &&
-          (stoppedBeforeFirstTurn || error instanceof NativePermissionDeclinedError || error instanceof NativeCancellationPendingRecoveryError || error.message === "native_finalization_missing: session returned no semantic result")) {
+          (stoppedBeforeFirstTurn || activeAtFailure?.cancellationCleanupTimedOut === true
+            || error instanceof NativePermissionDeclinedError || error instanceof NativeCancellationPendingRecoveryError || error.message === "native_finalization_missing: session returned no semantic result")) {
         const [stoppedRun] = await input.db.select().from(heartbeatRuns).where(and(
           eq(heartbeatRuns.id, input.execution.binding.runId),
           eq(heartbeatRuns.companyId, input.execution.binding.companyId),
