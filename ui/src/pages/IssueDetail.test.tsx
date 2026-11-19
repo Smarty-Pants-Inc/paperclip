@@ -7192,7 +7192,15 @@ describe("IssueDetail", () => {
     width: number,
     flow: "steer" | "queue",
     // steer-ui3: the POST answer DELAYED (gate 4's hand take: POST 2.67 s), or refused.
-    answer: { delayMs?: number; failStatus?: 500 | 409; says?: "bare" | "queued"; echoClientRequestId?: boolean } = {},
+    answer: {
+      delayMs?: number; failStatus?: 500 | 409; says?: "bare" | "queued"; echoClientRequestId?: boolean;
+      // dupbubble2: only the first N POSTs fail (a Retry then succeeds).
+      failTimes?: number;
+      // dupbubble2: an older server, no clientRequestId on any copy; and its copy's task.
+      noClientRequestId?: boolean; serverIssueId?: string;
+      // dupbubble2: an agent conversation whose ensureIssue resolves to a DIFFERENT task than the page's.
+      conversationResolvesTo?: string;
+    } = {},
   ) {
     const { TaskChatThread } = await vi.importActual<
       typeof import("../components/TaskChatThread")
@@ -7221,7 +7229,7 @@ describe("IssueDetail", () => {
       if (method === "POST" && /\/api\/issues\/[^/]+\/comments$/.test(url)) {
         posts.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
         if (answer.delayMs) await new Promise((resolve) => setTimeout(resolve, answer.delayMs));
-        if (answer.failStatus) {
+        if (answer.failStatus && posts.length <= (answer.failTimes ?? Number.POSITIVE_INFINITY)) {
           return new Response(JSON.stringify({ error: answer.failStatus === 409 ? "Conflict: the task changed" : "Internal server error" }), {
             status: answer.failStatus, headers: { "content-type": "application/json" },
           });
@@ -7231,7 +7239,9 @@ describe("IssueDetail", () => {
           : [...QUEUE_SF_THREAD_GET];
         state.queue = flow === "steer" || answer.says === "bare" ? emptyQueue : QUEUE_SF_QUEUED_COMMENTS_GET;
         // dupbubble: the server stores and answers the POST's own clientRequestId.
-        const answered = answer.echoClientRequestId ? { ...post, clientRequestId: posts.at(-1)!.clientRequestId } : post;
+        const answered = answer.noClientRequestId
+          ? { ...post, clientRequestId: null, ...(answer.serverIssueId ? { issueId: answer.serverIssueId } : {}) }
+          : answer.echoClientRequestId ? { ...post, clientRequestId: posts.at(-1)!.clientRequestId } : post;
         return new Response(JSON.stringify(answered), { status: 201, headers: { "content-type": "application/json" } });
       }
       fetched.push(`${method} ${url}`);
@@ -7255,7 +7265,19 @@ describe("IssueDetail", () => {
     mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([activeRun]);
     mockAuthApi.getSession.mockResolvedValue({ session: { userId: "chat-owner" }, user: { id: "chat-owner" } });
 
-    await act(async () => { renderIssueView(); });
+    if (answer.conversationResolvesTo) {
+      // A conversation reads its thread through the recent-comments window.
+      mockIssuesApi.recentComments.mockImplementation(async () => ({
+        comments: state.thread, latestCommentId: null, oldestCommentId: null, hasMore: false,
+      }));
+      const pageIssue = createIssue({ status: "in_progress", assigneeAgentId: "agent-1", executionRunId: runId });
+      const resolved = createIssue({ id: answer.conversationResolvesTo, identifier: "PAP-9", status: "in_progress", assigneeAgentId: "agent-1", executionRunId: runId });
+      await act(async () => {
+        renderIssueView(<TaskDetailSurface conversation={{ agent: createAgent({ adapterType: "paperclip_runner" }), issue: pageIssue, ensureIssue: async () => resolved }} />);
+      });
+    } else {
+      await act(async () => { renderIssueView(); });
+    }
     await flushReact();
     await flushReact();
     await waitForAssertion(() => expect(container.querySelector('[data-testid="stand-in-editor"]')).not.toBeNull());
@@ -7744,10 +7766,10 @@ describe("IssueDetail", () => {
     }
     return samples;
   }
-  async function refetchThread(state: { thread: unknown[] }, thread: unknown[]) {
+  async function refetchThread(state: { thread: unknown[] }, thread: unknown[], ref = "PAP-1") {
     state.thread = thread;
     await act(async () => {
-      await queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments("PAP-1") });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(ref) });
     });
   }
   const withRequestId = (comment: object, clientRequestId: unknown) => ({ ...comment, clientRequestId });
@@ -7846,6 +7868,158 @@ describe("IssueDetail", () => {
     20_000,
   );
 
+  // dupbubble2 (RFL UI-DELTAS-A-1119 §(1) D1-D3 on f47cdf0c): one bubble per send in EVERY
+  // case. D1: an older server's copy with NO clientRequestId, on the task the POST went
+  // to (not the page's) or 120 s off the client's clock. D2: a definite refusal keeps
+  // its bubble ('Not sent' + Retry + Edit). D3: two sends with the same words whose IDs
+  // differ are two bubbles, never merged.
+  const editorValue = () => container.querySelector<HTMLTextAreaElement>('[data-testid="stand-in-editor"]')?.value ?? "";
+  async function pressEnter() {
+    const editor = container.querySelector<HTMLTextAreaElement>('[data-testid="stand-in-editor"]')!;
+    const started = performance.now();
+    await act(async () => {
+      editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    });
+    return started;
+  }
+  const notSent = () => Array.from(container.querySelectorAll<HTMLElement>('[data-send-state="failed"]'));
+  function clickInFailed(label: "Retry" | "Edit") {
+    const button = Array.from(notSent()[0]!.querySelectorAll("button")).find((node) => node.textContent?.trim() === label)!;
+    return act(async () => { button.click(); });
+  }
+
+  it.each([390, 1440])(
+    "dupbubble2 D1: an older server's copy WITHOUT clientRequestId, 120 s ahead of the client's clock, arrives by GET before the POST answers: exactly one bubble at every 100 ms sample at %i",
+    async (width) => {
+      const { post, state, bubbles, finalThread } = await renderSteeringPlacement(width, "steer", { delayMs: 1000, noClientRequestId: true, serverIssueId: "issue-1" });
+      const started = await pressEnter();
+      expect(await waitUntil(() => bubbles().length === 1, 300)).toBe(true);
+      const node = bubbles()[0]!;
+      const early = await sampleBubbleCounts(bubbles, 300, started);
+      const skewed = new Date(Date.now() + 120_000).toISOString();
+      const serverCopy = { ...post, issueId: "issue-1", clientRequestId: null, createdAt: skewed, updatedAt: skewed };
+      await refetchThread(state, finalThread.filter((comment) => comment.id !== post.id).concat([serverCopy as never]));
+      const during = await sampleBubbleCounts(bubbles, 1800, started);
+      const samples = [...early, ...during];
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/dupbubble2-d1-skew-${width}.json`, JSON.stringify(samples));
+      }
+      expect(samples.filter((sample) => sample.count !== 1), JSON.stringify(samples)).toEqual([]);
+      expect(bubbles()[0]).toBe(node);
+    },
+    20_000,
+  );
+
+  it.each([390, 1440])(
+    "dupbubble2 D1: an older server's copy WITHOUT clientRequestId on the conversation's RESOLVED task (not the page's) arrives by GET before the POST answers: exactly one bubble at every 100 ms sample at %i",
+    async (width) => {
+      const resolvedId = STEER_A2_POST_RESPONSE.issueId;
+      const { post, posts, state, bubbles, finalThread } = await renderSteeringPlacement(width, "steer", {
+        delayMs: 1000, noClientRequestId: true, conversationResolvesTo: resolvedId,
+      });
+      const started = await pressEnter();
+      expect(await waitUntil(() => bubbles().length === 1, 300)).toBe(true);
+      const node = bubbles()[0]!;
+      const early = await sampleBubbleCounts(bubbles, 300, started);
+      // The POST went to the resolved task; its copy says so, and nothing else differs.
+      expect(posts).toHaveLength(1);
+      const now = new Date().toISOString();
+      const serverCopy = { ...post, issueId: resolvedId, clientRequestId: null, createdAt: now, updatedAt: now };
+      await refetchThread(state, finalThread.filter((comment) => comment.id !== post.id).concat([serverCopy as never]), "issue-1");
+      const during = await sampleBubbleCounts(bubbles, 1800, started);
+      // The page's thread really read the server's copy (the conversation's recent window).
+      expect(mockIssuesApi.recentComments.mock.calls.filter(([ref]) => ref === "issue-1").length).toBeGreaterThanOrEqual(2);
+      const samples = [...early, ...during];
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/dupbubble2-d1-resolved-${width}.json`, JSON.stringify(samples));
+      }
+      expect(samples.filter((sample) => sample.count !== 1), JSON.stringify(samples)).toEqual([]);
+      expect(bubbles()[0]).toBe(node);
+    },
+    20_000,
+  );
+
+  it.each([390, 1440])(
+    "dupbubble2 D3: another tab's send B (same words, its own clientRequestId) lands while this send A is pending: TWO bubbles, A still 'Sending…', never merged at %i",
+    async (width) => {
+      const { post, posts, state, bubbles, finalThread } = await renderSteeringPlacement(width, "steer", { delayMs: 1000, echoClientRequestId: true });
+      const started = await pressEnter();
+      expect(await waitUntil(() => bubbles().length === 1, 300)).toBe(true);
+      const pendingA = bubbles()[0]!;
+      await sampleBubbleCounts(bubbles, 300, started);
+      const now = new Date().toISOString();
+      const sendB = { ...post, id: "other-tab-send-b", issueId: "issue-1", clientRequestId: "other-tab-request-b", createdAt: now, updatedAt: now };
+      expect(sendB.clientRequestId).not.toBe(posts[0]!.clientRequestId);
+      await refetchThread(state, [...finalThread.filter((comment) => comment.id !== post.id), sendB as never]);
+      const beforeAnswer = await sampleBubbleCounts(bubbles, 900, started);
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/dupbubble2-d3-${width}.json`, JSON.stringify(beforeAnswer));
+      }
+      expect(beforeAnswer.filter((sample) => sample.count !== 2), JSON.stringify(beforeAnswer)).toEqual([]);
+      // A is its own bubble, still pending; B is the other one.
+      expect(pendingA.isConnected).toBe(true);
+      expect(pendingA.dataset.delivery).toBe("pending");
+      // A's answer: still two (A and B).
+      expect(await waitUntil(() => bubbles().some((node) => node.dataset.delivery === "sent"), 3000)).toBe(true);
+      await sampleBubbleCounts(bubbles, 1500, started);
+      expect(bubbles()).toHaveLength(2);
+    },
+    20_000,
+  );
+
+  it.each([390, 1440])(
+    "dupbubble2 D2: a 409 (nothing saved) keeps ONE bubble 'Not sent: <reason>' with Retry + Edit and the composer empty; Retry resends the same clientRequestId and the one bubble ends sent at %i",
+    async (width) => {
+      const { post, posts, bubbles } = await renderSteeringPlacement(width, "steer", { delayMs: 300, failStatus: 409, failTimes: 1, echoClientRequestId: true });
+      mockPushToast.mockClear();
+      const started = await pressEnter();
+      expect(await waitUntil(() => notSent().length === 1, 3000)).toBe(true);
+      const samples = await sampleBubbleCounts(bubbles, 1200, started);
+      expect(samples.filter((sample) => sample.count !== 1), JSON.stringify(samples)).toEqual([]);
+      const failed = notSent()[0]!;
+      expect(bubbles()).toHaveLength(1);
+      expect(bubbles()[0]).toBe(failed);
+      expect(failed.textContent).toContain("Not sent: Conflict: the task changed");
+      expect(failed.textContent).not.toMatch(/Sending…|\bSent\b|Delivered/);
+      expect(Array.from(failed.querySelectorAll("button")).map((node) => node.textContent?.trim())).toEqual(["Retry", "Edit"]);
+      // The words live in ONE place: the bubble, not also the composer.
+      expect(editorValue()).toBe("");
+      // The bubble says why; no second error toast.
+      expect(mockPushToast.mock.calls.some(([toast]) => (toast as { tone?: string }).tone === "error")).toBe(false);
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/dupbubble2-d2-not-sent-${width}.txt`, `editor: ${JSON.stringify(editorValue())}\n${failed.outerHTML}\n`);
+      }
+      const retryStarted = performance.now();
+      await clickInFailed("Retry");
+      expect(await waitUntil(() => bubbles()[0]?.dataset.delivery === "sent", 3000)).toBe(true);
+      const after = await sampleBubbleCounts(bubbles, 600, retryStarted);
+      expect(after.filter((sample) => sample.count !== 1), JSON.stringify(after)).toEqual([]);
+      expect(posts).toHaveLength(2);
+      expect(posts[1]!.clientRequestId).toBe(posts[0]!.clientRequestId);
+      expect(posts[1]!.body).toBe(post.body);
+      expect(notSent()).toHaveLength(0);
+      expect(editorValue()).toBe("");
+    },
+    20_000,
+  );
+
+  it.each([390, 1440])(
+    "dupbubble2 D2: Edit on the 'Not sent' bubble moves its words to the composer and removes the bubble (one place) at %i",
+    async (width) => {
+      const { post, posts, bubbles } = await renderSteeringPlacement(width, "steer", { delayMs: 300, failStatus: 409 });
+      await pressEnter();
+      expect(await waitUntil(() => notSent().length === 1, 3000)).toBe(true);
+      expect(editorValue()).toBe("");
+      await clickInFailed("Edit");
+      expect(await waitUntil(() => editorValue() === post.body, 3000)).toBe(true);
+      await sampleBubbleCounts(bubbles, 300, performance.now());
+      expect(bubbles()).toHaveLength(0);
+      expect(notSent()).toHaveLength(0);
+      expect(posts).toHaveLength(1);
+    },
+    20_000,
+  );
+
   it.each([390, 1440])(
     "steer-ui3: the delayed QUEUED answer moves the pending bubble out of the thread and into the waiting list at %i",
     async (width) => {
@@ -7864,8 +8038,13 @@ describe("IssueDetail", () => {
     20_000,
   );
 
+  // supersedes(steer-ui3 409 rows): SUPERSEDE-DUPBUBBLE2-REFUSED-SEND-KEEPS-ITS-BUBBLE-1119.
+  // A DEFINITE refusal (409, nothing saved) keeps ONE bubble 'Not sent: <reason>' with
+  // Retry + Edit, and the composer stays empty (dupbubble2 rows below). The 500 rows
+  // stay: the uncertain path (composer keeps the text, 'Sending when reconnected…'
+  // notice, the thread claims nothing) is unchanged.
   it.each([
-    [500, 390], [500, 1440], [409, 390], [409, 1440],
+    [500, 390], [500, 1440],
   ] as const)(
     "steer-ui3: the delayed %i answer turns the pending bubble into the composer's error line with the text kept, never a silent vanish at %i",
     async (status, width) => {

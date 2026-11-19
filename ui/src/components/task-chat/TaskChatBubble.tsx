@@ -1,6 +1,7 @@
 import { CoordinatorRelativeTime } from "@/components/coordinator/CoordinatorRelativeTime";
 import { useAgentChatRead } from "@/hooks/useAgentChatRead";
 import { Link } from "@/lib/router";
+import { useTaskChatFailedSend } from "./failed-send-context";
 import { useCoordinatorPresentation } from "@/components/coordinator/CoordinatorPresentation";
 import { TextAttachmentContext } from "@/context/TextAttachmentContext";
 import { useArtifactsV1Enabled } from "@/hooks/useArtifactsV1Enabled";
@@ -163,6 +164,7 @@ function TaskChatBubbleContent({
   onTryAgainNoLiveExecutionPath,
   tryAgainNoLiveExecutionPathPending,
 }: TaskChatBubbleProps) {
+  const failedSend = useTaskChatFailedSend();
   const readRef = useAgentChatRead(item.id, item.createdAtIso, item.author === "agent" && item.origin !== "fast_response" && !item.optimistic);
   const streamlined = useStreamlinedTaskChatPresentation();
   const coordinator = useCoordinatorPresentation();
@@ -249,6 +251,7 @@ function TaskChatBubbleContent({
       data-testid={item.steeredIntoRunId || item.steeredDelivery ? "task-chat-steered-message" : undefined}
       data-steered-into-run-id={item.steeredIntoRunId ?? undefined}
       data-delivery={item.steeredDelivery ?? (item.steeredIntoRunId ? "sent" : undefined)}
+      data-send-state={item.optimistic === "failed" ? "failed" : undefined}
       ref={readRef}
       className={cn(
         "flex w-full flex-col gap-1",
@@ -419,7 +422,27 @@ function TaskChatBubbleContent({
         </div>
       ) : null}
       {coordinator && recordedTimestamp && attachedTurn ? <span className="px-1 text-(length:--text-micro) text-muted-foreground"><CoordinatorRelativeTime value={recordedTimestamp!} /></span> : null}
-      {item.optimistic ? (
+      {item.optimistic === "failed" ? (
+        // Refused for certain, nothing saved: the bubble stays with why, and
+        // Retry (the same request ID) or Edit (the words go to the composer).
+        <span
+          role="alert"
+          data-testid="task-chat-send-failed"
+          className="flex flex-wrap items-center justify-end gap-x-2 gap-y-1 px-1 text-(length:--text-micro) text-destructive"
+        >
+          <span>{item.failureReason ? `Not sent: ${item.failureReason}` : "Not sent"}</span>
+          {failedSend ? (
+            <>
+              <button type="button" className="font-medium underline underline-offset-2" onClick={() => failedSend.retry(item.renderKey ?? item.id)}>
+                Retry
+              </button>
+              <button type="button" className="font-medium underline underline-offset-2" onClick={() => failedSend.edit(item.renderKey ?? item.id)}>
+                Edit
+              </button>
+            </>
+          ) : null}
+        </span>
+      ) : item.optimistic ? (
         <span className="flex items-center gap-1 px-1 text-(length:--text-micro) text-muted-foreground">
           <span>{item.optimistic === "queued" ? "Queued" : "Sending…"}</span>
           {item.optimistic === "queued" ? queuedAction : null}

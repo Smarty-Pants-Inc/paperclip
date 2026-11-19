@@ -33,7 +33,9 @@ export interface IssueChatComment extends IssueComment {
   runAgentId?: string | null;
   interruptedRunId?: string | null;
   clientId?: string;
-  clientStatus?: "pending" | "queued";
+  clientStatus?: "pending" | "queued" | "failed";
+  /** clientStatus 'failed': the plain reason the server refused it. */
+  failureReason?: string | null;
   queueState?: "queued";
   queueTargetRunId?: string | null;
   queueReason?: "hold" | "active_run" | "other";

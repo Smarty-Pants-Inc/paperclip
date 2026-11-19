@@ -77,7 +77,8 @@ import {
 import { ApiError } from "../api/client";
 import { issuesApi } from "../api/issues";
 import { isPendingDelivery, pendingDeliveryFields, readCommentDelivery, readSteeredIntoRunId, type CommentDeliveryIntent } from "../api/comment-delivery";
-import { classifySendFailure } from "../lib/pending-send";
+import { classifySendFailure, SendKeptInThreadError } from "../lib/pending-send";
+import { TaskChatFailedSendContext, type TaskChatFailedSendActions } from "../components/task-chat/failed-send-context";
 import { useUpdateIssueMutation } from "../hooks/useUpdateIssueMutation";
 import { describeInteractionResolutionFailure, interactionResolutionErrorMessage } from "../lib/interaction-resolution-error";
 import { approvalsApi } from "../api/approvals";
@@ -3420,6 +3421,41 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const [optimisticComments, setOptimisticComments] = useState<
     OptimisticIssueComment[]
   >([]);
+  // A send the server definitely refused keeps ONE bubble ('Not sent' +
+  // Retry + Edit). Its request, by the bubble's clientId, for Retry.
+  const failedSendRequestsRef = useRef(new Map<string, { kind: "comment" | "reassign"; variables: Record<string, unknown> }>());
+  // Requests whose refusal the thread kept: the composer must not restore them too.
+  const sendsKeptInThreadRef = useRef(new Set<string>());
+  // Retries from a 'Not sent' bubble: no composer holds their words.
+  const bubbleRetryRequestIdsRef = useRef(new Set<string>());
+  const [failedSendRestoreText, setFailedSendRestoreText] = useState<{ key: string; body: string } | null>(null);
+  const keepFailedSend = useCallback((
+    clientId: string,
+    err: unknown,
+    kind: "comment" | "reassign",
+    variables: Record<string, unknown>,
+  ) => {
+    const reason = describeError(err, { action: "post the comment" }).body;
+    setOptimisticComments((current) => current.map((entry) => {
+      if (entry.clientId !== clientId) return entry;
+      const { clientDelivery: _clientDelivery, ...rest } = entry as OptimisticIssueComment & { clientDelivery?: unknown };
+      return { ...rest, clientStatus: "failed" as const, failureReason: reason };
+    }));
+    failedSendRequestsRef.current.set(clientId, { kind, variables });
+    const requestId = typeof variables.clientRequestId === "string" ? variables.clientRequestId : null;
+    if (requestId) sendsKeptInThreadRef.current.add(requestId);
+  }, []);
+  // The POST's resolved task, on the pending copy: a server echo without a
+  // clientRequestId is matched against it, not against the page's task.
+  const recordSendTarget = useCallback((clientRequestId: string | undefined, writableIssueId: string, page: Issue | null | undefined) => {
+    if (!clientRequestId) return;
+    const lower = writableIssueId.toLowerCase();
+    const target = page && (page.id.toLowerCase() === lower || page.identifier?.toLowerCase() === lower)
+      ? page.id : writableIssueId;
+    setOptimisticComments((current) => current.map((entry) =>
+      entry.clientRequestId === clientRequestId && entry.clientStatus !== "failed" && entry.targetIssueId !== target
+        ? { ...entry, targetIssueId: target } : entry));
+  }, []);
   const [locallyQueuedCommentRunIds, setLocallyQueuedCommentRunIds] = useState<
     Map<string, string>
   >(() => new Map());
@@ -5205,6 +5241,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       if (issue?.conversationAgentId) clearLegacyChatMessageRequests(`${issue.companyId}:${currentUserId}:${issue.conversationAgentId}`);
       const writableIssueId = await resolveWritableIssueId();
       assertCurrentAccount();
+      recordSendTarget(clientRequestId, writableIssueId, issue);
       // Conversation messages use the ordered, idempotent comments endpoint.
       // Save the conversation's run preferences before admitting the next message.
       if (runSettings && issue?.conversationAgentId) {
@@ -5392,8 +5429,16 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         );
       }
     },
-    onError: (err, _variables, context) => {
-      if (context?.optimisticCommentId) {
+    onError: (err, variables, context) => {
+      const failure = classifySendFailure(err);
+      const bubbleRetry = !!variables.clientRequestId && bubbleRetryRequestIdsRef.current.has(variables.clientRequestId);
+      if (context?.optimisticCommentId && (failure === "rejected" || bubbleRetry)) {
+        // Refused for certain (nothing saved), or a bubble Retry whose words
+        // no composer holds: the bubble stays, 'Not sent', with Retry and
+        // Edit. onFinished must not drop it.
+        keepFailedSend(context.optimisticCommentId, err, "comment", variables as Record<string, unknown>);
+        context.optimisticCommentId = null;
+      } else if (context?.optimisticCommentId) {
         setOptimisticComments((current) =>
           current.filter(
             (entry) => entry.clientId !== context.optimisticCommentId,
@@ -5408,7 +5453,9 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       }
       // A comment that is not known to be saved stays in the composer and
       // resends with the same request ID; its notice replaces this toast.
-      if (classifySendFailure(err) === "pending") return;
+      if (failure === "pending") return;
+      // A kept bubble says why itself.
+      if (variables.clientRequestId && sendsKeptInThreadRef.current.has(variables.clientRequestId)) return;
       const { title, body } = describeError(err, { action: "post the comment" });
       pushToast({ title, body, tone: "error" });
     },
@@ -5821,8 +5868,13 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         );
       }
     },
-    onError: (err, _variables, context) => {
-      if (context?.optimisticCommentId) {
+    onError: (err, variables, context) => {
+      const failure = classifySendFailure(err);
+      const bubbleRetry = !!variables.clientRequestId && bubbleRetryRequestIdsRef.current.has(variables.clientRequestId);
+      if (context?.optimisticCommentId && (failure === "rejected" || bubbleRetry)) {
+        keepFailedSend(context.optimisticCommentId, err, "reassign", variables as Record<string, unknown>);
+        context.optimisticCommentId = null;
+      } else if (context?.optimisticCommentId) {
         setOptimisticComments((current) =>
           current.filter(
             (entry) => entry.clientId !== context.optimisticCommentId,
@@ -5837,7 +5889,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       }
       // A comment that is not known to be saved stays in the composer and
       // resends with the same request ID; its notice replaces this toast.
-      if (classifySendFailure(err) === "pending") return;
+      if (failure === "pending") return;
+      if (variables.clientRequestId && sendsKeptInThreadRef.current.has(variables.clientRequestId)) return;
       const { title, body } = describeError(err, { action: "post the comment" });
       pushToast({ title, body, tone: "error" });
     },
@@ -7128,25 +7181,55 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       runSettings?: ComposerRunSettings,
       deliveryIntent?: CommentDeliveryIntent,
     ) => {
-      if (!issue?.conversationAgentId && (reassignment || runSettings)) {
-        await addCommentAndReassign.mutateAsync({
-          body,
-          reopen,
-          reassignment,
-          attachmentIds,
-          clientRequestId,
-          runSettings,
-        });
-        return;
+      try {
+        if (!issue?.conversationAgentId && (reassignment || runSettings)) {
+          await addCommentAndReassign.mutateAsync({
+            body,
+            reopen,
+            reassignment,
+            attachmentIds,
+            clientRequestId,
+            runSettings,
+          });
+          return;
+        }
+        await addComment.mutateAsync(
+          deliveryIntent
+            ? { body, reopen, attachmentIds, clientRequestId, runSettings, deliveryIntent }
+            : { body, reopen, attachmentIds, clientRequestId, runSettings },
+        );
+      } catch (error) {
+        // The thread kept it as a 'Not sent' bubble: the composer must not restore it too.
+        if (clientRequestId && sendsKeptInThreadRef.current.delete(clientRequestId)) throw new SendKeptInThreadError(error);
+        throw error;
       }
-      await addComment.mutateAsync(
-        deliveryIntent
-          ? { body, reopen, attachmentIds, clientRequestId, runSettings, deliveryIntent }
-          : { body, reopen, attachmentIds, clientRequestId, runSettings },
-      );
     },
     [addComment, addCommentAndReassign, issue?.conversationAgentId],
   );
+  const failedSendActions = useMemo<TaskChatFailedSendActions>(() => ({
+    retry: (clientId) => {
+      const request = failedSendRequestsRef.current.get(clientId);
+      if (!request) return;
+      failedSendRequestsRef.current.delete(clientId);
+      setOptimisticComments((current) => current.filter((entry) => entry.clientId !== clientId));
+      const requestId = typeof request.variables.clientRequestId === "string" ? request.variables.clientRequestId : null;
+      if (requestId) {
+        // The same request ID: the server dedupes a resend of a saved one.
+        sendsKeptInThreadRef.current.delete(requestId);
+        bubbleRetryRequestIdsRef.current.add(requestId);
+      }
+      const settle = () => { if (requestId) bubbleRetryRequestIdsRef.current.delete(requestId); };
+      if (request.kind === "reassign") addCommentAndReassign.mutate(request.variables as never, { onSettled: settle });
+      else addComment.mutate(request.variables as never, { onSettled: settle });
+    },
+    edit: (clientId) => {
+      const failed = optimisticComments.find((entry) => entry.clientId === clientId);
+      failedSendRequestsRef.current.delete(clientId);
+      setOptimisticComments((current) => current.filter((entry) => entry.clientId !== clientId));
+      if (failed) setFailedSendRestoreText({ key: clientId, body: failed.body });
+    },
+    restoreText: failedSendRestoreText,
+  }), [addComment, addCommentAndReassign, failedSendRestoreText, optimisticComments]);
   const handleCommentImageUpload = useCallback(
     async (file: File) => {
       const attachment = await uploadAttachment.mutateAsync(file);
@@ -8792,6 +8875,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     void queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(issueId!) });
                     void queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) });
                   }} />
+                <TaskChatFailedSendContext.Provider value={failedSendActions}>
                 <IssueDetailChatTab
                   executionBlocked={Boolean(issue.executionBlocker)}
                   interruption={issue.interruption}
@@ -9072,6 +9156,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   }
                   linkCaseReferences={casesChipsEnabled}
                 />
+                </TaskChatFailedSendContext.Provider>
                 </DispositionRecoveryProvider>
                 </WorkspaceBaseRefRecoveryProvider>
               ) : null}

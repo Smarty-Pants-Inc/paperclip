@@ -143,7 +143,9 @@ export interface TaskChatMessageItem {
   /** Show a streaming cursor and suppress collapse while true. */
   streaming?: boolean;
   /** Optimistic local echo state (matches IssueChatComment.clientStatus). */
-  optimistic?: "pending" | "queued";
+  optimistic?: "pending" | "queued" | "failed";
+  /** optimistic 'failed': the server definitely refused it; the plain reason it shows. */
+  failureReason?: string | null;
   /** Live run this queued message is waiting behind. */
   queueTargetRunId?: string | null;
   /** The server steered this message into that running turn: it is sent, in the thread. */

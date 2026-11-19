@@ -32,7 +32,8 @@ import {
   type ComposerDraftSubmission,
   type ComposerSendRequest,
 } from "@/lib/composer-draft";
-import { classifySendFailure, type SendOutcome } from "@/lib/pending-send";
+import { useTaskChatFailedSend } from "./failed-send-context";
+import { classifySendFailure, SendKeptInThreadError, type SendOutcome } from "@/lib/pending-send";
 import { describeError } from "@/api/errors";
 import { useAutoResend } from "@/hooks/useDurableSubmit";
 import { useDraftOwner } from "@/hooks/useDraftOwner";
@@ -553,6 +554,17 @@ export function TaskChatComposer({
     });
   }
   const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Edit on a 'Not sent' bubble: its words move here (once per key), ahead of any draft.
+  const restoreText = useTaskChatFailedSend()?.restoreText ?? null;
+  const restoredTextKey = useRef<string | null>(null);
+  useEffect(() => {
+    if (!restoreText || restoredTextKey.current === restoreText.key) return;
+    restoredTextKey.current = restoreText.key;
+    const current = bodyRef.current;
+    const next = current ? `${restoreText.body}\n\n${current}` : restoreText.body;
+    changeBody(next);
+    if (draftKey) saveDraft(draftKey, next);
+  }, [restoreText]);
   const queuedEditRef = useRef(queuedEdit);
   queuedEditRef.current = queuedEdit;
   const queuedEditBackupRef = useRef<QueuedEditBackup | null>(null);
@@ -1199,6 +1211,12 @@ export function TaskChatComposer({
         setUncertainSubmission(uncertain);
         if (draftKey && loadDraftSubmission(draftKey)?.attemptId === attemptId)
           saveDraftSubmission(draftKey, uncertain);
+      } else if (error instanceof SendKeptInThreadError) {
+        // Refused for certain, and the thread keeps it as a 'Not sent' bubble
+        // with Retry and Edit: the words stay there only, not also here. Any
+        // next draft typed meanwhile stays as it is.
+        if (draftKey && attemptId) settleDraftSubmission(draftKey, attemptId, bodyRef.current);
+        return;
       } else if (draftKey && attemptId)
         clearDraftSubmission(draftKey, attemptId);
       // Restore the failed message for retry without discarding a next draft

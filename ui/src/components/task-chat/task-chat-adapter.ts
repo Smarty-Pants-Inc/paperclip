@@ -109,7 +109,9 @@ export function commentsToTaskChatItems(
         ? "queued"
         : comment.clientStatus === "pending"
           ? "pending"
-          : undefined;
+          : comment.clientStatus === "failed"
+            ? "failed"
+            : undefined;
     const createdAtIso =
       comment.createdAt instanceof Date
         ? comment.createdAt.toISOString()
@@ -143,6 +145,7 @@ export function commentsToTaskChatItems(
       sourceChannel: kind === "human" ? comment.metadata?.sourceChannel : undefined,
       timestamp: formatTaskChatCommentTimestamp(comment, kind),
       optimistic,
+      ...(optimistic === "failed" ? { failureReason: comment.failureReason ?? null } : {}),
       queueTargetRunId: queued ? comment.queueTargetRunId ?? null : null,
       ...(kind === "human" && readSteeredIntoRunId(comment)
         ? { steeredIntoRunId: readSteeredIntoRunId(comment), steeredDelivery: readSteeredDelivery(comment) ?? "sent" }

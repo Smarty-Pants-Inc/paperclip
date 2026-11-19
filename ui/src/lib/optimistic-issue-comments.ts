@@ -16,8 +16,12 @@ export interface IssueCommentReassignment {
 
 export interface OptimisticIssueComment extends IssueComment {
   clientId: string;
-  clientStatus: "pending" | "queued";
+  clientStatus: "pending" | "queued" | "failed";
   queueTargetRunId?: string | null;
+  /** The task the POST went to (the conversation's resolved task can differ from the page's). */
+  targetIssueId?: string | null;
+  /** A definite rejection (nothing saved): the plain reason the bubble shows as 'Not sent'. */
+  failureReason?: string | null;
 }
 
 export type IssueTimelineComment = IssueComment | OptimisticIssueComment;
@@ -131,6 +135,26 @@ export function applyLocalQueuedIssueCommentState<T extends IssueComment>(
   };
 }
 
+function findPersistedCopy(
+  persistedComments: IssueComment[],
+  comment: OptimisticIssueComment,
+  reconciled: ReadonlySet<string>,
+): IssueComment | undefined {
+  const requestId = comment.clientRequestId ?? null;
+  const target = comment.targetIssueId ?? comment.issueId;
+  return persistedComments.find((persisted) => {
+    if (reconciled.has(persisted.id)) return false;
+    const persistedRequestId = persisted.clientRequestId ?? null;
+    if (requestId && persistedRequestId) return persistedRequestId === requestId;
+    // Server ID absent (or a local copy that named none): only a send still in flight can be this echo; a definitely rejected one saved nothing.
+    if (comment.clientStatus === "failed") return false;
+    return persisted.issueId === target &&
+      persisted.authorType === comment.authorType &&
+      persisted.authorUserId === comment.authorUserId &&
+      persisted.body === comment.body;
+  });
+}
+
 export function mergeIssueComments(
   comments: IssueComment[] | undefined,
   optimisticComments: OptimisticIssueComment[],
@@ -139,31 +163,24 @@ export function mergeIssueComments(
   const merged = [...persistedComments];
   const existingIds = new Set(merged.map((comment) => comment.id));
   const reconciledPersistedIds = new Set<string>();
-  for (const comment of optimisticComments) {
+  // Oldest pending first: by createdAt, then the order they were sent (a stable sort).
+  const oldestFirst = [...optimisticComments].sort((a, b) => toTimestamp(a.createdAt) - toTimestamp(b.createdAt));
+  for (const comment of oldestFirst) {
     if (existingIds.has(comment.id)) continue;
 
     // The mutation response and comments feed can publish the canonical
     // comment in different React Query notifications. Keep the optimistic row
     // mounted through that handoff without briefly rendering both versions.
     // Consume matches one-for-one so repeated identical messages remain valid.
-    // The server's copy names the POST's own clientRequestId (the comments GET,
-    // the POST answer and a live refetch all carry it): that is the match, in
-    // whichever order they arrive. It is a fresh UUID per send, so it alone
-    // is the match: the pending copy's issueId can be the page's task while
-    // the POST went to the conversation's resolved task (ensureIssue). Body +
-    // time is the fallback for a copy without one.
-    const matchingPersistedComment = (comment.clientRequestId
-      ? persistedComments.find((persisted) =>
-        !reconciledPersistedIds.has(persisted.id) &&
-        persisted.clientRequestId === comment.clientRequestId)
-      : undefined) ?? persistedComments.find((persisted) =>
-      !reconciledPersistedIds.has(persisted.id) &&
-      persisted.issueId === comment.issueId &&
-      persisted.authorType === comment.authorType &&
-      persisted.authorUserId === comment.authorUserId &&
-      persisted.body === comment.body &&
-      Math.abs(toTimestamp(persisted.createdAt) - toTimestamp(comment.createdAt)) <= 60_000
-    );
+    // - Both IDs present: the server's copy names the POST's own clientRequestId
+    //   (the comments GET, the POST answer and a live refetch all carry it). A
+    //   fresh UUID per send: equal is the match, different is a DIFFERENT send
+    //   (another tab, the same words): never a text fallback.
+    // - Server ID absent (an older server): the same person and words on the
+    //   task the POST went to (targetIssueId, the resolved task, not the
+    //   page's), while still pending; oldest pending first. No clock bound:
+    //   client and server clocks can disagree by minutes.
+    const matchingPersistedComment = findPersistedCopy(persistedComments, comment, reconciledPersistedIds);
     if (matchingPersistedComment) {
       reconciledPersistedIds.add(matchingPersistedComment.id);
       // The server's copy replaces the pending one in place (same clientId,

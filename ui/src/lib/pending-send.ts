@@ -44,7 +44,21 @@ export class PendingSendAccountChangedError extends Error {
   }
 }
 
+/**
+ * A definite rejection whose words the thread keeps as a 'Not sent' bubble
+ * (Retry + Edit there). The composer must not also restore them: one place.
+ */
+export class SendKeptInThreadError extends Error {
+  readonly cause: unknown;
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : "Not sent");
+    this.name = "SendKeptInThreadError";
+    this.cause = cause;
+  }
+}
+
 export function classifySendFailure(error: unknown): SendFailure {
+  if (error instanceof SendKeptInThreadError) return "rejected";
   if (error instanceof PendingSendAccountChangedError) return "pending";
   if (error instanceof CommentSubmissionUnknownError) return "pending";
   const kind = classifyError(error);
