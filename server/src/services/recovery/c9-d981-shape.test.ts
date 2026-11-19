@@ -112,10 +112,11 @@ describe.skipIf(!support.supported)("d981 shape: unrestored saved files, Retry n
     expect(rewrite!(text, true)).toBe(text);
   });
 
-  it("held conversation banner (HELD_PREDECESSOR_NOTICE) names no Retry and stays unchanged: it uses the current held notice", () => {
+  it("held conversation banner (HELD_PREDECESSOR_NOTICE) names the next step: send a new message, names no Retry and stays unchanged", () => {
     const rewrite = (blockerModule as Record<string, unknown>).withoutUnavailableRetry as
       ((text: string, retryOffered: boolean) => string) | undefined;
     expect(typeof rewrite).toBe("function");
+    expect(HELD_PREDECESSOR_NOTICE).toMatch(/Send a new message/);
     expect(HELD_PREDECESSOR_NOTICE).not.toMatch(/\bRetry\b/);
     expect(rewrite!(HELD_PREDECESSOR_NOTICE, false)).toBe(HELD_PREDECESSOR_NOTICE);
   });
