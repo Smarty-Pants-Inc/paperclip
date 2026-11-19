@@ -48,6 +48,12 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * (reconcileBackup) and leftover settlement (settleLeftovers).
  */
 export const NATIVE_HARNESS_BACKUP_LOCAL_COPY_KEPT = "native_backup_local_copy_kept";
+/** BRIEF retention-keep: the same predicate keeps S3 mode's durable copy
+ * (expireDurableBackups: no row retirement, no object delete) and the raw trace
+ * in continuity-breaks archives and quarantine entries (retireEvidence and its
+ * leftover sweep). */
+export const NATIVE_HARNESS_BACKUP_DURABLE_COPY_KEPT = "native_backup_durable_copy_kept";
+export const NATIVE_RUNNER_EVIDENCE_KEPT = "native_runner_evidence_kept";
 function retentionKeepsNativeHarnessBackupLocalCopy(): boolean {
   return true;
 }
@@ -329,6 +335,13 @@ export function nativeHarnessBackupExpirationService(
   }, result: NativeHarnessBackupExpirationResult) {
     const storage = defaults.storage ?? durableNativeHarnessStorage();
     if (!storage) return;
+    // S3 mode: the object may be the only copy of the turn's raw trace (an
+    // ephemeral server keeps no local one). Never retire its row or delete it.
+    if (retentionKeepsNativeHarnessBackupLocalCopy()) {
+      result.skipped[NATIVE_HARNESS_BACKUP_DURABLE_COPY_KEPT] = (result.skipped[NATIVE_HARNESS_BACKUP_DURABLE_COPY_KEPT] ?? 0) + 1;
+      durableBackupCursor = null;
+      return;
+    }
     const candidates = await db.select({ id: nativeHarnessBackups.id, scopeDigest: nativeHarnessBackups.scopeDigest,
       companyId: nativeHarnessBackups.companyId, runId: nativeHarnessBackups.runId, survivingRunId: heartbeatRuns.id,
       sessionId: heartbeatRuns.nativeSessionId, status: nativeHarnessBackups.status, reference: nativeHarnessBackups.reference })
@@ -575,6 +588,9 @@ export function nativeHarnessBackupExpirationService(
       throw error;
     })) {
       if (!name.startsWith(EXPIRED_PREFIX) || !UUID_PATTERN.test(name.slice(EXPIRED_PREFIX.length))) continue;
+      // A leftover of an evidence removal interrupted before this rule holds the
+      // same raw trace: keep it.
+      if (retentionKeepsNativeHarnessBackupLocalCopy()) continue;
       if (!context.canInspect()) {
         context.dueAt(context.now);
         return;
@@ -609,6 +625,11 @@ export function nativeHarnessBackupExpirationService(
       context.retry();
       return skip("session_active");
     }
+    // Continuity archives and quarantine entries hold the session's raw trace
+    // (NATIVE_CONTINUITY_STATE_ENTRIES: control-plane journal, codex-home, pi,
+    // failover-backups...). Every other blocker reports first; an entry that
+    // would now be removed is kept in place and schedules nothing further.
+    if (retentionKeepsNativeHarnessBackupLocalCopy()) return skip(NATIVE_RUNNER_EVIDENCE_KEPT);
     const bytes = await allocatedBytes(target);
     result.evidenceCandidates++;
     result.evidenceCandidateBytes += bytes;
