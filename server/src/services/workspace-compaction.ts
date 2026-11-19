@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { listUnrecoveredObjectRunLogSpills } from "./object-run-log-store.js";
+import { candidateHoldsUnrecoveredRunLogSpill, listUnrecoveredObjectRunLogSpills } from "./object-run-log-store.js";
 import { listWorktreeRunLogSpillRoots } from "./workspace-instance-cleanup.js";
 
 // Directory names that hold regenerable output: installed dependencies, build
@@ -184,11 +184,18 @@ export async function findRegenerableWorkspaceDirs(
     }
     if (candidates.length === 0) break;
     const eligible = new Set(await filterRemovableCandidates(worktreePath, candidates, options.signal));
+    const contentKept = new Set<string>();
     for (const candidate of candidates) {
-      if (await intersectsSpill(path.join(worktreePath, candidate), protectedSpills)) eligible.delete(candidate);
+      const candidatePath = path.join(worktreePath, candidate);
+      if (await intersectsSpill(candidatePath, protectedSpills)) eligible.delete(candidate);
+      if (eligible.has(candidate) && await candidateHoldsUnrecoveredRunLogSpill(candidatePath)) {
+        eligible.delete(candidate);
+        contentKept.add(candidate);
+      }
     }
     removable.push(...candidates.filter((candidate) => eligible.has(candidate)));
-    roots = candidates.filter((candidate) => !eligible.has(candidate));
+    // Keep a content-protected candidate whole, including on a walk-bound hit.
+    roots = candidates.filter((candidate) => !eligible.has(candidate) && !contentKept.has(candidate));
   }
   return removable;
 }
@@ -223,6 +230,7 @@ export async function moveWorkspaceDirsToTrash(
     const stat = await fs.lstat(sourcePath).catch(() => null);
     if (!stat?.isDirectory()) continue;
     if (await intersectsSpill(sourcePath, protectedSpills)) continue;
+    if (await candidateHoldsUnrecoveredRunLogSpill(sourcePath)) continue;
     const trashPath = path.join(trashDir, String(index));
     try {
       await fs.rename(sourcePath, trashPath);
@@ -248,6 +256,7 @@ export async function restoreWorkspaceDirsFromTrash(worktreePath: string, move: 
 }
 
 export async function deleteWorkspaceCompactionTrash(trashDir: string) {
+  if (await candidateHoldsUnrecoveredRunLogSpill(trashDir)) return;
   await fs.rm(trashDir, { recursive: true, force: true });
 }
 
@@ -261,6 +270,7 @@ export async function purgeStaleWorkspaceCompactionTrash(worktreeParentDir: stri
     const entryPath = path.join(trashRoot, entry.name);
     const stat = await fs.lstat(entryPath).catch(() => null);
     if (!stat || stat.mtimeMs > cutoff) continue;
+    if (await candidateHoldsUnrecoveredRunLogSpill(entryPath)) continue;
     await fs.rm(entryPath, { recursive: true, force: true }).catch(() => {});
   }
 }
