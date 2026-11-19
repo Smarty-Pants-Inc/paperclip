@@ -82,6 +82,9 @@ type RestoreTreeStatusResult = TreeStatusUpdateResult & {
   restoreHold: IssueTreeHold | null;
 };
 
+/** The error a subtree Pause writes on each saved wake it cancels (cancelUnclaimedWakeupsForTree). The unanswered
+ * sweep reads it: such a wake is not coming back by itself (recovery/unanswered-person-message.ts). */
+export const TREE_PAUSE_WAKE_CANCELLED_REASON = "Cancelled because an active subtree pause hold was created";
 const TERMINAL_ISSUE_STATUSES = new Set<IssueStatus>(["done", "cancelled"]);
 export const ISSUE_TREE_RESUME_EXECUTABLE_STATUSES = ["todo", "in_progress", "in_review"];
 
@@ -1331,11 +1334,17 @@ export function issueTreeControlService(db: Db) {
     if (issueIds.length === 0) return [];
     const now = new Date();
     return db.transaction(async tx => {
-      const affected = await tx.select({ agentId: agentWakeupRequests.agentId }).from(agentWakeupRequests).where(and(
+      const affected = await tx.select({ agentId: agentWakeupRequests.agentId,
+        issueId: sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'`,
+        byPerson: sql<boolean>`${agentWakeupRequests.requestedByActorType} = 'user'` }).from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, companyId), inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
         isNull(agentWakeupRequests.runId), inArray(sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'`, issueIds),
       )).for("update");
       for (const agentId of new Set(affected.map(wake => wake.agentId))) await notifyStrandedAgentStatus(tx, { companyId, agentId });
+      // A person's saved message loses its wake here: hand its task to the unanswered sweep now, which says so once.
+      for (const issueId of new Set(affected.flatMap(wake => wake.byPerson && wake.issueId ? [wake.issueId] : []))) {
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.strandedAssignments, JSON.stringify({ companyId, issueId }));
+      }
       await notifyChatInboundWakeNotices(tx, { companyId });
       return tx
         .update(agentWakeupRequests)

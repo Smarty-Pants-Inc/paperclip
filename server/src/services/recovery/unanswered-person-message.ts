@@ -14,6 +14,7 @@ import {
 } from "@paperclipai/db";
 import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { issueService } from "../issues.js";
+import { TREE_PAUSE_WAKE_CANCELLED_REASON } from "../issue-tree-control.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { logActivity } from "../activity-log.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
@@ -109,6 +110,11 @@ export const UNANSWERED_MESSAGE_TEXT =
   "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
 export const UNANSWERED_MESSAGE_NO_RUN_TEXT =
   "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
+/** Proposed, pending RFL. A Pause of the task cancelled this message's saved wake before any run took it; Resume
+ * does not start it again. True while the task is paused and after it is resumed, so it never needs replacing. */
+export const UNANSWERED_MESSAGE_TASK_PAUSED_TEXT =
+  "Your message is saved, but it did not start because this task was paused. Send it again after the task is resumed.";
+export const UNANSWERED_MESSAGE_TASK_PAUSED_NEXT_ACTION = "Send the message again after the task is resumed.";
 export const UNANSWERED_MESSAGE_WAITING_TEXT =
   "Your message is waiting for the agent to be free; it will start by itself.";
 export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
@@ -722,6 +728,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   }
 
   let code: string;
+  let wakeCancelledByPause = false;
   if (settingUp) {
     code = UNANSWERED_MESSAGE_AGENT_SETUP_CODE;
   } else if (agentPaused) {
@@ -749,8 +756,15 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     // Only THIS message's own wake (Paperclip's queued-comment attribution) is
     // evidence; an unrelated failed wake on the issue is not.
     const wakeFailed = failedWakes.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
+    // A subtree Pause cancelled THIS message's saved wake (issue-tree-control.ts cancelUnclaimedWakeupsForTree).
+    // Like a failed wake it will not start by itself, also not on Resume: the one note is due now, in its own words.
+    const pauseCancelledWakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+      eq(agentWakeupRequests.status, "cancelled"), isNull(agentWakeupRequests.runId),
+      eq(agentWakeupRequests.error, TREE_PAUSE_WAKE_CANCELLED_REASON), gt(agentWakeupRequests.updatedAt, message.createdAt)));
+    wakeCancelledByPause = pauseCancelledWakes.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
     const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_NO_RUN_GRACE_MS;
-    if (!wakeFailed && due > now.getTime()) return { kind: "pending", recheckAt: due };
+    if (!wakeFailed && !wakeCancelledByPause && due > now.getTime()) return { kind: "pending", recheckAt: due };
     code = UNANSWERED_MESSAGE_NO_RUN_CODE;
   } else {
     if (!TERMINAL.includes(run.status)) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
@@ -880,7 +894,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? (workingEnded ? UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT : UNANSWERED_MESSAGE_NO_REPLY_TEXT)
-    : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
+    : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? (wakeCancelledByPause ? UNANSWERED_MESSAGE_TASK_PAUSED_TEXT : UNANSWERED_MESSAGE_NO_RUN_TEXT)
       : held ? HELD_PREDECESSOR_NOTICE : workingEnded ? UNANSWERED_MESSAGE_STARTED_FAILED_TEXT : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
@@ -893,7 +907,8 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
         : waiting ? "No action is needed; it will start by itself."
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : held || boundReached ? "Send a new message to try again."
-        : workingEnded ? UNANSWERED_MESSAGE_STARTED_NEXT_ACTION : "Send the message again; if it fails again, assign this agent a new task.",
+        : workingEnded ? UNANSWERED_MESSAGE_STARTED_NEXT_ACTION
+        : wakeCancelledByPause ? UNANSWERED_MESSAGE_TASK_PAUSED_NEXT_ACTION : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,

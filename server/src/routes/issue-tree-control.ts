@@ -7,7 +7,7 @@ import {
 import { and, eq, inArray, isNotNull } from "drizzle-orm";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { resumePauseInterruptedWork as resumeInterruptedWork } from "../services/issue-tree-resume.js";
-import { ISSUE_TREE_RESUME_EXECUTABLE_STATUSES } from "../services/issue-tree-control.js";
+import { ISSUE_TREE_RESUME_EXECUTABLE_STATUSES, TREE_PAUSE_WAKE_CANCELLED_REASON } from "../services/issue-tree-control.js";
 import { conflict } from "../errors.js";
 import {
   createIssueTreeHoldSchema,
@@ -247,7 +247,7 @@ export function issueTreeControlRoutes(
         root.companyId,
         root.id,
         result.hold.mode === "pause"
-          ? "Cancelled because an active subtree pause hold was created"
+          ? TREE_PAUSE_WAKE_CANCELLED_REASON
           : "Cancelled because a subtree cancel operation was applied",
       );
       for (const wakeup of cancelledWakeups) {
