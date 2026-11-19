@@ -1,5 +1,6 @@
 import { getPageVisibility, getVisibilityHeaderValue } from "@/lib/page-visibility";
 import { tenantSessionRecovery } from "@/lib/tenant-session-recovery";
+import type { QueryFunctionContext } from "@tanstack/react-query";
 import { ApiError, apiErrorFromResponse } from "./api-error";
 import { errorCopy } from "./errors";
 export { ApiError, apiErrorFromResponse, type ApiErrorOptions } from "./api-error";
@@ -265,6 +266,15 @@ export function detachInflightGet(path: string): void {
 /** End the sharing scope when identity changes; existing callers still settle. */
 export function detachInflightGets(): void {
   inflightGets.clear();
+}
+
+/**
+ * Read options for a TanStack query function. The signal lets a cancelled query
+ * release its request; a query that was invalidated (by a write such as a read
+ * receipt) reads fresh, so it is never handed a GET that started before the write.
+ */
+export function queryReadOptions({ signal, client, queryKey }: QueryFunctionContext): Pick<RequestOptions, "signal" | "fresh"> {
+  return { signal, fresh: client.getQueryState(queryKey)?.isInvalidated === true };
 }
 
 function isRequestOptions(value: unknown): value is RequestOptions {

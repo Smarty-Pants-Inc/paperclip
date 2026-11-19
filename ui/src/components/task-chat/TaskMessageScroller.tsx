@@ -1,12 +1,10 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { readThreadScrollAnchor, threadScrollAnchorDelta, type ThreadScrollAnchor } from "./scroll-anchor";
+import { isScrolledToEnd, readThreadScrollAnchor, threadScrollAnchorDelta, type ThreadScrollAnchor } from "./scroll-anchor";
 import { cn } from "@/lib/utils";
 import { useStreamlinedTaskChatPresentation } from "./presentation-mode";
 import { ArrowDown } from "lucide-react";
 import { parseCssTimeMs } from "./motion-tokens";
 import { taskChatHashAnchor, useTaskChatScrollNavigation } from "./scroll-navigation";
-
-const PIN_THRESHOLD_PX = 48;
 
 /** Visibility lifecycle of the scroll-to-latest pill. */
 type PillPhase = "hidden" | "in" | "out";
@@ -120,7 +118,7 @@ export function TaskMessageScroller({ children, contentKey, className, scrolling
   const isPinned = useCallback(() => {
     const el = ref.current;
     if (!el) return true;
-    return el.scrollHeight - el.scrollTop - el.clientHeight <= PIN_THRESHOLD_PX;
+    return isScrolledToEnd(el);
   }, []);
 
   const scrollToBottom = useCallback(() => {

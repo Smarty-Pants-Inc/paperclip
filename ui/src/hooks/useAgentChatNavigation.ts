@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Agent, Issue } from "@paperclipai/shared";
 import { agentsApi } from "@/api/agents";
 import { agentChatsApi } from "@/api/agentChats";
+import { queryReadOptions } from "@/api/client";
 import { authApi } from "@/api/auth";
 import { useCompany } from "@/context/CompanyContext";
 import { useSidebar } from "@/context/SidebarContext";
@@ -21,7 +22,7 @@ export function useAgentChatNavigation() {
     enabled: enabled && !!companyId,
   });
   const chats = useQuery({
-    queryKey: queryKeys.agentChats.list(companyId, userId), queryFn: () => agentChatsApi.list(companyId!),
+    queryKey: queryKeys.agentChats.list(companyId, userId), queryFn: context => agentChatsApi.list(companyId!, undefined, queryReadOptions(context)),
     enabled: enabled && !!companyId && session.isSuccess,
   });
   return { companyId, userId, enabled, loaded, agents, chats, session };
