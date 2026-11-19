@@ -13,6 +13,8 @@ import {
   companyMemberships,
   createDb,
   documents,
+  feedbackExports,
+  feedbackVotes,
   heartbeatRuns,
   issueReadStates,
   issueThreadInteractions,
@@ -302,6 +304,72 @@ describeEmbeddedPostgres("private-task overlay rows through the real routes (acc
     });
   });
 
+  async function seedTrace(f: Seeded) {
+    const targetId = randomUUID();
+    const [vote] = await db.insert(feedbackVotes).values({ companyId: f.companyId, issueId: f.issueId,
+      targetType: "issue_comment", targetId, authorUserId: OWNER, vote: "up" }).returning();
+    const [trace] = await db.insert(feedbackExports).values({ companyId: f.companyId, feedbackVoteId: vote!.id,
+      issueId: f.issueId, authorUserId: OWNER, targetType: "issue_comment", targetId, vote: "up",
+      targetSummary: { label: "OV-PRIVATE-TRACE", excerpt: DOC_TEXT } }).returning();
+    return trace!.id;
+  }
+
+  describe.each(DENIED)("F7 trace detail / bundle (%s)", (who) => {
+    it.each(["", "/bundle"])("GET /feedback-traces/:id%s → same 404 as a missing trace", async (suffix) => {
+      const f = await seed();
+      const traceId = await seedTrace(f);
+      const a = app(f.companyId, denied(f, who));
+      const before = await snapshot(f);
+      const response = await request(a).get(`/api/feedback-traces/${traceId}${suffix}`);
+      const missing = await request(a).get(`/api/feedback-traces/${randomUUID()}${suffix}`);
+      expect({ status: response.status, body: response.body }).toEqual({ status: missing.status, body: missing.body });
+      expect(JSON.stringify(response.body)).not.toContain(DOC_TEXT);
+      expect(await snapshot(f)).toEqual(before);
+    });
+  });
+
+  it.each(["", "/bundle"])("F7 control: owner reads /feedback-traces/:id%s → 200", async (suffix) => {
+    const f = await seed();
+    const traceId = await seedTrace(f);
+    const response = await request(app(f.companyId, { kind: "user", userId: OWNER })).get(`/api/feedback-traces/${traceId}${suffix}`);
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+  });
+
+  it("F7 audit feed: the private task's joined title/comment content is withheld from a revoked / never-granted user, kept for the owner", async () => {
+    const f = await seed();
+    const comment = await request(app(f.companyId, { kind: "agent", agentId: f.agentId, runId: f.runId }))
+      .post(`/api/issues/${f.issueId}/comments`).send({ body: "OV-PRIVATE-AUDIT-COMMENT" });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+    const path = `/api/companies/${f.companyId}/audit/agent-actions?actorScope=all`;
+    const ownerFeed = await request(app(f.companyId, { kind: "user", userId: OWNER })).get(path);
+    expect(ownerFeed.status, JSON.stringify(ownerFeed.body)).toBe(200);
+    // The feed joins the task snippet (identifier/title) onto each issue row.
+    expect(JSON.stringify(ownerFeed.body)).toContain("Private overlay task");
+    for (const userId of [REVOKED, NEVER]) {
+      const feed = await request(app(f.companyId, { kind: "user", userId })).get(path);
+      expect(feed.status, JSON.stringify(feed.body)).toBe(200);
+      expect(JSON.stringify(feed.body)).not.toContain("OV-PRIVATE-AUDIT-COMMENT");
+      expect(JSON.stringify(feed.body)).not.toContain("Private overlay task");
+    }
+  });
+
+  describe.each(DENIED)("F4 other run controls (%s)", (who) => {
+    it("POST admin/force-release → same 404 as missing, no release", async () => {
+      const f = await seed();
+      const a = app(f.companyId, denied(f, who));
+      await expectDeniedNoEffect(f, () => request(a).post(`/api/issues/${f.issueId}/admin/force-release`).send({}),
+        () => request(a).post(`/api/issues/${randomUUID()}/admin/force-release`).send({}),
+        { boardOnlyBeforeLookup: who === "non-granted-agent" });
+    });
+    it("POST stalled-review-decision → same 404 as missing, no decision", async () => {
+      const f = await seed();
+      const a = app(f.companyId, denied(f, who));
+      const body = { action: "approve" };
+      await expectDeniedNoEffect(f, () => request(a).post(`/api/issues/${f.issueId}/stalled-review-decision`).send(body),
+        () => request(a).post(`/api/issues/${randomUUID()}/stalled-review-decision`).send(body));
+    });
+  });
+
   // ---- F8 activity / run history: private == missing ----
   describe.each(DENIED)("F8 activity (%s)", (who) => {
     it.each(["activity", "runs"])("GET %s → same 404 as a missing task", async (path) => {
@@ -319,6 +387,12 @@ describeEmbeddedPostgres("private-task overlay rows through the real routes (acc
       const a = app(f.companyId, denied(f, who));
       await expectDeniedNoEffect(f, () => request(a).put(`/api/issues/${f.issueId}/title`).send({ title: "Renamed by outsider" }),
         () => request(a).put(`/api/issues/${randomUUID()}/title`).send({ title: "Renamed by outsider" }));
+    });
+    it.each(["post", "delete"] as const)("%s inbox-archive → same 404 as missing, no write", async (method) => {
+      const f = await seed();
+      const a = app(f.companyId, denied(f, who));
+      const send = (id: string) => method === "post" ? request(a).post(`/api/issues/${id}/inbox-archive`).send({}) : request(a).delete(`/api/issues/${id}/inbox-archive`);
+      await expectDeniedNoEffect(f, () => send(f.issueId), () => send(randomUUID()));
     });
     it("GET accepted-plan-decompositions → 404", async () => {
       const f = await seed();

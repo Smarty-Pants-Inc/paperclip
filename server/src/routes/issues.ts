@@ -14793,12 +14793,7 @@ export function issueRoutes(
     validate(stalledReviewDecisionSchema),
     async (req, res) => {
       const id = req.params.id as string;
-      const issue = await getAccessibleResource(
-        req,
-        res,
-        svc.getById(id),
-        "Issue not found",
-      );
+      const issue = await getReadableIssue(req, res, svc.getById(id), "Issue not found", undefined, "issue:mutate");
       if (!issue) return;
       assertBoard(req);
 
@@ -17825,12 +17820,7 @@ export function issueRoutes(
     }
 
     const id = req.params.id as string;
-    const existing = await getAccessibleResource(
-      req,
-      res,
-      svc.getById(id),
-      "Issue not found",
-    );
+    const existing = await getReadableIssue(req, res, svc.getById(id), "Issue not found", undefined, "issue:mutate");
     if (!existing) return;
 
     const clearAssignee = req.query.clearAssignee === "true";
@@ -20000,6 +19990,13 @@ export function issueRoutes(
     res.json(traces);
   });
 
+  /** A trace carries its task's content: the private-task read gate applies (same 404 as a missing trace). */
+  async function traceIssueReadable(req: Request, trace: { companyId: string; issueId: string }) {
+    const issue = await svc.getById(trace.issueId);
+    if (!issue || issue.companyId !== trace.companyId) return true;
+    return (await decideIssueAccess(req, issue, "issue:read")).allowed;
+  }
+
   router.get("/feedback-traces/:traceId", async (req, res) => {
     const traceId = req.params.traceId as string;
     if (req.actor.type !== "board") {
@@ -20012,7 +20009,7 @@ export function issueRoutes(
       parseBooleanQuery(req.query.includePayload) ||
       req.query.includePayload === undefined;
     const trace = await feedback.getFeedbackTraceById(traceId, includePayload);
-    if (!trace || !actorCanAccessCompany(req, trace.companyId)) {
+    if (!trace || !actorCanAccessCompany(req, trace.companyId) || !(await traceIssueReadable(req, trace))) {
       res.status(404).json({ error: "Feedback trace not found" });
       return;
     }
@@ -20028,7 +20025,7 @@ export function issueRoutes(
       return;
     }
     const bundle = await feedback.getFeedbackTraceBundle(traceId);
-    if (!bundle || !actorCanAccessCompany(req, bundle.companyId)) {
+    if (!bundle || !actorCanAccessCompany(req, bundle.companyId) || !(await traceIssueReadable(req, bundle))) {
       res.status(404).json({ error: "Feedback trace not found" });
       return;
     }
