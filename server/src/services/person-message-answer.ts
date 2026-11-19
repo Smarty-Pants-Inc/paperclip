@@ -52,6 +52,10 @@ const PERSON_MESSAGE_ANSWER_CARD_STATUSES = ["pending", "answered", "accepted", 
  *   With neither provenance nor an arrival record, nothing is history.
  */
 export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
+  // Failed-carrier exception (L1b, SMA-4 11-19 06:15:44Z d2840901): a message
+  // whose OWN carrying run FAILED without a reply was never seen through by the
+  // agent, so a reply to a LATER message does not answer it. It stays owed
+  // until a run that carries it (its re-delivery) answers, or its card stands.
   return sql`(exists (select 1 from ${heartbeatRuns} streamed
       where streamed.company_id = ${m.companyId}
         and (streamed.native_issue_id = ${m.issueId} or streamed.context_snapshot->>'issueId' = ${m.issueId}::text)
@@ -65,7 +69,8 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
         where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
           and (b.id = ${m.id} or (b.created_at > ${m.createdAt}
             -- A steer can overtake an earlier queued message: it answers only itself.
-            and not coalesce(r.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? b.id::text))
+            and not coalesce(r.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? b.id::text
+            and not ${failedCarrierSql(m)}))
           and ${chainCarriesCommentSql("r", sql`b.id`, m)}))
     or exists (select 1 from ${issueThreadInteractions} q
       join ${heartbeatRuns} r on r.id = q.source_run_id and r.company_id = q.company_id
@@ -80,6 +85,14 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
         -- Only the generic reply arm needs the new streamed-text guard.
         and ${chainCarriesCommentSql("r", m.id, m, false)})
     or ${importedPersonHistorySql(m)})`;
+}
+
+/** SQL: a run that carried message m FAILED and posted no reply of its own. */
+function failedCarrierSql(m: PersonMessageSql): SQL {
+  return sql`exists (select 1 from ${heartbeatRuns} fc
+    where fc.company_id = ${m.companyId} and fc.status = 'failed' and ${carriesCommentSql("fc", m.id, false)}
+      and not exists (select 1 from ${issueComments} fr where fr.company_id = fc.company_id
+        and fr.created_by_run_id = fc.id and fr.author_type = 'agent' and fr.deleted_at is null))`;
 }
 
 /** SQL: message m is a PERSON comment that arrived by a company import (see answeredPersonMessageSql). */
