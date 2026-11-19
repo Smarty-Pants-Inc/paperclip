@@ -41,8 +41,10 @@ import { CHAT_COMPLETION_WAKE_REASON } from "../chat-completion-delivery.js";
 import {
   acceptedStopOnlyReceipt,
   hasStopOnlyCleanup,
+  preparePendingCleanupCustodyStop,
   settleStopOnlyCleanup,
 } from "../sandbox-stop-and-retain.js";
+import { nativeCustodyKeptRecovery, nativeLeaseCustodyMissing } from "../native-runtime/native-lease-custody.js";
 import { discoverSettledNativeRunProcesses, inspectSettledNativeRunProcess, PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, recordNativeLocalProcessStopInTransaction, retryPendingSettledNativeRunProcesses } from "../native-local-process-stop.js";
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import { portableTaskPreparationLeaseId } from "../plugin-task-ownership.js";
@@ -1927,7 +1929,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
 
     let destroyed = 0;
     let capped = 0;
-    for (const row of rows) {
+    for (let row of rows) {
       if (pendingCleanupAttemptsInFlight.has(row.id)) continue;
       if (!hasStopOnlyCleanup(row) && hasNativeHarnessBackupMissing(row)) {
         await deferPendingCleanupLease(row.id);
@@ -1941,6 +1943,12 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       if (!(await allowLegacyShutdownWorkspaceCleanup(db, row))) {
         await deferPendingCleanupLease(row.id);
         continue;
+      }
+      // A destroy queued before the custody check for a native box with no
+      // verified saved harness copy: stop it (named, owned by the retained-
+      // orphan settle) instead of only refusing the destroy at the claim.
+      if (!hasStopOnlyCleanup(row) && await nativeLeaseCustodyMissing(db, row.id)) {
+        row = await preparePendingCleanupCustodyStop(db, row, nativeCustodyKeptRecovery()) ?? row;
       }
       const metadata = { ...(row.metadata ?? {}) } as Record<string, unknown>;
       const attempts = readPendingCleanupRetryAttempts(metadata);
