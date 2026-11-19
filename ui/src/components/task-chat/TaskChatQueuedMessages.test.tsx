@@ -779,6 +779,61 @@ describe("TaskChatQueuedMessages", () => {
       Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: width });
     }
   });
+  // heldbar-sharp (RFL 04:47Z), the sharp control: the guards are keyed to
+  // the STOPPED RUN, never to "this issue once had a person's own Stop". The
+  // bodies are planted verbatim from ONE real issue in c3-optS S10 (real
+  // routes): its GET /api/issues/:id/queued-comments + GET /api/issues/:id
+  // 10 s after the person's own Stop (3 held), then, after the real Send
+  // (POST .../queued-comments/interrupt), 10 s and 2 min after the SUCCESSOR
+  // run really failed. Planted in S10: only the harness's provider edge
+  // (executePaperclipNativeSession throws "successor_provider_turn_reached").
+  // The page composes the banner as IssueDetail does.
+  it("after the person's own Stop and a Send whose successor run fails, the banner and Retry come back and the stopped bar is gone (390 and 1440)", () => {
+    const real = JSON.parse(`{"stopped":[{"issueId":"86e4f315-b7e5-4c2b-abc9-a9e753e08c63","queueId":"268a8a54-0265-491e-a388-8034de290927","state":"deferred","targetRunId":null,"revision":"c4ee9a535a98f1d80e4f8d1ee3864b04","protocol":"paperclip_runner_v1","steeringDisposition":"unsupported","executionWait":{"reason":"stopped_by_person","message":"Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it."},"entries":[{"comment":{"id":"d25b7c48-b70b-4b01-8731-37287b914e6a","companyId":"4f0c9be6-e8d9-4dd4-8720-21020e7ac311","issueId":"86e4f315-b7e5-4c2b-abc9-a9e753e08c63","authorAgentId":null,"authorUserId":"responsible-user","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"251b6468-d314-4977-8252-5bc74ffcd7e6","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"M1 held","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T05:21:42.099Z","updatedAt":"2026-11-19T05:21:42.099Z"},"position":0,"canEdit":true,"canDiscard":true,"behindReset":false},{"comment":{"id":"b6afcc7b-7538-4195-9bfe-248b7c4a458b","companyId":"4f0c9be6-e8d9-4dd4-8720-21020e7ac311","issueId":"86e4f315-b7e5-4c2b-abc9-a9e753e08c63","authorAgentId":null,"authorUserId":"responsible-user","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"6f378552-d663-4ec5-bf8a-e32575ee77f6","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"M2 held","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T05:21:42.270Z","updatedAt":"2026-11-19T05:21:42.270Z"},"position":1,"canEdit":true,"canDiscard":true,"behindReset":false},{"comment":{"id":"669b4662-afd1-47de-ae23-e7ba2948ae1f","companyId":"4f0c9be6-e8d9-4dd4-8720-21020e7ac311","issueId":"86e4f315-b7e5-4c2b-abc9-a9e753e08c63","authorAgentId":null,"authorUserId":"responsible-user","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"8b82b6c4-0427-484b-a8ec-bf78ce8fb6d4","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"M3 held","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T05:21:42.455Z","updatedAt":"2026-11-19T05:21:42.455Z"},"position":2,"canEdit":true,"canDiscard":true,"behindReset":false}]},{"intentId":"268a8a54-0265-491e-a388-8034de290927","responsibility":"system","state":"failed","nextRetryAt":null,"canRetry":true,"userAction":null,"sourceRunIds":["ac591b3b-5ef2-4deb-bce7-494566494763"],"observedRunId":"ac591b3b-5ef2-4deb-bce7-494566494763"}],"failed":[["+10s",{"issueId":"86e4f315-b7e5-4c2b-abc9-a9e753e08c63","queueId":null,"state":null,"targetRunId":null,"revision":"5e99497165f934b249e2d2ffb7532e93","protocol":"paperclip_runner_v1","steeringDisposition":"unsupported","entries":[]},{"intentId":null,"responsibility":"system","state":"failed","nextRetryAt":null,"canRetry":true,"userAction":null,"sourceRunIds":["cb1a01d7-8fb4-45ad-8009-2f64f80a2492"],"observedRunId":"cb1a01d7-8fb4-45ad-8009-2f64f80a2492"}],["+2min",{"issueId":"86e4f315-b7e5-4c2b-abc9-a9e753e08c63","queueId":null,"state":null,"targetRunId":null,"revision":"5e99497165f934b249e2d2ffb7532e93","protocol":"paperclip_runner_v1","steeringDisposition":"unsupported","entries":[]},{"intentId":null,"responsibility":"system","state":"failed","nextRetryAt":null,"canRetry":true,"userAction":null,"sourceRunIds":["cb1a01d7-8fb4-45ad-8009-2f64f80a2492"],"observedRunId":"cb1a01d7-8fb4-45ad-8009-2f64f80a2492"}]]}`) as { stopped: [IssueQueuedCommentQueue, TaskInterruptionPresentation];
+      failed: [string, IssueQueuedCommentQueue, TaskInterruptionPresentation][] };
+    const bar = "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it.";
+    const page = (get: IssueQueuedCommentQueue, interruption: TaskInterruptionPresentation) => flushSync(() => root.render(
+      <MemoryRouter><ThemeProvider>
+        <ExecutionBlockerNotice presentation={interruption} canRetry onRetry={vi.fn()} heldByPersonStop={queueHeldByPersonStop(get)} />
+        <TaskChatQueuedMessages queue={get} onEdit={vi.fn()} onReorder={vi.fn().mockResolvedValue(undefined)}
+          onSteer={vi.fn().mockResolvedValue(undefined)} onDiscard={vi.fn().mockResolvedValue(undefined)}
+          onInterrupt={vi.fn().mockResolvedValue(undefined)} />
+      </ThemeProvider></MemoryRouter>));
+    // One issue throughout; the failure is the successor's, not the stopped run's.
+    expect(real.failed.map(([label]) => label)).toEqual(["+10s", "+2min"]);
+    const [stoppedGet, stoppedInterruption] = real.stopped;
+    for (const [, get, interruption] of real.failed) {
+      expect(get.issueId).toBe(stoppedGet.issueId);
+      expect(interruption.observedRunId).not.toBe(stoppedInterruption.observedRunId);
+    }
+    const width = window.innerWidth;
+    try {
+      for (const innerWidth of [390, 1440]) {
+        Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: innerWidth });
+        window.dispatchEvent(new Event("resize"));
+        // A fresh page at each width (the bar's entries are seeded on mount).
+        flushSync(() => root.unmount());
+        root = createRoot(container);
+        // Before the Send: the person's own Stop holds; the bar is the one line.
+        page(stoppedGet, stoppedInterruption);
+        expect([innerWidth, container.textContent!.split(bar).length]).toEqual([innerWidth, 2]);
+        expect(container.textContent).not.toContain("Couldn’t finish this attempt");
+        // After the successor really failed: the banner and Retry show, the bar is gone.
+        for (const [label, get, interruption] of real.failed) {
+          expect([label, interruption.state, interruption.canRetry, get.executionWait ?? null, get.entries]).toEqual([label, "failed", true, null, []]);
+          page(get, interruption);
+          expect([innerWidth, label, container.textContent!.includes("Couldn’t finish this attempt. Your message is saved.")])
+            .toEqual([innerWidth, label, true]);
+          expect([innerWidth, label, container.querySelector('[data-testid="task-execution-retry"]')?.textContent]).toEqual([innerWidth, label, "Retry"]);
+          expect(container.querySelector('[data-testid="task-chat-queued-stopped"]')).toBeNull();
+          expect(container.querySelector('[data-testid="task-chat-queued-stopped-send"]')).toBeNull();
+          expect(container.textContent).not.toContain(bar);
+        }
+      }
+    } finally {
+      Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: width });
+    }
+  });
   // rf-5 F1: Stop, then Pause. The real GET's wait is the Send route's own
   // paused code and line (agent-conversations.test.ts "(agent-paused)" row),
   // so the bar says it is paused and offers no Send that would be refused.
