@@ -1047,7 +1047,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
           else await recordWorkspaceFinalize(hasWorkspaceRestoreFailure(adapterResult.resultJson) ? "failed" : "succeeded", undefined,
             async () => { await measureRunPhase("execution.workspace_finalize", () => restoreNativeWorkspaceBestEffort({
               db, runId: run.id, assertOwnership: ownership?.assertHeld,
-              restore: () => nativeWorkspaceSync!.restoreWorkspace(ownership?.assertHeld),
+              restore: () => nativeWorkspaceSync!.restoreWorkspace(ownership?.assertHeld, ownership?.token),
             })); });
         }
         await ownership?.assertHeld();
