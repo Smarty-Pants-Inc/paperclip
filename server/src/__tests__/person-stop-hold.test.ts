@@ -151,9 +151,11 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
      * "unaccepted": the person's cancel that the Stop route did NOT accept: the
      * run ends cancelled with that person's attribution (heartbeat.cancelRun,
      * S's R10 control), but there is no run.stop.accepted person_stop row (rf-2 c). */
-    stopKind?: "person" | "interrupt" | "unaccepted" | "treePause";
+    stopKind?: "person" | "interrupt" | "unaccepted" | "treePause" | "system";
     /** How many messages wait behind the running turn (default 3: H1-H3). */
     heldCount?: number;
+    /** rf3 R17's name for heldCount (its row is kept byte-identical). */
+    count?: number;
     /** Runs while the turn is still running, after the messages are saved and before the Stop/Pause. */
     beforeStop?: (ctx: Ctx, held: string[], runId: string) => Promise<void>;
     /** Boat's stop stays hung: its stop receipt never comes during the wait. */
@@ -281,7 +283,7 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
     let stopping: Promise<{ status: number; body: unknown }> | undefined;
     fixture.onFirst = async ({ runId }) => {
       firstRunId = runId;
-      for (const body of ["H1 held", "H2 held", "H3 held", "H4 held"].slice(0, options.heldCount ?? 3)) held.push((await ctx.post(body).expect(201)).body.id);
+      for (const body of ["H1 held", "H2 held", "H3 held", "H4 held"].slice(0, options.heldCount ?? options.count ?? 3)) held.push((await ctx.post(body).expect(201)).body.id);
       await options.beforeStop?.(ctx, held, runId);
       if (options.stopKind === "interrupt") {
         const q = await ctx.queue();
@@ -291,6 +293,10 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
         stopping = ctx.heartbeat.cancelRun(runId, "Cancelled by a board operator", {
           resultJson: { cancelledByActorType: "user", cancelledByUserId: userId } } as any)
           .then(body => ({ status: 200, body }));
+      } else if (options.stopKind === "system") {
+        // rf3 R17's system cancel (no person, no stopAcceptance): the run ends before any person's Stop.
+        stopping = ctx.heartbeat.cancelRun(runId, 'Cancelled by system recovery', {
+          resultJson: { cancelledByActorType: 'system' } } as any).then(body => ({ status: 200, body }));
       } else if (options.stopKind === "treePause") {
         // The person's REAL tree Pause (POST /api/issues/:id/tree-holds {mode:"pause"}): it interrupts the
         // running turn (heartbeat.cancelRun) and runs cancelUnclaimedWakeupsForTree. No Stop route.
@@ -326,7 +332,7 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
     const accepted = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, firstRunId),
       eq(heartbeatRunEvents.message, "run.stop.accepted")));
     expect(accepted.map(row => (row.payload as any)?.kind), "the Stop route wrote its acceptance row")
-      .toEqual(options.stopKind === "unaccepted" || options.stopKind === "treePause" ? []
+      .toEqual(options.stopKind === "unaccepted" || options.stopKind === "treePause" || options.stopKind === "system" ? []
         : [options.stopKind === "interrupt" ? "interrupt" : "person_stop"]);
     return { ...ctx, held, firstRunId, stopBody: stopped?.body as any };
   }
@@ -914,5 +920,52 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
     expect(successorCalls()[0]!.ids).toEqual(r.held);
     expect(notesAfter).toEqual([]);
   }, 120_000);
+
+
+  // review-fleet-3's R17 (the hung-Boat shape), moved here from rf3-hold-review.test.ts:508 with ONLY the
+  // helpers it calls (review-fleet-3 code line 7002827026); the row's assertions are byte-identical.
+  const comments = async (r: Ctx) => {
+    const res = await request(r.client).get(`/api/issues/${r.issueId}/comments`).expect(200);
+    return (Array.isArray(res.body) ? res.body : res.body.comments ?? res.body.items) as any[];
+  };
+  const cards = async (r: Ctx, ids: string[]) => (await comments(r)).filter(c =>
+    c.authorType === 'system' && !c.deletedAt && ids.some(id => c.metadata?.authorizationReason === `unanswered_message:${id}`));
+  const sweep = async (r: Ctx, minutes: number) => settleUnansweredPersonMessage(db,
+    { companyId: r.companyId, issueId: r.issueId, now: new Date(Date.now() + minutes * 60_000) });
+  const assertExactlyOnce = (ids: string[], calls = successorCalls()) => {
+    expect(calls, JSON.stringify(calls)).toHaveLength(1);
+    expect(calls[0].ids.slice().sort()).toEqual(ids.slice().sort());
+    for (const id of ids) expect(calls.flatMap(c => c.ids).filter(x => x === id)).toHaveLength(1);
+  };
+
+  it('rf3 R17: PERSON message parked by real remote_cleanup producer, then real PERSON Stop becomes HELD, Send answers ONCE (no false sweep card)', async () => {
+    // Real producer, not a planted wait: a warm native run is cancelled by the system;
+    // its retained remote lease has no stop receipt, so admission parks the next person's POST on remote_cleanup.
+    const r = await stopWithHeld({ stopKind: 'system', count: 0 });
+    const p = (await r.post('PERSON request while previous run is saving').expect(201)).body.id as string;
+    await r.drive(400);
+    const before = await r.wakes(); const q0 = await r.queue();
+    await evidence('rf3-R17-saving', { p, before, queue: q0, calls: fixture.calls });
+    expect(before.some(w => w.ids?.includes(p) && w.wait === 'remote_cleanup'), JSON.stringify(before)).toBe(true);
+    expect(successorCalls()).toEqual([]);
+    const stopped = await request(r.client).post(`/api/heartbeat-runs/${r.firstRunId}/cancel`).send({});
+    expect(stopped.status, JSON.stringify(stopped.body)).toBe(200);
+    const hold = await readPersonStopHold(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId, messageId: p });
+    const q = await r.queue();
+    await sweep(r, 3); const notes = await cards(r, [p]);
+    await evidence('rf3-R17-stopped', { p, hold, queue: q, notes, calls: fixture.calls });
+    expect(hold).toMatchObject({ stoppedRunId: r.firstRunId, userId });
+    expect(q.executionWait?.reason).toBe('stopped_by_person');
+    expect(q.entries.map((x: any) => x.comment.id)).toContain(p);
+    expect(notes).toEqual([]);
+    const sent = await request(r.client).post(`/api/issues/${r.issueId}/queued-comments/interrupt`)
+      .send({ queueId: q.queueId ?? q.id, targetRunId: r.firstRunId, revision: q.revision });
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    await r.drive(4000);
+    await evidence('rf3-R17-sent', { p, calls: fixture.calls, wakes: await r.wakes(), comments: await comments(r) });
+    assertExactlyOnce([p]);
+  }, 120_000);
+
+
 
 });
