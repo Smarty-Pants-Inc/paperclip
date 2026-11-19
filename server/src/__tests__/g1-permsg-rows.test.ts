@@ -4,7 +4,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, isNull } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
+import { agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
 import express from "express";
 import request from "supertest";
 import { errorHandler } from "../middleware/index.js";
@@ -76,6 +76,85 @@ describe.skipIf(!support.supported)("G1 per-message cards (SUPERSEDE-LOSTDOUBLE-
       const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retry.body.id));
       expect(next!.contextSnapshot?.wakeCommentIds).toEqual([f.m1]);
       expect(next!.contextSnapshot?.wakeCommentId).toBe(f.m1);
+    }, 120_000);
+
+    // RETRY-DEDUP-PER-MESSAGE (rf-4 F1): retry ownership is (failedRunId, the selected message ids).
+    const retryOne = (f: Awaited<ReturnType<typeof seed>>, messageId: string) => request(f.client).post(`/api/agents/${f.agentId}/wakeup`)
+      .send({ source: "on_demand", triggerDetail: "manual", reason: "retry_failed_run", failedRunId: f.runId, messageId });
+    const successors = async (f: { runId: string }) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.runId));
+    const carriedCounts = (runs: any[]) => {
+      const counts: Record<string, number> = {};
+      for (const run of runs) for (const id of new Set<string>(run.contextSnapshot?.wakeCommentIds ?? [])) counts[id] = (counts[id] ?? 0) + 1;
+      return counts;
+    };
+
+    it(`${chat ? "chat" : "task"}: Retry M1 then Retry M2 => both carried (thread order), each by exactly one successor`, async () => {
+      const f = await seed(chat);
+      await settleUnansweredPersonMessage(db, f);
+      const first = await retryOne(f, f.m1);
+      expect(first.status, JSON.stringify(first.body)).toBe(202);
+      const second = await retryOne(f, f.m2);
+      expect(second.status, JSON.stringify(second.body)).toBe(202);
+      const runs = await successors(f);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]!.contextSnapshot?.wakeCommentIds).toEqual([f.m1, f.m2]);
+      expect(runs[0]!.contextSnapshot?.wakeCommentId).toBe(f.m2);
+      expect(carriedCounts(runs)).toEqual({ [f.m1]: 1, [f.m2]: 1 });
+    }, 120_000);
+
+    it(`${chat ? "chat" : "task"}: Retry M2 then Retry M1 => one successor carrying both in thread order`, async () => {
+      const f = await seed(chat);
+      await settleUnansweredPersonMessage(db, f);
+      expect((await retryOne(f, f.m2)).status).toBe(202);
+      expect((await retryOne(f, f.m1)).status).toBe(202);
+      const runs = await successors(f);
+      expect(runs.map(run => run.contextSnapshot?.wakeCommentIds)).toEqual([[f.m1, f.m2]]);
+    }, 120_000);
+
+    it(`${chat ? "chat" : "task"}: Retry M1 twice => one successor (dedup kept)`, async () => {
+      const f = await seed(chat);
+      await settleUnansweredPersonMessage(db, f);
+      const first = await retryOne(f, f.m1), again = await retryOne(f, f.m1);
+      expect(first.status).toBe(202); expect(again.status).toBe(202);
+      expect(again.body.id).toBe(first.body.id);
+      const runs = await successors(f);
+      expect(runs.map(run => run.contextSnapshot?.wakeCommentIds)).toEqual([[f.m1]]);
+    }, 120_000);
+
+    it(`${chat ? "chat" : "task"}: Retry M2 after M1's successor STARTED and ended => M2 carried by a NEW run; M1 not re-sent`, async () => {
+      const f = await seed(chat);
+      await settleUnansweredPersonMessage(db, f);
+      const first = await retryOne(f, f.m1);
+      expect(first.status).toBe(202);
+      await db.update(heartbeatRuns).set({ status: "succeeded", startedAt: new Date(), finishedAt: new Date() }).where(eq(heartbeatRuns.id, first.body.id));
+      await db.update(issues).set({ executionRunId: null, checkoutRunId: null }).where(eq(issues.id, f.issueId));
+      const second = await retryOne(f, f.m2);
+      expect(second.status, JSON.stringify(second.body)).toBe(202);
+      expect(second.body.id).not.toBe(first.body.id);
+      const runs = await successors(f);
+      expect(runs).toHaveLength(2);
+      expect(runs.find(run => run.id === first.body.id)!.contextSnapshot?.wakeCommentIds).toEqual([f.m1]);
+      expect(runs.find(run => run.id === second.body.id)!.contextSnapshot?.wakeCommentIds).toEqual([f.m2]);
+      expect(carriedCounts(runs)).toEqual({ [f.m1]: 1, [f.m2]: 1 });
+      const replay = await retryOne(f, f.m2);
+      expect(replay.body.id).toBe(second.body.id);
+      expect(await successors(f)).toHaveLength(2);
+    }, 120_000);
+
+    it(`${chat ? "chat" : "task"}: Retry M2 while M1's successor RUNS => M2 waits in ONE deferred wake of its own (not M1's run)`, async () => {
+      const f = await seed(chat);
+      await settleUnansweredPersonMessage(db, f);
+      const first = await retryOne(f, f.m1);
+      expect(first.status).toBe(202);
+      await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, first.body.id));
+      const second = await retryOne(f, f.m2);
+      expect(second.body.id).not.toBe(first.body.id);
+      await retryOne(f, f.m2);
+      const runs = await successors(f);
+      expect(runs.map(run => run.contextSnapshot?.wakeCommentIds)).toEqual([[f.m1]]);
+      const deferred = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, f.agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution")));
+      expect(deferred.map(row => (row.payload as any)?._paperclipWakeContext?.wakeCommentIds)).toEqual([[f.m2]]);
     }, 120_000);
 
     it(`${chat ? "chat" : "task"}: deleting M1 retires only M1's card`, async () => {
