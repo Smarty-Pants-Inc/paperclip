@@ -6,7 +6,7 @@ import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } fro
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
-import { hasAcknowledgedNativeStopIntent } from "./acknowledged-native-stop.js";
+import { hasAcknowledgedNativeRunStopRequest, hasAcknowledgedNativeStopIntent } from "./acknowledged-native-stop.js";
 import { hasStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
@@ -66,6 +66,26 @@ function provedWarmTurnHandoff(run: Run, runLeases: Lease[], coordinator: Coordi
       && !readLeaseReleaseDeferral(lease.metadata) && !hasStopOnlyCleanup(lease));
 }
 
+/** adopt-stoppending-card: a person's acknowledged Stop of a warm (keep_running)
+ * turn keeps the box ON PURPOSE, handed off for the next message
+ * (nativeStopWorkspaceOutcome 'handoff', the same handedOffWarmLease predicate
+ * as the Send's gate). For task-scoped recovery that is an intentional keep, not
+ * unconfirmed execution: the successor's own admission still waits for the
+ * runner-exit proof. The hand-off's existing bounds stay in force: unproven ->
+ * stop-and-retain intent -> its receipt within handedOffWarmStopReceiptBound;
+ * past that bound (or any other lease state) the blocker, and so ONE card, returns. */
+type HandOff = typeof import("./native-runtime/handed-off-warm-lease.js");
+function keptWarmTurnHandoff(run: Run, runLeases: Lease[],
+  { handedOffWarmLease, handedOffWarmStopWithinReceiptBound }: HandOff): boolean {
+  return run.status === "cancelled" && run.runtimeMode === "native" && hasAcknowledgedNativeRunStopRequest(run)
+    && runLeases.some(lease => handedOffWarmLease(run, lease) || handedOffWarmStopWithinReceiptBound(run, lease))
+    && runLeases.every(lease => !lease.provider || lease.provider === "local"
+      // A local lease (the host workspace) must itself be released; only the remote box is kept.
+      ? (!!lease.releasedAt || (lease.status === "retained" && lease.cleanupStatus === "success"))
+        && lease.status !== "pending_cleanup" && lease.cleanupStatus !== "failed"
+      : hasRemoteTerminationReceipt(lease) || handedOffWarmLease(run, lease) || handedOffWarmStopWithinReceiptBound(run, lease));
+}
+
 async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
   expectedRunCount?: number, settleCoordinators = true, skipRemoteProviderProof = false): Promise<string | null> {
   const runs = await db.select().from(heartbeatRuns).where(condition);
@@ -77,9 +97,12 @@ async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
   // handoff's still-active warm lease is the retained box, not live execution.
   const coordinatorRows = settleCoordinators ? [] : await db.select().from(nativeRunFinalizations)
     .where(inArray(nativeRunFinalizations.runId, runs.map(run => run.id)));
-  const handedOff = new Set(settleCoordinators ? [] : runs.filter(run => provedWarmTurnHandoff(run,
+  // Lazy, as acknowledged-native-stop does: a static import closes a module cycle.
+  const handOff = settleCoordinators ? null : await import("./native-runtime/handed-off-warm-lease.js");
+  const handedOff = new Set(!handOff ? [] : runs.filter(run => provedWarmTurnHandoff(run,
     allLeases.filter(lease => lease.heartbeatRunId === run.id),
-    coordinatorRows.find(row => row.runId === run.id))).map(run => run.id));
+    coordinatorRows.find(row => row.runId === run.id))
+    || keptWarmTurnHandoff(run, allLeases.filter(lease => lease.heartbeatRunId === run.id), handOff)).map(run => run.id));
   const leases = allLeases.filter(lease => !lease.heartbeatRunId || !handedOff.has(lease.heartbeatRunId));
   const proofLeases = leases.filter(lease => !skipRemoteProviderProof || !lease.provider || lease.provider === "local");
   const deferred = proofLeases.find(lease => lease.status === "active" && readLeaseReleaseDeferral(lease.metadata));
