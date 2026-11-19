@@ -117,42 +117,53 @@ export async function createNativeGitHubAccess(input: {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("GitHub broker did not listen");
     const url = `http://127.0.0.1:${address.port}`;
-    try {
-      bridge = await startBridge({
-        ...location,
-        runtimeRootDir: input.target?.kind === "remote"
-          ? githubOperationLauncherDirectory(location)
-          : null,
-        adapterKey: "native-github",
-        hostApiToken: token,
-        hostApiUrl: url,
-        enableSandboxDuplexBridge: duplexRequested,
-        startPaused: true,
-        getRunGeneration: () => activeGeneration ?? undefined,
-        duplexObservabilityRecorder: adapterExecutionTargetDuplexObservabilityRecorder(input.target),
-        onLog: input.onLog,
-      });
-      if (input.target?.kind === "remote" && !bridge) {
-        throw new Error("GitHub session requires a remote callback bridge");
+    const prepareBridge = async () => {
+      try {
+        bridge = await startBridge({
+          ...location,
+          runtimeRootDir: input.target?.kind === "remote"
+            ? githubOperationLauncherDirectory(location)
+            : null,
+          adapterKey: "native-github",
+          hostApiToken: token,
+          hostApiUrl: url,
+          enableSandboxDuplexBridge: duplexRequested,
+          startPaused: true,
+          getRunGeneration: () => activeGeneration ?? undefined,
+          duplexObservabilityRecorder: adapterExecutionTargetDuplexObservabilityRecorder(input.target),
+          onLog: input.onLog,
+        });
+        if (input.target?.kind === "remote" && !bridge) {
+          throw new Error("GitHub session requires a remote callback bridge");
+        }
+      } catch {
+        // GitHub remains optional. Stage anonymous wrappers for this session;
+        // the supervisor retries transport setup on the next run.
+        ready = false;
+        await new Promise<void>(resolve => server.close(() => resolve()));
+        await input.onLog?.("stderr", "[paperclip] GitHub runtime transport unavailable; continuing without managed GitHub access.\n").catch(() => undefined);
       }
-    } catch {
-      // GitHub remains optional. Stage anonymous wrappers for this session;
-      // the supervisor retries transport setup on the next run.
-      ready = false;
-      await new Promise<void>(resolve => server.close(() => resolve()));
-      await input.onLog?.("stderr", "[paperclip] GitHub runtime transport unavailable; continuing without managed GitHub access.\n").catch(() => undefined);
-    }
-    const env = await prepareGitHubOperationLaunchers({
-      ...location, cwd: input.cwd,
-      env: {
-        ...githubBrokerEnvironment({ PATH: input.env.PATH }, {
-          url: ready ? bridge?.env.PAPERCLIP_API_URL ?? url : "",
-          token: ready ? bridge?.env.PAPERCLIP_API_KEY ?? token : "",
-        }),
-        // Never retain an old run's bridge authentication override.
-        PAPERCLIP_GITHUB_BRIDGE_TOKEN: ready ? bridge?.env.PAPERCLIP_API_KEY ?? token : "",
-      },
-    });
+    };
+    // Launcher bytes need only the target and PATH, not the broker endpoint or
+    // authority. Independent control commands can stage them while the bridge
+    // starts. Join BOTH branches before cleanup: a late successful bridge must
+    // not escape after launcher staging failed.
+    const [preparedBridge, preparedLaunchers] = await Promise.allSettled([
+      prepareBridge(),
+      prepareGitHubOperationLaunchers({ ...location, cwd: input.cwd,
+        env: typeof input.env.PATH === "string" ? { PATH: input.env.PATH } : {},
+      }),
+    ]);
+    if (preparedBridge.status === "rejected") throw preparedBridge.reason;
+    if (preparedLaunchers.status === "rejected") throw preparedLaunchers.reason;
+    const env = {
+      ...githubBrokerEnvironment(preparedLaunchers.value, {
+        url: ready ? bridge?.env.PAPERCLIP_API_URL ?? url : "",
+        token: ready ? bridge?.env.PAPERCLIP_API_KEY ?? token : "",
+      }),
+      // Never retain an old run's bridge authentication override.
+      PAPERCLIP_GITHUB_BRIDGE_TOKEN: ready ? bridge?.env.PAPERCLIP_API_KEY ?? token : "",
+    };
     return {
       env,
       get ready() { return ready && !stopped && bridge?.readRunDisposition?.().failed !== true; },

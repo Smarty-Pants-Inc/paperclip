@@ -40,7 +40,9 @@ function localDuplexChannel(command: readonly string[], cwd: string): CommandMan
 async function broker(resolveCredentials = vi.fn(async (binding: ReturnType<typeof run>) => ({
   status: "available", env: { GH_TOKEN: `fixture-${binding.runId}` },
 })), remote = false, bridgeUnavailable = false, onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>,
-duplex?: { enabled?: boolean; capability: boolean; unavailable?: boolean; recorder?: DuplexObservabilityRecorder }) {
+duplex?: { enabled?: boolean; capability: boolean; unavailable?: boolean; recorder?: DuplexObservabilityRecorder }, rpcLatencyMs = 0,
+onCommand?: (input: Parameters<CommandManagedRuntimeRunner["execute"]>[0]) => Promise<void>,
+onBridgeStarted?: (bridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>>) => Promise<void>) {
   const root = await mkdtemp(path.join(tmpdir(), "native-github-reuse-"));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const bin = path.join(root, "real-bin");
@@ -48,6 +50,8 @@ duplex?: { enabled?: boolean; capability: boolean; unavailable?: boolean; record
   await writeFile(path.join(bin, "gh"), `#!${process.execPath}\nprocess.stdout.write(process.env.GH_TOKEN || 'anonymous');`, { mode: 0o700 });
   const execute = vi.fn<CommandManagedRuntimeRunner["execute"]>(async (input) => {
     const startedAt = new Date().toISOString();
+    if (rpcLatencyMs) await new Promise(resolve => setTimeout(resolve, rpcLatencyMs));
+    await onCommand?.(input);
     const child = promisify(execFile)(input.command, input.args ?? [], {
       cwd: input.cwd ?? root, env: { ...process.env, ...input.env }, timeout: 15_000, maxBuffer: 4 * 1024 * 1024,
     });
@@ -73,6 +77,7 @@ duplex?: { enabled?: boolean; capability: boolean; unavailable?: boolean; record
     bridgeUnavailable ? async () => { throw new Error("fixture bridge unavailable"); } : async input => {
       const bridge = await startAdapterExecutionTargetPaperclipBridge(input);
       bridgeModes.push(bridge?.env.PAPERCLIP_API_BRIDGE_MODE);
+      await onBridgeStarted?.(bridge);
       return bridge;
     });
   cleanups.push(result.stop);
@@ -215,6 +220,66 @@ it.each([false, true])("keeps one live parent and its original launcher environm
   await releaseB(); await b.stop();
   await expect(access(b.env.PAPERCLIP_GITHUB_LAUNCHER_DIR)).rejects.toThrow();
 }, 45_000);
+// Keep reason: independent control preparation must overlap and never leak a late bridge.
+it("stages token-free launchers while the real bridge entrypoint RPC is pending", async () => {
+  let releaseBridge!: () => void;
+  const pendingBridge = new Promise<void>(resolve => { releaseBridge = resolve; });
+  let bridgeStarted = false, launchersStarted = false;
+  const creating = broker(undefined, true, false, undefined, undefined, 0, async input => {
+    if (input.args?.some(arg => arg.includes(".paperclip-bridge-upload.lock"))) {
+      bridgeStarted = true;
+      await pendingBridge;
+    }
+    if (input.stdin?.includes("GitHub operation launcher")) launchersStarted = true;
+  });
+  try {
+    await vi.waitFor(() => {
+      expect(bridgeStarted).toBe(true);
+      expect(launchersStarted).toBe(true);
+    }, { timeout: 1000 });
+  } finally { releaseBridge(); await creating; }
+  const b = await creating;
+  expect((await request(b)).status).toBe(403);
+  const release = await b.activate(run("parallel"));
+  expect(await (await request(b)).json()).toMatchObject({ env: { GH_TOKEN: "fixture-parallel" } });
+  await release();
+});
+
+it("joins and closes a late real bridge when parallel launcher staging fails", async () => {
+  let releaseBridge!: () => void;
+  const pendingBridge = new Promise<void>(resolve => { releaseBridge = resolve; });
+  let bridgeStarted = false, launcherFailed = false, settled = false;
+  let bridgeFinished!: () => void;
+  const observedBridge = new Promise<void>(resolve => { bridgeFinished = resolve; });
+  let bridgeUrl: string | undefined, directory: string | undefined;
+  const creating = broker(undefined, true, false, undefined, undefined, 0, async input => {
+    if (input.args?.some(arg => arg.includes(".paperclip-bridge-upload.lock"))) {
+      bridgeStarted = true;
+      await pendingBridge;
+    }
+    if (input.stdin?.includes("GitHub operation launcher")) {
+      launcherFailed = true;
+      throw new Error("injected launcher staging failure");
+    }
+  }, async bridge => {
+    bridgeUrl = bridge!.env.PAPERCLIP_API_URL;
+    directory = path.dirname(path.dirname(bridge!.env.PAPERCLIP_BRIDGE_QUEUE_DIR!));
+    cleanups.push(async () => { bridge?.markOrderlyCompletion?.(); await bridge?.stop(); });
+    bridgeFinished();
+  }).then(value => { settled = true; return value; }, error => { settled = true; return error as Error; });
+  try {
+    await vi.waitFor(() => {
+      expect(bridgeStarted).toBe(true);
+      expect(launcherFailed).toBe(true);
+    }, { timeout: 1000 });
+    expect(settled).toBe(false);
+  } finally { releaseBridge(); await creating; await observedBridge; }
+  expect(await creating).toMatchObject({ message: "injected launcher staging failure" });
+  expect(bridgeUrl).toBeDefined();
+  await expect(fetch(bridgeUrl!)).rejects.toThrow();
+  await expect(access(directory!)).rejects.toThrow();
+});
+
 it("rejects other scopes, concurrent bindings, browser requests and forged authority", async () => {
   const b = await broker();
   for (const field of ["companyId", "agentId", "issueId"] as const) {
