@@ -7149,4 +7149,60 @@ describe.each([{ width: 390, mobile: true }, { width: 1440, mobile: false }])(
     await act(async () => {});
     expectEveryAnswerOnce(5, "reload");
   });
+
+  // Person case (app-lead livefinals, red from 907e0a37): the server posts NOTHING
+  // until the turn ends, so while it works only the transcript's finals exist.
+  // Each new answer is a NEW block below the last; earlier ones stay, each once.
+  // A replay prefix (an earlier, shorter copy of an answer, or a rebuild that
+  // has not yet re-read later answers) never regresses one already shown.
+  const userCommentsThrough = (answered: number, steered: boolean) =>
+    commentsThrough(answered, steered).filter((entry) => entry.authorType === "user");
+  const withPrefix = (entries: ReturnType<typeof transcriptThrough>, index: number, text: string) =>
+    entries.map((entry, at) => (at === index ? { ...entry, text } : entry));
+  it.each([true, false])("posting only at the end, keeps every live answer (steering metadata=%s)", async (steered) => {
+    sidebarState.isMobile = mobile;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    for (let answered = 1; answered <= 5; answered += 1) {
+      nativeTranscriptState.transcriptByRun.set(runId, transcriptThrough(answered, false));
+      render(<TaskChatThread {...base} comments={userCommentsThrough(answered, steered)} activeRun={live} />);
+      await act(async () => {});
+      expectEveryAnswerOnce(answered, `live (first frame) after answer ${answered}`);
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 400)); });
+      expectEveryAnswerOnce(answered, `live after answer ${answered}`);
+    }
+    nativeTranscriptState.transcriptByRun.set(runId, withPrefix(transcriptThrough(5, false), 4, "ANSWER-FIVE"));
+    render(<TaskChatThread {...base} comments={userCommentsThrough(5, steered)} activeRun={live} />);
+    await act(async () => {});
+    expectEveryAnswerOnce(5, "live after a replay prefix of the latest answer");
+    nativeTranscriptState.transcriptByRun.set(runId, withPrefix(transcriptThrough(5, false), 1, "ANSWER-TWO"));
+    render(<TaskChatThread {...base} comments={userCommentsThrough(5, steered)} activeRun={live} />);
+    await act(async () => {});
+    expectEveryAnswerOnce(5, "live after a replay prefix of an earlier answer");
+    nativeTranscriptState.transcriptByRun.set(runId, transcriptThrough(2, false));
+    render(<TaskChatThread {...base} comments={userCommentsThrough(5, steered)} activeRun={live} />);
+    await act(async () => {});
+    expectEveryAnswerOnce(5, "live while a replay has re-read only two answers");
+    nativeTranscriptState.transcriptByRun.set(runId, transcriptThrough(5, false));
+    render(<TaskChatThread {...base} comments={userCommentsThrough(5, steered)} activeRun={live} />);
+    await act(async () => {});
+    expectEveryAnswerOnce(5, "live after the replay caught up");
+    // The run ends and the server posts all five at once: the comments take over
+    // in the same order, with no frame missing or doubling an answer.
+    const posted = commentsThrough(5, steered).map((entry) =>
+      entry.authorType === "agent" ? { ...entry, createdAt: new Date(at(57)), updatedAt: new Date(at(57)) } : entry);
+    render(<TaskChatThread {...base} comments={posted} activeRun={live} />);
+    await act(async () => {});
+    expectEveryAnswerOnce(5, "live with all five just posted");
+    nativeTranscriptState.transcriptByRun.set(runId, transcriptThrough(5, true));
+    render(<TaskChatThread {...base} comments={posted} linkedRuns={[settled]} />);
+    await act(async () => {});
+    expectEveryAnswerOnce(5, "settling");
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 400)); });
+    expectEveryAnswerOnce(5, "settled");
+    flushSync(() => root?.unmount());
+    root = createRoot(container);
+    render(<TaskChatThread {...base} comments={posted} linkedRuns={[settled]} />);
+    await act(async () => {});
+    expectEveryAnswerOnce(5, "reload");
+  });
 });

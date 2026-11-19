@@ -27,6 +27,7 @@ import { TaskChatShimmerScope, useTaskChatShimmer } from "./TaskChatShimmer";
 import {
   buildTurnTimelineRows,
   isTerminalRunStatus,
+  isYieldedWaitStub,
   omitProgressRepeatedByResponse,
   paperclipRunnerFinalResponse,
   paperclipRunnerTimelineItems,
@@ -170,6 +171,8 @@ export function TaskChatRunnerTurn({
   agentIcon,
   agent,
   items,
+  runAnswerItems,
+  postedAnswerTexts,
   responseComment,
   status,
   execution,
@@ -191,6 +194,16 @@ export function TaskChatRunnerTurn({
   agentIcon?: string | null;
   agent?: import("../AgentAvatar").AvatarAgent;
   items: readonly TaskChatItem[];
+  /**
+   * The whole run's transcript items when `items` is only its latest steering
+   * segment; every answer the run gave is read from here. Defaults to `items`.
+   */
+  runAnswerItems?: readonly TaskChatItem[];
+  /**
+   * Normalized texts of this run's replies the thread already shows; an
+   * earlier answer with one of them is not drawn a second time.
+   */
+  postedAnswerTexts?: readonly string[];
   /** Saved duplicate hidden by this live lane; only its identical visible reply is read. */
   responseComment?: Pick<TaskChatMessageItem, "id" | "text" | "createdAtIso">;
   status: string;
@@ -279,6 +292,37 @@ export function TaskChatRunnerTurn({
     finalRef.current.providerText = observedProviderText;
   }
   const final = finalRef.current.item;
+  // One run can answer several steered questions, each with its own provider
+  // final. Every answer stays on screen as its own block, in transcript order,
+  // keyed by its transcript item id; a new one never replaces the last. Each is
+  // latched by id: a replay prefix (a shorter copy of the same item) or a
+  // rebuild that has not re-read it yet never regresses or drops it.
+  const answersRef = useRef<{ runId?: string | null; byId: Map<string, TaskChatMessageItem> }>({ runId, byId: new Map() });
+  if (answersRef.current.runId !== runId) answersRef.current = { runId, byId: new Map() };
+  const waitSummaries = [waitSummary, ...turnItems.flatMap((item) =>
+    item.kind === "protocol" && item.surface === "run_result" ? [item.summary] : [])];
+  for (const item of runAnswerItems ?? turnItems) {
+    if (item.kind !== "message" || item.channel !== "final" || !item.text.trim()) continue;
+    if ((yielded || awaitingContinuation) && isYieldedWaitStub(item.text, waitSummaries)) continue;
+    const latched = answersRef.current.byId.get(item.id);
+    if (!latched || item.text.length >= latched.text.length) answersRef.current.byId.set(item.id, item);
+  }
+  // The latest answer is `final` (drawn below, with its read identity). An
+  // earlier answer whose reply the thread already shows is not drawn twice.
+  const postedLeft = new Map<string, number>();
+  for (const text of postedAnswerTexts ?? []) postedLeft.set(text, (postedLeft.get(text) ?? 0) + 1);
+  const earlierAnswers = [...answersRef.current.byId.values()].filter((answer) => {
+    if (final && (answer.atMs != null && final.atMs != null
+      ? answer.atMs >= final.atMs
+      : answer.text === final.text)) return false;
+    const text = answer.text.trim().replace(/\s+/g, " ");
+    const posted = postedLeft.get(text) ?? 0;
+    if (posted > 0) {
+      postedLeft.set(text, posted - 1);
+      return false;
+    }
+    return true;
+  });
   const responseReadIdentity = final && responseComment &&
     final.text === responseComment.text
     ? { id: responseComment.id, createdAtIso: responseComment.createdAtIso }
@@ -351,6 +395,21 @@ export function TaskChatRunnerTurn({
         </div>
       ) : null}
       <McpAppTurnViews runId={runId} refreshKey={mcpAppRunRefreshKey(turnItems, status)} />
+      {earlierAnswers.map((answer) => (
+        <div
+          className="w-full"
+          key={`${runId ?? "run"}:answer:${answer.id}`}
+          data-testid="task-chat-earlier-response"
+          data-answer-id={answer.id}
+        >
+          <TaskChatBubble
+            item={{ ...answer, authorName: agentName ?? undefined, agentIcon, agent, timestamp: answer.timestamp ?? formatTaskChatTimestamp(answer.atMs) }}
+            animateEntry={false}
+            hideAgentIdentity={!continuedAfterSteering}
+            actions={<TaskChatBubbleActions copyText={answer.text} />}
+          />
+        </div>
+      ))}
       {final ? (
         <div
           className="w-full"

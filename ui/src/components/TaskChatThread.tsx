@@ -269,6 +269,29 @@ function isRunnerResponseComment(params: {
   );
 }
 
+/**
+ * While a native runner run is live or settling, its replies stay out of the
+ * backbone: the runner lane draws its answers. An earlier reply (posted before
+ * the lane's latest final, with other text) stays in the backbone instead, and
+ * the lane does not draw that answer a second time.
+ */
+function holdsRunnerResponseComment(params: {
+  comment: TaskChatThreadProps["comments"][number];
+  runId: string;
+  runStartedAtMs: number | null;
+  finalText: string | null;
+  finalAtMs: number | null;
+}): boolean {
+  const { comment, finalText, finalAtMs } = params;
+  return isRunnerResponseComment(params) && !(
+    finalText &&
+    finalAtMs != null &&
+    comment.authorType === "agent" &&
+    toMs(comment.createdAt) < finalAtMs &&
+    normalizedMessageText(comment.body) !== normalizedMessageText(finalText)
+  );
+}
+
 // PAP-462 B4: backstop for how long the just-settled run's transcript stays
 // mounted when neither a settled turn nor a reply comment ever arrives to hand
 // off to (e.g. a stopped run with no tool activity). Normal completions hand off
@@ -1468,22 +1491,13 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
       // canonical bubble + Worked header can replace that lane atomically.
       if (
         heldPaperclipRunnerRunId &&
-        isRunnerResponseComment({
+        holdsRunnerResponseComment({
           comment,
           runId: heldPaperclipRunnerRunId,
           runStartedAtMs: heldPaperclipRunnerStartedAtMs,
           finalText: heldPaperclipRunnerFinalText,
-        }) &&
-        // One run can answer several steered questions, each posted as its
-        // own reply. The lane shows only its latest answer, so an earlier
-        // reply (posted before that answer, with other text) stays visible.
-        !(
-          heldPaperclipRunnerFinalText &&
-          heldPaperclipRunnerFinalAtMs != null &&
-          comment.authorType === "agent" &&
-          toMs(comment.createdAt) < heldPaperclipRunnerFinalAtMs &&
-          normalizedMessageText(comment.body) !== normalizedMessageText(heldPaperclipRunnerFinalText)
-        )
+          finalAtMs: heldPaperclipRunnerFinalAtMs,
+        })
       )
         return;
       const item = commentItems[index];
@@ -2839,6 +2853,40 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
       tailPlanContentKey,
     ],
   );
+  // Every answer the tail run has given, parsed over the WHOLE run so each keeps
+  // one transcript id across steering segments; the lane keeps each on screen.
+  const tailRunAnswerItems = useMemo(
+    () => {
+      if (!tailRunId || !paperclipRunnerTail) return undefined;
+      if (tailSegmentStartMs == null) return tailItems;
+      return transcriptToTaskChatItems(tailAllEntries, {
+        runId: tailRunId,
+        agentName: tailAgentName,
+        running: tailStreaming,
+      });
+    },
+    // tailAllEntries is a fresh array each render; tailEntryContentKey tracks it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [tailRunId, paperclipRunnerTail, tailSegmentStartMs, tailItems, tailEntryContentKey, tailStreaming, tailAgentName],
+  );
+  // This run's replies the backbone already shows (not held for the lane).
+  // The lane skips an answer whose posted reply is there (same run, same text).
+  const tailRunPostedAnswerTexts = useMemo(() => {
+    if (!tailRunId) return undefined;
+    return projectedComments.filter((comment) =>
+      !comment.deletedAt && comment.authorType === "agent" &&
+      (comment.createdByRunId ?? comment.runId) === tailRunId &&
+      !queuedCommentIds.has(comment.id) &&
+      !(heldPaperclipRunnerRunId && holdsRunnerResponseComment({
+        comment,
+        runId: heldPaperclipRunnerRunId,
+        runStartedAtMs: heldPaperclipRunnerStartedAtMs,
+        finalText: heldPaperclipRunnerFinalText,
+        finalAtMs: heldPaperclipRunnerFinalAtMs,
+      })))
+      .map((comment) => normalizedMessageText(comment.body));
+  }, [tailRunId, projectedComments, queuedCommentIds, heldPaperclipRunnerRunId, heldPaperclipRunnerStartedAtMs,
+    heldPaperclipRunnerFinalText, heldPaperclipRunnerFinalAtMs]);
   const tailTurnStatus = useMemo(
     () =>
       isTerminalRunStatus(tailStatus)
@@ -3735,6 +3783,8 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                                       agentIcon={visibleTailAgentIcon}
                                       agent={tailAgent ?? (tailAgentId ? { id: tailAgentId } : undefined)}
                                       items={tailItems}
+                                      runAnswerItems={tailRunAnswerItems}
+                                      postedAnswerTexts={tailRunPostedAnswerTexts}
                                       responseComment={heldPaperclipRunnerResponseComment}
                                       preparationLabel={optimisticRunnerStartup && submissionTakingLonger ? "Taking longer than usual…" : undefined}
                                       allowSummaryFallback={!paperclipRunnerTail ||
