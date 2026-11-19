@@ -8,29 +8,32 @@ import { cleanupGitHubOperationLaunchers, githubOperationLauncherDirectory, prep
 
 /** Delay only managed, read-only context discovery on concurrent direct runners.
  * The callback returns derived keys, never an old PATH or credential snapshot.
- * Both calls classify a final remote Git probe failure (smarty-dev#21249): the
- * immediate one as a transient provider failure (legacy bootstrap retry), the
- * deferred one, which runs inside the native executor before any provider
- * turn, as a failed-before-provider-turn error, so the task continues once on
- * a fresh box instead of being blocked. */
+ * Both calls classify a final remote Git probe failure (smarty-dev#21249). For a
+ * native run (the deferred call, inside the native executor, and the immediate
+ * one, which Boat's runners take because they do not declare concurrent sync)
+ * no provider turn has started, so it is a failed-before-provider-turn error:
+ * the task continues once on a fresh box instead of being blocked. A legacy
+ * run's immediate call stays a transient provider failure (bootstrap retry). */
 export async function prepareHeartbeatGitHubEnvironment(input: Parameters<typeof prepareGitHubExecutionEnvironment>[0] & {
   defer: boolean;
+  /** The run resolved to the native runtime (heartbeat.ts `nativeRuntimeResolution.kind`). */
+  native?: boolean;
   environment?: { name: string; driver: string } | null;
   providerLeaseId?: string | null;
 }) {
+  const classify = (native: boolean) => (error: unknown): never => {
+    const classified = classifyExecutionTargetGitContextFailure(error, input.environment);
+    throw classified === error || !native ? classified : new NativeFailedBeforeProviderTurnError(input.providerLeaseId ?? null, error);
+  };
   const remote = input.target?.kind === "remote" && input.target.transport === "sandbox" ? input.target : null;
   if (!input.defer || input.hostCredentials || !remote?.runner || remote.runnerTask || remote.runner.allowConcurrentSyncOperations !== true) {
-    return { env: await prepareGitHubExecutionEnvironment(input).catch((error: unknown) => {
-      throw classifyExecutionTargetGitContextFailure(error, input.environment);
-    }), prepare: undefined };
+    return { env: await prepareGitHubExecutionEnvironment(input).catch(classify(input.native === true)), prepare: undefined };
   }
   return {
     env: { ...input.env, PAPERCLIP_GIT_METADATA_ROOTS: "[]", PAPERCLIP_RUNNER_NETWORK_ROOTS: "[]",
       PAPERCLIP_GITHUB_AUTH_MODE: "managed", PAPERCLIP_RUNNER_NETWORK_ACCESS: input.networkAccess ? "enabled" : "disabled" },
-    prepare: () => prepareGitHubExecutionEnvironment({ ...input, env: {} }).catch((error: unknown) => {
-      throw classifyExecutionTargetGitContextFailure(error, input.environment) === error
-        ? error : new NativeFailedBeforeProviderTurnError(input.providerLeaseId ?? null, error);
-    }),
+    // Only a native pi_rpc run defers, so this call is always native.
+    prepare: () => prepareGitHubExecutionEnvironment({ ...input, env: {} }).catch(classify(true)),
   };
 }
 

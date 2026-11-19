@@ -3523,7 +3523,9 @@ export function heartbeatService(
             (entry): entry is [string, string] => typeof entry[1] === "string")),
           hostCredentials: useHostGitHub,
           networkAccess: trustPreset.kind === "standard" && process.env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled",
-          // Classifies a final Git probe failure on both the immediate and the deferred call.
+          // Classifies a final Git probe failure on both the immediate and the deferred call; a
+          // native run's continues on a fresh box. The run is not yet persisted native here.
+          native: nativeRuntimeResolution.kind === "native",
           environment: selectedEnvironment, providerLeaseId: activeEnvironmentLease?.lease.providerLeaseId ?? null,
         }));
         if (useAgentGitHubEnv) githubEnvironment.env.PAPERCLIP_GITHUB_AUTH_MODE = "agent_env";
