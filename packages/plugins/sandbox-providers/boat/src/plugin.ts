@@ -501,6 +501,12 @@ async function currentSpareCount(key: ReadySpareKey): Promise<number | undefined
  * that reads off with no config event is applied here, as acquire applies it.
  */
 const admittedSpareCreates = new Map<string, Set<string>>();
+/** The same capacity rule owns create admission and unfinished-refill retention. */
+function spareRefillHasCapacity(key: ReadySpareKey, refillId: string, desired: number): boolean {
+  const admitted = admittedSpareCreates.get(readySparePoolKey(key));
+  const others = [...(admitted ?? [])].filter(id => id !== refillId).length;
+  return readySpares.ready(key).length + others < desired;
+}
 async function admitSpareCreate(key: ReadySpareKey, refillId?: string): Promise<boolean> {
   const poolId = readySparePoolKey(key);
   const pool = knownSparePools.get(poolId);
@@ -517,9 +523,8 @@ async function admitSpareCreate(key: ReadySpareKey, refillId?: string): Promise<
   pool.baseDesired = count;
   pool.desired = readySpares.demandTarget(key, count, pool.spareMax, pool.demandWindowMinutes);
   if (refillId === undefined) return true; // TTL renewal does not reserve another box.
+  if (!spareRefillHasCapacity(key, refillId, pool.desired)) return false;
   const admitted = admittedSpareCreates.get(poolId) ?? new Set<string>();
-  const others = [...admitted].filter(id => id !== refillId).length;
-  if (readySpares.ready(key).length + others >= pool.desired) return false;
   admitted.add(refillId);
   admittedSpareCreates.set(poolId, admitted);
   return true;
@@ -2171,8 +2176,10 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
           || ["archived", "stopped", "error", "cancelled"].includes(sandbox.state)))
         .map(sandbox => sandbox.labels["paperclip-refill"]).filter((id): id is string => typeof id === "string"));
       const resolving = new Set<string>();
-      // OFF must see unfinished paid boxes too, even though positive-target
-      // reconciliation leaves them to their durable refill's warm continuation.
+      const surplusRefills = new Set<string>();
+      // Retain an unfinished paid box for warm continuation only while it can
+      // still be admitted at the current target. OFF and nonzero target cuts
+      // must expose surplus boxes to the keeper's durable owed-stop path.
       const pool = knownSparePools.get(readySparePoolKey(key));
       const retainPending = !pool || (!pool.retired && pool.baseDesired > 0);
       await updateSpareRefills(key, pending => {
@@ -2185,13 +2192,17 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
           }
           if (made && !settled.has(entry.id) && !dedupedBoxStop(made)) {
             entry.sandboxId = made.id;
-            if (retainPending && !entry.refused) resolving.add(made.id);
+            if (retainPending && !entry.refused && (!pool || spareRefillHasCapacity(key, entry.id, pool.desired))) resolving.add(made.id);
+            else surplusRefills.add(made.id);
           }
         }
       });
       // Pending creates are not stale inventory to stop. The durable refill
       // resolves/adopts and warms that exact id instead of allocating another.
-      return owned.filter(sandbox => !resolving.has(sandbox.id)).map(sandbox => readySpareFromSandbox(sandbox, ttlSeconds));
+      return owned.filter(sandbox => !resolving.has(sandbox.id)).map(sandbox => ({
+        ...readySpareFromSandbox(sandbox, ttlSeconds),
+        ...(surplusRefills.has(sandbox.id) ? { retireUnfinished: true } : {}),
+      }));
     },
     async get(spare, signal) {
       const result = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
@@ -2199,7 +2210,14 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       }, false, { requireJson: true });
       const sandbox = result?.sandbox ?? result;
       if (sandbox?.id !== spare.id || !sandbox.labels) return undefined;
-      return readySpareFromSandbox(sandbox, ttlSeconds);
+      const current = readySpareFromSandbox(sandbox, ttlSeconds);
+      // A concurrent claim/target increase can make continuation admissible
+      // again between list and get. Recheck before authorizing retirement.
+      const pool = knownSparePools.get(readySparePoolKey(key));
+      if (spare.retireUnfinished && pool && !spareRefillHasCapacity(key, current.labels["paperclip-refill"], pool.desired)) {
+        current.retireUnfinished = true;
+      }
+      return current;
     },
     create: () => createReadySpare(config, key, ttlSeconds, from),
     // No pre-claim guest commands: starting Pi can write another run's home.

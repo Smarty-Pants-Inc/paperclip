@@ -68,6 +68,8 @@ export type ReadySpare = {
   name: string;
   labels: Record<string, string>;
   providerObservation?: Record<string, unknown>;
+  /** Durable refill inventory says this unfinished box no longer fits its target. */
+  retireUnfinished?: boolean;
 };
 
 export type ReadySpareOperations = {
@@ -810,7 +812,7 @@ export class ReadySpareKeeper {
     }
   }
 
-  /** Boat-only timer pass: retire eligible ready spares without consulting claim storage or refilling. */
+  /** Boat-only timer pass: retire ready surplus and explicitly surplus unfinished refills; no claim storage or refill. */
   async reconcileTimer(key: ReadySpareKey, desired: number, operations: ReadySpareOperations): Promise<void> {
     if (this.stopping) return;
     const poolId = readySparePoolKey(key);
@@ -821,15 +823,19 @@ export class ReadySpareKeeper {
       && spare.labels.environment === key.environmentId && spare.labels.purpose === "spare"
       && !spare.name.startsWith("paperclip-claim:")
       && (target === 0 ? !isTerminalState(spare.state)
-        : spare.labels.configHash === key.configHash && spare.name === `paperclip-spare:ready:${key.configHash}`
-          && (spare.state === "ready" || spare.state === "idle"));
+        : spare.labels.configHash === key.configHash && (spare.retireUnfinished === true && !isTerminalState(spare.state)
+          || spare.name === `paperclip-spare:ready:${key.configHash}` && (spare.state === "ready" || spare.state === "idle")));
     const keep = listed.filter(retirable);
     // Existing debt is serviced by the owed-stop retry path, at its backoff,
     // never by a fresh keeper stop on every tick (which would erase retry counts).
     const eligible = keep.filter(spare => !this.claiming.has(spare.id) && !this.stoppingSpares.has(spare.id)
       && !this.stopFailedSpares.has(spare.id));
-    const selected = eligible.slice(0, target);
-    for (const surplus of eligible.slice(selected.length)) {
+    // An explicitly surplus unfinished refill is never a ready candidate to
+    // keep, regardless of Boat inventory order. It uses the same owed-stop path.
+    const ready = eligible.filter(spare => !spare.retireUnfinished);
+    const selected = ready.slice(0, target);
+    const surplusCandidates = [...ready.slice(selected.length), ...eligible.filter(spare => spare.retireUnfinished)];
+    for (const surplus of surplusCandidates) {
       if (this.stopping) return;
       let current: ReadySpare | undefined;
       try { current = await operations.get(surplus); }

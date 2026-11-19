@@ -357,6 +357,52 @@ describe("spare.9 live-findings boundary", () => {
     expect((h.state.get(`${h.company}:stop-owed`) as any)?.owed ?? []).toEqual([]);
   });
 
+  // Never-OK money guard: BRIEF ADDED F1b, target CUT while a paid refill is unfinished.
+  it("F1b target 3 to 1 stops the saved unwarmed surplus refill within one tick through durable debt", async () => {
+    const h = await start("f1b-cut-pending");
+    h.config.spares = 3; await settle(h.configChanged());
+    await settle(taskAcquire(h, "teach-f1b")); await advance(5_000);
+    const initial = h.boat.liveSpares(); expect(initial).toHaveLength(3);
+    let refillId: string | undefined;
+    let failWarm = true;
+    const hasDebt = () => (h.state.get(`${h.company}:stop-owed`) as any)?.owed.some((entry: any) => entry.spareId === refillId);
+    vi.stubGlobal("fetch", async (input: unknown, init: RequestInit = {}) => {
+      const path = new URL(String(input)).pathname;
+      const method = init.method ?? "GET";
+      if (!refillId && method === "POST" && path.endsWith("/sandboxes")
+          && JSON.parse(String(init.body)).labels.purpose === "spare") {
+        const accepted = await h.boat.fetch(input, init);
+        const body = await accepted.json(); refillId = body.sandbox.id;
+        return response(body, 202);
+      }
+      if (refillId && path.endsWith(`/sandboxes/${refillId}`) && method === "GET" && failWarm) {
+        return response({ sandbox: { ...h.boat.boxes.get(refillId)!, state: "error" } });
+      }
+      if (refillId && path.endsWith(`/sandboxes/${refillId}/stop`) && method === "POST") {
+        if (failWarm) return response({ error: "injected immediate cleanup failure" }, 400);
+        expect(hasDebt(), "keeper persists owed-stop before the paid-box stop").toBe(true);
+        expect(JSON.parse(String(init.body)).force).not.toBe(true);
+      }
+      return h.boat.fetch(input, init);
+    });
+    expect((await settle(taskAcquire(h, "claim-for-f1b"))).providerLeaseId).toBe(initial[0]);
+    await until(() => !!refillId, "accepted refill with sandboxId"); await advance(3_000);
+    const pending = Object.values(h.state.get(`${h.company}:pending-refills`) as Record<string, any[]>).flat();
+    expect(pending.some(entry => entry.sandboxId === refillId)).toBe(true);
+    expect(h.boat.boxes.get(refillId!)!.name).toBe("");
+    expect(h.boat.liveSpares()).toHaveLength(3);
+    h.config.spares = 1; const at = h.boat.mark("target CUT 3 to 1 with saved unwarmed refill");
+    const cutAt = Date.now(); failWarm = false;
+    await advance(TICK_MS);
+    const stops = h.boat.log.filter(e => e.seq > at && e.method === "POST" && e.path === `/sandboxes/${refillId}/stop`);
+    expect(stops, "nonzero target must expose a no-longer-admissible paid refill").toHaveLength(1);
+    expect(stops[0].at - cutAt).toBeLessThanOrEqual(TICK_MS);
+    expect(h.boat.boxes.get(refillId!)!.state).toBe("archived");
+    expect(h.boat.liveSpares()).toHaveLength(1);
+    expect(h.boat.spareCreates(at)).toHaveLength(0);
+    expect(hasDebt()).toBe(false);
+  });
+
   it.each(["refused", "expired"])("F2 %s identity cannot starve refill; absent expired identity is forgotten", async kind => {
     const h = await start(`f2-${kind}`); const { s1 } = await seed(h);
     const hash = h.boat.boxes.get(s1)!.labels.configHash;
