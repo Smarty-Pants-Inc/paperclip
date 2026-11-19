@@ -1,5 +1,5 @@
 import { and, eq, inArray, sql, type SQL } from "drizzle-orm";
-import { activityLog, agentWakeupRequests, heartbeatRuns, issueComments, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
 import { freshContinuationSourceChainSql } from "./fresh-continuation-chain.js";
 import { wellFormedExecutionWaitSql } from "./deferred-execution-wait.js";
 
@@ -9,6 +9,77 @@ export const ISSUE_IMPORTED_ACTION = "issue.imported";
 export const COMPANY_IMPORTED_ACTION = "company.imported";
 
 type PersonMessageSql = { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL };
+type DeferredWakeSql = { companyId: SQL; agentId: SQL; issueId: SQL; requestedAt: SQL; payload: SQL };
+
+/** A later turn moved the thread on only when it STARTED after the boundary,
+ * succeeded, and published a live agent reply on this issue. Reply time alone
+ * cannot discard input that arrived while that turn was already running. */
+export function conversationMovedOnSql(m: Pick<PersonMessageSql, "companyId" | "issueId" | "createdAt">, commentId?: SQL): SQL {
+  return sql`exists (select 1 from ${heartbeatRuns} moved_on
+    where moved_on.company_id = ${m.companyId}
+      and (moved_on.native_issue_id = ${m.issueId} or moved_on.context_snapshot->>'issueId' = ${m.issueId}::text)
+      and moved_on.status = 'succeeded' and moved_on.started_at > ${m.createdAt}
+      and exists (select 1 from ${issueComments} moved_reply where moved_reply.company_id = moved_on.company_id
+        and moved_reply.issue_id = ${m.issueId} and moved_reply.created_by_run_id = moved_on.id
+        and moved_reply.author_type = 'agent' and moved_reply.deleted_at is null)
+      ${commentId ? sql`and not exists (select 1 from ${heartbeatRuns} later_carrier
+        where later_carrier.company_id = moved_on.company_id and later_carrier.started_at >= moved_on.started_at
+          and ${carriesCommentSql("later_carrier", commentId, false)})` : sql``})`;
+}
+
+/** RFL 17:07Z: a deferred receipt ages only when a succeeded replying turn
+ * actually claimed a newer PERSON input. Starting later is not evidence: a
+ * queued successor may start after messages that are still waiting behind it.
+ * Keep the per-message floor's separate carried-message rule above intact. */
+export function newerPersonInputAnsweredSql(w: Pick<DeferredWakeSql, "companyId" | "issueId" | "requestedAt">): SQL {
+  return sql`exists (select 1 from ${heartbeatRuns} newer_turn
+    where newer_turn.company_id = ${w.companyId} and newer_turn.status = 'succeeded'
+      and exists (select 1 from ${issueComments} newer_reply
+        where newer_reply.company_id = newer_turn.company_id and newer_reply.issue_id = ${w.issueId}
+          and newer_reply.created_by_run_id = newer_turn.id and newer_reply.author_type = 'agent'
+          and newer_reply.deleted_at is null)
+      and exists (select 1 from ${issueComments} newer_person
+        where newer_person.company_id = ${w.companyId} and newer_person.issue_id = ${w.issueId}
+          and newer_person.author_type = 'user' and newer_person.deleted_at is null
+          and newer_person.created_at > ${w.requestedAt}
+          and (${directInputCommentSql("newer_turn", sql`newer_person.id`)}
+            or exists (select 1 from ${agentWakeupRequests} claimed_input
+              where claimed_input.company_id = newer_turn.company_id
+                and (claimed_input.id = newer_turn.wakeup_request_id or claimed_input.run_id = newer_turn.id)
+                and (claimed_input.payload->>'commentId' = newer_person.id::text
+                  or claimed_input.payload->'_paperclipWakeContext'->>'commentId' = newer_person.id::text
+                  or claimed_input.payload->'_paperclipWakeContext'->>'wakeCommentId' = newer_person.id::text
+                  or coalesce(claimed_input.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? newer_person.id::text
+                  or coalesce(claimed_input.payload->'commentIds', '[]'::jsonb) ? newer_person.id::text
+                  or claimed_input.idempotency_key = 'conversation-comment:' || newer_person.id::text)))))`;
+}
+
+function directInputCommentSql(alias: string, commentId: SQL): SQL {
+  const context = sql`${sql.identifier(alias)}.context_snapshot`;
+  return sql`(${context}->>'wakeCommentId' = ${commentId}::text or ${context}->>'commentId' = ${commentId}::text
+    or coalesce(${context}->'wakeCommentIds', '[]'::jsonb) ? ${commentId}::text
+    or coalesce(${context}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${commentId}::text)`;
+}
+
+/** A Stop's held input outlives the next typed turn. The release saves the
+ * exact stopped-run id on its surviving receipt, NOT a latest-run inference.
+ * Older saved execution waits can name the Stop's own board recovery hold.
+ * Neither an Interrupt nor a generic execution wait grants this exception. */
+export function deferredWakeIsStaleSql(w: DeferredWakeSql): SQL {
+  const personStopHold = sql`(${w.payload}->'queuedCommentInterrupt' is null and exists (
+    select 1 from ${heartbeatRuns} stopped
+    where stopped.company_id = ${w.companyId} and stopped.agent_id = ${w.agentId}
+      and (stopped.native_issue_id = ${w.issueId} or stopped.context_snapshot->>'issueId' = ${w.issueId}::text)
+      and stopped.status = 'cancelled' and stopped.result_json->>'cancelledByActorType' = 'user'
+      and stopped.result_json->>'queuedCommentInterruptQueueId' is null
+      and (stopped.id::text = ${w.payload}->'personStopHold'->>'runId'
+        or exists (select 1 from ${issueRecoveryActions} stop_hold
+          where stop_hold.company_id = ${w.companyId} and stop_hold.source_issue_id = ${w.issueId}
+            and stop_hold.id::text = ${w.payload}->'executionWait'->>'recoveryActionId'
+            and stop_hold.cause = 'native_continuation_requires_reconciliation'
+            and stop_hold.evidence->>'runId' = stopped.id::text))))`;
+  return sql`(not ${personStopHold} and ${newerPersonInputAnsweredSql(w)})`;
+}
 
 function carriesCommentSql(alias: string, commentId: SQL, requireSteeredText: boolean): SQL {
   const context = sql`${sql.identifier(alias)}.context_snapshot`;
@@ -115,15 +186,19 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
  */
 /**
  * neworg-floor-custody: m is in LIVE custody (never floor-skipped): a wake that still holds it
- * (queued / deferred / claimed: the person-Stop hold included) or a run carrying it that has not
- * finished. Its owner delivers it; the floor only judges messages nothing holds.
+ * (queued / claimed, or non-stale deferred: a durable person-Stop hold included)
+ * or a run carrying it that has not finished. Its owner delivers it; stale deferred
+ * receipts cannot hide messages from the floor.
  */
 function liveMessageCustodySql(m: PersonMessageSql): SQL {
   return sql`(exists (select 1 from ${agentWakeupRequests} live_wake
       where live_wake.company_id = ${m.companyId}
-        and (live_wake.status in ('queued', 'deferred_issue_execution', 'claimed')
-          -- rf-4 C-V: a 'deferred' wake with a saved wait still holds its input (readPersonStopHold's shape).
-          or (live_wake.status = 'deferred' and ${wellFormedExecutionWaitSql(sql.raw("live_wake.payload"))}))
+        and (live_wake.status in ('queued', 'claimed')
+          or ((live_wake.status = 'deferred_issue_execution'
+            -- rf-4 C-V: a 'deferred' wake with a saved wait can still hold input.
+            or (live_wake.status = 'deferred' and ${wellFormedExecutionWaitSql(sql.raw("live_wake.payload"))}))
+            and not ${deferredWakeIsStaleSql({ companyId: sql`live_wake.company_id`, agentId: sql`live_wake.agent_id`,
+              issueId: m.issueId, requestedAt: sql`live_wake.requested_at`, payload: sql`live_wake.payload` })}))
         and (live_wake.idempotency_key = 'conversation-comment:' || ${m.id}::text
           or live_wake.payload->>'commentId' = ${m.id}::text
           or live_wake.payload->'_paperclipWakeContext'->>'wakeCommentId' = ${m.id}::text
@@ -134,12 +209,16 @@ function liveMessageCustodySql(m: PersonMessageSql): SQL {
 }
 
 /**
- * Option (B) (adopt-lead 15:11Z): m was EVER handed to the agent: a wake of any status, or a run, carried it.
- * The moved-on floor applies only to such messages; a never-carried message keeps its one true card.
+ * RFL 15:46Z amendment: a wake's fields count only after a run claimed it.
+ * A saved/deferred/cancelled-unclaimed receipt never handed its text to an agent.
+ * Run-side fields are unchanged. Never-carried messages keep their one true card.
  */
 function everCarriedSql(m: PersonMessageSql): SQL {
   return sql`(exists (select 1 from ${agentWakeupRequests} any_wake
       where any_wake.company_id = ${m.companyId}
+        and (any_wake.status in ('claimed', 'completed') or any_wake.run_id is not null
+          or exists (select 1 from ${heartbeatRuns} claimed_run where claimed_run.company_id = any_wake.company_id
+            and claimed_run.wakeup_request_id = any_wake.id))
         and (any_wake.idempotency_key = 'conversation-comment:' || ${m.id}::text
           or any_wake.payload->>'commentId' = ${m.id}::text
           or any_wake.payload->'_paperclipWakeContext'->>'wakeCommentId' = ${m.id}::text
@@ -160,21 +239,10 @@ function everCarriedSql(m: PersonMessageSql): SQL {
 
 export function personMessageOwedSql(m: PersonMessageSql): SQL {
   return sql`(not ${answeredPersonMessageSql(m)}
-    and (${liveMessageCustodySql(m)} or not exists (select 1 from ${heartbeatRuns} moved_on
-      where moved_on.company_id = ${m.companyId}
-        and (moved_on.native_issue_id = ${m.issueId} or moved_on.context_snapshot->>'issueId' = ${m.issueId}::text)
-        and moved_on.status = 'succeeded' and moved_on.started_at > ${m.createdAt}
-        and ${everCarriedSql(m)}
-        and exists (select 1 from ${issueComments} moved_reply where moved_reply.company_id = moved_on.company_id
-          and moved_reply.issue_id = ${m.issueId} and moved_reply.created_by_run_id = moved_on.id
-          and moved_reply.author_type = 'agent' and moved_reply.deleted_at is null)
-        -- neworg-floor-custody: a run that carries m and started at or after this run (a Stop-held
-        -- README's carrier after the '9 + 10' turn) owns m; the chat has not moved on past it,
-        -- so that carrier's failure still cards (G1).
-        and not exists (select 1 from ${heartbeatRuns} later_carrier
-          where later_carrier.company_id = moved_on.company_id
-            and later_carrier.started_at >= moved_on.started_at
-            and ${carriesCommentSql("later_carrier", m.id, false)})))
+    and (${liveMessageCustodySql(m)} or not ${everCarriedSql(m)}
+      -- A carrier at/after the move-on turn still owns m (Stop-held README,
+      -- then '9 + 10', then README's carrier); its own failure still cards.
+      or not ${conversationMovedOnSql(m, m.id)})
     and not exists (select 1 from ${issues} reset_issue
       join ${issueComments} reset_boundary on reset_boundary.id = reset_issue.conversation_boundary_comment_id
         and reset_boundary.company_id = reset_issue.company_id and reset_boundary.issue_id = reset_issue.id
