@@ -265,7 +265,8 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
       const nextStartup = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: vi.fn() });
       try {
         await service().registerCheckpointExpiration(nextStartup).ready;
-        expect(await db.select().from(nativeRunnerCheckpoints)).toEqual([]);
+        // Retention keeps the unreferenced checkpoint (R-keep-all-traces) and goes quiet.
+        expect(await db.select().from(nativeRunnerCheckpoints)).toHaveLength(3);
         expect(nextStartup.nextWakeAt()).toBeNull();
       } finally { await nextStartup.stop(); }
     }
@@ -289,7 +290,8 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
       await vi.waitFor(() => expect(coordinator.nextWakeAt()).toBeNull());
       await coordinator.stop(); // Await the DB transaction before asserting.
       expect(onError).not.toHaveBeenCalled();
-      expect(await db.select().from(nativeRunnerCheckpoints)).toEqual([]);
+      expect(select).toHaveBeenCalled(); // the resumed pass ran, and kept every row
+      expect(await db.select().from(nativeRunnerCheckpoints)).toHaveLength(3);
     } finally {
       await coordinator.stop();
       select.mockRestore();
@@ -297,7 +299,7 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     }
   });
 
-  it("retries a failed checkpoint from an earlier page before startup cleanup goes quiet", async () => {
+  it("retries a failed checkpoint from an earlier page before startup cleanup goes quiet, keeping every checkpoint", async () => {
     for (let index = 0; index < 2; index++) {
       const session = await seedSession({ finalization: { phase: "committed" } });
       await seedCheckpoint(session);
@@ -309,9 +311,11 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
       const expiration = nativeHarnessBackupExpirationService(db, { now, maxEntries: 1 });
       await expiration.registerCheckpointExpiration(coordinator).ready;
       await vi.waitFor(async () => {
-        expect(await db.select().from(nativeRunnerCheckpoints)).toEqual([]);
+        // The failed first transaction is retried (fail + retry + second page).
+        expect(transaction.mock.calls.length).toBeGreaterThanOrEqual(3);
         expect(coordinator.nextWakeAt()).toBeNull();
       }, { timeout: 5000 });
+      expect(await db.select().from(nativeRunnerCheckpoints)).toHaveLength(6);
     } finally {
       await coordinator.stop();
       transaction.mockRestore();
@@ -349,20 +353,22 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     const nextStartup = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: vi.fn() });
     try {
       await service().registerCheckpointExpiration(nextStartup).ready;
-      expect(await db.select().from(nativeRunnerCheckpoints)).toEqual([]);
+      expect(await db.select().from(nativeRunnerCheckpoints)).toHaveLength(3); // kept, not deleted
       expect(nextStartup.nextWakeAt()).toBeNull();
     } finally { await nextStartup.stop(); }
   });
 
-  it("expires unreferenced settled checkpoints even with an empty controller disk and fences old writers", async () => {
+  it("keeps unreferenced settled checkpoints even with an empty controller disk and fences no writer", async () => {
     const session = await seedSession({ finalization: { phase: "committed" } });
     await seedCheckpoint(session);
     await db.delete(agentTaskSessions);
     await fs.rm(stateBase, { recursive: true, force: true });
-    expect(await service().tickCheckpoints()).toMatchObject({ expiredCheckpoints: 1, checkpointCandidates: 1, failed: 0 });
-    expect(await db.select().from(nativeRunnerCheckpoints)).toEqual([]);
+    const result = await service().tickCheckpoints();
+    expect(result).toMatchObject({ expiredCheckpoints: 0, checkpointCandidates: 0, failed: 0 });
+    expect(result.skipped.native_runner_checkpoint_kept).toBe(1);
+    expect(await db.select().from(nativeRunnerCheckpoints)).toHaveLength(3);
     const [authority] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, session.runId));
-    expect(authority?.controllerGeneration).toBe(1);
+    expect(authority?.controllerGeneration).toBe(0);
     expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
   });
 
@@ -436,7 +442,10 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     const prior = db.$client.options.debug;
     db.$client.options.debug = (_connection, query, params) => { statements.push({ sql: query, params: [...params] }); };
     try {
-      expect(await service().tickCheckpoints({ dryRun: true })).toMatchObject({ checkpointCandidates: 1, failed: 0 });
+      // Neither foreign run protects it: it reaches the keep (not a blocker).
+      const dry = await service().tickCheckpoints({ dryRun: true });
+      expect(dry).toMatchObject({ checkpointCandidates: 0, failed: 0 });
+      expect(dry.skipped.native_runner_checkpoint_kept).toBe(1);
     } finally { db.$client.options.debug = prior; }
     const lookup = statements.find(query => query.sql.includes("nativeControllerRecovery")
       && query.sql.includes('"heartbeat_runs"."native_session_id" = '));
@@ -450,11 +459,13 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     // A second live run of the same session, company and agent protects it.
     await db.insert(heartbeatRuns).values({ companyId: session.companyId, agentId: session.agentId, status: "running",
       issueId: session.issueId, nativeIssueId: session.issueId, nativeSessionId: session.sessionId });
-    expect(await service().tickCheckpoints({ dryRun: true })).toMatchObject({ checkpointCandidates: 0, failed: 0 });
+    const protectedDry = await service().tickCheckpoints({ dryRun: true });
+    expect(protectedDry).toMatchObject({ checkpointCandidates: 0, failed: 0 });
+    expect(protectedDry.skipped.native_runner_checkpoint_kept).toBeUndefined(); // a blocker, not the keep
     expect(await db.select().from(nativeRunnerCheckpoints)).toHaveLength(3);
   });
 
-  it("continues checkpoint expiration past retained sessions within bounded pages", async () => {
+  it("continues checkpoint retention past retained sessions within bounded pages and keeps every checkpoint", async () => {
     for (let index = 0; index < 3; index++) {
       const session = await seedSession({ finalization: { phase: "committed" } });
       await seedCheckpoint(session);
@@ -464,8 +475,13 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     expect(await expiration.tickCheckpoints({ maxEntries: 2 })).toMatchObject({ expiredCheckpoints: 0, truncated: true });
     expect(await expiration.tickCheckpoints({ maxEntries: 2 })).toMatchObject({ expiredCheckpoints: 0, truncated: false });
     await db.delete(agentTaskSessions);
-    expect(await expiration.tickCheckpoints({ maxEntries: 2 })).toMatchObject({ expiredCheckpoints: 2, truncated: true });
-    expect(await expiration.tickCheckpoints({ maxEntries: 2 })).toMatchObject({ expiredCheckpoints: 1, truncated: false });
+    const firstPage = await expiration.tickCheckpoints({ maxEntries: 2 });
+    expect(firstPage).toMatchObject({ expiredCheckpoints: 0, truncated: true });
+    expect(firstPage.skipped.native_runner_checkpoint_kept).toBe(2);
+    const secondPage = await expiration.tickCheckpoints({ maxEntries: 2 });
+    expect(secondPage).toMatchObject({ expiredCheckpoints: 0, truncated: false });
+    expect(secondPage.skipped.native_runner_checkpoint_kept).toBe(1);
+    expect(await db.select().from(nativeRunnerCheckpoints)).toHaveLength(9);
   });
 
   it("excludes setup evidence scopes from session discovery without altering their evidence", async () => {
