@@ -63,6 +63,11 @@ import type { issuesApi } from "../api/issues";
 // persistence have their own hook tests; keep their readiness explicit here.
 const coordinatorPreference = vi.hoisted(() => ({ enabled: false, loaded: true }));
 const inlineEditorFixture = vi.hoisted(() => ({ real: false }));
+// Set by one row (C1) to the REAL TaskChatComposer, loaded with vi.importActual;
+// the TaskChatThread stub then renders it in place of its own takeover.
+const taskChatComposerFixture = vi.hoisted(() => ({
+  Real: null as null | ((props: Record<string, unknown>) => ReactElement | null),
+}));
 vi.mock("../hooks/useCoordinatorWorkspaceEnabled", () => ({
   useCoordinatorWorkspaceEnabled: () => coordinatorPreference,
 }));
@@ -461,9 +466,13 @@ vi.mock("../components/TaskChatThread", () => ({
       onSelect: (runId: string) => Promise<void> | void;
     }[];
     composerPause?: TaskComposerPause | null;
+    conversationMode?: boolean;
+    draftKey?: string;
+    composerDisabledReason?: string | null;
     footer?: ReactNode;
   }) => {
     mockIssueChatThreadRender(props);
+    const RealComposer = taskChatComposerFixture.Real;
     return (
       <div data-testid="task-chat-thread">
         {props.threadHeader}
@@ -505,7 +514,15 @@ vi.mock("../components/TaskChatThread", () => ({
             {action.label}
           </button>
         ))}
-        {props.composerPause ? <TaskChatPausedTakeover {...props.composerPause} /> : null}
+        {RealComposer ? (
+          <RealComposer
+            pause={props.composerPause ?? null}
+            conversationMode={props.conversationMode}
+            draftKey={props.draftKey}
+            disabledReason={props.composerDisabledReason}
+            onAdd={async () => undefined}
+          />
+        ) : props.composerPause ? <TaskChatPausedTakeover {...props.composerPause} /> : null}
         {props.footer}
       </div>
     );
@@ -1361,6 +1378,7 @@ describe("IssueDetail", () => {
   beforeEach(() => {
     Object.assign(coordinatorPreference, { enabled: false, loaded: true });
     inlineEditorFixture.real = false;
+    taskChatComposerFixture.Real = null;
     mockTaskPluginPanels.panels = []; mockTaskPluginPanels.isLoading = false;
     localStorage.clear();
     sessionStorage.clear();
@@ -6771,6 +6789,169 @@ describe("IssueDetail", () => {
       vi.useRealTimers();
     }
   });
+
+  // C1 (rf-5). The person's tree Pause on the same warm native turn as the row
+  // above (acknowledged cancellation; producer bodies), then the tree-control
+  // state read through the real API client (getTreeControlState's own body) and the REAL TaskChatComposer
+  // (vi.importActual, rendered by the TaskChatThread stub via
+  // taskChatComposerFixture; the stub's own takeover is not rendered).
+  // Planted: the GET /api/issues/:id/tree-control/state body below is the one the
+  // REAL route returned after the REAL POST /api/issues/:id/tree-holds
+  // {mode: pause} on a warm keep_running native turn (scratch harness
+  // zz-stopline-c1-hold, producer-tree-pause-state.json):
+  //   {"activePauseHold":{"holdId":<hold.id>,"rootIssueId":<issue.id>,"issueId":<issue.id>,
+  //     "isRoot":true,"mode":"pause","reason":null,"releasePolicy":<the POST's releasePolicy>}}
+  // with the ids mapped to this file's issue and hold, and releasePolicy echoed
+  // from the POST this row sends (the route echoes the hold's own policy).
+  // Before the POST the read returns {activePauseHold: null}.
+  async function renderTreePauseWithStateRead(holdRead: "real" | "null", width: number) {
+    const { api } = await vi.importActual<typeof import("../api/client")>("../api/client");
+    const { heartbeatsApi: realHeartbeatsApi } =
+      await vi.importActual<typeof import("../api/heartbeats")>("../api/heartbeats");
+    const { TaskChatComposer } = await vi.importActual<
+      typeof import("../components/task-chat/TaskChatComposer")
+    >("../components/task-chat/TaskChatComposer");
+    taskChatComposerFixture.Real = TaskChatComposer as never;
+    mockSidebarState.isMobile = width < 768;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    const runId = "efd1bbd0-971b-463c-b1d0-14cd9564a148";
+    const pausePreview = createPausePreview();
+    pausePreview.activeRuns = [{ id: runId, issueId: "issue-1", agentId: "agent-1", status: "running",
+      startedAt: "2026-11-19T00:59:44.634Z", createdAt: "2026-11-19T00:59:44.491Z" }] as never;
+    const pauseHold = createPauseHold({ id: "pause-hold-warm", mode: "pause", reason: null,
+      releasePolicy: { strategy: "manual", note: "leaf_pause" }, members: [] });
+    const run = {
+      id: runId, companyId: "company-1", status: "cancelled", runtimeMode: "native",
+      error: "Cancelled by a board operator's subtree pause",
+      resultJson: {
+        stopReason: "paused", cancelledByActorType: "user",
+        executionCancellation: { state: "requested", requestedAt: "2026-11-19T00:59:45.156Z" },
+        nativeCancellation: {
+          schema: "paperclip.native-cancellation.v1", runId, companyId: "company-1", scope: "run",
+          effects: ["release_run_resources"], dispatched: true, reasonCode: "cancellation_run_only",
+          dispatchState: "acknowledged", acknowledgedAt: "2026-11-19T00:59:45.176Z",
+        },
+      },
+    };
+    let postedPolicy: unknown = null;
+    const requests: string[] = [];
+    vi.mocked(globalThis.fetch).mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      requests.push(`${method} ${url}`);
+      let body: unknown = null;
+      let status = 200;
+      if (url.endsWith("/tree-holds") && method === "POST") {
+        postedPolicy = (JSON.parse(String(init?.body)) as { releasePolicy: unknown }).releasePolicy;
+        body = { hold: pauseHold, preview: pausePreview };
+        status = 201;
+      } else if (url.endsWith("/tree-control/state")) {
+        body = {
+          activePauseHold: postedPolicy !== null && holdRead === "real" ? {
+            holdId: pauseHold.id, rootIssueId: "issue-1", issueId: "issue-1", isRoot: true,
+            mode: "pause", reason: null, releasePolicy: postedPolicy,
+          } : null,
+        };
+      } else if (url.endsWith(`/heartbeat-runs/${runId}`)) {
+        body = run;
+      }
+      if (!body) return new Response("{}", { status: 404, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+    });
+    mockIssuesApi.createTreeHold.mockReset().mockImplementation((id: string, data: unknown) =>
+      api.post(`/issues/${id}/tree-holds`, data));
+    // The file merges mockIssuesApi into the real issuesApi object, so the real
+    // getTreeControlState is replayed by its own body (api.get of the route).
+    mockIssuesApi.getTreeControlState.mockReset().mockImplementation((id: string) =>
+      api.get(`/issues/${id}/tree-control/state`));
+    mockHeartbeatsApi.get.mockReset().mockImplementation((id: string) => realHeartbeatsApi.get(id));
+    mockIssuesApi.get.mockResolvedValue(createIssue({
+      status: "in_progress", assigneeAgentId: "agent-1", executionRunId: runId,
+    }));
+    mockAgentsApi.list.mockResolvedValue([createAgent()]);
+    mockAuthApi.getSession.mockResolvedValue({ session: { userId: "user-1" }, user: { id: "user-1" } });
+
+    await act(async () => { renderIssueView(); });
+    await flushReact();
+    await flushReact();
+    const openMenu = async () => {
+      const moreButton = container.querySelector('button[aria-label="More task actions"]') as HTMLButtonElement | null;
+      expect(moreButton).toBeTruthy();
+      await act(async () => {
+        moreButton!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      });
+      await flushReact();
+      return Array.from(container.querySelectorAll("button")).map((button) => ({
+        text: button.textContent?.trim() ?? "", disabled: button.disabled, button,
+        where: button.closest("[data-testid]")?.getAttribute("data-testid") ?? null,
+      }));
+    };
+    const before = await openMenu();
+    const pauseMenuButton = before
+      .find((item) => item.where === "issue-detail-header" && item.text === "Pause work")?.button;
+    expect(pauseMenuButton).toBeTruthy();
+    expect(container.querySelector('[data-testid="paused-composer-takeover"]')).toBeNull();
+    const line = "The stop was requested, but work is still stopping";
+    const alerts = () => Array.from(container.querySelectorAll('[role="alert"]')).map((node) => node.textContent ?? "");
+    const pausedHeadings = () => Array.from(container.querySelectorAll("h2"))
+      .filter((node) => node.textContent?.trim() === "Task is paused.").length;
+    let at30 = { alerts: [] as string[], paused: -1 };
+    let at60 = { alerts: [] as string[], paused: -1 };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      await act(async () => { pauseMenuButton!.click(); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_500); });
+      at30 = { alerts: alerts(), paused: pausedHeadings() };
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      at60 = { alerts: alerts(), paused: pausedHeadings() };
+    } finally {
+      vi.useRealTimers();
+    }
+    return { requests, at30, at60, after: await openMenu() };
+  }
+
+  it.each([390, 1440])(
+    "C1 (rf-5): after the person's tree Pause the task shows paused (real hold read, real composer) at %i",
+    async (width) => {
+      const { requests, at30, at60, after } = await renderTreePauseWithStateRead("real", width);
+      expect(requests).toContain("POST /api/issues/PAP-1/tree-holds");
+      expect(requests).toContain(`GET /api/heartbeat-runs/efd1bbd0-971b-463c-b1d0-14cd9564a148`);
+      expect(requests).toContain("GET /api/issues/PAP-1/tree-control/state");
+      // 'Task is paused.' is visible exactly once (the real composer's takeover).
+      expect(at30.paused).toBe(1);
+      expect(at60.paused).toBe(1);
+      const takeover = container.querySelector('[data-testid="paused-composer-takeover"]');
+      expect(takeover?.textContent).toContain("Resume this task to send a message.");
+      // No 'still stopping' red line at +30 s and +60 s.
+      expect(at30.alerts.some((text) => text.includes("still stopping"))).toBe(false);
+      expect(at60.alerts.some((text) => text.includes("still stopping"))).toBe(false);
+      // The real tree control (header 'More task actions' menu) does not offer
+      // 'Pause work' again as if unpaused: it offers 'Resume work', and the real
+      // composer's takeover offers 'Resume task'. (The TaskChatThread stub draws
+      // its per-run stop button, labelled 'Pause work', whenever onStopRun is
+      // passed; that is the stub, not the tree control, so it is not read here.)
+      const header = after.filter((item) => item.where === "issue-detail-header");
+      expect(header.find((item) => item.text === "Pause work")).toBeUndefined();
+      expect(header.find((item) => item.text === "Resume work")).toMatchObject({ disabled: false });
+      expect(after.find((item) => item.where === "paused-composer-takeover" && item.text === "Resume task"))
+        .toMatchObject({ disabled: false });
+    },
+  );
+
+  it.each([390, 1440])(
+    "C1 (rf-5) control: the tree-control state read returns no hold, so no paused takeover at %i",
+    async (width) => {
+      const { requests, at30, at60, after } = await renderTreePauseWithStateRead("null", width);
+      expect(requests).toContain("POST /api/issues/PAP-1/tree-holds");
+      expect(requests).toContain("GET /api/issues/PAP-1/tree-control/state");
+      expect(at30.paused).toBe(0);
+      expect(at60.paused).toBe(0);
+      expect(container.querySelector('[data-testid="paused-composer-takeover"]')).toBeNull();
+      const header = after.filter((item) => item.where === "issue-detail-header");
+      expect(header.find((item) => item.text === "Resume work")).toBeUndefined();
+      expect(header.find((item) => item.text === "Pause work")).toMatchObject({ disabled: false });
+    },
+  );
 
   it("confirms the composer Stop from the authoritative cancellation response during a status outage", async () => {
     mockIssuesApi.update.mockClear();
