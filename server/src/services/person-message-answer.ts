@@ -11,10 +11,12 @@ type PersonMessageSql = { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL 
 
 function carriesCommentSql(alias: string, commentId: SQL): SQL {
   const context = sql`${sql.identifier(alias)}.context_snapshot`;
-  return sql`(${context}->>'wakeCommentId' = ${commentId}::text or ${context}->>'commentId' = ${commentId}::text
+  return sql`((not coalesce(${context}->'steeredCommentIds', '[]'::jsonb) ? ${commentId}::text
+      or coalesce(${context}->'answeredSteeredCommentIds', '[]'::jsonb) ? ${commentId}::text)
+    and (${context}->>'wakeCommentId' = ${commentId}::text or ${context}->>'commentId' = ${commentId}::text
     or ${context}->>'conversationReplyBoundaryCommentId' = ${commentId}::text
     or coalesce(${context}->'wakeCommentIds', '[]'::jsonb) ? ${commentId}::text
-    or coalesce(${context}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${commentId}::text)`;
+    or coalesce(${context}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${commentId}::text))`;
 }
 
 /** A reply/card can belong to a later run without copying the original input
@@ -53,7 +55,9 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
       and a.created_at > ${m.createdAt}
       and exists (select 1 from ${issueComments} b
         where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
-          and (b.id = ${m.id} or b.created_at > ${m.createdAt})
+          and (b.id = ${m.id} or (b.created_at > ${m.createdAt}
+            -- A steer can overtake an earlier queued message: it answers only itself.
+            and not coalesce(r.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? b.id::text))
           and ${chainCarriesCommentSql("r", sql`b.id`, m)}))
     or exists (select 1 from ${issueThreadInteractions} q
       join ${heartbeatRuns} r on r.id = q.source_run_id and r.company_id = q.company_id
