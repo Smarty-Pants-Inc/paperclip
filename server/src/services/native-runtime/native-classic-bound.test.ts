@@ -8,7 +8,7 @@ import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, authUsers, companies, companyMemberships, completionContracts, createDb, environmentLeases, environments,
-  executionWorkspaces, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, workspaceOperations,
+  executionWorkspaces, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, nativeRunResults, workspaceOperations,
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, type Db } from "@paperclipai/db";
 import type { AdapterSandboxExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type { EnvironmentLease } from "@paperclipai/shared";
@@ -85,6 +85,7 @@ import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { nativeResponsePresentationWork } from "./native-response-presentation-work.js";
 import { nativeWorkspaceFinalizationWork } from "./native-workspace-finalization-work.js";
+import { WITHHELD_REPLY_SAVING_DEADLINE_MS } from "./native-withheld-reply-trigger.js";
 import { attemptNativeWorkspaceFinalization, recordNativeWorkspaceFinalizationFailure } from "./native-workspace-finalizer.js";
 import { cleanupNativeWorkspaceSync, prepareNativeWorkspaceSync, readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
 import { reconcileNativeFinalizations } from "./native-finalization-reconciler.js";
@@ -142,7 +143,8 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
   afterAll(async () => {
     if (process.env.CLASSIC_BOUND_EVIDENCE) await fs.writeFile(process.env.CLASSIC_BOUND_EVIDENCE, JSON.stringify(evidence, null, 2));
     await db?.$client.end({ timeout: 1 }); await database?.cleanup();
-    if (root) await fs.rm(root, { recursive: true, force: true });
+    // Evidence runs retain the box trees, including late-copy bytes, rather than cleaning them up.
+    if (root && !process.env.CLASSIC_BOUND_EVIDENCE) await fs.rm(root, { recursive: true, force: true });
     vi.unstubAllEnvs();
   });
 
@@ -568,6 +570,87 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
     } finally { stall.release(); await checking.catch(() => undefined); await cleanupNativeWorkspaceSync(s.runId); }
   }, 120_000);
 
+  it.each([6, 9])("K10b / K4: a healthy %i-minute classic copy with nobody parked SAVES before the file-line deadline", async minutes => {
+    // PLANTED run/claim as named in scenario; real preparation, acceptance, copy-back and GET.
+    const s = await scenario();
+    await s.streamAndAccept();
+    const [accepted] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, s.runId));
+    expect(WITHHELD_REPLY_SAVING_DEADLINE_MS).toBe(10 * 60_000);
+    const stall = s.armStall();
+    let clock = accepted.createdAt.getTime();
+    const checking = s.worker({ now: () => clock, personWaitCapMs: 100 }).check();
+    try {
+      await stall.reached;
+      clock += minutes * 60_000;
+      await sleep(350); // Let the real worker re-read its clock, without moving DB timestamps.
+      expect(await s.run()).toMatchObject({ status: "running", errorCode: null });
+      stall.release();
+      expect(await checking).toEqual({ entries: 1, results: [null] });
+      await reconcileNativeFinalizations(db, [s.runId], { environmentRuntime: {} as never });
+      await s.presentationWorker();
+      expect(await s.run()).toMatchObject({ status: "succeeded" });
+      expect(await s.attempts()).toEqual(["succeeded"]);
+      expect(await s.replies()).toHaveLength(1);
+      expect((await s.servedLine()).state).not.toBe("lost");
+      expect((await s.servedLine()).shown).toBeNull();
+      expect(await fs.readFile(path.join(s.hostDir, "notes.md"), "utf8")).toBe("R's new notes (unsaved)\n");
+      evidence[`K${minutes === 6 ? "4-clock2" : "10b"}`] = { minutes, line: await s.servedLine(), run: (await s.run()).status };
+    } finally { stall.release(); await checking.catch(() => undefined); }
+  }, 120_000);
+
+  it("K10 + K10c: nobody parked, classic copy hangs -> the file deadline ends R once; retries stop; late bytes stay quarantined and cannot publish", async () => {
+    // PLANTED run/claim (scenario), beside the real-executor K10 row below. All producers and GETs are real.
+    const s = await scenario();
+    await s.streamAndAccept();
+    await s.presentationWorker();
+    expect(await s.servedLine()).toMatchObject({ state: "saving" });
+    const [accepted] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, s.runId));
+    const stall = s.armStall();
+    let clock = accepted.createdAt.getTime() + WITHHELD_REPLY_SAVING_DEADLINE_MS - 1_000;
+    const checking = s.worker({ now: () => clock, personWaitCapMs: 100 }).check();
+    try {
+      await stall.reached;
+      expect(await s.attempts()).toEqual(["running"]);
+      clock += 1_000;
+      expect(await Promise.race([checking, sleep(3_000).then(() => "deadline not enforced")]))
+        .toEqual({ entries: 1, results: [null] });
+      expect(await s.run()).toMatchObject({ status: "failed", errorCode: STALLED });
+      expect(await s.coordinator()).toMatchObject({ phase: "terminal_failure", nextAttemptAt: null });
+      await s.presentationWorker();
+      const line = await s.servedLine();
+      expect(line).toMatchObject({ state: "lost", shown: THE_LINE });
+      expect(await s.replies()).toHaveLength(1);
+      const commandsAtDeadline = s.fault.commands;
+      for (let retry = 0; retry < 3; retry++) expect(await s.worker({ now: () => clock }).check()).toEqual({ entries: 0, results: [] });
+      const retryCallsAfterDeadline = s.fault.commands - commandsAtDeadline;
+      expect(retryCallsAfterDeadline).toBe(0);
+      const taskAtCut = await s.issue();
+      expect(taskAtCut).toMatchObject({ executionRunId: null, executionWorkspaceId: null });
+      const frozen = { status: (await s.run()).status, errorCode: (await s.run()).errorCode };
+      // The old root is now quarantine, not the task's saved workspace. The late apply may only land there.
+      stall.release();
+      await vi.waitFor(async () => expect(await s.attempts()).toEqual(["failed"]), { timeout: 30_000, interval: 50 });
+      const [late] = await db.select().from(workspaceOperations).where(and(eq(workspaceOperations.heartbeatRunId, s.runId),
+        eq(workspaceOperations.phase, "workspace_finalize")));
+      expect(late.stderrExcerpt).toContain("native_workspace_finalization_ownership_lost");
+      await reconcileNativeFinalizations(db, [s.runId], { environmentRuntime: {} as never });
+      await s.presentationWorker();
+      expect({ status: (await s.run()).status, errorCode: (await s.run()).errorCode }).toEqual(frozen);
+      expect((await s.issue()).executionWorkspaceId).toBeNull();
+      expect(await s.servedLine()).toEqual(line);
+      expect(await s.replies()).toHaveLength(1);
+      // NEVER-OK: bytes are kept in the retained old root AND box, not deleted on refusal.
+      expect(await fs.readFile(path.join(s.hostDir, "notes.md"), "utf8")).toBe("R's new notes (unsaved)\n");
+      expect(await fs.readFile(path.join(s.remoteCwd, "notes.md"), "utf8")).toBe("R's new notes (unsaved)\n");
+      const kept = await listing(s.hostDir);
+      if (process.env.CLASSIC_BOUND_EVIDENCE) await fs.cp(s.hostDir, `${process.env.CLASSIC_BOUND_EVIDENCE}.K10c-retained`, { recursive: true });
+      evidence.K10 = { acceptedAt: accepted.createdAt, deadlineAt: new Date(clock), line, run: frozen,
+        downloadOrCaptureCallsAfterDeadlineBeforeLateRelease: retryCallsAfterDeadline,
+        retryCallsAfterDeadline, late: { stderr: late.stderrExcerpt, status: late.status, kept, root: s.hostDir, box: s.remoteCwd } };
+    } finally { stall.release(); await checking.catch(() => undefined);
+      await vi.waitFor(async () => expect(await s.attempts()).not.toContain("running"), { timeout: 30_000, interval: 50 }); }
+  }, 120_000);
+
   it("K8 (applied, not recorded): the host apply FINISHED and the copy-back then hangs before its success is recorded -> the cap still ends R; P starts on the saved files in its own root; the line is LOST; R's later finish records nothing", async () => {
     const s = await scenario();
     await s.streamAndAccept();
@@ -842,6 +925,57 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
     return { companyId, agentId, issueId, app, boxes, runs, issue, say, agentComments, servedLine, faultedBox,
       stallReached, releaseStall: () => { release(); fault.stall = null; } };
   }
+
+  it("K10 live executor: real person POST -> real R hangs in its own copy-back, nobody parked -> the acceptance deadline ends it; GET stores one LOST line", async () => {
+    const s = await liveScenario();
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: () => ({}) as never });
+    const sweep = async (runId: string, clock: number) => {
+      const work = nativeWorkspaceFinalizationWork(db, { environmentRuntime: {} as never, copyOutBound: { now: () => clock },
+        onWorkspaceSettled: async () => undefined });
+      for (const entry of await work.load({ companyId: s.companyId, runId })) await work.check(entry);
+    };
+    try {
+      // REAL turn 0 saves the initial report through the real executor and copy-back.
+      await s.say("Please write the report.");
+      for (let waited = 0; waited < 60_000; waited += 250) {
+        await heartbeat.resumeQueuedRuns();
+        await reconcileNativeFinalizations(db, (await s.runs()).map(run => run.id), { environmentRuntime: {} as never });
+        const [first] = await s.runs();
+        if (first && !["running", "queued"].includes(first.status)) break;
+        await sleep(250);
+      }
+      await heartbeat.drainActiveRunExecutions();
+      expect((await s.runs())[0]).toMatchObject({ status: "succeeded" });
+      // REAL person's message creates R; real preparation, lease/claim, acceptance and teardown, no planted run.
+      await s.say("Please rewrite the report.");
+      for (let waited = 0; waited < 60_000; waited += 250) {
+        await heartbeat.resumeQueuedRuns();
+        if (await Promise.race([s.stallReached.then(() => true), sleep(250).then(() => false)])) break;
+      }
+      const [, r] = await s.runs();
+      expect(r).toMatchObject({ status: "running" });
+      const [accepted] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, r.id));
+      expect(accepted).toBeTruthy();
+      expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, s.agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution")))).toEqual([]);
+      const deadline = accepted.createdAt.getTime() + WITHHELD_REPLY_SAVING_DEADLINE_MS;
+      await sweep(r.id, deadline - 1);
+      expect((await s.runs())[1].status).toBe("running");
+      await sweep(r.id, deadline);
+      const presentation = nativeResponsePresentationWork(db);
+      for (const item of await presentation.load({ companyId: s.companyId, issueId: s.issueId })) await presentation.check(item);
+      const line = await s.servedLine(r.id);
+      expect(line).toMatchObject({ status: "failed", state: "lost", shown: THE_LINE });
+      expect((await s.agentComments()).filter(c => c.createdByRunId === r.id)).toHaveLength(1);
+      await sweep(r.id, deadline + 60_000);
+      s.releaseStall();
+      await heartbeat.drainActiveRunExecutions();
+      expect(await s.servedLine(r.id)).toEqual(line);
+      expect((await s.runs()).map(run => run.status)).toEqual(["succeeded", "failed"]);
+      evidence.K10live = { runId: r.id, producer: "POST /api/issues/:id/comments -> heartbeat real executor -> PaperclipControlPlanePort.completeRun -> live teardown",
+        acceptedAt: accepted.createdAt, deadlineAt: new Date(deadline), line, noParkedMessage: true };
+    } finally { s.releaseStall(); await heartbeat.drainActiveRunExecutions(); }
+  }, 240_000);
 
   it("K1 live + C7 (NEVER-OK) + C12: R is a real run hung in its OWN teardown copy-back -> at the cap it ends, P starts once beside the still-live executor; R's late throw never retries R, never overwrites its status, gives no second answer", async () => {
     const s = await liveScenario();

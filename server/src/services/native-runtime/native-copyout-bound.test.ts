@@ -10,7 +10,7 @@ import { and, desc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, authUsers, companies, companyMemberships, completionContracts, createDb, environmentLeases, environments,
   executionWorkspaces, executionWorkspaceSnapshots, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations,
-  workspaceOperations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, type Db } from "@paperclipai/db";
+  nativeRunResults, workspaceOperations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, type Db } from "@paperclipai/db";
 import type { AdapterSandboxExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type { EnvironmentLease } from "@paperclipai/shared";
 import type { PrpEvent } from "../../vendor/paperclip-runner/index.js";
@@ -75,6 +75,7 @@ import { abandonedWorkspaceFilesHeldOnLease } from "../remote-workspace-abandone
 import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
 import { nativeResponsePresentationWork } from "./native-response-presentation-work.js";
 import { nativeWorkspaceFinalizationWork } from "./native-workspace-finalization-work.js";
+import { WITHHELD_REPLY_SAVING_DEADLINE_MS } from "./native-withheld-reply-trigger.js";
 import { withNativeWorkspaceFinalizationOwnership } from "./native-workspace-finalization-ownership.js";
 import { FILE_LINE_KEPT_NO_BUTTON, readReplyFileLine, replyFileLineText } from "@paperclipai/shared";
 
@@ -114,7 +115,7 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
   afterAll(async () => {
     if (process.env.COPYOUT_BOUND_EVIDENCE) await fs.writeFile(process.env.COPYOUT_BOUND_EVIDENCE, JSON.stringify(evidence, null, 2));
     await db?.$client.end({ timeout: 1 }); await database?.cleanup();
-    if (root) await fs.rm(root, { recursive: true, force: true });
+    if (root && !process.env.COPYOUT_BOUND_EVIDENCE) await fs.rm(root, { recursive: true, force: true });
     vi.unstubAllEnvs();
   });
 
@@ -312,6 +313,43 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
       streamAndAccept, worker, coordinator, run, issue, workspace, authority, lease, attempts, committedSnapshots, recovery,
       presentationWorker, replies, armStall, expectEndedWithFilesKept, snapshotBefore, settled, storage, nextBoxes };
   }
+
+  it("K10 prepared epoch: nobody parked, hung real capture ends at the reply deadline through the existing stalled end; no retries", async () => {
+    // PLANTED run/lease/claim as named above; reserve/prepareRemoteWorkspace, completeRun, worker and GET are REAL.
+    // Same real-person/run shape beside this row: native-classic-bound.test.ts K10 live executor.
+    const s = await scenario();
+    await s.streamAndAccept();
+    const before = await s.snapshotBefore();
+    const [accepted] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, s.runId));
+    const stall = s.armStall();
+    let clock = accepted.createdAt.getTime() + WITHHELD_REPLY_SAVING_DEADLINE_MS - 1_000;
+    const checking = s.worker({ now: () => clock, personWaitCapMs: 100 }).check();
+    try {
+      await stall.reached;
+      clock += 1_000;
+      expect(await Promise.race([checking, sleep(3_000).then(() => "deadline not enforced")]))
+        .toEqual({ entries: 1, results: [null] });
+      await s.expectEndedWithFilesKept(before);
+      await s.presentationWorker();
+      const get = await request(s.app).get(`/api/issues/${s.issueId}/runs`);
+      expect(get.status).toBe(200);
+      const served = get.body.find((row: { runId: string }) => row.runId === s.runId);
+      expect(served).toMatchObject({ status: "failed", resultJson: { replyFileLine: { state: "kept" } } });
+      expect(replyFileLineText(readReplyFileLine(served.resultJson.replyFileLine), { nowMs: clock, recoverSavedFilesShown: false }))
+        .not.toMatch(/Saving/);
+      expect(await s.replies()).toHaveLength(1);
+      const calls = s.fault.commands;
+      for (let retry = 0; retry < 3; retry++) expect(await s.worker({ now: () => clock }).check()).toEqual({ entries: 0, results: [] });
+      expect(s.fault.commands - calls).toBe(0);
+      stall.release();
+      await vi.waitFor(async () => expect(await s.attempts()).toEqual(["failed"]), { timeout: 30_000, interval: 50 });
+      expect(await s.committedSnapshots()).toEqual(before.committed);
+      expect(await fs.readFile(s.editPath, "utf8")).toBe("R's unsaved edit\n");
+      evidence.K10 = { runId: s.runId, acceptedAt: accepted.createdAt, deadlineAt: new Date(clock),
+        served, retryCaptureCallsAfterDeadline: 0, retainedBox: s.remoteRoot };
+    } finally { stall.release(); await checking.catch(() => undefined);
+      await vi.waitFor(async () => expect(await s.attempts()).not.toContain("running"), { timeout: 30_000, interval: 50 }); }
+  }, 120_000);
 
   it("row 1 + row 3 (COPYOUT-STALL-1): a capture that never returns -> the bound ends the run with its files kept; the late save is refused", async () => {
     const s = await scenario();
