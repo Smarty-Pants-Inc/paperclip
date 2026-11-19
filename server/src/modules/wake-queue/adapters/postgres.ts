@@ -285,7 +285,16 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
               interruptQueueId ? eq(agentWakeupRequests.agentId, run.agentId) : undefined,
             ),
           )
-          .orderBy(asc(agentWakeupRequests.requestedAt))
+          // GAP1 (SMA-4 06:13:46): on a person's chat, a person's deferred wake is
+          // promoted before any automatic one (a chat-completion delivery queued
+          // earlier never starts ahead of the message the person is waiting on).
+          // Each kind stays oldest-first.
+          .orderBy(
+            sql`case when ${agentWakeupRequests.requestedByActorType} = 'user' and exists (select 1 from ${issues} ci
+              where ci.company_id = ${companyId} and ci.id::text = ${issueId} and ci.conversation_agent_id is not null)
+              then 0 else 1 end`,
+            asc(agentWakeupRequests.requestedAt),
+          )
           .limit(1)
           .then((rows) => rows[0] ?? null);
         if (!row) return null;
