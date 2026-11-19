@@ -53,9 +53,15 @@ describe.skipIf(!support.supported)("readTaskFailedOwnPersonMessageMembership: c
     const f = await task();
     const named = await f.messages(Array.from({ length: 450 }, (_, i) => 1_000 + i * 1_000));
     for (const [index, own] of chunks(named, 10).entries()) await f.run("failed", own, 500_000 + index * 2_000);
-    // Not members: named only by a succeeded, a cancelled or a running run; named by no run; an agent's own comment.
+    // Not members: named only by a succeeded run, a run a PERSON stopped or a running run; named by no run; an
+    // agent's own comment. The person's Stop record is PLANTED here as the real Stop route writes it
+    // (routes/agents.ts:7581-7584 cancelledByActorType "user" + cancelledByUserId); the real-route rows are
+    // recovery/answered-stop-and-card.test.ts "rf-3 membership".
     const [bySucceeded, byCancelled, byRunning] = await f.messages([900_000, 901_000, 902_000, 903_000]);
-    await f.run("succeeded", [bySucceeded!], 910_000); await f.run("cancelled", [byCancelled!], 911_000); await f.run("running", [byRunning!], 912_000);
+    await f.run("succeeded", [bySucceeded!], 910_000); await f.run("running", [byRunning!], 912_000);
+    await db.update(heartbeatRuns).set({ errorCode: "cancelled", resultJson: { cancelledByActorType: "user", cancelledByUserId: "board",
+      executionCancellation: { state: "requested", requestedAt: f.at(911_500).toISOString() } } })
+      .where(eq(heartbeatRuns.id, await f.run("cancelled", [byCancelled!], 911_000)));
     const all = await f.read();
     expect(all.exhausted, "the whole membership, and it says so").toBe(true);
     expect(all.next).toBeNull();
@@ -69,6 +75,30 @@ describe.skipIf(!support.supported)("readTaskFailedOwnPersonMessageMembership: c
     expect(more.members[0]).toMatchObject({ messageId: named[0], failedRunId: again, failedRunCount: 2, answered: false });
     expect(more.members.at(-1)!.messageId, "a message a failed run names as well is a member, in its place by time").toBe(bySucceeded);
   }, 120_000);
+
+  // rf-3 01:03Z (1): a NON-person cancel counts as FAILED. No path answers the messages of a run the system, the
+  // budget fan-out, recovery or a managing agent cancelled (the sweep owes them a notice:
+  // recovery/answered-stop-and-card.test.ts "negative: the SYSTEM cancels the run"), so they are members. A run a
+  // PERSON stopped (cancelledByActorType "user") is a Stop, not a failure. PLANTED cancel records, each as its real
+  // writer leaves it; the real-route rows (the real cancelRun, the real Stop route) are answered-stop-and-card.test.ts.
+  it("rf-3 non-person cancels: a cancelled run with no person behind it is a FAILED run (member); a person's Stop is not", async () => {
+    const f = await task();
+    const [system, budget, agent, person, plain] = await f.messages([1_000, 2_000, 3_000, 4_000, 5_000]);
+    const cancelled = async (own: string, ms: number, resultJson: Record<string, unknown> | null, errorCode = "cancelled") => {
+      const id = await f.run("cancelled", [own], ms);
+      await db.update(heartbeatRuns).set({ errorCode, resultJson }).where(eq(heartbeatRuns.id, id));
+      return id;
+    };
+    const bySystem = await cancelled(system!, 10_000, null);                                         // cancelRun with no actor
+    const byBudget = await cancelled(budget!, 11_000, { cancellation: { reason: "budget" } }, "budget_exceeded"); // no cancel actor
+    const byAgent = await cancelled(agent!, 12_000, { cancelledByActorType: "agent", cancelledByAgentId: f.agentId }, "operator_interrupted"); // routes/agents.ts:7578-7580
+    await cancelled(person!, 13_000, { cancelledByActorType: "user", cancelledByUserId: "board",
+      executionCancellation: { state: "requested", requestedAt: f.at(13_500).toISOString() } });       // routes/agents.ts:7581-7584
+    const failed = await f.run("failed", [plain!], 14_000);
+    expect((await f.read()).members.map(member => [member.messageId, member.kind, member.failedRunId]),
+      "system, budget and managing-agent cancels are failed runs; the person's Stop is not").toEqual([
+      [system, "message", bySystem], [budget, "message", byBudget], [agent, "message", byAgent], [plain, "message", failed]]);
+  }, 60_000);
 
   it("ORDERED: created_at ascending, the message id breaks ties; a caller's limit is stated as NOT exhausted and `next` continues without a gap or a repeat", async () => {
     const f = await task();

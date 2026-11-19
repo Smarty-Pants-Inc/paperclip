@@ -105,14 +105,26 @@ export function answeredPersonMessageSql(m: { id: SQL; companyId: SQL; issueId: 
 export const UNANSWERED_MESSAGE_REASON_PREFIX = "unanswered_message:";
 export const UNANSWERED_MESSAGE_GROUP_KEY = "unansweredMessageIds";
 
-/** A FAILED run, for the membership below: it ended without completing (failed, timed out or interrupted). A
- * cancelled run is a Stop, a succeeded run is not a failure, a live run has not ended. */
+/** A FAILED run, for the membership below: it ended without completing (failed, timed out or interrupted), or it
+ * was CANCELLED by anything but a person (rf-3 01:03Z: cancelledByActorType is not "user": the budget fan-out, a
+ * system or recovery cancel, a managing agent's stop). No path answers the messages of such a run (the sweep owes
+ * them a notice like a failed run's), so they are owed the same way. A run a PERSON stopped (the Stop and Interrupt
+ * routes record cancelledByActorType "user", routes/agents.ts:7581-7584) is a Stop, a succeeded run is not a
+ * failure, a live run has not ended. */
 export const FAILED_RUN_STATUSES = ["failed", "timed_out", "interrupted"] as const;
+/** SQL over run alias r: the run is a FAILED run (above). The ONE copy for the membership. */
+const failedRunSql = () => sql`(r.status in (${sql.join(FAILED_RUN_STATUSES.map(status => sql`${status}`), sql`, `)})
+  or (r.status = 'cancelled' and coalesce(r.result_json->>'cancelledByActorType', '') <> 'user'))`;
 /** The membership's fixed order: oldest message first, the message id as the tie-break. */
 export const FAILED_OWN_PERSON_MESSAGE_ORDER = "message created_at asc, message id asc" as const;
 const MEMBERSHIP_PAGE_SIZE = 200;
 
 export type FailedOwnPersonMessageMember = {
+  /** "message": a typed person message (messageId = its comment id, createdAt = when it was sent).
+   * "card_answer": a person's ANSWER to an agent's card (rf-3 01:03Z (2): the same input owed to a failed run):
+   * messageId = the card's id, createdAt = the answer time (resolved_at), authorUserId = who answered. It is keyed
+   * exactly as the one function, the carry (interactionIds) and the card-answer notice key it. */
+  kind: "message" | "card_answer";
   messageId: string; createdAt: Date; authorUserId: string | null;
   /** The newest FAILED run of this task whose OWN input names the message, and how many such runs there are. */
   failedRunId: string; failedRunCount: number;
@@ -144,17 +156,19 @@ export type FailedOwnPersonMessageMembership = {
  *    native_run_results_company_issue_run_id_uq, native_run_finalizations_pkey, issue_thread_interactions by
  *    (company_id, issue_id), activity_log_company_entity_created_idx, issues_company_origin_idx);
  * 4. the task's live unanswered-message notices: issue_comments_company_issue_created_at_idx, one scan.
- * No step scans a table sequentially, so no index was added. */
+ * No step scans a table sequentially, so no index was added.
+ * The member list has two arms: the task's person messages, and (second arm) a person's ANSWER to an agent's card
+ * that a failed run's OWN input names (the card-answer duty's shape, unansweredCardAnswerSql: answered, accepted or
+ * rejected by a person; never a withdrawal or an expiry), read by issue_thread_interactions' primary key. */
 function failedOwnPersonMessagePageSql(input: { companyId: string; issueId: string; limit: number;
   after?: { createdAt: string; messageId: string } | null }): SQL {
   const message = { id: sql.raw("m.id"), companyId: sql.raw("m.company_id"), issueId: sql.raw("m.issue_id"), createdAt: sql.raw("m.created_at") };
-  const failed = sql.join(FAILED_RUN_STATUSES.map(status => sql`${status}`), sql`, `);
   return sql`with failed_run as materialized (
       select r.id, r.created_at, r.context_snapshot from ${heartbeatRuns} r
-        where r.company_id = ${input.companyId}::uuid and r.context_snapshot->>'issueId' = ${input.issueId}::text and r.status in (${failed})
+        where r.company_id = ${input.companyId}::uuid and r.context_snapshot->>'issueId' = ${input.issueId}::text and ${failedRunSql()}
       union
       select r.id, r.created_at, r.context_snapshot from ${heartbeatRuns} r
-        where r.company_id = ${input.companyId}::uuid and r.native_issue_id = ${input.issueId}::uuid and r.status in (${failed})
+        where r.company_id = ${input.companyId}::uuid and r.native_issue_id = ${input.issueId}::uuid and ${failedRunSql()}
     ), candidate as materialized (
       select distinct named.id::uuid as message_id, f.id as run_id, f.created_at as run_created_at from failed_run f
       cross join lateral (
@@ -165,25 +179,42 @@ function failedOwnPersonMessagePageSql(input: { companyId: string; issueId: stri
         union all select jsonb_array_elements_text(case when jsonb_typeof(f.context_snapshot->'attributionCommentIds') = 'array'
           then f.context_snapshot->'attributionCommentIds' else '[]'::jsonb end)
         union all select jsonb_array_elements_text(case when jsonb_typeof(f.context_snapshot->'firstTurnQueuedInput'->'commentIds') = 'array'
-          then f.context_snapshot->'firstTurnQueuedInput'->'commentIds' else '[]'::jsonb end)) named
+          then f.context_snapshot->'firstTurnQueuedInput'->'commentIds' else '[]'::jsonb end)
+        union all select f.context_snapshot->>'interactionId'
+        union all select jsonb_array_elements_text(case when jsonb_typeof(f.context_snapshot->'interactionIds') = 'array'
+          then f.context_snapshot->'interactionIds' else '[]'::jsonb end)
+        union all select jsonb_array_elements_text(case when jsonb_typeof(f.context_snapshot->'attributionInteractionIds') = 'array'
+          then f.context_snapshot->'attributionInteractionIds' else '[]'::jsonb end)) named
       where named.id ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
     ), member as (
-      select m.id, m.company_id, m.issue_id, m.created_at, m.author_user_id,
-        (array_agg(c.run_id order by c.run_created_at desc, c.run_id desc))[1] as failed_run_id, count(*)::int as failed_run_count
-      from candidate c
-      join ${issueComments} m on m.id = c.message_id
-      join ${heartbeatRuns} r on r.id = c.run_id and r.company_id = m.company_id
-      where m.company_id = ${input.companyId}::uuid and m.issue_id = ${input.issueId}::uuid and m.author_type = 'user' and m.deleted_at is null
-        and ${ownInputNamesSql(sql.raw("m.id"))}
-        ${input.after ? sql`and (m.created_at, m.id) > (${input.after.createdAt}::timestamptz, ${input.after.messageId}::uuid)` : sql``}
-      group by m.id, m.company_id, m.issue_id, m.created_at, m.author_user_id
-      order by m.created_at, m.id limit ${input.limit}
+      select u.* from (
+        select m.id, m.company_id, m.issue_id, m.created_at, m.author_user_id, 'message'::text as kind,
+          (array_agg(c.run_id order by c.run_created_at desc, c.run_id desc))[1] as failed_run_id, count(*)::int as failed_run_count
+        from candidate c
+        join ${issueComments} m on m.id = c.message_id
+        join ${heartbeatRuns} r on r.id = c.run_id and r.company_id = m.company_id
+        where m.company_id = ${input.companyId}::uuid and m.issue_id = ${input.issueId}::uuid and m.author_type = 'user' and m.deleted_at is null
+          and ${ownInputNamesSql(sql.raw("m.id"))}
+        group by m.id, m.company_id, m.issue_id, m.created_at, m.author_user_id
+        union all
+        select q.id, q.company_id, q.issue_id, q.resolved_at as created_at, q.resolved_by_user_id as author_user_id, 'card_answer'::text as kind,
+          (array_agg(c.run_id order by c.run_created_at desc, c.run_id desc))[1] as failed_run_id, count(*)::int as failed_run_count
+        from candidate c
+        join ${issueThreadInteractions} q on q.id = c.message_id
+        join ${heartbeatRuns} r on r.id = c.run_id and r.company_id = q.company_id
+        where q.company_id = ${input.companyId}::uuid and q.issue_id = ${input.issueId}::uuid and q.created_by_agent_id is not null
+          and q.resolved_by_user_id is not null and q.resolved_at is not null and q.status in ('answered', 'accepted', 'rejected')
+          and ${ownInputNamesSql(sql.raw("q.id"))}
+        group by q.id, q.company_id, q.issue_id, q.resolved_at, q.resolved_by_user_id
+      ) u
+      ${input.after ? sql`where (u.created_at, u.id) > (${input.after.createdAt}::timestamptz, ${input.after.messageId}::uuid)` : sql``}
+      order by u.created_at, u.id limit ${input.limit}
     ), notice as materialized (
       select n.id, n.created_at, n.metadata from ${issueComments} n
       where n.company_id = ${input.companyId}::uuid and n.issue_id = ${input.issueId}::uuid and n.author_type = 'system' and n.deleted_at is null
         and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
     )
-    select m.id as "messageId", to_char(m.created_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "createdAt",
+    select m.kind as kind, m.id as "messageId", to_char(m.created_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "createdAt",
       m.author_user_id as "authorUserId", m.failed_run_id as "failedRunId", m.failed_run_count as "failedRunCount",
       ${answeredPersonMessageSql(message)} as answered, covering.id as "noticeId", covering.group_ids as "groupMessageIds"
     from member m
@@ -196,8 +227,9 @@ function failedOwnPersonMessagePageSql(input: { companyId: string; issueId: stri
 }
 
 /** The MEMBERSHIP of a task's failed-run person messages (rf-3 r3d item 1): every live person message of this
- * task and company that a FAILED run of the task names in its OWN input (ownInputNamesSql, the one copy; never
- * history, ancestry or a later input), each with its newest such run, whether it is ANSWERED (only through
+ * task and company, and every person's ANSWER to an agent's card (rf-3 01:03Z (2); `kind`), that a FAILED run of
+ * the task (FAILED_RUN_STATUSES, or cancelled by anything but a person) names in its OWN input (ownInputNamesSql,
+ * the one copy; never history, ancestry or a later input), each with its newest such run, whether it is ANSWERED (only through
  * answeredPersonMessageSql) and the group it is noticed in (read from the notice's metadata.unansweredMessageIds
  * where a group notice exists; never re-derived).
  * COMPLETE: with no `limit` the read pages (keyset on the order, MEMBERSHIP_PAGE_SIZE at a time) until the task

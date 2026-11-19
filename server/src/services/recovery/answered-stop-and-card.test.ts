@@ -13,7 +13,7 @@ import { agentRoutes } from "../../routes/agents.js";
 import { issueRoutes } from "../../routes/issues.js";
 import { heartbeatService } from "../heartbeat.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
-import { answeredPersonMessageSql } from "../person-message-answer.js";
+import { answeredPersonMessageSql, readTaskFailedOwnPersonMessageMembership } from "../person-message-answer.js";
 import { nativeContinuationAttributionContext } from "../native-runtime/status-decision-committer.js";
 import { settleUnansweredPersonMessagesForTask, unansweredPersonMessageCommentCondition, UNANSWERED_CARD_ANSWER_NO_REPLY_TEXT, UNANSWERED_CARD_ANSWER_NO_RUN_TEXT,
   UNANSWERED_CARD_ANSWER_TEXT, UNANSWERED_MESSAGE_NO_REPLY_TEXT, UNANSWERED_MESSAGE_TEXT,
@@ -360,6 +360,52 @@ describe.skipIf(!support.supported)("the sender's own Stop and an answerable car
     expect(all, "exactly one notice, ever: the answer's, never one for M").toHaveLength(1);
     expect(all[0]).toMatchObject({ deletedAt: null, body: UNANSWERED_CARD_ANSWER_NO_RUN_TEXT, metadata: key(f.cardId) });
     expect(all[0]!.body).toBe("Your answer is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.");
+  }, 60_000);
+
+  // rf-3 01:03Z on readTaskFailedOwnPersonMessageMembership, with the REAL routes (the planted variants are
+  // person-message-answer.membership.test.ts):
+  // (1) a NON-person cancel counts as FAILED: the real system cancel (heartbeatService.cancelRun, no cancel actor)
+  //     -> the run's message is a member; the sender's own real Stop (POST /heartbeat-runs/:runId/cancel) -> not.
+  it("rf-3 membership: the real SYSTEM cancel makes the run's message a member; the sender's own real Stop does not", async () => {
+    const f = await fixture();
+    const m1 = await f.send("M1: write the document.");
+    const run1 = await f.startRun(m1);
+    await heartbeatService(db).cancelRun(run1, "Cancelled by system", { errorCode: "cancelled" });
+    expect((await f.readRun(run1)).resultJson?.cancelledByActorType, "the real system cancel records no person").not.toBe("user");
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, f.issueId));
+    const m2 = await f.send("M2: and the summary.");
+    const run2 = await f.startRun(m2);
+    await f.stop(run2, f.sender);
+    const membership = await readTaskFailedOwnPersonMessageMembership(db, { companyId: f.companyId, issueId: f.issueId });
+    expect(membership.exhausted).toBe(true);
+    expect(membership.members.map(member => [member.messageId, member.kind, member.failedRunId, member.answered]),
+      "M1 (system-cancelled run) is a member; M2 (the sender's own Stop) is not").toEqual([[m1, "message", run1, false]]);
+  }, 60_000);
+
+  // (2) a card answer the failed run never consumed IS a member: the same input owed to a failed run, keyed by the
+  //     card id, dated by the answer (resolved_at), sent by the person who answered. Real answer (the interaction
+  //     service); the run that took the answer and its outcome are planted (fixture resumeRun).
+  it("rf-3 membership: a card answer a FAILED run took as its own input and never consumed is a member; answered once a later run replies", async () => {
+    const f = await cardFixture();
+    const read = async () => (await readTaskFailedOwnPersonMessageMembership(db, { companyId: f.companyId, issueId: f.issueId })).members
+      .map(member => ({ messageId: member.messageId, kind: member.kind, authorUserId: member.authorUserId, failedRunId: member.failedRunId,
+        failedRunCount: member.failedRunCount, answered: member.answered, noticed: Boolean(member.noticeId) }));
+    expect(await read(), "no failed run yet: M was answered by its card from a run that succeeded; nothing is a member").toEqual([]);
+    const resume = await f.resumeRun(f.cardId, "failed");
+    const [card] = await db.select({ resolvedAt: issueThreadInteractions.resolvedAt }).from(issueThreadInteractions).where(eq(issueThreadInteractions.id, f.cardId));
+    const first = await readTaskFailedOwnPersonMessageMembership(db, { companyId: f.companyId, issueId: f.issueId });
+    expect(first.members.map(member => member.createdAt.getTime()), "dated by the answer").toEqual([card!.resolvedAt!.getTime()]);
+    expect(await read()).toEqual([{ messageId: f.cardId, kind: "card_answer", authorUserId: f.sender, failedRunId: resume,
+      failedRunCount: 1, answered: false, noticed: false }]);
+    // REAL sweep: the answer's ONE line; the membership reads that notice for the member.
+    for (const minutes of PASSES) await f.sweep(minutes);
+    expect(await read()).toMatchObject([{ messageId: f.cardId, kind: "card_answer", answered: false, noticed: true }]);
+    // A later run takes the answer as its own input and replies: answered by the one function; still a member.
+    await f.resumeRun(f.cardId, "succeeded", true);
+    expect(await read()).toMatchObject([{ messageId: f.cardId, kind: "card_answer", failedRunId: resume, answered: true }]);
+    // A card the AGENT's side closed, or one nobody answered, is no person input: never a member (planted status).
+    await db.update(issueThreadInteractions).set({ status: "expired", resolvedByUserId: null }).where(eq(issueThreadInteractions.id, f.cardId));
+    expect(await read(), "an unanswered card is not a person's input").toEqual([]);
   }, 60_000);
 
   it("ruling 4 edge: a newer typed message after the answer is the owed input, not the answer", async () => {
