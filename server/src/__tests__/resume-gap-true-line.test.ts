@@ -136,7 +136,8 @@ describe.skipIf(!support.supported)("resume gap: from Resume to the run header t
       && /^(unanswered|retrying)_message:/.test(String(c.metadata?.authorizationReason ?? ""))).map(c => ({ id: c.id as string, body: c.body as string }));
     /** REAL GET: the runs whose header the thread shows for this task. */
     const headers = async (id = issueId) => (await get(`/api/issues/${id}/live-runs`) as any[])
-      .filter(run => ["queued", "running"].includes(run.status)).map(run => ({ id: run.id as string, status: run.status as string, execution: run.execution ?? null }));
+      .filter(run => ["queued", "running"].includes(run.status)).map(run => ({ id: run.id as string, status: run.status as string, execution: run.execution ?? null,
+        createdAt: run.createdAt as string, startedAt: (run.startedAt ?? null) as string | null }));
     let unlockDelivery: (() => void) | undefined, lockWork: Promise<unknown> | undefined, lockTimer: ReturnType<typeof setTimeout> | undefined;
     let otherSend: Promise<unknown> | undefined;
     const summary: any = { variant, samples: [] as any[], violations: [] as string[] };
