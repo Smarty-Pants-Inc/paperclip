@@ -592,6 +592,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   #sourceSequence = 0;
   readonly #config: PiNativeConfig;
   readonly #piMetadata: Record<string, unknown>;
+  readonly #piProcessIdentity: PiRpcTransport["processIdentity"];
   #identity: PiNativeAdmittedIdentity;
   #thinkingLoweringReported = false;
   readonly #toolLimitReportedRuns = new Set<string>();
@@ -627,6 +628,7 @@ export class PiRpcHarnessSession implements HarnessSession {
 
   constructor(state: PiSessionState) {
     this.#transport = state.transport;
+    this.#piProcessIdentity = state.transport.processIdentity ?? { boot_id: null, piPid: state.transport.pid, piProcessStartTicks: null };
     this.#runId = state.runId;
     this.#normalizedSessionId = state.normalizedSessionId;
     this.#providerSessionId = state.providerSessionId;
@@ -816,6 +818,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   #effectiveContext(): Record<string, unknown> {
     const context = this.#resident?.context ?? this.#initialContext;
     return { model: this.#identity.model, piRpcThinkingLevel: this.#identity.piRpcThinkingLevel, piMetadata: this.#piMetadata,
+      piProcessIdentity: this.#piProcessIdentity,
       toolDelivery: { api: context.api, nativeToolCount: context.nativeToolCount, dynamicToolCount: context.tools.length, totalToolCount: context.nativeToolCount + context.tools.length } };
   }
 

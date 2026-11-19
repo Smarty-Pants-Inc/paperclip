@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createPiEventProjector } from "./pi-event-projector.js";
 import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -65,6 +65,18 @@ async function queuedRecords(child: PiRpcTransport): Promise<PiRpcRecord[]> {
 }
 
 describe("PiRpcTransport large tool output and lagging consumers", () => {
+  it.skipIf(process.platform !== "linux")("reads the Pi child's real boot, pid and start ticks without another RPC", async () => {
+    const child = emittingTransport("");
+    try {
+      await child.request("identity-ready");
+      const identity = child.processIdentity;
+      expect(identity).toEqual({ boot_id: readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(),
+        piPid: child.pid, piProcessStartTicks: readFileSync(`/proc/${child.pid}/stat`, "utf8").split(") ").at(-1)!.split(" ")[19] });
+      expect(identity.piPid).not.toBe(process.pid);
+      expect(identity.piProcessStartTicks).toMatch(/^\d+$/);
+      expect(child.processIdentity).toEqual(identity);
+    } finally { await child.close(); }
+  });
   it("retains an oversized control input for bounded projection before a safe same-ID update", async () => {
     const child = emittingTransport(`${updateScript}
       await emit({ ...update("same", "first"), args: { input: "x".repeat(300000) } });
