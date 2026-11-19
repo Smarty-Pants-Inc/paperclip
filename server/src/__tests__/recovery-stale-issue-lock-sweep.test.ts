@@ -1,6 +1,7 @@
 import { persistHeartbeatRunProcessMetadata } from "../services/heartbeat/run-lifecycle.js";
 import { currentProcessSpaceHash } from "../services/controller-process-identity.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
+import { chatCompletionDeliveryService } from "../services/chat-completion-delivery.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -1601,6 +1602,68 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       expect(await wake(w.id)).toMatchObject({ status: "deferred_issue_execution", runId: null, payload: w.payload });
       expect(await systemNotes(c)).toEqual([]);
     });
+
+    it.each([true, false])("his-shape: one-id deferred head=%s plus four separate pending pre-boot deliveries never run", async hasHead => {
+      const c = await chat();
+      const ids: string[] = [];
+      for (const [index, identifier] of ["SMA-611", "SMA-618", "SMA-617", "SMA-615", "SMA-616"].entries()) {
+        const at = ago(13 * hour - index);
+        const [task] = await db.insert(issues).values({ companyId: c.companyId, identifier,
+          title: `Daily work ${identifier}`, status: "done", completedAt: at }).returning();
+        await db.insert(chatTaskHandoffs).values({ companyId: c.companyId, taskId: task.id,
+          conversationId: c.issueId, agentId: c.agentId, sessionGeneration: 0 });
+        const [d] = await db.insert(chatCompletionDeliveries).values({ companyId: c.companyId,
+          taskId: task.id, statusVersion: task.statusVersion, status: "pending", attempts: 0,
+          createdAt: at, nextAttemptAt: at }).returning();
+        ids.push(d.id);
+      }
+      if (hasHead) await db.insert(agentWakeupRequests).values({ companyId: c.companyId, agentId: c.agentId,
+        source: "automation", reason: "chat_task_completed", requestedByActorType: "system",
+        status: "deferred_issue_execution", requestedAt: ago(13 * hour), payload: { issueId: c.issueId,
+          chatCompletionDeliveryIds: [ids[0]], _paperclipWakeContext: { issueId: c.issueId,
+            taskKey: c.issueId, wakeReason: "chat_task_completed", chatCompletionDeliveryIds: [ids[0]] } } });
+      // The saved terminal owner has NO issue lock, exactly as at boot. Use
+      // the real stranded-receipt release boundary, without provider execution.
+      const previous = await run(c, [], ago(12 * hour));
+      await db.insert(nativeRunFinalizations).values({ companyId: c.companyId, issueId: c.issueId,
+        runId: previous.id, phase: "committed" });
+      const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, {
+        resolveResponsibleUserId: async () => owner,
+        getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+        resolveSessionBeforeForWakeup: async () => null,
+      }), recovery: {
+        escalateStrandedAssignedIssue: async () => { throw new Error("unexpected recovery"); },
+        escalateStrandedRecoveryIssueInPlace: async () => { throw new Error("unexpected recovery"); },
+      } });
+      const service = chatCompletionDeliveryService(db, c.heartbeat);
+      const started = Date.now();
+      for (let pass = 0; pass <= 10; pass++) {
+        await boot(c);
+        await release({ companyId: c.companyId, runId: previous.id, now: new Date(), resumeStrandedQueue: true,
+          suppressImmediateRecovery: true });
+        await db.update(chatCompletionDeliveries).set({ nextAttemptAt: new Date(0) })
+          .where(eq(chatCompletionDeliveries.companyId, c.companyId));
+        await service.sweepPending();
+        if (process.env.PAPERCLIP_HIS_SHAPE_SOAK === "1" && hasHead && pass < 10)
+          await new Promise(resolve => setTimeout(resolve, 60_000));
+      }
+      const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, c.companyId)))
+        .filter(r => r.id !== previous.id);
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, c.companyId));
+      const rows = await db.select().from(chatCompletionDeliveries).where(eq(chatCompletionDeliveries.companyId, c.companyId));
+      const notes = await systemNotes(c);
+      process.stdout.write(`his-shape persisted ${JSON.stringify({ hasHead, elapsedMs: Date.now() - started,
+        runs: runs.length, wakes: wakes.map(w => ({ id: w.id, status: w.status, runId: w.runId })),
+        notes: notes.map(n => n.body),
+        deliveries: rows.map(d => ({ id: d.id, status: d.status, attempts: d.attempts })) })}\n`);
+      expect(runs, "pre-boot reports must NEVER start a run").toHaveLength(0);
+      expect(wakes).toHaveLength(hasHead ? 1 : 0);
+      if (hasHead) expect(wakes[0]).toMatchObject({ status: "cancelled", runId: null });
+      expect(rows).toHaveLength(5);
+      expect(rows.every(d => d.status === "superseded")).toBe(true);
+      expect(notes).toHaveLength(1);
+      expect(notes[0].body).toBe("Finished earlier (these reports were delayed): SMA-611 — Daily work SMA-611; SMA-618 — Daily work SMA-618; SMA-617 — Daily work SMA-617; and 2 more.");
+    }, 11 * 60_000);
 
     it("boot-4d: platform's five pre-boot shapes yield ONE five-task naming note and ZERO runs", async () => {
       const c = await chat();
