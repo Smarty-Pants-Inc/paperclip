@@ -177,9 +177,9 @@ describe.skipIf(!support.supported)("allocation custody round 3: real cancel and
     const config = { ...f.config, reuseLease: true };
     await db.update(environments).set({ config }).where(eq(environments.id, f.environmentId));
     const [plugin] = await db.select().from(plugins).where(eq(plugins.id, f.pluginId));
-    const manifest = plugin!.manifestJson as { environmentDrivers: Array<Record<string, unknown>> };
+    const manifest = plugin!.manifestJson!;
     await db.update(plugins).set({ manifestJson: { ...manifest,
-      environmentDrivers: manifest.environmentDrivers.map(driver => ({ ...driver, supportsReusableLeases: true })) } })
+      environmentDrivers: manifest.environmentDrivers!.map(driver => ({ ...driver, supportsReusableLeases: true })) } })
       .where(eq(plugins.id, f.pluginId));
     const environment = (await environmentService(db).getById(f.environmentId))!;
     const runtime = environmentRuntimeService(db, { pluginWorkerManager: f.manager });

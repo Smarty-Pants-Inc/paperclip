@@ -94,20 +94,6 @@ export async function hasPendingRunCleanup(db: Db, companyId: string, runId: str
     OR EXISTS (SELECT 1 FROM ${environmentLeases}
       WHERE ${environmentLeases.companyId} = ${companyId} AND ${environmentLeases.heartbeatRunId} = ${runId}
         ${recoveredStopped.length ? sql`AND ${environmentLeases.id}::text NOT IN (${sql.join(recoveredStopped.map(id => sql`${id}`), sql`, `)})` : sql``}
-        -- A certified pre-turn replacement owes custody of the OLD allocation,
-        -- not execution cleanup on the fresh retry. Keep its stop intent and
-        -- named custody obligation intact; this is not a physical stop receipt.
-        -- The exact allocation must already be fenced against reuse by this run.
-        AND NOT COALESCE(
-          ${heartbeatRuns.status} = 'failed'
-          AND ${heartbeatRuns.resultJson}#>>'{predecessorRetirementFallback,version}' = '1'
-          AND ${heartbeatRuns.resultJson}#>'{predecessorRetirementFallback,providerWorkStarted}' = 'false'::jsonb
-          AND jsonb_typeof(${heartbeatRuns.resultJson}#>'{predecessorRetirementFallback,replacedProviderLeaseIds}') = 'array'
-          AND (${heartbeatRuns.resultJson}#>'{predecessorRetirementFallback,replacedProviderLeaseIds}') ? ${environmentLeases.providerLeaseId}
-          AND ${environmentLeases.metadata}#>>'{replaceBeforeReuse,schema}' = 'paperclip.replace-before-reuse.v1'
-          AND ${environmentLeases.metadata}#>>'{replaceBeforeReuse,runId}' = ${runId}
-          AND ${environmentLeases.metadata}#>'{orphanedRunLeaseRecovery,nativeCustodyUnverified}' = 'true'::jsonb
-          AND ${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,runId}' = ${runId}, false)
         AND (( ${environmentLeases.releasedAt} IS NULL AND NOT COALESCE(
             ${environmentLeases.status} = 'retained' AND ${environmentLeases.leasePolicy} = 'reuse_by_environment'
               AND ${environmentLeases.cleanupStatus} = 'success', false))
