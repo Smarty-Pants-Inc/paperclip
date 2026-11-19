@@ -16,7 +16,10 @@ type RemoteTargetIdentity = {
 export function remoteProviderPackMemoScope(target: RemoteTargetIdentity): string | undefined {
   if (target.transport !== "sandbox" || !target.environmentId || !target.leaseId
     || !target.sandboxLeaseAcquisition?.providerLeaseId) return undefined;
-  return JSON.stringify([target.environmentId, target.providerKey ?? null, target.leaseId,
+  // A new controller lease row can name the same still-running allocation.
+  // Keep requiring current lease authority above, but cache immutable bytes by
+  // box identity; the per-use probe below still fences boot/root/manifest changes.
+  return JSON.stringify([target.environmentId, target.providerKey ?? null,
     target.sandboxLeaseAcquisition.providerLeaseId]);
 }
 

@@ -467,7 +467,7 @@ describe("native Pi remote provider pack verification", () => {
 
 // Keep reason: trust boundary. Real verifier subprocesses read fixture bytes;
 // only root-owned OS metadata is simulated because the test user cannot chown.
-describe("lease-scoped remote provider pack verification memo", () => {
+describe("allocation-scoped remote provider pack verification memo", () => {
   async function memoFixture() {
     const fixture = await nativePiFixture();
     const state = { mode: "41ed", uid: 0, manifestMode: "81a4", manifestUid: 0, remoteUid: 1000,
@@ -515,6 +515,27 @@ describe("lease-scoped remote provider pack verification memo", () => {
       expect(second.payload.runnerSourceRevision).not.toBe("caller mutation");
       console.log(JSON.stringify({ evidence: "remote-pack-memo", coldMs, warmMs,
         fullVerifierInvocations: f.state.fullCalls / 2, warmRemoteRoundTrips: f.execute.mock.calls.length }));
+    } finally { await f.cleanup(); }
+  });
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21267
+  it("reuses the protected pack across fresh lease rows on the same warm allocation", async () => {
+    const f = await memoFixture();
+    const target = { transport: "sandbox", environmentId: randomUUID(), providerKey: "boat",
+      leaseId: "first-turn-lease", sandboxLeaseAcquisition: { providerLeaseId: "same-warm-box" } };
+    try {
+      const first = await verifyRemoteProviderPack({ ...f.input, memoScope: remoteProviderPackMemoScope(target) });
+      const second = await verifyRemoteProviderPack({ ...f.input,
+        memoScope: remoteProviderPackMemoScope({ ...target, leaseId: "second-turn-lease" }) });
+      expect(second).toEqual(first);
+      expect(f.state.fullCalls).toBe(2);
+      expect(f.state.audits).toBe(1);
+      expect(f.onMemoHit).toHaveBeenCalledOnce();
+      // A changed box must execute the full verifier even with identical bytes.
+      await verifyRemoteProviderPack({ ...f.input, memoScope: remoteProviderPackMemoScope({ ...target,
+        leaseId: "third-turn-lease", sandboxLeaseAcquisition: { providerLeaseId: "replacement-box" } }) });
+      expect(f.state.fullCalls).toBe(4);
+      expect(f.state.audits).toBe(2);
     } finally { await f.cleanup(); }
   });
 
@@ -616,13 +637,14 @@ describe("lease-scoped remote provider pack verification memo", () => {
     } finally { await f.cleanup(); }
   });
 
-  it("requires both the controller lease and physical allocation, scoped to the environment", () => {
+  it("requires a current lease but keys the physical allocation, provider and environment", () => {
     const target = { transport: "sandbox", environmentId: "env-a", leaseId: "lease-a",
       sandboxLeaseAcquisition: { providerLeaseId: "allocation-a" } };
     const scope = remoteProviderPackMemoScope(target);
     expect(scope).toBeDefined();
     expect(remoteProviderPackMemoScope({ ...target })).toBe(scope);
-    for (const changed of [{ environmentId: "env-b" }, { leaseId: "lease-b" },
+    expect(remoteProviderPackMemoScope({ ...target, leaseId: "lease-b" })).toBe(scope);
+    for (const changed of [{ environmentId: "env-b" }, { providerKey: "boat" },
       { sandboxLeaseAcquisition: { providerLeaseId: "allocation-b" } }]) {
       expect(remoteProviderPackMemoScope({ ...target, ...changed })).not.toBe(scope);
     }
