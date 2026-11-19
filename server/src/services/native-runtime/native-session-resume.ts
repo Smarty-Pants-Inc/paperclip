@@ -252,7 +252,7 @@ type NativeSessionResumeSelection = {
   predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
 };
 
-const NATIVE_RESUME_CANDIDATE_WINDOW = 32;
+export const NATIVE_RESUME_CANDIDATE_WINDOW = 32;
 const INHERITED_CHECKPOINT_SOURCE_FIELDS = ["backendKind", "driverKind", "sessionId", "providerSessionId"] as const;
 
 export async function findNativeSessionResumeRun(db: Db, input: NativeSessionResumeSelection) {

@@ -9,7 +9,8 @@ import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
+import { nativeSha256 } from "./canonical.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agentTaskSessions, agents, companies, controllerInstances, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, issueComments, nativeRunFinalizations, nativeRunResults, nativeRunnerCheckpoints } from "@paperclipai/db";
 import { decodeDurablePrpCheckpoint, DurablePrpControlPlane, NativeProviderTerminalFailure, parseNativeExecutionInput, QUALIFIED_PI_RPC_PROFILE, type DurablePrpCheckpoint, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
@@ -649,6 +650,93 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
         .toMatchObject({ kind: "missing_evidence", reason: "snapshot_digest_or_checkpoint_binding" });
     }
   });
+
+  // adopt-snapshot-binding3 (1440 / 390): run A succeeded with its own
+  // checkpoint; two Interrupts then cut runs B and C ~12 s after start, before
+  // either wrote a checkpoint (no `sessionCheckpoint` key at all). The
+  // successor on a NEW box must restore from A's checkpoint, not fail on
+  // `snapshot_binding`, and never over progress the cut runs made.
+  it.each(["no-progress", "write-tool", "other-session"] as const)(
+    "recovers a successor on a new box from the newest valid checkpoint past runs cut before their first checkpoint (%s)", async shape => {
+      const a = await seed();
+      await importNativeControllerRecovery(db, { ...a.scope, expectedConfigDigest: compatibility.configDigest, supervisor: a.supervisor });
+      if (shape === "other-session") {
+        const profile = { ...a.profile, sessionCheckpoint: { ...a.snapshot, identity: { ...a.snapshot.identity, sessionId: randomUUID() } } };
+        await db.update(heartbeatRuns).set({ runnerProfileJson: { ...profile, nativeControllerRecovery: (await db.select().from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, a.scope.runId)))[0].runnerProfileJson?.nativeControllerRecovery } }).where(eq(heartbeatRuns.id, a.scope.runId));
+      }
+      const [aRow] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, a.scope.runId));
+      const t0 = aRow.createdAt.getTime();
+      const cut: string[] = [];
+      for (const [index, offset] of [30_000, 60_000].entries()) {
+        const id = randomUUID(), startedAt = new Date(t0 + offset);
+        cut.push(id);
+        // piConversation is copied run to run; the 2nd cut run names the 1st.
+        await db.insert(heartbeatRuns).values({ id, companyId, agentId, issueId: a.scope.issueId, nativeIssueId: a.scope.issueId,
+          nativeSessionId: a.scope.normalizedSessionId, runnerInstanceId: randomUUID(), runtimeMode: "native",
+          status: "cancelled", errorCode: "cancelled", createdAt: startedAt, startedAt, finishedAt: new Date(t0 + offset + 12_000),
+          processPid: 5000 + index, processGroupId: 5000 + index, processStartedAt: new Date(t0 + offset + 1_000),
+          runnerProfileJson: { nativeExecutionInput: { admitted: true },
+            piConversation: { conversationId: a.scope.normalizedSessionId, runId: index ? cut[0] : a.scope.runId } } });
+        await db.insert(nativeRunFinalizations).values({ companyId, issueId: a.scope.issueId, runId: id, phase: "terminal_failure" });
+        // The cut turn's own Pi session lines: it started and resumed, nothing more.
+        await db.insert(heartbeatRunEvents).values([
+          { companyId, agentId, runId: id, seq: 1, stream: "system", eventType: "session.resumed", payload: { line: `${id}:1` } },
+          { companyId, agentId, runId: id, seq: 2, stream: "system", eventType: "turn.started", payload: { line: `${id}:2` } },
+          { companyId, agentId, runId: id, seq: 3, stream: "system", eventType: "item.started",
+            payload: { prpEvent: { payload: { kind: "userMessage", line: `${id}:3` } } } }]);
+      }
+      if (shape === "write-tool") await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: cut[0], seq: 4,
+        stream: "system", eventType: "tool.execution.started", payload: { name: "write_file", executionId: "call-1", transport: "process" } });
+      const custody = async () => nativeSha256({
+        runs: (await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.id, cut))).sort((x, y) => x.id.localeCompare(y.id)),
+        lines: (await db.select().from(heartbeatRunEvents).where(inArray(heartbeatRunEvents.runId, cut)))
+          .sort((x, y) => `${x.runId}${x.seq}`.localeCompare(`${y.runId}${y.seq}`)) });
+      const before = await custody();
+      const successorId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: successorId, companyId, agentId, issueId: a.scope.issueId, nativeIssueId: a.scope.issueId,
+        nativeSessionId: a.scope.normalizedSessionId, runnerInstanceId: randomUUID(), status: "running", runtimeMode: "native",
+        createdAt: new Date(t0 + 90_000) });
+      const recovered = await resolveNativeControllerRecovery(db, { ...a.scope, currentRunId: successorId });
+      if (shape === "write-tool") {
+        expect(recovered).toEqual({ kind: "missing_evidence", reason: "progress_after_checkpoint" });
+      } else if (shape === "other-session") {
+        expect(recovered).toEqual({ kind: "missing_evidence", reason: "snapshot_binding" });
+      } else {
+        expect(recovered.kind === "recoverable" ? null : recovered).toBeNull();
+        expect(recovered).toMatchObject({ kind: "recoverable", snapshot: { identity: { runId: a.scope.runId } } });
+        if (recovered.kind !== "recoverable") return;
+        expect(recovered.checkpoint.runId).toBe(a.scope.runId);
+        // The successor then runs on its new box through the real executor
+        // and control plane; only the provider boundary is a scripted peer.
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successorId));
+        const [issue] = await db.select().from(issues).where(eq(issues.id, a.scope.issueId));
+        const native = await prepareNativeHeartbeatRun({ db, run, issue, environmentLeaseId: randomUUID() });
+        const [prepared] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successorId));
+        const execution = parseNativeExecutionInput({ schema: "paperclip.native-execution-input.v1",
+          binding: { companyId, agentId, issueId: a.scope.issueId, runId: successorId, executionWorkspaceId: successorId },
+          provider: { kind: "codex", model: null },
+          task: { identifier: "NCD-CUT", title: issue.title, description: null, prompt: "Answer the owed messages.", workMode: "standard" },
+          workspace: { cwd: root, repoUrl: null, repoRef: null, branchName: null },
+          session: { normalizedSessionId: a.scope.normalizedSessionId, driverKind: "codex_app_server", protocolVersion: 1,
+            lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } },
+          completionContract: { id: prepared.completionContractId, sha256: prepared.completionContractSha256,
+            schemaVersion: "paperclip.completion-contract.v1", contract: { revision: "1", objective: issue.title,
+              criteria: [{ id: "objective", requirement: "Complete the task objective" }] } }, credentialBindings: [], interactionResponses: [] });
+        await db.update(heartbeatRuns).set({ runnerProfileJson: { ...prepared.runnerProfileJson, nativeExecutionInput: execution } })
+          .where(eq(heartbeatRuns.id, successorId));
+        await db.insert(nativeRunFinalizations).values({ companyId, issueId: a.scope.issueId, runId: successorId, phase: "observed" });
+        await db.update(issues).set({ executionRunId: successorId }).where(eq(issues.id, a.scope.issueId));
+        const { answered, settled } = await answerWithNativePeer({ db, execution, runnerInstanceId: native.runnerInstanceId,
+          text: "Answered every owed message once.", getFreshSessionHandoff: async () => null });
+        expect(answered).toMatchObject({ exitCode: 0, resultJson: { nativeResult: { summary: "Answered every owed message once." } } });
+        expect(settled).toMatchObject({ nativeSessionId: a.scope.normalizedSessionId, status: "succeeded" });
+        expect((await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, successorId))).length).toBe(1);
+        await db.delete(agentTaskSessions).where(eq(agentTaskSessions.taskKey, a.scope.issueId));
+      }
+      // (d) NEVER-OK: the cut runs' own records and session lines stay byte-identical.
+      expect(await custody()).toBe(before);
+    }, 60_000);
 
   async function seedBusyDirectoryRun(input: { checkpoint?: boolean; resultJson?: Record<string, unknown> } = {}) {
     const issueId = randomUUID(), runId = randomUUID();
