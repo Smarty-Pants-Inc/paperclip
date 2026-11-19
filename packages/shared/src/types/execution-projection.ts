@@ -183,4 +183,10 @@ export interface TaskInterruptionPresentation {
   observedRunId: string | null;
   /** The saved-work recovery step that must finish before the task continues. */
   recoveryStep?: "checking_previous_run" | "saving_previous_files" | "finishing_recovery";
+  /** The task's saved message is HELD for the person's one action (ExecutionBlocker.savedMessageWait
+   * "continue_required"): `line` is the task's ONE sentence, the execution blocker's `nextAction`. A list row carries no
+   * execution blocker, so the surfaces that render this projection (the Inbox failed-run row) read the hold here and
+   * offer its ONE action, "Continue with the files as they are" (POST /api/issues/:id/retry, retryAction
+   * "continue_with_files"), in place of a plain Retry. Absent in every other state. */
+  savedMessageWait?: { state: "continue_required"; line: string };
 }

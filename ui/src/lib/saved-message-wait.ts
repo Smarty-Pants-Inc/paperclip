@@ -1,4 +1,4 @@
-import { REPLY_FILES_CONTINUE_ACTION, type ExecutionBlocker } from "@paperclipai/shared";
+import { REPLY_FILES_CONTINUE_ACTION, type ExecutionBlocker, type TaskInterruptionPresentation } from "@paperclipai/shared";
 
 /**
  * A reply's file save failed for good while the person's next message waits (server execution-blocker.ts,
@@ -15,4 +15,22 @@ export interface SavedMessageWait {
 export function readSavedMessageWait(blocker: Pick<ExecutionBlocker, "nextAction" | "savedMessageWait"> | null | undefined): SavedMessageWait | null {
   if (!blocker?.savedMessageWait || !blocker.nextAction) return null;
   return { line: blocker.nextAction, continueLabel: blocker.savedMessageWait === "continue_required" ? REPLY_FILES_CONTINUE_ACTION : null };
+}
+
+/**
+ * The SAME hold where the task's execution blocker is not loaded: a list row (the Inbox failed-run row) has the task's
+ * interruption projection only, and the server copies the hold onto it (task-interruption-presentation.ts, from
+ * `savedMessageWait` "continue_required" of the same execution blocker). While the message is held, the row says the
+ * task's ONE sentence and its press is the ONE action the thread's card sends, never a plain Retry.
+ */
+export interface SavedMessageHold {
+  line: string;
+  continueLabel: string;
+  retryAction: "continue_with_files";
+}
+
+export function readSavedMessageHold(interruption: Pick<TaskInterruptionPresentation, "savedMessageWait"> | null | undefined): SavedMessageHold | null {
+  const hold = interruption?.savedMessageWait;
+  if (hold?.state !== "continue_required" || !hold.line) return null;
+  return { line: hold.line, continueLabel: REPLY_FILES_CONTINUE_ACTION, retryAction: "continue_with_files" };
 }
