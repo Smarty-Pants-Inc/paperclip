@@ -143,7 +143,7 @@ describe("plugin company authorization across hosts sharing Postgres", () => {
     expect(loadScopes).toHaveBeenCalledTimes(reads);
   });
 
-  it("does not resurrect an invocation that timed out while the registry read was pending", async () => {
+  it.each(["config", "issue"])("does not resurrect timed-out invocation authority for %s while the registry read was pending", async key => {
     await enableViaA();
     let release!: () => void, started!: () => void;
     const readStarted = new Promise<void>(resolve => { started = resolve; });
@@ -153,17 +153,23 @@ describe("plugin company authorization across hosts sharing Postgres", () => {
       await readReleased;
       return [companyId];
     });
-    const calls = configGet.mock.calls.length;
+    const calls = configGet.mock.calls.length, issueCalls = issueGet.mock.calls.length;
     const timedOut = expect(managerB.call(pluginId, "runJob", { job: {
-      jobKey: "config", runId: randomUUID(), trigger: "schedule", scheduledAt: new Date().toISOString(),
+      jobKey: key, runId: randomUUID(), trigger: "schedule", scheduledAt: new Date().toISOString(),
     } }, 100)).rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.TIMEOUT });
     try {
       await readStarted;
       await timedOut;
     } finally { release(); }
-    // A fresh request still succeeds; the retired request must not reach config.
-    await expect(job("config")).resolves.toBeNull();
-    expect(configGet).toHaveBeenCalledTimes(calls + 1);
+    // A fresh job is unchanged. A timed-out config read may finish only with
+    // fresh host-derived scope; a timed-out non-state read must stay refused.
+    await expect(job(key)).resolves.toBeNull();
+    expect(configGet).toHaveBeenCalledTimes(calls + (key === "config" ? 2 : 0));
+    expect(issueGet).toHaveBeenCalledTimes(issueCalls + (key === "issue" ? 1 : 0));
+    if (key === "config") {
+      expect(configGet.mock.calls.slice(calls).map(([, context]) => context))
+        .toContainEqual({ invocationScope: { companyId } });
+    }
   });
 
   it("wires the production loader to the plugin's authoritative registry rows", async () => {
