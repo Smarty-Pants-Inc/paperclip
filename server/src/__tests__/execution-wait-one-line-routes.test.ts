@@ -211,7 +211,7 @@ describe.skipIf(!support.supported)("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rea
     await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId });
     const queue = (await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
     const comments = (await request(f.client).get(`/api/issues/${f.issueId}/comments`).expect(200)).body;
-    const row = { producer: "POST comments -> admission; remoteTerminationReceipt -> environmentService.releaseLease -> heartbeatService.resumeRemoteStopComments",
+    const row = { producer: "POST /heartbeat-runs/:id/cancel; recordNativeLocalProcessStop; issueRecoveryActionService.upsertSourceScoped/resolveActiveForIssue; POST /issues/:id/comments -> heartbeat enqueueWakeup; reconcileStrandedAssignedIssues; GET queued-comments/comments",
       surface: f.chat ? "chat" : "task", reason, elapsed, readAt: new Date().toISOString(), messageId: f.message.id,
       issueBeforeSend: f.issueBeforeSend, issueAfterSend: f.issueAfterSend, queue, comments };
     expect(comments.filter((c: any) => c.authorType === "system" && c.metadata?.recoveryResponsibility !== "system")).toEqual([]);
@@ -234,7 +234,8 @@ describe.skipIf(!support.supported)("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rea
       expect(runs).toHaveLength(1);
       const run = (await request(f.client).get(`/api/heartbeat-runs/${runs[0].id}`).expect(200)).body;
       expect(run.status).toBe("queued"); // Real admission, not a claim of provider execution.
-      samples.push({ ...after, run, admittedRunCount: runs.length });
+      samples.push({ ...after, producer: "remoteTerminationReceipt (planted provider response) -> environmentService.releaseLease -> heartbeatService.resumeRemoteStopComments (twice); GET run/queued-comments/comments",
+        run, admittedRunCount: runs.length });
     });
 
     for (const deleteRoute of ["queued-panel", "comment"] as const) {
@@ -267,7 +268,8 @@ describe.skipIf(!support.supported)("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rea
         expect(later.queue.executionWait).toBeFalsy();
         expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
           .filter(run => JSON.stringify(run.contextSnapshot).includes(f.message.id))).toEqual([]);
-        samples.push({ ...after, deleteRoute, deletion, beforeQueue: before.queue, beforeComments: before.comments, laterQueue: later.queue,
+        samples.push({ ...after, producer: `REAL DELETE ${deletion}; GET queued-comments/comments; remoteTerminationReceipt (planted provider response) -> environmentService.releaseLease -> heartbeatService.resumeRemoteStopComments (twice); later GET queued-comments/comments`,
+          deleteRoute, deletion, beforeQueue: before.queue, beforeComments: before.comments, laterQueue: later.queue,
           wakeStatus: wake.status, wakePayload: wake.payload, laterAdmittedRunCount: 0 });
       });
     }
