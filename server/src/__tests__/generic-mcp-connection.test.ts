@@ -443,6 +443,9 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
     await db.delete(agents);
+    // Late producers can enqueue after the first flush; drain and clear again just before the FK target goes.
+    await flushSecretResolutionWrites(db);
+    await db.delete(secretAccessEvents);
     await db.delete(companies);
     await db.delete(authUsers);
   });
