@@ -36,6 +36,7 @@ export const DELIVERY_QUEUES = {
   runEvidenceMigration: "run-evidence-migration",
   providerTraceRetention: "provider-trace-retention",
   nativeRunnerEvidenceRetention: "native-runner-evidence-retention",
+  nativeSessionEvidence: "native-session-evidence",
   skillVersionRetention: "skill-version-retention",
   externalObjectRefresh: "external-object-refresh",
   databaseBackups: "database-backups",

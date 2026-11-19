@@ -1701,7 +1701,10 @@ describe.skipIf(!existsSync("/proc/self/cmdline"))("remote runner launch stale s
       } else {
         expect(result.stdout).toBe("launched");
         expect((await readFile(join(root, "identity"), "utf8")).split("\n")[0]).toBe("nonce");
-        expect(await readFile(log, "utf8")).toContain(`runner_stale_lineage_partial: runner ${stale.pid}:`);
+        // The launch's durable stderr file is copied to this shared log by
+        // an asynchronous child; launch completion is not its append receipt.
+        await vi.waitFor(async () => expect(await readFile(log, "utf8"))
+          .toContain(`runner_stale_lineage_partial: runner ${stale.pid}:`), { timeout: 5_000 });
       }
       for (const survivor of [other, trimmer, unknown]) expect(gone(survivor.pid!)).toBe(false);
     } finally {
@@ -12161,6 +12164,9 @@ describe("warm native session evidence copy", () => {
       await executePaperclipNativeSession({ db, execution: current, runnerInstanceId: environmentId, runnerExecutionTarget: target,
         useRunnerd: true, runnerIngressAuthorized: true });
       turnMs.push(performance.now() - started);
+      const [saved] = await db.select().from(tables.heartbeatRuns).where(eq(tables.heartbeatRuns.id, runId));
+      await db.update(tables.heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(),
+        runnerProfileJson: { ...saved?.runnerProfileJson, nativeExecutionInput: current } }).where(eq(tables.heartbeatRuns.id, runId));
       prior = current; priorLease = leaseId;
       return { runId, leaseId };
     };
@@ -12214,7 +12220,7 @@ describe("warm native session evidence copy", () => {
       await rm(home, { recursive: true, force: true }).catch(() => undefined);
     };
     return { db, tables, companyId, issueId, environmentId, session, runTurn, evidenceRows, waitFor, openEvidence, boxInventory, boxTree,
-      leaseMetadata, storageFaults, evidenceGate, commands, turnMs, cleanup, realStorage, codexHome, logger };
+      leaseMetadata, storageFaults, evidenceGate, commands, turnMs, cleanup, realStorage, codexHome, logger, commandRunner };
   }
 
   it("(a)(d) copies each succeeded warm turn's trace off the box before any close, verified, while the warm box and session are reused", async () => {
@@ -12303,6 +12309,7 @@ describe("warm native session evidence copy", () => {
       expect(marked?.nativeSessionEvidencePending, "an observable evidence-copy-pending marker").toMatchObject({ runId: first.runId, attempts: 1,
         lastError: expect.stringContaining("injected storage outage") });
       expect(await f.evidenceRows(first.runId, "current"), "never a false complete").toHaveLength(0);
+      expect(await f.evidenceRows(first.runId, "pending"), "failed upload attempt cannot remain in the publication queue").toHaveLength(0);
       // The later bounded retry completes and clears the marker.
       const [row] = await f.waitFor(() => f.evidenceRows(first.runId, "current"), rows => rows.length === 1, 20_000);
       expect(row).toBeDefined();
@@ -12325,6 +12332,72 @@ describe("warm native session evidence copy", () => {
       expect(await f.evidenceRows(second.runId, "current")).toHaveLength(0);
       f.storageFaults.putFailures = 0;
     } finally { alarms.mockRestore(); await f.cleanup(); }
+  }, 120_000);
+
+  it.each(["readable", "gone"] as const)("restart sweep resumes durable pending evidence when box is %s", async box => {
+    const f = await warmEvidenceFixture(`restart-${box}`);
+    const evidence = await import("./native-session-evidence.js");
+    const { createDeliveryWorkCoordinator } = await import("../delivery-work-coordinator.js");
+    const { registerNativeSessionEvidenceWork } = await import("./native-session-evidence-work.js");
+    const originalDelay = evidence.nativeSessionEvidenceRetry.delayMs;
+    evidence.nativeSessionEvidenceRetry.delayMs = 1;
+    const alarms = vi.spyOn(f.logger, "error");
+    let coordinator: ReturnType<typeof createDeliveryWorkCoordinator> | undefined;
+    try {
+      f.storageFaults.putFailures = 1000;
+      const first = await f.runTurn();
+      await Promise.all([...evidence.nativeSessionEvidenceCopies.values()]);
+      expect((await f.leaseMetadata(first.leaseId))?.nativeSessionEvidencePending).toMatchObject({ runId: first.runId, attempts: 3 });
+      expect(await f.evidenceRows(first.runId, "current")).toHaveLength(0);
+      // Reconstruct solely from durable c38db3e3-shaped state: no cached source,
+      // runner, pending promise or live session is handed to the new worker.
+      const metadata = await f.leaseMetadata(first.leaseId);
+      const pending = metadata!.nativeSessionEvidencePending as Record<string, unknown>;
+      await f.db.update(f.tables.environmentLeases).set({ metadata: { ...metadata,
+        nativeSessionEvidencePending: { runId: first.runId, sessionId: pending.sessionId,
+          providerLeaseId: pending.providerLeaseId, since: pending.since, attempts: 3, lastError: pending.lastError } } })
+        .where(eq(f.tables.environmentLeases.id, first.leaseId));
+      // Recovery has the same three-attempt budget: two more upload faults
+      // must still complete, and failed attempts must not be pending receipts.
+      f.storageFaults.putFailures = box === "readable" ? 2 : 0;
+      alarms.mockClear();
+      const runtime = { readPredecessorSandboxRecord: vi.fn(async () => box === "gone" ? { kind: "gone" as const } : { kind: "present" as const }),
+        execute: vi.fn(async (input: Parameters<typeof f.commandRunner.execute>[0]) => f.commandRunner.execute(input)) };
+      const errors: unknown[] = [];
+      const start = async () => {
+        coordinator = createDeliveryWorkCoordinator({ owner: f.db, canRun: () => true, onError: error => errors.push(error) });
+        await registerNativeSessionEvidenceWork(f.db, coordinator, runtime as never, () => true).ready;
+      };
+      await start();
+      expect(errors).toEqual([]);
+      expect(coordinator!.nextWakeAt(), "settled startup evidence must not poll idle history").toBeNull();
+      if (box === "readable") {
+        const [row] = await f.evidenceRows(first.runId, "current");
+        expect(row, "startup reconstructs and completes the uncopied warm trace").toBeDefined();
+        const opened = await f.openEvidence(row!);
+        expect(await readFile(join(opened.root, "codex-home", "sessions", "rollout.jsonl"), "utf8")).toContain("turn-1 history");
+        expect(opened.manifest.directories[0].sha256).toBe((await f.boxInventory()).sha256);
+        expect((await f.leaseMetadata(first.leaseId))?.nativeSessionEvidencePending).toBeUndefined();
+        expect(await f.evidenceRows(first.runId, "failed")).toHaveLength(5);
+        expect(await f.evidenceRows(first.runId, "pending")).toHaveLength(0);
+        expect(runtime.execute.mock.calls.every(([input]) => input.readOnlyProbe === true && input.bypassSession === true)).toBe(true);
+      } else {
+        // A second server-start sweep must not emit the permanent-loss alarm twice.
+        await coordinator!.stop();
+        await start();
+        const calls = alarms.mock.calls.filter(call => String(call[1]).startsWith("custody_evidence_pending_alarm"));
+        expect(calls).toHaveLength(1);
+        expect(calls[0]![0]).toMatchObject({ reason: "box_gone", runId: first.runId, boxId: "same-warm-box", companyId: f.companyId });
+        expect((await f.leaseMetadata(first.leaseId))?.nativeSessionEvidencePending).toMatchObject({ runId: first.runId });
+        expect(runtime.execute).not.toHaveBeenCalled();
+        expect(await f.evidenceRows(first.runId, "current")).toHaveLength(0);
+      }
+    } finally {
+      await coordinator?.stop();
+      evidence.nativeSessionEvidenceRetry.delayMs = originalDelay;
+      alarms.mockRestore();
+      await f.cleanup();
+    }
   }, 120_000);
 
   it("(1)(2) the next message on the same warm session starts while the copy is stalled; a source that changes mid-copy is retried, never stored partial", async () => {
