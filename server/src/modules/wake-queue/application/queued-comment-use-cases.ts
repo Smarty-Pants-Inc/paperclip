@@ -278,7 +278,16 @@ export function createDiscardQueuedComment(deps: { issueLock: QueuedCommentIssue
         const queueBecomesEmpty = remainingIds.length === 0;
 
         let cancelledRun: { id: string } | null = null;
-        let nextWake = locked.wake;
+        // A discard removes the input from the durable wake even when it was
+        // the last entry. Cancellation alone must not retain a deleted input
+        // for a later cleanup/recovery consumer. The adapter preserves only
+        // input already claimed by the active run's first turn.
+        const nextWake = await tx.updateWakeQueuedCommentIds({
+          wakeId: locked.wake.id,
+          payload: locked.wake.payload,
+          ids: remainingIds,
+          updatedAt: input.now,
+        });
         let nextQueueRun = locked.queueRun;
 
         if (queueBecomesEmpty) {
@@ -309,12 +318,6 @@ export function createDiscardQueuedComment(deps: { issueLock: QueuedCommentIssue
             await tx.touchIssueUpdatedAt({ issueId: input.issue.id, updatedAt: input.now });
           }
         } else {
-          nextWake = await tx.updateWakeQueuedCommentIds({
-            wakeId: locked.wake.id,
-            payload: locked.wake.payload,
-            ids: remainingIds,
-            updatedAt: input.now,
-          });
           nextQueueRun = await updateQueueRunCommentIdsGuarded(tx, {
             queueRun: locked.queueRun,
             ids: remainingIds,

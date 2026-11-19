@@ -20,7 +20,7 @@ import { issueService } from "../issues.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { logActivity } from "../activity-log.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
-import { isWellFormedExecutionWait, wellFormedExecutionWaitSql } from "../deferred-execution-wait.js";
+import { isWellFormedExecutionWait, wellFormedExecutionWaitSql, PENDING_WAIT_START_BOUND_MS } from "../deferred-execution-wait.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
 import { PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "../native-runtime/native-provider-failure.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
@@ -82,8 +82,7 @@ export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";
 /** Setup completes by itself; a stalled setup gets one factual waiting note. */
 export const UNANSWERED_MESSAGE_AGENT_SETUP_CODE = "agent_setup";
 // Preserve the sweep's existing start bound as the one shared ten-minute value.
-export { PENDING_WAIT_START_BOUND_MS } from "../deferred-execution-wait.js";
-import { PENDING_WAIT_START_BOUND_MS } from "../deferred-execution-wait.js";
+export { PENDING_WAIT_START_BOUND_MS };
 export const SETUP_WAIT_BOUND_MS = PENDING_WAIT_START_BOUND_MS;
 const WAITING_KIND_CODES = new Set(["agent_paused", UNANSWERED_MESSAGE_AGENT_SETUP_CODE]);
 /** Paperclip's pause model: POST /agents/:id/resume is allowed for a board user
