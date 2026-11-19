@@ -10,7 +10,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents, authUsers, companies, companyMemberships, createDb,
   heartbeatRunEvents, heartbeatRuns, issueComments, issues,
-  agentWakeupRequests, nativeRunFinalizations,
+  agentWakeupRequests, nativeRunFinalizations, activityLog,
 } from "@paperclipai/db";
 import { PiRpcDriver } from "../../../packages/paperclip-runner/src/drivers/pi/pi-rpc-driver.js";
 import type { PiRpcRecord, PiRpcTransport } from "../../../packages/paperclip-runner/src/drivers/pi/pi-rpc-transport.js";
@@ -28,10 +28,13 @@ import * as nativeExecutor from "../services/native-runtime/native-session-execu
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { waitForPendingCommentSteers } from "../services/conversation-steering.js";
+import * as commentSteering from "../services/conversation-steering.js";
 import { readUnreadSteeredMessages } from "../services/native-runtime/unread-steered-messages.js";
 import { readPersonStopHold } from "../services/acknowledged-native-stop.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { notifyDeferredWakesForIssue } from "../services/deferred-execution-notifications.js";
+import { loadCapturedFixture, assertCapturedRoundTrip } from "./helpers/load-captured-fixture.js";
+import { B6RealPiPeer } from "./helpers/b6-real-pi-peer.js";
 
 // Keep reason: BRIEF-RED.md S-a..S-e and the recorded 11-17 S9 loss at
 // 0d59da31. Explicitly requested route/native integration REDs, not live model proof.
@@ -196,13 +199,15 @@ let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
 let root: string;
 type Outcome = { result?: Awaited<ReturnType<typeof executePaperclipNativeSession>>; error?: string };
 const scheduled = new Map<string, { bodies: string[]; peers: RecordingPiPeer[]; executions: Promise<unknown>[];
-  first: RecordingPiPeer; outcomes: Map<string, Outcome> }>();
+  first: RecordingPiPeer; outcomes: Map<string, Outcome>; attachGate?: Promise<void> }>();
 const realExecute = executePaperclipNativeSession;
 function backendFor(execution: Parameters<typeof realExecute>[0]["execution"], runnerInstanceId: string, peer: RecordingPiPeer) {
   const workspace = execution.workspace.cwd;
   const driver = new PiRpcDriver({ model: execution.provider.kind === "pi_rpc" ? execution.provider.model : undefined,
     piRpcThinkingLevel: "off", runtimeDirectory: workspace, runnerInstanceId,
-    environment: { PI_CODING_AGENT_DIR: join(workspace, "agent") }, transportFactory: options => {
+    ...(peer instanceof B6RealPiPeer ? { command: peer.command } : {}),
+    environment: peer instanceof B6RealPiPeer ? peer.environment(join(workspace, "agent")) : { PI_CODING_AGENT_DIR: join(workspace, "agent") }, transportFactory: options => {
+      if (peer instanceof B6RealPiPeer) return peer.attach(options);
       const args = options.args ?? [];
       peer.sessionFile = args[args.indexOf("--session") + 1];
       // The scripted Pi process owns its session file, just as real Pi does.
@@ -243,7 +248,7 @@ beforeAll(async () => {
       if (inputs.length) peer.answer(inputs);
       peer.finish();
     });
-    const execution = realExecute({ ...input, useRunnerd: false, backend: backendFor(input.execution, input.runnerInstanceId, peer) });
+    const execution = Promise.resolve(owner.attachGate).then(() => realExecute({ ...input, useRunnerd: false, backend: backendFor(input.execution, input.runnerInstanceId, peer) }));
     owner.executions.push(execution.then(result => owner.outcomes.set(input.execution.binding.runId, { result }),
       error => owner.outcomes.set(input.execution.binding.runId, { error: String(error) })));
     return execution;
@@ -251,7 +256,7 @@ beforeAll(async () => {
 }, 60_000);
 afterAll(async () => { vi.restoreAllMocks(); await db?.$client.end(); await database?.cleanup(); vi.unstubAllEnvs(); });
 
-async function fixture(label: string, conversation = true) {
+async function fixture(label: string, conversation = true, earlyBodies: string[] = []) {
   const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), userId = randomUUID();
   const workspace = join(root, label); await mkdir(workspace);
   await writeFile(join(workspace, "AGENTS.md"), "Answer each incoming person message exactly once.\n");
@@ -266,8 +271,13 @@ async function fixture(label: string, conversation = true) {
     ...(conversation ? { conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" as const } : {}) });
   const initial = randomUUID();
   await db.insert(issueComments).values({ id: initial, companyId, issueId, authorType: "user", authorUserId: userId, body: "Do the original two-step work." });
-  const peer = new RecordingPiPeer();
+  const peer = process.env.B6_REAL_PI === "1" && label === "B6-starting"
+    ? await (async () => { const actual = new B6RealPiPeer(); await actual.start(); return actual as unknown as RecordingPiPeer; })()
+    : new RecordingPiPeer();
   const owner = { bodies: [] as string[], peers: [] as RecordingPiPeer[], executions: [] as Promise<unknown>[], first: peer, outcomes: new Map<string, Outcome>() };
+  let attach!: () => void;
+  if (earlyBodies.length) Object.assign(owner, { attachGate: new Promise<void>(resolve => { attach = resolve; }) });
+  const early: Array<{ id: string; body: string }> = [];
   scheduled.set(companyId, owner);
   let coordinator: ReturnType<typeof createDeliveryWorkCoordinator> | undefined;
   let work: ReturnType<ReturnType<typeof heartbeatService>["registerDeferredReceiptWork"]> | undefined;
@@ -284,6 +294,12 @@ async function fixture(label: string, conversation = true) {
   expect(admission, "initial native run must be admitted by the real heartbeat scheduler").not.toBeNull();
   const runId = admission!.id;
   try {
+    if (earlyBodies.length) await vi.waitFor(() => expect(owner.executions).toHaveLength(1), { timeout: 15000 });
+    for (const body of earlyBodies) {
+      const receipt = await request(app).post(`/api/issues/${issueId}/comments`).send({ body, clientRequestId: randomUUID() }).expect(201);
+      early.push(receipt.body); owner.bodies.push(body);
+    }
+    attach?.();
     await vi.waitFor(async () => {
       const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       if (["failed", "cancelled", "timed_out"].includes(run.status)) throw new Error(`native fixture failed: ${run.errorCode}: ${run.error}`);
@@ -308,11 +324,24 @@ async function fixture(label: string, conversation = true) {
     const view = (await request(app).get(`/api/issues/${issueId}/queued-comments`).expect(200)).body;
     queues.push(view); return view;
   };
-  return { companyId, agentId, issueId, runId, userId, initial, peer, app, running, post, commands, comments, wakes, queue, owner,
+  return { companyId, agentId, issueId, runId, userId, initial, peer, app, running, post, commands, comments, wakes, queue, owner, early,
     async startDelivery() {
       coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => workerErrors.push(error) });
       work = heartbeatService(db).registerDeferredReceiptWork(coordinator, () => true); await work.ready;
       await db.transaction(tx => notifyDeferredWakesForIssue(tx, { companyId, issueId }));
+    },
+    async assertSteeredOnce(messages: Array<{ id: string; body: string }>) {
+      // The parallel reply-publication builder owns issue-comment writing.
+      // Here prove Pi's actual transcript and the durable native answer receipts.
+      await vi.waitFor(async () => {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        for (const message of messages) {
+          expect(run.contextSnapshot?.answeredSteeredCommentIds).toContain(message.id);
+          expect(peer.consumed.filter(body => body === message.body)).toHaveLength(1);
+          expect(peer.replies.filter(body => body === `ANSWER:${message.body}`)).toHaveLength(1);
+          expect((await wakes()).filter(w => ["queued", "deferred_issue_execution"].includes(w.status) && JSON.stringify(w.payload).includes(message.id))).toEqual([]);
+        }
+      }, { timeout: 15000 });
     },
     async assertAnsweredOnce(messages: Array<{ id: string; body: string }>) {
       const rows = await comments();
@@ -353,8 +382,10 @@ async function fixture(label: string, conversation = true) {
       scheduled.delete(companyId);
       if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, `${label}.json`), JSON.stringify({
         companyId, agentId, issueId, runId, commands: peer.requests, consumed: peer.consumed, replies: peer.replies, outcome: owner.outcomes.get(runId),
+        realPi: peer instanceof B6RealPiPeer ? { command: peer.command, version: "1.5.2", modelRequests: peer.modelRequests } : null,
         successorPeers: owner.peers.slice(1).map(peer => ({ commands: peer.requests, facadeCalls: peer.facadeCalls, consumed: peer.consumed, replies: peer.replies })), workerErrors,
-        queues, issue: (await db.select().from(issues).where(eq(issues.id, issueId)))[0],
+        queues, activity: await db.select().from(activityLog).where(eq(activityLog.companyId, companyId)),
+        issue: (await db.select().from(issues).where(eq(issues.id, issueId)))[0],
         finalizations: await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.companyId, companyId)),
         runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)),
         wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)),
@@ -369,6 +400,132 @@ async function fixture(label: string, conversation = true) {
 // B3's explicitly commissioned native integration rows; controlled Pi peer,
 // real attachment, scheduler, comment POST, drivers and durable event ingestion.
 describe("person comment default steering eligibility and asynchronous receipt", () => {
+  it.runIf(Boolean(process.env.B6_CAPTURE_DIR))("B6 captured gate2 failing state round-trips through real PG", async () => {
+    const dir = process.env.B6_CAPTURE_DIR!;
+    await loadCapturedFixture(db, dir);
+    const counts = await assertCapturedRoundTrip(db, dir);
+    expect(counts.heartbeat_run_events).toBe(1178);
+    const [original] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, "7d477d98-3c41-4871-a2af-c46b00928e05"));
+    expect(original.contextSnapshot?.steeredCommentIds).toContain("02ecd802-31f6-4c98-8de4-87a57a64d41e");
+    expect(original.contextSnapshot?.steeredCommentIds).not.toContain("9d297e17-95f8-4e07-9dc6-3afd1126e8c6");
+    const [pair] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, "24de96a7-a3bb-4ab7-8e42-ce400c766044"));
+    expect(pair.runId).toBe("4b215a2e-ff44-4302-ac5a-2c1f36999b46");
+    if (process.env.B6_CAPTURE_DEMO_RED) expect(pair.runId, "captured PAIR1 must reach the original run, not a successor").toBe(original.id);
+  }, 90_000);
+
+  // B6: same captured timing shape; real POST/PG/scheduler/native executor,
+  // controlled Pi peer (not a real model/provider qualification).
+  it("B6 STARTING M1 then rapid M2/M3 all enter the same run in order, no extra run", async () => {
+    const f = await fixture("B6-starting", true, ["B6-M1"]);
+    try {
+      const messages = [...f.early, await f.post("B6-M2"), await f.post("B6-M3")];
+      await vi.waitFor(() => expect(f.commands("steer").map(c => c.input?.message)).toEqual(messages.map(m => m.body)), { timeout: 5000 });
+      await waitForPendingCommentSteers(); f.peer.boundary();
+      await vi.waitFor(() => expect(f.peer.consumed).toEqual(messages.map(m => m.body)));
+      if (process.env.B6_DUPLICATE_PROBE === "1") {
+        await vi.waitFor(async () => {
+          const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+          for (const message of messages) expect(run.contextSnapshot?.answeredSteeredCommentIds).toContain(message.id);
+        });
+        await f.complete(); await f.startDelivery();
+        await vi.waitFor(async () => expect((await f.wakes()).filter(w => ["queued", "deferred_issue_execution", "claimed"].includes(w.status))).toEqual([]), { timeout: 15000 });
+        expect(f.owner.peers, "consumed fallback must never create a duplicate native run/answer").toHaveLength(1);
+      } else {
+        await f.assertSteeredOnce(messages); await f.complete(); await f.startDelivery();
+      }
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).map(r => r.id)).toEqual([f.runId]);
+    } finally { await f.close(); }
+  }, 45_000);
+
+  it("B6 a lone STARTING default drains on turn attach without another POST", async () => {
+    const f = await fixture("B6-lone", true, ["B6-LONE"]);
+    try {
+      await vi.waitFor(() => expect(f.commands("steer").map(c => c.input?.message)).toEqual(["B6-LONE"]), { timeout: 5000 });
+      await waitForPendingCommentSteers(); f.peer.boundary();
+      await f.assertSteeredOnce(f.early); await f.complete();
+    } finally { await f.close(); }
+  }, 45_000);
+
+  it("B6 explicit Queue stays waiting while a following default steers", async () => {
+    const f = await fixture("B6-queue");
+    try {
+      const queued = (await request(f.app).post(`/api/issues/${f.issueId}/comments`).send({ body: "B6-EXPLICIT", deliveryIntent: "queue", clientRequestId: randomUUID() }).expect(201)).body;
+      const message = await f.post("B6-DEFAULT");
+      await waitForPendingCommentSteers();
+      expect(f.commands("steer").map(c => c.input?.message)).toEqual([message.body]);
+      expect((await f.wakes()).some(w => ["queued", "deferred_issue_execution"].includes(w.status) && JSON.stringify(w.payload).includes(queued.id))).toBe(true);
+    } finally { await f.close(); }
+  }, 45_000);
+
+  it("B6 unavailable M1 drains ahead of M2 and persists the observed reason across phase changes", async () => {
+    const f = await fixture("B6-reason");
+    const unavailable = vi.spyOn(nativeExecutor, "getNativeSessionSteeringState").mockResolvedValue({ disposition: "temporarily_unavailable", activeTurnId: null });
+    try {
+      await vi.waitFor(async () => expect((await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId))).some(e => e.eventType === "turn.started")).toBe(true));
+      const first = await f.post("B6-DEFERRED");
+      const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      await db.update(heartbeatRuns).set({ nativePhase: "starting" }).where(eq(heartbeatRuns.id, f.runId));
+      const view = (await request(f.app).get(`/api/issues/${f.issueId}/comments`).expect(200)).body;
+      expect(view.find((c: any) => c.id === first.id).steeringUnavailableReason).toBe("steering unavailable");
+      await db.update(heartbeatRuns).set({ nativePhase: before.nativePhase }).where(eq(heartbeatRuns.id, f.runId));
+      unavailable.mockRestore();
+      const second = await f.post("B6-FOLLOWING");
+      await waitForPendingCommentSteers();
+      expect(f.commands("steer").map(c => c.input?.message)).toEqual([first.body, second.body]);
+      f.peer.boundary(); await f.assertSteeredOnce([first, second]); await f.complete();
+    } finally { unavailable.mockRestore(); await f.close(); }
+  }, 45_000);
+
+  it("B6 finishing input takes one ordinary next run, never a late steer", async () => {
+    const f = await fixture("B6-finishing");
+    const release = f.peer.holdClose();
+    try {
+      f.peer.finish();
+      await vi.waitFor(async () => expect((await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId))).some(e => e.eventType === "turn.completed")).toBe(true));
+      await vi.waitFor(async () => expect((await getNativeSessionSteeringState(f.runId)).disposition).not.toBe("available"));
+      const message = await f.post("B6-LATE");
+      expect(f.commands("steer")).toEqual([]);
+      release(); await f.complete(); await f.startDelivery();
+      await vi.waitFor(async () => { await f.assertAnsweredOnce([message]); }, { timeout: 15000 });
+      expect(f.owner.peers).toHaveLength(2);
+      expect(f.owner.peers[1].requests.filter(r => r.type === "prompt")).toHaveLength(1);
+    } finally { release(); await f.close(); }
+  }, 45_000);
+
+  it("B6 turn attachment racing ordinary fallback admission cannot strand the lone message", async () => {
+    const f = await fixture("B6-admission-race");
+    const [message] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: f.userId, body: "B6-RACING" }).returning();
+    let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+    let entered = false;
+    const unavailable = vi.spyOn(nativeExecutor, "getNativeSessionSteeringState").mockResolvedValue({ disposition: "temporarily_unavailable", activeTurnId: null });
+    const handling = commentSteering.trySteerPersonComment(db, message, { deliveryIntent: "steer", onRejected: async () => {
+      entered = true; await gate;
+      return heartbeatService(db).wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
+        idempotencyKey: `conversation-comment:${message.id}`, requestedByActorType: "user", requestedByActorId: f.userId,
+        payload: { issueId: f.issueId, commentId: message.id },
+        contextSnapshot: { issueId: f.issueId, wakeCommentId: message.id, wakeCommentIds: [message.id], source: "issue.comment" } });
+    } });
+    let draining: Promise<void> | undefined;
+    try {
+      await vi.waitFor(() => expect(entered).toBe(true));
+      unavailable.mockRestore();
+      draining = commentSteering.drainFallbackPersonComments(db, f.runId);
+      release(); expect(await handling).toBe(true); await draining;
+      await waitForPendingCommentSteers();
+      expect(f.commands("steer").map(c => c.input?.message)).toEqual([message.body]);
+      f.peer.boundary(); await f.assertSteeredOnce([message]); await f.complete();
+    } finally { release(); unavailable.mockRestore(); await handling; await draining; await f.close(); }
+  }, 45_000);
+
+  it("B6 /new waiting remains a hard ordering boundary", async () => {
+    const f = await fixture("B6-new");
+    try {
+      await f.post("/new"); await f.post("B6-AFTER-NEW");
+      await waitForPendingCommentSteers(); expect(f.commands("steer")).toEqual([]);
+    } finally { await f.close(); }
+  }, 45_000);
+
   it("S-task: a person comment on a TASK enters its attached Pi turn, without a wake or a restart", async () => {
     const f = await fixture("B-task", false);
     try {

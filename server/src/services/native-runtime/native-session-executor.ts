@@ -12771,6 +12771,10 @@ async function executePaperclipNativeSessionAttempt(
         }
       },
       onCommittedEvent: async (event, cursor) => {
+        if (event.eventType === "turn.started" && input.execution.provider.kind === "pi_rpc") {
+          const { drainFallbackPersonComments } = await import("../conversation-steering.js");
+          await drainFallbackPersonComments(input.db, input.execution.binding.runId);
+        }
         await controllerSteps.measure("recovery_notice", () => materializePiSessionRecoveryNotice({ db: input.db, execution: input.execution, event }));
         if (event.eventType === "run.result.proposed") {
           const at = Date.now();
