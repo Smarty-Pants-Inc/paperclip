@@ -9,7 +9,7 @@ import { nativeSha256 } from "./native-runtime/canonical.js";
 import { isConfirmedCursorCloudTerminalObservation } from "./native-runtime/cursor-cloud-runtime.js";
 import { isAgentLifecycleStopRecord } from "./governance-pause-stop.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
-import { isWellFormedExecutionWait, wellFormedExecutionWaitSql } from "./deferred-execution-wait.js";
+import { PERSON_STOP_HOLDABLE_WAKE_STATUSES } from "../modules/wake-queue/domain/values.js";
 import { stopAcceptanceEventSql } from "./heartbeat-run-events.js";
 import { QUEUED_SEND_AFTER_STOP_KEY, recordedUserStop } from "./run-cancellation.js";
 
@@ -204,9 +204,10 @@ export function personStopWakeCommentIds(payload: unknown): string[] {
  *   row at all is never a hold (NULL-safe: no row, no hold);
  * - that person has not typed a new message on the issue since the Stop (a
  *   typed message runs first; the held ones follow it);
- * - a deferred_issue_execution wake, or a deferred wake with a well-formed
- *   saved wait, carries the issue's messages (the given message, or wake, when
- *   named), WITH OR WITHOUT a saved wait, and has no queuedCommentInterrupt nor
+ * - a deferred wake (PERSON_STOP_HOLDABLE_WAKE_STATUSES: the drain's
+ *   deferred_issue_execution, or 'deferred') carries the issue's messages (the
+ *   given message, or wake, when named), WHATEVER its wait text, well formed,
+ *   malformed or none (RFL ruling (a)), and has no queuedCommentInterrupt nor
  *   a Send-after-Stop receipt (a person's Send is delivering it);
  * - every live message it carries was written by THAT person at or before the
  *   Stop. Another person's message, or anything newer, is not held.
@@ -259,10 +260,9 @@ export async function readPersonStopHold(db: Db, input: {
   const wakes = await db.select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, payload: agentWakeupRequests.payload })
     .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.agentId, input.agentId),
       input.wakeId ? eq(agentWakeupRequests.id, input.wakeId) : undefined,
-      or(eq(agentWakeupRequests.status, "deferred_issue_execution"),
-        and(eq(agentWakeupRequests.status, "deferred"), wellFormedExecutionWaitSql(agentWakeupRequests.payload)))));
+      inArray(agentWakeupRequests.status, [...PERSON_STOP_HOLDABLE_WAKE_STATUSES])));
   const candidates = wakes.filter(wake => (!input.wakeId || wake.id === input.wakeId)
-    && (wake.status === "deferred_issue_execution" || isWellFormedExecutionWait(parseObject(wake.payload).executionWait))
+    && PERSON_STOP_HOLDABLE_WAKE_STATUSES.includes(wake.status)
     && (wake.id === input.sendingWakeId || (parseObject(wake.payload).queuedCommentInterrupt == null
       && parseObject(wake.payload)[QUEUED_SEND_AFTER_STOP_KEY] == null))
     && personStopWakeCarries(wake.payload, input.issueId, input.messageId));
