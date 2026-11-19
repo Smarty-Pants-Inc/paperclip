@@ -321,30 +321,33 @@ describe("a run retry and its predecessor's pending sandbox creation", () => {
     expect(lease.providerLeaseId).toBe("box-1");
   });
 
-  it("SUPERSEDE-RF4-J7-REFUSAL-SPENT-1119: key_reused is its own named error; the old box goes to cleanup before any fresh create", async () => {
+  // SUPERSEDE-RF4-J7-REFUSAL-SPENT-1119 (judges' final key_reused rule, RFL +
+  // review-fleet-4, 03:13-03:15Z): Boat's 409 idempotency_key_reused SPENDS the
+  // creation like a firm refusal, is reported as its own named error, and that
+  // key is NEVER sent again: the host's next retry mints a fresh key. There is no
+  // find-and-hand-to-cleanup step; the earlier attempt's box (if any) self-stops
+  // at its ttl, so ONLY in this bug case may the run have up to 2 boxes.
+  it("SUPERSEDE-RF4-J7-REFUSAL-SPENT-1119: key_reused is its own named error, SPENT, and the next retry gets a FRESH key (<= 2 boxes only here)", async () => {
     const { retry } = await timedOutThenRetry();
     bodyChanged = true;
     const error = await acquire(retry).catch(error => error);
     expect(error).toMatchObject({ name: "SandboxCreationKeyReusedError", code: "sandbox_creation_key_reused" });
     expect(readTransientLeaseAcquisitionFailure(error, { id: retry, companyId })).toEqual({ reason: "creation_key_reused" });
-    // Until cleanup holds the old box, the creation stays carried-and-failing.
-    const again = await run(retry);
-    await expect(acquire(again)).rejects.toMatchObject({ code: "sandbox_creation_key_reused" });
-    expect(new Set(keys).size).toBe(1);
-    expect(running()).toEqual(["box-1"]);
-    await recover();
-    const [handed] = await db.select().from(sandboxCreationOperations);
-    expect(handed).toMatchObject({ id: keys[0], state: "cleanup_pending" });
-    const cleanupRow = (await db.select().from(environmentLeases))[0];
-    await runtime().retryPendingSandboxTeardown({ environment: (await environmentService(db).getById(environmentId))!,
-      lease: (await environmentService(db).getLeaseById(cleanupRow.id))! });
-    expect(destroyed).toEqual(["box-1"]);
-    bodyChanged = false;
-    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, again));
-    const { lease } = await acquire(await run(again));
-    expect(new Set(keys).size).toBe(2);
+    const [spent] = await db.select().from(sandboxCreationOperations);
+    expect(spent).toMatchObject({ id: keys[0], state: "resolved", leaseId: null,
+      metadata: { creationReconciliationReason: "provider_key_reused" } });
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, retry));
+    const { lease } = await acquire(await run(retry));
+    // The reused key went out twice (the timed-out create, the refused re-send) and never again.
+    expect(keys).toHaveLength(3);
+    expect(keys[1]).toBe(keys[0]);
+    expect(keys[2]).not.toBe(keys[0]);
+    expect(keys.filter(key => key === keys[0])).toHaveLength(2);
     expect(lease.providerLeaseId).toBe("box-2");
-    expect(running()).toEqual(["box-2"]);
+    expect(boxes.size).toBeLessThanOrEqual(2);
+    expect(running()).toEqual(["box-1", "box-2"]);
+    expect(destroyed).toEqual([]);
+    expect((await db.select().from(sandboxCreationOperations)).find(op => op.id === keys[0])).toMatchObject({ state: "resolved" });
   });
 
   it("SUPERSEDE-RF4-J7-REFUSAL-SPENT-1119: box_stopped spends the creation; the next retry gets a FRESH key and ONE running box", async () => {
