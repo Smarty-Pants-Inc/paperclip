@@ -54,6 +54,11 @@ export const NATIVE_HARNESS_BACKUP_LOCAL_COPY_KEPT = "native_backup_local_copy_k
  * leftover sweep). */
 export const NATIVE_HARNESS_BACKUP_DURABLE_COPY_KEPT = "native_backup_durable_copy_kept";
 export const NATIVE_RUNNER_EVIDENCE_KEPT = "native_runner_evidence_kept";
+/** BRIEF keep-round2 (RFL OPEN 1): the same predicate keeps runner checkpoints
+ * (expireCheckpoints: no retirement, no fencing, no row delete) and the run-only
+ * provider artifacts their expiry used to release. Those rows hold the encrypted
+ * controller journal (database only) and those artifacts are held by no backup. */
+export const NATIVE_RUNNER_CHECKPOINT_KEPT = "native_runner_checkpoint_kept";
 function retentionKeepsNativeHarnessBackupLocalCopy(): boolean {
   return true;
 }
@@ -437,6 +442,10 @@ export function nativeHarnessBackupExpirationService(
       try {
         const previousRetirement = readNativeCheckpointRetirement(candidate.retirement, candidate);
         if (previousRetirement && previousRetirement.sessionId !== candidate.sessionId) throw new Error("native_runner_checkpoint_retirement_invalid");
+        const keep = () => { result.skipped[NATIVE_RUNNER_CHECKPOINT_KEPT] = (result.skipped[NATIVE_RUNNER_CHECKPOINT_KEPT] ?? 0) + 1; };
+        // A retirement left by an expiry before this rule: its parts still hold
+        // the journal. Keep them and release no artifact.
+        if (previousRetirement && retentionKeepsNativeHarnessBackupLocalCopy()) { keep(); continue; }
         const retirement = previousRetirement ?? await db.transaction(async tx => {
           const blocker = await sessionRetentionBlocker(tx, {
             scopeDigest: null, checkpoint: true, closedBefore: options.closedBefore,
@@ -449,6 +458,9 @@ export function nativeHarnessBackupExpirationService(
               sql`${agentTaskSessions.sessionParamsJson}->>'sessionId' = ${candidate.sessionId}`),
           )).limit(1);
           if (resume) return false;
+          // Every other blocker reports first; a checkpoint that would now be
+          // retired (fenced, artifacts released, rows deleted) is kept.
+          if (retentionKeepsNativeHarnessBackupLocalCopy()) { keep(); return false; }
           result.checkpointCandidates++;
           if (options.dryRun) return false;
           // Serialize with checkpoint writers and retire every old authority for
