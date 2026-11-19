@@ -316,7 +316,10 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         if (!prior) box = `spike-box-${randomUUID()}`;
         const lease = await envService.acquireLease({ companyId: input.companyId, environmentId,
           heartbeatRunId: input.heartbeatRunId, executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId,
-          provider: "boat", providerLeaseId: prior?.providerLeaseId ?? box, leasePolicy: "reuse_by_environment",
+          // The production built-in fake allocation has a valid stop-only
+          // identity. An unregistered provider without pluginId cannot settle
+          // a stop receipt; it would test fixture corruption, not I-B.
+          provider: "fake", providerLeaseId: prior?.providerLeaseId ?? box, leasePolicy: "reuse_by_environment",
           ...(prior ? { replacesReusableLeaseId: prior.id } : {}), metadata: { remoteCwd: remoteWorkspace, agentId: input.agentId,
             sandboxLeaseAcquisition: { outcome: prior ? "resumed" : "created", providerLeaseId: box } } });
         stage("allocation", { leaseId: lease.id, box: lease.providerLeaseId, runId: input.heartbeatRunId, warm: !!prior });
@@ -362,7 +365,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       },
     }];
     await db.insert(environments).values({ id: environmentId, name: "Turnstop loopback allocation", driver: "sandbox",
-      config: { provider: "boat", reuseLease: true, remoteCwd: workspace, runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 300000 } });
+      config: { provider: "fake", reuseLease: true, runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 300000 } });
 
     const [{ createApp }, { createStorageService }, { createLocalDiskStorageProvider }, runner, { setupRunnerPrpWebSocketServer }, { subscribeCompanyLiveEvents }] = await Promise.all([
       import("../app.js"), import("../storage/service.js"), import("../storage/local-disk-provider.js"),
