@@ -15,6 +15,7 @@ import {
   cleanupGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
   runAdapterExecutionTargetProcess,
+  EXECUTION_TARGET_GIT_CONTEXT_UNAVAILABLE_CODE,
 } from "./execution-target.js";
 
 const exec = promisify(execFile);
@@ -359,6 +360,75 @@ describe("managed GitHub launcher environment", () => {
     expect(env.PAPERCLIP_GIT_METADATA_ROOTS).toBe("[]");
     expect(JSON.parse(env.PAPERCLIP_RUNNER_NETWORK_ROOTS!)).not.toHaveLength(0);
     expect(fixture.runner.execute).toHaveBeenCalledWith(expect.objectContaining({ cwd: fixture.root }));
+  });
+
+  describe("Git context probe on a fresh execution target", () => {
+    const framed = "\0PAPERCLIP_GIT_CONTEXT_V1\0PAPERCLIP_GIT_METADATA_ROOT\0/workspace/.git\0\0PAPERCLIP_GIT_CONTEXT_END\0";
+    const outcome = (over: Partial<{ exitCode: number | null; timedOut: boolean; stdout: string; stderr: string }>) => ({
+      exitCode: 0, signal: null, timedOut: false, stdout: framed, stderr: "", pid: null,
+      startedAt: new Date().toISOString(), ...over });
+    const plantedToken = `ghp_${"Z".repeat(36)}`;
+    afterEach(() => { vi.useRealTimers(); });
+
+    async function probe(fixture: Awaited<ReturnType<typeof sandbox>>) {
+      vi.useFakeTimers({ toFake: ["setTimeout"] });
+      const settled = prepareGitHubExecutionEnvironment({
+        target: fixture.target, cwd: fixture.root, env: {}, hostCredentials: false, networkAccess: true,
+      }).then((env) => ({ env }), (error: unknown) => ({ error }));
+      await vi.advanceTimersByTimeAsync(0);
+      const callsBeforePause = fixture.runner.execute.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(2_000);
+      return { ...(await settled), callsBeforePause };
+    }
+
+    it("R1: retries once after a short pause when the first probe fails, then proceeds", async () => {
+      const fixture = await sandbox("usr/bin");
+      fixture.runner.execute
+        .mockResolvedValueOnce(outcome({ exitCode: 1, stdout: "", stderr: "exec channel not ready" }))
+        .mockResolvedValueOnce(outcome({}));
+      const result = await probe(fixture);
+      expect(result).not.toHaveProperty("error");
+      expect(result.callsBeforePause).toBe(1);
+      expect(fixture.runner.execute).toHaveBeenCalledTimes(2);
+      expect("env" in result && result.env.PAPERCLIP_GIT_METADATA_ROOTS).toBe('["/workspace/.git"]');
+    });
+
+    it("R2: keeps the exit code, timedOut=false and a short redacted stderr tail when both probes fail", async () => {
+      const fixture = await sandbox("usr/bin");
+      const stderr = `${"noise ".repeat(400)}\nfatal: GH_TOKEN=${plantedToken} push ${plantedToken}\nfatal: not a git repository`;
+      fixture.runner.execute.mockResolvedValue(outcome({ exitCode: 1, stdout: "", stderr }));
+      const { error } = await probe(fixture) as { error: Error & Record<string, unknown> };
+      expect(fixture.runner.execute).toHaveBeenCalledTimes(2);
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message.startsWith("Could not read execution-target Git context")).toBe(true);
+      expect(error).toMatchObject({ code: EXECUTION_TARGET_GIT_CONTEXT_UNAVAILABLE_CODE, exitCode: 1, timedOut: false, attempts: 2 });
+      expect(error.message).toContain("the probe exited with code 1");
+      expect(error.message).toContain("timedOut=false");
+      expect(error.message).toContain("fatal: not a git repository");
+      expect(error.message).toContain("***REDACTED***");
+      expect(String(error.stderrTail).length).toBeLessThanOrEqual(500);
+      expect(String(error.stderrTail)).toContain("fatal: not a git repository");
+      expect(`${error.message} ${String(error.stderrTail)}`).not.toContain("Z".repeat(12));
+    });
+
+    it("R3: reports timedOut=true when both probes time out, each within the unchanged 15 s limit", async () => {
+      const fixture = await sandbox("usr/bin");
+      fixture.runner.execute.mockResolvedValue(outcome({ exitCode: null, timedOut: true, stdout: "" }));
+      const { error } = await probe(fixture) as { error: Error & Record<string, unknown> };
+      expect(fixture.runner.execute).toHaveBeenCalledTimes(2);
+      expect(fixture.runner.execute.mock.calls.map(([input]) => input.timeoutMs)).toEqual([15_000, 15_000]);
+      expect(error).toMatchObject({ code: EXECUTION_TARGET_GIT_CONTEXT_UNAVAILABLE_CODE, timedOut: true, exitCode: null });
+      expect(error.message).toMatch(/^Could not read execution-target Git context: the probe timed out/);
+      expect(error.message).toContain("timedOut=true");
+    });
+
+    it("R4: runs exactly one probe when the first succeeds", async () => {
+      const fixture = await sandbox("usr/bin");
+      fixture.runner.execute.mockResolvedValue(outcome({}));
+      const result = await probe(fixture);
+      expect(result).not.toHaveProperty("error");
+      expect(fixture.runner.execute).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("reads Git metadata from the SSH workspace instead of an existing controller directory", async () => {
