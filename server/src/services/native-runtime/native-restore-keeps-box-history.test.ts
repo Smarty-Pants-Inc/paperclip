@@ -5,15 +5,17 @@
 // backup over it. Real shell staging (tar) and the pack's own Pi validator.
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { build } from "esbuild";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { probePiSessionResumeFile } from "./pi-session-file-repair.js";
-import { RESTORE_TARGET_HISTORY_DIFFERS, restoreHarnessBackupKeepingRemoteHistory } from "./native-session-executor.js";
+import { RESTORE_TARGET_HISTORY_DIFFERS, RESTORE_TARGET_HOLDS_OTHER_CONVERSATION, RESTORE_TARGET_KEPT_PERSON_LINE,
+  restoreHarnessBackupKeepingRemoteHistory, restoreTargetHoldsOtherConversationCode } from "./native-session-executor.js";
 
 const roots: string[] = [];
 let providerPackRoot: string;
@@ -51,37 +53,96 @@ async function fixture() {
   const runner: CommandManagedRuntimeRunner = { execute: input => runChildProcess(`restore-history-${randomUUID()}`,
     input.command, input.args ?? [], { cwd: root, env: {}, timeoutSec: (input.timeoutMs ?? 60_000) / 1000, graceSec: 1,
       stdin: input.stdin, onLog: async () => {} }) };
-  const restore = () => restoreHarnessBackupKeepingRemoteHistory({
-    target: { kind: "remote" } as never, runner, backupRoot: backup,
+  // A provider runner's native syncIn: a directory is destroyed, then replaced.
+  const replacingRunner: CommandManagedRuntimeRunner = { execute: runner.execute, syncIn: async operations => {
+    for (const operation of operations) for (const file of operation.files) {
+      await rm(file.targetPath, { recursive: true, force: true });
+      await cp(file.sourcePath, file.targetPath, { recursive: true });
+    }
+    return { operations: [] } as never;
+  } };
+  const restore = (via: "command" | "syncIn" = "command") => restoreHarnessBackupKeepingRemoteHistory({
+    target: { kind: "remote" } as never, runner: via === "syncIn" ? replacingRunner : runner, backupRoot: backup,
     directories: [{ name: "runner", targetPath: join(box, "runner") }, { name: "pi-agent", targetPath: join(box, "pi-agent") }],
   });
   const validate = (id = sessionId) => probePiSessionResumeFile({ runner, node: process.execPath, providerPackRoot,
     directory: boxSessions, filename, normalizedSessionId: sessionId, providerSessionId: id, providerBackendSessionId: id,
     workingDirectory: root });
-  return { root, header, older, newer, boxSessions, boxSession, runnerState, suspended, restore, validate };
+  // The real producer: the runner's pinned Pi SessionManager builds the context
+  // the next turn sends to the model from the box's conversation file.
+  const nextTurnContext = async () => {
+    const pi = await import(pathToFileURL(resolve(import.meta.dirname,
+      "../../../../packages/paperclip-runner/node_modules/@earendil-works/pi-coding-agent/dist/index.js")).href) as {
+      SessionManager: { open(file: string, dir: string): { buildSessionContext(): { messages: unknown[] } } } };
+    return pi.SessionManager.open(boxSession, boxSessions).buildSessionContext().messages;
+  };
+  const backupSession = join(backup, "pi-agent", "sessions", filename);
+  return { root, header, older, newer, boxSessions, boxSession, backupSession, runnerState, suspended, restore, validate, nextTurnContext };
 }
 
-it.each([
-  ["a newer copy of the same conversation", "same"],
-  ["a different conversation under the same file", "different"],
-] as const)("RED-FIRST: a box holding %s keeps it byte-identical and readable; the older backup is refused", async (_label, shape) => {
+// smarty-dev#21273 round 3 (rf-3 ruling, #4605 09:05Z): a Retry onto a new
+// box resumes or continues, never a bare failure.
+// (a) The box holds a NEWER copy of the same conversation (the backup is a byte
+//     prefix of it): the box's file is the latest conversation. It is kept
+//     as-is (nothing copied over it), the rest of the backup is staged, and the
+//     next turn's context carries the newer assistant message.
+it.each(["command", "syncIn"] as const)("(a) a box holding a NEWER copy of the same conversation is resumed from it: kept byte-identical, the newer reply in the next turn's context (%s staging)", async via => {
+  const f = await fixture();
+  await mkdir(f.boxSessions, { recursive: true });
+  await writeFile(f.boxSession, f.newer);
+  expect(existsSync(f.runnerState)).toBe(false);
+
+  await f.restore(via);
+
+  // Nothing was copied over the newer conversation.
+  expect(await readFile(f.boxSession, "utf8")).toBe(f.newer);
+  // The rest of the verified backup (the Runner state) is staged beside it.
+  expect(await readFile(f.runnerState, "utf8")).toBe(f.suspended);
+  expect(await f.validate()).toBe("valid");
+  // The real Pi SessionManager builds the next turn's context from the box's file.
+  const texts = (await f.nextTurnContext()).map(entry => JSON.stringify(entry));
+  expect(texts.some(text => text.includes("Fixed: the import path was wrong"))).toBe(true);
+  expect(texts.filter(text => text.includes("Fixed: the import path was wrong"))).toHaveLength(1);
+  // The backup's own copy is unchanged.
+  expect(await readFile(f.backupSession, "utf8")).toBe(f.older);
+});
+
+// (b) A DIFFERENT conversation under the same file: touch nothing; the restore
+//     refuses with the fresh-thread code the run continues on (the executor row
+//     in native-session-executor.test.ts shows the fresh thread and the note).
+it("(b) a box holding a DIFFERENT conversation keeps both files byte-identical and refuses with the fresh-thread code", async () => {
   const f = await fixture();
   const otherId = randomUUID();
-  const onBox = shape === "same" ? f.newer
-    : f.header(otherId) + message("x1", null, "user", "A different task") + message("x2", "x1", "assistant", "Different answer");
+  const other = f.header(otherId) + message("x1", null, "user", "A different task") + message("x2", "x1", "assistant", "Different answer");
   await mkdir(f.boxSessions, { recursive: true });
-  await writeFile(f.boxSession, onBox);
-  // review-fleet-3's shape: neither Runner-state copy is on the box.
+  await writeFile(f.boxSession, other);
+
+  const failure = await f.restore().then(() => null, (error: Error) => error);
+
+  expect(await readFile(f.boxSession, "utf8")).toBe(other);
+  expect(await readFile(f.backupSession, "utf8")).toBe(f.older);
+  expect(failure).not.toBeNull();
+  expect((failure as Error & { code?: string }).code).toBe(RESTORE_TARGET_HOLDS_OTHER_CONVERSATION);
+  expect(restoreTargetHoldsOtherConversationCode(failure)).toBe(RESTORE_TARGET_HOLDS_OTHER_CONVERSATION);
+  expect(await f.validate(otherId)).toBe("valid");
+  // Nothing staged beside the kept conversation.
   expect(existsSync(f.runnerState)).toBe(false);
-  expect(await f.validate(shape === "same" ? undefined : otherId)).toBe("valid");
+});
 
-  const outcome = await f.restore().then(() => "restored", (error: Error) => error.message);
-
-  // Checked first, so an overwrite shows the lost bytes.
-  expect(await readFile(f.boxSession, "utf8")).toBe(onBox);
-  expect(outcome).toBe(RESTORE_TARGET_HISTORY_DIFFERS);
-  expect(await f.validate(shape === "same" ? undefined : otherId)).toBe("valid");
-  // The refusal stages nothing: no Runner state appears beside the kept history.
+// (c) Unreadable: touch nothing and refuse with the true line, which says
+//     plainly what the person can do.
+it("(c) an unreadable conversation file on the box is kept and refused with a plain line", async () => {
+  const f = await fixture();
+  await mkdir(f.boxSessions, { recursive: true });
+  await writeFile(f.boxSession, f.newer);
+  await chmod(f.boxSession, 0o000);
+  try {
+    const failure = await f.restore().then(() => null, (error: Error) => error);
+    expect(failure?.message).toContain(RESTORE_TARGET_HISTORY_DIFFERS);
+    expect(failure?.message).toContain(RESTORE_TARGET_KEPT_PERSON_LINE);
+    expect(restoreTargetHoldsOtherConversationCode(failure)).toBeNull();
+  } finally { await chmod(f.boxSession, 0o600); }
+  expect(await readFile(f.boxSession, "utf8")).toBe(f.newer);
   expect(existsSync(f.runnerState)).toBe(false);
 });
 
@@ -103,13 +164,14 @@ it("a box holding an older prefix of the same history (nothing to lose) receives
   expect(await f.validate()).toBe("valid");
 });
 
-it("a symbolic link at the conversation path is kept, not followed or replaced", async () => {
+it("(c) a symbolic link at the conversation path is kept, not followed or replaced, and refused with a plain line", async () => {
   const f = await fixture();
   await mkdir(f.boxSessions, { recursive: true });
   const elsewhere = join(f.root, "elsewhere.jsonl");
   await writeFile(elsewhere, f.newer);
   await symlink(elsewhere, f.boxSession);
   await expect(f.restore()).rejects.toThrow(RESTORE_TARGET_HISTORY_DIFFERS);
+  await expect(f.restore()).rejects.toThrow(RESTORE_TARGET_KEPT_PERSON_LINE);
   expect((await lstat(f.boxSession)).isSymbolicLink()).toBe(true);
   expect(await readlink(f.boxSession)).toBe(elsewhere);
   expect(await readFile(elsewhere, "utf8")).toBe(f.newer);

@@ -15977,17 +15977,43 @@ async function removeRemoteCheckpointSnapshot(
     .catch(() => undefined);
 }
 
-/** The restore owner's refusal: the box already holds another conversation. */
+/** The restore owner's refusal: the box holds a conversation file it cannot
+ * compare safely (unreadable, a symbolic link, not a plain file, or no hash
+ * tool). Nothing is staged, moved or deleted. */
 export const RESTORE_TARGET_HISTORY_DIFFERS = "runner_harness_state_mismatch: restore_target_history_differs";
+/** #21273 round 3 (b): the box holds a DIFFERENT, readable conversation under
+ * the backup's file. Nothing is staged; the run continues in a fresh thread
+ * (takeRestoreUnavailableFreshThread), never a bare failure. */
+export const RESTORE_TARGET_HOLDS_OTHER_CONVERSATION =
+  "runner_harness_state_mismatch: restore_target_holds_other_conversation" as const;
+/** The plain line of the (c) refusal: what happened and what the person can do. */
+export const RESTORE_TARGET_KEPT_PERSON_LINE = "The new computer already holds a saved conversation file that could not be read "
+  + "safely, so nothing was copied over it and it was left exactly as it was. To continue now, start a new chat; to keep "
+  + "this chat's earlier history, ask an administrator to check that file, then press Retry.";
 
-// Prints, per relative path on stdin, `A` (absent), `X` (not a plain file, a
-// symlink, or no hash tool) or `<bytes> <sha256>` of the box's copy.
+function restoreTargetKeptError(code: string): Error & { code: string } {
+  return Object.assign(new Error(`${code}: ${RESTORE_TARGET_KEPT_PERSON_LINE}`), { code });
+}
+
+/** (b)'s exact code, carried by a structured error or its cause chain. */
+export function restoreTargetHoldsOtherConversationCode(value: unknown, depth = 0): typeof RESTORE_TARGET_HOLDS_OTHER_CONVERSATION | null {
+  if (!value || typeof value !== "object" || depth > 5) return null;
+  const failure = value as { code?: unknown; cause?: unknown };
+  return failure.code === RESTORE_TARGET_HOLDS_OTHER_CONVERSATION ? RESTORE_TARGET_HOLDS_OTHER_CONVERSATION
+    : restoreTargetHoldsOtherConversationCode(failure.cause, depth + 1);
+}
+
+// Reads `<backup bytes> <relative path>` per line on stdin and prints, per
+// line, `A` (absent), `X` (a symlink, not a plain readable file, or no hash
+// tool) or `<bytes> <sha256> <sha256 of the first <backup bytes> bytes>` of
+// the box's copy.
 const REMOTE_HISTORY_PROBE_SCRIPT =
-  'set -u; while IFS= read -r rel; do f="$1/$rel"; ' +
-  'if test -L "$f"; then echo X; elif test ! -e "$f"; then echo A; elif test ! -f "$f"; then echo X; ' +
-  'elif command -v sha256sum >/dev/null 2>&1; then printf "%s %s\\n" "$(wc -c < "$f" | tr -d " ")" "$(sha256sum < "$f" | cut -d " " -f1)"; ' +
-  'elif command -v shasum >/dev/null 2>&1; then printf "%s %s\\n" "$(wc -c < "$f" | tr -d " ")" "$(shasum -a 256 < "$f" | cut -d " " -f1)"; ' +
-  'else echo X; fi; done';
+  'set -u; if command -v sha256sum >/dev/null 2>&1; then h() { sha256sum | cut -d " " -f1; }; ' +
+  'elif command -v shasum >/dev/null 2>&1; then h() { shasum -a 256 | cut -d " " -f1; }; else h() { return 1; }; fi; ' +
+  'while IFS=" " read -r n rel; do f="$1/$rel"; ' +
+  'if test -L "$f"; then echo X; elif test ! -e "$f"; then echo A; elif test ! -f "$f" || test ! -r "$f"; then echo X; ' +
+  'elif s=$(wc -c < "$f" | tr -d " ") && w=$(h < "$f") && p=$(head -c "$n" < "$f" | h) && test -n "$w" && test -n "$p"; ' +
+  'then printf "%s %s %s\\n" "$s" "$w" "$p"; else echo X; fi; done';
 
 function localConversationHistoryFiles(root: string, prefix = ""): string[] {
   if (!existsSync(root)) return [];
@@ -15998,58 +16024,86 @@ function localConversationHistoryFiles(root: string, prefix = ""): string[] {
   });
 }
 
+const sha256Hex = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+
 /**
- * #21273 (review-fleet-3): stage a verified failover backup onto a box only
- * when doing so loses no conversation the box already holds. Before anything
- * is staged, each conversation history in the backup (a `.jsonl` file) is
- * compared with the same path on the box: the box's copy must be absent or a
- * byte prefix of the backup's copy (an older state of the same history). Any
- * other copy, a newer or a different conversation, is kept as it is and the
- * restore is refused with RESTORE_TARGET_HISTORY_DIFFERS. Nothing is
- * overwritten, moved or deleted on that refusal.
+ * #21273: stage a verified failover backup onto a box without losing any
+ * conversation the box already holds. Before anything is staged, each
+ * conversation history in the backup (a `.jsonl` file) is compared with the
+ * same path on the box (rf-3 ruling, #4605 09:05Z):
+ * - absent, or a byte prefix of the backup's copy (an older state): staged.
+ * - NEWER: the backup's copy is a byte prefix of the box's. The box's file IS
+ *   the latest conversation: it is kept as-is (nothing is copied over it) and
+ *   the rest of the backup is staged beside it.
+ * - a DIFFERENT readable conversation: nothing is staged, moved or deleted;
+ *   refused with RESTORE_TARGET_HOLDS_OTHER_CONVERSATION, which the run takes
+ *   as a fresh thread with the continuation note.
+ * - unreadable, a symlink or no hash tool: nothing is staged, moved or deleted;
+ *   refused with RESTORE_TARGET_HISTORY_DIFFERS and a plain line.
  */
 export async function restoreHarnessBackupKeepingRemoteHistory(input: {
   target: Extract<AdapterExecutionTarget, { kind: "remote" }>;
   runner: CommandManagedRuntimeRunner;
   backupRoot: string;
   directories: readonly { name: string; targetPath: string }[];
-}): Promise<void> {
+}): Promise<{ keptNewerOnBox: string[] }> {
+  const keep = new Map<string, string[]>();
+  let otherConversation = false;
   for (const directory of input.directories) {
     const sourceRoot = resolve(input.backupRoot, directory.name);
     const histories = localConversationHistoryFiles(sourceRoot);
     if (histories.length === 0) continue;
-    if (histories.some(relative => relative.includes("\n"))) throw nativeReconciliationError(RESTORE_TARGET_HISTORY_DIFFERS);
+    if (histories.some(relative => relative.includes("\n"))) throw restoreTargetKeptError(RESTORE_TARGET_HISTORY_DIFFERS);
+    const backups = histories.map(relative => readFileSync(join(sourceRoot, relative)));
     const probe = await input.runner.execute({
       command: "sh",
       args: ["-c", REMOTE_HISTORY_PROBE_SCRIPT, "paperclip-runner-restore-history-probe", directory.targetPath],
-      stdin: `${histories.join("\n")}\n`,
+      stdin: histories.map((relative, index) => `${backups[index]!.length} ${relative}\n`).join(""),
       bypassSession: true,
       timeoutMs: 30_000,
     });
     const lines = probe.stdout.split("\n").filter(line => line.length > 0);
     if (probe.exitCode !== 0 || probe.timedOut || lines.length !== histories.length) {
-      throw new Error("runner_harness_state_mismatch: restore_target_unreadable");
+      throw restoreTargetKeptError("runner_harness_state_mismatch: restore_target_unreadable");
     }
+    const kept: string[] = [];
     histories.forEach((relative, index) => {
       const line = lines[index]!;
       if (line === "A") return;
-      const match = /^(\d+) ([0-9a-f]{64})$/.exec(line);
-      const backupBytes = readFileSync(join(sourceRoot, relative));
-      const boxBytes = match ? Number(match[1]) : -1;
-      const losesNothing = match !== null && boxBytes <= backupBytes.length
-        && createHash("sha256").update(backupBytes.subarray(0, boxBytes)).digest("hex") === match[2];
-      if (!losesNothing) throw nativeReconciliationError(RESTORE_TARGET_HISTORY_DIFFERS);
+      const match = /^(\d+) ([0-9a-f]{64})(?: ([0-9a-f]{64}))?$/.exec(line);
+      if (!match) throw restoreTargetKeptError(RESTORE_TARGET_HISTORY_DIFFERS);
+      const backupBytes = backups[index]!, boxBytes = Number(match[1]);
+      if (boxBytes <= backupBytes.length && sha256Hex(backupBytes.subarray(0, boxBytes)) === match[2]) return;
+      if (boxBytes > backupBytes.length && match[3] === sha256Hex(backupBytes)) { kept.push(relative); return; }
+      otherConversation = true;
     });
+    if (kept.length > 0) keep.set(directory.name, kept);
   }
+  if (otherConversation) throw nativeReconciliationError(RESTORE_TARGET_HOLDS_OTHER_CONVERSATION);
   for (const directory of input.directories) {
-    await stageRemoteRunnerDirectory({
-      target: input.target,
-      runner: input.runner,
-      sourcePath: resolve(input.backupRoot, directory.name),
-      targetPath: directory.targetPath,
-      mode: 0o700,
-    });
+    const kept = keep.get(directory.name) ?? [];
+    let stagingRoot: string | null = null;
+    try {
+      let sourcePath = resolve(input.backupRoot, directory.name);
+      if (kept.length > 0) {
+        // Stage a copy without the box's newer conversations, so nothing is
+        // copied over them (any file name; never the verified backup itself).
+        stagingRoot = mkdtempSync(join(tmpdir(), "paperclip-runner-restore-keep-"));
+        const copy = join(stagingRoot, "source");
+        cpSync(sourcePath, copy, { recursive: true, preserveTimestamps: true });
+        for (const relative of kept) rmSync(join(copy, relative), { force: true });
+        sourcePath = copy;
+      }
+      // A runner's syncIn replaces a directory wholesale (destroy-then-replace),
+      // which would delete the kept file; the command path extracts over it.
+      await stageRemoteRunnerDirectory({ target: input.target,
+        runner: kept.length > 0 ? { execute: input.runner.execute.bind(input.runner) } : input.runner, sourcePath,
+        targetPath: directory.targetPath, mode: 0o700 });
+    } finally {
+      if (stagingRoot) rmSync(stagingRoot, { recursive: true, force: true });
+    }
   }
+  return { keptNewerOnBox: [...keep].flatMap(([name, kept]) => kept.map(relative => `${name}/${relative}`)) };
 }
 
 export async function stageRemoteRunnerDirectory(input: {
@@ -20497,12 +20551,18 @@ async function createRunnerdBackendWithinSessionClaim(
     // no checkpoint of this run (NSR session === null), so the fresh session
     // gets NSR's saved-history handoff. The recover path keeps it: NSR's
     // in-run replacement owns that refusal there.
-    const launchProfile = path === "open" && restoreUnavailableOnNewBoxCode(failure) === null
+    // #21273 round 3 (b) (rf-3 ruling, #4605 09:05Z): the verified backup met
+    // a DIFFERENT conversation on this box and staged nothing over it. Taken
+    // on any box acquisition: the box's files are set aside (renamed, never
+    // rewritten or deleted) with the rest of this session's continuity state.
+    const otherConversation = restoreUnavailableOnNewBoxCode(failure) === null
+      ? restoreTargetHoldsOtherConversationCode(failure) : null;
+    const launchProfile = path === "open" && restoreUnavailableOnNewBoxCode(failure) === null && otherConversation === null
       && freshThreadRefusalCode(failure) === LAUNCH_PROFILE_MISMATCH_CODE;
-    const code = launchProfile ? LAUNCH_PROFILE_MISMATCH_CODE : restoreUnavailableOnNewBoxCode(failure);
+    const code = launchProfile ? LAUNCH_PROFILE_MISMATCH_CODE : otherConversation ?? restoreUnavailableOnNewBoxCode(failure);
     if (code === null || restoreUnavailableFreshThread || remoteTarget?.transport !== "sandbox"
       || !remoteCommandRunner || !sandboxLeaseAcquisition?.providerLeaseId
-      || (!launchProfile && sandboxLeaseAcquisition.outcome !== "created")) return false;
+      || (!launchProfile && !otherConversation && sandboxLeaseAcquisition.outcome !== "created")) return false;
     // The box's own state must be settled: a turn in flight, an active or
     // working goal, a deferred terminal or an ambiguous turn start keeps the
     // refusal (unreadable state keeps it too).

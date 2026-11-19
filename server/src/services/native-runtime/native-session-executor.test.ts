@@ -26208,8 +26208,10 @@ describe("runnerd provider runtime wiring", () => {
           durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
         }) };
         if (command.args?.[0] === "--version") return { exitCode: 0, timedOut: false, stdout: "codex-cli 0.160.0", stderr: "" };
-        if (command.args?.[1]?.includes("base64") || command.args?.[1]?.includes(".continuity-break-")) {
-          try { return { exitCode: 0, timedOut: false, stdout: execFileSync("sh", command.args, { encoding: "utf8" }), stderr: "" }; }
+        if (command.args?.[1]?.includes("base64") || command.args?.[1]?.includes(".continuity-break-")
+          || command.args?.[2] === "paperclip-runner-restore-history-probe") {
+          try { return { exitCode: 0, timedOut: false, stdout: execFileSync("sh", command.args, { encoding: "utf8",
+            input: (command as { stdin?: string }).stdin }), stderr: "" }; }
           catch { return { exitCode: 1, timedOut: false, stdout: "", stderr: "" }; }
         }
         return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
@@ -26394,6 +26396,59 @@ describe("runnerd provider runtime wiring", () => {
       expect(recovered).toMatchObject({ recovered: false, recoveryRefusalCode: FLOOR_CODE });
       expect(fixture.openSession).not.toHaveBeenCalled();
       expect(restoreUnavailableNotice).not.toHaveBeenCalled();
+    });
+
+    // smarty-dev#21273 round 3 (b) (rf-3 ruling, #4605 09:05Z): a Retry onto a
+    // new box whose verified backup is AUTHORIZED to restore, but the box
+    // already holds a DIFFERENT conversation under the backup's history file.
+    // Today: runner_harness_state_mismatch: restore_target_history_differs, a
+    // chat that never answers. Now: nothing is copied over it, the run
+    // continues in a fresh thread with the existing true note, answered once,
+    // and both conversations are kept byte-identical.
+    it("(#21273 b) a DIFFERENT conversation on the new box: touched by no copy, the SAME run answers once on a fresh thread with the note", async () => {
+      const fixture = await floorFixture("other-conversation", "destroyed");
+      const history = "codex-home/sessions/rollout-1.jsonl";
+      const backupHistory = join(fixture.root, "failover-backups/current", history);
+      const backupBytes = '{"type":"session","id":"retained"}\n{"type":"message","text":"older backup"}\n';
+      await mkdir(dirname(backupHistory), { recursive: true });
+      await writeFile(backupHistory, backupBytes);
+      // Rebuild the manifest over the backup that now holds the history.
+      await writeFile(join(fixture.root, "failover-backups/current/manifest.json"), JSON.stringify(buildNativeHarnessBackupManifest({
+        backupRoot: join(fixture.root, "failover-backups/current"), execution: fixture.current,
+        runnerInstanceId: "j322-runner-other-conversation", sourceProviderLeaseId: "prior-sandbox",
+        providerSessionIdentity: identityOf("retained-provider-thread") })));
+      const boxHistory = join(fixture.remoteSession, "filesystem", history);
+      const boxBytes = '{"type":"session","id":"another"}\n{"type":"message","text":"a different conversation"}\n';
+      await mkdir(dirname(boxHistory), { recursive: true });
+      await writeFile(boxHistory, boxBytes);
+
+      await expect(fixture.backend.openSession({ identity: { runId: fixture.current.binding.runId,
+          sessionId: fixture.current.session.normalizedSessionId },
+        workingDirectory: fixture.current.workspace.cwd } as never)).resolves.toBe(fixture.fresh);
+
+      // Answered once: the refused open, then ONE fresh open in the same run.
+      expect(fixture.openSession).toHaveBeenCalledTimes(2);
+      expect(fixture.refusals).toEqual([expect.objectContaining({
+        code: "runner_harness_state_mismatch: restore_target_holds_other_conversation" })]);
+      // Nothing was ever copied onto the box.
+      expect(fixture.syncIn).not.toHaveBeenCalled();
+      // ONE existing true note (pi-session-recovery-notice.ts restore_unavailable_on_new_box).
+      expect(restoreUnavailableNotice).toHaveBeenCalledOnce();
+      expect(restoreUnavailableNotice).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        runId: fixture.current.binding.runId, issueId: fixture.current.binding.issueId,
+        code: "runner_harness_state_mismatch: restore_target_holds_other_conversation", reason: "restore_unavailable_on_new_box" }));
+      expect(fixture.onLog).toHaveBeenCalledWith("stdout", expect.stringContaining("continuing in a fresh provider thread"));
+      // Every byte of both conversations is kept: the box's set aside (renamed), the backup's set aside.
+      const boxParent = dirname(fixture.remoteSession);
+      const setAside = (await readdir(boxParent)).filter(name => name.startsWith(`${basename(fixture.remoteSession)}.continuity-break-`));
+      expect(setAside).toHaveLength(1);
+      expect(await readFile(join(boxParent, setAside[0]!, "filesystem", history), "utf8")).toBe(boxBytes);
+      const breaks = await readdir(join(fixture.root, "continuity-breaks"));
+      expect(breaks).toHaveLength(1);
+      expect(await readFile(join(fixture.root, "continuity-breaks", breaks[0]!, "failover-backups/current", history), "utf8")).toBe(backupBytes);
+      // The lineage records old thread -> the box's fresh thread.
+      expect(fixture.resets()).toEqual([expect.objectContaining({ reason: "resume_failed_on_new_box",
+        previousIdentity: identityOf("retained-provider-thread"), identity: identityOf("fresh-provider-thread") })]);
     });
 
     it("guard: a fresh-thread code that is NOT member (a) keeps today's next-run path", async () => {
