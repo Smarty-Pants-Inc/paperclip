@@ -284,18 +284,22 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
 
   // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7018965885
   // Keep reason: NEVER-OK trace custody. Actual DB-backed sweep, writer and filesystem.
-  it.each(["guest", "drift", "unreadable", "recovered"] as const)("scheduled sweep keeps undiscoverable content (%s)", async mode => {
-    const seeded = await seedWorkspace({ commitOnBranch: true, populate: false });
+  it.each([
+    ["guest", true], ["drift", true], ["unreadable", true], ["recovered", true],
+    ["guest", false], ["drift", false], ["unreadable", false], ["recovered", false],
+  ] as const)("scheduled sweep keeps undiscoverable content (%s, unmerged=%s)", async (mode, unmerged) => {
+    const seeded = await seedWorkspace({ commitOnBranch: unmerged, populate: false });
     await fs.appendFile(path.join(seeded.repoRoot, ".gitignore"), "build/\n");
     await git(seeded.repoRoot, ["add", ".gitignore"]);
     await git(seeded.repoRoot, ["commit", "-m", "Ignore build output"]);
-    await git(seeded.worktreePath, ["cherry-pick", "main"]);
+    await git(seeded.worktreePath, unmerged ? ["cherry-pick", "main"] : ["merge", "--ff-only", "main"]);
     const spill = await contentSpill(seeded.worktreePath, path.join(seeded.worktreePath, "build"), mode);
     await writeFile(path.join(seeded.worktreePath, "dist", "control.js"), "regenerable\n");
     const sweep = await service().sweepTerminalWorkspaces();
     const survived = await exists(spill.path);
-    console.info("content-custody-scheduled", { mode, sweep, survived });
-    expect(sweep).toMatchObject({ compacted: 1, compactionFailed: 0, archived: 0 });
+    console.info("content-custody-scheduled", { mode, unmerged, sweep, survived });
+    expect(sweep).toMatchObject({ compacted: 1, compactionFailed: 0,
+      archived: mode === "recovered" && !unmerged ? 1 : 0 });
     expect(survived).toBe(mode !== "recovered");
     expect(await exists(path.join(seeded.worktreePath, "dist"))).toBe(false);
     if (survived) {
