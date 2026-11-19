@@ -1,4 +1,5 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
+import { redactProviderKeys } from "@paperclipai/adapter-utils/provider-prefix-redaction";
 import { isPublicExecutorToolSelector, looksLikeCredentialJwt } from "@paperclipai/adapter-utils/command-redaction";
 
 const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization(?:[-_]?code)?|bearer|secrets?|passwd|passwords?|credentials?|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)(?:[-_]?(?:value|header|prod(?:uction)?|dev(?:elopment)?|test|staging|primary|secondary))*`;
@@ -1025,6 +1026,9 @@ export function redactAgentAdapterConfig(
 }
 
 export function redactSensitiveText(input: string): string {
+  // Run before the legacy hint fast path: AWS, GCP and Slack keys need not
+  // contain a field-name hint, a dot, or any registered run secret.
+  input = redactProviderKeys(input, REDACTED_EVENT_VALUE);
   if (!maybeContainsSecretText(input)) return input;
   return redactCommandText(
     redactStandaloneBearerCredentials(redactAuthorizationCredentials(input))

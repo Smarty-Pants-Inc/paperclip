@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 
@@ -127,6 +127,22 @@ const reviewedManifest = {
   exports: { "./evals": "./dist/evals.js" },
   devDependencies: { [kernel]: "workspace:*" },
 };
+
+test("shared provider rules admit only the import-free redaction leaf, not adapter runtimes", async (t) => {
+  const source = await readFile(resolve(defaultPackageRoot, "../adapter-utils/src/provider-prefix-redaction.ts"), "utf8");
+  assert.deepEqual(findSpecifiers(source), [], "the admitted leaf must not pull a provider SDK into the standalone Runner");
+  const packageName = "@paperclipai/adapter-utils";
+  const leaf = `${packageName}/provider-prefix-redaction`;
+  const manifest = { dependencies: { [packageName]: "workspace:*" } };
+  assert.deepEqual(await fixtureBoundary(t, { manifest, files: { "src/diagnostic.ts": `import "${leaf}";` } }), []);
+  for (const specifier of [packageName, `${packageName}/acpx-engine`, `${leaf}/private`, "@paperclipai/shared"]) {
+    const violations = await fixtureBoundary(t, { manifest, files: { "src/diagnostic.ts": `import "${specifier}";` } });
+    assert.equal(violations.length, 1, specifier);
+    assert.equal(violations[0].specifier, specifier);
+  }
+  assert.equal((await fixtureBoundary(t, { files: { "src/diagnostic.ts": `import "${leaf}";` } })).length, 1,
+    "the leaf requires the declared runtime workspace dependency");
+});
 
 test("only exact declared public subpaths are admitted", async (t) => {
   const violations = await fixtureBoundary(t, {

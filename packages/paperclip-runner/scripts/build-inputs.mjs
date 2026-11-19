@@ -34,7 +34,9 @@
 // Inputs: every file under packages/paperclip-runner except its build outputs
 // (dist, dist-browser, runner/target, provider-assets), node_modules and dot-directories (tool
 // caches); every file under packages/paperclip-eval-kernel except dist and
-// node_modules, because build:typescript builds that package first; every
+// node_modules, because build:typescript builds that package first; the shared
+// provider-prefix rules and adapter-utils package manifest, because diagnostic
+// redaction and trace spooling bundle that runtime subpath; every
 // file under the root patches directory, because check:acpx-profiles hashes
 // the acpx patch and build-verified-provider-entrypoints.mjs copies the pi-acp
 // and brace-expansion patches into dist; and the root files the Runner's
@@ -69,6 +71,8 @@ const RUNNER_PACKAGE_RELATIVE = "packages/paperclip-runner";
 const EVAL_KERNEL_PACKAGE_RELATIVE = "packages/paperclip-eval-kernel";
 const ROOT_INPUT_DIRECTORIES = ["patches"];
 const ROOT_INPUT_FILES = [
+  "packages/adapter-utils/src/provider-prefix-redaction.ts",
+  "packages/adapter-utils/package.json",
   "package.json",
   "pnpm-lock.yaml",
   "pnpm-workspace.yaml",

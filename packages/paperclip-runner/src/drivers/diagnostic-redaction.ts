@@ -1,4 +1,5 @@
 import { stripVTControlCharacters } from "node:util";
+import { redactProviderKeys } from "@paperclipai/adapter-utils/provider-prefix-redaction";
 
 /** Redact diagnostic text without importing the provider process or its credentials. */
 export function redactProviderDiagnostic(message: string): string {
@@ -7,7 +8,7 @@ export function redactProviderDiagnostic(message: string): string {
   const normalized = stripVTControlCharacters(
     message.replaceAll(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, ""),
   );
-  const sanitized = normalized
+  const sanitized = redactProviderKeys(normalized, "[REDACTED]")
     .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, "Bearer [REDACTED]")
     .replace(/Basic\s+([A-Za-z0-9+/=]+)/gi, (match, encoded: string) => {
       try {

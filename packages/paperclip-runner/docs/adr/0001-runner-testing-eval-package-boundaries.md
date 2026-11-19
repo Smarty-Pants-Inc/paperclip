@@ -73,6 +73,42 @@ Eval consumers ----> @paperclipai/paperclip-runner/evals
 
 No arrow points from App runtime to an external eval repository.
 
+## Shared credential-rule leaf (2026-11-19)
+
+[smarty-dev#21032](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21032)
+requires the server and Runner to mask recognizable provider keys from one rule
+table, without separate copies drifting. The only new admitted runtime workspace
+subpath is `@paperclipai/adapter-utils/provider-prefix-redaction`. Adapter-utils is
+already a server dependency and part of the Runner's `ensure:eval-build-deps` step.
+Its leaf contains regex data and a replacement function, with no imports, provider
+SDK, environment reads, or credential lookup. The dependency is declared in the
+Runner manifest, not reached through a source-relative escape. Importing the
+adapter-utils root, SDK subpaths, or other App packages is still forbidden.
+
+The source of truth is
+`packages/adapter-utils/src/provider-prefix-redaction.ts`: 26 DEFAULT Gitleaks
+rules from `v8.30.1`, each with its upstream ID and regex line number, source URL,
+and file SHA-256. Only Go case-flag syntax is translated for JavaScript. The
+redactor uses upstream formats/keywords, not entropy thresholds or repository
+allowlists. Existing broader redactors remain to preserve their accepted guards;
+they are not another copy of the adopted table. Bearer-prose policy is unchanged.
+
+Direct server and Runner imports use the built subpath; the adapter-utils command
+helper imports the same source locally. Build adapter-utils before running source
+checks. Runner builds already do this, and verified provider entrypoints bundle
+the leaf into their self-contained ESM/CommonJS closure while retaining the MIT
+notice. The Runner build-input stamp now includes the shared source and package
+manifest, so a rules-only edit cannot reuse an obsolete vendored build.
+
+Write boundaries covered are Runner diagnostics and Pi spills/provider events,
+Codex errors/provider failures, TypeScript provider trace frames (before digest
+and base64 encoding) and their metadata, server event payloads and comments, and
+the production/development Pino byte sink (including serialized Error stacks).
+Credentials are masked even when optional username censorship is disabled. No
+historical rows are rewritten. A source regression or relocated bundle smoke does
+not certify an installed release or a live provider workflow; those remain an
+explicit release/acceptance gate.
+
 ## Compatibility and versioning
 
 Package semver describes distribution compatibility. Independently versioned

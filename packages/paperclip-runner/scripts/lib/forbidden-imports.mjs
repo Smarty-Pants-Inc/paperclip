@@ -12,6 +12,17 @@ const RUST_IMPORT_PATTERNS = [
 ];
 const REVIEWED_EVAL_KERNEL = "@paperclipai/paperclip-eval-kernel";
 const REVIEWED_EVAL_HARNESS = "src/eval/workflow-harness.ts";
+// dl-redact-21032 explicitly shares one import-free rule table with the server.
+// Only this data leaf is admitted; adapter SDKs and the package root stay out.
+const REVIEWED_PROVIDER_RULES_PACKAGE = "@paperclipai/adapter-utils";
+const REVIEWED_PROVIDER_RULES_LEAF = `${REVIEWED_PROVIDER_RULES_PACKAGE}/provider-prefix-redaction`;
+
+function hasReviewedProviderRulesDependency(manifest) {
+  return manifest.dependencies?.[REVIEWED_PROVIDER_RULES_PACKAGE] === "workspace:*"
+    && manifest.optionalDependencies?.[REVIEWED_PROVIDER_RULES_PACKAGE] === undefined
+    && manifest.peerDependencies?.[REVIEWED_PROVIDER_RULES_PACKAGE] === undefined
+    && manifest.devDependencies?.[REVIEWED_PROVIDER_RULES_PACKAGE] === undefined;
+}
 
 const libraryDirectory = dirname(fileURLToPath(import.meta.url));
 export const defaultPackageRoot = resolve(libraryDirectory, "../..");
@@ -163,7 +174,7 @@ function isForbiddenBrowserPackage(specifier) {
   );
 }
 
-function violationReason({ file, packageRoot, specifier, publicRunnerImports, reviewedEvalHarness }) {
+function violationReason({ file, packageRoot, specifier, publicRunnerImports, reviewedEvalHarness, reviewedProviderRules }) {
   const relativeFile = relative(packageRoot, file).split(/[\\/]/).join("/");
   const isExampleConsumer = relativeFile.startsWith("examples/");
   if (
@@ -179,7 +190,8 @@ function violationReason({ file, packageRoot, specifier, publicRunnerImports, re
     specifier.startsWith("@paperclipai/") &&
     specifier !== "@paperclipai/paperclip-runner" &&
     !publicRunnerImports.has(specifier) &&
-    !(specifier === REVIEWED_EVAL_KERNEL && reviewedEvalHarness && relativeFile === REVIEWED_EVAL_HARNESS)
+    !(specifier === REVIEWED_EVAL_KERNEL && reviewedEvalHarness && relativeFile === REVIEWED_EVAL_HARNESS) &&
+    !(specifier === REVIEWED_PROVIDER_RULES_LEAF && reviewedProviderRules)
   ) {
     return "Paperclip workspace packages are outside the standalone boundary";
   }
@@ -234,7 +246,8 @@ async function manifestViolations(packageRoot) {
   );
   return [...runtimeDependencies, ...unreviewedDevelopmentDependencies]
     .filter(
-      (name) => name.startsWith("@paperclipai/") && name !== "@paperclipai/paperclip-runner",
+      (name) => name.startsWith("@paperclipai/") && name !== "@paperclipai/paperclip-runner"
+        && !(name === REVIEWED_PROVIDER_RULES_PACKAGE && hasReviewedProviderRulesDependency(manifest)),
     )
     .map((specifier) => ({
       file: manifestPath,
@@ -310,7 +323,8 @@ export async function checkForbiddenImports({
     && !publicSources.has(resolve(packageRoot, REVIEWED_EVAL_HARNESS));
   for (const { file, source } of sources) {
     for (const { specifier, offset } of specifiers.get(file)) {
-      const reason = violationReason({ file, packageRoot, specifier, publicRunnerImports, reviewedEvalHarness });
+      const reason = violationReason({ file, packageRoot, specifier, publicRunnerImports, reviewedEvalHarness,
+        reviewedProviderRules: hasReviewedProviderRulesDependency(manifest) });
       if (reason === null) continue;
       violations.push({ file, line: source.slice(0, offset).split("\n").length, specifier, reason });
     }

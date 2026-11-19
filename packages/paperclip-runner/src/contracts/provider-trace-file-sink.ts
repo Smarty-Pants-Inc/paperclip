@@ -1,10 +1,18 @@
 import { createHash } from "node:crypto";
+import { redactProviderKeys } from "@paperclipai/adapter-utils/provider-prefix-redaction";
 import { open, type FileHandle } from "node:fs/promises";
 
 const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
 const MAX_PENDING_RECORDS = 1_024;
 
 type TraceRecord = Record<string, unknown>;
+
+function redactTraceMetadata(value: unknown): unknown {
+  if (typeof value === "string") return redactProviderKeys(value, "[REDACTED]");
+  if (Array.isArray(value)) return value.map(redactTraceMetadata);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, redactTraceMetadata(child)]));
+}
 type ProviderTraceDirection =
   | "client_to_provider"
   | "provider_to_client"
@@ -149,7 +157,7 @@ export class ProviderTraceFileSink {
   }
 
   #append(value: TraceRecord): void {
-    const record = {
+    const record: TraceRecord = {
       ...value,
       debugChannel: this.#channel,
       debugSequence: this.#nextDebugSequence++,
@@ -158,7 +166,11 @@ export class ProviderTraceFileSink {
       this.#incompleteReason ??= "trace_sidecar_spool_full";
       return;
     }
-    this.#queue.push(`${JSON.stringify(record)}\n`);
+    // rawBase64 was sanitized before byteLength/digest were computed. Never
+    // pattern-match its encoding: that could invalidate the frame's digest.
+    const { rawBase64, ...metadata } = record;
+    const sanitized = { ...redactTraceMetadata(metadata) as TraceRecord, ...(rawBase64 === undefined ? {} : { rawBase64 }) };
+    this.#queue.push(`${JSON.stringify(sanitized)}\n`);
     if (this.#draining === null) this.#scheduleDrain();
   }
 
@@ -186,14 +198,15 @@ export class ProviderTraceFileSink {
     // Raw frames may split a private key at any byte boundary. Keep trace
     // routing/timing metadata, but never spool raw content for identity runs.
     if (this.#hasPrivateIdentity) return Buffer.from("[REDACTED: agent identity runtime]");
-    if (this.#sensitiveValues.size === 0) return raw;
     let value = raw.toString("utf8");
     for (const sensitive of [...this.#sensitiveValues].sort(
       (left, right) => right.length - left.length,
     )) {
       value = value.split(sensitive).join("[REDACTED]");
     }
-    return Buffer.from(value, "utf8");
+    value = redactProviderKeys(value, "[REDACTED]");
+    // Preserve non-text frames byte-for-byte when no masking was needed.
+    return value === raw.toString("utf8") ? raw : Buffer.from(value, "utf8");
   }
 }
 

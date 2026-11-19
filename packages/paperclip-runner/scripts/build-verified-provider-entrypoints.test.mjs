@@ -22,6 +22,14 @@ test("provider entrypoints include self-contained ESM and descriptor-safe Common
       assert.equal(bundle.outputFiles?.length, 1, entrypoint.name);
       const source = bundle.outputFiles[0].text;
       assert.match(source, /^#!\/usr\/bin\/env node\n/);
+      const includesProviderRules = Object.keys(bundle.metafile.inputs).some(input => input.endsWith("/provider-prefix-redaction.js"));
+      if (includesProviderRules) {
+        assert.match(source, /openai-api-key/);
+        assert.match(source, /Copyright \(c\) 2019 Zachary Rice/, "bundling adopted rule data must retain its MIT notice");
+      }
+      if (entrypoint.name === "pi-rpc-app-server-proxy") {
+        assert.ok(includesProviderRules, "the shipped Pi proxy must include the shared provider-key rules");
+      }
     }
     assert.doesNotMatch(
       verifiedResult.outputFiles[0].text,

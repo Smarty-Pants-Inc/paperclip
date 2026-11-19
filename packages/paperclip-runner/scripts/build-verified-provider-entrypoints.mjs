@@ -102,7 +102,8 @@ export async function bundleVerifiedProviderEntrypoints({ write = true } = {}) {
         packages: "bundle",
         splitting: false,
         sourcemap: false,
-        legalComments: "none",
+        // Retain third-party notices, including the adopted Gitleaks rule data.
+        legalComments: "eof",
         metafile: true,
         treeShaking: true,
         write,

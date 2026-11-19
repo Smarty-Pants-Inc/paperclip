@@ -1,4 +1,5 @@
 import os from "node:os";
+import { redactProviderKeys } from "@paperclipai/adapter-utils/provider-prefix-redaction";
 
 export const CURRENT_USER_REDACTION_TOKEN = "*";
 
@@ -106,6 +107,10 @@ function resolveCurrentUserCandidates(opts?: CurrentUserRedactionOptions) {
 
 export function redactCurrentUserText(input: string, opts?: CurrentUserRedactionOptions) {
   if (!input) return input;
+  // Provider credentials must never enter comments or logs, even when the
+  // optional current-user censorship setting is disabled. Scan before any
+  // username replacement can split a key's recognizable prefix.
+  input = redactProviderKeys(input, "***REDACTED***");
   if (opts?.enabled === false) return input;
 
   const { userNames, homeDirs, replacement } = resolveCurrentUserCandidates(opts);

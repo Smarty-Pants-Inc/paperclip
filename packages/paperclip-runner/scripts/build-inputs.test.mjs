@@ -131,6 +131,18 @@ test("the input set covers sources, the eval kernel, root patches and root confi
   });
 });
 
+// Never-OK: a cached vendored Runner must not retain obsolete credential rules.
+test("shared provider-prefix rule edits invalidate the Runner build", async () => {
+  await withRepo(async ({ repoRoot, packageRoot }) => {
+    const source = "packages/adapter-utils/src/provider-prefix-redaction.ts";
+    await writeTree(repoRoot, { [source]: "export const rules = ['openai'];\n" });
+    recordCurrentBuild({ repoRoot, packageRoot });
+    assert.ok(collectBuildInputFiles(repoRoot).includes(source));
+    await writeTree(repoRoot, { [source]: "export const rules = ['openai', 'anthropic'];\n" });
+    assert.equal(assessRunnerBuild({ repoRoot, packageRoot }).code, "inputs_changed");
+  });
+});
+
 test("the output manifest lists every file under dist with its size, and nothing outside it", async () => {
   await withRepo(async ({ packageRoot }) => {
     const outputs = collectBuildOutputFiles(packageRoot);
