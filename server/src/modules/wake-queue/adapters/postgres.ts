@@ -467,10 +467,13 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       const containedSelfAuthoredComment = rows.some(
         (row) => targetsFinishingRunAgent && !row.deletedAt && row.createdByRunId === finishingRunId,
       );
-      // Do not cancel system work without proof that another durable owner
-      // retains its obligation (restore/export/monitor, for example). Preserve
-      // its receipt, skip it for this drain, and allow owed person input behind it.
-      const heldBeforeBoot = beforeBoot && !completion && !owedPersonAtBoot &&
+      // The saved monitor wake is itself the next check's durable driver;
+      // preserve its pre-existing promotion path rather than parking it forever.
+      const monitor = ["issue_monitor", "issue_monitor_due"].includes(String(context.wakeReason ?? wake?.reason));
+      // Do not cancel other system work without proof that another durable owner
+      // retains its obligation (restore/export, for example). Preserve its receipt,
+      // skip it for this drain, and allow owed person input behind it.
+      const heldBeforeBoot = beforeBoot && !completion && !monitor && !owedPersonAtBoot &&
         (wake?.requestedByActorType !== "user" || personRows.length === 0);
       return { liveNonSelfCommentIds, containedSelfAuthoredComment, deliveredCommentIds: [...delivered],
         conversationMovedOn, heldBeforeBoot };
