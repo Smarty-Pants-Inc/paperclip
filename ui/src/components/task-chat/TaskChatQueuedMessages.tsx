@@ -55,6 +55,10 @@ type QueueAction = "steer" | "interrupt" | "discard" | null;
  * (no automatic steer countdown, so no steer fires from the UI).
  */
 export const QUEUE_ROW_REORDER_EDIT_STEER_ENABLED = false;
+/** Delete hides the row at once and offers Undo this long; only then is the
+ * discard sent. Undo sends nothing. A page that closes inside the window sends
+ * nothing either, so the message simply stays queued (never lost). */
+export const QUEUED_DELETE_UNDO_MS = 8_000;
 export const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
 export const CHAT_STOPPED_BY_PERSON_LINE = "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it.";
 /** The stopped bar's own fact: the server's person-Stop reason on the chat's
@@ -208,10 +212,24 @@ function SortableQueuedMessage({
         <GripVertical className="h-3.5 w-3.5" aria-hidden />
       </button> : null}
 
-      <CornerDownRight
-        className="h-3.5 w-3.5 shrink-0 text-muted-foreground"
-        aria-hidden
-      />
+      {/* Delete leads the row and Interrupt ends it (ml-auto), with the message
+          between them, so a mis-tap on one can never land on the other, at 390
+          as at 1440. Delete is undoable for QUEUED_DELETE_UNDO_MS. */}
+      <button
+        type="button"
+        onClick={onDiscard}
+        disabled={laterWake || busy || !entry.canDiscard}
+        title="Delete queued message (Undo for a few seconds)"
+        aria-label={`Discard queued message: ${label}`}
+        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
+        data-testid={`task-chat-queued-discard-${entry.comment.id}`}
+      >
+        {action === "discard" ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+        ) : (
+          <Trash2 className="h-3.5 w-3.5" aria-hidden />
+        )}
+      </button>
       <div className="flex min-w-24 max-w-full flex-1 flex-col items-start gap-1 overflow-hidden px-1 sm:flex-row sm:items-center sm:gap-2" title={label || undefined}>
         {label ? <MarkdownBody
           className="w-full min-w-0 line-clamp-2 sm:w-auto sm:flex-1 sm:line-clamp-1 [&_p]:m-0!"
@@ -232,7 +250,7 @@ function SortableQueuedMessage({
       </span> : null}
 
       {sendOnLine ? null : autoSteerSecondsLeft !== null ? (
-        <span className="flex shrink-0 items-center gap-1" data-testid={`task-chat-queued-auto-steer-${entry.comment.id}`}>
+        <span className="ml-auto flex shrink-0 items-center gap-1" data-testid={`task-chat-queued-auto-steer-${entry.comment.id}`}>
           <span className="px-1 text-xs text-muted-foreground tabular-nums">
             Sending in {autoSteerSecondsLeft}s
           </span>
@@ -265,7 +283,7 @@ function SortableQueuedMessage({
           aria-label={!queue.targetRunId ? "Send queued messages" : undefined}
           disabled={laterWake || busy || !queue.queueId || !onInterrupt}
           title={queue.targetRunId ? "Interrupt the active turn and send queued messages" : "Send queued messages now"}
-          className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
+          className="ml-auto flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
           data-testid={`task-chat-queued-interrupt-${entry.comment.id}`}
         >
           {action === "interrupt" ? (
@@ -281,7 +299,7 @@ function SortableQueuedMessage({
           onClick={onSteer}
           disabled={steerDisabled}
           title={steerTitle}
-          className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
+          className="ml-auto flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
           data-testid={`task-chat-queued-steer-${entry.comment.id}`}
         >
           {action === "steer" ? (
@@ -292,22 +310,6 @@ function SortableQueuedMessage({
           Steer
         </button>
       ))}
-
-      <button
-        type="button"
-        onClick={onDiscard}
-        disabled={laterWake || busy || !entry.canDiscard}
-        title="Discard queued message"
-        aria-label={`Discard queued message: ${label}`}
-        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
-        data-testid={`task-chat-queued-discard-${entry.comment.id}`}
-      >
-        {action === "discard" ? (
-          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-        ) : (
-          <Trash2 className="h-3.5 w-3.5" aria-hidden />
-        )}
-      </button>
 
       {/* The menu holds only Edit message: hidden with Edit in this build. */}
       {QUEUE_ROW_REORDER_EDIT_STEER_ENABLED && autoSteerSecondsLeft === null ? <DropdownMenu>
@@ -358,6 +360,17 @@ export function TaskChatQueuedMessages({
   const [now, setNow] = useState(() => Date.now());
   const latestQueue = useRef(queue);
   latestQueue.current = queue;
+  const latestOnDiscard = useRef(onDiscard);
+  latestOnDiscard.current = onDiscard;
+  // Delete with Undo: "undo" rows are hidden with an Undo line in their place
+  // and nothing sent; "sending" rows are hidden while the discard is in flight.
+  const [deleting, setDeleting] = useState<ReadonlyMap<string, "undo" | "sending">>(() => new Map());
+  const undoTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  // Leaving the page inside the window sends nothing: the message stays queued.
+  useEffect(() => () => {
+    for (const timer of undoTimers.current.values()) clearTimeout(timer);
+    undoTimers.current.clear();
+  }, []);
   const optimisticDeliveryIds = useRef(new Set<string>());
   const [pending, setPending] = useState<{
     commentId: string;
@@ -451,6 +464,74 @@ export function TaskChatQueuedMessages({
     void runRowAction(due.comment.id, "steer");
   });
 
+  function setDeletingState(commentId: string, state: "undo" | "sending" | null) {
+    setDeleting((current) => {
+      const next = new Map(current);
+      if (state) next.set(commentId, state); else next.delete(commentId);
+      return next;
+    });
+  }
+
+  function startDelete(commentId: string) {
+    if (pending || reordering || deleting.has(commentId) ||
+      entries.some((entry) => entry.comment.id === commentId && entry.queueId && entry.queueId !== queue.queueId)) return;
+    setVisibleError(null);
+    setDeletingState(commentId, "undo");
+    setAnnouncement("Queued message deleted. Undo is available for a few seconds.");
+    undoTimers.current.set(commentId, setTimeout(() => {
+      undoTimers.current.delete(commentId);
+      void commitDiscard(commentId);
+    }, QUEUED_DELETE_UNDO_MS));
+  }
+
+  function undoDelete(commentId: string) {
+    const timer = undoTimers.current.get(commentId);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    undoTimers.current.delete(commentId);
+    setDeletingState(commentId, null);
+    setAnnouncement("Queued message restored.");
+  }
+
+  /** The Undo window ended (or Interrupt is sending the queue): send the discard now. */
+  async function commitDiscard(commentId: string): Promise<boolean> {
+    setDeletingState(commentId, "sending");
+    try {
+      await latestOnDiscard.current(commentId, latestQueue.current.revision);
+      setEntries((current) => current.filter((entry) => entry.comment.id !== commentId));
+      setDeletingState(commentId, null);
+      setAnnouncement("Queued message discarded.");
+      return true;
+    } catch (error) {
+      setDeletingState(commentId, null);
+      setAnnouncement("");
+      const code = queueActionErrorCode(error);
+      setVisibleError(
+        code === "queued_comment_already_dispatching"
+          ? "Too late to discard: this message is already being sent."
+          : code === "queued_comment_revision_conflict"
+            ? "The queue changed in another session. Review it and try again."
+            : "Couldn’t discard. Message is still queued.",
+      );
+      return false;
+    }
+  }
+
+  /** A message deleted inside its Undo window must never ride along with an Interrupt. */
+  async function commitUndoableDeletes(): Promise<boolean> {
+    const ids = [...undoTimers.current.keys()];
+    for (const id of ids) {
+      clearTimeout(undoTimers.current.get(id));
+      undoTimers.current.delete(id);
+    }
+    for (const id of ids) {
+      if (!(await commitDiscard(id))) return false;
+      // Let the parent's queue (and its new revision) render before the next one.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    return true;
+  }
+
   async function handleDragEnd(event: DragEndEvent) {
     const { active, over } = event;
     if (
@@ -505,6 +586,7 @@ export function TaskChatQueuedMessages({
     ) {
       return;
     }
+    if (action === "interrupt" && undoTimers.current.size > 0 && !(await commitUndoableDeletes())) return;
     const deliveredIds = action === "interrupt"
       ? entries.map((entry) => entry.comment.id)
       : action === "steer" ? [commentId] : [];
@@ -592,7 +674,10 @@ export function TaskChatQueuedMessages({
   const stoppedPaused = queue.executionWait?.reason === CHAT_AGENT_PAUSED_REASON &&
     Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0;
 
+  const hasUndoLine = [...deleting.values()].includes("undo");
   if (entries.length === 0 && !visibleError && !statusMessage && !steeringUnavailableReason) return null;
+  if (entries.every((entry) => deleting.get(entry.comment.id) === "sending") && !hasUndoLine &&
+    !visibleError && !statusMessage && !steeringUnavailableReason) return null;
 
   return (
     <TaskChatComposerBar
@@ -618,6 +703,29 @@ export function TaskChatQueuedMessages({
             data-testid="task-chat-queued-messages-list"
           >
           {entries.map((entry) => {
+            const deleteState = deleting.get(entry.comment.id);
+            if (deleteState === "sending") return null;
+            if (deleteState === "undo") {
+              const label = stripStandaloneImageEmbeds(queuedMessageLabel(entry));
+              return (
+                <div
+                  key={entry.comment.id}
+                  className="flex min-h-11 min-w-0 items-center gap-2 border-b border-border/55 bg-card/95 px-2.5 py-1 text-xs text-muted-foreground last:border-b-0"
+                  data-testid={`task-chat-queued-undo-${entry.comment.id}`}
+                >
+                  <span className="min-w-0 flex-1 truncate">Message deleted.</span>
+                  <button
+                    type="button"
+                    onClick={() => undoDelete(entry.comment.id)}
+                    aria-label={`Undo delete: ${label || "Images"}`}
+                    className="flex h-7 shrink-0 items-center rounded-md border border-border px-2.5 text-xs font-medium text-foreground transition-colors hover:bg-accent"
+                    data-testid={`task-chat-queued-undo-button-${entry.comment.id}`}
+                  >
+                    Undo
+                  </button>
+                </div>
+              );
+            }
             const action =
               pending?.commentId === entry.comment.id ? pending.action : null;
             const busy = Boolean(pending || reordering);
@@ -645,7 +753,7 @@ export function TaskChatQueuedMessages({
                     ? () => void runRowAction(entry.comment.id, "interrupt")
                     : undefined
                 }
-                onDiscard={() => void runRowAction(entry.comment.id, "discard")}
+                onDiscard={() => startDelete(entry.comment.id)}
                 sendOnLine={stoppedByPerson || stoppedPaused}
               />
             );

@@ -15,7 +15,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConnectivityProvider, createConnectivityStore } from "@/lib/connectivity";
 import { INITIAL_TRANSCRIPT_REVEAL_BUDGET_MS, TaskChatThread } from "./TaskChatThread";
-import { QUEUE_ROW_REORDER_EDIT_STEER_ENABLED } from "./task-chat/TaskChatQueuedMessages";
+import { QUEUE_ROW_REORDER_EDIT_STEER_ENABLED, QUEUED_DELETE_UNDO_MS } from "./task-chat/TaskChatQueuedMessages";
 import { IssueChatThread } from "./IssueChatThread";
 import type {
   Agent,
@@ -5784,13 +5784,22 @@ describe("TaskChatThread Paperclip Runner queue", () => {
       onDiscardQueuedComment: async () => {},
     });
 
-    await act(async () => {
-      container
-        .querySelector<HTMLButtonElement>(
-          '[data-testid="task-chat-queued-discard-optimistic-local-1"]',
-        )
-        ?.click();
-    });
+    // Re-pin (delundo): Delete hides the row at once; the discard (here the
+    // local cancel) is sent when the Undo window ends.
+    vi.useFakeTimers();
+    try {
+      await act(async () => {
+        container
+          .querySelector<HTMLButtonElement>(
+            '[data-testid="task-chat-queued-discard-optimistic-local-1"]',
+          )
+          ?.click();
+      });
+      expect(onCancelQueued).not.toHaveBeenCalled();
+      await act(async () => { await vi.advanceTimersByTimeAsync(QUEUED_DELETE_UNDO_MS); });
+    } finally {
+      vi.useRealTimers();
+    }
 
     expect(onCancelQueued).toHaveBeenCalledWith("optimistic-local-1");
     expect(

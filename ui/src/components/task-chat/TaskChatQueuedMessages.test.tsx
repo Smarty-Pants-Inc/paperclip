@@ -13,6 +13,7 @@ import { ThemeProvider } from "@/context/ThemeContext";
 import { MemoryRouter } from "@/lib/router";
 import {
   QUEUE_ROW_REORDER_EDIT_STEER_ENABLED,
+  QUEUED_DELETE_UNDO_MS,
   queueHeldByPersonStop,
   reorderQueuedMessageEntries,
   TaskChatQueuedMessages,
@@ -88,6 +89,108 @@ describe("TaskChatQueuedMessages", () => {
     return props;
   }
 
+  /** Delete, then let the Undo window run out (the discard is sent only then). */
+  async function deleteAndWaitOutUndo(id: string) {
+    vi.useFakeTimers();
+    try {
+      await act(async () => {
+        container.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-discard-${id}"]`)!.click();
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(QUEUED_DELETE_UNDO_MS); });
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  const rowOf = (id: string) => container.querySelector(`[data-testid="task-chat-queued-message-${id}"]`);
+  const rowIds = () => [...container.querySelectorAll('[data-testid^="task-chat-queued-message-comment-"]')]
+    .map((row) => row.getAttribute("data-testid")!.replace("task-chat-queued-message-", ""));
+
+  describe.each([390, 1440])("delete with Undo at %ipx", (width) => {
+    beforeEach(() => {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+      window.dispatchEvent(new Event("resize"));
+      vi.useFakeTimers();
+    });
+    afterEach(() => { vi.useRealTimers(); });
+    const press = async (testId: string) => {
+      await act(async () => { container.querySelector<HTMLButtonElement>(`[data-testid="${testId}"]`)!.click(); });
+    };
+    const advance = async (ms: number) => { await act(async () => { await vi.advanceTimersByTimeAsync(ms); }); };
+
+    it("hides the row at once with Undo; Undo puts it back in place and sends no discard", async () => {
+      const props = render({ onInterrupt: vi.fn().mockResolvedValue(undefined) });
+      expect(rowIds()).toEqual(["comment-1", "comment-2"]);
+      await press("task-chat-queued-discard-comment-1");
+      expect(rowOf("comment-1")).toBeNull();
+      expect(container.querySelector('[data-testid="task-chat-queued-undo-comment-1"]')?.textContent).toContain("Undo");
+      await advance(QUEUED_DELETE_UNDO_MS - 100);
+      expect(props.onDiscard).not.toHaveBeenCalled();
+      await press("task-chat-queued-undo-button-comment-1");
+      expect(rowIds()).toEqual(["comment-1", "comment-2"]);
+      expect(rowOf("comment-1")?.textContent).toContain("First queued message");
+      expect(container.querySelector('[data-testid="task-chat-queued-undo-comment-1"]')).toBeNull();
+      await advance(QUEUED_DELETE_UNDO_MS * 2);
+      expect(props.onDiscard).not.toHaveBeenCalled();
+    });
+
+    it("sends exactly one discard when the Undo window ends", async () => {
+      const props = render({ onInterrupt: vi.fn().mockResolvedValue(undefined) });
+      await press("task-chat-queued-discard-comment-2");
+      await advance(QUEUED_DELETE_UNDO_MS - 1);
+      expect(props.onDiscard).not.toHaveBeenCalled();
+      await advance(1);
+      expect(props.onDiscard).toHaveBeenCalledTimes(1);
+      expect(props.onDiscard).toHaveBeenCalledWith("comment-2", "rev-1");
+      await advance(QUEUED_DELETE_UNDO_MS * 2);
+      expect(props.onDiscard).toHaveBeenCalledTimes(1);
+      expect(rowIds()).toEqual(["comment-1"]);
+      expect(container.querySelector('[data-testid="task-chat-queued-undo-comment-2"]')).toBeNull();
+    });
+
+    it("sends nothing when the bar closes inside the window (the message stays queued)", async () => {
+      const props = render({ onInterrupt: vi.fn().mockResolvedValue(undefined) });
+      await press("task-chat-queued-discard-comment-1");
+      flushSync(() => root.unmount());
+      root = createRoot(container);
+      await advance(QUEUED_DELETE_UNDO_MS * 2);
+      expect(props.onDiscard).not.toHaveBeenCalled();
+    });
+
+    it("never lets a message deleted inside the window ride along with Interrupt", async () => {
+      const order: string[] = [];
+      const props = render({
+        onDiscard: vi.fn(async (id: string) => { order.push(`discard:${id}`); }),
+        onInterrupt: vi.fn(async () => { order.push("interrupt"); }),
+      });
+      await press("task-chat-queued-discard-comment-1");
+      await press("task-chat-queued-interrupt-comment-2");
+      await advance(10);
+      expect(order).toEqual(["discard:comment-1", "interrupt"]);
+      await advance(QUEUED_DELETE_UNDO_MS * 2);
+      expect(props.onDiscard).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps Delete and Interrupt apart: Delete leads the row, Interrupt ends it, the message between", () => {
+      render({ onInterrupt: vi.fn().mockResolvedValue(undefined) });
+      for (const id of ["comment-1", "comment-2"]) {
+        const row = rowOf(id)!;
+        const children = [...row.children];
+        const del = row.querySelector(`[data-testid="task-chat-queued-discard-${id}"]`)!;
+        const interrupt = row.querySelector(`[data-testid="task-chat-queued-interrupt-${id}"]`)!;
+        const text = [...row.querySelectorAll("div")].find((el) => el.getAttribute("title")?.includes("queued message"))!;
+        const di = children.indexOf(del), ti = children.indexOf(text), ii = children.indexOf(interrupt);
+        expect(di).toBe(0);
+        expect(ii).toBe(children.length - 1);
+        expect(di < ti && ti < ii).toBe(true);
+        expect(del.nextElementSibling).not.toBe(interrupt);
+        expect(interrupt.previousElementSibling).not.toBe(del);
+        // ml-auto pins Interrupt to the far end even when the row wraps at 390.
+        expect(interrupt.className).toContain("ml-auto");
+      }
+    });
+  });
+
   // SUPERSEDE-QUEUE-ROW-HIDE-1119 (org 10:19Z): in this build a queued row
   // offers only Delete and the row's Interrupt; drag (the grip), Edit (row
   // button + menu) and the per-row Steer are hidden behind
@@ -117,7 +220,8 @@ describe("TaskChatQueuedMessages", () => {
       expect(row.querySelector(`[data-testid="task-chat-queued-auto-steer-${id}"]`)).toBeNull();
       expect(row.querySelector('[title="Queued message actions"]')).toBeNull();
       expect([...row.querySelectorAll("button")].map(button => button.textContent?.trim() || button.getAttribute("aria-label")))
-        .toEqual([`Interrupt`, `Discard queued message: ${entry.comment.body}`]);
+        // Re-pin (delundo): Delete leads the row, Interrupt ends it, never adjacent.
+        .toEqual([`Discard queued message: ${entry.comment.body}`, `Interrupt`]);
     }
   }
 
@@ -463,21 +567,12 @@ describe("TaskChatQueuedMessages", () => {
   });
 
   it("waits for authoritative discard acknowledgement before removing the row", async () => {
+    // Re-pin (delundo): the row hides at Delete (Undo window); the discard is
+    // sent when the window ends and announced only on the server's ack.
     const acknowledgement = deferred<void>();
-    render({ onDiscard: vi.fn().mockReturnValue(acknowledgement.promise) });
-    await act(async () => {
-      container
-        .querySelector<HTMLButtonElement>(
-          '[data-testid="task-chat-queued-discard-comment-1"]',
-        )
-        ?.click();
-      await Promise.resolve();
-    });
-    expect(
-      container.querySelector(
-        '[data-testid="task-chat-queued-message-comment-1"]',
-      ),
-    ).not.toBeNull();
+    const props = render({ onDiscard: vi.fn().mockReturnValue(acknowledgement.promise) });
+    await deleteAndWaitOutUndo("comment-1");
+    expect(props.onDiscard).toHaveBeenCalledTimes(1);
     expect(container.textContent).not.toContain("Queued message discarded.");
 
     await act(async () => {
@@ -499,13 +594,7 @@ describe("TaskChatQueuedMessages", () => {
         body: { details: { code: "queued_comment_already_dispatching" } },
       }),
     });
-    await act(async () => {
-      container
-        .querySelector<HTMLButtonElement>(
-          '[data-testid="task-chat-queued-discard-comment-1"]',
-        )
-        ?.click();
-    });
+    await deleteAndWaitOutUndo("comment-1"); // re-pin (delundo): discard is sent after the Undo window
     expect(
       container.querySelector(
         '[data-testid="task-chat-queued-message-comment-1"]',
@@ -522,13 +611,7 @@ describe("TaskChatQueuedMessages", () => {
         body: { details: { code: "queued_comment_revision_conflict" } },
       }),
     });
-    await act(async () => {
-      container
-        .querySelector<HTMLButtonElement>(
-          '[data-testid="task-chat-queued-discard-comment-1"]',
-        )
-        ?.click();
-    });
+    await deleteAndWaitOutUndo("comment-1"); // re-pin (delundo): discard is sent after the Undo window
     expect(container.textContent).toContain(
       "The queue changed in another session. Review it and try again.",
     );
@@ -594,13 +677,7 @@ describe("TaskChatQueuedMessages", () => {
     };
     const props = render({ queue: optimisticQueue });
 
-    await act(async () => {
-      container
-        .querySelector<HTMLButtonElement>(
-          '[data-testid="task-chat-queued-discard-optimistic-local-1"]',
-        )
-        ?.click();
-    });
+    await deleteAndWaitOutUndo("optimistic-local-1"); // re-pin (delundo): discard is sent after the Undo window
 
     expect(props.onDiscard).toHaveBeenCalledWith("optimistic-local-1", "rev-1");
     expect(
