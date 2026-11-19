@@ -568,6 +568,14 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
     const freshThreadId = !piConversation ? await selectFreshContinuationThread(db, {
       companyId: agent.companyId, agentId: agent.id, issueId: issueRef.id, runId: run.id,
     }) : null;
+    // RESTORE-INPUT: the turn that starts the fresh thread from saved history
+    // carries every owed person message as explicit queued input, oldest first.
+    if ((piConversation?.reason.startsWith("fresh_continuation:") && piConversation.runId === run.id)
+      || (freshThreadId && freshThreadId !== run.nativeSessionId)) {
+      const { carryOwedMessagesIntoFreshThread } = await import("../native-runtime/fresh-thread-owed-input.js");
+      await carryOwedMessagesIntoFreshThread(db, { companyId: agent.companyId, agentId: agent.id,
+        issueId: issueRef.id, runId: run.id, context });
+    }
     const requestedNativeSessionId =
       run.nativeSessionId ?? piConversation?.id ?? freshThreadId ?? resumableTaskSessionId;
     // A task-session lastRunId can lag a failed turn or point at an older
