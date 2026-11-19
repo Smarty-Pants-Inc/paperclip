@@ -229,7 +229,7 @@ async function runReleaseDrain(
       continue;
     }
 
-    let liveness: { liveNonSelfCommentIds: string[]; containedSelfAuthoredComment: boolean; deliveredCommentIds?: string[] } =
+    let liveness: Awaited<ReturnType<WakeQueueTransaction["getQueuedCommentLiveness"]>> =
       { liveNonSelfCommentIds: candidate.queuedCommentIds, containedSelfAuthoredComment: false };
     // The message is an authorization edge for this independent response,
     // even when an earlier turn already received the message itself.
@@ -238,11 +238,11 @@ async function runReleaseDrain(
       ["accepted", "answered", "rejected"].includes(String(candidate.deferredContextSeed.interactionStatus)) &&
       Boolean(readNonEmptyString(candidate.deferredContextSeed.source)?.startsWith("chat:"));
     if (
-      !candidate.authorizedFailedChatRetry &&
-      candidate.queuedCommentIds.length > 0
+      !candidate.authorizedFailedChatRetry
     ) {
       liveness = await ports.transaction.getQueuedCommentLiveness({
         companyId: run.companyId,
+        wakeId: candidate.id,
         issueId: issue.id,
         wakeAgentId: candidate.agentId,
         finishingRunId: run.id,
@@ -250,6 +250,11 @@ async function runReleaseDrain(
         queuedCommentIds: candidate.queuedCommentIds,
         ...(retainDeliveredCommentBindings ? { retainDeliveredCommentBindings: true } : {}),
       });
+    }
+    if (liveness.conversationMovedOn && (candidate.requestedByActorType === "system" || liveness.liveNonSelfCommentIds.length === 0)) {
+      await ports.transaction.cancelDeferredWake({ companyId: run.companyId, wakeId: candidate.id,
+        agentId: candidate.agentId, reason: "The conversation moved on", now: input.now });
+      continue;
     }
     // Retained messages a run already received only authorize the response.
     // They are not fresh input, so they must not reopen a finished task.
