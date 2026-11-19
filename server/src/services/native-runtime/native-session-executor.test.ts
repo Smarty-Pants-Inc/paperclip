@@ -12590,27 +12590,39 @@ describe("native warm session supervision", () => {
       await proofDb.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, status: "succeeded", runtimeMode: "native",
         nativeSessionId: sessionId, finishedAt: new Date(Date.now() - 10_000) });
       const runnerInstanceId = "tl08-server-runner";
-      // The backup behind the stamp is real (custody gate, BRIEF backup-gate):
-      // a stamp that names no held backup keeps the box instead of destroying it.
-      let backupStamp: ReturnType<typeof createNativeHarnessBackupStamp> | null = null;
+      // RFL record SUPERSEDE-TL08B-BACKUP-FIXTURE-REAL-1118 (BRIEF backup-gate-delta item 2):
+      // the backup=true fixture's stamp names a REAL held backup, made by the executor's own
+      // producer chain (exec:20079-20129): buildNativeHarnessBackupManifest into a pending
+      // root, publishNativeHarnessBackup to failover-backups/current, and
+      // createNativeHarnessBackupStamp inside its stamp callback. It supersedes the planted
+      // stamp (sha256:bbbb..., scope aaaa...) that had no backup behind it: under the custody
+      // gate a stamp that names no held backup keeps the box instead of destroying it.
+      // Every assertion line of this describe block is byte-identical to tB2 523dfe75.
+      let backupStamp = null as ReturnType<typeof createNativeHarnessBackupStamp> | null;
       if (withBackup) {
         const stateBase = await mkdtemp(join(tmpdir(), "tl08-backup-"));
         vi.stubEnv("PAPERCLIP_RUNNER_STATE_DIR", stateBase);
         onTestFinished(() => { vi.unstubAllEnvs(); });
         const sessionScopeId = `tl08-scope-${randomUUID()}`;
-        const current = join(stateBase, createHash("sha256").update(sessionScopeId).digest("hex"), "failover-backups", "current");
-        for (const directory of ["runner", "pi-agent", "pi"]) await mkdir(join(current, directory), { recursive: true });
-        await writeFile(join(current, "runner", "runner-state.json"), "warm owner checkpoint");
-        await writeFile(join(current, "pi", `${sessionId}.jsonl`), '{"role":"user","content":"indigo"}\n');
-        const manifest = buildNativeHarnessBackupManifest({ backupRoot: current, runnerInstanceId, sourceProviderLeaseId: providerLeaseId,
+        const scopeDigest = createHash("sha256").update(sessionScopeId).digest("hex");
+        const backupRoot = join(stateBase, scopeDigest, "failover-backups");
+        const pending = join(backupRoot, `.pending-${randomUUID()}`);
+        for (const directory of ["runner", "pi-agent", "pi"]) await mkdir(join(pending, directory), { recursive: true });
+        await writeFile(join(pending, "runner", "runner-state.json"), "warm owner checkpoint");
+        await writeFile(join(pending, "pi", `${sessionId}.jsonl`), '{"role":"user","content":"indigo"}\n');
+        const manifest = buildNativeHarnessBackupManifest({ backupRoot: pending, runnerInstanceId, sourceProviderLeaseId: providerLeaseId,
           providerSessionIdentity: { providerSessionId: sessionId },
           execution: { provider: { kind: "pi_rpc" }, binding: { companyId, runId, issueId, agentId, executionWorkspaceId: workspaceId },
             workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
             session: { normalizedSessionId: sessionId, driverKind: "pi_rpc", protocolVersion: 1, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300000 } },
           } as never });
-        await writeFile(join(current, "manifest.json"), JSON.stringify(manifest));
-        backupStamp = createNativeHarnessBackupStamp({ manifestPath: join(current, "manifest.json"), sessionScopeId, normalizedSessionId: sessionId,
-          runnerInstanceId, authorizedProviderLeaseId: providerLeaseId, completedAt: manifest.completedAt });
+        await writeFile(join(pending, "manifest.json"), JSON.stringify(manifest));
+        const { publishNativeHarnessBackup } = await import("./native-harness-backup-publication.js");
+        await publishNativeHarnessBackup({ db: proofDb, companyId, scopeDigest, backupRoot, pendingRoot: pending,
+          stamp: async currentRoot => {
+            backupStamp = createNativeHarnessBackupStamp({ manifestPath: join(currentRoot, "manifest.json"), sessionScopeId,
+              normalizedSessionId: sessionId, runnerInstanceId, authorizedProviderLeaseId: providerLeaseId, completedAt: manifest.completedAt });
+          } });
       }
       const manifestSha256 = backupStamp?.manifestSha256 ?? `sha256:${"b".repeat(64)}`;
       const [lease] = await proofDb.insert(environmentLeases).values({ companyId, environmentId, executionWorkspaceId: workspaceId,
