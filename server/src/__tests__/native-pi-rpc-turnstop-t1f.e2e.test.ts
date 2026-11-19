@@ -56,8 +56,10 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "R-no-ack", "R-no-ack-double", "R-no-ack-restart", "finished"] as const)(`warm turnstop T1-F: %s (real Runner/Pi, two prior turns)`, async scenario => {
-  const stopTurn = 3;
+it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "R-no-ack", "R-no-ack-double", "R-no-ack-restart", "finished"] as const)(`warm turnstop T1-F: %s (real Runner/Pi)`, async scenario => {
+  // No-ack cleanup must not depend on qualifying earlier same-session turns;
+  // that path is a separate acceptance area. Existing warm controls keep two.
+  const stopTurn = scenario.startsWith("R-no-ack") ? 1 : 3;
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("responses");
   expect(process.env.TMPDIR, "dedicated test tmpdir is required").toBeTruthy();
