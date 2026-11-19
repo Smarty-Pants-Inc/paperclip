@@ -1108,76 +1108,125 @@ const ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
 type RedactionStage = (text: string, replace: ReplaceCredential) => string;
 type ApplyRedactionStage = (text: string, stage: RedactionStage) => string;
 
+interface AnsiCredentialView {
+  text: string;
+  starts: number[];
+  ends: number[];
+}
+interface CredentialSpan { start: number; end: number; replacement: string }
+
+// Both scanners keep whole-line context. V1 removes CSI (including codes inside
+// credentials); V2 substitutes ASCII space U+0020, a boundary for every bare
+// token pattern. Only V1 may recognize schemes, assignments or prose rules.
 export function redactSensitiveText(input: string): string {
   if (!input.includes("\u001b")) return redactPlainSensitiveText(input);
 
-  const originalIndices: number[] = [];
-  const runs: string[] = [];
+  const transparent: AnsiCredentialView = { text: "", starts: [], ends: [] };
+  const boundary: AnsiCredentialView = { text: "", starts: [], ends: [] };
+  const append = (start: number, end: number) => {
+    for (const view of [transparent, boundary]) {
+      view.text += input.slice(start, end);
+      for (let index = start; index < end; index += 1) {
+        view.starts.push(index);
+        view.ends.push(index + 1);
+      }
+    }
+  };
   let copiedThrough = 0;
   for (const match of input.matchAll(ANSI_ESCAPE_RE)) {
-    runs.push(input.slice(copiedThrough, match.index));
-    for (let index = copiedThrough; index < match.index; index += 1) originalIndices.push(index);
+    append(copiedThrough, match.index);
     copiedThrough = match.index + match[0].length;
+    boundary.text += " ";
+    boundary.starts.push(match.index);
+    boundary.ends.push(copiedThrough);
   }
   if (copiedThrough === 0) return redactPlainSensitiveText(input);
-  runs.push(input.slice(copiedThrough));
-  for (let index = copiedThrough; index < input.length; index += 1) originalIndices.push(index);
-  const view = runs.join("");
+  append(copiedThrough, input.length);
 
-  // Track the source interval of every UTF-16 code unit as existing scanner
-  // stages replace values. A later stage may cover a prior mask; all its
-  // replacement bytes then inherit the complete original credential interval.
-  let starts = originalIndices.map((_index, index) => index);
-  let ends = starts.map(index => index + 1);
+  const spans = [
+    ...credentialSpansForView(transparent, (text, apply) => redactPlainSensitiveText(text, apply)),
+    ...credentialSpansForView(boundary, redactBoundaryTokenRanges),
+  ].sort((a, b) => a.start - b.start || b.end - a.end);
+  if (spans.length === 0) return input;
+
+  const union: CredentialSpan[] = [];
+  for (const span of spans) {
+    const previous = union[union.length - 1];
+    if (previous && span.start <= previous.end) {
+      if (span.end > previous.end) {
+        // Keep only the outer delimiters when two replacement spans join.
+        const prefix = previous.replacement.slice(0, previous.replacement.indexOf(REDACTED_EVENT_VALUE));
+        const suffix = span.replacement.slice(span.replacement.indexOf(REDACTED_EVENT_VALUE) + REDACTED_EVENT_VALUE.length);
+        previous.replacement = prefix + REDACTED_EVENT_VALUE + suffix;
+        previous.end = span.end;
+      }
+    } else union.push({ ...span });
+  }
+  const parts: string[] = [];
+  copiedThrough = 0;
+  for (const span of union) {
+    parts.push(input.slice(copiedThrough, span.start), span.replacement);
+    copiedThrough = span.end;
+  }
+  parts.push(input.slice(copiedThrough));
+  return parts.join("");
+}
+
+function credentialSpansForView(
+  view: AnsiCredentialView,
+  scan: (text: string, apply: ApplyRedactionStage) => string,
+): CredentialSpan[] {
+  const spans: CredentialSpan[] = [];
+  // Replacement bytes inherit their source interval, so a later stage covering
+  // an earlier mask still maps to the entire original credential, not a diff.
+  let starts = view.starts;
+  let ends = view.ends;
+  let changed = starts.map(() => false);
   const apply: ApplyRedactionStage = (text, stage) => {
     const edits: Array<{ start: number; end: number; replacement: string }> = [];
     const output = stage(text, (start, end, replacement) => {
-      edits.push({ start, end, replacement });
+      if (text.slice(start, end) !== replacement) edits.push({ start, end, replacement });
       return replacement;
     });
     if (edits.length === 0) return output;
     const nextStarts: number[] = [];
     const nextEnds: number[] = [];
+    const nextChanged: boolean[] = [];
     let cursor = 0;
     for (const edit of edits) {
       for (; cursor < edit.start; cursor += 1) {
         nextStarts.push(starts[cursor]);
         nextEnds.push(ends[cursor]);
+        nextChanged.push(changed[cursor]);
       }
-      const sourceStart = starts[edit.start] ?? view.length;
+      const sourceStart = starts[edit.start] ?? ends[ends.length - 1] ?? 0;
       const sourceEnd = edit.end === edit.start ? sourceStart : ends[edit.end - 1];
       for (let index = 0; index < edit.replacement.length; index += 1) {
         nextStarts.push(sourceStart);
         nextEnds.push(sourceEnd);
+        nextChanged.push(true);
       }
       cursor = edit.end;
     }
     for (; cursor < text.length; cursor += 1) {
       nextStarts.push(starts[cursor]);
       nextEnds.push(ends[cursor]);
+      nextChanged.push(changed[cursor]);
     }
     starts = nextStarts;
     ends = nextEnds;
+    changed = nextChanged;
     return output;
   };
-  const masked = redactPlainSensitiveText(view, apply);
-  if (masked === view) return input;
-
-  const parts: string[] = [];
-  copiedThrough = 0;
+  const masked = scan(view.text, apply);
   for (let index = 0; index < masked.length;) {
+    if (!changed[index]) { index += 1; continue; }
     let end = index + 1;
-    while (end < masked.length && starts[end] === starts[index] && ends[end] === ends[index]) end += 1;
-    const originalStart = originalIndices[starts[index]] ?? input.length;
-    const originalEnd = ends[index] === starts[index]
-      ? originalStart : originalIndices[ends[index] - 1] + 1;
-    if (originalStart > copiedThrough) parts.push(input.slice(copiedThrough, originalStart));
-    parts.push(masked.slice(index, end));
-    copiedThrough = Math.max(copiedThrough, originalEnd);
+    while (end < masked.length && changed[end] && starts[end] === starts[index] && ends[end] === ends[index]) end += 1;
+    spans.push({ start: starts[index], end: ends[index], replacement: masked.slice(index, end) });
     index = end;
   }
-  parts.push(input.slice(copiedThrough));
-  return parts.join("");
+  return spans;
 }
 
 // The shared command scanner exposes rewritten text, not source intervals.
@@ -1212,12 +1261,28 @@ function redactCommandTextRanges(input: string, apply: ApplyRedactionStage): str
       const quote = escapedQuote ?? rawQuote ?? "";
       return prefix + quote + replace(index + prefix.length + quote.length, index + match.length - quote.length, REDACTED_EVENT_VALUE) + quote;
     }));
-  for (const pattern of [RANGE_COMMAND_OPENAI_KEY_RE, RANGE_COMMAND_GITHUB_TOKEN_RE, RANGE_COMMAND_JWT_RE]) {
-    text = apply(text, (value, replace) => value.replace(pattern, (match: string, index: number) =>
-      pattern === RANGE_COMMAND_JWT_RE && !looksLikeCredentialJwt(match)
-        ? match : replace(index, index + match.length, REDACTED_EVENT_VALUE)));
+  return redactTokenPatterns(text, apply, [RANGE_COMMAND_OPENAI_KEY_RE, RANGE_COMMAND_GITHUB_TOKEN_RE, RANGE_COMMAND_JWT_RE]);
+}
+
+function redactTokenPatterns(input: string, apply: ApplyRedactionStage, patterns: RegExp[], barePrefixesOnly = false): string {
+  let text = input;
+  for (const pattern of patterns) {
+    text = apply(text, (value, replace) => value.replace(pattern, (match: string, index: number) => {
+      if (barePrefixesOnly && !STRICT_CREDENTIAL_SHAPES.tokenPrefixes.some(prefix => match.startsWith(prefix))) return match;
+      if (pattern === RANGE_COMMAND_JWT_RE && !looksLikeCredentialJwt(match)) return match;
+      return replace(index, index + match.length, REDACTED_EVENT_VALUE);
+    }));
   }
   return text;
+}
+
+function redactBoundaryTokenRanges(input: string, apply: ApplyRedactionStage): string {
+  // Reuse exactly the uncoloured body lengths, charsets and JWT validation.
+  // Never run Bearer/Basic/Authorization or context-sensitive rules on V2.
+  return redactTokenPatterns(input, apply, [
+    RANGE_COMMAND_OPENAI_KEY_RE, RANGE_COMMAND_GITHUB_TOKEN_RE, RANGE_COMMAND_JWT_RE,
+    GITHUB_FINE_GRAINED_TOKEN_RE, AWS_ACCESS_KEY_ID_RE,
+  ], true);
 }
 
 function redactPlainSensitiveText(input: string, track?: ApplyRedactionStage): string {
@@ -1234,9 +1299,5 @@ function redactPlainSensitiveText(input: string, track?: ApplyRedactionStage): s
       (match: string, prefix: string, suffix: string, index: number) => prefix + replace(index + prefix.length, index + match.length - suffix.length, REDACTED_EVENT_VALUE) + suffix));
   }
   text = track ? redactCommandTextRanges(text, apply) : redactCommandText(text, REDACTED_EVENT_VALUE);
-  for (const pattern of [GITHUB_FINE_GRAINED_TOKEN_RE, AWS_ACCESS_KEY_ID_RE]) {
-    text = apply(text, (value, replace) => value.replace(pattern,
-      (match: string, index: number) => replace(index, index + match.length, REDACTED_EVENT_VALUE)));
-  }
-  return text;
+  return redactTokenPatterns(text, apply, [GITHUB_FINE_GRAINED_TOKEN_RE, AWS_ACCESS_KEY_ID_RE]);
 }
