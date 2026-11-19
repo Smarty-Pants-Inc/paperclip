@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { createObjectRunLogStore, listUnrecoveredObjectRunLogSpills, readObjectRunLogSpill,
   resolveObjectRunLogSpillDir } from "./object-run-log-store.js";
-import { event, ids, newStore, readAll, record, sha, spilledRun } from "./object-run-log-spill.fixture.js";
+import { event, ids, newStore, readAll, record, sha, spilledRun, spillMemory } from "./object-run-log-spill.fixture.js";
 import { recoverSpilledRunLog } from "./heartbeat/run-log-spill-recovery.js";
 
 vi.mock("../middleware/logger.js", () => ({ logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() } }));
@@ -78,6 +78,42 @@ describe("a spilled run log becomes readable once storage is restored", () => {
     expect(r.m.state.payloadPuts).toBe(puts);
     expect((await readAll(store, r.logRef)).equals(r.admitted)).toBe(true);
     expect((await readObjectRunLogSpill(r.spillDir, r.logRef)).unrecovered.length).toBe(0);
+  }, 30_000);
+
+  it("a recovery that storage takes only part of resumes at the right offset: every range lands once, in order", async () => {
+    const m = spillMemory(), spillDir = mkdtempSync(path.join(os.tmpdir(), "objlog-spill-"));
+    const store = newStore(m, spillDir), runId = "spill-partial";
+    const handle = await store.begin({ ...ids, runId });
+    await store.append(handle, event(1, "one"));
+    // Record 2 is in a failing flush while record 3 is admitted behind it: two spilled ranges, one journal offset.
+    let release!: () => void;
+    Object.assign(m.state, { down: true, hold: new Promise<void>(resolve => { release = resolve; }) });
+    const big = "b".repeat(200_000);
+    const second = (await store.enqueue!(handle, event(2, "small"))).committed.catch(() => undefined);
+    const flushing = store.flush!(handle).catch(() => undefined);
+    await vi.waitFor(() => expect(m.state.held).toBe(true));
+    const third = (await store.enqueue!(handle, event(3, big))).committed.catch(() => undefined);
+    m.state.hold = undefined;
+    release();
+    await flushing;
+    const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    try { expect((await store.finalize(handle)).bytes).toBeNull(); } finally { warning.mockRestore(); }
+    await Promise.all([second, third]);
+    const admitted = Buffer.concat([record(handle.attemptId, 1, "one"), record(handle.attemptId, 2, "small"), record(handle.attemptId, 3, big)]);
+    const spilled = (await readObjectRunLogSpill(spillDir, handle.logRef)).records.filter(entry => entry.event === "spilled");
+    expect(spilled.length).toBe(2);
+    expect(spilled[1]!.journalEnd).toBe(spilled[0]!.journalEnd);
+    // Storage is back for small objects only: the first range is stored, the second still refused.
+    Object.assign(m.state, { down: false, maxPayloadBytes: 50_000 });
+    await expect(newStore(m, spillDir).recoverSpill!({ ...ids, runId })).rejects.toMatchObject({ code: "EIO" });
+    const partial = await readObjectRunLogSpill(spillDir, handle.logRef);
+    expect(partial.records.map(entry => entry.event)).toEqual(["spilled", "spilled", "recovered"]);
+    expect(Buffer.concat([await readAll(newStore(m, spillDir), handle.logRef), partial.unrecovered]).equals(admitted)).toBe(true);
+    // Fully restored: the second range goes right behind the first.
+    m.state.maxPayloadBytes = Infinity;
+    const restored = newStore(m, spillDir);
+    expect(await restored.recoverSpill!({ ...ids, runId })).toEqual({ bytes: admitted.length, sha256: sha(admitted), compressed: false });
+    expect((await readAll(restored, handle.logRef)).equals(admitted)).toBe(true);
   }, 30_000);
 
   it("a spill that no longer fits the journal end is kept, and the log is never closed as complete", async () => {
