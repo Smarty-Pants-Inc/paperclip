@@ -424,7 +424,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     || !["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return { kind: "out_of_scope" };
   const agentId = issue.assigneeAgentId;
 
-  const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments).where(and(
+  const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt,
+    authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)))
     .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
@@ -475,13 +476,16 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // run the person's message ended on: the automatic lineage, typed or not,
   // ends there (fork-lead a6342a4d4, fresh-continuation-chain.ts).
   const latest = runs[0];
-  // Stop means stop: the person stopped this task's latest turn (the chat
-  // bar's own reading, routes/issues.ts buildQueuedCommentQueue) after this
-  // message was saved. The stopped message and any message held by that Stop
-  // are the person's to send again; a newer run (a typed message, the held
-  // batch) is newer than the Stop and ends this, so its failure still shows.
+  // Stop means stop: the message's own sender stopped this task's latest turn
+  // (the chat bar's own reading, routes/issues.ts buildQueuedCommentQueue)
+  // after this message was saved (ruling (b): the SENDER's Stop only; another
+  // person's Stop leaves the sender's card). The stopped message and any
+  // message held by that Stop are the sender's to send again; a newer run (a
+  // typed message, the held batch) is newer than the Stop and ends this, so
+  // its failure still shows.
   const stop = (latest?.resultJson ?? {}) as Record<string, unknown>;
   if (latest?.status === "cancelled" && stop.cancelledByActorType === "user" && !stop.queuedCommentInterruptQueueId
+    && typeof stop.cancelledByUserId === "string" && !!message.authorUserId && stop.cancelledByUserId === message.authorUserId
     && message.createdAt <= (latest.finishedAt ?? latest.updatedAt)) return { kind: "explained" };
   const run = messageRun && latest && latest.id !== messageRun.id
     && ["failed", "timed_out", "interrupted", "cancelled"].includes(latest.status)
