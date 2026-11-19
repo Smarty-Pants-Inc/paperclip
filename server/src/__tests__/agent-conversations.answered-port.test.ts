@@ -24,6 +24,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, authUsers, companies, createDb, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
 import { recoveryPostgresSupport as support, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
 import { issueRoutes } from "../routes/issues.js";
+import { agentRoutes } from "../routes/agents.js";
+import { heartbeatService } from "../services/heartbeat.js";
 import { activityRoutes } from "../routes/activity.js";
 import { errorHandler } from "../middleware/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
@@ -34,7 +36,11 @@ import { prepareConversationTurn, settleConversationTurnForRun } from "../servic
 import { answeredPersonMessageSql } from "../services/person-message-answer.js";
 import { settleUnansweredPersonMessages, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
 
-type Turn = { reply?: string; progress?: string; card?: boolean; exit?: number; hold?: () => Promise<void> };
+/** The person's own Stop of a run with a pending card, as a333913e leaves the chat (the control row pins it). */
+const PERSON_STOP_AS_ON_BASE = { statusRow: "In Progress", notices: [] as string[] };
+type Turn = { reply?: string; progress?: string; card?: boolean; exit?: number; hold?: () => Promise<void>;
+  /** Runs after the card is posted, while the turn is still running. */
+  afterCard?: () => Promise<void> };
 
 (support.supported ? describe : describe.skip)("F-B: the chat's answered state follows the one function", () => {
   let database: Awaited<ReturnType<typeof startRecoveryPostgres>>;
@@ -90,6 +96,7 @@ type Turn = { reply?: string; progress?: string; card?: boolean; exit?: number; 
             payload: { version: 1, questions: [{ id: "q1", prompt: "Which color?", selectionMode: "single",
               options: [{ id: "blue", label: "Blue" }, { id: "red", label: "Red" }] }] } } as never, { agentId });
         }
+        if (turn.card) await turn.afterCard?.();
         if (turn.progress) {
           const comment = await issueService(db).addComment(issueId, turn.progress, { agentId, runId: run!.id });
           // PLANTED: the report_progress receipt (the native runner's tool path writes it on the run's result).
@@ -119,6 +126,7 @@ type Turn = { reply?: string; progress?: string; card?: boolean; exit?: number; 
     app.use(actorMiddleware(db, { deploymentMode: "local_trusted" }));
     app.use("/api", issueRoutes(db, { wakeup: async () => null } as never));
     app.use("/api", activityRoutes(db));
+    app.use("/api", agentRoutes(db));
     app.use(errorHandler);
 
     /** The person's Send: the real board route. */
@@ -303,4 +311,53 @@ type Turn = { reply?: string; progress?: string; card?: boolean; exit?: number; 
     const { seen } = await c.parity("card answer beside an owed message", [m0.id, m1.id]);
     expect(seen.statusRow).toBe("In Progress");
   }, 120_000);
+
+  // rf-5 m9 finding 3: a pending, answerable card is the person's next step whatever ended its run. A run the
+  // SYSTEM cancelled must park the chat exactly as a failed / timed-out one does (case 2): the same one-function read.
+  /** A turn that posts its card (the real producer) and is then still running when `end` is called. */
+  async function cardThenStillRunning() {
+    const c = await chat();
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let posted!: () => void;
+    const cardPosted = new Promise<void>(resolve => { posted = resolve; });
+    c.script.push({ card: true, afterCard: async () => { posted(); await held; } });
+    const m = await c.send("Pick a color for me.");
+    await cardPosted;
+    const runId = c.turns[0]!.runId;
+    expect((await c.runs()).find(run => run.id === runId)!.status, "the run that posted the card is still running").toBe("running");
+    return { c, m, runId, release };
+  }
+
+  it("a pending card from a run the SYSTEM then cancelled (the real cancel, no user actor): the person has a card to answer -> In Review, no notice", async () => {
+    const { c, m, runId, release } = await cardThenStillRunning();
+    // REAL: the system's cancel, as the server's own callers make it (heartbeat.cancelRun(runId, reason) with no
+    // actor: index.ts "Native startup timed out; cancelling and verifying cleanup").
+    await heartbeatService(db).cancelRun(runId, "Cancelled by control plane");
+    release();
+    await c.idle("card then system cancel");
+    const cancelled = (await c.runs()).find(run => run.id === runId)!;
+    expect(cancelled.status).toBe("cancelled");
+    expect((cancelled.resultJson as Record<string, unknown> | null)?.cancelledByActorType ?? null, "no person cancelled it").not.toBe("user");
+    const [card] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, c.issueId));
+    expect(card, "the card is still pending and answerable").toMatchObject({ status: "pending", sourceRunId: runId });
+    const { verdicts, seen } = await c.parity("pending card from a system-cancelled run", [m.id]);
+    expect(verdicts, "the one function: an answerable card answers M whatever the run's later status").toEqual([true]);
+    expect(seen, "the Status row says the person is the one being waited on").toMatchObject({ statusRow: "In Review", notices: [] });
+  }, 90_000);
+
+  it("control (ruling 8): the person's OWN Stop of that run (the real Stop route) keeps its own semantics: the chat is not parked by the cancel arm", async () => {
+    const { c, runId, release } = await cardThenStillRunning();
+    // REAL: the person's Stop, the board route the chat's Stop button calls.
+    const stop = await request(c.app).post(`/api/heartbeat-runs/${runId}/cancel`).send({});
+    expect(stop.status, JSON.stringify(stop.body)).toBe(200);
+    release();
+    await c.idle("card then the person's Stop");
+    const stopped = (await c.runs()).find(run => run.id === runId)!;
+    expect(stopped, "what the real Stop route recorded").toMatchObject({ status: "cancelled", resultJson: { cancelledByActorType: "user" } });
+    await c.sweep();
+    const seen = await c.screen();
+    console.log("M9_PERSON_STOP_CONTROL", JSON.stringify({ statusRow: seen.statusRow, notices: seen.notices, stored: (await c.stored()).conversationState }));
+    expect({ statusRow: seen.statusRow, notices: seen.notices }, "unchanged by the system-cancel arm").toEqual(PERSON_STOP_AS_ON_BASE);
+  }, 90_000);
 });
