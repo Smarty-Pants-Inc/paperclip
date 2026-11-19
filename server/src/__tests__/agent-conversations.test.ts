@@ -811,7 +811,7 @@ import {
       const send = async (body: string) => {
         if (chatMode) {
           const response = await request(routes(null)).post(`/api/issues/${issue.id}/comments`)
-            .send({ body, clientRequestId: randomUUID() }).expect(201);
+            .send({ body, clientRequestId: randomUUID(), deliveryIntent: "queue" }).expect(201);
           return response.body;
         }
         const comment = await issueService(db).addComment(issue.id, body, { userId: "local-board" },

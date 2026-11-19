@@ -174,12 +174,15 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
 
   type Chat = Awaited<ReturnType<typeof seedChat>>;
 
-  /** Sends person messages while the turn runs, through the real chat delivery outbox. */
+  /** Legacy Queue/Interrupt rows opt into Queue explicitly. Every message is
+   * saved by the real HTTP route and the real chat outbox, never by a test-only
+   * delivery selector. The S-* default rows intentionally omit this mode. */
   async function send(chat: Chat, bodies: string[]) {
-    const sent = [];
+    const sent: Array<{ id: string; body: string }> = [];
     for (const body of bodies) {
-      sent.push(await issueService(db).addComment(chat.issue.id, body, { userId: owner },
-        { clientRequestId: randomUUID() }));
+      const response = await request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/comments`)
+        .send({ body, clientRequestId: randomUUID(), deliveryIntent: "queue" }).expect(201);
+      sent.push(response.body);
     }
     await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup);
     return sent;
