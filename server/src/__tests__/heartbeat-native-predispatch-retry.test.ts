@@ -3,7 +3,10 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { and, eq, inArray } from "drizzle-orm";
 import { activityLog, agents, authUsers, companyMemberships, createDb, environmentLeases, environments, heartbeatRuns, issueComments,
-  issueRecoveryActions, issueRelations, issues } from "@paperclipai/db";
+  issueRecoveryActions, issueRelations, issues, nativeHarnessBackups, plugins } from "@paperclipai/db";
+import { environmentRuntimeService } from "../services/environment-runtime.js";
+import { hasPendingRunCleanup } from "../services/execution-blocker.js";
+import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { NativePredecessorRetirementUnprovenError } from "../services/native-runtime/predecessor-retirement.js";
 import { NativeProviderArtifactTransferTimeoutError } from "../services/native-runtime/native-provider-artifacts.js";
 import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
@@ -240,6 +243,122 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
     } finally {
       await heartbeat.drainActiveRunExecutions();
       await closeIdleWarmNativeSessionsForRestart();
+      await db.$client.end();
+    }
+  }, 90_000);
+
+  it("releases a certified fresh-box retry from its predecessor's named custody obligation without destroying the old box", async () => {
+    const { companyId, agentId } = fixture.current;
+    const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
+    const pluginId = randomUUID(), driverKey = `custody-pd-${pluginId}`;
+    const config = { provider: driverKey, image: "fake:test", reuseLease: false };
+    const methods = ["environmentAcquireLease", "environmentResumeLease", "environmentStopLease", "environmentDestroyLease",
+      "environmentReleaseLease", "environmentExecute"];
+    await db.insert(plugins).values({ id: pluginId, pluginKey: driverKey, packageName: "@paperclipai/plugin-fake-sandbox",
+      version: "1.0.0", apiVersion: 1, categories: ["automation"], status: "ready", installOrder: 1,
+      manifestJson: { id: driverKey, apiVersion: 1, version: "1.0.0", displayName: "Custody provider", description: "Test provider",
+        author: "Paperclip", categories: ["automation"], capabilities: ["environment.drivers.register"],
+        entrypoints: { worker: "dist/worker.js" }, environmentDrivers: [{ driverKey, kind: "sandbox_provider",
+          displayName: "Custody provider", configSchema: { type: "object" } }] } } as never);
+    const [environment] = await db.insert(environments).values({ name: driverKey, driver: "sandbox", config }).returning();
+    const oldBox = "sandbox-reused", freshBox = `fresh-${randomUUID()}`;
+    const calls: Array<{ method: string; box?: string }> = [];
+    let stopAvailable = false;
+    const manager = { isRunning: (id: string) => id === pluginId,
+      getWorker: () => ({ supportedMethods: methods }),
+      call: async (_id: string, method: string, params: { providerLeaseId?: string }) => {
+        calls.push({ method, box: params.providerLeaseId });
+        if (method === "environmentAcquireLease") return { providerLeaseId: freshBox,
+          metadata: { ...config, remoteCwd: "/workspace" } };
+        if (method === "environmentStopLease") {
+          if (params.providerLeaseId === oldBox && !stopAvailable) throw new Error("Provider stop temporarily unavailable");
+          return { providerLeaseId: params.providerLeaseId, state: "stopped" };
+        }
+        if (method === "environmentDestroyLease" || method === "environmentReleaseLease")
+          return { providerLeaseId: params.providerLeaseId, state: "destroyed" };
+        throw new Error(`Unexpected provider call ${method}`);
+      } } as unknown as PluginWorkerManager;
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: manager });
+    const turnMessages = new Map<string, string>();
+    const backend = nativeBackend(db, { unretiredPredecessorOnce: { failed: false, environmentId: environment!.id,
+      leasePolicy: "reuse_by_execution_workspace" }, turnMessages });
+    let successorLease: Awaited<ReturnType<typeof runtime.acquireRunLease>> | undefined;
+    const heartbeat = heartbeatService(db, { environmentRuntime: runtime, pluginWorkerManager: manager,
+      nativeSessionBackendFactory: execution => {
+        const sessionBackend = backend(execution);
+        return { ...sessionBackend, descriptor: async () => {
+          try {
+            const descriptor = await sessionBackend.descriptor();
+            successorLease = await runtime.acquireRunLease({ companyId, environment: environment!, agentId,
+              heartbeatRunId: execution.binding.runId, issueId: execution.binding.issueId,
+              persistedExecutionWorkspace: null, adapterType: "paperclip_runner" });
+            return descriptor;
+          } catch (error) {
+            if (error instanceof NativePredecessorRetirementUnprovenError) {
+              await db.update(environmentLeases).set({ provider: driverKey,
+                metadata: { ...config, driver: "sandbox", remoteCwd: "/workspace", pluginId,
+                  pluginKey: driverKey, sandboxProviderPlugin: true } }).where(and(
+                eq(environmentLeases.heartbeatRunId, execution.binding.runId), eq(environmentLeases.providerLeaseId, oldBox)));
+            }
+            throw error;
+          }
+        } };
+      } });
+    try {
+      const { runId } = await startTask(db, heartbeat);
+      const [oldLease] = await db.select().from(environmentLeases).where(and(
+        eq(environmentLeases.heartbeatRunId, runId), eq(environmentLeases.providerLeaseId, oldBox)));
+      expect(oldLease).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed",
+        metadata: expect.objectContaining({ orphanedRunLeaseRecovery: expect.objectContaining({ nativeCustodyUnverified: true }) }) });
+      expect(await db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.runId, runId))).toEqual([]);
+      expect(await hasPendingRunCleanup(db, companyId, runId)).toBe(false);
+      const [failed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      // Neither a generic cleanup failure, a foreign replacement marker, nor a
+      // certificate for another box can release the predecessor's execution gate.
+      for (const metadata of [{ ...oldLease!.metadata, orphanedRunLeaseRecovery: {} },
+        { ...oldLease!.metadata, replaceBeforeReuse: { ...oldLease!.metadata?.replaceBeforeReuse as object, runId: randomUUID() } }]) {
+        await db.update(environmentLeases).set({ metadata }).where(eq(environmentLeases.id, oldLease!.id));
+        expect(await hasPendingRunCleanup(db, companyId, runId)).toBe(true);
+      }
+      await db.update(environmentLeases).set({ metadata: oldLease!.metadata }).where(eq(environmentLeases.id, oldLease!.id));
+      const fallback = failed!.resultJson!.predecessorRetirementFallback as Record<string, unknown>;
+      for (const invalid of [{ ...fallback, providerWorkStarted: true }, { ...fallback, replacedProviderLeaseIds: [freshBox] }]) {
+        await db.update(heartbeatRuns).set({ resultJson: { ...failed!.resultJson, predecessorRetirementFallback: invalid } })
+          .where(eq(heartbeatRuns.id, runId));
+        expect(await hasPendingRunCleanup(db, companyId, runId)).toBe(true);
+      }
+      await db.update(heartbeatRuns).set({ resultJson: failed!.resultJson }).where(eq(heartbeatRuns.id, runId));
+      const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+      expect(await heartbeat.promoteDueScheduledRetries()).toMatchObject({ promoted: 1 });
+      await heartbeat.resumeQueuedRuns();
+      await waitForCondition("the fresh-box custody successor to succeed", async () =>
+        (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor!.id)))[0]?.status === "succeeded");
+      await waitForCondition("the fresh-box custody successor to settle", () => heartbeat.getTaskDrainStatus().quiescent);
+      expect(successorLease?.lease.providerLeaseId).toBe(freshBox);
+      expect(successorLease?.lease.id).not.toBe(oldLease!.id);
+      expect(turnMessages.has(runId)).toBe(false);
+      expect(turnMessages.has(successor!.id)).toBe(true);
+      expect(calls.filter(call => call.box === oldBox && /Destroy|Release/.test(call.method))).toEqual([]);
+      // Restore provider availability and drive the ordinary pending-cleanup
+      // sweep: stop-only settlement, still no verified copy and no destroy.
+      stopAvailable = true;
+      await db.update(environmentLeases).set({ updatedAt: new Date(Date.now() - 60_000) })
+        .where(eq(environmentLeases.id, oldLease!.id));
+      await heartbeat.sweepPendingCleanupLeases();
+      const [kept] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, oldLease!.id));
+      expect(kept).toMatchObject({ status: "released", cleanupStatus: "success", metadata: expect.objectContaining({
+        remoteExecutionTermination: expect.objectContaining({ state: "stopped", providerLeaseId: oldBox }),
+        orphanedRunLeaseRecovery: expect.objectContaining({ nativeCustodyUnverified: true }) }) });
+      expect(calls.filter(call => call.box === oldBox && call.method === "environmentStopLease")).toHaveLength(2);
+      expect(calls.filter(call => call.box === oldBox && /Destroy|Release/.test(call.method))).toEqual([]);
+      console.log("CUSTODY_PREDISPATCH", JSON.stringify({ runId, successorRunId: successor!.id,
+        oldBox, freshBox, oldLeaseId: oldLease!.id, freshLeaseId: successorLease!.lease.id, calls,
+        oldStatus: kept!.status, termination: kept!.metadata?.remoteExecutionTermination }));
+    } finally {
+      await heartbeat.drainActiveRunExecutions();
+      await closeIdleWarmNativeSessionsForRestart();
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(and(
+        eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["queued", "scheduled_retry"])));
       await db.$client.end();
     }
   }, 90_000);
