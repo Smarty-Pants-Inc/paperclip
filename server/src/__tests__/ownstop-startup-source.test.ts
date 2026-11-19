@@ -227,7 +227,7 @@ describe.skipIf(!support.supported)("own Stop during startup writes no reconcili
         }
       }
       expect(fixture.calls).toEqual([]);
-      if (kind === "tree_pause") return;
+      if ((kind as string) === "tree_pause") return;
       const sent = await s.send();
       console.log("OWNSTOP SEND", sent.status, JSON.stringify(sent.body).slice(0, 400));
       expect(sent.status).toBe(200);
