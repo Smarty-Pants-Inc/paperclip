@@ -45,7 +45,7 @@ export async function settleWarmRetention(db: Db, lease: typeof environmentLease
     if (run.status !== "succeeded" && disposition !== "keep_running") return { lease: current, disposition };
     const completedTurn = run.status === "succeeded" || run.status === "cancelled"
       && !!run.runnerProfileJson?.nativeRetainedIdleCheckpoint
-      && (await import("./native-runtime/native-session-executor.js")).hasRetainedNativeTurnStop?.(run) === true;
+      && (await import("./native-runtime/native-session-executor.js")).hasRetainedNativeTurnStop?.(run, current, { settlingAllocation: true }) === true;
     const metadata = { ...current.metadata };
     if (completedTurn || metadata.warmFailureRunId !== lease.heartbeatRunId) {
       const prior = typeof metadata.warmFailureStreak === "number" && Number.isSafeInteger(metadata.warmFailureStreak)
