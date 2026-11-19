@@ -14,7 +14,7 @@ import { notifyChatRunMilestones } from "../../../services/chat-run-milestone-no
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-work-notifications.js";
 import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
 import { readRunCancellation } from "../../../services/run-cancellation.js";
-import { CHAT_COMPLETION_WAKE_REASON, isCompletedOnboardingHandoffWake, supersedeStaleChatCompletionWake } from "../../../services/chat-completion-delivery.js";
+import { CHAT_COMPLETION_WAKE_REASON, isCompletedOnboardingHandoffWake, supersedeStaleChatCompletionWake, clipForNote } from "../../../services/chat-completion-delivery.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition, isConversationReset } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
@@ -484,9 +484,14 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           const held = commentIds.length ? await tx.select({ body: issueComments.body }).from(issueComments).where(and(
             eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
             inArray(issueComments.id, commentIds), isNull(issueComments.deletedAt))).orderBy(asc(issueComments.createdAt)) : [];
-          const named = held.map(comment => `Saved update: "${comment.body}".`);
+          // Bounded, no raw reason codes: quotes ~60 characters each, at most 3, then 'and N more'.
+          const quoted = held.map(comment => `"${clipForNote(comment.body)}"`);
+          const listed = quoted.slice(0, 3).join("; ") + (quoted.length > 3 ? `; and ${quoted.length - 3} more` : "");
+          const body = quoted.length
+            ? `Not run because the conversation moved on (${quoted.length === 1 ? "this update was" : "these updates were"} delayed): ${listed}.`
+            : "A delayed automatic update was not run because the conversation moved on.";
           await insertIssueComment(tx, { companyId, issueId, authorType: "system",
-            body: [...named, `The queued "${cancelled.reason ?? "system"}" update was not delivered as a turn because the conversation moved on.`].join("\n"),
+            body,
             metadata: { version: 1, sections: [], authorizationReason: `stale_system_wake:${wakeId}` } });
         }
       }
