@@ -1235,15 +1235,28 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     await quiet();
   });
 
-  it("reconciles retention without issue row locks", async () => {
-    await seedSession({ closedDaysAgo: 2 }); const queries: string[] = [];
+  // rf-3 item 3 (amended record): this row asserted only the reconcile's SQL and
+  // its (absent) deadline. It also asserts the kept BYTES: past the deadline tB2
+  // armed for this close (close + 7d + 1 = now + 5d + 1), the backup is still
+  // current and re-hashes. The bytes are checked before the deadline/SQL ones, so
+  // tB2 behaviour (keep predicate false) fails on the bytes, not only on them.
+  it("reconciles retention without issue row locks and keeps the backup past its former deadline", async () => {
+    const session = await seedSession({ closedDaysAgo: 2 }); const queries: string[] = [];
     const previous = db.$client.options.debug;
     db.$client.options.debug = (_connection, query) => { queries.push(query); };
+    const idle = () => vi.waitFor(async () => {
+      await vi.advanceTimersByTimeAsync(1000); expect(idleWorkSnapshot().active).toBe(0);
+    }, { timeout: 5000 });
     try {
-      await startBackups(); await settled();
+      await startBackups(); await idle();
+      const deadline = coordinator!.nextWakeAt();
+      await vi.advanceTimersByTimeAsync(8 * DAY_MS); await idle();
+      await expectKept(session);
+      expect(await taskSessionCount(session.agentId)).toBe(1);
+      expect(deadline).toBeNull();
       expect(queries.some(query => /for\s+share/i.test(query))).toBe(false);
     } finally { db.$client.options.debug = previous; }
-    await quiet();
+    await settled(); await quiet();
   });
 
   it("finds a backup root's leases by run, backup stamp and identity through indexes, within one company", async () => {
@@ -1790,15 +1803,25 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     expect(await exists(archive)).toBe(true);
   });
 
-  it("dry run reports no evidence candidate, before or after new evidence is written", async () => {
+  // rf-3 item 3 (amended record): this row asserted only dry-run counters. It also
+  // asserts the kept BYTES: a real pass after the dry run (where tB2 removed the
+  // 10-day archive) leaves it in place and it re-hashes to its seed digest. The
+  // bytes are checked before the counters, so tB2 behaviour fails on the bytes.
+  it("dry run reports no evidence candidate, before or after new evidence is written, and a real pass after it keeps the archive", async () => {
     const session = await seedSession({ issueStatus: "in_progress", backupAgeDays: 1 });
-    await seedArchive(session.root);
+    const archive = await seedArchive(session.root);
+    const digest = await treeDigest(archive);
     const retention = evidenceService({ dryRun: true });
+    const later = { now: new Date(now.getTime() + 7 * DAY_MS) };
 
-    expect(await retention.tick()).toMatchObject({ evidenceCandidates: 0 });
-    expect(await retention.tick()).toMatchObject({ evidenceCandidates: 0 });
+    const reports = [await retention.tick(), await retention.tick()];
     retention.noteEvidence(now.getTime());
-    expect(await retention.tick({ now: new Date(now.getTime() + 7 * DAY_MS) })).toMatchObject({ evidenceCandidates: 0 });
+    reports.push(await retention.tick(later));
+    const real = await evidenceService().tick(later);
+    expect(await exists(archive)).toBe(true);
+    expect(await treeDigest(archive)).toBe(digest);
+    for (const report of reports) expect(report).toMatchObject({ evidenceCandidates: 0 });
+    expect(real).toMatchObject({ evidenceCandidates: 0, evidenceRemoved: 0, skipped: { native_runner_evidence_kept: 1 } });
   });
 
   it("counts inspected archives against the entry limit and keeps leftovers", async () => {

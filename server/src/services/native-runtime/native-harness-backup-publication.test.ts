@@ -85,7 +85,12 @@ describe("native harness backup publication", () => {
   // Retargeted (rotation-keep): publication no longer removes the retired tree,
   // so there is no long removal to stay responsive through; the request is
   // still served during publication and the 2,000-file tree is kept whole.
-  it("serves an unrelated request during publication and keeps the retired backup whole", async () => {
+  // Trigger retargeted again (rf-3 04:04Z, amended record): the stamp holds
+  // publication until the probe response is served, so the request lands while
+  // the retired 2,000-file tree is moved aside ('previous', not yet in
+  // superseded). The strength is kept: exactly "1" (served while publication
+  // is still active), as before the keep; accepting "0" was a weakening.
+  it("serves an unrelated request while the retired backup is moved aside and keeps it whole", async () => {
     const input = await fixture();
     for (let index = 0; index < 40; index++) {
       const directory = path.join(input.current, `skill-${index}`);
@@ -95,6 +100,7 @@ describe("native harness backup publication", () => {
       await fs.chmod(directory, 0o555);
     }
     let publishing = false;
+    let servedWhileAside: { previous: boolean; superseded: boolean } | undefined;
     let probeReceived: (response: ServerResponse | null) => void;
     const probeReady = new Promise<ServerResponse | null>(resolve => { probeReceived = resolve; });
     const server = createServer((request, response) => {
@@ -145,15 +151,23 @@ describe("native harness backup publication", () => {
           client.send({ kind: "probe" });
           const response = await probeReady;
           if (!response) return;
-          setImmediate(() => {
-            response.setHeader("x-publication-active", publishing ? "1" : "0");
-            response.end("ok");
+          await new Promise<void>(served => {
+            response.once("finish", served); response.once("close", served);
+            setImmediate(() => {
+              servedWhileAside = {
+                previous: existsSync(path.join(backupRoot, "previous", "skill-39", "file-49")),
+                superseded: existsSync(path.join(backupRoot, "superseded")),
+              };
+              response.setHeader("x-publication-active", publishing ? "1" : "0");
+              response.end("ok");
+            });
           });
         },
       }).finally(() => { publishing = false; });
       const result = await response;
       await publication;
-      expect(["0", "1"]).toContain(result.active);
+      expect(result.active).toBe("1");
+      expect(servedWhileAside).toEqual({ previous: true, superseded: false });
       expect((await fs.readdir(backupRoot)).sort()).toEqual(["current", "superseded"]);
       expect(await fs.readFile(path.join(input.current, "manifest.json"), "utf8")).toBe("replacement");
       const [kept] = await fs.readdir(path.join(backupRoot, "superseded"));
