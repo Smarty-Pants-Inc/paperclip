@@ -139,6 +139,7 @@ import { budgetService } from "../budgets.js";
 import { isBoardOwnedBudgetBlock } from "../budget-block-ownership.js";
 import { unadmittedChatWakeupCondition } from "../durable-chat-wakeup.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
+import { retireSupersededCompletionStrandedActions } from "./superseded-completion-retirement.js";
 import { PROVIDER_LIMIT_DEFAULT_COOLDOWN_MS } from "../system-recovery-state.js";
 import { parseProviderQuotaClockReset } from "../provider-quota-reset.js";
 import { hasUnverifiedNativeWorkspaceFinalizationOwner } from "../native-runtime/native-workspace-finalization-recovery-state.js";
@@ -4954,6 +4955,9 @@ export function recoveryService(
     skipExternalConversationSettlement?: boolean;
     skipRelatedRecovery?: boolean;
   }) {
+    // The false card on a person's chat (SMA-4 22d69698): retire existing
+    // stranded actions whose run failed only as a superseded completion turn.
+    await retireSupersededCompletionStrandedActions(db, { companyId: opts?.companyId, issueId: opts?.issueId });
     const candidates = await db
       .select(recoveryIssueFields)
       .from(issues)
