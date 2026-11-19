@@ -1002,6 +1002,10 @@ export function recoveryService(
     ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
     /** Settle retained explicit retry claims through the queue-first release policy. */
     settleExplicitContinuationRetry?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>;
+    /** The one release drain for a TERMINAL execution owner whose own release never ran its drain (a native
+     * turn whose workspace finalization was busy returns before it: heartbeat.ts executor). It clears the lock
+     * and promotes deferred wakes under all its own gates; the bare clear below starts nothing. */
+    releaseTerminalExecutionOwner?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>;
     /**
      * Whether a failed or interrupted run has consumed every bounded
      * transient retry, so `scheduleRecoveryRetry` can no longer produce a
@@ -7177,6 +7181,17 @@ export function recoveryService(
           referencedRunStatuses: Object.fromEntries(runStatusById),
         },
       });
+
+      // A terminal native owner whose busy finalization skipped release left
+      // plain deferred wakes undrained. Only the existing guarded clear above
+      // proves Stop and releases its claims; do not let the drain bypass that
+      // proof or its accounting/audit. The drain finds the task from the run's
+      // context and rechecks any successor before promoting at most one wake.
+      if (owner && deps.releaseTerminalExecutionOwner && issue.executionRunId === owner.id
+        && TERMINAL_HEARTBEAT_RUN_STATUSES.has(owner.status)) {
+        await deps.releaseTerminalExecutionOwner(owner).catch(err =>
+          logger.warn({ err, issueId: issue.id, runId: owner.id }, "release drain after stale-lock clear failed; lock remains released"));
+      }
     }
 
     if (result.cleared > 0 || result.terminalizedRunIds.length > 0) {
