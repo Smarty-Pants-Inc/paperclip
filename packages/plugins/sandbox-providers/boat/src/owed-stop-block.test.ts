@@ -113,7 +113,7 @@ class FakeBoat {
 
 type SpareConfig = { spares?: number; spareMax?: number; spareDemandWindowMinutes?: number; spareEnvironmentIds?: string[]; spareIdleMinutes?: number };
 type Harness = {
-  boat: FakeBoat; company: string; env: string; config: SpareConfig;
+  boat: FakeBoat; company: string; env: string; config: SpareConfig; state: Map<string, unknown>;
   /** A second company whose spares stay on (its pool keeps maintenance running). */
   otherCompany: string; otherEnv: string; acquireOther(runId: string): Promise<{ providerLeaseId: string | null }>;
   configChanged(): Promise<void>;
@@ -172,7 +172,7 @@ async function harness(name: string): Promise<Harness> {
   };
   await plugin.definition.setup(ctx as any);
   const h: Harness = {
-    boat, company, env, config, otherCompany, otherEnv,
+    boat, company, env, config, state, otherCompany, otherEnv,
     acquireOther(runId) {
       return plugin.definition.onEnvironmentAcquireLease!({ driverKey: "boat", companyId: otherCompany, environmentId: otherEnv, runId,
         creationOperationId: `attempt-${runId}`, config: baseConfig } as any) as Promise<{ providerLeaseId: string | null }>;
@@ -308,6 +308,50 @@ describe("#21251: a pool whose own owed stop keeps failing makes no new spare cr
       await advance(TICK_MS);
     }
   }
+  it("S1-A one failed tick retry is not two: keeper stop failures do not inflate the owed-retry count", async () => {
+    const { h, s1, state } = await stuckOwedStop("s1-exact-retries");
+    await tickRetries(h, s1, state, 1);
+    const at = h.boat.mark("one failed owed-stop retry");
+    await wake(h, "issue.comment.created", s1);
+    expect(poolSpareCreates(h, h.env, at)).toHaveLength(1);
+    await tickRetries(h, s1, state, 1);
+    // Remove the replacement so the capped pool would otherwise want another.
+    for (const id of h.boat.liveSpares()) if (id !== s1) h.boat.boxes.get(id)!.state = "archived";
+    const cappedAt = h.boat.mark("two failed owed-stop retries");
+    await wake(h, "issue.comment.created", s1);
+    expect(poolSpareCreates(h, h.env, cappedAt)).toEqual([]);
+  });
+
+  it("S7-B an unrelated stop result cannot erase an expired owed-retry cap across two restarts", async () => {
+    const { h, s1 } = await stuckOwedStop("s7-expired-debt");
+    await settle(h.acquireOther("seed-other"));
+    await advance(5_000);
+    const other = [...h.boat.boxes.values()].find(box => box.labels.environment === h.otherEnv && box.labels.purpose === "spare")!;
+    // Put both debts in one company's durable record; only one stop can succeed.
+    other.labels.owner = `paperclip:${h.company}`;
+    const hash = h.boat.boxes.get(s1)!.labels.configHash;
+    const otherHash = other.labels.configHash;
+    await h.restart(true);
+    h.state.set(`${h.company}:stop-owed`, { holds: [
+      { environmentId: h.env, configHash: hash, until: Date.now() - 1, failures: 6, retries: 2 },
+      { environmentId: h.otherEnv, configHash: otherHash, until: Date.now() - 1, failures: 1, retries: 0 },
+    ], owed: [
+      { environmentId: h.env, configHash: hash, spareId: s1 },
+      { environmentId: h.otherEnv, configHash: otherHash, spareId: other.id },
+    ] });
+    await settle(plugin.definition.onEnvironmentAcquireLease!({ driverKey: "boat", companyId: h.company,
+      environmentId: h.otherEnv, runId: "pay-other-debt", config: baseConfig } as any));
+    await advance(5_000);
+    const stored = h.state.get(`${h.company}:stop-owed`) as any;
+    expect(stored.holds.find((hold: any) => hold.environmentId === h.env)?.retries).toBe(2);
+    await h.restart(true);
+    const at = h.boat.mark("restart still owes capped pool stop");
+    await settle(h.acquire("after-second-restart"));
+    await advance(READY_SPARE_STOP_BACKOFF_MS + TICK_MS);
+    await wake(h, "issue.comment.created", s1);
+    expect(poolSpareCreates(h, h.env, at)).toEqual([]);
+  });
+
   const poolSpareCreates = (h: Harness, env: string, after: number) =>
     h.boat.spareCreates(after).filter(e => h.boat.boxes.get(e.id!)!.labels.environment === env).map(e => e.id);
 
@@ -347,5 +391,80 @@ describe("#21251: a pool whose own owed stop keeps failing makes no new spare cr
     expect(runCreates.map(e => e.id), "ROW 4: the run create is not blocked by spare debt").toEqual([lease.providerLeaseId]);
     await wake(h, "issue.comment.created", s1);
     expect(poolSpareCreates(h, h.env, onAt), "the blocked pool still made no spare create").toEqual([]);
+  });
+});
+
+
+// Gate-5 incidents supplied in BRIEF.md: money and handoff regression guards.
+describe("spares-ON gate-5 rows", () => {
+  it("F1/S7 a READY spare survives restart and is claimed before any run create", async () => {
+    const h = await start("f1-ready-after-restart");
+    const { s1 } = await seed(h);
+    await h.restart(true);
+    const at = h.boat.mark("first message in a fresh chat after restart");
+    const lease = await settle(h.acquire("fresh-chat-message"));
+    expect(lease.providerLeaseId).toBe(s1);
+    expect(h.boat.log.filter(e => e.seq > at && e.purpose === "run")).toEqual([]);
+    await advance(5_000);
+    expect(h.boat.liveSpares()).toHaveLength(1);
+    expect(h.boat.spareCreates(at)).toHaveLength(1);
+  });
+
+  it("F2 size 1 and three sequential claims: one refill each, never two idle spares", async () => {
+    const h = await start("f2-no-paired-refills");
+    await seed(h);
+    for (let run = 0; run < 3; run++) {
+      const [id] = h.boat.liveSpares();
+      const at = h.boat.mark(`claim ${run}`);
+      expect((await settle(h.acquire(`message-${run}`))).providerLeaseId).toBe(id);
+      await advance(5_000);
+      expect(h.boat.spareCreates(at)).toHaveLength(1);
+      expect(h.boat.liveSpares()).toHaveLength(1);
+    }
+  });
+
+  it("F3 one setting OFF without config delivery retires idle spares non-force on the next tick", async () => {
+    const h = await start("f3-off-next-tick");
+    const { s1 } = await seed(h);
+    h.config.spares = 0;
+    const at = h.boat.mark("durable spares=0; no config event");
+    await advance(TICK_MS);
+    expect(h.boat.boxes.get(s1)!.state).toBe("archived");
+    expect(h.boat.log.some(e => e.seq > at && e.method === "POST" && e.path === `/sandboxes/${s1}/stop`)).toBe(true);
+    expect(h.boat.spareCreates(at)).toEqual([]);
+    await advance(4 * TICK_MS);
+    expect(h.boat.liveSpares()).toEqual([]);
+  });
+
+  it("STALE baseDesired: durable spares=0 means no new spare on the next wake", async () => {
+    const h = await start("stale-baseDesired");
+    const { s1 } = await seed(h);
+    h.boat.boxes.get(s1)!.state = "archived";
+    h.config.spares = 0;
+    const at = h.boat.mark("off before next event wake");
+    await settle(h.emit("issue.comment.created"));
+    await advance(5_000);
+    expect(h.boat.spareCreates(at)).toEqual([]);
+  });
+
+  it("S5 an unclaimed spare receives no commands or file writes before claim", async () => {
+    const h = await start("s5-no-preclaim-writes");
+    const { s1 } = await seed(h);
+    expect(h.boat.log.filter(e => e.id === s1 && (e.path?.endsWith("/commands") || e.path?.endsWith("/files")))).toEqual([]);
+  });
+
+  it("S5 current environment config retires old spare and supplies the replacement create body", async () => {
+    const h = await start("s5-current-config");
+    const { s1 } = await seed(h);
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", async (input: unknown, init: RequestInit = {}) => {
+      if (init.method === "POST" && new URL(String(input)).pathname.endsWith("/sandboxes")) bodies.push(JSON.parse(String(init.body)));
+      return h.boat.fetch(input, init);
+    });
+    const lease = await settle(h.acquire("changed-env", { ...baseConfig, type: "large" }));
+    await advance(5_000);
+    expect(lease.providerLeaseId).not.toBe(s1);
+    expect(h.boat.boxes.get(s1)!.state).toBe("archived");
+    expect(bodies.filter(body => body.labels.purpose === "spare").map(body => body.type)).toEqual(["large"]);
   });
 });
