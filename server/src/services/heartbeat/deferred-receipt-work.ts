@@ -123,6 +123,11 @@ export function registerDeferredReceiptWork(
               sql`${agentWakeupRequests.payload}->'executionWait' is not null`,
               sql`jsonb_typeof(${agentWakeupRequests.payload}#>'{_paperclipWakeContext,wakeCommentIds}') = 'array'
                 and ${agentWakeupRequests.payload}#>'{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
+              // An older server may already have cleared the completion's
+              // owner lock without draining it. Reconstruct that receipt via
+              // the same locked release/stale check, never direct enqueue.
+              sql`jsonb_typeof(${agentWakeupRequests.payload}->'chatCompletionDeliveryIds') = 'array'
+                and ${agentWakeupRequests.payload}->'chatCompletionDeliveryIds' <> '[]'::jsonb`,
               sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
               // Plugin requestWakeup saves input without comment IDs. Keep
               // reconstruction aligned with the stranded-queue admission scan.

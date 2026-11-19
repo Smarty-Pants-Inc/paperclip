@@ -136,6 +136,8 @@ export interface WakeQueueTransaction {
     deliveredCommentIds?: string[];
     /** A succeeded replying turn claimed a person message saved after this receipt. */
     conversationMovedOn?: boolean;
+    /** Pre-boot system work with no owed person input; retain its durable obligation. */
+    heldBeforeBoot?: boolean;
   }>;
   /** Cancels the wake with `status = 'deferred_issue_execution'` as an atomic compare-and-set guard. */
   cancelDeferredWake(input: {

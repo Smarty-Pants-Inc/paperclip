@@ -1,6 +1,7 @@
 import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../../../services/recovery/unanswered-person-message.js";
 import { readPersonStopHold } from "../../../services/acknowledged-native-stop.js";
 import { answeredPersonMessageSql, deferredWakeIsStaleSql, personMessageOwedSql } from "../../../services/person-message-answer.js";
+import * as serverInfo from "../../../server-info.js";
 import { resolveExternalTestDatabaseUrl } from "../../../__tests__/helpers/external-test-database.js";
 import { DELIVERY_QUEUES } from "../../../services/delivery-work-notifications.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
@@ -1815,7 +1816,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-stale-deferred-wake-");
     db = createDb(tempDb.connectionString);
   }, 60_000);
-  afterEach(async () => { await db.execute(sql`TRUNCATE TABLE companies CASCADE`); });
+  afterEach(async () => { vi.restoreAllMocks(); await db.execute(sql`TRUNCATE TABLE companies CASCADE`); });
   afterAll(async () => { await db?.$client.end(); await tempDb?.cleanup(); });
 
   async function seed() {
@@ -2273,6 +2274,9 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
   for (const x of stNotClaimCases.filter(x => x.answer === "failed")) it.fails(`st-not-claim: ${x.shape} / ${x.answer} / old carried=${x.carried}: THE answer function decides`, () => stNotClaimCase(x));
 
   it.each(["issue_monitor", "restored_run"])("st-system: stale %s names its held update once, with no run", async reason => {
+    // This is the POST-boot stale-update rule. Pre-boot obligations without a
+    // proven alternate owner are held, covered by the boot-4c native rows.
+    vi.spyOn(serverInfo, "getServerProcessStartedAt").mockReturnValue(ago(day).toISOString());
     const c = await seed();
     const [held] = await db.insert(issueComments).values({ companyId: c.companyId, issueId: c.issueId,
       authorType: "agent", authorAgentId: c.agentId, body: `${reason}: check the README result`, createdAt: ago(40 * 60_000) }).returning();
@@ -2294,6 +2298,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
   });
 
   it("st-system-long: a 500-character held update is quoted at 60 characters in ONE note", async () => {
+    vi.spyOn(serverInfo, "getServerProcessStartedAt").mockReturnValue(ago(day).toISOString());
     const c = await seed();
     const [held] = await db.insert(issueComments).values({ companyId: c.companyId, issueId: c.issueId,
       authorType: "agent", authorAgentId: c.agentId, body: "x".repeat(500), createdAt: ago(40 * 60_000) }).returning();

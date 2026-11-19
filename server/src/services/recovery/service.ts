@@ -7142,6 +7142,15 @@ export function recoveryService(
             // The reads above can be stale here. A resume claim can return a
             // referenced run to running, and a failure can schedule a resume.
             not(lockRunLive),
+            // A persisted result owns the release handoff even BETWEEN native
+            // finalizer leases. Clearing here would lose the registry retry
+            // while the release drain correctly waits for coordinator commit.
+            notExists(tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
+              eq(nativeRunFinalizations.companyId, issue.companyId),
+              inArray(nativeRunFinalizations.runId, ownerRunIds),
+              isNotNull(nativeRunFinalizations.resultId),
+              inArray(nativeRunFinalizations.phase, ["observed", "applied"]),
+            ))),
             taskClosed ? undefined : not(pendingResumeLock),
           ),
         )
