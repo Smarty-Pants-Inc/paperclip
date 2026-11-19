@@ -35,6 +35,7 @@ import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { HttpError } from "../errors.js";
 import { commentCarriedSql } from "./interrupt-carry-custody.js";
 import { deferredWakeIsStaleSql, personMessageOwedSql } from "./person-message-answer.js";
+import { AGENT_PAUSE_STOP_REASON, BUDGET_PAUSE_STOP_REASON } from "./governance-pause-stop.js";
 
 export type ConversationIdentity = {
   conversationAgentId?: string | null;
@@ -592,7 +593,11 @@ export async function conversationReplay(
  * past. Keep claimed and stale receipts, including never-carried input whose
  * only remaining response is its one unanswered-message note. */
 function retainedConversationReceiptSql(issueId: SQL): SQL {
+  // Only a PAUSE's cancellation (agent or budget) leaves input unsent; every other cancel of a
+  // conversation receipt was a deliberate stop (revoked direction, a denied request, a discard,
+  // already delivered) and stays 'sent' (rf-3 19:34Z).
   return sql`(${agentWakeupRequests.status} <> 'cancelled'
+    or coalesce(${agentWakeupRequests.error}, '') not in (${AGENT_PAUSE_STOP_REASON}, ${BUDGET_PAUSE_STOP_REASON})
     or ${agentWakeupRequests.runId} is not null or ${agentWakeupRequests.claimedAt} is not null
     or exists (select 1 from ${heartbeatRuns} receipt_run
       where receipt_run.company_id = ${agentWakeupRequests.companyId}

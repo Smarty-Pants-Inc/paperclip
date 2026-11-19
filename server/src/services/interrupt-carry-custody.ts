@@ -1,6 +1,7 @@
 import { and, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, type Db } from "@paperclipai/db";
 import { answeredPersonMessageIds } from "./person-message-answer.js";
+import { AGENT_PAUSE_STOP_REASON, BUDGET_PAUSE_STOP_REASON } from "./governance-pause-stop.js";
 
 /**
  * ONE successor per Interrupt (adopt-one-successor, 390 take 11:16-11:20Z).
@@ -22,6 +23,7 @@ export function commentCarriedSql(companyId: string, issueId: string, id: SQL): 
       -- A pause can cancel a plain wake before any run claims it. Such a
       -- receipt never took custody; actual Interrupt/restore run records below still do.
       and (held.status <> 'cancelled' or held.run_id is not null or held.claimed_at is not null
+        or coalesce(held.error, '') not in (${AGENT_PAUSE_STOP_REASON}, ${BUDGET_PAUSE_STOP_REASON})
         or exists (select 1 from ${heartbeatRuns} receipt_run where receipt_run.company_id = held.company_id
           and receipt_run.wakeup_request_id = held.id))
       and coalesce(held.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? (${id})::text)
