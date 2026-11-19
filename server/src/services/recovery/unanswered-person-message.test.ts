@@ -46,7 +46,7 @@ import { accessService } from "../access.js";
 import { deliverReconciledExecutions, markExecutionReconciliation, settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
 import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
 import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
-import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
+import { settleUnansweredPersonMessage, settleUnansweredPersonMessagesForTask, unansweredPersonMessageCommentCondition,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
   UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY,
   PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS, PENDING_WAIT_START_BOUND_MS } from "./unanswered-person-message.js";
@@ -1836,6 +1836,77 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await noticesEver()).toHaveLength(0);
     expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent"))))
       .toHaveLength(1);
+  });
+
+  // merged9 item 9, rf-5's f6 v3.2 row 159 ("h3-iv: one disposition pass creates exactly ONE successor on the chain
+  // edge, and its built input holds the answer", f6:1978; red at f6:1988 on M1, on 98ea9cee and on this head: no
+  // successor exists). Checked against D1 (RULING-1119): the row's state is an answered card whose answer-resume
+  // run failed with a COMMITTED failed result under the board hold. On this line the disposition pass never takes
+  // that state: execution-recovery-resolution.ts unresolvedExecutionDispositions selects a hold only while its
+  // run's finalization has NO result (`isNull(nativeRunFinalizations.resultId)`) and is absent or 'terminal_failure'
+  // (:705-709), so no continuation is produced (the producer that takes a committed failed result is bb/tamin6's
+  // h3 unit, not on M1). D1's rule for that: no continuation continues the answer's turn, so the answer is OWED and
+  // the person gets ONE true line; it is never silent. This row states that person-visible outcome and stays true
+  // when the producer lands: then the successor's OWN input must name the answer instead.
+  // REAL: the answer (answerQuestions), the disposition pass (settleUnrecoverableExecutions +
+  // deliverReconciledExecutions with the real wakeup), the sweep. PLANTED, as f6 plants them (f6:1936-1966): the
+  // failed answer-resume run with its committed failed result, the delivery's target, the blocked task and the hold.
+  it("f6 row 159 state (answered card, answer-resume failed with a committed result, board hold): never silent: a successor whose own input names the answer, or exactly ONE true 'wasn't acted on' line", async () => {
+    const f = await fixture({ status: "in_progress" });
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+    const m = await f.message("Ask me which scope, then continue.");
+    const root = await f.run({ commentId: m, status: "succeeded" });
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, sourceRunId: root,
+      kind: "ask_user_questions", status: "pending", createdByAgentId: f.agentId, addresseeUserId: f.userId,
+      continuationPolicy: "none", createdAt: f.at(), payload: { version: 1, questions: [{ id: "scope", prompt: "Which scope?",
+        required: true, selectionMode: "single", options: [{ id: "first", label: "First" }] }] } }).returning();
+    await issueThreadInteractionService(db).answerQuestions({ id: f.issueId, companyId: f.companyId }, card!.id,
+      { answers: [{ questionId: "scope", optionIds: ["first"] }] }, { userId: f.userId });
+    const resume = await f.run({ status: "failed", errorCode: "adapter_failed", error: "Native session failed" });
+    await db.update(heartbeatRuns).set({ nativePhase: "committed", nativeSessionId: randomUUID(), contextSnapshot: {
+      issueId: f.issueId, source: "issue.interaction.respond", mutation: "interaction", wakeReason: "issue_commented",
+      interactionId: card!.id, interactionIds: [card!.id], interactionStatus: "answered", commentId: m, wakeCommentIds: [m] } })
+      .where(eq(heartbeatRuns.id, resume));
+    await db.update(issueQuestionResponseDeliveries).set({ targetRunId: resume, status: "fallback_queued", deliveryMode: "wake_fallback" })
+      .where(eq(issueQuestionResponseDeliveries.interactionId, card!.id));
+    const [contract] = await db.insert(completionContracts).values({ companyId: f.companyId, issueId: f.issueId, revision: 1,
+      schemaVersion: "v1", policyVersion: "v1", risk: "low", completionAuthority: "agent", incompleteCriteriaPolicy: "block",
+      contractJson: {}, canonicalSha256: "48".repeat(32), createdByActorType: "system", createdByActorId: "fixture" }).returning();
+    await db.update(heartbeatRuns).set({ completionContractId: contract!.id }).where(eq(heartbeatRuns.id, resume));
+    const [result] = await db.insert(nativeRunResults).values({ companyId: f.companyId, issueId: f.issueId, runId: resume,
+      completionContractId: contract!.id, serverFingerprint: "fixture", schemaStatus: "accepted", canonicalSha256: "fixture",
+      resultJson: { stopReason: "adapter_failed", finalizationPhase: "committed" } }).returning();
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: resume,
+      phase: "committed", resultId: result!.id });
+    const [blocked] = await db.update(issues).set({ status: "blocked", statusVersion: sql`${issues.statusVersion} + 1` })
+      .where(eq(issues.id, f.issueId)).returning();
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", status: "active", ownerType: "board", returnOwnerAgentId: f.agentId,
+      cause: "native_continuation_requires_reconciliation", fingerprint: `native-continuation:${resume}`,
+      evidence: { runId: resume, originalFailureCode: "adapter_failed",
+        nativeFailureBlock: { runId: resume, statusVersion: blocked!.statusVersion } },
+      nextAction: "The run stopped before it finished. Paperclip continues the task from its last saved work.", maxAttempts: 3 });
+    // Hold dispatch (an unrelated running run fills the agent's one slot): an admitted successor would stay queued.
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    await settleUnrecoverableExecutions(db);
+    await deliverReconciledExecutions(db, heartbeatService(db).wakeup);
+    const successors = (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+      eq(heartbeatRuns.retryOfRunId, resume)))).filter(run => (run.contextSnapshot as Record<string, unknown> | null)?.issueId === f.issueId);
+    const late = new Date(Date.now() + PENDING_WAIT_START_BOUND_MS + 60_000);
+    for (let pass = 0; pass < 2; pass++) await settleUnansweredPersonMessagesForTask(db, { companyId: f.companyId, issueId: f.issueId, now: late });
+    const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+      sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`));
+    if (successors.length > 0) {
+      // The producer exists: by D1 its OWN input must name the answer, and the waiting successor is the attempt.
+      const context = successors[0]!.contextSnapshot as Record<string, unknown>;
+      expect([context.interactionId, ...((context.interactionIds as string[] | undefined) ?? []),
+        ...((context.attributionInteractionIds as string[] | undefined) ?? [])], "the successor's own input names the answer").toContain(card!.id);
+      expect(notices.filter(note => note.deletedAt === null), "a continuation carries the answer: no line").toHaveLength(0);
+    } else {
+      // No continuation on this line: the answer is owed, with ONE true line and none for the message.
+      expect(notices.map(note => [note.metadata?.authorizationReason, note.deletedAt, note.body]), "exactly one true line, the answer's").toEqual([
+        [`unanswered_message:${card!.id}`, null, "Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task."]]);
+    }
   });
 
   // Keep: rf5 H4 F1 caught confirmation acceptance changing pending -> accepted,
