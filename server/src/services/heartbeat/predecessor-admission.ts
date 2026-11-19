@@ -16,6 +16,9 @@ export const PREVIOUS_TURN_FILES_SET_ASIDE_NOTICE = "Your previous turn's file c
 /** The same notice after a classic sync run: nothing was set aside or kept (the person's line is LOST). */
 export const PREVIOUS_TURN_FILES_NOT_SAVED_NOTICE = "Your previous turn's file changes were not saved. This workspace holds the "
   + "last saved files without them. Work from the files as they are now, and do not claim or assume those edits.";
+/** PROPOSED, PENDING RFL (d2shared2, rf-5 (a)): the same notice when the checkout no longer equals the last saved state. */
+export const PREVIOUS_TURN_FILES_PARTLY_SAVED_NOTICE = "Your previous turn's file changes were not all saved, and some of them may be "
+  + "in this workspace. Check the files as they are now before you rely on them, and do not claim or assume those edits.";
 export function readPreviousTurnWorkspaceNotice(context: Record<string, unknown> | null | undefined): string | null {
   const notice = context?.previousTurnWorkspaceNotice as { text?: unknown } | null | undefined;
   return typeof notice?.text === "string" && notice.text.trim() ? notice.text : null;
@@ -60,6 +63,18 @@ export async function fenceUnverifiedPredecessorsAtAdmission(db: Db, candidate: 
     let context = run.contextSnapshot ?? {};
     let detachWorkspace = false;
     let fencedAny = false;
+    // d2shared2: a person's message admitted behind a reply whose files read LOST continues ON THE SAME checkout
+    // (explicit-native-continuation.ts wrote this receipt in the admitting transaction). The run is told once.
+    const [lostReply] = await tx.select({ receipt: sql<{ sourceRunId?: unknown; checkout?: unknown } | null>`
+      ${issueRecoveryActions.evidence}#>'{explicitUserContinuation,currentCheckout}'` }).from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, run.companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+      sql`${issueRecoveryActions.evidence}#>>'{explicitUserContinuation,runId}' = ${run.id}`,
+      sql`jsonb_typeof(${issueRecoveryActions.evidence}#>'{explicitUserContinuation,currentCheckout}') = 'object'`)).limit(1);
+    if (typeof lostReply?.receipt?.sourceRunId === "string" && !readPreviousTurnWorkspaceNotice(context)) {
+      context = { ...context, previousTurnWorkspaceNotice: { runId: lostReply.receipt.sourceRunId,
+        text: lostReply.receipt.checkout === "matches_last_save" ? PREVIOUS_TURN_FILES_NOT_SAVED_NOTICE : PREVIOUS_TURN_FILES_PARTLY_SAVED_NOTICE } };
+      fencedAny = true;
+    }
     for (const source of predecessors) {
       // A copy-out that made no progress was fenced (fenceSourceWorkspace) by
       // the write that ended its run, and its accepted reply stays its own to

@@ -367,6 +367,13 @@ export async function readFreshWorkspaceReadiness(db: Db, run: Pick<typeof heart
   const freshContinuation = run.contextSnapshot?.freshContinuationIsolation
     ? await readFreshContinuationReadiness(db, run, issueId) : null;
   if (freshContinuation) return freshContinuation;
+  // d2shared2: admission continued this run ON THE CURRENT checkout behind a reply whose files read LOST. No
+  // workspace is selected for it: the task keeps the root it has (a Retry would otherwise default to a new, empty one).
+  const [onCurrentCheckout] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, run.companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+    sql`${issueRecoveryActions.evidence}#>>'{explicitUserContinuation,runId}' = ${run.id}`,
+    sql`jsonb_typeof(${issueRecoveryActions.evidence}#>'{explicitUserContinuation,currentCheckout}') = 'object'`)).limit(1);
+  if (onCurrentCheckout) return null;
   const [action] = await db.select({ evidence: issueRecoveryActions.evidence }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, run.companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
     sql`${issueRecoveryActions.evidence}#>>'{explicitUserContinuation,runId}' = ${run.id}`,

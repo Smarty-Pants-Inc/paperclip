@@ -1,4 +1,6 @@
 import { isPreDispatchReviewWait, neverStartedDispatchCancellationPredicate } from "./pre-dispatch-review-wait.js";
+import { replyFileLineReadsLost } from "./native-runtime/native-late-save-rule.js";
+import { REPLY_FILES_NOT_SAVED_LINE } from "./system-recovery-state.js";
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { preDispatchExecutionWaitRecoveryActionPredicate } from "./pre-dispatch-execution-wait.js";
 import { legacyShutdownBeforeDispatchCondition } from "./legacy-shutdown-before-dispatch.js";
@@ -516,7 +518,11 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     // A stopped reviewer can differ from the task owner who receives the work back.
     agentId: run?.agentId ?? null,
     cause: action.cause,
-    nextAction: withoutUnavailableRetry(workspaceRecovery?.message
+    // d2shared2 (proposed, pending RFL): a reply whose file line reads LOST, with a person's message waiting behind
+    // it, says the ONE line. It never sends the person to a new task or to a Retry of a check that cannot change:
+    // the message continues on the same checkout (explicit-native-continuation.ts, the LOST-line gate).
+    nextAction: saved.length && restoreHold && run && replyFileLineReadsLost(run.resultJson) ? REPLY_FILES_NOT_SAVED_LINE
+      : withoutUnavailableRetry(workspaceRecovery?.message
       ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
       retryOffered),
 

@@ -23,6 +23,7 @@ import {
 } from "@paperclipai/adapter-utils/execution-target";
 import { disposeGitWorkspaceSnapshot, type GitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import {
+  captureDirectorySnapshot,
   directorySnapshotSha256,
   disposeDirectorySnapshot,
   openDirectorySnapshot,
@@ -1179,6 +1180,40 @@ export async function prepareNativeWorkspaceSync(input: {
     await runtime?.cleanupWorkspaceSnapshot?.();
     if (!existingReference) await cleanupNativeWorkspaceSync(input.runId);
     throw error;
+  }
+}
+
+/**
+ * d2shared2 (rf-5 condition (a), BYTES). Whether a run's local root still equals the state this run started from:
+ * the last SAVED state when the run's own copy-back never applied. The copy-back applies onto the root file by file
+ * (workspace-restore-merge.ts mergeDirectoryWithBaseline: an rm loop, then a copy loop, no staging and no rename of
+ * the whole tree), so an apply that fails midway leaves a prefix of the run's changes there. `differs` names that
+ * (or any other writer of a shared root); `unknown` means the saved state can no longer be read.
+ */
+export async function compareNativeWorkspaceSyncRootWithBaseline(input: {
+  companyId: string; runId: string; reference: NativeWorkspaceSyncReference;
+}): Promise<{ state: "matches_last_save" | "differs" | "unknown"; baselineSha256: string; cwd: string | null; differing: string[] }> {
+  const unknown = { state: "unknown" as const, baselineSha256: input.reference.baselineSha256, cwd: null, differing: [] };
+  const existing = await readDescriptor(input).catch(() => null);
+  if (!existing) return unknown;
+  let current: DirectorySnapshot | null = null;
+  try {
+    if (existing.descriptor.binding.companyId !== input.companyId) return unknown;
+    const cwd = existing.descriptor.binding.localCwd;
+    current = await captureDirectorySnapshot(cwd, { exclude: existing.baseline.exclude, ignoredPaths: existing.baseline.ignoredPaths });
+    const same = (left: unknown, right: unknown) => JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+    const differing = new Set<string>();
+    for (const [relative, entry] of existing.baseline.entries) if (!same(entry, current.entries.get(relative))) differing.add(relative);
+    for (const [relative, entry] of current.entries) if (!same(entry, existing.baseline.entries.get(relative))) differing.add(relative);
+    return { state: differing.size ? "differs" : "matches_last_save", baselineSha256: existing.descriptor.baselineSha256, cwd,
+      differing: [...differing].sort().slice(0, 20) };
+  } catch {
+    return unknown;
+  } finally {
+    await disposeDirectorySnapshot(current);
+    await disposeDirectorySnapshot(existing.baseline);
+    await disposeGitWorkspaceSnapshot(existing.descriptor.gitSnapshot);
+    for (const repository of existing.descriptor.repositories ?? []) await disposeGitWorkspaceSnapshot(repository.snapshot);
   }
 }
 
