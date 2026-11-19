@@ -25,6 +25,8 @@ import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "../heartbeat.js";
+import { createAgentLifecycle } from "../agent-lifecycle.js";
+import { LIFECYCLE_ENVIRONMENT_WAIT_MESSAGE } from "../../modules/agent-lifecycle/application/retry.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
 import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
@@ -1281,6 +1283,110 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect((await f.visible()).map(n => n.body)).toEqual([PAUSED_TEXT]);
   });
 
+  // Keep: stack-lead live fact on B, 2026-11-18: an agent RESUMED before the
+  // message still said '<agent> is paused' while it worked and above its
+  // answer. The real lifecycle writers the pause and resume routes call
+  // (routes/agents.ts:6105 pauseAgent, :6142 resumeAgent); the worker's
+  // 'complete' (pausing -> paused) is the one write simulated here.
+  const pauseRoute = async (f: { agentId: string }) => {
+    await createAgentLifecycle(db).pauseAgent(f.agentId);
+    await db.update(agents).set({ lifecycleState: "paused" }).where(eq(agents.id, f.agentId));
+  };
+  const resumeRoute = async (f: { agentId: string }) => {
+    await createAgentLifecycle(db).resumeAgent(f.agentId);
+    const [row] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(row).toMatchObject({ lifecycleState: "resuming", status: "paused", lifecycleHolds: [], pauseReason: null });
+  };
+  const noPausedLine = async (f: { visible: () => Promise<Array<{ body: string }>> }, when: string) =>
+    expect(JSON.stringify(await f.visible()), when).not.toMatch(/is paused|resume/i);
+  const answers = (f: { issueId: string }) => db.select().from(issueComments)
+    .where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent")));
+
+  it.each([[true, null], [false, null], [true, LIFECYCLE_ENVIRONMENT_WAIT_MESSAGE], [false, LIFECYCLE_ENVIRONMENT_WAIT_MESSAGE]] as const)(
+    "pause-resume 1: chat=%s, pause -> resume (resuming, lifecycleError=%s) -> message: no paused line at +0, +2 m, +10 m; answered once",
+    async (chat, lifecycleError) => {
+      const f = await fixture({ chat });
+      await pauseRoute(f);
+      await resumeRoute(f);
+      if (lifecycleError) await db.update(agents).set({ lifecycleError }).where(eq(agents.id, f.agentId));
+      const commentId = await f.message("After the resume: are you there?");
+      await f.sweep();
+      await noPausedLine(f, "+0");
+      const run = await f.run({ commentId, status: "running" });
+      await settleAt(f, 2 * 60_000);
+      await noPausedLine(f, "+2 m");
+      await settleAt(f, 10 * 60_000);
+      await noPausedLine(f, "+10 m");
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run));
+      await f.reply(run);
+      await settleAt(f, 11 * 60_000);
+      expect(await f.visible()).toHaveLength(0);
+      expect(await answers(f)).toHaveLength(1);
+    });
+
+  it.each([[true, "waits"], [false, "waits"], [true, "runs"], [false, "runs"]] as const)(
+    "pause-resume 2: chat=%s, pause -> message -> resume (the turn %s): the SAME sweep replaces the paused note with ONE waiting note; the answer supersedes it",
+    async (chat, turn) => {
+      const f = await fixture({ chat });
+      await pauseRoute(f);
+      const commentId = await f.message("While paused: are you there?");
+      await f.sweep();
+      const [pausedNote] = await f.visible();
+      expect((await f.visible()).map(n => n.body)).toEqual([PAUSED_TEXT]);
+      await resumeRoute(f);
+      const run = turn === "runs" ? await f.run({ commentId, status: "running" }) : null;
+      await f.sweep();
+      expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: pausedNote!.id, body: WAITING }]);
+      const carrying = run ?? await f.run({ commentId, status: "running" });
+      for (const ms of [2 * 60_000, 10 * 60_000]) {
+        await settleAt(f, ms);
+        expect((await f.visible()).map(n => ({ id: n.id, body: n.body })), `+${ms}`).toEqual([{ id: pausedNote!.id, body: WAITING }]);
+      }
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, carrying));
+      await f.reply(carrying);
+      await f.sweep();
+      expect(await f.visible()).toHaveLength(0);
+      expect(await answers(f)).toHaveLength(1);
+    });
+
+  it.each([
+    ["the pause route's hold", null],
+    ["budget", { status: "paused", lifecycleState: "paused", lifecycleHolds: ["budget"], pauseReason: "budget", lifecycleError: null }],
+    ["company_paused", { status: "paused", lifecycleState: "paused", lifecycleHolds: ["company_paused"], pauseReason: "company_paused", lifecycleError: null }],
+    ["a pauseReason with no hold", { status: "paused", lifecycleState: "paused", lifecycleHolds: [], pauseReason: "manual", lifecycleError: null }],
+    ["a lifecycleError", { status: "paused", lifecycleState: "paused", lifecycleHolds: [], pauseReason: null, lifecycleError: "Saved execution configuration failed verification." }],
+  ] as const)("pause-resume 3 control: %s keeps the paused line ONCE while truly paused (chat and task)", async (_shape, row) => {
+    for (const chat of [true, false]) {
+      const f = await fixture({ chat });
+      if (row) await db.update(agents).set({ ...row, lifecycleHolds: [...row.lifecycleHolds] }).where(eq(agents.id, f.agentId));
+      else await pauseRoute(f);
+      await f.message("Are you there?");
+      await f.sweep();
+      const [note] = await f.visible();
+      for (const ms of [2 * 60_000, 10 * 60_000]) {
+        await settleAt(f, ms);
+        expect((await f.visible()).map(n => ({ id: n.id, body: n.body })), `chat=${chat} +${ms}`).toEqual([{ id: note!.id, body: PAUSED_TEXT }]);
+      }
+    }
+  });
+
+  it.each([[true, null], [false, LIFECYCLE_ENVIRONMENT_WAIT_MESSAGE]] as const)(
+    "pause-resume 4: chat=%s, a 'resuming' that sticks (lifecycleError=%s) is never paused: the waiting note, then the no-run text at +10 m",
+    async (chat, lifecycleError) => {
+      const f = await fixture({ chat });
+      await pauseRoute(f);
+      await resumeRoute(f);
+      if (lifecycleError) await db.update(agents).set({ lifecycleError }).where(eq(agents.id, f.agentId));
+      await f.message("After the resume: are you there?");
+      await f.sweep();
+      await noPausedLine(f, "+0");
+      await settleAt(f, AFTER_WAKE_BOUND_MS);
+      const [note] = await f.visible();
+      expect((await f.visible()).map(n => n.body)).toEqual([WAITING]);
+      await settleAt(f, 11 * 60_000);
+      expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: note!.id, body: NO_RUN }]);
+    });
+
   it("paused agent, then resumed: the saved message's run is the only run (B' starts none), no second note, the answer supersedes it", async () => {
     const f = await fixture();
     await pause(f);
@@ -1295,9 +1401,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     // Resumed: Paperclip delivers the saved message to one run of its own.
     await resume(f);
     const run = await f.run({ commentId, status: "running" });
+    const [pausedNote] = await f.visible();
     await settleAt(f, 4 * 60_000);
+    // pause-resume (2): no longer paused, so the SAME note is the one waiting note, never the stale paused line.
+    expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: pausedNote!.id, body: WAITING }]);
     await settleAt(f, 20 * 60_000);
-    expect((await f.visible()).map(n => n.body)).toEqual([PAUSED_TEXT]);
+    expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: pausedNote!.id, body: WAITING }]);
     expect(await runsCarrying()).toBe(1);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run));
     await f.reply(run);
