@@ -8,7 +8,7 @@ import request from "supertest";
 import { eq } from "drizzle-orm";
 import { expect, vi } from "vitest";
 import { agents, authUsers, companies, companyMemberships, createDb, environmentLeases, environments, heartbeatRuns, issues,
-  type Db } from "@paperclipai/db";
+  projects, projectWorkspaces, type Db } from "@paperclipai/db";
 import type { AdapterSandboxExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type { PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { startEmbeddedPostgresTestDatabase } from "./embedded-postgres.js";
@@ -101,7 +101,11 @@ export function resetClassicLiveBox() { vi.useRealTimers(); box.inputs.length = 
 // SCRIPTED (named): the provider turn. It accepts its own result through PaperclipControlPlanePort, bound as
 //   native-session-executor.ts binds it (openRun, the stream, run.result.accepted, run.terminal, completeRun).
 // PLANTED (named): the task's workspace row for its saved directory, in the shape row K1's real P leaves behind.
-export async function liveScenario({ db, root }: ClassicLiveContext, options: { holdPublication?: boolean } = {}) {
+export async function liveScenario({ db, root }: ClassicLiveContext, options: { holdPublication?: boolean;
+  /** The task belongs to a project whose primary workspace is a local checkout: the REAL workspace preparation then
+   * gives every run that shared checkout as its root (a root the task does not own). The project and its workspace
+   * row are the configuration a person makes; they are inserted here. */
+  sharedProjectRoot?: boolean } = {}) {
   const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
   await db.insert(companies).values({ id: companyId, name: "Classic bound live", issuePrefix: `L${companyId.slice(0, 6)}`,
     defaultResponsibleUserId: PERSON, requireBoardApprovalForNewAgents: false });
@@ -113,13 +117,23 @@ export async function liveScenario({ db, root }: ClassicLiveContext, options: { 
   const [environment] = await db.insert(environments).values({ name: `Box ${issueId}`, driver: "sandbox", status: "active",
     config: { provider: "fake", image: "fixture:test", reuseLease: true } }).returning();
   await db.update(agents).set({ defaultEnvironmentId: environment.id }).where(eq(agents.id, agentId));
+  let projectCheckout: string | null = null;
+  if (options.sharedProjectRoot) {
+    projectCheckout = path.join(root, issueId, "project-checkout");
+    await fs.mkdir(projectCheckout, { recursive: true });
+    const [project] = await db.insert(projects).values({ companyId, name: "Shared project", status: "in_progress" }).returning();
+    const [checkout] = await db.insert(projectWorkspaces).values({ companyId, projectId: project.id, name: "Primary checkout",
+      sourceType: "local_path", cwd: projectCheckout, isPrimary: true }).returning();
+    await db.update(issues).set({ projectId: project.id, projectWorkspaceId: checkout.id }).where(eq(issues.id, issueId));
+  }
   const app = express(); app.use(express.json());
   app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: PERSON, companyIds: [companyId],
     memberships: [{ companyId, membershipRole: "owner", status: "active" }], isInstanceAdmin: true }; next(); });
   app.use("/api", agentRoutes(db, {} as never)); app.use("/api", issueRoutes(db, {} as never, {}));
   app.use("/api", activityRoutes(db)); app.use(errorHandler);
   // Every box is a local directory. Only R's box carries the fault, armed after R accepted.
-  const fault = { stall: null as null | { entered: () => void; release: Promise<void> } };
+  // SAVE-FAILS (named injection): while `fail` is set, every command of R's box comes back as a failure.
+  const fault = { stall: null as null | { entered: () => void; release: Promise<void> }, fail: false };
   const boxes: Array<{ providerLeaseId: string; cwd: string; leaseIds: string[] }> = [];
   type Execute = NonNullable<AdapterSandboxExecutionTarget["runner"]>["execute"];
   box.nextBox = async (leaseId, real, lease) => {
@@ -139,6 +153,7 @@ export async function liveScenario({ db, root }: ClassicLiveContext, options: { 
     const target: AdapterSandboxExecutionTarget = { ...actualTarget, kind: "remote", transport: "sandbox", leaseId, remoteCwd: cwd, timeoutMs: 30_000,
       runner: { execute: (async input => {
         if (index === faultedBox.index && fault.stall) { fault.stall.entered(); await fault.stall.release; }
+        if (index === faultedBox.index && fault.fail) return { exitCode: 1, signal: null, timedOut: false, stdout: "", stderr: "save call failed (stand-in)", pid: null, startedAt: new Date().toISOString() };
         return new Promise(resolve => {
           const child = execFile(input.command, input.args ?? [], { cwd: input.cwd ?? cwd, env: { ...process.env, ...input.env },
             timeout: input.timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => resolve({
@@ -236,7 +251,7 @@ export async function liveScenario({ db, root }: ClassicLiveContext, options: { 
       .filter(operation => operation.heartbeatRunId === runId && operation.phase === "workspace_finalize")
       .map(operation => ({ status: operation.status, stderr: operation.stderrExcerpt }));
   };
-  return { companyId, agentId, issueId, app, boxes, runs, issue, say, agentComments, servedLine, inspectorSaves, faultedBox,
+  return { companyId, agentId, issueId, app, boxes, runs, issue, say, agentComments, servedLine, inspectorSaves, faultedBox, fault, projectCheckout,
     stallReached, releaseStall: () => { release(); fault.stall = null; } };
 }
 
