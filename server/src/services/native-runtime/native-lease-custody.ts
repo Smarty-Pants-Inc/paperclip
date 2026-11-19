@@ -16,7 +16,8 @@ type CustodyLease = Pick<typeof environmentLeases.$inferSelect, "id" | "companyI
 /** The lease's custody stamp across its warm-handoff lease CHAIN (the stop's
  * close can stamp the admission row): the newest stamp of the session the tip
  * served, with no provider work after it. Null when none. */
-export async function nativeLeaseChainCustodyStamp(db: Db, lease: CustodyLease): Promise<unknown> {
+export async function nativeLeaseChainCustodyStamp(db: Db, lease: CustodyLease,
+  normalizedSessionId?: string | null): Promise<unknown> {
   if (!lease.providerLeaseId) return null;
   const allocation = { companyId: lease.companyId, providerLeaseId: lease.providerLeaseId };
   let chain = await loadNativeHarnessBackupLeaseChain(db, allocation);
@@ -25,7 +26,8 @@ export async function nativeLeaseChainCustodyStamp(db: Db, lease: CustodyLease):
     if (rows.length !== 1 || rows[0]!.id !== lease.id) return null;
     chain = { tip: rows[0]!, predecessors: [] };
   }
-  const stamp = newestNativeHarnessBackupStampOnChain(chain, await nativeSessionOfLeaseRun(db, chain.tip), "cleanup");
+  const stamp = newestNativeHarnessBackupStampOnChain(chain,
+    normalizedSessionId === undefined ? await nativeSessionOfLeaseRun(db, chain.tip) : normalizedSessionId, "cleanup");
   if (!stamp || await nativeHarnessBackupHasLaterProviderWork(db, { companyId: lease.companyId,
     normalizedSessionId: stamp.normalizedSessionId, completedAt: stamp.completedAt })) return null;
   return stamp;
@@ -53,28 +55,46 @@ export async function nativeLeaseCustodyMissing(db: Db, leaseId: string): Promis
   if (typeof (db as Partial<Db>)?.select !== "function") return false;
   try {
     const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
-    if (!lease?.heartbeatRunId || !lease.providerLeaseId) return false;
-    if (!(await nativeRunSessionIdentity(db, lease, lease.heartbeatRunId))) return false;
-    for (const stamp of [lease.metadata?.nativeHarnessBackup, await nativeLeaseChainCustodyStamp(db, lease).catch(() => null)]) {
-      if (stamp && await verifyRecoverableNativeHarnessBackup({ db, companyId: lease.companyId,
-        stamp, providerLeaseId: lease.providerLeaseId }).catch(() => false)) return false;
+    if (!lease?.providerLeaseId) return false;
+    // A warm handoff changes the lease/run identity, not the box's contents.
+    // Every native holder of this allocation needs its own verified custody;
+    // even an irregular chain is evidence of possible contents, never absence.
+    const holders = await loadNativeHarnessBackupLeaseRows(db, { companyId: lease.companyId,
+      providerLeaseId: lease.providerLeaseId });
+    for (const holder of holders) {
+      if (holder.provider !== lease.provider || !holder.heartbeatRunId
+        || !await nativeRunSessionIdentity(db, holder, holder.heartbeatRunId)) continue;
+      if (!await nativeHolderHasCustody(db, holder, lease)) return true;
     }
-    const copies = await db.select().from(nativeHarnessBackups).where(and(
-      eq(nativeHarnessBackups.companyId, lease.companyId), eq(nativeHarnessBackups.runId, lease.heartbeatRunId),
-      inArray(nativeHarnessBackups.status, ["current", "superseded"]))).orderBy(desc(nativeHarnessBackups.createdAt)).limit(5);
-    if (copies.length === 0) return true;
-    let storage;
-    try { storage = durableNativeHarnessStorage() ?? getStorageService(); } catch { return true; }
-    for (const copy of copies) {
-      const verified = await verifyDurableNativeHarnessBackup({ db, storage, companyId: copy.companyId,
-        scopeDigest: copy.scopeDigest, manifestSha256: copy.manifestSha256, backupId: copy.id,
-        downloadIdleTimeoutMs: NATIVE_HARNESS_DOWNLOAD_IDLE_TIMEOUT_MS }).catch(() => false);
-      if (verified) return false;
-    }
-    return true;
+    return false;
   } catch {
     return true;
   }
+}
+
+/** The allocation tip may carry a predecessor's session stamp after close.
+ * A different holder/session's copy never discharges this holder's obligation. */
+async function nativeHolderHasCustody(db: Db, holder: typeof environmentLeases.$inferSelect,
+  allocation: typeof environmentLeases.$inferSelect): Promise<boolean> {
+  const sessionId = await nativeSessionOfLeaseRun(db, holder);
+  for (const stamp of [holder.metadata?.nativeHarnessBackup,
+    await nativeLeaseChainCustodyStamp(db, allocation, sessionId).catch(() => null)]) {
+    if (sessionId && (stamp as { normalizedSessionId?: unknown } | null)?.normalizedSessionId !== sessionId) continue;
+    if (stamp && await verifyRecoverableNativeHarnessBackup({ db, companyId: holder.companyId,
+      stamp, providerLeaseId: allocation.providerLeaseId! }).catch(() => false)) return true;
+  }
+  const copies = await db.select().from(nativeHarnessBackups).where(and(
+    eq(nativeHarnessBackups.companyId, holder.companyId), eq(nativeHarnessBackups.runId, holder.heartbeatRunId!),
+    inArray(nativeHarnessBackups.status, ["current", "superseded"]))).orderBy(desc(nativeHarnessBackups.createdAt)).limit(5);
+  if (copies.length === 0) return false;
+  let storage;
+  try { storage = durableNativeHarnessStorage() ?? getStorageService(); } catch { return false; }
+  for (const copy of copies) {
+    if (await verifyDurableNativeHarnessBackup({ db, storage, companyId: copy.companyId,
+      scopeDigest: copy.scopeDigest, manifestSha256: copy.manifestSha256, backupId: copy.id,
+      downloadIdleTimeoutMs: NATIVE_HARNESS_DOWNLOAD_IDLE_TIMEOUT_MS }).catch(() => false)) return true;
+  }
+  return false;
 }
 
 /** Native for custody = ANY native session identity of the run (rf-3 F3), not
