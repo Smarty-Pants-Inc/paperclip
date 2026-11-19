@@ -584,7 +584,12 @@ async function admitSpareCreate(key: ReadySpareKey, refillId?: string): Promise<
  * each pool's owed-until hold and each spare whose stop is still owed.
  */
 const SPARE_STOP_OWED_STATE_KEY = "stop-owed";
-type AcquisitionStopDebt = { attemptId: string; runId?: string; keepId: string; ids: string[]; settleUntil: number };
+/** Boat PATCH sets auto-stop to now + ttlSeconds. Bound a known hedge loser
+ * before its owed non-force stop, while this worker still holds credentials. */
+const LOSER_TTL = 300;
+type LoserTtl = { ttlSeconds: number; outcome: "applied" | "failed"; attemptedAt: number };
+type AcquisitionStopDebt = { attemptId: string; runId?: string; keepId: string; ids: string[]; settleUntil: number;
+  loserTtls?: Record<string, LoserTtl> };
 type OwedSpareStops = {
   holds: Array<{ environmentId: string; configHash: string; until: number; failures: number; retries: number }>;
   owed: Array<{ environmentId: string; configHash: string; spareId: string; acquisition?: AcquisitionStopDebt }>;
@@ -649,6 +654,10 @@ async function loadOwedSpareStops(companyId: string): Promise<OwedSpareStops> {
               || typeof acquisition.keepId !== "string" || !Number.isFinite(acquisition.settleUntil)
               || !Array.isArray(acquisition.ids) || acquisition.ids.some(id => typeof id !== "string" || !id)
               || (acquisition.runId !== undefined && typeof acquisition.runId !== "string"))) throw new Error("Boat acquisition stop debt is invalid");
+          if (acquisition?.loserTtls !== undefined && (!acquisition.loserTtls || typeof acquisition.loserTtls !== "object"
+              || Array.isArray(acquisition.loserTtls) || Object.values(acquisition.loserTtls).some(ttl => !ttl
+                || ttl.ttlSeconds !== LOSER_TTL || !["applied", "failed"].includes(ttl.outcome)
+                || !Number.isFinite(ttl.attemptedAt)))) throw new Error("Boat acquisition loser TTL debt is invalid");
           record.owed.push({ environmentId: owed.environmentId, configHash: owed.configHash, spareId: owed.spareId,
             ...(acquisition ? { acquisition } : {}) });
         }
@@ -764,7 +773,11 @@ async function resumeOwedSpareStops(config: Config, companyId: string, environme
             if (sandbox.labels?.owner !== `paperclip:${companyId}` || sandbox.labels?.environment !== environmentId
                 || sandbox.labels?.["paperclip-acquire"] !== debt.attemptId
                 || (debt.runId !== undefined && sandbox.labels?.run !== debt.runId)) throw new Error("Boat hedge stop ownership changed");
-            if (!["archived", "stopped"].includes(sandbox.state)) await stopSandbox(config, id);
+            if (!["archived", "stopped"].includes(sandbox.state)) {
+              // Also bound a late-create loser first discovered by maintenance.
+              await boundProvisionLoser(config, companyId, record, debt, id);
+              await stopSandbox(config, id);
+            }
           }
           // An unanswered create can still appear. Absence before the shared
           // creation settle floor never discharges that identity's debt.
@@ -1670,6 +1683,27 @@ async function saveProvisionHedge(owner: { companyId: string; environmentId: str
   if (!pluginContext?.state?.set) throw new Error("Boat provisioning hedge requires durable plugin state");
   await pluginContext.state.set(provisionHedgeScope(owner, attemptId), { ...record });
 }
+/** Do not renew a successful short TTL: PATCH again would extend the loser's
+ * life. A refusal is recorded without provider text (which may hold secrets),
+ * and never prevents the existing owed non-force stop from being attempted.
+ * https://docs.boat.dev/api/reference/sandboxes/update-sandbox */
+async function boundProvisionLoser(config: Config, companyId: string, record: OwedSpareStops,
+  debt: AcquisitionStopDebt, id: string): Promise<void> {
+  if (id === debt.keepId || debt.loserTtls?.[id]) return;
+  const attemptedAt = Date.now();
+  let outcome: LoserTtl["outcome"] = "failed";
+  try {
+    await request(config, `/sandboxes/${encodeURIComponent(id)}`, { method: "PATCH", signal: AbortSignal.timeout(5_000),
+      body: JSON.stringify({ ttlSeconds: LOSER_TTL }) }, false, { maxSends: 1 });
+    outcome = "applied";
+  } catch {
+    duplexLogger?.warn("Boat hedge loser TTL not confirmed; non-force stop remains owed", { companyId, sandboxId: id });
+  }
+  (debt.loserTtls ??= {})[id] = { ttlSeconds: LOSER_TTL, outcome, attemptedAt };
+  // State failure must not veto the safe stop either. In-memory outcome remains
+  // available to the same worker; existing durable debt still owns the loser.
+  try { await persistOwedSpareStops(companyId, record); } catch { /* Continue owed stop. */ }
+}
 /** A decision is durable before a loser stop; an unanswered POST keeps its
  * creation identity owed until the same settle floor core uses for late boxes. */
 async function oweProvisionLosers(config: Config, owner: { companyId: string; environmentId: string; runId?: string }, attemptId: string,
@@ -1680,10 +1714,17 @@ async function oweProvisionLosers(config: Config, owner: { companyId: string; en
   // must not invert it merely because inventory lists the primary first.
   const acquisition: AcquisitionStopDebt = { attemptId, runId: owner.runId, keepId: record.winnerId ?? keepId,
     ids: [record.firstId, ...(record.hedgeBoxId ? [record.hedgeBoxId] : [])],
-    settleUntil: record.hedgeBoxId ? Date.now() : record.startedAt + BOAT_CREATION_SETTLE_MS };
+    settleUntil: record.hedgeBoxId ? Date.now() : record.startedAt + BOAT_CREATION_SETTLE_MS,
+    loserTtls: owed.owed.find(entry => entry.spareId === spareId)?.acquisition?.loserTtls ?? {} };
   owed.owed = owed.owed.filter(entry => entry.spareId !== spareId);
   owed.owed.push({ environmentId: owner.environmentId, configHash: `hedge:${attemptId}`, spareId, acquisition });
   await persistOwedSpareStops(owner.companyId, owed);
+  // Known losers get Boat's restart-independent bound at the decision, before
+  // inventory/stop work. Never PATCH the durable committed winner, even replay.
+  for (const id of acquisition.ids) {
+    if (id === acquisition.keepId) continue;
+    await boundProvisionLoser(config, owner.companyId, owed, acquisition, id);
+  }
   // Registers this key even with spare pools OFF, and tracks the bounded stop
   // work for shutdown; a slow/refused stop never blocks the winning lease.
   await resumeOwedSpareStops(config, owner.companyId, owner.environmentId);

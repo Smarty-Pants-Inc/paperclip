@@ -26,9 +26,10 @@ beforeEach(async () => {
   });
 });
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
-function world(readyAfter: number[], options: { errorAt?: number; archivedAt?: number; refuseStops?: boolean; hangHedge?: boolean; omitLoser?: boolean; hedgeVisibleAt?: number; hedgePostDelayMs?: number; listGate?: () => Promise<void> } = {}) {
+function world(readyAfter: number[], options: { errorAt?: number; archivedAt?: number; refuseStops?: boolean; refuseTtl?: boolean; hangHedge?: boolean; omitLoser?: boolean; hedgeVisibleAt?: number; hedgePostDelayMs?: number; listGate?: () => Promise<void> } = {}) {
   const creates: { at: number; key: string; body: string }[] = [], stops: { id: string; body: any }[] = [];
-  const boxes = new Map<string, { key: string; labels: any; at: number; stopped: boolean }>();
+  const patches: { id: string; body: any; at: number }[] = [], events: string[] = [];
+  const boxes = new Map<string, { key: string; labels: any; at: number; stopped: boolean; ttlSeconds?: number; deadline?: number }>();
   const state = (id: string, b: any) => b.stopped || (id === "bx_hedge0" && Date.now() >= (options.archivedAt ?? Infinity)) ? "archived" : id === "bx_hedge0" && Date.now() >= (options.errorAt ?? Infinity) ? "error"
     : Date.now() - b.at >= readyAfter[Number(id.slice(-1))] ? "running" : "provisioning";
   vi.stubGlobal("fetch", vi.fn(async (input: any, init: any = {}) => {
@@ -38,7 +39,16 @@ function world(readyAfter: number[], options: { errorAt?: number; archivedAt?: n
       creates.push({ at: Date.now(), key, body: init.body });
       let existing = [...boxes].find(([, b]) => b.key === key);
       const firstSend = !existing;
-      if (!existing) { const id = `bx_hedge${boxes.size}`; boxes.set(id, { key, labels: body.labels, at: Date.now(), stopped: false }); existing = [id, boxes.get(id)!]; }
+      if (!existing) {
+        const id = `bx_hedge${boxes.size}`;
+        let explicitlyStopped = false;
+        // Provider time survives plugin timer/module loss. Only PATCH changes
+        // this fixture's deadline; no replacement request is needed to expire it.
+        boxes.set(id, { key, labels: body.labels, at: Date.now(),
+          get stopped() { return explicitlyStopped || Date.now() >= (this.deadline ?? Infinity); },
+          set stopped(value: boolean) { explicitlyStopped = value; } });
+        existing = [id, boxes.get(id)!];
+      }
       if (options.hedgePostDelayMs && firstSend && existing[0] === "bx_hedge1") await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(resolve, options.hedgePostDelayMs);
         init.signal.addEventListener("abort", () => { clearTimeout(timer); reject(init.signal.reason); }, { once: true });
@@ -52,7 +62,15 @@ function world(readyAfter: number[], options: { errorAt?: number; archivedAt?: n
       return res({ sandboxes: [...boxes].filter(([id, b]) => b.labels[filter[0]] === filter[1] && !(options.omitLoser && id === "bx_hedge0") && !(id === "bx_hedge1" && Date.now() < (options.hedgeVisibleAt ?? 0))).map(([id, b]) => ({ id, state: state(id, b), labels: b.labels })), pageInfo: { nextCursor: null } });
     }
     const id = path.split("/")[2], b = boxes.get(id);
+    if (b && method === "PATCH") {
+      const body = JSON.parse(init.body);
+      patches.push({ id, body, at: Date.now() }); events.push(`PATCH:${id}`);
+      if (options.refuseTtl) return res({ error: "TTL refused" }, 403);
+      b.ttlSeconds = body.ttlSeconds; b.deadline = Date.now() + body.ttlSeconds * 1000;
+      return res({ sandbox: { id, labels: b.labels, state: state(id, b), ttlSeconds: b.ttlSeconds, archiveAfter: new Date(b.deadline).toISOString() } });
+    }
     if (b && method === "POST" && path.endsWith("/stop")) {
+      events.push(`STOP:${id}`);
       stops.push({ id, body: JSON.parse(init.body) });
       if (options.refuseStops) return res({ error: "stop refused" }, 403);
       b.stopped = true; return res({ stop: { id: `stop_${id}`, status: "pending" } }, 202);
@@ -60,7 +78,7 @@ function world(readyAfter: number[], options: { errorAt?: number; archivedAt?: n
     if (b && method === "GET") return res({ sandbox: { id, labels: b.labels, state: state(id, b), ...(b.stopped ? { stop: { id: `stop_${id}`, status: "completed" } } : {}) } });
     throw new Error(`Unexpected ${method} ${path}`);
   }));
-  return { creates, stops, boxes };
+  return { creates, stops, boxes, patches, events };
 }
 const settle = (work: Promise<unknown>) => work.then(lease => ({ lease }), error => ({ error }));
 // Keep: never-OK winner-stop and paid-loser guards from rf-4's spare.13 verdict.
@@ -357,4 +375,66 @@ it("hedge POST times out but its late box remains owned and is stopped when firs
   const w = world([100_000, 40_000], { hangHedge: true }); const r = await acquire();
   expect(r.error).toBeUndefined(); expect(r.lease.providerLeaseId).toBe("bx_hedge0");
   expect(w.stops.map(s => s.id)).toEqual(["bx_hedge1"]); money(w);
+});
+
+// Keep: F2 money guard. The provider's TTL, not startup credentials or a new
+// acquisition, must stop a refused loser after the worker is replaced.
+it.each(["ON", "OFF", "NONE"] as const)("F2 %s: refused loser expires on Boat after replacement with setup + health only", async setting => {
+  const w = world([240_000, 40_000], { refuseStops: true });
+  const r = await acquire(170_000);
+  expect(r.error).toBeUndefined(); expect(r.lease.providerLeaseId).toBe("bx_hedge1");
+  expect(w.stops).toEqual([{ id: "bx_hedge0", body: {} }]);
+  expect(w.boxes.get("bx_hedge0")!.stopped).toBe(false);
+  const debt: any = [...storage.entries()].find(([key]) => key.includes("stop-owed"))?.[1];
+  vi.clearAllTimers(); vi.resetModules();
+  const restarted = (await import("./plugin.js")).default;
+  vi.useFakeTimers(); vi.setSystemTime(170_000);
+  const replacementContext = { ...context, ...(setting === "NONE" ? {} : { config: { get: async () => ({
+    spares: setting === "ON" ? 1 : 0, spareMax: 3, spareEnvironmentIds: ["henv"], spareIdleMinutes: 60,
+  }) } }) };
+  await restarted.definition.setup(replacementContext);
+  await restarted.definition.onHealth!();
+  const requestsAtRestart = vi.mocked(fetch).mock.calls.length;
+  await vi.advanceTimersByTimeAsync(244_999); // One ms before PATCH(115000) + 300 s.
+  const beforeDeadline = w.boxes.get("bx_hedge0")!.stopped;
+  await vi.advanceTimersByTimeAsync(1);
+  const atDeadline = w.boxes.get("bx_hedge0")!.stopped;
+  await vi.advanceTimersByTimeAsync(755_000); // Original F2 observation: 1170000.
+  const receipt = { setting, at: Date.now(), beforeDeadline, atDeadline, patches: w.patches, events: w.events,
+    stops: w.stops, debt, requestsAtRestart, requestsNow: vi.mocked(fetch).mock.calls.length,
+    boxes: [...w.boxes].map(([id, b]) => ({ id, stopped: b.stopped, ttlSeconds: b.ttlSeconds, deadline: b.deadline })) };
+  console.info("F2 no-new-call TTL boundary", JSON.stringify(receipt));
+  expect(beforeDeadline).toBe(false); expect(atDeadline).toBe(true);
+  expect(w.patches).toEqual([{ id: "bx_hedge0", body: { ttlSeconds: 300 }, at: 115_000 }]);
+  expect(w.events.slice(0, 2)).toEqual(["PATCH:bx_hedge0", "STOP:bx_hedge0"]);
+  expect(debt.owed[0].acquisition.loserTtls.bx_hedge0).toEqual({ ttlSeconds: 300, outcome: "applied", attemptedAt: 115_000 });
+  expect(w.boxes.get("bx_hedge0")!.stopped).toBe(true);
+  expect(w.boxes.get(r.lease.providerLeaseId)!.stopped).toBe(false);
+  expect(vi.mocked(fetch).mock.calls.length).toBe(requestsAtRestart);
+  expect(w.creates).toHaveLength(2); expect(w.stops).toHaveLength(1); money(w);
+});
+it("TTL PATCH refusal records failed bound but still attempts the owed non-force loser stop", async () => {
+  const w = world([240_000, 40_000], { refuseTtl: true, refuseStops: true });
+  const r = await acquire(170_000);
+  expect(r.error).toBeUndefined();
+  const debt: any = [...storage.entries()].find(([key]) => key.includes("stop-owed"))?.[1];
+  console.info("F2 PATCH refused: no short bound", JSON.stringify({ patches: w.patches, stops: w.stops, debt }));
+  expect(w.patches).toEqual([{ id: "bx_hedge0", body: { ttlSeconds: 300 }, at: 115_000 }]);
+  expect(w.events.slice(0, 2)).toEqual(["PATCH:bx_hedge0", "STOP:bx_hedge0"]);
+  expect(w.stops).toEqual([{ id: "bx_hedge0", body: {} }]);
+  expect(debt.owed[0].acquisition.loserTtls.bx_hedge0).toEqual({ ttlSeconds: 300, outcome: "failed", attemptedAt: 115_000 });
+  expect(w.boxes.get("bx_hedge0")!.deadline).toBeUndefined();
+  expect(w.boxes.get(r.lease.providerLeaseId)!.stopped).toBe(false); money(w);
+});
+it("re-entry never renews an applied loser TTL and never PATCHes a committed winner", async () => {
+  const w = world([240_000, 40_000], { refuseStops: true });
+  const r = await acquire(170_000);
+  vi.clearAllTimers(); vi.resetModules();
+  const restarted = (await import("./plugin.js")).default;
+  vi.useFakeTimers(); vi.setSystemTime(175_000); await restarted.definition.setup(context);
+  const work = settle(restarted.definition.onEnvironmentAcquireLease!(params));
+  await vi.advanceTimersByTimeAsync(2_000);
+  expect((await work as any).error).toBeUndefined();
+  expect(w.patches).toEqual([{ id: "bx_hedge0", body: { ttlSeconds: 300 }, at: 115_000 }]);
+  expect(w.boxes.get(r.lease.providerLeaseId)!.deadline).toBeUndefined();
 });

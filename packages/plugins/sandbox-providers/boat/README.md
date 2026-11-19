@@ -37,18 +37,33 @@ refuses an exact-ID cleanup of that winner before changing its lease lifecycle.
 Explicit ordinary release/stop/destroy requests are unchanged.
 
 The winner decision is persisted before handing off. Losers enter the existing
-durable `stop-owed` queue, with exact known IDs and acquisition ownership; only
-non-force stop is used, never delete. The winner ID is excluded from that debt.
+durable `stop-owed` queue, with exact known IDs and acquisition ownership. While
+credentials are still in hand, each known loser first receives Boat's documented
+[`PATCH /sandboxes/{id}`](https://docs.boat.dev/api/reference/sandboxes/update-sandbox)
+`{ttlSeconds: 300}`, then the existing non-force stop (never force or delete).
+`LOSER_TTL` is a provider-side auto-stop fallback: PATCH sets its deadline to
+now + 300 seconds. The committed winner is excluded from both PATCH and stop.
+The debt records the TTL attempt time and applied/failed outcome per loser,
+without any key or provider error text. An attempted TTL is not sent again on
+replay/retry, because another PATCH could extend a successfully applied deadline.
+A failed PATCH does not block the owed stop, but provides **no confirmed short
+bound**; that row remains dependent on stop retries or the prior provider TTL.
 Missing list entries cannot erase known loser IDs. A refused stop remains owed
 and is retried by the existing maintenance service, including with spares OFF.
 A replacement's credentialed acquisition restores and arms maintenance for its
 surviving debt even without a spare setting or a currently visible loser. Retry
 uses the existing 15-minute backoff (observed on the 15-second maintenance tick),
 without requiring another acquisition or inspection; settlement makes it idle.
-This still requires that **first credentialed replacement acquisition**: setup
-and health alone cannot resume stops because the SDK supplies no environment
-credential reference or authorized environment-config read to the worker. No
-resolved API key is persisted to work around that missing recovery path.
+Stop retries still require that **first credentialed replacement acquisition**:
+setup and health alone cannot resume authenticated stops because the SDK supplies
+no environment credential reference or authorized environment-config read to the
+worker. For a known loser whose short PATCH succeeded, Boat's own auto-stop now
+survives replacement without any new acquisition or startup credentials. A late
+loser discovered by credentialed maintenance is likewise PATCHed before stopping.
+An unknown/unanswered create cannot receive a per-ID bound until discovered.
+No resolved API key or secret reference is persisted. This is an auto-stop TTL,
+not a force-stop receipt or unconditional billing guarantee: provider scheduling
+and Boat's documented working-agent TTL behavior still apply.
 An unanswered hedge POST retains identity-level debt through the shared
 30-minute creation-settle floor so a late box can be found and stopped. Core's
 abandoned-creation inspection reconstructs this debt if the worker died before
