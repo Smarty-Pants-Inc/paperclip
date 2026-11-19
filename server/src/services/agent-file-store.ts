@@ -5,7 +5,7 @@ import { assertAgentInteraction } from "./agent-interaction-policy.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { cachedAgentFileManifest, checkpointSnapshot, type AgentFileManifest } from "./agent-file-checkpoints.js";
-import { constants } from "node:fs";
+import { constants, type BigIntStats } from "node:fs";
 import { Readable } from "node:stream";
 import path from "node:path";
 import { and, desc, eq, isNull, sql } from "drizzle-orm";
@@ -17,6 +17,7 @@ import { assertInstructionPathSafe, instructionPath, instructionBytes, materiali
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot } from "./agent-instructions.js";
 import type { AuthorizationActor } from "./authorization.js";
 import { agentFileProjectionCurrent, durableAgentFilesEnabled, invalidateAgentFileProjection, persistDurableAgentFiles, restoreDurableAgentFiles, uploadAgentFilesBeforeCommit, withAgentFilesRestoredBeforeLock, type PreparedAgentFileObjects } from "./agent-file-durability.js";
+import { logger } from "../middleware/logger.js";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Agent = typeof agents.$inferSelect;
@@ -238,6 +239,99 @@ async function writeConflictCopy(sourceDir: string, root: string, item: AgentFil
   } finally { await fs.rm(temporary, { force: true }); }
 }
 
+const MERGE_UNDO_PREFIX = ".agent-files-undo-";
+/**
+ * PERSIST-FAILURE (rf-3, smarty-dev#20787): the pre-merge state of exactly the
+ * entries one tree merge can touch, kept beside the canonical tree before the
+ * merge writes anything. A save that fails after its merge (the durable
+ * persist, the audit or a conflict copy) is rolled back in PostgreSQL;
+ * `restore` then puts the tree back as it was, so the manifest and the files
+ * never disagree once the save has settled and nothing of the failed save is
+ * left. `merged`: the paths the merge applies (the run's changed paths that
+ * are not held as conflicts). `created`: the conflict copies it writes. The
+ * merge only removes or replaces what is at or under a merged path, or a file
+ * standing where a new entry needs a folder; only those files are copied
+ * (reflink where the filesystem has it). Call under the agent row lock.
+ */
+async function keepMergePreimage(root: string, current: DirectorySnapshot, incoming: DirectorySnapshot, merged: ReadonlySet<string>, created: string[]) {
+  const parent = path.dirname(root);
+  // Under the row lock no other save of this agent is in flight: an undo
+  // directory found here was left by a crashed save and restores nothing.
+  for (const name of await fs.readdir(parent)) {
+    if (name.startsWith(MERGE_UNDO_PREFIX)) await fs.rm(path.join(parent, name), { recursive: true, force: true });
+  }
+  const directory = path.join(parent, `${MERGE_UNDO_PREFIX}${randomUUID()}`);
+  const ancestors = (name: string) => {
+    const list: string[] = [];
+    for (let above = path.posix.dirname(name); above !== "."; above = path.posix.dirname(above)) list.push(above);
+    return list;
+  };
+  const atOrUnderMerged = (name: string) => merged.has(name) || ancestors(name).some(above => merged.has(above));
+  const applied = [...merged].filter(name => incoming.entries.has(name));
+  const needsFolder = new Set(applied.flatMap(ancestors));
+  const stamp = (info: BigIntStats) => [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(":");
+  const files: Array<{ name: string; stamp: string }> = [], folders: string[] = [];
+  try {
+    for (const [name, entry] of current.entries) {
+      if (entry.kind === "dir") {
+        if (atOrUnderMerged(name)) folders.push(name);
+        continue;
+      }
+      if (!atOrUnderMerged(name) && !needsFolder.has(name)) continue;
+      const from = path.join(root, name), to = path.join(directory, name);
+      const info = await fs.lstat(from, { bigint: true });
+      await fs.mkdir(path.dirname(to), { recursive: true, mode: 0o700 });
+      await fs.copyFile(from, to, constants.COPYFILE_FICLONE);
+      await fs.utimes(to, info.atime, info.mtime);
+      files.push({ name, stamp: stamp(info) });
+    }
+  } catch (error) {
+    await fs.rm(directory, { recursive: true, force: true });
+    throw error;
+  }
+  const added = [...new Set([...applied.flatMap(name => [...ancestors(name), name]), ...created])].filter(name => !current.entries.has(name));
+  // A restore that failed keeps its copies (the directory is named in the
+  // error log) until this agent's next save.
+  let restoreFailed = false;
+  return {
+    discard: async () => { if (!restoreFailed) await fs.rm(directory, { recursive: true, force: true }); },
+    /** Works over a merge that stopped anywhere, including before its first write. */
+    restore: async () => {
+      restoreFailed = true;
+      try {
+        for (const name of added) {
+          await fs.rm(path.join(root, name), { recursive: true, force: true }).catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== "ENOTDIR") throw error;
+          });
+        }
+        // Parents sort before their children.
+        for (const name of folders.sort()) {
+          const target = path.join(root, name);
+          const info = await fs.lstat(target).catch(() => null);
+          if (info?.isDirectory()) continue;
+          if (info) await fs.rm(target, { force: true });
+          await fs.mkdir(target, { recursive: true });
+        }
+        for (const file of files) {
+          const target = path.join(root, file.name);
+          const info = await fs.lstat(target, { bigint: true }).catch(() => null);
+          // Same inode and change time: the merge never reached this file.
+          if (info && !info.isDirectory() && stamp(info) === file.stamp) continue;
+          if (info?.isDirectory()) await fs.rm(target, { recursive: true, force: true });
+          await fs.mkdir(path.dirname(target), { recursive: true });
+          await fs.rename(path.join(directory, file.name), target);
+        }
+        restoreFailed = false;
+      } finally {
+        // The projection is unverified until the durable head restores or re-marks it.
+        await invalidateAgentFileProjection(root);
+      }
+      await fs.rm(directory, { recursive: true, force: true });
+    },
+    directory,
+  };
+}
+
 export function agentFileStore(db: Db) {
   db = fileStorageDb(db);
   async function locked<T>(companyId: string, agentId: string, actor: AuthorizationActor, write: boolean,
@@ -397,7 +491,10 @@ export function agentFileStore(db: Db) {
      * latest, at the canonical commit boundary (before the tree merge).
      * `onCommitBoundary` runs in the same tick that last check passes: from
      * then on the write lands or fails as a whole and an abort is too late,
-     * so the caller must wait for this call and report its real outcome. */
+     * so the caller must wait for this call and report its real outcome.
+     * A write that fails after the boundary leaves nothing behind: its
+     * transaction rolls back and the merged tree is put back to its pre-merge
+     * state before this call rejects (keepMergePreimage). */
     apply: async (input: { companyId: string; agentId: string; sourceDir: string; baseline: DirectorySnapshot; checkpoint?: AgentFileManifest }, actor: AuthorizationActor,
       options: { signal?: AbortSignal; onCommitBoundary?: () => void } = {}) => {
       const { signal } = options;
@@ -424,7 +521,8 @@ export function agentFileStore(db: Db) {
         .filter(([name, entry]) => entry.kind === "file" && JSON.stringify(incoming.entries.get(name)) !== JSON.stringify(input.baseline.entries.get(name)))
         .map(([name, entry]) => ({ path: name, size: entry.size!, sha256: entry.hash! }))) : undefined;
       signal?.throwIfAborted();
-      return locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound) => {
+      let undo: Awaited<ReturnType<typeof keepMergePreimage>> | undefined;
+      try { return await locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound, onRollback) => {
         signal?.throwIfAborted();
         if (deriveBundleState(agent).entryFile !== requestedEntry) throw conflict("Agent instructions entry changed; retry the file synchronization");
         const entryPath = deriveBundleState(agent).entryFile;
@@ -525,13 +623,25 @@ export function agentFileStore(db: Db) {
         }
         assertDirectorySize(total, finalEntries.size);
         const entryBefore = changed.includes(entryPath) ? await readInstructionBytes(root, entryPath) : null;
+        // PERSIST-FAILURE (rf-3): the pre-merge state of what this merge can
+        // touch is kept outside the tree first, still before the boundary.
+        const kept = undo = await keepMergePreimage(root, current, incoming, new Set(changed.filter(name => !held.has(name))),
+          conflicts.flatMap(item => item.conflictCopy ? [item.conflictCopy] : []));
         // The canonical commit boundary: nothing canonical has changed yet (no
         // byte in the agent's tree, no durable row; the transaction rolls
         // back). A cancellation raised before this point stops the save here.
-        // From the merge on, the write is not interrupted half-way: a rolled
-        // back transaction would leave the merged tree on disk.
+        // From the merge on, an abort no longer interrupts the write (the
+        // caller reports its real outcome). A write that FAILS from here on is
+        // rolled back whole: PostgreSQL by its transaction, the tree by the
+        // restore registered below, under the same row lock.
         signal?.throwIfAborted();
         options.onCommitBoundary?.();
+        onRollback(() => kept.restore().catch(error => {
+          // The original failure is the one to report. The projection marker is
+          // already invalid, so the durable head restores the tree under the next lock.
+          logger.error({ err: error, companyId: input.companyId, agentId: input.agentId, preMergeCopies: kept.directory },
+            "Agent files could not be put back to their pre-merge state after a failed save");
+        }));
         await mergeDirectoryWithBaseline({ ...input, baseline: applyBaseline, targetDir: root,
           ...(input.checkpoint ? { snapshots: { source: incoming, current } } : {}) });
         for (const item of conflicts) if (item.conflictCopy) await writeConflictCopy(input.sourceDir, root, item, incoming.entries.get(item.path)!);
@@ -546,7 +656,9 @@ export function agentFileStore(db: Db) {
           ...(entry ? { path: entryPath, contentHash: fileHash(entry), byteLength: entry.length } : {}),
           ...(conflicts.length ? { conflicts } : {}) });
         return { storageWarning: storageWarning(total, finalEntries.size, fullFile), conflicts };
-      }, [...changedMentions.values()].map(value => value.text), prepared);
+      }, [...changedMentions.values()].map(value => value.text), prepared); } finally {
+        await undo?.discard().catch(error => logger.warn({ err: error, agentId: input.agentId }, "Agent file undo scratch could not be removed"));
+      }
     },
   };
 }

@@ -560,8 +560,8 @@ describe("agent directory collection aborted after the canonical commit boundary
     const recorded = await copyRow(runId);
     const lockFreeAfter = await independentPoolCanTakeLock();
     const sourceKept = await fs.readFile(path.join(copy.executionRoot, noteName), "utf8").catch(() => null);
-    // No rollback machinery is added: the rolled-back transaction leaves the
-    // merged tree, and the store's existing restore heals it under its next lock.
+    // The failed apply puts the tree back itself (R10/R11 observe that raw).
+    // This row keeps its original observation: after a store read, DB == tree.
     const rolledBack = await canonical(note);
     await fileStoreModule.agentFileStore(db).read(companyId, agentId, entryFile, board());
     const healed = await canonical(note);
