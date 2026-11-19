@@ -518,6 +518,21 @@ async function settleOneMessage(db: Db, issue: DecisionIssue, now: Date,
     }
     return done({ kind: "pending", recheckAt: decision.recheckAt });
   }
+  if (decision.kind === "retire") {
+    // The message's ONE standing note stopped being true and needs no card
+    // (the sender's own subtree cancel): retire it by its id under the same
+    // fence, re-deciding unchanged first. No card remains.
+    await db.transaction(async tx => {
+      await tx.select({ id: issues.id }).from(issues)
+        .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
+      const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, input.nativeBlockedRepairApplies, messageId);
+      if (fenced.kind !== "retire" || fenced.reason !== decision.reason || fenced.retireCommentId !== decision.retireCommentId) return;
+      await tx.update(issueComments).set({ deletedAt: now, updatedAt: now })
+        .where(and(eq(issueComments.id, fenced.retireCommentId), eq(issueComments.companyId, issue.companyId),
+          isNull(issueComments.deletedAt)));
+    });
+    return done({ kind: "explained" });
+  }
   if (decision.kind !== "notice") return done(decision);
   const commentId = await db.transaction(async tx => {
     // The issue fence that comment writers, the executor's held-notice writer
@@ -682,6 +697,8 @@ type WaitRecord = { messageId: string; runId: string | null; waitKind?: "setup";
 type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" }>
   | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string };
       recordWait?: WaitRecord }
+  /** The message's standing note is retired by its id; no card remains. */
+  | { kind: "retire"; reason: string; retireCommentId: string }
   | { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice>;
       recordWait?: WaitRecord;
       /** Set when this replaces the message's standing waiting note. */
@@ -740,7 +757,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
       issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }))).limit(1);
   if (answer) return { kind: "answered" };
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
-  const [noticed] = await q.select({ id: issueComments.id,
+  const [noticed] = await q.select({ id: issueComments.id, deletedAt: issueComments.deletedAt,
     waiting: sql<boolean>`coalesce(${issueComments.metadata}->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)`,
     waitingCode: sql<string | null>`(select r->>'value' from jsonb_array_elements(coalesce(${issueComments.metadata}->'sections', '[]'::jsonb)) sec,
       jsonb_array_elements(coalesce(sec->'rows', '[]'::jsonb)) r where r->>'label' = ${WAITING_ROW_LABEL} limit 1)` })
@@ -774,7 +791,9 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   if (messageRun && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: messageRun.id }))) {
     return { kind: "answered" };
   }
-  if (issue.status === "cancelled") return decideCancelledTask(q, issue, message, messageRun, reason);
+  if (issue.status === "cancelled") {
+    return decideCancelledTask(q, issue, message, messageRun, reason, upgrading && !noticed?.deletedAt ? upgrading : null);
+  }
 
   // A failed fresh continuation that descends from the message's run is the
   // run the person's message ended on: the automatic lineage, typed or not,
@@ -1270,10 +1289,15 @@ export const UNANSWERED_MESSAGE_CANCELLED_TEXT =
  * cancel needs no card; anyone else's (another person, an agent, the system:
  * a NULL user, compared NULL-safe, never equal) gets ONE true card. A message
  * whose own run started, or a task cancelled without a subtree cancel, stays
- * out of scope as before. */
+ * out of scope as before.
+ * The message keeps ONE note (its key `unanswered_message:<id>`): a standing
+ * waiting note for it (e.g. '<agent> is paused … it will run when resumed')
+ * is no longer true once the cancel took its wake. The sender's cancel
+ * retires THAT note by its id (no card); anyone else's upgrades THAT note in
+ * place to the cancel words (the same id), never a second note (rf-3). */
 async function decideCancelledTask(q: Db, issue: DecisionIssue,
   message: { id: string; createdAt: Date; authorUserId: string | null }, messageRun: { id: string } | null,
-  reason: string): Promise<Decision> {
+  reason: string, standingNoteId: string | null): Promise<Decision> {
   if (messageRun) return { kind: "out_of_scope" };
   const [cancel] = await q.select({ id: issueTreeHolds.id, byUserId: issueTreeHolds.createdByUserId,
     createdAt: issueTreeHolds.createdAt }).from(issueTreeHolds)
@@ -1285,7 +1309,7 @@ async function decideCancelledTask(q: Db, issue: DecisionIssue,
   if (!cancel || message.createdAt > cancel.createdAt) return { kind: "out_of_scope" };
   // NULL-safe: a NULL canceller (the system) is never the sender.
   if (cancel.byUserId != null && message.authorUserId != null && cancel.byUserId === message.authorUserId) {
-    return { kind: "explained" };
+    return standingNoteId ? { kind: "retire", reason, retireCommentId: standingNoteId } : { kind: "explained" };
   }
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
@@ -1300,7 +1324,8 @@ async function decideCancelledTask(q: Db, issue: DecisionIssue,
     sourceRun: null,
     failureCode: UNANSWERED_MESSAGE_CANCELLED_CODE,
   });
-  return { kind: "notice", reason, code: UNANSWERED_MESSAGE_CANCELLED_CODE, notice };
+  return { kind: "notice", reason, code: UNANSWERED_MESSAGE_CANCELLED_CODE, notice,
+    ...(standingNoteId ? { upgradeCommentId: standingNoteId } : {}) };
 }
 
 /** Resume (paused -> resuming) is an event: every open task of this agent whose
