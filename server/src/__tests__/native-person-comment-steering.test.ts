@@ -369,7 +369,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
     const f = await fixture("B-task", false);
     try {
       const message = await f.post("TASK-M: change the next step, do not stop");
-      expect(message).toMatchObject({ steeredIntoRunId: f.runId });
+      expect(message).toMatchObject({ steeredIntoRunId: f.runId, steerDeliveredAt: null });
       await vi.waitFor(() => expect(f.commands("steer").map(command => command.input?.message)).toEqual([message.body]));
       expect(f.commands("abort")).toEqual([]);
       expect((await f.wakes()).filter(wake => JSON.stringify(wake.payload).includes(message.id))).toEqual([]);
@@ -379,10 +379,14 @@ describe("person comment default steering eligibility and asynchronous receipt",
         const thread = (await request(f.app).get(`/api/issues/${f.issueId}/comments`).expect(200)).body;
         expect(thread.find((comment: any) => comment.id === message.id)).toMatchObject({
           steeredIntoRunId: f.runId, steeringStatus: "delivered", steeringDeliveryEventSeq: expect.any(Number),
+          steerDeliveredAt: expect.any(String),
         });
       });
+      const thread = (await request(f.app).get(`/api/issues/${f.issueId}/comments`).expect(200)).body;
       const [carrying] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
       expect(carrying.contextSnapshot?.steeredDeliveredAts).toMatchObject({ [message.id]: expect.any(String) });
+      expect(thread.find((comment: any) => comment.id === message.id).steerDeliveredAt)
+        .toBe((carrying.contextSnapshot?.steeredDeliveredAts as Record<string, string>)[message.id]);
     } finally { await f.close(); }
   }, 45_000);
 

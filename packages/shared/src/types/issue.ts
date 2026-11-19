@@ -1118,6 +1118,8 @@ export interface IssueComment {
   /** Same-turn custody, never proof of delivery or an answer. */
   steeredIntoRunId?: string | null;
   steeredAt?: string | null;
+  /** Persisted Pi input-read time; never the steering RPC acknowledgement. */
+  steerDeliveredAt?: string | null;
   steeringStatus?: "accepted" | "carried" | "delivered" | null;
   carriedIntoRunId?: string | null;
   /** Pi's own persisted userMessage event, not our acknowledgement. */
