@@ -406,7 +406,7 @@ import {
   type NativeRestartRecoveryClaim,
   carriesSettledPredecessorSession,
 } from "./native-restart-recovery.js";
-import { resetTurnAuthority, revokeTurnAuthority } from "./turn-authority-revocation.js";
+import { pauseRevokedTurn, resetTurnAuthority, revokeTurnAuthority } from "./turn-authority-revocation.js";
 
 type ActiveNativeSession = {
   session: NativeSession;
@@ -1168,6 +1168,9 @@ export async function claimWarmNativeInstructionCopy(input: {
     })) || prior.workspace.cwd !== input.workspace.cwd) return null;
   const scope = nativeSessionScopeKey(prior);
   const busyEntry = warmNativeSessions.get(scope);
+  // Pause: the predecessor's turn was revoked and its teardown still holds
+  // this entry; never wait for or adopt it (the successor opens fresh).
+  if (busyEntry && pauseRevokedTurn(busyEntry.runId)) return null;
   if (busyEntry?.busy || settlingNativeSessionScopes.has(scope) || closingWarmNativeSessions.has(scope)) await waitForWarmNativeSessionSettled(scope);
   // Re-read after the wait: the release may have retired or replaced the session.
   const entry = warmNativeSessions.get(scope);
@@ -1227,6 +1230,7 @@ export async function reserveWarmNativeInstructionDirectory(input: {
   for (const [id, entry] of warmNativeSessions) {
     if (entry.companyId !== input.companyId || entry.agentId !== input.agentId || entry.instructionCopy?.runId !== input.previousRunId) continue;
     if (await forgetUnretiredOwnerOnOtherSandbox(id, entry, input.target)) return null;
+    if (pauseRevokedTurn(entry.runId)) return null;
     // T9 (chat-retire3): a quick follow-up (no Stop) meets the previous turn's
     // release still finishing: a Boat Runner is a release/resume pair owner,
     // busy until its finishRelease in that run's final cleanup. Wait it out
@@ -2763,6 +2767,8 @@ const sessionHarnessBackupOwners = new WeakMap<SessionAuthorityEpoch, Awaited<Re
 const initializingSessionToolAuthorities = new Set<string>();
 const executingRunnerdSessionScopes = new Map<string, string>();
 const executingNativeOwnerScopes = new Map<string, symbol>();
+/** The run each owner-scope reservation belongs to (Pause: a revoked owner yields its scope). */
+const executingNativeOwnerRuns = new Map<symbol, string>();
 const executingNativeIngressAllocations = new Map<string, symbol>();
 /** Session scope -> the run releasing it after its turn (warm release and
  * hand-back), which a follow-up's instruction claim may wait for. */
@@ -2916,6 +2922,9 @@ async function retireSupersededWarmNativeSessions(
     // saved session reserves that directory, then must retire the old provider
     // while keeping the directory it adopted. Any other reservation is busy.
     const ownReservation = logicalOwner && entry.preparingRunId === runId;
+    // Pause: a revoked predecessor's own teardown retires its entry; the
+    // successor's fresh session never waits for it or retires it.
+    if (logicalOwner && pauseRevokedTurn(entry.runId)) continue;
     if (entry.busy || (entry.preparingRunId && !ownReservation) || executingRunnerdSessionScopes.has(scope)) {
       throw new Error("native_session_supervisor_busy");
     }
@@ -9585,6 +9594,9 @@ function loadWarmNativeCheckpoint(
     throw new Error("native_session_supervisor_checkpoint_mismatch");
   }
   const persistedIdentity = record(envelope.snapshot.identity);
+  // Pause: the checkpoint of a turn a person's Pause revoked, whose teardown
+  // still holds that provider session, is never recovered; start fresh.
+  if (typeof persistedIdentity.runId === "string" && pauseRevokedTurn(persistedIdentity.runId)) return null;
   if (
     persistedIdentity.sessionId !== nativeSessionKey(execution) ||
     persistedIdentity.companyId !== execution.binding.companyId ||
@@ -11509,10 +11521,14 @@ async function executePaperclipNativeSessionUnnoticed(input: {
       ownsPhysicalIngress = true;
     }
     // Reserve across session identities before retiring or staging anything.
-    if (executingNativeOwnerScopes.has(ownerScope)) {
+    // Pause: an owner whose turn a person's Pause revoked (its teardown still
+    // runs here) no longer holds the scope; the successor opens fresh.
+    const scopeOwner = executingNativeOwnerScopes.get(ownerScope);
+    if (scopeOwner && !pauseRevokedTurn(executingNativeOwnerRuns.get(scopeOwner) ?? "")) {
       throw new Error("native_session_supervisor_busy");
     }
     executingNativeOwnerScopes.set(ownerScope, ownerToken);
+    executingNativeOwnerRuns.set(ownerToken, runId);
     if (!input.useRunnerd) await retireSupersededWarmNativeSessions(
       ownerScope, nativeSessionScopeKey(input.execution), nativeSessionKey(input.execution), runId,
       undefined, input.runnerExecutionTarget,
@@ -11529,7 +11545,8 @@ async function executePaperclipNativeSessionUnnoticed(input: {
     // descriptors. Claim it before any workspace scrub/write so a duplicate
     // execution cannot truncate or replace the active turn's staging inode.
     sessionScopeId = nativeSessionScopeKey(input.execution);
-    if (executingRunnerdSessionScopes.has(sessionScopeId)) {
+    const scopeRun = executingRunnerdSessionScopes.get(sessionScopeId);
+    if (scopeRun !== undefined && !pauseRevokedTurn(scopeRun)) {
       throw new Error("native_session_supervisor_busy");
     }
     executingRunnerdSessionScopes.set(
@@ -11746,6 +11763,7 @@ async function executePaperclipNativeSessionUnnoticed(input: {
         if (executingNativeOwnerScopes.get(ownerScope) === ownerToken) {
           executingNativeOwnerScopes.delete(ownerScope);
         }
+        executingNativeOwnerRuns.delete(ownerToken);
         if (
           ownsSessionScope &&
           sessionScopeId !== null &&
@@ -13209,7 +13227,10 @@ async function executePaperclipNativeSessionAttempt(
   };
   if (warmSessionId !== null && warmConfigDigest !== null && canRecoverWarmOwner) {
     const registered = warmNativeSessions.get(warmSessionId);
-    const entry = registered && await forgetUnretiredOwnerOnOtherSandbox(warmSessionId, registered, input.runnerExecutionTarget)
+    // Pause: never adopt or wait for a revoked predecessor's warm entry; its
+    // own teardown retires it (loadWarmNativeCheckpoint skips its checkpoint).
+    const entry = registered && (pauseRevokedTurn(registered.runId)
+      || await forgetUnretiredOwnerOnOtherSandbox(warmSessionId, registered, input.runnerExecutionTarget))
       ? undefined : registered;
     if (entry?.released) requireReleasedWarmScope(input, releasedWarmRunner(readWarmNativeEnvelope(input.execution)),
         readRunnerdDurableIdentity(scopedRunnerdStateRoot(input.execution)));
@@ -13899,7 +13920,10 @@ async function executePaperclipNativeSessionAttempt(
                 warmSessionId !== null &&
                 warmConfigDigest !== null
               ) {
-                const existing = warmNativeSessions.get(warmSessionId);
+                // Pause: a revoked predecessor's entry is never adopted; this
+                // fresh session registers its own (the old one's teardown ends it).
+                const registeredWarm = warmNativeSessions.get(warmSessionId);
+                const existing = registeredWarm && pauseRevokedTurn(registeredWarm.runId) ? undefined : registeredWarm;
                 if (existing) {
                   if (existing.ownerToken !== warmSessionOwnerToken) {
                     throw new Error("native_session_supervisor_busy");

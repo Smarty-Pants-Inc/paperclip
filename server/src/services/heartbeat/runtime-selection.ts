@@ -1,4 +1,5 @@
 import { assertPaperclipRunnerBinaryConfiguration } from "../native-runtime/native-codex-runner.js";
+import { pauseRevokedTurn } from "../native-runtime/turn-authority-revocation.js";
 import { readNativeWorkspaceMigration, migratedNativeExecutionCwd } from "../native-runtime/native-workspace-migration.js";
 import { resolveProviderApiPlacement } from "../native-runtime/provider-api-placement.js";
 import { readClaimedNativeStopRecovery } from "../native-runtime/native-cancellation-request.js";
@@ -37,6 +38,8 @@ import {
   type agents,
   completionContracts,
   heartbeatRunEvents,
+  environmentLeases,
+  executionWorkspaceSnapshots,
   heartbeatRuns,
   nativeRunFinalizations,
 } from "@paperclipai/db";
@@ -590,6 +593,25 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
             predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
           }))
         : null;
+    // Pause: the predecessor's turn was revoked (exact-owner certificate) and
+    // its own teardown, which would save its files, still runs. This run
+    // starts a fresh provider session (rebindNativeSessionCheckpoint /
+    // loadWarmNativeCheckpoint) from the last saved state; its fresh-session
+    // handoff carries the predecessor's run summary, which says so in the
+    // ruled words (workspace-recovery-fallback previousRunUnsavedFilesLine).
+    // Its files are unsaved only while its box (a non-local lease) is still
+    // held mid-stop and no committed workspace snapshot came from it.
+    if (previousNativeRun?.errorCode === "agent_paused" && pauseRevokedTurn(previousNativeRun.id) && (await db.select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, previousNativeRun.id),
+        sql`exists (select 1 from ${environmentLeases} where ${environmentLeases.heartbeatRunId} = ${heartbeatRuns.id}
+          and ${environmentLeases.provider} <> 'local' and ${environmentLeases.status} = 'active')`,
+        sql`not exists (select 1 from ${executionWorkspaceSnapshots} where ${executionWorkspaceSnapshots.sourceRunId} = ${heartbeatRuns.id}
+          and ${executionWorkspaceSnapshots.status} = 'committed')`)).limit(1)).length > 0) {
+      const { previousRunUnsavedFilesLine } = await import("../workspace-recovery-fallback.js");
+      await db.update(heartbeatRuns).set({ nextAction: previousRunUnsavedFilesLine("could not save") }).where(and(
+        eq(heartbeatRuns.id, previousNativeRun.id), eq(heartbeatRuns.companyId, agent.companyId),
+        sql`${heartbeatRuns.nextAction} is null`));
+    }
     nativeRunnerInstanceId =
       previousNativeRun?.runnerInstanceId &&
       previousNativeRun.nativeSessionId ===
