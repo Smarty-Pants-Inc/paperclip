@@ -7,7 +7,7 @@ import { createServer, type Socket } from "node:net";
 import { basename, dirname, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
-  PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, dispatchPiToolCall,
+  PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, PI_TOOL_CALLBACK_TIMEOUT, PiToolCallbackTimeoutError, dispatchPiToolCall,
   validSocketPath, validatePiToolCallReceipt, validatePiToolCallRequest,
   type PiToolCallReceipt, type PiToolCallRequest, type PiToolResult, type RunAuthority,
 } from "./pi-bind-protocol.js";
@@ -120,12 +120,16 @@ export async function startPiCallbackServer(options: PiCallbackServerOptions): P
     let timer: ReturnType<typeof setTimeout> | undefined;
     let deadline = Infinity;
     // At most one 1 MiB backing buffer per reader, even for one-byte chunks.
-    let buffer: Buffer | undefined, bytes = 0, reading = false, handled = false, replied = false;
+    let buffer: Buffer | undefined, bytes = 0, reading = false, handled = false, replied = false, executing = false;
     let queued: Job | undefined;
     const stopReading = () => { if (reading) { reading = false; --readers; } };
     const armDeadline = () => {
       clearTimeout(timer);
-      timer = setTimeout(() => { if (replied) socket.destroy(); else reject(); }, timeoutMs);
+      timer = setTimeout(() => {
+        if (replied) socket.destroy();
+        else if (executing) reply(`${JSON.stringify({ error: PI_TOOL_CALLBACK_TIMEOUT })}\n`, true);
+        else reject();
+      }, timeoutMs);
     };
     const reply = (frame: string, rejectCall = false) => {
       if (replied || socket.destroyed) return;
@@ -163,6 +167,7 @@ export async function startPiCallbackServer(options: PiCallbackServerOptions): P
         signal.throwIfAborted();
         if (!authority.accept(call.origin)) throw refused();
         deadline = performance.now() + timeoutMs;
+        executing = true;
         armDeadline();
         // Keep the identical deeply immutable snapshot at both consumer boundaries.
         // The helper still performs atomic once-only consume, cancellation and result gates.
@@ -179,9 +184,13 @@ export async function startPiCallbackServer(options: PiCallbackServerOptions): P
         // Validate the emitted bytes too: details/toJSON must not change the wire shape.
         if (Buffer.byteLength(frame) > PI_BIND_MAX_FRAME_BYTES || !validatePiToolCallReceipt(JSON.parse(frame), call)) throw refused();
         signal.throwIfAborted();
-        if (closed || !authority.accept(call.origin, call.toolCallId) || performance.now() >= deadline) throw refused();
+        if (closed || !authority.accept(call.origin, call.toolCallId)) throw refused();
+        if (performance.now() >= deadline) throw new PiToolCallbackTimeoutError();
         reply(frame);
-      } catch { reject(); }
+      } catch (error) {
+        if (error instanceof PiToolCallbackTimeoutError) reply(`${JSON.stringify({ error: PI_TOOL_CALLBACK_TIMEOUT })}\n`, true);
+        else reject();
+      }
       finally { signal?.removeEventListener("abort", reject); }
     }
     socket.on("data", (chunk: Buffer) => {

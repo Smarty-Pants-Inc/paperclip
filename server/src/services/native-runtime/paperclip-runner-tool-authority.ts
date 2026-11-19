@@ -573,7 +573,11 @@ export class PaperclipRunnerToolAuthority {
       if (result === undefined) return null;
       return { result: call.tool === "hire_agent" ? hireAgentResult(result, context.actor.adapterConfig?.provider) : apiToolResult(result) };
     }
-    if (call.tool === "workspace_write" || call.tool === "workspace_run") {
+    if (this.binding.assignedMcpTools?.has(call.tool)) {
+      if (this.binding.firstPartyOnly) throw forbidden("Assigned app tools are unavailable to this run");
+      this.binding.assignedMcpTools.authorize(call, context.issue.workMode as "standard" | "planning" | "ask");
+    }
+    if (call.tool === "workspace_write" || call.tool === "workspace_run" || this.binding.assignedMcpTools?.has(call.tool)) {
       const bridge = record(record(run.resultJson?.bridgeToolReceipts)[callKey]);
       if (bridge.state === "completed" && bridge.tool === call.tool
         && bridge.digest === toolInputDigest({ tool: call.tool, arguments: call.arguments })
@@ -782,8 +786,14 @@ export class PaperclipRunnerToolAuthority {
     }
     if (this.binding.assignedMcpTools?.has(call.tool)) {
       const current = await this.#boundContext({ tool: call.tool });
-      const result = await this.binding.assignedMcpTools.execute(call, current.issue.workMode as "standard" | "planning" | "ask");
-      return captureRunnerToolResult(result, this.#responseCaptureIo("runner.assigned_tool"));
+      const mutation = this.binding.assignedMcpTools.authorize(call, current.issue.workMode as "standard" | "planning" | "ask");
+      const execute = async () => {
+        const result = await this.binding.assignedMcpTools!.execute(call, current.issue.workMode as "standard" | "planning" | "ask");
+        return captureRunnerToolResult(result, this.#responseCaptureIo("runner.assigned_tool"));
+      };
+      // Reuse the run's durable callback receipt after a lost mutation reply.
+      // Discovery and reads still refresh current grants/state on every call.
+      return mutation ? this.#bridgeMutation(call, execute, "assigned_tool") : execute();
     }
     if (isConnectorTool(call.tool)) {
       if (!(this.binding.connectorAssignments ?? []).some((assignment) => assignment.tools.some((tool) => tool.name === call.tool))) throw forbidden("Connector tool is not available to this run");
@@ -1167,7 +1177,7 @@ export class PaperclipRunnerToolAuthority {
     }
   }
 
-  async #bridgeMutation(call: { tool: string; callId: string; arguments: unknown }, execute: () => Promise<unknown>) {
+  async #bridgeMutation(call: { tool: string; callId: string; arguments: unknown }, execute: () => Promise<unknown>, source: "workspace" | "assigned_tool" = "workspace") {
     if (!call.callId || call.callId.length > 500) throw badRequest("Use a stable bounded call ID");
     const key = toolCallKey(call.callId);
     const digest = toolInputDigest({ tool: call.tool, arguments: call.arguments });
@@ -1179,23 +1189,30 @@ export class PaperclipRunnerToolAuthority {
       const old = record(receipts[key]);
       if (receipts[key]) {
         if (old.digest !== digest) throw badRequest("Call ID reused with different arguments");
-        return { result: old.result ?? { outcome: "unknown", guidance: "A workspace effect may have occurred. Inspect files and state before issuing another mutation; this call will not execute again." } };
+        return { result: old.state === "completed" && Object.hasOwn(old, "result") ? old.result : { outcome: "unknown", guidance: source === "workspace"
+          ? "A workspace effect may have occurred. Inspect files and state before issuing another mutation; this call will not execute again."
+          : "Tool outcome unknown, may have succeeded: check before retrying. This call will not execute again." } };
       }
-      if (Object.keys(receipts).length >= 1000) throw badRequest("Workspace mutation limit reached");
+      if (Object.keys(receipts).length >= 1000) throw badRequest("Run tool mutation limit reached");
       receipts[key] = { digest, tool: call.tool, state: "pending" };
       await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, bridgeToolReceipts: receipts } }).where(eq(heartbeatRuns.id, this.binding.runId));
       return null;
     }));
     if (prior) return prior.result;
     let result: unknown;
-    try { result = await execute(); } catch (error) { result = { outcome: "failed", message: error instanceof Error ? error.message : "Workspace operation failed" }; }
+    try { result = await execute(); } catch (error) {
+      // A gateway rejection may follow a committed external effect. Preserve
+      // its pending receipt rather than storing a fabricated final failure.
+      if (source === "assigned_tool") throw error;
+      result = { outcome: "failed", message: error instanceof Error ? error.message : "Workspace operation failed" };
+    }
     await withTransactionRetry(this.db, () => this.db.transaction(async tx => {
       const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, this.binding.runId), eq(heartbeatRuns.companyId, this.binding.companyId))).for("update");
       const resultJson = record(run?.resultJson), receipts = record(resultJson.bridgeToolReceipts);
       receipts[key] = { digest, tool: call.tool, state: "completed", result };
       await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, bridgeToolReceipts: receipts } }).where(eq(heartbeatRuns.id, this.binding.runId));
     }));
-    await logActivity(this.db, { companyId: this.binding.companyId, actorType: "agent", actorId: this.binding.agentId, runId: this.binding.runId,
+    if (source === "workspace") await logActivity(this.db, { companyId: this.binding.companyId, actorType: "agent", actorId: this.binding.agentId, runId: this.binding.runId,
       action: "runner.workspace_operation", entityType: "issue", entityId: this.binding.issueId, details: { tool: call.tool, requestFingerprint: digest, outcome: record(result).outcome ?? "completed" } });
     return result;
   }

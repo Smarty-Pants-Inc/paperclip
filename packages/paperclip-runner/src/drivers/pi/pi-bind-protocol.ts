@@ -1,11 +1,16 @@
 import { createHash } from "node:crypto";
 import { connect } from "node:net";
+import { performance } from "node:perf_hooks";
 import { CAPABILITY_SEMANTIC_TOOL_CATALOG } from "../../semantic-tools/catalog.js";
 
 /** Private IPC only: never put these records on Pi stdin/stdout or in its journal. */
 export const PI_BIND_MAX_FRAME_BYTES = 1024 * 1024;
 export const PI_BIND_TIMEOUT_MS = 5000;
 export const PI_BIND_ERROR = "Pi private request rejected";
+export const PI_TOOL_CALLBACK_TIMEOUT = "Pi tool callback timed out; outcome unknown, may have succeeded: check before retrying";
+export class PiToolCallbackTimeoutError extends Error {
+  constructor() { super(PI_TOOL_CALLBACK_TIMEOUT); this.name = "PiToolCallbackTimeoutError"; }
+}
 /** OpenAI Chat Completions `tools`: "A maximum of 128 functions are supported."
  * https://platform.openai.com/docs/api-reference/chat/create#chat-create-tools
  * piManagedProviderApi maps gateway `chat` to openai-completions. This is the
@@ -357,11 +362,11 @@ export async function sendPiBindRequest<C extends PiBindCommand>(socketPath: str
 }
 export async function sendPiToolRequest(socketPath: string, request: PiToolCallRequest, options: PiPrivateRequestOptions = {}): Promise<PiToolResult> {
   if (!validatePiToolCallRequest(request)) throw new Error(PI_BIND_ERROR);
-  const response = await exchange(socketPath, request, options);
+  const response = await exchange(socketPath, request, options, true);
   if (!validatePiToolCallReceipt(response, request)) throw new Error("Pi tool receipt mismatch");
   return response.result;
 }
-async function exchange(socketPath: string, request: unknown, options: PiPrivateRequestOptions): Promise<unknown> {
+async function exchange(socketPath: string, request: unknown, options: PiPrivateRequestOptions, toolCall = false): Promise<unknown> {
   if (!validSocketPath(socketPath)) throw new Error(PI_BIND_ERROR);
   const frame = `${JSON.stringify(request)}\n`;
   if (Buffer.byteLength(frame) > PI_BIND_MAX_FRAME_BYTES) throw new Error("Pi private frame too large");
@@ -375,7 +380,7 @@ async function exchange(socketPath: string, request: unknown, options: PiPrivate
       if (error) reject(error); else resolve(value);
     };
     const abort = () => finish(new Error("Pi private request aborted"));
-    const timer = setTimeout(() => finish(new Error("Pi private request timed out")), timeoutMs);
+    const timer = setTimeout(() => finish(toolCall ? new PiToolCallbackTimeoutError() : new Error("Pi private request timed out")), timeoutMs);
     options.signal?.addEventListener("abort", abort, { once: true });
     socket.once("error", () => finish(new Error("Pi private channel failed")));
     socket.once("close", () => finish(new Error("Pi private channel closed before receipt")));
@@ -385,7 +390,9 @@ async function exchange(socketPath: string, request: unknown, options: PiPrivate
       try {
         if (newline !== buffer.length - 1) throw new Error();
         const value: unknown = JSON.parse(buffer.subarray(0, newline).toString("utf8"));
-        if (object(value) && Object.hasOwn(value, "error")) { finish(new Error(PI_BIND_ERROR)); return; }
+        if (object(value) && Object.hasOwn(value, "error")) {
+          finish(toolCall && value.error === PI_TOOL_CALLBACK_TIMEOUT ? new PiToolCallbackTimeoutError() : new Error(PI_BIND_ERROR)); return;
+        }
         finish(undefined, value);
       } catch { finish(new Error("Pi private receipt malformed")); }
     });
@@ -458,17 +465,24 @@ export async function dispatchPiToolCall(
   const controller = new AbortController();
   const signal = AbortSignal.any([controller.signal, originSignal, ...(options.signal ? [options.signal] : [])]);
   let rejectAbort: (() => void) | undefined;
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const deadline = performance.now() + timeoutMs;
+  const timer = setTimeout(() => controller.abort(new PiToolCallbackTimeoutError()), timeoutMs);
   try {
     signal.throwIfAborted();
     const result = await Promise.race([
       Promise.resolve().then(() => { signal.throwIfAborted(); return handler(captured, signal); }),
-      new Promise<never>((_, reject) => { rejectAbort = () => reject(new Error("Pi tool callback refused")); signal.addEventListener("abort", rejectAbort, { once: true }); }),
+      new Promise<never>((_, reject) => { rejectAbort = () => reject(signal.reason instanceof PiToolCallbackTimeoutError ? signal.reason : new Error("Pi tool callback refused")); signal.addEventListener("abort", rejectAbort, { once: true }); }),
     ]);
     signal.throwIfAborted();
+    if (performance.now() >= deadline) throw new PiToolCallbackTimeoutError();
     if (!authority.accept(origin, captured.toolCallId) || !validatePiToolResult(result) || Buffer.byteLength(JSON.stringify(result)) > PI_BIND_MAX_FRAME_BYTES / 2) throw new Error();
     return result;
-  } catch { throw new Error("Pi tool callback refused"); }
+  } catch (error) {
+    if (error instanceof PiToolCallbackTimeoutError) throw error;
+    if (signal.reason instanceof PiToolCallbackTimeoutError) throw signal.reason;
+    if (performance.now() >= deadline) throw new PiToolCallbackTimeoutError();
+    throw new Error("Pi tool callback refused");
+  }
   finally { clearTimeout(timer); if (rejectAbort) signal.removeEventListener("abort", rejectAbort); }
 }
 export function guardCallback(authority: RunAuthority, capturedOrigin: Origin, toolCallId: string | undefined, diagnose: (message: string) => void): boolean {

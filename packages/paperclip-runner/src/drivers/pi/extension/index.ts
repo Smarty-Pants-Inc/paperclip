@@ -11,7 +11,7 @@ import { isPiThinkingLevelAtMost } from "../pi-native-config.js";
 import { installPiPerformanceDiagnostics } from "../pi-performance-diagnostics.js";
 import { PI_TOOL_LIMIT_ENTRY, piToolLimitMessage } from "../pi-tool-limit-diagnostics.js";
 import {
-  PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, PI_BIND_TIMEOUT_MS, PI_DYNAMIC_TOOL_LIMIT_BY_API, RunAuthority, bindContent, digest, dispatchPiToolCall,
+  PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, PI_BIND_TIMEOUT_MS, PI_DYNAMIC_TOOL_LIMIT_BY_API, PiToolCallbackTimeoutError, RunAuthority, bindContent, digest, dispatchPiToolCall,
   isDigest, sendPiToolRequest, stringList, validSocketPath, validateBindingConfig, validateOrigin,
   validatePiBindCommand, validatePiToolResult,
   type BindReceipt, type Origin, type ParkReadyResult, type PiBindCommand, type PiBindingConfig,
@@ -226,7 +226,10 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
                 : Promise.reject(new Error(PI_BIND_ERROR)), { signal, timeoutMs: 60000 });
             if (!authority.accept(origin, toolCallId) || !validatePiToolResult(result) || Buffer.byteLength(JSON.stringify(result)) > PI_BIND_MAX_FRAME_BYTES / 2) throw new Error(PI_BIND_ERROR);
             return result;
-          } catch { throw new Error("Pi tool callback refused"); }
+          } catch (error) {
+            if (error instanceof PiToolCallbackTimeoutError) throw error;
+            throw new Error("Pi tool callback refused");
+          }
         },
       });
       registeredTools.set(name, definition);
