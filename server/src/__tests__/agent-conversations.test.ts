@@ -57,6 +57,7 @@ import { classifyIssueGraphLiveness } from "../services/recovery/issue-graph-liv
 import { NATIVE_STATUS_ARBITER_POLICY_VERSION } from "../services/native-runtime/status-arbiter.js";
 import { runningProcesses } from "../adapters/index.js";
 import { CONVERSATION_CONTINUATION_POLICY } from "../services/conversation-continuation.js";
+import { queuedCommentIdsFromWakePayload } from "../services/issue-queued-comment-queue.js";
 import {
   buildPaperclipTaskMarkdown,
   buildPaperclipWakePayload,
@@ -908,7 +909,8 @@ import {
           // 11-19 04:33Z).
           const stored = await db.select().from(agentWakeupRequests).where(and(
             eq(agentWakeupRequests.agentId, runtimeAgent), eq(agentWakeupRequests.status, "deferred_issue_execution")));
-          expect(stored.map((wake) => (wake.payload as Record<string, unknown>).executionWait)).toEqual(queuedIds.map(() => ({
+          expect(stored.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload)
+            .map(() => (wake.payload as Record<string, unknown>).executionWait))).toEqual(queuedIds.map(() => ({
             reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." })));
           const stopAt = Date.now();
           vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true });
