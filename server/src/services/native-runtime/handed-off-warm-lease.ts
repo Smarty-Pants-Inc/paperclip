@@ -153,6 +153,16 @@ function handedOffStopPending(run: Pick<Run, "id">, lease: typeof environmentLea
   return lease.status === "pending_cleanup" && intent?.runId === run.id && handedOffStopMarkers.some(key => intent[key] === true);
 }
 
+/** adopt-stoppending-card: DB-only. A handed-off box's stop-and-retain intent
+ * still inside its receipt bound (handedOffWarmStopReceiptBound from the durable
+ * intent time, not yet marked overdue). Past it, the box is really unproven. */
+export function handedOffWarmStopWithinReceiptBound(run: Pick<Run, "id">, lease: typeof environmentLeases.$inferSelect,
+  now = Date.now()): boolean {
+  return handedOffStopPending(run, lease) && !handedOffWarmStopReceiptOverdue(run, lease)
+    && (lease.metadata?.[HANDED_OFF_WARM_STOP_OVERDUE_KEY] as { runId?: unknown } | undefined)?.runId !== run.id
+    && !!lease.releasedAt && lease.releasedAt.getTime() + handedOffWarmStopReceiptBound.ms > now;
+}
+
 /** adopt-hung-stop: DB-only. The handed-off box's stop receipt is overdue and the box is
  * marked replace-before-reuse, so admission no longer waits for its receipt. */
 export function handedOffWarmStopReceiptOverdue(run: Pick<Run, "id">, lease: typeof environmentLeases.$inferSelect): boolean {
