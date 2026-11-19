@@ -25,6 +25,8 @@ export async function queuedRunPredecessorHold(db: Db, input: {
   executionRunId: string | null | undefined;
   isTerminal?: (status: string | null | undefined) => boolean;
   isLive?: (runId: string) => boolean;
+  /** Pause only: the predecessor's exact in-process executor carries turnAuthorityRevoked. */
+  pauseRevoked?: (runId: string) => boolean;
 }): Promise<QueuedRunPredecessorHold | null> {
   const { run, issueId, ownsIssue } = input;
   const isTerminal = input.isTerminal ?? isHeartbeatRunTerminalStatus;
@@ -36,6 +38,7 @@ export async function queuedRunPredecessorHold(db: Db, input: {
     const [previous] = await db.select({ status: heartbeatRuns.status, agentId: heartbeatRuns.agentId,
       issueId: heartbeatRuns.issueId, nativeIssueId: heartbeatRuns.nativeIssueId,
       supersededByFreshContinuation: sql<boolean>`${heartbeatRuns.resultJson} ? 'freshContinuationSupersededAt'`,
+      errorCode: heartbeatRuns.errorCode,
       contextIssueId: sql<unknown>`coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId')`,
     })
       .from(heartbeatRuns).where(and(
@@ -44,6 +47,10 @@ export async function queuedRunPredecessorHold(db: Db, input: {
       ));
     if (previousRunId !== executionOwnerId && (previous?.agentId !== run.agentId ||
         (previous.nativeIssueId ?? previous.issueId ?? previous.contextIssueId) !== issueId)) continue;
+    // A person's Pause revoked the predecessor's turn (exact-owner certificate,
+    // run cancelled agent_paused): its teardown and box stop continue in the
+    // background on the stopped box, which the next input never reuses.
+    if (previous?.status === "cancelled" && previous.errorCode === "agent_paused" && input.pauseRevoked?.(previousRunId)) continue;
     // A terminal result can precede workspace/lease cleanup on this or
     // another controller. Local absence alone is not a release receipt.
     if (!isTerminal(previous?.status) ||
