@@ -1102,11 +1102,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     for (const elapsed of [PENDING_WAIT_BOUND_MS + 1_000, 599_000, 601_000, 660_000]) {
       await settleAt(f, elapsed);
-      expect(await f.visible()).toHaveLength(0);
+      // M stays on its real receipt line. The earlier, separately owed
+      // planted-Stop message still MUST get its one notice on this merged base.
+      expect(await f.own()).toHaveLength(0);
+      await f.earlierOwedOnce();
     }
-    // A stored executionWait is already visible; no second bounded-note clock.
-    expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId), eq(activityLog.action, PENDING_WAIT_ACTION))))
-      .toHaveLength(0);
+    // No second bounded-note clock for M. Preserve the earlier message's
+    // single durable wait record rather than silencing its distinct duty.
+    expect((await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId), eq(activityLog.action, PENDING_WAIT_ACTION))))
+      .map(row => (row.details as Record<string, unknown>).messageId)).toEqual([f.stoppedId]);
   });
 
   it.each(["deferred", "deferred_issue_execution"].flatMap(status =>
