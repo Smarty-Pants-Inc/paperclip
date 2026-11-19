@@ -48,7 +48,21 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 const box = vi.hoisted(() => ({ targets: new Map<string, unknown>(), inputs: [] as unknown[],
   nextBox: null as null | ((leaseId: string, real: () => Promise<any>, lease: any) => Promise<unknown>),
   /** The scripted provider turn of one run (the live-executor rows): returns after it accepted its own result. */
-  session: null as null | ((input: { execution: any; runnerInstanceId: string; db: unknown }) => Promise<unknown>) }));
+  session: null as null | ((input: { execution: any; runnerInstanceId: string; db: unknown }) => Promise<unknown>),
+  /** HELD-PUBLICATION-1: the first sync publication after arming waits here (one shot). */
+  publication: null as null | { armed: boolean; entered: () => void; release: Promise<void> } }));
+// NAMED INJECTION HELD-PUBLICATION-1 (FU-c): the run-reference publication of a finalized sync (persistRunReference,
+// native-workspace-sync.ts, the statement after the copy-back's LAST ownership check) waits until the test releases it.
+// Everything it then does is the product's own code.
+vi.mock("../transaction-retry.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../transaction-retry.js")>();
+  return { ...actual, retryUnlessTransactionBound: ((...args: Parameters<typeof actual.retryUnlessTransactionBound>) => {
+    const gate = box.publication;
+    if (!gate?.armed || !/persistRunReference/.test(new Error().stack ?? "")) return actual.retryUnlessTransactionBound(...args);
+    gate.armed = false; gate.entered();
+    return gate.release.then(() => actual.retryUnlessTransactionBound(...args));
+  }) as typeof actual.retryUnlessTransactionBound };
+});
 vi.mock("../environment-execution-target.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../environment-execution-target.js")>();
   return { ...actual, resolveEnvironmentExecutionTarget: (async (input: { leaseId?: string | null }) =>
@@ -141,7 +155,7 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
     await db.insert(authUsers).values({ id: PERSON, name: "Person", email: "classic@example.invalid", emailVerified: true,
       createdAt: new Date(), updatedAt: new Date() });
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
-  afterEach(() => { vi.useRealTimers(); box.inputs.length = 0; box.session = null; box.nextBox = null; });
+  afterEach(() => { vi.useRealTimers(); box.inputs.length = 0; box.session = null; box.nextBox = null; box.publication = null; });
   afterAll(async () => {
     if (process.env.CLASSIC_BOUND_EVIDENCE) await fs.writeFile(process.env.CLASSIC_BOUND_EVIDENCE, JSON.stringify(evidence, null, 2));
     await db?.$client.end({ timeout: 1 }); await database?.cleanup();
@@ -152,6 +166,21 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
 
   const ANSWER = "Done. I rewrote the report and added the notes file.";
   const SAVED = { "report.md": "report, saved v1\n", "data/keep.txt": "kept since the first turn\n" };
+
+  /** REAL: the task as the person's page loads it (GET /api/issues/:id), read every 100 ms until stopped. */
+  function sampleTask(app: express.Express, issueId: string) {
+    const samples: Array<{ at: number; status: string }> = [];
+    let stopped = false;
+    const loop = (async () => {
+      while (!stopped) {
+        const at = Date.now();
+        const got = await request(app).get(`/api/issues/${issueId}`);
+        if (got.status === 200) samples.push({ at, status: String(got.body.status) });
+        await sleep(Math.max(0, 100 - (Date.now() - at)));
+      }
+    })();
+    return { samples, stop: async () => { stopped = true; await loop; } };
+  }
 
   async function scenario(options: { sharedProjectRoot?: boolean; gitRepository?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
@@ -424,7 +453,8 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
       // R's own reference is untouched and still `prepared` (K5 rests on it).
       expect(readNativeWorkspaceSyncReference(record(ended.runnerProfileJson).nativeWorkspaceSync)).toMatchObject({ state: "prepared", leaseId: s.leaseId });
       // The task is detached from R's root.
-      expect(await s.issue()).toMatchObject({ executionRunId: null, executionWorkspaceId: null, status: "blocked" });
+      // C12 (rf-5 06:58Z): a person is waiting, so the task is NOT set Blocked: it stays In progress for P.
+      expect(await s.issue()).toMatchObject({ executionRunId: null, executionWorkspaceId: null, status: "in_progress" });
 
       // R's reply: once, with the LOST line, read from the real GETs.
       await s.presentationWorker();
@@ -627,7 +657,9 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
       const retryCallsAfterDeadline = s.fault.commands - commandsAtDeadline;
       expect(retryCallsAfterDeadline).toBe(0);
       const taskAtCut = await s.issue();
-      expect(taskAtCut).toMatchObject({ executionRunId: null, executionWorkspaceId: null });
+      // C12 control: NOBODY was parked at the cut, so the task is Blocked as before (GET /api/issues/:id).
+      expect(taskAtCut).toMatchObject({ executionRunId: null, executionWorkspaceId: null, status: "blocked" });
+      expect((await request(s.app).get(`/api/issues/${s.issueId}`)).body).toMatchObject({ status: "blocked" });
       const frozen = { status: (await s.run()).status, errorCode: (await s.run()).errorCode };
       // REAL: after the cut (nobody was parked at it), the person starts P on the saved state.
       const sent = await request(s.app).post(`/api/issues/${s.issueId}/comments`)
@@ -815,7 +847,7 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
   // SCRIPTED (named): the provider turn. It accepts its own result through PaperclipControlPlanePort, bound as
   //   native-session-executor.ts binds it (openRun, the stream, run.result.accepted, run.terminal, completeRun).
   // PLANTED (named): the task's workspace row for its saved directory, in the shape row K1's real P leaves behind.
-  async function liveScenario() {
+  async function liveScenario(options: { holdPublication?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Classic bound live", issuePrefix: `L${companyId.slice(0, 6)}`,
       defaultResponsibleUserId: PERSON, requireBoardApprovalForNewAgents: false });
@@ -917,7 +949,9 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
       await fs.writeFile(path.join(boxCwd, "report.md"), "report, REWRITTEN BY R (unsaved)\n");
       await fs.writeFile(path.join(boxCwd, "notes.md"), "R's new notes (unsaved)\n");
       faultedBox.index = boxIndex;
-      fault.stall = { entered: reached, release: stallRelease };
+      // HELD-PUBLICATION-1 instead of CLASSIC-STALL-1: R's copy-back runs to its last ownership check and is held there.
+      if (options.holdPublication) box.publication = { armed: true, entered: reached, release: stallRelease };
+      else fault.stall = { entered: reached, release: stallRelease };
       return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Rewrote the report." };
     };
     const runs = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)))
@@ -940,7 +974,15 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
       const state = readReplyFileLine(served?.resultJson?.replyFileLine);
       return { status: served?.status ?? null, state: state?.state ?? null, shown: replyFileLineText(state, { nowMs: Date.now(), recoverSavedFilesShown: false }) };
     };
-    return { companyId, agentId, issueId, app, boxes, runs, issue, say, agentComments, servedLine, faultedBox,
+    /** REAL: the run inspector's Workspace tab (GET /api/heartbeat-runs/:runId/workspace-operations), this run's save only. */
+    const inspectorSaves = async (runId: string) => {
+      const got = await request(app).get(`/api/heartbeat-runs/${runId}/workspace-operations`);
+      expect(got.status, JSON.stringify(got.body)).toBe(200);
+      return (got.body as Array<{ heartbeatRunId: string | null; phase: string; status: string; stderrExcerpt: string | null }>)
+        .filter(operation => operation.heartbeatRunId === runId && operation.phase === "workspace_finalize")
+        .map(operation => ({ status: operation.status, stderr: operation.stderrExcerpt }));
+    };
+    return { companyId, agentId, issueId, app, boxes, runs, issue, say, agentComments, servedLine, inspectorSaves, faultedBox,
       stallReached, releaseStall: () => { release(); fault.stall = null; } };
   }
 
@@ -1044,6 +1086,8 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
         eq(agentWakeupRequests.status, "deferred_issue_execution")))).filter(wake => JSON.stringify(wake.payload).includes(next));
       await vi.waitFor(async () => expect(await parked()).toHaveLength(1), { timeout: 10_000, interval: 50 });
       const parkedAt = (await parked())[0].requestedAt.getTime();
+      // C12 (rf-5 06:58Z): the task as the person's page reads it, every 100 ms from here until P is running.
+      const sampler = sampleTask(s.app, s.issueId);
       // REAL: the bound's own sweep, beside the live executor that still holds the copy-back's lock.
       const ended = async () => (await s.runs())[1].status !== "running";
       while (!(await ended()) && Date.now() - parkedAt < CAP + 15_000) { await sweep(r.id); await sleep(200); }
@@ -1053,8 +1097,11 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
       expect(endedAfterParkingMs).toBeGreaterThanOrEqual(CAP);
       expect(record(record(rEnded.runnerProfileJson).nativeWorkspaceFinalizationOwner)).toMatchObject({ fenced: true });
       expect(JSON.stringify(rEnded.resultJson)).not.toMatch(/"token"|processGroupId|controllerBootId|processStartedAt/);
-      // C12: R's accepted `done` is DROPPED, never applied: the person sees the task Blocked, not Done.
-      expect(await s.issue()).toMatchObject({ status: "blocked", executionRunId: null, executionWorkspaceId: null });
+      // C12: R's accepted `done` is DROPPED, never applied: the task is not Done. A person is waiting, so it is
+      // not set Blocked either: it stays In progress for P.
+      // (The status itself is read below, from the 100 ms samples of the real GET.)
+      expect(await s.issue()).toMatchObject({ executionRunId: null, executionWorkspaceId: null });
+      expect((await s.issue()).status).not.toBe("done");
 
       // P starts ONCE while R's executor is still hung in this same process.
       const startAt = Date.now();
@@ -1066,6 +1113,20 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
       [, , p] = await s.runs();
       expect(p, "P never started beside R's still-live executor").toBeTruthy();
       expect(box.inputs).toHaveLength(3);
+      // C12: between R's fence and P running, the task NEVER reads Blocked (no In progress -> Blocked -> In progress).
+      await sleep(250);
+      await sampler.stop();
+      const fencedAt = rEnded.finishedAt!.getTime();
+      const sinceFence = sampler.samples.filter(sample => sample.at >= fencedAt - 200);
+      const maxGapMs = Math.max(0, ...sampler.samples.slice(1).map((sample, index) => sample.at - sampler.samples[index].at));
+      evidence.C12 = { route: "GET /api/issues/:id", everyMs: 100, samples: sampler.samples.length, sinceFence: sinceFence.length, maxGapMs,
+        statuses: [...new Set(sampler.samples.map(sample => sample.status))],
+        blocked: sampler.samples.filter(sample => sample.status === "blocked").map(sample => sample.at - fencedAt),
+        pStartedAfterFenceMs: p!.startedAt ? p!.startedAt.getTime() - fencedAt : null };
+      expect(sinceFence.length).toBeGreaterThanOrEqual(3);
+      expect(sampler.samples.filter(sample => sample.status === "blocked").map(sample => `${sample.at - fencedAt} ms after the fence`)).toEqual([]);
+      expect([...new Set(sampler.samples.map(sample => sample.status))]).toEqual(["in_progress"]);
+      expect((await request(s.app).get(`/api/issues/${s.issueId}`)).body).toMatchObject({ status: "in_progress", executionRunId: p!.id });
       expect(JSON.stringify(p!.contextSnapshot)).toContain(next);
       const startedAfterMs = Date.now() - startAt;
       const pReference = readNativeWorkspaceSyncReference(record(p!.runnerProfileJson).nativeWorkspaceSync)!;
@@ -1117,6 +1178,123 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
         task: { status: (await s.issue()).status }, agentComments: comments.map(comment => ({ by: comment.createdByRunId === r.id ? "R" : comment.createdByRunId === p!.id ? "P"
           : comment.createdByRunId === r0.id ? "turn 0" : comment.createdByRunId, body: comment.body })),
         settled };
+    } finally {
+      s.releaseStall(); receipts.stop?.(); await delivery.stop(); await heartbeat.drainActiveRunExecutions();
+    }
+  }, 240_000);
+
+  it("C12 control: a NON-fenced terminal save failure (the box is gone: unrecoverable) still sets the task Blocked, even with a person's message parked", async () => {
+    const s = await scenario();
+    await s.streamAndAccept();
+    await s.personSaysWhileSaving("Also add a summary section to the report.");
+    // PLANTED (named): R's box lease is expired, so the copy-back is unrecoverable. Beside it, the fenced path by the
+    // real route is the K1 live row above. REAL from here: the worker's own check -> attemptNativeWorkspaceFinalization
+    // -> recordNativeWorkspaceFinalizationFailure -> the finalizer's one terminal write.
+    await db.update(environmentLeases).set({ status: "expired" }).where(eq(environmentLeases.id, s.leaseId));
+    expect(await s.worker().check()).toMatchObject({ entries: 1 });
+    const ended = await s.run();
+    expect(ended).toMatchObject({ status: "failed", errorCode: "native_workspace_sync_out_unrecoverable" });
+    // Not fenced: no stall marker, no tombstone, the task keeps its root.
+    expect(record(ended.resultJson).workspaceSyncOutStall).toBeUndefined();
+    expect(record(record(ended.runnerProfileJson).nativeWorkspaceFinalizationOwner).fenced).toBeUndefined();
+    const task = (await request(s.app).get(`/api/issues/${s.issueId}`)).body;
+    expect(task).toMatchObject({ status: "blocked", executionWorkspaceId: s.workspaceId });
+    evidence.C12control = { route: "GET /api/issues/:id", task: { status: task.status }, run: { status: ended.status, errorCode: ended.errorCode } };
+    await cleanupNativeWorkspaceSync(s.runId);
+  }, 120_000);
+
+  it("FU-c, the held-publication probe: R's copy-back passed its LAST ownership check and its publication is held; R is fenced at the cap and P starts; the publication is released -> R's reference is not finalized, R's lease is not stamped, the inspector never shows R's save Succeeded, P's files are unchanged", async () => {
+    const s = await liveScenario({ holdPublication: true });
+    const errors: unknown[] = [];
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: () => ({}) as never });
+    const delivery = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => errors.push(error) });
+    const receipts = heartbeat.registerDeferredReceiptWork(delivery, () => true);
+    const CAP = 2_000;
+    const work = nativeWorkspaceFinalizationWork(db, { environmentRuntime: {} as never, copyOutBound: { personWaitCapMs: CAP },
+      onWorkspaceSettled: async () => undefined });
+    const sweep = async (runId: string) => { for (const entry of await work.load({ companyId: s.companyId, runId })) await work.check(entry); };
+    const seen: string[] = [];
+    try {
+      await receipts.ready;
+      // REAL turn 0, then REAL M -> R (as in the K1 live row): no planted run, lease or workspace.
+      await s.say("Please write the report.");
+      for (let waited = 0; waited < 60_000; waited += 250) {
+        await heartbeat.resumeQueuedRuns();
+        await reconcileNativeFinalizations(db, (await s.runs()).map(run => run.id), { environmentRuntime: {} as never }).catch(() => undefined);
+        const [first] = await s.runs();
+        if (first && first.status !== "running" && first.status !== "queued") break;
+        await sleep(250);
+      }
+      await heartbeat.drainActiveRunExecutions();
+      expect((await s.runs())[0]).toMatchObject({ status: "succeeded" });
+      const hostDir = (await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, (await s.issue()).executionWorkspaceId!)))[0].cwd!;
+      await s.say("Please rewrite the report.");
+      const held = Promise.race([s.stallReached.then(() => "held" as const), sleep(60_000).then(() => "R never reached its publication" as const)]);
+      for (let waited = 0; waited < 60_000 && !(await Promise.race([held, sleep(250).then(() => null)])); waited += 250) await heartbeat.resumeQueuedRuns();
+      expect(await held).toBe("held");
+      const [, r] = await s.runs();
+      expect(r).toMatchObject({ status: "running", runtimeMode: "native" });
+      const rReference = readNativeWorkspaceSyncReference(record(r.runnerProfileJson).nativeWorkspaceSync)!;
+      expect(rReference).toMatchObject({ state: "prepared" });
+      // The hold is PAST the copy-back: R's apply already landed in R's root (the host write is done), nothing is published.
+      expect(await listing(hostDir)).toMatchObject({ "notes.md": "R's new notes (unsaved)\n" });
+      expect(record(r.runnerProfileJson).nativeWorkspaceFinalizationOwner).toMatchObject({ token: expect.any(String) });
+      seen.push(...(await s.inspectorSaves(r.id)).map(save => save.status));
+      expect(seen).toEqual(["running"]);
+      // REAL: the person's next message parks; the bound's sweep fences R at the cap.
+      const next = await s.say("Also add a summary section to the report.");
+      const parked = async () => (await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, s.agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution")))).filter(wake => JSON.stringify(wake.payload).includes(next));
+      await vi.waitFor(async () => expect(await parked()).toHaveLength(1), { timeout: 10_000, interval: 50 });
+      const parkedAt = (await parked())[0].requestedAt.getTime();
+      while ((await s.runs())[1].status === "running" && Date.now() - parkedAt < CAP + 15_000) { await sweep(r.id); await sleep(200); }
+      const [, rEnded] = await s.runs();
+      expect(rEnded).toMatchObject({ status: "failed", errorCode: STALLED });
+      expect(record(record(rEnded.runnerProfileJson).nativeWorkspaceFinalizationOwner)).toMatchObject({ fenced: true });
+      // REAL: P starts beside R's held publication.
+      const startAt = Date.now();
+      while (Date.now() - startAt < 30_000 && box.inputs.length < 3) { await heartbeat.resumeQueuedRuns(); await sleep(250); }
+      const [, , p] = await s.runs();
+      expect(p, "P never started beside R's held publication").toBeTruthy();
+      expect(box.inputs).toHaveLength(3);
+      const [pWorkspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, (await s.issue()).executionWorkspaceId!));
+      const pRoot = pWorkspace.cwd!;
+      expect(pRoot).not.toBe(hostDir);
+      expect(await listing(pRoot)).toEqual(SAVED);
+      const pRootBefore = await treeSha256(pRoot);
+      seen.push(...(await s.inspectorSaves(r.id)).map(save => save.status));
+
+      // The publication is released AFTER the fence.
+      s.releaseStall();
+      const polling = (async () => { for (let i = 0; i < 20; i++) { seen.push(...(await s.inspectorSaves(r.id)).map(save => save.status)); await sleep(100); } })();
+      await heartbeat.drainActiveRunExecutions();
+      await polling;
+      await sweep(r.id);
+      const presentation = nativeResponsePresentationWork(db);
+      for (const entry of await presentation.load({ companyId: s.companyId, issueId: s.issueId })) await presentation.check(entry);
+      const [, rLate] = await s.runs();
+      const [rLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, rReference.leaseId));
+      const saves = await s.inspectorSaves(r.id);
+      evidence.FUc = { route: "GET /api/heartbeat-runs/:runId/workspace-operations", R: { id: r.id, status: rLate.status, errorCode: rLate.errorCode,
+        reference: readNativeWorkspaceSyncReference(record(rLate.runnerProfileJson).nativeWorkspaceSync)?.state,
+        leaseStamp: record(rLease.metadata).nativeWorkspaceSync ?? null, saves, seen: [...new Set(seen)] },
+        P: { id: p.id, root: pRoot, sha256Before: pRootBefore, sha256After: await treeSha256(pRoot) } };
+      // R's reference is not finalized;
+      expect(readNativeWorkspaceSyncReference(record(rLate.runnerProfileJson).nativeWorkspaceSync)).toMatchObject({ state: "prepared" });
+      // the lease is not stamped R;
+      expect(record(record(rLease.metadata).nativeWorkspaceSync).finalizedRunId).not.toBe(r.id);
+      // the inspector never shows R's save Succeeded: it ends failed, superseded by the fence (ownership lost);
+      expect([...new Set(seen)]).not.toContain("succeeded");
+      expect(saves.map(save => save.status)).toEqual(["failed"]);
+      // R stays as the bound ended it, the tombstone stays, one LOST line;
+      expect(rLate).toMatchObject({ status: "failed", errorCode: STALLED });
+      expect(record(record(rLate.runnerProfileJson).nativeWorkspaceFinalizationOwner)).toMatchObject({ fenced: true });
+      expect(await s.servedLine(r.id)).toMatchObject({ status: "failed", state: "lost", shown: THE_LINE });
+      // P's files are unchanged, and the task still names P's root.
+      expect(await treeSha256(pRoot)).toBe(pRootBefore);
+      expect(await listing(pRoot)).toEqual(SAVED);
+      expect((await s.issue()).executionWorkspaceId).toBe(pWorkspace.id);
+      expect(errors).toEqual([]);
     } finally {
       s.releaseStall(); receipts.stop?.(); await delivery.stop(); await heartbeat.drainActiveRunExecutions();
     }
