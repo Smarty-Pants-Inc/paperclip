@@ -34,6 +34,8 @@ import {
 } from "../services/agent-conversations.js";
 import { answeredPersonMessageSql } from "../services/person-message-answer.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
+import { createHeartbeatRunControl } from "../services/heartbeat/run-control.js";
+import { callbacks as runControlCallbacks } from "../services/heartbeat/__tests__/run-control-fixtures.js";
 import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
 import { getServerAdapter, registerServerAdapter, runningProcesses } from "../adapters/index.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat/run-preparation.js";
@@ -424,6 +426,79 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     expect(carriers.wakes.length + carriers.runs.length).toBe(1);
     expect(await answered(response.body.id)).toBe(false);
   });
+
+  // catch: rf-3 S-c(i), accepted steer lost when the runner dies before reading it.
+  it.each(["failed", "paused", "stopped", "answered"] as const)("A2: post-commit ordinary admission never loses a restored steer (%s)", async variant => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const response = await postDefault(chat, "M must get one answer").expect(201);
+    expect(response.body.steeringStatus).toBe("accepted");
+    if (variant === "answered") await answeredLog(chat);
+    if (variant === "paused") await db.update(agents).set({ status: "paused", lifecycleState: "paused",
+      lifecycleHolds: ["manual"], pauseReason: "manual" }).where(eq(agents.id, chat.agentId));
+    await db.update(heartbeatRuns).set({ status: variant === "stopped" ? "cancelled" : variant === "answered" ? "succeeded" : "failed",
+      runtimeMode: "legacy", finishedAt: new Date(), resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify(
+        variant === "stopped" ? { cancelledByActorType: "user", cancelledByUserId: owner } : { reportedWorkDisposition: "needs_review" })}::jsonb` })
+      .where(eq(heartbeatRuns.id, chat.runId));
+    const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    await settleConversationTurn(db, ended!);
+    runningProcesses.delete(chat.runId);
+    // The actual process executor answers the exact input ids. Provider/native
+    // attachment is separately covered by S-a2; this row isolates release admission.
+    const processAdapter = getServerAdapter("process");
+    const replies: string[][] = [];
+    const answeringAdapter = { ...processAdapter, execute: async (context: Parameters<typeof processAdapter.execute>[0]) => {
+      const ids = (context.context.wakeCommentIds ?? []) as string[];
+      replies.push(ids);
+      await issueService(db).addComment(chat.issue.id, JSON.stringify({ answers: ids }),
+        { agentId: chat.agentId, runId: context.runId });
+      return processAdapter.execute(context);
+    } };
+    registerServerAdapter(answeringAdapter);
+    await db.update(agents).set({ adapterType: "process", adapterConfig: { command: process.execPath, args: ["-e", ""] } })
+      .where(eq(agents.id, chat.agentId));
+    const heartbeat = heartbeatService(db);
+    const dependencies = runControlCallbacks(db);
+    dependencies.enqueueWakeup = heartbeat.wakeup;
+    dependencies.wakeQueue = createWakeQueue(db, releaseDeps as never);
+    const control = createHeartbeatRunControl(db, dependencies);
+    const release = () => control.releaseIssueExecutionAndPromote({ companyId: chat.companyId, id: chat.runId });
+    try {
+      await release(); await release();
+      await joinOwnedWork();
+    } finally {
+      registerServerAdapter(processAdapter);
+    }
+    expect(replies.flat()).toEqual(variant === "failed" ? [response.body.id] : []);
+    if (variant === "failed") expect(await answered(response.body.id)).toBe(true);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, chat.agentId));
+    const successors = runs.filter(run => run.id !== chat.runId &&
+      ((run.contextSnapshot as any)?.wakeCommentIds ?? []).includes(response.body.id));
+    if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `A2-${variant}-custody.json`), JSON.stringify({ runs,
+      wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId)),
+      issue: await db.select().from(issues).where(eq(issues.id, chat.issue.id)) }, null, 2));
+    expect(successors).toHaveLength(variant === "failed" ? 1 : 0);
+    const receipts = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, chat.companyId),
+      eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${response.body.id}`)));
+    expect(receipts).toHaveLength(variant === "answered" ? 0 : 1);
+    if (variant === "paused" || variant === "stopped") {
+      expect((await deferredWakes(chat)).flatMap(wakeCommentIds)).toContain(response.body.id);
+      const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+        eq(issueComments.authorType, "system"), sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + response.body.id}`));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.body).toContain(variant === "paused" ? "paused" : "stopped");
+      await db.update(agents).set({ status: "idle", lifecycleState: "ready", lifecycleHolds: [], pauseReason: null })
+        .where(eq(agents.id, chat.agentId));
+      registerServerAdapter(answeringAdapter);
+      try {
+        const queue = (await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200)).body;
+        await request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/queued-comments/interrupt`)
+          .send({ queueId: queue.queueId, revision: queue.revision, targetRunId: null }).expect(200);
+        await joinOwnedWork();
+      } finally { registerServerAdapter(processAdapter); }
+      expect(replies.flat()).toEqual([response.body.id]);
+      expect(await answered(response.body.id)).toBe(true);
+    }
+  }, 30_000);
 
   it("S-d: delivery without following assistant text joins the ONE person-Stop hold", async () => {
     const chat = await seedChat(); await attachSteerable(chat);

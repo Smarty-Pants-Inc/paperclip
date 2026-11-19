@@ -1,4 +1,5 @@
 import { assertAgentLifecycleAuthority } from "../agent-subtree-management.js";
+import { admitRestoredSteersAfterRelease } from "./restored-steer-admission.js";
 import { withAccountingTransaction } from "../accounting-transaction.js";
 import { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 export { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
@@ -1156,6 +1157,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       } else {
         await applyWakeQueuePostCommitEffects(postCommitEffects);
       }
+      await admitRestoredSteersAfterRelease(db, run, enqueueWakeup);
       const [completed] = await db.select({
         id: heartbeatRuns.id,
         status: heartbeatRuns.status,
