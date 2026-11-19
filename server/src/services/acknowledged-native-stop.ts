@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
-import { agentWakeupRequests, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueTreeHolds, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { parseObject } from "../adapters/utils.js";
 import { resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
@@ -190,6 +190,9 @@ export function personStopWakeCommentIds(payload: unknown): string[] {
 export async function readPersonStopHold(db: Db, input: {
   companyId: string; issueId: string; agentId: string; messageId?: string; wakeId?: string;
   admittingTypedCommentIds?: string[];
+  /** The person's Send now delivering this exact held wake (it carries
+   * queuedCommentInterrupt); only that wake is read through the Send. */
+  sendingWakeId?: string;
 }): Promise<PersonStopHold | null> {
   const onIssue = or(eq(heartbeatRuns.nativeIssueId, input.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`);
   const [running] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
@@ -224,8 +227,8 @@ export async function readPersonStopHold(db: Db, input: {
         and(eq(agentWakeupRequests.status, "deferred"), wellFormedExecutionWaitSql(agentWakeupRequests.payload)))));
   const candidates = wakes.filter(wake => (!input.wakeId || wake.id === input.wakeId)
     && (wake.status === "deferred_issue_execution" || isWellFormedExecutionWait(parseObject(wake.payload).executionWait))
-    && parseObject(wake.payload).queuedCommentInterrupt == null
-    && parseObject(wake.payload)[QUEUED_SEND_AFTER_STOP_KEY] == null
+    && (wake.id === input.sendingWakeId || (parseObject(wake.payload).queuedCommentInterrupt == null
+      && parseObject(wake.payload)[QUEUED_SEND_AFTER_STOP_KEY] == null))
     && personStopWakeCarries(wake.payload, input.issueId, input.messageId));
   const ids = [...new Set(candidates.flatMap(wake => personStopWakeCommentIds(wake.payload)))];
   const comments = ids.length ? await db.select({ id: issueComments.id, authorUserId: issueComments.authorUserId,
@@ -237,6 +240,61 @@ export async function readPersonStopHold(db: Db, input: {
     return live.length > 0 && live.every(comment => comment.authorUserId === userId && comment.createdAt <= acceptedAt);
   });
   return held.length ? { stoppedRunId: stop.runId, userId, acceptedAt: acceptedAt.toISOString(), wakeIds: held.map(wake => wake.id) } : null;
+}
+
+/** The run-control cancel reason of a board user's task-tree Pause
+ * (routes/issue-tree-control.ts, heartbeat.cancelRun for each active run). */
+export const SUBTREE_PAUSE_CANCEL_REASON = "Cancelled by a board operator's subtree pause";
+
+/**
+ * ONE fact: a person's OWN accepted Stop of a run still in STARTUP (no
+ * provider session ever existed to acknowledge it, so isAcknowledgedNativeStop
+ * never holds). Read by the wake-queue release (no reconciliation), by Send
+ * admission (explicit-native-continuation: the stop counts as proven) and by
+ * the task interruption projection (resolved, not failed). True only when:
+ * - the run is cancelled with errorCode 'cancelled' and a startupCancellation
+ *   fence (before or after native selection);
+ * - the cause is the person's: readPersonStopHold (the ONE person-Stop reader)
+ *   names THIS run, or the run was cancelled by a board user's task-tree Pause
+ *   (SUBTREE_PAUSE_CANCEL_REASON, cancelledByActorType 'user') and a pause
+ *   hold created by a user is still active on the task or an ancestor
+ *   (issueTreeControlService.getActivePauseHoldGate);
+ * - no coordinator lease owner and no adapter control own it here;
+ * - provesNoNativeRunProviderWork: no provider event, tool call or result.
+ * System cancels, timeouts, failures and runs with provider work never match.
+ */
+export async function isPersonAcceptedStartupStop(db: Db, input: {
+  id: string; companyId: string; status: string; errorCode: string | null; issueId: string;
+}, options: { sendingWakeId?: string } = {}): Promise<boolean> {
+  if (input.status !== "cancelled" || input.errorCode !== "cancelled" || !input.issueId) return false;
+  // Callers hold partial or redacted run shapes; read the stored row once.
+  const [stored] = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+    status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, error: heartbeatRuns.error, resultJson: heartbeatRuns.resultJson })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.id)));
+  if (!stored || stored.status !== "cancelled" || stored.errorCode !== "cancelled"
+    || Object.keys(parseObject(stored.resultJson?.startupCancellation)).length === 0) return false;
+  const run = { ...stored, issueId: input.issueId };
+  const { adapterExecutionControls } = await import("./adapter-execution-control.js");
+  if (adapterExecutionControls.has(run.id)) return false;
+  const [coordinator] = await db.select({ leaseOwner: nativeRunFinalizations.leaseOwner }).from(nativeRunFinalizations)
+    .where(and(eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, run.id)));
+  if (coordinator?.leaseOwner) return false;
+  const personStop = (await readPersonStopHold(db, { companyId: run.companyId, issueId: run.issueId,
+    agentId: run.agentId, sendingWakeId: options.sendingWakeId }))?.stoppedRunId === run.id;
+  if (!personStop && !(await isPersonTreePauseCancel(db, run))) return false;
+  const { provesNoNativeRunProviderWork } = await import("./native-runtime/native-provider-work-proof.js");
+  return provesNoNativeRunProviderWork(db, { companyId: run.companyId, runId: run.id });
+}
+
+async function isPersonTreePauseCancel(db: Db, run: { companyId: string; issueId: string; error: string | null;
+  resultJson: Record<string, unknown> | null }) {
+  if (run.error !== SUBTREE_PAUSE_CANCEL_REASON || run.resultJson?.cancelledByActorType !== "user") return false;
+  const { issueTreeControlService } = await import("./issue-tree-control.js");
+  const gate = await issueTreeControlService(db).getActivePauseHoldGate(run.companyId, run.issueId);
+  if (!gate) return false;
+  const [hold] = await db.select({ by: issueTreeHolds.createdByActorType }).from(issueTreeHolds)
+    .where(and(eq(issueTreeHolds.companyId, run.companyId), eq(issueTreeHolds.id, gate.holdId)));
+  return hold?.by === "user";
 }
 
 /** The Stop's OWN board hold: the release wrote it for the very run the person
