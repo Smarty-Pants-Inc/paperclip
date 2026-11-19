@@ -23,9 +23,12 @@ export function providerResourceDispositionForTerminalRun(
   if (!["failed", "cancelled", "interrupted"].includes(status ?? "")) return "stop_and_retain";
   // These are ordinary run outcomes, not integrity/reconciliation failures.
   // In particular, native_restart_recovery_blocked, replay conflicts and
-  // quarantined cleanup retain their existing stop policy.
+  // quarantined cleanup retain their existing stop policy. A person's Interrupt
+  // (operator_interrupted, routes/issues.ts operatorInterruptCancelOptions) is a
+  // Stop plus a new message: it hands the warm box to the successor exactly as a
+  // Stop does, instead of stopping it and pinning its files behind a card.
   if (errorCode && !["adapter_failed", "adapter_error", "native_session_interrupted",
-    "native_retry_cancelled", "cancelled"].includes(errorCode)) {
+    "native_retry_cancelled", "cancelled", "operator_interrupted"].includes(errorCode)) {
     return "stop_and_retain";
   }
   return desired;
