@@ -19847,10 +19847,25 @@ describe("runnerd provider runtime wiring", () => {
         }));
       }
       execute.mockClear(); restore.mockClear();
+      // This work starts after heartbeat's preparation drain, before the native
+      // trace exists. Its receipt must survive alongside warm restoration.
+      state.stageNativeRunnerWakeAttachments.mockImplementationOnce(async () => {
+        await new Promise(resolve => setTimeout(resolve, 60));
+        return { attachments: [], cleanup: vi.fn(async () => undefined) };
+      });
       target.sandboxLeaseAcquisition.outcome = "resumed";
       await expect(executePaperclipNativeSession({ db: nextDb, execution: next,
         runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target,
         onEvent: async event => { events.push(event); } })).resolves.toMatchObject({ exitCode: 0 });
+      const restoreSpan = events.find(event => event.eventType === "run.performance.span"
+        && event.payload?.span === "native.controller.warm_restore");
+      expect(restoreSpan?.payload).toMatchObject({ outcome: "ok", parentSpan: "task.prepare" });
+      expect(restoreSpan?.payload?.durationMs).toBeGreaterThanOrEqual(0);
+      expect(restoreSpan?.payload?.wallStartedAtMs).toBeDefined();
+      const stagingSpan = events.find(event => event.eventType === "run.performance.span"
+        && event.payload?.span === "native.controller.attachment_staging");
+      expect(stagingSpan?.payload).toMatchObject({ outcome: "ok", parentSpan: "task.prepare" });
+      expect(stagingSpan?.payload?.durationMs).toBeGreaterThanOrEqual(50);
       const spans = events.filter(event => event.eventType === "run.performance.span"
         && event.payload?.span === "native.controller.warm_owner_identity_check");
       expect(spans).toHaveLength(resumedFromState === "stopped" || resumedFromState === "archived" ? 0 : 1);

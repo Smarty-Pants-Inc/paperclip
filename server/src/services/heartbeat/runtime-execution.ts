@@ -259,13 +259,21 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
   const { providerTraceCapture, nativeRunnerPreparationSpans, attestedQuestionResponseAtMs, attemptStartedAtMs, environmentAcquireStartedAtMs, environmentRealizeEndedAtMs } = input.trace;
   const { executionControl, executionPhaseContext, dispatchResolvedInteractionContinuationWithAtomicGate } = input.control;
   const dispatchWithTiming: HeartbeatRuntimeExecutionInput["control"]["dispatchResolvedInteractionContinuationWithAtomicGate"] = async dispatch => {
+    const startedAtMs = Date.now();
     if (await preparedRunInteractionDeliveryDenied(db, run)) {
       await input.services.cancelRunInternal(run.id, "Queued agent input is no longer permitted.", {
         errorCode: INTERACTION_DELIVERY_DENIED, suppressImmediateRecovery: true,
       });
       return { dispatched: false };
     }
-    const providerDispatch = AsyncLocalStorage.bind(dispatch);
+    const providerDispatch = AsyncLocalStorage.bind((...args: Parameters<typeof dispatch>) => {
+      // Admission ends when the gate calls dispatch, NOT when the provider's
+      // result settles. This interval precedes construction of the run trace.
+      if (nativeRuntimeResolution.kind === "native") nativeRunnerPreparationSpans.push({
+        name: "native.controller.dispatch_admission", startedAtMs, endedAtMs: Date.now(),
+      });
+      return dispatch(...args);
+    });
     return measureRunPhase("execution.dispatch_admission", () => dispatchResolvedInteractionContinuationWithAtomicGate(providerDispatch));
   };
   const { identityRedactor, appendIdentityRedactedLog, onLog, onAdapterEvent, onAdapterMeta, finishAdapterEvents } = input.output;
@@ -558,12 +566,14 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         nativeExecution.runtimeContext.mcp.bindingId
           ? nativeExecution.runtimeContext.mcp.digest
           : null;
+      const mcpStartedAtMs = Date.now();
       const nativeMcpServers = "homeMode" in nativeExecution && nativeExecution.homeMode === "preconfigured" ? [] : await measureRunPhase("execution.mcp_handoff", () => buildPaperclipRuntimeMcpServers({
         db,
         agent,
         runId: run.id,
         expectedAssignmentDigest: expectedNativeMcpDigest,
       }));
+      nativeRunnerPreparationSpans.push({ name: "execution.mcp_handoff", startedAtMs: mcpStartedAtMs, endedAtMs: Date.now() });
       if ("runtimeContext" in nativeExecution) {
         if (nativeMcpServers.length > 1)
           throw new Error(

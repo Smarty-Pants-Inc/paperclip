@@ -784,6 +784,14 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
         expect(exporter.getFinishedSpans().filter(span => span.name === "execution.dispatch_admission")).toHaveLength(1);
       }, { timeout: 5_000 });
       expect(native ? executePaperclipNativeSession : adapter.execute).toHaveBeenCalledOnce();
+      const admission = input.trace.nativeRunnerPreparationSpans.filter(span => span.name === "native.controller.dispatch_admission");
+      const mcp = input.trace.nativeRunnerPreparationSpans.filter(span => span.name === "execution.mcp_handoff");
+      expect(admission).toHaveLength(native ? 1 : 0);
+      expect(mcp).toHaveLength(native ? 1 : 0);
+      if (native) {
+        expect(admission[0]!.endedAtMs).toBeGreaterThanOrEqual(admission[0]!.startedAtMs);
+        expect(mcp[0]!.endedAtMs).toBeLessThanOrEqual(admission[0]!.startedAtMs);
+      }
       expect(exporter.getFinishedSpans().find(span => span.name === "task.execution_attempt")).toBeUndefined();
       expect(await finalizations()).toHaveLength(0);
       release({ exitCode: 0, signal: null, timedOut: false });

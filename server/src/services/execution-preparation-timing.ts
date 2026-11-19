@@ -38,8 +38,8 @@ type PreparationPhase = "environment_selection" | "execution_configuration" | "s
   | "github_access" | "wake_binding" | "backend_setup" | "connector_assignments"
   | "assigned_mcp" | "tool_authority" | "companion_selection" | "runner_binary"
   | "github_stop" | "coordinator_release" | "instruction_checkpoint"
-  | "instruction_changes" | "warm_release" | "instruction_collection"
-  | "attachment_staging" | "warm_restore" | "span_persistence" | "state_migration"
+  | "instruction_changes" | "warm_release" | "warm_release_wait" | "instruction_collection"
+  | "attachment_staging" | "warm_restore" | "preparation_lease_read" | "span_persistence" | "state_migration"
   | "accounting_history" | "usage_delivery" | "instruction_rehydrate" | "review_binding";
 
 export type ExecutionPhase =
@@ -199,9 +199,10 @@ export function drainRunPreparationPhases(runId: string): RecordedPreparationPha
 function measure<T>(runId: string, name: string, work: () => T | Promise<T>, independent = false, counts: { fileCount?: number; bytes?: number } = {}, activeParent?: Context, recordRunId?: string): Promise<T> {
   const startedAtMs = Date.now();
   const operation = measureTraced(runId, name, work, independent, counts, activeParent, recordRunId);
-  // Only pre-dispatch preparation reaches the run log here; execution attempts
-  // and runtime timings belong to the turn, not to the next attempt's prepare.
-  if (isPreparationPhaseName(name)) operation.then(
+  // Only pre-dispatch preparation reaches the run log here. Native attachment
+  // staging also precedes trace construction (and heartbeat's earlier drain).
+  // Other controller/runtime timings belong to the executing turn's own trace.
+  if (isPreparationPhaseName(name) || name === "native.controller.attachment_staging") operation.then(
     () => recordPreparationPhase(runId, { name, startedAtMs, endedAtMs: Date.now(), outcome: "ok" }),
     () => recordPreparationPhase(runId, { name, startedAtMs, endedAtMs: Date.now(), outcome: "failed" }),
   );
