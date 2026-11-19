@@ -12,6 +12,7 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { heartbeatRuns, issues, issueRecoveryActions, nativeRunFinalizations, workspaceOperations, withDedicatedDbConnection, type Db } from "@paperclipai/db";
+import { runInDedicatedLockSession } from "@paperclipai/db/transaction-context";
 import { currentNativeWorkspaceRecoveryResult } from "./native-workspace-recovery-binding.js";
 import { withWorkspaceLockKeepalive } from "./native-workspace-lock-keepalive.js";
 import {
@@ -128,7 +129,7 @@ export async function withNativeWorkspaceFinalizationOwnership<T>(
   let actionPromise: Promise<T> | undefined;
   const finishAcquisition = beginRunPhase("execution.workspace_ownership_wait");
   try {
-    return await withDedicatedDbConnection(input.db, (dedicated) => dedicated.transaction(async (lock) => {
+    return await withDedicatedDbConnection(input.db, (dedicated) => runInDedicatedLockSession(() => dedicated.transaction(async (lock) => {
       const rows = await lock.execute(sql`select pg_try_advisory_xact_lock(hashtextextended(${nativeWorkspaceFinalizationLockKey(input.companyId, input.runId)}, 0)) as acquired,
         (select setting::bigint from pg_settings where name = 'idle_in_transaction_session_timeout') as idle_timeout_ms`);
       if (rows[0]?.acquired !== true) return {
@@ -338,7 +339,7 @@ export async function withNativeWorkspaceFinalizationOwnership<T>(
         await ownership.assertHeld();
         return { acquired: true, value } as const;
       });
-    }));
+    })));
   } catch (error) {
     finishAcquisition(true);
     throw error;
