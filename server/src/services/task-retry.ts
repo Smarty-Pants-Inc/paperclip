@@ -11,7 +11,7 @@ import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, chatActions, chatConversations, chatEndpoints, heartbeatRuns, issues, issueComments, runIdentityContexts, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { conflict, forbidden, notFound, HttpError } from "../errors.js";
 import { persistActivity } from "./activity-log.js";
-import { createSystemRecovery, readSystemRecovery, savedFilesUnrecoverable } from "./system-recovery-state.js";
+import { createSystemRecovery, readSystemRecovery, savedFilesUnrecoverable, CHECKOUT_CONTINUE_REQUIRED_REASON } from "./system-recovery-state.js";
 import { adoptSystemRecovery, updateSystemRecovery } from "./system-recovery.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { notifyChatActionWork } from "./chat-work-notifications.js";
@@ -248,7 +248,9 @@ export async function retireTaskRetriesContinuedBy(db: Db, input: {
 type TaskRetryRequest = {
   db: Db; companyId: string; issueId: string; actorId: string;
   idempotencyKey: string; observedRunId: string | null; actorSource?: string;
-  retryAction?: "move_forward";
+  /** `continue_with_files`: the person's ONE action on a mixed checkout, "Continue with the files as they are"
+   * (packages/shared reply-file-line.ts, sentence 3). It is a Retry that also records that choice on the hold. */
+  retryAction?: "move_forward" | "continue_with_files";
   /** Paperclip requests the user's Retry itself: after a restart lost an
    * unstarted turn, or once a provider usage limit it waited on has reset. */
   initiatedBy?: "restart_recovery" | "provider_limit_reset";
@@ -329,6 +331,22 @@ function admitTaskRetry(input: TaskRetryRequest) {
     if (input.retryAction === "move_forward" && !["queued", "running"].includes(latest.status) &&
         !(await undeliveredContinuation(tx, { companyId: issue.companyId, issueId: issue.id })))
       return { requestId: null, accepted: false, stale: false, alreadyMovedOn: true, observedRunId: latest.id, chatActionId: undefined };
+    if (input.retryAction === "continue_with_files") {
+      // Only while the gate holds a message for exactly this choice (its wait reason, saved on the waiting message).
+      // The choice is recorded on the held run's recovery action; the gate reads it there and releases the message once.
+      const [held] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+        sql`${agentWakeupRequests.payload}#>>'{executionWait,reason}' = ${CHECKOUT_CONTINUE_REQUIRED_REASON}`)).limit(1);
+      const chosen = held ? await tx.update(issueRecoveryActions).set({ updatedAt: new Date(),
+        evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{checkoutContinue}', ${JSON.stringify({
+          sourceRunId: latest.id, actorId: input.actorId, requestedAt: new Date().toISOString() })}::jsonb)` }).where(and(
+        eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        sql`${issueRecoveryActions.evidence}->>'runId' = ${latest.id}`)).returning({ id: issueRecoveryActions.id }) : [];
+      if (!chosen.length)
+        return { requestId: null, accepted: false, stale: false, notHeld: true, observedRunId: latest.id, chatActionId: undefined };
+    }
     let active = (await tx.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, issue.assigneeAgentId),
       sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,

@@ -241,8 +241,16 @@ function unrecoverableSavedFilesReason(failure: RecoveryFailure) {
   return recoveryRefusalReasons[failure.code] ?? "a safety check on the saved files did not pass";
 }
 
-/** The words live in ONE place (packages/shared/src/reply-file-line.ts); PROPOSED, PENDING RFL (d2shared2). */
-export { REPLY_FILES_NOT_SAVED_LINE, REPLY_FILES_PARTLY_SAVED_LINE } from "@paperclipai/shared";
+/** The words live in ONE place (packages/shared/src/reply-file-line.ts): RFL's, 11:45Z. */
+export { REPLY_FILES_NOT_SAVED_LINE, REPLY_FILES_PARTLY_SAVED_LINE, REPLY_FILES_LOST_WAITING_LINE,
+  CHECKOUT_CONTINUE_REQUIRED_REASON } from "@paperclipai/shared";
+
+/** The person's ONE action on a mixed checkout, "Continue with the files as they are", recorded on the hold's
+ * recovery action by POST /api/issues/:id/retry (task-retry.ts) and read by the gate (explicit-native-continuation.ts). */
+export function checkoutContinueChosen(evidence: Record<string, unknown> | null | undefined, sourceRunId: string) {
+  const chosen = evidence?.checkoutContinue as { sourceRunId?: unknown; actorId?: unknown } | null | undefined;
+  return Boolean(chosen && typeof chosen === "object" && chosen.sourceRunId === sourceRunId && typeof chosen.actorId === "string");
+}
 
 export function unrecoverableSavedFilesNotice(failure: RecoveryFailure) {
   return `Paperclip could not recover the unsaved files from the previous run: ${unrecoverableSavedFilesReason(failure)}. `

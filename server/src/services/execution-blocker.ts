@@ -1,6 +1,7 @@
 import { isPreDispatchReviewWait, neverStartedDispatchCancellationPredicate } from "./pre-dispatch-review-wait.js";
 import { replyFileLineReadsLost } from "./native-runtime/native-late-save-rule.js";
-import { REPLY_FILES_NOT_SAVED_LINE } from "./system-recovery-state.js";
+import { CHECKOUT_CONTINUE_REQUIRED_REASON, REPLY_FILES_LOST_WAITING_LINE, REPLY_FILES_NOT_SAVED_LINE, REPLY_FILES_PARTLY_SAVED_LINE,
+  readSystemRecovery, savedFilesUnrecoverable } from "./system-recovery-state.js";
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { preDispatchExecutionWaitRecoveryActionPredicate } from "./pre-dispatch-execution-wait.js";
 import { legacyShutdownBeforeDispatchCondition } from "./legacy-shutdown-before-dispatch.js";
@@ -502,16 +503,40 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     nextAction = "Verify the Grok connection, then send a new message to continue. The stopped work will not be replayed.";
   }
 
+  // A reply whose file line reads LOST, with a person's message waiting behind it (and a recovery that is not one of
+  // the three "unrecoverable" codes, which keep their old text): the task says ONE sentence, the SAME one the queue's
+  // wait line says (the gate's own words, saved on the waiting message by explicit-native-continuation.ts).
+  //  - the gate named a wait .............. its words (the mixed-checkout hold names its one action)
+  //  - no wait named yet, box not stopped . the wait words (never "starts now" before it is true)
+  //  - the box is stopped ................. "starts now": the message continues on the same checkout
+  let savedMessageWait: { state: "waiting" | "starting" | "continue_required"; line: string } | null = null;
+  if (saved.length && restoreHold && run && replyFileLineReadsLost(run.resultJson)
+      && !savedFilesUnrecoverable(readSystemRecovery(action.evidence))) {
+    const gateWait = queue.map(entry => entry.payload?.executionWait as { reason?: unknown; message?: unknown } | null | undefined)
+      .filter(wait => typeof wait?.reason === "string" && typeof wait.message === "string" && wait.message.trim());
+    const held = gateWait.find(wait => wait!.reason === CHECKOUT_CONTINUE_REQUIRED_REASON);
+    if (held) savedMessageWait = { state: "continue_required", line: REPLY_FILES_PARTLY_SAVED_LINE };
+    else if (gateWait.length) savedMessageWait = { state: "waiting", line: String(gateWait[0]!.message) };
+    else {
+      const leases = await db.select().from(environmentLeases).where(and(
+        eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, run.id)));
+      // The gate's own stop proof (explicit-native-continuation.ts: remote_cleanup / local_cleanup).
+      const stopped = leases.some(lease => lease.provider !== "local")
+        ? leases.every(lease => hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))
+        : leases.every(lease => Boolean(lease.releasedAt) && lease.cleanupStatus !== "failed");
+      savedMessageWait = stopped ? { state: "starting", line: REPLY_FILES_NOT_SAVED_LINE }
+        : { state: "waiting", line: REPLY_FILES_LOST_WAITING_LINE };
+    }
+  }
+
   return {
     recoveryActionId: action.id,
     runId,
     // A stopped reviewer can differ from the task owner who receives the work back.
     agentId: run?.agentId ?? null,
     cause: action.cause,
-    // d2shared2 (proposed, pending RFL): a reply whose file line reads LOST, with a person's message waiting behind
-    // it, says the ONE line. It never sends the person to a new task or to a Retry of a check that cannot change:
-    // the message continues on the same checkout (explicit-native-continuation.ts, the LOST-line gate).
-    nextAction: saved.length && restoreHold && run && replyFileLineReadsLost(run.resultJson) ? REPLY_FILES_NOT_SAVED_LINE
+    // The ONE sentence (above). It never sends the person to a new task or to a Retry of a check that cannot change.
+    nextAction: savedMessageWait ? savedMessageWait.line
       : withoutUnavailableRetry(workspaceRecovery?.message
       ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
       retryOffered),
@@ -523,6 +548,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     canRetry: retryOffered,
     ...(restoreHold ? { workspaceRepairRequired, canRecordWorkspaceRepair: workspaceRepairRequired && hasRequiredWorkspaceRecovery(action.evidence) } : {}),
     savedMessageCount: saved.length,
+    ...(savedMessageWait ? { savedMessageWait: savedMessageWait.state } : {}),
     ...(canReconstructWorkspace ? { canReconstructWorkspace, workspaceRecoveryStatusVersion: conversation!.statusVersion } : {}),
     ...(reconstructionPending ? { workspaceReconstructionPending: true } : {}),
   };

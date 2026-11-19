@@ -18,6 +18,10 @@ export interface ExecutionBlocker {
   workspaceReconstructionPending?: boolean;
   workspaceRecoveryStatusVersion?: number;
   savedMessageCount?: number;
+  /** A reply's file save failed for good while a person's message waits: which of the three sentences of
+   * reply-file-line.ts `nextAction` is saying. `continue_required` offers the one action "Continue with the files as
+   * they are" (POST /api/issues/:id/retry, retryAction "continue_with_files"). Absent in every other state. */
+  savedMessageWait?: "waiting" | "starting" | "continue_required";
   workspaceRecovery?: {
     status: "queued" | "recovering" | "blocked" | "recovered";
     stage: "verifying_stop" | "restoring_files" | "saving_receipts";
