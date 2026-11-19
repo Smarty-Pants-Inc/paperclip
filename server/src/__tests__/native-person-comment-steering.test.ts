@@ -200,6 +200,7 @@ const scheduled = new Map<string, { bodies: string[]; peers: RecordingPiPeer[]; 
 const realExecute = executePaperclipNativeSession;
 function backendFor(execution: Parameters<typeof realExecute>[0]["execution"], runnerInstanceId: string, peer: RecordingPiPeer) {
   const workspace = execution.workspace.cwd;
+  if (!workspace) throw new Error("native steering fixture requires a workspace cwd");
   const driver = new PiRpcDriver({ model: execution.provider.kind === "pi_rpc" ? execution.provider.model : undefined,
     piRpcThinkingLevel: "off", runtimeDirectory: workspace, runnerInstanceId,
     environment: { PI_CODING_AGENT_DIR: join(workspace, "agent") }, transportFactory: options => {
