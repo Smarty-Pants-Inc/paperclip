@@ -1,19 +1,24 @@
+import { randomUUID } from "node:crypto";
 import { and, eq, inArray, ne, notInArray, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { writeEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { nativeWorkspaceExportPendingForLease } from "./native-runtime/native-workspace-finalization-state.js";
 import { abandonedWorkspaceFilesHeldOnLeaseRowSql } from "./remote-workspace-abandoned-files-hold.js";
 import type { OwnerProof } from "./owner-proof.js";
-import type { InProgressRecord, SettleOutcome } from "./recovery/ownership-registry.js";
+import type { InProgressRecord, OwnershipSettleEffects, SettleOutcome } from "./recovery/ownership-registry.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { ORPHANED_SANDBOX_RECOVERY_KEY, prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
 import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "./reusable-sandbox-kept-marker.js";
-import { hasRetainedUnaddressableNativeCustody, NATIVE_CUSTODY_UNVERIFIED_REASON, nativeLeaseCustodyMissing } from "./native-runtime/native-lease-custody.js";
+import { hasRetainedUnaddressableNativeCustody, retainedUnaddressableNativeCustodyCondition as unaddressableNativeCustodyCondition, NATIVE_CUSTODY_UNVERIFIED_REASON, nativeLeaseCustodyMissing } from "./native-runtime/native-lease-custody.js";
 import { PENDING_CLEANUP_SWEEP_ATTEMPT_CAP } from "./environment-cleanup-state.js";
 import { logger } from "../middleware/logger.js";
 
 /** Failure reason on a retained orphan sandbox released for destruction. */
 export const RETAINED_ORPHAN_RELEASED_REASON = "retained_orphan_sandbox_released";
+/** A kept, unaddressable paid box gets one exact stop-and-keep recovery after
+ * this bounded window. Refusal/uncertainty belongs to the operator, never destroy. */
+export const UNADDRESSABLE_CUSTODY_STOP_AFTER_MS = 6 * 60 * 60_000;
+const UNADDRESSABLE_CUSTODY_STOP_CLAIM_MS = 2 * 60_000;
 
 const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out", "interrupted"];
 /** Runs on the same issue that may still continue from this sandbox. */
@@ -26,22 +31,6 @@ type LeaseRow = typeof environmentLeases.$inferSelect;
 export function retainedOrphanSandboxCondition() {
   return or(orphanedRunSandboxCondition(), abandonedWarmSandboxCondition(), supersededRunningWarmSandboxCondition(),
     unaddressableNativeCustodyCondition());
-}
-
-/** SQL listing mirror of hasRetainedUnaddressableNativeCustody. Unlike a
- * stopped source, this possibly RUNNING paid box remains listed even while a
- * successor uses another box. An open task must not hide its operator debt. */
-function unaddressableNativeCustodyCondition() {
-  return and(eq(environmentLeases.status, "retained"), eq(environmentLeases.cleanupStatus, "failed"),
-    eq(environmentLeases.failureReason, "native_custody_stop_unavailable"),
-    sql`${environmentLeases.heartbeatRunId} is not null`,
-    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,nativeCustodyUnverified}' = 'true'`,
-    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,recoveredOrphanedRunLease}' = 'true'`,
-    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,ownerProof}' = ${NATIVE_CUSTODY_UNVERIFIED_REASON}`,
-    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,runId}' = ${environmentLeases.heartbeatRunId}::text`,
-    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,disposition}' = 'retained_unstoppable'`,
-    sql`${environmentLeases.metadata}#>>'{replaceBeforeReuse,schema}' = 'paperclip.replace-before-reuse.v1'`,
-    sql`${environmentLeases.metadata}#>>'{replaceBeforeReuse,runId}' = ${environmentLeases.heartbeatRunId}::text`);
 }
 
 /** The newest lease row for its sandbox: an older row was handed on. */
@@ -179,7 +168,58 @@ export async function nextRetainedOrphanDueAt(db: Db, now: Date): Promise<Date |
   const [row] = await db.select({ due: sql<string | null>`min(${environmentLeases.expiresAt})` }).from(environmentLeases)
     .where(and(retainedOrphanSandboxCondition(), sql`not ${alwaysHeldSql()}`, sql`${softlyHeldSql(now)}`,
       sql`${environmentLeases.expiresAt} is not null`));
-  return row?.due ? new Date(row.due) : null;
+  let due = row?.due ? new Date(row.due) : null;
+  // The same owner registers the actual six-hour deadline. Saturating its
+  // attempts must not remove the future stop duty or introduce another timer.
+  const custody = await db.select().from(environmentLeases).where(unaddressableNativeCustodyCondition());
+  for (const lease of custody) {
+    const expiry = custodyExpiry(lease);
+    if (expiry.state === "stopped" || expiry.state === "manual_stop") continue;
+    const at = expiry.state === "attempting" && typeof expiry.deadlineMs === "number"
+      ? expiry.deadlineMs : custodyStopDueAt(lease);
+    const next = new Date(Math.max(now.getTime(), at));
+    if (!due || next < due) due = next;
+  }
+  return due;
+}
+
+function custodyExpiry(lease: LeaseRow): Record<string, unknown> {
+  const value = lease.metadata?.nativeCustodyExpiry;
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function custodyStopDueAt(lease: LeaseRow): number {
+  const recovery = lease.metadata?.orphanedRunLeaseRecovery as Record<string, unknown> | undefined;
+  const at = typeof recovery?.recoveredAt === "string" ? Date.parse(recovery.recoveredAt) : NaN;
+  return (Number.isFinite(at) ? at : lease.acquiredAt.getTime()) + UNADDRESSABLE_CUSTODY_STOP_AFTER_MS;
+}
+
+function custodyBoxId(lease: LeaseRow): string | null {
+  return typeof lease.metadata?.sandboxId === "string" && lease.metadata.sandboxId.trim()
+    ? lease.metadata.sandboxId : lease.providerLeaseId;
+}
+
+/** Serialize the per-box alarm ledger across holders and server processes.
+ * Lock only this namespace, never provider I/O or another lease row. */
+async function lockCustodyAlarmLedger(tx: Db, lease: LeaseRow) {
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(
+    ${JSON.stringify(["custody_unpinned_alarm", lease.companyId, lease.provider, custodyBoxId(lease)])}, 0))`);
+}
+
+async function custodyAlarmSeen(tx: Db, lease: LeaseRow, key: "nativeCustodyFirstAlarm" | "nativeCustodyManualStopAlarm") {
+  const [seen] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, lease.companyId), eq(environmentLeases.provider, lease.provider!),
+    sql`coalesce(nullif(${environmentLeases.metadata}->>'sandboxId', ''), ${environmentLeases.providerLeaseId}) = ${custodyBoxId(lease)}`,
+    sql`${environmentLeases.metadata}->>${key} = 'true'`)).limit(1);
+  return Boolean(seen);
+}
+
+function custodyAlarm(lease: LeaseRow, alarm: "first" | "manual_stop") {
+  logger.warn({ boxId: custodyBoxId(lease),
+    providerLeaseId: lease.providerLeaseId, companyId: lease.companyId, alarm,
+    leaseId: lease.id, environmentId: lease.environmentId,
+    ...(alarm === "first" ? { attempts: PENDING_CLEANUP_SWEEP_ATTEMPT_CAP } : {}) },
+  `custody_unpinned_alarm ${alarm}: retained box requires fleet capacity custody recovery`);
 }
 
 /**
@@ -208,15 +248,20 @@ export async function nextRetainedOrphanDueAt(db: Db, now: Date): Promise<Date |
  * while the task is open, cap/escalate its unresolved stop, and never infer
  * termination from its provider expiry or a saved transcript.
  *
+ * At the bounded unaddressable-custody deadline, claim one stop-and-keep
+ * attempt and invoke the runtime's exact-resource capability outside the
+ * transaction. Refusal or an uncertain old claim names manual_stop once.
+ * The lease and its obligation stay retained in BOTH outcomes.
+ *
  * Otherwise hand the sandbox to the pending-cleanup sweep for destruction,
- * with a compare-and-swap on the exact row it judged. It never calls a
- * provider itself and never runs on the turn path.
+ * with a compare-and-swap on the exact row it judged. Never on the turn path.
  */
 export async function settleRetainedOrphanSandbox(db: Db, record: InProgressRecord,
-  context: { now: Date; proof: OwnerProof }): Promise<SettleOutcome> {
+  context: { now: Date; proof: OwnerProof } & OwnershipSettleEffects): Promise<SettleOutcome> {
   if (!record.runId) return { settled: false, reason: "lease_has_no_run" };
   const runId = record.runId;
-  return db.transaction(async transaction => {
+  const effects: { first?: LeaseRow; manual?: LeaseRow; expiry?: { leaseId: string; attemptId: string } } = {};
+  const outcome: SettleOutcome = await db.transaction(async transaction => {
     const tx = transaction as unknown as Db;
     // Re-judge the row under its lock with the same listing predicate.
     const [lease] = await tx.select().from(environmentLeases).where(and(eq(environmentLeases.id, record.recordId),
@@ -229,19 +274,37 @@ export async function settleRetainedOrphanSandbox(db: Db, record: InProgressReco
       const [run] = await tx.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, lease.companyId)));
       if (!run || !TERMINAL_RUN_STATUSES.includes(run.status)) return { settled: false, reason: "run_active" };
+      await lockCustodyAlarmLedger(tx, lease);
       const recorded = Number(lease.metadata?.nativeCustodyAttempts ?? 0);
       const attempts = Math.min(PENDING_CLEANUP_SWEEP_ATTEMPT_CAP,
         (Number.isFinite(recorded) && recorded >= 0 ? Math.floor(recorded) : 0) + 1);
-      const escalate = attempts >= PENDING_CLEANUP_SWEEP_ATTEMPT_CAP && lease.metadata?.nativeCustodyEscalated !== true;
-      if (attempts === recorded && !escalate) return { settled: false, reason: "native_custody_stop_unavailable" };
-      await tx.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({
-        nativeCustodyAttempts: attempts, ...(escalate ? { nativeCustodyEscalated: true } : {}) })}::jsonb` })
-        .where(eq(environmentLeases.id, lease.id));
-      if (escalate) logger.warn({ leaseId: lease.id, environmentId: lease.environmentId, runId, attempts,
-        provider: lease.provider, providerLeaseId: lease.providerLeaseId, expiresAt: lease.expiresAt,
-        reason: lease.failureReason },
-        "environment lease needs operator attention; retained native box may still be running and its stop cannot be addressed");
-      return { settled: false, reason: "native_custody_stop_unavailable" };
+      // Older releases set Escalated without the fleet alarm. A separate ledger
+      // upgrades those rows once; another holder of the same box never repeats it.
+      const needsAlarm = attempts >= PENDING_CLEANUP_SWEEP_ATTEMPT_CAP && lease.metadata?.nativeCustodyFirstAlarm !== true;
+      const escalate = needsAlarm && !await custodyAlarmSeen(tx, lease, "nativeCustodyFirstAlarm");
+      const expiry = custodyExpiry(lease);
+      let nextExpiry: Record<string, unknown> | undefined;
+      if (!expiry.state && context.now.getTime() >= custodyStopDueAt(lease)) {
+        const attemptId = randomUUID();
+        nextExpiry = { state: "attempting", attemptId, deadlineMs: context.now.getTime() + UNADDRESSABLE_CUSTODY_STOP_CLAIM_MS };
+        effects.expiry = { leaseId: lease.id, attemptId };
+      } else if (expiry.state === "attempting"
+        && (typeof expiry.deadlineMs !== "number" || context.now.getTime() >= expiry.deadlineMs)) {
+        // Controller loss during a stop is indeterminate, not permission to
+        // repeat the provider side effect. Keep the box and name the runbook owner.
+        nextExpiry = { ...expiry, state: "manual_stop", reason: "stop_attempt_unconfirmed" };
+        if (!await custodyAlarmSeen(tx, lease, "nativeCustodyManualStopAlarm")) effects.manual = lease;
+      }
+      if (attempts !== recorded || needsAlarm || nextExpiry) {
+        await tx.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({
+          nativeCustodyAttempts: attempts, ...(needsAlarm ? { nativeCustodyEscalated: true, nativeCustodyFirstAlarm: true } : {}),
+          ...(nextExpiry ? { nativeCustodyExpiry: nextExpiry } : {}),
+          ...(nextExpiry?.state === "manual_stop" ? { nativeCustodyManualStopAlarm: true } : {}) })}::jsonb` })
+          .where(eq(environmentLeases.id, lease.id));
+      }
+      if (escalate) effects.first = lease;
+      return { settled: false, reason: "native_custody_stop_unavailable",
+        watch: attempts < PENDING_CLEANUP_SWEEP_ATTEMPT_CAP || (nextExpiry ?? expiry).state === "attempting" };
     }
     const held = await heldBy(tx, lease, runId, context.now);
     if (held) return { settled: false, reason: held };
@@ -287,6 +350,30 @@ export async function settleRetainedOrphanSandbox(db: Db, record: InProgressReco
       .returning({ id: environmentLeases.id }), { companyId: lease.companyId, runId, leaseId: lease.id });
     return released.length ? { settled: true, reason: context.proof.reason } : { settled: false, reason: "lease_changed_since_proof" };
   });
+  // Log only committed transitions. Provider I/O is outside all row/task locks.
+  if (effects.first) custodyAlarm(effects.first, "first");
+  if (effects.manual) custodyAlarm(effects.manual, "manual_stop");
+  if (effects.expiry) {
+    const { leaseId, attemptId } = effects.expiry;
+    const stopped = await context.stopRetainedCustody?.(leaseId, attemptId).catch(() => false) ?? false;
+    const manualAlarm = await db.transaction(async transaction => {
+      const tx = transaction as unknown as Db;
+      const [lease] = await tx.select().from(environmentLeases).where(and(eq(environmentLeases.id, leaseId),
+        unaddressableNativeCustodyCondition(), sql`${environmentLeases.metadata}#>>'{nativeCustodyExpiry,state}' = 'attempting'`,
+        sql`${environmentLeases.metadata}#>>'{nativeCustodyExpiry,attemptId}' = ${attemptId}`)).for("update");
+      if (!lease) return null;
+      await lockCustodyAlarmLedger(tx, lease);
+      const emit = !stopped && !await custodyAlarmSeen(tx, lease, "nativeCustodyManualStopAlarm");
+      await tx.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({
+        nativeCustodyExpiry: { state: stopped ? "stopped" : "manual_stop", attemptId,
+          completedAt: context.now.toISOString(), reason: stopped ? "exact_provider_stop" : "exact_provider_stop_refused" },
+        ...(!stopped ? { nativeCustodyManualStopAlarm: true } : {}),
+      })}::jsonb` }).where(eq(environmentLeases.id, leaseId));
+      return emit ? lease : null;
+    });
+    if (manualAlarm) custodyAlarm(manualAlarm, "manual_stop");
+  }
+  return outcome;
 }
 
 async function heldBy(tx: Db, lease: LeaseRow, runId: string, now: Date): Promise<string | null> {

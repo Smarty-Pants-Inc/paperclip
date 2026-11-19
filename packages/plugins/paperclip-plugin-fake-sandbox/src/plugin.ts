@@ -347,7 +347,9 @@ const plugin = definePlugin({
   },
 
   async onEnvironmentInspectLease(params: PluginEnvironmentInspectLeaseParams): Promise<PluginEnvironmentLeaseObservation> {
-    return { providerLeaseId: params.providerLeaseId, state: leases.has(params.providerLeaseId) ? "active" : "destroyed" };
+    const lease = leases.get(params.providerLeaseId);
+    return { providerLeaseId: params.providerLeaseId, ...(lease ? { boxId: lease.providerLeaseId } : {}),
+      state: lease ? "active" : "destroyed" };
   },
 
   async onEnvironmentDestroyLease(

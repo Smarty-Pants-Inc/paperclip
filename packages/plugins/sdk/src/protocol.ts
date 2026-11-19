@@ -740,6 +740,10 @@ export interface PluginEnvironmentLeaseObservation {
   creationLease?: PluginEnvironmentLease;
   creationCleanup?: import("./environment-creation-cleanup.js").PluginEnvironmentCreationCleanup;
   providerLeaseId: string;
+  /** The provider's own box identity from this fresh read, not an echo of the
+   * requested lookup id. Required for unpinned stop-and-keep recovery; older
+   * providers that omit it remain manual-stop only. Absent for missing boxes. */
+  boxId?: string;
   state: "active" | "stopped" | "destroyed" | "unknown";
   /** When the sandbox last stopped, by any cause (ISO 8601); null while not stopped. From a fresh provider read. */
   stoppedAt?: string | null;

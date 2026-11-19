@@ -114,6 +114,33 @@ until an explicit close-readiness or lifecycle inspection computes it. Workspace
 detail reads also return unknown delivery state without running Git or contacting
 a storage provider. Use close-readiness for current Git safety checks.
 
+## Unaddressable native sandbox custody
+
+A retained lease carrying `native_custody_stop_unavailable` and its run-bound
+`orphanedRunLeaseRecovery` obligation is a live kept holder under **every** lease
+policy. Environment delete-blast-radius and the atomic DELETE guard share the
+same predicate. Teardown consent does not authorize destruction of this holder;
+ordinary released execution-workspace/ephemeral leases are not added to the count.
+
+The existing retained-orphan owner caps custody attempts at five. At that cap it
+emits one warning JSON event whose `msg` starts with `custody_unpinned_alarm`, with
+`boxId`, `providerLeaseId`, `companyId`, and `alarm: "first"`. A durable per-box
+ledger suppresses repeats across sweeps/holders. Existing capped rows without the
+new alarm ledger emit the structured alarm on their next reconciliation.
+
+Six hours after the retained obligation was recorded, the same owner schedules
+one stop-and-keep attempt. The runtime resolves only the current environment
+provider configuration, requires exactly one installed provider declaration,
+inspects the exact provider lease, and checks the provider's own `boxId` against
+the recorded box before stopping. It never acquires, resumes, releases, or
+destroys a box on this path. Older plugins without the optional inspection
+`boxId`, any mismatch/refusal, or an indeterminate expired stop claim produce one
+`alarm: "manual_stop"` warning for fleet capacity operations. Neither successful
+stop nor manual escalation releases the retained lease or its custody obligation;
+it remains counted and prevents environment deletion. Provider calls run outside
+row/task locks, and the existing owner registers the actual expiry deadline; no
+new polling owner or timer is introduced.
+
 ## Deployment Modes
 
 For mode definitions and intended CLI behavior, see `doc/DEPLOYMENT-MODES.md`.

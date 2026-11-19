@@ -134,7 +134,13 @@ export type SettleOutcome = {
 /** Moves one record whose owner was just proven gone to its next state. It must
  * compare-and-swap on the exact owner that was proven, so a record taken over
  * since the proof is never released. It is called only with a `gone` proof. */
-export type SettleRecord = (db: Db, record: InProgressRecord, context: { now: Date; proof: OwnerProof }) => Promise<SettleOutcome>;
+export type OwnershipSettleEffects = {
+  /** Stop-only, exact-resource recovery. The runtime owns provider resolution;
+   * absence/refusal grants no release, destroy or guessed stop authority. */
+  stopRetainedCustody?: (leaseId: string, attemptId: string) => Promise<boolean>;
+};
+export type SettleRecord = (db: Db, record: InProgressRecord,
+  context: { now: Date; proof: OwnerProof } & OwnershipSettleEffects) => Promise<SettleOutcome>;
 
 /** Surfaces the operator action for a record whose owner is unprovable. It
  * never releases the record. Idempotent. */
