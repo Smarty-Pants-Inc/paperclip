@@ -59,7 +59,14 @@ export class B6RealPiPeer {
   async request(type: string, input?: PiRpcRecord, options?: any) {
     this.requests.push({ type, input, at: Date.now() });
     if (type === "prompt") this.active = true;
-    if (type === "steer") this.pending.push(String(input?.message));
+    if (type === "steer") {
+      const body = String(input?.message);
+      this.pending.push(body);
+      // Direct admission/recheck rows insert their comment in PG rather than
+      // through fixture.post(). Teach ONLY the scripted model what to answer;
+      // seen/consumed still require the real Pi user-message/model boundary.
+      if (!this.bodies.includes(body)) this.bodies.push(body);
+    }
     return this.transport!.request(type, input, options);
   }
   async *events() {
