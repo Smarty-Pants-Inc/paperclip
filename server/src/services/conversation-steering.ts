@@ -2,9 +2,17 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { activityLog, agents, agentWakeupRequests, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { acceptSteeredIdentity, reconcileSteeredIdentity, rejectSteeredIdentity, reserveSteeredIdentity, storedSteeringAcknowledgement } from "./run-identity.js";
 import { nativeRunHasStopRequest } from "./native-runtime/native-run-stop-request.js";
+import { logger } from "../middleware/logger.js";
 
 const object = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const ids = (value: unknown): string[] => Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
+
+function logSteeringFailure(error: unknown) {
+  // Fixed class labels only: an RPC error's name/message can contain person text.
+  const errorClass = error instanceof TypeError ? "TypeError" : error instanceof RangeError ? "RangeError"
+    : error instanceof Error ? "Error" : "NonError";
+  logger.warn({ errorClass }, "Conversation steering failed; using ordinary delivery");
+}
 
 /** A saved comment is the outbox. Its existing activity receipt keeps an explicit
  * Queue/Interrupt durable across a server crash, without manufacturing a wake. */
@@ -46,8 +54,15 @@ export async function trySteerConversationComment(db: Db, comment: typeof issueC
   if (!run || nativeRunHasStopRequest(run.resultJson) || run.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return false;
   // Lazy import keeps the existing conversation/runtime dependency cycle inert.
   const { getNativeSessionSteeringState, steerNativeSession, NativeSessionSteeringError } = await import("./native-runtime/native-session-executor.js");
-  const state = await getNativeSessionSteeringState(run.id);
-  if (state.disposition !== "available" || !state.activeTurnId) return false; // includes provider-ended / saving-files
+  let state: Awaited<ReturnType<typeof getNativeSessionSteeringState>>;
+  try {
+    state = await getNativeSessionSteeringState(run.id);
+  } catch (error) {
+    // A snapshot/capability RPC can disconnect before any identity is reserved.
+    logSteeringFailure(error);
+    return false;
+  }
+  if (state?.disposition !== "available" || !state.activeTurnId) return false; // includes provider-ended / saving-files
   const identity = await reserveSteeredIdentity(db, { companyId: issue.companyId, issueId: issue.id, runId: run.id, messageId: comment.id, source: "comment" });
   const prepared = await db.transaction(async tx => {
     const [currentIssue] = await tx.select().from(issues).where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("update");
@@ -70,6 +85,9 @@ export async function trySteerConversationComment(db: Db, comment: typeof issueC
       runId: run.id, message: comment.body, correlationId: comment.id, timeoutMs: 750,
       onAcknowledged: identity ? () => reconcileSteeredIdentity(db, identity) : undefined,
     });
+    if (typeof acknowledgement?.turnId !== "string" || !acknowledgement.turnId.trim()) {
+      throw new TypeError("Invalid steering acknowledgement");
+    }
     await db.transaction(async tx => {
       const [current] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).for("update");
       if (!current) return;
@@ -81,9 +99,14 @@ export async function trySteerConversationComment(db: Db, comment: typeof issueC
     });
     return true;
   } catch (error) {
-    // Timeout is uncertain, not refusal. The run keeps custody and its end
-    // restores the message once; enqueueing here could answer it twice.
-    if (!(error instanceof NativeSessionSteeringError) || error.code === "steering_timeout") throw error;
+    // Timeout is uncertain, not refusal. Return accepted (HTTP 201), retaining
+    // the pending receipt and the run's custody: its end restores M once if
+    // still unanswered. Enqueueing here could answer it twice after a late ack.
+    if (error instanceof NativeSessionSteeringError && error.code === "steering_timeout") return true;
+    // A failed RPC must not turn an already-saved person message into a 500.
+    // Unknown failures use the same durable refusal cleanup as typed refusals;
+    // the caller then admits the ordinary next message. Never log message text.
+    if (!(error instanceof NativeSessionSteeringError)) logSteeringFailure(error);
     if (identity) await rejectSteeredIdentity(db, identity);
     await db.transaction(async tx => {
       const [current] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).for("update");
