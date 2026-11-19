@@ -394,6 +394,32 @@ describe("person comment default steering eligibility and asynchronous receipt",
     } finally { await f.close(); }
   }, 45_000);
 
+  it.each([[true, false], [true, true], [false, false], [false, true]] as const)(
+    "B4 retry: conversation=%s concurrent=%s produces one saved comment and one native steer", async (conversation, concurrent) => {
+      const f = await fixture(`B4-retry-${conversation}-${concurrent}`, conversation);
+      let release!: () => void;
+      f.peer.steerAckGate = new Promise<void>(resolve => { release = resolve; });
+      try {
+        const body = `RETRY-${conversation}-${concurrent}`, clientRequestId = randomUUID();
+        const post = () => request(f.app).post(`/api/issues/${f.issueId}/comments`).send({ body, clientRequestId });
+        const responses = concurrent ? await Promise.all([post(), post()]) : [await post(), await post()];
+        for (const response of responses) expect(response.status, JSON.stringify(response.body)).toBe(201);
+        expect(responses[0].body.id).toBe(responses[1].body.id);
+        expect((await f.comments()).filter(comment => comment.clientRequestId === clientRequestId)).toHaveLength(1);
+        release(); await waitForPendingCommentSteers();
+        expect(f.commands("steer").map(command => command.input?.message)).toEqual([body]);
+        expect((await f.wakes()).filter(wake => JSON.stringify(wake.payload).includes(responses[0].body.id))).toEqual([]);
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
+        f.peer.boundary();
+        await vi.waitFor(async () => {
+          const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+          expect(run.contextSnapshot?.answeredSteeredCommentIds).toEqual([responses[0].body.id]);
+        });
+        expect(f.peer.consumed).toEqual([body]);
+      } finally { release(); await f.close(); }
+    }, 45_000,
+  );
+
   // B4: fault only the provider receipt boundary. Timeout rows retain the real
   // native timeout implementation; shorten its deadline, not the dispatch path.
   it.each([true, false])("B4 timeout: Pi took M=%s; answer once, carry only unread input", async took => {
