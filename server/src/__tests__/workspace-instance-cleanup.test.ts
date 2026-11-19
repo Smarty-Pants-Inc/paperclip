@@ -40,9 +40,11 @@ function createRecorderDouble() {
     attachExecutionWorkspaceId: async () => {},
     recordOperation: async (input) => {
       const result = await input.run(async () => {});
+      // Match the real recorder: operation results contribute cleanup evidence.
+      const metadata = input.metadata || result.metadata ? { ...input.metadata, ...result.metadata } : null;
       operations.push({
         status: result.status ?? "succeeded",
-        metadata: input.metadata ?? null,
+        metadata,
         system: result.system ?? null,
       });
       return {
@@ -63,7 +65,7 @@ function createRecorderDouble() {
         logCompressed: false,
         stdoutExcerpt: result.stdout ?? null,
         stderrExcerpt: result.stderr ?? null,
-        metadata: input.metadata ?? null,
+        metadata,
         startedAt: new Date(),
         finishedAt: new Date(),
         createdAt: new Date(),
@@ -112,6 +114,44 @@ describe("worktree instance cleanup", () => {
 
     expect(result).toMatchObject({ status: "removed", postgresStopped: false });
     await expect(fs.stat(instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7002475364 (rf-3 condition 4)
+  // Keep reason: NEVER-OK trace custody. This cleanup is the one path that
+  // removes a whole instance root; run-log bytes that exist ONLY in the kept
+  // spill under it must never go with it.
+  it.each([
+    ["holds run-log bytes object storage has not taken", "refused", false],
+    ["holds recovered spill bytes retained as raw traces", "refused", true],
+  ] as const)("an instance whose run-log spill %s is %s", async (_case, status, recovered) => {
+    const worktreesDir = await makeTempRoot("paperclip-managed-worktrees-");
+    const workspacePath = await makeTempRoot("paperclip-cleanup-workspace-");
+    const instanceId = "pap-spill";
+    const instanceRoot = path.join(worktreesDir, "instances", instanceId);
+    const spillDir = path.join(instanceRoot, "data", "run-logs", ".spill", "company", "agent");
+    await fs.mkdir(spillDir, { recursive: true });
+    const bytes = "{\"chunk\":\"admitted\"}\n";
+    const entry = { v: 1, event: "spilled", at: "2026-11-19T00:00:00Z", logRef: "company/agent/run", spillStart: 0,
+      bytes: bytes.length, sha256: "0".repeat(64), journalEnd: 0 };
+    await fs.writeFile(path.join(spillDir, "run.ndjson"), bytes);
+    await fs.writeFile(path.join(spillDir, "run.index.ndjson"),
+      [entry, ...(recovered ? [{ ...entry, event: "recovered", journalEnd: bytes.length }] : [])]
+        .map(line => `${JSON.stringify(line)}\n`).join(""));
+    await writeWorkspaceEnv(workspacePath, worktreesDir, instanceId);
+    const { recorder, operations } = createRecorderDouble();
+    const result = await cleanupWorktreeInstanceArtifacts({
+      pointer: (await readWorktreeInstancePointer(workspacePath))!, workspaceId: "workspace-1", workspacePath,
+      expectedInstanceId: instanceId, expectedInstanceRoot: instanceRoot, worktreesDir, recorder,
+    });
+    expect(result.status).toBe(status);
+    if (status === "refused") {
+      expect(await fs.readFile(path.join(spillDir, "run.ndjson"), "utf8")).toBe(bytes);
+      // TODAY keeps all raw traces, including recovered spill files. Recovery
+      // never authorizes deleting the retained trace or weakening that guard.
+      expect(operations.at(-1)?.metadata).toMatchObject(recovered === true
+        ? { refusalReason: "raw_traces_kept", rawTraceDirectories: [path.join(instanceRoot, "data", "run-logs")] }
+        : { refusalReason: "run_log_spill_unrecovered", unrecoveredRunLogSpills: ["company/agent/run"] });
+    }
   });
 
   it("preserves a collision-resistant active instance when persisted ownership is absent", async () => {
