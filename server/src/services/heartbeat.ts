@@ -1739,6 +1739,14 @@ export function heartbeatService(
     // recovery worker already knows, from one batched query per page, which
     // visited tasks have such a message: the others cost nothing here.
     if (unanswered === false) return result;
+    // adopt-requeue-boot: a chat already left 'blocked' by a recovery that
+    // completed with nothing queued gets the same post-recovery dispatch
+    // (ONE wake carrying its owed messages) before any card is considered.
+    if (recoveryOpts.companyId && recoveryOpts.issueId) {
+      await runControl.requeueRecoveredWorkspaceForIssue(recoveryOpts.companyId, recoveryOpts.issueId).catch(err => {
+        logger.warn({ err, issueId: recoveryOpts.issueId }, "recovered work's owed messages could not be requeued by the sweep");
+      });
+    }
     const settled = unanswered === true && recoveryOpts.companyId && recoveryOpts.issueId
       ? await settleUnansweredPersonMessagesForTask(db, { companyId: recoveryOpts.companyId, issueId: recoveryOpts.issueId,
         issueCreatedAtGte, onDeferredDeadline: recoveryOpts.onDeferredDeadline,

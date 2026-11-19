@@ -27,7 +27,8 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "../heartbeat-run-status-payload.js";
 import { publishLiveEvent } from "../live-events.js";
 import { DEFERRED_WAKE_CONTEXT_KEY } from "./queue.js";
-import { liftRecoveredWorkspaceBlock, recordRecoveredWorkspaceRequeue, recoveredWorkspaceOwedMessages } from "../recovered-workspace-requeue.js";
+import { liftRecoveredWorkspaceBlock, recordRecoveredWorkspaceRequeue, recoveredWorkspaceOwedMessages,
+  recoveredWorkspaceRequeueRuns } from "../recovered-workspace-requeue.js";
 import { CANCELLABLE_HEARTBEAT_RUN_STATUSES } from "./recovery.js";
 import {
   type WakeupOptions,
@@ -834,6 +835,16 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       return null;
     });
     await recordRecoveredWorkspaceRequeue(db, owed.hold.id, { runId: queued?.id ?? null, commentIds: ids });
+  }
+
+  /** adopt-requeue-boot: the stranded sweep's visit to a task applies the
+   * same post-recovery dispatch to any failed run whose recovered hold has
+   * not had it (a chat already left 'blocked' when the build boots). */
+  async function requeueRecoveredWorkspaceForIssue(companyId: string, issueId: string) {
+    for (const run of await recoveredWorkspaceRequeueRuns(db, companyId, issueId)) {
+      if (adapterExecutionControls.has(run.id)) continue;
+      await requeueRecoveredWorkspaceMessages(run, issueId);
+    }
   }
 
   /** One writer per native session: the acknowledged Stop, a released
@@ -2200,6 +2211,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     releaseEnvironmentLeasesForRun,
     acknowledgeRemoteStop,
     resumeRemoteStopComments,
+    requeueRecoveredWorkspaceForIssue,
     cancelRunInternal,
     resumeExecutionWaitComments,
     resumeQueuedCommentInterrupt,
