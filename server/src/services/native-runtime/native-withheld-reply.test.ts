@@ -58,7 +58,8 @@ vi.mock("./native-workspace-sync.js", async importOriginal => ({
 import { FILE_LINE_KEPT_NO_BUTTON, FILE_LINE_NOT_SAVED_YET, FILE_LINE_SAVING, readReplyFileLine, replyFileLineText } from "@paperclipai/shared";
 import { nativeRunResults } from "@paperclipai/db";
 import { activityRoutes } from "../../routes/activity.js";
-import { publishWithheldAcceptedReply } from "./native-withheld-reply.js";
+import { nativeWithheldReplyCandidates, publishWithheldAcceptedReply } from "./native-withheld-reply.js";
+import { nativeResponsePresentationCandidates } from "./native-response-presentation-query.js";
 import { agentRoutes } from "../../routes/agents.js";
 import { issueRoutes } from "../../routes/issues.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -215,7 +216,8 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     const runtime = { resumeRunLease: vi.fn(async () => ({ providerLeaseId, metadata: { remoteCwd: "/work" } })),
       retryPendingSandboxTeardown: vi.fn(async () => ({ providerLeaseId, state: "stopped" })) };
     /** REAL: one copy-back attempt by the reconciler; a success also commits the result. */
-    const copyBack = () => reconcileNativeFinalizations(db, [runId], { environmentRuntime: runtime as never });
+    const copyBack = (options: { skipNativeResponsePresentation?: boolean } = {}) =>
+      reconcileNativeFinalizations(db, [runId], { environmentRuntime: runtime as never, ...options });
     const coordinator = async () => (await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId)))[0];
     const run = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0];
     /** What the commit did to the task itself: the committed path's other effects, beside the reply. */
@@ -498,6 +500,47 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     expect(await s.line()).toBeNull();
     expect(await s.task()).toEqual(HEALTHY_TASK_AFTER_COMMIT(s.runId));
     await s.expectAnsweredOnceAndNoNotice();
+  }, 120_000);
+
+  it("L4: an acceptance entry also discovered by the ordinary producer is listed once, then publishes 1 reply", async () => {
+    setting.trigger = "shipped";
+    const s = await scenario();
+    // REAL runner acceptance and finalization producers; no planted marker/commit.
+    await s.streamAndAcceptThroughPort();
+    box.resume.mockResolvedValue(true);
+    // Use the reconciler's real split-worker option: commit now, present in the worker below.
+    await s.copyBack({ skipNativeResponsePresentation: true });
+    expect(await s.coordinator()).toMatchObject({ phase: "committed" });
+    expect(await s.replies()).toEqual([]);
+    const scope = { companyId: s.companyId, issueId: s.issueId };
+    const ordinary = await db.select().from(nativeResponsePresentationCandidates(scope).as("ordinary"));
+    const withheld = await db.select().from(nativeWithheldReplyCandidates(scope).as("withheld"));
+    expect(ordinary.map(row => row.id)).toEqual([s.runId]);
+    expect(withheld.map(row => row.id)).toEqual([s.runId]);
+    const work = nativeResponsePresentationWork(db);
+    const entries = await work.load(scope);
+    expect(entries.map(entry => entry.id)).toEqual([s.runId]);
+    const due = (row: typeof ordinary[number]) => Math.max(row.nextAttemptAt?.getTime() ?? 0,
+      row.publicationNextAttemptAt ? Date.parse(row.publicationNextAttemptAt) : 0);
+    expect(entries[0].dueAt).toBe(Math.min(due(ordinary[0]), due(withheld[0])));
+    // PLANTED scheduling-only twin, beside the real-producer overlap above:
+    // ordinary discovery is later, but the acceptance entry is already due.
+    const savedNextAttemptAt = (await s.coordinator()).nextAttemptAt;
+    await db.update(nativeRunFinalizations).set({ nextAttemptAt: new Date(Date.now() + 60_000) })
+      .where(eq(nativeRunFinalizations.runId, s.runId));
+    const planted = await work.load(scope);
+    expect(planted.map(entry => entry.id)).toEqual([s.runId]);
+    expect(planted[0].dueAt).toBe(due(withheld[0]));
+    await db.update(nativeRunFinalizations).set({ nextAttemptAt: savedNextAttemptAt })
+      .where(eq(nativeRunFinalizations.runId, s.runId));
+    for (const entry of entries) await work.check(entry);
+    await s.presentationWorker();
+    const replies = await s.replies();
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({ body: ANSWER, createdByRunId: s.runId });
+    await s.expectAnsweredOnceAndNoNotice();
+    await l3Evidence("L4 overlap real producers", { ordinary: ordinary.map(row => row.id), withheld: withheld.map(row => row.id),
+      discovered: entries, plantedLaterOrdinary: planted, replies: replies.map(row => ({ id: row.id, body: row.body })) });
   }, 120_000);
 
   it("R4: after the withheld reply is published, a board Retry that succeeds commits the run and posts nothing more", async () => {
