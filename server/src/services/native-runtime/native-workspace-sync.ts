@@ -11,7 +11,7 @@ import fs from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { environmentLeases, heartbeatRuns } from "@paperclipai/db";
 import { retryUnlessTransactionBound } from "../transaction-retry.js";
@@ -616,10 +616,10 @@ export const NATIVE_WORKSPACE_SYNC_PUBLICATION_FENCED = "native_workspace_sync_p
 
 /**
  * Writes the run's sync reference. A FINALIZED reference is a publication (`finalized`): it and the lease stamp are
- * written in ONE transaction, and the reference write is ONE statement conditional on the run's copy-back owner
- * (never a tombstone; the caller's token when it holds one). The owner key is on the same row the copy-back bound
- * rewrites (isolateClassicSourceWorkspace), so the two serialize on the row lock: a publication released after the
- * fence writes nothing, and the bound refuses a run whose publication committed first.
+ * written in ONE transaction that first locks the run row and rechecks the run's copy-back owner on it (never a
+ * tombstone; the caller's token when it holds one). The owner key is on the same row the copy-back bound rewrites
+ * (isolateClassicSourceWorkspace), so the two serialize on the row lock: a publication released after the fence
+ * writes nothing, and the bound refuses a run whose publication committed first.
  */
 async function persistRunReference(
   db: Db,
@@ -638,7 +638,13 @@ async function persistRunReference(
       .then((rows) => rows[0] ?? null);
     if (!run) throw new Error("native_workspace_sync_run_missing");
     await notifyCancelledWorkspacePreservation(tx, { companyId: run.companyId, runId });
-    const write = tx
+    // The run row is locked above, and the copy-back bound's tombstone is a write to this same row: the owner read
+    // here is the owner at commit. A fenced copy-back publishes nothing: not the reference, not the lease stamp.
+    const owner = parseObject(parseObject(run.runnerProfileJson).nativeWorkspaceFinalizationOwner);
+    if (finalized && (owner.fenced === true || (finalized.ownerToken && owner.token !== finalized.ownerToken))) {
+      throw new Error(NATIVE_WORKSPACE_SYNC_PUBLICATION_FENCED);
+    }
+    await tx
       .update(heartbeatRuns)
       .set({
         runnerProfileJson: {
@@ -646,18 +652,9 @@ async function persistRunReference(
           nativeWorkspaceSync: reference,
         },
         updatedAt: new Date(),
-      });
-    if (!finalized) {
-      await write.where(eq(heartbeatRuns.id, runId));
-      return;
-    }
-    const owner = sql`${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceFinalizationOwner'`;
-    const published = await write
-      .where(and(eq(heartbeatRuns.id, runId), sql`${owner}->>'fenced' is distinct from 'true'`,
-        finalized.ownerToken ? sql`${owner}->>'token' = ${finalized.ownerToken}` : undefined))
-      .returning({ id: heartbeatRuns.id });
-    // Nothing of a fenced copy-back is published: not the reference, not the lease stamp.
-    if (!published.length) throw new Error(NATIVE_WORKSPACE_SYNC_PUBLICATION_FENCED);
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    if (!finalized) return;
     await writeLeaseStamp(tx, finalized);
   }));
 }
