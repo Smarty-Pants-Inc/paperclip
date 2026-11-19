@@ -682,7 +682,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     if (run.runtimeMode === "native" && run.status === "cancelled") {
       const [full] = await db.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id))).limit(1);
-      if (full) await proveHandedOffWarmLeases(db, full).catch(() => "unproven");
+      // adopt-unproven-bound: a re-proof scheduled at the unproven bound that proves exit re-runs this resume.
+      if (full) await proveHandedOffWarmLeases(db, full, { redispatch: () => resumeRemoteStopComments(run, requestId) }).catch(() => "unproven");
     }
     if (!isHeartbeatRunTerminalStatus(run.status) || adapterExecutionControls.has(run.id)) return;
     let interruptedPreparation = false;
@@ -900,7 +901,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`)).orderBy(desc(heartbeatRuns.createdAt)).limit(1);
     if (!source || source.status !== "cancelled") return;
     let gaveUp = false;
-    const proof = proveHandedOffWarmLeases(db, source);
+    const proof = proveHandedOffWarmLeases(db, source, { redispatch: () => resumeQueuedCommentInterrupt(companyId, queueId) });
     void proof.then(outcome => {
       if (gaveUp && outcome === "proven") return resumeQueuedCommentInterrupt(companyId, queueId);
     }).catch(err => logger.warn({ err, runId: source.id, queueId }, "handed-off warm proof could not re-dispatch the saved Send"));
