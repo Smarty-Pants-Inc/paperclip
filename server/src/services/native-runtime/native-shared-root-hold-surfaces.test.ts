@@ -141,7 +141,7 @@ describe.skipIf(!support.supported)("a message held for Continue on a SHARED pro
       out.snapshots[label] = snapshot;
       return snapshot;
     };
-    const pump = async (ms = 3500) => {
+    const pump = async (ms = 3500, settle = true) => {
       const until = Date.now() + ms;
       do {
         // NAMED CLOCK-SKIP: the deferred receipt's own 30 s scheduler wait is made due; the gate and the workers are real.
@@ -156,7 +156,7 @@ describe.skipIf(!support.supported)("a message held for Continue on a SHARED pro
         await sleep(150);
       } while (Date.now() < until);
       await h.drainActiveRunExecutions();
-      await present();
+      if (settle) await present();
     };
     /** What the Inbox failed-run row presses (ui/src/pages/Inbox.tsx retryRunMutation -> issuesApi.retryTask): R's run id
      * from the Inbox's failed-run GET, and "Continue with the files as they are" (retryAction continue_with_files) only
@@ -230,7 +230,13 @@ describe.skipIf(!support.supported)("a message held for Continue on a SHARED pro
       recovery = registerWorkspaceRecoveryWork(db, delivery, environmentRuntimeService(db), h.resumeRemoteStopComments);
       await recovery.ready;
       registerEnvironmentCleanupWork(db, delivery, { canRun: () => true, sweepPending: backoffMs => h.sweepPendingCleanupLeases({ backoffMs }), minimumSpacingMs: 1 });
-      await pump(8000);
+      if (opts.waitingSweep) {
+        // BEFORE R's file line settles: the reply-presentation worker (`present`) has not run since R failed, so R's line
+        // does not read LOST yet. A real GET of the task and the queue in that state (nothing planted).
+        await pump(8000, false);
+        out.beforeLineSettles = { issue: await get(`/api/issues/${s.issueId}`), queue: await get(`/api/issues/${s.issueId}/queued-comments`) };
+        await present();
+      } else await pump(8000);
       if (opts.waitingSweep) {
         // R's box is NOT stopped yet (PLANTED BOX-STOPPED comes below): the automatic wait. Nothing is planted for it.
         await snap("waiting");
@@ -300,6 +306,11 @@ describe.skipIf(!support.supported)("a message held for Continue on a SHARED pro
     expect.soft(waiting.issue.executionBlocker, "(f) the task's ONE sentence in the automatic wait").toMatchObject({ nextAction: WAITING, savedMessageWait: "waiting" });
     expect.soft(waiting.queue.executionWait, "(f) the queue's wait line in the automatic wait").toMatchObject({ message: WAITING });
     expect.soft(JSON.stringify([waiting.issue.executionBlocker?.nextAction, waiting.queue.executionWait]), "(f) a recovery's Retry words for a message").not.toMatch(/Your Retry is saved|refused to recover/);
+    // (f) CONTROL, green on both sides: BEFORE R's file line settled (it did not read LOST yet) that same stored wait
+    // was the gate's CURRENT answer for R's spent recovery, and it stands as it is: the queue says it, and the task says
+    // none of the three sentences. Only beside a LOST line is it no longer the message's wait.
+    expect(out.beforeLineSettles.queue, "(f) control: the gate's stored wait before the line settles").toMatchObject({ state: "deferred", executionWait: { reason: "saved_work_recovery_refused" } });
+    expect(out.beforeLineSettles.issue.executionBlocker?.savedMessageWait ?? null, "(f) control: no saved-message sentence before the line reads LOST").toBeNull();
     // (c) The Inbox's task projection says what the task says: the SAME sentence, an automatic wait (nothing to press).
     for (const row of [inboxTask(waiting.inboxMine, out.ids.issueId), waiting.inboxRows.find((candidate: { id: string }) => candidate.id === out.ids.issueId)])
       expect.soft(row?.interruption?.savedMessageWait, "(c) the Inbox's GET says nothing of the wait").toEqual({ state: "waiting", line: WAITING });
