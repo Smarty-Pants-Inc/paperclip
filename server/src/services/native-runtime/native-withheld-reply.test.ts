@@ -17,6 +17,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 //   the person's message M ...... POST /api/issues/:id/comments (routes/issues.ts)
 //   the streamed answer ......... NativeRunCoordinatorStore.appendEvent (item.delta, item.completed)
 //   acceptance .................. NativeRunCoordinatorStore.completeRun
+//   acceptance, the runner's ..... PaperclipControlPlanePort.openRun / appendEvent / completeRun, in the
+//                                 order packages/paperclip-runner native-session-runtime.ts calls them (F1 rows)
 //   every copy-back attempt ..... reconcileNativeFinalizations -> attemptNativeWorkspaceFinalization
 //                                 -> recordNativeWorkspaceFinalizationFailure -> recordNativeFinalizationFailure
 //   the pause cancel ............ POST /api/agents/:id/pause (routes/agents.ts -> heartbeat.cancelActiveForAgent)
@@ -61,6 +63,7 @@ import { answeredPersonMessageSql } from "../person-message-answer.js";
 import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_REASON_PREFIX } from "../recovery/unanswered-person-message.js";
 import { reconcileNativeFinalizations } from "./native-finalization-reconciler.js";
 import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
+import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { nativeResponsePresentationWork } from "./native-response-presentation-work.js";
 import { retryNativeWorkspaceExport } from "./native-workspace-export-retry.js";
 import { remoteTerminationReceipt } from "../remote-execution-termination.js";
@@ -163,6 +166,35 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
         terminal: { schema: "paperclip.prp.terminal.v1", runTerminalState: "succeeded", turnTerminalState: "completed", reportedWorkDisposition: "done" },
         turnId: "answer-turn" });
     }
+    // The runner's own production acceptance path (RFL F1). REAL: PaperclipControlPlanePort, bound as
+    // native-session-executor.ts binds it, driven in the order native-session-runtime.ts drives it:
+    // openRun, the stream, the two control events (run.result.accepted, run.terminal), completeRun.
+    const controlPlaneId = randomUUID();
+    const RESULT = { schema: "paperclip.run_result.v1" as const, reportedWorkDisposition: "done" as const,
+      summary: "Renamed the helper.", completionClaim: { contractRevision: "test", objectiveSatisfied: true, criteria: [], remainingWork: [] },
+      evidence: [], verification: [], attentionRequests: [], artifacts: [] };
+    const TERMINAL = { schema: "paperclip.prp.terminal.v1" as const, runTerminalState: "succeeded" as const,
+      turnTerminalState: "completed" as const, reportedWorkDisposition: "done" as const };
+    const port = new PaperclipControlPlanePort(db, { companyId, issueId, runId, agentId, sessionId,
+      completionContractId: contract.id, completionContractSha256: contract.canonicalSha256,
+      sourceInstanceId: runnerId, controlPlaneSourceInstanceId: controlPlaneId });
+    /** REAL: the runner's stream and its accepted result, through the PORT (not the coordinator store). */
+    async function streamAndAcceptThroughPort() {
+      await port.openRun({ identity: { companyId, issueId, runId, agentId, sessionId }, backendKind: "runner", sourceInstanceId: runnerId });
+      for (const text of STREAM) await port.appendEvent(event("item.delta", { kind: "agentMessage", channel: "final", text }));
+      await port.appendEvent(event("item.completed", { kind: "agentMessage", channel: "final", providerPhase: "final", text: ANSWER }));
+      const control = (seq: number, eventType: string, payload: Record<string, unknown>): PrpEvent => ({
+        schema: "paperclip.prp.event.v1", schemaVersion: 1, runId, normalizedSessionId: sessionId, turnId: "answer-turn",
+        sourceInstanceId: controlPlaneId, sourceEventId: `${controlPlaneId}:${runId}:${seq}`, sourceSeq: seq, sourceKind: "control_plane",
+        eventType, priority: 0, emittedAt: new Date().toISOString(), payload } as PrpEvent);
+      await port.appendEvent(control(1, "run.result.accepted", { result: RESULT }));
+      await port.appendEvent(control(2, "run.terminal", TERMINAL));
+      await port.completeRun({ result: RESULT, terminal: TERMINAL, turnId: "answer-turn",
+        callerResultId: `${runnerId}:${runId}:result`, callerDedupeKey: `${runId}:${contract.canonicalSha256}` });
+    }
+    /** REAL: a coordinator replay of the same accepted result (NativeRunCoordinatorStore.completeRun). */
+    const coordinatorReplay = () => store.completeRun({ result: RESULT, terminal: TERMINAL, turnId: "answer-turn" })
+      .then(done => done.disposition, (error: Error) => `refused:${error.message}`);
     const runtime = { resumeRunLease: vi.fn(async () => ({ providerLeaseId, metadata: { remoteCwd: "/work" } })),
       retryPendingSandboxTeardown: vi.fn(async () => ({ providerLeaseId, state: "stopped" })) };
     /** REAL: one copy-back attempt by the reconciler; a success also commits the result. */
@@ -319,7 +351,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
         run: wake.runId ? (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake.runId)))[0] ?? null : null })));
     }
     const otherRuns = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).filter(row => row.id !== runId);
-    return { untouchedByPublish, personSays, wakesFor, otherRuns, task, servedRun, fileLine, line, acceptedAt, publishAgain, expectRenderFixture, savedFilesSource, recoverSavedFiles, app, companyId, agentId, issueId, runId, leaseId, messageId, streamAndAccept, copyBack, coordinator, run, presentationWorker,
+    return { streamAndAcceptThroughPort, coordinatorReplay, untouchedByPublish, personSays, wakesFor, otherRuns, task, servedRun, fileLine, line, acceptedAt, publishAgain, expectRenderFixture, savedFilesSource, recoverSavedFiles, app, companyId, agentId, issueId, runId, leaseId, messageId, streamAndAccept, copyBack, coordinator, run, presentationWorker,
       thread, replies, answered, expectAnsweredOnceAndNoNotice, failCopyBackThreeTimes, boardRetrySucceeds };
   }
 
@@ -790,6 +822,106 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     // The hang ends; the copy-out succeeds; the commit posts nothing more.
     release(true);
     await copying;
+    expect(await s.coordinator()).toMatchObject({ phase: "committed" });
+    await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
+    expect((await s.replies()).map(comment => comment.id)).toEqual([reply.id]);
+    expect(await s.line()).toBeNull();
+    await s.expectAnsweredOnceAndNoNotice();
+  }, 120_000);
+
+  // ---- RFL F1: the runner's own acceptance (PaperclipControlPlanePort.completeRun) writes the publish entry too. ----
+
+  it("L1 (shipped default; the PORT's real openRun/appendEvent/completeRun; NAMED INJECTION 'hanging copy-out'): the reply is published within 5 s, exactly once, by the registered worker", async () => {
+    setting.trigger = "shipped";
+    const s = await scenario();
+    // NAMED INJECTION 'hanging copy-out': the box's export (resumeNativeWorkspaceSync, the faked box) is
+    // entered and never returns until `release` is called. Everything around it is the real finalizer.
+    let release!: (ok: boolean) => void;
+    const hung = new Promise<boolean>(resolve => { release = resolve; });
+    box.resume.mockImplementation(() => hung);
+    const errors: unknown[] = [];
+    const delivery = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => errors.push(error) });
+    // REAL: the registered reply-presentation worker; nothing in this row calls the publisher by hand before the reply shows.
+    const worker = nativeResponsePresentationWork(db).register(delivery, () => true);
+    let copying: Promise<unknown> = Promise.resolve();
+    try {
+      await worker.ready;
+      await s.streamAndAcceptThroughPort();
+      const acceptedAt = performance.now();
+      // The port's own accepting transaction left the entry: pending, trigger 'acceptance', naming the accepted result.
+      const [accepted] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, s.runId));
+      expect(accepted).toMatchObject({ schemaStatus: "accepted" });
+      expect((await s.coordinator())).toMatchObject({ phase: "workspace_finalizing", resultId: accepted.id });
+      let copyBackEnded = false;
+      copying = s.copyBack().finally(() => { copyBackEnded = true; });
+      await vi.waitFor(async () => expect(await s.replies()).toHaveLength(1), { timeout: 5_000, interval: 20 });
+      const tookMs = performance.now() - acceptedAt;
+      timing("L1 port acceptance, copy-out hanging -> published reply (registered worker)", acceptedAt);
+      expect(tookMs).toBeLessThan(5_000);
+      await vi.waitFor(() => expect(box.resume).toHaveBeenCalledTimes(1), { timeout: 15_000, interval: 20 });
+      const [reply] = await s.replies();
+      expect(reply).toMatchObject({ body: ANSWER, createdByRunId: s.runId });
+      // The copy-out is still hanging: nothing but the reply moved.
+      expect(copyBackEnded).toBe(false);
+      expect(await s.coordinator()).toMatchObject({ phase: "workspace_finalizing" });
+      expect(await s.task()).toEqual({ status: "in_progress", executionRunId: s.runId });
+      expect(await s.run()).toMatchObject({ status: "running", nativePhase: "workspace_finalizing" });
+      // The port's own run fields are kept beside the entry (one row, both writes).
+      expect((await s.run()).resultJson).toMatchObject({ nativeTerminal: { runTerminalState: "succeeded" }, prpRunTerminalState: "succeeded",
+        nativeWithheldReply: { state: "published", trigger: "acceptance", resultId: accepted.id, commentId: reply.id } });
+      expect(await s.fileLine()).toMatchObject({ commentId: reply.id, state: "saving" });
+      expect(await s.answered()).toEqual([true]);
+      // Exactly once: four more worker passes and the publisher called again post nothing.
+      await Promise.all([s.presentationWorker(), s.presentationWorker(), s.presentationWorker(), s.presentationWorker()]);
+      expect(await s.publishAgain()).toEqual([false, false]);
+      expect((await s.replies()).map(comment => comment.id)).toEqual([reply.id]);
+      expect(errors).toEqual([]);
+      // The hang ends; the copy-out succeeds; the commit posts nothing more.
+      release(true);
+      await copying;
+      expect(await s.coordinator()).toMatchObject({ phase: "committed" });
+      await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
+      expect((await s.replies()).map(comment => comment.id)).toEqual([reply.id]);
+      expect(await s.line()).toBeNull();
+    } finally { release(true); await copying.catch(() => {}); worker.stop(); await delivery.stop(); }
+    await s.expectAnsweredOnceAndNoNotice();
+  }, 120_000);
+
+  it("L2 (shipped default): a coordinator replay after the PORT accepted -> still exactly 1 reply, the entry intact", async () => {
+    setting.trigger = "shipped";
+    const s = await scenario();
+    let release!: (ok: boolean) => void;
+    const hung = new Promise<boolean>(resolve => { release = resolve; });
+    box.resume.mockImplementation(() => hung);
+    await s.streamAndAcceptThroughPort();
+    const entry = async () => ((await s.run()).resultJson as Record<string, any>).nativeWithheldReply;
+    const [accepted] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, s.runId));
+    const pending = { state: "pending", trigger: "acceptance", resultId: accepted.id };
+    expect(await entry()).toMatchObject(pending);
+    // REAL: the coordinator replays the accepted result BEFORE any worker ran. It accepts nothing new
+    // (the port's result is the run's one accepted result), and it leaves the port's entry as written.
+    const before = await entry();
+    const first = await s.coordinatorReplay();
+    expect(["duplicate", "refused:native_result_replay_conflict"]).toContain(first);
+    expect(await entry()).toEqual(before);
+    expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, s.runId))).toHaveLength(1);
+    // The entry still publishes: the worker's own discovery and check, as after a restart.
+    await s.presentationWorker();
+    const [reply] = await s.replies();
+    expect(await s.replies()).toHaveLength(1);
+    expect(reply).toMatchObject({ body: ANSWER, createdByRunId: s.runId });
+    const published = await entry();
+    expect(published).toMatchObject({ state: "published", trigger: "acceptance", resultId: accepted.id, commentId: reply.id });
+    // The replay again, AFTER the publish, with four workers: still exactly 1, the entry not reset to pending.
+    expect(await s.coordinatorReplay()).toBe(first);
+    await Promise.all([s.presentationWorker(), s.presentationWorker(), s.presentationWorker(), s.presentationWorker()]);
+    expect(await s.publishAgain()).toEqual([false, false]);
+    expect(await entry()).toEqual(published);
+    expect((await s.replies()).map(comment => comment.id)).toEqual([reply.id]);
+    // The copy-out succeeds; the commit posts nothing more.
+    box.resume.mockReset().mockResolvedValue(true);
+    release(true);
+    await s.copyBack();
     expect(await s.coordinator()).toMatchObject({ phase: "committed" });
     await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
     expect((await s.replies()).map(comment => comment.id)).toEqual([reply.id]);
