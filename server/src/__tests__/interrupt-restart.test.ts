@@ -24,7 +24,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 // empty map. Provider edges as in interrupt-native / send-after-stop3 (713e7d1b):
 // the Runner's cancel acknowledgement, the orchestrator's releaseForRun, and the
 // provider's stop receipt through the real settleStopOnlyCleanup.
-const proc = vi.hoisted(() => ({ restarted: false, calls: [] as Array<{ runId: string; providerLeaseId: string | null; restarted: boolean }> }));
+const proc = vi.hoisted(() => ({ restarted: false, preRestartProof: true, liveClaim: false,
+  calls: [] as Array<{ runId: string; providerLeaseId: string | null; restarted: boolean }> }));
 vi.mock("../services/native-runtime/native-session-executor.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../services/native-runtime/native-session-executor.js")>();
   const { heartbeatRuns: runs } = await import("@paperclipai/db");
@@ -36,8 +37,11 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
       proc.calls.push({ ...input, restarted: proc.restarted });
       // Before the restart: this process holds the idle warm session and its Runner exits (stand-in).
       // After: the fresh module's real answer (its warm map is empty).
-      return proc.restarted ? actual.handedOffWarmOwnerRunnerExited(input) : true;
+      return proc.restarted ? actual.handedOffWarmOwnerRunnerExited(input) : proc.preRestartProof;
     },
+    // adopt-boot-reprove row 3: a control scripts a LIVE turn holding the box (process-local claim).
+    handedOffWarmOwnerClaimedByAnotherRun: (input: { runId: string; providerLeaseId: string | null }) =>
+      proc.liveClaim || (real.handedOffWarmOwnerClaimedByAnotherRun as ((i: unknown) => boolean) | undefined)?.(input) === true,
     handedOffWarmOwnerProofUnavailable: (input: { runId: string; providerLeaseId: string | null }) =>
       proc.restarted ? (real.handedOffWarmOwnerProofUnavailable as ((i: unknown) => boolean) | undefined)?.(input) === true : false,
     cancelNativeSession: (async (...args: Parameters<typeof actual.cancelNativeSession>) => {
@@ -76,7 +80,26 @@ async function restartServer(connectionString: string) {
   const { settleStopOnlyCleanup } = await import("../services/sandbox-stop-and-retain.js");
   const { buildExecutionContinuation } = await import("../services/execution-continuation.js");
   const executor = await import("../services/native-runtime/native-session-executor.js");
-  return { db, heartbeat: freshHeartbeat(db), settleStopOnlyCleanup, buildExecutionContinuation, executor, at: Date.now() };
+  const { createDeliveryWorkCoordinator } = await import("../services/delivery-work-coordinator.js");
+  const heartbeat = freshHeartbeat(db);
+  /** The fresh process's real deferred-receipt worker (index.ts registers it at boot; its re-check cadence is the 30 s age gate). */
+  const bootDeferredReceiptWork = async () => {
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
+    const work = heartbeat.registerDeferredReceiptWork(coordinator, () => true);
+    await work.ready;
+    return work;
+  };
+  return { db, heartbeat, settleStopOnlyCleanup, buildExecutionContinuation, executor, bootDeferredReceiptWork, at: Date.now() };
+}
+
+/** Poll a DB read (test-side only) until it holds or the deadline passes. */
+async function until<T>(read: () => Promise<T>, ok: (value: T) => boolean, ms: number): Promise<T> {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const value = await read();
+    if (ok(value) || Date.now() > deadline) return value;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
 }
 
 describe.skipIf(!support.supported)("row 12: a hand-off after a SERVER RESTART never waits for warm expiry", () => {
@@ -247,6 +270,134 @@ describe.skipIf(!support.supported)("row 12: a hand-off after a SERVER RESTART n
     expect(await unanswered(f.issueId, [f.held])).toEqual([]);
     expect((await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
       eq(issueComments.authorType, "agent"), eq(issueComments.createdByRunId, carrying[0]!.id))))).toHaveLength(1);
+  }, 120_000);
+
+  // adopt-boot-reprove row 1 (RED on a1fb126d): Interrupt -> SERVER RESTART -> NO Send, NO explicit resume call.
+  // Only the fresh process's real deferred-receipt worker (registered at boot, 30 s re-check cadence) runs.
+  it("BR1: Interrupt -> SERVER RESTART -> NO Send => stop-and-retain, receipt, ONE successor within a minute", async () => {
+    proc.restarted = false; proc.preRestartProof = true; proc.liveClaim = false; proc.calls.length = 0;
+    const f = await seedLiveNativeTurn();
+    const { queueId } = await interruptAndHandOff(f);
+    // The deploy takes its time: the saved Interrupt is past the worker's 30 s age gate when the new process boots.
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 31_000) }).where(eq(agentWakeupRequests.id, queueId));
+    // ---- SERVER RESTART ----
+    const server = await restartServer(tempDb.connectionString);
+    fresh.push(server.db);
+    const work = await server.bootDeferredReceiptWork();
+    try {
+      const stopping = await until(() => leaseOf(f.leaseId), lease => lease.status === "pending_cleanup", 10_000);
+      await evidence("BR1_lease_after_boot", { status: stopping.status, intent: stopping.metadata?.sandboxStopAndRetain ?? null,
+        msAfterBoot: Date.now() - server.at, wait: (await wakeOf(queueId)).payload?.executionWait ?? null });
+      expect(stopping.status).toBe("pending_cleanup");
+      expect(stopping.metadata?.sandboxStopAndRetain).toMatchObject({ runId: f.liveRunId, providerLeaseId: f.providerLeaseId,
+        handedOffWarmProofUnavailable: true });
+      // The provider's stop receipt through the real stop-only settle, then the sweep's receipt path.
+      await server.settleStopOnlyCleanup(server.db, stopping, { attemptId: String(stopping.metadata?.pendingCleanupAttemptId),
+        receipt: { providerLeaseId: f.providerLeaseId, state: "stopped" } });
+      await server.heartbeat.resumeRemoteStopComments((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.liveRunId)))[0]!);
+      const wake = await wakeOf(f.wakeId);
+      const successors = (await runsOf(f.companyId)).filter(run => run.id !== f.liveRunId && run.contextSnapshot?.issueId === f.issueId);
+      const elapsedMs = Date.now() - server.at;
+      await evidence("BR1_admitted", { wake: { status: wake.status, runId: wake.runId }, elapsedMs, successors: successors.length });
+      expect(successors).toHaveLength(1);
+      expect(((successors[0]!.contextSnapshot?.wakeCommentIds as string[] | undefined) ?? [])).toContain(f.held);
+      expect(wake).toMatchObject({ status: "coalesced", runId: successors[0]!.id });
+      expect(elapsedMs).toBeLessThan(60_000);
+    } finally { await work.stop(); }
+  }, 120_000);
+
+  // Row 1b: the restart lands right after the press; nothing is backdated.
+  it("BR1b: same, restart right after the press (NO backdating): the real 30 s re-check cadence admits within a minute", async () => {
+    proc.restarted = false; proc.preRestartProof = true; proc.liveClaim = false; proc.calls.length = 0;
+    const f = await seedLiveNativeTurn();
+    const { queueId } = await interruptAndHandOff(f);
+    // ---- SERVER RESTART ----
+    const server = await restartServer(tempDb.connectionString);
+    fresh.push(server.db);
+    const work = await server.bootDeferredReceiptWork();
+    try {
+      const stopping = await until(() => leaseOf(f.leaseId), lease => lease.status === "pending_cleanup", 45_000);
+      await evidence("BR1b_lease_after_boot", { status: stopping.status, intent: stopping.metadata?.sandboxStopAndRetain ?? null,
+        msAfterBoot: Date.now() - server.at, wait: (await wakeOf(queueId)).payload?.executionWait ?? null });
+      expect(stopping.status).toBe("pending_cleanup");
+      expect(stopping.metadata?.sandboxStopAndRetain).toMatchObject({ runId: f.liveRunId, providerLeaseId: f.providerLeaseId,
+        handedOffWarmProofUnavailable: true });
+      // The provider's stop receipt through the real stop-only settle, then the sweep's receipt path.
+      await server.settleStopOnlyCleanup(server.db, stopping, { attemptId: String(stopping.metadata?.pendingCleanupAttemptId),
+        receipt: { providerLeaseId: f.providerLeaseId, state: "stopped" } });
+      await server.heartbeat.resumeRemoteStopComments((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.liveRunId)))[0]!);
+      const wake = await wakeOf(f.wakeId);
+      const successors = (await runsOf(f.companyId)).filter(run => run.id !== f.liveRunId && run.contextSnapshot?.issueId === f.issueId);
+      const elapsedMs = Date.now() - server.at;
+      await evidence("BR1b_admitted", { wake: { status: wake.status, runId: wake.runId }, elapsedMs, successors: successors.length });
+      expect(successors).toHaveLength(1);
+      expect(((successors[0]!.contextSnapshot?.wakeCommentIds as string[] | undefined) ?? [])).toContain(f.held);
+      expect(wake).toMatchObject({ status: "coalesced", runId: successors[0]!.id });
+      expect(elapsedMs).toBeLessThan(60_000);
+    } finally { await work.stop(); }
+  }, 120_000);
+
+  // Row 2: Interrupt -> proof UNPROVEN in the old boot -> restart INSIDE the 30 s bound. The new boot re-arms the bound
+  // from the stored handedOffWarmUnprovenSince (the old boot's timer died with it), so the box is still stopped and kept
+  // at since + 30 s, never at warm expiry. The lease is unstamped, so only the stored bound (not the boot id) bounds it.
+  it("BR2: Interrupt -> UNPROVEN -> restart inside 30 s -> still bounded from the stored handedOffWarmUnprovenSince", async () => {
+    proc.restarted = false; proc.preRestartProof = false; proc.liveClaim = false; proc.calls.length = 0;
+    const f = await seedLiveNativeTurn();
+    const lease = await leaseOf(f.leaseId);
+    const { leaseController: _stamp, ...unstamped } = lease.metadata ?? {};
+    await db.update(environmentLeases).set({ metadata: unstamped }).where(eq(environmentLeases.id, f.leaseId));
+    const { queueId } = await interruptAndHandOff(f);
+    // The old boot's run-end path proves: UNPROVEN, so it stores since and arms its (process-local) timer.
+    await heartbeatService(db).resumeRemoteStopComments((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.liveRunId)))[0]!);
+    const unproven = await leaseOf(f.leaseId);
+    expect(unproven.status).toBe("retained");
+    const since = (unproven.metadata?.handedOffWarmUnprovenSince as { at: string }).at;
+    expect(since).toBeTruthy();
+    // The restart lands 25 s into the bound: 5 s left. (The old boot's timer would fire 30 s after the REAL since.)
+    const shifted = new Date(Date.now() - 25_000).toISOString();
+    await db.update(environmentLeases).set({ metadata: { ...unproven.metadata, handedOffWarmUnprovenSince: { runId: f.liveRunId, at: shifted } } })
+      .where(eq(environmentLeases.id, f.leaseId));
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 31_000) }).where(eq(agentWakeupRequests.id, queueId));
+    // ---- SERVER RESTART ----
+    const server = await restartServer(tempDb.connectionString);
+    fresh.push(server.db);
+    const work = await server.bootDeferredReceiptWork();
+    try {
+      const stopping = await until(() => leaseOf(f.leaseId), row => row.status === "pending_cleanup", 12_000);
+      const msAfterBoot = Date.now() - server.at;
+      await evidence("BR2_lease_after_boot", { status: stopping.status, intent: stopping.metadata?.sandboxStopAndRetain ?? null, msAfterBoot });
+      expect(stopping.status).toBe("pending_cleanup");
+      expect(stopping.metadata?.sandboxStopAndRetain).toMatchObject({ runId: f.liveRunId, handedOffWarmProofUnproven: true,
+        unprovenSince: shifted });
+      expect(msAfterBoot).toBeLessThan(12_000);
+    } finally { await work.stop(); }
+  }, 120_000);
+
+  // Row 3 control: a LIVE holder of the box is never stopped by the boot / re-check trigger.
+  it("BR3 control: restart with a LIVE turn holding the box -> the boot trigger never stops it", async () => {
+    proc.restarted = false; proc.preRestartProof = false; proc.liveClaim = false; proc.calls.length = 0;
+    const f = await seedLiveNativeTurn();
+    const lease = await leaseOf(f.leaseId);
+    const { leaseController: _stamp, ...unstamped } = lease.metadata ?? {};
+    await db.update(environmentLeases).set({ metadata: unstamped }).where(eq(environmentLeases.id, f.leaseId));
+    const { queueId } = await interruptAndHandOff(f);
+    await db.update(environmentLeases).set({ metadata: { ...unstamped, handedOffWarmUnprovenSince: { runId: f.liveRunId,
+      at: new Date(Date.now() - 120_000).toISOString() } } }).where(eq(environmentLeases.id, f.leaseId));
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 31_000) }).where(eq(agentWakeupRequests.id, queueId));
+    const server = await restartServer(tempDb.connectionString);
+    fresh.push(server.db);
+    proc.liveClaim = true; // another live turn holds the box in the new process
+    const callsBefore = proc.calls.length;
+    const work = await server.bootDeferredReceiptWork();
+    try {
+      await until(async () => proc.calls.length, n => n > callsBefore, 5_000);
+      await new Promise(resolve => setTimeout(resolve, 1_000));
+      const held = await leaseOf(f.leaseId);
+      await evidence("BR3_lease", { status: held.status, proofCalls: proc.calls.length - callsBefore });
+      expect(proc.calls.length).toBeGreaterThan(callsBefore);
+      expect(held.status).toBe("retained");
+      expect(held.metadata?.sandboxStopAndRetain ?? null).toBeNull();
+    } finally { await work.stop(); proc.liveClaim = false; }
   }, 120_000);
 
   // send-after-stop3 (713e7d1b)'s Stop shape: the person's Stop of a warm turn, the box handed off, messages saved.
