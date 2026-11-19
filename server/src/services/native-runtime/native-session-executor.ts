@@ -5,6 +5,7 @@ import { nativeReconciliationError, freshThreadRefusalCode, isFreshThreadRefusal
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { probePiSessionResumeFile, restorePiSessionResumeFile } from "./pi-session-file-repair.js";
 import { readRemoteCheckpointManifest, verifyLocalCheckpointManifest } from "./remote-checkpoint-manifest.js";
+import { scheduleNativeSessionEvidenceCopy, type NativeSessionEvidenceSource } from "./native-session-evidence.js";
 import { clearProviderIdentityBreak, noteProviderIdentityBreak, recordedProviderIdentityTransitionIsAllowed, type ProviderIdentityLineageScope } from "./provider-identity-lineage.js";
 import { settleReattachRun } from "../heartbeat/run-admission.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
@@ -1050,6 +1051,11 @@ function forgetWarmNativeSession(scope: string, entry: WarmNativeSession) {
 }
 
 const pluginTaskSessionOwners = new WeakMap<NativeSession, ReturnType<typeof createPluginRunnerTaskOwner>>();
+const nativeSessionEvidenceSources = new WeakMap<NativeSession, NativeSessionEvidenceSource>();
+/** Test/diagnostic read of the evidence source bound to a session. */
+export function readNativeSessionEvidenceSource(session: NativeSession): NativeSessionEvidenceSource | undefined {
+  return nativeSessionEvidenceSources.get(session);
+}
 const sandboxSessionOwners = new WeakMap<NativeSession, SandboxRunnerRetention>();
 // The one definition of "this warm owner has a release/resume pair": a v1
 // plugin task owner whose driver offers releaseResume (plugin-runner-task.ts),
@@ -13841,6 +13847,8 @@ async function executePaperclipNativeSessionAttempt(
               if (session) {
                 runnerdBackend?.bindDiagnosticSession?.(session);
                 if (runnerdBackend?.sandboxRetention) sandboxSessionOwners.set(session, runnerdBackend.sandboxRetention);
+                // Keyed by the session so the warm entry's later turns find it too.
+                if (runnerdBackend?.sessionEvidenceSource) nativeSessionEvidenceSources.set(session, runnerdBackend.sessionEvidenceSource);
               }
               if (session && input.runnerExecutionTarget?.kind === "remote"
                 && input.runnerExecutionTarget.transport === "sandbox") {
@@ -15044,6 +15052,15 @@ async function executePaperclipNativeSessionAttempt(
       if (collectInstructions && ownedSession) {
         ownedSession.closeOnReleaseReason = "registered instruction edits require stopped-provider collection";
       }
+      // READ.md §4: a retained (not closed) succeeded session gets an
+      // evidence-only trace copy off the box. Started here, after the turn
+      // settled and before either hand-back branch below, never awaited: it
+      // cannot delay the reply or the next turn. Closed sessions keep the
+      // existing suspended resumable capture.
+      const evidenceSource = retainSession && ownedSession?.ownerToken === warmSessionOwnerToken && !ownedSession.closeOnReleaseReason
+        ? nativeSessionEvidenceSources.get(ownedSession.session) : undefined;
+      if (evidenceSource) void scheduleNativeSessionEvidenceCopy({ db: input.db, source: evidenceSource,
+        companyId: input.execution.binding.companyId, issueId: input.execution.binding.issueId, runId: input.execution.binding.runId });
       if (retainSession && ownedSession?.ownerToken === warmSessionOwnerToken && !ownedSession.closeOnReleaseReason
         && warmOwnerHasReleaseResumePair(ownedSession.session)) {
         const scope = warmSessionId, entry = ownedSession, token = warmSessionOwnerToken;
@@ -18213,6 +18230,7 @@ type ManagedRunnerdBackend = NativeSessionBackend & {
   /** Fresh PRP command/result exchange for this backend's recorded generation. */
   runnerIdentityCheck?: () => Promise<boolean>;
   sandboxRetention?: SandboxRunnerRetention;
+  sessionEvidenceSource?: NativeSessionEvidenceSource;
   bindManagedSession(session: NativeSession, options?: { releaseResumeOnly: true }): NativeSession;
   bindDiagnosticSession?(session: NativeSession): void;
   sessionCheckpointPersisted?(snapshot: PersistedNativeSession): void;
@@ -21211,6 +21229,18 @@ async function createRunnerdBackendWithinSessionClaim(
       finally { clearTimeout(timer); abort.abort(); }
     },
     sandboxRetention,
+    // The same configured persistence directories the close capture copies, for
+    // the warm turn-end evidence copy (native-session-evidence.ts).
+    sessionEvidenceSource: retainedCommandRunner && remoteTarget?.transport === "sandbox" ? {
+      runner: retainedCommandRunner, sessionScopeDigest: createHash("sha256").update(sessionScopeId).digest("hex"),
+      normalizedSessionId: nativeSessionKey(input.execution),
+      providerLeaseId: sandboxLeaseAcquisition?.providerLeaseId ?? remoteTarget.leaseId ?? "unknown",
+      environmentId: remoteTarget.environmentId ?? null, environmentLeaseId: remoteTarget.leaseId ?? null,
+      directories: persistenceProfile.directories.flatMap(directory => {
+        const sourcePath = remotePersistencePath(directory);
+        return sourcePath ? [{ name: directory.name, sourcePath, excludeEntries: directory.excludeEntries ?? [] }] : [];
+      }),
+    } : undefined,
     restartAdoptedRunner: () => replacementBackend ? replacementBackend.restartAdoptedRunner?.() === true : restartAdoptedRunner,
     bindManagedSession: (session, options) => replacementBackend
       ? replacementBackend.bindManagedSession(session, options) : wrapManagedSession(session),

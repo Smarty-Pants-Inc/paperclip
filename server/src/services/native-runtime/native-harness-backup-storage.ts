@@ -28,6 +28,12 @@ import type { SettledNativeHarnessBackupOwner } from "./native-harness-preservat
 import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
 
 const SCHEMA = "paperclip.native-harness-object.v1";
+/** Evidence-only warm-session trace copy (native-session-evidence.ts). Never
+ * offered for restore, recoverability or destroy proof. */
+export const NATIVE_SESSION_EVIDENCE_KIND = "paperclip.native-session-evidence.v1";
+/** Every restore/recoverability read selects only resumable rows. */
+const resumableNativeHarnessBackupRow = sql`(${nativeHarnessBackups.reference}->>'kind') is distinct from ${NATIVE_SESSION_EVIDENCE_KIND}`;
+type SessionEvidenceOwner = { kind: "session_evidence"; companyId: string; issueId: string; runId: string };
 type Binding = { companyId: string; scopeDigest: string; id: string };
 type Reference = Binding & {
   schema: typeof SCHEMA; objectKey: string; sha256: string; byteSize: number;
@@ -35,6 +41,7 @@ type Reference = Binding & {
   providerArtifacts?: NativeProviderArtifactReceipt;
   // Absent in older objects: unknown is retained, never assumed disposable.
   piConversationEvidence?: boolean;
+  kind?: typeof NATIVE_SESSION_EVIDENCE_KIND;
 };
 type Row = typeof nativeHarnessBackups.$inferSelect;
 type OfflineOwner = { kind: "offline_migration"; companyId: string; issueId: string; runId: string;
@@ -109,9 +116,17 @@ export async function nativeHarnessBackupOwner(db: Db, input: { companyId: strin
   if (!row || !row.leaseOwner && (row.phase !== "committed" || !row.resultId)) fail("owner_missing");
   return { ...input, authorityRunId: input.runId, leaseOwner: row!.leaseOwner, generation: row!.controllerGeneration } satisfies NativeRunnerCheckpointFenceOwner;
 }
-async function fence(tx: Parameters<Parameters<Db["transaction"]>[0]>[0], owner: NativeRunnerCheckpointFenceOwner | OfflineOwner | SettledControllerArchiveOwner | SettledNativeHarnessBackupOwner,
+async function fence(tx: Parameters<Parameters<Db["transaction"]>[0]>[0], owner: NativeRunnerCheckpointFenceOwner | OfflineOwner | SettledControllerArchiveOwner | SettledNativeHarnessBackupOwner | SessionEvidenceOwner,
   inactiveSource?: InactiveSource, signal?: AbortSignal) {
   if (inactiveSource && "kind" in owner) fail("prestage_requires_runtime_owner");
+  if ("kind" in owner && owner.kind === "session_evidence") {
+    // An evidence copy authorizes nothing and supersedes nothing resumable (its
+    // scope is per run); it only needs the run it names to exist in the company.
+    const [run] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, owner.runId), eq(heartbeatRuns.companyId, owner.companyId))).limit(1);
+    if (!run) fail("owner_missing");
+    return;
+  }
   if ("kind" in owner && owner.kind === "settled_native_harness_backup") {
     await (await import("./native-harness-preservation-source.js")).assertSettledNativeHarnessBackupSource(tx as unknown as Db, owner, signal);
     return;
@@ -204,7 +219,7 @@ export async function assertNativeHarnessBackupOwner(db: Db, owner: NativeRunner
 }
 
 type PersistNativeHarnessBackupInput = {
-  db: Db; storage: StorageService; owner: NativeRunnerCheckpointFenceOwner | OfflineOwner | SettledControllerArchiveOwner | SettledNativeHarnessBackupOwner;
+  db: Db; storage: StorageService; owner: NativeRunnerCheckpointFenceOwner | OfflineOwner | SettledControllerArchiveOwner | SettledNativeHarnessBackupOwner | SessionEvidenceOwner;
   scopeDigest: string; root: string; signal?: AbortSignal; maxArchiveBytes?: number;
   inactiveSource?: { normalizedSessionId: string; runnerInstanceId: string; providerLeaseId: string };
   providerArtifacts?: NativeProviderArtifactSource;
@@ -244,6 +259,7 @@ async function persistNativeHarnessBackupOnce(input: PersistNativeHarnessBackupI
     const cipher = createCipheriv("aes-256-gcm", key, iv); cipher.setAAD(aad(binding));
     await pipeline(createReadStream(archive), cipher, createWriteStream(encrypted, { flags: "wx", mode: 0o600 }), { signal: input.signal });
     const ref: Reference = { schema: SCHEMA, ...binding, manifestSha256, ...(providerArtifacts ? { providerArtifacts } : {}),
+      ...("kind" in input.owner && input.owner.kind === "session_evidence" ? { kind: NATIVE_SESSION_EVIDENCE_KIND } : {}),
       piConversationEvidence: inventory.piConversationEvidence,
       objectKey: `${binding.companyId}/native-harness-backups/${binding.scopeDigest}/${binding.id}.pchn`,
       ...await digest(encrypted, input.signal),
@@ -385,7 +401,8 @@ async function restoreCurrentNativeHarnessBackup(input: {
   db: Db; storage: StorageService; companyId: string; scopeDigest: string;
   backupRoot: string; signal?: AbortSignal;
 }): Promise<boolean> {
-  const [row] = await input.db.select().from(nativeHarnessBackups).where(and(scope(input), eq(nativeHarnessBackups.status, "current")));
+  const [row] = await input.db.select().from(nativeHarnessBackups).where(and(scope(input), eq(nativeHarnessBackups.status, "current"),
+    resumableNativeHarnessBackupRow));
   if (!row) return false;
   const ref = reference(row);
   const wrapped = JSON.parse(createLocalEncryptedCipher("read").decrypt(ref.material));
@@ -441,7 +458,7 @@ export async function verifyDurableNativeHarnessBackup(input: {
 }): Promise<boolean> {
   const [row] = await input.db.select().from(nativeHarnessBackups).where(and(scope(input),
     eq(nativeHarnessBackups.manifestSha256, input.manifestSha256), input.backupId ? eq(nativeHarnessBackups.id, input.backupId) : undefined,
-    inArray(nativeHarnessBackups.status, ["current", "superseded"]))).limit(1);
+    inArray(nativeHarnessBackups.status, ["current", "superseded"]), resumableNativeHarnessBackupRow)).limit(1);
   if (!row) return false;
   await withDownloadProgressDeadline(input, (storage, signal) => receive(storage, reference(row), undefined, signal));
   return true;
