@@ -51,12 +51,17 @@ const RESERVED_KEYS = new Set([
   ...PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS,
 ]);
 
+/** Operator Pi extension authority (gold #21121): the only configured PAPERCLIP_PI_
+ * names that cross. Exact, case-sensitive; every other PAPERCLIP_PI_ name stays excluded. */
+const CONFIGURED_PI_AUTHORITY_KEYS = new Set(["PAPERCLIP_PI_EXTENSIONS", "PAPERCLIP_PI_EXTENSIONS_MODE"]);
+
 function eligibleKey(key: string): boolean {
   const upper = key.toUpperCase();
   return /^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(key)
     && !GENERATED_RUNTIME_ENVIRONMENT_KEYS.has(upper)
     && !RESERVED_KEYS.has(upper)
-    && !/^(?:LD_|DYLD_|GIT_CONFIG_|PAPERCLIP_(?:RUNNER_|NATIVE_|GITHUB_|ACPX_|PI_|CURSOR_CLOUD_|VERIFIED_))/.test(upper);
+    && (CONFIGURED_PI_AUTHORITY_KEYS.has(key)
+      || !/^(?:LD_|DYLD_|GIT_CONFIG_|PAPERCLIP_(?:RUNNER_|NATIVE_|GITHUB_|ACPX_|PI_|CURSOR_CLOUD_|VERIFIED_))/.test(upper));
 }
 
 function checkedNames(names: unknown): string[] {
