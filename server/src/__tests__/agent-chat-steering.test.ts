@@ -284,6 +284,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const response = await postDefault(chat, "M, sent while working");
     expect(response.status, JSON.stringify(response.body)).toBe(201);
     expect(performance.now() - started).toBeLessThan(1000);
+    await waitForPendingCommentSteers(); // POST receipts no longer wait for provider ACK
     expect(mocks.steer).toHaveBeenCalledWith(expect.objectContaining({ runId: chat.runId,
       correlationId: response.body.id, message: "M, sent while working" }));
     expect(mocks.cancel).not.toHaveBeenCalled();
@@ -332,6 +333,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       const response = await postDefault(chat, "Pi must read this after the held tool").expect(201);
       const postMs = performance.now() - started;
       expect(postMs).toBeLessThan(1000);
+      await waitForPendingCommentSteers(); // release the peer's tool only after RPC acceptance
       expect(await deferredWakes(chat)).toHaveLength(0);
       expect(await answered(response.body.id)).toBe(false);
       expect(events.filter(event => event.eventType === "item.started" && event.payload.kind === "userMessage")).toHaveLength(1);
@@ -368,6 +370,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   it("S-a RED: a reply which started before M was read never answers M, even if published afterwards", async () => {
     const chat = await seedChat(); await attachSteerable(chat);
     const response = await postDefault(chat, "Tuesday's lost message").expect(201);
+    await waitForPendingCommentSteers();
     await runLog(chat, [
       { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
       { eventType: "item.started", kind: "agentMessage", itemId: "turn-1:old-text", text: "" },
@@ -386,6 +389,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const chat = await seedChat(); await attachSteerable(chat);
     const a = await postDefault(chat, "First steer").expect(201);
     const b = await postDefault(chat, "Second steer").expect(201);
+    await waitForPendingCommentSteers();
     expect(mocks.steer.mock.calls.map(([input]: any[]) => input.correlationId)).toEqual([a.body.id, b.body.id]);
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
     expect(run!.contextSnapshot!.steeredCommentIds).toEqual([a.body.id, b.body.id]);
@@ -408,6 +412,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       mocks.steer.mockRejectedValue(new NativeSessionSteeringError("steering_stale_turn", "Turn ended"));
     }
     const response = await postDefault(chat, `Fallback ${variant}`).expect(201);
+    await waitForPendingCommentSteers();
     await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup);
     const carriers = await carriersOf(chat, response.body.id);
     expect(carriers.wakes.length + carriers.runs.length).toBe(1);
@@ -422,6 +427,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   it("S-c accepted-then-ended: an unread default steer is restored exactly once at run end", async () => {
     const chat = await seedChat(); await attachSteerable(chat);
     const response = await postDefault(chat, "Unread default").expect(201);
+    await waitForPendingCommentSteers();
     await finishTurn(chat, { log: false });
     await releaseRun(chat);
     const carriers = await carriersOf(chat, response.body.id);
@@ -505,6 +511,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   it("S-d: delivery without following assistant text joins the ONE person-Stop hold", async () => {
     const chat = await seedChat(); await attachSteerable(chat);
     const response = await postDefault(chat, "Stop before answering this").expect(201);
+    await waitForPendingCommentSteers();
     await runLog(chat, [
       { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
       { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${response.body.id}` },

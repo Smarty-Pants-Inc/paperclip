@@ -7,6 +7,9 @@ import { logger } from "../middleware/logger.js";
 /** Existing outbox lock; shared with task-comment admission and run-end adoption. */
 export const personCommentDeliveryLockKey = (issueId: string): string => `conversation-delivery:${issueId}`;
 
+export type SteerablePersonComment = Pick<typeof issueComments.$inferSelect,
+  "id" | "companyId" | "issueId" | "body" | "authorAgentId" | "authorUserId"> & { deletedAt?: Date | null };
+
 export type PersonCommentSteeringOptions = {
   /** Only the existing conversation outbox, while holding the lock above. */
   lockHeld?: boolean;
@@ -18,6 +21,7 @@ export type PersonCommentSteeringOptions = {
 // The native attachment is process-owned. This promise chain only preserves RPC
 // order at that owner; durable custody remains the saved comment + carrying run.
 // It never holds the admission lock or makes a later POST await a provider ACK.
+const COMMENT_STEER_ACK_TIMEOUT_MS = 30_000;
 const dispatches = new Map<string, Promise<void>>();
 export async function waitForPendingCommentSteers(): Promise<void> {
   while (dispatches.size) await Promise.all([...dispatches.values()]);
@@ -28,7 +32,7 @@ const ids = (value: unknown): string[] => Array.isArray(value) ? value.filter((i
 
 /** A saved comment is the outbox. Its existing activity receipt keeps an explicit
  * Queue/Interrupt durable across a server crash, without manufacturing a wake. */
-async function deliveryIntent(db: Db, comment: typeof issueComments.$inferSelect) {
+async function deliveryIntent(db: Db, comment: SteerablePersonComment) {
   const [receipt] = await db.select({ details: activityLog.details }).from(activityLog).where(and(
     eq(activityLog.companyId, comment.companyId), eq(activityLog.entityId, comment.issueId),
     eq(activityLog.action, "issue.comment_added"), sql`${activityLog.details}->>'commentId' = ${comment.id}`,
@@ -42,7 +46,7 @@ async function deliveryIntent(db: Db, comment: typeof issueComments.$inferSelect
  * between acceptance and our receipt restores it through the existing release.
  * Pi's one-at-a-time mode is deliberately left unchanged.
  */
-export async function trySteerPersonComment(db: Db, comment: typeof issueComments.$inferSelect, options: PersonCommentSteeringOptions = {}): Promise<boolean> {
+export async function trySteerPersonComment(db: Db, comment: SteerablePersonComment, options: PersonCommentSteeringOptions = {}): Promise<boolean> {
   if (!comment.authorUserId || comment.authorAgentId || comment.deletedAt || comment.body.trim() === "/new") return false;
   if (!options.lockHeld) return db.transaction(async tx => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${personCommentDeliveryLockKey(comment.issueId)}, 0))`);
@@ -108,13 +112,20 @@ export async function trySteerPersonComment(db: Db, comment: typeof issueComment
   const dispatch = previous.then(async () => {
     let identity: Awaited<ReturnType<typeof reserveSteeredIdentity>> = null;
     try {
+      const [currentRun] = await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, issue.companyId),
+      ));
+      // An ACK-blocked predecessor can outlive Stop or run end. Do not dispatch
+      // a later accepted input after that fence; the existing release/hold owns it.
+      if (!currentRun || currentRun.status !== "running" || nativeRunHasStopRequest(currentRun.resultJson) ||
+        !ids(currentRun.contextSnapshot?.steeredCommentIds).includes(comment.id)) return;
       const currentState = await getNativeSessionSteeringState(run.id);
       if (currentState.disposition !== "available" || currentState.activeTurnId !== state.activeTurnId)
         throw new NativeSessionSteeringError("steering_stale_turn", "The accepted native turn is no longer attached.");
       identity = await reserveSteeredIdentity(db, { companyId: issue.companyId, issueId: issue.id, runId: run.id, messageId: comment.id, source: "comment" });
       const reserved = identity;
       const acknowledgement = await storedSteeringAcknowledgement(db, { companyId: issue.companyId, runId: run.id, messageId: comment.id }) ?? await steerNativeSession({
-        runId: run.id, message: comment.body, correlationId: comment.id,
+        runId: run.id, message: comment.body, correlationId: comment.id, timeoutMs: COMMENT_STEER_ACK_TIMEOUT_MS,
         onAcknowledged: reserved ? () => reconcileSteeredIdentity(db, reserved) : undefined,
       });
       await db.transaction(async tx => {

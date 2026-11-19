@@ -397,6 +397,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
         const response = await request(f.app).post(`/api/issues/${f.issueId}/comments`)
           .send({ body: `LATENCY-${index}`, clientRequestId: randomUUID() });
         samples.push(performance.now() - started);
+        expect(samples.at(-1), `POST ${index} must return the decision while Pi ACK is blocked`).toBeLessThan(1000);
         expect(response.status, JSON.stringify(response.body)).toBe(201);
         expect(response.body).toMatchObject({ steeredIntoRunId: f.runId, steeringStatus: "accepted", steeringDeliveryEventSeq: null });
         messages.push(response.body);
