@@ -417,6 +417,113 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     });
   });
 
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21272
+  // A3: exercise the real comment POST and ordinary wake admission/release.
+  it.each(["generic", "disconnect", "refusal", "probe", "unexpected-disposition"] as const)("A3: %s steer failure returns 201 and the ordinary successor answers once", async variant => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
+    if (variant === "probe") mocks.probe.mockRejectedValueOnce(new Error("snapshot RPC disconnected"));
+    else if (variant === "unexpected-disposition") mocks.steer.mockResolvedValueOnce({ disposition: "unexpected" });
+    else mocks.steer.mockRejectedValueOnce(variant === "refusal"
+      ? new NativeSessionSteeringError("steering_rejected", "refused")
+      : variant === "disconnect" ? new TypeError("RPC disconnected") : new Error("private person text must not be logged"));
+    const response = await postDefault(chat, `A3 ordinary ${variant}`);
+    expect(response.status, JSON.stringify(response.body)).toBe(201);
+    expect(response.body).toMatchObject({ deliveryOutcome: "queued", steeringStatus: null,
+      steeringUnavailableReason: expect.any(String) });
+    const messageId = response.body.id;
+    const [reserved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    expect((reserved!.contextSnapshot as any).steeredCommentIds ?? []).not.toContain(messageId);
+    expect((reserved!.contextSnapshot as any).wakeCommentIds ?? []).not.toContain(messageId);
+    if (variant !== "probe") expect((reserved!.resultJson as any).queuedSteeringAcknowledgements[messageId].status).toBe("rejected");
+    await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup);
+    const carriers = await carriersOf(chat, messageId);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+    const seen: string[][] = [];
+    const responder = createServer(async (req, res) => {
+      try {
+        let body = ""; for await (const chunk of req) body += chunk;
+        const { runId } = JSON.parse(body);
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        const context = run!.contextSnapshot as any;
+        seen.push(context.wakeCommentIds ?? [context.wakeCommentId ?? context.commentId]);
+        await issueService(db).addComment(chat.issue.id, `ANSWER:${messageId}`, { agentId: chat.agentId, runId });
+        res.end("ok");
+      } catch (error) { res.statusCode = 500; res.end(String(error)); }
+    });
+    responder.listen(0, "127.0.0.1"); await once(responder, "listening");
+    const port = (responder.address() as { port: number }).port;
+    try {
+      const script = `fetch("http://127.0.0.1:${port}/reply",{method:"POST",body:JSON.stringify({runId:process.env.PAPERCLIP_RUN_ID})}).then(async r=>{if(!r.ok)throw Error(await r.text())})`;
+      await db.update(agents).set({ adapterType: "process", adapterConfig: { command: process.execPath, args: ["-e", script] },
+        runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } } }).where(eq(agents.id, chat.agentId));
+      runningProcesses.delete(chat.runId);
+      await finishTurn(chat, { log: false });
+      // This fixture calls the release adapter directly, outside heartbeat's
+      // completion owner. Run the existing queued-run dispatcher after commit.
+      await heartbeatService(db).resumeQueuedRunsForAgent(chat.companyId, chat.agentId);
+      await vi.waitFor(async () => {
+        const replies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+          eq(issueComments.body, `ANSWER:${messageId}`)));
+        expect(replies).toHaveLength(1);
+      }, { timeout: 15_000 });
+      await joinOwnedWork();
+      await releaseRun(chat); await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup); await joinOwnedWork();
+      expect(seen.flat()).toEqual([messageId]);
+      expect(await answered(messageId)).toBe(true);
+      const remaining = await carriersOf(chat, messageId);
+      expect(remaining.wakes).toHaveLength(0);
+      expect(remaining.runs).toHaveLength(1);
+      expect(remaining.runs[0]!.status).toBe("succeeded");
+      const replies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+        eq(issueComments.body, `ANSWER:${messageId}`)));
+      expect(replies).toHaveLength(1);
+    } finally {
+      if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `A3-${variant}-delivery.json`), JSON.stringify({
+        post: response.body, seen,
+        runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId)),
+        wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId)),
+        comments: await db.select().from(issueComments).where(eq(issueComments.issueId, chat.issue.id)),
+      }, null, 2));
+      responder.close(); await once(responder, "close");
+    }
+  }, 25_000);
+
+  it("A3 S9: the ONE answered predicate keeps a consumed steer owed after a tool and unrelated final", async () => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const response = await postDefault(chat, "A3 S9 still owed").expect(201);
+    await runLog(chat, [
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
+      { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${response.body.id}` },
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:read-M" },
+      { eventType: "item.started", kind: "commandExecution", itemId: "turn-1:old-work" },
+      { eventType: "tool.execution.started", itemId: "turn-1:old-work" },
+      { eventType: "tool.execution.completed", itemId: "turn-1:old-work" },
+      { eventType: "item.started", kind: "agentMessage", itemId: "turn-1:unrelated-final" },
+      { eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:unrelated-final", text: "ORIGINAL_WORK_FINISHED" },
+      { eventType: "turn.completed", itemId: "turn-1:end" },
+    ]);
+    expect(await answered(response.body.id)).toBe(false);
+    await finishTurn(chat, { log: false }); await releaseRun(chat);
+    expect(await answered(response.body.id)).toBe(false);
+    const carriers = await carriersOf(chat, response.body.id);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+  });
+
+  it("A3: uncertain steering timeout returns 201 accepted and end-of-run carries M once", async () => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
+    mocks.steer.mockRejectedValueOnce(new NativeSessionSteeringError("steering_timeout", "uncertain receipt"));
+    const response = await postDefault(chat, "A3 timeout");
+    expect(response.status, JSON.stringify(response.body)).toBe(201);
+    expect(response.body).toMatchObject({ deliveryOutcome: "steered", steeringStatus: "accepted", steeredIntoRunId: chat.runId });
+    expect(await deferredWakes(chat)).toHaveLength(0);
+    expect(await answered(response.body.id)).toBe(false);
+    await finishTurn(chat, { log: false }); await releaseRun(chat);
+    const carriers = await carriersOf(chat, response.body.id);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+  });
+
   it("S-c accepted-then-ended: an unread default steer is restored exactly once at run end", async () => {
     const chat = await seedChat(); await attachSteerable(chat);
     const response = await postDefault(chat, "Unread default").expect(201);
