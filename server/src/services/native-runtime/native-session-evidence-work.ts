@@ -6,6 +6,7 @@ import { registerDeadlineWork } from "../deadline-work.js";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import type { environmentRuntimeService } from "../environment-runtime.js";
+import { toEnvironment, toEnvironmentLease } from "../environments.js";
 import { scheduleNativeSessionEvidenceCopy } from "./native-session-evidence.js";
 
 /** The delivery coordinator owns startup reconstruction, error retry and stop.
@@ -62,7 +63,8 @@ export function registerNativeSessionEvidenceWork(
             source: { ...source,
               providerLeaseId: lease.providerLeaseId, environmentId: lease.environmentId, environmentLeaseId: lease.id,
               runner: { execute: async command => {
-                const result = await runtime.execute({ ...command, lease, environment, readOnlyProbe: true, bypassSession: true });
+                const result = await runtime.execute({ ...command, lease: toEnvironmentLease(lease), environment: toEnvironment(environment),
+                  readOnlyProbe: true, bypassSession: true });
                 return { ...result, signal: result.signal ?? null, pid: null, startedAt: new Date().toISOString() };
               } } } });
         } catch (err) {

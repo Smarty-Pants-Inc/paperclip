@@ -225,7 +225,7 @@ function hasConstraintName(error: unknown, constraintName: string): boolean {
     || hasConstraintName(candidate.cause, constraintName);
 }
 
-function toEnvironment(row: EnvironmentRow): Environment {
+export function toEnvironment(row: EnvironmentRow): Environment {
   return {
     id: row.id,
     name: row.name,
