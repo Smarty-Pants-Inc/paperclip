@@ -24,7 +24,7 @@ import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-ses
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { noticeMetadataReferencesRecoveryAction } from "./successful-run-handoff.js";
-import { keyValueRow } from "./notice-format.js";
+import { keyValueRow, type NoticeMetadataSection } from "./notice-format.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
@@ -405,14 +405,20 @@ export async function settleUnansweredPersonMessage(
   // (c) then each OLDER message the ONE answered predicate says is owed (RFL 09:03Z), newest first, at most
   //     OWED_OLDER_MESSAGES_PER_SWEEP per task per pass. The older selection SKIPS every message (a) just noticed,
   //     by the notice key, so a carried steer never gets a second card from (c).
+  // Thread order (SUPERSEDE-LOSTDOUBLE-PER-BATCH-TO-PER-MESSAGE-1119): the older owed messages' cards are written
+  // oldest first and BEFORE the newest's, so the cards stand in the same order as the messages they name.
   const carried = await settleCarriedSteerNotices(db, issue, now);
-  const newest = await settleOneMessage(db, issue, now, input.nativeBlockedRepairApplies, null);
+  const [newestRow] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+    eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)))
+    .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
   const older: UnansweredMessageOutcome[] = [];
-  if (newest.outcome.kind !== "out_of_scope" && newest.outcome.kind !== "none" && newest.messageId) {
-    for (const id of await owedOlderMessageIds(db, issue, newest.messageId, carried.noticedReasons)) {
+  if (newestRow) {
+    for (const id of (await owedOlderMessageIds(db, issue, newestRow.id, carried.noticedReasons)).reverse()) {
       older.push((await settleOneMessage(db, issue, now, input.nativeBlockedRepairApplies, id)).outcome);
     }
   }
+  const newest = await settleOneMessage(db, issue, now, input.nativeBlockedRepairApplies, null);
   // Returned: the newest's 'noticed' wins; else (a)'s noticed; else, when the newest or (a) is pending, pending at
   // the MIN over the newest, the carried and the older pending; else the newest's own outcome (its contract
   // unchanged). Every older outcome, noticed or pending, goes to input.olderOutcomes: the sweep counts each card
@@ -449,15 +455,8 @@ async function owedOlderMessageIds(db: Db, issue: DecisionIssue, newestId: strin
         or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${issueComments.id}::text
         or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${issueComments.id}::text)
       and not ${failedCarrierRunSql("r", { id: sql`${issueComments.id}` })})`,
-    // One card per failed carrier's batch (interrupt-lostdouble L1/L1b): a failed run that carried m AND a LATER
-    // message still owed is told by that later message's card (the newest's, or its own older pick), never twice.
-    sql`not exists (select 1 from ${heartbeatRuns} fb where fb.company_id = ${issueComments.companyId}
-      and ${failedCarrierRunSql("fb", { id: sql`${issueComments.id}` })}
-      and exists (select 1 from ${issueComments} later where later.company_id = ${issueComments.companyId}
-        and later.issue_id = ${issueComments.issueId} and later.author_type = 'user' and later.deleted_at is null
-        and later.created_at > ${issueComments.createdAt}
-        and ${failedCarrierRunSql("fb", { id: sql.raw("later.id") })}
-        and not ${answeredPersonMessageSql(rawMessage("later"))}))`,
+    // SUPERSEDE-LOSTDOUBLE-PER-BATCH-TO-PER-MESSAGE-1119 (RFL): no 'covering' rule. A failed run that carried
+    // M1 AND M2 leaves TWO owed messages and so TWO cards, each naming its own message, retiring on its own.
     eq(issueComments.authorType, "user")))
     .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(OWED_OLDER_MESSAGES_PER_SWEEP);
   return rows.map(row => row.id);
@@ -498,6 +497,7 @@ async function settleOneMessage(db: Db, issue: DecisionIssue, now: Date,
     const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, input.nativeBlockedRepairApplies, messageId);
     if (fenced.kind !== "notice" || fenced.reason !== decision.reason
       || fenced.upgradeCommentId !== decision.upgradeCommentId) return null;
+    await nameNoticeMessage(tx as unknown as Db, issue, fenced.reason, fenced.notice);
     if (fenced.upgradeCommentId) {
       // The SAME note (same key) becomes the failure text: still one note.
       const [updated] = await tx.update(issueComments).set({ body: fenced.notice.body, presentation: fenced.notice.presentation,
@@ -514,6 +514,26 @@ async function settleOneMessage(db: Db, issue: DecisionIssue, now: Date,
     return comment?.id ?? null;
   });
   return done(commentId ? { kind: "noticed", code: decision.code, commentId } : { kind: "noticed_before" });
+}
+
+/** The short quote a card shows to name its message. */
+export const NAMED_MESSAGE_QUOTE_CHARS = 80;
+export const NAMED_MESSAGE_SECTION_TITLE = "Your message";
+
+/** SUPERSEDE-LOSTDOUBLE-PER-BATCH-TO-PER-MESSAGE-1119: every unanswered-message card NAMES its message (a short
+ * quote of it, first section), so two cards from one failed run are told apart. Keyed by the card's own reason. */
+async function nameNoticeMessage(q: Db, issue: DecisionIssue, reason: string,
+  notice: { metadata: { sections: NoticeMetadataSection[] } }): Promise<void> {
+  if (!reason.startsWith(UNANSWERED_MESSAGE_REASON_PREFIX)) return;
+  const id = reason.slice(UNANSWERED_MESSAGE_REASON_PREFIX.length);
+  const [message] = await q.select({ body: issueComments.body }).from(issueComments).where(and(
+    eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+    sql`${issueComments.id}::text = ${id}`)).limit(1);
+  const text = (message?.body ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return;
+  const quote = `\u201c${text.length > NAMED_MESSAGE_QUOTE_CHARS ? `${text.slice(0, NAMED_MESSAGE_QUOTE_CHARS - 1)}\u2026` : text}\u201d`;
+  notice.metadata.sections = [{ title: NAMED_MESSAGE_SECTION_TITLE, rows: [keyValueRow("Message", quote)] },
+    ...notice.metadata.sections.filter(section => section.title !== NAMED_MESSAGE_SECTION_TITLE)];
 }
 
 type CarriedSteerNotice = { reason: string; code: string; upgradeCommentId: string | null;
@@ -623,6 +643,7 @@ async function settleCarriedSteerNotices(db: Db, issue: DecisionIssue, now: Date
       const fenced = (await decideCarriedSteerNotices(tx as unknown as Db, issue, now)).notices
         .find((entry) => entry.reason === candidate.reason && entry.upgradeCommentId === candidate.upgradeCommentId);
       if (!fenced) return null;
+      await nameNoticeMessage(tx as unknown as Db, issue, fenced.reason, fenced.notice);
       if (fenced.upgradeCommentId) {
         // The message's standing waiting note becomes this text: still one note.
         const [updated] = await tx.update(issueComments).set({ body: fenced.notice.body, presentation: fenced.notice.presentation,
