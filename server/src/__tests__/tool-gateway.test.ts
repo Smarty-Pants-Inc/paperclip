@@ -63,6 +63,7 @@ import {
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
 import { resolveConnectionGrantSecret } from "../services/connection-credentials.js";
 import { secretService } from "../services/secrets.js";
+import { flushSecretResolutionWrites } from "../services/secret-resolution-writes.js";
 import * as cogneeBridge from "../services/cognee-connection.js";
 import { createKvDemoHttpServer, type KvDemoHttpServer } from "../../../packages/kv-demo-mcp-server/src/http.js";
 import {
@@ -565,6 +566,11 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
   }, 90_000);
 
   afterEach(async () => {
+    // Secret resolution queues its secret_access_events audit rows and writes
+    // them in a deferred batch. Flush that queue first, or a batch can land
+    // after secret_access_events is cleared and block the companies delete
+    // with a 23503 foreign-key error.
+    await flushSecretResolutionWrites();
     await db.delete(activityLog);
     await db.delete(toolCallEvents);
     await db.delete(toolRuntimeSlots);
