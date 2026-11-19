@@ -10,7 +10,7 @@ import { unionAll } from "drizzle-orm/pg-core";
 import { EXECUTION_RECONCILIATION_CAUSES, HEARTBEAT_RUN_STATUSES, readProviderFailure, type TaskInterruptionPresentation } from "@paperclipai/shared";
 import { captureTaskInterruptionFailure } from "../sentry.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
-import { readSystemRecovery } from "./system-recovery-state.js";
+import { readSystemRecovery, REPLY_FILES_NOT_SAVED_LINE, REPLY_FILES_NOT_SAVED_WAIT_REASON } from "./system-recovery-state.js";
 import { PROJECT_ACCESS_DENIED } from "./project-access-denial.js";
 import { authorizationService } from "./authorization.js";
 import { taskWorkspaceProjectRequirements } from "./task-workspace-access.js";
@@ -183,6 +183,7 @@ const retryWaitMessages: Record<string, string> = {
   saved_work_recovery_failed: "Saving the agent's files failed. Retry to try again; the agent will not repeat its work.",
   saved_work_recovery_refused: "Paperclip refused to recover the saved files because a safety check on them cannot pass. "
     + "Retry checks the saved files again. The agent's result is saved, and the agent will not repeat its work.",
+  [REPLY_FILES_NOT_SAVED_WAIT_REASON]: REPLY_FILES_NOT_SAVED_LINE,
   workspace_owner_stop_required: "Retry is waiting until Paperclip confirms that the previous server stopped saving files. The agent's result and your Retry are saved.",
   cleanup_quarantined: NATIVE_CLEANUP_SETTLING_MESSAGE,
   cancelled_by_operator: "This attempt was stopped. Send a new message to continue from saved work.",

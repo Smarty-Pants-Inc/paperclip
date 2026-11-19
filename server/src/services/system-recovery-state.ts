@@ -241,6 +241,15 @@ function unrecoverableSavedFilesReason(failure: RecoveryFailure) {
   return recoveryRefusalReasons[failure.code] ?? "a safety check on the saved files did not pass";
 }
 
+/**
+ * PROPOSED, PENDING RFL (d2shared). The one line a person reads while their message is parked behind a run whose
+ * reply already reads "The file changes from this reply couldn't be saved." (LOST) and whose saved-work recovery is
+ * spent. Those files never land in the task's workspace (native-late-save-rule.ts, K15b), so nothing more is waited
+ * for: Retry continues the task (explicit-native-continuation.ts), and the message is answered once.
+ */
+export const REPLY_FILES_NOT_SAVED_WAIT_REASON = "reply_files_not_saved";
+export const REPLY_FILES_NOT_SAVED_LINE = "Your message is saved. The last reply's file changes couldn't be saved; Retry to continue.";
+
 export function unrecoverableSavedFilesNotice(failure: RecoveryFailure) {
   return `Paperclip could not recover the unsaved files from the previous run: ${unrecoverableSavedFilesReason(failure)}. `
     + "Retry continued this task in a new workspace from its recorded work: comments, documents, attachments and pushed commits. "

@@ -6,7 +6,9 @@ import { canSelectFreshWorkspace, freshReadinessSchema, retainedIssueWorkspaceFo
 import { verifiedWorkspaceSnapshotReceipt } from "./workspace-recovery-snapshot.js";
 import { readTaskRetryIntent, retireTaskRetriesContinuedBy } from "./task-retry.js";
 import { isPreDispatchExecutionWaitVerified } from "./pre-dispatch-execution-wait.js";
-import { readSystemRecovery, savedFilesUnrecoverable, unrecoverableSavedFilesFailure, unrecoverableSavedFilesNotice } from "./system-recovery-state.js";
+import { readSystemRecovery, savedFilesUnrecoverable, unrecoverableSavedFilesFailure, unrecoverableSavedFilesNotice,
+  REPLY_FILES_NOT_SAVED_LINE, REPLY_FILES_NOT_SAVED_WAIT_REASON } from "./system-recovery-state.js";
+import { replyFileLineReadsLost } from "./native-runtime/native-late-save-rule.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
 import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-migration.js";
@@ -393,6 +395,8 @@ export async function admitExplicitNativeContinuation(input: {
   const sources: Run[] = [];
   let readiness: ContinuationReadiness | undefined;
   const freshSources = new Map<string, string>();
+  /** Runs whose reply's file line reads LOST and whose spent saved-work recovery no longer holds the task. */
+  const lostLineSources = new Set<string>();
   const freshCandidates: Array<{ run: Run; intent: string; cause: string; evidence: Record<string, unknown>;
     remote: boolean; leaseIds: string[] }> = [];
   const stoppedSessions: Array<{ evidence: Record<string, unknown>; retire: () => boolean }> = [];
@@ -516,8 +520,15 @@ export async function admitExplicitNativeContinuation(input: {
         // instead of an endless finalizing wait (RC-50b, s14).
         if (!live.length || !live.every(row => row.recoveryState === "exhausted"))
           return blocked("finalizing_saved_result", "Paperclip is finishing the saved result.");
-        if (!freshIntent || !live.every(row => savedFilesUnrecoverable(readSystemRecovery(row.evidence))))
-          return live.some(row => row.retryClass === "service_required")
+        // The person was already told this reply's files could not be saved (its line reads LOST), and a late save
+        // of them never lands in the task's workspace (native-late-save-rule.ts, K15b). So a spent recovery of
+        // those files holds nothing: the task continues as it does when the files are unrecoverable, in the
+        // workspace the existing strategy below selects, with the same notice. Proposed, pending RFL.
+        const lostLine = replyFileLineReadsLost(run.resultJson);
+        if (lostLine && freshIntent) lostLineSources.add(run.id);
+        if (!freshIntent || !(lostLine || live.every(row => savedFilesUnrecoverable(readSystemRecovery(row.evidence)))))
+          return lostLine ? blocked(REPLY_FILES_NOT_SAVED_WAIT_REASON, REPLY_FILES_NOT_SAVED_LINE)
+            : live.some(row => row.retryClass === "service_required")
             ? blocked("saved_work_recovery_refused", "Paperclip refused to recover the saved files because a safety check on them cannot pass. Your Retry is saved.")
             : blocked("saved_work_recovery_failed", "Saving the agent's files failed. Retry to try again.");
       }
@@ -745,8 +756,12 @@ export async function admitExplicitNativeContinuation(input: {
     failureDetail: sql`coalesce(${nativeRunFinalizations.failureDetail}, '{}'::jsonb) || ${JSON.stringify({ replacementDenied: "explicit_user_continuation" })}::jsonb`,
     updatedAt: new Date(),
   }).where(and(eq(nativeRunFinalizations.companyId, companyId), inArray(nativeRunFinalizations.runId, nativeSources.map(run => run.id))));
-  const unrecoverable = actions.map(action => freshSources.has(String(action.evidence.runId))
-    ? unrecoverableSavedFilesFailure(readSystemRecovery(action.evidence)) : null).find(failure => failure !== null) ?? null;
+  const unrecoverable = actions.map(action => {
+    const sourceRunId = String(action.evidence.runId), recovery = readSystemRecovery(action.evidence);
+    if (!freshSources.has(sourceRunId)) return null;
+    return unrecoverableSavedFilesFailure(recovery)
+      ?? (lostLineSources.has(sourceRunId) && recovery?.state === "exhausted" ? recovery.failure : null);
+  }).find(failure => failure != null) ?? null;
   if (actions.length) await db.transaction(async tx => {
     await notifyUnsafeWorkspaceExportRecovery(tx, { companyId, issueId });
   for (const action of actions) {
