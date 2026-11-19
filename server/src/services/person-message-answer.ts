@@ -168,6 +168,25 @@ export function personMessageOwedSql(m: PersonMessageSql): SQL {
         and exists (select 1 from ${issueComments} moved_reply where moved_reply.company_id = moved_on.company_id
           and moved_reply.issue_id = ${m.issueId} and moved_reply.created_by_run_id = moved_on.id
           and moved_reply.author_type = 'agent' and moved_reply.deleted_at is null)
+        -- RFL 19:05Z: the person moved past m only when this turn CLAIMED a newer PERSON message; a turn that
+        -- only revived work or answered a system wake (merely started later) does not.
+        and exists (select 1 from ${issueComments} newer_person
+          where newer_person.company_id = ${m.companyId} and newer_person.issue_id = ${m.issueId}
+            and newer_person.author_type = 'user' and newer_person.deleted_at is null
+            and newer_person.created_at > ${m.createdAt}
+            and (moved_on.context_snapshot->>'wakeCommentId' = newer_person.id::text
+              or moved_on.context_snapshot->>'commentId' = newer_person.id::text
+              or coalesce(moved_on.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? newer_person.id::text
+              or coalesce(moved_on.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? newer_person.id::text
+              or exists (select 1 from ${agentWakeupRequests} claimed_input
+                where claimed_input.company_id = moved_on.company_id
+                  and (claimed_input.id = moved_on.wakeup_request_id or claimed_input.run_id = moved_on.id)
+                  and (claimed_input.payload->>'commentId' = newer_person.id::text
+                    or claimed_input.payload->'_paperclipWakeContext'->>'commentId' = newer_person.id::text
+                    or claimed_input.payload->'_paperclipWakeContext'->>'wakeCommentId' = newer_person.id::text
+                    or coalesce(claimed_input.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? newer_person.id::text
+                    or coalesce(claimed_input.payload->'commentIds', '[]'::jsonb) ? newer_person.id::text
+                    or claimed_input.idempotency_key = 'conversation-comment:' || newer_person.id::text))))
         -- neworg-floor-custody: a run that carries m and started at or after this run (a Stop-held
         -- README's carrier after the '9 + 10' turn) owns m; the chat has not moved on past it,
         -- so that carrier's failure still cards (G1).
