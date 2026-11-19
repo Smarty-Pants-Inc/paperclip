@@ -4927,6 +4927,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.issues.liveRuns(issueId!) });
       void queryClient.invalidateQueries({ queryKey: queryKeys.issues.activeRun(issueId!) });
+      // The company live-runs view (companyLiveRunsQueryKey, :3796) drops the run too, socket or not.
+      if (resolvedCompanyId) void queryClient.invalidateQueries({ queryKey: queryKeys.liveRuns(resolvedCompanyId) });
       return Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(issueId!) }),
         queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) }),

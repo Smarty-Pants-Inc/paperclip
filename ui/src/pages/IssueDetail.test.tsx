@@ -7043,8 +7043,12 @@ describe("IssueDetail", () => {
         scope: "run", dispatchState: "acknowledged",
       } },
     }), true);
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
     // The Stop's own settle waits on the held GET /issues/:id/runs; the lane must not.
     await act(async () => { void lane().props!.onCancelRun!(); });
+    // F1 (rf-2): the confirmed Stop's settle also invalidates the COMPANY live-runs
+    // cache (['live-runs', companyId]), so a company view need not wait for a socket or poll.
+    await waitForAssertion(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.liveRuns("company-1") }));
     expect(mockHeartbeatsApi.cancel).toHaveBeenCalledExactlyOnceWith("run-active-1");
     await waitForAssertion(() => expect(lane().run).toBeNull());
     expect(Date.now() - cancelResponseAt).toBeLessThan(1_000);
