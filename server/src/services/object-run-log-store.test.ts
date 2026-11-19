@@ -76,7 +76,8 @@ describe("S3 run log store", () => {
     const handle = await store.begin({ ...input, runId });
     await store.append(handle, { ...event(1), chunk: "private-run-log-content" });
     const payload = [...m.objects].find(([key]) => key.includes("/objects/"))!;
-    const retained = new Map([...m.objects].filter(([key]) => key.includes("/objects/")));
+    const retained = new Map([...m.objects].filter(([key]) => key.includes("/objects/"))
+      .map(([key, bytes]) => [key, Buffer.from(bytes)]));
     const get = m.provider.getObject.bind(m.provider);
     let failures = 0;
     // Named seam injection: immutable payload GET is briefly invisible after PUT.
@@ -117,6 +118,68 @@ describe("S3 run log store", () => {
       m.provider.getObject = get;
       expect((await store.read(handle)).content).toBe(payload[1].toString());
     } finally { warning.mockRestore(); m.provider.getObject = get; }
+  });
+
+  it("restarts the digest after a later range fails without replaying writes", async () => {
+    const m = memory(), store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", flushMs: 1,
+      assertWriterAuthority: async () => undefined });
+    const handle = await store.begin({ ...input, runId: "multi-range-digest" });
+    const record = { ...event(1), chunk: "x".repeat(4 * 1024 * 1024 + 128) };
+    const bytes = Buffer.from(`${JSON.stringify({ ts: record.ts, attemptId: handle.attemptId,
+      stream: record.stream, chunk: record.chunk, seq: record.seq })}\n`);
+    await store.append(handle, record);
+    const tailKey = `logs/segments-v1/${handle.logRef}/objects/${createHash("sha256")
+      .update(bytes.subarray(4 * 1024 * 1024)).digest("hex")}`;
+    const get = m.provider.getObject.bind(m.provider), put = vi.spyOn(m.provider, "putObjectConditional");
+    let failures = 0;
+    m.provider.getObject = async value => {
+      if (value.objectKey === tailKey && failures++ === 0)
+        throw Object.assign(new Error("tail segment not yet visible"), { name: "NoSuchKey" });
+      return get(value);
+    };
+    const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    try {
+      expect(await store.finalize(handle)).toEqual({ bytes: bytes.length,
+        sha256: createHash("sha256").update(bytes).digest("hex"), compressed: false });
+      expect(failures).toBe(2);
+      expect(warning).not.toHaveBeenCalled();
+      // Finalize publishes the closed head exactly once, never re-appends data.
+      expect(put.mock.calls.map(([value]) => value.objectKey)).toEqual([
+        `logs/segments-v1/${handle.logRef}/head.json`,
+      ]);
+    } finally { warning.mockRestore(); put.mockRestore(); m.provider.getObject = get; }
+  });
+
+  it.each(["flush", "close"] as const)("logs a content-free cause at the failing %s step without deleting bytes", async step => {
+    const m = memory(), store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", flushMs: 1000,
+      assertWriterAuthority: async () => undefined });
+    const runId = `finalize-${step}`, handle = await store.begin({ ...input, runId });
+    await store.append(handle, event(1));
+    const retained = new Map([...m.objects].filter(([key]) => key.includes("/objects/"))
+      .map(([key, bytes]) => [key, Buffer.from(bytes)]));
+    const put = m.provider.putObjectConditional!.bind(m.provider);
+    m.provider.putObjectConditional = async value => {
+      const closing = value.objectKey.endsWith("/head.json") && Buffer.isBuffer(value.body) &&
+        JSON.parse(value.body.toString()).closed === true;
+      if (step === "close" ? closing : value.objectKey.includes("/objects/"))
+        throw Object.assign(new Error("private-content-from-response"), { name: "AccessDenied", code: "EACCES" });
+      return put(value);
+    };
+    const pending = step === "flush" ? (await store.enqueue!(handle, event(2))).committed.catch(error => error) : undefined;
+    const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    vi.mocked(logger.warn).mockClear();
+    try {
+      expect(await store.finalize(handle)).toEqual({ bytes: null, sha256: null, compressed: false });
+      if (pending) expect(await pending).toBeInstanceOf(Error);
+      expect(vi.mocked(logger.warn).mock.calls).toEqual([
+        [expect.objectContaining({ runId, step, attempt: 1, maxAttempts: 1,
+          err: { name: "AccessDenied", code: "EACCES", reason: undefined, statusCode: undefined } }), expect.any(String)],
+      ]);
+      expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain("private-content-from-response");
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("persistence is incomplete"));
+      expect(new Map([...m.objects].filter(([key]) => key.includes("/objects/")))).toEqual(retained);
+      expect((await store.read(handle)).content.trim().split("\n")).toHaveLength(1);
+    } finally { warning.mockRestore(); m.provider.putObjectConditional = put; }
   });
 
   it("awaits a successor flush started by another drain waiter before finalizing", async () => {
