@@ -37,6 +37,7 @@ import { executeEnvironmentTask, pluginEnvironmentSupportsTasks, settleDispatche
 import { allowLegacyShutdownWorkspaceCleanup, legacyShutdownWorkspaceResourceProtected } from "./legacy-shutdown-workspace-settlement.js";
 import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-runtime/native-workspace-finalization-state.js";
 import { hasNativeHarnessBackupMissing } from "./native-runtime/native-harness-backup-missing.js";
+import { nativeCustodyKeptRecovery, nativeLeaseChainCustodyStamp, nativeLeaseCustodyMissing } from "./native-runtime/native-lease-custody.js";
 import { abandonedWorkspaceFilesHeldOnLease, abandonedWorkspaceFilesParked, parkAbandonedWorkspaceFilesLease } from "./remote-workspace-abandoned-files-hold.js";
 import { beginIdleTrackedWork } from "./task-admission.js";
 import { historicalProviderCredentials } from "./historical-provider-credentials.js";
@@ -1795,19 +1796,8 @@ function createSandboxEnvironmentDriver(
    * custody (the restore proof would refuse them), unless this lease is the
    * allocation's only row: then it is its own one-row chain.
    */
-  async function obsoleteLeaseCustodyStamp(lease: EnvironmentLease): Promise<unknown> {
-    if (!lease.providerLeaseId) return null;
-    const allocation = { companyId: lease.companyId, providerLeaseId: lease.providerLeaseId };
-    let chain = await loadNativeHarnessBackupLeaseChain(db, allocation);
-    if (!chain || chain.tip.id !== lease.id) {
-      const rows = await loadNativeHarnessBackupLeaseRows(db, allocation);
-      if (rows.length !== 1 || rows[0]!.id !== lease.id) return null;
-      chain = { tip: rows[0]!, predecessors: [] };
-    }
-    const stamp = newestNativeHarnessBackupStampOnChain(chain, await nativeSessionOfLeaseRun(db, chain.tip), "cleanup");
-    if (!stamp || await nativeHarnessBackupHasLaterProviderWork(db, { companyId: lease.companyId,
-      normalizedSessionId: stamp.normalizedSessionId, completedAt: stamp.completedAt })) return null;
-    return stamp;
+  function obsoleteLeaseCustodyStamp(lease: EnvironmentLease): Promise<unknown> {
+    return nativeLeaseChainCustodyStamp(db, lease);
   }
 
   /**
@@ -4549,6 +4539,12 @@ export function environmentRuntimeService(
     releasesKeptSandbox?: boolean;
   }): Promise<EnvironmentLease | null> {
     if (hasNativeHarnessBackupMissing(input.leaseRow)) return null;
+    if (await nativeLeaseCustodyMissing(db, input.leaseRow.id)) {
+      // No verified saved harness copy: stop and keep the box (named), never destroy it.
+      if (input.leaseRow.status === "active") await prepareSandboxStopAndRetain(db, input.leaseRow, nativeCustodyKeptRecovery());
+      else if (input.leaseRow.status === "retained") await prepareSupersededWarmSandboxStop(db, input.leaseRow, nativeCustodyKeptRecovery());
+      return null;
+    }
     if (await nativeWorkspaceExportPendingForLease(db, input.leaseRow)) return null;
     if (!(await allowLegacyShutdownWorkspaceCleanup(db, input.leaseRow))) return null;
     if (await agentFileSaveHeldOnLease(db, input.leaseRow)) return null;
@@ -4796,6 +4792,12 @@ export function environmentRuntimeService(
           if (!warmRetention) continue; // Another release or handoff already settled this owner.
           leaseRow = warmRetention.lease;
           providerResourceDisposition = warmRetention.disposition;
+          // Custody before destruction: a native box with no verified saved
+          // harness copy is stopped and kept (named), never destroyed.
+          const custodyKept = providerResourceDisposition !== "stop_and_retain" && providerResourceDisposition !== "keep_running"
+            && (providerResourceDisposition === "destroy" || leaseRow.leasePolicy !== "reuse_by_environment")
+            && !hasStopOnlyCleanup(leaseRow) && await nativeLeaseCustodyMissing(db, leaseRow.id);
+          if (custodyKept) providerResourceDisposition = "stop_and_retain";
           const environment = leaseRow.environmentId
             ? await environmentsSvc.getById(leaseRow.environmentId)
             : null;
@@ -4807,7 +4809,8 @@ export function environmentRuntimeService(
           }
           if (providerResourceDisposition === "stop_and_retain" && !hasStopOnlyCleanup(leaseSnapshot)
             && getLeaseDriverKey(leaseSnapshot, environment) === "sandbox") {
-            const prepared = await prepareSandboxStopAndRetain(db, leaseSnapshot);
+            const prepared = await prepareSandboxStopAndRetain(db, leaseSnapshot,
+              custodyKept ? nativeCustodyKeptRecovery() : undefined);
             if (!prepared) continue;
             leaseSnapshot = toEnvironmentLeaseSnapshot(prepared);
             preparedStopAttemptId = prepared.metadata?.pendingCleanupAttemptId;
