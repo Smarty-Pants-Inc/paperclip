@@ -272,6 +272,35 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
       console.log("OPTS QUEUE", JSON.stringify(queue.body));
       await readTurns();
       expect(turns).toEqual([]);
+      // heldbar-2c R1 (live on 2a, 11-19 04:00Z): the real Stop's recovery
+      // path stores a wait on the held wake after the Stop. The person's Stop
+      // wins over it: the GET's bar stays the stopped line, now and later
+      // (fake clock; the server's own sweeps run at each time).
+      const stored = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, s.f.companyId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+      expect(stored.map(wake => (wake.payload as Record<string, any>).executionWait?.reason)).toContain("execution_recovery");
+      const stopAt = Date.now();
+      vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true });
+      try {
+        for (const [label, offset] of [["+0", 0], ["+10s", 10_000], ["+2min", 120_000], ["+10min", 600_000]] as const) {
+          vi.setSystemTime(stopAt + offset);
+          if (offset) {
+            await s.heartbeat.resumeQueuedRuns();
+            await s.heartbeat.drainActiveRunExecutions();
+            await s.heartbeat.tickAgentTimers(new Date());
+            await s.heartbeat.tickIssueMonitors(new Date());
+          }
+          const bar = (await request(s.client).get(`/api/issues/${s.f.issueId}/queued-comments`).expect(200)).body;
+          const runs = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
+            .where(eq(heartbeatRuns.companyId, s.f.companyId));
+          const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, s.f.companyId));
+          await evidence(`heldbar R1 ${label}`, { get: bar,
+            providerCalls: fixture.calls.length, runs, wakes: wakes.map(w => ({ status: w.status, wait: (w.payload as any)?.executionWait })) });
+          expect([label, bar.executionWait]).toEqual([label, { reason: "stopped_by_person",
+            message: "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it." }]);
+          expect(bar.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(s.held);
+        }
+      } finally { vi.useRealTimers(); }
       const pressedAt = Date.now();
       const sent = await s.send();
       console.log("OPTS SEND", sent.status, JSON.stringify(sent.body));
@@ -285,6 +314,10 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
       expect(turns[0]!.commentIds).toEqual(s.held);
       expect([...s.answered().values()]).toEqual([1, 1, 1]);
       expect(Date.now() - pressedAt).toBeLessThan(15_000);
+      // R2: after the Send the bar is gone.
+      const after = (await request(s.client).get(`/api/issues/${s.f.issueId}/queued-comments`).expect(200)).body;
+      expect(after.entries).toEqual([]);
+      expect(after.executionWait ?? null).toBeNull();
     } finally { s.done(); }
   }, 120_000);
 

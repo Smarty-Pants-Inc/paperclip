@@ -84,6 +84,7 @@ import multer from "multer";
 import { z } from "zod";
 import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { readPersonStopHold } from "../services/acknowledged-native-stop.js";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
   activityLog,
@@ -7894,18 +7895,17 @@ export function issueRoutes(
       actorType: input.actor.actorType,
       actorId: input.actor.actorId,
     });
-    if (wake && queueState?.state === "deferred" && !input.activeRun && !queue.executionWait && comments.length > 0 &&
+    if (wake && queueState?.state === "deferred" && !input.activeRun && !interruptHandoff && comments.length > 0 &&
         input.issue.conversationAgentId && input.issue.conversationAgentId === input.issue.assigneeAgentId &&
         !queuedInteractionId(wake.payload)) {
       // Stop means stop (org 11-17): after a person's Stop the chat's waiting
       // messages are not sent. The person sends them, or deletes some first.
-      const [lastTurn] = await input.executor.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
-        .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.issue.companyId),
-          eq(heartbeatRuns.agentId, input.issue.conversationAgentId),
-          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issue.id}`))
-        .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-      const stop = readObject(lastTurn?.resultJson);
-      if (lastTurn?.status === "cancelled" && stop.cancelledByActorType === "user" && !stop.queuedCommentInterruptQueueId) {
+      // The ONE person-Stop reader decides, with or without a saved wait on the
+      // held wake: the person's Stop wins over a stale stored wait the Stop's
+      // own recovery path writes after it (execution_recovery, remote_cleanup,
+      // execution_settling). Paused still beats stopped.
+      if (await readPersonStopHold(input.executor as Db, { companyId: input.issue.companyId, issueId: input.issue.id,
+        agentId: input.issue.conversationAgentId, wakeId: wake.id })) {
         queue.executionWait = await isChatAgentPaused(input.executor, input.issue.companyId, input.issue.conversationAgentId)
           ? { reason: CHAT_AGENT_PAUSED_REASON, message: CHAT_AGENT_PAUSED_MESSAGE }
           : { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
