@@ -26,7 +26,7 @@ beforeEach(async () => {
   });
 });
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
-function world(readyAfter: number[], options: { errorAt?: number; archivedAt?: number; refuseStops?: boolean; hangHedge?: boolean; omitLoser?: boolean } = {}) {
+function world(readyAfter: number[], options: { errorAt?: number; archivedAt?: number; refuseStops?: boolean; hangHedge?: boolean; omitLoser?: boolean; hedgeVisibleAt?: number; listGate?: () => Promise<void> } = {}) {
   const creates: { at: number; key: string; body: string }[] = [], stops: { id: string; body: any }[] = [];
   const boxes = new Map<string, { key: string; labels: any; at: number; stopped: boolean }>();
   const state = (id: string, b: any) => b.stopped || (id === "bx_hedge0" && Date.now() >= (options.archivedAt ?? Infinity)) ? "archived" : id === "bx_hedge0" && Date.now() >= (options.errorAt ?? Infinity) ? "error"
@@ -42,8 +42,9 @@ function world(readyAfter: number[], options: { errorAt?: number; archivedAt?: n
       return res({ sandbox: { id: existing[0], state: state(...existing) } }, 202);
     }
     if (method === "GET" && path === "/sandboxes") {
+      await options.listGate?.();
       const filter = u.searchParams.get("label")!.split("=");
-      return res({ sandboxes: [...boxes].filter(([id, b]) => b.labels[filter[0]] === filter[1] && !(options.omitLoser && id === "bx_hedge0")).map(([id, b]) => ({ id, state: state(id, b), labels: b.labels })), pageInfo: { nextCursor: null } });
+      return res({ sandboxes: [...boxes].filter(([id, b]) => b.labels[filter[0]] === filter[1] && !(options.omitLoser && id === "bx_hedge0") && !(id === "bx_hedge1" && Date.now() < (options.hedgeVisibleAt ?? 0))).map(([id, b]) => ({ id, state: state(id, b), labels: b.labels })), pageInfo: { nextCursor: null } });
     }
     const id = path.split("/")[2], b = boxes.get(id);
     if (b && method === "POST" && path.endsWith("/stop")) {
@@ -143,6 +144,32 @@ it("refused loser stop stays durably owed after a successful hedge", async () =>
   expect(r.error).toBeUndefined(); expect(r.lease.providerLeaseId).toBe("bx_hedge1");
   const debt: any = [...storage.entries()].find(([key]) => key.includes("stop-owed"))?.[1];
   expect(debt.owed).toHaveLength(1); expect(debt.owed[0].acquisition.attemptId).toBe("hop"); money(w);
+});
+it("an unanswered hedge appearing after handoff is stopped by existing maintenance with spares OFF and no further acquire", async () => {
+  const w = world([100_000, 40_000], { hangHedge: true, hedgeVisibleAt: 150_000 });
+  const r = await acquire(130_000);
+  expect(r.error).toBeUndefined(); expect(r.lease.providerLeaseId).toBe("bx_hedge0"); expect(w.stops).toHaveLength(0);
+  // The shared owed-stop path retains its existing 15-minute retry backoff.
+  await vi.advanceTimersByTimeAsync(1_000_000);
+  expect(w.stops.map(s => s.id)).toEqual(["bx_hedge1"]); money(w);
+});
+it("shutdown during the owed-stop inventory read cannot discharge an unstopped loser", async () => {
+  vi.resetModules();
+  const isolated = (await import("./plugin.js")).default;
+  vi.useFakeTimers(); vi.setSystemTime(0); await isolated.definition.setup(context);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const w = world([240_000, 40_000], { listGate: () => gate });
+  const pending = settle(isolated.definition.onEnvironmentAcquireLease!(params));
+  await vi.advanceTimersByTimeAsync(116_000);
+  const r: any = await pending; expect(r.error).toBeUndefined();
+  expect(w.stops).toHaveLength(0);
+  const shutdown = isolated.definition.onShutdown!();
+  release(); await shutdown;
+  const debt: any = [...storage.entries()].find(([key]) => key.includes("stop-owed"))?.[1];
+  // Either drain the stop, or retain its durable obligation for replacement.
+  // A skipped stop with cleared debt is never acceptable.
+  expect(w.boxes.get("bx_hedge0")!.stopped || debt.owed.some((row: any) => row.acquisition?.attemptId === "hop")).toBe(true);
 });
 it("hedge POST times out but its late box remains owned and is stopped when first wins", async () => {
   const w = world([100_000, 40_000], { hangHedge: true }); const r = await acquire();

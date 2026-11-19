@@ -744,7 +744,10 @@ async function resumeOwedSpareStops(config: Config, companyId: string, environme
             await persistOwedSpareStops(companyId, record);
           }
           for (const id of ids) {
-            if (id === debt.keepId || shuttingDown) continue;
+            // Drain may stop further requests, but can never discharge a
+            // loser whose stop was skipped. Replacement still owns this debt.
+            if (shuttingDown) return;
+            if (id === debt.keepId) continue;
             const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`);
             const sandbox = result.sandbox ?? result;
             assertSandboxId(sandbox, id);
@@ -1672,6 +1675,9 @@ async function oweProvisionLosers(config: Config, owner: { companyId: string; en
   // Registers this key even with spare pools OFF, and tracks the bounded stop
   // work for shutdown; a slow/refused stop never blocks the winning lease.
   await resumeOwedSpareStops(config, owner.companyId, owner.environmentId);
+  // Identity-only debt may have no visible loser yet and no failed stop to
+  // arm the keeper. It still needs the existing maintenance retry service.
+  if (heldStopDebt()) ensureSpareRefreshTimer();
 }
 /** Independent ready observers race inside ONE acquisition deadline. The
  * first observer starts exactly one durable hedge only on provisioning >= H.
