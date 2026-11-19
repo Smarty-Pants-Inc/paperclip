@@ -104,6 +104,14 @@ it("adopted readiness alone is stopped at the 180-second deadline", async () => 
   expect(w.calls.find(c => c.method === "POST" && c.path.endsWith("/stop"))?.at).toBe(180_000);
   emit("readiness-budget", w, result);
 });
+it("WHOLE-BUDGET guard: adopted readiness plus setup must not hand off after 180 seconds", async () => {
+  const w = world({ visibleAt: 85_000, setupUntil: 220_000 });
+  const work = plugin.definition.onEnvironmentAcquireLease!({ ...p, config: { ...cfg, setupScript: "true", setupTimeoutSeconds: 300 } }).then(lease => ({ lease }), error => ({ error }));
+  await vi.advanceTimersByTimeAsync(225_000); const result = await work;
+  emit("setup-overruns-budget", w, result);
+  expect(result).toHaveProperty("error");
+  expect(w.calls.some(c => c.method === "POST" && c.path.endsWith("/stop"))).toBe(true);
+});
 it.each(["absent", "error"])("new %s diagnostics expose no API key in logs, error tree, stack or RPC data", async state => {
   const w = world(state === "absent" ? { visibleAt: 1_000_000 } : { state: "error" });
   const work = plugin.definition.onEnvironmentAcquireLease!(p).catch(e => e);
