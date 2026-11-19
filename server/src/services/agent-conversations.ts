@@ -2,6 +2,7 @@ import { isContextCompactionRun } from "./context-compaction.js";
 import { personCommentDeliveryLockKey, trySteerConversationComment } from "./conversation-steering.js";
 import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "./issue-queued-comment-queue.js";
 import { notifyDeferredExecutionWork } from "./deferred-execution-notifications.js";
+import { nativeRunHasStopRequest } from "./native-runtime/native-run-stop-request.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
@@ -698,7 +699,14 @@ async function appendConversationQueueComment(db: Db, comment: typeof issueComme
     const [issue] = await tx.select().from(issues).where(and(
       eq(issues.companyId, comment.companyId), eq(issues.id, comment.issueId),
     )).for("update");
-    if (!issue?.conversationAgentId || issue.conversationUserId !== comment.authorUserId) return false;
+    if (!issue?.conversationAgentId || issue.conversationUserId !== comment.authorUserId || !issue.executionRunId) return false;
+    // A fresh Send after Stop has its own admission semantics (typed input
+    // first, then the held queue). Never absorb it into that stopped backlog.
+    const [active] = await tx.select({ resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, issue.conversationAgentId),
+      eq(heartbeatRuns.id, issue.executionRunId), eq(heartbeatRuns.status, "running"),
+    )).limit(1);
+    if (!active || nativeRunHasStopRequest(active.resultJson)) return false;
     const key = `conversation-comment:${comment.id}`;
     const [receipt] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, comment.companyId), eq(agentWakeupRequests.idempotencyKey, key),
@@ -711,6 +719,7 @@ async function appendConversationQueueComment(db: Db, comment: typeof issueComme
     )).orderBy(desc(agentWakeupRequests.requestedAt), desc(agentWakeupRequests.createdAt), desc(agentWakeupRequests.id))
       .for("update").limit(1);
     if (!tail || tail.status !== "deferred_issue_execution" || tail.runId || tail.payload?.interactionId ||
+        (tail.payload?._paperclipWakeContext as Record<string, unknown> | undefined)?.interactionId ||
         tail.requestedByActorType !== "user" || tail.requestedByActorId !== comment.authorUserId) return false;
     const ids = queuedCommentIdsFromWakePayload(tail.payload);
     if (!ids.length) return false;
