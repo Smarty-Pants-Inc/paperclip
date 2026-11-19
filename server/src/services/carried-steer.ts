@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
-import { agentWakeupRequests, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, heartbeatRunEvents, heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
 import { withSteeredCommentDisplay, type SteeredCommentDisplay } from "./conversation-steering.js";
+import { answeredPersonMessageSql } from "./person-message-answer.js";
 
 export { PAPERCLIP_RECEIVED_MID_TASK_LABEL } from "@paperclipai/adapter-utils/server-utils";
 
@@ -85,6 +86,33 @@ export async function withCarriedSteerDisplay<T extends { id: string; issueId: s
     for (const id of [payload.commentId, context.commentId, context.wakeCommentId, ...ids(context.wakeCommentIds)])
       if (typeof id === "string") heldByLiveWake.add(id);
   }
+  const endedOf = (comment: { id: string }) => runs.find(run => ids(run.context?.steeredCommentIds).includes(comment.id) ||
+    ids(run.result?.restoredSteeredCommentIds).includes(comment.id) || ids(run.result?.stopRestoredSteeredCommentIds).includes(comment.id) ||
+    ["pending", "acknowledged"].includes(String(object(object(run.result?.queuedSteeringAcknowledgements)[comment.id]).status)));
+  // An ended run's never-'delivered' steer may still have been ANSWERED (builds before A2r3 kept no read
+  // seq; the held wake ran and answered it). The ONE answered predicate decides (app-lead ad5a07a2, folded).
+  const endedIds = displayed.filter(comment => endedOf(comment)).map(comment => comment.id);
+  const answered = new Set(endedIds.length ? (await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, first.companyId), eq(issueComments.issueId, first.issueId), inArray(issueComments.id, endedIds),
+    answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }),
+  ))).map(row => row.id) : []);
+  // A later run that carried it as ORDINARY input (not as its own steer; the steering run lists a steer in
+  // both fields) ends the 'turn ended unread' story even if that run failed: its own failure card names
+  // the message (RFL cap-6), so no 'Not delivered' caption here.
+  const carriedLater = new Set<string>();
+  if (endedIds.length) {
+    const laterRuns = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, first.companyId),
+      or(eq(heartbeatRuns.nativeIssueId, first.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${first.issueId}`),
+      inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry", "succeeded", "failed", "timed_out"])));
+    for (const run of laterRuns) {
+      const context = object(run.context);
+      const steered = new Set(ids(context.steeredCommentIds));
+      for (const id of [context.commentId, context.wakeCommentId, ...ids(context.wakeCommentIds)])
+        if (typeof id === "string" && !steered.has(id)) carriedLater.add(id);
+    }
+  }
   return displayed.map<T & CarriedSteerDisplay>(comment => {
     const carrier = carriers.find(run => ids(run.context?.carriedSteeredCommentIds).includes(comment.id) &&
       ![...ids(run.result?.restoredSteeredCommentIds), ...ids(run.result?.stopRestoredSteeredCommentIds)].includes(comment.id));
@@ -94,11 +122,18 @@ export async function withCarriedSteerDisplay<T extends { id: string; issueId: s
         steeringDeliveryEventSeq: read ? Number(read.seq) : null,
         deliveryOutcome: "ordinary", steeringUnavailableReason: null };
     }
-    const ended = runs.find(run => ids(run.context?.steeredCommentIds).includes(comment.id) ||
-      ids(run.result?.restoredSteeredCommentIds).includes(comment.id) || ids(run.result?.stopRestoredSteeredCommentIds).includes(comment.id) ||
-      ["pending", "acknowledged"].includes(String(object(object(run.result?.queuedSteeringAcknowledgements)[comment.id]).status)));
+    const ended = endedOf(comment);
+    if (ended && answered.has(comment.id)) {
+      // Answered: the agent read it. A steered bubble reads as read; one with no steering fields stays ordinary.
+      return { ...comment, carriedIntoRunId: null, steeringUnavailableReason: null,
+        steeringStatus: comment.steeringStatus === "accepted" ? "delivered" : comment.steeringStatus };
+    }
     const restored = ended && [...ids(ended.result?.restoredSteeredCommentIds), ...ids(ended.result?.stopRestoredSteeredCommentIds)].includes(comment.id);
     if (ended && (restored || (!["queued", "running", "scheduled_retry"].includes(ended.status) && comment.steeringStatus !== "delivered"))) {
+      if (carriedLater.has(comment.id)) {
+        return { ...comment, steeringStatus: null, carriedIntoRunId: null, steeringDeliveryEventSeq: null,
+          deliveryOutcome: "ordinary", steeringUnavailableReason: null };
+      }
       if (heldByLiveWake.has(comment.id)) {
         return { ...comment, steeringStatus: null, carriedIntoRunId: null, steeringDeliveryEventSeq: null,
           deliveryOutcome: "queued", steeringUnavailableReason: null };
