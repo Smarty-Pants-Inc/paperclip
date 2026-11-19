@@ -27,6 +27,7 @@ import {
 import * as nativeExecutor from "../services/native-runtime/native-session-executor.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { waitForPendingCommentSteers } from "../services/conversation-steering.js";
 import { readUnreadSteeredMessages } from "../services/native-runtime/unread-steered-messages.js";
 import { readPersonStopHold } from "../services/acknowledged-native-stop.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
@@ -329,6 +330,7 @@ async function fixture(label: string, conversation = true) {
       return owner.outcomes.get(runId)!.result!;
     },
     async close() {
+      await waitForPendingCommentSteers();
       await work?.stop(); await coordinator?.stop();
       // Teardown must not promote the very deferred input a RED just exposed.
       // Pause admission only AFTER all row assertions, then drain the genuine
@@ -379,6 +381,8 @@ describe("person comment default steering eligibility and asynchronous receipt",
           steeredIntoRunId: f.runId, steeringStatus: "delivered", steeringDeliveryEventSeq: expect.any(Number),
         });
       });
+      const [carrying] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect(carrying.contextSnapshot?.steeredDeliveredAts).toMatchObject({ [message.id]: expect.any(String) });
     } finally { await f.close(); }
   }, 45_000);
 
