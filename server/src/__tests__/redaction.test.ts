@@ -1339,3 +1339,113 @@ describe("narrow Bearer recognition at an immediate CSI boundary", () => {
       .toBe(`Bearer \u001b[31m${REDACTED_EVENT_VALUE}${reset}`);
   });
 });
+
+// catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21230
+// Keep reason: never disclose credentials through terminal controls or OSC URLs.
+describe("ECMA-48 credential views beyond 7-bit CSI", () => {
+  const body = "rf2SyntheticOnly0123456789ABCDEF";
+  const shapes = [
+    ["sk-proj-", "sk-proj-", body],
+    ["sk-ant-", "sk-ant-", body],
+    ["ghp_", "ghp_", body],
+    ["github_pat_", "github_pat_", body],
+    ["AKIA", "AKIA", "RF2SYNTH01234567"],
+    ["JWT", "eyJ", "hbGciOiJIUzI1NiJ9.eyJzdWIiOiJyZjJzeW50aGV0aWMifQ.c3ludGhldGljU2lnbmF0dXJl"],
+    ["Bearer", "Bearer ", body],
+  ] as const;
+  const escapes = [
+    ["CSI7", "\u001b[31m", "\u001b[0m"],
+    ["CSI8", "\u009b31m", "\u009b0m"],
+    ["tput sgr0", "\u001b(B\u001b[m", "\u001b(B\u001b[m"],
+    ["nF", "\u001b(B", "\u001b(B"],
+    ["nF multi-intermediate", "\u001b( B", "\u001b(B"],
+    ["Fp save", "\u001b7", "\u001b8"],
+    ["Fp restore", "\u001b8", "\u001b7"],
+    ["Fe", "\u001bM", "\u001bM"],
+    ["Fs", "\u001bc", "\u001bc"],
+    ["OSC BEL", "\u001b]8;;https://docs.example/guide\u0007", "\u001b]8;;\u0007"],
+    ["OSC ST", "\u001b]8;;https://docs.example/guide\u001b\\", "\u001b]8;;\u001b\\"],
+  ] as const;
+  const rows = escapes.flatMap(([kind, open, close]) => shapes.flatMap(([shape, prefix, tail]) => {
+    const masked = prefix === "Bearer " ? `Bearer ${REDACTED_EVENT_VALUE}` : REDACTED_EVENT_VALUE;
+    const key = prefix + tail;
+    return [
+      { kind, shape, position: "inside after prefix", input: `${prefix}${open}${tail}${close}`,
+        expected: `${prefix === "Bearer " ? `Bearer ${open}${REDACTED_EVENT_VALUE}` : masked}${close}` },
+      { kind, shape, position: "word+escape+key", input: `task${open}${key}${close}`,
+        // Schemes remain V1-only: controls must not promote taskBearer to Bearer.
+        expected: prefix === "Bearer " ? `task${open}${key}${close}` : `task${open}${masked}${close}` },
+      { kind, shape, position: "around key", input: `log ${open}${key}${close} done`, expected: `log ${open}${masked}${close} done` },
+      { kind, shape, position: "line start", input: `${open}${key}`, expected: `${open}${masked}` },
+      { kind, shape, position: "inside body", input: `${open}${prefix}${tail.slice(0, 3)}${open}${tail.slice(3)}${close}`,
+        expected: `${open}${masked}${close}` },
+    ];
+  }));
+  it.each(rows)("$kind / $shape / $position", ({ input, expected }) => {
+    // Exact equality proves the whole original span is removed, including all
+    // internal escape bytes, while external control bytes remain untouched.
+    expect(redactSensitiveText(input)).toBe(expected);
+  });
+
+  it.each(shapes)("masks %s after a lone ESC, including after a word", (_shape, prefix, tail) => {
+    const masked = prefix === "Bearer " ? `Bearer ${REDACTED_EVENT_VALUE}` : REDACTED_EVENT_VALUE;
+    expect(redactSensitiveText(`\u001b${prefix}${tail}`)).toBe(`\u001b${masked}`);
+    if (prefix !== "Bearer ") {
+      expect(redactSensitiveText(`task\u001b${prefix}${tail}`)).toBe(`task\u001b${masked}`);
+    }
+  });
+
+  it.each(["\u0007", "\u001b\\"])("masks existing shapes in original OSC URLs terminated by %j", terminator => {
+    for (const [_shape, prefix, tail] of shapes) {
+      const value = prefix + tail;
+      const masked = prefix === "Bearer " ? `Bearer ${REDACTED_EVENT_VALUE}` : REDACTED_EVENT_VALUE;
+      const input = `\u001b]8;;https://docs.example/?q=${value}${terminator}guide\u001b]8;;${terminator}`;
+      expect(redactSensitiveText(input)).toBe(`\u001b]8;;https://docs.example/?q=${masked}${terminator}guide\u001b]8;;${terminator}`);
+    }
+    expect(redactSensitiveText(`\u001b]8;;https://docs.example/?token=sk-proj-${body}${terminator}guide\u001b]8;;${terminator}`))
+      .toBe(`\u001b]8;;https://docs.example/?token=${REDACTED_EVENT_VALUE}${terminator}guide\u001b]8;;${terminator}`);
+  });
+
+  it.each(escapes)("%s leaves ordinary output and short tails byte-equal", (_kind, open, close) => {
+    for (const text of ["completed work", "the bearer of good news", "Use bearer authentication here", "sk-proj-123", "sk-ant-1234", "ghp_123", "github_pat_123", "AKIA12", "eyJ123"]) {
+      const input = `log ${open}${text}${close} done`;
+      expect(redactSensitiveText(input)).toBe(input);
+    }
+    expect(redactSensitiveText(`standard${open}bearer abc123def${close}`))
+      .toBe(`standard${open}bearer abc123def${close}`);
+  });
+
+  it.each(["\u0007", "\u001b\\"])("does not treat an OSC 8 URL as a credential by itself (%j)", terminator => {
+    for (const url of ["https://docs.example/guide", "https://docs.example/very_long_documentation_reference_0123456789", "https://docs.example/?q=ordinary-prose"]) {
+      const input = `\u001b]8;;${url}${terminator}ordinary prose\u001b]8;;${terminator}`;
+      expect(redactSensitiveText(input)).toBe(input);
+    }
+  });
+
+  it("keeps unterminated OSC as text through the line, rather than stripping its introducer", () => {
+    const text = "\u001b]8;;https://docs.example/unfinished";
+    expect(redactSensitiveText(text)).toBe(text);
+    // Even an apparent terminator on a later line must not erase the first line.
+    const acrossLine = `sk-proj-\u001b]8;;unfinished\n${body}\u001b\\`;
+    expect(redactSensitiveText(acrossLine)).toBe(acrossLine);
+    for (const newline of ["\n", "\r", "\r\n"]) {
+      const input = `${text}${newline}\u009b31msk-proj-${body}\u009b0m`;
+      expect(redactSensitiveText(input)).toBe(`${text}${newline}\u009b31m${REDACTED_EVENT_VALUE}\u009b0m`);
+    }
+    expect(redactSensitiveText(`\u001b]8;;https://docs.example/?token=sk-proj-${body}`))
+      .toBe(`\u001b]8;;https://docs.example/?token=${REDACTED_EVENT_VALUE}`);
+  });
+
+  it("accepts ESC bytes in OSC payloads that are not ST without leaking payload keys", () => {
+    const input = `\u001b]8;;https://docs.example/a\u001b7?q=sk-proj-${body}\u001b\\guide\u001b]8;;\u001b\\`;
+    expect(redactSensitiveText(input))
+      .toBe(`\u001b]8;;https://docs.example/a\u001b7?q=${REDACTED_EVENT_VALUE}\u001b\\guide\u001b]8;;\u001b\\`);
+  });
+
+  it("unions original URL, transparent-key and boundary-key spans in one diagnostic", () => {
+    const open = `\u001b]8;;https://docs.example/?token=sk-proj-${body}\u001b\\`;
+    const close = "\u001b]8;;\u001b\\";
+    expect(redactSensitiveText(`🙂 ${open}sk-proj-${body.slice(0, 8)}\u001b(B${body.slice(8)}${close} task\u009b31mgithub_pat_${body}\u009b0m`))
+      .toBe(`🙂 \u001b]8;;https://docs.example/?token=${REDACTED_EVENT_VALUE}\u001b\\${REDACTED_EVENT_VALUE}${close} task\u009b31m${REDACTED_EVENT_VALUE}\u009b0m`);
+  });
+});
