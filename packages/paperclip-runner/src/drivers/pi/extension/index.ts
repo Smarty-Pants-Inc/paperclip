@@ -33,8 +33,45 @@ export interface PiBindContext {
 }
 export interface PiBindTool {
   name: string; label: string; description: string; parameters: Record<string, unknown>;
+  /** Pi 1.5.2 docs/extensions.md "Structured output": codemode scripts get `structuredContent`. */
+  outputSchema?: Record<string, unknown>;
   exposure: "direct" | "hidden";
-  execute(toolCallId: string, args: unknown, signal: AbortSignal | undefined, onUpdate: unknown, ctx: PiBindContext): Promise<PiToolResult>;
+  execute(toolCallId: string, args: unknown, signal: AbortSignal | undefined, onUpdate: unknown, ctx: PiBindContext): Promise<PiToolResult & { structuredContent?: Record<string, unknown> | unknown[] }>;
+}
+
+// Paperclip tools answer with one JSON text item: runnerd serializes the host's result
+// object. Without an outputSchema, Pi codemode hands a script that TEXT as a string, so
+// a script reading the object a direct call shows (`get_task(...).data.status`) read
+// `undefined.status`. Pi's documented structured output (docs/extensions.md): declare
+// `outputSchema` and return the same value as `structuredContent`; the model still
+// receives `content` unchanged. These tools return the HTTP API envelope.
+const PI_API_RESULT_TOOLS: ReadonlySet<string> = new Set([
+  "call_api", "save_api_response", "hire_agent",
+  "get_task", "comment_on_task", "list_task_documents", "read_task_document", "write_task_document",
+]);
+const PI_API_RESULT_SCHEMA = {
+  type: "object", additionalProperties: true,
+  properties: {
+    ok: { type: "boolean", description: "Whether the API call succeeded." },
+    status: { type: ["integer", "null"], description: "The HTTP status code, not a task status." },
+    data: { description: "The parsed response body. For get_task it is the task: its status is data.status." },
+    error: { type: "string" },
+    apiOperationId: { type: "string" },
+  },
+};
+/** The semantic tool contract's object outputSchema; a few bridge reads (list_assigned_skills) return a list. */
+const PI_OBJECT_RESULT_SCHEMA = { anyOf: [{ type: "object", additionalProperties: true }, { type: "array", items: {} }] };
+export function piToolOutputSchema(name: string): Record<string, unknown> {
+  return PI_API_RESULT_TOOLS.has(name) ? PI_API_RESULT_SCHEMA : PI_OBJECT_RESULT_SCHEMA;
+}
+/** The JSON object or list a successful tool result's single text item carries, else
+ * undefined: plain text stays text, and failures stay text and still reject in a script. */
+export function piStructuredContent(result: PiToolResult): Record<string, unknown> | unknown[] | undefined {
+  if (result.isError || result.content.length !== 1) return undefined;
+  try {
+    const value: unknown = JSON.parse(result.content[0]!.text);
+    return value !== null && typeof value === "object" ? value as Record<string, unknown> | unknown[] : undefined;
+  } catch { return undefined; }
 }
 type LifecycleHandler = (event: any, ctx: PiBindContext) => any;
 export interface PiBindApi {
@@ -212,6 +249,7 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
       const capturedBinding = Object.freeze({ epoch: candidate.epoch, runId: candidate.runId });
       pi.registerTool({
         name, label: name, description: definition.description, parameters: definition.inputSchema,
+        outputSchema: piToolOutputSchema(name),
         exposure: wanted.has(name) ? "direct" : "hidden",
         async execute(toolCallId, args, signal) {
           // The execution-start snapshot is immutable and belongs to THIS closure's binding.
@@ -225,7 +263,8 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
               : candidate.toolSocketPath ? sendPiToolRequest(candidate.toolSocketPath, captured, { signal: innerSignal, timeoutMs: 60000 })
                 : Promise.reject(new Error(PI_BIND_ERROR)), { signal, timeoutMs: 60000 });
             if (!authority.accept(origin, toolCallId) || !validatePiToolResult(result) || Buffer.byteLength(JSON.stringify(result)) > PI_BIND_MAX_FRAME_BYTES / 2) throw new Error(PI_BIND_ERROR);
-            return result;
+            const structuredContent = piStructuredContent(result);
+            return structuredContent ? { ...result, structuredContent } : result;
           } catch { throw new Error("Pi tool callback refused"); }
         },
       });
