@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { openPiModelInputPeer, type CapturedPiModelRequest } from "./pi-model-input-peer.js";
 import { PiRpcDriver } from "../../../../packages/paperclip-runner/src/drivers/pi/pi-rpc-driver.js";
 import type { PiRpcRecord, PiRpcTransport } from "../../../../packages/paperclip-runner/src/drivers/pi/pi-rpc-transport.js";
 import { createPiRpcAppServerProxy } from "../../../../packages/paperclip-runner/src/cli/pi-rpc-app-server-proxy.js";
@@ -7,7 +8,7 @@ import { FakeCodexTransport, makeDriver } from "../../../../packages/paperclip-r
 /** A controlled Pi RPC peer, not an answer projector. It cannot consume a steer
  * until the test releases the current tool call. Both production drivers and
  * the production Pi app-server proxy handle every wire record. */
-export async function openPiSteeringPeer(root: string, runId: string) {
+export async function openPiSteeringPeer(root: string, runId: string, options: { captureModelInput?: boolean } = {}) {
   let wake: (() => void) | undefined;
   let closed = false;
   const records: PiRpcRecord[] = [];
@@ -56,7 +57,8 @@ export async function openPiSteeringPeer(root: string, runId: string) {
     },
     async close() { closed = true; peer.exited = true; wake?.(); },
   };
-  const pi = await new PiRpcDriver({ model: "neutral/model", piRpcThinkingLevel: "high",
+  const modelPeer = options.captureModelInput ? await openPiModelInputPeer(root, runId, true) : null;
+  const pi = modelPeer?.session ?? await new PiRpcDriver({ model: "neutral/model", piRpcThinkingLevel: "high",
     runtimeDirectory: join(root, "pi-runtime"), environment: { PI_CODING_AGENT_DIR: join(root, "pi-agent") },
     transportFactory: () => peer as unknown as PiRpcTransport,
   }).openSession({ runId, normalizedSessionId: "boundary-peer-normalized", workingDirectory: root });
@@ -81,13 +83,15 @@ export async function openPiSteeringPeer(root: string, runId: string) {
   });
   transport.notify = (method, params) => { proxy.acceptLine(JSON.stringify({ method, params })); };
   transport.close = async () => { await proxy.close(); transport.queue.close(); };
-  const session = await makeDriver([transport], { model: "neutral/model", conversationMode: "direct",
+  const session = await makeDriver([transport], { model: modelPeer ? "paperclip/faux" : "neutral/model", conversationMode: "direct",
     includeCollaborationModeInstructions: false, capabilities: { steering: true },
     driverIdentity: { kind: "pi_rpc", displayName: "Pi RPC", version: "1.5.2" },
   }).openSession({ runId, normalizedSessionId: "boundary-peer-normalized", workingDirectory: root });
   return {
-    session, commands,
+    session, commands: modelPeer?.commands ?? commands,
+    modelRequests: modelPeer?.modelRequests ?? [] as CapturedPiModelRequest[],
     releaseBoundary(reply: boolean) {
+      if (modelPeer) { modelPeer.releaseBoundary(); return; }
       send({ type: "tool_execution_end", toolCallId: "held-tool", toolName: "bash", result: { content: [{ type: "text", text: "done" }] }, isError: false });
       const text = pending.shift(); if (text === undefined) throw new Error("No queued steer at boundary");
       user(text);
@@ -111,6 +115,12 @@ export async function openPiSteeringPeer(root: string, runId: string) {
       // Pinned Pi's agent_end is a continuation boundary, NOT the run terminal.
       send({ type: "agent_settled" });
     },
-    async close() { await session.close({ reason: "boundary peer cleanup" }); await pi.close({ reason: "boundary peer cleanup" }); },
+    async close() {
+      try { await session.close({ reason: "boundary peer cleanup" }); }
+      finally {
+        if (modelPeer) await modelPeer.close();
+        else await pi.close({ reason: "boundary peer cleanup" });
+      }
+    },
   };
 }
