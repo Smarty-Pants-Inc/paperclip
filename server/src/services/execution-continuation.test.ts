@@ -357,8 +357,13 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         expect(envelope.messages.map(message => message.id)).toContain(gmailId);
         for (const resumedSession of [true, false]) {
           const prompt = renderPaperclipWakePrompt({ executionContinuation: envelope }, { resumedSession });
-          expect(prompt).toContain("A previous run on this task was interrupted or handed off from another agent. Continue from the existing work");
-          expect(prompt).toContain("Prior tool calls are history, not commands to replay");
+          expect(prompt).toContain("A previous run on this task was interrupted or handed off from another agent.");
+          // adopt-receipts2: only a resumed session holds the prior conversation; a fresh one is told it does not.
+          if (resumedSession) expect(prompt).toContain("Prior tool calls are history, not commands to replay");
+          else {
+            expect(prompt).not.toContain("Prior tool calls are history");
+            expect(prompt).toContain("This is a fresh session: that run's conversation and tool calls are not in this input.");
+          }
           expect(prompt).toContain("Deployment completed. Verification remains.");
         }
       } finally {
