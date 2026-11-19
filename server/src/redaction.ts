@@ -1105,8 +1105,49 @@ const AWS_SECRET_ACCESS_KEY_ASSIGNMENT_RE =
 const URL_USERINFO_PASSWORD_RE =
   /((?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s:/?#@"'<>`]*:)[^\s/?#"'<>`]+(?=@)/gi;
 
-// CSI includes SGR colours and erase-line sequences emitted by grep --color.
-const ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+const ANSI_CSI_RE = /(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/y;
+const ANSI_VT_ESCAPE_RE = /\u001b[ -/]*[0-~]/y;
+interface TerminalEscape { start: number; end: number; payloadEnd?: number }
+
+function* terminalEscapes(input: string): Generator<TerminalEscape> {
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+    if (char !== "\u001b" && char !== "\u009b") continue;
+    if (char === "\u001b" && input[index + 1] === "]") {
+      let end = index + 2;
+      while (end < input.length && input[end] !== "\r" && input[end] !== "\n") {
+        if (input[end] === "\u0007" || (input[end] === "\u001b" && input[end + 1] === "\\")) break;
+        end += 1;
+      }
+      if (end < input.length && input[end] !== "\r" && input[end] !== "\n") {
+        const after = end + (input[end] === "\u0007" ? 1 : 2);
+        yield { start: index, end: after, payloadEnd: end };
+        index = after - 1;
+      } else {
+        // An unterminated OSC is text for the entire remaining line. Do not
+        // reinterpret its ESC ] introducer, or nested escapes, as VT controls.
+        index = end - 1;
+      }
+      continue;
+    }
+    // A stray ESC immediately before a credential prefix is ambiguous with a
+    // two-byte VT escape. Preserve the first credential byte, not just its tail.
+    if (char === "\u001b" && (
+      STRICT_CREDENTIAL_SHAPES.tokenPrefixes.some(prefix => input.startsWith(prefix, index + 1)) ||
+      /^Bearer[ \t]/i.test(input.slice(index + 1, index + 8))
+    )) {
+      yield { start: index, end: index + 1 };
+      continue;
+    }
+    const csi = char === "\u009b" || input[index + 1] === "[";
+    const pattern = csi ? ANSI_CSI_RE : ANSI_VT_ESCAPE_RE;
+    pattern.lastIndex = index;
+    const match = pattern.exec(input);
+    if (!match) continue;
+    yield { start: index, end: index + match[0].length };
+    index += match[0].length - 1;
+  }
+}
 type RedactionStage = (text: string, replace: ReplaceCredential) => string;
 type ApplyRedactionStage = (text: string, stage: RedactionStage) => string;
 
@@ -1114,18 +1155,20 @@ interface AnsiCredentialView {
   text: string;
   starts: number[];
   ends: number[];
+  escapeBoundaries?: Set<number>;
 }
 interface CredentialSpan { start: number; end: number; replacement: string }
 
-// Both scanners keep whole-line context. V1 removes CSI (including codes inside
-// credentials); V2 substitutes ASCII space U+0020 for bare-token matching and
-// strict Bearer bodies only when CSI is immediately before the scheme. General
+// Both scanners keep whole-line context. V1 removes terminal controls (including
+// codes inside credentials); V2 substitutes ASCII space U+0020 for bare-token
+// matching and strict Bearer bodies only at an immediate CSI boundary. General
 // schemes, assignments and context-sensitive prose rules remain V1-only.
+// Original OSC payloads are scanned so stripping a hyperlink cannot hide a key.
 export function redactSensitiveText(input: string): string {
-  if (!input.includes("\u001b")) return redactPlainSensitiveText(input);
+  if (!input.includes("\u001b") && !input.includes("\u009b")) return redactPlainSensitiveText(input);
 
   const transparent: AnsiCredentialView = { text: "", starts: [], ends: [] };
-  const boundary: AnsiCredentialView = { text: "", starts: [], ends: [] };
+  const boundary: AnsiCredentialView = { text: "", starts: [], ends: [], escapeBoundaries: new Set() };
   const append = (start: number, end: number) => {
     for (const view of [transparent, boundary]) {
       view.text += input.slice(start, end);
@@ -1136,19 +1179,47 @@ export function redactSensitiveText(input: string): string {
     }
   };
   let copiedThrough = 0;
-  for (const match of input.matchAll(ANSI_ESCAPE_RE)) {
-    append(copiedThrough, match.index);
-    copiedThrough = match.index + match[0].length;
+  const originalPayloadSpans: CredentialSpan[] = [];
+  for (const escape of terminalEscapes(input)) {
+    append(copiedThrough, escape.start);
+    copiedThrough = escape.end;
+    if (input[escape.start] === "\u009b" || input.startsWith("\u001b[", escape.start)) {
+      boundary.escapeBoundaries!.add(boundary.text.length);
+    }
     boundary.text += " ";
-    boundary.starts.push(match.index);
+    boundary.starts.push(escape.start);
     boundary.ends.push(copiedThrough);
+    if (escape.payloadEnd !== undefined) {
+      // A payload is a separate control string, not visible scheme context.
+      // Keep its literal bytes and identity map for the existing scanner; no
+      // blanket URL mask, and no per-visible-run rescan that promotes prose.
+      const start = escape.start + 2;
+      const text = input.slice(start, escape.payloadEnd);
+      for (const span of credentialSpansForView({
+        text,
+        starts: Array.from({ length: text.length }, (_, index) => start + index),
+        ends: Array.from({ length: text.length }, (_, index) => start + index + 1),
+      }, (value, apply) => redactPlainSensitiveText(value, apply))) {
+        originalPayloadSpans.push(span);
+      }
+    }
   }
   if (copiedThrough === 0) return redactPlainSensitiveText(input);
   append(copiedThrough, input.length);
 
+  // The original-byte pass is token-only outside OSC payloads. Running full
+  // Bearer/prose rules over raw controls would turn `bearer of<reset>` into a
+  // credential, or promote `standard<escape>bearer` to a standalone scheme.
+  const originalTokenSpans: CredentialSpan[] = [];
+  redactBoundaryTokenRanges(input, (text, stage) => stage(text, (start, end, replacement) => {
+    originalTokenSpans.push({ start, end, replacement });
+    return text.slice(start, end);
+  }));
   const spans = [
     ...credentialSpansForView(transparent, (text, apply) => redactPlainSensitiveText(text, apply)),
     ...credentialSpansForView(boundary, (text, apply) => redactBoundaryTokenRanges(text, apply, boundary)),
+    ...originalPayloadSpans,
+    ...originalTokenSpans,
   ].sort((a, b) => a.start - b.start || b.end - a.end);
   if (spans.length === 0) return input;
 
@@ -1288,13 +1359,13 @@ const CSI_BOUNDARY_BEARER_RE = new RegExp(
   "gi",
 );
 
-function redactBoundaryTokenRanges(input: string, apply: ApplyRedactionStage, view: AnsiCredentialView): string {
+function redactBoundaryTokenRanges(input: string, apply: ApplyRedactionStage, view?: AnsiCredentialView): string {
   // Run first, while match offsets still address the original boundary view.
-  // A substituted CSI has a multi-byte source interval; an ordinary space
-  // does not. Only that CSI-created boundary may introduce a Bearer scheme.
+  // Only a substituted CSI may introduce a Bearer scheme. The original-byte
+  // token pass has no view and never acquires synthetic scheme boundaries.
   const text = apply(input, (value, replace) => value.replace(CSI_BOUNDARY_BEARER_RE,
     (match: string, prefix: string, _token: string, index: number) => {
-      if (index === 0 || view.ends[index - 1] - view.starts[index - 1] <= 1) return match;
+      if (!view?.escapeBoundaries?.has(index - 1)) return match;
       return prefix + replace(index + prefix.length, index + match.length, REDACTED_EVENT_VALUE);
     }));
   // JWT/bare-prefix tokens retain their existing lengths, charsets and
