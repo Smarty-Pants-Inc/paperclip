@@ -254,6 +254,19 @@ export async function prepareInspectedSourceSandboxStop(db: Db, lease: typeof en
   return prepareStopAndRetain(db, lease, lease.status, { endedLeaseEvidence: lease });
 }
 
+/** A destroy queued in `pending_cleanup` before the custody check, for a native
+ * box with no verified saved harness copy (rf-3 F2): the claim refuses its
+ * destroy, so convert it to the stop-only cleanup with the same named marker
+ * as the orphan sweep's kept box. The retained-orphan settle owns it. Never
+ * touches an in-flight attempt, an existing stop or a destroyed allocation. */
+export async function preparePendingCleanupCustodyStop(db: Db, lease: typeof environmentLeases.$inferSelect,
+  recovery: Record<string, unknown>) {
+  if (lease.status !== "pending_cleanup" || !lease.heartbeatRunId || !lease.provider || lease.provider === "local"
+    || !lease.providerLeaseId || lease.metadata?.pendingCleanupInFlight === true || hasStopOnlyCleanup(lease)
+    || (lease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed") return null;
+  return prepareStopAndRetain(db, lease, "pending_cleanup", recovery);
+}
+
 /** A deliberate user Retry re-arms only the existing, validated stop owner.
  * It never changes allocation identity, resumes a provider, or clears proof.
  * In-flight cleanup and workspace-export recovery keep their own budgets. */
@@ -291,7 +304,7 @@ async function prepareStopAndRetain(db: Db, lease: Lease, fromStatus: string, re
       // survive that settlement, including all identity and timestamp fields.
       ...(preserveEndedEvidence ? { endedLeaseEvidence: recovery.endedLeaseEvidence } : {}),
       // A cleanup-gate owner's stop keeps its sandbox: it is not an orphan to destroy.
-      ...(fromStatus === "active" && Object.keys(recovery).length && recovery[NATIVE_CLEANUP_GATE_OWNER_STOP_KEY] !== true
+      ...(["active", "pending_cleanup"].includes(fromStatus) && Object.keys(recovery).length && recovery[NATIVE_CLEANUP_GATE_OWNER_STOP_KEY] !== true
         && recovery[PREVIOUS_BOOT_CLOSED_TIP_STOP_KEY] !== true
         ? { [ORPHANED_SANDBOX_RECOVERY_KEY]: { ...recovery, runId: lease.heartbeatRunId, recoveredAt: now.toISOString() } } : {}),
       pendingCleanupInFlight: false, pendingCleanupLeaseExpiresAtMs: 0,
