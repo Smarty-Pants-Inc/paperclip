@@ -1045,6 +1045,44 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         statuses: ["todo", "in_progress", "in_review", "blocked", ...(interrupted ? ["done"] : [])] },
       idempotencyKey: `queued-comment-${interrupted ? "interrupt" : "delivery"}:${queueId}`,
     }, queueId);
+    if (interrupted && !response) await dropCarriedFromLaterWakes(companyId, wake, issueId, commentIds);
+  }
+
+  /**
+   * Carry first (adopt-carry-guards, rf-4): the person's Interrupt carry now holds
+   * `commentIds`. Any LATER saved wake on the same task (any producer) drops those
+   * ids, so nothing is carried twice; a wake left with nothing completes as
+   * coalesced into the carry.
+   */
+  async function dropCarriedFromLaterWakes(companyId: string, carry: typeof agentWakeupRequests.$inferSelect,
+    issueId: string, commentIds: string[]) {
+    const [admitted] = await db.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.id, carry.id), eq(agentWakeupRequests.companyId, companyId)));
+    if (!commentIds.length || admitted?.status === "deferred_issue_execution") return;
+    await db.transaction(async tx => {
+      const later = await tx.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, carry.agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"), ne(agentWakeupRequests.id, carry.id),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+        sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
+        sql`${agentWakeupRequests.requestedAt} >= ${carry.requestedAt.toISOString()}::timestamptz`,
+      )).for("update");
+      const now = new Date();
+      for (const wake of later) {
+        const ids = queuedCommentIdsFromWakePayload(wake.payload);
+        if (!ids.some(id => commentIds.includes(id))) continue;
+        const left = ids.filter(id => !commentIds.includes(id));
+        if (left.length) {
+          await tx.update(agentWakeupRequests).set({ payload: withQueuedCommentIdsInWakePayload(wake.payload, left), updatedAt: now })
+            .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+        } else {
+          await tx.update(agentWakeupRequests).set({ status: "coalesced", finishedAt: now, updatedAt: now,
+            payload: sql`${agentWakeupRequests.payload} || jsonb_build_object('coalescedIntoWakeupRequestId', ${carry.id}::text)`,
+            error: "Sent with the chat's other queued messages" })
+            .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+        }
+      }
+    });
   }
 
   async function resumeTaskRetry(companyId: string, requestId: string) {
