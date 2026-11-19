@@ -90,6 +90,18 @@ export async function openPiSteeringPeer(root: string, runId: string, options: {
   return {
     session, commands: modelPeer?.commands ?? commands,
     modelRequests: modelPeer?.modelRequests ?? [] as CapturedPiModelRequest[],
+    /** POST returns 201 before the asynchronous steer dispatch reaches this peer.
+     * Wait (bounded) until `count` steers are queued before draining at a
+     * boundary; if they never arrive, fail with the boundary's own message. */
+    async waitForQueuedSteers(count: number, timeoutMs = 10_000) {
+      const deadline = Date.now() + timeoutMs;
+      while (pending.length < count) {
+        if (Date.now() >= deadline) {
+          throw new Error(pending.length === 0 ? "No queued steer at boundary" : "No second queued steer at boundary");
+        }
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    },
     releaseBoundary(reply: boolean) {
       if (modelPeer) { modelPeer.releaseBoundary(); return; }
       send({ type: "tool_execution_end", toolCallId: "held-tool", toolName: "bash", result: { content: [{ type: "text", text: "done" }] }, isError: false });
