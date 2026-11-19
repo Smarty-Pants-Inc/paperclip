@@ -1354,9 +1354,12 @@ function buildAgentStatusToast(
   };
 }
 
+type RunToastChat = { title: string | null; href: string };
+
 function buildRunStatusToast(
   payload: Record<string, unknown>,
   nameOf: (id: string) => string | null,
+  chatOf?: (issueId: string) => RunToastChat | null,
 ): ToastInput | null {
   const runId = readString(payload.runId);
   const agentId = readString(payload.agentId);
@@ -1364,7 +1367,6 @@ function buildRunStatusToast(
   if (!runId || !agentId || !status || !RUN_TOAST_STATUSES.has(status))
     return null;
 
-  const error = readString(payload.error);
   const errorCode = readString(payload.errorCode);
   // Interrupt is an intentional conversation control. Its caller gives
   // feedback; the terminal event must not announce a cancelled/failed run.
@@ -1372,7 +1374,6 @@ function buildRunStatusToast(
   // Workspace contention is ordinary scheduling, not a failed user action.
   if (errorCode === "workspace_busy" || errorCode === "agent_directory_busy") return null;
   const contextSource = readString(payload.contextSource);
-  const triggerDetail = readString(payload.triggerDetail);
   const name = nameOf(agentId) ?? "Agent";
   if (
     status === "failed" &&
@@ -1394,29 +1395,37 @@ function buildRunStatusToast(
       : status === "cancelled"
         ? "info"
         : "error";
-  const statusLabel =
+  // A person reads this toast, usually about a chat that is not on screen.
+  // The run's error / errorCode are server diagnostics (they can read
+  // "runner_state_identity_mismatch: ..."), so they never reach the toast;
+  // the run page and the chat thread keep the detail.
+  const issueId = readString(payload.issueId);
+  const chat = issueId && chatOf ? chatOf(issueId) : null;
+  const where = chat?.title ? ` in \u201c${chat.title}\u201d` : "";
+  const outcome =
     status === "succeeded"
-      ? "succeeded"
+      ? "finished"
       : status === "failed"
-        ? "failed"
+        ? "stopped with a problem"
         : status === "timed_out"
-          ? "timed out"
-          : "cancelled";
-  const title = `${name} run ${statusLabel}`;
-
-  let body: string | undefined;
-  if (error) {
-    body = error;
-  } else if (triggerDetail) {
-    body = `Trigger: ${triggerDetail}`;
-  }
+          ? "ran out of time"
+          : "was stopped";
+  const title = `${name} ${outcome}${where}`;
+  const body =
+    status === "failed" || status === "timed_out"
+      ? chat
+        ? "Open the chat to see what happened."
+        : "Open the run to see what happened."
+      : undefined;
 
   return {
     title,
     body,
     tone,
     ttlMs: status === "succeeded" ? 5000 : 7000,
-    action: { label: "View run", href: `/agents/${agentId}/runs/${runId}` },
+    action: chat
+      ? { label: "Open chat", href: chat.href }
+      : { label: "View run", href: `/agents/${agentId}/runs/${runId}` },
     dedupeKey: `run-status:${runId}:${status}`,
   };
 }
@@ -2205,7 +2214,15 @@ function handleLiveEvent(
     }
     invalidateVisibleIssueRunQueries(queryClient, pathname, payload);
     if (event.type === "heartbeat.run.status") {
-      const toast = buildRunStatusToast(payload, nameOf);
+      const toast = buildRunStatusToast(payload, nameOf, (issueId) => {
+        const chat = resolveIssueToastContext(
+          queryClient,
+          expectedCompanyId,
+          issueId,
+          null,
+        );
+        return { title: chat.title, href: chat.href };
+      });
       if (toast && event.toastEligible === true && !suppressRunToast) {
         gatedPushToast(gate, pushToast, "run-status", toast);
       }

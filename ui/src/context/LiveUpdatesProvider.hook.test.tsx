@@ -326,7 +326,7 @@ describe("LiveUpdatesProvider socket run notification scope", () => {
     // exact run identity but deliberately omits issueId and provider output.
     await receiveStatus({ runId: "unrelated-run", agentId, status: "failed", startedAt: "2026-09-09T17:59:00.000Z", finishedAt: "2026-09-09T18:00:00.000Z", deliveryId: "status-delivery" });
     expect(pushToast).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
-      title: "Agent run failed", dedupeKey: "run-status:unrelated-run:failed",
+      title: "Agent stopped with a problem", dedupeKey: "run-status:unrelated-run:failed",
       action: { label: "View run", href: `/agents/${agentId}/runs/unrelated-run` },
     }));
   });
