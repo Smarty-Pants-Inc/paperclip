@@ -97,6 +97,7 @@ describe("findRegenerableWorkspaceDirs", () => {
       await fs.symlink(spillRoot, value, "dir");
     }
     await write(path.join(worktreePath, "build", "regenerable.js"));
+    await write(path.join(worktreePath, "dist", "regenerable.js"));
     const staleCandidates = source === "late" ? await findRegenerableWorkspaceDirs(worktreePath) : null;
     vi.stubEnv(key, value);
     const m = spillMemory();
@@ -120,7 +121,6 @@ describe("findRegenerableWorkspaceDirs", () => {
       await fs.appendFile(envPath, `${key}=${JSON.stringify(value)}\n`);
       vi.stubEnv(key, undefined);
     }
-    await write(path.join(worktreePath, "dist", "regenerable.js"));
     const candidates = staleCandidates ?? await findRegenerableWorkspaceDirs(worktreePath);
     const move = await moveWorkspaceDirsToTrash(worktreePath, candidates);
     await deleteWorkspaceCompactionTrash(move.trashDir);
