@@ -14,7 +14,7 @@ import { reserveFreshPluginTaskWorkspace, stageProviderFreshWorkspace } from "..
 import { freshWorkspaceSchema, type PluginFreshWorkspace } from "@paperclipai/plugin-sdk";
 import { pluginRegistryService } from "../plugin-registry.js";
 import { attachPreservedWorkspaceSnapshots } from "../workspace-recovery-snapshot.js";
-import { describeRetainedPriorWorkspace, materializeFreshWorkspaceSeed } from "../fresh-workspace-seed.js";
+import { describeRetainedPriorWorkspace, materializeFreshWorkspaceSeed, materializeSavedSeedWorkspace, readSavedSeedSource } from "../fresh-workspace-seed.js";
 import { assertTaskWorkspaceExecutionAccess } from "../task-workspace-access.js";
 import { preparePluginWorkspace, type WorkspaceWorkers } from "../plugin-workspaces.js";
 import { readWorkspaceProviderBinding } from "@paperclipai/shared";
@@ -212,6 +212,9 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
   const providerApiPlacement = resolveProviderApiPlacement(input);
   const fresh = input.task.freshWorkspace?.mode === "fresh_isolated_workspace";
   const timeWorkspace = createHeartbeatPreparationTiming(run.id);
+  // After the copy-back bound, the fresh root is built from the ended run's saved seed (never empty, never the project ref).
+  const savedSeed = input.task.freshWorkspace?.mode === "fresh_isolated_workspace" ? await readSavedSeedSource(db, {
+    companyId: agent.companyId, sourceRunId: input.task.freshWorkspace.sourceRunId, readinessId: input.task.freshWorkspace.retryIntentId }) : null;
   const {
     issueRef,
     issueId,
@@ -439,6 +442,7 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
             ...(fresh && !reusableExistingExecutionWorkspace ? { attemptId: run.id } : {}),
             ...(reusableExistingExecutionWorkspace ? { reuseCwd: reusableExistingExecutionWorkspace.cwd! } : {}),
           });
+          if (savedSeed && !reusableExistingExecutionWorkspace) await materializeSavedSeedWorkspace({ destination: cwd, source: savedSeed });
         } catch (error) {
           if (!reusableExistingExecutionWorkspace) throw error;
           throw new WorkspaceValidationFailure("The existing execution workspace is not this task's isolated directory.", {
@@ -909,7 +913,9 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
         onBehalfOfUserId: responsibleUserId === "local-board" ? null : responsibleUserId,
       }, agent.companyId, { issueId });
     };
-    const cwd = await materializeFreshWorkspaceSeed({
+    const cwd = savedSeed ? await materializeSavedSeedWorkspace({ source: savedSeed, destination: path.join(
+      await materializeIsolatedTaskDirectory({ companyId: agent.companyId, issueId, attemptId: run.id }), "workspace") })
+    : await materializeFreshWorkspaceSeed({
       companyId: agent.companyId, issueId, runId: run.id, sourceCwd: executionWorkspaceBase.baseCwd,
       repoUrl: executionWorkspaceBase.repoUrl,
       baseRef: readNonEmptyString(parseObject(mergedConfig.workspaceStrategy).baseRef) ?? executionWorkspaceBase.repoRef,
@@ -1035,7 +1041,8 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
         }),
     },
   ));
-  if (!remoteAuthority && input.task.freshWorkspace?.mode === "fresh_isolated_workspace" && issueId) {
+  // (Not after the copy-back bound: the ended run's directory may still be written, and is not offered as a source.)
+  if (!remoteAuthority && !savedSeed && input.task.freshWorkspace?.mode === "fresh_isolated_workspace" && issueId) {
     const recoveredFiles = providerFresh ? providerFresh.recoverySnapshots.map(snapshot => ({
       operationId: snapshot.operationId, sourceRunId: snapshot.sourceRunId,
       path: `.paperclip-recovered/${snapshot.operationId}`,

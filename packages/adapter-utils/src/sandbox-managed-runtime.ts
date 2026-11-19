@@ -991,13 +991,16 @@ export async function createTarballFromDirectory(input: {
   });
 }
 
-async function extractTarballToDirectory(input: {
+export async function extractTarballToDirectory(input: {
   archivePath: string;
   localDir: string;
   exclude?: string[];
+  /** Keep each entry's recorded mode whatever this process's umask is. */
+  preservePermissions?: boolean;
 }): Promise<void> {
   await fs.mkdir(input.localDir, { recursive: true });
-  await execTar([...(input.exclude ?? []).map(entry => `--exclude=${escapeTarExcludeLiteral(entry)}`), "-xf", input.archivePath, "-C", input.localDir]);
+  await execTar([...(input.exclude ?? []).map(entry => `--exclude=${escapeTarExcludeLiteral(entry)}`),
+    ...(input.preservePermissions ? ["-p"] : []), "-xf", input.archivePath, "-C", input.localDir]);
 }
 
 async function* walkDirectory(root: string, relative = "", childrenFirst = false): AsyncGenerator<string> {

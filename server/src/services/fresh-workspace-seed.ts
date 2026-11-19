@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { lstat, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { and, eq, sql } from "drizzle-orm";
@@ -8,6 +8,12 @@ import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { isTaskOwnedLocalWorkspace, readableOwnGitRoot, recoveryGenerationSettled, sourceNeedsWorkspaceRepair,
   workspaceHasOtherWriter } from "./fresh-workspace-continuation.js";
 import { materializeIsolatedTaskDirectory } from "./isolated-task-directory.js";
+import { extractTarballToDirectory } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
+import { captureDirectorySnapshot, directorySnapshotSha256, disposeDirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { workspacePaths } from "@paperclipai/adapter-utils/workspace-manifest";
+import { disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { WORKSPACE_SYNC_OUT_STALL_KEY } from "../agent-run-cancellation.js";
+import { readNativeWorkspaceSavedSeed, readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
 
 const execFile = promisify(execFileCallback);
@@ -80,6 +86,54 @@ export function parsePorcelainZ(status: string) {
     if (/[RC]/.test(entry.slice(0, 2))) index++;
   }
   return changed;
+}
+
+/** The source of a fresh root after the copy-back bound ended `sourceRunId` unsaved (isolateClassicSourceWorkspace):
+ * that run's own startup seed. Null for every other fresh attempt. */
+export async function readSavedSeedSource(db: Db, input: { companyId: string; sourceRunId: string; readinessId: string }) {
+  const [source] = await db.select({ profile: heartbeatRuns.runnerProfileJson, result: heartbeatRuns.resultJson }).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.sourceRunId)));
+  const fence = (source?.result?.[WORKSPACE_SYNC_OUT_STALL_KEY] as { workspace?: { kind?: unknown; readinessId?: unknown } } | undefined)?.workspace;
+  if (fence?.kind !== "classic_isolated" || fence.readinessId !== input.readinessId) return null;
+  const reference = readNativeWorkspaceSyncReference(source?.profile?.nativeWorkspaceSync);
+  if (!reference) throw new Error("saved_seed_reference_missing");
+  return { runId: input.sourceRunId, reference };
+}
+
+/** Build a fresh root from a source run's saved seed: its Git tar, then its working-tree tar, then its deleted
+ * paths, exactly as its own box was seeded. Never from the source's directory (its copy-back may still be
+ * writing there), never from the project ref (the task's saved, uncommitted files would be gone), never empty.
+ * Fails closed: the result must hash to the baseline the seed was taken at, and appears by one rename. */
+export async function materializeSavedSeedWorkspace(input: { destination: string;
+  source: NonNullable<Awaited<ReturnType<typeof readSavedSeedSource>>> }) {
+  const existing = await readdir(input.destination).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") throw error;
+    return [];
+  });
+  // Only this attempt ever writes its own directory, and only by the rename below.
+  if (existing.length) return input.destination;
+  const seed = await readNativeWorkspaceSavedSeed(input.source);
+  const staging = await mkdtemp(path.join(path.dirname(input.destination), ".saved-seed-"));
+  try {
+    if (seed.paths.gitArchivePath) await extractTarballToDirectory({ archivePath: seed.paths.gitArchivePath, localDir: staging, preservePermissions: true });
+    await extractTarballToDirectory({ archivePath: seed.paths.workspaceArchivePath, localDir: staging, preservePermissions: true });
+    for (const deleted of [...(seed.gitSnapshot ? [["", seed.gitSnapshot] as const] : []),
+      ...seed.repositories.map(repository => [repository.path, repository.snapshot] as const)]) {
+      for (const relative of workspacePaths(deleted[1].deletedPaths)) await rm(path.join(staging, deleted[0], relative), { recursive: true, force: true });
+    }
+    const replayed = await captureDirectorySnapshot(staging, { exclude: seed.baseline.exclude,
+      ignoredPaths: seed.baseline.ignoredPaths, diskBacked: !(seed.baseline.entries instanceof Map) });
+    const replayedSha256 = directorySnapshotSha256(replayed);
+    await disposeDirectorySnapshot(replayed);
+    if (replayedSha256 !== seed.baselineSha256) throw new Error("saved_seed_baseline_mismatch");
+    await rename(staging, input.destination);
+    return input.destination;
+  } finally {
+    await rm(staging, { recursive: true, force: true });
+    await disposeDirectorySnapshot(seed.baseline);
+    await disposeGitWorkspaceSnapshot(seed.gitSnapshot);
+    for (const repository of seed.repositories) await disposeGitWorkspaceSnapshot(repository.snapshot);
+  }
 }
 
 /** Seed from committed objects, never from a possibly changing old directory.

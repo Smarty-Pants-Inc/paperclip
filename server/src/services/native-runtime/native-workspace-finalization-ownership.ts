@@ -182,6 +182,9 @@ export async function withNativeWorkspaceFinalizationOwnership<T>(
         let deploymentProof: { reason: "deployment_replaced"; previousDeploymentId: string; worker: WorkspaceWorker } | null = null;
         const waitReason = () => platformStopPending ? "platform_stop_pending" as const
           : localStopPending ? "local_stop_pending" as const : "owner_unverified" as const;
+        // The copy-back bound replaced this run's owner with a tombstone (isolateClassicSourceWorkspace):
+        // its root is quarantined, and nothing ever owns its copy-back again.
+        if ((rawPrior as { fenced?: unknown } | null)?.fenced === true) return { acquired: false, reason: "binding_changed" } as const;
         if (rawPrior != null) {
           const requireStopVerification = async () => {
             if (input.retainedRepairActionId) return { acquired: false, reason: "owner_unverified" } as const;

@@ -2280,7 +2280,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
   const retainedNativeCleanup = retainedNativeSessionCleanupWork(db, cleanupRetainedNativeSession);
   const nativeWorkspaceFinalization = nativeWorkspaceFinalizationWork(db, {
     environmentRuntime, pluginWorkerManager: dependencies.pluginWorkerManager,
-    onWorkspaceSettled: settleRecoveredNativeWorkspace,
+    onWorkspaceSettled: input => settleRecoveredNativeWorkspace(input, { skipEnvironmentSettlement: input.skipEnvironmentSettlement }),
     attempt: input => {
       const operation = attemptNativeWorkspaceFinalization(input);
       const tracked = operation.then(() => undefined, () => undefined);

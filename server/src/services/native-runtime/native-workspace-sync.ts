@@ -1257,6 +1257,16 @@ export async function resumeNativeWorkspaceSync(input: {
   return true;
 }
 
+/** A run's startup seed, digest-verified: the saved files its box was first given, and the baseline they hash to. */
+export async function readNativeWorkspaceSavedSeed(input: { runId: string; reference: NativeWorkspaceSyncReference }) {
+  const { descriptor, baseline } = await readDescriptor(input);
+  if (!descriptor.seed) throw new Error("workspace_sync_out_unrecoverable");
+  const paths = await verifiedDurableSeed({ runId: input.runId, seed: descriptor.seed,
+    gitSnapshot: descriptor.gitSnapshot, repositories: descriptor.repositories });
+  return { paths, baseline, baselineSha256: descriptor.baselineSha256, gitSnapshot: descriptor.gitSnapshot,
+    repositories: descriptor.repositories ?? [] };
+}
+
 export async function cleanupNativeWorkspaceSync(runId: string): Promise<void> {
   await fs.rm(descriptorDirectory(runId), { recursive: true, force: true });
 }

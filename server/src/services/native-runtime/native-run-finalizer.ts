@@ -2,7 +2,7 @@ import { NATIVE_WITHHELD_REPLY_SCHEMA, pendingNativeWithheldReply } from "./nati
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { REMOTE_WORKSPACE_SANDBOX_DISK_FULL_CODE } from "../remote-workspace-transport.js";
-import { fenceSourceWorkspace } from "../remote-workspace-epoch-abandonment.js";
+import { fenceSourceWorkspace, isolateClassicSourceWorkspace } from "../remote-workspace-epoch-abandonment.js";
 import { WORKSPACE_SYNC_OUT_STALL_KEY } from "../../agent-run-cancellation.js";
 import { notifyExternalAgentSettlement } from "../../modules/external-agents/index.js";
 import { notifyNativeRecoveryNotices } from "../native-recovery-notice-notifications.js";
@@ -365,6 +365,10 @@ export const NATIVE_FINALIZATION_SUPERSEDED = "native_finalization_superseded";
  * the epoch fence written with it, and it does not hold the task's next turn.
  */
 export const NATIVE_WORKSPACE_SYNC_OUT_STALLED = "native_workspace_sync_out_stalled";
+// The same cause on a classic sync run: nothing is set aside or kept, so these never say "kept" or "recover".
+const CLASSIC_STALL_RUN_ERROR = "Saving the workspace made no progress, so this run was ended. The agent's result is kept. "
+  + "This turn's file changes were not saved; the task continues from the last saved files.";
+const CLASSIC_STALL_NEXT_ACTION = "This turn's file changes were not saved. Continue from the last saved files, or ask for the changes again.";
 
 /** The run columns that end a run whose finalization reached a terminal verdict. */
 function terminalFinalizationRunPatch(input: {
@@ -559,8 +563,13 @@ async function recordRetryableFailure(input: {
     // copy-out that returns later cannot publish (remote-workspaces.ts
     // `remote_workspace_authority_changed` / `remote_workspace_publication_fenced`).
     // A run whose files cannot be fenced is never ended by the bound.
-    const stallFence = stalled ? await fenceSourceWorkspace(tx as unknown as Db, input.run) : null;
+    // A classic sync run has no epoch: it is isolated instead (isolateClassicSourceWorkspace), and its files are not kept.
+    const stallFence = !stalled ? null : await fenceSourceWorkspace(tx as unknown as Db, input.run)
+      ?? await isolateClassicSourceWorkspace(tx as unknown as Db, input.run, input.coordinator.issueId);
     if (stalled && !stallFence) return current;
+    // C8: the texts follow the fence kind, so "kept for recovery" never sits beside the LOST line.
+    const filesNotKept = Boolean(stallFence && "kind" in stallFence);
+    if (filesNotKept) input = { ...input, nextAction: CLASSIC_STALL_NEXT_ACTION };
     const latestDecision = issue?.lastStatusDecisionId
       ? await tx
           .select({
@@ -715,7 +724,7 @@ async function recordRetryableFailure(input: {
         executionStatusDeliveryId: randomUUID(),
         ...(projectsTerminalStatus
           ? terminalFinalizationRunPatch({ status: terminalRunStatus, failureCode, now,
-              error: terminalFinalizationFailureMessage(failureCode, input.failureScope, failureCause) })
+              error: filesNotKept ? CLASSIC_STALL_RUN_ERROR : terminalFinalizationFailureMessage(failureCode, input.failureScope, failureCause) })
           : {}),
         nativePhase: phase,
         nativePhaseUpdatedAt: now,
