@@ -2,7 +2,7 @@ import { assertNoOpenTransaction } from "@paperclipai/db/transaction-context";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { environmentLeases, type Db, type heartbeatRuns } from "@paperclipai/db";
 import { admittedNativeResourceDisposition, nativeStopWorkspaceOutcome } from "./native-failed-workspace-recovery.js";
-import { hasAcknowledgedNativeRunStopRequest, hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
+import { hasAcknowledgedNativeRunStopRequest } from "../acknowledged-native-stop.js";
 import { hasStopOnlyCleanup, prepareSupersededWarmSandboxStop } from "../sandbox-stop-and-retain.js";
 import { ownLeaseStopRecord } from "../environment-lease-handoff.js";
 import { warmSandboxExpiryCandidateCondition } from "../warm-sandbox-expiry.js";
@@ -127,14 +127,17 @@ export const PERSON_CUT_STOP_AT_PRESS_KEY = "personCutStopAtPress";
 const handedOffStopMarkers = [HANDED_OFF_WARM_STOP_KEY, HANDED_OFF_WARM_UNAVAILABLE_STOP_KEY, HANDED_OFF_WARM_UNPROVEN_STOP_KEY,
   PERSON_CUT_STOP_AT_PRESS_KEY];
 
-/** adopt-stop-at-press: a person cut this run (Interrupt, or a person's acknowledged
- * Stop) and the lease is a retained remote box with no stop receipt that is NOT a
- * hand-off. DB-free. A live holder is excluded by the stop request's own
+/** adopt-stop-at-press: a person's Interrupt cut this run and the lease is a
+ * retained remote box with no stop receipt that is NOT a hand-off. DB-free.
+ * adopt-bc-stop: never for a person's Stop. A box stopped at a Stop sends the
+ * next message into a stopped-box resume, where a Stop mid-tool refuses
+ * (native_controller_recovery_missing_evidence:retained_sandbox_binding) on
+ * every later message. A live holder is excluded by the stop request's own
  * warmSandboxExpiryCandidateCondition (and the process-local live-claim check). */
 export function personCutRetainedNonHandoffLease(run: Run & { errorCode?: string | null },
   lease: typeof environmentLeases.$inferSelect): boolean {
   const personCut = run.runtimeMode === "native" && run.status === "cancelled"
-    && (run.errorCode === "operator_interrupted" || hasAcknowledgedNativeStopIntent(run));
+    && run.errorCode === "operator_interrupted";
   return personCut && lease.provider !== "local" && lease.status === "retained" && !lease.releasedAt
     && !hasRemoteTerminationReceipt(lease) && !hasRecoveredCleanupStopReceipt(lease)
     // The lease's OWN run's stop record means the box already stopped (adopt-receipt-own-run b').

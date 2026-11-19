@@ -302,4 +302,22 @@ describe.skipIf(!support.supported)("adopt-stop-at-press: a person-cut box that 
     expect(lease.metadata?.sandboxStopAndRetain).toBeUndefined();
     expect(lease.metadata?.replaceBeforeReuse).toBeUndefined();
   }, 120_000);
+  it("(p) bc-stop: a person's Stop (not an Interrupt) of a retained box is NOT stopped at the press (the successor is not sent into a stopped-box resume)", async () => {
+    proc.cause = "runner_stop_failed_or_refused"; proc.liveClaim = false; proc.proven = false; proc.calls.length = 0;
+    const f = await seedLiveNativeTurn("stop_and_retain");
+    await interruptAndRetain(f);
+    // The cut reshaped as a person's acknowledged Stop (gate 7, run 483f3219): errorCode cancelled, cancelled by the user.
+    const [cut] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.liveRunId));
+    await db.update(heartbeatRuns).set({ errorCode: "cancelled", resultJson: { ...cut!.resultJson,
+      cancelledByActorType: "user", cancelledByUserId: userId } }).where(eq(heartbeatRuns.id, f.liveRunId));
+    const [stoppedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.liveRunId));
+    await heartbeatService(db).resumeRemoteStopComments(stoppedRun!);
+    const atPress = await until(async () => { const lease = await leaseOf(f.leaseId); return lease.status === "pending_cleanup" ? lease : null; },
+      AT_PRESS_MS);
+    await evidence("p_person_stop", { status: (await leaseOf(f.leaseId)).status,
+      intent: (await leaseOf(f.leaseId)).metadata?.sandboxStopAndRetain ?? null });
+    expect(atPress?.metadata?.sandboxStopAndRetain ?? null, "a person's Stop is not stop-and-retained at the press").toBeNull();
+    expect((await leaseOf(f.leaseId)).status).toBe("retained");
+  }, 120_000);
 });
+
