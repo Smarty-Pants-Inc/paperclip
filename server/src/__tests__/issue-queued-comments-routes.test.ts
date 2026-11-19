@@ -3446,6 +3446,67 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(JSON.stringify(queue.body.executionWait ?? null)).not.toMatch(/will start|starting|starts (soon|shortly|next)|about to start/i);
   });
 
+  // adopt-s2-hold (adopt-lead rule S2): a message HELD by the person's own Stop (the ONE readPersonStopHold)
+  // gets NO sweep card: the stopped bar is its one true line. B's every-owed sweep (c) SKIPS any message
+  // that reader holds, by calling it; when the hold is gone, the card rule applies as before.
+  // REAL: the comment POST, the Stop route, the queued-comments GET (the bar), the hold reader and the sweep.
+  // PLANTED (named): as seedStoppableTurn; answerBy's replies (no provider runs here); the held batch's run.
+  it.each(["chat", "task"] as const)("S2 hold %s: Stop + 3 held, +11 ⇒ the bar only, no card; type T ⇒ T answered, the held run once each, no card", async (surface) => {
+    const f = await seedStoppableTurn(surface);
+    const held = [await postMessage(f, "Reply exactly H1"), await postMessage(f, "Reply exactly H2"), await postMessage(f, "Reply exactly H3")];
+    const stopped = await stopByRoute(f, "queue-owner");
+    const whileHeld = await sweepAt(f, stopped.finishedAt!, [2, 11]);
+    const bar = await request(boardApp(f.companyId, "queue-owner")).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+    expect(whileHeld.map(s => s.notes), JSON.stringify(whileHeld)).toEqual([[], []]);
+    expect(bar.body.entries.map((entry: any) => entry.comment.id as string), JSON.stringify(bar.body)).toEqual(held);
+    // T typed: the hold ends (T runs first, the held right after it). While T is still owed, no card on the held.
+    const typed = await postMessage(f, "Reply exactly T");
+    const typedAt = new Date();
+    const whileTyped = await sweepAt(f, typedAt, [2, 11, 30]);
+    expect(whileTyped.flatMap(s => s.notes).filter(n => held.includes(n.message) || n.message === f.m0), JSON.stringify(whileTyped)).toEqual([]);
+    const tRun = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .find(run => JSON.stringify(run.contextSnapshot ?? {}).includes(typed));
+    // PLANTED (named) where T's own wake has not become a run yet (the task page's slot is held by the filler):
+    // T's run, carrying T alone, and its wake claimed by it.
+    const tRunId = tRun?.id ?? randomUUID();
+    if (!tRun) {
+      await db.insert(heartbeatRuns).values({ id: tRunId, companyId: f.companyId, agentId: f.agentId, invocationSource: "on_demand",
+        status: "running", runtimeMode: "native", nativeIssueId: f.issueId, startedAt: new Date(),
+        contextSnapshot: { issueId: f.issueId, commentId: typed, wakeCommentId: typed, wakeCommentIds: [typed] } });
+      for (const wake of await wakesCarrying(f, typed))
+        await db.update(agentWakeupRequests).set({ status: "completed", runId: tRunId }).where(eq(agentWakeupRequests.id, wake.id));
+    }
+    await answerBy(f, tRunId, "T");
+    // PLANTED (named): the drain runs the held batch once, right after T: ONE run carrying each held message once.
+    const heldRun = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: heldRun, companyId: f.companyId, agentId: f.agentId, invocationSource: "on_demand",
+      status: "running", runtimeMode: "native", nativeIssueId: f.issueId, startedAt: new Date(),
+      contextSnapshot: { issueId: f.issueId, wakeCommentIds: held } });
+    for (const id of held) for (const wake of await wakesCarrying(f, id))
+      await db.update(agentWakeupRequests).set({ status: "completed", runId: heldRun }).where(eq(agentWakeupRequests.id, wake.id));
+    await answerBy(f, heldRun, "H1 H2 H3");
+    const after = await sweepAt(f, new Date(), [2, 11]);
+    const carriers = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter(run => held.some(id => JSON.stringify(run.contextSnapshot ?? {}).includes(id)));
+    process.stdout.write(`S2-HOLD ${surface} ${JSON.stringify({ held, typed, whileHeld, whileTyped, after,
+      answered: await answeredIds(f, [typed, ...held]), carriers: carriers.map(run => run.id) })}\n`);
+    expect(after.map(s => s.notes), JSON.stringify(after)).toEqual([[], []]);
+    expect((await answeredIds(f, [typed, ...held])).sort()).toEqual([typed, ...held].sort());
+    expect(carriers.map(run => run.id), "the held run once each").toEqual([heldRun]);
+  });
+
+  it.each(["chat", "task"] as const)("S2 hold control %s: owed with NO hold (the held wakes are gone) ⇒ one card each, once", async (surface) => {
+    const f = await seedStoppableTurn(surface);
+    const owed = [await postMessage(f, "Reply exactly A1"), await postMessage(f, "Reply exactly A2")];
+    const stopped = await stopByRoute(f, "queue-owner");
+    // PLANTED (named): the held wakes are cancelled by anything other than the person: no hold remains.
+    for (const id of owed) for (const wake of await wakesCarrying(f, id))
+      await db.update(agentWakeupRequests).set({ status: "cancelled" }).where(eq(agentWakeupRequests.id, wake.id));
+    const seen = await sweepAt(f, stopped.finishedAt!, [11, 30]);
+    process.stdout.write(`S2-HOLD-CONTROL ${surface} ${JSON.stringify({ owed, seen })}\n`);
+    expect(seen.map(s => s.notes.map(n => n.message).sort()), JSON.stringify(seen)).toEqual([[...owed].sort(), [...owed].sort()]);
+  });
+
   // RFL 04:17Z (cut 2c): the no-card gate never turns a LOST held message into
   // silence. A held message is explained only while its own wake is still
   // deferred under the sender's Stop (readPersonStopHold), or the person

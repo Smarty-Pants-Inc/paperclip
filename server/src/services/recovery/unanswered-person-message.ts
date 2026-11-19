@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql } from "../person-message-answer.js";
+import { answeredPersonMessageIds, answeredPersonMessageSql } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -456,6 +456,7 @@ export async function settleUnansweredPersonMessage(
   const older: UnansweredMessageOutcome[] = [];
   if (newest.outcome.kind !== "out_of_scope" && newest.outcome.kind !== "none" && newest.messageId) {
     for (const id of await owedOlderMessageIds(db, issue, newest.messageId, carried.noticedReasons)) {
+      if (await heldByPersonStop(db, issue, id)) continue;
       older.push((await settleOneMessage(db, issue, now, input.nativeBlockedRepairApplies, id)).outcome);
     }
   }
@@ -471,6 +472,23 @@ export async function settleUnansweredPersonMessage(
         ? { kind: "pending", recheckAt: Math.min(...pendingAt) } : newest.outcome);
   input.olderOutcomes?.push(...older);
   return returned;
+}
+
+/** adopt-s2-hold (adopt-lead rule S2): a message HELD by its person's own Stop gets NO card from (c): the
+ * stopped bar is its one true line. Decided by CALLING the ONE reader (readPersonStopHold), never a copy:
+ * held while the reader holds it; and, once that person's typed message T ended the hold (the reader's
+ * state (b): endedByTypedCommentId, the held run right after T), still no card while T itself is owed
+ * (T's own outcome is the line; the held follow it). When the held wake is gone (cancelled, sent, run) or
+ * T is answered and they still wait, the reader no longer names them / T no longer covers them: card as before. */
+async function heldByPersonStop(db: Db, issue: DecisionIssue, messageId: string): Promise<boolean> {
+  if (!issue.assigneeAgentId) return false;
+  const hold = await readPersonStopHold(db, { companyId: issue.companyId, issueId: issue.id,
+    agentId: issue.assigneeAgentId, messageId, reportEndedByTypedMessage: true });
+  if (!hold) return false;
+  if (!hold.endedByTypedCommentId) return true;
+  const answered = await answeredPersonMessageIds(db, { companyId: issue.companyId, issueId: issue.id,
+    commentIds: [hold.endedByTypedCommentId] });
+  return !answered.has(hold.endedByTypedCommentId);
 }
 
 /** The per-sweep bound on OLDER owed messages settled for one task in one pass. */
