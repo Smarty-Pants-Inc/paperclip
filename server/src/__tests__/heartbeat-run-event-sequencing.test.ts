@@ -1,5 +1,9 @@
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { logger } from "../middleware/logger.js";
 import { eq, sql } from "drizzle-orm";
 import { createFullDatabaseResponseCapture, installDatabaseResponseCapture } from "./helpers/full-database-response-capture.js";
 import {
@@ -276,6 +280,47 @@ describe("P6-11..13 / P6-17 canonical event allocator", () => {
       expect(await append("runner-b", 3)).toBe(1);
       expect(await append("runner-b", 2)).toBe(3);
     } finally {
+      await temporary.cleanup();
+    }
+  }, 60_000);
+  // R-keep-all-traces (never-OK): the instance run marker is best effort. With
+  // an unwritable data/ dir the run event still lands, the marker is absent and
+  // the failure is logged; the reaper then keeps the instance because its db/
+  // is non-empty (execution-workspaces-service.test.ts U2).
+  it("U1: a run event append completes when the instance data/ dir is unwritable; marker absent, log line present", async () => {
+    const temporary = await startEmbeddedPostgresTestDatabase("paperclip-marker-unwritable-");
+    const db = createDb(temporary.connectionString);
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-marker-home-"));
+    const instanceId = "marker-unwritable";
+    const dataDir = path.join(home, "instances", instanceId, "data");
+    await fs.mkdir(dataDir, { recursive: true });
+    await fs.chmod(dataDir, 0o500);
+    const previous = { home: process.env.PAPERCLIP_HOME, id: process.env.PAPERCLIP_INSTANCE_ID };
+    process.env.PAPERCLIP_HOME = home;
+    process.env.PAPERCLIP_INSTANCE_ID = instanceId;
+    const warn = vi.spyOn(logger, "warn");
+    const companyId = "20000000-0000-4000-8000-0000000000a1";
+    const agentId = "20000000-0000-4000-8000-0000000000a2";
+    const runId = "20000000-0000-4000-8000-0000000000a3";
+    try {
+      await db.insert(companies).values({ id: companyId, name: "Marker", issuePrefix: "MKU" });
+      await db.insert(agents).values({ id: agentId, companyId, name: "Marker agent" });
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running" });
+      // assertWritable routes through the locked append, the path that writes
+      // the marker (heartbeat-run-events.ts appendLockedEvent).
+      const appended = await appendHeartbeatRunEvent(db, { companyId, agentId, runId, eventType: "item.delta",
+        payload: { text: "agent frame" }, assertWritable: () => undefined });
+      expect(appended).toBeDefined();
+      const rows = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+      expect(rows).toHaveLength(1);
+      await expect(fs.lstat(path.join(dataDir, "heartbeat-runs-recorded"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(warn.mock.calls.some((call) => call.includes("could not write the instance heartbeat-run marker"))).toBe(true);
+    } finally {
+      warn.mockRestore();
+      if (previous.home === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previous.home;
+      if (previous.id === undefined) delete process.env.PAPERCLIP_INSTANCE_ID; else process.env.PAPERCLIP_INSTANCE_ID = previous.id;
+      await fs.chmod(dataDir, 0o700).catch(() => undefined);
+      await fs.rm(home, { recursive: true, force: true });
       await temporary.cleanup();
     }
   }, 60_000);
