@@ -1,5 +1,5 @@
 import { isContextCompactionRun } from "./context-compaction.js";
-import { personCommentDeliveryLockKey, trySteerConversationComment } from "./conversation-steering.js";
+import { deliveryIntent, personCommentDeliveryLockKey, trySteerConversationComment } from "./conversation-steering.js";
 import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "./issue-queued-comment-queue.js";
 import { notifyDeferredExecutionWork } from "./deferred-execution-notifications.js";
 import { nativeRunHasStopRequest } from "./native-runtime/native-run-stop-request.js";
@@ -699,6 +699,10 @@ export async function heldConversationComments(
  */
 async function appendConversationQueueComment(db: Db, comment: typeof issueComments.$inferSelect) {
   if (isConversationReset(comment.body)) return false;
+  // Only an explicit Queue (Paul's 'queue one or more messages') joins a batch. A default Send that
+  // steering refused ('run starting') keeps its own wake, so the starting run's drain can still take it
+  // (rf-3, B6 + Q1c composed: two default Enters batched into one wake missed the starting run).
+  if ((await deliveryIntent(db, comment)) !== "queue") return false;
   return db.transaction(async (tx) => {
     const [issue] = await tx.select().from(issues).where(and(
       eq(issues.companyId, comment.companyId), eq(issues.id, comment.issueId),
