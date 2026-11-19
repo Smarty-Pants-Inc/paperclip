@@ -27,6 +27,7 @@ import {
 import * as nativeExecutor from "../services/native-runtime/native-session-executor.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import * as heartbeatModule from "../services/heartbeat.js";
 import { waitForPendingCommentSteers } from "../services/conversation-steering.js";
 import { readUnreadSteeredMessages } from "../services/native-runtime/unread-steered-messages.js";
 import { readPersonStopHold } from "../services/acknowledged-native-stop.js";
@@ -208,7 +209,8 @@ let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
 let root: string;
 type Outcome = { result?: Awaited<ReturnType<typeof executePaperclipNativeSession>>; error?: string };
 const scheduled = new Map<string, { bodies: string[]; peers: RecordingPiPeer[]; executions: Promise<unknown>[];
-  first: RecordingPiPeer; outcomes: Map<string, Outcome>; contendAtFinalization?: boolean; deferCommitAtReturn?: boolean }>();
+  first: RecordingPiPeer; outcomes: Map<string, Outcome>; contendAtFinalization?: boolean; deferCommitAtReturn?: boolean;
+  deferredPhase?: "observed" | "applied" }>();
 const realExecute = executePaperclipNativeSession;
 function backendFor(execution: Parameters<typeof realExecute>[0]["execution"], runnerInstanceId: string, peer: RecordingPiPeer) {
   const workspace = execution.workspace.cwd;
@@ -258,7 +260,7 @@ beforeAll(async () => {
     });
     const execution = realExecute({ ...input, useRunnerd: false, backend: backendFor(input.execution, input.runnerInstanceId, peer) }).then(async result => {
       if (owner.deferCommitAtReturn && first) {
-        await db.update(nativeRunFinalizations).set({ phase: "observed", leaseOwner: "native-row-reconciler",
+        await db.update(nativeRunFinalizations).set({ phase: owner.deferredPhase ?? "observed", leaseOwner: "native-row-reconciler",
           leaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(nativeRunFinalizations.runId, input.execution.binding.runId));
       }
       if (owner.contendAtFinalization && first) {
@@ -296,7 +298,7 @@ async function fixture(label: string, conversation = true, skipIssueComment = tr
   const initial = randomUUID();
   await db.insert(issueComments).values({ id: initial, companyId, issueId, authorType: "user", authorUserId: userId, body: "Do the original two-step work." });
   const peer = new RecordingPiPeer();
-  const owner = { contendAtFinalization: false, deferCommitAtReturn: false, bodies: [] as string[], peers: [] as RecordingPiPeer[], executions: [] as Promise<unknown>[], first: peer, outcomes: new Map<string, Outcome>() };
+  const owner = { contendAtFinalization: false, deferCommitAtReturn: false, deferredPhase: "observed" as "observed" | "applied", bodies: [] as string[], peers: [] as RecordingPiPeer[], executions: [] as Promise<unknown>[], first: peer, outcomes: new Map<string, Outcome>() };
   scheduled.set(companyId, owner);
   let coordinator: ReturnType<typeof createDeliveryWorkCoordinator> | undefined;
   let work: ReturnType<ReturnType<typeof heartbeatService>["registerDeferredReceiptWork"]> | undefined;
@@ -550,6 +552,137 @@ describe("native completion promotion (rf3-ibpair)", () => {
       await f.assertAnsweredOnce([message]);
       console.info("P-DEFERRED persisted proof", JSON.stringify({ elapsedMs: Date.now() - started, messageId: message.id,
         wake: (await personWakes())[0], successor: successors[0].id, successorContext: successors[0].contextSnapshot }));
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it.each(["observed", "applied"] as const)("P2: normal end with %s finalization; standalone commit answers deferred person batch ONCE", async phase => {
+    const f = await fixture(`P2-normal-${phase}`, true, false);
+    try {
+      const messages = [await f.post("P2-M1: answer my first last-second question", "queue"),
+        await f.post("P2-M2: answer my second last-second question", "queue")];
+      await waitForPendingCommentSteers();
+      const deferred = (await f.wakes()).filter(w => w.status === "deferred_issue_execution");
+      expect(deferred).toHaveLength(1);
+      expect(JSON.stringify(deferred[0].payload)).toContain(messages[0].id);
+      expect(JSON.stringify(deferred[0].payload)).toContain(messages[1].id);
+      expect(f.commands("steer")).toEqual([]);
+      f.owner.deferCommitAtReturn = true;
+      f.owner.deferredPhase = phase;
+      await f.complete();
+      expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))[0].phase).toBe(phase);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].status).toBe("succeeded");
+      expect((await f.wakes()).find(w => w.id === deferred[0].id)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      await db.update(nativeRunFinalizations).set({ leaseOwner: null, leaseExpiresAt: null })
+        .where(eq(nativeRunFinalizations.runId, f.runId));
+      // P2-live: another cleanup already cleared ownership, so there is NO
+      // issue_execution_lock record left for the registry to settle/drain.
+      await db.update(issues).set({ executionRunId: null, checkoutRunId: null,
+        executionAgentNameKey: null, executionLockedAt: null }).where(eq(issues.id, f.issueId));
+      expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].executionRunId).toBeNull();
+      const started = Date.now();
+      // No registry settlement, recovery sweep, delivery worker, or new input:
+      // this finalizer is the ONLY owner of the post-commit continuation.
+      await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+      expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))[0].phase).toBe("committed");
+      await vi.waitFor(async () => { await f.assertAnsweredOnce(messages); }, { timeout: 30_000 });
+      await heartbeatService(db).drainActiveRunExecutions();
+      const elapsedMs = Date.now() - started;
+      expect(elapsedMs).toBeLessThan(30_000);
+      const successors = () => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))
+        .then(rows => rows.filter(run => run.id !== f.runId));
+      expect(await successors()).toHaveLength(1);
+      for (const message of messages) expect((await successors())[0].contextSnapshot?.wakeCommentIds).toContain(message.id);
+      // Replayed commit AND the settlement's own drain must remain idempotent.
+      await Promise.all([finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true }), settleOwner(f)]);
+      await settleOwner(f);
+      await heartbeatService(db).drainActiveRunExecutions();
+      await f.assertAnsweredOnce(messages);
+      expect(await successors()).toHaveLength(1);
+      const proof = { phase, elapsedMs, originalRun: f.runId, issueLockBeforeCommit: null,
+        messageIds: messages.map(m => m.id), successorRuns: (await successors()).map(r => r.id),
+        wakes: await f.wakes(), comments: await f.comments() };
+      console.info("P2 persisted proof", JSON.stringify(proof));
+      if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(
+        join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, `P2-proof-${phase}.json`), JSON.stringify(proof, null, 2));
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it("P2-double: registry settlement drains before the committed finalizer's drain; ONE successor", async () => {
+    const f = await fixture("P2-double", true, false);
+    let resume!: () => void;
+    let reached!: () => void;
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    const atDrain = new Promise<void>(resolve => { reached = resolve; });
+    let finalizing: Promise<unknown> | undefined;
+    let restoreSpy = () => {};
+    const realHeartbeatService = heartbeatModule.heartbeatService;
+    try {
+      const message = await f.post("P2-DOUBLE: one answer despite both drains", "queue");
+      await waitForPendingCommentSteers();
+      f.owner.deferCommitAtReturn = true;
+      await f.complete();
+      await db.update(nativeRunFinalizations).set({ leaseOwner: null, leaseExpiresAt: null })
+        .where(eq(nativeRunFinalizations.runId, f.runId));
+      // Gate ONLY scheduling order, not a release result. The registry's sweep
+      // and both release transactions below are the real product code.
+      let finalizerDrainCalls = 0;
+      const spy = vi.spyOn(heartbeatModule, "heartbeatService").mockImplementation((...args) => {
+        const service = realHeartbeatService(...args);
+        return { ...service, releaseIssueExecutionAndPromote: async (...releaseArgs: Parameters<typeof service.releaseIssueExecutionAndPromote>) => {
+          if (releaseArgs[0].id === f.runId) { finalizerDrainCalls++; reached(); await gate; }
+          return service.releaseIssueExecutionAndPromote(...releaseArgs);
+        } };
+      });
+      restoreSpy = () => spy.mockRestore();
+      finalizing = finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+      await vi.waitFor(() => expect(finalizerDrainCalls).toBe(1), { timeout: 5000 });
+      await atDrain;
+      expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].executionRunId).toBe(f.runId);
+      await settleOwner(f); // wins the guarded clear AND invokes its wired drain
+      await vi.waitFor(async () => { await f.assertAnsweredOnce([message]); }, { timeout: 30_000 });
+      resume(); await finalizing;
+      await heartbeatService(db).drainActiveRunExecutions();
+      await f.assertAnsweredOnce([message]);
+      const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+        .filter(r => r.id !== f.runId);
+      expect(runs).toHaveLength(1);
+      const proof = { finalizerDrainCalls, registrySettledFirst: true, successorRuns: runs.map(r => r.id) };
+      console.info("P2 double persisted proof", JSON.stringify(proof));
+      if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(
+        join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, "P2-proof-double.json"), JSON.stringify(proof, null, 2));
+    } finally { resume(); await finalizing; restoreSpy(); await f.close(); }
+  }, 60_000);
+
+  it.each(["completion", "system"] as const)("P2 pre-boot %s wake: standalone commit does NOT promote historical work", async kind => {
+    const f = await fixture(`P2-preboot-${kind}`, true, false);
+    try {
+      const task = kind === "completion" ? await completionTask(f, "P2 old completed daily task") : null;
+      const wake = task ? (await held(f, task)).wake : (await db.insert(agentWakeupRequests).values({
+        companyId: f.companyId, agentId: f.agentId, source: "automation", triggerDetail: "system",
+        reason: "automation_no_new_person", requestedByActorType: "system", status: "deferred_issue_execution",
+        payload: { issueId: f.issueId, _paperclipWakeContext: { issueId: f.issueId, wakeReason: "automation_no_new_person" } },
+      }).returning())[0];
+      await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - 3 * 60 * 60_000) })
+        .where(eq(agentWakeupRequests.id, wake.id));
+      f.owner.deferCommitAtReturn = true;
+      await f.complete();
+      await db.update(nativeRunFinalizations).set({ leaseOwner: null, leaseExpiresAt: null })
+        .where(eq(nativeRunFinalizations.runId, f.runId));
+      await db.update(issues).set({ executionRunId: null, checkoutRunId: null,
+        executionAgentNameKey: null, executionLockedAt: null }).where(eq(issues.id, f.issueId));
+      for (let pass = 0; pass < 2; pass++) {
+        await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+        await settleOwner(f);
+      }
+      await heartbeatService(db).drainActiveRunExecutions();
+      expect(f.owner.peers).toHaveLength(1);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+        .toHaveLength(task ? 2 : 1); // completion producer's worker is not a chat successor
+      expect((await f.wakes()).find(w => w.id === wake.id)).toMatchObject({
+        status: task ? "cancelled" : "deferred_issue_execution", runId: null });
+      const notes = (await f.comments()).filter(c => c.authorType === "system");
+      if (task) expect(notes.filter(c => c.body.includes(task.identifier))).toHaveLength(1);
+      else expect(notes).toEqual([]);
     } finally { await f.close(); }
   }, 60_000);
 
