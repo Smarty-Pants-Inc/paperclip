@@ -174,8 +174,33 @@ test("refused A reload exposes current B and Try again queues one B continuation
       agent: (await db.select().from(agents).where(eq(agents.id, agent.id)))[0],
     }, null, 2));
     expect(initial.interruption?.responsibility).toBe("system");
+    // The live socket's first open re-reads every active query (LiveUpdatesProvider onopen). Mark the issue
+    // read that completes after that handler ran, so B is written only after the page's own reconcile: else the
+    // reconcile can land after B and the first click is already B's (200), never the stale A (409).
+    await page.addInitScript((issuePath: string) => {
+      const marks = window as unknown as { __liveOpen?: boolean; __issueReadAfterOpen?: boolean };
+      const NativeSocket = window.WebSocket;
+      window.WebSocket = class extends NativeSocket {
+        override set onopen(handler: ((this: WebSocket, event: Event) => unknown) | null) {
+          super.onopen = !handler || !this.url.includes("/events/ws") ? handler : function (this: WebSocket, event: Event) {
+            marks.__liveOpen = true;
+            return handler.call(this, event);
+          };
+        }
+        override get onopen() { return super.onopen; }
+      };
+      const nativeFetch = window.fetch.bind(window);
+      window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        const response = nativeFetch(input, init);
+        const url = new URL(input instanceof Request ? input.url : String(input), location.href);
+        if (url.pathname === issuePath) void response.finally(() => { if (marks.__liveOpen) marks.__issueReadAfterOpen = true; }).catch(() => {});
+        return response;
+      };
+    }, `/api/issues/${issue.identifier}`);
     await page.goto(`/${company.issuePrefix}/issues/${issue.identifier}`);
     await expect(page.getByTestId("recovery-action-resolve-trigger")).toBeVisible({ timeout: 30_000 });
+    await page.waitForFunction(() => (window as unknown as { __issueReadAfterOpen?: boolean }).__issueReadAfterOpen === true,
+      undefined, { timeout: 30_000 });
     await page.screenshot({ path: path.join(artifactDir, "screenshot-1-old-card.png"), fullPage: true });
     expect((await json(await request.get(`/api/issues/${issue.id}`))).activeRecoveryAction.evidence.latestRunId).toBe(sourceA);
 
