@@ -12,9 +12,13 @@
  *   is attached; the ordinary path otherwise.
  * - POST response and GET thread data: `steeredIntoRunId` (string | null),
  *   `steeredAt` (ISO string | null), `steeringStatus`
- *   ('accepted' | 'delivered' | null) and `steeringDeliveryEventSeq`
- *   (number | null). 'accepted' is shown as SENT; only 'delivered' (Pi's own
- *   persisted read of the message) is shown as DELIVERED, on the same bubble.
+ *   ('accepted' | 'carried' | 'delivered' | null), `carriedIntoRunId`
+ *   (string | null) and `steeringDeliveryEventSeq` (number | null).
+ *   'accepted' is shown as SENT, 'carried' as TAKEN INTO THE NEXT TURN; only
+ *   'delivered' (Pi's own persisted read of the message) is shown as
+ *   DELIVERED, on the same bubble. `steeringUnavailableReason`
+ *   'run_ended_before_read' is shown as NOT DELIVERED (neworg/steer-A2r3-c3,
+ *   server/src/services/carried-steer.ts).
  * - `deliveryOutcome: 'queued'` and `steeringUnavailableReason` (the D5
  *   reason) arrive in the server's follow-up with these exact names. Until
  *   then a queued POST answers with `steeredIntoRunId: null`, and the waiting
@@ -47,6 +51,7 @@ type DeliveryFields = {
   steeredIntoRunId?: unknown;
   steeredAt?: unknown;
   steeringStatus?: unknown;
+  carriedIntoRunId?: unknown;
   deliveryOutcome?: unknown;
   steeringUnavailableReason?: unknown;
 };
@@ -78,29 +83,30 @@ export function isPendingDelivery(comment: object | null | undefined): boolean {
 }
 
 /**
- * How far a steered message got, as the server says: 'sent' (the server
- * handed it to the running turn: `steeringStatus` 'accepted') or 'delivered'
- * (Pi itself read it into the turn: `steeringStatus` 'delivered'). 'pending'
- * only for the client's neutral mark before the POST answers. Null for a
- * message that was not steered.
- *
- * 'not_delivered' is derived ONLY from two server facts: the server still says
- * `steeringStatus` 'accepted' AND the run `steeredIntoRunId` names is terminal
- * in the issue's runs (`terminalRunIds`). The turn ended before the agent read
- * it, so it must not keep saying 'Sent'. A later 'delivered', or the server
- * moving the message (no `steeredIntoRunId`), wins.
+ * How far a steered message got, as the server says. Every state is a server
+ * field; nothing here is inferred from run status:
+ * - 'sent': `steeringStatus` 'accepted' (handed to the running turn).
+ * - 'carried': `steeringStatus` 'carried' (+ `carriedIntoRunId`): the turn
+ *   ended before the agent read it and the server took it into the next turn.
+ *   It is on its way, not lost.
+ * - 'delivered': `steeringStatus` 'delivered' (Pi itself read it).
+ * - 'not_delivered': `steeringUnavailableReason` 'run_ended_before_read',
+ *   whatever `steeringStatus` says (the server has no carrier for it).
+ * 'pending' only for the client's neutral mark before the POST answers. Null
+ * for a message that was not steered.
  */
-export type SteeredDelivery = "pending" | "sent" | "delivered" | "not_delivered";
+export type SteeredDelivery = "pending" | "sent" | "carried" | "delivered" | "not_delivered";
 export const STEERED_NOT_DELIVERED_TEXT = "Not delivered: the turn ended before the agent read it.";
-export function readSteeredDelivery(
-  comment: object | null | undefined,
-  terminalRunIds?: ReadonlySet<string> | null,
-): SteeredDelivery | null {
+export const STEERED_CARRIED_TEXT = "Taken into the next turn";
+export function readSteeredDelivery(comment: object | null | undefined): SteeredDelivery | null {
+  if (!comment) return null;
+  const fields = comment as DeliveryFields;
+  if (fields.steeringUnavailableReason === "run_ended_before_read") return "not_delivered";
   const runId = readSteeredIntoRunId(comment);
+  const carriedIntoRunId = stringOrNull(fields.carriedIntoRunId);
+  if (fields.steeringStatus === "carried") return "carried";
+  if (fields.steeringStatus === "delivered" && (runId || carriedIntoRunId)) return "delivered";
   if (!runId) return isPendingDelivery(comment) ? "pending" : null;
-  const status = (comment as DeliveryFields).steeringStatus;
-  if (status === "delivered") return "delivered";
-  if (status === "accepted" && terminalRunIds?.has(runId)) return "not_delivered";
   return "sent";
 }
 

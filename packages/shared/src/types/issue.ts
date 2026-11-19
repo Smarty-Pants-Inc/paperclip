@@ -1118,7 +1118,8 @@ export interface IssueComment {
   /** Same-turn custody, never proof of delivery or an answer. */
   steeredIntoRunId?: string | null;
   steeredAt?: string | null;
-  steeringStatus?: "accepted" | "delivered" | null;
+  steeringStatus?: "accepted" | "carried" | "delivered" | null;
+  carriedIntoRunId?: string | null;
   /** Pi's own persisted userMessage event, not our acknowledgement. */
   steeringDeliveryEventSeq?: number | null;
   clientRequestId?: string | null;

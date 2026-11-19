@@ -7322,10 +7322,38 @@ describe("IssueDetail", () => {
     15_000,
   );
 
+  // A2r3 projection (neworg/steer-A2r3-c3 8fc517e2, server/src/services/carried-steer.ts:38-94):
+  // the thread GET body of the captured A2 steer once its turn ended unread. DERIVED, not
+  // re-captured: the captured A2 body plus exactly the fields withCarriedSteerDisplay sets.
+  const a2r3 = (fields: Record<string, unknown>) => [
+    { ...STEER_A2_THREAD_GET_DELIVERED[0], ...fields },
+    STEER_A2_THREAD_GET_DELIVERED[1],
+  ];
+  const A2R3_CARRIER_RUN_ID = "c4a7e2d1-5b3f-4e8a-9c6d-2f1e0b9a8d7c";
+  const A2R3_NOT_DELIVERED = { steeringStatus: null, carriedIntoRunId: null, steeringDeliveryEventSeq: null,
+    deliveryOutcome: "ordinary", steeringUnavailableReason: "run_ended_before_read" };
+  const A2R3_CARRIED = { steeringStatus: "carried", carriedIntoRunId: A2R3_CARRIER_RUN_ID, steeringDeliveryEventSeq: null,
+    deliveryOutcome: "ordinary", steeringUnavailableReason: null };
+  const A2R3_CARRIED_DELIVERED = { ...A2R3_CARRIED, steeringStatus: "delivered", steeringDeliveryEventSeq: 7 };
+
+  async function endTheSteeredRun(runId: string, status = "failed") {
+    const endedRun = {
+      runId, runtimeMode: "native", status, agentId: "agent-1", adapterType: "paperclip_runner",
+      createdAt: "2026-11-19T07:43:59.400Z", startedAt: "2026-11-19T07:43:59.400Z", finishedAt: "2026-11-19T07:44:30.000Z",
+    };
+    mockHeartbeatsApi.activeRunForIssue.mockResolvedValue(null);
+    mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([]);
+    mockActivityApi.recentRunsForIssue.mockResolvedValue([endedRun]);
+    mockActivityApi.runsForIssue.mockResolvedValue([endedRun]);
+  }
+
   // cluster-lead 09:37Z (frame steerkill-g4b-092242/screen-1440/0046-after-reload.jpg):
-  // the bubble read '5m ago · Sent' after its run FAILED with steeringStatus still
-  // 'accepted'. Server facts only: 'accepted' + the run steeredIntoRunId names is
-  // terminal in the issue's runs -> 'Not delivered'; a later 'delivered' wins.
+  // the bubble read '5m ago · Sent' after its run FAILED.
+  // supersedes(fe40f9d2 "a steered message whose turn ended unread says 'Not delivered', not 'Sent'; a later
+  // server 'delivered' wins") under SUPERSEDE-STEER-NOTDELIVERED-SERVER-FIELD-1119 (RFL: read the server's
+  // run_ended_before_read, do not infer). Name unchanged. Re-pinned: 'Not delivered' now comes from the
+  // server's steeringUnavailableReason 'run_ended_before_read' (A2r3 projection, steeringStatus null),
+  // not from 'accepted' + a terminal run in the client's run lists.
   it.each([390, 1440])(
     "a steered message whose turn ended unread says 'Not delivered', not 'Sent'; a later server 'delivered' wins at %i",
     async (width) => {
@@ -7340,15 +7368,9 @@ describe("IssueDetail", () => {
       expect(state.thread).toContainEqual(expect.objectContaining({ id: post.id, steeringStatus: "accepted", steeredIntoRunId: runId }));
       expect(delivery()).toContain("Sent");
       expect(delivery()).not.toContain("Not delivered");
-      // R FAILED before Pi read it; the server still says 'accepted'.
-      const failedRun = {
-        runId, runtimeMode: "native", status: "failed", agentId: "agent-1", adapterType: "paperclip_runner",
-        createdAt: "2026-11-19T07:43:59.400Z", startedAt: "2026-11-19T07:43:59.400Z", finishedAt: "2026-11-19T07:44:30.000Z",
-      };
-      mockHeartbeatsApi.activeRunForIssue.mockResolvedValue(null);
-      mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([]);
-      mockActivityApi.recentRunsForIssue.mockResolvedValue([failedRun]);
-      mockActivityApi.runsForIssue.mockResolvedValue([failedRun]);
+      // R FAILED before Pi read it and no carrier took it: the server says run_ended_before_read.
+      await endTheSteeredRun(runId);
+      state.thread = a2r3(A2R3_NOT_DELIVERED);
       await act(async () => { await queryClient.invalidateQueries(); });
       expect(await waitUntil(() => bubbles()[0]?.dataset.delivery === "not_delivered")).toBe(true);
       expect(bubbles()).toHaveLength(1);
@@ -7366,6 +7388,76 @@ describe("IssueDetail", () => {
       expect(delivery()).not.toContain("Not delivered");
       if (process.env.STEER_UI_EVIDENCE) {
         writeFileSync(`${process.env.STEER_UI_EVIDENCE}/after-not-delivered-server-delivered-${width}.txt`, `${bubbles()[0]!.outerHTML}\n`);
+      }
+    },
+    15_000,
+  );
+
+  // carried: A2r3 's-steer5a i-b' (steerkill-g4s5a-i-b-105057): the turn ended unread, the server took
+  // the message into the next turn (steeringStatus 'carried' + carriedIntoRunId), then Pi read it there
+  // ('delivered'). Also with no steeredIntoRunId in the body: the server's word alone places the bubble.
+  it.each([
+    [390, "kept"], [1440, "kept"], [390, "null"], [1440, "null"],
+  ] as const)(
+    "carried: a steer whose turn ended unread reads 'Taken into the next turn' (never 'Not delivered'), then 'Delivered' at %i (steeredIntoRunId %s)",
+    async (width, steered) => {
+      const { runId, state, bubbles } = await renderSteeringPlacement(width, "steer");
+      const editor = container.querySelector<HTMLTextAreaElement>('[data-testid="stand-in-editor"]')!;
+      await act(async () => {
+        editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+      });
+      const delivery = () => bubbles()[0]?.querySelector('[data-testid="task-chat-steered-delivery"]')?.textContent ?? "";
+      expect(await waitUntil(() => bubbles()[0]?.dataset.delivery === "sent")).toBe(true);
+      expect(delivery()).toContain("Sent");
+      const steeredIntoRunId = steered === "kept" ? runId : null;
+      await endTheSteeredRun(runId);
+      state.thread = a2r3({ ...A2R3_CARRIED, steeredIntoRunId });
+      await act(async () => { await queryClient.invalidateQueries(); });
+      expect(await waitUntil(() => bubbles()[0]?.dataset.delivery === "carried")).toBe(true);
+      expect(bubbles()).toHaveLength(1);
+      expect(delivery()).toContain("Taken into the next turn");
+      expect(delivery()).not.toContain("Not delivered");
+      expect(delivery()).not.toMatch(/\bSent\b/);
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/carried-${steered}-${width}.txt`, `${bubbles()[0]!.outerHTML}\n`);
+      }
+      state.thread = a2r3({ ...A2R3_CARRIED_DELIVERED, steeredIntoRunId });
+      await act(async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments("PAP-1") }); });
+      expect(await waitUntil(() => bubbles()[0]?.dataset.delivery === "delivered")).toBe(true);
+      expect(delivery()).toContain("Delivered");
+      expect(delivery()).not.toContain("Not delivered");
+      expect(delivery()).not.toContain("Taken into the next turn");
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/carried-then-delivered-${steered}-${width}.txt`, `${bubbles()[0]!.outerHTML}\n`);
+      }
+    },
+    15_000,
+  );
+
+  // No client inference: the server still says 'accepted' with NO reason while the client's run lists
+  // show R ended. The bubble keeps the server's word ('Sent'), never 'Not delivered'.
+  it.each([390, 1440])(
+    "accepted + an ended run with NO server reason is NOT 'Not delivered' (no client inference) at %i",
+    async (width) => {
+      const { post, runId, state, bubbles } = await renderSteeringPlacement(width, "steer");
+      const editor = container.querySelector<HTMLTextAreaElement>('[data-testid="stand-in-editor"]')!;
+      await act(async () => {
+        editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+      });
+      const delivery = () => bubbles()[0]?.querySelector('[data-testid="task-chat-steered-delivery"]')?.textContent ?? "";
+      expect(await waitUntil(() => bubbles()[0]?.dataset.delivery === "sent")).toBe(true);
+      await endTheSteeredRun(runId);
+      await act(async () => { await queryClient.invalidateQueries(); });
+      await flushReact();
+      await flushReact();
+      expect(state.thread).toContainEqual(expect.objectContaining({ id: post.id, steeringStatus: "accepted", steeredIntoRunId: runId }));
+      expect(mockActivityApi.runsForIssue).toHaveBeenCalled();
+      expect(bubbles()).toHaveLength(1);
+      expect(bubbles()[0]!.dataset.delivery).toBe("sent");
+      expect(delivery()).toContain("Sent");
+      expect(delivery()).not.toContain("Not delivered");
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/accepted-ended-no-reason-${width}.txt`, `${bubbles()[0]!.outerHTML}\n`);
       }
     },
     15_000,
