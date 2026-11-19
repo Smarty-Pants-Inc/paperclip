@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { describeError } from "../api/errors";
 import type { IssueRelationIssueSummary, TaskInterruptionPresentation } from "@paperclipai/shared";
 import { AlertCircle } from "lucide-react";
@@ -22,17 +23,29 @@ const recoveryStepText: Record<NonNullable<TaskInterruptionPresentation["recover
  * attempt to report; a task refused before its first run just waits. */
 function budgetWaitText(presentation: TaskInterruptionPresentation) {
   const wait = "It is waiting for the budget to allow new work. Raise the budget in Costs.";
+  const saved = carriedSavedLine(presentation);
   return presentation.observedRunId || presentation.sourceRunIds.length
-    ? `Couldn’t finish this attempt. Your message is saved. ${wait}`
+    ? saved ? <>Couldn’t finish this attempt. <span data-testid="task-execution-carried">{saved}</span> {wait}</>
+      : `Couldn’t finish this attempt. Your message is saved. ${wait}`
     : `This task has not started. ${wait}`;
 }
-/** adopt-g1-naming: the failure card names the person messages the failed run carried, quoted, oldest first. */
-function CarriedMessages({ presentation }: { presentation: TaskInterruptionPresentation }) {
+const CARRIED_QUOTED = 3;
+/**
+ * adopt-naming-words: the failure card says "saved" about exactly the person messages the failed run carried and
+ * still owes (the server's carriedMessages), in the person's own words: at most three, then "and N more"; an
+ * attachment-only message reads "(attachment)". With none, the card keeps its plain "Your message is saved."
+ */
+export function carriedSavedLine(presentation: TaskInterruptionPresentation) {
   const messages = presentation.carriedMessages ?? [];
   if (!messages.length) return null;
-  return <span className="block" data-testid="task-execution-carried">Not answered yet:{" "}
-    {messages.map((message, index) => <span key={message.id}>{index ? ", " : ""}<span className="italic"
-      data-testid="task-execution-carried-message">{`“${message.quote}”`}</span></span>)}</span>;
+  const quoted = messages.slice(0, CARRIED_QUOTED)
+    .map(message => message.attachmentOnly || !message.quote ? "(attachment)" : `“${message.quote}”`).join(", ");
+  const more = messages.length > CARRIED_QUOTED ? ` and ${messages.length - CARRIED_QUOTED} more` : "";
+  return messages.length === 1 ? `Your message is saved: ${quoted}.` : `Your messages are saved: ${quoted}${more}.`;
+}
+function CarriedMessages({ presentation, as: Tag = "span" }: { presentation: TaskInterruptionPresentation; as?: "span" | "p" }) {
+  const line = carriedSavedLine(presentation);
+  return line ? <Tag className={Tag === "span" ? "block" : undefined} data-testid="task-execution-carried">{line}</Tag> : null;
 }
 const isBudgetWait = (presentation: TaskInterruptionPresentation | null | undefined) =>
   presentation?.state === "waiting_for_user" && presentation.userAction === "budget";
@@ -61,6 +74,13 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
   projectName?: string;
 }) {
   useSecondTick(presentation?.state === "retry_scheduled");
+  // adopt-naming-words: Retry sends the saved messages once. A second press on the same failed attempt does nothing
+  // new; a new attempt (or a refused send, shown as error) offers Retry again.
+  const attemptKey = `${presentation?.intentId ?? ""}:${presentation?.observedRunId ?? ""}:${presentation?.sourceRunIds.join(",") ?? ""}`;
+  const [pressedFor, setPressedFor] = useState<string | null>(null);
+  if (error && pressedFor !== null) setPressedFor(null);
+  const retryPressed = pressedFor === attemptKey;
+  const retryOnce = () => { if (retryPressed) return; setPressedFor(attemptKey); onRetry(); };
   if (presentation?.projectAccess && !optimistic && !takingLonger) return <TaskProjectAccessNotice
     access={presentation.projectAccess} issueId={issueId} agentName={agentName} projectName={projectName}
     canRetry={canRetry && presentation.canRetry} onRetry={onRetry} error={error} className={className} />;
@@ -81,9 +101,9 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
     // Saved-work recovery is what the task waits for, so name it over the
     // generic automatic-retry line while keeping the provider explanation.
     return <ProviderFailureNotice failure={presentation.providerFailure} className={className}
-      actions={canRetry && presentation.canRetry ? <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button> : undefined}>
+      actions={canRetry && presentation.canRetry ? <Button variant="outline" size="sm" onClick={retryOnce} disabled={retryPressed} data-testid="task-execution-retry">Retry</Button> : undefined}>
       {presentation.notice && <p data-testid="task-execution-notice">{presentation.notice.text}</p>}
-      {presentation.state !== "retry_scheduled" && <CarriedMessages presentation={presentation} />}
+      {presentation.state !== "retry_scheduled" && <CarriedMessages presentation={presentation} as="p" />}
       {presentation.state === "retry_scheduled" && <p>{step ? `${step}. ${retryIn}` : "Paperclip will retry automatically."}</p>}
       {isBudgetWait(presentation) && <p data-testid="task-execution-waiting">It is waiting for the budget to allow new work. Raise the budget in Costs.</p>}
     </ProviderFailureNotice>;
@@ -133,7 +153,7 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
       <div role="status" aria-label="Task status" data-testid="task-execution-waiting"
         className="flex items-center gap-3 rounded-lg bg-destructive/10 p-4 text-sm text-foreground">
         <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />
-        <span className="min-w-0 flex-1">{budgetWaitText(presentation)}<CarriedMessages presentation={presentation} /></span>
+        <span className="min-w-0 flex-1">{budgetWaitText(presentation)}</span>
       </div>
     </div>
   );
@@ -158,9 +178,12 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
             ? <>Couldn’t prepare the task folders. {presentation.workspaceFailure.message}</>
           : presentation.setupFailure
             ? <>Couldn’t set up the task workspace. {presentation.setupFailure.message}. Fix the command in the project’s workspace settings, then retry.</>
-            : "Couldn’t finish this attempt. Your message is saved."}
-          {presentation.state === "failed" && <CarriedMessages presentation={presentation} />}</span>
-        {canRetry && presentation.canRetry && <Button variant="outline" size="sm" className="shrink-0" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
+            : carriedSavedLine(presentation)
+              ? <>Couldn’t finish this attempt. <span data-testid="task-execution-carried">{carriedSavedLine(presentation)}</span></>
+              : "Couldn’t finish this attempt. Your message is saved."}
+          {presentation.state === "failed" && (presentation.notice || presentation.retryWait || presentation.workspaceFailure
+            || presentation.setupFailure) && <CarriedMessages presentation={presentation} />}</span>
+        {canRetry && presentation.canRetry && <Button variant="outline" size="sm" className="shrink-0" onClick={retryOnce} disabled={retryPressed} data-testid="task-execution-retry">Retry</Button>}
       </div>
     </div>
   );

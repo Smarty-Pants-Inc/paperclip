@@ -162,9 +162,9 @@ export interface TaskInterruptionPresentation {
   /** The visible notice that stands on this task's conversation (the same one
    * the execution blocker reads). The card shows its text, not generic text. */
   notice?: { code: string; text: string };
-  /** The person messages the failed run itself carried and that are still unanswered, quoted short, oldest
-   * first. The failure card names them at the failure (the late sweep posts no card once the chat moved on). */
-  carriedMessages?: { id: string; quote: string }[];
+  /** The person messages the failed run itself carried and that are still unanswered (kept and owed), the
+   * person's own text cut at about 60 characters, oldest first; an attachment-only message has attachmentOnly. The failure card names them at the failure (the late sweep posts no card once the chat moved on). */
+  carriedMessages?: { id: string; quote: string; attachmentOnly?: true }[];
   intentId: string | null;
   responsibility: "system" | "user";
   state: "working" | "retry_scheduled" | "failed" | "waiting_for_user" | "resolved";

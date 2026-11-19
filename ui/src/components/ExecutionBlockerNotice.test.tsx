@@ -221,32 +221,63 @@ describe("ordinary task interruption", () => {
 describe("the failure card names the messages the failed run carried", () => {
   let root: Root;
   let container: HTMLDivElement;
-  beforeEach(() => { container = document.createElement("div"); document.body.append(container); root = createRoot(container); });
+  const retry = vi.fn();
+  beforeEach(() => { retry.mockReset(); container = document.createElement("div"); document.body.append(container); root = createRoot(container); });
   afterEach(async () => { await act(async () => root.unmount()); container.remove(); });
   const render = async (presentation: TaskInterruptionPresentation) =>
-    act(async () => root.render(<ExecutionBlockerNotice presentation={presentation} canRetry onRetry={() => {}} />));
-  const carriedMessages = [{ id: "m1", quote: "Please rename the export" }, { id: "m2", quote: "Also add a total row…" }];
-  const quotes = () => [...container.querySelectorAll('[data-testid="task-execution-carried-message"]')].map(node => node.textContent);
+    act(async () => root.render(<ExecutionBlockerNotice presentation={presentation} canRetry onRetry={retry} />));
+  const m = (id: string, quote: string) => ({ id, quote });
+  const carriedMessages = [m("m1", "Please rename the export"), m("m2", "Also add a total row…")];
+  const line = () => container.querySelector('[data-testid="task-execution-carried"]')?.textContent ?? null;
+  const providerFailure = { schema: "paperclip.provider-failure.v1" as const, provider: "openai", phase: "startup" as const,
+    category: "overloaded" as const, retryability: "transient" as const, message: "Provider overloaded" };
 
-  it("a run carrying M1+M2 failed => the card quotes M1, M2 in order, with its Retry", async () => {
+  // adopt-naming-words: the person's own words; "saved" is said once, about exactly these messages.
+  it("two messages => 'Couldn’t finish this attempt. Your messages are saved: “M1”, “M2”.' + one Retry", async () => {
     await render({ ...failed, carriedMessages });
-    expect(container.textContent).toContain("Couldn’t finish this attempt. Your message is saved.");
-    expect(quotes()).toEqual(["“Please rename the export”", "“Also add a total row…”"]);
-    expect(container.querySelector('[data-testid="task-execution-carried"]')?.textContent).toContain("Not answered yet:");
-    expect(container.querySelector('[data-testid="task-execution-retry"]')?.textContent).toBe("Retry");
+    expect(container.textContent).toBe("Couldn’t finish this attempt. Your messages are saved: “Please rename the export”, “Also add a total row…”.Retry");
+    expect(container.textContent).not.toContain("Not answered yet");
+    expect(container.textContent!.match(/saved/g)).toHaveLength(1);
+  });
+  it("one message => 'Your message is saved: “M1”.'", async () => {
+    await render({ ...failed, carriedMessages: [carriedMessages[0]!] });
+    expect(container.textContent).toBe("Couldn’t finish this attempt. Your message is saved: “Please rename the export”.Retry");
+  });
+  it("four messages => the first three quoted, then 'and 1 more'", async () => {
+    await render({ ...failed, carriedMessages: [m("a", "One"), m("b", "Two"), m("c", "Three"), m("d", "Four")] });
+    expect(container.textContent).toBe("Couldn’t finish this attempt. Your messages are saved: “One”, “Two”, “Three” and 1 more.Retry");
+    expect(container.textContent).not.toContain("Four");
+  });
+  it("an attachment-only message shows (attachment), not an empty quote", async () => {
+    await render({ ...failed, carriedMessages: [{ id: "a", quote: "", attachmentOnly: true }] });
+    expect(container.textContent).toBe("Couldn’t finish this attempt. Your message is saved: (attachment).Retry");
+    await render({ ...failed, carriedMessages: [m("a", "See the file"), { id: "b", quote: "", attachmentOnly: true }] });
+    expect(line()).toBe("Your messages are saved: “See the file”, (attachment).");
+  });
+  it("Retry sends once; a second press does nothing new", async () => {
+    await render({ ...failed, carriedMessages });
+    const button = container.querySelector<HTMLButtonElement>('[data-testid="task-execution-retry"]')!;
+    await act(async () => button.click());
+    await act(async () => button.click());
+    expect(retry).toHaveBeenCalledOnce();
   });
   it("the provider-failure card that replaces it names them too", async () => {
-    const providerFailure = { schema: "paperclip.provider-failure.v1" as const, provider: "openai", phase: "startup" as const,
-      category: "overloaded" as const, retryability: "transient" as const, message: "Provider overloaded" };
     await render({ ...failed, providerFailure, carriedMessages });
     expect(container.textContent).toContain("Provider overloaded");
-    expect(quotes()).toEqual(["“Please rename the export”", "“Also add a total row…”"]);
+    expect(line()).toBe("Your messages are saved: “Please rename the export”, “Also add a total row…”.");
+  });
+  it("the budget hold card names them in its one saved sentence", async () => {
+    await render({ ...failed, state: "waiting_for_user", userAction: "budget", canRetry: false, carriedMessages });
+    expect(container.textContent).toBe("Couldn’t finish this attempt. Your messages are saved: “Please rename the export”, “Also add a total row…”. "
+      + "It is waiting for the budget to allow new work. Raise the budget in Costs.");
   });
   it("a failed run carrying nothing person-authored => card unchanged", async () => {
     await render(failed);
-    expect(container.querySelector('[data-testid="task-execution-carried"]')).toBeNull();
+    expect(line()).toBeNull();
     await render({ ...failed, carriedMessages: [] });
-    expect(container.querySelector('[data-testid="task-execution-carried"]')).toBeNull();
+    expect(line()).toBeNull();
     expect(container.textContent).toBe("Couldn’t finish this attempt. Your message is saved.Retry");
+    await render({ ...failed, state: "waiting_for_user", userAction: "budget", canRetry: false });
+    expect(container.textContent).toBe("Couldn’t finish this attempt. Your message is saved. It is waiting for the budget to allow new work. Raise the budget in Costs.");
   });
 });
