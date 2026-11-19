@@ -4,6 +4,9 @@ import { describe, expect, it, vi } from "vitest";
 import type { StorageProvider } from "../storage/types.js";
 import { ObjectJournalBusyError } from "./object-byte-journal.js";
 import { createObjectRunLogStore } from "./object-run-log-store.js";
+import { logger } from "../middleware/logger.js";
+
+vi.mock("../middleware/logger.js", () => ({ logger: { warn: vi.fn() } }));
 
 async function readBody(body: AsyncIterable<Uint8Array>) {
   const chunks: Buffer[] = [];
@@ -64,6 +67,58 @@ const event = (seq: number) => ({
 });
 
 describe("S3 run log store", () => {
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21269 (row 8)
+  // Keep reason: trace custody; a digest outage must not discard immutable log bytes.
+  it.each(["transient", "persistent"] as const)("finalize digest visibility failure: %s", async mode => {
+    const m = memory(), runId = `finalize-${mode}`;
+    const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", flushMs: 1,
+      assertWriterAuthority: async () => undefined });
+    const handle = await store.begin({ ...input, runId });
+    await store.append(handle, { ...event(1), chunk: "private-run-log-content" });
+    const payload = [...m.objects].find(([key]) => key.includes("/objects/"))!;
+    const retained = new Map([...m.objects].filter(([key]) => key.includes("/objects/")));
+    const get = m.provider.getObject.bind(m.provider);
+    let failures = 0;
+    // Named seam injection: immutable payload GET is briefly invisible after PUT.
+    const digestVisibilityFailure = Object.assign(new Error("private-run-log-content"), {
+      name: "NoSuchKey", $metadata: { httpStatusCode: 404 },
+      responseBody: "private-run-log-content",
+    });
+    m.provider.getObject = async value => {
+      if (value.objectKey === payload[0] && (mode === "persistent" || failures === 0)) {
+        failures++;
+        throw digestVisibilityFailure;
+      }
+      return get(value);
+    };
+    const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    vi.mocked(logger.warn).mockClear();
+    try {
+      const summary = await store.finalize(handle);
+      const diagnostics = vi.mocked(logger.warn).mock.calls;
+      console.info("finalize-visibility-row", JSON.stringify({ mode, runId, summary, failures,
+        incomplete: warning.mock.calls.length, diagnostics }));
+      // Neither retry nor persistent failure may delete/truncate any payload or index.
+      expect(new Map([...m.objects].filter(([key]) => key.includes("/objects/")))).toEqual(retained);
+      expect(diagnostics).toEqual(expect.arrayContaining([
+        [expect.objectContaining({ runId, step: "digest", attempt: 1, maxAttempts: 3,
+          err: expect.objectContaining({ name: "NoSuchKey", statusCode: 404 }) }), expect.any(String)],
+      ]));
+      expect(JSON.stringify(diagnostics)).not.toContain("private-run-log-content");
+      if (mode === "transient") {
+        expect(summary).toEqual({ bytes: payload[1].length,
+          sha256: createHash("sha256").update(payload[1]).digest("hex"), compressed: false });
+        expect(warning).not.toHaveBeenCalled();
+      } else {
+        expect(summary).toEqual({ bytes: null, sha256: null, compressed: false });
+        expect(failures).toBe(3);
+        expect(warning).toHaveBeenCalledWith(expect.stringContaining("persistence is incomplete"));
+      }
+      m.provider.getObject = get;
+      expect((await store.read(handle)).content).toBe(payload[1].toString());
+    } finally { warning.mockRestore(); m.provider.getObject = get; }
+  });
+
   it("awaits a successor flush started by another drain waiter before finalizing", async () => {
     const m = memory(), store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", flushMs: 1000,
       segmentBytes: 1024, assertWriterAuthority: async () => undefined });
