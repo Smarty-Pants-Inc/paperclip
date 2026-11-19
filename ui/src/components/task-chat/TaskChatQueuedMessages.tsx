@@ -551,17 +551,17 @@ export function TaskChatQueuedMessages({
     }
   }
 
-  // A chat message held in the outbox (for example by the agent's daily
-  // limit) has no receipt or run whose task status could explain the wait,
-  // so the queue says why it waits. Receipt-backed waits keep the task status.
-  const statusMessage = deferredStatus?.message
-    ?? (queue.state === "deferred" && !queue.queueId && !queue.targetRunId && entries.length > 0
-      ? queue.executionWait?.message ?? null : null);
-
   // Stop means stop (org 11-17): after a person's Stop the chat's waiting
   // messages are not sent until the person sends them (or deletes some first).
   const stoppedByPerson = queue.executionWait?.reason === CHAT_STOPPED_BY_PERSON_REASON &&
     Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0 && Boolean(onInterrupt);
+
+  // SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119: no run means no turn header.
+  // Both task and chat name the stored wait here, including receipt-backed
+  // input. The existing Stop line owns its state; a queued RUN owns its header.
+  const statusMessage = stoppedByPerson ? null : deferredStatus?.message
+    ?? (queue.state === "deferred" && !queue.targetRunId && entries.length > 0 && !isQueuedInterruptHandoff(queue)
+      ? queue.executionWait?.message ?? null : null);
 
   if (entries.length === 0 && !visibleError && !statusMessage) return null;
 

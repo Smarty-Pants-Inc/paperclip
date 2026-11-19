@@ -66,12 +66,6 @@ const OVERDUE_NATIVE_RETRY_MS = 5 * 60_000;
 export const UNANSWERED_MESSAGE_NO_REPLY_CODE = "no_reply";
 export const UNANSWERED_MESSAGE_NO_RUN_CODE = "no_run";
 export const UNANSWERED_MESSAGE_UNCLASSIFIED_CODE = "unclassified_failure";
-/** While the run that carries the message is queued and has not started, the
- * turn header says "Waiting to start" (Paperclip's useWaitingToStart, #21447;
- * DESIGN.md: a queued turn's hold is named once, in the turn header), so B'
- * posts no note of its own. A carrying run that still has not started by
- * T0 + this bound gets ONE no-run note, which its answer supersedes. */
-export const PENDING_WAIT_START_BOUND_MS = 10 * 60_000;
 /** The non-failure marker row of a waiting-kind note (no "Failure code" row).
  * A legacy "waiting to start" note (Waiting code waiting_to_start) still
  * carries it and is replaced in place by the no-run text at the bound. */
@@ -481,7 +475,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
       runId: latest.id, ancestorRunId: messageRun.id }) ? latest : messageRun;
 
-  // Every wait for a further attempt is BOUNDED, except a turn in progress:
+  // Unrepresented further attempts are BOUNDED. A live turn's header and a
+  // stored executionWait already name their wait; neither gets a second note:
   // T0 is recorded ONCE (durably, PENDING_WAIT_ACTION, keyed by the message
   // and its carrying run, messageRun; a refused successor below never
   // restarts it) the first time this step defers to such an attempt,
@@ -511,18 +506,11 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       ...(waitT0 === null ? { recordWait: setupWaitRecord ?? { messageId: message.id, runId: messageRun?.id ?? null } } : {}) };
   };
 
-  // Only a turn IN PROGRESS keeps an unbounded wait (a quiet healthy turn is
-  // never noticed): a run that is RUNNING on this task, carrying the message
-  // or not (a person's message that arrives during a long turn waits for that
-  // turn to end, when its deferred wake is promoted). A hung running run is
-  // still caught by Paperclip's silent active-run watchdog
-  // (modules/active-run-watchdog/application/use-cases.ts:332
-  // scanSilentActiveRuns; doc/execution-semantics.md §12). A QUEUED or
-  // scheduled run, carrying the message or not, is bounded: one that is never
-  // claimed (the agent's slots are full, or its claim is refused) must not keep
-  // the person silent. When the run that waits carries the message, the turn
-  // header already says it is waiting to start (useWaitingToStart): no note
-  // until PENDING_WAIT_START_BOUND_MS, then the no-run note.
+  // A running turn remains quiet; its watchdog owns a hung execution. A
+  // queued run carrying M (including a proven output-cap successor) already
+  // has upstream's runner-turn header: "Waiting for <agent>" or "Waiting to
+  // start". SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119: no second note, including
+  // beyond the former ten-minute boundary and while the agent is paused.
   const live = runs.filter(candidate => LIVE.includes(candidate.status));
   const [otherLive] = live.length ? [] : await q.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
     contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
@@ -531,6 +519,13 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const liveRuns = otherLive ? [...live, otherLive] : live;
   if (liveRuns.some(candidate => candidate.status === "running")) {
     return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+  }
+  for (const candidate of liveRuns) {
+    if (runCarriesMessage(candidate.contextSnapshot, message.id) || (messageRun && candidate.id !== messageRun.id
+      && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
+        runId: candidate.id, ancestorRunId: messageRun.id, includeAnswerLineage: true }))) {
+      return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+    }
   }
   // The agent is paused (Paperclip's lifecycle: status paused, lifecycle state
   // paused/pausing, or a lifecycle hold such as "manual"): nothing runs until
@@ -563,40 +558,20 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   if (agentPaused && agentRow?.pauseReason === "import" && (agentRow.lifecycleHolds ?? []).every(hold => hold === "import")) {
     return { kind: "none" };
   }
-  if (agentPaused) {
-    const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
-    if (due > now.getTime()) return { kind: "pending", recheckAt: due };
-    if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE) {
-      return { kind: "pending", recheckAt: now.getTime() + 5 * 60_000 };
-    }
-  }
-  let waitingToStart = false;
-  let continuationWaiting = false;
   if (liveRuns.length && !agentPaused && !settingUp) {
     const wait = await bounded(now.getTime() + 30_000);
     if (wait) return wait;
-    for (const candidate of liveRuns) {
-      // A queued successor (including an output-cap continuation) is still
-      // this message's attempt even when its context no longer copies m.
-      // Keep the ordinary start bound, but a proven successor is waiting
-      // work, not a reason to resend its predecessor's input.
-      const descendant = Boolean(messageRun && candidate.id !== messageRun.id
-        && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
-          runId: candidate.id, ancestorRunId: messageRun.id, includeAnswerLineage: true }));
-      if (runCarriesMessage(candidate.contextSnapshot, message.id) || descendant) waitingToStart = true;
-      if (descendant) { continuationWaiting = true; break; }
-    }
   }
 
-  // A board-owned hold means nothing moves by itself: queued wakes behind it
-  // do not count as a further attempt.
+  // A board-owned hold means queued wakes alone are not a further attempt.
+  // A stored executionWait still owns this message's one visible wait line.
   const [activeRecovery] = await q.select({ id: issueRecoveryActions.id, nextAction: issueRecoveryActions.nextAction,
     ownerType: issueRecoveryActions.ownerType, wakePolicy: issueRecoveryActions.wakePolicy }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
     inArray(issueRecoveryActions.status, ["active", "escalated"])))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
   const boardHold = activeRecovery?.ownerType === "board" ? activeRecovery : null;
-  if (!boardHold && !agentPaused && !settingUp) {
+  if (!settingUp) {
     const wakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status })
       .from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
@@ -608,12 +583,19 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     const pendingExecutionWait = wakes.some(wake => ["deferred", "deferred_issue_execution"].includes(wake.status)
       && isWellFormedExecutionWait(wake.payload?.executionWait)
       && wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
-    if (pendingExecutionWait || wakes.some(wake => wake.status !== "deferred" && wakeCarriesIssue(wake.payload, issue.id))) {
+    // tB2 523dfe75:613-623 predicate only; do not port its waiting note.
+    // This message's deferred receipt already has one visible panel line.
+    if (pendingExecutionWait) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+    if (!boardHold && !agentPaused && wakes.some(wake => wake.status !== "deferred" && wakeCarriesIssue(wake.payload, issue.id))) {
       const wait = await bounded(now.getTime() + 30_000);
       if (wait) return wait;
-      // After the short pending grace, use the existing waiting note and its
-      // start bound below instead of telling the person to duplicate input.
-      if (pendingExecutionWait) waitingToStart = true;
+    }
+  }
+  if (agentPaused) {
+    const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
+    if (due > now.getTime()) return { kind: "pending", recheckAt: due };
+    if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE) {
+      return { kind: "pending", recheckAt: now.getTime() + 5 * 60_000 };
     }
   }
 
@@ -622,16 +604,6 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     code = UNANSWERED_MESSAGE_AGENT_SETUP_CODE;
   } else if (agentPaused) {
     code = UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
-  } else if (waitingToStart) {
-    // The turn header says "Waiting to start" until T0 + PENDING_WAIT_START_BOUND_MS;
-    // after that the carrying run has not started (a dead claim, a stuck
-    // queue): one no-run note. A known queued continuation of the message's
-    // run keeps the header (pending) until it starts or terminates: asking
-    // for duplicate input while it remains pending is false.
-    if (continuationWaiting) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
-    const startDeadline = (waitT0 ?? now.getTime()) + PENDING_WAIT_START_BOUND_MS;
-    if (startDeadline > now.getTime()) return { kind: "pending", recheckAt: startDeadline };
-    code = UNANSWERED_MESSAGE_NO_RUN_CODE;
   } else if (!run) {
     // Paperclip records a deferred or coalesced wake that could not start as
     // FAILED: that is the trigger. The grace covers a wake that threw before
