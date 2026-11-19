@@ -1920,13 +1920,8 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
         const responseBoundary = sourceHasNativeResponse
           ? " after returning a final response"
           : "";
-        // A person's Stop: the unfinished reply is not carried into the next
-        // message (Pi drops the aborted assistant message). It claims nothing
-        // about finished steps: one not saved to the host is not carried (RFL 06:40Z).
         const detail =
-          source.status === "cancelled" && meta?.resultJson?.cancelledByActorType === "user"
-            ? "Stopped. The unfinished reply isn't sent to the agent with your next message."
-            : source.status === "cancelled"
+          source.status === "cancelled"
             ? `The run was cancelled${responseBoundary}.`
             : source.status === "interrupted"
               ? `The run was interrupted${responseBoundary}.`
