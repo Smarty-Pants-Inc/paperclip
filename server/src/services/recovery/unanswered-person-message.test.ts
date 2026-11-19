@@ -798,6 +798,48 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       "no unanswered notice was ever written").toHaveLength(0);
   });
 
+  // merged9 item 1, the second hop by the two producers that really follow a FAILED native-status successor on the
+  // main path (its own second schedule_retry is refused there: native-run-finalizer.ts:1875
+  // failedTurnContinuationUsed -> status-arbiter.ts:452-462 blocks the task for a person):
+  //   - "fresh-session lane": the WHOLE real producer, materializeNativeToolReceiptLimitContinuation (status-arbiter.ts
+  //     :411-423 comes before :452), which writes the retry run and its wake from the carry over hop 1;
+  //   - "retry seed": the one carry every Retry / recovery seed spreads (fixture retryContinuation: heartbeat/retries.ts
+  //     :783, recovery/service.ts:2247), which names M as the new attempt's wake comment (a fresh attempt: M is sent
+  //     to it once, as its wake comment).
+  // Hop 1 names M ONLY in the attribution fields (built by nativeContinuationAttributionContext); the carry must read them.
+  it.each(["fresh-session lane", "retry seed"] as const)("merged9 two-hop carry: a failed native-status successor, then the real %s over it -> the reply answers M, 0 notices", async producer => {
+    const f = await fixture();
+    const commentId = await f.message("What about my follow-up?");
+    const failed = await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "native_workspace_required" });
+    const hop1 = await f.nativeSuccessor(failed, "failed", { fromProducer: true });
+    await db.update(heartbeatRuns).set({ errorCode: "semantic_tool_turn_receipt_limit", error: "tool receipt limit" }).where(eq(heartbeatRuns.id, hop1));
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, hop1)))[0]!.contextSnapshot, "hop 1 names M for attribution only")
+      .toMatchObject({ attributionCommentIds: [commentId], conversationReplyBoundaryCommentId: commentId });
+    let hop2: string;
+    if (producer === "fresh-session lane") {
+      hop2 = await db.transaction(tx => materializeNativeToolReceiptLimitContinuation({ tx: tx as unknown as typeof db,
+        companyId: f.companyId, issueId: f.issueId, runId: hop1, agentId: f.agentId }));
+      await db.update(heartbeatRuns).set({ status: "succeeded", error: null, errorCode: null, createdAt: f.at(), startedAt: f.at(),
+        finishedAt: f.at() }).where(eq(heartbeatRuns.id, hop2));
+      await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.runId, hop2));
+    } else hop2 = await f.retryContinuation(hop1);
+    const context = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, hop2)))[0]!.contextSnapshot as Record<string, unknown>;
+    if (producer === "fresh-session lane") {
+      expect(context.attributionCommentIds, "hop 2 (the real lane) still names M, for attribution only").toEqual([commentId]);
+      expect(["wakeCommentId", "wakeCommentIds", "commentId", "commentIds", "firstTurnQueuedInput", "conversationReplyBoundaryCommentId",
+        "paperclipWake"].filter(key => key in context), "nothing in the lane's context sends M to the model again").toEqual([]);
+    } else {
+      expect(context, "hop 2 (the retry seed) takes M as its one wake comment").toMatchObject({ wakeCommentIds: [commentId], wakeCommentId: commentId });
+      expect("attributionCommentIds" in context || Boolean(context.firstTurnQueuedInput), "named once: not also for attribution, no first-turn receipt").toBe(false);
+    }
+    await f.reply(hop2);
+    for (let pass = 0; pass < 2; pass++) {
+      expect(await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId })).toEqual({ kind: "answered" });
+      expect(await f.visible(), "no notice beside a visible answer").toHaveLength(0);
+    }
+    expect(await readContinuationCommentInput(db, { ...f, runId: hop1 }), "answered: never carried again").toEqual({});
+  });
+
   it("RFL F4: an unrelated timer run's success is not evidence; the message's own path gives exactly one notice", async () => {
     const f = await fixture();
     await f.message();
