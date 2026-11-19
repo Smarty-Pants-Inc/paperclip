@@ -408,6 +408,11 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const carriers = await carriersOf(chat, response.body.id);
     expect(carriers.wakes.length + carriers.runs.length).toBe(1);
     expect(await answered(response.body.id)).toBe(false);
+    expect(response.body).toMatchObject({ deliveryOutcome: "queued", steeringUnavailableReason: expect.any(String) });
+    const thread = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/comments`).expect(200);
+    expect(thread.body.find((comment: any) => comment.id === response.body.id)).toMatchObject({
+      deliveryOutcome: "queued", steeringUnavailableReason: expect.any(String),
+    });
   });
 
   it("S-c accepted-then-ended: an unread default steer is restored exactly once at run end", async () => {
@@ -438,6 +443,117 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     expect(await answered(response.body.id)).toBe(false);
     const queue = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200);
     expect(queue.body.entries.map((entry: any) => entry.comment.id)).toContain(response.body.id);
+  });
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21272
+  it.each([false, true])("S-j/S-x: ordered Pi ingestion delayed past agent_end holds the steer, then answers once (past bound=%s)", async pastBound => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const root = await mkdtemp(join(tmpdir(), "chat-pi-late-ingestion-"));
+    const peer = await openPiSteeringPeer(root, chat.runId);
+    let resume!: () => void;
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    let readPaused = false, reads = 0, terminal = false;
+    let pumpError: unknown;
+    let port: PaperclipControlPlanePort | undefined;
+    const pump = (async () => {
+      for await (const event of peer.session.events()) {
+        port ??= new PaperclipControlPlanePort(db, { companyId: chat.companyId, issueId: chat.issue.id,
+          runId: chat.runId, agentId: chat.agentId, sessionId: event.normalizedSessionId,
+          completionContractId: randomUUID(), completionContractSha256: `sha256:${"a".repeat(64)}`,
+          sourceInstanceId: event.sourceInstanceId, controlPlaneSourceInstanceId: event.sourceInstanceId });
+        if (event.eventType === "item.started" && event.payload.kind === "userMessage" && ++reads === 2) {
+          readPaused = true; await gate; // Delay the whole ordered suffix, NEVER reorder it.
+        }
+        await port.appendEvent(event);
+        if (event.eventType === "turn.completed") terminal = true;
+      }
+    })().catch(error => { pumpError = error; });
+    try {
+      const { turnId } = await peer.session.startTurn({ message: { role: "user", text: chat.first.body } });
+      await vi.waitFor(() => expect(reads).toBe(1));
+      mocks.probe.mockResolvedValue({ disposition: "available", activeTurnId: turnId });
+      mocks.steer.mockImplementation(async (input: { message: string; correlationId: string }) => {
+        await peer.session.steer!({ turnId, message: { role: "user", text: input.message }, correlationId: input.correlationId });
+        return { turnId };
+      });
+      const response = await postDefault(chat, "Read before agent_end, ingested afterwards").expect(201);
+      peer.releaseBoundary(true); peer.endTurn(); // Producer has ended while its read is still held.
+      await vi.waitFor(() => expect(readPaused).toBe(true));
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, chat.runId));
+      const release = releaseRun(chat);
+      if (pastBound) {
+        await release; // Beyond the named wait bound: keep original custody, no wake/successor.
+        const carriers = await carriersOf(chat, response.body.id);
+        expect(carriers.wakes.length + carriers.runs.length, "a restored carrier would answer M twice").toBe(0);
+        const [held] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+        expect((held!.contextSnapshot as any).steeredCommentIds).toContain(response.body.id);
+      }
+      resume();
+      await vi.waitFor(() => { if (pumpError) throw pumpError; expect(terminal).toBe(true); }, { timeout: 5000 });
+      await release; await releaseRun(chat);
+      expect(await answered(response.body.id)).toBe(true);
+      const carriers = await carriersOf(chat, response.body.id);
+      expect(carriers.wakes.length + carriers.runs.length, "M must have no second-answer carrier").toBe(0);
+      const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+      expect((ended!.resultJson as any).restoredSteeredCommentIds ?? []).not.toContain(response.body.id);
+    } finally { resume(); await peer.close(); await pump; await rm(root, { recursive: true, force: true }); }
+  }, 20_000);
+
+  it("S-j no terminal: a closed crashed stream carries only what its ingested facts leave unanswered, once", async () => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const response = await postDefault(chat, "Read and answer both lost on crash").expect(201);
+    // No provider terminal and no read/text survived. Recovery's true failed line owns the run.
+    await runLog(chat, [
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
+      { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${response.body.id}` },
+    ]);
+    await finishTurn(chat, { status: "failed", log: false });
+    await releaseRun(chat);
+    const carriers = await carriersOf(chat, response.body.id);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+    expect(await answered(response.body.id)).toBe(false);
+  });
+
+  it.each(["interrupt-first", "release-first", "concurrent"] as const)("S-d2: unread steers are carried once under the release lock (%s)", async order => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const sent = [];
+    for (const text of ["read and answered", "unread first", "unread second"]) sent.push((await postDefault(chat, text).expect(201)).body);
+    await runLog(chat, [
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
+      { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${sent[0].id}` },
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:read" },
+      { eventType: "item.started", kind: "agentMessage", itemId: "turn-1:reply" },
+      { eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:reply", text: "answered" },
+      ...sent.slice(1).map(message => ({ eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${message.id}` })),
+    ]);
+    const { recordSteeredMessageEvidence } = await import("../services/native-runtime/steered-message-answers.js");
+    await recordSteeredMessageEvidence(db, { companyId: chat.companyId, runId: chat.runId });
+    const reader = await import("../services/native-runtime/unread-steered-messages.js");
+    expect(reader).toHaveProperty("readUnreadSteeredForInterrupt");
+    const take = () => db.transaction(async tx => {
+      const ids = await (reader as any).readUnreadSteeredForInterrupt(tx, { issueId: chat.issue.id, runId: chat.runId });
+      if (ids.length) await tx.insert(heartbeatRuns).values({ companyId: chat.companyId, agentId: chat.agentId,
+        status: "queued", contextSnapshot: { issueId: chat.issue.id, wakeCommentIds: ids } });
+      return ids;
+    });
+    // A person's Stop keeps restored wakes held; no background successor obscures the DB race.
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(),
+      resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || '{"cancelledByActorType":"user"}'::jsonb` })
+      .where(eq(heartbeatRuns.id, chat.runId));
+    let taken: string[];
+    if (order === "interrupt-first") { taken = await take(); await releaseRun(chat); }
+    else if (order === "release-first") { await releaseRun(chat); taken = await take(); }
+    else [taken] = await Promise.all([take(), releaseRun(chat)]);
+    if (order === "interrupt-first") expect(taken).toEqual(sent.slice(1).map(message => message.id));
+    if (order === "release-first") expect(taken).toEqual([]);
+    expect(await take()).toEqual([]);
+    for (const message of sent.slice(1)) {
+      const carriers = await carriersOf(chat, message.id);
+      expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+    }
+    const answeredCarriers = await carriersOf(chat, sent[0].id);
+    expect(answeredCarriers.wakes.length + answeredCarriers.runs.length).toBe(0);
+    expect(await answered(sent[0].id)).toBe(true);
   });
 
   it("S-f: explicit Queue never calls steer even on an attached Pi turn", async () => {
