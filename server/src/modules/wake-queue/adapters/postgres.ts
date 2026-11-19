@@ -10,7 +10,7 @@ import { notifyUnsafeWorkspaceExportRecovery } from "../../../services/unsafe-wo
 import { notifyChatInboundWakeNotices } from "../../../services/chat-inbound-wake-notice-notifications.js";
 import { notifyChatRunMilestones } from "../../../services/chat-run-milestone-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-work-notifications.js";
-import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
+import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop, readPersonStopHold } from "../../../services/acknowledged-native-stop.js";
 import { readRunCancellation } from "../../../services/run-cancellation.js";
 import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
@@ -267,6 +267,10 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       const invokability = await evaluateAgentInvokabilityFromDb(tx, agent);
       return { id: agent.id, companyId: agent.companyId, name: agent.name, invokable: invokability.invokable,
         paused: !invokability.invokable && invokability.reason === "paused" };
+    },
+
+    async isHeldByPersonStop({ companyId, issueId, agentId, wakeId }) {
+      return Boolean(await readPersonStopHold(tx, { companyId, issueId, agentId, wakeId }));
     },
 
     async findNextDeferredWake({ companyId, issueId, excludedWakeIds }) {

@@ -1,3 +1,4 @@
+import { readPersonStopHold } from "./acknowledged-native-stop.js";
 import { notifyStrandedAgentStatus } from "./live-run-recovery-notifications.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
@@ -1331,10 +1332,20 @@ export function issueTreeControlService(db: Db) {
     if (issueIds.length === 0) return [];
     const now = new Date();
     return db.transaction(async tx => {
-      const affected = await tx.select({ agentId: agentWakeupRequests.agentId }).from(agentWakeupRequests).where(and(
+      const unclaimed = await tx.select({ id: agentWakeupRequests.id, agentId: agentWakeupRequests.agentId, status: agentWakeupRequests.status,
+        issueId: sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'` }).from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, companyId), inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
         isNull(agentWakeupRequests.runId), inArray(sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'`, issueIds),
       )).for("update");
+      // Stop means stop: messages a person's Stop holds stay saved for that
+      // person's Send or next message. The pause has nothing to cancel there.
+      const heldWakeIds = new Set<string>();
+      for (const key of new Set(unclaimed.filter(wake => wake.status === "deferred_issue_execution" && wake.issueId)
+        .map(wake => `${wake.issueId}:${wake.agentId}`))) {
+        const [issueId, agentId] = key.split(":") as [string, string];
+        for (const id of (await readPersonStopHold(tx as unknown as Db, { companyId, issueId, agentId }))?.wakeIds ?? []) heldWakeIds.add(id);
+      }
+      const affected = unclaimed.filter(wake => !heldWakeIds.has(wake.id));
       for (const agentId of new Set(affected.map(wake => wake.agentId))) await notifyStrandedAgentStatus(tx, { companyId, agentId });
       await notifyChatInboundWakeNotices(tx, { companyId });
       return tx
@@ -1351,6 +1362,7 @@ export function issueTreeControlService(db: Db) {
             inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
             isNull(agentWakeupRequests.runId),
             inArray(sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'`, issueIds),
+            heldWakeIds.size ? notInArray(agentWakeupRequests.id, [...heldWakeIds]) : undefined,
           ),
         )
         .returning({

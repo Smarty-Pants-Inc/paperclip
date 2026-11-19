@@ -172,6 +172,15 @@ async function runReleaseDrain(
     }
     processedWakeIds.add(candidate.id);
 
+    // Stop means stop: messages a person's Stop holds wait for that person's
+    // Send or next typed message. No release, Resume or later run promotes them.
+    if (await ports.transaction.isHeldByPersonStop({
+      companyId: run.companyId, issueId: issue.id, agentId: candidate.agentId, wakeId: candidate.id,
+    })) {
+      preservedWakeIds.push(candidate.id);
+      continue;
+    }
+
     if (locked.handoffAssigneeAgentId && candidate.agentId !== locked.handoffAssigneeAgentId) {
       preservedWakeIds.push(candidate.id);
       continue;
