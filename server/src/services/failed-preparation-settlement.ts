@@ -1,4 +1,5 @@
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, not, sql } from "drizzle-orm";
+import { seqPastStopAcceptance, stopAcceptanceEventSql } from "./heartbeat-run-events.js";
 import { heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { isUuidLike } from "@paperclipai/shared";
 
@@ -8,9 +9,9 @@ export async function readFailedPreparationSettlement(db: Db, source: Source, al
   unsupportedHarnessWarning: { message: string | null; revision: string } | null;
 } | null> {
   if (typeof source.error !== "string" || !source.error.length) return null;
-  const events = await db.select().from(heartbeatRunEvents).where(and(
-    eq(heartbeatRunEvents.companyId, source.companyId), eq(heartbeatRunEvents.runId, source.id),
-  )).orderBy(asc(heartbeatRunEvents.seq)).limit(allowRunStarted ? 7 : 6);
+  const events = await seqPastStopAcceptance(db, source.companyId, source.id, await db.select().from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.companyId, source.companyId), eq(heartbeatRunEvents.runId, source.id), not(stopAcceptanceEventSql()),
+  )).orderBy(asc(heartbeatRunEvents.seq)).limit(allowRunStarted ? 7 : 6));
   const hostEvent = (event: typeof heartbeatRunEvents.$inferSelect) => event.agentId === source.agentId
     && event.stream === "system" && event.sourceInstanceId === null && event.sourceEventId === null
     && event.sourceSeq === null && event.sourcePayloadSha256 === null && event.protocolSchemaVersion === null;
