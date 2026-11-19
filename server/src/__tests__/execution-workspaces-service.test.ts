@@ -1516,6 +1516,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
           const full = path.join(directory, entry.name);
           if (entry.isDirectory()) await visit(full);
+          else if (entry.isSymbolicLink()) files.set(path.relative(root, full), `symlink:${await fs.readlink(full)}`);
           else files.set(path.relative(root, full),
             createHash("sha256").update(await fs.readFile(full)).digest("hex"));
         }
@@ -1616,16 +1617,196 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect(row?.cleanupReason).toContain("raw traces");
     }, 30_000);
 
-    it("R3c (control): an owned worktree instance with a non-empty embedded DB that never recorded a run is reaped as today", async () => {
+    // The flipped rule (rf-3, 2c): remove an instance ONLY when it is proven
+    // never to have recorded a run. A non-empty db/ without the marker cannot
+    // prove that (the marker write may have failed), so it is kept.
+    it("R3c (never-OK, fail closed): an owned worktree instance with a non-empty embedded DB and no run marker is kept", async () => {
       const seeded = await seedPastCooldown();
       const instance = await attachManagedWorktreeInstance(seeded);
       await fs.writeFile(path.join(instance.instanceRoot, "db", "PG_VERSION"), "17\n", "utf8");
+      const before = await readTree(instance.instanceRoot);
 
       const sweep = await withEnv({ PAPERCLIP_WORKTREES_DIR: instance.worktreesDir }, () =>
         cooldownService(1).sweepTerminalWorkspaces());
 
       expect(sweep).toMatchObject({ archived: 1, skippedCooldown: 0, cleanupFailed: 0 });
+      expect(await readTree(instance.instanceRoot)).toEqual(before);
+    }, 30_000);
+
+    // rf-3 rows (https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-6999027740),
+    // all through the real sweeper. Shared: sweep past the cooldown, the workspace
+    // is archived and its worktree removed either way; the instance is kept whole
+    // (byte for byte) or removed.
+    async function sweepAndExpectArchived(seeded: Awaited<ReturnType<typeof seedTerminalWorkspace>>, worktreesDir: string) {
+      const sweep = await withEnv({ PAPERCLIP_WORKTREES_DIR: worktreesDir }, () =>
+        cooldownService(1).sweepTerminalWorkspaces());
+      expect(sweep).toMatchObject({ archived: 1, skippedCooldown: 0, cleanupFailed: 0 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+      const [row] = await db.select({ cleanupReason: executionWorkspaces.cleanupReason }).from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      return row?.cleanupReason ?? "";
+    }
+
+    async function withPointerEnv(instance: { instanceRoot: string }, seeded: { worktreePath: string }, line: string) {
+      await fs.appendFile(path.join(seeded.worktreePath, ".paperclip", ".env"), `${line}\n`, "utf8");
+    }
+
+    it("F1 (rf-3 #1, never-OK): an embedded DB holding an agent-event frame and a stdout excerpt, no marker, no run log, is kept byte for byte", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      // Planted (named): embedded-Postgres relation files holding a run event.
+      await fs.writeFile(path.join(instance.instanceRoot, "db", "PG_VERSION"), "17\n", "utf8");
+      await fs.mkdir(path.join(instance.instanceRoot, "db", "base", "16384"), { recursive: true });
+      await fs.writeFile(path.join(instance.instanceRoot, "db", "base", "16384", "24601"),
+        '{"eventType":"agent.frame","stdoutExcerpt":"provider said: rate limited"}\n', "utf8");
+      await expect(fs.lstat(path.join(instance.instanceRoot, "data", "heartbeat-runs-recorded"))).rejects.toMatchObject({ code: "ENOENT" });
+      const before = await readTree(instance.instanceRoot);
+
+      expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
+      expect(await readTree(instance.instanceRoot)).toEqual(before);
+    }, 30_000);
+
+    it("F2 (rf-3 #2, never-OK): a RELATIVE in-root .env override holding the real setup producer's conversation evidence is kept", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      await withPointerEnv(instance, seeded, "PAPERCLIP_RUNNER_STATE_DIR=runtime/custom-state");
+      const stateDir = path.join(instance.instanceRoot, "runtime", "custom-state");
+      // Real producer, run as the guest instance with that override resolved
+      // against its instance root.
+      await withEnv({ PAPERCLIP_HOME: instance.worktreesDir, PAPERCLIP_INSTANCE_ID: instance.instanceId,
+        PAPERCLIP_RUNNER_STATE_DIR: stateDir }, async () => {
+        const { createNativeSetupRuntime, cleanupNativeSetupRuntime } = await import("../services/native-runtime/native-setup-evidence.ts");
+        const scratch = await createNativeSetupRuntime(seeded.companyId);
+        await fs.writeFile(path.join(scratch, "provider-stderr.log"), "planted raw trace: relative override\n", { mode: 0o600 });
+        await cleanupNativeSetupRuntime(scratch, true);
+      });
+      const before = await readTree(instance.instanceRoot);
+      expect([...before.keys()].some((name) => name.startsWith(path.join("runtime", "custom-state", "conversation-evidence")))).toBe(true);
+
+      expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
+      expect(await readTree(instance.instanceRoot)).toEqual(before);
+    }, 30_000);
+
+    it("F2a (never-OK): an ABSOLUTE in-root .env override holding run logs is kept", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      const runLogs = path.join(instance.instanceRoot, "logs-elsewhere");
+      await withPointerEnv(instance, seeded, `RUN_LOG_BASE_PATH=${JSON.stringify(runLogs)}`);
+      await fs.mkdir(runLogs, { recursive: true });
+      await fs.writeFile(path.join(runLogs, "run.ndjson"), "planted run log line\n", "utf8");
+      const before = await readTree(instance.instanceRoot);
+
+      expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
+      expect(await readTree(instance.instanceRoot)).toEqual(before);
+    }, 30_000);
+
+    it("F3 (rf-3 #3, never-OK): a named trace dir that is a SYMLINK to another in-root dir is kept, its target intact", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      const target = path.join(instance.instanceRoot, "archive", "run-logs-real");
+      await fs.mkdir(target, { recursive: true });
+      await fs.writeFile(path.join(target, "run.ndjson"), "planted run log behind a symlink\n", "utf8");
+      await fs.mkdir(path.join(instance.instanceRoot, "data"), { recursive: true });
+      await fs.symlink(target, path.join(instance.instanceRoot, "data", "run-logs"));
+      const before = await readTree(instance.instanceRoot);
+
+      expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
+      expect(await readTree(instance.instanceRoot)).toEqual(before);
+      expect((await fs.lstat(path.join(instance.instanceRoot, "data", "run-logs"))).isSymbolicLink()).toBe(true);
+    }, 30_000);
+
+    it("F3b (never-OK): a named trace dir symlinked OUT of the root keeps the instance and its outside target intact", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      const outside = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reaper-outside-"));
+      tempDirs.add(outside);
+      await fs.writeFile(path.join(outside, "trace.jsonl"), "planted provider trace outside the root\n", "utf8");
+      await fs.mkdir(path.join(instance.instanceRoot, "data"), { recursive: true });
+      await fs.symlink(outside, path.join(instance.instanceRoot, "data", "provider-traces"));
+      const outsideBefore = await readTree(outside);
+
+      expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
+      expect((await fs.lstat(path.join(instance.instanceRoot, "data", "provider-traces"))).isSymbolicLink()).toBe(true);
+      expect(await readTree(outside)).toEqual(outsideBefore);
+    }, 30_000);
+
+    it("F4 (never-OK): a provider home under the instance (companies/<id>/codex-home sessions) is kept", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      // codex-local codex-home.ts resolveManagedCodexHomeDir(): <instance>/companies/<companyId>/codex-home
+      const sessions = path.join(instance.instanceRoot, "companies", seeded.companyId, "codex-home", "sessions");
+      await fs.mkdir(sessions, { recursive: true });
+      await fs.writeFile(path.join(sessions, "rollout.jsonl"), "planted codex session line\n", "utf8");
+      const before = await readTree(instance.instanceRoot);
+
+      expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
+      expect(await readTree(instance.instanceRoot)).toEqual(before);
+    }, 30_000);
+
+    it("F6 (never-OK): the run marker alone (db empty, no trace dirs) keeps the instance", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      await withEnv({ PAPERCLIP_HOME: instance.worktreesDir, PAPERCLIP_INSTANCE_ID: instance.instanceId }, async () => {
+        const { markInstanceHasHeartbeatRuns } = await import("../services/instance-run-marker.ts");
+        await markInstanceHasHeartbeatRuns();
+      });
+      const before = await readTree(instance.instanceRoot);
+      expect(before.has(path.join("data", "heartbeat-runs-recorded"))).toBe(true);
+
+      expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
+      expect(await readTree(instance.instanceRoot)).toEqual(before);
+    }, 30_000);
+
+    it("U2 (never-OK, fail closed): an unwritable data/ dir loses the marker (logged), and the instance with a non-empty DB is kept", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      await fs.writeFile(path.join(instance.instanceRoot, "db", "PG_VERSION"), "17\n", "utf8");
+      const dataDir = path.join(instance.instanceRoot, "data");
+      await fs.mkdir(dataDir, { recursive: true });
+      await fs.chmod(dataDir, 0o500);
+      try {
+        const { logger } = await import("../middleware/logger.ts");
+        const warn = vi.spyOn(logger, "warn");
+        try {
+          await withEnv({ PAPERCLIP_HOME: instance.worktreesDir, PAPERCLIP_INSTANCE_ID: instance.instanceId }, async () => {
+            const { markInstanceHasHeartbeatRuns } = await import("../services/instance-run-marker.ts");
+            await expect(markInstanceHasHeartbeatRuns()).resolves.toBeUndefined();
+          });
+          expect(warn.mock.calls.some((call) => call.includes("could not write the instance heartbeat-run marker"))).toBe(true);
+        } finally {
+          warn.mockRestore();
+        }
+        await expect(fs.lstat(path.join(dataDir, "heartbeat-runs-recorded"))).rejects.toMatchObject({ code: "ENOENT" });
+        const before = await readTree(instance.instanceRoot);
+
+        expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
+        expect(await readTree(instance.instanceRoot)).toEqual(before);
+      } finally {
+        await fs.chmod(dataDir, 0o700).catch(() => undefined);
+      }
+    }, 30_000);
+
+    it("F5 (control): a trace-free instance (no marker, empty db, empty named dirs and provider home, an outside symlink) is removed, the symlink's outside target intact", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      for (const empty of [
+        path.join("runtime", "paperclip-runner", "durable-sessions"),
+        path.join("data", "provider-traces"),
+        path.join("data", "run-logs"),
+        path.join("runtime", "custom-state"),
+        path.join("companies", seeded.companyId, "codex-home"),
+      ]) await fs.mkdir(path.join(instance.instanceRoot, empty), { recursive: true });
+      await withPointerEnv(instance, seeded, "PAPERCLIP_RUNNER_STATE_DIR=runtime/custom-state");
+      // Not a trace dir: removal unlinks it and never follows it out of the root.
+      const outside = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reaper-outside-"));
+      tempDirs.add(outside);
+      await fs.writeFile(path.join(outside, "keep.txt"), "outside the root\n", "utf8");
+      await fs.symlink(outside, path.join(instance.instanceRoot, "scratch-link"));
+
+      expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).not.toContain("raw traces");
       await expect(fs.lstat(instance.instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await fs.readFile(path.join(outside, "keep.txt"), "utf8")).toBe("outside the root\n");
     }, 30_000);
   });
 
