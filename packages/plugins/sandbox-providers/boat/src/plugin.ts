@@ -517,7 +517,7 @@ async function admitSpareCreate(key: ReadySpareKey): Promise<boolean> {
  */
 const SPARE_STOP_OWED_STATE_KEY = "stop-owed";
 type OwedSpareStops = {
-  holds: Array<{ environmentId: string; configHash: string; until: number; failures: number }>;
+  holds: Array<{ environmentId: string; configHash: string; until: number; failures: number; retries: number }>;
   owed: Array<{ environmentId: string; configHash: string; spareId: string }>;
 };
 const companyOwedStops = new Map<string, OwedSpareStops>();
@@ -568,7 +568,8 @@ async function loadOwedSpareStops(companyId: string): Promise<OwedSpareStops> {
         const hold = row as Record<string, unknown> | null;
         if (hold && text(hold.environmentId) && text(hold.configHash) && Number.isFinite(hold.until)) {
           record.holds.push({ environmentId: hold.environmentId, configHash: hold.configHash, until: Number(hold.until),
-            failures: Number.isInteger(hold.failures) && Number(hold.failures) > 0 ? Number(hold.failures) : 1 });
+            failures: Number.isInteger(hold.failures) && Number(hold.failures) > 0 ? Number(hold.failures) : 1,
+            retries: Number.isInteger(hold.retries) && Number(hold.retries) > 0 ? Number(hold.retries) : 0 });
         }
       }
       if (Array.isArray(value.owed)) for (const row of value.owed) {
@@ -603,11 +604,16 @@ async function recordSpareStop(record: SpareStopRecord): Promise<void> {
   const now = Date.now();
   if (record.outcome === "stopped" && !owed.owed.some(entry => entry.spareId === record.spareId)
       && !owed.holds.some(hold => hold.environmentId === environmentId && hold.configHash === configHash)) return;
-  owed.holds = owed.holds.filter(hold => hold.until > now && !(hold.environmentId === environmentId && hold.configHash === configHash));
+  const previous = owed.holds.find(hold => hold.environmentId === environmentId && hold.configHash === configHash);
   owed.owed = owed.owed.filter(entry => entry.spareId !== record.spareId);
+  if (record.outcome === "failed") owed.owed.push({ environmentId, configHash, spareId: record.spareId });
+  // A hold's time may expire, but its retry count belongs to the unpaid debt.
+  owed.holds = owed.holds.filter(hold => ((hold.until > now && !(hold.environmentId === environmentId && hold.configHash === configHash)) || owed.owed.some(entry =>
+    entry.environmentId === hold.environmentId && entry.configHash === hold.configHash))
+    && !(record.outcome === "failed" && hold.environmentId === environmentId && hold.configHash === configHash));
   if (record.outcome === "failed") {
-    owed.holds.push({ environmentId, configHash, until: record.until, failures: record.failures });
-    owed.owed.push({ environmentId, configHash, spareId: record.spareId });
+    owed.holds.push({ environmentId, configHash, until: record.until, failures: record.failures,
+      retries: record.retries ?? previous?.retries ?? 0 });
     // rf-4 U1c C2: a stop owed under a held key keeps the maintenance tick on, even with every pool off.
     if (owedStopKeys.has(JSON.stringify([companyId, environmentId]))) ensureSpareRefreshTimer();
   } else if (!owed.owed.some(entry => entry.environmentId === environmentId && entry.configHash === configHash)) {
@@ -636,7 +642,7 @@ async function resumeOwedSpareStops(config: Config, companyId: string, environme
       record.owed.filter(entry => entry.environmentId === environmentId && entry.configHash === configHash).map(entry => entry.spareId));
     // #21251: a previous worker's failed retries of this pool's owed stop still hold its creates back.
     if (hold && record.owed.some(entry => entry.environmentId === environmentId && entry.configHash === configHash)) {
-      readySpares.restoreOwedStopRetryFailures({ companyId, environmentId, configHash }, hold.failures - 1);
+      readySpares.restoreOwedStopRetryFailures({ companyId, environmentId, configHash }, hold.retries);
     }
   }
   const owed = record.owed.filter(entry => entry.environmentId === environmentId);
@@ -671,9 +677,9 @@ async function resumeOwedSpareStops(config: Config, companyId: string, environme
         readySpares.restoreStopBackoff(key, fromTick ? 0 : until, failures, [entry.spareId]);
         // #21251: but a pool whose own owed stop keeps failing on retry (two or more
         // retries, the tick's included) makes no new spare create until a stop succeeds.
+        const retries = (record.holds.find(hold => hold.environmentId === environmentId && hold.configHash === entry.configHash)?.retries ?? 0) + 1;
         readySpares.noteOwedStopRetryFailed(key);
-        readySpares.restoreOwedStopRetryFailures(key, failures - 1);
-        await recordSpareStop({ outcome: "failed", key, spareId: entry.spareId, until, failures });
+        await recordSpareStop({ outcome: "failed", key, spareId: entry.spareId, until, failures, retries });
       }
     }
   })());
@@ -984,6 +990,10 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       const hasRateLimitWait = retryAfter !== null || isIpLimit;
       if (isIpLimit) {
         retryAfterMs = Math.min(retryAfterMs, 120_000);
+        // Boat may give the IP start window as an absolute timestamp instead
+        // of Retry-After. No spare (or other call) may send inside that pause.
+        const nextStartAt = providerTimestamp(body?.nextStartAt ?? body?.error?.nextStartAt);
+        if (nextStartAt) retryAfterMs = Math.max(retryAfterMs, Date.parse(nextStartAt) - Date.now());
         boatRateLimitPauseUntil = Math.max(boatRateLimitPauseUntil, Date.now() + retryAfterMs);
         if (!responseOptions.closedLogs) duplexLogger?.warn("Boat IP rate-limit pause", {
           reason: "IP_RATE_LIMIT_EXCEEDED", pauseUntil: new Date(boatRateLimitPauseUntil).toISOString(),
@@ -1813,14 +1823,14 @@ function readySpareHash(config: Config, ttlSeconds: number, from: string | undef
     accountFingerprint: createHash("sha256").update(`${apiBase(config)}\n${config.apiKey}`).digest("hex"),
   });
 }
-async function listBoatSandboxes(config: Config, labels: Array<[string, string]>): Promise<any[]> {
+async function listBoatSandboxes(config: Config, labels: Array<[string, string]>, signal?: AbortSignal): Promise<any[]> {
   const sandboxes: any[] = [], cursors = new Set<string>();
   let cursor: string | undefined;
   do {
     const query = new URLSearchParams({ limit: "200" });
     for (const [key, value] of labels) query.append("label", `${key}=${value}`);
     if (cursor) query.set("cursor", cursor);
-    const result = await request(config, `/sandboxes?${query}`, { signal: AbortSignal.timeout(2500) }, false, { requireJson: true });
+    const result = await request(config, `/sandboxes?${query}`, { signal: signal ?? AbortSignal.timeout(2500) }, false, { requireJson: true });
     if (!Array.isArray(result?.sandboxes)) throw new Error("Boat sandbox inventory omitted a sandboxes array");
     for (const sandbox of result.sandboxes) {
       if (!sandbox || typeof sandbox !== "object" || typeof sandbox.id !== "string" || !sandbox.id || !sandbox.labels || typeof sandbox.labels !== "object") {
@@ -1898,7 +1908,7 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
   const scoped = [["owner", `paperclip:${key.companyId}`], ["environment", key.environmentId], ["purpose", "spare"]] as Array<[string, string]>;
   return {
     async list() {
-      const sandboxes = await listBoatSandboxes(config, scoped);
+      const sandboxes = await listBoatSandboxes(config, scoped, AbortSignal.timeout(2500));
       return sandboxes.filter(sandbox => sandbox.labels.owner === `paperclip:${key.companyId}` && sandbox.labels.environment === key.environmentId && sandbox.labels.purpose === "spare")
         .map(sandbox => readySpareFromSandbox(sandbox, ttlSeconds));
     },
@@ -1911,39 +1921,8 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       return readySpareFromSandbox(sandbox, ttlSeconds);
     },
     create: () => createReadySpare(config, key, ttlSeconds, from),
-    async warmUp(spare) {
-      const startedAt = new Date().toISOString();
-      const started = Date.now();
-      const node = "/opt/paperclip-runner/provider-pack/node_modules/node/bin/node";
-      const cli = "/opt/paperclip-runner/provider-pack/provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js";
-      const wrapper = [
-        "const { spawn } = require('node:child_process');",
-        `const child = spawn(${JSON.stringify(node)}, [${JSON.stringify(cli)}, '--mode', 'rpc', '--no-session'], { env: { PI_CODING_AGENT_DIR: '/home/user/.pi/agent', HOME: process.env.HOME, PATH: process.env.PATH }, stdio: ['pipe', 'pipe', 'ignore'] });`,
-        "let firstLine = false; let done = false; let timedOut = false;",
-        "const timer = setTimeout(() => { if (!done) { timedOut = true; child.kill('SIGTERM'); setTimeout(() => child.kill('SIGKILL'), 500).unref(); } }, 24000);",
-        "child.stdout.on('data', chunk => { if (!firstLine && (firstLine = chunk.toString().includes('\\n'))) child.stdin.end(); });",
-        "child.on('error', () => { done = true; clearTimeout(timer); process.exitCode = 1; });",
-        "child.on('exit', (code, signal) => { done = true; clearTimeout(timer); if (timedOut) process.exitCode = 124; else if (!firstLine || signal || code !== 0) process.exitCode = code || 1; });",
-        "child.stdin.write('{\\\"type\\\":\\\"get_state\\\",\\\"id\\\":\\\"1\\\"}\\n');",
-      ].join(" ");
-      const command = `if [ ! -x ${q(node)} ] || [ ! -f ${q(cli)} ]; then printf '__PI_WARMUP_MISSING_PACK__'; exit 0; fi; ${q(node)} -e ${q(wrapper)}`;
-      let outcome: "completed" | "missing_pack" | "failed" | "timeout" = "failed";
-      try {
-        const result = await runCommand(config, spare.id, command, 25_000);
-        if (result.stdout.includes("__PI_WARMUP_MISSING_PACK__")) outcome = "missing_pack";
-        else if (result.timedOut || result.exitCode === 124) outcome = "timeout";
-        else if (result.exitCode === 0) outcome = "completed";
-        else outcome = "failed";
-      } catch {
-        outcome = "failed";
-      }
-      const finishedAt = new Date().toISOString();
-      const details = { spareId: spare.id, warmupStartedAt: startedAt, warmupFinishedAt: finishedAt,
-        warmupMs: Date.now() - started, warmupOutcome: outcome };
-      if (outcome === "completed" || outcome === "missing_pack") duplexLogger?.info("Boat spare Pi warm-up", details);
-      else duplexLogger?.warn("Boat spare Pi warm-up", details);
-      return outcome;
-    },
+    // No pre-claim guest commands: starting Pi can write another run's home.
+    // Run preparation (including the sentinel) belongs to finishAcquisition.
     async claim(spare, name, claimTtlSeconds) {
       const result = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
         method: "PATCH", signal: AbortSignal.timeout(2500), body: JSON.stringify({ name, ttlSeconds: claimTtlSeconds }),
@@ -2120,12 +2099,21 @@ async function maintainReadySpares(reconcile = false): Promise<void> {
   if (shuttingDown) return;
   // rf-4 U1c C2: owed stops first, whatever the pools' settings (the last pool OFF included).
   await serviceOwedSpareStops();
-  if (![...knownSparePools.values()].some(pool => pool.desired > 0)) return;
+  if (![...knownSparePools.values()].some(pool => pool.desired > 0)) { clearSpareRefreshTimerIfIdle(); return; }
   if (spareMaintenanceWork) return spareMaintenanceWork;
   const work = (async () => {
     const activeByPool = new Map<string, boolean>();
     for (const [poolId, pool] of knownSparePools) {
       if (shuttingDown) return;
+      // A durable OFF need not arrive as a config event. Apply it before this
+      // tick's renewals and retirement, not only before the next create POST.
+      if (!pool.retired && pool.baseDesired > 0) {
+        const count = await currentSpareCount(pool.key);
+        if (count !== undefined) {
+          pool.baseDesired = count;
+          pool.desired = readySpares.demandTarget(pool.key, count, pool.spareMax, pool.demandWindowMinutes);
+        }
+      }
       activeByPool.set(poolId, await companySpareIsActive(pool.key.companyId, pool.idleMinutes));
     }
     const refreshOperations = (key: ReadySpareKey) => {
@@ -2165,7 +2153,10 @@ async function maintainReadySpares(reconcile = false): Promise<void> {
   })();
   spareMaintenanceWork = work;
   try { await work; }
-  finally { if (spareMaintenanceWork === work) spareMaintenanceWork = undefined; }
+  finally {
+    if (spareMaintenanceWork === work) spareMaintenanceWork = undefined;
+    clearSpareRefreshTimerIfIdle();
+  }
 }
 async function finishAcquisition(
   params: PluginEnvironmentAcquireLeaseParams,
@@ -2751,12 +2742,10 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     } else if (spareClaimStore && spareOperations) {
       const desiredSpares = readySpares.demandTarget(spareKey, baseSpares, spareMax, demandWindowMinutes);
       let id: string | undefined;
-      let adoptionTask: Promise<void> | undefined;
       if (desiredSpares > 0 && readySpares.ready(spareKey).length === 0) {
-        // Recovery inventory is asynchronous: a cache miss never waits on Boat
-        // before following the established create path. A healthy adopted
-        // candidate becomes available to the next acquire.
-        adoptionTask = readySpares.adopt(spareKey, spareOperations).catch(() => undefined);
+        // Consult the bounded durable inventory BEFORE allocating a run box.
+        // Claim discovery only reads; retirement belongs to reconciliation.
+        await readySpares.adopt(spareKey, spareOperations, true).catch(() => undefined);
       }
       const claimAttempt = `${encodeURIComponent(params.runId ?? "unknown")}:${encodeURIComponent(attemptId)}`;
       const claimResult = await readySpares.claimWithOutcome(spareKey, claimAttempt, ttl, spareOperations, params.runId ?? "unknown");
@@ -2781,8 +2770,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       }
       await recordOutcomeOnce("cold", claimResult.reason);
       if (shuttingDown) throw new Error("Boat provider is shutting down");
-      if (adoptionTask) void adoptionTask.then(() => queueSpares(desiredSpares, spareOperations));
-      else queueSpares(desiredSpares, spareOperations);
+      queueSpares(desiredSpares, spareOperations);
       return await createOrdinaryLease();
     } else {
       await recordOutcomeOnce("cold", "no_ready_spare");

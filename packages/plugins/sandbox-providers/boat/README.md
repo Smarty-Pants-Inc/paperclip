@@ -88,16 +88,14 @@ The Boat plugin's company-scoped instance settings are `spares` (0–3, default 
 `spareEnvironmentIds` (up to 10 environment IDs, default empty), and
 `spareIdleMinutes` (15–1440, default 60). Empty or absent `spareEnvironmentIds`
 means **no spares**. For each listed environment in an active company, `spares`
-is the floor and the pool follows demand: target is `clamp(max(spares,
-claims_in_window + 1 when claims_in_window >= 1, otherwise spares), spares,
-spareMax)`. Successful warm-spare claims are counted in the rolling
-`spareDemandWindowMinutes` window. Thus two successful claims in the default
-window raise a floor of one to three ready spares (subject to `spareMax`); when
-that window empties, the pool scales back to its floor by stopping surplus
-sandboxes through Boat's confirmed stop path, never deleting them. The floor
-remains at least one only when `spares` is configured above zero, the environment
-is listed and the company is active. Configure these
-settings in plugin settings; no environment edit is needed.
+is the desired count **and hard idle-pool bound**, further limited by `spareMax`.
+Claims replace a spare; they never expand that bound. Acquisition history still
+uses `spareDemandWindowMinutes` for compatibility, but does not scale the pool.
+Set **`spares=0`** to disable creation and retire unclaimed idle spares by
+confirmed, non-force stop (never delete). A delivered config change applies it
+immediately; the next existing 15-second maintenance tick also re-reads the
+durable setting, so OFF does not depend on delivery of a config event. Once
+retirement/debt settles, the spare timer stops. No environment edit is needed.
 
 Every acquire records exactly one outcome (`spare` when a warm spare is claimed,
 otherwise `cold` with a reason) in company-scoped plugin state by environment,
@@ -134,18 +132,30 @@ workspace sentinel and applies guardian checks/binding. Boat's update API cannot
 change labels, so claim custody is recorded durably in the sandbox `name` as
 `paperclip-claim:<run>:<attempt>` and the lease metadata records that name.
 
-Only a ready/idle/running spare whose Pi warm-up succeeded, expiry is still in
-the future, and company/environment/config hash all match can be claimed. The
-claim is reserved in-process before a `PATCH` updates the name and TTL. A claim
-cache miss or unhealthy item follows the ordinary create path; spare inventory
-recovery is asynchronous so a slow list call does not delay that fallback. The
-replacement starts immediately after a claim. After a worker restart, the first
-acquire asynchronously rediscovers candidates by labels; if it has no in-memory
-candidate, that acquire creates normally and a later acquire may claim the adopted
-spare. Mismatched, stopped, expired or unfinished unclaimed spares are stopped,
-never deleted. At most three spares are configured
-per company/environment. Failed starts use exponential backoff (up to 15
-minutes).
+Only a ready/idle/running spare whose environment setup completed, expiry is
+still in the future, and company/environment/config hash all match can be claimed.
+A fresh GET, claim PATCH and verification GET must show no stop record. The
+claim is reserved in-process and in the plugin's database before the PATCH.
+On a cache miss (including worker restart), the acquire first awaits a read-only
+inventory discovery with a 2.5-second aggregate list budget. It tries the ready
+spare **before** any ordinary run create; unreadable inventory or an unhealthy
+candidate falls back to an ordinary create. Retirement never delays discovery.
+The replacement starts immediately after a claim, up to the fixed pool size.
+Mismatched, stopped, expired or unfinished unclaimed spares are retired by the
+reconciler, never deleted. Failed starts use exponential backoff (up to 15 minutes).
+
+Failed owed-stop retries have their own durable counter, separate from keeper
+stop-failure/backoff totals. After two failed retry-service attempts for a pool's
+own owed stop, that pool creates nothing until its debt is paid. One failed
+retry is not two; other pools and ordinary run creates remain admitted. An
+expired timed hold with unpaid debt retains its retry count across unrelated
+stop results and worker restarts. Legacy records without a retry counter start
+that counter at zero; their owed IDs and timed holds are still restored and
+serviced when an acquire supplies the Boat key.
+
+Spare calls honor Boat's worker-wide IP 429 pause, including an absolute
+`nextStartAt` timestamp. Send admission re-reads the spare setting after waits,
+so a delayed create is not sent after OFF.
 
 Two hourly limits bound what spares can cost (smarty-dev#20869):
 
@@ -191,24 +201,18 @@ dies, Boat auto-stops the spare when that TTL expires. The immutable expiry
 label records the initial create deadline; Boat's refreshed `archiveAfter` is
 the enforced current deadline.
 
-Every successfully ready spare gets one throwaway Pi RPC warm-up, exactly:
+The plugin sends **no pre-claim guest commands or file writes**. In particular,
+it no longer launches Pi RPC before claim: even `--no-session` cannot guarantee
+that Pi/extensions will not write caches/settings under another run's home.
+The sentinel and all run-specific preparation stay on the shared handoff path.
+The environment's own configured snapshot, Boat environment and `setupScript`
+remain part of the create body, exactly as for ordinary creates; their contents
+are not a claim of a pristine external snapshot. No per-run Paperclip secrets,
+checkout or agent identity are staged before claim.
 
-```sh
-printf '{"type":"get_state","id":"1"}\n' | PI_CODING_AGENT_DIR=/home/user/.pi/agent timeout 25 pi --mode rpc --no-session >/dev/null
-```
-
-The `--no-session` flag prevents this probe from writing a Pi conversation
-session/transcript under `~/.pi/agent/sessions`; the plugin does not delete
-anything under `~/.pi`. The RPC runs inside the Boat sandbox, not on the plugin
-worker. This code does not inspect or clean files that Pi or loaded extensions
-may independently use for caches/settings under `~/.pi/agent`; those files, if
-any, are left untouched. A failed or timed-out warm-up is never claimable and
-its sandbox is stopped. The same create body means a configured Boat
-environment's own contents/secrets are present before claim, but no per-run
-Paperclip secrets are staged until the shared lease path runs.
-
-A running `small` spare costs about **$0.018/hour (~$13 per 30-day month)**;
-`default` is about **$0.036/hour (~$26/month)**. The actual cost follows the
+A running `small` spare costs about **$0.018/hour ($0.43/day; ~$13 per 30-day month)**;
+`default` is about **$0.036/hour ($0.86/day; ~$26/month)**. At the hard configured
+maximum of three per pool that is about **$1.30/day** or **$2.59/day**, respectively. The actual cost follows the
 Boat `type` configured on each environment, and each spare runs continuously.
 These are provider pricing estimates, not billing observations. Prior Boat/Pi
 measurements supplied for this design found roughly 15–18 seconds cold to first

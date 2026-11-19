@@ -137,7 +137,7 @@ export type StopBackoff = {
 
 /** A spare stop's outcome, for the plugin's durable record of owed stops and holds (rf-4 U1 F5/D). */
 export type SpareStopRecord =
-  | { outcome: "failed"; key: ReadySpareKey; spareId: string; until: number; failures: number }
+  | { outcome: "failed"; key: ReadySpareKey; spareId: string; until: number; failures: number; retries?: number }
   | { outcome: "stopped"; key: ReadySpareKey; spareId: string };
 
 /** The named operator event at a spare refusal or over-ceiling run, and its health reason. */
@@ -238,13 +238,10 @@ export function readySpareDemandWindowMinutes(config: unknown): number {
     ? Number(minutes) : DEFAULT_READY_SPARE_DEMAND_WINDOW_MINUTES;
 }
 
-/** Demand adds one spare beyond each recent acquire, bounded by floor and configured maximum. */
-export function readySpareDemandTarget(spares: number, claimsInWindow: number, spareMax: number): number {
-  const floor = Math.max(0, Math.min(MAX_CONFIGURED_READY_SPARES, Math.trunc(spares)));
-  if (floor === 0) return 0;
-  const maximum = Math.max(floor, Math.min(MAX_READY_SPARES, Math.trunc(spareMax)));
-  const demand = claimsInWindow >= 1 ? Math.trunc(claimsInWindow) + 1 : floor;
-  return Math.max(floor, Math.min(maximum, demand));
+/** The configured size is a hard idle-pool bound, not a demand-expanding floor. */
+export function readySpareDemandTarget(spares: number, _claimsInWindow: number, spareMax: number): number {
+  const size = Math.max(0, Math.min(MAX_CONFIGURED_READY_SPARES, Math.trunc(spares)));
+  return Math.min(size, Math.max(1, Math.min(MAX_READY_SPARES, Math.trunc(spareMax))));
 }
 
 export function readySpareIdleMinutes(config: unknown): number {
@@ -390,7 +387,11 @@ export class ReadySpareKeeper {
     this.owedStopRetryFailures.set(poolId, Math.max(this.owedStopRetryFailures.get(poolId) ?? 0, Math.trunc(retries)));
   }
   /** #21251: a stop this pool owed succeeded (or nothing more is owed): its creates may resume. */
-  clearOwedStopRetryFailures(key: ReadySpareKey): void { this.owedStopRetryFailures.delete(readySparePoolKey(key)); }
+  clearOwedStopRetryFailures(key: ReadySpareKey): void {
+    const poolId = readySparePoolKey(key);
+    this.owedStopRetryFailures.delete(poolId);
+    this.stopBackoffs.delete(poolId);
+  }
   /** #21251: true while this pool's own owed stop keeps failing; no new spare create for it. */
   owedStopBlocksCreates(key: ReadySpareKey): boolean {
     return (this.owedStopRetryFailures.get(readySparePoolKey(key)) ?? 0) >= OWED_STOP_RETRY_FAILURES_BLOCKING_CREATES;
@@ -698,19 +699,19 @@ export class ReadySpareKeeper {
   }
 
   /** Load durable labeled inventory into the fast claim index without creating anything. */
-  async adopt(key: ReadySpareKey, operations: ReadySpareOperations): Promise<void> {
+  async adopt(key: ReadySpareKey, operations: ReadySpareOperations, readOnly = false): Promise<void> {
     if (this.stopping) return;
     const poolId = readySparePoolKey(key);
     if ((this.pools.get(poolId) ?? []).some(item => readyAndHealthy(item, key, this.now()))) return;
     const active = this.adopting.get(poolId);
     if (active) return active;
-    const work = this.adoptOnce(key, operations);
+    const work = this.adoptOnce(key, operations, readOnly);
     this.adopting.set(poolId, work);
     try { await work; }
     finally { if (this.adopting.get(poolId) === work) this.adopting.delete(poolId); }
   }
 
-  private async adoptOnce(key: ReadySpareKey, operations: ReadySpareOperations): Promise<void> {
+  private async adoptOnce(key: ReadySpareKey, operations: ReadySpareOperations, readOnly: boolean): Promise<void> {
     const poolId = readySparePoolKey(key);
     const listed = await operations.list();
     const keep: ReadySpare[] = [];
@@ -719,7 +720,7 @@ export class ReadySpareKeeper {
       if (spare.labels.owner !== `paperclip:${key.companyId}` || spare.labels.environment !== key.environmentId || spare.labels.purpose !== "spare") continue;
       if (this.claiming.has(spare.id) || this.stoppingSpares.has(spare.id) || spare.name.startsWith("paperclip-claim:")) continue;
       if (readyAndHealthy(spare, key, this.now())) keep.push(spare);
-      else await this.stopSpare(key, spare, operations, { maybeRefill: true });
+      else if (!readOnly) await this.stopSpare(key, spare, operations, { maybeRefill: true });
     }
     this.commitPool(poolId, keep, listed);
   }
@@ -877,7 +878,7 @@ export class ReadySpareKeeper {
       if (this.claiming.has(spare.id) || this.stoppingSpares.has(spare.id) || spare.name.startsWith("paperclip-claim:")) continue;
       if (strictBoatOnly && (spare.labels.configHash !== key.configHash
           || spare.name !== `paperclip-spare:ready:${key.configHash}`
-          || (spare.state !== "ready" && spare.state !== "idle"))) continue;
+          || (spare.state !== "ready" && spare.state !== "idle" && !readyAndHealthy(spare, key, this.now())))) continue;
       if (readyAndHealthy(spare, key, this.now())) keep.push(spare);
       else if (!strictBoatOnly) toStop.push(spare);
     }
