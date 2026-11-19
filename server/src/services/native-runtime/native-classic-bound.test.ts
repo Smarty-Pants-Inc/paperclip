@@ -122,6 +122,21 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
   const ANSWER = "Done. I rewrote the report and added the notes file.";
   const SAVED = { "report.md": "report, saved v1\n", "data/keep.txt": "kept since the first turn\n" };
 
+  /** REAL: the task as the person's page loads it (GET /api/issues/:id), read every 100 ms until stopped. */
+  function sampleTask(app: express.Express, issueId: string) {
+    const samples: Array<{ at: number; status: string }> = [];
+    let stopped = false;
+    const loop = (async () => {
+      while (!stopped) {
+        const at = Date.now();
+        const got = await request(app).get(`/api/issues/${issueId}`);
+        if (got.status === 200) samples.push({ at, status: String(got.body.status) });
+        await sleep(Math.max(0, 100 - (Date.now() - at)));
+      }
+    })();
+    return { samples, stop: async () => { stopped = true; await loop; } };
+  }
+
   async function scenario(options: { sharedProjectRoot?: boolean; gitRepository?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     const sessionId = randomUUID(), runnerId = randomUUID();
@@ -393,7 +408,8 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
       // R's own reference is untouched and still `prepared` (K5 rests on it).
       expect(readNativeWorkspaceSyncReference(record(ended.runnerProfileJson).nativeWorkspaceSync)).toMatchObject({ state: "prepared", leaseId: s.leaseId });
       // The task is detached from R's root.
-      expect(await s.issue()).toMatchObject({ executionRunId: null, executionWorkspaceId: null, status: "blocked" });
+      // C12 (rf-5 06:58Z): a person is waiting, so the task is NOT set Blocked: it stays In progress for P.
+      expect(await s.issue()).toMatchObject({ executionRunId: null, executionWorkspaceId: null, status: "in_progress" });
 
       // R's reply: once, with the LOST line, read from the real GETs.
       await s.presentationWorker();
@@ -596,7 +612,9 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
       const retryCallsAfterDeadline = s.fault.commands - commandsAtDeadline;
       expect(retryCallsAfterDeadline).toBe(0);
       const taskAtCut = await s.issue();
-      expect(taskAtCut).toMatchObject({ executionRunId: null, executionWorkspaceId: null });
+      // C12 control: NOBODY was parked at the cut, so the task is Blocked as before (GET /api/issues/:id).
+      expect(taskAtCut).toMatchObject({ executionRunId: null, executionWorkspaceId: null, status: "blocked" });
+      expect((await request(s.app).get(`/api/issues/${s.issueId}`)).body).toMatchObject({ status: "blocked" });
       const frozen = { status: (await s.run()).status, errorCode: (await s.run()).errorCode };
       // REAL: after the cut (nobody was parked at it), the person starts P on the saved state.
       const sent = await request(s.app).post(`/api/issues/${s.issueId}/comments`)
@@ -785,7 +803,7 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
   //   native-session-executor.ts binds it (openRun, the stream, run.result.accepted, run.terminal, completeRun).
   // PLANTED (named): the task's workspace row for its saved directory, in the shape row K1's real P leaves behind.
   // liveScenario: __tests__/helpers/classic-live-scenario.ts (moved there unchanged; the SCRIPTED and PLANTED notes with it).
-  const liveScenario = () => liveScenarioIn({ db, root });
+  const liveScenario = (options: { holdPublication?: boolean } = {}) => liveScenarioIn({ db, root }, options);
 
   it("K10 live executor: real person POST -> real R hangs in its own copy-back, nobody parked -> the acceptance deadline ends it; GET stores one LOST line", async () => {
     const s = await liveScenario();
@@ -887,6 +905,8 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
         eq(agentWakeupRequests.status, "deferred_issue_execution")))).filter(wake => JSON.stringify(wake.payload).includes(next));
       await vi.waitFor(async () => expect(await parked()).toHaveLength(1), { timeout: 10_000, interval: 50 });
       const parkedAt = (await parked())[0].requestedAt.getTime();
+      // C12 (rf-5 06:58Z): the task as the person's page reads it, every 100 ms from here until P is running.
+      const sampler = sampleTask(s.app, s.issueId);
       // REAL: the bound's own sweep, beside the live executor that still holds the copy-back's lock.
       const ended = async () => (await s.runs())[1].status !== "running";
       while (!(await ended()) && Date.now() - parkedAt < CAP + 15_000) { await sweep(r.id); await sleep(200); }
@@ -896,8 +916,11 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
       expect(endedAfterParkingMs).toBeGreaterThanOrEqual(CAP);
       expect(record(record(rEnded.runnerProfileJson).nativeWorkspaceFinalizationOwner)).toMatchObject({ fenced: true });
       expect(JSON.stringify(rEnded.resultJson)).not.toMatch(/"token"|processGroupId|controllerBootId|processStartedAt/);
-      // C12: R's accepted `done` is DROPPED, never applied: the person sees the task Blocked, not Done.
-      expect(await s.issue()).toMatchObject({ status: "blocked", executionRunId: null, executionWorkspaceId: null });
+      // C12: R's accepted `done` is DROPPED, never applied: the task is not Done. A person is waiting, so it is
+      // not set Blocked either: it stays In progress for P.
+      // (The status itself is read below, from the 100 ms samples of the real GET.)
+      expect(await s.issue()).toMatchObject({ executionRunId: null, executionWorkspaceId: null });
+      expect((await s.issue()).status).not.toBe("done");
 
       // P starts ONCE while R's executor is still hung in this same process.
       const startAt = Date.now();
@@ -909,6 +932,20 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
       [, , p] = await s.runs();
       expect(p, "P never started beside R's still-live executor").toBeTruthy();
       expect(box.inputs).toHaveLength(3);
+      // C12: between R's fence and P running, the task NEVER reads Blocked (no In progress -> Blocked -> In progress).
+      await sleep(250);
+      await sampler.stop();
+      const fencedAt = rEnded.finishedAt!.getTime();
+      const sinceFence = sampler.samples.filter(sample => sample.at >= fencedAt - 200);
+      const maxGapMs = Math.max(0, ...sampler.samples.slice(1).map((sample, index) => sample.at - sampler.samples[index].at));
+      evidence.C12 = { route: "GET /api/issues/:id", everyMs: 100, samples: sampler.samples.length, sinceFence: sinceFence.length, maxGapMs,
+        statuses: [...new Set(sampler.samples.map(sample => sample.status))],
+        blocked: sampler.samples.filter(sample => sample.status === "blocked").map(sample => sample.at - fencedAt),
+        pStartedAfterFenceMs: p!.startedAt ? p!.startedAt.getTime() - fencedAt : null };
+      expect(sinceFence.length).toBeGreaterThanOrEqual(3);
+      expect(sampler.samples.filter(sample => sample.status === "blocked").map(sample => `${sample.at - fencedAt} ms after the fence`)).toEqual([]);
+      expect([...new Set(sampler.samples.map(sample => sample.status))]).toEqual(["in_progress"]);
+      expect((await request(s.app).get(`/api/issues/${s.issueId}`)).body).toMatchObject({ status: "in_progress", executionRunId: p!.id });
       expect(JSON.stringify(p!.contextSnapshot)).toContain(next);
       const startedAfterMs = Date.now() - startAt;
       const pReference = readNativeWorkspaceSyncReference(record(p!.runnerProfileJson).nativeWorkspaceSync)!;
@@ -960,6 +997,123 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
         task: { status: (await s.issue()).status }, agentComments: comments.map(comment => ({ by: comment.createdByRunId === r.id ? "R" : comment.createdByRunId === p!.id ? "P"
           : comment.createdByRunId === r0.id ? "turn 0" : comment.createdByRunId, body: comment.body })),
         settled };
+    } finally {
+      s.releaseStall(); receipts.stop?.(); await delivery.stop(); await heartbeat.drainActiveRunExecutions();
+    }
+  }, 240_000);
+
+  it("C12 control: a NON-fenced terminal save failure (the box is gone: unrecoverable) still sets the task Blocked, even with a person's message parked", async () => {
+    const s = await scenario();
+    await s.streamAndAccept();
+    await s.personSaysWhileSaving("Also add a summary section to the report.");
+    // PLANTED (named): R's box lease is expired, so the copy-back is unrecoverable. Beside it, the fenced path by the
+    // real route is the K1 live row above. REAL from here: the worker's own check -> attemptNativeWorkspaceFinalization
+    // -> recordNativeWorkspaceFinalizationFailure -> the finalizer's one terminal write.
+    await db.update(environmentLeases).set({ status: "expired" }).where(eq(environmentLeases.id, s.leaseId));
+    expect(await s.worker().check()).toMatchObject({ entries: 1 });
+    const ended = await s.run();
+    expect(ended).toMatchObject({ status: "failed", errorCode: "native_workspace_sync_out_unrecoverable" });
+    // Not fenced: no stall marker, no tombstone, the task keeps its root.
+    expect(record(ended.resultJson).workspaceSyncOutStall).toBeUndefined();
+    expect(record(record(ended.runnerProfileJson).nativeWorkspaceFinalizationOwner).fenced).toBeUndefined();
+    const task = (await request(s.app).get(`/api/issues/${s.issueId}`)).body;
+    expect(task).toMatchObject({ status: "blocked", executionWorkspaceId: s.workspaceId });
+    evidence.C12control = { route: "GET /api/issues/:id", task: { status: task.status }, run: { status: ended.status, errorCode: ended.errorCode } };
+    await cleanupNativeWorkspaceSync(s.runId);
+  }, 120_000);
+
+  it("FU-c, the held-publication probe: R's copy-back passed its LAST ownership check and its publication is held; R is fenced at the cap and P starts; the publication is released -> R's reference is not finalized, R's lease is not stamped, the inspector never shows R's save Succeeded, P's files are unchanged", async () => {
+    const s = await liveScenario({ holdPublication: true });
+    const errors: unknown[] = [];
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: () => ({}) as never });
+    const delivery = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => errors.push(error) });
+    const receipts = heartbeat.registerDeferredReceiptWork(delivery, () => true);
+    const CAP = 2_000;
+    const work = nativeWorkspaceFinalizationWork(db, { environmentRuntime: {} as never, copyOutBound: { personWaitCapMs: CAP },
+      onWorkspaceSettled: async () => undefined });
+    const sweep = async (runId: string) => { for (const entry of await work.load({ companyId: s.companyId, runId })) await work.check(entry); };
+    const seen: string[] = [];
+    try {
+      await receipts.ready;
+      // REAL turn 0, then REAL M -> R (as in the K1 live row): no planted run, lease or workspace.
+      await s.say("Please write the report.");
+      for (let waited = 0; waited < 60_000; waited += 250) {
+        await heartbeat.resumeQueuedRuns();
+        await reconcileNativeFinalizations(db, (await s.runs()).map(run => run.id), { environmentRuntime: {} as never }).catch(() => undefined);
+        const [first] = await s.runs();
+        if (first && first.status !== "running" && first.status !== "queued") break;
+        await sleep(250);
+      }
+      await heartbeat.drainActiveRunExecutions();
+      expect((await s.runs())[0]).toMatchObject({ status: "succeeded" });
+      const hostDir = (await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, (await s.issue()).executionWorkspaceId!)))[0].cwd!;
+      await s.say("Please rewrite the report.");
+      const held = Promise.race([s.stallReached.then(() => "held" as const), sleep(60_000).then(() => "R never reached its publication" as const)]);
+      for (let waited = 0; waited < 60_000 && !(await Promise.race([held, sleep(250).then(() => null)])); waited += 250) await heartbeat.resumeQueuedRuns();
+      expect(await held).toBe("held");
+      const [, r] = await s.runs();
+      expect(r).toMatchObject({ status: "running", runtimeMode: "native" });
+      const rReference = readNativeWorkspaceSyncReference(record(r.runnerProfileJson).nativeWorkspaceSync)!;
+      expect(rReference).toMatchObject({ state: "prepared" });
+      // The hold is PAST the copy-back: R's apply already landed in R's root (the host write is done), nothing is published.
+      expect(await listing(hostDir)).toMatchObject({ "notes.md": "R's new notes (unsaved)\n" });
+      expect(record(r.runnerProfileJson).nativeWorkspaceFinalizationOwner).toMatchObject({ token: expect.any(String) });
+      seen.push(...(await s.inspectorSaves(r.id)).map(save => save.status));
+      expect(seen).toEqual(["running"]);
+      // REAL: the person's next message parks; the bound's sweep fences R at the cap.
+      const next = await s.say("Also add a summary section to the report.");
+      const parked = async () => (await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, s.agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution")))).filter(wake => JSON.stringify(wake.payload).includes(next));
+      await vi.waitFor(async () => expect(await parked()).toHaveLength(1), { timeout: 10_000, interval: 50 });
+      const parkedAt = (await parked())[0].requestedAt.getTime();
+      while ((await s.runs())[1].status === "running" && Date.now() - parkedAt < CAP + 15_000) { await sweep(r.id); await sleep(200); }
+      const [, rEnded] = await s.runs();
+      expect(rEnded).toMatchObject({ status: "failed", errorCode: STALLED });
+      expect(record(record(rEnded.runnerProfileJson).nativeWorkspaceFinalizationOwner)).toMatchObject({ fenced: true });
+      // REAL: P starts beside R's held publication.
+      const startAt = Date.now();
+      while (Date.now() - startAt < 30_000 && box.inputs.length < 3) { await heartbeat.resumeQueuedRuns(); await sleep(250); }
+      const [, , p] = await s.runs();
+      expect(p, "P never started beside R's held publication").toBeTruthy();
+      expect(box.inputs).toHaveLength(3);
+      const [pWorkspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, (await s.issue()).executionWorkspaceId!));
+      const pRoot = pWorkspace.cwd!;
+      expect(pRoot).not.toBe(hostDir);
+      expect(await listing(pRoot)).toEqual(SAVED);
+      const pRootBefore = await treeSha256(pRoot);
+      seen.push(...(await s.inspectorSaves(r.id)).map(save => save.status));
+
+      // The publication is released AFTER the fence.
+      s.releaseStall();
+      const polling = (async () => { for (let i = 0; i < 20; i++) { seen.push(...(await s.inspectorSaves(r.id)).map(save => save.status)); await sleep(100); } })();
+      await heartbeat.drainActiveRunExecutions();
+      await polling;
+      await sweep(r.id);
+      const presentation = nativeResponsePresentationWork(db);
+      for (const entry of await presentation.load({ companyId: s.companyId, issueId: s.issueId })) await presentation.check(entry);
+      const [, rLate] = await s.runs();
+      const [rLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, rReference.leaseId));
+      const saves = await s.inspectorSaves(r.id);
+      evidence.FUc = { route: "GET /api/heartbeat-runs/:runId/workspace-operations", R: { id: r.id, status: rLate.status, errorCode: rLate.errorCode,
+        reference: readNativeWorkspaceSyncReference(record(rLate.runnerProfileJson).nativeWorkspaceSync)?.state,
+        leaseStamp: record(rLease.metadata).nativeWorkspaceSync ?? null, saves, seen: [...new Set(seen)] },
+        P: { id: p.id, root: pRoot, sha256Before: pRootBefore, sha256After: await treeSha256(pRoot) } };
+      // R's reference is not finalized;
+      expect(readNativeWorkspaceSyncReference(record(rLate.runnerProfileJson).nativeWorkspaceSync)).toMatchObject({ state: "prepared" });
+      // the lease is not stamped R;
+      expect(record(record(rLease.metadata).nativeWorkspaceSync).finalizedRunId).not.toBe(r.id);
+      // the inspector never shows R's save Succeeded: it ends failed, superseded by the fence (ownership lost);
+      expect([...new Set(seen)]).not.toContain("succeeded");
+      expect(saves.map(save => save.status)).toEqual(["failed"]);
+      // R stays as the bound ended it, the tombstone stays, one LOST line;
+      expect(rLate).toMatchObject({ status: "failed", errorCode: STALLED });
+      expect(record(record(rLate.runnerProfileJson).nativeWorkspaceFinalizationOwner)).toMatchObject({ fenced: true });
+      expect(await s.servedLine(r.id)).toMatchObject({ status: "failed", state: "lost", shown: THE_LINE });
+      // P's files are unchanged, and the task still names P's root.
+      expect(await treeSha256(pRoot)).toBe(pRootBefore);
+      expect(await listing(pRoot)).toEqual(SAVED);
+      expect((await s.issue()).executionWorkspaceId).toBe(pWorkspace.id);
+      expect(errors).toEqual([]);
     } finally {
       s.releaseStall(); receipts.stop?.(); await delivery.stop(); await heartbeat.drainActiveRunExecutions();
     }
