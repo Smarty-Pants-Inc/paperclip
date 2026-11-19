@@ -27,6 +27,7 @@ import { NATIVE_CLEANUP_SETTLING_MESSAGE } from "./native-runtime/completed-turn
 import { NATIVE_CLEANUP_HOLD_CAUSE, NATIVE_CLEANUP_HOLD_NEXT_ACTION, nativeCleanupAdmissionBlock }
   from "./native-runtime/native-cleanup-admission-hold.js";
 import { isAcknowledgedLegacyUserStop, runStopPresentationJson } from "./run-cancellation.js";
+import { issueTreeControlService } from "./issue-tree-control.js";
 const MAX_PREDECESSOR_CLEANUP_CHECKS = 16;
 const ANOTHER_ROUTINE_TASK = "another task in this routine";
 const text = (v: unknown) => (typeof v === "string" ? v : null);
@@ -203,7 +204,10 @@ export async function executionProjectionsForRuns(
   // executor the claim also waits for. Pending uses admission's own predicate.
   const settlingPredecessorKeys = new Set<string>();
   const queuedRuns = runs.filter(run => run.status === "queued");
-  const setupAgentIds = [...new Set(queuedRuns.filter(run => !run.startedAt).map(run => run.agentId))];
+  const coordinatorByRun = new Map(coordinators.map((row) => [row.runId, row]));
+  // A person's Stop or Pause settles a native run as native_retry_cancelled.
+  const stoppedRuns = runs.filter(run => run.status === "cancelled" && coordinatorByRun.get(run.id)?.failureCode === "native_retry_cancelled");
+  const setupAgentIds = [...new Set([...queuedRuns.filter(run => !run.startedAt), ...stoppedRuns].map(run => run.agentId))];
   const setupAgents = setupAgentIds.length ? await read(async () => db
     .select({ id: agents.id, lifecycleState: agents.lifecycleState,
       lifecycleHolds: agents.lifecycleHolds, adapterType: agents.adapterType,
@@ -216,6 +220,11 @@ export async function executionProjectionsForRuns(
     ? await read(() => agentQueueLinesForRuns(db, companyId, queuedRuns.filter(run => !run.startedAt), now))
     : new Map<string, NonNullable<ExecutionProjection["agentQueue"]>>();
   const issueIdOf = (run: Run) => run.nativeIssueId ?? text(run.contextSnapshot?.issueId);
+  // While that Pause is still active (the agent's own, or a task-tree pause hold
+  // on the task or an ancestor), a new message is held, not continued.
+  const stoppedIssueIds = [...new Set(stoppedRuns.map(issueIdOf).filter((id): id is string => !!id))];
+  const pauseHeldIssueIds = stoppedIssueIds.length
+    ? await read(() => issueTreeControlService(db).listActivePauseHeldIssueIds(companyId, stoppedIssueIds)) : new Set<string>();
   const queuedIssueIds = [...new Set(queuedRuns.map(issueIdOf).filter((id): id is string => !!id))];
   // A routine runs one execution at a time (issues_open_routine_execution_uq):
   // a never-started run of a routine task waits while another open task of
@@ -292,7 +301,6 @@ export async function executionProjectionsForRuns(
         if (candidates.some(id => pendingIds.has(id))) settlingPredecessorKeys.add(runId);
     }
   }
-  const coordinatorByRun = new Map(coordinators.map((row) => [row.runId, row]));
   const responseWaitRuns = runs.filter(run => run.status === "succeeded"
     && run.resultJson?.finalizationReasonCode === NATIVE_RESPONSE_WAKE_WAITING_REASON && issueIdOf(run));
   const responseWaitIssues = responseWaitRuns.length ? await read(async () => db
@@ -330,6 +338,8 @@ export async function executionProjectionsForRuns(
         agentQueueByRun.get(run.id),
         run.status === "queued" && !run.startedAt ? routineHolderByIssue.get(issueIdOf(run) ?? "") : undefined,
         cleanupHeldRuns.has(run.id),
+        stoppedRuns.includes(run) && (pauseHeldIssueIds.has(issueIdOf(run) ?? "")
+          || ["paused", "pausing"].includes(setupByAgent.get(run.agentId)?.lifecycleState ?? "")),
       ),
     );
   }
@@ -362,6 +372,8 @@ export function projectExecution(
   routineHolder?: string,
   /** Admission holds this run while its task's previous native session cleanup is unsettled. */
   nativeCleanupHold = false,
+  /** The Pause that stopped this run is still active, so a new message would be held. */
+  pauseActive = false,
 ): ExecutionProjection {
   const detail = coordinator?.failureDetail ?? {};
   const successorRunId = text(detail.successorRunId);
@@ -520,7 +532,7 @@ export function projectExecution(
   if (run.status === "cancelled" && coordinator?.phase === "terminal_failure" && coordinator.failureCode === "native_retry_cancelled"
     && !recoveryAction && !cleanupQuarantined && !detail.replacementDenied) {
     projection.cause = null;
-    projection.nextAction = "Send a new message to continue from saved work.";
+    projection.nextAction = pauseActive ? "Resume to continue." : "Send a new message to continue from saved work.";
     return set("completed", "Stopped");
   }
   if (coordinator?.phase === "terminal_failure" || recoveryAction || cleanupQuarantined) {
