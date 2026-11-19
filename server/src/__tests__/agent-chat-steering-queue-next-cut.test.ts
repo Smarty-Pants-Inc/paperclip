@@ -372,6 +372,9 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
         expect(await answered(id)).toBe(false);
       }
       expect((await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200)).body.entries).toEqual([]);
+      if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `Q1-delivery-${chat.issue.id}.json`),
+        JSON.stringify({ fixture: "real routes + PostgreSQL + process adapter; responder records carried ids in replies",
+          expected, deleted, seen, comments }, null, 2));
       return seen;
     } finally {
       await heartbeat.cancelActiveForAgent(chat.agentId).catch(() => undefined);
@@ -406,7 +409,9 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
     const queue = (await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200)).body;
     expect(queue.entries.map((entry: any) => entry.comment.id)).toEqual(sent.map(comment => comment.id));
     expect(queue.entries.map((entry: any) => Boolean(entry.behindReset))).toEqual([false, false, true, true, true]);
-    await drainVisibleQueue(chat, sent.map(comment => comment.id));
+    const turns = await drainVisibleQueue(chat, sent.map(comment => comment.id));
+    expect(turns.map(turn => turn.ids)).toEqual([sent.slice(0, 2).map(comment => comment.id), sent.slice(3).map(comment => comment.id)]);
+    expect(turns.map(turn => turn.generation)).toEqual([0, 1]);
   }, 30_000);
 
   // RED 3: reorder works on a chat.
@@ -420,6 +425,10 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
       .send({ queueId: queue.body.queueId, revision: queue.body.revision, orderedCommentIds: order });
     expect(reordered.status, JSON.stringify(reordered.body)).toBe(200);
     expect(reordered.body.entries.map((entry: any) => entry.comment.id)).toEqual(order);
+    const reloaded = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200);
+    expect(reloaded.body.entries.map((entry: any) => entry.comment.id)).toEqual(order);
+    await request(app(chat.companyId)).put(`/api/issues/${chat.issue.id}/queued-comments/order`)
+      .send({ queueId: queue.body.queueId, revision: queue.body.revision, orderedCommentIds: sent.map(comment => comment.id) }).expect(409);
   });
 
   // RED 4: the live native probe decides for a chat.
@@ -483,6 +492,100 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
   // live probe, and the message is never dropped: it stays queued for the turn boundary.
   
 
+  it('DESIGN row controls: a live steerable native Pi turn offers "Steer now" and consumes the queued row once', async () => {
+    const chat = await seedChat();
+    await attachSteerable(chat);
+    const [message] = await send(chat, ["Explicit Queue, then Steer now"]);
+    const queue = (await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200)).body;
+    expect(queue).toMatchObject({ targetRunId: chat.runId, protocol: "paperclip_runner_v1", steeringDisposition: "available" });
+    expect(queue.entries).toHaveLength(1);
+    expect(queue.entries[0]).toMatchObject({ canEdit: true, canDiscard: true, behindReset: false });
+    expect(mocks.steer).not.toHaveBeenCalled();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/queued-comments/${message!.id}/steer`)
+        .send({ queueId: queue.queueId, revision: queue.revision, targetRunId: chat.runId }).expect(200);
+      expect(response.body.entries).toEqual([]);
+    }
+    expect(mocks.steer).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      runId: chat.runId, correlationId: message!.id, message: message!.body,
+    }));
+    await finishTurn(chat);
+    expect(await answered(message!.id)).toBe(true);
+  });
+
+  it("B6 queue boundary: later default sends never steer an explicitly queued message or jump ahead of it", async () => {
+    const chat = await seedChat();
+    await attachSteerable(chat);
+    const [queued] = await send(chat, ["Explicitly wait after this turn"]);
+    const response = await postDefault(chat, "Default after the explicit Queue").expect(201);
+    await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup);
+    const queue = (await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200)).body;
+    expect(queue.entries.map((entry: any) => entry.comment.id)).toEqual([queued!.id, response.body.id]);
+    expect(mocks.steer).not.toHaveBeenCalled();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    expect(run!.contextSnapshot?.steeredCommentIds ?? []).toEqual([]);
+    for (const id of [queued!.id, response.body.id]) expect(await answered(id)).toBe(false);
+    await db.update(agents).set({ adapterType: "process" }).where(eq(agents.id, chat.agentId));
+    await drainVisibleQueue(chat, [queued!.id, response.body.id]);
+  }, 30_000);
+
+  it("Queue → Steer now crosses the production Pi drivers/proxy and records a read and one following answer", async () => {
+    const chat = await seedChat();
+    await attachSteerable(chat);
+    const root = await mkdtemp(join(tmpdir(), "q1-pi-boundary-"));
+    const peer = await openPiSteeringPeer(root, chat.runId);
+    const events: PrpEvent[] = [];
+    let port: PaperclipControlPlanePort | undefined;
+    let pumpError: unknown;
+    const pump = (async () => {
+      for await (const event of peer.session.events()) {
+        port ??= new PaperclipControlPlanePort(db, { companyId: chat.companyId, issueId: chat.issue.id,
+          runId: chat.runId, agentId: chat.agentId, sessionId: event.normalizedSessionId,
+          completionContractId: randomUUID(), completionContractSha256: `sha256:${"a".repeat(64)}`,
+          sourceInstanceId: event.sourceInstanceId, controlPlaneSourceInstanceId: event.sourceInstanceId });
+        await port.appendEvent(event);
+        events.push(event);
+      }
+    })().catch(error => { pumpError = error; });
+    try {
+      const { turnId } = await peer.session.startTurn({ message: { role: "user", text: chat.first.body } });
+      await vi.waitFor(() => {
+        if (pumpError) throw pumpError;
+        expect(events.some(event => event.eventType === "tool.execution.started")).toBe(true);
+      });
+      mocks.probe.mockResolvedValue({ disposition: "available", activeTurnId: turnId });
+      mocks.steer.mockImplementation(async (input: { message: string; correlationId: string }) => {
+        await peer.session.steer!({ turnId, message: { role: "user", text: input.message }, correlationId: input.correlationId });
+        return { turnId };
+      });
+      const [message] = await send(chat, ["Queue this until I choose Steer now"]);
+      expect(peer.commands.some(command => command.type === "steer")).toBe(false);
+      const queue = (await queueOf(chat)).queue.body;
+      expect(queue.steeringDisposition).toBe("available");
+      const response = await steer(chat, message!.id, queue.queueId);
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body.entries).toEqual([]);
+      expect(await answered(message!.id)).toBe(false);
+      peer.releaseBoundary(true);
+      await vi.waitFor(async () => {
+        if (pumpError) throw pumpError;
+        expect(await answered(message!.id)).toBe(true);
+      }, { timeout: 5000 });
+      expect(peer.commands.filter(command => ["prompt", "steer", "abort", "follow_up"].includes(command.type))
+        .map(command => command.type)).toEqual(["prompt", "steer"]);
+      const persisted = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, chat.runId)).orderBy(asc(heartbeatRunEvents.seq));
+      if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, "Q1-pi-queue-steer.json"), JSON.stringify({
+        fixture: "real routes, PostgreSQL, Pi/Codex drivers, proxy and event ingestion; controlled Pi RPC peer and native-session registry",
+        message, queue, response: response.body, commands: peer.commands, events, persisted,
+      }, null, 2));
+    } finally {
+      await peer.close();
+      await pump;
+      await rm(root, { recursive: true, force: true });
+    }
+    await finishTurn(chat, { log: false });
+  }, 20_000);
+
   async function queueOf(chat: Chat) {
     const queue = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200);
     return { queue };
@@ -504,6 +607,7 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
   // queued: the chat stays active and only the steered message is answered.
   it("after a drag, steering only the head leaves the earlier messages pending and unanswered", async () => {
     const chat = await seedChat();
+    await attachSteerable(chat);
     const [a, b, c] = await send(chat, ["A", "B", "C"]);
     expect((await reorder(chat, [c!.id, b!.id, a!.id])).status).toBe(200);
     const [wake] = await deferredWakes(chat);
@@ -522,6 +626,7 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
   // once in that order, each is answered, and the chat settles to waiting.
   it("after a drag, steering every message in the final order answers each once and settles the chat", async () => {
     const chat = await seedChat();
+    await attachSteerable(chat);
     const [a, b, c] = await send(chat, ["A", "B", "C"]);
     expect((await reorder(chat, [c!.id, b!.id, a!.id])).status).toBe(200);
     for (const target of [c!, b!, a!]) {
@@ -543,6 +648,7 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
     async (_position, index) => {
       const chat = await seedChat();
       const sent = await send(chat, ["One", "Two"]);
+      const before = (await queueOf(chat)).queue.body;
       const response = await edit(chat, sent[index]!.id, "/new");
       expect(response.status, JSON.stringify(response.body)).toBe(409);
       expect(response.body.code).toBe("conversation_reset_requires_own_message");
@@ -552,6 +658,7 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
       const bodies = await db.select({ body: issueComments.body }).from(issueComments)
         .where(eq(issueComments.id, sent[index]!.id));
       expect(bodies[0]!.body).toBe(index === 0 ? "One" : "Two");
+      expect((await queueOf(chat)).queue.body).toEqual(before);
     },
   );
 
@@ -564,18 +671,15 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
     expect((await reorder(chat, [two!.id, one!.id])).status).toBe(200);
     const [wake] = await deferredWakes(chat);
     expect(wakeCommentIds(wake!)).toEqual([two!.id, one!.id]);
-    await finishTurn(chat);
-    const [nextRun] = await db.insert(heartbeatRuns).values({
-      companyId: chat.companyId, agentId: chat.agentId, status: "running", runtimeMode: "native",
-      contextSnapshot: (wake!.payload as Record<string, any>)._paperclipWakeContext,
-    }).returning();
-    await db.update(issues).set({ executionRunId: nextRun!.id }).where(eq(issues.id, chat.issue.id));
-    expect((await prepareConversationTurn(db, nextRun!)).reset).toBe(false);
-    const issue = await finishTurn({ ...chat, runId: nextRun!.id });
+    const turns = await drainVisibleQueue(chat, [two!.id, one!.id]);
+    expect(turns).toHaveLength(1);
+    expect(turns[0]!.generation).toBe(0);
+    expect(turns[0]!.input).toContain("One, edited");
+    const [issue] = await db.select().from(issues).where(eq(issues.id, chat.issue.id));
     expect(issue).toMatchObject({ status: "in_review", conversationState: "waiting" });
     expect(await answered(one!.id)).toBe(true);
     expect(await answered(two!.id)).toBe(true);
-  });
+  }, 30_000);
 
   // rf5 F2: a single queued message edited into /new keeps its own wake and resets the session.
   
@@ -584,9 +688,11 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
   it("refuses another board operator's reorder of the owner's chat queue (403)", async () => {
     const chat = await seedChat();
     const sent = await send(chat, ["A", "B"]);
+    const before = (await queueOf(chat)).queue.body;
     const response = await reorder(chat, sent.map((comment) => comment.id).reverse(), app(chat.companyId, "other-operator"));
     expect(response.status).toBe(403);
     expect(wakeCommentIds((await deferredWakes(chat))[0]!)).toEqual(sent.map((comment) => comment.id));
+    expect((await queueOf(chat)).queue.body).toEqual(before);
   });
 
   
