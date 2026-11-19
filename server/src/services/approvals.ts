@@ -11,7 +11,7 @@ import { redactCurrentUserText } from "../log-redaction.js";
 import { createAgentLifecycle } from "./agent-lifecycle.js";
 
 import { instanceSettingsService } from "./instance-settings.js";
-import { reviseCompanyCreationPayload } from "./company-creation-approval.js";
+import { reviseCompanyCreationPayload } from "./company-creation-approval-payload.js";
 
 export function approvalRecords(db: Db) {
   const instanceSettings = instanceSettingsService(db);

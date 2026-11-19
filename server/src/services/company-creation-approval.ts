@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { approvals, companies, companyMemberships, userCompanyPreferences, type Db } from "@paperclipai/db";
-import { z } from "zod";
 import { conflict, forbidden, unprocessable } from "../errors.js";
 import { resolvableApprovalStatuses } from "../lib/approval-records.js";
 import { writeApprovalChange } from "./approval-work-notifications.js";
@@ -13,48 +12,9 @@ import { isCloudManagedInstance } from "./cloud-instance.js";
 import { finishCompanyProvisioning } from "./company-provisioning.js";
 import { logActivity } from "./activity-log.js";
 
-/** Said plainly on the card: approval is irreversible on hq. */
-export const CREATE_COMPANY_IRREVERSIBLE_NOTICE =
-  "Approving creates this new organization right away. A new organization can't be deleted on hq.";
-
-/** The exact creation the person approves (#21271). */
-export const createCompanyApprovalPayloadSchema = z.object({
-  name: z.string().trim().min(1).max(200),
-  description: z.string().trim().max(4000).nullable().optional(),
-  ownerUserId: z.string().min(1),
-  budgetMonthlyCents: z.number().int().nonnegative().optional(),
-}).strict();
-
-const reviseCompanyApprovalPayloadSchema = createCompanyApprovalPayloadSchema
-  .pick({ name: true, description: true, budgetMonthlyCents: true }).partial().strict();
-
-/** A revision changes the proposed organization, never the owner or effect ids. */
-export function reviseCompanyCreationPayload(current: Record<string, unknown>, payload: unknown) {
-  const parsed = reviseCompanyApprovalPayloadSchema.safeParse(payload);
-  if (!parsed.success) throw unprocessable("An organization revision may change only name, description and budget.",
-    { issues: parsed.error.issues });
-  const fields = createCompanyApprovalPayloadSchema.parse({
-    name: current.name, description: current.description ?? null, ownerUserId: current.ownerUserId,
-    budgetMonthlyCents: current.budgetMonthlyCents ?? 0, ...parsed.data,
-  });
-  return { ...current, ...companyCreationCardPayload(fields) };
-}
-
-function companyCreationCardPayload(fields: z.infer<typeof createCompanyApprovalPayloadSchema>) {
-  return {
-    ...fields,
-    description: fields.description ?? null,
-    budgetMonthlyCents: fields.budgetMonthlyCents ?? 0,
-    title: fields.name,
-    summary: `Create the new organization "${fields.name}" owned by this person. ${CREATE_COMPANY_IRREVERSIBLE_NOTICE}`,
-    irreversibleNotice: CREATE_COMPANY_IRREVERSIBLE_NOTICE,
-    normalizedName: normalizeCompanyName(fields.name),
-  };
-}
-
-export function normalizeCompanyName(name: string) {
-  return name.normalize("NFKC").trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
-}
+import { companyCreationCardPayload, createCompanyApprovalPayloadSchema, normalizeCompanyName } from "./company-creation-approval-payload.js";
+export { CREATE_COMPANY_IRREVERSIBLE_NOTICE, createCompanyApprovalPayloadSchema, normalizeCompanyName,
+  reviseCompanyCreationPayload } from "./company-creation-approval-payload.js";
 
 type AgentActor = { type: string; agentId?: string | null; companyId?: string | null };
 type ApproverActor = { type: string; userId?: string | null; source?: string | null; isInstanceAdmin?: boolean };
