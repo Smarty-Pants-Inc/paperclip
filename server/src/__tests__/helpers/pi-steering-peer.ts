@@ -8,7 +8,8 @@ import { FakeCodexTransport, makeDriver } from "../../../../packages/paperclip-r
 /** A controlled Pi RPC peer, not an answer projector. It cannot consume a steer
  * until the test releases the current tool call. Both production drivers and
  * the production Pi app-server proxy handle every wire record. */
-export async function openPiSteeringPeer(root: string, runId: string, options: { captureModelInput?: boolean } = {}) {
+export async function openPiSteeringPeer(root: string, runId: string, options: { captureModelInput?: boolean; normalizedSessionId?: string } = {}) {
+  const normalizedSessionId = options.normalizedSessionId ?? "boundary-peer-normalized";
   let wake: (() => void) | undefined;
   let closed = false;
   const records: PiRpcRecord[] = [];
@@ -19,10 +20,9 @@ export async function openPiSteeringPeer(root: string, runId: string, options: {
     const message = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
     send({ type: "message_start", message }); send({ type: "message_end", message });
   };
-  const answer = () => {
-    const text = "Answered after reading the steer.";
+  const answer = (text = "Answered after reading the steer.", commentary = false) => {
     const message = { role: "assistant", content: [{ type: "text", text }],
-      model: "model", provider: "neutral", api: "openai-completions", stopReason: "stop", timestamp: Date.now(),
+      model: "model", provider: "neutral", api: "openai-completions", stopReason: commentary ? "toolUse" : "stop", timestamp: Date.now(),
       usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
     send({ type: "message_start", message: { ...message, content: [] } });
@@ -61,12 +61,12 @@ export async function openPiSteeringPeer(root: string, runId: string, options: {
   const pi = modelPeer?.session ?? await new PiRpcDriver({ model: "neutral/model", piRpcThinkingLevel: "high",
     runtimeDirectory: join(root, "pi-runtime"), environment: { PI_CODING_AGENT_DIR: join(root, "pi-agent") },
     transportFactory: () => peer as unknown as PiRpcTransport,
-  }).openSession({ runId, normalizedSessionId: "boundary-peer-normalized", workingDirectory: root });
+  }).openSession({ runId, normalizedSessionId, workingDirectory: root });
   const transport = new FakeCodexTransport();
   let nextRequest = 0;
   const waiting = new Map<number, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>();
   const proxy = createPiRpcAppServerProxy({
-    environment: { PAPERCLIP_RUN_ID: runId, PAPERCLIP_NORMALIZED_SESSION_ID: "boundary-peer-normalized" },
+    environment: { PAPERCLIP_RUN_ID: runId, PAPERCLIP_NORMALIZED_SESSION_ID: normalizedSessionId },
     stdout: { write(bytes) {
       const value = JSON.parse(bytes);
       if (typeof value.id === "number") {
@@ -86,7 +86,7 @@ export async function openPiSteeringPeer(root: string, runId: string, options: {
   const session = await makeDriver([transport], { model: modelPeer ? "paperclip/faux" : "neutral/model", conversationMode: "direct",
     includeCollaborationModeInstructions: false, capabilities: { steering: true },
     driverIdentity: { kind: "pi_rpc", displayName: "Pi RPC", version: "1.5.2" },
-  }).openSession({ runId, normalizedSessionId: "boundary-peer-normalized", workingDirectory: root });
+  }).openSession({ runId, normalizedSessionId, workingDirectory: root });
   return {
     session, commands: modelPeer?.commands ?? commands,
     modelRequests: modelPeer?.modelRequests ?? [] as CapturedPiModelRequest[],
@@ -110,6 +110,12 @@ export async function openPiSteeringPeer(root: string, runId: string, options: {
       }
       if (reply) answer();
     },
+    /** A separate Pi assistant message per consumed steer, in this same turn. */
+    answerNextSteer(text: string, commentary = false) {
+      const next = pending.shift(); if (next === undefined) throw new Error("No queued steer");
+      user(next); answer(text, commentary);
+    },
+    answerOwnInput(text: string, commentary = false) { answer(text, commentary); },
     endTurn() {
       send({ type: "turn_end" }); send({ type: "agent_end", messages: [] });
       // Pinned Pi's agent_end is a continuation boundary, NOT the run terminal.
