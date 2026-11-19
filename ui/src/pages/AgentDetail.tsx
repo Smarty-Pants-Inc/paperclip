@@ -34,6 +34,8 @@ import { accessApi } from "../api/access";
 import { issuesApi } from "../api/issues";
 import { usePanel } from "../context/PanelContext";
 import { useSidebar } from "../context/SidebarContext";
+import { useAgentChatEnabled } from "../hooks/useAgentChatEnabled";
+import { usePrimaryAgentOwner } from "../hooks/usePrimaryAgentOwner";
 import { useCompany } from "../context/CompanyContext";
 import { useDialogActions } from "../context/DialogContext";
 import { useToastActions } from "../context/ToastContext";
@@ -423,6 +425,14 @@ export function AgentDetail() {
   const lifecycle = useAgentLifecycleStatus(agent);
   const resolvedCompanyId = agent?.companyId ?? selectedCompanyId;
   const canonicalAgentRef = agent ? agentRouteRef(agent) : routeAgentRef;
+  // Another member's Smarty lands only on that member's read-only chat. Its
+  // settings tabs stay reachable by URL for people who manage agents.
+  const { enabled: agentChatEnabled } = useAgentChatEnabled();
+  const { session: ownerSession, primaries: ownerPrimaries, otherOwnerId } =
+    usePrimaryAgentOwner(resolvedCompanyId, agent?.id, agentChatEnabled && !!agent);
+  const landingView = !urlRunId && activeView === "overview";
+  const ownershipPending = agentChatEnabled && !!agent && ownerPrimaries.isPending && !ownerSession.isError;
+  const opensOwnerChat = landingView && agentChatEnabled && !!otherOwnerId;
   const handleLegacyTabChange = useCallback((next: string) => {
     if (!prepareAgentNavigation()) return;
     navigate(`/agents/${canonicalAgentRef || routeAgentRef}/${next}`);
@@ -595,6 +605,11 @@ export function AgentDetail() {
 
   useEffect(() => {
     if (!agent) return;
+    if (opensOwnerChat) {
+      navigate(`/chats/${canonicalAgentRef}`, { replace: true });
+      return;
+    }
+    if (landingView && ownershipPending) return;
     if (activeView === "advanced" && (configSaving || configDirty)) return;
     if (urlRunId) {
       if (routeAgentRef !== canonicalAgentRef) {
@@ -607,7 +622,7 @@ export function AgentDetail() {
       navigate(`${agentDetailHref(canonicalAgentRef, canonicalTab)}${location.search}`, { replace: true });
       return;
     }
-  }, [agent, routeAgentRef, canonicalAgentRef, urlRunId, urlTab, activeView, configSaving, configDirty, navigate, location.search]);
+  }, [agent, routeAgentRef, canonicalAgentRef, urlRunId, urlTab, activeView, configSaving, configDirty, navigate, location.search, opensOwnerChat, landingView, ownershipPending]);
 
   useEffect(() => {
     if (!agent?.companyId || agent.companyId === selectedCompanyId) return;
@@ -790,6 +805,7 @@ export function AgentDetail() {
     return <QueryErrorState size="page" error={error} action="load this agent" onRetry={agentView.retry} retrying={agentView.isFetching} />;
   }
   if (!agent) return null;
+  if (opensOwnerChat || (landingView && ownershipPending)) return <PageSkeleton variant="detail" />;
   if (!urlRunId && !urlTab) {
     return <Navigate to={agentDetailHref(canonicalAgentRef)} replace />;
   }
@@ -922,7 +938,8 @@ export function AgentDetail() {
           assignLabel="New task"
           size="default"
           assignIcon={Paperclip}
-          showChat
+          showChat={!otherOwnerId && !ownershipPending}
+          showAssign={!otherOwnerId && !ownershipPending}
           showStatus={false}
           workActionsInMenu
           menuItems={[{ label: "Agent history", icon: HistoryIcon, onSelect: () => setHistoryOpen(true) }]}
