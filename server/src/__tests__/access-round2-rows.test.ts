@@ -442,4 +442,22 @@ describeEmbeddedPostgres("access-round2 residual rows through the real routes (F
       .send({ source: "on_demand", triggerDetail: "manual", payload: { issueId: "OVP-2" } });
     expect(response.status, JSON.stringify(response.body)).toBe(202);
   });
+
+  it("A2 control: an explicitly GRANTED non-assigned agent still reaches the gated routes (no 404)", async () => {
+    const f = await seed();
+    await request(app(f.companyId, { kind: "user", userId: OWNER })).post(`/api/issues/${f.issueId}/access-grants`)
+      .send({ subjectType: "agent", subjectId: f.otherAgentId }).expect(201);
+    const a = app(f.companyId, { kind: "agent", agentId: f.otherAgentId });
+    const monitor = await request(a).post(`/api/issues/${f.issueId}/monitor/check-now`).send({});
+    expect(monitor.status, JSON.stringify(monitor.body)).not.toBe(404);
+    const goal = await request(a).post(`/api/issues/${f.issueId}/runner-goal/actions`).send(oracleBody(f, "runner-goal/actions", f.otherAgentId));
+    expect(goal.status, JSON.stringify(goal.body)).not.toBe(404);
+    const run = await request(a).get(`/api/heartbeat-runs/${f.runId}`);
+    expect(run.status, JSON.stringify(run.body)).toBe(200);
+    for (const ref of ["OVP-1", f.issueId]) {
+      const wake = await request(a).post(`/api/agents/${f.otherAgentId}/wakeup`)
+        .send({ source: "on_demand", triggerDetail: "manual", payload: { issueId: ref } });
+      expect(wake.status, `${ref} ${JSON.stringify(wake.body)}`).toBe(202);
+    }
+  });
 });
