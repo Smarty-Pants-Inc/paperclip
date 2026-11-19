@@ -80,7 +80,7 @@ export async function attachSandboxCreation(db: Db, id: string, scope: { company
       const [run] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, scope.heartbeatRunId), eq(heartbeatRuns.companyId, scope.companyId), eq(heartbeatRuns.status, "running"),
       )).for("update");
-      if (!run || operation?.runId !== scope.heartbeatRunId) throw new Error("Sandbox creation run authority changed");
+      if (!run || (operation?.runId !== scope.heartbeatRunId && operation?.metadata.creationHeartbeatRunId !== scope.heartbeatRunId)) throw new Error("Sandbox creation run authority changed");
     }
     if (operation?.state === "attached" && operation.leaseId) {
       const existing = await environmentService(tx as unknown as Db).getLeaseById(operation.leaseId);

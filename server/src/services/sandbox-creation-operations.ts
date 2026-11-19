@@ -120,6 +120,7 @@ export async function createOwnedSandbox(
   const runId = owner.heartbeatRunId ?? randomUUID();
   const settleAt = new Date(Date.now() + Math.max(CREATION_SETTLE_FLOOR_MS, (owner.timeoutMs ?? 0) + 60_000));
   const creationController = await currentControllerProcess();
+  let carried: SandboxCreationOperation | undefined;
   const admit = (stopped?: SandboxCreationOperation) => db.transaction(async tx => {
     await notifyEnvironmentCleanup(tx, { companyId: owner.companyId, runId: owner.heartbeatRunId ?? undefined });
     await assertEnvironmentCompanyBinding(tx as unknown as Db, owner.environmentId, owner.companyId);
@@ -128,6 +129,19 @@ export async function createOwnedSandbox(
     if (stopped) await tx.update(sandboxCreationOperations).set({ state: "resolved", updatedAt: new Date() }).where(and(
       eq(sandboxCreationOperations.id, stopped.id), eq(sandboxCreationOperations.state, "attached"),
       eq(sandboxCreationOperations.leaseId, stopped.leaseId!)));
+    // A run retry re-sends its predecessor's still-pending creation: same id
+    // (idempotency key) and runId, so the provider returns that one resource.
+    // Moving the heartbeat owner and settle deadline keeps recovery off it.
+    const [retry] = owner.heartbeatRunId && !stopped ? await tx.select({ of: heartbeatRuns.retryOfRunId }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, owner.heartbeatRunId)) : [];
+    if (retry?.of) [carried] = await tx.update(sandboxCreationOperations).set({ nextAttemptAt: settleAt, updatedAt: new Date(),
+      metadata: sql`${sandboxCreationOperations.metadata} || ${JSON.stringify({ creationHeartbeatRunId: owner.heartbeatRunId,
+        creationController, creationSettleAt: settleAt.toISOString() })}::jsonb` }).where(and(
+      eq(sandboxCreationOperations.companyId, owner.companyId), eq(sandboxCreationOperations.originalEnvironmentId, owner.environmentId),
+      eq(sandboxCreationOperations.requestKey, owner.requestKey ?? "run"), eq(sandboxCreationOperations.state, "pending"),
+      sql`${sandboxCreationOperations.leaseId} is null and ${sandboxCreationOperations.metadata}->>'creationHeartbeatRunId' = ${retry.of}`,
+    )).returning();
+    if (carried) return carried;
     const [inserted] = await tx.insert(sandboxCreationOperations).values({
       id, companyId: owner.companyId, environmentId: owner.environmentId, originalEnvironmentId: owner.environmentId,
       runId, requestKey: owner.requestKey ?? "run", issueId: owner.issueId, executionWorkspaceId: owner.executionWorkspaceId,
@@ -147,7 +161,7 @@ export async function createOwnedSandbox(
   });
   let operation = await admit();
   if (operation.id !== id && await createdSandboxStopped(db, operation)) operation = await admit(operation);
-  if (operation.id !== id) {
+  if (operation.id !== id && operation !== carried) {
     if (operation.state !== "attached" || !operation.leaseId) throw new Error("Sandbox creation requires reconciliation before another attempt");
     const existing = await environmentService(db).getLeaseById(operation.leaseId);
     if (!existing || existing.status !== "active" || !existing.providerLeaseId) throw new Error("Sandbox creation has already transferred ownership");
@@ -156,14 +170,14 @@ export async function createOwnedSandbox(
   }
   try {
     crashPoint("sandbox.create.after_intent_before_provider");
-    const lease = await create({ id, runId });
+    const lease = await create({ id: operation.id, runId: operation.runId });
     crashPoint("sandbox.create.after_provider_before_lease");
-    return { ...lease, metadata: { ...lease.metadata, creationOperationId: id } };
+    return { ...lease, metadata: { ...lease.metadata, creationOperationId: operation.id } };
   } catch (error) {
     if (recoverablePluginCreation(operation)) {
       try {
         await writeEnvironmentCleanup(db, tx => tx.update(sandboxCreationOperations).set({ nextAttemptAt: new Date(), updatedAt: new Date() })
-          .where(and(eq(sandboxCreationOperations.id, id), recoverableSandboxCreationCondition())),
+          .where(and(eq(sandboxCreationOperations.id, operation.id), recoverableSandboxCreationCondition())),
         { companyId: operation.companyId, runId: owner.heartbeatRunId ?? undefined });
       } catch {
         logger.warn({ errorKind: "task_creation_recovery_wakeup_failed", operationId: id, companyId: operation.companyId },
