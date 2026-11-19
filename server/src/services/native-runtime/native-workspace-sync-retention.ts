@@ -7,6 +7,7 @@ import { logger } from "../../middleware/logger.js";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import { readProcessStartedAt } from "../hot-restart.js";
+import { hasBoundRemoteStopReceipt } from "../remote-execution-termination.js";
 import { currentProcessProbe, type ProcessProbe as OwnerProcessProbe } from "../owner-proof.js";
 import { proveRunProcessGone } from "../run-process-owner.js";
 import { workspaceExportCauses } from "../workspace-recovery-source.js";
@@ -183,11 +184,6 @@ async function retentionBlocker(
             or metadata->>'pendingCleanupInFlight' = 'true')
       ) as export_resume,
       exists(
-        select 1 from environment_leases
-        where company_id = ${run.company_id} and id::text = ${reference.leaseId}
-          and metadata->'remoteExecutionTermination'->>'state' = 'destroyed'
-      ) as lease_destroyed,
-      exists(
         select 1 from issue_recovery_actions
         where company_id = ${run.company_id} and evidence->>'runId' = ${runId}
           and (evidence->'systemRecovery'->>'state' in (${sql.join(RETAINED_RECOVERY_STATES.map((state) => sql`${state}`), sql`, `)})
@@ -214,9 +210,28 @@ async function retentionBlocker(
   if (owners?.export_recovery) return "export_recovery";
   if (owners?.owner_unverified) return "owner_unverified";
   if (owners?.export_resume) return "export_resume";
-  if (!owners?.lease_destroyed && owners?.retained_recovery) return "retained_recovery";
+  if (owners?.retained_recovery && !(await leaseDestroyedByOwnRun(tx, run.company_id, reference.leaseId))) {
+    return "retained_recovery";
+  }
   if (owners?.backfill_pending) return "recovery_backfill_pending";
   return null;
+}
+
+/** adopt-foreign-receipt F1: the referenced lease was destroyed only when its
+ * destroyed termination is bound to that lease's own run, lease and provider.
+ * Another run's copied record never retires this run's saved files. */
+async function leaseDestroyedByOwnRun(tx: Tx, companyId: string, leaseId: string): Promise<boolean> {
+  const leases = (await tx.execute(sql`
+    select id, company_id, heartbeat_run_id, provider, provider_lease_id,
+      metadata->'remoteExecutionTermination' as termination
+    from environment_leases
+    where company_id = ${companyId} and id::text = ${leaseId}
+      and metadata->'remoteExecutionTermination'->>'state' = 'destroyed'
+  `)) as unknown as Array<{ id: string; company_id: string; heartbeat_run_id: string | null; provider: string | null;
+    provider_lease_id: string | null; termination: unknown }>;
+  return leases.some((lease) => hasBoundRemoteStopReceipt({ id: lease.id, companyId: lease.company_id,
+    heartbeatRunId: lease.heartbeat_run_id, provider: lease.provider, providerLeaseId: lease.provider_lease_id,
+    metadata: { remoteExecutionTermination: typeof lease.termination === "string" ? JSON.parse(lease.termination) : lease.termination } }));
 }
 
 const defaultProcessProbe: ProcessProbe = {
