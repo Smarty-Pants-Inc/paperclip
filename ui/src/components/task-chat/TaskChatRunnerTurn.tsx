@@ -141,8 +141,10 @@ interface RunnerHeaderProps {
 function runnerWaitingLabel({ runId, status, execution, preparationLabel }: RunnerHeaderProps, waitingToStart = false) {
   if (isTerminalRunStatus(status)) return null;
   if (execution?.phase === "waiting_for_provider") return execution.label;
-  if (!runId && preparationLabel) return preparationLabel;
   if (status === "queued" && execution?.cause) return execution.label;
+  // No admitted run exists yet. A saved/submitted message is not evidence of
+  // agent work, even during the normal startup feedback grace period.
+  if (!runId) return preparationLabel ?? WAITING_TO_START_LABEL;
   return waitingToStart ? WAITING_TO_START_LABEL : null;
 }
 
@@ -423,7 +425,7 @@ export function TaskChatRunnerTurn({
           />
         </div>
       ) : null}
-      {!final && currentActivityItems.length === 0 && !(status === "queued" && runId && (waitingLabel || agentQueueWaitFor({ status, execution })))
+      {!final && currentActivityItems.length === 0 && !(status === "queued" && (waitingLabel || agentQueueWaitFor({ status, execution })))
         ? <RunnerCurrentActivityTail status={status} waitingLabel={waitingLabel} /> : null}
     </div></TaskChatShimmerScope>
   );
