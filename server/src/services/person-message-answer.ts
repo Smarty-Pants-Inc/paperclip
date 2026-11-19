@@ -1,6 +1,7 @@
 import { and, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { activityLog, agentWakeupRequests, heartbeatRuns, issueComments, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
 import { freshContinuationSourceChainSql } from "./fresh-continuation-chain.js";
+import { wellFormedExecutionWaitSql } from "./deferred-execution-wait.js";
 
 /** The import's per-task arrival record: one activity row per issue a company import creates (issues.importIssues). */
 export const ISSUE_IMPORTED_ACTION = "issue.imported";
@@ -120,7 +121,9 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
 function liveMessageCustodySql(m: PersonMessageSql): SQL {
   return sql`(exists (select 1 from ${agentWakeupRequests} live_wake
       where live_wake.company_id = ${m.companyId}
-        and live_wake.status in ('queued', 'deferred_issue_execution', 'claimed')
+        and (live_wake.status in ('queued', 'deferred_issue_execution', 'claimed')
+          -- rf-4 C-V: a 'deferred' wake with a saved wait still holds its input (readPersonStopHold's shape).
+          or (live_wake.status = 'deferred' and ${wellFormedExecutionWaitSql(sql.raw("live_wake.payload"))}))
         and (live_wake.idempotency_key = 'conversation-comment:' || ${m.id}::text
           or live_wake.payload->>'commentId' = ${m.id}::text
           or live_wake.payload->'_paperclipWakeContext'->>'wakeCommentId' = ${m.id}::text
