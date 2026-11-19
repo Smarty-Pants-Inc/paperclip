@@ -33,6 +33,8 @@ import {
   undeliveredConversationComments,
 } from "../services/agent-conversations.js";
 import { answeredPersonMessageSql } from "../services/person-message-answer.js";
+import { configureAgentLifecycle, createAgentLifecycle } from "../services/agent-lifecycle.js";
+import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
 import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
 import { getServerAdapter, registerServerAdapter, runningProcesses } from "../adapters/index.js";
@@ -485,5 +487,72 @@ describeEmbeddedPostgres("ONE successor per Interrupt (adopt-one-successor, 390 
       payload: { issueId: chat.issue.id, commentId: first }, contextSnapshot: { ...wake.contextSnapshot, commentId: first,
         wakeCommentId: first, wakeCommentIds: [first] } })).toBeNull();
     expect((await commentWakes(chat, first)).filter(w => w.status !== "coalesced")).toEqual([]);
+  });
+
+  // ---- adopt-held-status (guard (a), commentCarriedSql's 'held' arm): only a wake that still owns or delivered a
+  // message holds it. A wake the pause CANCELLED names M in wakeCommentIds forever; it must not mark M as sent. ----
+
+  /** Every wake that delivers or will deliver `id` (cancelled, failed and skipped wakes deliver nothing). */
+  async function deliveriesOf(chat: Chat, id: string) {
+    return (await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, chat.companyId),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${chat.issue.id}`,
+      sql`${agentWakeupRequests.status} not in ('cancelled', 'failed', 'skipped', 'coalesced')`)))
+      .filter(wake => wakeCommentIds(wake).includes(id));
+  }
+  async function wakeDump(chat: Chat) {
+    return (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId))
+      .orderBy(asc(agentWakeupRequests.requestedAt))).map(w => ({ key: w.idempotencyKey, status: w.status, reason: w.reason,
+      runId: w.runId, ids: wakeCommentIds(w), queued: (w.payload as any).queuedCommentIds }));
+  }
+
+  /** The real pause and resume: the lifecycle commands, and the real host driver's pause Stop sweep and onReady. */
+  function lifecycle() {
+    const worker = configureAgentLifecycle(db, { ...createLifecycleDriver(db, {} as never),
+      requiredPluginIds: async () => [], runPlugin: async () => "complete" });
+    const commands = createAgentLifecycle(db);
+    return {
+      pause: async (agentId: string) => {
+        // The provider acknowledges the native Stop (as the Interrupt rows' cancel does).
+        mocks.cancel.mockImplementation(async (runId: string) => {
+          const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+          await db.update(heartbeatRuns).set({ resultJson: { ...(run!.resultJson ?? {}), nativeCancellation: {
+            schema: "paperclip.native-cancellation.v1", runId, companyId: run!.companyId, issueId: (run!.contextSnapshot as any).issueId,
+            scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+            intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID() } } }).where(eq(heartbeatRuns.id, runId));
+          return { decision: { stopped: true }, auditId: randomUUID() };
+        });
+        await commands.pauseAgent(agentId); await worker.process(agentId);
+        await heartbeatService(db).cancelActiveForAgent(agentId); },
+      resume: async (agentId: string) => { await commands.resumeAgent(agentId); await worker.process(agentId); },
+      stop: () => worker.stop(),
+    };
+  }
+
+  it("(held-1) queue M, the agent is paused (its wake cancelled), resume: M is delivered once", async () => {
+    const chat = await seedChat();
+    const [m] = await send(chat, ["M: queued while you work"]);
+    const life = lifecycle();
+    try {
+      await life.pause(chat.agentId);
+      expect((await db.select().from(agents).where(eq(agents.id, chat.agentId)))[0]!.status).toBe("paused");
+      expect(await deliveriesOf(chat, m!.id), "the pause cancelled M's wake").toEqual([]);
+      await life.resume(chat.agentId);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, chat.issue.id));
+      // The outbox after the resume (the run end / the stranded sweep), twice.
+      for (let i = 0; i < 2; i++) await deliverConversationComments(db, issue!, heartbeatService(db).wakeup);
+      expect(await deliveriesOf(chat, m!.id), `M delivered once after the resume: ${JSON.stringify(await wakeDump(chat))}`)
+        .toHaveLength(1);
+    } finally { await life.stop(); }
+  });
+
+  it("(held-2) control: M in a live deferred wake is not re-sent", async () => {
+    const chat = await seedChat();
+    const [m] = await send(chat, ["M: queued while you work"]);
+    const held = await deliveriesOf(chat, m!.id);
+    expect(held.map(w => w.status)).toEqual(["deferred_issue_execution"]);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, chat.issue.id));
+    for (let i = 0; i < 2; i++) await deliverConversationComments(db, issue!, heartbeatService(db).wakeup);
+    expect((await deliveriesOf(chat, m!.id)).map(w => w.id), "M re-sent while a live wake holds it").toEqual(held.map(w => w.id));
+    expect((await undeliveredConversationComments(db, chat.companyId, chat.issue.id)).map(c => c.id)).not.toContain(m!.id);
   });
 });

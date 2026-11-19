@@ -3,6 +3,13 @@ import { agentWakeupRequests, heartbeatRuns, type Db } from "@paperclipai/db";
 import { answeredPersonMessageIds } from "./person-message-answer.js";
 
 /**
+ * adopt-held-status: the wake statuses (WAKEUP_REQUEST_STATUSES) that still own or delivered a message.
+ * EXCLUDED: 'cancelled' (a pause / Stop sweep ended it), 'failed', 'skipped' (a refused admission): such a
+ * wake delivers nothing, so the message it once named is still owed.
+ */
+export const WAKES_THAT_HOLD_A_MESSAGE = sql`('queued', 'deferred_issue_execution', 'claimed', 'coalesced', 'completed')`;
+
+/**
  * ONE successor per Interrupt (adopt-one-successor, 390 take 11:16-11:20Z).
  *
  * The Interrupt press moves the cut turn's steers out of that run's
@@ -19,6 +26,7 @@ import { answeredPersonMessageIds } from "./person-message-answer.js";
 export function commentCarriedSql(companyId: string, issueId: string, id: SQL): SQL {
   return sql`(exists (select 1 from ${agentWakeupRequests} held where held.company_id = ${companyId}::uuid
       and held.payload->>'issueId' = ${issueId}::text
+      and held.status in ${WAKES_THAT_HOLD_A_MESSAGE}
       and coalesce(held.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? (${id})::text)
     or exists (select 1 from ${heartbeatRuns} cut where cut.company_id = ${companyId}::uuid
       and (cut.native_issue_id = ${issueId}::uuid or cut.context_snapshot->>'issueId' = ${issueId}::text)
