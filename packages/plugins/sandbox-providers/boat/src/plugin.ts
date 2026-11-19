@@ -27,6 +27,7 @@ import type {
   PluginEnvironmentValidateConfigParams, PluginEnvironmentValidationResult, PluginEnvironmentCreationCleanup, PluginEnvironmentAcquisitionDiagnostic,
   PluginEnvironmentInspectLeaseParams, PluginEnvironmentLeaseObservation,
   PluginEnvironmentRunnerIngressEndpointParams, PluginEnvironmentRunnerIngressEndpoint, PluginContext,
+  EnvironmentCreationIdempotencyCode,
 } from "@paperclipai/plugin-sdk";
 
 type Config = RunnerConfig & { apiBaseUrl?: string; provider: string; setupTimeoutSeconds: number; runLeaseRenewCapSeconds: number; retainOnDestroy: boolean; labels: Record<string, string>; duplexCarrier: "off" | "ssh" };
@@ -1446,6 +1447,20 @@ async function creationExpiry(companyId: string, creationId: string, ttlSeconds:
   finally { if (createExpiryWrites.get(companyId) === write) createExpiryWrites.delete(companyId); }
   return expiry;
 }
+/**
+ * The host sees Boat's idempotency outcome across the worker connection only as
+ * the plugin SDK's closed creationIdempotencyCode, which the SDK reads from the
+ * acquire error's (or a cause's) string `code`. It decides the host retry:
+ * key_reused and box_stopped spend the creation (the next retry mints a fresh
+ * key); in_progress is carried (the same key is sent again). Boat's code rides
+ * as a cause, so the error's own fields (status, boatCode, code) stay as they are.
+ */
+function nameCreationIdempotency<E extends Error>(error: E, code: EnvironmentCreationIdempotencyCode): E {
+  const named = Object.assign(new Error(`Boat create ${code}`), { code });
+  if (error.cause !== undefined) named.cause = error.cause;
+  error.cause = named;
+  return error;
+}
 /** Boat's "Retry shortly with the same key" (:2242) pause between create sends. */
 const BOAT_IDEMPOTENCY_IN_PROGRESS_RESEND_MS = 2_000;
 function boatCreateCode(error: unknown): string | undefined {
@@ -1486,8 +1501,10 @@ async function sendCreate(config: Config, attemptId: string, body: string, creat
         failure.message = `boat_idempotency_key_reused: ${failure.message} (Boat holds this creation's Idempotency-Key with a different request body; no create was sent under a new key)`;
         if (failure.stack) failure.stack = failure.stack.replace("Error: ", "Error: boat_idempotency_key_reused: ");
         failure.code = "boat_idempotency_key_reused";
-        throw failure;
+        throw nameCreationIdempotency(failure, "idempotency_key_reused");
       }
+      // A key still in progress when the cap ends escapes as this 409.
+      if (code === "idempotency_in_progress" && error instanceof Error) nameCreationIdempotency(error, code);
       if (code !== "idempotency_in_progress" || shuttingDown
         || Date.now() + BOAT_IDEMPOTENCY_IN_PROGRESS_RESEND_MS >= capAt) throw error;
       inProgress = error;
