@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createObjectRunLogStore, readObjectRunLogSpill } from "../services/object-run-log-store.js";
+import { candidateHoldsUnrecoveredRunLogSpill, createObjectRunLogStore, readObjectRunLogSpill } from "../services/object-run-log-store.js";
 import { listWorktreeRunLogSpillRoots } from "../services/workspace-instance-cleanup.js";
 import { contentSpill, event, ids, spillMemory } from "../services/object-run-log-spill.fixture.js";
 import {
@@ -160,6 +160,14 @@ describe("findRegenerableWorkspaceDirs", () => {
       expect(await fs.readFile(spill.path)).toEqual(spill.bytes);
       expect(await fs.readFile(spill.indexPath)).toEqual(spill.index);
     }
+  });
+
+  // Keep reason: trace custody must not quietly make real dependency trees uncompactable.
+  it("fits this repository's installed node_modules inside the content walk bound", async () => {
+    const candidate = path.resolve(import.meta.dirname, "../../../node_modules");
+    const started = performance.now();
+    expect(await candidateHoldsUnrecoveredRunLogSpill(candidate)).toBe(false);
+    console.info("installed-node-modules-content-walk", { candidate, elapsedMs: performance.now() - started });
   });
 
   it("does not follow or return a symlinked directory", async () => {
