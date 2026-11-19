@@ -576,4 +576,26 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     expect(cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
     expect(held).toBe(true);
   });
+  // Keep reason: adopt-stoppending-card. A person's Stop of a warm turn hands the
+  // box off ON PURPOSE; no card while its existing bounds run (here the
+  // stop-and-retain intent awaiting its receipt). Past the receipt bound with
+  // no receipt, the box really cannot be shown stopped: exactly ONE card.
+  it("a handed-off warm Stop raises no card inside the receipt bound and ONE card past it", async () => {
+    const f = await warmStopFixture("missing");
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...run!.runnerProfileJson, nativeResourceDisposition: "keep_running" } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    const intent = async (releasedAt: Date) => db.update(environmentLeases).set({ status: "pending_cleanup", releasedAt,
+      metadata: { ...f.lease.metadata, sandboxStopAndRetain: { runId: f.runId, handedOffWarmProofUnproven: true,
+        requestedAt: releasedAt.toISOString() } } }).where(eq(environmentLeases.id, f.lease.id));
+    await intent(new Date());
+    expect((await onePass(f)).cards).toEqual([]);
+    await db.update(issues).set({ checkoutRunId: f.runId, executionRunId: f.runId, executionLockedAt: new Date() })
+      .where(eq(issues.id, f.issueId));
+    await intent(new Date(Date.now() - 61_000));
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+    await onePass(f);
+    const { cards } = await onePass(f);
+    expect(cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
+  });
 });

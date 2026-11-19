@@ -70,6 +70,7 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
 import * as environmentOrchestrator from "../services/environment-run-orchestrator.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { recoveryService } from "../services/recovery/service.js";
 import { preserveCancelledNativeWorkspaces, registerCancelledWorkspacePreservationWork }
   from "../services/native-runtime/native-failed-workspace-recovery.js";
 
@@ -140,7 +141,12 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
   async function stopThenMessage(options: { warm: boolean; messageDelay: "immediate" | "after_sweep";
     // A second producer of the same hold that runs in the window between the run
     // turning cancelled and the heartbeat's lease release (lease still active).
-    producer?: "worker" | "sweep" }) {
+    producer?: "worker" | "sweep";
+    // adopt-stoppending-card: the real stale-lock sweep and stranded passes run
+    // at the gate's order: the run cancelled by the person's Stop, the warm box
+    // just handed off (keep_running release, lease retained), the task still
+    // holding its locks, and no stop receipt of any kind.
+    recoveryAtHandoff?: boolean }) {
     fixture.warm = options.warm;
     fixture.calls = [];
     const f = await seed();
@@ -196,6 +202,34 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
     let stopping: Promise<unknown> | undefined;
     let windowLease: typeof environmentLeases.$inferSelect | undefined;
     let windowHold: (typeof issueRecoveryActions.$inferSelect)[] | undefined;
+    let handoff: { lease?: typeof environmentLeases.$inferSelect; task?: typeof issues.$inferSelect;
+      run?: typeof heartbeatRuns.$inferSelect; cards?: (typeof issueRecoveryActions.$inferSelect)[] } | undefined;
+    if (options.recoveryAtHandoff) release.mockImplementation(async (input: { heartbeatRunId: string; providerResourceDisposition?: string }) => {
+      // The same provider edge as `release` above (local released, a keep_running box retained),
+      // the stop_and_retain box released with no receipt.
+      await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date() })
+        .where(and(eq(environmentLeases.heartbeatRunId, input.heartbeatRunId), eq(environmentLeases.status, "active"),
+          ...(input.providerResourceDisposition === "keep_running" ? [eq(environmentLeases.provider, "local")] : [])));
+      if (input.providerResourceDisposition === "keep_running") await db.update(environmentLeases)
+        .set({ status: "retained", cleanupStatus: "success" })
+        .where(and(eq(environmentLeases.heartbeatRunId, input.heartbeatRunId), eq(environmentLeases.status, "active")));
+      if (input.heartbeatRunId === f.runId && !handoff) {
+        // In this harness cancelRun's own release (run-control releaseIssueExecutionAndPromote)
+        // has already cleared the claims (adopt-stoppending NOTES). The gate saw the
+        // sweep reach the task first: re-impose that observed state, claims on the stopped run.
+        await db.update(issues).set({ checkoutRunId: f.runId, executionRunId: f.runId, executionLockedAt: new Date() })
+          .where(eq(issues.id, f.issueId));
+        const locked = (await db.select().from(issues).where(eq(issues.id, f.issueId)))[0];
+        const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+        await recovery.sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+        await recovery.reconcileStrandedAssignedIssues();
+        handoff = { lease: (await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId!)))[0],
+          task: locked,
+          run: (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0],
+          cards: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId)) };
+      }
+      return { released: [], errors: [] };
+    });
     fixture.onFirst = async ({ runId }) => {
       // Mid tool call: the tool has written an agent file the turn has not synced.
       await fs.writeFile(unsynced, "unsynced agent notes\n");
@@ -249,7 +283,9 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
       const messageRuns = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
         sql`${heartbeatRuns.contextSnapshot}->>'commentId' = ${commentId}`));
       const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId!));
-      return { f, hold, messageRuns, lease, release, unsynced, unsyncedSha, calls: [...fixture.calls], windowLease, windowHold };
+      const cards = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      return { f, hold, messageRuns, lease, release, unsynced, unsyncedSha, calls: [...fixture.calls], windowLease, windowHold,
+        handoff, cards };
     } finally {
       fixture.onFirst = undefined;
       factory.mockRestore();
@@ -303,6 +339,32 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
     },
     120_000,
   );
+
+  // Keep reason: adopt-stoppending-card (gate 2). A person's Stop of a warm
+  // turn keeps the box ON PURPOSE (handed off for the next message). The real
+  // stale-lock sweep and stranded passes, run while the task still holds its
+  // locks and before any receipt, wrote an escalated execution_stop_pending
+  // card ~0.1 s after the run ended. Only a box that really cannot be shown
+  // stopped or kept within the bound may raise it.
+  it("(a) a warm Stop handed off: the sweep and stranded passes at the handoff write no Stop-pending card; the next message runs", async () => {
+    const r = await stopThenMessage({ warm: true, messageDelay: "after_sweep", recoveryAtHandoff: true });
+    // The gate's order: cancelled by the person, locks still held, box handed off, no receipt.
+    expect(r.handoff?.run).toMatchObject({ status: "cancelled" });
+    expect(r.handoff?.task).toMatchObject({ checkoutRunId: r.f.runId, executionRunId: r.f.runId });
+    expect(r.handoff?.lease).toMatchObject({ status: "retained", leasePolicy: "reuse_by_environment", releasedAt: null });
+    expect(r.handoff?.lease?.metadata?.remoteExecutionTermination).toBeUndefined();
+    expect(r.handoff?.cards?.map(card => card.cause)).toEqual([]);
+    expect(r.cards.filter(card => card.cause === "execution_stop_pending" || card.evidence?.stopPending)).toEqual([]);
+    expect(r.messageRuns).toHaveLength(1);
+    expect(r.calls).toEqual([r.f.runId, r.messageRuns[0]!.id]);
+  }, 120_000);
+
+  it("(b) control: a Stop whose box is NOT handed off and never sends a receipt still raises the card", async () => {
+    const r = await stopThenMessage({ warm: false, messageDelay: "after_sweep", recoveryAtHandoff: true });
+    expect(r.handoff?.task).toMatchObject({ checkoutRunId: r.f.runId, executionRunId: r.f.runId });
+    expect(r.handoff?.cards?.filter(card => card.evidence?.stopPending)).toMatchObject([{ status: "escalated",
+      evidence: { stopPending: { code: "execution_stop_pending", escalation: "board", runIds: [r.f.runId] } } }]);
+  }, 120_000);
 
   it.each(["worker", "sweep"] as const)(
     "the %s still writes the hold for a non-warm Stop in the same window",
