@@ -1,8 +1,10 @@
-import { existsSync, promises as fs } from "node:fs";
+import { existsSync, promises as fs, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createServer, type ServerResponse } from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { onNativeHarnessBackupChange } from "../native-harness-backup-expiration-notifications.js";
 import { publishNativeHarnessBackup } from "./native-harness-backup-publication.js";
@@ -143,4 +145,119 @@ describe("native harness backup publication", () => {
       }
     }
   }, 15_000);
+});
+
+// BRIEF rotation-keep (RFL 11-19 03:00Z, never-OK): a superseded backup IS a
+// trace unless shown byte-identical to, or a byte-prefix of, the newer copy.
+// Pi 1.5.2 rewrites its session file in place (session-manager.js _rewriteFile,
+// open "w") when it loads an older-version file, and drops malformed lines; the
+// control-plane journal is a whole-file snapshot. So rotation must keep it.
+describe("native harness backup rotation keeps the superseded copy (rotation-keep)", () => {
+  let stateBase = "";
+  afterEach(async () => { if (stateBase) await fs.rm(stateBase, { recursive: true, force: true }); stateBase = ""; });
+  const sha = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+  async function scopeRoot() {
+    stateBase = await fs.mkdtemp(path.join(os.tmpdir(), "native-backup-rotation-"));
+    const scope = createHash("sha256").update("rotation-keep-scope").digest("hex");
+    const root = path.join(stateBase, scope);
+    await fs.mkdir(root, { recursive: true });
+    return { scope, root, backupRoot: path.join(root, "failover-backups") };
+  }
+  async function publish(backupRoot: string, scope: string, files: Record<string, Buffer | string>) {
+    await fs.mkdir(backupRoot, { recursive: true });
+    const pendingRoot = path.join(backupRoot, `.pending-${Math.random().toString(16).slice(2)}`);
+    for (const [relative, bytes] of Object.entries(files)) {
+      await fs.mkdir(path.dirname(path.join(pendingRoot, relative)), { recursive: true });
+      await fs.writeFile(path.join(pendingRoot, relative), bytes);
+    }
+    await publishNativeHarnessBackup({ db: {}, companyId: "company", scopeDigest: scope, backupRoot, pendingRoot });
+  }
+  /** Every file under `root` whose bytes hash to `digest`. */
+  async function filesWithHash(root: string, digest: string): Promise<string[]> {
+    const found: string[] = [];
+    const visit = async (directory: string) => {
+      for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+        const filename = path.join(directory, entry.name);
+        if (entry.isDirectory()) await visit(filename);
+        else if (entry.isFile() && sha(await fs.readFile(filename)) === digest) found.push(path.relative(root, filename));
+      }
+    };
+    await visit(root);
+    return found.sort();
+  }
+  async function superseded(backupRoot: string) {
+    const kept = path.join(backupRoot, "superseded");
+    const names = existsSync(kept) ? (await fs.readdir(kept)).sort() : [];
+    for (const name of names) expect(name).toMatch(/^\d{13}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    return names.map(name => path.join(kept, name));
+  }
+
+  it("ROT-1 (real producer, Pi 1.5.2): a session file Pi rewrote in place, then published twice, keeps every earlier byte in failover-backups/superseded and each copy re-hashes", async () => {
+    const { scope, root, backupRoot } = await scopeRoot();
+    // Real producer: the runner's pinned Pi SessionManager (packages/paperclip-runner, 1.5.2).
+    const pi = await import(pathToFileURL(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../packages/paperclip-runner/node_modules/@earendil-works/pi-coding-agent/dist/index.js")).href) as {
+      SessionManager: { open(file: string, dir: string): { appendCompaction(summary: string, firstKeptEntryId: string | null, tokensBefore: number): string; getLeafId(): string | null } };
+    };
+    const live = path.join(root, "pi"); await fs.mkdir(live);
+    const sessionFile = path.join(live, "2026-11-01T00-00-00-000Z_11111111-1111-4111-8111-111111111111.jsonl");
+    const s0 = Buffer.from([
+      JSON.stringify({ type: "session", version: 1, id: "11111111-1111-4111-8111-111111111111", timestamp: "2026-11-01T00:00:00.000Z", cwd: "/w" }),
+      JSON.stringify({ type: "message", timestamp: "2026-11-01T00:00:01.000Z", message: { role: "user", content: "first question", timestamp: 1 } }),
+      '{"type":"message","partial line the next load drops',
+      JSON.stringify({ type: "message", timestamp: "2026-11-01T00:00:02.000Z", message: { role: "assistant", content: [{ type: "text", text: "first answer" }], timestamp: 2 } }),
+    ].join("\n") + "\n");
+    await fs.writeFile(sessionFile, s0);
+    const manifest = JSON.stringify({ providerKind: "pi_rpc", directories: [{ name: "pi" }] });
+    const relative = path.join("pi", path.basename(sessionFile));
+    await publish(backupRoot, scope, { "manifest.json": manifest, [relative]: s0 });
+    // Pi opens the older-version file, migrates and rewrites it, then compacts (appends).
+    const session = pi.SessionManager.open(sessionFile, live);
+    session.appendCompaction("summary of the first exchange", session.getLeafId(), 1234);
+    const s1 = await fs.readFile(sessionFile);
+    expect(s1.subarray(0, s0.length).equals(s0), "Pi rewrote earlier bytes: the old copy is not a prefix").toBe(false);
+    expect(s1.includes(Buffer.from("partial line the next load drops"))).toBe(false);
+    await publish(backupRoot, scope, { "manifest.json": manifest, [relative]: s1 });
+    session.appendCompaction("summary after the second turn", session.getLeafId(), 2345);
+    const s2 = await fs.readFile(sessionFile);
+    await publish(backupRoot, scope, { "manifest.json": manifest, [relative]: s2 });
+
+    // The earlier bytes still exist somewhere under the state base...
+    expect(await filesWithHash(stateBase, sha(s0)), "s0 (pre-rewrite) bytes kept").not.toEqual([]);
+    // ...and specifically in the kept superseded copies, oldest first.
+    const kept = await superseded(backupRoot);
+    expect(kept).toHaveLength(2);
+    expect(sha(await fs.readFile(path.join(kept[0]!, relative)))).toBe(sha(s0));
+    expect(sha(await fs.readFile(path.join(kept[1]!, relative)))).toBe(sha(s1));
+    expect(sha(await fs.readFile(path.join(backupRoot, "current", relative)))).toBe(sha(s2));
+    expect((await fs.readdir(backupRoot)).sort()).toEqual(["current", "superseded"]);
+  });
+
+  it("ROT-2 (planted: a non-Pi codex rollout rewritten by summarisation), published twice: the earlier bytes are kept and re-hash", async () => {
+    const { scope, backupRoot } = await scopeRoot();
+    const relative = "codex-home/sessions/rollout-1.jsonl";
+    const v0 = Buffer.from('{"turn":1,"text":"only copy of turn one"}\n{"turn":2,"text":"turn two"}\n');
+    const v1 = Buffer.from('{"summary":"turns 1-2 summarised"}\n{"turn":3,"text":"turn three"}\n'); // planted rewrite
+    const v2 = Buffer.from('{"summary":"turns 1-3 summarised"}\n');
+    for (const bytes of [v0, v1, v2]) await publish(backupRoot, scope, { "manifest.json": '{"providerKind":"codex_app_server"}', [relative]: bytes });
+    expect(await filesWithHash(stateBase, sha(v0)), "v0 bytes kept").not.toEqual([]);
+    const kept = await superseded(backupRoot);
+    expect(kept.map(root => sha(readFileSync(path.join(root, relative))))).toEqual([sha(v0), sha(v1)]);
+    expect(await fs.readFile(path.join(backupRoot, "current", relative))).toEqual(v2);
+  });
+
+  it("ROT-3: a leftover 'previous' from an interrupted publish is moved aside by rename, never deleted", async () => {
+    const { scope, backupRoot } = await scopeRoot();
+    await publish(backupRoot, scope, { "manifest.json": "first", "codex-home/a.jsonl": "first bytes" });
+    const previous = path.join(backupRoot, "previous");
+    await fs.mkdir(path.join(previous, "codex-home"), { recursive: true });
+    await fs.writeFile(path.join(previous, "codex-home", "a.jsonl"), "leftover bytes");
+    const leftoverInode = (await fs.stat(previous)).ino;
+    await publish(backupRoot, scope, { "manifest.json": "second", "codex-home/a.jsonl": "second bytes" });
+    const kept = await superseded(backupRoot);
+    expect(kept).toHaveLength(2);
+    expect(await fs.readFile(path.join(kept[0]!, "codex-home", "a.jsonl"), "utf8")).toBe("leftover bytes");
+    expect((await fs.stat(kept[0]!)).ino, "rename, not copy").toBe(leftoverInode);
+    expect(await fs.readFile(path.join(kept[1]!, "codex-home", "a.jsonl"), "utf8")).toBe("first bytes");
+    expect(existsSync(previous)).toBe(false);
+  });
 });
