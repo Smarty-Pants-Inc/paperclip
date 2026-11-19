@@ -43,6 +43,7 @@ import {
   hasStopOnlyCleanup,
   preparePendingCleanupCustodyStop,
   settleStopOnlyCleanup,
+  settleUnaddressableNativeCustody,
 } from "../sandbox-stop-and-retain.js";
 import { nativeCustodyKeptRecovery, nativeLeaseCustodyMissing } from "../native-runtime/native-lease-custody.js";
 import { discoverSettledNativeRunProcesses, inspectSettledNativeRunProcess, PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, recordNativeLocalProcessStopInTransaction, retryPendingSettledNativeRunProcesses } from "../native-local-process-stop.js";
@@ -1936,6 +1937,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       if (!hasStopOnlyCleanup(row) && await nativeLeaseCustodyMissing(db, row.id)) {
         row = await preparePendingCleanupCustodyStop(db, row, nativeCustodyKeptRecovery()) ?? row;
       }
+      // Upgrade historical invalid intents without claiming destructive cleanup.
+      if (row.status !== "pending_cleanup" || await settleUnaddressableNativeCustody(db, row)) continue;
       if (!hasStopOnlyCleanup(row) && hasNativeHarnessBackupMissing(row)) {
         await deferPendingCleanupLease(row.id);
         continue;
