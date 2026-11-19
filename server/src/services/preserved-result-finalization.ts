@@ -3,6 +3,7 @@ import { and, desc, eq, gte, ne, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, nativeRunResults, type Db } from "@paperclipai/db";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { preservedResultHasStop } from "./native-runtime/preserved-native-result-finalization.js";
+import { replyFileLineReadsLost } from "./native-runtime/native-late-save-rule.js";
 import { readWorkspaceRecovery, verifiedWorkspaceRepairReceipt } from "./workspace-recovery-receipt.js";
 import { persistActivity, publishActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
@@ -79,6 +80,9 @@ async function readApplicableResult(db: Db, companyId: string, runId: string, lo
     gte(heartbeatRuns.createdAt, run.createdAt),
   )).limit(1);
   if (newer) return null;
+  // K15b (RFL 11-19): once the reply's file line reads LOST, a late save is
+  // never applied as this run's. Its bytes stay kept aside.
+  if (replyFileLineReadsLost(run.resultJson)) return null;
   const [result] = await db.select({ id: nativeRunResults.id }).from(nativeRunResults).where(and(
     eq(nativeRunResults.companyId, companyId), eq(nativeRunResults.issueId, issue.id),
     eq(nativeRunResults.runId, runId), eq(nativeRunResults.id, coordinator.resultId),
