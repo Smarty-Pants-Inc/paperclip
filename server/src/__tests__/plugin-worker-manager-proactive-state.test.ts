@@ -3,8 +3,9 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { ROOT_CONTEXT, trace } from "@opentelemetry/api";
+import { InMemorySpanExporter, SimpleSpanProcessor, TracerProvider } from "@opentelemetry/sdk-trace";
 import { runWithRuntimeParent } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
-import { companies, createDb, plugins, pluginState, pluginLogs } from "@paperclipai/db";
+import { activityLog, companies, createDb, plugins, pluginState, pluginLogs, providerTraceRecords } from "@paperclipai/db";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { createHostClientHandlers, PLUGIN_RPC_ERROR_CODES, type WorkerHostCallContext } from "@paperclipai/plugin-sdk";
 import { buildHostServices, flushPluginLogBuffer } from "../services/plugin-host-services.js";
@@ -112,6 +113,28 @@ describe("plugin worker proactive state while an agent invocation is active", ()
     if (busy) await agentEntered;
     return {
       observed, dispatched, contexts, streams, methods: Object.keys(handlers),
+      async badId(mode: string, actor: string) {
+        // B is configured too: an allowlist-only check cannot distinguish A/B.
+        const key = { ...stateKey("bad-id-hook", agentCompanyId), expire: mode === "expired" };
+        const call = () => actor === "agent"
+          ? handle.call("executeTool", { toolName: "keeper", parameters: key,
+              runContext: { companyId: agentCompanyId, agentId, runId, projectId: randomUUID() } }, mode === "expired" ? 100 : undefined)
+          : handle.call("performAction", { key: "keeper", params: key,
+              actorContext: { companyId: agentCompanyId, type: "user", userId, agentId: null, runId: null } }, mode === "expired" ? 100 : undefined);
+        const invoke = () => runWithRuntimeParent(trace.setSpanContext(ROOT_CONTEXT, {
+          traceId: "12345678901234567890123456789012", spanId: "1234567890123456", traceFlags: 1,
+        }), call);
+        if (mode === "expired") await expect(invoke()).rejects.toThrow(/timed out/i);
+        else await invoke();
+        const { invocation } = await handle.call("getData", { key: "keeper-capture", params: {} }) as unknown as Keeper;
+        expect(invocation.scope).toEqual({ companyId: agentCompanyId,
+          ...(actor === "agent" ? { agentOrigin: { agentId, runId } } : {}) });
+        expect(invocation.traceparent).toBe("00-12345678901234567890123456789012-1234567890123456-01");
+        await handle.call("getData", { key: "keeper-resume", params: { invocationId: invocation.id, operations: [] } });
+        const id = mode === "forged" ? JSON.stringify({ ...invocation, id: `forged-${randomUUID()}`,
+          companyId: agentCompanyId, agentId, userId }) : invocation.id;
+        return { id, invocation };
+      },
       failScopeReads: () => { scopeReadsFail = true; },
       keeper: (params: Record<string, unknown>) => runWithRuntimeParent(trace.setSpanContext(ROOT_CONTEXT, {
         traceId: "12345678901234567890123456789012", spanId: "1234567890123456", traceFlags: 1,
@@ -143,6 +166,121 @@ describe("plugin worker proactive state while an agent invocation is active", ()
     eq(pluginState.pluginId, pluginId), eq(pluginState.scopeId, scopeId), eq(pluginState.stateKey, key)));
 
   type Keeper = { invocation: { id: string; traceparent: string; scope: { companyId: string } }; before: unknown };
+
+  const badIdCases = ["forged", "replayed", "expired"].flatMap(mode =>
+    ["agent", "person"].map(actor => ({ mode, actor })));
+
+  async function configureBothCompanies() {
+    await pluginRegistryService(db).upsertConfig(pluginId, agentCompanyId, {
+      companyId: agentCompanyId, configJson: { private: "company B config" },
+    });
+  }
+
+  it.each(badIdCases)("EQUAL SCOPE: $mode id from $actor equals the same plugin's untagged context", async ({ mode, actor }) => {
+    await configureBothCompanies();
+    const worker = await start();
+    try {
+      const bad = await worker.badId(mode, actor);
+      for (const method of ["state.set", "state.get", "state.delete", "config.get"]) {
+        const params = method === "config.get" ? { companyId } : { ...stateKey(`equal-${mode}-${actor}`), value: "A" };
+        const received = () => method === "state.set" ? worker.observed.map(row => row.context)
+          : worker.contexts.filter(row => row.method === method).map(row => row.context);
+        const before = received().length;
+        await worker.timer(method, params);
+        expect(received(), method).toHaveLength(before + 1);
+        const untagged = received().at(-1);
+        await worker.timer(method, params, bad.id);
+        expect(received(), method).toHaveLength(before + 2);
+        const tagged = received().at(-1);
+        expect(untagged, method).toStrictEqual({ invocationScope: { companyId } });
+        expect(tagged, method).toStrictEqual(untagged);
+      }
+      console.info("equal-scope proof", JSON.stringify({ mode, actor, contexts: worker.contexts, writes: worker.observed }));
+    } finally { await worker.stop(); }
+  });
+
+  it.each(badIdCases)("HOST CHOOSES THE COMPANY: $mode id naming configured B cannot redirect $actor keeper A", async ({ mode, actor }) => {
+    await configureBothCompanies();
+    const worker = await start();
+    const key = `company-choice-${mode}-${actor}`;
+    try {
+      // Prove both companies really are admitted through the same real worker.
+      await worker.timer("state.set", { ...stateKey(key, agentCompanyId), value: "private B state" });
+      await expect(worker.timer("config.get", { companyId: agentCompanyId })).resolves.toEqual({ private: "company B config" });
+      const beforeB = await rows(agentCompanyId, key);
+      const bad = await worker.badId(mode, actor);
+      await worker.timer("state.set", { ...stateKey(key), value: "A state" }, bad.id);
+      await expect(worker.timer("state.get", stateKey(key), bad.id)).resolves.toBe("A state");
+      await expect(worker.timer("config.get", { companyId }, bad.id)).resolves.toEqual({ enabled: true });
+      expect(worker.observed.at(-1)).toEqual({ context: { invocationScope: { companyId } }, origin: undefined });
+      expect(worker.contexts.findLast(row => row.method === "config.get")?.context).toEqual({ invocationScope: { companyId } });
+      await denied(worker.timer("state.get", { ...stateKey(key), companyId: agentCompanyId }, bad.id));
+      await worker.timer("state.delete", stateKey(key), bad.id);
+      expect(await rows(companyId, key)).toEqual([]);
+      expect(await rows(agentCompanyId, key)).toEqual(beforeB);
+      console.info("host-company proof", JSON.stringify({ mode, actor, oldCompany: bad.invocation.scope.companyId,
+        hostCompany: companyId, unchangedB: beforeB, writes: worker.observed }));
+    } finally { await worker.stop(); }
+  });
+
+  it.each(badIdCases)("NO ACTOR FROM A BAD ID: $mode $actor id never enters real activity, audit or trace rows", async ({ mode, actor }) => {
+    await configureBothCompanies();
+    const exporter = new InMemorySpanExporter();
+    const provider = new TracerProvider({ spanProcessors: [new SimpleSpanProcessor({ exporter })] });
+    expect(trace.setGlobalTracerProvider(provider)).toBe(true);
+    // A functioning real OTel sink, not a mocked span recorder.
+    trace.getTracer("bad-id-proof").startSpan("sink-control").end();
+    await provider.forceFlush();
+    expect(exporter.getFinishedSpans()).toHaveLength(1);
+    const worker = await start();
+    try {
+      const bad = await worker.badId(mode, actor);
+      await flushPluginLogBuffer();
+      // activity.log and authorization.audit use activity_log; the manager's
+      // host-derived audit uses plugin_logs. Provider trace metadata lives in
+      // provider_trace_records; worker spans themselves use the OTel sink.
+      exporter.reset();
+      const priorLogs = new Set((await db.select().from(pluginLogs)).map(row => row.id));
+      const beforeActivity = await db.select().from(activityLog);
+      const beforeTraces = await db.select().from(providerTraceRecords);
+      for (const method of ["state.set", "state.get", "state.delete", "config.get"]) {
+        await worker.timer(method, method === "config.get" ? { companyId } : {
+          ...stateKey(`no-actor-${mode}-${actor}`), value: "plugin-owned",
+        }, bad.id);
+      }
+      for (const method of ["activity.log", "authorization.audit.search", "log", "span.record"]) {
+        const beforeDispatch = worker.dispatched.length;
+        await denied(worker.timer(method, { companyId, message: "must not record", actorId: bad.id,
+          agentId, userId, traceparent: bad.invocation.traceparent }, bad.id));
+        expect(worker.dispatched.slice(beforeDispatch), method).toEqual([]);
+      }
+      await flushPluginLogBuffer();
+      const logs = (await db.select().from(pluginLogs)).filter(row => !priorLogs.has(row.id));
+      expect(logs).toHaveLength(4);
+      for (const row of logs) {
+        expect(row).toMatchObject({ pluginId, companyId, meta: {
+          scopeSource: "host-derived scope", actorType: "plugin", actorId: pluginId,
+        } });
+        for (const identity of [bad.id, bad.invocation.id, agentId, runId, userId, bad.invocation.traceparent]) {
+          expect(JSON.stringify(row)).not.toContain(identity);
+        }
+      }
+      expect(await db.select().from(activityLog)).toEqual(beforeActivity);
+      expect(await db.select().from(providerTraceRecords)).toEqual(beforeTraces);
+      expect(worker.observed.at(-1)?.origin).toBeUndefined();
+      await provider.forceFlush();
+      const spans = exporter.getFinishedSpans().map(span => ({ name: span.name,
+        context: span.spanContext(), parent: span.parentSpanContext, attributes: span.attributes, links: span.links }));
+      for (const identity of [bad.id, bad.invocation.id, agentId, runId, userId, "12345678901234567890123456789012"]) {
+        expect(JSON.stringify(spans)).not.toContain(identity);
+      }
+      console.info("no-bad-actor proof", JSON.stringify({ mode, actor, logs, activity: beforeActivity, traces: beforeTraces, spans }));
+    } finally {
+      await worker.stop();
+      trace.disable();
+      await provider.shutdown();
+    }
+  });
 
   it("continues keeper state work after its hook ends without laundering identity or trace", async () => {
     const worker = await start();
