@@ -16492,6 +16492,55 @@ describe("native warm session supervision", () => {
     } finally { await closeIdleWarmNativeSessionsForRestart(); }
   });
 
+  it.each(["warm", "cold"] as const)("does not stall %s turn admission on diagnostic span persistence, but drains it before return", async mode => {
+    const first = { ...execution, binding: { ...execution.binding, runId: `diagnostic-first-${mode}`, executionWorkspaceId: `diagnostic-workspace-${mode}` },
+      session: { ...execution.session, normalizedSessionId: `diagnostic-session-${mode}`, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } } } as NativeExecutionInputV1;
+    const second = { ...first, binding: { ...first.binding, runId: `diagnostic-second-${mode}` } };
+    const sharedSession = { close: vi.fn(async () => undefined) };
+    const result = { result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" }, turnId: "turn",
+      normalizedSessionId: first.session.normalizedSessionId, providerSessionId: "provider", driverKind: "test", driverVersion: "1",
+      nativeEventCount: 3, highestContiguousSourceSeq: 3, usage: null };
+    const spans: string[] = [];
+    let sinkPending = false;
+    let startedWhileSinkPending = false;
+    let elapsedMs = 0;
+    state.execute.mockReset();
+    if (mode === "warm") state.execute.mockImplementationOnce(async options => { await options.onSession?.(sharedSession); return result; });
+    state.execute.mockImplementationOnce(async options => {
+      expect(options.existingSession).toBe(mode === "warm" ? sharedSession : undefined);
+      await options.onSession?.(sharedSession);
+      const startedAt = performance.now();
+      let seq = 0;
+      for (const eventType of [mode === "warm" ? "session.resumed" : "session.started", "turn.submitted", "turn.started"] as const) {
+        await accountingEvents.committed!({ schema: "paperclip.prp.event.v1", sourceEventId: `diagnostic-${mode}-${++seq}`,
+          sourceSeq: seq, sourceInstanceId: "runner", sourceKind: "runner", runId: second.binding.runId,
+          normalizedSessionId: second.session.normalizedSessionId!, turnId: "turn", eventType, schemaVersion: 1, priority: 0,
+          emittedAt: new Date().toISOString(), payload: {} });
+      }
+      elapsedMs = performance.now() - startedAt;
+      startedWhileSinkPending = sinkPending;
+      return result;
+    });
+    try {
+      if (mode === "warm") await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: "runner" });
+      await executePaperclipNativeSession({ db: leaseDb(second), execution: second, runnerInstanceId: "runner", onEvent: async event => {
+        if (event.eventType !== "run.performance.span") return;
+        const name = String(event.payload?.span);
+        if (name === (mode === "warm" ? "runner.session.resume" : "runner.session.bootstrap")) {
+          sinkPending = true;
+          await new Promise(resolve => setTimeout(resolve, 160));
+          sinkPending = false;
+        }
+        spans.push(name);
+      } });
+      process.stdout.write(`${JSON.stringify({ measurement: "turn-diagnostics", mode, injectedSinkMs: 160, elapsedToStartedMs: elapsedMs })}\n`);
+      expect(startedWhileSinkPending).toBe(true);
+      expect(sinkPending).toBe(false);
+      expect(spans).toEqual(expect.arrayContaining([mode === "warm" ? "runner.session.resume" : "runner.session.bootstrap",
+        "runner.turn.submit", "runner.session.startup", "runner.turn.submitted_to_started"]));
+    } finally { await closeIdleWarmNativeSessionsForRestart(); }
+  });
+
   it("reuses one session across distinct governed runs and closes it after idle expiry", async () => {
     let releaseClose!: () => void;
     const closeBarrier = new Promise<void>(resolve => { releaseClose = resolve; });
