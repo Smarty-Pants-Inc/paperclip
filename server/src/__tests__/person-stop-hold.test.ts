@@ -1067,6 +1067,31 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
     expect((await r.queue()).executionWait?.reason).not.toBe("stopped_by_person");
   }, 120_000);
 
+  it("RF4 K4 purpose: Stop with three held then Send carries marker once AND all three answered once, never the stopped request", async () => {
+    const r = await stopWithHeld();
+    await r.boatStopAnswers();
+    const q = await r.queue();
+    const sent = await request(r.client).post(`/api/issues/${r.issueId}/queued-comments/interrupt`)
+      .send({ queueId: q.queueId ?? q.id, targetRunId: r.firstRunId, revision: q.revision });
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    await r.drive(4_000);
+    const calls = successorCalls();
+    const replies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, r.issueId), eq(issueComments.authorType, "agent")));
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, r.companyId));
+    await evidence("RF4-K4-stop-three-send", { held: r.held, stoppedRequestIds: fixture.calls[0]?.ids, sent: sent.body,
+      calls, replies: replies.map(c => ({ runId: c.createdByRunId, body: c.body })),
+      runs: runs.map(run => ({ id: run.id, status: run.status })), queue: await r.queue() });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.ids.slice().sort()).toEqual(r.held.slice().sort());
+    expect(markerCount(calls[0]!.prompt), calls[0]!.prompt).toBe(1);
+    expect(calls[0]!.prompt).toContain("answer the new comments in order, oldest first");
+    for (const id of r.held) expect(calls.filter(call => call.ids.includes(id))).toHaveLength(1);
+    for (const id of fixture.calls[0]!.ids) expect(calls[0]!.ids).not.toContain(id);
+    expect(runs.find(run => run.id === calls[0]!.runId)?.status).toBe("succeeded");
+    expect(replies.map(c => c.createdByRunId)).toEqual([calls[0]!.runId]);
+    expect((await r.queue()).entries).toHaveLength(0);
+  }, 120_000);
+
   // adopt-stop-marker (RFL F1, take v1-stop-late-g2-m4): after a person's Stop, the NEXT turn's input says the
   // person stopped the previous turn and not to resume it unless asked; said once, only for a person's Stop.
   const STOP_MARKER = "The person stopped your previous turn. Do not resume or redo that work unless they ask; answer their new message.";
