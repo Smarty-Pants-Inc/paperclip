@@ -34,3 +34,21 @@ export function readSavedMessageHold(interruption: Pick<TaskInterruptionPresenta
   if (hold?.state !== "continue_required" || !hold.line) return null;
   return { line: hold.line, continueLabel: REPLY_FILES_CONTINUE_ACTION, retryAction: "continue_with_files" };
 }
+
+/**
+ * What a list row says and offers while the task says one of its saved-message sentences (the same projection):
+ *  - held for Continue: the sentence and the ONE action (`hold`, above);
+ *  - waiting for the previous reply's environment to stop: the sentence and NOTHING to press (`hold` is null), because
+ *    the message starts by itself.
+ * Null in every other state: the row keeps its own text and its plain Retry.
+ */
+export interface SavedMessageRowWait {
+  line: string;
+  hold: SavedMessageHold | null;
+}
+
+export function readSavedMessageRowWait(interruption: Pick<TaskInterruptionPresentation, "savedMessageWait"> | null | undefined): SavedMessageRowWait | null {
+  const wait = interruption?.savedMessageWait;
+  if (!wait?.line || (wait.state !== "continue_required" && wait.state !== "waiting")) return null;
+  return { line: wait.line, hold: readSavedMessageHold(interruption) };
+}

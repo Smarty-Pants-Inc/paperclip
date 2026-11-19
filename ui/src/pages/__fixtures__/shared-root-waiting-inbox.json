@@ -1,19 +1,19 @@
 {
- "source": "BASE 1334565e (bb/2d-shared4). REAL GET bodies read by server row WAITING of server/src/services/native-runtime/native-shared-root-hold-surfaces.test.ts while R's box is still stopping (GET /api/companies/:id/inbox/mine, .../heartbeat-runs?summary&latestFailuresOnly, .../issues?view=rows&ids, .../agents, and the task's GET for its blocker and its queue's wait). INJECTED in that row, named at its lines: PARTIAL-EIO (the real partial apply), CLOCK-SKIP. Nothing is planted for this state. Only host paths replaced.",
+ "source": "HEAD (bb/2d-shared5, all three fixes). REAL GET bodies read by server row WAITING of server/src/services/native-runtime/native-shared-root-hold-surfaces.test.ts while R's box is still stopping (GET /api/companies/:id/inbox/mine, .../heartbeat-runs?summary&latestFailuresOnly, .../issues?view=rows&ids, .../agents, and the task's GET for its blocker and its queue's wait). INJECTED in that row, named at its lines: PARTIAL-EIO (the real partial apply), CLOCK-SKIP. Nothing is planted for this state. Only host paths replaced.",
  "waiting_boxStopping": {
-  "companyId": "0b9ed5c5-4fc5-4d47-9002-ad5de970a108",
-  "issueId": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
-  "agentId": "c41a701b-239b-422a-8478-a857a618a915",
-  "rRunId": "bb4014d3-537c-4fba-b012-39241636f2e0",
+  "companyId": "9c4d7529-b1e1-4da4-b608-783b4d1b4801",
+  "issueId": "547d834e-ac96-4278-aca1-955f2bce2fb0",
+  "agentId": "d746d4b5-04eb-466f-a9cf-4a24639285a9",
+  "rRunId": "c0d394c7-0762-4f05-8340-e3defdab0e6c",
   "inboxMine": {
    "userId": "classic-bound-person",
    "issues": [
     {
      "externalConversationState": null,
-     "id": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
-     "companyId": "0b9ed5c5-4fc5-4d47-9002-ad5de970a108",
-     "projectId": "6059725d-4502-4978-88ae-2fa3f0b0fea7",
-     "projectWorkspaceId": "a631e02c-3f4b-4743-be52-1e0593832d74",
+     "id": "547d834e-ac96-4278-aca1-955f2bce2fb0",
+     "companyId": "9c4d7529-b1e1-4da4-b608-783b4d1b4801",
+     "projectId": "a290e9da-840c-4c06-8337-ee5de954d4a6",
+     "projectWorkspaceId": "c6c37175-10fc-474d-98f3-020e8356f1f5",
      "goalId": null,
      "parentId": null,
      "visibility": "open",
@@ -24,7 +24,7 @@
      "workMode": "standard",
      "priority": "medium",
      "reviewPolicy": null,
-     "assigneeAgentId": "c41a701b-239b-422a-8478-a857a618a915",
+     "assigneeAgentId": "d746d4b5-04eb-466f-a9cf-4a24639285a9",
      "assigneeUserId": null,
      "checkoutRunId": null,
      "executionRunId": null,
@@ -33,18 +33,18 @@
      "createdByAgentId": null,
      "createdByUserId": null,
      "issueNumber": 1,
-     "identifier": "L0b9ed5-1",
+     "identifier": "L9c4d75-1",
      "originKind": "manual",
      "originId": null,
      "originRunId": null,
      "requestDepth": 0,
      "billingCode": null,
-     "executionWorkspaceId": "d2291041-632a-4ed5-b66e-5d222171cced",
-     "startedAt": "2026-11-19T17:45:01.243Z",
+     "executionWorkspaceId": "5fbedf68-526e-424a-93e3-cf70bc7223fa",
+     "startedAt": "2026-11-19T17:47:03.272Z",
      "completedAt": null,
      "cancelledAt": null,
-     "createdAt": "2026-11-19T17:44:58.942Z",
-     "updatedAt": "2026-11-19T17:45:11.974Z",
+     "createdAt": "2026-11-19T17:47:00.708Z",
+     "updatedAt": "2026-11-19T17:47:13.889Z",
      "labelIds": [],
      "labels": [],
      "reviewAttention": {
@@ -54,9 +54,9 @@
      },
      "liveDescendantCount": 0,
      "runningDescendantCount": 0,
-     "myLastTouchAt": "2026-11-19T17:45:02.104Z",
-     "lastExternalCommentAt": "2026-11-19T17:45:11.972Z",
-     "lastActivityAt": "2026-11-19T17:45:11.974Z",
+     "myLastTouchAt": "2026-11-19T17:47:04.052Z",
+     "lastExternalCommentAt": "2026-11-19T17:47:13.888Z",
+     "lastActivityAt": "2026-11-19T17:47:13.889Z",
      "isUnreadForMe": true,
      "activeRecoveryAction": null,
      "interruption": null,
@@ -67,10 +67,10 @@
    "contextIssues": [
     {
      "externalConversationState": null,
-     "id": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
-     "companyId": "0b9ed5c5-4fc5-4d47-9002-ad5de970a108",
-     "projectId": "6059725d-4502-4978-88ae-2fa3f0b0fea7",
-     "projectWorkspaceId": "a631e02c-3f4b-4743-be52-1e0593832d74",
+     "id": "547d834e-ac96-4278-aca1-955f2bce2fb0",
+     "companyId": "9c4d7529-b1e1-4da4-b608-783b4d1b4801",
+     "projectId": "a290e9da-840c-4c06-8337-ee5de954d4a6",
+     "projectWorkspaceId": "c6c37175-10fc-474d-98f3-020e8356f1f5",
      "goalId": null,
      "parentId": null,
      "visibility": "open",
@@ -81,7 +81,7 @@
      "workMode": "standard",
      "priority": "medium",
      "reviewPolicy": null,
-     "assigneeAgentId": "c41a701b-239b-422a-8478-a857a618a915",
+     "assigneeAgentId": "d746d4b5-04eb-466f-a9cf-4a24639285a9",
      "assigneeUserId": null,
      "checkoutRunId": null,
      "executionRunId": null,
@@ -90,18 +90,18 @@
      "createdByAgentId": null,
      "createdByUserId": null,
      "issueNumber": 1,
-     "identifier": "L0b9ed5-1",
+     "identifier": "L9c4d75-1",
      "originKind": "manual",
      "originId": null,
      "originRunId": null,
      "requestDepth": 0,
      "billingCode": null,
-     "executionWorkspaceId": "d2291041-632a-4ed5-b66e-5d222171cced",
-     "startedAt": "2026-11-19T17:45:01.243Z",
+     "executionWorkspaceId": "5fbedf68-526e-424a-93e3-cf70bc7223fa",
+     "startedAt": "2026-11-19T17:47:03.272Z",
      "completedAt": null,
      "cancelledAt": null,
-     "createdAt": "2026-11-19T17:44:58.942Z",
-     "updatedAt": "2026-11-19T17:45:11.974Z",
+     "createdAt": "2026-11-19T17:47:00.708Z",
+     "updatedAt": "2026-11-19T17:47:13.889Z",
      "labelIds": [],
      "labels": [],
      "blockerAttention": {
@@ -116,7 +116,7 @@
       "sampleStalledBlockerIdentifier": null,
       "blockingTreeLive": false,
       "directBlockerIssueId": null,
-      "terminalBlockerIssueId": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
+      "terminalBlockerIssueId": "547d834e-ac96-4278-aca1-955f2bce2fb0",
       "terminalBlocker": null
      },
      "reviewAttention": {
@@ -124,11 +124,11 @@
       "paths": [],
       "reason": null
      },
-     "lastActivityAt": "2026-11-19T17:45:11.974Z",
+     "lastActivityAt": "2026-11-19T17:47:13.889Z",
      "activeRecoveryAction": {
-      "id": "afb7d7cb-9ae7-416e-9f09-74a0886242ed",
-      "companyId": "0b9ed5c5-4fc5-4d47-9002-ad5de970a108",
-      "sourceIssueId": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
+      "id": "cb39435a-f67b-4359-9598-d1c21709ec75",
+      "companyId": "9c4d7529-b1e1-4da4-b608-783b4d1b4801",
+      "sourceIssueId": "547d834e-ac96-4278-aca1-955f2bce2fb0",
       "recoveryIssueId": null,
       "kind": "active_run_watchdog",
       "status": "active",
@@ -136,11 +136,11 @@
       "ownerAgentId": null,
       "ownerUserId": null,
       "previousOwnerAgentId": null,
-      "returnOwnerAgentId": "c41a701b-239b-422a-8478-a857a618a915",
+      "returnOwnerAgentId": "d746d4b5-04eb-466f-a9cf-4a24639285a9",
       "cause": "native_workspace_sync_out_retry_exhausted",
-      "fingerprint": "15050d5123af3e01a0226c6cc51921d10a51e9122c9c19e7f784820ffac1ee83",
+      "fingerprint": "ec8db555279779a9c452826aa68bca2281a83af418d7c8fd25dda0a82c981957",
       "evidence": {
-       "runId": "bb4014d3-537c-4fba-b012-39241636f2e0",
+       "runId": "c0d394c7-0762-4f05-8340-e3defdab0e6c",
        "systemRecovery": {
         "phase": "verify_execution",
         "state": "exhausted",
@@ -151,26 +151,26 @@
          "sourceVerification": {
           "reason": "lease_cwd_invalid"
          },
-         "evidenceFingerprint": "d51d9c7ae4eb9216e69ed6f2edfa06c68414ae74c92dab4691b76f3665da9103"
+         "evidenceFingerprint": "1cb750248f99caac2f9bee539d5c89d73ed3a3f538c9b479d650f8bce20e1b7a"
         },
         "attempts": 1,
         "intentId": null,
         "revision": 2,
-        "attemptId": "f75ce5e8-e090-4e83-ae0b-22925058e270",
-        "deadlineAt": 1795112103686,
+        "attemptId": "bc8b34d7-4ffb-47d7-b1f0-5d1a532a3548",
+        "deadlineAt": 1795112225635,
         "retriesUsed": 0,
-        "sourceRunId": "bb4014d3-537c-4fba-b012-39241636f2e0",
-        "generationId": "81c7a6d7-d09d-4047-a9ea-b722c230c4b6",
+        "sourceRunId": "c0d394c7-0762-4f05-8340-e3defdab0e6c",
+        "generationId": "de0608a2-2e21-4130-8e29-d249046c2764",
         "nextAttemptAt": null,
         "policyVersion": 1,
-        "firstFailureAt": 1795110303686,
+        "firstFailureAt": 1795110425635,
         "freshAttemptRunId": null,
         "providerCooldownAt": null,
         "capturePolicyVersion": 2,
         "preservationOperationIds": []
        },
        "workspaceRecovery": {
-        "runId": "bb4014d3-537c-4fba-b012-39241636f2e0",
+        "runId": "c0d394c7-0762-4f05-8340-e3defdab0e6c",
         "stage": "verifying_stop",
         "schema": "paperclip.workspace-recovery.v1",
         "status": "blocked",
@@ -182,22 +182,22 @@
        },
        "coordinatorAttempt": 0,
        "originalFailureCode": "native_workspace_sync_out_failed",
-       "systemRecoveryActiveAt": 1795110303675,
+       "systemRecoveryActiveAt": 1795110425624,
        "workspaceFinalizeAttempt": 3,
        "previousWorkspaceRecovery": null,
        "workspaceFinalizationBlock": {
-        "runId": "bb4014d3-537c-4fba-b012-39241636f2e0",
+        "runId": "c0d394c7-0762-4f05-8340-e3defdab0e6c",
         "schema": "paperclip.native-workspace-finalization-block.v1",
-        "agentId": "c41a701b-239b-422a-8478-a857a618a915",
-        "issueId": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
-        "resultId": "dca54678-1f43-4f19-9822-6dcb6f4b7fed",
-        "companyId": "0b9ed5c5-4fc5-4d47-9002-ad5de970a108",
-        "contractId": "8298c80a-680f-4809-aff2-4fb7ff9ab82c",
-        "resultSha256": "be5dbddc82cca767d26f286f92b570cad0b0afdb98a68f0c9f1ff3d992281d4d",
+        "agentId": "d746d4b5-04eb-466f-a9cf-4a24639285a9",
+        "issueId": "547d834e-ac96-4278-aca1-955f2bce2fb0",
+        "resultId": "062be998-cc6e-46b9-aba5-8b1ebb619a10",
+        "companyId": "9c4d7529-b1e1-4da4-b608-783b4d1b4801",
+        "contractId": "ec93cffb-2325-4be3-8376-ecc24d7dcfb7",
+        "resultSha256": "498dc2fc6cb545d23b59e7ea64a1b3ea6b13c27342de5da995e20d7d7c1b4872",
         "statusVersion": 4,
         "contractSha256": "f9c262062eb76412e593aaa785ad2ab62472070023e77b8963d26b83a1f98cef",
-        "priorDecisionId": "9dfb9346-a241-4af7-b13c-cabf7b95bf63",
-        "identityContextId": "81f62b63-05aa-47ad-9009-0e09eccf2443",
+        "priorDecisionId": "fffe154c-80d3-40fa-853a-a9c2587461e0",
+        "identityContextId": "0f79b917-4b10-40a7-956e-3b5f2b5cc9eb",
         "responsibleUserId": "classic-bound-person"
        }
       },
@@ -207,24 +207,28 @@
       "attemptCount": 1,
       "maxAttempts": 3,
       "timeoutAt": null,
-      "lastAttemptAt": "2026-11-19T17:45:03.595Z",
+      "lastAttemptAt": "2026-11-19T17:47:05.528Z",
       "outcome": null,
       "resolutionNote": null,
       "resolvedAt": null,
-      "createdAt": "2026-11-19T17:45:03.569Z",
-      "updatedAt": "2026-11-19T17:45:03.689Z"
+      "createdAt": "2026-11-19T17:47:05.485Z",
+      "updatedAt": "2026-11-19T17:47:05.637Z"
      },
      "interruption": {
-      "intentId": "f4d381c3-3fe9-4335-8c75-226c879f71b1",
+      "intentId": "52a11bfc-5f28-464a-a066-3b64b606624a",
       "responsibility": "system",
       "state": "failed",
       "nextRetryAt": null,
       "canRetry": true,
       "userAction": null,
       "sourceRunIds": [
-       "bb4014d3-537c-4fba-b012-39241636f2e0"
+       "c0d394c7-0762-4f05-8340-e3defdab0e6c"
       ],
-      "observedRunId": "bb4014d3-537c-4fba-b012-39241636f2e0"
+      "observedRunId": "c0d394c7-0762-4f05-8340-e3defdab0e6c",
+      "savedMessageWait": {
+       "state": "waiting",
+       "line": "Waiting for the previous environment to stop. Your message will start automatically."
+      }
      },
      "successfulRunHandoff": null,
      "listProjection": "rows"
@@ -232,12 +236,12 @@
    ],
    "failureRuns": [
     {
-     "id": "bb4014d3-537c-4fba-b012-39241636f2e0",
+     "id": "c0d394c7-0762-4f05-8340-e3defdab0e6c",
      "responsibleUserId": "classic-bound-person",
-     "companyId": "0b9ed5c5-4fc5-4d47-9002-ad5de970a108",
-     "agentId": "c41a701b-239b-422a-8478-a857a618a915",
+     "companyId": "9c4d7529-b1e1-4da4-b608-783b4d1b4801",
+     "agentId": "d746d4b5-04eb-466f-a9cf-4a24639285a9",
      "scopeKind": "issue",
-     "issueId": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
+     "issueId": "547d834e-ac96-4278-aca1-955f2bce2fb0",
      "invocationSource": "automation",
      "triggerDetail": "system",
      "status": "failed",
@@ -246,10 +250,10 @@
      "outputTokens": null,
      "totalTokens": null,
      "costUsd": null,
-     "startedAt": "2026-11-19T17:45:01.197Z",
-     "finishedAt": "2026-11-19T17:45:03.569Z",
+     "startedAt": "2026-11-19T17:47:03.210Z",
+     "finishedAt": "2026-11-19T17:47:05.485Z",
      "error": "Saving the workspace failed after 3 attempts. The agent's result is kept; follow the run's recovery action to repair the workspace.",
-     "wakeupRequestId": "2c5f2b4d-dbdd-4b06-a73a-0c4e8d7aa3eb",
+     "wakeupRequestId": "3c7674c9-920c-46de-b80b-249a6c5a5dfd",
      "exitCode": null,
      "signal": null,
      "usageJson": null,
@@ -281,15 +285,15 @@
      "continuationAttempt": 0,
      "lastUsefulActionAt": null,
      "nextAction": null,
-     "createdAt": "2026-11-19T17:45:01.085Z",
-     "updatedAt": "2026-11-19T17:45:11.974Z",
+     "createdAt": "2026-11-19T17:47:03.040Z",
+     "updatedAt": "2026-11-19T17:47:13.890Z",
      "resultJson": null,
      "contextSnapshot": {
-      "issueId": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
-      "taskId": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
-      "taskKey": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
-      "commentId": "c704fbad-a4af-434e-82e0-d70d3e0082dc",
-      "wakeCommentId": "c704fbad-a4af-434e-82e0-d70d3e0082dc",
+      "issueId": "547d834e-ac96-4278-aca1-955f2bce2fb0",
+      "taskId": "547d834e-ac96-4278-aca1-955f2bce2fb0",
+      "taskKey": "547d834e-ac96-4278-aca1-955f2bce2fb0",
+      "commentId": "796f4df0-d61f-40e0-b526-5ac08cece2e8",
+      "wakeCommentId": "796f4df0-d61f-40e0-b526-5ac08cece2e8",
       "wakeReason": "issue_reopened_via_comment",
       "wakeSource": "automation",
       "wakeTriggerDetail": "system"
@@ -297,17 +301,17 @@
     }
    ],
    "failureIssueIds": [
-    "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f"
+    "547d834e-ac96-4278-aca1-955f2bce2fb0"
    ]
   },
   "inboxRuns": [
    {
-    "id": "bb4014d3-537c-4fba-b012-39241636f2e0",
+    "id": "c0d394c7-0762-4f05-8340-e3defdab0e6c",
     "responsibleUserId": "classic-bound-person",
-    "companyId": "0b9ed5c5-4fc5-4d47-9002-ad5de970a108",
-    "agentId": "c41a701b-239b-422a-8478-a857a618a915",
+    "companyId": "9c4d7529-b1e1-4da4-b608-783b4d1b4801",
+    "agentId": "d746d4b5-04eb-466f-a9cf-4a24639285a9",
     "scopeKind": "issue",
-    "issueId": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
+    "issueId": "547d834e-ac96-4278-aca1-955f2bce2fb0",
     "invocationSource": "automation",
     "triggerDetail": "system",
     "status": "failed",
@@ -316,10 +320,10 @@
     "outputTokens": null,
     "totalTokens": null,
     "costUsd": null,
-    "startedAt": "2026-11-19T17:45:01.197Z",
-    "finishedAt": "2026-11-19T17:45:03.569Z",
+    "startedAt": "2026-11-19T17:47:03.210Z",
+    "finishedAt": "2026-11-19T17:47:05.485Z",
     "error": "Saving the workspace failed after 3 attempts. The agent's result is kept; follow the run's recovery action to repair the workspace.",
-    "wakeupRequestId": "2c5f2b4d-dbdd-4b06-a73a-0c4e8d7aa3eb",
+    "wakeupRequestId": "3c7674c9-920c-46de-b80b-249a6c5a5dfd",
     "exitCode": null,
     "signal": null,
     "usageJson": null,
@@ -351,15 +355,15 @@
     "continuationAttempt": 0,
     "lastUsefulActionAt": null,
     "nextAction": null,
-    "createdAt": "2026-11-19T17:45:01.085Z",
-    "updatedAt": "2026-11-19T17:45:11.974Z",
+    "createdAt": "2026-11-19T17:47:03.040Z",
+    "updatedAt": "2026-11-19T17:47:13.890Z",
     "resultJson": null,
     "contextSnapshot": {
-     "issueId": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
-     "taskId": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
-     "taskKey": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
-     "commentId": "c704fbad-a4af-434e-82e0-d70d3e0082dc",
-     "wakeCommentId": "c704fbad-a4af-434e-82e0-d70d3e0082dc",
+     "issueId": "547d834e-ac96-4278-aca1-955f2bce2fb0",
+     "taskId": "547d834e-ac96-4278-aca1-955f2bce2fb0",
+     "taskKey": "547d834e-ac96-4278-aca1-955f2bce2fb0",
+     "commentId": "796f4df0-d61f-40e0-b526-5ac08cece2e8",
+     "wakeCommentId": "796f4df0-d61f-40e0-b526-5ac08cece2e8",
      "wakeReason": "issue_reopened_via_comment",
      "wakeSource": "automation",
      "wakeTriggerDetail": "system"
@@ -369,10 +373,10 @@
   "inboxRows": [
    {
     "externalConversationState": null,
-    "id": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
-    "companyId": "0b9ed5c5-4fc5-4d47-9002-ad5de970a108",
-    "projectId": "6059725d-4502-4978-88ae-2fa3f0b0fea7",
-    "projectWorkspaceId": "a631e02c-3f4b-4743-be52-1e0593832d74",
+    "id": "547d834e-ac96-4278-aca1-955f2bce2fb0",
+    "companyId": "9c4d7529-b1e1-4da4-b608-783b4d1b4801",
+    "projectId": "a290e9da-840c-4c06-8337-ee5de954d4a6",
+    "projectWorkspaceId": "c6c37175-10fc-474d-98f3-020e8356f1f5",
     "goalId": null,
     "parentId": null,
     "visibility": "open",
@@ -383,7 +387,7 @@
     "workMode": "standard",
     "priority": "medium",
     "reviewPolicy": null,
-    "assigneeAgentId": "c41a701b-239b-422a-8478-a857a618a915",
+    "assigneeAgentId": "d746d4b5-04eb-466f-a9cf-4a24639285a9",
     "assigneeUserId": null,
     "checkoutRunId": null,
     "executionRunId": null,
@@ -392,18 +396,18 @@
     "createdByAgentId": null,
     "createdByUserId": null,
     "issueNumber": 1,
-    "identifier": "L0b9ed5-1",
+    "identifier": "L9c4d75-1",
     "originKind": "manual",
     "originId": null,
     "originRunId": null,
     "requestDepth": 0,
     "billingCode": null,
-    "executionWorkspaceId": "d2291041-632a-4ed5-b66e-5d222171cced",
-    "startedAt": "2026-11-19T17:45:01.243Z",
+    "executionWorkspaceId": "5fbedf68-526e-424a-93e3-cf70bc7223fa",
+    "startedAt": "2026-11-19T17:47:03.272Z",
     "completedAt": null,
     "cancelledAt": null,
-    "createdAt": "2026-11-19T17:44:58.942Z",
-    "updatedAt": "2026-11-19T17:45:11.974Z",
+    "createdAt": "2026-11-19T17:47:00.708Z",
+    "updatedAt": "2026-11-19T17:47:13.889Z",
     "labelIds": [],
     "labels": [],
     "blockerAttention": {
@@ -418,7 +422,7 @@
      "sampleStalledBlockerIdentifier": null,
      "blockingTreeLive": false,
      "directBlockerIssueId": null,
-     "terminalBlockerIssueId": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
+     "terminalBlockerIssueId": "547d834e-ac96-4278-aca1-955f2bce2fb0",
      "terminalBlocker": null
     },
     "reviewAttention": {
@@ -426,11 +430,11 @@
      "paths": [],
      "reason": null
     },
-    "lastActivityAt": "2026-11-19T17:45:11.974Z",
+    "lastActivityAt": "2026-11-19T17:47:13.889Z",
     "activeRecoveryAction": {
-     "id": "afb7d7cb-9ae7-416e-9f09-74a0886242ed",
-     "companyId": "0b9ed5c5-4fc5-4d47-9002-ad5de970a108",
-     "sourceIssueId": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
+     "id": "cb39435a-f67b-4359-9598-d1c21709ec75",
+     "companyId": "9c4d7529-b1e1-4da4-b608-783b4d1b4801",
+     "sourceIssueId": "547d834e-ac96-4278-aca1-955f2bce2fb0",
      "recoveryIssueId": null,
      "kind": "active_run_watchdog",
      "status": "active",
@@ -438,11 +442,11 @@
      "ownerAgentId": null,
      "ownerUserId": null,
      "previousOwnerAgentId": null,
-     "returnOwnerAgentId": "c41a701b-239b-422a-8478-a857a618a915",
+     "returnOwnerAgentId": "d746d4b5-04eb-466f-a9cf-4a24639285a9",
      "cause": "native_workspace_sync_out_retry_exhausted",
-     "fingerprint": "15050d5123af3e01a0226c6cc51921d10a51e9122c9c19e7f784820ffac1ee83",
+     "fingerprint": "ec8db555279779a9c452826aa68bca2281a83af418d7c8fd25dda0a82c981957",
      "evidence": {
-      "runId": "bb4014d3-537c-4fba-b012-39241636f2e0",
+      "runId": "c0d394c7-0762-4f05-8340-e3defdab0e6c",
       "systemRecovery": {
        "phase": "verify_execution",
        "state": "exhausted",
@@ -453,26 +457,26 @@
         "sourceVerification": {
          "reason": "lease_cwd_invalid"
         },
-        "evidenceFingerprint": "d51d9c7ae4eb9216e69ed6f2edfa06c68414ae74c92dab4691b76f3665da9103"
+        "evidenceFingerprint": "1cb750248f99caac2f9bee539d5c89d73ed3a3f538c9b479d650f8bce20e1b7a"
        },
        "attempts": 1,
        "intentId": null,
        "revision": 2,
-       "attemptId": "f75ce5e8-e090-4e83-ae0b-22925058e270",
-       "deadlineAt": 1795112103686,
+       "attemptId": "bc8b34d7-4ffb-47d7-b1f0-5d1a532a3548",
+       "deadlineAt": 1795112225635,
        "retriesUsed": 0,
-       "sourceRunId": "bb4014d3-537c-4fba-b012-39241636f2e0",
-       "generationId": "81c7a6d7-d09d-4047-a9ea-b722c230c4b6",
+       "sourceRunId": "c0d394c7-0762-4f05-8340-e3defdab0e6c",
+       "generationId": "de0608a2-2e21-4130-8e29-d249046c2764",
        "nextAttemptAt": null,
        "policyVersion": 1,
-       "firstFailureAt": 1795110303686,
+       "firstFailureAt": 1795110425635,
        "freshAttemptRunId": null,
        "providerCooldownAt": null,
        "capturePolicyVersion": 2,
        "preservationOperationIds": []
       },
       "workspaceRecovery": {
-       "runId": "bb4014d3-537c-4fba-b012-39241636f2e0",
+       "runId": "c0d394c7-0762-4f05-8340-e3defdab0e6c",
        "stage": "verifying_stop",
        "schema": "paperclip.workspace-recovery.v1",
        "status": "blocked",
@@ -484,22 +488,22 @@
       },
       "coordinatorAttempt": 0,
       "originalFailureCode": "native_workspace_sync_out_failed",
-      "systemRecoveryActiveAt": 1795110303675,
+      "systemRecoveryActiveAt": 1795110425624,
       "workspaceFinalizeAttempt": 3,
       "previousWorkspaceRecovery": null,
       "workspaceFinalizationBlock": {
-       "runId": "bb4014d3-537c-4fba-b012-39241636f2e0",
+       "runId": "c0d394c7-0762-4f05-8340-e3defdab0e6c",
        "schema": "paperclip.native-workspace-finalization-block.v1",
-       "agentId": "c41a701b-239b-422a-8478-a857a618a915",
-       "issueId": "b75d98ce-c14a-4c56-af0b-fd3f80a0c96f",
-       "resultId": "dca54678-1f43-4f19-9822-6dcb6f4b7fed",
-       "companyId": "0b9ed5c5-4fc5-4d47-9002-ad5de970a108",
-       "contractId": "8298c80a-680f-4809-aff2-4fb7ff9ab82c",
-       "resultSha256": "be5dbddc82cca767d26f286f92b570cad0b0afdb98a68f0c9f1ff3d992281d4d",
+       "agentId": "d746d4b5-04eb-466f-a9cf-4a24639285a9",
+       "issueId": "547d834e-ac96-4278-aca1-955f2bce2fb0",
+       "resultId": "062be998-cc6e-46b9-aba5-8b1ebb619a10",
+       "companyId": "9c4d7529-b1e1-4da4-b608-783b4d1b4801",
+       "contractId": "ec93cffb-2325-4be3-8376-ecc24d7dcfb7",
+       "resultSha256": "498dc2fc6cb545d23b59e7ea64a1b3ea6b13c27342de5da995e20d7d7c1b4872",
        "statusVersion": 4,
        "contractSha256": "f9c262062eb76412e593aaa785ad2ab62472070023e77b8963d26b83a1f98cef",
-       "priorDecisionId": "9dfb9346-a241-4af7-b13c-cabf7b95bf63",
-       "identityContextId": "81f62b63-05aa-47ad-9009-0e09eccf2443",
+       "priorDecisionId": "fffe154c-80d3-40fa-853a-a9c2587461e0",
+       "identityContextId": "0f79b917-4b10-40a7-956e-3b5f2b5cc9eb",
        "responsibleUserId": "classic-bound-person"
       }
      },
@@ -509,24 +513,28 @@
      "attemptCount": 1,
      "maxAttempts": 3,
      "timeoutAt": null,
-     "lastAttemptAt": "2026-11-19T17:45:03.595Z",
+     "lastAttemptAt": "2026-11-19T17:47:05.528Z",
      "outcome": null,
      "resolutionNote": null,
      "resolvedAt": null,
-     "createdAt": "2026-11-19T17:45:03.569Z",
-     "updatedAt": "2026-11-19T17:45:03.689Z"
+     "createdAt": "2026-11-19T17:47:05.485Z",
+     "updatedAt": "2026-11-19T17:47:05.637Z"
     },
     "interruption": {
-     "intentId": "f4d381c3-3fe9-4335-8c75-226c879f71b1",
+     "intentId": "52a11bfc-5f28-464a-a066-3b64b606624a",
      "responsibility": "system",
      "state": "failed",
      "nextRetryAt": null,
      "canRetry": true,
      "userAction": null,
      "sourceRunIds": [
-      "bb4014d3-537c-4fba-b012-39241636f2e0"
+      "c0d394c7-0762-4f05-8340-e3defdab0e6c"
      ],
-     "observedRunId": "bb4014d3-537c-4fba-b012-39241636f2e0"
+     "observedRunId": "c0d394c7-0762-4f05-8340-e3defdab0e6c",
+     "savedMessageWait": {
+      "state": "waiting",
+      "line": "Waiting for the previous environment to stop. Your message will start automatically."
+     }
     },
     "successfulRunHandoff": null,
     "listProjection": "rows"
@@ -534,8 +542,8 @@
   ],
   "agents": [
    {
-    "id": "c41a701b-239b-422a-8478-a857a618a915",
-    "companyId": "0b9ed5c5-4fc5-4d47-9002-ad5de970a108",
+    "id": "d746d4b5-04eb-466f-a9cf-4a24639285a9",
+    "companyId": "9c4d7529-b1e1-4da4-b608-783b4d1b4801",
     "name": "Worker",
     "role": "engineer",
     "title": null,
@@ -543,7 +551,7 @@
     "appearance": {
      "schemaVersion": 1,
      "characterVersion": "cap-v1",
-     "paletteId": "cherry-pop"
+     "paletteId": "bubblegum-sky"
     },
     "status": "idle",
     "lifecycleState": "ready",
@@ -563,7 +571,7 @@
       "maxConcurrentRuns": 1
      }
     },
-    "defaultEnvironmentId": "fb4da1e4-21c8-4a6b-b7bc-0abfa139f09c",
+    "defaultEnvironmentId": "f8439a92-790e-48dc-8d00-229cc71b3f66",
     "budgetMonthlyCents": 0,
     "spendMonthUtc": null,
     "spentMonthlyCents": 0,
@@ -574,20 +582,20 @@
      "canCreateAgents": false,
      "canCreateSkills": true
     },
-    "lastHeartbeatAt": "2026-11-19T17:45:03.599Z",
+    "lastHeartbeatAt": "2026-11-19T17:47:05.534Z",
     "metadata": null,
     "createdByUserId": null,
-    "createdAt": "2026-11-19T17:44:58.939Z",
-    "updatedAt": "2026-11-19T17:45:03.599Z",
+    "createdAt": "2026-11-19T17:47:00.705Z",
+    "updatedAt": "2026-11-19T17:47:05.534Z",
     "urlKey": "worker",
-    "avatarUrl": "/api/agent-avatars/cap-v1/cherry-pop/rest.png?size=512&scale=1",
+    "avatarUrl": "/api/agent-avatars/cap-v1/bubblegum-sky/rest.png?size=512&scale=1",
     "orgChainHealth": {
      "status": "healthy",
      "reason": "healthy",
      "fullChain": [
       {
-       "id": "c41a701b-239b-422a-8478-a857a618a915",
-       "companyId": "0b9ed5c5-4fc5-4d47-9002-ad5de970a108",
+       "id": "d746d4b5-04eb-466f-a9cf-4a24639285a9",
+       "companyId": "9c4d7529-b1e1-4da4-b608-783b4d1b4801",
        "name": "Worker",
        "status": "idle",
        "reportsTo": null,
@@ -604,12 +612,12 @@
    }
   ],
   "taskBlocker": {
-   "nextAction": "Paperclip refused to recover the saved files because a safety check on them cannot pass. Your Retry is saved.",
+   "nextAction": "Waiting for the previous environment to stop. Your message will start automatically.",
    "savedMessageWait": "waiting"
   },
   "queueWait": {
-   "reason": "saved_work_recovery_refused",
-   "message": "Paperclip refused to recover the saved files because a safety check on them cannot pass. Your Retry is saved."
+   "reason": "remote_cleanup",
+   "message": "Waiting for the previous environment to stop. Your message will start automatically."
   },
   "runsThatCarryM": [],
   "attributedRepliesToM": 0
