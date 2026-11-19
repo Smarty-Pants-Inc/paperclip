@@ -36,6 +36,13 @@ import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 // NAMED INJECTIONS, each at its line: CLASSIC-STALL-1 (the harness), PARTIAL-EIO (the real copy-back publishes notes.md,
 //   then the publication of report.md fails), CLOCK-SKIP (retry delays are moved to now; the sweep is given a later
 //   clock), PLANTED BOX-STOPPED (R's box stop receipt).
+// d2shared5: the SAME walk one step earlier, while R's box is STILL STOPPING (the automatic wait; row WAITING below, the
+//   former PROBE of e2008042 turned into an asserting row). Every surface must say the ONE waiting line there:
+//   (a) the +11 min unanswered sweep posts no "no run started ... Sending it again is safe" in that wait, so no such note
+//       stands beside Continue once the hold forms;
+//   (c) the Inbox's GET carries the wait (its row then shows the sentence and no button);
+//   (f) the task and the queue never say a recovery's "... Your Retry is saved." for the person's message.
+const WAITING = "Waiting for the previous environment to stop. Your message will start automatically.";
 const LINE = "Your message is saved. The last reply's file changes couldn't be saved; your message starts now on the project's files as they are.";
 const PARTLY = "The last reply's file changes couldn't be saved, and part of them may already be in the project's files. Your message will start once you choose Continue.";
 const CONTINUE = "continue_with_files";
@@ -225,10 +232,14 @@ describe.skipIf(!support.supported)("a message held for Continue on a SHARED pro
       registerEnvironmentCleanupWork(db, delivery, { canRun: () => true, sweepPending: backoffMs => h.sweepPendingCleanupLeases({ backoffMs }), minimumSpacingMs: 1 });
       await pump(8000);
       if (opts.waitingSweep) {
-        // PROBE only: the same +11 min sweep while R's box is NOT stopped yet (the task says the automatic wait line).
+        // R's box is NOT stopped yet (PLANTED BOX-STOPPED comes below): the automatic wait. Nothing is planted for it.
         await snap("waiting");
+        // THE +11-minute sweep (NAMED CLOCK-SKIP: its clock only), DURING that wait.
         out.waitingSweep = await settleUnansweredPersonMessagesForTask(db, { companyId: s.companyId, issueId: s.issueId, now: new Date(Date.now() + 11 * 60_000) });
         await snap("waiting-after-11min-sweep");
+        // The gate runs again in the SAME state (the box is still not stopped): its own words for this wait, now.
+        await pump(3500);
+        await snap("waiting-gate-reran");
       }
       // PLANTED BOX-STOPPED: R's box stop receipt, in the shape of the real termination-receipt producer (the harness's
       // fake provider cannot stop a box that is a local directory).
@@ -277,11 +288,44 @@ describe.skipIf(!support.supported)("a message held for Continue on a SHARED pro
   const visibleNotes = (snapshot: Snapshot) => snapshot.comments.filter(comment => comment.authorType === "system")
     .map(comment => JSON.stringify([comment.body, comment.presentation ?? null, comment.metadata ?? null]));
 
-  // PROBE mode (evidence only, NO assertion; D2SHARED4_PROBE=1 writes every GET to D2SHARED4_PROBE_DIR): two states this
-  // fix does not change. (1) The +11 min sweep while R's box is still stopping (the automatic wait, not the hold).
-  // (2) The Inbox's GET after a plain Retry was sent to the route during the hold.
-  it.skipIf(!process.env.D2SHARED4_PROBE)("PROBE: the +11 min sweep in the automatic waiting state; the Inbox's GET after a plain Retry during the hold", async () => {
-    await drive("probe-waiting-sweep-and-plain-retry", { partial: true, waitingSweep: true, actions: ["retry"] });
+  it("WAITING (a)(c)(f): while R's box is still stopping, the task, the queue and the Inbox's GET say the ONE waiting line (never a recovery's 'Your Retry is saved'); the +11 min sweep posts nothing in that wait, so no send-again note stands beside Continue once the hold forms; Continue then answers M exactly once", async () => {
+    const out = await drive("waiting-sweep", { partial: true, waitingSweep: true, holdSweep: true, actions: ["continue"] });
+    expect(out.faults.length).toBeGreaterThan(0);
+    const waiting = out.snapshots.waiting as Snapshot;
+    // The automatic wait: R's box is not stopped, nothing started, M is parked.
+    expect([waiting.providerTurns, waiting.carriers, waiting.answerCount, waiting.queue.state]).toEqual([0, [], 0, "deferred"]);
+    // (f) The task and the queue say the ONE waiting line. Red at 1334565e: both said the gate's answer from BEFORE R's
+    // file line read LOST, "Paperclip refused to recover the saved files because a safety check on them cannot pass.
+    // Your Retry is saved." (the person sent a message, not a Retry; the gate's own next run says the waiting line).
+    expect.soft(waiting.issue.executionBlocker, "(f) the task's ONE sentence in the automatic wait").toMatchObject({ nextAction: WAITING, savedMessageWait: "waiting" });
+    expect.soft(waiting.queue.executionWait, "(f) the queue's wait line in the automatic wait").toMatchObject({ message: WAITING });
+    expect.soft(JSON.stringify([waiting.issue.executionBlocker?.nextAction, waiting.queue.executionWait]), "(f) a recovery's Retry words for a message").not.toMatch(/Your Retry is saved|refused to recover/);
+    // (c) The Inbox's task projection says what the task says: the SAME sentence, an automatic wait (nothing to press).
+    for (const row of [inboxTask(waiting.inboxMine, out.ids.issueId), waiting.inboxRows.find((candidate: { id: string }) => candidate.id === out.ids.issueId)])
+      expect.soft(row?.interruption?.savedMessageWait, "(c) the Inbox's GET says nothing of the wait").toEqual({ state: "waiting", line: WAITING });
+    expect(waiting.inboxMine.failureRuns.map((run: { id: string }) => run.id)).toContain(out.ids.r);
+    // (a) The +11 min sweep in that wait. Red at 1334565e: noticed 1, "... no run started ... Sending it again is safe".
+    expect.soft(out.waitingSweep.noticed, "(a) +11min sweep in the automatic wait must not advise send-again").toBe(0);
+    expect.soft(visibleNotes(out.snapshots["waiting-after-11min-sweep"]).filter(note => SEND_AGAIN.test(note)), "(a) notes beside the waiting line").toEqual([]);
+    // The gate's own next run in the same state (box still not stopped) names this very wait, in the same words.
+    const reran = out.snapshots["waiting-gate-reran"] as Snapshot;
+    expect(reran.queue).toMatchObject({ state: "deferred", executionWait: { reason: "remote_cleanup", message: WAITING } });
+    expect(reran.issue.executionBlocker).toMatchObject({ nextAction: WAITING, savedMessageWait: "waiting" });
+    expect([reran.providerTurns, reran.carriers, reran.answerCount]).toEqual([0, [], 0]);
+    // R's box stops (PLANTED BOX-STOPPED) and the hold forms: the partial sentence and Continue, with NO send-again
+    // note beside them; the sweep during the hold adds none (F1).
+    expectHeld(out.snapshots.hold);
+    expect.soft(visibleNotes(out.snapshots.hold).filter(note => SEND_AGAIN.test(note)), "(a) notes beside Continue once the hold forms").toEqual([]);
+    expect(out.holdSweep.noticed, "+11min hold sweep must not advise send-again").toBe(0);
+    expect.soft(visibleNotes(out.snapshots["hold-after-11min-sweep"]).filter(note => SEND_AGAIN.test(note))).toEqual([]);
+    expectHeld(out.snapshots["hold-after-11min-sweep"]);
+    // Continue (the card's ONE action): exactly one run, M answered once.
+    expect(out.presses[0]).toMatchObject({ action: "continue", status: 202, body: { accepted: true } });
+    expectAnsweredOnce(out.snapshots["after-continue"]);
+    expectAnsweredOnce(out.snapshots.final);
+    expect.soft(visibleNotes(out.snapshots.final).filter(note => SEND_AGAIN.test(note))).toEqual([]);
+    expect(out.checkout).toMatchObject({ ...SAVED, "notes.md": "R's new notes (unsaved)\n" });
+    expect(out.errors).toEqual([]);
   }, 300_000);
 
   it("F1 HOLD-SWEEP: the REAL partial apply holds M; the +11 min sweep DURING the hold posts nothing (noticed 0; no send-again note, no 'wasn't answered' line); the card and the queue still say the partial sentence; Continue then answers M exactly once", async () => {
