@@ -30,6 +30,7 @@ export type NativeTurnCustody =
 export type NativeTurnCustodyBasis =
   | "not_a_sandbox_box"
   | "no_turn_lease"
+  | "failed_create_never_held_turn"
   | "runner_never_launched"
   | "non_native_no_box_session"
   | "backup_and_copy_out_held";
@@ -70,9 +71,15 @@ export async function nativeTurnCustodyForLease(db: Db, lease: LeaseRow): Promis
   const metadata = lease.metadata ?? {};
   const stamped = metadata.nativeHarnessBackup !== undefined;
   const missingMarker = hasNativeHarnessBackupMissing(lease);
-  // Probe / setup-test / failed-create leases carry no run (environment-probe.ts
-  // heartbeatRunId: null). A box that ran a native turn carries its stamp.
-  if (!lease.heartbeatRunId && !stamped && !missingMarker) return { destroy: true, basis: "no_turn_lease" };
+  // Probe / setup-test leases carry no run and no issue (environment-probe.ts
+  // heartbeatRunId: null, issueId: null; c1's closedSetupTestLease). A box that
+  // ran a native turn carries its stamp (or a missing-backup marker).
+  if (!stamped && !missingMarker) {
+    if (!lease.heartbeatRunId && !lease.issueId) return { destroy: true, basis: "no_turn_lease" };
+    // A failed creation never finished making the box, so no turn ran in it
+    // (sandbox-creation-operations.ts insertPendingCleanupLease failedCreateCleanup).
+    if (metadata.failedCreateCleanup !== undefined && metadata.failedCreateCleanup !== null) return { destroy: true, basis: "failed_create_never_held_turn" };
+  }
   const [run] = lease.heartbeatRunId ? await db.select({
     id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, runtimeMode: heartbeatRuns.runtimeMode,
     runnerProfileJson: heartbeatRuns.runnerProfileJson,

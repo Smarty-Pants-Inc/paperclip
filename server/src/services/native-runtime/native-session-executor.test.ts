@@ -12589,14 +12589,35 @@ describe("native warm session supervision", () => {
           sandboxCapabilities: { reusableLeases: true, duplexCommandStream: true } }] } as never });
       await proofDb.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, status: "succeeded", runtimeMode: "native",
         nativeSessionId: sessionId, finishedAt: new Date(Date.now() - 10_000) });
-      const manifestSha256 = `sha256:${"b".repeat(64)}`, runnerInstanceId = "tl08-server-runner";
+      const runnerInstanceId = "tl08-server-runner";
+      // The backup behind the stamp is real (custody gate, BRIEF backup-gate):
+      // a stamp that names no held backup keeps the box instead of destroying it.
+      let backupStamp: ReturnType<typeof createNativeHarnessBackupStamp> | null = null;
+      if (withBackup) {
+        const stateBase = await mkdtemp(join(tmpdir(), "tl08-backup-"));
+        vi.stubEnv("PAPERCLIP_RUNNER_STATE_DIR", stateBase);
+        onTestFinished(() => { vi.unstubAllEnvs(); });
+        const sessionScopeId = `tl08-scope-${randomUUID()}`;
+        const current = join(stateBase, createHash("sha256").update(sessionScopeId).digest("hex"), "failover-backups", "current");
+        for (const directory of ["runner", "pi-agent", "pi"]) await mkdir(join(current, directory), { recursive: true });
+        await writeFile(join(current, "runner", "runner-state.json"), "warm owner checkpoint");
+        await writeFile(join(current, "pi", `${sessionId}.jsonl`), '{"role":"user","content":"indigo"}\n');
+        const manifest = buildNativeHarnessBackupManifest({ backupRoot: current, runnerInstanceId, sourceProviderLeaseId: providerLeaseId,
+          providerSessionIdentity: { providerSessionId: sessionId },
+          execution: { provider: { kind: "pi_rpc" }, binding: { companyId, runId, issueId, agentId, executionWorkspaceId: workspaceId },
+            workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+            session: { normalizedSessionId: sessionId, driverKind: "pi_rpc", protocolVersion: 1, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300000 } },
+          } as never });
+        await writeFile(join(current, "manifest.json"), JSON.stringify(manifest));
+        backupStamp = createNativeHarnessBackupStamp({ manifestPath: join(current, "manifest.json"), sessionScopeId, normalizedSessionId: sessionId,
+          runnerInstanceId, authorizedProviderLeaseId: providerLeaseId, completedAt: manifest.completedAt });
+      }
+      const manifestSha256 = backupStamp?.manifestSha256 ?? `sha256:${"b".repeat(64)}`;
       const [lease] = await proofDb.insert(environmentLeases).values({ companyId, environmentId, executionWorkspaceId: workspaceId,
         issueId, heartbeatRunId: runId, provider: "fixture", providerLeaseId, status: "retained", leasePolicy: "reuse_by_environment",
         metadata: { pluginId, provider: "fixture", sandboxProviderPlugin: true,
           reusableSandboxLease: { version: 1, adapterType: "paperclip_runner", executionWorkspaceId: workspaceId },
-          ...(withBackup ? { nativeHarnessBackup: { schema: "paperclip.native-harness-backup-stamp.v2", normalizedSessionId: sessionId,
-            runnerInstanceId, sessionScopeSha256: "a".repeat(64), sourceProviderLeaseId: providerLeaseId,
-            authorizedProviderLeaseId: providerLeaseId, manifestSha256, completedAt: new Date().toISOString() } } : {}) },
+          ...(backupStamp ? { nativeHarnessBackup: backupStamp } : {}) },
       }).returning();
       await proofDb.insert(issueComments).values({ companyId, issueId, authorAgentId: agentId, body: "Earlier answer: the release color is indigo." });
       const warmExecution: NativeExecutionInputV1 = { ...execution,
