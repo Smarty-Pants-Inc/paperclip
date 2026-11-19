@@ -31,3 +31,10 @@ Record name requested by adopt-lead; RFL to confirm the name and the ruling. rf-
 - Kept: a `failing` stop is never a receipt (old and new); the stop body is still `{}` (no force).
 - Dropped: the old row's eventual `failing` then `completed` progression inside one call. It is now covered by `stop-refusal.test.ts` ROW-4 (pending then completed: same receipt) and ROW-4b (a completed stop after a refusal clears the back-off).
 - Ruling: pending RFL confirmation of this record (adopt-lead asks RFL).
+
+## J2 (rf-4's independent judge, `judge-stop-refusal.test.ts`; rf-4 U2b S3, gold 1 x 1)
+- Old expectation: an unknown future stop status (`unexpected-future-status`) throws a plain Error whose message reads `... entered unexpected-future-status`.
+- New expectation: the same plain Error (not a typed refusal, never a stopped receipt) reads `... entered unrecognised (unexpected-future-status)`. A status outside Boat's closed `[a-z_]` token shape now goes through the one redactor (`providerStatus`), so it is bounded, sanitised and marked unrecognised.
+- In-repo row: `stop-refusal-rf4.test.ts` "J2 (superseded wording, SUPERSEDE-BOAT-U2-F2-STOPFAIL-1118)". The judge file itself is rf-4's; its owner updates its J2 string.
+- Kept: no false receipt; the error is not `PluginEnvironmentStopError`.
+- Ruling: pending RFL confirmation, under this same record.
