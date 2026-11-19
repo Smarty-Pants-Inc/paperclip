@@ -31,9 +31,13 @@ export function conversationMovedOnSql(m: Pick<PersonMessageSql, "companyId" | "
  * actually claimed a newer PERSON input. Starting later is not evidence: a
  * queued successor may start after messages that are still waiting behind it.
  * Keep the per-message floor's separate carried-message rule above intact. */
-export function newerPersonInputAnsweredSql(w: Pick<DeferredWakeSql, "companyId" | "issueId" | "requestedAt">): SQL {
+export function newerPersonInputAnsweredSql(w: Pick<DeferredWakeSql, "companyId" | "issueId" | "requestedAt">,
+  stillCarried?: SQL): SQL {
   return sql`exists (select 1 from ${heartbeatRuns} newer_turn
     where newer_turn.company_id = ${w.companyId} and newer_turn.status = 'succeeded'
+      ${stillCarried ? sql`and not exists (select 1 from ${heartbeatRuns} later_carrier
+        where later_carrier.company_id = newer_turn.company_id and later_carrier.started_at >= newer_turn.started_at
+          and ${carriesCommentSql("later_carrier", stillCarried, false)})` : sql``}
       and exists (select 1 from ${issueComments} newer_reply
         where newer_reply.company_id = newer_turn.company_id and newer_reply.issue_id = ${w.issueId}
           and newer_reply.created_by_run_id = newer_turn.id and newer_reply.author_type = 'agent'
@@ -242,7 +246,10 @@ export function personMessageOwedSql(m: PersonMessageSql): SQL {
     and (${liveMessageCustodySql(m)} or not ${everCarriedSql(m)}
       -- A carrier at/after the move-on turn still owns m (Stop-held README,
       -- then '9 + 10', then README's carrier); its own failure still cards.
-      or not ${conversationMovedOnSql(m, m.id)})
+      -- The person moved past m only when a succeeded replying turn CLAIMED a newer person message (the
+      -- stale rule's evidence, RFL 17:07Z); a turn that only revived work or answered a system wake does not
+      -- (gate 7 888e5d1d, 11-19: '9 + 10' silently unanswered under the start clock).
+      or not ${newerPersonInputAnsweredSql({ companyId: m.companyId, issueId: m.issueId, requestedAt: m.createdAt }, m.id)})
     and not exists (select 1 from ${issues} reset_issue
       join ${issueComments} reset_boundary on reset_boundary.id = reset_issue.conversation_boundary_comment_id
         and reset_boundary.company_id = reset_issue.company_id and reset_boundary.issue_id = reset_issue.id
