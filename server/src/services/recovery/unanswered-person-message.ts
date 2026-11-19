@@ -8,6 +8,8 @@ import {
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  issueTreeHoldMembers,
+  issueTreeHolds,
   issues,
   nativeRunFinalizations,
   type Db,
@@ -506,7 +508,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   nativeBlockedRepairApplies: NativeBlockedRepairApplies | undefined,
   standing: { replacePaused?: (pending: Extract<Decision, { kind: "pending" }>) => Decision }): Promise<Decision> {
   if (issue.hiddenAt || !issue.assigneeAgentId || issue.assigneeUserId
-    || !["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return { kind: "out_of_scope" };
+    || !["todo", "in_progress", "in_review", "blocked", "cancelled"].includes(issue.status)) return { kind: "out_of_scope" };
   const agentId = issue.assigneeAgentId;
 
   const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt,
@@ -556,6 +558,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   if (messageRun && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: messageRun.id }))) {
     return { kind: "answered" };
   }
+  if (issue.status === "cancelled") return decideCancelledTask(q, issue, message, messageRun, reason);
 
   // A failed fresh continuation that descends from the message's run is the
   // run the person's message ended on: the automatic lineage, typed or not,
@@ -1040,6 +1043,51 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
 }
 
+
+export const UNANSWERED_MESSAGE_CANCELLED_CODE = "task_cancelled";
+export const UNANSWERED_MESSAGE_CANCELLED_TEXT =
+  "This task was cancelled, so your message didn't run. Sending it again reopens the task and starts one run.";
+
+/** A subtree CANCEL over a person's HELD message (RFL 06:48Z): the cancel
+ * cancels its held wake, so it will never run. The canceller is read from the
+ * existing record of that cancel: the cancel hold that took this task
+ * (issue_tree_holds.created_by_user_id, the actor that
+ * cancelIssueStatusesForHold writes the status change as). The SENDER's own
+ * cancel needs no card; anyone else's (another person, an agent, the system:
+ * a NULL user, compared NULL-safe, never equal) gets ONE true card. A message
+ * whose own run started, or a task cancelled without a subtree cancel, stays
+ * out of scope as before. */
+async function decideCancelledTask(q: Db, issue: DecisionIssue,
+  message: { id: string; createdAt: Date; authorUserId: string | null }, messageRun: { id: string } | null,
+  reason: string): Promise<Decision> {
+  if (messageRun) return { kind: "out_of_scope" };
+  const [cancel] = await q.select({ id: issueTreeHolds.id, byUserId: issueTreeHolds.createdByUserId,
+    createdAt: issueTreeHolds.createdAt }).from(issueTreeHolds)
+    .innerJoin(issueTreeHoldMembers, and(eq(issueTreeHoldMembers.holdId, issueTreeHolds.id),
+      eq(issueTreeHoldMembers.companyId, issueTreeHolds.companyId)))
+    .where(and(eq(issueTreeHolds.companyId, issue.companyId), eq(issueTreeHolds.mode, "cancel"),
+      eq(issueTreeHoldMembers.issueId, issue.id), eq(issueTreeHoldMembers.skipped, false)))
+    .orderBy(desc(issueTreeHolds.createdAt)).limit(1);
+  if (!cancel || message.createdAt > cancel.createdAt) return { kind: "out_of_scope" };
+  // NULL-safe: a NULL canceller (the system) is never the sender.
+  if (cancel.byUserId != null && message.authorUserId != null && cancel.byUserId === message.authorUserId) {
+    return { kind: "explained" };
+  }
+  const notice = buildStrandedRecoveryEscalationNotice({
+    seed: {
+      title: "This task was cancelled",
+      body: UNANSWERED_MESSAGE_CANCELLED_TEXT,
+      tone: "warning",
+      nextAction: "Send the message again to reopen the task.",
+    },
+    recoveryActionId: null,
+    recoveryOwner: null,
+    recoveryResponsibility: "user",
+    sourceRun: null,
+    failureCode: UNANSWERED_MESSAGE_CANCELLED_CODE,
+  });
+  return { kind: "notice", reason, code: UNANSWERED_MESSAGE_CANCELLED_CODE, notice };
+}
 
 /** Resume (paused -> resuming) is an event: every open task of this agent whose
  * person's message carries a standing '<agent> is paused' note is handed to the
