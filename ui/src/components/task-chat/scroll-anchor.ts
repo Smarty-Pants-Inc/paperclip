@@ -1,3 +1,11 @@
+/** How close to the end of a thread counts as "at the end" (following it, caught up). */
+export const PIN_THRESHOLD_PX = 48;
+
+/** One policy for the scroller's pinning and for chat read receipts. */
+export function isScrolledToEnd(el: Element): boolean {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= PIN_THRESHOLD_PX;
+}
+
 /** Keep a reading position by logical row identity, not total scroll height. */
 export interface ThreadScrollAnchor {
   id: string;

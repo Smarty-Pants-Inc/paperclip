@@ -12,6 +12,8 @@ import { AgentChat } from "./AgentChat";
 const api = vi.hoisted(() => ({ enabled: true, list: vi.fn(), get: vi.fn(), getChat: vi.fn(), listChats: vi.fn(), directory: vi.fn(), primaries: vi.fn(), ensure: vi.fn(), session: vi.fn() }));
 const agentId = "18c5ad50-9d70-4e24-bd82-337e1d45a414";
 vi.mock("@/api/agents", () => ({ agentsApi: { list: api.list, get: api.get } }));
+// Chat reads carry the query's signal and whether it must read fresh (#21268).
+const chatReadOptions = expect.objectContaining({ signal: expect.anything(), fresh: expect.any(Boolean) });
 vi.mock("@/api/agentChats", () => ({ agentChatsApi: { get: api.getChat, list: api.listChats, ensure: api.ensure } }));
 vi.mock("@/api/access", () => ({ accessApi: { listUserDirectory: api.directory } }));
 vi.mock("@/api/auth", () => ({ authApi: { getSession: api.session } }));
@@ -78,7 +80,7 @@ it.each(["cached_refetch_failed", "fresh"])("opens historical chat from an avail
   render();
   await waitFor(() => expect(container.textContent).toContain("History for Retired helper"));
   expect(api.get).toHaveBeenCalledWith(agentId, "company-a");
-  expect(api.getChat).toHaveBeenCalledWith("company-a", agentId);
+  expect(api.getChat).toHaveBeenCalledWith("company-a", agentId, chatReadOptions);
   expect(container.textContent).not.toContain("Agent not found");
   expect(api.ensure).not.toHaveBeenCalled();
 });
@@ -126,7 +128,7 @@ it("opens a stale navigation conversation immediately while revalidating in the 
   render();
   expect(container.textContent).toContain("History for Helper");
   expect(container.textContent).not.toContain("Loading conversation");
-  await waitFor(() => expect(api.getChat).toHaveBeenCalledWith("company-a", agentId));
+  await waitFor(() => expect(api.getChat).toHaveBeenCalledWith("company-a", agentId, chatReadOptions));
   expect(api.ensure).not.toHaveBeenCalled();
 });
 
@@ -180,7 +182,7 @@ it("finds the owner's conversation beyond the first members=all page", async () 
     .mockResolvedValueOnce([{ id: "paul-chat", conversationAgentId: agentId, conversationUserId: "paul" }]);
   render();
   await waitFor(() => expect(container.querySelector('[data-issue-id="paul-chat"]')).not.toBeNull());
-  expect(api.listChats).toHaveBeenLastCalledWith("company-a", { agentId, members: "all", limit: 100, offset: 100 });
+  expect(api.listChats).toHaveBeenLastCalledWith("company-a", { agentId, members: "all", limit: 100, offset: 100 }, chatReadOptions);
 });
 
 it("never flashes the interactive view while primary ownership is loading", async () => {

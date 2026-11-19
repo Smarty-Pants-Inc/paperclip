@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { agentChatsApi } from "@/api/agentChats";
+import { queryReadOptions } from "@/api/client";
 import { agentsApi } from "@/api/agents";
 import { authApi } from "@/api/auth";
 import { accessApi } from "@/api/access";
@@ -55,7 +56,7 @@ export function AgentChat() {
   const chatKey = queryKeys.agentChats.detail(selectedCompanyId, userId, agent?.id);
   const chat = useQuery({
     queryKey: chatKey,
-    queryFn: () => agentChatsApi.get(selectedCompanyId!, agent!.id),
+    queryFn: context => agentChatsApi.get(selectedCompanyId!, agent!.id, queryReadOptions(context)),
     initialData: () => ownChatEnabled
       ? client.getQueryData<Issue[]>(queryKeys.agentChats.list(selectedCompanyId, userId))
         ?.find(issue => issue.companyId === selectedCompanyId && issue.conversationAgentId === agent?.id)
@@ -68,11 +69,11 @@ export function AgentChat() {
   });
   const memberChat = useQuery({
     queryKey: [...queryKeys.agentChats.list(selectedCompanyId, userId), "owner", agent?.id, otherOwnerId],
-    queryFn: async () => {
+    queryFn: async context => {
       // The existing shared-chat read is paginated. An absent owner on page one
       // does not mean they have no conversation.
       for (let offset = 0; ; offset += 100) {
-        const page = await agentChatsApi.list(selectedCompanyId!, { agentId: agent!.id, members: "all", limit: 100, offset });
+        const page = await agentChatsApi.list(selectedCompanyId!, { agentId: agent!.id, members: "all", limit: 100, offset }, queryReadOptions(context));
         const owned = page.find(item => item.conversationUserId === otherOwnerId);
         if (owned) return owned;
         if (page.length < 100) return null;
