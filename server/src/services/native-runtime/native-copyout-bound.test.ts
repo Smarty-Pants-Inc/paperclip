@@ -647,16 +647,17 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
     s.fault.slowMs = 700;
     // Each sandbox command takes longer than the whole no-attempt bound (300 ms); the attempt timeout is 60 s.
     const checking = s.worker({ attemptTimeoutMs: 60_000, noAttemptMs: 300 }).check();
-    // While it runs, another sweep of the same run (as from a second controller) waits and does not fire,
-    // even with its clock 20 minutes on and the production constants.
+    // While it runs, another controller waits before the reply deadline. The old 20-minute
+    // control is superseded by clock (ii): nine minutes is healthy; ten must end (K10 above).
     await vi.waitFor(async () => expect(await s.attempts()).toEqual(["running"]), { timeout: 10_000, interval: 25 });
     const peer = createDb(database.connectionString);
     try {
-      const waited = await s.worker({ now: () => Date.now() + 20 * 60_000 }, peer).check();
+      const [accepted] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, s.runId));
+      const waited = await s.worker({ now: () => accepted.createdAt.getTime() + WITHHELD_REPLY_SAVING_DEADLINE_MS - 60_000 }, peer).check();
       expect(waited.entries).toBe(1);
       expect(waited.results[0]).toMatchObject({ id: s.runId });
       expect((await s.run()).status).toBe("running");
-    } finally { await peer.$client.end({ timeout: 1 }); }
+    } finally { await peer.$client.end({ timeout: 1 }); await checking.catch(() => undefined); }
     const checked = await checking;
     expect(s.fault.commands).toBeGreaterThanOrEqual(2);
     expect(checked.entries).toBe(1);
