@@ -440,11 +440,13 @@ function maybeContainsSecretText(input: string) {
   );
 }
 
+const INLINE_WHITESPACE_RE = /[ \t]/;
+
 function inlineWhitespaceEnd(input: string, start: number): number {
   let index = start;
   while (
     index < input.length &&
-    (input[index] === " " || input[index] === "\t")
+    INLINE_WHITESPACE_RE.test(input[index])
   ) {
     index += 1;
   }
@@ -1279,8 +1281,12 @@ function redactTokenPatterns(input: string, apply: ApplyRedactionStage, patterns
 
 // Match Bearer's case-insensitive scheme, but not its broad uncoloured body
 // parser: that would promote `standard<CSI>bearer abc123def` into a credential.
-// Require one ASCII space and at least 20 token characters, with optional `=`.
-const CSI_BOUNDARY_BEARER_RE = /\b(Bearer )([A-Za-z0-9._~+/-]{20,}=?)(?![A-Za-z0-9._~+/=-])/gi;
+// Share its one-or-more inline spaces/tabs; unquotedCredentialEnd consumes any
+// trailing `=` padding. Only the body retains V2's stricter 20-character floor.
+const CSI_BOUNDARY_BEARER_RE = new RegExp(
+  String.raw`\b(Bearer${INLINE_WHITESPACE_RE.source}+)([A-Za-z0-9._~+/-]{20,}=*)(?![A-Za-z0-9._~+/=-])`,
+  "gi",
+);
 
 function redactBoundaryTokenRanges(input: string, apply: ApplyRedactionStage, view: AnsiCredentialView): string {
   // Run first, while match offsets still address the original boundary view.
