@@ -648,7 +648,7 @@ describe("codex execute", () => {
       expect(capture.prompt).toContain("Use this wake to continue the task, applying new user direction and preserving its approval gates.");
       expect(capture.prompt).toContain("Do not switch to another issue until you have handled this wake.");
       expect(capture.prompt).toContain(
-        "acknowledge the latest comment and explain how it changes your next action.",
+        "answer the new comments in order, oldest first, and explain how each changes your next action.",
       );
       expect(capture.prompt).toContain("First comment");
       expect(capture.prompt).toContain("Second comment");

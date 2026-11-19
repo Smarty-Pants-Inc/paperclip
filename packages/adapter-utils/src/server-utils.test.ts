@@ -2168,6 +2168,28 @@ describe("renderPaperclipWakePrompt", () => {
       latestCommentId: "comment-1",
     });
     expect(commentPrompt).toContain("acknowledge the latest comment");
+    expect(commentPrompt.split("\n")).toContain(
+      "Before generic repo exploration or boilerplate heartbeat updates, acknowledge the latest comment and explain how it changes your next action.",
+    );
+    expect(commentPrompt).not.toContain("oldest first");
+
+    const threeCommentPrompt = renderPaperclipWakePrompt({
+      ...base,
+      reason: "issue_commented",
+      commentWindow: { requestedCount: 3, includedCount: 3, missingCount: 0 },
+      comments: [
+        { id: "comment-1", body: "H1 held", authorType: "user" },
+        { id: "comment-2", body: "H2 held", authorType: "user" },
+        { id: "comment-3", body: "H3 held", authorType: "user" },
+      ],
+      latestCommentId: "comment-3",
+    });
+    expect(threeCommentPrompt.split("\n")).toContain(
+      "Before generic repo exploration or boilerplate heartbeat updates, answer the new comments in order, oldest first, and explain how each changes your next action.",
+    );
+    expect(threeCommentPrompt).not.toContain("acknowledge the latest comment");
+    expect(threeCommentPrompt).toContain("- pending comments: 3/3");
+    expect(zeroCommentPrompt).not.toContain("oldest first");
     expect(commentPrompt).toContain("Only fetch the API thread");
     expect(commentPrompt).toContain("- pending comments: 1/1");
     expect(commentPrompt).toContain("- latest comment id: comment-1");
