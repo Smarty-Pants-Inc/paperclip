@@ -27,9 +27,10 @@ describe.skipIf(!support.supported)("reached clause: a never-carried message is 
     await db.insert(issueComments).values({ id: m1, companyId, issueId, authorType: "user", body: "M1 (held)", createdAt: new Date(t),
       ...(opts.originImport ? { origin: "import" } : {}) });
     await db.insert(issueComments).values({ id: m2, companyId, issueId, authorType: "user", body: "M2", createdAt: new Date(t + 1000) });
-    const run = async (contextSnapshot: Record<string, unknown>, at: number, status = "succeeded") => {
+    const run = async (contextSnapshot: Record<string, unknown>, at: number, status = "succeeded", started = true) => {
       const id = randomUUID();
-      await db.insert(heartbeatRuns).values({ id, companyId, agentId, status, startedAt: new Date(at), finishedAt: new Date(at + 500),
+      // started = false: the shape a cancel before claim leaves (status cancelled, started_at null; claim sets started_at).
+      await db.insert(heartbeatRuns).values({ id, companyId, agentId, status, startedAt: started ? new Date(at) : null, finishedAt: new Date(at + 500),
         nativeIssueId: issueId, contextSnapshot: { issueId, ...contextSnapshot } });
       return id;
     };
@@ -74,6 +75,24 @@ describe.skipIf(!support.supported)("reached clause: a never-carried message is 
     const f = await seed({ originImport: true });
     expect([...await answeredPersonMessageIds(db, { ...f, commentIds: [f.m1] })]).toEqual([f.m1]);
     expect(await f.owed()).not.toContain(f.m1);
+  });
+
+  it("reached-started: M1 carried only by a run CANCELLED BEFORE START, M2 answered by its own run => M1 still OWED", async () => {
+    const f = await seed();
+    await f.run({ wakeCommentId: f.m1, wakeCommentIds: [f.m1] }, f.t + 500, "cancelled", false);
+    const r2 = await f.run({ wakeCommentId: f.m2, wakeCommentIds: [f.m2] }, f.t + 2000);
+    await f.reply(r2, f.t + 3000);
+    expect([...await answeredPersonMessageIds(db, { ...f, commentIds: [f.m1, f.m2] })]).toEqual([f.m2]);
+    expect(await f.owed()).toEqual([f.m1]);
+  });
+
+  it("reached-started control: M1 carried by a run that STARTED and succeeded => M2's reply answers it (as before)", async () => {
+    const f = await seed();
+    await f.run({ wakeCommentId: f.m1, wakeCommentIds: [f.m1] }, f.t + 500, "succeeded", true);
+    const r2 = await f.run({ wakeCommentId: f.m2, wakeCommentIds: [f.m2] }, f.t + 2000);
+    await f.reply(r2, f.t + 3000);
+    expect(new Set(await answeredPersonMessageIds(db, { ...f, commentIds: [f.m1, f.m2] }))).toEqual(new Set([f.m1, f.m2]));
+    expect(await f.owed()).toEqual([]);
   });
 
   it("L1b kept: M1's own carrier FAILED without a reply => a later reply does not answer it", async () => {

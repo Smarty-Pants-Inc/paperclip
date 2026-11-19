@@ -58,7 +58,8 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
   // until a run that carries it (its re-delivery) answers, or its card stands.
   // Reached clause (RFL 08:41Z): a reply to a LATER message answers m ONLY if m
   // REACHED the agent: m was in some run's input (any carried key, including
-  // wakeCommentIds and context.commentId). A STEERED m counts as reached only
+  // wakeCommentIds and context.commentId) of a run that STARTED (started_at, set
+  // at claim; a run cancelled before start never reached the model). A STEERED m counts as reached only
   // when its text went into a model request (requireSteeredText = true: it is in
   // answeredSteeredCommentIds); Pi's read alone is not enough (RFL). A message
   // held and never carried stays owed (carried next, or a true card). Imported
@@ -78,9 +79,12 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
             -- A steer can overtake an earlier queued message: it answers only itself.
             and not coalesce(r.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? b.id::text
             and not ${failedCarrierSql(m)}
-            -- Reached clause (RFL 08:41Z): ...and only if m REACHED the agent (see the comment above).
+            -- Reached clause (RFL 08:41Z): ...and only if m REACHED the agent (see the comment above),
+            -- by a run that STARTED its turn: the claim sets started_at; a run cancelled before
+            -- start (still null) never put m before a model, so m stays owed.
             and exists (select 1 from ${heartbeatRuns} rc
-              where rc.company_id = ${m.companyId} and ${carriesCommentSql("rc", m.id, true)})))
+              where rc.company_id = ${m.companyId} and rc.started_at is not null
+                and ${carriesCommentSql("rc", m.id, true)})))
           and ${chainCarriesCommentSql("r", sql`b.id`, m)}))
     or exists (select 1 from ${issueThreadInteractions} q
       join ${heartbeatRuns} r on r.id = q.source_run_id and r.company_id = q.company_id
