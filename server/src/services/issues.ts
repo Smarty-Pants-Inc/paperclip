@@ -13832,7 +13832,12 @@ export function issueService(db: Db) {
             || run.responsibleUserId !== current.conversationUserId) {
             throw forbidden("Invalid background chat message authority");
           }
-        } else if (runTaskId !== issueId || run?.contextSnapshot?.conversationSessionGeneration !== current.conversationSessionGeneration) {
+        } else if (runTaskId !== issueId) {
+          // A run on another task is not a turn of this chat. Say so, and name the
+          // supported channel, instead of blaming a session reset that never happened.
+          throw conflict("This run belongs to another task; post to your chat with send_chat_message", {
+            code: "chat_reply_from_other_task", sourceTaskId: runTaskId ?? null });
+        } else if (run?.contextSnapshot?.conversationSessionGeneration !== current.conversationSessionGeneration) {
           throw conflict("Conversation session changed; this reply belongs to an earlier session");
         }
       }
