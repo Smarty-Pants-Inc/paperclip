@@ -4473,7 +4473,8 @@ export function heartbeatService(
   }
 
   async function agentInvocationStopBlocker(agentIds: string[], reason: string, options: StopInvocationOptions = {}) {
-    await cancelInvocationsForAgentsInternal(agentIds, reason, options);
+    const cancellation = await cancelInvocationsForAgentsInternal(agentIds, reason, options);
+    if ("pauseSuperseded" in cancellation) return "pause_superseded";
     const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
     const leasesToRelease = await db.select({ runId: environmentLeases.heartbeatRunId }).from(environmentLeases)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))

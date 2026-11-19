@@ -109,6 +109,7 @@ import {
 } from "@paperclipai/shared";
 import {
   agentWakeupRequests,
+  agents,
   browserUseRuns,
   browserUseSessions,
   companies,
@@ -192,7 +193,10 @@ async function withBudgetStopDelivery<T>(db: Db, work: () => Promise<T>): Promis
  * messages it deferred for delivery once the pause lifts. */
 /** serverRecordOnly (pause): skip provider-dependent Stop proof only; box
  * release goes to the existing lease sweep instead of being awaited. */
-export type StopInvocationOptions = { preservePauseDeferred?: boolean; trigger?: string; serverRecordOnly?: boolean };
+/** pauseOperation: the pause's own lifecycle operation; once a Resume replaced
+ * it, the pause's late-returning cancel stops before any further effect. */
+export type StopInvocationOptions = { preservePauseDeferred?: boolean; trigger?: string; serverRecordOnly?: boolean;
+  pauseOperation?: { agentId: string; operationId: string; version: number } };
 
 /** Cancellation shares executor ownership and delegates lifecycle and admission effects. */
 
@@ -1961,6 +1965,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     let runsCancelled = 0;
     for (const agentId of uniqueAgentIds) {
       runsCancelled += await cancelActiveForAgentInternal(agentId, reason);
+    }
+    const pause = options.pauseOperation;
+    if (pause && !(await db.select({ id: agents.id }).from(agents).where(and(eq(agents.id, pause.agentId),
+      eq(agents.lifecycleState, "pausing"), eq(agents.lifecycleVersion, pause.version),
+      sql`${agents.lifecycleOperation}->>'id' = ${pause.operationId}`))).length) {
+      return { agentIds: uniqueAgentIds, runsCancelled, wakeupsCancelled: 0, pauseSuperseded: true };
     }
     const wakeupsCancelled = await cancelPendingWakeupsForAgentsInternal(
       uniqueAgentIds,

@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  agents, authUsers, companies, companyMemberships, createDb, environmentLeases, environments, heartbeatRuns, issues, plugins,
+  agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, environmentLeases, environments, heartbeatRuns,
+  issueComments, issues, plugins,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -13,19 +14,26 @@ vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClien
 // and then rejects with NativeCancellationPendingRecoveryError (:10996-10998).
 // The first cancel here hangs until the test lets it reach that outcome; later
 // cancels reach it at once. The startup itself never returns.
+// arm(true): the first cancel instead RETURNS NORMALLY once let go (S3).
 const cancelGate = vi.hoisted(() => {
-  let release!: () => void;
-  const released = new Promise<void>(resolve => { release = resolve; });
-  return { calls: 0, released, release };
+  const gate = { calls: 0, returns: false, released: Promise.resolve(), release: () => {},
+    arm(returns: boolean) {
+      gate.calls = 0; gate.returns = returns;
+      gate.released = new Promise<void>(resolve => { gate.release = resolve; });
+    } };
+  gate.arm(false);
+  return gate;
 });
 vi.mock("../services/native-runtime/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/native-runtime/index.js")>();
   return { ...actual, cancelNativeSession: vi.fn(async () => {
     if (cancelGate.calls++ === 0) await cancelGate.released;
+    if (cancelGate.returns) return { dispatched: true, decision: { kind: "cancelled" }, decisionId: "d", auditId: "a" };
     throw new actual.NativeCancellationPendingRecoveryError();
   }) };
 });
 
+import { heartbeatService } from "../services/heartbeat.ts";
 import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
 import { configureAgentLifecycle, createAgentLifecycle } from "../services/agent-lifecycle.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -94,7 +102,7 @@ describe.skipIf(!support.supported)("Resume while a pause waits on a run hung in
     const call = vi.fn(() => new Promise(() => {}));
     const manager = { isRunning: vi.fn((id: string) => id === pluginId),
       getWorker: vi.fn(() => ({ supportedMethods: PROVIDER_METHODS })), call } as unknown as PluginWorkerManager;
-    return { agentId, runId, manager };
+    return { companyId, agentId, issueId, runId, userId, manager };
   }
 
   const agentRow = async (id: string) => (await db.select().from(agents).where(eq(agents.id, id)))[0]!;
@@ -148,5 +156,82 @@ describe.skipIf(!support.supported)("Resume while a pause waits on a run hung in
       const after = await agentRow(f.agentId);
       expect(after).toMatchObject({ lifecycleState: "ready", lifecycleHolds: [], lifecycleVersion: row.lifecycleVersion });
     } finally { cancelGate.release(); await pausing.stop(); await other.stop(); }
+  }, 30_000);
+
+  /** A person's message: the comment row plus the comment route's wakeup (routes/issues.ts issue_commented). */
+  async function personMessage(heartbeat: ReturnType<typeof heartbeatService>, f: Awaited<ReturnType<typeof seed>>,
+    issueId: string, body: string) {
+    const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId, authorType: "user",
+      authorUserId: f.userId, body }).returning();
+    await within(heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
+      payload: { issueId, commentId: comment!.id, mutation: "comment" },
+      requestedByActorType: "user", requestedByActorId: f.userId,
+      contextSnapshot: { issueId, taskId: issueId, commentId: comment!.id, wakeCommentId: comment!.id,
+        source: "issue.comment", wakeReason: "issue_commented" } }), 10_000, "message wakeup");
+    const [wakeup] = await db.select().from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.agentId} = ${f.agentId} and ${agentWakeupRequests.payload}->>'commentId' = ${comment!.id}`);
+    return wakeup!;
+  }
+
+  it("S3: Pause (blocked in its cancel), Resume, a message, then the old cancel RETURNS: the message's wakeup is not cancelled", async () => {
+    cancelGate.arm(true);
+    const f = await seed();
+    const heartbeat = heartbeatService(db);
+    // The message's task is busy with a colleague's run, so its wakeup waits
+    // unclaimed (deferred) and the hung run's own cancel cannot promote it.
+    const colleagueId = randomUUID(), busyIssueId = randomUUID(), colleagueRunId = randomUUID();
+    await db.insert(agents).values({ id: colleagueId, companyId: f.companyId, name: "Colleague", role: "engineer",
+      status: "running", adapterType: "process", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    await db.insert(issues).values({ id: busyIssueId, companyId: f.companyId, title: "Busy task", status: "in_progress",
+      priority: "medium", assigneeAgentId: f.agentId });
+    await db.insert(heartbeatRuns).values({ id: colleagueRunId, companyId: f.companyId, agentId: colleagueId,
+      invocationSource: "on_demand", status: "running", runtimeMode: "native", runtimeModeResolvedAt: new Date(), issueId: busyIssueId,
+      nativeIssueId: busyIssueId, startedAt: new Date(), contextSnapshot: { issueId: busyIssueId } });
+    await db.update(issues).set({ executionRunId: colleagueRunId }).where(eq(issues.id, busyIssueId));
+    const other = lifecycleWorker(f.manager), pausing = lifecycleWorker(f.manager);
+    let oldPause: Promise<void> | undefined;
+    try {
+      const lifecycle = createAgentLifecycle(db);
+      await lifecycle.pauseAgent(f.agentId);
+      oldPause = pausing.process(f.agentId);
+      const deadline = Date.now() + 5_000;
+      while (cancelGate.calls === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+      expect(cancelGate.calls).toBe(1);
+      await lifecycle.resumeAgent(f.agentId);
+      const ready = await until(other, f.agentId, "ready", 5_000);
+      expect(ready.lifecycleState).toBe("ready");
+      const queued = await personMessage(heartbeat, f, busyIssueId, "Are you back?");
+      expect(queued.status).toBe("deferred_issue_execution");
+      expect(queued.runId).toBeNull();
+      // The old pause's cancel now returns normally (not "stop still pending").
+      cancelGate.release();
+      await within(oldPause, 10_000, "old pause step");
+      const [wakeup] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queued.id));
+      expect(wakeup!.status).not.toBe("cancelled");
+      expect(await agentRow(f.agentId)).toMatchObject({ lifecycleState: "ready", lifecycleVersion: ready.lifecycleVersion });
+      // It still waits, unclaimed, for its task to free up: deliverable, not dropped.
+      expect(wakeup).toMatchObject({ status: "deferred_issue_execution", runId: null, error: null, finishedAt: null });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, queued.id))).toHaveLength(0);
+    } finally { cancelGate.release(); await pausing.stop(); await other.stop(); }
+  }, 40_000);
+
+  it("Stop control: a person's Stop (no pause operation) cancels the same queued wakeups as at tB2", async () => {
+    const f = await seed();
+    const heartbeat = heartbeatService(db);
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    const base = { companyId: f.companyId, agentId: f.agentId, source: "on_demand", reason: "issue_commented" } as const;
+    const rows = await db.insert(agentWakeupRequests).values([
+      { ...base, status: "queued" },
+      { ...base, status: "deferred_issue_execution", payload: { issueId: f.issueId } },
+      { ...base, status: "deferred_issue_execution", payload: { issueId: f.issueId, executionWait: { trigger: "pause_lifted" } } },
+      { ...base, status: "queued", runId: f.runId },
+      { ...base, status: "completed" },
+    ] as never).returning();
+    const result = await heartbeat.cancelInvocationsForAgents([f.agentId], "Stopped by a person");
+    expect(result).toMatchObject({ wakeupsCancelled: 3 });
+    expect("pauseSuperseded" in result).toBe(false);
+    const after = await db.select().from(agentWakeupRequests).where(inArray(agentWakeupRequests.id, rows.map(row => row.id)));
+    const status = new Map(after.map(row => [row.id, row.status]));
+    expect(rows.map(row => status.get(row.id))).toEqual(["cancelled", "cancelled", "cancelled", "queued", "completed"]);
   }, 30_000);
 });
