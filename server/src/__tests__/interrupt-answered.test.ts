@@ -189,10 +189,11 @@ describe.skipIf(!support.supported)("Interrupt: the interrupted turn's own messa
   // route tests' seedQueue shape), then press the REAL Interrupt route. The
   // successor is held in the ordinary queue (maxConcurrentRuns 1 behind an
   // unrelated running run) so its exact input is read without a provider.
-  async function seedLiveTurn(stopBefore: boolean) {
+  async function seedLiveTurn(stopBefore: boolean, options: { steeredUnread?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
     const liveRunId = randomUUID(), wakeId = randomUUID();
     const [held1, held2, held3] = [randomUUID(), randomUUID(), randomUUID()];
+    const steered1 = randomUUID();
     const issuePrefix = `J${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     await db.insert(companies).values({ id: companyId, name: "IA seeded", issuePrefix, requireBoardApprovalForNewAgents: false });
     await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId,
@@ -203,7 +204,9 @@ describe.skipIf(!support.supported)("Interrupt: the interrupted turn's own messa
     // HELD1's own turn: live, its input is HELD1.
     await db.insert(heartbeatRuns).values({ id: liveRunId, companyId, agentId, invocationSource: "on_demand",
       triggerDetail: "manual", status: "running", runtimeMode: "native", startedAt: t(3), responsibleUserId: userId,
-      contextSnapshot: { issueId, wakeCommentId: held1, commentId: held1, wakeCommentIds: [held1], responsibleUserId: userId } });
+      contextSnapshot: { issueId, wakeCommentId: held1, commentId: held1, wakeCommentIds: [held1], responsibleUserId: userId,
+        // S-d2: STEERED1 was steered into the live turn (custody recorded) and never read by it.
+        ...(options.steeredUnread ? { steeredCommentIds: [steered1] } : {}) } });
     await db.insert(issues).values({ id: issueId, companyId, identifier: `${issuePrefix}-1`, title: "Chat", status: "in_progress",
       priority: "medium", assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: userId,
       conversationState: "active", responsibleUserId: userId, executionRunId: liveRunId });
@@ -218,6 +221,8 @@ describe.skipIf(!support.supported)("Interrupt: the interrupted turn's own messa
         resultJson: { cancelledByActorType: "user", cancelledByUserId: userId },
         contextSnapshot: { issueId, wakeCommentId: m0, wakeCommentIds: [m0] } });
     }
+    if (options.steeredUnread) await db.insert(issueComments).values({ id: steered1, companyId, issueId, authorType: "user",
+      authorUserId: userId, body: "STEERED1", createdAt: t(3.5), updatedAt: t(3.5) });
     await db.insert(issueComments).values([[held1, "HELD1", 2], [held2, "HELD2", 4], [held3, "HELD3", 5]].map(([id, body, m]) => ({
       id: id as string, companyId, issueId, authorType: "user" as const, authorUserId: userId, body: body as string,
       createdAt: t(m as number), updatedAt: t(m as number) })));
@@ -238,7 +243,7 @@ describe.skipIf(!support.supported)("Interrupt: the interrupted turn's own messa
     });
     client.use("/api", issueRoutes(db, {} as any, {}));
     client.use(errorHandler);
-    return { companyId, agentId, issueId, liveRunId, wakeId, held1, held: [held2, held3], client };
+    return { companyId, agentId, issueId, liveRunId, wakeId, held1, steered1, held: [held2, held3], client };
   }
 
   async function interruptLiveTurn(f: Awaited<ReturnType<typeof seedLiveTurn>>) {
@@ -331,5 +336,18 @@ describe.skipIf(!support.supported)("Interrupt: the interrupted turn's own messa
     expect(a.perRun, JSON.stringify({ clicked: c.clicked, all: a.all, wakes: a.wakes })).toHaveLength(1);
     expect(a.perRun[0]!.ids).toEqual([typed]);
     expect(a.answeredBy(typed)).toHaveLength(1);
+  }, 120_000);
+  it("S-d2: an Interrupt carries the cut turn's own message, then its unread steered messages, then the held ones, each once, deduped by comment id", async () => {
+    // compose-abc, adopt-lead by-line rule (b) 11-19 08:15Z. Seeded rows only (seedLiveTurn): the live turn's
+    // context records STEERED1 as steered into it (steeredCommentIds) with no read/answer evidence.
+    const f = await seedLiveTurn(false, { steeredUnread: true });
+    const { runs, wakes } = await interruptLiveTurn(f);
+    await evidence("S-d2", { f: { ...f, client: undefined }, runs: runs.map(r => ({ id: r.id, status: r.status, ctx: r.contextSnapshot })), wakes });
+    expect(runs, JSON.stringify({ wakes })).toHaveLength(1);
+    expect(runs[0]!.contextSnapshot?.wakeCommentIds, "own -> steered-unread -> held, each once")
+      .toEqual([f.held1, f.steered1, ...f.held]);
+    const [cut] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.liveRunId));
+    expect(cut!.resultJson?.interruptCarriedSteeredCommentIds, "the Interrupt adopted the steer in its transaction")
+      .toEqual([f.steered1]);
   }, 120_000);
 });
