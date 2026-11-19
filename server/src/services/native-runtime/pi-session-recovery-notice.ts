@@ -7,6 +7,7 @@ import { redactCurrentUserText } from "../../log-redaction.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueService } from "../issues.js";
 import { readPiConversation } from "./pi-conversation-record.js";
+import { HELD_PREDECESSOR_NOTICE } from "./held-predecessor-notice-text.js";
 
 const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const nativeId = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value);
@@ -66,13 +67,22 @@ const uncommittedNoticeWrites = new WeakMap<object, Map<string, string>>();
 export async function supersedeHeldConversationNotice(tx: Parameters<Parameters<Db["transaction"]>[0]>[0], input: {
   companyId: string; issueId: string; heldSessionId: string | null; reason: string;
 }): Promise<void> {
-  if (!input.heldSessionId) return;
   const [current] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
     sql`${issueComments.metadata}->>'authorizationReason' = ${input.reason}`,
     sql`${issueComments.metadata}->>'supersededByCommentId' is null`)).limit(1);
   if (!current) return;
+  // adopt-marker-restore (2): the stranded sweep's unanswered-message note in the held words ('... Send a new message
+  // to try again', unanswered-person-message.ts) is no longer true once the automatic fresh thread starts: it
+  // retires here, by the same supersede, so one true note stands (this fresh-thread note).
+  await tx.update(issueComments).set({ metadata: sql`jsonb_set(${issueComments.metadata},
+    '{supersededByCommentId}', to_jsonb(${current.id}::text))` }).where(and(
+    eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
+    eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt), eq(issueComments.body, HELD_PREDECESSOR_NOTICE),
+    sql`starts_with(coalesce(${issueComments.metadata}->>'authorizationReason', ''), 'unanswered_message:')`,
+    sql`${issueComments.metadata}->>'supersededByCommentId' is null`));
+  if (!input.heldSessionId) return;
   await tx.update(issueComments).set({ metadata: sql`jsonb_set(${issueComments.metadata},
     '{supersededByCommentId}', to_jsonb(${current.id}::text))` }).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
