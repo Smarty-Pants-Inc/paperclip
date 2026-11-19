@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
-import { agentWakeupRequests, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueTreeHolds, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, agents, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueTreeHolds, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { parseObject } from "../adapters/utils.js";
 import { resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
@@ -267,7 +267,9 @@ export const SUBTREE_PAUSE_CANCEL_REASON = "Cancelled by a board operator's subt
  * admission (explicit-native-continuation: the stop counts as proven) and by
  * the task interruption projection (resolved, not failed). True only when:
  * - the run is cancelled with errorCode 'cancelled' and a startupCancellation
- *   fence (before or after native selection);
+ *   fence, and is native; or, the one exception, it was stopped before native
+ *   selection (beforeNativeSelection) on a paperclip_runner agent and the
+ *   person-Stop arm (readPersonStopHold names it) holds;
  * - the cause is the person's: readPersonStopHold (the ONE person-Stop reader)
  *   names THIS run, or the run was cancelled by a board user's task-tree Pause
  *   (SUBTREE_PAUSE_CANCEL_REASON, cancelledByActorType 'user') and a pause
@@ -286,11 +288,19 @@ export async function isPersonAcceptedStartupStop(db: Db, input: {
     status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, error: heartbeatRuns.error, resultJson: heartbeatRuns.resultJson,
     runtimeMode: heartbeatRuns.runtimeMode })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.id)));
-  // Native shape only (rf-2 F3): a Stop before native selection (runtimeMode
-  // still 'legacy') is released by the legacy path and Send admission never
-  // takes it, so no caller (the banner included) may read it as this fact.
-  if (!stored || stored.status !== "cancelled" || stored.errorCode !== "cancelled" || stored.runtimeMode !== "native"
+  if (!stored || stored.status !== "cancelled" || stored.errorCode !== "cancelled"
     || Object.keys(parseObject(stored.resultJson?.startupCancellation)).length === 0) return false;
+  // Native shape only (rf-2 F3), with ONE deliberate exception: a person's own
+  // Stop BEFORE native selection (run-control beforeNativeSelection; runtimeMode
+  // still the 'legacy' default) of a native-bound (paperclip_runner) agent's
+  // run. Its legacy release then settles it as this fact (no reconciliation,
+  // held messages gathered), so the banner, the release and Send agree. Only
+  // the person-Stop arm below admits it; a direct adapter's legacy run, a
+  // tree Pause and any system cancel before selection never match.
+  const preselection = stored.runtimeMode !== "native";
+  if (preselection && (parseObject(stored.resultJson?.startupCancellation).beforeNativeSelection !== true
+    || (await db.select({ adapterType: agents.adapterType }).from(agents).where(and(eq(agents.companyId, stored.companyId),
+      eq(agents.id, stored.agentId))))[0]?.adapterType !== "paperclip_runner")) return false;
   const run = { ...stored, issueId: input.issueId };
   const { adapterExecutionControls } = await import("./adapter-execution-control.js");
   if (adapterExecutionControls.has(run.id)) return false;
@@ -304,7 +314,7 @@ export async function isPersonAcceptedStartupStop(db: Db, input: {
     agentId: run.agentId, sendingWakeId: options.sendingWakeId });
   const personStop = hold?.stoppedRunId === run.id
     && (options.sendingUserId === undefined || isStoppingPersonsOwn(options.sendingUserId, hold.userId));
-  if (!personStop && !(await isPersonTreePauseCancel(db, run, options.sendingUserId))) return false;
+  if (!personStop && (preselection || !(await isPersonTreePauseCancel(db, run, options.sendingUserId)))) return false;
   const { provesNoNativeRunProviderWork } = await import("./native-runtime/native-provider-work-proof.js");
   return provesNoNativeRunProviderWork(db, { companyId: run.companyId, runId: run.id });
 }
