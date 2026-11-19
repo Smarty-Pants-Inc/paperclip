@@ -1,10 +1,11 @@
 import { assertNoOpenTransaction } from "@paperclipai/db/transaction-context";
-import { and, eq, sql } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { environmentLeases, type Db, type heartbeatRuns } from "@paperclipai/db";
 import { admittedNativeResourceDisposition, nativeStopWorkspaceOutcome } from "./native-failed-workspace-recovery.js";
 import { hasAcknowledgedNativeRunStopRequest } from "../acknowledged-native-stop.js";
 import { hasStopOnlyCleanup, prepareSupersededWarmSandboxStop } from "../sandbox-stop-and-retain.js";
 import { warmSandboxExpiryCandidateCondition } from "../warm-sandbox-expiry.js";
+import { hasRecoveredCleanupStopReceipt, hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { logger } from "../../middleware/logger.js";
 import { readEnvironmentLeaseController } from "../environment-lease-controller.js";
 import { currentControllerBootId } from "../controller-process-identity.js";
@@ -69,6 +70,41 @@ export function handedOffWarmUnprovenWaitMessage(): string {
   const seconds = Math.max(1, Math.ceil((handedOffWarmUnprovenBound.ms + handedOffWarmStopReceiptBound.ms) / 1000));
   const [n, unit] = seconds > 60 ? [Math.ceil(seconds / 60), "minute"] : [seconds, "second"];
   return `Waiting up to ${n} ${unit}${n === 1 ? "" : "s"} for the previous environment to stop. Your message will start automatically.`;
+}
+/** adopt-words-state: the ONE projection of the person's hand-off waiting line,
+ * derived from STATE (run + its leases), never from saved prose. A bounded wait:
+ * (unproven phase) a retained handed-off warm lease, not yet proven, whose
+ * handedOffWarmUnprovenSince names this run; (receipt phase) the lease is
+ * pending_cleanup with this module's stop-and-retain intent for this run, no stop
+ * receipt yet, before the overdue mark. Either -> the ceiling line; else null
+ * (callers keep their own line). DB-free: admission and the queue GET both call it. */
+export function handedOffWarmWaitLine(run: Run, leases: readonly (typeof environmentLeases.$inferSelect)[]): string | null {
+  const waiting = leases.some(lease => {
+    if (lease.provider === "local" || hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease)) return false;
+    if (handedOffWarmLease(run, lease)) return !handedOffWarmLeaseSettled(run, lease)
+      && (lease.metadata?.[HANDED_OFF_WARM_UNPROVEN_SINCE_KEY] as { runId?: unknown } | undefined)?.runId === run.id;
+    return handedOffStopPending(run, lease) && !handedOffWarmStopReceiptOverdue(run, lease);
+  });
+  return waiting ? handedOffWarmUnprovenWaitMessage() : null;
+}
+
+/** adopt-words-state: the queue GET's read of the same projection for an Interrupt
+ * wake: the interrupted run (the payload's targetRunId, else the task's latest
+ * run) and its leases, read now. DB-only, no saved prose involved. */
+export async function readHandedOffWarmWaitLine(db: Db, input: { companyId: string; issueId: string;
+  targetRunId?: string | null }): Promise<string | null> {
+  const { heartbeatRuns: runs } = await import("@paperclipai/db");
+  const fields = { id: runs.id, companyId: runs.companyId, nativeIssueId: runs.nativeIssueId, status: runs.status,
+    resultJson: runs.resultJson, runtimeMode: runs.runtimeMode, runnerProfileJson: runs.runnerProfileJson };
+  const issueRuns = and(eq(runs.companyId, input.companyId),
+    sql`(${runs.nativeIssueId} = ${input.issueId} or ${runs.issueId} = ${input.issueId})`);
+  const [run] = input.targetRunId
+    ? await db.select(fields).from(runs).where(and(issueRuns, sql`${runs.id}::text = ${input.targetRunId}`)).limit(1)
+    : await db.select(fields).from(runs).where(issueRuns).orderBy(desc(runs.createdAt), desc(runs.id)).limit(1);
+  if (!run) return null;
+  const leases = await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
+    eq(environmentLeases.heartbeatRunId, run.id)));
+  return handedOffWarmWaitLine(run, leases);
 }
 type Redispatch = () => Promise<unknown>;
 /** adopt-hung-stop (org criterion (b)): the SECOND bound. After the stop-and-retain
