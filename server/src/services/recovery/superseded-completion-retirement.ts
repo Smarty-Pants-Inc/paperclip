@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { logActivity } from "../activity-log.js";
@@ -6,12 +6,16 @@ import { logActivity } from "../activity-log.js";
 export const SUPERSEDED_COMPLETION_ERROR = "chat_completion_superseded";
 export const SUPERSEDED_COMPLETION_RETIRED_ACTION = "issue.recovery_action_retired_superseded_completion";
 
-/** A run whose ONLY failure was a superseded automatic chat-completion turn
- * (before 9e501968 it ended as setup_failed / chat_completion_superseded; now
- * it is a succeeded no-op). Any other code or text is a real failure. */
-function failedOnlyAsSupersededCompletion(run: { status: string; errorCode: string | null; error: string | null }) {
-  return run.status === "failed" && (run.errorCode === "setup_failed" || run.errorCode === SUPERSEDED_COMPLETION_ERROR)
-    && (run.error ?? "").trim() === SUPERSEDED_COMPLETION_ERROR;
+/** A heartbeat run whose ONLY failure was a superseded automatic
+ * chat-completion turn (before 9e501968 it ended as setup_failed /
+ * chat_completion_superseded; now it is a succeeded no-op). Any other code or
+ * text is a real failure. The ONE predicate: this sweep retires a stranded
+ * card only for such runs, and the task interruption projection never shows
+ * such a run as a failed attempt (no false failure banner or Retry). */
+export function failedOnlyAsSupersededCompletion() {
+  return sql<boolean>`coalesce(${heartbeatRuns.status} = 'failed'
+    and ${heartbeatRuns.errorCode} in ('setup_failed', ${SUPERSEDED_COMPLETION_ERROR})
+    and ${heartbeatRuns.error} ~ ${`^\s*${SUPERSEDED_COMPLETION_ERROR}\s*$`}, false)`;
 }
 
 /**
@@ -35,10 +39,9 @@ export async function retireSupersededCompletionStrandedActions(db: Db, opts: { 
     const runIds = [...new Set([evidence.latestRunId, evidence.sourceRunId]
       .filter((id): id is string => typeof id === "string" && id.length > 0))];
     if (!runIds.length) continue;
-    const runs = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
-      error: heartbeatRuns.error }).from(heartbeatRuns)
+    const runs = await db.select({ id: heartbeatRuns.id, superseded: failedOnlyAsSupersededCompletion() }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, action.companyId), inArray(heartbeatRuns.id, runIds)));
-    if (runs.length !== runIds.length || !runs.every(failedOnlyAsSupersededCompletion)) continue;
+    if (runs.length !== runIds.length || !runs.every(run => run.superseded)) continue;
     const resolved = await issueRecoveryActionService(db).resolveActiveForIssue({
       companyId: action.companyId, sourceIssueId: action.sourceIssueId, actionId: action.id,
       kind: "stranded_assigned_issue", status: "resolved", outcome: "false_positive",
