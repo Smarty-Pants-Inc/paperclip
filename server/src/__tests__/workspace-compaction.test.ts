@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createObjectRunLogStore, readObjectRunLogSpill } from "../services/object-run-log-store.js";
+import { findWorktreeInstanceRawTraces } from "../services/workspace-instance-cleanup.js";
 import { event, ids, spillMemory } from "../services/object-run-log-spill.fixture.js";
 import {
   WORKSPACE_COMPACTION_TRASH_DIR,
@@ -79,7 +80,7 @@ describe("findRegenerableWorkspaceDirs", () => {
 
   // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7016708798
   // Keep reason: NEVER-OK trace custody. Real writer + Git discovery + reaper rename/delete, no filesystem doubles.
-  it.each(["process", "pointer", "instance", "cwd", "base"] as const)("keeps unrecovered configured spill under ignored build/ (%s)", async source => {
+  it.each(["process", "pointer", "instance", "cwd", "base", "late", "nested", "alias"] as const)("keeps unrecovered configured spill under ignored build/ (%s)", async source => {
     const { root, worktreePath } = await createRepoWithWorktree(["build/", "dist/"]);
     const instanceRoot = path.join(root, "instances", "spill-reaper");
     await fs.mkdir(instanceRoot, { recursive: true });
@@ -89,12 +90,20 @@ describe("findRegenerableWorkspaceDirs", () => {
     vi.stubEnv("RUN_LOG_SPILL_PATH", undefined);
     vi.stubEnv("RUN_LOG_BASE_PATH", undefined);
     const key = source === "base" ? "RUN_LOG_BASE_PATH" : "RUN_LOG_SPILL_PATH";
-    const value = source === "base" ? path.join(worktreePath, "build") : spillRoot;
+    const value = source === "base" ? path.join(worktreePath, "build")
+      : source === "alias" ? path.join(root, "spill-alias") : spillRoot;
+    if (source === "alias") {
+      await fs.mkdir(spillRoot, { recursive: true });
+      await fs.symlink(spillRoot, value, "dir");
+    }
+    await write(path.join(worktreePath, "build", "regenerable.js"));
+    const staleCandidates = source === "late" ? await findRegenerableWorkspaceDirs(worktreePath) : null;
     vi.stubEnv(key, value);
     const m = spillMemory();
     const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", flushMs: 1000,
       assertWriterAuthority: async () => undefined });
-    const handle = await store.begin({ ...ids, runId: "configured-reaper" });
+    const binding = source === "nested" ? { companyId: "build", agentId: "node_modules" } : ids;
+    const handle = await store.begin({ ...binding, runId: "configured-reaper" });
     m.state.down = true;
     const receipt = await store.enqueue!(handle, event(1, "the reaper must not take this only copy"));
     const committed = receipt.committed.catch(() => undefined);
@@ -103,14 +112,16 @@ describe("findRegenerableWorkspaceDirs", () => {
     const spill = await readObjectRunLogSpill(undefined, handle.logRef);
     expect(spill.unrecovered.length).toBeGreaterThan(0);
     const bytes = await fs.readFile(spill.path), index = await fs.readFile(spill.indexPath);
-    if (source !== "process" && source !== "base") {
+    expect(await findWorktreeInstanceRawTraces(instanceRoot, { [key]: value }))
+      .toContain(source === "base" ? path.join(value, ".spill") : value);
+    if (["pointer", "instance", "cwd"].includes(source)) {
       const envPath = source === "pointer" ? path.join(worktreePath, ".paperclip/.env")
         : source === "instance" ? path.join(instanceRoot, ".env") : path.join(worktreePath, ".env");
       await fs.appendFile(envPath, `${key}=${JSON.stringify(value)}\n`);
       vi.stubEnv(key, undefined);
     }
     await write(path.join(worktreePath, "dist", "regenerable.js"));
-    const candidates = await findRegenerableWorkspaceDirs(worktreePath);
+    const candidates = staleCandidates ?? await findRegenerableWorkspaceDirs(worktreePath);
     const move = await moveWorkspaceDirsToTrash(worktreePath, candidates);
     await deleteWorkspaceCompactionTrash(move.trashDir);
     const survived = await fs.stat(spill.path).then(() => true, () => false);
@@ -119,7 +130,9 @@ describe("findRegenerableWorkspaceDirs", () => {
     expect((await fs.readFile(spill.path)).equals(bytes)).toBe(true);
     expect((await fs.readFile(spill.indexPath)).equals(index)).toBe(true);
     expect(candidates).toContain("dist");
-    expect(candidates).not.toContain("build");
+    if (source === "late") expect(candidates).toContain("build");
+    else expect(candidates).not.toContain("build");
+    expect(move.moved.map(entry => entry.relativePath)).not.toContain("build");
   });
 
   it("does not follow or return a symlinked directory", async () => {
