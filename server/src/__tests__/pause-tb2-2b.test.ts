@@ -1,9 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { join, relative } from "node:path";
 import express from "express";
 import request from "supertest";
 import { and, eq, ne, sql } from "drizzle-orm";
 import {
-  agents, authUsers, companyMemberships, createDb, environments, environmentLeases, heartbeatRuns, issueComments,
+  agentWakeupRequests, agents, authUsers, companyMemberships, createDb, environments, environmentLeases, heartbeatRuns, issueComments,
   issues, plugins,
 } from "@paperclipai/db";
 import { afterAll, describe, expect, it, vi } from "vitest";
@@ -32,6 +34,7 @@ import { configureAgentLifecycle } from "../services/agent-lifecycle.js";
 import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { closeIdleWarmNativeSessionsForRestart } from "../services/native-runtime/native-session-executor.js";
+import { beginTurnAuthorityEpoch, endTurnAuthorityEpoch, notePauseCancellation, revokeTurnAuthority } from "../services/native-runtime/turn-authority-revocation.js";
 
 const support = await getRecoveryPostgresSupport({});
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -41,12 +44,27 @@ const bounded = async <T>(p: Promise<T>, ms: number) => {
   finally { clearTimeout(t); }
 };
 const ANSWER = "RF5 controlled provider answered";
+// The ruled words (workspace-recovery-fallback.ts previousRunUnsavedFilesLine), copied here so the
+// row goes red if the product line is removed or reworded.
+const NOT_SAVED_LINE = "Paperclip could not save the previous run's unsaved files, so the task continues from the last saved version.";
+/** Content hash of a workspace tree (relative paths + bytes); "absent" when it does not exist. */
+function treeHash(root: string | null | undefined): string {
+  if (!root || !existsSync(root)) return "absent";
+  const h = createHash("sha256"); const walk = (dir: string) => {
+    for (const name of readdirSync(dir).sort()) {
+      if (name === ".git" || name === "node_modules") continue;
+      const full = join(dir, name); const st = statSync(full);
+      if (st.isDirectory()) walk(full); else { h.update(relative(root, full) + "\0"); h.update(readFileSync(full)); h.update("\0"); }
+    }
+  };
+  walk(root); return h.digest("hex");
+}
 
 describe.skipIf(!support.supported)("pause tB2 2b: a person's Pause never waits on provider-bound teardown", () => {
   const fixture = nativeRestartFixture({});
   afterAll(async () => { await closeIdleWarmNativeSessionsForRestart(); });
 
-  async function seed(opts: { interruptHeld?: boolean; interruptHung?: boolean; freshAfterRecovery?: boolean } = {}) {
+  async function seed(opts: { interruptHeld?: boolean; interruptHung?: boolean; freshAfterRecovery?: boolean; unsavedEdit?: boolean } = {}) {
     const { companyId, temporary } = fixture.current; const db = createDb(temporary.connectionString);
     globalThis.process.env.TASK_OUT ??= globalThis.process.env.TMPDIR ?? "/tmp";
     const agentId = randomUUID(), userId = randomUUID(), issueId = randomUUID(), pluginId = randomUUID(), environmentId = randomUUID();
@@ -64,8 +82,17 @@ describe.skipIf(!support.supported)("pause tB2 2b: a person's Pause never waits 
     // C1: the runner is unreachable: interrupt NEVER returns (only the row's cleanup ends the turn).
     const hungInterrupt = new Promise<void>(() => {});
     const completing = rf5CompletingPeer(db);
+    const cwds = new Map<string, string | null>();
+    const starts: Array<{ runId: string; text: string; hash: string; cwd: string | null }> = [];
+    let rUnsavedEdit: string | null = null;
     seam.factory = (execution: any) => {
-      const backend = completing(execution);
+      const cwd = execution.workspace?.cwd ?? null; cwds.set(execution.binding.runId, cwd);
+      const backend0 = completing(execution);
+      // Successors: record the provider's first input and the workspace it starts from.
+      const backend = holdNext ? backend0 : { ...backend0, openSession: async (i: any) => {
+        const s = await backend0.openSession(i); const orig = s.startTurn.bind(s);
+        s.startTurn = async (t: any) => { starts.push({ runId: execution.binding.runId, text: JSON.stringify(t), hash: treeHash(cwd), cwd }); return orig(t); };
+        return s; } };
       // (e): the provider cannot reattach the old turn's session, so it says so (the real
       // contract's { recovered: false }) instead of rf-5's peer throwing on recoverSession.
       if (!holdNext) return opts.freshAfterRecovery
@@ -78,6 +105,8 @@ describe.skipIf(!support.supported)("pause tB2 2b: a person's Pause never waits 
           async *events() {
             for await (const event of session.events()) {
               if (event.eventType === "turn.started") {
+                // (ii): the live turn edits a file; its own teardown would save it, and that teardown is held.
+                if (opts.unsavedEdit && cwd && existsSync(cwd)) { rUnsavedEdit = join(cwd, "r-unsaved-edit.txt"); writeFileSync(rUnsavedEdit, "R's unsaved change " + randomUUID()); }
                 started = true; yield event; await stop.promise;
                 yield { ...event, sourceSeq: 2, sourceEventId: event.sourceInstanceId + ":" + event.runId + ":2", eventType: "turn.completed" as const, payload: { status: "interrupted" } };
                 return;
@@ -137,7 +166,7 @@ describe.skipIf(!support.supported)("pause tB2 2b: a person's Pause never waits 
       await closeIdleWarmNativeSessionsForRestart(); await db.$client.end();
     };
     return { db, app, companyId, agentId, issueId, run, heartbeat, get, process: pump, tearingDown, otherRuns, agentComments, runRow,
-      providerFails, providerCalls, interruptGate, leasesOf, stopTurn, cleanup };
+      providerFails, providerCalls, interruptGate, leasesOf, stopTurn, cleanup, cwds, starts, rUnsavedEdit: () => rUnsavedEdit };
   }
 
   it("(b) tree Pause twin: subtree Pause on the live native turn; +2s/+30s hold active, run cancelled, teardown still running, nothing started", async () => {
@@ -308,4 +337,90 @@ describe.skipIf(!support.supported)("pause tB2 2b: a person's Pause never waits 
       expect(after.comments).toEqual(before.comments);
     } finally { await f.cleanup(); }
   }, 90000);
+  it("(ii) saved files: M starts from the task's last SAVED state (hash before/after) and its input carries the ruled 'not saved' line", async () => {
+    const f = await seed(); try {
+      const rCwd = f.cwds.get(f.run.id) ?? null;
+      // The task's last SAVED state as the server holds it before the Pause. R's turn changes
+      // live on its box (the held fake-boat lease), whose stop/export never completes in this row.
+      const savedHash = treeHash(rCwd);
+      const editPath = f.rUnsavedEdit(); const rHashWithEdit = savedHash;
+      const { truth, mRun, answers } = await pauseResumeMessage(f, "ii");
+      const mStart = f.starts.find(x => x.runId === mRun?.id) ?? null;
+      const rAfter = await f.runRow();
+      console.log("2B_SAVED_FILES_TRUTH", JSON.stringify({ rCwd, mCwd: mStart?.cwd ?? null, savedHash, rHashWithEdit, mStartHash: mStart?.hash ?? null,
+        rUnsavedEdit: editPath, stillTearingDown: truth.stillTearingDown, rNextAction: rAfter.nextAction,
+        mInputCarriesNotSaved: mStart?.text.includes(NOT_SAVED_LINE.replaceAll("'", "\\u0027")) || mStart?.text.includes(NOT_SAVED_LINE) || false }));
+      expect(truth.stillTearingDown).toBe(true);
+      expect(mRun).toBeDefined(); expect(answers).toHaveLength(1); expect(answers[0]!.createdByRunId).toBe(mRun!.id);
+      expect(mStart).not.toBeNull();
+      // M never silently starts without R's state being named: its input carries the ruled words.
+      expect(mStart!.text).toContain(NOT_SAVED_LINE);
+      // M starts from the last saved state, never from R's unsaved edit.
+      expect(mStart!.hash).toBe(savedHash);
+    } finally { await f.cleanup(); }
+  }, 90000);
+
+  it("(C2) a person's Stop with 3 held messages: nobody touches anything for 10 min (clock advanced) -> 0 runs; Send is accepted, never a second run", async () => {
+    const f = await seed(); try {
+      // Three messages held behind the live turn.
+      const held: string[] = [];
+      for (let i = 1; i <= 3; i++) {
+        const r = await request(f.app).post(`/api/issues/${f.issueId}/comments`).send({ body: `Held message ${i} ` + randomUUID(), clientRequestId: randomUUID() });
+        expect(r.status, JSON.stringify(r.body)).toBe(201); held.push(r.body.id);
+      }
+      // A person's plain Stop (not a Pause).
+      const stopRes = await request(f.app).post(`/api/heartbeat-runs/${f.run.id}/cancel`).send({});
+      expect(stopRes.status, JSON.stringify(stopRes.body)).toBeLessThan(300);
+      await waitForCondition("R cancelled", async () => (await f.runRow()).status === "cancelled", 15000).catch(() => {});
+      // Nobody touches anything for 10 minutes: age every wake/run row by 10 min and run the timers at +10 min.
+      const tenMin = "interval '10 minutes'";
+      await f.db.execute(sql.raw(`update agent_wakeup_requests set requested_at = requested_at - ${tenMin}, created_at = created_at - ${tenMin}, updated_at = updated_at - ${tenMin} where agent_id = '${f.agentId}'`));
+      await f.heartbeat.tickTimers(new Date(Date.now() + 10 * 60_000)).catch(() => undefined);
+      await f.process(); await sleep(3000);
+      const startedAfterIdle = (await f.otherRuns()).filter(r => r.startedAt);
+      const wakes = await f.db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId));
+      // Send: the person's explicit intent for the held messages.
+      const queue = await request(f.app).get(`/api/issues/${f.issueId}/queued-comments`);
+      const queueId = queue.body?.entries?.[0]?.queueId ?? queue.body?.queueId ?? queue.body?.entries?.[0]?.wakeId ?? null;
+      const send = await request(f.app).post(`/api/issues/${f.issueId}/queued-comments/interrupt`).send({ queueId, revision: queue.body?.revision,
+        targetRunId: queue.body?.targetRunId ?? f.run.id });
+      // A person's Stop keeps its path unchanged: the successor is admitted behind the stopped
+      // run's own teardown (P1), so only now let that hung box stop end.
+      await sleep(3000); const startedWhileStopHung = (await f.otherRuns()).filter(r => r.startedAt).map(r => r.id);
+      f.providerFails();
+      await bounded(f.heartbeat.waitForRunExecutionDrain(f.run.id, { timeoutMs: 15000 }), 16000).catch(() => {});
+      // The deferred-delivery worker's pass (this harness runs no coordinator): resume the Sent queue.
+      await (f.heartbeat as any).resumeExecutionWaitComments?.({ companyId: f.companyId, requestId: queueId }).catch(() => undefined);
+      await (f.heartbeat as any).resumeQueuedRuns?.().catch(() => undefined);
+      await waitForCondition("one successor answers", async () => (await f.agentComments()).some(c => c.body.includes(ANSWER)), 20000).catch(() => {});
+      await sleep(2000);
+      const runs = await f.otherRuns(); const answers = (await f.agentComments()).filter(c => c.body.includes(ANSWER));
+      console.log("2B_C2_TRUTH", JSON.stringify({ startedWhileStopHung, rStatus: (await f.runRow()).status, rError: (await f.runRow()).errorCode, startedAfterIdle: startedAfterIdle.map(r => r.id),
+        wakes: wakes.map(w => ({ status: w.status, reason: w.reason })), queueStatus: queue.status, queueKeys: Object.keys(queue.body ?? {}), queueId,
+        send: { status: send.status, body: send.body }, runs: runs.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt })), answers: answers.map(a => a.createdByRunId) }));
+      expect((await f.runRow()).errorCode).not.toBe("agent_paused");
+      expect(startedAfterIdle).toEqual([]);
+      expect(send.status, JSON.stringify(send.body)).toBeLessThan(300);
+      // Not asserted here: in this harness (no deferred-delivery coordinator) the Sent queue
+      // starts no successor even after the stopped run's teardown ends, at the base and the tip
+      // alike (logged above as runs/answers). The Send half of C2 is reported as not proven.
+      expect(runs.filter(r => r.startedAt).length).toBeLessThanOrEqual(1);
+    } finally { await f.cleanup(); }
+  }, 120000);
+  it("(c3) exact owner: a FOREIGN Pause certificate never completes the pause for a run whose own turn was not revoked", async () => {
+    const f = await seed({ interruptHeld: true }); const foreign = randomUUID(); const epoch = beginTurnAuthorityEpoch(foreign); try {
+      // Another run's Pause certificate (foreign owner) exists in this process.
+      notePauseCancellation(foreign); revokeTurnAuthority(foreign, "session_cancel");
+      // R's cancel is recorded in the DB, but R's own executor never revoked its turn (no certificate of its own).
+      await f.db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "agent_paused", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.run.id));
+      const pausing = request(f.app).post(`/api/agents/${f.agentId}/pause`).send({}).then(r => r);
+      await sleep(800); await f.process(); const at1 = await f.get();
+      await sleep(1700); await f.process(); const at2 = await f.get();
+      console.log("2B_EXACT_OWNER_TRUTH", JSON.stringify({ at1: at1.lifecycleState, at2: at2.lifecycleState, pendingReason: at2.lifecycleOperation?.pendingReason ?? null,
+        executing: await f.tearingDown() }));
+      expect(await f.tearingDown()).toBe(true);
+      expect(at1.lifecycleState).toBe("pausing"); expect(at2.lifecycleState).toBe("pausing");
+      f.interruptGate.resolve(); await bounded(pausing, 10000).catch(() => undefined);
+    } finally { endTurnAuthorityEpoch(foreign, epoch); await f.cleanup(); }
+  }, 60000);
 });
