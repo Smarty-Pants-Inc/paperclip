@@ -46,6 +46,15 @@ import {
 } from "@/components/ui/dropdown-menu";
 
 type QueueAction = "steer" | "interrupt" | "discard" | null;
+/**
+ * Drag (the grip), Edit (the row button and the row menu's Edit) and the
+ * per-row Steer are NOT offered on a queued row in this build: their server
+ * routes stay guarded, so the row offers only what works here, Delete and
+ * Interrupt (org 10:19Z). They return with their server rows in neworg-lead's
+ * Q1; flip this one constant then. Off, the bar also never steers on its own
+ * (no automatic steer countdown, so no steer fires from the UI).
+ */
+export const QUEUE_ROW_REORDER_EDIT_STEER_ENABLED = false;
 export const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
 export const CHAT_STOPPED_BY_PERSON_LINE = "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it.";
 /** The stopped bar's own fact: the server's person-Stop reason on the chat's
@@ -186,7 +195,7 @@ function SortableQueuedMessage({
       )}
       data-testid={`task-chat-queued-message-${entry.comment.id}`}
     >
-      <button
+      {QUEUE_ROW_REORDER_EDIT_STEER_ENABLED ? <button
         type="button"
         ref={sortable.setActivatorNodeRef}
         {...sortable.attributes}
@@ -197,7 +206,7 @@ function SortableQueuedMessage({
         className="flex h-7 w-7 shrink-0 cursor-grab items-center justify-center rounded-md text-muted-foreground/70 transition-colors hover:bg-accent hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40"
       >
         <GripVertical className="h-3.5 w-3.5" aria-hidden />
-      </button>
+      </button> : null}
 
       <CornerDownRight
         className="h-3.5 w-3.5 shrink-0 text-muted-foreground"
@@ -247,7 +256,8 @@ function SortableQueuedMessage({
             Cancel
           </button>
         </span>
-      ) : (queue.targetRunId || queue.state === "deferred") && (!queue.targetRunId || queue.protocol === "legacy" || entry.source?.requiresFreshSession ||
+      ) : (queue.targetRunId || queue.state === "deferred") && (!QUEUE_ROW_REORDER_EDIT_STEER_ENABLED || // no per-row Steer: Interrupt
+        !queue.targetRunId || queue.protocol === "legacy" || entry.source?.requiresFreshSession ||
         (queue.steeringDisposition !== "available" && onInterrupt) ? (
         <button
           type="button"
@@ -299,7 +309,8 @@ function SortableQueuedMessage({
         )}
       </button>
 
-      {autoSteerSecondsLeft === null ? <DropdownMenu>
+      {/* The menu holds only Edit message: hidden with Edit in this build. */}
+      {QUEUE_ROW_REORDER_EDIT_STEER_ENABLED && autoSteerSecondsLeft === null ? <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <button
             type="button"
@@ -394,7 +405,9 @@ export function TaskChatQueuedMessages({
   );
   const autoSteerDeadlines = useMemo(() => {
     const deadlines = new Map<string, number>();
-    if (autoSteerDelayMs === null) return deadlines;
+    // No per-row Steer in this build, so no automatic steer either: with no
+    // deadline there is no countdown (and no Edit on it) and nothing fires.
+    if (autoSteerDelayMs === null || !QUEUE_ROW_REORDER_EDIT_STEER_ENABLED) return deadlines;
     for (const entry of autoSteerEntries) {
       if (queuedMessageAutoSteerEligible({ queue, entry, cancelledIds: cancelledAutoSteer,
         attemptedKeys: attemptedAutoSteer.current, editingCommentId })) {

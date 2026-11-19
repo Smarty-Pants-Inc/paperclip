@@ -12,6 +12,7 @@ import { commentsToTaskChatItems } from "./task-chat-adapter";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { MemoryRouter } from "@/lib/router";
 import {
+  QUEUE_ROW_REORDER_EDIT_STEER_ENABLED,
   queueHeldByPersonStop,
   reorderQueuedMessageEntries,
   TaskChatQueuedMessages,
@@ -87,6 +88,39 @@ describe("TaskChatQueuedMessages", () => {
     return props;
   }
 
+  // SUPERSEDE-QUEUE-ROW-HIDE-1119 (org 10:19Z): in this build a queued row
+  // offers only Delete and the row's Interrupt; drag (the grip), Edit (row
+  // button + menu) and the per-row Steer are hidden behind
+  // QUEUE_ROW_REORDER_EDIT_STEER_ENABLED until neworg-lead's Q1 brings their
+  // server rows. Each row below that pinned drag/edit/steer is re-pinned, by
+  // name, to this 'hidden in this build' check; its own body runs again when
+  // the constant returns to true.
+  async function pinHiddenInThisBuild(advance?: (ms: number) => Promise<void>) {
+    const props = render({ queue, onInterrupt: vi.fn().mockResolvedValue(undefined), autoSteerDelayMs: 5_000 });
+    expectQueuedRowsOnlyDeleteAndInterrupt();
+    if (advance) await advance(10_000);
+    expectQueuedRowsOnlyDeleteAndInterrupt();
+    expect(props.onSteer).not.toHaveBeenCalled();
+    expect(props.onEdit).not.toHaveBeenCalled();
+    expect(props.onReorder).not.toHaveBeenCalled();
+  }
+
+  function expectQueuedRowsOnlyDeleteAndInterrupt() {
+    for (const entry of queue.entries) {
+      const id = entry.comment.id;
+      const row = container.querySelector(`[data-testid="task-chat-queued-message-${id}"]`)!;
+      expect(row.textContent).toContain(entry.comment.body);
+      expect(row.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-discard-${id}"]`)?.disabled).toBe(false);
+      expect(row.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-interrupt-${id}"]`)?.textContent).toBe("Interrupt");
+      expect(row.querySelector('[aria-label^="Reorder queued message:"]')).toBeNull();
+      expect(row.querySelector(`[data-testid="task-chat-queued-steer-${id}"]`)).toBeNull();
+      expect(row.querySelector(`[data-testid="task-chat-queued-auto-steer-${id}"]`)).toBeNull();
+      expect(row.querySelector('[title="Queued message actions"]')).toBeNull();
+      expect([...row.querySelectorAll("button")].map(button => button.textContent?.trim() || button.getAttribute("aria-label")))
+        .toEqual([`Interrupt`, `Discard queued message: ${entry.comment.body}`]);
+    }
+  }
+
   it("keeps saved input visible without duplicating the task status", () => {
     const message = "Waiting for the previous environment to stop. Your message will start automatically.";
     render({ queue: { ...queue, executionWait: { reason: "remote_cleanup", message } } });
@@ -123,7 +157,31 @@ describe("TaskChatQueuedMessages", () => {
     expect(container.textContent).toContain("Second queued message");
   });
 
-  it("renders every later-wake message but disables its row controls with a reason", () => {
+  // org 10:19Z: a queued row offers only the controls that work in this build.
+  it.each([390, 1440])("in this build a queued row offers only Delete and Interrupt: no grip, no Edit, no Steer at %ipx", async (width) => {
+    const saved = window.innerWidth;
+    try {
+      Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: width });
+      window.dispatchEvent(new Event("resize"));
+      vi.useFakeTimers({ now: new Date("2026-11-07T12:00:00Z") });
+      const props = render({ queue, onInterrupt: vi.fn().mockResolvedValue(undefined), autoSteerDelayMs: 5_000 });
+      expectQueuedRowsOnlyDeleteAndInterrupt();
+      expect(container.textContent).not.toContain("Sending in");
+      // No automatic steer fires from the bar either.
+      await act(async () => { vi.advanceTimersByTime(10_000); await Promise.resolve(); });
+      expect(props.onSteer).not.toHaveBeenCalled();
+      expectQueuedRowsOnlyDeleteAndInterrupt();
+      await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-interrupt-comment-1"]')!.click(); });
+      expect(props.onInterrupt).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: saved });
+    }
+  });
+
+  it("renders every later-wake message but disables its row controls with a reason", async () => {
+    // SUPERSEDE-QUEUE-ROW-HIDE-1119: hidden in this build.
+    if (!QUEUE_ROW_REORDER_EDIT_STEER_ENABLED) return pinHiddenInThisBuild();
     const entries = [queue.entries[0],
       { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2" },
       { ...queue.entries[1], comment: { ...queue.entries[1].comment, id: "comment-3", body: "Third queued message" },
@@ -199,6 +257,8 @@ describe("TaskChatQueuedMessages", () => {
   });
 
   it.each(["legacy", "native", "native-plan"] as const)("shows a read-only response and sends it only on click for %s", async (runtime) => {
+    // SUPERSEDE-QUEUE-ROW-HIDE-1119: hidden in this build.
+    if (!QUEUE_ROW_REORDER_EDIT_STEER_ENABLED) return pinHiddenInThisBuild();
     const entry = { ...queue.entries[0], canEdit: false, canDiscard: false,
       comment: { ...queue.entries[0].comment, body: 'Accepted: Build the app\n\n{"revision": "v1"}' },
       source: { kind: "interaction" as const, interactionId: "confirmation-1", interactionKind: "request_confirmation",
@@ -255,6 +315,8 @@ describe("TaskChatQueuedMessages", () => {
   });
 
   it("removes the selected steering row before the provider acknowledges it", async () => {
+    // SUPERSEDE-QUEUE-ROW-HIDE-1119: hidden in this build.
+    if (!QUEUE_ROW_REORDER_EDIT_STEER_ENABLED) return pinHiddenInThisBuild();
     const acknowledgement = deferred<void>();
     const props = render({
       onSteer: vi.fn().mockReturnValue(acknowledgement.promise),
@@ -307,6 +369,8 @@ describe("TaskChatQueuedMessages", () => {
   });
 
   it.each(["steer", "interrupt"] as const)("shows a delivery error even when the queue becomes empty while %s is pending", async action => {
+    // SUPERSEDE-QUEUE-ROW-HIDE-1119: hidden in this build.
+    if (action === "steer" && !QUEUE_ROW_REORDER_EDIT_STEER_ENABLED) return pinHiddenInThisBuild();
     const delivery = deferred<void>();
     const props = render({ queue: { ...queue, protocol: action === "interrupt" ? "legacy" : "paperclip_runner_v1" },
       onSteer: vi.fn().mockReturnValue(delivery.promise), onInterrupt: vi.fn().mockReturnValue(delivery.promise) });
@@ -319,6 +383,8 @@ describe("TaskChatQueuedMessages", () => {
   });
 
   it("does not restore a message discarded elsewhere while steering was pending", async () => {
+    // SUPERSEDE-QUEUE-ROW-HIDE-1119: hidden in this build.
+    if (!QUEUE_ROW_REORDER_EDIT_STEER_ENABLED) return pinHiddenInThisBuild();
     let rejectSteer!: (error: Error) => void;
     const delivery = new Promise<void>((_, reject) => { rejectSteer = reject; });
     const props = render({ onSteer: vi.fn().mockReturnValue(delivery) });
@@ -331,6 +397,8 @@ describe("TaskChatQueuedMessages", () => {
   });
 
   it("keeps a row queued when steering fails and announces the retryable state", async () => {
+    // SUPERSEDE-QUEUE-ROW-HIDE-1119: hidden in this build.
+    if (!QUEUE_ROW_REORDER_EDIT_STEER_ENABLED) return pinHiddenInThisBuild();
     render({
       onSteer: vi.fn().mockRejectedValue(new Error("steering_timeout")),
     });
@@ -351,7 +419,9 @@ describe("TaskChatQueuedMessages", () => {
     );
   });
 
-  it("disables steering when the provider does not advertise it", () => {
+  it("disables steering when the provider does not advertise it", async () => {
+    // SUPERSEDE-QUEUE-ROW-HIDE-1119: hidden in this build.
+    if (!QUEUE_ROW_REORDER_EDIT_STEER_ENABLED) return pinHiddenInThisBuild();
     render({ queue: { ...queue, steeringDisposition: "unsupported" } });
     expect(
       container.querySelector<HTMLButtonElement>(
@@ -381,6 +451,8 @@ describe("TaskChatQueuedMessages", () => {
   );
 
   it("keeps same-turn steering when the provider is available, even with an interrupt callback", async () => {
+    // SUPERSEDE-QUEUE-ROW-HIDE-1119: hidden in this build.
+    if (!QUEUE_ROW_REORDER_EDIT_STEER_ENABLED) return pinHiddenInThisBuild();
     const props = render({ onInterrupt: vi.fn().mockResolvedValue(undefined) });
     expect(container.querySelector('[data-testid="task-chat-queued-interrupt-comment-1"]')).toBeNull();
     await act(async () => {
@@ -464,6 +536,8 @@ describe("TaskChatQueuedMessages", () => {
   });
 
   it("can discard a saved message while queue acknowledgement is pending", async () => {
+    // SUPERSEDE-QUEUE-ROW-HIDE-1119: hidden in this build.
+    if (!QUEUE_ROW_REORDER_EDIT_STEER_ENABLED) return pinHiddenInThisBuild();
     const merged = mergePendingIssueQueuedComments({
       issueId: queue.issueId,
       authoritativeQueue: queue,
@@ -628,7 +702,7 @@ describe("TaskChatQueuedMessages", () => {
   // c3-optS-send-after-stop.test.ts's S10 row (real Stop route, real
   // heartbeat), read at head at +10 min (the stopped line wins) and at the
   // base 62fcab5b+69f9fba9 at +0 (the stored wait won: no bar, no bar Send).
-  it("after a person's Stop the held bar stays, with Send, over the stored recovery wait (390 and 1440)", () => {
+  it("after a person's Stop the held bar stays, with Send, over the stored recovery wait (390 and 1440)", async () => {
     const headGet = JSON.parse(`{"issueId":"6c7d7400-dc98-42a4-9e87-ad91db5e97cd","queueId":"cca4581b-adb0-4ad9-b2e6-5bef40493fa4","state":"deferred","targetRunId":null,"revision":"8fa39885b8dfc7197cd00ddb4b348053","protocol":"paperclip_runner_v1","steeringDisposition":"unsupported","executionWait":{"reason":"stopped_by_person","message":"Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it."},"entries":[{"comment":{"id":"6f5ae773-bd39-440e-b54b-59dbd9daf865","companyId":"29c41c91-8bf1-4c44-8048-26775a123edd","issueId":"6c7d7400-dc98-42a4-9e87-ad91db5e97cd","authorAgentId":null,"authorUserId":"responsible-user","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"0f61e147-8d15-42fc-b885-d7e0e4e80098","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"M1 held","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T04:13:38.465Z","updatedAt":"2026-11-19T04:13:38.465Z"},"position":0,"canEdit":true,"canDiscard":true,"behindReset":false},{"comment":{"id":"072974a2-9683-4e9c-b8c2-14d3bee97f3b","companyId":"29c41c91-8bf1-4c44-8048-26775a123edd","issueId":"6c7d7400-dc98-42a4-9e87-ad91db5e97cd","authorAgentId":null,"authorUserId":"responsible-user","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"6884efbe-46bc-4bdd-b579-2a1a8ce13338","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"M2 held","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T04:13:38.540Z","updatedAt":"2026-11-19T04:13:38.540Z"},"position":1,"canEdit":true,"canDiscard":true,"behindReset":false},{"comment":{"id":"ac599d94-05cc-4eff-88be-8243a2e3553a","companyId":"29c41c91-8bf1-4c44-8048-26775a123edd","issueId":"6c7d7400-dc98-42a4-9e87-ad91db5e97cd","authorAgentId":null,"authorUserId":"responsible-user","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"e49d9998-30db-4b61-84d7-84438d4362e3","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"M3 held","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T04:13:38.609Z","updatedAt":"2026-11-19T04:13:38.609Z"},"position":2,"canEdit":true,"canDiscard":true,"behindReset":false}]}`) as IssueQueuedCommentQueue;
     const baseGet = JSON.parse(`{"issueId":"33e936d7-2326-49f8-8ad4-2825b5f9eee3","queueId":"f3fe04dc-e110-4663-bec9-ff53a1d5b8cf","state":"deferred","targetRunId":null,"revision":"93774103ff523ba9077c1c69b7137469","protocol":"paperclip_runner_v1","steeringDisposition":"unsupported","executionWait":{"reason":"execution_recovery","message":"Waiting for execution recovery. Your message is saved."},"entries":[{"comment":{"id":"8a705b40-23aa-4f88-87c7-df1ab5194762","companyId":"03aa0a18-07fd-477a-abba-c3fc671cd205","issueId":"33e936d7-2326-49f8-8ad4-2825b5f9eee3","authorAgentId":null,"authorUserId":"responsible-user","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"3c08e7b6-67cd-489c-9a22-c2676604ef0a","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"M1 held","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T04:13:55.254Z","updatedAt":"2026-11-19T04:13:55.254Z"},"position":0,"canEdit":true,"canDiscard":true,"behindReset":false},{"comment":{"id":"fde29335-ecaa-43f5-b880-bd9430d129a5","companyId":"03aa0a18-07fd-477a-abba-c3fc671cd205","issueId":"33e936d7-2326-49f8-8ad4-2825b5f9eee3","authorAgentId":null,"authorUserId":"responsible-user","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"e029988d-9eed-467f-bd1e-9593f52c8b1d","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"M2 held","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T04:13:55.329Z","updatedAt":"2026-11-19T04:13:55.329Z"},"position":1,"canEdit":true,"canDiscard":true,"behindReset":false},{"comment":{"id":"08c798fb-2cb3-4499-a9fd-bd97903c405c","companyId":"03aa0a18-07fd-477a-abba-c3fc671cd205","issueId":"33e936d7-2326-49f8-8ad4-2825b5f9eee3","authorAgentId":null,"authorUserId":"responsible-user","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"c1a37182-90ed-40b0-ac8e-4af2302b1ab3","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"M3 held","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T04:13:55.421Z","updatedAt":"2026-11-19T04:13:55.421Z"},"position":2,"canEdit":true,"canDiscard":true,"behindReset":false}]}`) as IssueQueuedCommentQueue;
     const bar = "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it.";
@@ -638,6 +712,9 @@ describe("TaskChatQueuedMessages", () => {
         Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: innerWidth });
         window.dispatchEvent(new Event("resize"));
         render({ queue: headGet, onInterrupt: vi.fn().mockResolvedValue(undefined) });
+        // SUPERSEDE-QUEUE-ROW-HIDE-1119 (harness only): with no row menu the list's
+        // passive sync to the new queue is flushed here, not by the menu's mount.
+        await act(async () => {});
         expect(container.textContent!.split(bar)).toHaveLength(2);
         expect(container.querySelector('[data-testid="task-chat-queued-stopped"] p[role="status"]')?.textContent).toBe(bar);
         const send = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-stopped-send"]');
@@ -801,6 +878,8 @@ describe("TaskChatQueuedMessages", () => {
     afterEach(() => { vi.useRealTimers(); });
 
     it("shows a countdown with Edit and Cancel, then steers into the live turn", async () => {
+      // SUPERSEDE-QUEUE-ROW-HIDE-1119: hidden in this build.
+      if (!QUEUE_ROW_REORDER_EDIT_STEER_ENABLED) return pinHiddenInThisBuild(advance);
       const props = render({ queue: fresh(), autoSteerDelayMs: delay });
       expect(countdown()?.textContent).toContain("Sending in 5s");
       expect(container.querySelector('[data-testid="task-chat-queued-steer-comment-1"]')).toBeNull();
@@ -813,6 +892,8 @@ describe("TaskChatQueuedMessages", () => {
     });
 
     it("gives a saved edit a full window while another row's countdown keeps the clock running", async () => {
+      // SUPERSEDE-QUEUE-ROW-HIDE-1119: hidden in this build.
+      if (!QUEUE_ROW_REORDER_EDIT_STEER_ENABLED) return pinHiddenInThisBuild(advance);
       const start = Date.now();
       const twoRows: IssueQueuedCommentQueue = { ...queue, entries: queue.entries.slice(0, 2).map((entry, index) => {
         const at = new Date(start + index * 4_000);
@@ -837,6 +918,8 @@ describe("TaskChatQueuedMessages", () => {
     });
 
     it("keeps a cancelled message in the queue with its explicit Steer button", async () => {
+      // SUPERSEDE-QUEUE-ROW-HIDE-1119: hidden in this build.
+      if (!QUEUE_ROW_REORDER_EDIT_STEER_ENABLED) return pinHiddenInThisBuild(advance);
       const props = render({ queue: fresh(), autoSteerDelayMs: delay });
       await act(async () => {
         container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-auto-steer-cancel-comment-1"]')?.click();
@@ -849,6 +932,8 @@ describe("TaskChatQueuedMessages", () => {
     });
 
     it("waits while the message is being edited and restarts from the saved revision", async () => {
+      // SUPERSEDE-QUEUE-ROW-HIDE-1119: hidden in this build.
+      if (!QUEUE_ROW_REORDER_EDIT_STEER_ENABLED) return pinHiddenInThisBuild(advance);
       const queued = fresh();
       const props = render({ queue: queued, autoSteerDelayMs: delay });
       await act(async () => {
@@ -878,6 +963,8 @@ describe("TaskChatQueuedMessages", () => {
     });
 
     it("tries each message revision once, then leaves it queued after a failure", async () => {
+      // SUPERSEDE-QUEUE-ROW-HIDE-1119: hidden in this build.
+      if (!QUEUE_ROW_REORDER_EDIT_STEER_ENABLED) return pinHiddenInThisBuild(advance);
       const props = render({ queue: fresh(), autoSteerDelayMs: delay, onSteer: vi.fn().mockRejectedValue(new Error("rejected")) });
       await advance(5_100);
       await advance(10_000);

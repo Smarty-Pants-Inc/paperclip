@@ -15,6 +15,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConnectivityProvider, createConnectivityStore } from "@/lib/connectivity";
 import { INITIAL_TRANSCRIPT_REVEAL_BUDGET_MS, TaskChatThread } from "./TaskChatThread";
+import { QUEUE_ROW_REORDER_EDIT_STEER_ENABLED } from "./task-chat/TaskChatQueuedMessages";
 import { IssueChatThread } from "./IssueChatThread";
 import type {
   Agent,
@@ -5685,6 +5686,15 @@ describe("TaskChatThread Paperclip Runner queue", () => {
     const props = { comments: [queuedComment], onAdd: async () => {}, queuedCommentQueue: actionQueue,
       onSteerQueuedComment: () => delivery, onInterruptQueued: () => delivery, queuedMessageAutoSteerDelayMs: null };
     render(<TaskChatThread {...props} />);
+    if (action === "steer" && !QUEUE_ROW_REORDER_EDIT_STEER_ENABLED) {
+      // SUPERSEDE-QUEUE-ROW-HIDE-1119 (org 10:19Z): no per-row Steer in this build;
+      // the queued row offers Delete and Interrupt only.
+      expect(container.querySelector('[data-testid="task-chat-queued-steer-queued-prp-1"]')).toBeNull();
+      expect(container.querySelector('[data-testid="task-chat-queued-interrupt-queued-prp-1"]')?.textContent).toBe("Interrupt");
+      expect(container.querySelector('[data-testid="task-chat-queued-discard-queued-prp-1"]')).not.toBeNull();
+      expect(container.querySelector('[aria-label^="Reorder queued message:"]')).toBeNull();
+      return;
+    }
     await act(async () => {
       container.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-${action}-queued-prp-1"]`)!.click();
     });
