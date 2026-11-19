@@ -7,6 +7,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { createHostClientHandlers, PLUGIN_RPC_ERROR_CODES, type WorkerHostCallContext } from "@paperclipai/plugin-sdk";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { currentPluginInteractionOrigin } from "../services/plugin-interaction-context.js";
+import { createPluginEventBus } from "../services/plugin-event-bus.js";
 import { pluginRegistryService } from "../services/plugin-registry.js";
 import { createPluginWorkerHandle } from "../services/plugin-worker-manager.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -53,8 +54,7 @@ describe("plugin worker proactive state while an agent invocation is active", ()
     const blocked = new Promise<void>(resolve => { release = resolve; });
     const agentEntered = new Promise<void>(resolve => { entered = resolve; });
     const observed: { context: WorkerHostCallContext | undefined; origin: ReturnType<typeof currentPluginInteractionOrigin> }[] = [];
-    const bus = { forPlugin: () => ({ emit: async () => {}, subscribe: () => {} }) };
-    const services = buildHostServices(db, pluginId, manifest.id, bus as Parameters<typeof buildHostServices>[3]);
+    const services = buildHostServices(db, pluginId, manifest.id, createPluginEventBus());
     const handlers = createHostClientHandlers({ pluginId, capabilities: manifest.capabilities, services });
     const handle = createPluginWorkerHandle(pluginId, {
       entrypointPath: fileURLToPath(new URL("./fixtures/plugin-worker-proactive-state.cjs", import.meta.url)),
@@ -80,7 +80,7 @@ describe("plugin worker proactive state while an agent invocation is active", ()
     });
     await handle.start();
     const agent = busy ? handle.call("executeTool", { toolName: "hold", parameters: {},
-      runContext: { companyId: agentCompanyId, agentId, runId } }) : undefined;
+      runContext: { companyId: agentCompanyId, agentId, runId, projectId: randomUUID() } }) : undefined;
     // Attach a rejection handler immediately, including on a failed assertion.
     const agentResult = agent?.then(value => ({ value }), error => ({ error }));
     if (busy) await agentEntered;
@@ -132,7 +132,7 @@ describe("plugin worker proactive state while an agent invocation is active", ()
     } finally { await worker.stop(); }
   });
 
-  it("does not grant instance state, wildcard state, or a forged or retired invocation id", async () => {
+  it("does not grant instance state, wildcard state, or a forged invocation id", async () => {
     const worker = await start();
     try {
       await denied(worker.timer("state.set", { scopeKind: "instance", stateKey: "instance", value: true }));
@@ -156,6 +156,23 @@ describe("plugin worker proactive state while an agent invocation is active", ()
     } finally { await worker.stop(); }
   });
 
+  it("revokes proactive state authority when the stored company configuration is removed", async () => {
+    const worker = await start();
+    const registry = pluginRegistryService(db);
+    try {
+      await worker.timer("state.set", { ...stateKey("revoked"), value: "before removal" });
+      await registry.deleteConfig(pluginId, companyId);
+      await denied(worker.timer("state.set", { ...stateKey("revoked"), value: "after removal" }));
+      await denied(worker.timer("state.get", stateKey("revoked")));
+      await denied(worker.timer("state.delete", stateKey("revoked")));
+      expect(await rows(companyId, "revoked")).toMatchObject([{ valueJson: "before removal" }]);
+      expect(worker.observed).toHaveLength(1);
+    } finally {
+      await registry.upsertConfig(pluginId, companyId, { companyId, configJson: { enabled: true } });
+      await worker.stop();
+    }
+  });
+
   it("leaves the idle-server proactive state and non-state behavior unchanged", async () => {
     const worker = await start(false);
     try {
@@ -163,6 +180,8 @@ describe("plugin worker proactive state while an agent invocation is active", ()
       await expect(worker.timer("state.get", stateKey("idle"))).resolves.toBe("idle");
       await expect(worker.timer("companies.get", { companyId })).resolves.toMatchObject({ id: companyId });
       await denied(worker.timer("state.set", { ...stateKey("idle-denied", unconfiguredCompanyId), value: true }));
+      await denied(worker.timer("state.set", { ...stateKey("idle-disguised", unconfiguredCompanyId), companyId, value: true }));
+      expect(await rows(unconfiguredCompanyId, "idle-disguised")).toEqual([]);
     } finally { await worker.stop(); }
   });
 });

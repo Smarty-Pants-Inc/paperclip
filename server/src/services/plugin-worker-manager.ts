@@ -2904,6 +2904,19 @@ export function createPluginWorkerHandle(
       (message as { paperclipInvocationId?: unknown }).paperclipInvocationId,
     );
     if (!invocationId) {
+      const params = message.params;
+      if ((message.method === "state.get" || message.method === "state.set" || message.method === "state.delete") &&
+          isRecord(params) && params.scopeKind === "company") {
+        // Plugin-owned state needs no agent/person authority. Mint a company-only
+        // proactive scope even while an agent invocation is active, using the
+        // actual state scopeId (never an unrelated top-level companyId).
+        const companyId = readNonEmptyString(params.scopeId);
+        return companyId && companyScopes.has(companyId)
+          ? { invocationScope: { companyId } }
+          : { invalidInvocationScope: true };
+      }
+      // Other untagged calls must not escape an active agent's invocation scope
+      // or borrow its identity. Only plugin-owned company state is exempt above.
       if (Array.from(activeInvocations.values()).some(entry => entry.scope?.agentOrigin)) {
         return { invalidInvocationScope: true };
       }
@@ -2912,7 +2925,7 @@ export function createPluginWorkerHandle(
       // plugin is authorized to act on proactively, resolve it to that
       // company's scope so the governed-access gate admits it. This never
       // widens access beyond the plugin's configured companies, and only
-      // applies here when the worker is NOT inside a host-issued invocation.
+      // applies here when no agent-origin invocation is active.
       // Scoped invocations keep their strict single-company match below.
       const proactiveCompanyId = referencedCompanyId(
         message.method,
