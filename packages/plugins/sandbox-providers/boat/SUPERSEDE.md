@@ -30,11 +30,11 @@ Record name requested by adopt-lead; RFL to confirm the name and the ruling. rf-
 - New assertion: POST /stop 202 `failing`, then GET /sandboxes/{id} `failing`, then the record reads `failing`. The release hook rejects with `PluginEnvironmentStopError`, whose message carries Boat's `stop.error`, after exactly these 3 requests in order: `POST .../stop`, `GET .../{id}`, `GET .../stops/stop_123`.
 - Kept: a `failing` stop is never a receipt (old and new); the stop body is still `{}` (no force).
 - Dropped: the old row's eventual `failing` then `completed` progression inside one call. It is now covered by `stop-refusal.test.ts` ROW-4 (pending then completed: same receipt) and ROW-4b (a completed stop after a refusal clears the back-off).
-- Ruling: pending RFL confirmation of this record (adopt-lead asks RFL).
+- Ruling: CONFIRMED by RFL, 2026-11-19 00:30Z: "the record form for Boat unit #2 is c2911b65 (al/boat-stopfail2-rw): the commit that CHANGES the test carries the SUPERSEDE-BOAT-U2-F2-STOPFAIL-1118 prefix, as the test-change rule binds. The separate SUPERSEDE.md commit may ride too, but it doesn't replace the prefix."
 
 ## J2 (rf-4's independent judge, `judge-stop-refusal.test.ts`; rf-4 U2b S3, gold 1 x 1)
 - Old expectation: an unknown future stop status (`unexpected-future-status`) throws a plain Error whose message reads `... entered unexpected-future-status`.
 - New expectation: the same plain Error (not a typed refusal, never a stopped receipt) reads `... entered unrecognised (unexpected-future-status)`. A status outside Boat's closed `[a-z_]` token shape now goes through the one redactor (`providerStatus`), so it is bounded, sanitised and marked unrecognised.
 - In-repo row: `stop-refusal-rf4.test.ts` "J2 (superseded wording, SUPERSEDE-BOAT-U2-F2-STOPFAIL-1118)". The judge file itself is rf-4's; its owner updates its J2 string.
 - Kept: no false receipt; the error is not `PluginEnvironmentStopError`.
-- Ruling: pending RFL confirmation, under this same record.
+- Ruling: CONFIRMED by RFL, 2026-11-19 00:54Z: the record is amended to cover rf-4's J2 gold: the expectation moves to 'entered unrecognised (...)' for an unknown stop status, and the 'not a receipt; only completed settles' assertion stays byte-identical (R1 rfl-verdicts/SUPERSEDE-BOAT-U2-F2-STOPFAIL-1118.md, confirmation section).
