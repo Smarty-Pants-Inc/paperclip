@@ -1838,8 +1838,8 @@ describe("LiveUpdatesProvider run lifecycle toasts", () => {
         () => "CodexCoder",
       ),
     ).toMatchObject({
-      title: "CodexCoder run failed",
-      body: "boom",
+      title: "CodexCoder stopped with a problem",
+      body: "Open the run to see what happened.",
       tone: "error",
     });
   });
@@ -1894,7 +1894,7 @@ describe("LiveUpdatesProvider run lifecycle toasts", () => {
         () => "CodexCoder",
       ),
     ).toMatchObject({
-      title: "CodexCoder run failed",
+      title: "CodexCoder stopped with a problem",
       tone: "error",
       action: { label: "View run" },
     });
@@ -1912,10 +1912,59 @@ describe("LiveUpdatesProvider run lifecycle toasts", () => {
         () => "CodexCoder",
       ),
     ).toMatchObject({
-      title: "CodexCoder run failed",
-      body: "Adapter process exited",
+      title: "CodexCoder stopped with a problem",
+      body: "Open the run to see what happened.",
       tone: "error",
       action: { label: "View run" },
+    });
+  });
+
+  describe("a failed run in another chat, as the person on chat A sees it", () => {
+    const RAW = "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=journal_commands_unsettled(runner.suspend.pending)";
+    const chatA = { id: "issue-a", identifier: "V2-1", companyId: "company-1", title: "TEST hand-take BA3-1 113425", assigneeAgentId: "agent-a" };
+    const chatB = { id: "issue-b", identifier: "V2-3", companyId: "company-1", title: "TEST hand-take BA3-3 113426", assigneeAgentId: "agent-b" };
+    function deliverFailed(issueId: string, agentId: string) {
+      vi.stubGlobal("document", { visibilityState: "visible", hasFocus: () => true });
+      const client = new QueryClient();
+      client.setQueryData(queryKeys.agents.list("company-1"), [
+        { id: "agent-a", name: "TEST hand-take BA3-1 113425" },
+        { id: "agent-b", name: "TEST hand-take BA3-3 113426" },
+      ]);
+      client.setQueryData(queryKeys.issues.detail("V2-1"), chatA);
+      client.setQueryData(queryKeys.issues.detail("issue-a"), chatA);
+      client.setQueryData(queryKeys.issues.detail("issue-b"), chatB);
+      const toasts: Array<Record<string, unknown>> = [];
+      const gate = { cooldownHits: new Map<string, number[]>(), suppressUntil: 0, observedRunOutcomes: new Set<string>() };
+      try {
+        __liveUpdatesTestUtils.handleLiveEvent(client, "company-1", "/V2/issues/V2-1", {
+          id: 1, companyId: "company-1", type: "heartbeat.run.status", createdAt: "2026-11-19T11:34:26Z", toastEligible: true,
+          payload: { runId: `run-${issueId}`, agentId, issueId, status: "failed", contextSource: `chat:${issueId}`,
+            error: RAW, errorCode: "runner_state_identity_mismatch", triggerDetail: "system" },
+        } as never, (toast) => { toasts.push(toast as never); return "toast-1"; }, gate, { userId: "paul", agentId: null });
+      } finally {
+        vi.unstubAllGlobals();
+      }
+      return toasts;
+    }
+
+    it("names that chat in plain words and links to it, with no server code text", () => {
+      const toasts = deliverFailed("issue-b", "agent-b");
+      expect(toasts).toHaveLength(1);
+      expect(toasts[0]).toMatchObject({
+        title: "TEST hand-take BA3-3 113426 stopped with a problem in \u201cTEST hand-take BA3-3 113426\u201d",
+        body: "Open the chat to see what happened.",
+        tone: "error",
+        action: { label: "Open chat", href: "/issues/V2-3" },
+      });
+      const shown = `${toasts[0].title} ${toasts[0].body}`;
+      for (const code of ["runner_state", "retirement_refused", "journal_commands", "runner.suspend"]) {
+        expect(shown).not.toContain(code);
+      }
+      expect(shown).not.toMatch(/[a-z]+_[a-z_]+/);
+    });
+
+    it("gives no toast for a failed run of the chat on screen", () => {
+      expect(deliverFailed("issue-a", "agent-a")).toEqual([]);
     });
   });
 });
