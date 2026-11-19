@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import {
+  PAPERCLIP_ANSWER_ONCE_LINE,
   readPaperclipRuntimeSkillEntries,
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
@@ -1146,6 +1147,25 @@ describe("renderPaperclipWakePrompt", () => {
       const unclaimed = renderPaperclipWakePrompt({ ...payload, checkedOutByHarness }, { resumedSession });
       expect(unclaimed).not.toContain("checkout: already claimed");
       expect(unclaimed).not.toContain("The harness already checked out this issue for the current run.");
+    }
+  });
+
+  it("renders the answer-once line exactly once for a chat wake with comments, never for non-chat or empty wakes", () => {
+    const comment = (n: number) => ({ id: `c${n}`, issueId: "chat", body: n === 1 ? "Write the release note" : n === 2 ? "6 x 7?" : "France?",
+      bodyTruncated: false, createdAt: `2026-11-19T10:26:${10 + n}.000Z`, authorType: "user", authorId: "paul" });
+    const wake = (count: number) => ({
+      reason: "issue_commented", issue: { id: "chat", status: "in_progress", workMode: "standard" },
+      commentIds: Array.from({ length: count }, (_, i) => `c${i + 1}`), latestCommentId: count ? `c${count}` : null,
+      comments: Array.from({ length: count }, (_, i) => comment(i + 1)),
+      commentWindow: { requestedCount: count, includedCount: count, missingCount: 0 }, fallbackFetchNeeded: false,
+    });
+    const occurrences = (text: string) => text.split(PAPERCLIP_ANSWER_ONCE_LINE).length - 1;
+    for (const resumedSession of [false, true]) {
+      for (const count of [1, 3]) {
+        expect(occurrences(renderPaperclipWakePrompt(wake(count), { resumedSession, conversationMode: true }))).toBe(1);
+        expect(occurrences(renderPaperclipWakePrompt(wake(count), { resumedSession }))).toBe(0);
+      }
+      expect(occurrences(renderPaperclipWakePrompt(wake(0), { resumedSession, conversationMode: true }))).toBe(0);
     }
   });
 
