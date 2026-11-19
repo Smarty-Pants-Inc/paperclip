@@ -150,6 +150,46 @@ describe("authoritative Stop response", () => {
   });
 });
 
+// Planted: the warm keep_running shape the real POST /heartbeat-runs/:id/cancel
+// returns (executionCancellation requested, native cancellation acknowledged,
+// no termination receipt).
+describe("the person's Stop control on a warm native turn", () => {
+  const warm = (receipt: Record<string, unknown> = {}) => {
+    const value = nativeRun("native", receipt);
+    return { ...value, resultJson: { ...value.resultJson, executionCancellation: { state: "requested" } } };
+  };
+
+  it("accepts the server's acknowledged cancellation record without a physical receipt", async () => {
+    const getRun = vi.fn().mockResolvedValue(warm());
+    await waitForStoppedRuns(["native"], { initialRuns: [warm()], getRun, acceptNativeCancellationRecord: true });
+    expect(getRun).not.toHaveBeenCalled();
+  });
+
+  it("keeps waiting for the physical receipt without the person's acceptance", async () => {
+    vi.useFakeTimers();
+    const getRun = vi.fn().mockResolvedValue(warm());
+    const result = waitForStoppedRuns(["native"], { initialRuns: [warm()], getRun, timeoutMs: 1000 });
+    const assertion = expect(result).rejects.toThrow("work is still stopping");
+    await vi.advanceTimersByTimeAsync(1000);
+    await assertion;
+  });
+
+  it.each([
+    ["unacknowledged", warm({ dispatchState: "pending" })],
+    ["foreign receipt", warm({ runId: "other" })],
+    ["live run", { ...warm(), status: "running" } as HeartbeatRun],
+    ["legacy run", { ...warm(), runtimeMode: "legacy" } as HeartbeatRun],
+  ])("still waits for a %s with the person's acceptance", async (_label, initial) => {
+    vi.useFakeTimers();
+    const getRun = vi.fn().mockResolvedValue(initial);
+    const result = waitForStoppedRuns(["native"], { initialRuns: [initial], getRun, timeoutMs: 1000,
+      acceptNativeCancellationRecord: true });
+    const assertion = expect(result).rejects.toThrow("work is still stopping");
+    await vi.advanceTimersByTimeAsync(1000);
+    await assertion;
+  });
+});
+
 describe("bounded readonly verification recovery", () => {
   it.each([new TypeError("Failed to fetch"), new ApiError("Unavailable", 503, null)])(
     "recovers a transient status failure within the original deadline: %s", async (error) => {
