@@ -1372,7 +1372,30 @@ async function sendCreate(config: Config, attemptId: string, body: string, creat
     }
   }
 }
-async function waitReady(config: Config, id: string, allowArchived = false, bound: { signal?: AbortSignal; deadline?: number; sendGuard?: () => void } = {}): Promise<any> {
+// review-fleet-4 GAP 1. A key still in progress at the strict cap fails the
+// acquire, and our cleanup stops the box Boat was building. The host retry
+// re-sends the same key and body, and Boat's dedupe (:2229) answers with that
+// same box, now stopped, stopping, or running with our stop still owed (Boat
+// refused it and retries it by itself). Such a box is NEVER handed over as a
+// ready lease. It is not resumed either (our stop ends our resume, see
+// stopSandbox): the attempt fails typed and the caller's cleanup keeps the box.
+const DEDUPED_BOX_STOP_STATES: ReadonlySet<string> = new Set(["stopping", "stopped", "archiving", "archived"]);
+class BoatDedupedBoxStoppedError extends Error {
+  readonly code = "boat_idempotency_box_stopped";
+  constructor(readonly sandboxId: string, readonly observed: string) {
+    super(`boat_idempotency_box_stopped: Boat answered this creation's Idempotency-Key with sandbox ${sandboxId}, which is ${observed}. `
+      + "A stopped or stopping box is never handed over as a ready lease and is not resumed; the acquire's cleanup keeps it.");
+    this.name = "BoatDedupedBoxStoppedError";
+  }
+}
+/** The closed reason a create's box is stopped or stopping, from Boat's own observation (which survives a worker restart); undefined when it is not. */
+function dedupedBoxStop(sandbox: any): string | undefined {
+  if (typeof sandbox?.state === "string" && DEDUPED_BOX_STOP_STATES.has(sandbox.state)) return sandbox.state;
+  const stop = sandbox?.stop;
+  if (stop && typeof stop === "object" && (stop.status === "pending" || stop.status === "failing")) return `running with a ${stop.status} stop`;
+  return undefined;
+}
+async function waitReady(config: Config, id: string, allowArchived = false, bound: { signal?: AbortSignal; deadline?: number; sendGuard?: () => void; observe?: (sandbox: any) => void } = {}): Promise<any> {
   // A bounded caller (a 409 recovery) never waits past its call budget, and its
   // admission and lifecycle check runs before every poll (frozen8 F-01/F-03).
   const until = Math.min(Date.now() + 120_000, bound.deadline ?? Number.POSITIVE_INFINITY);
@@ -1389,6 +1412,8 @@ async function waitReady(config: Config, id: string, allowArchived = false, boun
     }
     const s = result.sandbox ?? result;
     assertSandboxId(s, id);
+    // A caller's check of every observation, before it can count as ready (GAP 1).
+    bound.observe?.(s);
     if (["ready", "idle", "running"].includes(s.state)) return s;
     if (s.state === "error" || (!allowArchived && s.state === "archived")) throw new BoatSandboxStateError(id, s.state);
     lastObservedState = s.state;
@@ -2530,8 +2555,15 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         const sb = created?.sandbox ?? created; if (typeof sb?.id !== "string" || !sb.id) throw new Error("Boat create response did not contain sandbox.id");
         id = sb.id;
         idleActivity.resource(activityKey(c, sb.id));
+        // GAP 1: a (deduped) box that is stopped or stopping is never a ready lease;
+        // `id` is set, so the cleanup below still stops it and owns it.
+        const refuseStopped = (sandbox: any) => {
+          const observed = dedupedBoxStop(sandbox);
+          if (observed) throw new BoatDedupedBoxStoppedError(sb.id, observed);
+        };
+        refuseStopped(sb);
         // An adopted box is still starting (or preparing): wait inside the acquire budget.
-        const ready = await waitReady(c, sb.id, false, adopted ? { deadline: createStartedAt + BOAT_ACQUIRE_ATTEMPT_BUDGET_MS } : {}).catch(error => {
+        const ready = await waitReady(c, sb.id, false, { ...(adopted ? { deadline: createStartedAt + BOAT_ACQUIRE_ATTEMPT_BUDGET_MS } : {}), observe: refuseStopped }).catch(error => {
           if (error instanceof BoatSandboxStateError && error.state === "error") {
             startFailure = { phase: "create", elapsedMs: Math.min(Math.max(0, Date.now() - createStartedAt), BOAT_ACQUIRE_ATTEMPT_BUDGET_MS - 1),
               budgetMs: BOAT_ACQUIRE_ATTEMPT_BUDGET_MS, providerState: "error" };
