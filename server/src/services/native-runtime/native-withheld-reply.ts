@@ -12,7 +12,8 @@ import type { NativeResponsePresentationScope } from "../native-response-present
 import { settledResponsePublicationSql } from "./native-response-publication-receipt.js";
 import { isNativeRunnerOwnershipHeld } from "./native-runner-ownership.js";
 import { acceptedReplyAlreadyPresented, acceptedResponseDigestMatches, NATIVE_WITHHELD_REPLY_FAILURE_CODES,
-  NATIVE_WITHHELD_REPLY_SCHEMA, selectAcceptedFinalAgentMessage } from "./native-run-finalizer.js";
+  NATIVE_WITHHELD_REPLY_SCHEMA, NATIVE_WORKSPACE_SYNC_OUT_STALLED, selectAcceptedFinalAgentMessage } from "./native-run-finalizer.js";
+import { abandonedRemoteWorkspaceFilesHeldForRun } from "../remote-workspace-abandoned-preparation.js";
 import { readNativeWorkspaceExportResume } from "./native-workspace-export-resume.js";
 import { readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
 
@@ -38,6 +39,11 @@ export const FILE_LINE_LOST = "The file changes from this reply couldn't be save
  * export (preserveNativeWorkspaceExportLease). The board's "Recover saved
  * files" action (ui WorkspaceExportRecovery.tsx) reads that retained box. */
 export const FILE_LINE_KEPT = "The file changes from this reply are kept and can be recovered from the task's saved files.";
+
+/** NATIVE_WORKSPACE_SYNC_OUT_STALLED: the files are set aside and held, but the
+ * board's "Recover saved files" request does not read a set-aside epoch, so
+ * this line does not name that control (RFL's wording for that case). */
+export const FILE_LINE_KEPT_SET_ASIDE = "The file changes from this reply aren't saved yet. They're kept, and we can recover them.";
 
 const record = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -191,7 +197,8 @@ export async function publishWithheldAcceptedReply(
     // Decision (i): a cancelled run whose copy-back succeeded lost no files.
     const fileLine = !terminal ? null : await exportIsRetained(tx, run, coordinator) ? "kept" as const : "lost" as const;
     const body = fileLine === null ? resolved.text
-      : `${resolved.text}\n\n${fileLine === "kept" ? FILE_LINE_KEPT : FILE_LINE_LOST}`;
+      : `${resolved.text}\n\n${fileLine === "lost" ? FILE_LINE_LOST
+        : coordinator.failureCode === NATIVE_WORKSPACE_SYNC_OUT_STALLED ? FILE_LINE_KEPT_SET_ASIDE : FILE_LINE_KEPT}`;
     await notifyChatRunMilestones(tx, input);
     const comment = await issueService(db).addComment(input.issueId, body,
       { agentId: run.agentId, runId: run.id }, { authorizationReason, completionReply: true, withheldAcceptedReply: true }, tx);
@@ -216,6 +223,8 @@ export async function publishWithheldAcceptedReply(
  * lease in the terminal transaction. Anything else is reported as not saved. */
 async function exportIsRetained(tx: Db, run: typeof heartbeatRuns.$inferSelect,
   coordinator: typeof nativeRunFinalizations.$inferSelect) {
+  // The no-progress bound set this run's files aside; they are kept while that hold stands.
+  if (coordinator.failureCode === NATIVE_WORKSPACE_SYNC_OUT_STALLED) return abandonedRemoteWorkspaceFilesHeldForRun(tx, run);
   if (coordinator.failureCode !== "native_workspace_sync_out_retry_exhausted") return false;
   const reference = readNativeWorkspaceSyncReference(record(run.runnerProfileJson).nativeWorkspaceSync);
   if (!reference) return false;

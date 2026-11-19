@@ -51,6 +51,18 @@ export function agentRunSupersededByFreshContinuation(run: { resultJson?: Record
   return typeof run?.resultJson?.[FRESH_CONTINUATION_SUPERSEDED_KEY] === "string";
 }
 
+/**
+ * The copy-out no-progress bound ended this run (native-run-finalizer.ts): the
+ * terminal write abandoned its workspace epoch and recorded that fence here.
+ * Its unsaved files are set aside and the task's next turn reuses none of them.
+ */
+export const WORKSPACE_SYNC_OUT_STALL_KEY = "workspaceSyncOutStall";
+
+export function agentRunFilesSetAsideByCopyOutBound(run: { resultJson?: Record<string, unknown> | null } | null | undefined) {
+  const stall = run?.resultJson?.[WORKSPACE_SYNC_OUT_STALL_KEY];
+  return Boolean(stall && typeof stall === "object" && (stall as { workspace?: unknown }).workspace);
+}
+
 /** Backup restoration revokes the terminal source run in the source-lease CAS transaction. */
 export const SANDBOX_BACKUP_SOURCE_SUPERSEDED_KEY = "sandboxBackupSourceSupersededAt";
 

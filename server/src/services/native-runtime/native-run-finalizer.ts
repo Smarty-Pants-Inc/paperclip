@@ -1,6 +1,8 @@
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { REMOTE_WORKSPACE_SANDBOX_DISK_FULL_CODE } from "../remote-workspace-transport.js";
+import { fenceSourceWorkspace } from "../remote-workspace-epoch-abandonment.js";
+import { WORKSPACE_SYNC_OUT_STALL_KEY } from "../../agent-run-cancellation.js";
 import { notifyExternalAgentSettlement } from "../../modules/external-agents/index.js";
 import { notifyNativeRecoveryNotices } from "../native-recovery-notice-notifications.js";
 import { resolveCommittedNativeRecoveryNotices } from "./native-recovery-notices.js";
@@ -326,6 +328,10 @@ export function readWorkspaceFailureCause(value: unknown): string | null {
 
 function terminalFinalizationFailureMessage(failureCode: string, failureScope: "provider" | "workspace" | undefined,
   failureCause?: string | null) {
+  if (failureCode === NATIVE_WORKSPACE_SYNC_OUT_STALLED) {
+    return "Saving the workspace made no progress, so this run was ended. The agent's result is kept. This turn's file "
+      + "changes were set aside and are kept for recovery; follow the run's recovery action to recover them.";
+  }
   if (failureCode === "native_workspace_sync_out_retry_exhausted" && isSandboxStorageExhausted(failureCause)) {
     return "Saving the workspace stopped because the sandbox disk is full. The agent's result is kept, and Paperclip "
       + "saves the files again from the retained sandbox without repeating the agent's work; follow the run's recovery "
@@ -352,6 +358,12 @@ function terminalFinalizationFailureMessage(failureCode: string, failureScope: "
 }
 
 export const NATIVE_FINALIZATION_SUPERSEDED = "native_finalization_superseded";
+/**
+ * The copy-out no-progress bound (native-workspace-finalization-work.ts) ended
+ * the run: a permanent workspace failure. Its files are set aside and kept by
+ * the epoch fence written with it, and it does not hold the task's next turn.
+ */
+export const NATIVE_WORKSPACE_SYNC_OUT_STALLED = "native_workspace_sync_out_stalled";
 
 /** The run columns that end a run whose finalization reached a terminal verdict. */
 function terminalFinalizationRunPatch(input: {
@@ -479,6 +491,7 @@ async function recordRetryableFailure(input: {
   const now = new Date();
   const nextAttemptAt = new Date(now.getTime() + 30_000);
   const failureCause = readWorkspaceFailureCause(input.failureCause);
+  const stalled = input.failureScope === "workspace" && input.failureCode === NATIVE_WORKSPACE_SYNC_OUT_STALLED;
   const acceptedRunTerminalState = record(
     input.run.resultJson,
   ).prpRunTerminalState;
@@ -519,8 +532,10 @@ async function recordRetryableFailure(input: {
         eq(workspaceOperations.status, "succeeded"),
       )).limit(1);
       // The live exporter may have acquired ownership since the stale error
-      // was raised, or already durably published a successful copyback.
-      if (exported.length || record(currentRun.runnerProfileJson).nativeWorkspaceFinalizationOwner) return current;
+      // was raised, or already durably published a successful copyback. Only
+      // the no-progress bound passes a recorded owner, and only with that
+      // owner's workspace epoch fenced below, in this transaction.
+      if (exported.length || (!stalled && record(currentRun.runnerProfileJson).nativeWorkspaceFinalizationOwner)) return current;
     }
     input = { ...input, coordinator: current, run: currentRun };
     const issue = await tx
@@ -539,6 +554,12 @@ async function recordRetryableFailure(input: {
       .for("update")
       .limit(1)
       .then((rows) => rows[0] ?? null);
+    // The fence: the run's epoch is abandoned without applying its files, so a
+    // copy-out that returns later cannot publish (remote-workspaces.ts
+    // `remote_workspace_authority_changed` / `remote_workspace_publication_fenced`).
+    // A run whose files cannot be fenced is never ended by the bound.
+    const stallFence = stalled ? await fenceSourceWorkspace(tx as unknown as Db, input.run) : null;
+    if (stalled && !stallFence) return current;
     const latestDecision = issue?.lastStatusDecisionId
       ? await tx
           .select({
@@ -706,6 +727,8 @@ async function recordRetryableFailure(input: {
           // The latest attempt's redacted cause; cleared when it named none.
           failureCause,
           ...(finalizationFailureCount === null ? {} : { finalizationFailureCount }),
+          ...(stallFence && phase === "terminal_failure" && !supersededByNewerRun ? { [WORKSPACE_SYNC_OUT_STALL_KEY]: {
+            schema: "paperclip.workspace-sync-out-stall.v1", recordedAt: now.toISOString(), workspace: stallFence } } : {}),
           nextAttemptAt: supersededByNewerRun || exhausted ? null : nextAttemptAt.toISOString(),
           // The accepted answer will never reach the committed reply path now.
           ...(withheldReplyResultId ? pendingNativeWithheldReply(withheldReplyResultId, failureCode) : {}),
@@ -860,6 +883,8 @@ export async function recordNativeFinalizationFailure(input: {
       input.failureScope === "workspace"
         && (message === "native_plugin_workspace_branch_mismatch" || message === "native_plugin_workspace_owner_mismatch")
         ? "Repair the plugin workspace branch or owner, then resume finalization without another provider turn."
+        : input.failureScope === "workspace" && message === NATIVE_WORKSPACE_SYNC_OUT_STALLED
+        ? "This turn's file changes were set aside and kept. Recover the saved files from this task, or continue from the last saved version."
         : input.failureScope === "workspace"
         ? input.permanent
           ? "Restore the exact sandbox containing the unexported workspace changes, or resolve the task manually from durable evidence."
@@ -994,7 +1019,7 @@ export async function acceptedResponseDigestMatches(
 export const NATIVE_WITHHELD_REPLY_SCHEMA = "paperclip.native_withheld_reply.v1";
 /** Copy-back failures that end an accepted run without ever committing it. */
 export const NATIVE_WITHHELD_REPLY_FAILURE_CODES = [
-  "native_workspace_sync_out_retry_exhausted", "native_workspace_sync_out_unrecoverable",
+  "native_workspace_sync_out_retry_exhausted", "native_workspace_sync_out_unrecoverable", NATIVE_WORKSPACE_SYNC_OUT_STALLED,
 ] as const;
 /** The durable trigger of publishWithheldAcceptedReply (native-withheld-reply.ts).
  * It is written by the SAME statement that ends the accepted run without a

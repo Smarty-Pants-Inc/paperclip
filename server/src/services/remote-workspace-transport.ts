@@ -213,7 +213,7 @@ export function sandboxProviderFailureLabel(error: unknown): { label: string; co
   return { label, code, status };
 }
 
-const WORKSPACE_COMMAND_TIMEOUT_MS = 300_000;
+export const WORKSPACE_COMMAND_TIMEOUT_MS = 300_000;
 
 async function command(target: RemoteWorkspaceTarget, operation: RemoteWorkspaceOperation,
   args: string[], env?: Record<string, string>, timeoutMs = WORKSPACE_COMMAND_TIMEOUT_MS) {
