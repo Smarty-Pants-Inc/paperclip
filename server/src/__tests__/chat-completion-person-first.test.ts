@@ -30,6 +30,8 @@ describePostgres("automatic chat-completion turns on a person's chat", () => {
   const dispatched: Array<{ runId: string; context: Record<string, unknown> }> = [];
   const oldHome = process.env.PAPERCLIP_HOME;
   let home: string;
+  /** A turn on this chat blocks in the adapter until its gate resolves (a live turn). */
+  const gates = new Map<string, Promise<void>>();
 
   beforeAll(async () => {
     temporary = await startRecoveryPostgres("chat-completion-person-first-");
@@ -42,6 +44,8 @@ describePostgres("automatic chat-completion turns on a person's chat", () => {
       type: adapterType, supportsLocalAgentJwt: false,
       execute: async input => {
         dispatched.push({ runId: input.runId, context: input.context as Record<string, unknown> });
+        const gate = gates.get(String((input.context as Record<string, unknown>).issueId));
+        if (gate) await gate;
         return { exitCode: 0, signal: null, timedOut: false, resultJson: {} };
       },
       testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }),
@@ -183,5 +187,38 @@ describePostgres("automatic chat-completion turns on a person's chat", () => {
     const runs = await completionRuns(f);
     expect(runs).toHaveLength(1);
     expect(dispatched.filter(turn => turn.runId === runs[0].id)).toHaveLength(1);
+  }, 180_000);
+
+  it("GAP1: on a chat, the person's deferred wake is promoted before an automation wake queued EARLIER", async () => {
+    const f = await seedChat();
+    let release!: () => void;
+    gates.set(f.chatId, new Promise<void>(resolve => { release = resolve; }));
+    // A live turn on the chat (the person's earlier message), running in the adapter.
+    await heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
+      requestedByActorType: "user", requestedByActorId: f.userId,
+      payload: { issueId: f.chatId }, contextSnapshot: { issueId: f.chatId, taskId: f.chatId, wakeReason: "issue_commented" } });
+    const live = await (async () => { for (let i = 0; i < 400; i += 1) {
+      const [run] = (await chatRuns(f)).filter(r => r.status === "running");
+      if (run && dispatched.some(d => d.runId === run.id)) return run;
+      await new Promise(resolve => setTimeout(resolve, 25)); } throw new Error("no live turn"); })();
+    // An automation (completion) wake deferred behind it FIRST, then the person's message.
+    const deliveryId = randomUUID();
+    const [automation] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "automation", triggerDetail: "system", reason: "chat_task_completed", status: "deferred_issue_execution",
+      requestedByActorType: "system", requestedByActorId: "chat_completion_delivery", requestedAt: new Date(Date.now() - 10_000),
+      payload: { issueId: f.chatId, chatCompletionDeliveryIds: [deliveryId],
+        _paperclipWakeContext: { issueId: f.chatId, taskId: f.chatId, wakeReason: "chat_task_completed",
+          chatCompletionDeliveryIds: [deliveryId], conversationSessionGeneration: 0 } } }).returning();
+    const held = await holdPersonMessage(f);
+    gates.delete(f.chatId);
+    release();
+    await heartbeat.drainActiveRunExecutions();
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    const runs = (await chatRuns(f)).filter(run => run.id !== live.id && run.createdAt >= live.createdAt).sort((a, b) => +a.createdAt - +b.createdAt);
+    const snapshot = { live: live.id, wakes: wakes.map(w => ({ id: w.id, reason: w.reason, status: w.status, runId: w.runId })),
+      runs: runs.map(r => ({ id: r.id, status: r.status, reason: r.contextSnapshot?.wakeReason, ids: r.contextSnapshot?.wakeCommentIds })) };
+    expect(runs.length, JSON.stringify(snapshot)).toBeGreaterThan(0);
+    expect(runs[0]!.contextSnapshot?.wakeCommentIds, `the person's message runs first: ${JSON.stringify(snapshot)}`).toEqual([held.commentId]);
+    expect(wakes.find(w => w.id === automation.id)?.runId ?? null, JSON.stringify(snapshot)).not.toBe(runs[0]!.id);
   }, 180_000);
 });
