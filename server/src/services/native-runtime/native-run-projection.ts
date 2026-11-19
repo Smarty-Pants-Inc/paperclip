@@ -59,9 +59,17 @@ export async function settleNativeTerminalWake(tx: Db, run: Pick<typeof heartbea
   }).where(claim);
 }
 
+/** The receipt a commit leaves on a run that had already ended (K12): the run's
+ * status, error, failure code and end time were kept, on purpose. */
+export const ENDED_RUN_KEPT_KEY = "endedRunKept";
+
 export function nativeRunProjectionNeedsRepair(projectedStatus: "succeeded" | "failed" | "cancelled" | SQL) {
   return and(
     eq(heartbeatRuns.runtimeMode, "native"),
+    // K12 (RFL 11-19): a run that had already ended when its late save
+    // committed keeps the status it ended with (ENDED_RUN_KEPT_KEY, written by
+    // that commit). It is not a missed projection, so it is never "repaired".
+    sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? ${ENDED_RUN_KEPT_KEY})`,
     or(
       inArray(heartbeatRuns.status, ["queued", "running", "failed"]),
       and(eq(heartbeatRuns.status, projectedStatus),

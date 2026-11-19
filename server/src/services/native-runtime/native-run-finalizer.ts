@@ -9,7 +9,7 @@ import { notifyNativeRecoveryNotices } from "../native-recovery-notice-notificat
 import { resolveCommittedNativeRecoveryNotices } from "./native-recovery-notices.js";
 import { nativeLeaseHolder, notifyNativeTokenLeaseClaimed } from "./native-token-lease-settlement.js";
 import { notifyNativeRunProjection } from "../native-run-projection-notifications.js";
-import { projectCommittedRun, recoveredExecutionFailureMetadata, settleNativeTerminalWake } from "./native-run-projection.js";
+import { ENDED_RUN_KEPT_KEY, projectCommittedRun, recoveredExecutionFailureMetadata, settleNativeTerminalWake } from "./native-run-projection.js";
 import { notifyNativeResultCommit } from "../native-result-commit-notifications.js";
 import { notifyRetainedNativeSessionCleanup } from "../retained-native-session-cleanup-notifications.js";
 import { notifyNativeFinalizationWork } from "../native-finalization-notifications.js";
@@ -2232,7 +2232,10 @@ async function finalizeNativeRunAndProject(input: {
         || ${JSON.stringify(finalizationMetadata)}::jsonb
         || ${cancelledWithheldReply}
         || ${savedReplyFileLine}
-        || ${finalizationPhase === "committed" ? sql`case when ${runAlreadyEnded} then '{}'::jsonb
+        || ${finalizationPhase === "committed" ? sql`case when ${runAlreadyEnded} and ${heartbeatRuns.status} is distinct from ${projectedStatus}
+            then jsonb_build_object(${ENDED_RUN_KEPT_KEY}::text, jsonb_build_object('schema', 'paperclip.ended-run-kept.v1',
+              'status', ${heartbeatRuns.status}, 'finishedAt', ${heartbeatRuns.finishedAt}, 'committedAt', ${now.toISOString()}::text))
+          when ${runAlreadyEnded} then '{}'::jsonb
           else '{"failureCode":null,"originalFailureCode":null}'::jsonb end` : sql`'{}'::jsonb`}
         || ${clearExecutionFailure ? sql`case when ${heartbeatRuns.status} = 'cancelled' or ${runAlreadyEnded} then '{}'::jsonb
           else ${recoveredExecutionFailureMetadata()} end` : sql`'{}'::jsonb`}`;
