@@ -430,8 +430,11 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       } catch (error) {
         state.failure = error;
         // The failed batch and everything admitted behind it are kept, in order.
-        const held = [...batch, ...state.pending.splice(0)];
-        if (held.length) await keep(state, held, error);
+        // The failed batch stays its own unit, so a retry re-sends exactly the
+        // bytes of the failed append and stays idempotent.
+        const behind = state.pending.splice(0);
+        if (batch.length) await keep(state, batch, error);
+        if (behind.length) await keep(state, behind, error);
         throw error;
       } finally {
         capacityChanged();
