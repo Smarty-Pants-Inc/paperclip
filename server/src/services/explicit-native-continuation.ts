@@ -205,7 +205,7 @@ export async function admitExplicitNativeContinuation(input: {
   interactionPayload?: unknown;
   dryRun?: boolean;
   onBlocked?: (reason: string, message: string) => void;
-}): Promise<{ previousRunId: string; commentId: string | null; failedRunId?: string; taskRetryRequestId?: string; queuedCommentInterruptId?: string; readiness?: ContinuationReadiness } | null> {
+}): Promise<{ previousRunId: string; commentId: string | null; failedRunId?: string; taskRetryRequestId?: string; queuedCommentInterruptId?: string; readiness?: ContinuationReadiness; retainedNativeTurnStop?: true } | null> {
   const { db, companyId, issueId, agentId, actorId, commentId } = input;
   const blocked = (reason: string, message: string) => { input.onBlocked?.(reason, message); return null; };
   let blocker: Awaited<ReturnType<typeof getExecutionBlocker>> = null;
@@ -403,6 +403,7 @@ export async function admitExplicitNativeContinuation(input: {
   if (!sourceChecks.length) return null;
 
   const sources: Run[] = [];
+  const retainedSourceIds = new Set<string>();
   let readiness: ContinuationReadiness | undefined;
   const freshSources = new Map<string, string>();
   const freshCandidates: Array<{ run: Run; intent: string; cause: string; evidence: Record<string, unknown>;
@@ -601,20 +602,6 @@ export async function admitExplicitNativeContinuation(input: {
           run.status === "cancelled" && !coordinator.leaseOwner
             ? "The cancelled run still needs verified cleanup. Your message is saved. Inspect the run and its environment for details."
             : "Waiting for the previous run to finish recovery. Your message will start automatically.");
-    // This exact live owner has already ended its turn and released its writer
-    // like a finished warm run. No old result is accepted or replayed. A missing
-    // live proof (including a restart) retains all existing teardown gates.
-    const hasRetainedNativeTurnStop = run.runnerProfileJson?.nativeRetainedIdleCheckpoint
-      ? (await import("./native-runtime/native-session-executor.js")).hasRetainedNativeTurnStop : undefined;
-    if (hasRetainedNativeTurnStop?.(run)) {
-      const retainedLeases = await db.select().from(environmentLeases).where(and(
-        eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, run.id)));
-      if (retainedLeases.every(lease => hasRetainedNativeTurnStop(run, lease)
-        || hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))) {
-        sources.push(run);
-        continue;
-      }
-    }
     const preserved = hasRequiredWorkspaceRecovery(run.resultJson) ? null
       : await preserveNativeFailedWorkspace(db, run);
     if (preserved && hasRequiredWorkspaceRecovery(preserved.resultJson)) return blocked("workspace_repair_required",
@@ -624,6 +611,12 @@ export async function admitExplicitNativeContinuation(input: {
         eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, run.id),
       ));
     const remote = leases.some(lease => lease.provider !== "local");
+    // Exempt only this allocation's obsolete physical-exit requirement. Keep
+    // preservation, quarantine, pending cleanup and fresh-source handling below.
+    const hasRetainedNativeTurnStop = remote && leases.length > 0 && run.runnerProfileJson?.nativeRetainedIdleCheckpoint
+      ? (await import("./native-runtime/native-session-executor.js")).hasRetainedNativeTurnStop : undefined;
+    const retainedTurnStops = new Set(leases.filter(lease => lease.provider !== "local"
+      && hasRetainedNativeTurnStop?.(run, lease)).map(lease => lease.id));
     if (remote) {
       // Never interpret remote PIDs using the control-plane host's process table.
       // pl/send-after-stop: a person's Stop of a warm (keep_running) turn hands
@@ -634,6 +627,7 @@ export async function admitExplicitNativeContinuation(input: {
       const handedOff = new Set<string>();
       for (const lease of leases) {
         if (hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease)) continue;
+        if (retainedTurnStops.has(lease.id)) { handedOff.add(lease.id); continue; }
         // adopt-hung-stop: the handed-off box's stop receipt is overdue; it is stop debt, replaced before any reuse.
         if (handedOffWarmStopReceiptOverdue(run, lease)) continue;
         // rf-4 row 22a: DB-only read of the persisted proof; the remote proof runs
@@ -651,7 +645,7 @@ export async function admitExplicitNativeContinuation(input: {
         return blocked("remote_cleanup", handedOffWarmWaitLine(run, unsettled)
           ?? "Waiting for the previous environment to stop. Your message will start automatically.");
       }
-      if (run.runtimeMode === "native" && !input.dryRun && !leases.every(lease => completeTerminatedRemoteNativeSessionCleanup({
+      if (run.runtimeMode === "native" && !input.dryRun && !leases.every(lease => retainedTurnStops.has(lease.id) || completeTerminatedRemoteNativeSessionCleanup({
         companyId, runId: run.id, remoteCleanupScope: remoteLeaseCleanupScope(lease)!,
       }))) return refused("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
     } else {
@@ -675,10 +669,13 @@ export async function admitExplicitNativeContinuation(input: {
     // at once, so hold the input here with the matching reason instead of
     // dispatching a run that can only fail. A pending close settles by itself
     // and its release wakes deferred execution; the held input then starts.
-    const retainedCleanup = !remote && run.runtimeMode === "native"
+    const retainedCleanup = (!remote || retainedTurnStops.size > 0) && run.runtimeMode === "native"
       ? nativeSessionCleanupBlock({ companyId, issueId }) : null;
     if (retainedCleanup === "pending" && run.errorCode !== "native_session_cleanup_quarantined")
       return blocked("local_cleanup", "Waiting for the previous provider session to finish cleanup. Your message will start automatically.");
+    if (remote && retainedTurnStops.size > 0 &&
+        (run.errorCode === "native_session_cleanup_quarantined" || retainedCleanup === "operator_required"))
+      return blocked("local_cleanup", "Waiting for the previous provider and its tools to stop. Your message is saved.");
     if (!remote && run.runtimeMode === "native" &&
         (run.errorCode === "native_session_cleanup_quarantined" || retainedCleanup === "operator_required")) {
       // Never permission to resume the interrupted turn: new input and a
@@ -713,8 +710,9 @@ export async function admitExplicitNativeContinuation(input: {
         : blocked("local_cleanup", "Waiting for the previous provider and its tools to stop. Your message is saved.");
       stoppedSessions.push(stopped);
     }
-    if (nativeQueuedSend && await hasPendingRunCleanup(db, companyId, run.id))
+    if ((nativeQueuedSend || retainedTurnStops.size > 0) && await hasPendingRunCleanup(db, companyId, run.id))
       return blocked("cleanup_pending", "Waiting for the previous run to finish cleanup. Your message is saved.");
+    if (retainedTurnStops.size > 0 && !freshIntent) retainedSourceIds.add(run.id);
     if (freshIntent && !await hasVerifiedWorkspaceRepair(db, run)) {
       freshSources.set(run.id, freshIntent);
       freshCandidates.push({ run, intent: freshIntent, cause: action.cause, evidence: strategyEvidence, remote,
@@ -763,7 +761,9 @@ export async function admitExplicitNativeContinuation(input: {
     summary: null, exposeLowTrustRaw: false });
   const continuation = { previousRunId: previous.id, commentId, ...(retry ? { failedRunId: input.failedRunId! } : {}),
     ...(queuedInterrupt ? { queuedCommentInterruptId: input.queuedCommentInterruptId! } : {}),
-    ...(taskRetry ? { taskRetryRequestId: input.taskRetryRequestId! } : {}), ...(readiness ? { readiness } : {}) };
+    ...(taskRetry ? { taskRetryRequestId: input.taskRetryRequestId! } : {}), ...(readiness ? { readiness } : {}),
+    ...(!readiness && sources.length > 0 && sources.every(run => retainedSourceIds.has(run.id))
+      ? { retainedNativeTurnStop: true as const } : {}) };
   if (input.dryRun) return continuation;
   for (const stopped of stoppedSessions) {
     if (!stopped.retire()) return blocked("local_cleanup", "The previous provider cleanup changed. Your message is saved.");

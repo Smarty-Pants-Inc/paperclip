@@ -781,8 +781,8 @@ type WarmNativeSession = {
   sandboxLeaseId?: string;
   sandboxRunner?: { runner: CommandManagedRuntimeRunner; remoteCwd: string };
   closeFailureEvidenceLogged?: boolean;
-  /** Exact turn whose in-bound interrupt and idle snapshot retained this owner. */
-  stoppedTurnRunId?: string;
+  /** Process-local clean-stop evidence is valid only for this owner generation. */
+  stoppedTurn?: { runId: string; ownerToken: symbol; bootId: string; generation: number };
   /** A successor's retirement of this owner failed; it stays registered for its own sandbox. */
   retirementUnproven?: boolean;
   observabilityCompatibilityKey?: string;
@@ -817,20 +817,26 @@ type WarmNativeSession = {
 export function hasRetainedNativeTurnStop(run: {
   id: string; companyId: string; nativeIssueId: string | null; status: string;
   resultJson: Record<string, unknown> | null; runnerProfileJson: Record<string, unknown> | null;
-}, lease?: typeof environmentLeases.$inferSelect): boolean {
+}, lease?: typeof environmentLeases.$inferSelect, options?: { settlingAllocation?: boolean }): boolean {
   if (run.status !== "cancelled" || !hasAcknowledgedNativeStopIntent(run)) return false;
-  if (lease && (lease.heartbeatRunId !== run.id || lease.status !== "retained" || lease.releasedAt
+  if (lease && (lease.companyId !== run.companyId || lease.heartbeatRunId !== run.id
+    || !(lease.status === "retained" || options?.settlingAllocation === true && lease.status === "active") || lease.releasedAt
     || lease.cleanupStatus === "failed" || lease.metadata?.pendingCleanupInFlight === true || hasStopOnlyCleanup(lease))) return false;
   const receipt = record(run.runnerProfileJson?.nativeRetainedIdleCheckpoint);
   if (receipt.schema !== "paperclip.native-retained-idle-checkpoint.v1" || receipt.runId !== run.id
     || receipt.companyId !== run.companyId || receipt.issueId !== run.nativeIssueId) return false;
-  return [...warmNativeSessions.values()].some(owner => owner.runId === run.id && owner.stoppedTurnRunId === run.id
+  return [...warmNativeSessions.values()].some(owner => owner.runId === run.id && owner.stoppedTurn?.runId === run.id
+    && owner.stoppedTurn.ownerToken === owner.ownerToken
+    && owner.stoppedTurn.bootId === receipt.bootId && owner.stoppedTurn.generation === receipt.generation
     && owner.companyId === run.companyId && owner.issueId === run.nativeIssueId
     && owner.normalizedSessionId === receipt.sessionId
     && (!lease || owner.sandboxLeaseId === lease.id && owner.providerLeaseId === lease.providerLeaseId)
-    && !owner.busy && !owner.preparingRunId
-    && !owner.closeOnReleaseReason && !owner.controllerDetachedForRestart && !owner.retirementUnproven
-    && owner.runnerConnectionLive?.() !== false);
+    && !owner.busy && !owner.preparingRunId && !owner.instructionPreparationRunId
+    && !handedOffWarmOwnerClaimedByAnotherRun({ runId: run.id, providerLeaseId: owner.providerLeaseId ?? null })
+    // The clean-stop marker was certified while the authenticated connection
+    // was live. Warm release may park that ingress; ordinary attach still
+    // re-authenticates and proves the current Runner generation before input.
+    && !owner.closeOnReleaseReason && !owner.controllerDetachedForRestart && !owner.retirementUnproven);
 }
 
 const WARM_CLOSE_FAILURE_DETAIL_MAX = 2_000;
@@ -1474,15 +1480,26 @@ async function supersededOwnerRunnerExited(entry: WarmNativeSession): Promise<bo
 export async function handedOffWarmOwnerRunnerExited(input: { runId: string; providerLeaseId: string | null }): Promise<boolean> {
   for (const entry of warmNativeSessions.values()) {
     if (entry.runId !== input.runId || (input.providerLeaseId && entry.providerLeaseId !== input.providerLeaseId)) continue;
-    if (entry.busy || entry.preparingRunId) return false;
+    if (entry.busy || entry.preparingRunId || entry.instructionPreparationRunId
+      || handedOffWarmOwnerClaimedByAnotherRun(input)) return false;
+    // A proof sampled before cancellation may reach here after clean retention.
+    // Choose ONE authority synchronously, before the first destructive await:
+    // retention keeps this generation, or proof reserves and retires it. The
+    // existing busy/close fences also exclude attach, expiry and late retention.
+    if (entry.stoppedTurn?.runId === entry.runId && entry.stoppedTurn.ownerToken === entry.ownerToken
+      && !entry.closeOnReleaseReason && !entry.controllerDetachedForRestart && !entry.retirementUnproven) return false;
+    entry.busy = true;
+    entry.closeOnReleaseReason ??= "handed-off warm owner exit proof";
     const startedAt = Date.now();
-    const stopped = await supersededOwnerRunnerExited(entry);
-    if (entry.sandboxLeaseDb) recordWarmRetentionProbe(entry.sandboxLeaseDb,
-      { companyId: entry.companyId, agentId: entry.agentId, runId: entry.runId,
-        leaseId: entry.sandboxLeaseId ?? null },
-      { phase: "proof_runner_stop", outcome: stopped ? "stopped_runner" : "unproven",
-        runnerStopProven: stopped, elapsedMs: Math.max(0, Date.now() - startedAt) });
-    return stopped;
+    try {
+      const stopped = await supersededOwnerRunnerExited(entry);
+      if (entry.sandboxLeaseDb) recordWarmRetentionProbe(entry.sandboxLeaseDb,
+        { companyId: entry.companyId, agentId: entry.agentId, runId: entry.runId,
+          leaseId: entry.sandboxLeaseId ?? null },
+        { phase: "proof_runner_stop", outcome: stopped ? "stopped_runner" : "unproven",
+          runnerStopProven: stopped, elapsedMs: Math.max(0, Date.now() - startedAt) });
+      return stopped;
+    } finally { entry.busy = false; }
   }
   return false;
 }
@@ -13461,6 +13478,7 @@ async function executePaperclipNativeSessionAttempt(
         entry.instructionWorkingCopy = input.instructionWorkingCopy?.checkpointWarm ? undefined : input.instructionWorkingCopy;
         entry.busy = true;
         entry.ownerToken = warmSessionOwnerToken;
+        entry.stoppedTurn = undefined;
         reusingReleasedRunner = entry.released === true;
         entry.released = false;
         entry.environmentId =
@@ -13955,7 +13973,12 @@ async function executePaperclipNativeSessionAttempt(
               cancelledSessionRetained = reason === "retained";
               if (cancelledSessionRetained) {
                 retainedCancelledCheckpoint = snapshot;
-                owner!.stoppedTurnRunId = input.execution.binding.runId;
+                // Certify the live generation at the existing cancellation
+                // boundary, before release can deliberately park its ingress.
+                // An absent liveness hook is never affirmative evidence.
+                if (owner!.runnerConnectionLive?.() === true)
+                  owner!.stoppedTurn = { runId: input.execution.binding.runId, ownerToken: warmSessionOwnerToken,
+                    bootId: controller.bootId, generation: controllerGeneration };
               }
               return probe(reason, cancelledSessionRetained);
             },

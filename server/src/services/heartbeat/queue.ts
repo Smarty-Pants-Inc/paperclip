@@ -5168,7 +5168,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           if (!explicitContinuation && (executionBlocker || (continuationBlocked && !verifiedConversationReset)) && !ownsReconstructionContinuation)
             return deferBlockedExecution(continuationHold());
           if (explicitContinuation) {
-            enrichedContextSnapshot.forceFreshSession = true;
+            // Clean retained turns still enter ordinary owner/source admission.
+            // Do not immediately retire their live Pi merely because the old
+            // run was cancelled. Every nonqualified/fresh-workspace case keeps
+            // the existing fresh-session fallback.
+            enrichedContextSnapshot.forceFreshSession = explicitContinuation.retainedNativeTurnStop !== true;
             enrichedContextSnapshot.previousRunId = explicitContinuation.previousRunId;
             enrichedContextSnapshot.explicitUserContinuation = explicitContinuation;
           }
