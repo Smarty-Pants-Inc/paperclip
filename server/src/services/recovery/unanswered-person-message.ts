@@ -536,8 +536,10 @@ async function decideCarriedSteerNotices(q: Db, issue: DecisionIssue, now: Date)
   const messages = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id), inArray(issueComments.id, ids),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
-    sql`not ${answeredSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
-      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}`));
+    // neworg-floor-custody (rf-4 C1): the same ONE floor as the outbox and decideMessage; a restored steer
+    // the chat moved on past gets no card, one still in custody or carried after the move-on run keeps it.
+    personMessageOwedSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })));
   if (messages.length === 0) return none;
   const runs = await q.select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status,
     error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson,
