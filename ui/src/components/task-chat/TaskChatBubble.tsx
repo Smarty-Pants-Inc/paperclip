@@ -42,7 +42,7 @@ import {
   stripStandaloneImageEmbeds,
   type AttachmentRef,
 } from "./task-chat-attachments";
-import { STEERED_NOT_DELIVERED_TEXT } from "@/api/comment-delivery";
+import { STEERED_CARRIED_TEXT, STEERED_NOT_DELIVERED_TEXT } from "@/api/comment-delivery";
 import { TaskChatBubbleActions } from "./TaskChatBubbleActions";
 import { TaskChatSystemNotice } from "./TaskChatSystemNotice";
 import type { TaskChatMessageItem } from "./task-chat-model";
@@ -246,11 +246,9 @@ function TaskChatBubbleContent({
   return (
     <div
       data-conversation-message={isHuman ? "human" : "agent"}
-      data-testid={item.steeredIntoRunId || item.steeredDelivery === "pending" ? "task-chat-steered-message" : undefined}
+      data-testid={item.steeredIntoRunId || item.steeredDelivery ? "task-chat-steered-message" : undefined}
       data-steered-into-run-id={item.steeredIntoRunId ?? undefined}
-      data-delivery={item.steeredIntoRunId
-        ? item.steeredDelivery === "delivered" || item.steeredDelivery === "not_delivered" ? item.steeredDelivery : "sent"
-        : item.steeredDelivery === "pending" ? "pending" : undefined}
+      data-delivery={item.steeredDelivery ?? (item.steeredIntoRunId ? "sent" : undefined)}
       ref={readRef}
       className={cn(
         "flex w-full flex-col gap-1",
@@ -447,12 +445,14 @@ function TaskChatBubbleContent({
             {sentFromIMessage ? "Sent from iMessage" : null}
             {sentFromIMessage && timestamp ? " · " : null}
             {timestamp}
-            {item.steeredIntoRunId ? (
-              // Steered into the running turn: 'Sent' once the server has it,
-              // 'Delivered' once the agent has read it. Subtle, same bubble.
+            {item.steeredIntoRunId || (item.steeredDelivery && item.steeredDelivery !== "pending") ? (
+              // The server's word, subtle, on the same bubble: 'Sent' once it
+              // has it, 'Taken into the next turn' when carried, 'Delivered'
+              // once the agent has read it, 'Not delivered' on run_ended_before_read.
               <span data-testid="task-chat-steered-delivery" data-delivery={item.steeredDelivery ?? "sent"}>
                 {timestamp ? " · " : null}
                 {item.steeredDelivery === "delivered" ? "Delivered"
+                  : item.steeredDelivery === "carried" ? STEERED_CARRIED_TEXT
                   : item.steeredDelivery === "not_delivered" ? STEERED_NOT_DELIVERED_TEXT : "Sent"}
               </span>
             ) : null}
