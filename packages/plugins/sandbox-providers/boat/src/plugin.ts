@@ -1260,6 +1260,22 @@ async function createReadySpare(config: Config, key: ReadySpareKey, ttlSeconds: 
     throw error;
   }
 }
+const BOAT_STOP_STATUSES = new Set(["pending", "failing", "completed", "superseded"]);
+/**
+ * After a claim PATCH, Boat's answer must still be a spare with no stop record
+ * (rf-4 U1 F2). If a stop is there, the claim is abandoned, not forced: no
+ * resume, no delete, no second stop. The box keeps its claim name, so no claim
+ * or reconcile picks it up again, and Boat's own stop or TTL archives it. The
+ * caller's run gets a cold box. Logged fields are closed: IDs and a known status.
+ */
+function abandonSickClaim(spare: ReadySpare, observed: Record<string, unknown>, step: "patch" | "verify"): boolean {
+  const stop = observed?.stop as { status?: unknown } | null | undefined;
+  if (stop === undefined || stop === null) return false;
+  const status = typeof stop.status === "string" && BOAT_STOP_STATUSES.has(stop.status) ? stop.status : "unknown";
+  duplexLogger?.warn("Boat ready spare claim abandoned: a stop appeared after the claim; the run gets a cold box",
+    { companyId: spare.key.companyId, environmentId: spare.key.environmentId, spareId: spare.id, step, stopStatus: status });
+  return true;
+}
 function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSeconds: number, from?: string): ReadySpareOperations {
   const scoped = [["owner", `paperclip:${key.companyId}`], ["environment", key.environmentId], ["purpose", "spare"]] as Array<[string, string]>;
   return {
@@ -1268,9 +1284,9 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       return sandboxes.filter(sandbox => sandbox.labels.owner === `paperclip:${key.companyId}` && sandbox.labels.environment === key.environmentId && sandbox.labels.purpose === "spare")
         .map(sandbox => readySpareFromSandbox(sandbox, ttlSeconds));
     },
-    async get(spare) {
+    async get(spare, signal) {
       const result = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
-        method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000),
+        method: "GET", cache: "no-store", signal: signal ? AbortSignal.any([AbortSignal.timeout(10_000), signal]) : AbortSignal.timeout(10_000),
       }, false, { requireJson: true });
       const sandbox = result?.sandbox ?? result;
       if (sandbox?.id !== spare.id || !sandbox.labels) return undefined;
@@ -1316,11 +1332,15 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       }, false, { requireJson: true });
       const patched = result?.sandbox ?? result;
       if (patched?.id !== spare.id || !["ready", "idle", "running"].includes(patched.state) || (patched.name && patched.name !== name)) return false;
+      // rf-4 U1 F2: a stop Boat recorded after the clean pre-claim GET shows in
+      // the PATCH answer or the verification GET. Either one abandons the claim.
+      if (abandonSickClaim(spare, patched, "patch")) return false;
       const observed = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
         method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000),
       }, false, { requireJson: true });
       const sandbox = observed?.sandbox ?? observed;
       if (sandbox?.id !== spare.id || !["ready", "idle", "running"].includes(sandbox.state) || sandbox.name !== name) return false;
+      if (abandonSickClaim(spare, sandbox, "verify")) return false;
       spare.name = name;
       spare.state = sandbox.state;
       spare.expiresAt = parseDeadline(sandbox.archiveAfter) ?? parseDeadline(sandbox.expiresAt) ?? new Date(Date.now() + claimTtlSeconds * 1000).toISOString();
@@ -1342,6 +1362,7 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
     },
     stop: async spare => { await stopSandbox(config, spare.id); },
     desired: () => freshSpareDesired(key),
+    settingMark: () => spareSettingEpoch(key.companyId, key.environmentId),
     async allowCreate() {
       // Every spare-labelled box created in the last hour, claimed or not, in
       // any state: labels are immutable, so a claimed box still says spare.

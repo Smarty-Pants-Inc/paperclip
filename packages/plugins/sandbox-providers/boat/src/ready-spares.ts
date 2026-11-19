@@ -27,6 +27,14 @@ export const READY_SPARE_TTL_SECONDS = 1_800;
  * retries a failing final snapshot itself (bx_h63drzhu: ~39 min on 2026-11-18).
  */
 export const READY_SPARE_STOP_BACKOFF_MS = 15 * 60_000;
+/**
+ * A person waits on the warm claim (rf-4 U1 F6): it re-reads at most this many
+ * candidates from Boat, and spends at most WARM_CLAIM_DEADLINE_MS in total,
+ * before it falls back to a cold box. Adopted inventory can hold more matching
+ * spares than any target, so the pool size is not a bound.
+ */
+export const MAX_WARM_CLAIM_CANDIDATES = 5;
+export const WARM_CLAIM_DEADLINE_MS = 10_000;
 export const DEFAULT_READY_SPARE_IDLE_MINUTES = 60;
 export const MIN_READY_SPARE_IDLE_MINUTES = 15;
 export const MAX_READY_SPARE_IDLE_MINUTES = 1_440;
@@ -58,7 +66,8 @@ export type ReadySpare = {
 
 export type ReadySpareOperations = {
   list(): Promise<ReadySpare[]>;
-  get(spare: ReadySpare): Promise<ReadySpare | undefined>;
+  /** Boat's fresh record of the box. `signal` aborts the read (the warm claim's aggregate deadline). */
+  get(spare: ReadySpare, signal?: AbortSignal): Promise<ReadySpare | undefined>;
   create(key: ReadySpareKey): Promise<ReadySpare>;
   /** Best-effort one-time work after a newly created spare is ready. */
   warmUp?(spare: ReadySpare): Promise<"completed" | "missing_pack" | "failed" | "timeout">;
@@ -71,6 +80,13 @@ export type ReadySpareOperations = {
    * stop decided under an older (idle) view never outruns a newer event.
    */
   desired?(): Promise<number>;
+  /**
+   * A token of the spare setting now (rf-4 U1 F3). A reconcile pass reads it
+   * when it begins and again right before its spare create POSTs; if it moved
+   * ('off' or a newer setting landed during the pass's awaits), the pass sends
+   * no create and the newest instruction runs instead.
+   */
+  settingMark?(): string;
   /**
    * Optional provider-side hourly check; fail closed on an unknown result.
    * `false` refuses (churn_cap). An object reports the durable count of spare
@@ -674,18 +690,26 @@ export class ReadySpareKeeper {
     this.inFlightClaims.set(poolId, (this.inFlightClaims.get(poolId) ?? 0) + 1);
     const reason: "claim_conflict" = "claim_conflict";
     const unknown: ReadySpare[] = [];
+    let scanTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       // Re-read each candidate from Boat before the claim. A spare whose stop
       // is pending or failing, or that is no longer a ready idle spare, leaves
       // the claim index; an unreadable one stays indexed but is not claimed.
+      // The scan is capped in candidates and in total time (rf-4 U1 F6).
+      const deadline = this.now() + WARM_CLAIM_DEADLINE_MS;
+      const scanBudget = new AbortController();
+      scanTimer = setTimeout(() => scanBudget.abort(new Error("warm claim deadline passed")), WARM_CLAIM_DEADLINE_MS);
+      let candidates = 0;
       for (;;) {
         let fresh: ReadySpare | undefined;
         let known = true;
-        try { fresh = await operations.get(spare); } catch { known = false; }
+        candidates++;
+        try { fresh = await operations.get(spare, scanBudget.signal); } catch { known = false; }
         if (this.stopping) return { outcome: "cold", reason };
         if (known && fresh?.id === spare.id && claimableNow(fresh, key, this.now())) break;
         if (!known) unknown.push(spare);
         this.claiming.delete(spare.id);
+        if (candidates >= MAX_WARM_CLAIM_CANDIDATES || this.now() >= deadline || scanBudget.signal.aborted) return { outcome: "cold", reason: "no_ready_spare" };
         const next = pool.findIndex(item => !this.claiming.has(item.id) && !this.stoppingSpares.has(item.id) && readyAndHealthy(item, key, this.now()));
         if (next < 0) return { outcome: "cold", reason: "no_ready_spare" };
         [spare] = pool.splice(next, 1);
@@ -698,6 +722,7 @@ export class ReadySpareKeeper {
     } catch {
       return { outcome: "cold", reason };
     } finally {
+      if (scanTimer) clearTimeout(scanTimer);
       this.claiming.delete(spare.id);
       for (const item of unknown) if (!pool.some(entry => entry.id === item.id)) pool.push(item);
       const remainingClaims = (this.inFlightClaims.get(poolId) ?? 1) - 1;
@@ -775,6 +800,7 @@ export class ReadySpareKeeper {
   private async reconcileOnce(key: ReadySpareKey, desired: number, operations: ReadySpareOperations, strictBoatOnly = false): Promise<void> {
     if (this.stopping) return;
     const poolId = readySparePoolKey(key);
+    const settingMark = operations.settingMark?.();
     const listed = await operations.list();
     if (this.stopping) return;
     const keep: ReadySpare[] = [];
@@ -878,6 +904,16 @@ export class ReadySpareKeeper {
       reservations.push(reservation);
     }
     if (!reservations.length) return;
+    // Right before the POSTs: 'off' (or a newer setting) that landed during
+    // this pass's inventory reads cancels its unsent creates (rf-4 U1 F3).
+    // The newest instruction runs next; a pass that has none is re-run, so a
+    // setting that keeps spares on still refills.
+    if (operations.settingMark && operations.settingMark() !== settingMark) {
+      const recent = this.windowed(this.recentCreates, key.companyId);
+      for (const reservation of reservations) recent.delete(reservation);
+      if (!this.pendingReconciliations.has(poolId)) this.pendingReconciliations.set(poolId, { key, desired, operations, strictBoatOnly });
+      return;
+    }
     this.inFlightCreates.set(poolId, (this.inFlightCreates.get(poolId) ?? 0) + reservations.length);
     try {
       const results = await Promise.allSettled(reservations.map(async () => {
