@@ -32,7 +32,8 @@ import {
   settleConversationTurn,
   undeliveredConversationComments,
 } from "../services/agent-conversations.js";
-import { answeredPersonMessageSql } from "../services/person-message-answer.js";
+import { answeredPersonMessageSql, personMessageOwedSql } from "../services/person-message-answer.js";
+import { commentCarriedSql, commentIdsCarriedElsewhere } from "../services/interrupt-carry-custody.js";
 import { waitForPendingCommentSteers } from "../services/conversation-steering.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
@@ -405,6 +406,39 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     }
   });
 
+  it("refusal custody diagnostic: direct predicates and real sweep at unfixed HEAD", async () => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
+    mocks.steer.mockRejectedValueOnce(new NativeSessionSteeringError("steering_stale_turn", "Turn ended"));
+    const response = await postDefault(chat, "Diagnostic refused message").expect(201);
+    await waitForPendingCommentSteers();
+    const messageId = response.body.id;
+    async function snapshot(stage: string) {
+      const m = { id: sql`m.id`, companyId: sql`m.company_id`, issueId: sql`m.issue_id`, createdAt: sql`m.created_at` };
+      const rows = await db.execute(sql`select ${answeredPersonMessageSql(m)} as answered, ${personMessageOwedSql(m)} as owed,
+        ${commentCarriedSql(chat.companyId, chat.issue.id, m.id)} as carried_sql from issue_comments m where m.id = ${messageId}::uuid`);
+      return { stage, rows, dispatchCarried: [...await commentIdsCarriedElsewhere(db, { companyId: chat.companyId, issueId: chat.issue.id, commentIds: [messageId] })],
+        undelivered: (await undeliveredConversationComments(db, chat.companyId, chat.issue.id)).map(c => c.id),
+        runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId)),
+        wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId)) };
+    }
+    const beforeEnd = await snapshot("refused-before-end");
+    runningProcesses.delete(chat.runId);
+    await finishTurn(chat, { log: false }); await joinOwnedWork();
+    const afterEnd = await snapshot("after-turn-end");
+    const outcomes = [];
+    let now = new Date(Date.now() + 600_000);
+    for (let i = 0; i < 4; i++) {
+      const outcome = await settleUnansweredPersonMessage(db, { companyId: chat.companyId, issueId: chat.issue.id, now });
+      outcomes.push(outcome);
+      if (outcome.kind !== "pending") break;
+      now = new Date(outcome.recheckAt + 1);
+    }
+    const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+      sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + messageId}`));
+    if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `${process.env.REFUSAL_EVIDENCE_LABEL ?? "fixed"}-predicates.json`), JSON.stringify({ messageId, beforeEnd, afterEnd, outcomes, card: notices.length > 0, notices }, null, 2));
+  });
+
   it.each(["starting", "saving-files", "non-Pi", "stale-turn"] as const)("S-c/S-c2: %s uses the ordinary next-message path once", async variant => {
     const chat = await seedChat(); await attachSteerable(chat);
     if (variant === "starting" || variant === "saving-files") mocks.probe.mockResolvedValue({ disposition: "temporarily_unavailable", activeTurnId: null });
@@ -435,7 +469,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
 
   // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21272
   // A3: exercise the real comment POST and ordinary wake admission/release.
-  it.each(["generic", "disconnect", "refusal", "probe", "unexpected-disposition"] as const)("A3: %s steer failure returns 201 and the ordinary successor answers once", async variant => {
+  it.each(["generic", "disconnect", "refusal", "probe", "unexpected-disposition", "newer-first", "stale-turn"] as const)("A3: %s steer failure returns 201 and the ordinary successor answers once", async variant => {
     const chat = await seedChat(); await attachSteerable(chat);
     const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
     let refuseAfter201: (() => void) | undefined;
@@ -446,6 +480,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     else if (variant === "unexpected-disposition") mocks.steer.mockResolvedValueOnce({ disposition: "unexpected" });
     else mocks.steer.mockRejectedValueOnce(variant === "refusal"
       ? new NativeSessionSteeringError("steering_rejected", "refused")
+      : variant === "stale-turn" || variant === "newer-first" ? new NativeSessionSteeringError("steering_stale_turn", "Turn ended")
       : variant === "disconnect" ? new TypeError("RPC disconnected") : new Error("private person text must not be logged"));
     const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
     const unsubscribe = subscribeCompanyLiveEvents(chat.companyId, event => { events.push(event); });
@@ -483,6 +518,19 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup);
     const carriers = await carriersOf(chat, messageId);
     expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+    if (variant === "newer-first") {
+      // Controlled completed N run: exercise refusal custody even when a later
+      // message's answer is already persisted before M's successor executes.
+      const newer = await issueService(db).addComment(chat.issue.id, "N, answered first", { userId: owner });
+      const [newerRun] = await db.insert(heartbeatRuns).values({ companyId: chat.companyId, agentId: chat.agentId,
+        status: "succeeded", startedAt: new Date(), finishedAt: new Date(),
+        contextSnapshot: { issueId: chat.issue.id, conversationMode: true, conversationSessionGeneration: 0,
+          commentId: newer.id, wakeCommentId: newer.id, wakeCommentIds: [newer.id] },
+      }).returning();
+      await issueService(db).addComment(chat.issue.id, "ANSWER:N", { agentId: chat.agentId, runId: newerRun!.id });
+      expect(await answered(newer.id)).toBe(true);
+      expect(await answered(messageId)).toBe(false);
+    }
     const seen: string[][] = [];
     const responder = createServer(async (req, res) => {
       try {
@@ -532,6 +580,47 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       responder.close(); await once(responder, "close");
     }
   }, 25_000);
+
+  it("refusal days-old: boot outbox and two sweeps never replay the historical coalesced receipt", async () => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
+    mocks.steer.mockRejectedValueOnce(new NativeSessionSteeringError("steering_stale_turn", "Turn ended"));
+    const response = await postDefault(chat, "M, refused two days ago").expect(201);
+    await waitForPendingCommentSteers();
+    const messageId = response.body.id;
+    const old = new Date(Date.now() - 2 * 24 * 60 * 60_000);
+    await db.update(issueComments).set({ createdAt: old, updatedAt: old }).where(eq(issueComments.id, messageId));
+    // Persist exactly the broken base's observed terminal receipt, not a new
+    // definition of outbox custody. Rejected historical messages stay consumed.
+    await db.update(agentWakeupRequests).set({ status: "coalesced", finishedAt: old, requestedAt: old,
+      error: "Sent with the chat's other queued messages" }).where(eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${messageId}`));
+    await db.update(heartbeatRuns).set({ startedAt: new Date(old.getTime() - 60_000) }).where(eq(heartbeatRuns.id, chat.runId));
+    runningProcesses.delete(chat.runId); await finishTurn(chat, { log: false }); await joinOwnedWork();
+    const newer = await issueService(db).addComment(chat.issue.id, "N, later person message", { userId: owner });
+    const [laterRun] = await db.insert(heartbeatRuns).values({ companyId: chat.companyId, agentId: chat.agentId,
+      status: "succeeded", startedAt: new Date(), finishedAt: new Date(),
+      contextSnapshot: { issueId: chat.issue.id, conversationMode: true, conversationSessionGeneration: 0,
+        commentId: newer.id, wakeCommentId: newer.id, wakeCommentIds: [newer.id] },
+    }).returning();
+    await issueService(db).addComment(chat.issue.id, "ANSWER:N", { agentId: chat.agentId, runId: laterRun!.id });
+    const beforeRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId));
+    const beforeWakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId));
+    expect(await answered(messageId)).toBe(false);
+    const outcomes = [];
+    for (let i = 0; i < 2; i++) {
+      await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup);
+      outcomes.push(await settleUnansweredPersonMessage(db, { companyId: chat.companyId, issueId: chat.issue.id, now: new Date(Date.now() + 600_000) }));
+      await joinOwnedWork();
+    }
+    const afterRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId));
+    const afterWakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId));
+    expect(afterRuns.map(r => r.id).sort()).toEqual(beforeRuns.map(r => r.id).sort());
+    expect(afterWakes.map(w => w.id).sort()).toEqual(beforeWakes.map(w => w.id).sort());
+    const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+      sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + messageId}`));
+    expect(notices.length).toBeLessThanOrEqual(1);
+    if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, "days-old.json"), JSON.stringify({ messageId, beforeRuns, beforeWakes, afterRuns, afterWakes, outcomes, notices }, null, 2));
+  });
 
   it('A3 S9 re-pin, RFL 10:29Z: "Widening the window from m\'s read to the end of that turn matches v1"', async () => {
     const chat = await seedChat(); await attachSteerable(chat);
