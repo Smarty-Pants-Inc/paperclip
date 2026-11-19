@@ -1823,6 +1823,8 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
       const settled = prepareHeartbeatGitHubEnvironment({ defer: false,
         target: { kind: "remote", transport: "sandbox", providerKey: "boat", remoteCwd: "/workspace", runner: { execute } } as never,
         cwd: "/controller/workspace", env: {}, hostCredentials: false, networkAccess: true,
+        // heartbeat.ts passes the selected environment, so the seam classifies the immediate call.
+        ...({ environment: boatEnvironment, providerLeaseId: "box-1" } as object),
       }).then(() => { throw new Error("expected the probe to fail"); }, (error: unknown) => error);
       await vi.advanceTimersByTimeAsync(2_000);
       const error = await settled;
@@ -1838,8 +1840,8 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
 
   it.each(["exit", "timeout"] as const)("GP-R1: a final execution-target Git probe failure (%s) is transient and queues one bounded retry", async kind => {
     const f = await fixture();
-    const error = await classifyAsHeartbeatSetup(await probeFailure(kind === "exit"
-      ? { exitCode: 1, timedOut: false, stdout: "" } : { exitCode: null, timedOut: true, stdout: "" }));
+    const error = await probeFailure(kind === "exit"
+      ? { exitCode: 1, timedOut: false, stdout: "" } : { exitCode: null, timedOut: true, stdout: "" });
     f.deps.scheduleBoundedRetryForRun.mockResolvedValueOnce({ outcome: "scheduled", runId: randomUUID(), issueId: null } as never);
     await f.completion.failRunSetup(f.setup(error));
     const failed = await read(f.run.id);
@@ -1856,7 +1858,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
 
   it("GP-R3: the person's line for a final Git probe failure names the sandbox, says no work started and that it retries", async () => {
     const f = await fixture();
-    const error = await classifyAsHeartbeatSetup(await probeFailure({ exitCode: 1, timedOut: false, stdout: "" }));
+    const error = await probeFailure({ exitCode: 1, timedOut: false, stdout: "" });
     f.deps.scheduleBoundedRetryForRun.mockResolvedValueOnce({ outcome: "not_scheduled", reason: "Fixture scheduler boundary", issueId: null });
     await f.completion.failRunSetup(f.setup(error));
     const failed = await read(f.run.id);
