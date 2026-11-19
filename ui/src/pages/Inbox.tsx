@@ -20,7 +20,7 @@ import { executionWorkspacesApi } from "../api/execution-workspaces";
 import { issuesApi } from "../api/issues";
 import { useSecondTick } from "../hooks/useSecondTick";
 import { taskRetryNotStartedReason } from "../hooks/useTaskRetry";
-import { readSavedMessageHold } from "../lib/saved-message-wait";
+import { readSavedMessageHold, readSavedMessageRowWait } from "../lib/saved-message-wait";
 import { agentsApi } from "../api/agents";
 import { heartbeatsApi } from "../api/heartbeats";
 import { instanceSettingsApi } from "../api/instanceSettings";
@@ -407,11 +407,14 @@ export function FailedRunInboxRow({
   const interruption = issue?.interruption;
   // The task's saved message is HELD for the person's Continue: the row says the task's ONE sentence (the same the
   // thread's card says) and offers that ONE action. A plain Retry would be accepted and start nothing.
-  const savedMessageHold = readSavedMessageHold(interruption);
+  // While it still WAITS for the previous reply's environment to stop, the row says that sentence and offers nothing
+  // to press: the message starts by itself.
+  const savedMessageWait = readSavedMessageRowWait(interruption);
+  const savedMessageHold = savedMessageWait?.hold ?? null;
   useSecondTick(interruption?.state === "retry_scheduled");
   const retrySeconds = Math.max(0, Math.ceil((Date.parse(interruption?.nextRetryAt ?? "") - Date.now()) / 1000));
   const displayError = isRetrying ? "Thinking"
-    : savedMessageHold ? savedMessageHold.line
+    : savedMessageWait ? savedMessageWait.line
     : interruption?.retryWait ? interruption.retryWait.message
     : interruption?.state === "working" ? "Thinking"
     : interruption?.state === "retry_scheduled" ? `Trying again in ${retrySeconds}s…`
@@ -423,7 +426,8 @@ export function FailedRunInboxRow({
           confirm_owner_stop: "Confirm the previous server stopped",
           confirm_run_stopped: "Confirm the previous run stopped",
         }[interruption.userAction ?? "resume"]) : runFailureMessage(run);
-  const retryAvailable = Boolean(savedMessageHold) || !interruption || (interruption.canRetry && interruption.retryAction !== "move_forward");
+  const retryAvailable = savedMessageWait ? Boolean(savedMessageHold)
+    : !interruption || (interruption.canRetry && interruption.retryAction !== "move_forward");
   const retryLabel = savedMessageHold ? savedMessageHold.continueLabel : "Retry";
   const showUnreadSlot = unreadState !== null;
   const showUnreadDot = unreadState === "visible" || unreadState === "fading";
@@ -485,8 +489,8 @@ export function FailedRunInboxRow({
             <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
               {!interruption && <StatusBadge status={run.status} />}
               {linkedAgentName && issue ? <span>{linkedAgentName}</span> : null}
-              <span className={savedMessageHold && !isRetrying ? "basis-full text-foreground" : "truncate max-w-(--sz-300px)"}
-                data-testid={savedMessageHold ? "failed-run-saved-message-hold" : undefined}>{displayError}</span>
+              <span className={savedMessageWait && !isRetrying ? "basis-full text-foreground" : "truncate max-w-(--sz-300px)"}
+                data-testid={savedMessageHold ? "failed-run-saved-message-hold" : savedMessageWait ? "failed-run-saved-message-wait" : undefined}>{displayError}</span>
               <span>{timeAgo(run.createdAt)}</span>
             </span>
           </span>

@@ -935,8 +935,10 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       // The task's saved message is HELD for the person's Continue (execution-blocker.ts savedMessageWait): a plain
       // Retry is accepted and starts nothing. The projection says so in the blocker's own words, so a surface that has
       // no execution blocker (a list row, the Inbox) offers the hold's ONE action instead of that Retry.
-      if (presentation && blocker?.savedMessageWait === "continue_required")
-        presentation.savedMessageWait = { state: "continue_required", line: blocker.nextAction };
+      // One step earlier the same message WAITS for the previous reply's box to stop and starts by itself
+      // ("waiting"): the projection carries that sentence too, so the row says it and offers nothing to press.
+      if (presentation && (blocker?.savedMessageWait === "continue_required" || blocker?.savedMessageWait === "waiting"))
+        presentation.savedMessageWait = { state: blocker.savedMessageWait, line: blocker.nextAction };
       if (!presentation || !blocker || blocker.canRetry) continue;
       presentation.canRetry = false;
       delete presentation.retryAction;
