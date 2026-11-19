@@ -113,7 +113,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
    * Only the database controller checkpoint and recovery pointer survive. */
   async function seedRecoveredPriorRun(control: "settled" | "pending-command" | "unanswered-tool"
     | "failed-turn-start" | "rejected-turn-start" | "indeterminate-turn-start" | "unknown-outcome-turn-start"
-    | "unsuperseded-unknown-outcome-turn-start" | "failed-suspend" | "pending-attach" | "pending-tool-result" = "settled",
+    | "unsuperseded-unknown-outcome-turn-start" | "failed-suspend" | "pending-attach" | "pending-tool-result" | "pending-suspend" = "settled",
     options: { controller?: { bootId: string; pid: number; processStartedAt: Date }; provider?: "codex" | "acpx" | "opencode" | "pi_rpc";
       lifecycle?: "warm"; governedWait?: boolean; issueId?: string } = {}) {
     const issueId = options.issueId ?? randomUUID(), workspaceId = randomUUID(), runId = randomUUID();
@@ -163,8 +163,10 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       const answered = answers as Record<string, unknown>;
       // A warm Runner stays ready after its turn: its controller sends no suspend.
       const commands = ["run.prepare", "session.open", ...(control in answered ? ["turn.start"] : []), "turn.start",
-        ...(options.lifecycle === "warm" ? [] : ["runner.suspend"])].map(type => controller.queueCommand(type));
-      for (const command of control === "pending-command" ? commands.slice(0, -1) : commands) {
+        // pending-suspend: a person's Stop closed the session; its close barrier
+        // queued runner.suspend and the Runner never answered it.
+        ...(options.lifecycle === "warm" && control !== "pending-suspend" ? [] : ["runner.suspend"])].map(type => controller.queueCommand(type));
+      for (const command of control === "pending-command" || control === "pending-suspend" ? commands.slice(0, -1) : commands) {
         Object.assign(command, { status: "completed", result: { status: "completed" } });
       }
       if (control in answered) Object.assign(commands[2]!, answers[control as keyof typeof answers]);
@@ -1268,6 +1270,65 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       status: "expired", releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
     await stopSettledOwner(prior);
     expect(await followUp.start()).toBe(outcome);
+  }, 60_000);
+
+  // adopt-suspend-pending (live 11-19, B+A3): Paul Stops a warm Pi turn
+  // running `sleep 60`; the Stop's close barrier queued runner.suspend and the
+  // Runner never answered before its box was stopped (Boat's stop still
+  // pending, so the prior lease is not ended). 30 s later "what is 9 + 10?"
+  // got a NEW box and failed after 13 s at the retirement fence with
+  // journal_commands_unsettled(runner.suspend.pending), then a recovery card
+  // and an automatic re-run of the stopped sleeps. A settled person Stop
+  // settles its own Runner's lifecycle commands: the message runs once.
+  async function stoppedWithPendingSuspend(stop: Parameters<typeof stopSettledOwner>[1] = {},
+    control: "pending-suspend" | "pending-command" = "pending-suspend") {
+    const prior = await seedRecoveredPriorRun(control, { provider: "pi_rpc", lifecycle: "warm" });
+    const followUp = await admitFollowUp(prior);
+    // The stopped run's own box: Boat's stop not yet confirmed, lease still active.
+    const priorEnvironmentId = randomUUID();
+    await db.insert(environments).values({ id: priorEnvironmentId, name: `stopping-${prior.runId}`, driver: "sandbox" });
+    await db.insert(environmentLeases).values({ companyId, environmentId: priorEnvironmentId, issueId: prior.issueId,
+      heartbeatRunId: prior.runId, provider: "boat", providerLeaseId: `bx_stopping_${prior.runId.slice(0, 8)}`,
+      status: "active", metadata: { remoteCwd: "/workspace" } });
+    await stopSettledOwner(prior, { events: [
+      { eventType: "harness.diagnostic", payload: { code: "provider_interrupt_requested", pendingCallIds: [] } },
+    ], ...stop });
+    return { prior, followUp };
+  }
+
+  it.each(["created", "replacement"] as const)(
+    "adopt-suspend-pending (a): a person's Stop that left runner.suspend pending; the next message runs on a %s box, once, with no recovery card", async outcome => {
+      const { prior, followUp } = await stoppedWithPendingSuspend();
+      expect(await followUp.start(outcome)).toBe(ADMITTED);
+      expect(followUp.logs.join("")).not.toContain("retirement_refused");
+      expect(await quarantined()).toEqual([]);
+      expect(await archivedOwners(await sessionRoot())).toEqual([prior.runId]);
+      // The same provider thread continues; nothing raised a recovery action.
+      expect(followUp.selectedRunId).toBe(prior.runId);
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, prior.issueId))).toEqual([]);
+      expect(await fenceEvents(followUp.runId)).toEqual([]);
+    }, 60_000);
+
+  it.each<[string, { stop: false | Parameters<typeof stopSettledOwner>[1]; control?: "pending-command" }, string]>([
+    // The fence's purpose: an owner nobody Stopped, its suspend unanswered.
+    ["no person Stop (committed owner)", { stop: false }, stranded("journal_commands_unsettled(runner.suspend.pending)")],
+    ["a Stop whose interrupt left a tool call pending", { stop: { events: [{ eventType: "harness.diagnostic",
+      payload: { code: "provider_interrupt_requested", pendingCallIds: ["call-bash"] } }] } }, stranded("owner_stop_unsettled")],
+    ["an unacknowledged Stop", { stop: { ack: "none" } }, stranded("journal_commands_unsettled(runner.suspend.pending)")],
+    // Only the Runner's own lifecycle commands: a pending turn.start is still owed work.
+    ["a Stop with a turn.start never answered", { stop: {}, control: "pending-command" },
+      stranded("journal_commands_unsettled(turn.start.pending)")],
+  ])("adopt-suspend-pending (b) control: %s still refuses", async (_label, options, refusal) => {
+    if (options.stop === false) {
+      const prior = await seedRecoveredPriorRun("pending-suspend", { provider: "pi_rpc", lifecycle: "warm" });
+      const followUp = await admitFollowUp(prior);
+      expect(await followUp.start("created")).toBe(refusal);
+      expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
+      return;
+    }
+    const { followUp } = await stoppedWithPendingSuspend(options.stop, options.control);
+    expect(await followUp.start("created")).toBe(refusal);
+    expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
   }, 60_000);
 
   /** H6 (recovery/service.ts): a warm Stop whose release was skipped raises
