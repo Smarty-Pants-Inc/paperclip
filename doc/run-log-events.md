@@ -114,6 +114,24 @@ The preparation spans of a native run (`heartbeat.queue`, `heartbeat.prepare_*`,
 provider starts, and before the run's trace finishes. They can appear after the
 first Runner events of the run.
 
+Native executor deferrals first commit the exact content-free receipt to
+`native_run_diagnostics`. This small custody INSERT does not allocate a run-event
+sequence or update/lock the run for sequence allocation. A failed custody write
+propagates before the caller may continue admission. Retained Pi reuse decisions
+(`run.startup.reuse` for Runner and provider session) enter custody together before
+their delivery is scheduled. Confirmed sink delivery removes its custody row;
+sink failure or controller death leaves the original receipt, including span
+names, sanitized attributes and timings, durably available in the instance DB.
+Recovery and normal finalization label leftovers with
+`loss_reason = 'delivery_unconfirmed_at_finalization'`. This accounts for possible
+run-log delivery loss, not loss of an authoritative Runner event. A crash between
+sink commit and custody acknowledgement can leave both copies, so recovery does
+not replay them or claim confirmed delivery. The journal's run-scoped foreign key
+cascades on run deletion; it adds no polling or execution authority. These records
+are run-log custody only, not Telemetry or a new OpenTelemetry export. The additive
+migration starts with an empty journal; old sessions, checkpoints and pack identity
+stay unchanged. Receipts already lost by an older release are not reconstructed.
+
 `run.performance.span` also records `task.time_to_first_token` once per native
 dispatch at the first newly committed deliverable text: assistant or reasoning
 `item.delta`/`item.completed`, a redaction tail released at completion, or an

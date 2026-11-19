@@ -1,4 +1,5 @@
 import { NATIVE_WITHHELD_REPLY_SCHEMA, pendingNativeWithheldReply } from "./native-withheld-reply-trigger.js";
+import { accountUnconfirmedNativeRunDiagnostics } from "./native-run-diagnostics.js";
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { REMOTE_WORKSPACE_SANDBOX_DISK_FULL_CODE } from "../remote-workspace-transport.js";
@@ -1583,6 +1584,10 @@ async function finalizeNativeRunAndProject(input: {
     .then((rows) => rows[0] ?? null);
   if (!admittedRun || admittedRun.runtimeMode !== "native")
     throw new Error("native_finalization_run_missing");
+  // Normal trace completion removes confirmed deliveries. After a crash the
+  // same finalization/recovery entry point retains and labels every leftover.
+  await accountUnconfirmedNativeRunDiagnostics(input.db, { companyId: admittedRun.companyId, runId: admittedRun.id })
+    .catch(err => logger.warn({ err, runId: admittedRun.id }, "Native diagnostic delivery accounting deferred"));
   const claim = await claimCoordinator({
     db: input.db,
     runId: input.runId,

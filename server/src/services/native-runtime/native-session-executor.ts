@@ -1,4 +1,5 @@
 import { isRetryableTransactionError, withTransactionRetry } from "../transaction-retry.js";
+import { nativeRunDiagnosticCustody } from "./native-run-diagnostics.js";
 import { nativeReconciliationError, freshThreadRefusalCode, isFreshThreadRefusal, type FreshThreadRefusalCode,
   RESTORE_UNAVAILABLE_ON_NEW_BOX_CODE, RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON, restoreUnavailableOnNewBoxCode,
   LAUNCH_PROFILE_MISMATCH_CODE, LAUNCH_PROFILE_CHANGED_REASON } from "./runner-reconciliation-refusal.js";
@@ -11960,6 +11961,7 @@ async function executePaperclipNativeSessionAttempt(
     runId: traceRunId,
     startedAtMs: preparationStarts.runStartedAtMs,
     onEvent: input.onEvent ? event => measureNativeControllerStep("span_persistence", () => input.onEvent!(event)) : undefined,
+    custody: input.onEvent ? nativeRunDiagnosticCustody(input.db, input.execution.binding) : undefined,
     onFinish: () => {
       finishControllerSteps();
       if (nativeRunRecoveryFlushers.get(traceRunId) === flushRecovery) nativeRunRecoveryFlushers.delete(traceRunId);
@@ -13289,23 +13291,26 @@ async function executePaperclipNativeSessionAttempt(
         if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
         entry.idleTimer = null;
         existingWarmSession = entry.session;
-        const emitReuse = async () => {
-          await timeController("warm_reuse_runner", () => emitStartupReuse(input.onEvent, "runner", { state: "reused", reason: "verified_reuse" }));
+        const emitReuse = async (sink = input.onEvent) => {
+          await timeController("warm_reuse_runner", () => emitStartupReuse(sink, "runner", { state: "reused", reason: "verified_reuse" }));
           executionContext?.assertOpen();
-          await timeController("warm_reuse_provider_session", () => emitStartupReuse(input.onEvent, "provider_session", { state: "reused", reason: "verified_reuse" }));
+          await timeController("warm_reuse_provider_session", () => emitStartupReuse(sink, "provider_session", { state: "reused", reason: "verified_reuse" }));
           trace.setBudgetStart("warm");
         };
         try {
           if (input.execution.provider.kind === "pi_rpc" && !executionContext) {
             // All owner/configuration/instruction fences above have passed.
-            // These two receipts are diagnostics (emitStartupReuse already
-            // swallows sink failures), not admission authority. Keep their
-            // order and drain them with the trace, without serially awaiting
-            // two run-log writes before a retained Pi turn can start.
+            // Commit the two known decisions together without allocating a
+            // run-event seq. Then defer their slow sink writes, preserving
+            // custody even if emitStartupReuse swallows a sink failure.
             // Startup-context providers keep their deadline/Stop wait intact.
+            const receipts: AdapterRuntimeEvent[] = [];
+            const collect = async (event: AdapterRuntimeEvent) => { receipts.push(event); };
+            await emitStartupReuse(collect, "runner", { state: "reused", reason: "verified_reuse" });
+            await emitStartupReuse(collect, "provider_session", { state: "reused", reason: "verified_reuse" });
             trace.setBudgetStart("warm");
-            trace.defer(emitReuse);
-          } else if (executionContext) await executionContext.wait(emitReuse);
+            await trace.deferWithCustody(receipts, emitReuse);
+          } else if (executionContext) await executionContext.wait(() => emitReuse());
           else await emitReuse();
         } catch (error) {
           if (lifecyclePolicy.mode === "warm") {

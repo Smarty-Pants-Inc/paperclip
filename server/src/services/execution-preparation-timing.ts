@@ -45,6 +45,9 @@ type PreparationPhase = "environment_selection" | "execution_configuration" | "s
   | "warm_task_describe" | "portable_source" | "warm_task_resume" | "warm_owner_detach"
   | "warm_checkpoint_recovery" | "failed_attachment_read" | "warm_owner_wait" | "warm_backup_verify"
   | "warm_terminal_log" | "warm_runner_probe" | "warm_recovery_inspect"
+  | "startup_context_clear" | "warm_owner_forget" | "warm_admission_task_describe" | "warm_predecessor_retire"
+  | "warm_owner_projection" | "warm_instruction_check" | "warm_instruction_close" | "warm_reuse_runner"
+  | "warm_reuse_provider_session" | "warm_reuse_release" | "case_handoff_read" | "interaction_read" | "tools_refresh_read"
   | "runner_identity_write" | "controller_identity" | "controller_process";
 
 export type ExecutionPhase =

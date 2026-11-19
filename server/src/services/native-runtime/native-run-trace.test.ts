@@ -625,6 +625,51 @@ describe("time to first token anchor", () => {
 });
 
 describe("deferred diagnostics", () => {
+  it("waits for durable custody, never admits on a failed capture, and acknowledges only successful delivery", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const acknowledge = vi.fn(async () => {});
+    const custody = vi.fn(async () => { await gate; return acknowledge; });
+    const sink = vi.fn(async () => {});
+    const trace = createNativeRunTrace({ runId: "durable-deferred", custody, onEvent: sink, traceContext: createRecordingTraceContext().traceContext });
+    let returned = false;
+    const record = trace.record({ name: "runner.session.bootstrap", startedAtMs: 1, endedAtMs: 2 }, { deferRunLog: true }).then(() => { returned = true; });
+    await Promise.resolve();
+    expect(returned).toBe(false); expect(sink).not.toHaveBeenCalled();
+    release(); await record; await trace.finish("ok");
+    expect(acknowledge).toHaveBeenCalledOnce();
+    expect(custody.mock.calls).toHaveLength(1);
+
+    const rejectedSink = vi.fn(async () => {});
+    const rejected = createNativeRunTrace({ runId: "failed-custody", custody: async () => { throw new Error("custody failed"); },
+      onEvent: rejectedSink, traceContext: createRecordingTraceContext().traceContext });
+    await expect(rejected.record({ name: "runner.session.bootstrap", startedAtMs: 1, endedAtMs: 2 }, { deferRunLog: true })).rejects.toThrow("custody failed");
+    expect(rejectedSink).not.toHaveBeenCalled();
+    await rejected.finish("failed");
+  });
+
+  it("uses the awaited sink when no custody store is supplied and propagates its failure", async () => {
+    const failure = new Error("sink unavailable");
+    const trace = createNativeRunTrace({ runId: "no-custody", onEvent: async () => { throw failure; },
+      traceContext: createRecordingTraceContext().traceContext });
+    await expect(trace.record({ name: "runner.session.bootstrap", startedAtMs: 1, endedAtMs: 2 }, { deferRunLog: true })).rejects.toBe(failure);
+    await expect(trace.deferWithCustody([{ eventType: "run.startup.reuse" }], async sink => {
+      await sink?.({ eventType: "run.startup.reuse" }).catch(() => {});
+    })).rejects.toThrow("native_run_diagnostic_delivery_unconfirmed");
+    await trace.finish("failed");
+  });
+
+  it("keeps custody when a deferred non-span emitter swallows sink failure", async () => {
+    const acknowledge = vi.fn(async () => {});
+    const event = { eventType: "run.startup.reuse", payload: { layer: "runner", state: "reused" } };
+    const custody = vi.fn(async () => acknowledge);
+    const trace = createNativeRunTrace({ runId: "durable-reuse", custody, onEvent: async () => { throw new Error("sink failed"); },
+      traceContext: createRecordingTraceContext().traceContext });
+    await trace.deferWithCustody([event], async sink => { await sink?.(event).catch(() => {}); });
+    await trace.finish("ok");
+    expect(custody).toHaveBeenCalledWith([event]); expect(acknowledge).not.toHaveBeenCalled();
+  });
+
   it("never blocks the caller and settles before the trace finishes", async () => {
     const events: AdapterRuntimeEvent[] = [];
     const trace = createNativeRunTrace({
@@ -660,7 +705,8 @@ describe("deferred diagnostics", () => {
       await gate;
       written.push((event.payload as Record<string, unknown>)?.span);
     });
-    const trace = createNativeRunTrace({ runId: "deferred-rows", startedAtMs: 1_000, traceContext, onEvent: write });
+    const trace = createNativeRunTrace({ runId: "deferred-rows", startedAtMs: 1_000, traceContext, onEvent: write,
+      custody: async () => async () => {} }); // In-memory test port; PG custody is integration-tested.
     trace.start("task.prepare", { parentName: "task.provider_session", startedAtMs: 1_000 });
     const names = ["heartbeat.queue", "heartbeat.prepare_before_environment", "heartbeat.prepare_after_environment"];
     for (const [index, name] of names.entries()) {

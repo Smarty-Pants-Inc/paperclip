@@ -27,6 +27,7 @@ function preparationSpans(trace: NativeRunTrace | undefined, phase: "github_acce
 
 type Binding = { companyId: string; agentId: string; issueId: string; runId: string };
 type LauncherInput = Parameters<typeof prepareGitHubOperationLaunchers>[0];
+type CallbackBridge = Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>>;
 export type NativeGitHubAccess = Awaited<ReturnType<typeof createNativeGitHubAccess>>;
 
 /** A process-lifetime transport, with authority only while its controller owns a run.
@@ -52,7 +53,7 @@ export async function createNativeGitHubAccess(input: {
   let stopped = false;
   let ready = true;
   let stopping: Promise<void> | undefined;
-  let bridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
+  let bridge: CallbackBridge = null;
   const server = createServer(async (req, res) => {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Content-Type", "application/json");
@@ -135,7 +136,7 @@ export async function createNativeGitHubAccess(input: {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("GitHub broker did not listen");
     const url = `http://127.0.0.1:${address.port}`;
-    const prepareBridge = async () => {
+    const prepareBridge = async (): Promise<CallbackBridge> => {
       try {
         bridge = await startBridge({
           ...location,
@@ -155,12 +156,14 @@ export async function createNativeGitHubAccess(input: {
         if (input.target?.kind === "remote" && !bridge) {
           throw new Error("GitHub session requires a remote callback bridge");
         }
+        return bridge;
       } catch {
         // GitHub remains optional. Stage anonymous wrappers for this session;
         // the supervisor retries transport setup on the next run.
         ready = false;
         await new Promise<void>(resolve => server.close(() => resolve()));
         await input.onLog?.("stderr", "[paperclip] GitHub runtime transport unavailable; continuing without managed GitHub access.\n").catch(() => undefined);
+        return null;
       }
     };
     // Launcher bytes need only the target and PATH, not the broker endpoint or
@@ -175,7 +178,8 @@ export async function createNativeGitHubAccess(input: {
     ]);
     if (preparedBridge.status === "rejected") throw preparedBridge.reason;
     if (preparedLaunchers.status === "rejected") throw preparedLaunchers.reason;
-    const env = {
+    bridge = preparedBridge.value;
+    const env: Record<string, string> = {
       ...githubBrokerEnvironment(preparedLaunchers.value, {
         url: ready ? bridge?.env.PAPERCLIP_API_URL ?? url : "",
         token: ready ? bridge?.env.PAPERCLIP_API_KEY ?? token : "",

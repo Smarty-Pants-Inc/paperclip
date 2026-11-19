@@ -1578,7 +1578,7 @@ exit 23
 // launch failed with runner_ingress_bind_conflict in a restart loop.
 describe.skipIf(!existsSync("/proc/self/cmdline"))("remote runner launch stale state holder", () => {
   const gone = (pid: number) => { try { return readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1]?.startsWith("Z") ?? true; } catch { return true; } };
-  const fixture = async () => {
+  const fixture = async (delayMirror = false) => {
     const root = await mkdtemp(join(tmpdir(), "remote-launch-fence-"));
     const binary = join(root, "bin", "paperclip-runnerd");
     await mkdir(join(root, "bin"));
@@ -1603,7 +1603,9 @@ describe.skipIf(!existsSync("/proc/self/cmdline"))("remote runner launch stale s
     const running = (child: ReturnType<typeof spawn>, arg: string) =>
       vi.waitFor(async () => expect((await readFile(`/proc/${child.pid}/cmdline`, "utf8")).split("\0")).toContain(arg));
     const launch = (stateDirectory: string, report: { verified: boolean; reason: string | null; remaining?: (number | "LAUNCH_SHELL")[] }) =>
-      spawnSync("/bin/sh", ["-c", REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT, "launch", join(root, "identity"), "nonce", "runner",
+      spawnSync("/bin/sh", ["-c", delayMirror
+        ? REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT.replace("( ( exec sh -c", "( ( sleep 0.2; exec sh -c")
+        : REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT, "launch", join(root, "identity"), "nonce", "runner",
         join(root, "diagnostics"), binary, "--state-dir", stateDirectory], { encoding: "utf8", env: { ...process.env,
         REAP_LOG: join(root, "reap.log"), REAP_EXIT: report.verified ? "0" : "1",
         REAP_REPORT: JSON.stringify({ schema: "paperclip.runner.process-lineage-reap.v1", journals: 1, signalled: 0, remaining: [], ...report })
@@ -1677,7 +1679,9 @@ describe.skipIf(!existsSync("/proc/self/cmdline"))("remote runner launch stale s
   // detached shell and other sessions' Runners are such orphans; any other
   // orphan could be an old tool that escaped between samples.
   it.each(["owned elsewhere", "an unknown orphan", "no journal"] as const)("handles a reap refusal for %s", async (kind) => {
-    const { root, start, running, launch, cleanup } = await fixture();
+    // Deterministically expose the real async mirror boundary: the canonical
+    // generation file is synchronous, but the shared log is copied by a child.
+    const { root, start, running, launch, cleanup } = await fixture(true);
     const stateDirectory = join(root, "state");
     const log = join(root, "diagnostics", REMOTE_RUNNER_PROCESS_STDERR_FILE);
     const other = start(["--state-dir", join(root, "other-state")]);
@@ -1686,6 +1690,7 @@ describe.skipIf(!existsSync("/proc/self/cmdline"))("remote runner launch stale s
     const unknown = start(["--tool"], { argv0: join(root, "bin", "tool") });
     try {
       await mkdir(join(root, "diagnostics"), { mode: 0o700 });
+      await writeFile(log, "");
       const stale = start(["--state-dir", stateDirectory]);
       for (const [child, arg] of [[stale, stateDirectory], [other, "--state-dir"], [trimmer, "paperclip-runner-stderr-trim"], [unknown, "--tool"]] as const) {
         await running(child, arg);
@@ -1702,7 +1707,10 @@ describe.skipIf(!existsSync("/proc/self/cmdline"))("remote runner launch stale s
       } else {
         expect(result.stdout).toBe("launched");
         expect((await readFile(join(root, "identity"), "utf8")).split("\n")[0]).toBe("nonce");
-        expect(await readFile(log, "utf8")).toContain(`runner_stale_lineage_partial: runner ${stale.pid}:`);
+        const warning = `runner_stale_lineage_partial: runner ${stale.pid}:`;
+        const generationLog = join(root, "diagnostics", `runnerd.launch-stderr.nonce.${result.pid}.log`);
+        expect(await readFile(generationLog, "utf8")).toContain(warning);
+        await vi.waitFor(async () => expect(await readFile(log, "utf8")).toContain(warning));
       }
       for (const survivor of [other, trimmer, unknown]) expect(gone(survivor.pid!)).toBe(false);
     } finally {
@@ -9021,14 +9029,17 @@ function leaseDb(
       return query;
     },
   });
+  const remove = () => ({ where: async () => [] });
   const tx = {
     insert,
+    delete: remove,
     execute: async () => [],
     select,
     update,
   };
   return {
     insert,
+    delete: remove,
     select,
     transaction: async (operation: (transaction: Db) => Promise<unknown>) =>
       operation(tx as unknown as Db),
@@ -16677,6 +16688,57 @@ describe("native warm session supervision", () => {
       }
     } finally { await closeIdleWarmNativeSessionsForRestart(); }
   });
+
+  // Spawned by native-diagnostic-custody.integration.test.ts. Only provider and
+  // coordinator ports are fixtures; both diagnostic stores use real PostgreSQL.
+  it.skipIf(!process.env.PAPERCLIP_DIAGNOSTIC_CRASH_FIXTURE)("diagnostic custody crash child", async () => {
+    const config = JSON.parse(process.env.PAPERCLIP_DIAGNOSTIC_CRASH_FIXTURE!);
+    const { createDb } = await import("@paperclipai/db");
+    const { getTableName } = await import("drizzle-orm");
+    const { appendHeartbeatRunEvent } = await import("../heartbeat-run-events.js");
+    const realDb = createDb(config.connectionString);
+    const first = { ...execution, binding: { ...execution.binding, ...config.binding, runId: randomUUID() },
+      ...(config.mode === "pi-warm" ? { provider: { kind: "pi_rpc", model: "paperclip/test", profile: QUALIFIED_PI_RPC_PROFILE } } : {}),
+      session: { ...execution.session, ...(config.mode === "pi-warm" ? { driverKind: "pi_rpc" } : {}),
+        normalizedSessionId: randomUUID(), lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } } } as NativeExecutionInputV1;
+    const second = { ...first, binding: { ...first.binding, runId: config.binding.runId } };
+    const sharedSession = { close: vi.fn(async () => undefined) };
+    const result = { result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" }, turnId: "turn",
+      normalizedSessionId: first.session.normalizedSessionId, providerSessionId: "provider", driverKind: "test", driverVersion: "1",
+      nativeEventCount: 3, highestContiguousSourceSeq: 3, usage: null };
+    const fakeDb = leaseDb(second);
+    const db = new Proxy(fakeDb, { get(target, property) {
+      if (["insert", "delete", "update"].includes(String(property))) return (table: Parameters<Db["insert"]>[0]) => {
+        const store = getTableName(table) === "native_run_diagnostics" ? realDb : target;
+        return (store[property as "insert"] as (value: Parameters<Db["insert"]>[0]) => unknown).call(store, table);
+      };
+      return Reflect.get(target, property);
+    } });
+    state.execute.mockReset();
+    if (config.mode !== "cold") state.execute.mockImplementationOnce(async options => { await options.onSession?.(sharedSession); return result; });
+    state.execute.mockImplementationOnce(async options => {
+      await options.onSession?.(sharedSession);
+      const startedAt = performance.now();
+      let seq = 0;
+      for (const eventType of [config.mode !== "cold" ? "session.resumed" : "session.started", "turn.submitted", "turn.started"] as const) {
+        await accountingEvents.committed!({ schema: "paperclip.prp.event.v1", sourceEventId: `crash-${++seq}`, sourceSeq: seq,
+          sourceInstanceId: "runner", sourceKind: "runner", runId: second.binding.runId, normalizedSessionId: second.session.normalizedSessionId!,
+          turnId: "turn", eventType, schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(), payload: {} });
+      }
+      await writeFile(config.admittedPath, JSON.stringify({ mode: config.mode, admitted: true, elapsedMs: performance.now() - startedAt, pid: process.pid }));
+      await new Promise(() => {}); // The parent SIGKILLs us here, never normal drain.
+      return result;
+    });
+    if (config.mode !== "cold") await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: "runner" });
+    await executePaperclipNativeSession({ db, execution: second, runnerInstanceId: "runner", onEvent: async event => {
+      if ((event.eventType === "run.performance.span" && event.payload?.span === (config.mode !== "cold" ? "runner.session.resume" : "runner.session.bootstrap")) ||
+          (config.mode === "pi-warm" && event.eventType === "run.startup.reuse" && event.payload?.layer === "runner")) {
+        await new Promise(() => {}); // Hold the real run-event sink before INSERT.
+      }
+      await appendHeartbeatRunEvent(realDb, { companyId: config.binding.companyId, runId: config.binding.runId,
+        agentId: config.binding.agentId, ...event });
+    } });
+  }, 60_000);
 
   it.each(["warm", "cold"] as const)("does not stall %s turn admission on diagnostic span persistence, but drains it before return", async mode => {
     const first = { ...execution, binding: { ...execution.binding, runId: `diagnostic-first-${mode}`, executionWorkspaceId: `diagnostic-workspace-${mode}` },

@@ -9,6 +9,7 @@ import {
   heartbeatRuns,
   issues,
   nativeRunFinalizations,
+  nativeRunDiagnostics,
   nativeRunResults,
   workAssessments,
 } from "@paperclipai/db";
@@ -22,6 +23,7 @@ import {
 } from "../../vendor/paperclip-runner/testing.js";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { finalizeNativeRun } from "./native-run-finalizer.js";
+import { nativeRunDiagnosticCustody } from "./native-run-diagnostics.js";
 import { commitNativeStatusDecision } from "./status-decision-committer.js";
 import { NATIVE_STATUS_ARBITER_POLICY_VERSION } from "./status-arbiter.js";
 
@@ -86,6 +88,9 @@ describeEmbeddedPostgres("native finalization recovery state", () => {
   it("clears stale recovery state when the finalizer claims a persisted result", async () => {
     const fixture = await seedNativeRun();
     await completeResult(fixture);
+    await nativeRunDiagnosticCustody(db, { companyId, issueId: fixture.issueId, runId: fixture.runId })([
+      { eventType: "run.performance.span", payload: { schema: "paperclip.run-performance-span.v1", span: "runner.session.bootstrap" } },
+    ]);
     await db.update(nativeRunFinalizations).set({ recoveryState: "resuming_session", recoveryRequestId: "restart-request" })
       .where(eq(nativeRunFinalizations.runId, fixture.runId));
     await finalizeNativeRun({ db, runId: fixture.runId, workspaceFinalizeStatus: "succeeded", failpoint: "status_projection" })
@@ -93,6 +98,8 @@ describeEmbeddedPostgres("native finalization recovery state", () => {
     expect(await readFinalization(fixture.runId)).toMatchObject({
       phase: "retryable_failure", recoveryState: null, recoveryRequestId: null,
     });
+    expect(await db.select().from(nativeRunDiagnostics).where(eq(nativeRunDiagnostics.runId, fixture.runId)))
+      .toMatchObject([{ lossReason: "delivery_unconfirmed_at_finalization", event: { payload: { span: "runner.session.bootstrap" } } }]);
   });
 
   it("clears stale recovery state when a status decision commits", async () => {

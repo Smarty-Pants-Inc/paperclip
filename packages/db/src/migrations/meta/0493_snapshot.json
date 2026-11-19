@@ -1,6 +1,6 @@
 {
-  "id": "349cdd89-db04-4340-a5d3-3b877bf7227d",
-  "prevId": "d5d69127-12de-4281-9816-c20e013bfeb7",
+  "id": "76bebcfd-0851-4a5f-af95-3acc347050a2",
+  "prevId": "a0757941-5d7d-4617-9bf7-15172ff0c122",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -2381,6 +2381,12 @@
           "primaryKey": false,
           "notNull": true,
           "default": "now()"
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
         }
       },
       "indexes": {},
@@ -45395,6 +45401,102 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.native_run_diagnostics": {
+      "name": "native_run_diagnostics",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "company_id": {
+          "name": "company_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "issue_id": {
+          "name": "issue_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "run_id": {
+          "name": "run_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "event": {
+          "name": "event",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "loss_reason": {
+          "name": "loss_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "native_run_diagnostics_run_idx": {
+          "name": "native_run_diagnostics_run_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "run_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "native_run_diagnostics_company_id_issue_id_run_id_heartbeat_runs_company_id_native_issue_id_id_fk": {
+          "name": "native_run_diagnostics_company_id_issue_id_run_id_heartbeat_runs_company_id_native_issue_id_id_fk",
+          "tableFrom": "native_run_diagnostics",
+          "tableTo": "heartbeat_runs",
+          "columnsFrom": [
+            "company_id",
+            "issue_id",
+            "run_id"
+          ],
+          "columnsTo": [
+            "company_id",
+            "native_issue_id",
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.native_run_finalizations": {
       "name": "native_run_finalizations",
       "schema": "",
@@ -64122,6 +64224,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": false
+        },
+        "agent_reasoning_display": {
+          "name": "agent_reasoning_display",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::jsonb"
         },
         "created_at": {
           "name": "created_at",

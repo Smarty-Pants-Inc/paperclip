@@ -281,6 +281,9 @@ export function createNativeRunTrace(input: {
   runId: string;
   startedAtMs?: number;
   onEvent?: NativeRunTraceSink;
+  /** Commit custody before a deferred receipt can be outrun by admission.
+   * The returned acknowledgement removes custody only after sink success. */
+  custody?: (events: readonly AdapterRuntimeEvent[]) => Promise<() => Promise<void>>;
   traceContext?: StartupTraceContextHandle;
   /** Called once when the trace finishes. */
   onFinish?: () => void;
@@ -423,39 +426,48 @@ export function createNativeRunTrace(input: {
     }
   };
 
-  const emitCompletedSpanEvent = async (
+  const completedSpanEvent = (
     span: NativeRunHistoricalSpan,
-  ): Promise<void> => {
+  ): AdapterRuntimeEvent => {
     const startedAtMs = finiteMs(span.startedAtMs);
     const endedAtMs = Math.max(startedAtMs, finiteMs(span.endedAtMs));
     const durationMs = endedAtMs - startedAtMs;
     const outcome = span.outcome ?? "ok";
     const attributes = safeAttributes(span.attributes);
+    return {
+      eventType: NATIVE_RUN_SPAN_EVENT_TYPE,
+      stream: "system",
+      level: outcome === "failed" ? "warn" : "info",
+      message: `runner span: ${span.name} (${durationMs.toFixed(1)}ms)`,
+      payload: {
+        // Keep the persisted schema identifier stable; traceSchemaVersion
+        // describes the OTel hierarchy independently of the run-log shape.
+        schema: "paperclip.run-performance-span.v1",
+        traceSchemaVersion: NATIVE_RUN_TRACE_SCHEMA_VERSION,
+        span: span.name,
+        parentSpan: span.parentName ?? "task.provider_session",
+        startOffsetMs: startedAtMs - traceStartedAtMs,
+        durationMs,
+        outcome,
+        ...attributes,
+        // The span's own start time. The row can be written late (deferred
+        // diagnostics), so readers must not infer the start from its write time.
+        wallStartedAtMs: startedAtMs,
+      },
+    };
+  };
+
+  const emitSpanEvent = async (event: AdapterRuntimeEvent): Promise<boolean> => {
     try {
-      await input.onEvent?.({
-        eventType: NATIVE_RUN_SPAN_EVENT_TYPE,
-        stream: "system",
-        level: outcome === "failed" ? "warn" : "info",
-        message: `runner span: ${span.name} (${durationMs.toFixed(1)}ms)`,
-        payload: {
-          // Keep the persisted schema identifier stable; traceSchemaVersion
-          // describes the OTel hierarchy independently of the run-log shape.
-          schema: "paperclip.run-performance-span.v1",
-          traceSchemaVersion: NATIVE_RUN_TRACE_SCHEMA_VERSION,
-          span: span.name,
-          parentSpan: span.parentName ?? "task.provider_session",
-          startOffsetMs: startedAtMs - traceStartedAtMs,
-          durationMs,
-          outcome,
-          ...attributes,
-          // The span's own start time. The row can be written late (deferred
-          // diagnostics), so readers must not infer the start from its write time.
-          wallStartedAtMs: startedAtMs,
-        },
-      });
+      await input.onEvent?.(event);
+      return true;
     } catch {
-      // A diagnostic sink failure must not fail the task.
+      // Keep custody on sink failure; diagnostics do not replace the result.
+      return false;
     }
+  };
+  const emitCompletedSpanEvent = async (span: NativeRunHistoricalSpan): Promise<void> => {
+    await emitSpanEvent(completedSpanEvent(span));
   };
 
   const start = (
@@ -573,7 +585,7 @@ export function createNativeRunTrace(input: {
         outcome,
         attributes: state.attributes,
       };
-      if (options.deferRunLog) deferRunLogRow(completed);
+      if (options.deferRunLog) await deferRunLogRow(completed);
       else await emitCompletedSpanEvent(completed);
     }
     checkSpanBudget(state.name, state.startedAtMs, endedAtMs);
@@ -674,11 +686,41 @@ export function createNativeRunTrace(input: {
   // Deferred run-log rows are written one at a time, in the order their spans
   // ended, so the sink sees the same sequence as the awaited path.
   let runLogRows: Promise<void> = Promise.resolve();
-  const deferRunLogRow = (span: NativeRunHistoricalSpan): void => {
+  const deferRunLogRow = async (span: NativeRunHistoricalSpan): Promise<void> => {
     if (ended) return;
-    const written = runLogRows.then(() => emitCompletedSpanEvent(span));
+    const event = completedSpanEvent(span);
+    if (input.onEvent && !input.custody) {
+      // A custom caller without durable custody must use the awaited sink,
+      // including its failure, rather than silently reverting to a RAM queue.
+      await input.onEvent(event);
+      return;
+    }
+    // This small INSERT does not allocate a run-event sequence. It must be
+    // awaited, unlike the slow sink, and must not be swallowed by defer().
+    const acknowledge = input.onEvent ? await input.custody?.([event]) : undefined;
+    const written = runLogRows.then(async () => {
+      if (await emitSpanEvent(event)) await acknowledge?.();
+    }).catch(() => { /* An ACK failure leaves the durable receipt intact. */ });
     runLogRows = written;
     defer(() => written);
+  };
+
+  /** For known non-span receipts whose whole delivery is deferred. Capture a
+   * batch before scheduling work; swallowed emitter errors still retain it. */
+  const deferWithCustody = async (events: readonly AdapterRuntimeEvent[], work: (sink: NativeRunTraceSink | undefined) => Promise<void>): Promise<void> => {
+    if (ended) return;
+    const acknowledge = input.onEvent ? await input.custody?.(events) : undefined;
+    const deliver = async () => {
+      let delivered = true;
+      await work(input.onEvent ? async event => {
+        try { await input.onEvent!(event); }
+        catch (error) { delivered = false; throw error; }
+      } : undefined);
+      if (delivered) await acknowledge?.();
+      else if (!input.custody) throw new Error("native_run_diagnostic_delivery_unconfirmed");
+    };
+    if (input.onEvent && !input.custody) await deliver();
+    else defer(deliver);
   };
 
   const finish = async (outcome: NativeRunSpanOutcome): Promise<void> => {
@@ -771,6 +813,7 @@ export function createNativeRunTrace(input: {
     record,
     measure,
     defer,
+    deferWithCustody,
     finish,
   };
 }
