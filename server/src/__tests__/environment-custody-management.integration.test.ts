@@ -11,8 +11,7 @@ import { environmentRoutes } from "../routes/environments.js";
 import { errorHandler } from "../middleware/index.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
-import { settleUnaddressableNativeCustody } from "../services/sandbox-stop-and-retain.js";
-import { hasRetainedUnaddressableNativeCustody, nativeCustodyKeptRecovery } from "../services/native-runtime/native-lease-custody.js";
+import { nativeCustodyKeptRecovery } from "../services/native-runtime/native-lease-custody.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -54,12 +53,29 @@ describe.skipIf(!support.supported)("environment management keeps unaddressable 
     return { lease, environmentId, companyId, runId, boxId };
   }
 
+  // Persist the historical obligation as input, independently of the repair's
+  // producer. The unpinned suite exercises the real sweep/release producer.
+  async function settleUnaddressableNativeCustody(_db: typeof db,
+    lease: typeof environmentLeases.$inferSelect, recovery: Record<string, unknown>) {
+    const now = new Date();
+    const [retained] = await db.update(environmentLeases).set({ status: "retained", cleanupStatus: "failed",
+      failureReason: "native_custody_stop_unavailable", releasedAt: null,
+      metadata: { ...lease.metadata,
+        orphanedRunLeaseRecovery: { ...recovery, runId: lease.heartbeatRunId, recoveredAt: now.toISOString(),
+          disposition: "retained_unstoppable", reason: "provider_plugin_pin_missing" },
+        replaceBeforeReuse: { schema: "paperclip.replace-before-reuse.v1", runId: lease.heartbeatRunId,
+          predecessorRunId: null, recordedAt: now.toISOString() },
+        pendingCleanupInFlight: false, pendingCleanupLeaseExpiresAtMs: 0 } })
+      .where(eq(environmentLeases.id, lease.id)).returning();
+    return retained!;
+  }
+
   it.each(["reuse_by_execution_workspace", "reuse_by_environment", "ephemeral", "retain_on_failure"] as const)(
     "counts retained custody under %s and refuses the real DELETE, even with teardown consent", async policy => {
       const { lease, environmentId } = await seed(policy);
       const retained = await settleUnaddressableNativeCustody(db, lease, nativeCustodyKeptRecovery());
       expect(retained).not.toBeNull();
-      expect(hasRetainedUnaddressableNativeCustody(retained!)).toBe(true);
+      expect(retained).toMatchObject({ status: "retained", releasedAt: null, cleanupStatus: "failed" });
       const summary = await request(app).get(`/api/environments/${environmentId}/delete-blast-radius`);
       // Exercise the real route even on red: a wrong summary must not hide
       // whether DELETE actually loses the retained holder's environment.
@@ -189,7 +205,7 @@ describe.skipIf(!support.supported)("environment management keeps unaddressable 
     const [kept] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
     expect(kept).toMatchObject({ status: "retained", releasedAt: null, cleanupStatus: "failed",
       metadata: { orphanedRunLeaseRecovery: { nativeCustodyUnverified: true }, nativeCustodyExpiry: { state: "stopped" } } });
-    expect(hasRetainedUnaddressableNativeCustody(kept!)).toBe(true);
+    expect(kept!.metadata?.orphanedRunLeaseRecovery).toMatchObject({ disposition: "retained_unstoppable" });
     expect(await environmentService(db).getDeleteBlastRadius(environmentId)).toMatchObject({ canDelete: false, reusableSandboxLeaseCount: 1 });
     expect((await request(app).delete(`/api/environments/${environmentId}?destroyReusableSandboxLeases=true`)).status).toBe(409);
     console.log("CUSTODY_EXPIRY_PROOF", JSON.stringify({ leaseId: lease.id, calls, status: kept!.status, expiry: kept!.metadata!.nativeCustodyExpiry }));
@@ -215,7 +231,7 @@ describe.skipIf(!support.supported)("environment management keeps unaddressable 
         expect(calls.filter(call => /Destroy|Release|Acquire|Resume/.test(call.method))).toEqual([]);
         const [kept] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
         expect(kept).toMatchObject({ status: "retained", releasedAt: null, metadata: { nativeCustodyExpiry: { state: "manual_stop" } } });
-        expect(hasRetainedUnaddressableNativeCustody(kept!)).toBe(true);
+        expect(kept!.metadata?.orphanedRunLeaseRecovery).toMatchObject({ disposition: "retained_unstoppable" });
         expect(await environmentService(db).getDeleteBlastRadius(environmentId)).toMatchObject({ canDelete: false, reusableSandboxLeaseCount: 1 });
         console.log("CUSTODY_REFUSAL_PROOF", JSON.stringify({ mode, leaseId: lease.id, calls,
           alarms: [...lines("first"), ...lines("manual_stop")].map(([fields, msg]) => ({ ...fields as object, msg })) }));

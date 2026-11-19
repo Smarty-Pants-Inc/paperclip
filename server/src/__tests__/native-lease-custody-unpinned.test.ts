@@ -289,10 +289,10 @@ describe.skipIf(!support.supported)("unaddressable native custody releases fresh
       const [environment] = await db.insert(environments).values({ name: "Historical unpinned source", driver: "sandbox", status: "active",
         config: { provider: "historical-unregistered-provider", image: "fake:test" } }).returning();
       const oldBox = `sealed-old-${randomUUID()}`;
-      const [lease] = await db.insert(environmentLeases).values({ environmentId: environment!.id, companyId, agentId, issueId,
+      const [lease] = await db.insert(environmentLeases).values({ environmentId: environment!.id, companyId, issueId,
         heartbeatRunId: runId, provider: "historical-unregistered-provider", providerLeaseId: oldBox,
-        status: "pending_cleanup", cleanupStatus: "failed", cleanupAttempts: 4,
-        metadata: { driver: "plugin", sandboxProvider: true, remote: true,
+        leasePolicy: "ephemeral", status: "pending_cleanup", cleanupStatus: "failed",
+        metadata: { driver: "plugin", sandboxProvider: true, remote: true, pendingCleanupRetryAttempts: 4,
           orphanedRunLeaseRecovery: { nativeCustodyUnverified: true, reason: "native_harness_copy_unverified", recoveredAt: new Date().toISOString() },
           sandboxStopAndRetain: { schema: "paperclip.sandbox-stop-and-retain.v1", requestId: "legacy-invalid-stop", nativeCustodyUnverified: true,
             pluginId: null, providerLeaseId: oldBox, allocationKey: "legacy", bindingDigest: "legacy", requestedAt: new Date().toISOString() } } }).returning();
