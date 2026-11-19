@@ -260,9 +260,17 @@ export function TaskChatRunnerTurn({
   // replay latch once the control plane establishes that this turn is waiting
   // for continuation; only an authored (non-wait) final is re-latched below.
   if (yielded || awaitingContinuation) finalRef.current = { runId };
+  // One run can answer several steered questions with separate finals. A
+  // later provider final is a new answer, not a replay prefix: it replaces
+  // the displayed one even when shorter (earlier answers stay as replies).
+  const observedLaterProviderFinal = Boolean(
+    observedFinal && observedProviderText && finalRef.current.providerText &&
+    observedFinal.atMs != null && finalRef.current.item?.atMs != null &&
+    observedFinal.atMs > finalRef.current.item.atMs,
+  );
   if (
     observedFinal &&
-    (!finalRef.current.item ||
+    (!finalRef.current.item || observedLaterProviderFinal ||
       (observedProviderText && !finalRef.current.providerText) ||
       (observedProviderText === Boolean(finalRef.current.providerText) &&
         observedFinal.text.length >= finalRef.current.item.text.length))

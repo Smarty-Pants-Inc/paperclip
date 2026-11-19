@@ -1284,6 +1284,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     return null;
   }, [heldPaperclipRunnerRunId, transcriptByRun]);
   const heldPaperclipRunnerFinalText = heldPaperclipRunnerFinalMessage?.text ?? null;
+  const heldPaperclipRunnerFinalAtMs = heldPaperclipRunnerFinalMessage ? toMs(heldPaperclipRunnerFinalMessage.ts) : null;
 
   // Reading a live response may adopt only its own run's saved identity, not
   // an equal-text reply from another turn. Prefer the earliest exact copy so
@@ -1472,7 +1473,17 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
           runId: heldPaperclipRunnerRunId,
           runStartedAtMs: heldPaperclipRunnerStartedAtMs,
           finalText: heldPaperclipRunnerFinalText,
-        })
+        }) &&
+        // One run can answer several steered questions, each posted as its
+        // own reply. The lane shows only its latest answer, so an earlier
+        // reply (posted before that answer, with other text) stays visible.
+        !(
+          heldPaperclipRunnerFinalText &&
+          heldPaperclipRunnerFinalAtMs != null &&
+          comment.authorType === "agent" &&
+          toMs(comment.createdAt) < heldPaperclipRunnerFinalAtMs &&
+          normalizedMessageText(comment.body) !== normalizedMessageText(heldPaperclipRunnerFinalText)
+        )
       )
         return;
       const item = commentItems[index];
@@ -1682,6 +1693,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     heldPaperclipRunnerRunId,
     heldPaperclipRunnerStartedAtMs,
     heldPaperclipRunnerFinalText,
+    heldPaperclipRunnerFinalAtMs,
     queuedCommentIds,
   ]);
 
