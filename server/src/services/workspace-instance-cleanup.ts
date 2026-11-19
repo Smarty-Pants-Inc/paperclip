@@ -117,8 +117,13 @@ export const WORKTREE_INSTANCE_RAW_TRACE_DIRECTORIES: ReadonlyArray<{ relativePa
  * - <root>/companies/<id>/acp-engine (per-agent state and codex-home):
  *   packages/adapter-utils/src/acpx-engine/execute.ts defaultStateDir() (:836), resolveManagedCodexApiKeyHomeDir() (:844)
  * - <root>/companies/<id>/agents/<agentId>/codex-home: server/src/routes/agents.ts codexLocalAgentHome() (:2329)
+ * - <root>/companies/<id>/agents/<agentId>/claude-runtime:
+ *   packages/adapters/claude-local/src/server/claude-config.ts (:165, per-agent Claude runtime state)
+ * - <root>/workspaces/<agentId> (agent_home cwd, where agent-home runs write):
+ *   server/src/home-paths.ts resolveDefaultAgentWorkspaceDir() (:55)
  */
-export const WORKTREE_INSTANCE_PROVIDER_HOME_NAMES = ["codex-home", "grok-home"] as const;
+export const WORKTREE_INSTANCE_PROVIDER_HOME_NAMES = ["codex-home", "grok-home", "workspaces"] as const;
+export const WORKTREE_INSTANCE_AGENT_PROVIDER_HOME_NAMES = ["codex-home", "claude-runtime"] as const;
 export const WORKTREE_INSTANCE_COMPANY_PROVIDER_STATE_NAMES = ["codex-home", "grok-home", "acp-engine"] as const;
 
 /**
@@ -178,14 +183,20 @@ async function listDirectoryNames(directory: string): Promise<string[]> {
  * ONLY when this is empty, i.e. when it is PROVEN never to have recorded a run
  * (rf-3's flipped rule): no run marker, AND db/ absent or empty, AND no content
  * in any named trace dir or provider home, each resolved by realpath. A trace
- * dir's env override is honoured when it is absolute or RELATIVE (resolved
- * against the instance root) and lands in the root. Otherwise the whole
+ * dir's ABSOLUTE env override is honoured when it lands in the root. A RELATIVE
+ * one cannot be pinned to one base: its producers resolve it against their
+ * PROCESS CWD (native-setup-evidence.ts createNativeSetupRuntime() and
+ * native-harness-backup-stamp.ts nativeHarnessStateBase() path.resolve();
+ * provider-trace-store.ts and run-log-store.ts pass it to fs as is). So it is
+ * resolved against the instance root AND every base in relativeBases, and ANY
+ * resolved path that holds content keeps the instance. Otherwise the whole
  * instance is kept (R-keep-all-traces, never-OK).
  */
 export async function findWorktreeInstanceRawTraces(
   instanceRoot: string,
   instanceEnv: Record<string, string | undefined> | ReadonlyArray<Record<string, string | undefined>> = {},
   rootAliases: ReadonlyArray<string> = [],
+  relativeBases: ReadonlyArray<string> = [],
 ): Promise<string[]> {
   const found: string[] = [];
   const envs = Array.isArray(instanceEnv) ? instanceEnv : [instanceEnv as Record<string, string | undefined>];
@@ -196,6 +207,19 @@ export async function findWorktreeInstanceRawTraces(
     const real = await realpathOrNull(candidate);
     return real !== null && isSameOrChildPath(real, canonicalRoot);
   };
+  // A default path plus its env override: absolute as is, RELATIVE against the
+  // instance root and every base in relativeBases.
+  const overrideCandidates = (defaultPath: string, envOverride: string) => {
+    const out: Array<{ raw: string; resolved: string }> = [{ raw: defaultPath, resolved: defaultPath }];
+    for (const env of envs) {
+      const override = env[envOverride]?.trim();
+      if (!override) continue;
+      const expanded = expandHomePrefix(override);
+      if (path.isAbsolute(expanded)) out.push({ raw: expanded, resolved: path.resolve(expanded) });
+      else for (const base of [instanceRoot, ...relativeBases]) out.push({ raw: expanded, resolved: path.resolve(base, expanded) });
+    }
+    return out;
+  };
 
   // 1. The run marker (instance-run-marker.ts).
   const marker = path.join(instanceRoot, INSTANCE_HEARTBEAT_RUN_MARKER);
@@ -204,14 +228,32 @@ export async function findWorktreeInstanceRawTraces(
   //    kept too: a failed marker write must fail closed.
   const embeddedDb = path.join(instanceRoot, "db");
   if (await holdsContent(embeddedDb)) found.push(embeddedDb);
+  // 2b. A root-local secrets master key (home-paths resolveDefaultSecretsKeyFilePath()
+  //     <root>/secrets/master.key, or its PAPERCLIP_SECRETS_MASTER_KEY_FILE override)
+  //     when the instance's DB is NOT its embedded <root>/db: the key wraps the
+  //     material that decrypts rows kept in that external DB, e.g. the per-backup
+  //     key of encrypted .pchn native-harness backups in object storage
+  //     (native-harness-backup-storage.ts :250 write, :391 read). With the embedded
+  //     DB, everything the key wraps is in db/, which keeps the instance itself.
+  if (!(await usesEmbeddedDb(instanceRoot, envs))) {
+    for (const candidate of overrideCandidates(path.join(instanceRoot, "secrets"), "PAPERCLIP_SECRETS_MASTER_KEY_FILE")) {
+      if (path.isAbsolute(candidate.raw) && !(await inRoot(candidate.resolved))) continue;
+      if (await holdsContent(candidate.resolved)) found.push(candidate.resolved);
+    }
+  }
   // 3. The named trace dirs, at their defaults and their in-root overrides.
   for (const { relativePath, envOverride } of WORKTREE_INSTANCE_RAW_TRACE_DIRECTORIES) {
     const candidates = new Set([path.join(instanceRoot, relativePath)]);
     for (const env of envs) {
       const override = env[envOverride]?.trim();
       if (!override) continue;
-      const resolved = path.resolve(instanceRoot, expandHomePrefix(override));
-      if (await inRoot(resolved)) candidates.add(resolved);
+      const expanded = expandHomePrefix(override);
+      if (path.isAbsolute(expanded)) {
+        const resolved = path.resolve(expanded);
+        if (await inRoot(resolved)) candidates.add(resolved);
+        continue;
+      }
+      for (const base of [instanceRoot, ...relativeBases]) candidates.add(path.resolve(base, expanded));
     }
     for (const candidate of candidates) if (await holdsContent(candidate)) found.push(candidate);
   }
@@ -222,11 +264,43 @@ export async function findWorktreeInstanceRawTraces(
     const companyDir = path.join(companiesDir, companyId);
     for (const name of WORKTREE_INSTANCE_COMPANY_PROVIDER_STATE_NAMES) providerHomes.push(path.join(companyDir, name));
     for (const agentId of await listDirectoryNames(path.join(companyDir, "agents"))) {
-      providerHomes.push(path.join(companyDir, "agents", agentId, "codex-home"));
+      for (const name of WORKTREE_INSTANCE_AGENT_PROVIDER_HOME_NAMES) providerHomes.push(path.join(companyDir, "agents", agentId, name));
     }
   }
   for (const home of providerHomes) if (await holdsContent(home)) found.push(home);
   return found;
+}
+
+/**
+ * Whether the instance provably runs on its embedded <root>/db: no DATABASE_URL
+ * in its env files and its config.json database.mode is (or defaults to)
+ * embedded-postgres (server/src/config.ts :161, :182; config-schema.ts :31).
+ * An unreadable config fails closed (not embedded).
+ */
+async function usesEmbeddedDb(instanceRoot: string, envs: ReadonlyArray<Record<string, string | undefined>>): Promise<boolean> {
+  if (envs.some((env) => env.DATABASE_URL?.trim())) return false;
+  try {
+    const config = JSON.parse(await fs.readFile(path.join(instanceRoot, "config.json"), "utf8")) as { database?: { mode?: unknown } };
+    const mode = config?.database?.mode ?? "embedded-postgres";
+    return mode === "embedded-postgres";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Every process cwd a guest instance's producer can have, for resolving a
+ * RELATIVE trace-dir override (the instance root itself is always a base too):
+ * - <worktree>/server: `pnpm dev` -> scripts/dev-runner.ts spawns
+ *   `pnpm --filter @paperclipai/server dev`, which runs in the server package dir
+ *   (also `pnpm dev:server`)
+ * - <worktree>: the CLI worktree init/reseed process.chdir(worktree root)
+ *   (cli/src/commands/worktree.ts) and `paperclipai run` from the checkout
+ * - this process's own cwd: a producer running in the same process as the reaper
+ */
+function worktreeInstanceProcessCwds(workspacePath: string): string[] {
+  const worktree = path.resolve(workspacePath);
+  return [...new Set([path.join(worktree, "server"), worktree, process.cwd()])];
 }
 
 /** The instance root's own .env (resolvePaperclipEnvPath() beside its config.json), if any. */
@@ -544,6 +618,7 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
       currentInstanceRoot,
       [parseEnvContents(input.pointer.envContents), await readInstanceRootEnv(currentInstanceRoot)],
       [configuredInstanceRoot],
+      worktreeInstanceProcessCwds(input.workspacePath),
     );
     if (keptRawTraces.length > 0) return;
     await dependencies.removeInstanceRoot(currentInstanceRoot);

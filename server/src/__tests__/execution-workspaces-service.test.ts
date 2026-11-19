@@ -1688,6 +1688,68 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect(await readTree(instance.instanceRoot)).toEqual(before);
     }, 30_000);
 
+    // F-REL (rf-3 flip judge, https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7000230397):
+    // the real setup producer resolves a RELATIVE PAPERCLIP_RUNNER_STATE_DIR
+    // against its PROCESS CWD (native-setup-evidence.ts createNativeSetupRuntime()
+    // path.resolve), not against the instance root. The value below is written
+    // UNCHANGED to the guest pointer and given UNCHANGED to the producer, which
+    // runs with each cwd a guest process can have:
+    // - <worktree>/server: scripts/dev-runner.ts spawns `pnpm --filter @paperclipai/server dev`
+    // - <worktree>: cli worktree init chdir(worktree root) (cli/src/commands/worktree.ts process.chdir)
+    // - the reaper's own process cwd: a producer in the same process as the sweep
+    // The sweep runs from its own deep cwd, so no two bases resolve the value to
+    // the same path by accident of depth: each row is carried by its own base.
+    it.each([
+      ["<worktree>/server (dev-runner)", (worktreePath: string, _sweepCwd: string) => path.join(worktreePath, "server")],
+      ["<worktree> (worktree init)", (worktreePath: string, _sweepCwd: string) => worktreePath],
+      ["the reaper's own process cwd", (_worktreePath: string, sweepCwd: string) => sweepCwd],
+    ])("F-REL (never-OK): a RELATIVE override resolved by the real producer against its process cwd %s is kept byte for byte", async (_label, cwdFor) => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      const sweepRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reaper-cwd-"));
+      tempDirs.add(sweepRoot);
+      const sweepCwd = path.join(sweepRoot, "reaper", "process", "cwd");
+      await fs.mkdir(sweepCwd, { recursive: true });
+      const producerCwd = cwdFor(seeded.worktreePath, sweepCwd);
+      // An empty dir: git does not track it, so the worktree stays clean.
+      await fs.mkdir(producerCwd, { recursive: true });
+      const stateDir = path.join(instance.instanceRoot, "runtime", "custom-state");
+      const relativeValue = path.relative(producerCwd, stateDir);
+      expect(path.isAbsolute(relativeValue)).toBe(false);
+      expect(relativeValue.startsWith("..")).toBe(true);
+      await withPointerEnv(instance, seeded, `PAPERCLIP_RUNNER_STATE_DIR=${relativeValue}`);
+      const originalCwd = process.cwd();
+      process.chdir(producerCwd);
+      try {
+        await withEnv({ PAPERCLIP_HOME: instance.worktreesDir, PAPERCLIP_INSTANCE_ID: instance.instanceId,
+          PAPERCLIP_RUNNER_STATE_DIR: relativeValue }, async () => {
+          const { createNativeSetupRuntime, cleanupNativeSetupRuntime } = await import("../services/native-runtime/native-setup-evidence.ts");
+          const scratch = await createNativeSetupRuntime(seeded.companyId);
+          expect(scratch.startsWith(`${stateDir}${path.sep}`)).toBe(true);
+          await fs.writeFile(path.join(scratch, "provider-stderr.log"), "planted raw trace: relative override, producer cwd\n", { mode: 0o600 });
+          await cleanupNativeSetupRuntime(scratch, true);
+        });
+      } finally {
+        process.chdir(originalCwd);
+      }
+      const before = await readTree(instance.instanceRoot);
+      expect([...before.keys()].some((name) => name.startsWith(path.join("runtime", "custom-state", "conversation-evidence"))
+        && name.endsWith("provider-stderr.log"))).toBe(true);
+      // No other keep condition holds: the instance is kept ONLY by the relative override.
+      expect([...before.keys()].filter((name) => !name.startsWith(path.join("runtime", "custom-state")))).toEqual(["config.json"]);
+      // Only the producer's own cwd resolves the value into the instance.
+      const bases = [instance.instanceRoot, path.join(seeded.worktreePath, "server"), seeded.worktreePath, sweepCwd];
+      expect(bases.filter((base) => path.resolve(base, relativeValue) === stateDir)).toEqual([producerCwd]);
+
+      process.chdir(sweepCwd);
+      try {
+        expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
+      } finally {
+        process.chdir(originalCwd);
+      }
+      expect(await readTree(instance.instanceRoot)).toEqual(before);
+    }, 30_000);
+
     it("F2a (never-OK): an ABSOLUTE in-root .env override holding run logs is kept", async () => {
       const seeded = await seedPastCooldown();
       const instance = await attachManagedWorktreeInstance(seeded);
@@ -1742,6 +1804,56 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
 
       expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
       expect(await readTree(instance.instanceRoot)).toEqual(before);
+    }, 30_000);
+
+    // (b) Other in-root provider homes, by line: claude-local claude-config.ts
+    // (:165) companies/<id>/agents/<agentId>/claude-runtime, and home-paths.ts
+    // resolveDefaultAgentWorkspaceDir() (:55) workspaces/<agentId>.
+    it.each([
+      ["companies/<id>/agents/<agentId>/claude-runtime", (companyId: string) => path.join("companies", companyId, "agents", "agent-1", "claude-runtime", "projects")],
+      ["workspaces/<agentId> (agent home)", (_companyId: string) => path.join("workspaces", "agent-1")],
+    ])("F4b (never-OK): the in-root provider home %s holding a session is kept", async (_label, homeFor) => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      const home = path.join(instance.instanceRoot, homeFor(seeded.companyId));
+      await fs.mkdir(home, { recursive: true });
+      // Planted (named): a provider session transcript line.
+      await fs.writeFile(path.join(home, "session.jsonl"), '{"type":"assistant","text":"planted"}\n', "utf8");
+      const before = await readTree(instance.instanceRoot);
+
+      expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
+      expect(await readTree(instance.instanceRoot)).toEqual(before);
+    }, 30_000);
+
+    // (a) An EXTERNAL Postgres instance (no <root>/db) with a ROOT-LOCAL secrets
+    // master key: the key wraps the per-backup key of encrypted .pchn backups
+    // whose reference rows live in that external DB
+    // (native-harness-backup-storage.ts :250/:391). Removing the root loses it.
+    async function plantRootLocalKey(instanceRoot: string, databaseMode: "postgres" | "embedded-postgres") {
+      await fs.rm(path.join(instanceRoot, "db"), { recursive: true, force: true });
+      await fs.writeFile(path.join(instanceRoot, "config.json"), `${JSON.stringify({ database: { mode: databaseMode } })}\n`, "utf8");
+      // Planted (named): a 64-hex master key at resolveDefaultSecretsKeyFilePath().
+      await fs.mkdir(path.join(instanceRoot, "secrets"), { recursive: true, mode: 0o700 });
+      await fs.writeFile(path.join(instanceRoot, "secrets", "master.key"), "ab".repeat(32), { mode: 0o600 });
+    }
+
+    it("F-KEY (never-OK): an external-Postgres instance with a root-local secrets master key is kept byte for byte", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      await plantRootLocalKey(instance.instanceRoot, "postgres");
+      const before = await readTree(instance.instanceRoot);
+
+      expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
+      expect(await readTree(instance.instanceRoot)).toEqual(before);
+    }, 30_000);
+
+    it("F-KEYc (control): an embedded-DB instance with an empty db and a root-local key is removed as today", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      await plantRootLocalKey(instance.instanceRoot, "embedded-postgres");
+
+      await sweepAndExpectArchived(seeded, instance.worktreesDir);
+      await expect(fs.lstat(instance.instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
     }, 30_000);
 
     it("F6 (never-OK): the run marker alone (db empty, no trace dirs) keeps the instance", async () => {
