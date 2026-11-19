@@ -34,6 +34,7 @@ import {
 } from "../services/agent-conversations.js";
 import { answeredPersonMessageSql } from "../services/person-message-answer.js";
 import { waitForPendingCommentSteers } from "../services/conversation-steering.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
 import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
 import { getServerAdapter, registerServerAdapter, runningProcesses } from "../adapters/index.js";
@@ -434,16 +435,40 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   it.each(["generic", "disconnect", "refusal", "probe", "unexpected-disposition"] as const)("A3: %s steer failure returns 201 and the ordinary successor answers once", async variant => {
     const chat = await seedChat(); await attachSteerable(chat);
     const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
-    if (variant === "probe") mocks.probe.mockRejectedValueOnce(new Error("snapshot RPC disconnected"));
+    let refuseAfter201: (() => void) | undefined;
+    if (variant === "generic") mocks.steer.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      refuseAfter201 = () => reject(new Error("private person text must not be logged"));
+    }));
+    else if (variant === "probe") mocks.probe.mockRejectedValueOnce(new Error("snapshot RPC disconnected"));
     else if (variant === "unexpected-disposition") mocks.steer.mockResolvedValueOnce({ disposition: "unexpected" });
     else mocks.steer.mockRejectedValueOnce(variant === "refusal"
       ? new NativeSessionSteeringError("steering_rejected", "refused")
       : variant === "disconnect" ? new TypeError("RPC disconnected") : new Error("private person text must not be logged"));
+    const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const unsubscribe = subscribeCompanyLiveEvents(chat.companyId, event => { events.push(event); });
     const response = await postDefault(chat, `A3 ordinary ${variant}`);
     expect(response.status, JSON.stringify(response.body)).toBe(201);
-    expect(response.body).toMatchObject({ deliveryOutcome: "queued", steeringStatus: null,
-      steeringUnavailableReason: expect.any(String) });
+    // Async POST reports custody, not the eventual RPC refusal. Keep the
+    // original queued-state assertion on the authoritative joined GET.
+    if (response.body.deliveryOutcome === "steered") expect(response.body).toMatchObject({
+      steeringStatus: "accepted", steeringDeliveryEventSeq: null,
+    });
+    if (variant === "generic") {
+      expect(response.body.deliveryOutcome).toBe("steered");
+      await vi.waitFor(() => expect(refuseAfter201).toBeTypeOf("function"));
+      refuseAfter201!(); // the refusal cannot happen before the saved 201
+    }
+    await waitForPendingCommentSteers();
+    unsubscribe();
     const messageId = response.body.id;
+    const thread = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/comments`).expect(200);
+    expect(thread.body.find((comment: any) => comment.id === messageId)).toMatchObject({
+      deliveryOutcome: "queued", steeringStatus: null, steeringUnavailableReason: expect.any(String),
+    });
+    if (variant !== "probe") expect(events.filter(event => event.type === "activity.logged" &&
+      event.payload.action === "issue.comment_added" &&
+      (event.payload.details as any)?.source === "steering.refused" &&
+      (event.payload.details as any)?.commentId === messageId)).toHaveLength(1);
     const [reserved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
     expect((reserved!.contextSnapshot as any).steeredCommentIds ?? []).not.toContain(messageId);
     expect((reserved!.contextSnapshot as any).wakeCommentIds ?? []).not.toContain(messageId);
