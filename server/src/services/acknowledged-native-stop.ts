@@ -365,8 +365,7 @@ export async function readAcceptedPersonStop(db: Db, input: { companyId: string;
   // R17 (3d): a person's Stop of an ALREADY-ENDED latest run is the same acceptance row, marked endedRun;
   // the run's own cancel was not theirs (the system ended it), so only its terminal state is read.
   if (accepted.endedRun === true) {
-    if (!(HEARTBEAT_RUN_ENDED_STATUSES as readonly string[]).includes(stop.status) ||
-        parseObject(stop.resultJson).queuedCommentInterruptQueueId) return null;
+    if (!isSystemEndedRun(stop) || parseObject(stop.resultJson).queuedCommentInterruptQueueId) return null;
     return { runId: stop.runId, userId, acceptedAt };
   }
   const stopped = recordedUserStop(stop);
@@ -375,7 +374,18 @@ export async function readAcceptedPersonStop(db: Db, input: { companyId: string;
   return { runId: stop.runId, userId, acceptedAt };
 }
 
-const HEARTBEAT_RUN_ENDED_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
+/** R17 bound (a) (RFL 09:27Z): the ended runs a person's Stop of an ALREADY-ENDED run may count on are the ones the
+ * SYSTEM ended (a system cancel / cleanup / timeout). A run that succeeded or failed by itself ended its own work;
+ * a stray Stop on it never holds new messages. */
+const SYSTEM_ENDED_RUN_STATUSES = ["cancelled", "timed_out"] as const;
+
+/** The run row of a system cancel: cancelled or timed out, and no person's cancel on it (heartbeat.cancelRun records a
+ * person's as cancelledByActorType 'user' + cancelledByUserId, and the Stop route's fence as recordedUserStop). */
+export function isSystemEndedRun(run: { status: string; resultJson: Record<string, unknown> | null }): boolean {
+  return (SYSTEM_ENDED_RUN_STATUSES as readonly string[]).includes(run.status)
+    && parseObject(run.resultJson).cancelledByActorType !== "user" && !hasRecordedUserStopRequest(run)
+    && !recordedUserStop(run);
+}
 
 /**
  * R17 (adopt-cutc2 3d; adopt-lead's pick, conditions rf-3 + rf-4 09:26Z): a board person's Stop of a run that
@@ -388,11 +398,11 @@ const HEARTBEAT_RUN_ENDED_STATUSES = ["succeeded", "interrupted", "failed", "can
  * Returns whether the Stop now holds. Send / typing release it exactly as a live-run Stop.
  */
 export async function recordPersonStopOfEndedRun(db: Db, input: {
-  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "status" | "createdAt" | "contextSnapshot" | "nativeIssueId">;
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "status" | "createdAt" | "contextSnapshot" | "nativeIssueId" | "resultJson">;
   userId: string;
 }): Promise<boolean> {
   const { run, userId } = input;
-  if (!(HEARTBEAT_RUN_ENDED_STATUSES as readonly string[]).includes(run.status) || !userId) return false;
+  if (!isSystemEndedRun(run) || !userId) return false;
   const context = parseObject(run.contextSnapshot);
   const issueId = typeof context.issueId === "string" && context.issueId ? context.issueId : run.nativeIssueId;
   if (!issueId) return false;
