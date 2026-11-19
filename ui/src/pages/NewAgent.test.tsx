@@ -11,6 +11,74 @@ import {
 } from "./NewAgent.test-support";
 
 describe("New agent setup", () => {
+  // catch: https://github.com/Smarty-Pants-Inc/paperclip/commit/57af7156eb1ee6b33d6f48163211faae6943e60d
+  it.each([
+    ["company-computer", "local-1", "company-computer"],
+    [null, "instance-computer", "instance-computer"],
+    [null, "local-1", null],
+    [null, "foreign-computer", null],
+    ["foreign-computer", "instance-computer", "instance-computer"],
+    ["archived-computer", "instance-computer", "instance-computer"],
+    [null, "archived-computer", null],
+  ] as const)("uses company default %s then usable instance %s in the real draft, picker and hire", async (companyDefault, instanceDefault, expected) => {
+    state.company.defaultEnvironmentId = companyDefault;
+    settings.get.mockResolvedValue({ defaultEnvironmentId: instanceDefault });
+    envApi.list.mockResolvedValue([
+      { id: "local-1", name: "Local", driver: "local", status: "active", config: {} },
+      { id: "company-computer", name: "Company computer", companyId: "company-1", driver: "plugin", status: "active", config: {} },
+      { id: "instance-computer", name: "Instance computer", companyId: null, driver: "ssh", status: "active", config: {} },
+      { id: "foreign-computer", name: "Foreign computer", companyId: "company-2", driver: "plugin", status: "active", config: {} },
+      { id: "archived-computer", name: "Archived computer", companyId: "company-1", driver: "ssh", status: "archived", config: {} },
+    ]);
+    await render("codex_local");
+    expect(api.create.mock.calls[0][1].defaultEnvironmentId).toBe(expected);
+    await click("OpenAIAPI key");
+    await fill("API key", "setup-test-key");
+    await click("Connect");
+    const picker = container.querySelector<HTMLSelectElement>('select[aria-label="Environment"]')!;
+    expect([...picker.options].map(option => option.value)).not.toContain("foreign-computer");
+    expect(picker.selectedOptions[0].textContent).toContain(expected === "company-computer" ? "Company computer" : expected === "instance-computer" ? "Instance computer" : "None");
+    await click("Finish setup");
+    expect(api.hire).toHaveBeenCalledWith("company-1", expect.objectContaining({ defaultEnvironmentId: expected }));
+  });
+
+  it.each([false, true])("saves the company environment on the name-only draft handed to the real page before configuring or hiring (initial refusal=%s)", async (refused) => {
+    const id = "00000000-0000-4000-8000-000000000094";
+    const draft = { id, companyId: "company-1", name: "Atlas", role: "general", adapterType: "codex_local", adapterConfig: {},
+      runtimeConfig: {}, defaultEnvironmentId: null, lifecycleState: "paused", pauseReason: "setup", status: "paused" };
+    state.company.defaultEnvironmentId = "company-computer";
+    state.params = new URLSearchParams({ name: "Atlas", adapterType: "codex_local", setupAgentId: id });
+    envApi.list.mockResolvedValue([{ id: "company-computer", name: "Company computer", companyId: "company-1", driver: "ssh", status: "active", config: {} }]);
+    api.get.mockResolvedValue(draft);
+    api.update.mockImplementation(async (_id, patch) => ({ ...draft, ...patch }));
+    if (refused) api.update.mockRejectedValueOnce(new ApiError("Could not save the draft environment", 422, null));
+    await renderCurrentParams();
+    if (refused) {
+      expect(container.querySelector('[role="alert"]')?.textContent).toContain("Could not save the draft environment");
+      expect(api.testEnvironment).not.toHaveBeenCalled();
+      expect(api.hire).not.toHaveBeenCalled();
+      await click("Retry saving environment");
+    }
+    expect(api.update).toHaveBeenCalledWith(id, { defaultEnvironmentId: "company-computer" }, "company-1");
+    expect(cache.getQueryData(queryKeys.agents.detail(id))).toMatchObject({ defaultEnvironmentId: "company-computer" });
+    expect(api.create).not.toHaveBeenCalled();
+    await click("OpenAIAPI key");
+    await fill("API key", "setup-test-key");
+    await click("Connect");
+    await click("Finish setup");
+    expect(api.hire).toHaveBeenCalledWith("company-1", expect.objectContaining({ setupAgentId: id, defaultEnvironmentId: "company-computer" }));
+  });
+
+  it("shows the server's plain foreign-environment 422 reason on the real New Agent page", async () => {
+    await render("codex_local");
+    await click("OpenAIAPI key");
+    await fill("API key", "setup-test-key");
+    await click("Connect");
+    api.hire.mockRejectedValueOnce(new ApiError("This environment belongs to another company", 422, { error: "This environment belongs to another company" }));
+    await click("Finish setup");
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("This environment belongs to another company");
+    expect(container.textContent).not.toContain("Your agent is ready");
+  });
   it.each([
     ["claude_local", "Claude", "plugin"], ["codex_local", "OpenAI", "plugin"],
     ["claude_local", "Claude", "sandbox"], ["codex_local", "OpenAI", "sandbox"],
@@ -142,7 +210,8 @@ describe("New agent setup", () => {
     expect(container.textContent).toContain("Preparing your agent computer");
     await click("OpenAIAPI key");
     expect(api.testEnvironment).not.toHaveBeenCalled();
-    api.get.mockResolvedValue({ ...draft, lifecycleState: "verifying" });
+    // The preference PATCH persists on the same record before its lifecycle read.
+    api.get.mockResolvedValue({ ...draft, defaultEnvironmentId: "computer", lifecycleState: "verifying" });
     await act(async () => { await cache.invalidateQueries({ queryKey: queryKeys.agents.detail(id) }); });
     await settle();
     expect(container.textContent).not.toContain("Preparing your agent computer");

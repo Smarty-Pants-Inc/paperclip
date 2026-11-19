@@ -36,6 +36,7 @@ const secrets = vi.hoisted(() => ({
   removeUserSecretDefinition: vi.fn(),
 }));
 const state = vi.hoisted(() => ({
+  company: { id: "company-1", defaultEnvironmentId: null as string | null },
   params: new URLSearchParams(),
   adapters: [] as object[],
   navigate: vi.fn(),
@@ -54,7 +55,7 @@ vi.mock("@/api/secrets", () => ({ secretsApi: secrets }));
 const adapterApi = vi.hoisted(() => ({ list: vi.fn() }));
 vi.mock("@/api/adapters", () => ({ adaptersApi: adapterApi }));
 vi.mock("@/context/CompanyContext", () => ({
-  useCompany: () => ({ selectedCompanyId: "company-1" }),
+  useCompany: () => ({ selectedCompanyId: "company-1", selectedCompany: state.company }),
 }));
 vi.mock("../context/BreadcrumbContext", () => ({
   useBreadcrumbs: () => ({ setBreadcrumbs: vi.fn() }),
@@ -160,6 +161,7 @@ const pass = {
 };
 beforeEach(() => {
   vi.clearAllMocks();
+  state.company = { id: "company-1", defaultEnvironmentId: null };
   adapterApi.list.mockImplementation(async () => state.adapters);
   managedApi.list.mockResolvedValue({ currentUserId: "user-1", canManageConnections: true, connections: [] });
   container = document.createElement("div");
@@ -188,7 +190,8 @@ beforeEach(() => {
     return record;
   });
   api.update.mockImplementation(async (id, input) => {
-    const record = { ...setupRecords.get(id), ...input, id, companyId: "company-1", status: "paused", lifecycleState: "paused", pauseReason: "setup" };
+    const existing = setupRecords.get(id) ?? await api.get(id, "company-1");
+    const record = { ...existing, ...input, id, companyId: "company-1" };
     setupRecords.set(id, record);
     return record;
   });

@@ -1,5 +1,20 @@
 import type { Environment } from "@paperclipai/shared";
 
+/** Shared create-draft default: company first, then a usable non-local instance default. */
+export function resolveNewAgentDefaultEnvironmentId(input: {
+  companyId: string | null | undefined;
+  companyDefaultEnvironmentId: string | null | undefined;
+  instanceDefaultEnvironmentId: string | null | undefined;
+  environments: readonly Environment[];
+}): string | null {
+  for (const id of [input.companyDefaultEnvironmentId, input.instanceDefaultEnvironmentId]) {
+    const environment = input.environments.find(candidate => candidate.id === id);
+    if (environment && environment.driver !== "local" && environment.status !== "archived"
+      && (!environment.companyId || environment.companyId === input.companyId)) return environment.id;
+  }
+  return null;
+}
+
 /**
  * The managed-sandbox-only policy hides the local environment and runs every
  * agent in the managed sandbox, but no managed sandbox environment is

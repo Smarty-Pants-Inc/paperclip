@@ -50,6 +50,7 @@ import {
   resolveAdapterTestEnvironmentId,
   resolveLocalDefaultEnvironmentId,
   resolveManagedSandboxEnvironmentId,
+  resolveNewAgentDefaultEnvironmentId,
 } from "@/lib/adapter-test-environment";
 import { resolveForcedKubernetesEnvironment } from "@/lib/forced-kubernetes-environment";
 import { environmentDisplayLabel } from "@/lib/managed-sandbox-environment";
@@ -133,6 +134,7 @@ function Setup({
   setupAgentId: string | null;
 }) {
   const navigate = useNavigate();
+  const { selectedCompany } = useCompany();
   const cache = useQueryClient();
   const { openNewIssue } = useDialogActions();
   const appearanceDraft = useAgentAppearanceDraft(`${companyId}:new-agent`);
@@ -201,6 +203,7 @@ function Setup({
   if (setupAgentId) setupId.current = setupAgentId;
   const creating = useRef(false);
   const restored = useRef<string | null>(null);
+  const initializedEnvironmentDraft = useRef<string | null>(null);
   const [creationAttempt, setCreationAttempt] = useState(0);
   const recordId = createdAgentId ?? setupAgentId;
   const currentCreated = !recordId || createdInSession?.id === recordId ? createdInSession : null;
@@ -306,9 +309,17 @@ function Setup({
     queryFn: () => secretsApi.listMyUserSecrets(companyId),
     enabled: hasCredentialField && (adapterType !== "cursor_cloud" || nativeCursorCloud),
   });
+  const environments = (envs.data ?? []).filter(env => !env.companyId || env.companyId === companyId);
+  const defaultEnvironmentId = resolveNewAgentDefaultEnvironmentId({
+    companyId,
+    companyDefaultEnvironmentId: selectedCompany?.id === companyId ? selectedCompany.defaultEnvironmentId : null,
+    instanceDefaultEnvironmentId: settings.data?.defaultEnvironmentId,
+    environments,
+  });
+  const defaultEnvironment = environments.find(env => env.id === defaultEnvironmentId);
   const forced = resolveForcedKubernetesEnvironment(
     general.data?.executionMode,
-    envs.data ?? [],
+    environments,
   );
   const managedOnly = experimental.data?.enableManagedSandboxOnly === true;
   let environmentId: string | null = null;
@@ -317,22 +328,25 @@ function Setup({
     environmentId = nativeCursorCloud ? null : forced.forced
       ? (forced.kubernetesEnvironment?.id ?? null)
       : resolveAdapterTestEnvironmentId({
-          agentDefaultEnvironmentId: environmentOverride || null,
+          agentDefaultEnvironmentId: environmentOverride || defaultEnvironmentId,
           instanceDefaultEnvironmentId:
-            settings.data?.defaultEnvironmentId ?? null,
+            environments.find(env => env.id === settings.data?.defaultEnvironmentId
+              && env.driver === "local" && env.status !== "archived")?.id ?? null,
           localDefaultEnvironmentId: resolveLocalDefaultEnvironmentId(
-            envs.data ?? [],
+            environments,
           ),
           managedSandboxOnly: managedOnly,
           managedSandboxEnvironmentId: resolveManagedSandboxEnvironmentId(
-            envs.data ?? [],
+            environments,
           ),
-          visibleEnvironmentIds: (envs.data ?? []).map((env) => env.id),
+          visibleEnvironmentIds: environments.map((env) => env.id),
         });
   } catch (cause) {
     environmentError =
       describeError(cause).body;
   }
+  const draftEnvironmentId = nativeCursorCloud ? null : environmentOverride
+    || (forced.forced || managedOnly ? environmentId : defaultEnvironmentId);
   const adapters = useQuery({
     queryKey: queryKeys.adapters.availability(companyId, environmentId),
     queryFn: () => adaptersApi.list({ companyId, environmentId }),
@@ -363,7 +377,7 @@ function Setup({
   useEffect(() => {
     if (requestAccountModels) void refreshAccountModels();
   }, [requestAccountModels, accountModelScope, refreshAccountModels]);
-  const environment = envs.data?.find((env) => env.id === environmentId);
+  const environment = environments.find((env) => env.id === environmentId);
   const setupEnvironmentKey = JSON.stringify([companyId, environmentId, environment?.config]);
   const setupEnvironmentRef = useRef("");
   setupEnvironmentRef.current = setupEnvironmentKey;
@@ -436,7 +450,7 @@ function Setup({
     adapter => adapter.type === "paperclip_runner" && adapter.loaded && !adapter.disabled,
   ));
   const connectionSettingsReady = Boolean(
-    configurationAvailable &&
+    configurationAvailable && selectedCompany?.id === companyId &&
     (!["codex_local", "claude_local", "opencode_local", "pi_local"].includes(adapterType) || runner !== "auto" || Boolean(adapters.data)) &&
     !environmentError &&
     !envs.isPending &&
@@ -456,8 +470,7 @@ function Setup({
   const needsCurrentSetup = ["codex_local", "claude_local", "opencode_local", "pi_local"].includes(adapterType);
   const preparingComputer = created?.pauseReason === "setup" && ["preparing", "pausing"].includes(created.lifecycleState ?? "");
   const environmentSelectionSaved = nativeCursorCloud
-    || (!environmentOverride && created?.defaultEnvironmentId == null)
-      || (created?.defaultEnvironmentId ?? null) === (environmentOverride || (forced.forced || managedOnly ? environmentId : null));
+    || (created?.defaultEnvironmentId ?? null) === draftEnvironmentId;
   const ready = (pendingAntigravity || Boolean(created) && environmentSelectionSaved) && !environmentSaving && !preparingComputer && connectionSettingsReady && (!needsCurrentSetup || (
     envs.isSuccess && !envs.isFetching
     && settings.isSuccess && !settings.isFetching
@@ -602,7 +615,9 @@ function Setup({
   }
 
   useEffect(() => {
-    if (pendingAntigravity || !name || !adapterType || !connectionSettingsReady || createdAgentId || created || creating.current
+    if (pendingAntigravity || !name || !adapterType || !connectionSettingsReady
+      || !envs.isSuccess || envs.isFetching || !settings.isSuccess || settings.isFetching
+      || createdAgentId || created || creating.current
       || (setupAgentId && !savedAgent.isError)) return;
     if (savedAgent.error && (!(savedAgent.error instanceof ApiError) || savedAgent.error.status !== 404)) return;
     creating.current = true;
@@ -621,7 +636,7 @@ function Setup({
           ...(["claude", "grok", "copilot", "antigravity", "kimi"].includes(runnerProvider) ? { acpxAgent: runnerProvider } : {}),
         }),
         ...(antigravityCandidate ? { model: antigravityCandidate.model } : {}),
-      } : {}, defaultEnvironmentId: nativeCursorCloud ? null : environmentOverride || (forced.forced || managedOnly ? environmentId : null),
+      } : {}, defaultEnvironmentId: draftEnvironmentId,
       runtimeConfig: buildNewAgentRuntimeConfig({ heartbeatEnabled: false }),
     }).then(async agent => {
       await cache.cancelQueries({ queryKey: queryKeys.agents.detail(agent.id) });
@@ -630,7 +645,8 @@ function Setup({
       void cache.invalidateQueries({ queryKey: queryKeys.agents.list(companyId) });
     }).catch(cause => setError(cause instanceof Error ? cause.message : "Could not create the agent."))
       .finally(() => { creating.current = false; });
-  }, [name, adapterType, companyId, connectionSettingsReady, creationAttempt, createdAgentId, setupAgentId, savedAgent.isError, created, pendingAntigravity]);
+  }, [name, adapterType, companyId, connectionSettingsReady, creationAttempt, createdAgentId, setupAgentId, savedAgent.isError, created, pendingAntigravity,
+    envs.isSuccess, envs.isFetching, settings.isSuccess, settings.isFetching]);
 
   useEffect(() => {
     if (!savedAgent.data || restored.current === savedAgent.data.id || savedAgent.data.companyId !== companyId) return;
@@ -662,6 +678,27 @@ function Setup({
     setScreen(binding || !connectionAdapter ? "runtime" : "connect");
   }, [savedAgent.data, companyId, connectionAdapter, brandType]);
 
+  // The name/adapter dialog hands this page an existing held draft, so the
+  // create effect above is not its initialization path. Persist its preference
+  // once before probes/hire, without rewriting its adapter or saved choices.
+  useEffect(() => {
+    if (!created || created.pauseReason !== "setup" || !connectionSettingsReady
+      || !envs.isSuccess || envs.isFetching || !settings.isSuccess || settings.isFetching
+      || savedAgent.data?.id !== created.id || restored.current !== created.id
+      || initializedEnvironmentDraft.current === created.id) return;
+    initializedEnvironmentDraft.current = created.id;
+    if (created.defaultEnvironmentId || !draftEnvironmentId || environmentOverride) return;
+    setEnvironmentSaving(true);
+    setEnvironmentSaveError(null);
+    void agentsApi.update(created.id, { defaultEnvironmentId: draftEnvironmentId }, companyId).then(async agent => {
+      await cache.cancelQueries({ queryKey: queryKeys.agents.detail(agent.id) });
+      setCreated(agent);
+      cache.setQueryData(queryKeys.agents.detail(agent.id), agent);
+    }).catch(cause => setEnvironmentSaveError(describeError(cause).body))
+      .finally(() => setEnvironmentSaving(false));
+  }, [created, companyId, connectionSettingsReady, envs.isSuccess, envs.isFetching,
+    settings.isSuccess, settings.isFetching, savedAgent.data?.id, draftEnvironmentId, environmentOverride, cache]);
+
   async function saveDraft(nextConnection = connection, exit = false, testedConfig?: Record<string, unknown>, selectedEnvironment = environmentOverride) {
     if (pendingAntigravity) return;
     if (!created || completed) return;
@@ -684,7 +721,7 @@ function Setup({
       submitted = true;
       const agent = await agentsApi.update(created.id, {
         adapterType: requestAdapterType, runner, adapterConfig: config,
-        defaultEnvironmentId: nativeCursorCloud ? null : selectedEnvironment || (forced.forced || managedOnly ? environmentId : null),
+        defaultEnvironmentId: nativeCursorCloud ? null : selectedEnvironment || (forced.forced || managedOnly ? environmentId : defaultEnvironmentId),
         runtimeConfig: { ...created.runtimeConfig, ...(binding ? { aiConnection: binding } : {}) },
         ...(antigravityCandidate ? { metadata: { ...created.metadata, setupAdapterPending: false, setupAdapterChoice: undefined } } : {}),
         ...(nextConnection?.applyStoredClaudeLogin ? { applyStoredClaudeLogin: true } : {}),
@@ -812,9 +849,7 @@ function Setup({
         adapterType: requestAdapterType,
         ...(["codex_local", "claude_local", "opencode_local", "pi_local", "cursor_cloud"].includes(adapterType) && runner !== "auto" ? { runner } : {}),
         adapterConfig: config,
-        defaultEnvironmentId: nativeCursorCloud ? null :
-          environmentOverride ||
-          (forced.forced || managedOnly ? environmentId : null),
+        defaultEnvironmentId: draftEnvironmentId,
         runtimeConfig: { ...buildNewAgentRuntimeConfig({ heartbeatEnabled: false }), ...(aiBinding ? { aiConnection: aiBinding } : {}) },
         budgetMonthlyCents: 0,
         ...(connection?.storedSessionId
@@ -897,7 +932,7 @@ function Setup({
         }}
       />
     );
-  if (!created && connectionSettingsReady && !pendingAntigravity) return <div className="space-y-4">
+  if (!created && connectionSettingsReady && !envs.isFetching && !settings.isFetching && !pendingAntigravity) return <div className="space-y-4">
     <p role={error ? "alert" : "status"}>{error ?? "Creating your agent…"}</p>
     {error && <Button onClick={() => setCreationAttempt(value => value + 1)}>Retry</Button>}
   </div>;
@@ -912,7 +947,7 @@ function Setup({
     saved: "Confirmation",
   };
   const confirmationEnvironment = created?.defaultEnvironmentId
-    ? envs.data?.find((env) => env.id === created.defaultEnvironmentId)
+    ? environments.find((env) => env.id === created.defaultEnvironmentId)
     : environment;
   const createdKimiModel = (
     created?.adapterConfig?.env as Record<string, unknown> | undefined
@@ -975,6 +1010,8 @@ function Setup({
             {environmentError}
           </p>
         )}
+        {environmentSaveError && <p role="alert" className="text-sm text-destructive">{environmentSaveError}</p>}
+        {environmentSaveError && !environmentSelectionSaved && <Button disabled={busy} onClick={() => void changeEnvironment()}>Retry saving environment</Button>}
         {preparingComputer && <p role="status" className="text-sm text-muted-foreground">Preparing your agent computer…</p>}
         {created?.lifecycleError && <div className="space-y-2">
           <p role="alert" className="text-sm text-destructive">{created.lifecycleError}</p>
@@ -1493,9 +1530,9 @@ function Setup({
                             }}
                           >
                             <option value="">
-                              Default: {environmentLabel}
+                              Default: {defaultEnvironment ? environmentDisplayLabel(defaultEnvironment) : "None"}
                             </option>
-                            {(envs.data ?? [])
+                            {environments
                               .filter((env) => env.status === "active" && (!managedOnly || env.driver !== "local"))
                               .map((env) => (
                                 <option key={env.id} value={env.id}>
@@ -1520,8 +1557,6 @@ function Setup({
                         {error}
                       </p>
                     )}
-                    {environmentSaveError && <p role="alert" className="text-sm text-destructive">{environmentSaveError}</p>}
-                    {environmentSaveError && !environmentSelectionSaved && <Button disabled={busy} onClick={() => void changeEnvironment()}>Retry saving environment</Button>}
                     <div className="flex justify-between border-t border-border py-5">
                       <div className="flex items-center gap-3">
                         <Button type="button" variant="ghost" disabled={busy} onClick={() => void saveAndExit()}>{pendingAntigravity ? "Back to agents" : "Save & exit"}</Button>

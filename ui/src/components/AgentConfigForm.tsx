@@ -64,6 +64,7 @@ import {
   resolveAdapterTestEnvironmentId,
   resolveLocalDefaultEnvironmentId,
   resolveManagedSandboxEnvironmentId,
+  resolveNewAgentDefaultEnvironmentId,
 } from "../lib/adapter-test-environment";
 import { environmentDisplayLabel } from "../lib/managed-sandbox-environment";
 import { adapterCuratesModelOrder, extractModelName, extractProviderId } from "../lib/model-utils";
@@ -879,11 +880,12 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const companyDefaultEnvironmentId = selectedCompany?.id === selectedCompanyId
     ? selectedCompany.defaultEnvironmentId ?? null : null;
   const instanceDefaultEnvironmentId = useMemo(() => {
-    const environmentId = instanceSettings?.defaultEnvironmentId ?? null;
-    if (!environmentId) return "";
-    const selected = environments.find((environment) => environment.id === environmentId) ?? null;
-    return !selected || selected.driver === "local" || (selected.companyId && selected.companyId !== selectedCompanyId)
-      ? "" : environmentId;
+    return resolveNewAgentDefaultEnvironmentId({
+      companyId: selectedCompanyId,
+      companyDefaultEnvironmentId: null,
+      instanceDefaultEnvironmentId: instanceSettings?.defaultEnvironmentId,
+      environments,
+    }) ?? "";
   }, [environments, instanceSettings?.defaultEnvironmentId, selectedCompanyId]);
   // Initialize a new draft once, after both asynchronous inputs have arrived.
   // Never reapply defaults over an explicit choice (including a later clear).
@@ -893,10 +895,12 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       || !environmentsLoaded || !instanceSettingsLoaded || initializedEnvironmentCompany.current === selectedCompanyId) return;
     initializedEnvironmentCompany.current = selectedCompanyId;
     if (props.values.defaultEnvironmentId || forcedKubernetes || isCursorCloudRunner) return;
-    const preferred = environments.find(environment => environment.id === companyDefaultEnvironmentId);
-    const companyDefault = preferred && preferred.driver !== "local"
-      && (!preferred.companyId || preferred.companyId === selectedCompanyId) ? preferred.id : "";
-    const environmentId = companyDefault || instanceDefaultEnvironmentId;
+    const environmentId = resolveNewAgentDefaultEnvironmentId({
+      companyId: selectedCompanyId,
+      companyDefaultEnvironmentId,
+      instanceDefaultEnvironmentId,
+      environments,
+    });
     if (environmentId) props.onChange({ defaultEnvironmentId: environmentId });
   }, [props, selectedCompanyId, selectedCompany?.id, environmentsLoaded, instanceSettingsLoaded, environments,
     companyDefaultEnvironmentId, instanceDefaultEnvironmentId, forcedKubernetes, isCursorCloudRunner]);
