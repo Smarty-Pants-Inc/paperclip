@@ -48,6 +48,9 @@ import {
 type QueueAction = "steer" | "interrupt" | "discard" | null;
 export const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
 export const CHAT_STOPPED_BY_PERSON_LINE = "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it.";
+/** A paused chat agent (the Send route's own 409 code): the bar says the
+ * server's paused line and offers no Send. */
+export const CHAT_AGENT_PAUSED_REASON = "queued_comment_chat_paused";
 
 export function reorderQueuedMessageEntries(
   entries: IssueQueuedCommentEntry[],
@@ -562,6 +565,9 @@ export function TaskChatQueuedMessages({
   // messages are not sent until the person sends them (or deletes some first).
   const stoppedByPerson = queue.executionWait?.reason === CHAT_STOPPED_BY_PERSON_REASON &&
     Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0 && Boolean(onInterrupt);
+  // The paused line is a fact, not a promise: no Send on the bar or on a row.
+  const stoppedPaused = queue.executionWait?.reason === CHAT_AGENT_PAUSED_REASON &&
+    Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0;
 
   if (entries.length === 0 && !visibleError && !statusMessage) return null;
 
@@ -610,7 +616,7 @@ export function TaskChatQueuedMessages({
                     : undefined
                 }
                 onDiscard={() => void runRowAction(entry.comment.id, "discard")}
-                sendOnLine={stoppedByPerson}
+                sendOnLine={stoppedByPerson || stoppedPaused}
               />
             );
           })}
@@ -636,6 +642,9 @@ export function TaskChatQueuedMessages({
             Send
           </button>
         </div>
+      ) : stoppedPaused ? (
+        <p role="status" className="border-t border-border px-3 py-1.5 text-xs text-muted-foreground"
+          data-testid="task-chat-queued-paused">{queue.executionWait!.message}</p>
       ) : null}
       {visibleError ? (
         <div

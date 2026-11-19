@@ -618,6 +618,33 @@ describe("TaskChatQueuedMessages", () => {
       Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: width });
     }
   });
+  // rf-5 F1: Stop, then Pause. The real GET's wait is the Send route's own
+  // paused code and line (agent-conversations.test.ts "(agent-paused)" row),
+  // so the bar says it is paused and offers no Send that would be refused.
+  it("after a person's Stop a paused agent's held bar says the paused line and offers no Send, only Delete (390 and 1440)", () => {
+    const realGet = { ...queue, targetRunId: null, protocol: "legacy", steeringDisposition: "unsupported",
+      executionWait: { reason: "queued_comment_chat_paused", message: "This agent is paused. Resume it to send these messages." } } as IssueQueuedCommentQueue;
+    const bar = "This agent is paused. Resume it to send these messages.";
+    const width = window.innerWidth;
+    try {
+      for (const innerWidth of [390, 1440]) {
+        Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: innerWidth });
+        window.dispatchEvent(new Event("resize"));
+        render({ queue: realGet, onInterrupt: vi.fn().mockResolvedValue(undefined) });
+        expect(container.textContent!.split(bar)).toHaveLength(2);
+        expect(container.querySelector('[data-testid="task-chat-queued-paused"]')?.textContent).toBe(bar);
+        expect(container.textContent).not.toContain("Send them now");
+        expect(container.querySelector('[data-testid="task-chat-queued-stopped-send"]')).toBeNull();
+        expect([...container.querySelectorAll("button")].filter(button => /Send|Steer|Interrupt/.test(button.textContent ?? ""))).toHaveLength(0);
+        for (const entry of realGet.entries) {
+          expect(container.querySelector(`[data-testid="task-chat-queued-interrupt-${entry.comment.id}"]`)).toBeNull();
+          expect(container.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-discard-${entry.comment.id}"]`)?.disabled).toBe(false);
+        }
+      }
+    } finally {
+      Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: width });
+    }
+  });
   it("says why Send is refused while the chat is paused, and keeps the messages", async () => {
     const stopped: IssueQueuedCommentQueue = { ...queue, targetRunId: null, protocol: "legacy", steeringDisposition: "unsupported",
       executionWait: { reason: "stopped_by_person", message: "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it." } };
