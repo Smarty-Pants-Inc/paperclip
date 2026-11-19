@@ -18,11 +18,12 @@ import { applyRestorePoint, captureRestorePoint, currentRestorePointSnapshot, im
   RestorePointRestoreFailure, RestorePointSkip, type RestorePointLimits, type RestorePointSnapshot } from "./git-restore-point.js";
 import { findRegenerableWorkspaceDirs, REGENERABLE_WORKSPACE_DIR_NAMES, WORKSPACE_COMPACTION_TRASH_DIR } from "./workspace-compaction.js";
 import { ensureManagedRepositoriesIgnored } from "./managed-repository-checkout.js";
-import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lock-keepalive.js";
+import { currentHostMutationDrain, withHeldLockHostDrain } from "./native-runtime/held-lock-host-drain.js";
+import { hostCleanup, hostDeferredCleanup, hostMutation } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { canonicalRepositoryRoot, localWorkspaceSourcePaths } from "./execution-workspace-source-roots.js";
 import { withExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifecycle-lock.js";
 import { loadGitRestorePoint } from "./git-restore-point-storage.js";
-import { nestedWorktreeBranchPrefix, readLinkedNestedCheckout, repairMovedNestedRepositoryWorktree, withNestedRepositoryBaseLock } from "./nested-repository-worktrees.js";
+import { nestedWorktreeBranchPrefix, readLinkedNestedCheckout, withNestedRepositoryBaseLock } from "./nested-repository-worktrees.js";
 import { getStorageService } from "../storage/index.js";
 import { createIssueGitRemoteAuthProvider } from "./git-credentials.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
@@ -239,25 +240,44 @@ export async function historyKey(cwd: string, admin: string, signal?: AbortSigna
   return JSON.stringify([shas(reflog), original.trim()]);
 }
 
-async function repairLinkedCheckout(checkout: string) {
-  const marker = await fs.lstat(path.join(checkout, ".git")).catch(() => null);
-  if (!marker?.isFile()) return;
-  const common = (await git(checkout, ["rev-parse", "--path-format=absolute", "--git-common-dir"])).trim();
-  await repairMovedNestedRepositoryWorktree(path.dirname(common), checkout);
+/** pl/keepalive8: the combined held-lock signal (the caller's, and the held gate's), checked inside a multi-step helper. */
+function assertStepHeld(signal?: AbortSignal) {
+  signal?.throwIfAborted();
+  currentHostMutationDrain()?.signal.throwIfAborted();
 }
 
-async function retargetNestedBranch(checkout: string, from: string) {
+/** pl/keepalive8: checked before EACH git command and lock/file write inside, not only once around the helper. */
+async function repairLinkedCheckout(checkout: string, signal?: AbortSignal) {
+  assertStepHeld(signal);
   const marker = await fs.lstat(path.join(checkout, ".git")).catch(() => null);
   if (!marker?.isFile()) return;
-  const head = (await git(checkout, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => "")).trim();
+  assertStepHeld(signal);
+  const common = (await git(checkout, ["rev-parse", "--path-format=absolute", "--git-common-dir"], { signal })).trim();
+  assertStepHeld(signal);
+  await withNestedRepositoryBaseLock(path.dirname(common), async () => {
+    assertStepHeld(signal);
+    await git(path.dirname(common), ["worktree", "repair", checkout], { signal });
+  });
+}
+
+async function retargetNestedBranch(checkout: string, from: string, signal?: AbortSignal) {
+  assertStepHeld(signal);
+  const marker = await fs.lstat(path.join(checkout, ".git")).catch(() => null);
+  if (!marker?.isFile()) return;
+  assertStepHeld(signal);
+  const head = (await git(checkout, ["symbolic-ref", "--quiet", "--short", "HEAD"], { signal }).catch(() => "")).trim();
   const previous = await nestedWorktreeBranchPrefix(from);
   if (!head.startsWith(previous)) return;
   const next = `${await nestedWorktreeBranchPrefix(checkout)}${head.slice(previous.length)}`;
   if (next === head) return;
-  const base = path.dirname((await git(checkout, ["rev-parse", "--path-format=absolute", "--git-common-dir"])).trim());
+  assertStepHeld(signal);
+  const base = path.dirname((await git(checkout, ["rev-parse", "--path-format=absolute", "--git-common-dir"], { signal })).trim());
+  assertStepHeld(signal);
   await withNestedRepositoryBaseLock(base, async () => {
-    if ((await git(base, ["rev-parse", "--verify", "-q", `refs/heads/${next}`]).catch(() => "")).trim()) throw new Error("nested_branch_conflict");
-    await git(checkout, ["branch", "-m", head, next]);
+    assertStepHeld(signal);
+    if ((await git(base, ["rev-parse", "--verify", "-q", `refs/heads/${next}`], { signal }).catch(() => "")).trim()) throw new Error("nested_branch_conflict");
+    assertStepHeld(signal);
+    await git(checkout, ["branch", "-m", head, next], { signal });
   });
 }
 
@@ -296,32 +316,96 @@ async function provenTarget(db: Db | Tx, workspaceId: string, pending: IsolatedR
   return !other;
 }
 
-export async function returnTransferItems(original: string, moved: string, moves: string[], conflict: string) {
-  for (const relative of moves) {
-    if (await exists(path.join(moved, relative)) && await exists(path.join(original, relative))) throw new Error(conflict);
-  }
-  for (const relative of [...moves].reverse()) {
-    const from = path.join(moved, relative), to = path.join(original, relative);
-    if (!await exists(from) || await exists(to)) continue;
-    await fs.mkdir(path.dirname(to), { recursive: true });
-    await fs.rename(from, to);
-    await repairLinkedCheckout(to).catch(() => undefined);
-    await retargetNestedBranch(to, from).catch(() => undefined);
+/**
+ * pl/keepalive7: ONE host step of a multi-step consumer. Before the step, the combined held-lock signal (the
+ * caller's, and the held gate's: this lock's or any outer lock's loss) is checked, so a lost lock stops the
+ * consumer with its typed lost error before the NEXT step; the step itself goes through the held gate, so it is
+ * refused after a loss and the drain counts it while in flight. Outside a held lock, with no signal, it is fn().
+ */
+async function heldStep<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  signal?.throwIfAborted();
+  currentHostMutationDrain()?.signal.throwIfAborted();
+  return hostMutation(fn);
+}
+
+/** The secret pair: a workspace's .env files and its .claude/settings.local.json. They move as ONE unit. */
+function secretTransferItem(relative: string) {
+  return relative === ".claude/settings.local.json" || /^\.env(\..*)?$/.test(path.posix.basename(relative));
+}
+
+/**
+ * pl/keepalive8: move the secret pair as ONE unit, never split between source and target. Each rename is a
+ * checked, gated host step; the unit commits only if the held lock (combined signal) is still held after the
+ * last rename. On a loss (or any failure) before the commit, BOTH go back to their original paths: the rollback
+ * is registered with the held drain before the first rename, so a closing drain runs it after the in-flight
+ * rename returns, before ownership is released. The rollback only renames back; it never deletes a secret file
+ * and never overwrites one.
+ */
+async function moveSecretUnit(fromRoot: string, toRoot: string, items: string[], signal?: AbortSignal) {
+  if (!items.length) return;
+  for (const relative of items) if (await exists(path.join(toRoot, relative))) throw new Error("transfer_conflict");
+  const moved: string[] = [];
+  let committed = false;
+  const rollback = hostDeferredCleanup(async () => {
+    if (committed) return;
+    for (const relative of [...moved].reverse()) {
+      const original = path.join(fromRoot, relative), staged = path.join(toRoot, relative);
+      if (await exists(original) || !await exists(staged)) continue;
+      await fs.mkdir(path.dirname(original), { recursive: true });
+      await fs.rename(staged, original);
+    }
+    moved.length = 0;
+  });
+  try {
+    for (const relative of items) {
+      const source = path.join(fromRoot, relative), destination = path.join(toRoot, relative);
+      await heldStep(() => fs.mkdir(path.dirname(destination), { recursive: true }), signal);
+      await heldStep(async () => { await fs.rename(source, destination); moved.push(relative); }, signal);
+    }
+    // Commit both only while the lock is still held; otherwise the finally rolls BOTH back.
+    signal?.throwIfAborted();
+    currentHostMutationDrain()?.signal.throwIfAborted();
+    committed = true;
+  } finally {
+    await rollback();
   }
 }
 
-export async function moveTransferItems(from: string, to: string, moves: string[], linkedBases: Map<string, string>) {
-  if (moves.some(item => item.startsWith(`${PROJECT_REPOSITORIES_DIR}/`))) await ensureManagedRepositoriesIgnored(to);
+export async function returnTransferItems(original: string, moved: string, moves: string[], conflict: string, signal?: AbortSignal) {
   for (const relative of moves) {
+    if (await exists(path.join(moved, relative)) && await exists(path.join(original, relative))) throw new Error(conflict);
+  }
+  // pl/keepalive8: the secret pair returns as one unit (both or neither).
+  const secrets: string[] = [];
+  for (const relative of moves.filter(secretTransferItem)) {
+    if (await exists(path.join(moved, relative)) && !await exists(path.join(original, relative))) secrets.push(relative);
+  }
+  await moveSecretUnit(moved, original, secrets, signal);
+  for (const relative of [...moves].reverse().filter(item => !secretTransferItem(item))) {
+    const from = path.join(moved, relative), to = path.join(original, relative);
+    if (!await exists(from) || await exists(to)) continue;
+    await heldStep(() => fs.mkdir(path.dirname(to), { recursive: true }), signal);
+    await heldStep(() => fs.rename(from, to), signal);
+    await heldStep(() => repairLinkedCheckout(to, signal).catch(() => undefined), signal);
+    await heldStep(() => retargetNestedBranch(to, from, signal).catch(() => undefined), signal);
+  }
+}
+
+/** pl/keepalive7: every move (and its mkdir / linked-checkout repair) is its own checked, gated host step. */
+export async function moveTransferItems(from: string, to: string, moves: string[], linkedBases: Map<string, string>, signal?: AbortSignal) {
+  if (moves.some(item => item.startsWith(`${PROJECT_REPOSITORIES_DIR}/`))) await heldStep(() => ensureManagedRepositoriesIgnored(to), signal);
+  for (const relative of moves.filter(item => !secretTransferItem(item))) {
     const destination = path.join(to, relative);
     if (await exists(destination)) throw new Error("transfer_conflict");
-    await fs.mkdir(path.dirname(destination), { recursive: true });
-    await fs.rename(path.join(from, relative), destination);
+    await heldStep(() => fs.mkdir(path.dirname(destination), { recursive: true }), signal);
+    await heldStep(() => fs.rename(path.join(from, relative), destination), signal);
     if (linkedBases.has(relative)) {
-      await repairLinkedCheckout(destination);
-      await retargetNestedBranch(destination, path.join(from, relative));
+      await heldStep(() => repairLinkedCheckout(destination, signal), signal);
+      await heldStep(() => retargetNestedBranch(destination, path.join(from, relative), signal), signal);
     }
   }
+  // pl/keepalive8: the secret pair (.env files + .claude/settings.local.json) moves last, as ONE unit.
+  await moveSecretUnit(from, to, moves.filter(secretTransferItem), signal);
 }
 
 export async function assertTransferredItems(from: string, to: string, moves: string[], linkedBases: Map<string, string>) {
@@ -335,33 +419,47 @@ export async function assertTransferredItems(from: string, to: string, moves: st
   }
 }
 
-async function undoMove(db: Db | Tx, workspaceId: string, pending: IsolatedRepositoryRehomePending, ownsTarget?: boolean) {
+async function undoMove(db: Db | Tx, workspaceId: string, pending: IsolatedRepositoryRehomePending, ownsTarget?: boolean, signal?: AbortSignal) {
   if (ownsTarget ?? await provenTarget(db, workspaceId, pending)) {
-    await returnTransferItems(pending.from, pending.target, pending.moves, "rehome_rollback_conflict");
-    await git(pending.base, ["worktree", "remove", "--force", "--force", pending.target]).catch(() => undefined);
-    await fs.rm(pending.target, { recursive: true, force: true });
-    await git(pending.base, ["worktree", "prune"]).catch(() => undefined);
+    await returnTransferItems(pending.from, pending.target, pending.moves, "rehome_rollback_conflict", signal);
+    await heldStep(() => git(pending.base, ["worktree", "remove", "--force", "--force", pending.target]).catch(() => undefined), signal);
+    await heldStep(() => fs.rm(pending.target, { recursive: true, force: true }), signal);
+    await heldStep(() => git(pending.base, ["worktree", "prune"]).catch(() => undefined), signal);
   }
   const branchRef = `refs/heads/${pending.branch}`;
   const tip = (await git(pending.base, ["rev-parse", "--verify", "-q", `${branchRef}^{commit}`]).catch(() => "")).trim();
   if (tip !== pending.head || (await git(pending.base, ["worktree", "list", "--porcelain"])).split("\n").includes(`branch ${branchRef}`)) return;
-  if (pending.previousTip) await git(pending.base, ["update-ref", branchRef, pending.previousTip, pending.head]);
+  if (pending.previousTip) await heldStep(() => git(pending.base, ["update-ref", branchRef, pending.previousTip!, pending.head]), signal);
   else {
-    await git(pending.base, ["update-ref", "-d", branchRef, pending.head]);
-    for (const key of ["remote", "merge"]) await git(pending.base, ["config", "--local", "--unset-all", `branch.${pending.branch}.${key}`]).catch(() => undefined);
+    await heldStep(() => git(pending.base, ["update-ref", "-d", branchRef, pending.head]), signal);
+    for (const key of ["remote", "merge"]) {
+      await heldStep(() => git(pending.base, ["config", "--local", "--unset-all", `branch.${pending.branch}.${key}`]).catch(() => undefined), signal);
+    }
   }
 }
 
-export function withWorkspaceMoveLocks<T>(db: Db, workspace: Workspace, work: (tx: Tx) => Promise<T>) {
+/** pl/keepalive5: the move's lifecycle-lock session died (failed keepalive ping); another owner may hold the lock. */
+export class WorkspaceMoveLockLostError extends Error {
+  override name = "WorkspaceMoveLockLostError";
+  constructor(cause?: unknown) { super("workspace_move_lock_lost", { cause }); }
+}
+
+export function withWorkspaceMoveLocks<T>(db: Db, workspace: Workspace, work: (tx: Tx, signal?: AbortSignal) => Promise<T>) {
   return withIsolatedRepositorySourceLock(db, workspace.companyId, workspace.sourceIssueId!, () =>
     withWorkspaceSourceLocks(db, { companyId: workspace.companyId, projectIds: workspace.projectId ? [workspace.projectId] : [] }, async () => {
+      // pl/keepalive6: the held source scope's gate, captured before the move's own lock connection opens.
+      const sourceGate = currentHostMutationDrain();
       for (const cwd of localWorkspaceSourcePaths(workspace)) await retainCurrentWorkspaceSource(cwd);
       return withDedicatedDbConnection(db, connection => connection.transaction(async tx => {
         const rows = await tx.execute<{ locked: boolean; idle_timeout_ms: string | number | null }>(sql`select
           pg_try_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${workspace.id}`}, 0)) as locked,
           (select setting::bigint from pg_settings where name = 'idle_in_transaction_session_timeout') as idle_timeout_ms`);
         if (!rows[0]?.locked) throw new Error("lifecycle_busy");
-        return withWorkspaceLockKeepalive(tx, Number(rows[0]?.idle_timeout_ms), () => work(tx));
+        // pl/keepalive6: the move's gate is JOINED to the source scope's: losing the move's lifecycle lock OR the
+        // outer source lock stops the move's host writes; in-flight ones drain before the locks are released.
+        return withHeldLockHostDrain({ lock: tx, idleTimeoutMs: Number(rows[0]?.idle_timeout_ms), parent: sourceGate,
+          label: "workspace move lock", lostError: cause => new WorkspaceMoveLockLostError(cause) },
+        (signal) => work(tx, signal));
       }));
     }), true);
 }
@@ -383,16 +481,20 @@ function skip(result: IsolatedRepositoryRehomeResult, error: unknown) {
   return reason;
 }
 
-export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Workspace, options: {
+export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Workspace, callerOptions: {
   dryRun?: boolean; now?: Date; signal?: AbortSignal; limits?: Partial<RestorePointLimits>; hooks?: IsolatedRepositoryRehomeHooks;
 } = {}): Promise<IsolatedRepositoryRehomeResult> {
+  let options = callerOptions;
   const result = emptyResult();
   const candidate = isIsolatedRepositoryRehomeCandidate(snapshot);
   if (!snapshot.sourceIssueId || (!candidate && !hasPendingIsolatedRepositoryRehomeCleanup(snapshot))) return { ...result, reason: "not_candidate" };
   try {
-    return await withWorkspaceMoveLocks(db, snapshot, async tx => {
+    return await withWorkspaceMoveLocks(db, snapshot, async (tx, lost) => {
+      // pl/keepalive5: the lock-loss signal joins the caller's; every signal-taking git step and the host writes below re-check it.
+      if (lost) options = { ...callerOptions, signal: callerOptions.signal ? AbortSignal.any([callerOptions.signal, lost]) : lost };
       const [row] = await db.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.id, snapshot.id), eq(executionWorkspaces.companyId, snapshot.companyId)));
       if (!row || row.updatedAt.getTime() !== snapshot.updatedAt.getTime()) throw new Error("workspace_changed");
+      options.signal?.throwIfAborted();
       if (!candidate) return await cleanupRehomedSource(db, tx, row, result, options);
       if (!await workspaceMoveEligible(tx, row)) throw new Error("live_or_unresolved_consumer");
       let recipe: GitCacheRestoration | null = null;
@@ -410,7 +512,9 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
         if (interrupted.base !== base || interrupted.from !== old.cwd || interrupted.branch !== branch
           || interrupted.target !== path.join(await fs.realpath(base), standardWorktreeSuffix(branch))) throw new Error("invalid_rehome_record");
         if (options.dryRun) return { ...result, outcome: "dry_run" as const, reason: "interrupted_rehome_pending", from: row.cwd, to: interrupted.target };
-        await undoMove(tx, row.id, interrupted);
+        options.signal?.throwIfAborted();
+        await undoMove(tx, row.id, interrupted, undefined, options.signal);
+        options.signal?.throwIfAborted();
         await writePending(db, row.id, null);
       }
       const target = await targetWorktree(tx, row, base, branch, options.signal);
@@ -425,7 +529,9 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
       result.candidateBytes = await allocatedBytes(clone, () => { options.signal?.throwIfAborted(); return true; }).catch(() => 0);
       if (options.dryRun) return { ...result, outcome: "dry_run" as const };
       const admins = [path.basename(old.admin)];
-      const locks = await acquireGitExpirationLocks(rehomeLockLocations(clone, admins, branch), lockToken(row.id))
+      options.signal?.throwIfAborted();
+      // pl/keepalive6: the move's host writes below go through the held locks' (joined) gate: refused after a loss, drained before release.
+      const locks = await heldStep(() => acquireGitExpirationLocks(rehomeLockLocations(clone, admins, branch), lockToken(row.id)))
         .catch(() => { throw new Error("worktree_git_busy"); });
       const pending: IsolatedRepositoryRehomePending = { base, from: old.cwd, target, branch, head: old.head, previousTip, moves };
       let recorded = false, ownsTarget = false, committed = false;
@@ -435,37 +541,42 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
         if (before.head !== old.head) throw new Error("head_changed");
         const captured = await captureRestorePoint({ cwd: old.cwd, upstreamCommits: await sharedHistoryBoundary(old.cwd, base, old.head, options.signal),
           limits: options.limits ?? ISOLATED_REHOME_RESTORE_POINT_LIMITS, signal: options.signal });
-        const manifest = captured ? await importRestorePoint({ repositoryCwd: base, payload: captured.payload, signal: options.signal }) : null;
+        const manifest = captured ? await heldStep(() => importRestorePoint({ repositoryCwd: base, payload: captured.payload, signal: options.signal })) : null;
         const reflog = shas(await git(old.cwd, ["reflog", "show", "--format=%H", "HEAD"], { signal: options.signal }).catch(() => ""));
         const original = (await fs.readFile(path.join(old.admin, "ORIG_HEAD"), "utf8").catch(() => "")).trim();
         const history = [old.head, ...reflog, ...(SHA.test(original) ? [original] : [])];
         const present = await presentCommits(base, history, options.signal);
         if (history.some(sha => !present.has(sha))) throw new Error("history_not_transferred");
+        options.signal?.throwIfAborted();
         await writePending(db, row.id, pending);
         recorded = true;
-        if (previousTip) await git(base, ["update-ref", branchRef, old.head, previousTip], { signal: options.signal });
+        if (previousTip) await heldStep(() => git(base, ["update-ref", branchRef, old.head, previousTip], { signal: options.signal }));
         else {
-          await git(base, ["update-ref", branchRef, old.head, ""], { signal: options.signal });
+          await heldStep(() => git(base, ["update-ref", branchRef, old.head, ""], { signal: options.signal }));
           for (const key of ["remote", "merge"]) {
             const value = (await git(old.cwd, ["config", "--local", "--get", `branch.${branch}.${key}`]).catch(() => "")).trim();
-            if (value) await git(base, ["config", "--local", `branch.${branch}.${key}`, value], { signal: options.signal });
+            if (value) await heldStep(() => git(base, ["config", "--local", `branch.${branch}.${key}`, value], { signal: options.signal }));
           }
         }
-        await fs.mkdir(path.dirname(target), { recursive: true });
+        options.signal?.throwIfAborted();
+        await heldStep(() => fs.mkdir(path.dirname(target), { recursive: true }));
         await assertSafeBaseConfig(base, options.signal);
         await options.hooks?.beforeWorktreeAdd?.({ from: old.cwd, to: target });
         if (await exists(target)) throw new Error("target_worktree_exists");
-        await git(base, ["worktree", "add", target, branch], { signal: options.signal, timeout: 15 * 60_000 });
+        await heldStep(() => git(base, ["worktree", "add", target, branch], { signal: options.signal, timeout: 15 * 60_000 }));
         ownsTarget = true;
-        if (manifest) await applyRestorePoint({ cwd: target, manifest, signal: options.signal });
+        if (manifest) await heldStep(() => applyRestorePoint({ cwd: target, manifest, signal: options.signal }));
         const newAdmin = (await git(target, ["rev-parse", "--absolute-git-dir"], { signal: options.signal })).trim();
-        await fs.mkdir(path.join(newAdmin, "logs"), { recursive: true });
-        await fs.copyFile(path.join(old.admin, "logs", "HEAD"), path.join(newAdmin, "logs", "HEAD")).catch(async (error: NodeJS.ErrnoException) => {
+        options.signal?.throwIfAborted();
+        await heldStep(() => fs.mkdir(path.join(newAdmin, "logs"), { recursive: true }));
+        await heldStep(() => fs.copyFile(path.join(old.admin, "logs", "HEAD"), path.join(newAdmin, "logs", "HEAD"))).catch(async (error: NodeJS.ErrnoException) => {
           if (error.code !== "ENOENT") throw error;
-          await fs.rm(path.join(newAdmin, "logs", "HEAD"), { force: true });
+          await heldStep(() => fs.rm(path.join(newAdmin, "logs", "HEAD"), { force: true }));
         });
-        if (original) await fs.copyFile(path.join(old.admin, "ORIG_HEAD"), path.join(newAdmin, "ORIG_HEAD"));
-        await moveTransferItems(old.cwd, target, moves, linkedBases);
+        if (original) await heldStep(() => fs.copyFile(path.join(old.admin, "ORIG_HEAD"), path.join(newAdmin, "ORIG_HEAD")));
+        options.signal?.throwIfAborted();
+        // pl/keepalive7: each transfer step is checked and gated individually (not the whole loop once).
+        await moveTransferItems(old.cwd, target, moves, linkedBases, options.signal);
         await options.hooks?.beforeVerify?.({ from: old.cwd, to: target });
         const after = await currentRestorePointSnapshot(old.cwd, options.signal);
         const moved = await currentRestorePointSnapshot(target, options.signal);
@@ -476,6 +587,7 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
         if ((await git(target, ["symbolic-ref", "--short", "HEAD"], { signal: options.signal })).trim() !== branch) throw new Error("branch_identity_changed");
         await assertTransferredItems(old.cwd, target, moves, linkedBases);
         const at = (options.now ?? new Date()).toISOString();
+        options.signal?.throwIfAborted();
         await db.transaction(async updateTx => {
           const [current] = await updateTx.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, row.id)).for("update");
           if (!current || current.updatedAt.getTime() !== row.updatedAt.getTime()) throw new Error("workspace_changed");
@@ -492,16 +604,19 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
         committed = true;
       } finally {
         try {
-          if (!committed && recorded) {
-            await undoMove(tx, row.id, pending, ownsTarget);
+          // pl/keepalive5: after a lock loss the pending record stays; the next owner's interrupted-move recovery undoes it.
+          if (!committed && recorded && !lost?.aborted) {
+            await undoMove(tx, row.id, pending, ownsTarget, lost);
+            lost?.throwIfAborted();
             await writePending(db, row.id, null);
           }
-        } finally { await locks.release().catch(() => undefined); }
+        } finally { await hostCleanup(() => locks.release()).catch(() => undefined); }
       }
       result.rehomed = true;
       result.outcome = "rehomed";
       const [updated] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, row.id));
       await options.hooks?.afterDatabaseUpdate?.(updated!);
+      options.signal?.throwIfAborted();
       return await cleanupRehomedSource(db, tx, updated!, result, options);
     });
   } catch (error) {
@@ -622,7 +737,10 @@ async function cleanupRehomedSource(db: Db, tx: Tx, row: Workspace, result: Isol
   const keep = async (reason: string, retained: boolean) => {
     result.cloneKeptReason = reason;
     if (!result.rehomed) result.outcome = "clone_kept";
-    if (retained && !options.dryRun) await markCleaned(db, row.id, options.now, reason);
+    if (retained && !options.dryRun) {
+      options.signal?.throwIfAborted(); currentHostMutationDrain()?.signal.throwIfAborted();
+      await markCleaned(db, row.id, options.now, reason);
+    }
     return result;
   };
   if (cloneReal && path.relative(cloneReal, from).startsWith("..")) return keep("unproven_worktree_admin", false);
@@ -639,12 +757,13 @@ async function cleanupRehomedSource(db: Db, tx: Tx, row: Workspace, result: Isol
       if (!fromStat.isDirectory() || fromStat.isSymbolicLink()) return keep("unsafe_worktree_path", false);
       if (!await worktreeOfClone(from, cloneReal, options.signal)) return keep("source_identity_changed", false);
       result.reclaimedBytes += await allocatedBytes(from, () => true).catch(() => 0);
-      if (await exists(worktreeTrash)) await fs.rm(worktreeTrash, { recursive: true, force: true });
-      await fs.rename(from, worktreeTrash);
+      // pl/keepalive6: the cleanup's removals go through the held locks' gate (refused after a loss, drained before release).
+      if (await exists(worktreeTrash)) await heldStep(() => fs.rm(worktreeTrash, { recursive: true, force: true }));
+      await heldStep(() => fs.rename(from, worktreeTrash));
     }
-    await git(clone, ["worktree", "prune"], { signal: options.signal });
+    await heldStep(() => git(clone, ["worktree", "prune"], { signal: options.signal }));
   }
-  if (await exists(worktreeTrash)) await fs.rm(worktreeTrash, { recursive: true, force: true });
+  if (await exists(worktreeTrash)) await heldStep(() => fs.rm(worktreeTrash, { recursive: true, force: true }));
   if (cloneReal) {
     const consumer = await cloneConsumers(tx, row.companyId, row.sourceIssueId, row.id, clone);
     if (consumer) return keep(consumer, consumer === "base_has_consumers");
@@ -656,16 +775,17 @@ async function cleanupRehomedSource(db: Db, tx: Tx, row: Workspace, result: Isol
       return keep(disposable.reason, false);
     }
     const bytes = await allocatedBytes(clone, () => true).catch(() => 0);
-    if (await exists(cloneTrash)) await fs.rm(cloneTrash, { recursive: true, force: true });
-    await fs.rename(clone, cloneTrash);
+    if (await exists(cloneTrash)) await heldStep(() => fs.rm(cloneTrash, { recursive: true, force: true }));
+    await heldStep(() => fs.rename(clone, cloneTrash));
     result.reclaimedBytes += bytes;
   }
   if (await exists(cloneTrash)) {
-    await fs.rm(cloneTrash, { recursive: true, force: true });
+    await heldStep(() => fs.rm(cloneTrash, { recursive: true, force: true }));
     result.cloneRemoved = true;
   }
-  await fs.rmdir(parent).catch(() => undefined);
+  await heldStep(() => fs.rmdir(parent)).catch(() => undefined);
   if (!result.rehomed) result.outcome = "cleaned";
+  options.signal?.throwIfAborted(); currentHostMutationDrain()?.signal.throwIfAborted();
   await markCleaned(db, row.id, options.now);
   return result;
 }
@@ -740,7 +860,7 @@ export async function sweepOrphanedIsolatedRepositorySources(db: Db, options: { 
           const clone = isolatedRemoteSourcePath(companyId, issueId);
           const parent = path.dirname(clone);
           for (const entry of await fs.readdir(parent, { withFileTypes: true })) {
-            if (!options.dryRun && entry.isDirectory() && SOURCE_TRASH.test(entry.name)) await fs.rm(path.join(parent, entry.name), { recursive: true, force: true });
+            if (!options.dryRun && entry.isDirectory() && SOURCE_TRASH.test(entry.name)) await heldStep(() => fs.rm(path.join(parent, entry.name), { recursive: true, force: true }), options.signal);
           }
           const stat = await fs.lstat(clone).catch(() => null);
           if (!stat) return;
@@ -770,12 +890,12 @@ export async function sweepOrphanedIsolatedRepositorySources(db: Db, options: { 
           result.candidateBytes = await allocatedBytes(clone, () => { options.signal?.throwIfAborted(); return true; }).catch(() => 0);
           if (options.dryRun) return;
           const trash = path.join(parent, `.orphaned-checkout-${randomBytes(8).toString("hex")}`);
-          await fs.rename(clone, trash);
-          await fs.rm(trash, { recursive: true, force: true });
+          await heldStep(() => fs.rename(clone, trash), options.signal);
+          await heldStep(() => fs.rm(trash, { recursive: true, force: true }), options.signal);
           result.removed = true;
           result.reclaimedBytes = result.candidateBytes;
-          await fs.rmdir(parent).catch(() => undefined);
-          await fs.rmdir(path.dirname(parent)).catch(() => undefined);
+          await heldStep(() => fs.rmdir(parent), options.signal).catch(() => undefined);
+          await heldStep(() => fs.rmdir(path.dirname(parent)), options.signal).catch(() => undefined);
         }, true);
       } catch (error) {
         options.signal?.throwIfAborted();

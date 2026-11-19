@@ -24,7 +24,8 @@ import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import { agentDirectoryBaselineDigest, agentDirectoryProbeProgram, observeLocalAgentDirectory } from "./agent-directory-probe.js";
 import { hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "./remote-execution-termination.js";
 import { cachedAgentFileManifest, captureAgentFileCheckpoint, checkpointBaseline, checkpointSnapshot, type AgentFileManifest } from "./agent-file-checkpoints.js";
-import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lock-keepalive.js";
+import { currentHostMutationDrain, withHeldLockHostDrain } from "./native-runtime/held-lock-host-drain.js";
+import { hostMutation } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { logger } from "../middleware/logger.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 
@@ -37,6 +38,28 @@ function adoptionAuthority(row: Copy) {
 export class AgentDirectoryReuseInvalidatedError extends Error {}
 export class AgentDirectoryOperationBusyError extends HttpError {
   constructor() { super(409, "Agent directory operation is already active"); }
+}
+/** pl/keepalive5: the agent-directory operation lock session died (failed keepalive ping); another owner may hold it. */
+/**
+ * pl/keepalive7: the combined held-lock signal of a multi-step agent-directory consumer: the operation lock's own
+ * (`signal`) or the gate of any held lock it runs inside. Checked before EVERY capture, save, patch and removal,
+ * so a lost lock stops the consumer with its typed lost error before the next step (the caller treats it as a
+ * failure). Healthy (nothing aborted), it changes nothing.
+ */
+function heldLost(signal?: AbortSignal): AbortSignal | undefined {
+  if (signal?.aborted) return signal;
+  const gate = currentHostMutationDrain()?.signal;
+  return gate?.aborted ? gate : undefined;
+}
+function assertHeld(signal?: AbortSignal) { heldLost(signal)?.throwIfAborted(); }
+/** One host step: checked first, then through the held gate (refused after a loss, counted by the drain). */
+function heldStep<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  try { assertHeld(signal); } catch (error) { return Promise.reject(error); }
+  return hostMutation(fn);
+}
+export class AgentDirectoryOperationLockLostError extends Error {
+  override name = "AgentDirectoryOperationLockLostError";
+  constructor(cause?: unknown) { super("agent_directory_operation_lock_lost", { cause }); }
 }
 const completed = new Set(["saved", "unchanged", "resolved"]);
 /** The one instruction shown while a stopped agent-file save is unverified. */
@@ -484,7 +507,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (!value || typeof value.digest !== "string" || !/^[a-f0-9]{64}$/.test(value.digest) || typeof value.identity !== "string") throw new Error("Invalid agent directory observation");
     return value as { digest: string; identity: string };
   }
-  async function prepareCopy(input: { companyId: string; agentId: string; runId: string; target?: AdapterExecutionTarget | null; cwd: string; warm?: boolean; reuseRunId?: string; onWarmHandoff?: (copy: Copy) => void }, serialHeld = false): Promise<Copy | null> {
+  async function prepareCopy(input: { companyId: string; agentId: string; runId: string; target?: AdapterExecutionTarget | null; cwd: string; warm?: boolean; reuseRunId?: string; onWarmHandoff?: (copy: Copy) => void }, serialHeld = false, signal?: AbortSignal): Promise<Copy | null> {
     const [agent] = await db.select().from(agents).where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId)));
     if (!agent) throw notFound("Agent not found");
     if (agentInstructionsBundleMode(agent) !== "managed") return null;
@@ -557,7 +580,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       // Join cleanup's lock before resetting its receipt or creating new bytes.
       // Interrupted admission may have registered the row before making this root.
       await fs.mkdir(path.resolve(localRoot, "../../.."), { recursive: true, mode: 0o700 });
-      return serial(row, () => prepareCopy(input, true), "agent_directory_prepare");
+      return serial(row, (_current, lost) => prepareCopy(input, true, lost), "agent_directory_prepare");
     }
     if (row && !settled(row) && row.state !== "preparing") {
       if (input.target?.kind === "remote") {
@@ -574,6 +597,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         ...(row ? { pendingConflicts: pendingConflicts(row) } : {}), ...(input.warm ? { warm: true, directoryRunId: input.runId } : {}), ...(input.target?.kind === "remote"
         ? { cleanup: { leaseId: input.target.leaseId ?? null, remoteCwd: input.target.remoteCwd } } : {}) }, processStoppedAt: null, attempts: 0,
       nextAttemptAt: null, errorCode: null, errorMessage: null };
+    assertHeld(signal);
     if (row) row = await patch(row, preparing);
     else {
       await insertCopy({ runId: input.runId, companyId: input.companyId, agentId: input.agentId, responsibleUserId: bound.onBehalfOfUserId!, ...preparing });
@@ -586,10 +610,10 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       const inspected = await inspectAgentDirectory(canonical, false);
       // A stopped lifecycle has already accounted for all its bytes. No live
       // or pending candidate ever enters this replacement path.
-      await fs.rm(localRoot, { recursive: true, force: true });
-      await fs.mkdir(path.dirname(localRoot), { recursive: true, mode: 0o700 });
+      await heldStep(() => fs.rm(localRoot, { recursive: true, force: true }), signal);
+      await heldStep(() => fs.mkdir(path.dirname(localRoot), { recursive: true, mode: 0o700 }), signal);
       try {
-        await fs.cp(canonical, localRoot, { recursive: true, preserveTimestamps: true });
+        await heldStep(() => fs.cp(canonical, localRoot, { recursive: true, preserveTimestamps: true }), signal);
         return inspected;
       } catch (error) {
         await fs.rm(path.dirname(localRoot), { recursive: true, force: true });
@@ -606,8 +630,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         ...(input.warm ? { sessionEntryHash: loadedEntry?.kind === "file" ? loadedEntry.hash : null } : {}) },
       processStoppedAt: null, attempts: 0, nextAttemptAt: null, errorCode: null, errorMessage: null };
     try {
+      assertHeld(signal);
       row = await patch(row, values);
-      if (input.warm) await fs.writeFile(ownerFile(row), JSON.stringify({ runId: row.runId }));
+      if (input.warm) await heldStep(() => fs.writeFile(ownerFile(row!), JSON.stringify({ runId: row!.runId })), signal);
     } catch (error) {
       await fs.rm(path.dirname(localRoot), { recursive: true, force: true });
       throw error;
@@ -622,9 +647,12 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         }
       }
       const observed = await observe(row, input.target).catch(() => null);
+      assertHeld(signal);
       return await patch(row, { state: "prepared", receipt: { ...row.receipt,
         ...(observed?.digest === agentDirectoryBaselineDigest(snapshot) ? { materializationIdentity: observed.identity } : {}) } });
     } catch (error) {
+      // pl/keepalive7: after a lock loss the next owner decides; no prepared->unavailable patch, no release.
+      assertHeld(signal);
       // Preparation failed before a provider could start using this copy.
       row = await patch(row, { state: "unavailable", processStoppedAt: new Date(), errorCode: "AGENT_FILES_PREPARE_FAILED",
         errorMessage: "Agent files could not be staged. The temporary copy was discarded.", nextAttemptAt: null });
@@ -650,7 +678,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // Reconstruct a private mirror without applying save quotas to admission.
     // An empty merge baseline downloads all remote bytes without uploading any;
     // the original save baseline remains unchanged in Postgres.
-    await fs.mkdir(row.localRoot, { recursive: true, mode: 0o700 });
+    await heldStep(() => fs.mkdir(row.localRoot, { recursive: true, mode: 0o700 }));
     let projection: PreparedAdapterExecutionTargetRuntime | undefined;
     try {
       projection = await prepareAdapterExecutionTargetRuntime({ target, runId: row.runId, adapterKey: "agent-files-recovery",
@@ -658,9 +686,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         runtimeRootDir: sandboxTransferRoot(row, target.remoteCwd), syncWorkspace: true,
         workspaceInboundMode: "adopt_remote", workspaceBaseline: { exclude: [".paperclip-runtime"], entries: new Map() },
         workspaceGitSnapshot: null, workspaceRepositories: [], workspaceFileMode: "all", workspaceExclude: [".paperclip-runtime", ".paperclip-runtime/**"] });
-      await projection.restoreWorkspace();
+      await heldStep(() => projection!.restoreWorkspace());
       await inspectAgentDirectory(row.localRoot, false);
-      if (row.receipt?.warm === true) await fs.writeFile(ownerFile(row), JSON.stringify({ runId: row.runId }));
+      if (row.receipt?.warm === true) await heldStep(() => fs.writeFile(ownerFile(row), JSON.stringify({ runId: row.runId })));
     } catch (error) {
       await fs.rm(row.localRoot, { recursive: true, force: true });
       throw error;
@@ -840,13 +868,15 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
   async function checkpoint(row: Copy, target?: AdapterExecutionTarget | null, stopped = false, signal?: AbortSignal): Promise<Copy> {
     // AF-ABORT: an aborted stopped collection starts no further remote command
     // and writes nothing (no save, no hold): the deadline owner writes the hold.
-    const live = () => signal?.throwIfAborted();
+    // (target adaptation, pl/keepalive7: live() is the combined held-lock check: the operation lock's signal or an enclosing held lock's gate.)
+    const live = () => assertHeld(signal);
     live();
     if (!await owns(row) || row.state === "superseded") return row;
     target ??= transports.get(key(row))?.target;
     if (row.location !== "local" && target?.kind !== "remote") {
       // A missing controller cache is not the remote directory. Retain the
       // pending save until its exact remote collector or destruction proof exists.
+      assertHeld(signal);
       if (agentFileSaveHeld(row)) return retryHeldSave(row);
       return patch(row, { ...(stopped ? { state: "pending_collection", processStoppedAt: row.processStoppedAt ?? new Date() } : {}),
         errorCode: "INSTRUCTION_REMOTE_COLLECTOR_UNAVAILABLE", errorMessage: "The remote agent directory is retained; its collector is unavailable. No save or discard is claimed.",
@@ -856,25 +886,28 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // a changed copy is collected by it; cleaned only after it is recorded.
     const aside = row.location !== "local" && target?.kind === "remote" && row.receipt?.notesAside === true ? target : null;
     // A failed surfacing fails CLOSED: no cleanup, and no stopped release.
-    let unsurfaced = aside ? await notesAsideRetried(row, aside, "surface") === null : false;
+    let unsurfaced = aside ? await heldStep(() => notesAsideRetried(row, aside, "surface"), signal) === null : false;
     let failure: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {
       let captured: Awaited<ReturnType<typeof captureAgentFileCheckpoint>> | undefined;
       try {
         live();
         const previous = row.receipt?.checkpointManifest as AgentFileManifest | undefined ?? checkpointBaseline(baseline(row));
-        captured = await captureAgentFileCheckpoint({ runId: row.runId, localRoot: row.localRoot, executionRoot: row.executionRoot, previous, target, signal });
+        // pl/keepalive7: each capture, the canonical save and each receipt patch are separate checked steps.
+        captured = await heldStep(() => captureAgentFileCheckpoint({ runId: row.runId, localRoot: row.localRoot, executionRoot: row.executionRoot, previous, target, signal }), signal);
         live();
         const snapshot = checkpointSnapshot(captured.manifest);
         const nextHash = directorySnapshotSha256(snapshot);
         const changed = nextHash !== row.baseHash;
         live();
         const { storageWarning, conflicts } = changed
-          ? await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: path.join(captured.directory, "files"), baseline: baseline(row), checkpoint: captured.manifest }, actor(row))
-          : await unchangedCheckpoint(row).then(() => ({
+          ? await heldStep(() => store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: path.join(captured!.directory, "files"), baseline: baseline(row), checkpoint: captured!.manifest }, actor(row)), signal)
+          : await heldStep(() => unchangedCheckpoint(row), signal).then(() => ({
             storageWarning: typeof row.receipt?.storageWarning === "string" ? row.receipt.storageWarning : null, conflicts: [],
           }));
-        live();
+        // pl/keepalive8: the combined held-lock signal is checked again AFTER the awaited save, immediately before
+        // the success receipt patch: a lock lost during the save writes no success receipt (the caller fails).
+        assertHeld(signal);
         row = await patch(row, { state: stopped ? (changed ? "saved" : "unchanged") : "warm_saved", baseHash: nextHash,
           candidateHash: nextHash, errorCode: null, errorMessage: null, attempts: 0, nextAttemptAt: null,
           ...(stopped ? { processStoppedAt: new Date() } : {}),
@@ -885,8 +918,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
             pendingConflicts: [...pendingConflicts(row), ...conflicts] } });
         if (aside && !unsurfaced) {
           live();
-          const remaining = await notesAsideRetried(row, aside, "clean");
-          if (remaining === 0) row = await patch(row, { receipt: { ...row.receipt, notesAside: false } });
+          const remaining = await heldStep(() => notesAsideRetried(row, aside, "clean"), signal);
+          if (remaining === 0) { live(); row = await patch(row, { receipt: { ...row.receipt, notesAside: false } }); }
           // A copy left after clean changed since it was surfaced (or could not
           // be read): at the stopped boundary that is unsurfaced bytes.
           else unsurfaced = true;
@@ -915,6 +948,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     }
     live();
     const rejection = failure instanceof HttpError && failure.status === 403 ? failure.message : null;
+    assertHeld(signal);
     if (!stopped) return patch(row, { errorCode: "AGENT_FILES_CHECKPOINT_UNSTABLE",
       errorMessage: rejection ? `Agent-file save rejected: ${rejection} Changes were not saved.` : "Incremental checkpoint could not be validated; collecting after provider stop.", nextAttemptAt: null });
     const storageLimit = failure instanceof AgentFileLimitError || String(failure).includes("LIMIT_EXCEEDED");
@@ -950,7 +984,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
   }
   async function collectStopped(row: Copy, target?: AdapterExecutionTarget | null, signal?: AbortSignal) {
     // AF-ABORT: re-checked before every remote command and every write.
-    const live = () => signal?.throwIfAborted();
+    const live = () => assertHeld(signal); // (target adaptation, pl/keepalive7: the combined held-lock check)
     live();
     target = abortableExecutionTarget(target, signal);
     if (row.receipt?.retainedByRunId) return row;
@@ -959,16 +993,17 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // A held remote save without its exact collector keeps the source until
     // that collector returns; only exact destruction proof settles it.
     if (held && row.location !== "local" && !transports.has(key(row)) && target?.kind !== "remote"
-      && row.receipt?.warm === true) return recoverStoppedRemote(row);
+      && row.receipt?.warm === true) return recoverStoppedRemote(row, signal);
     if (row.receipt?.warm === true && !settled(row)) {
+      // pl/keepalive7: the checkpoint checks the combined signal before each of its own steps.
       row = await checkpoint(row, target, true, signal);
       // Never release a stopped copy while retained aside copies are unsurfaced.
       if (row.errorCode === "AGENT_FILES_ASIDE_UNSURFACED") return row;
       live();
-      await release(row, target);
+      await release(row, target, signal);
       return (await get(row.companyId, row.runId))!;
     }
-    if (settled(row)) { live(); await release(row); return (await get(row.companyId, row.runId))!; }
+    if (settled(row)) { live(); await release(row, undefined, signal); return (await get(row.companyId, row.runId))!; }
     // A held save whose exact tree was already retrieved into the controller
     // mirror retries from that verified mirror; no live collector is needed.
     const mirrorHash = held ? (row.receipt?.savePending as { mirrorHash?: unknown } | undefined)?.mirrorHash : undefined;
@@ -977,7 +1012,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (row.location !== "local" && !fromMirror && (!remoteLease
       || remoteLease.releasedAt || remoteLease.status !== "active" || hasRemoteTerminationReceipt(remoteLease))) {
       live();
-      return recoverStoppedRemote(row);
+      return recoverStoppedRemote(row, signal);
     }
     live();
     row = await patch(row, { processStoppedAt: row.processStoppedAt ?? new Date() });
@@ -996,18 +1031,22 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           if (directorySnapshotSha256(mirrored.snapshot) !== mirrorHash) throw new Error("Retained agent-file mirror changed; its source is kept for review");
           inspected = mirrored;
         }
-        inspected ??= await retrieve(row, target, signal);
+        // pl/keepalive6: the projection write and the canonical save go through the held lock's gate.
+        inspected ??= await heldStep(() => retrieve(row, target, signal), signal);
         live();
         const { snapshot } = inspected;
         const candidateHash = directorySnapshotSha256(snapshot);
         let storageWarning = inspected.storageWarning;
         let conflicts: AgentFileConflict[] = [];
         if (candidateHash === row.baseHash) {
+          assertHeld(signal);
           row = await patch(row, { state: "unchanged", errorCode: null, errorMessage: null, nextAttemptAt: null });
         } else {
-          ({ storageWarning, conflicts } = await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row)));
+          ({ storageWarning, conflicts } = await heldStep(() => store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row)), signal));
+          assertHeld(signal);
           row = await patch(row, { state: "saved", candidateHash, errorCode: null, errorMessage: null, nextAttemptAt: null });
         }
+        assertHeld(signal);
         row = await patch(row, { receipt: { ...withoutSaveHold(row.receipt), storageWarning, conflicts, pendingConflicts: [...pendingConflicts(row), ...conflicts] } });
         break;
       } catch (error) {
@@ -1023,7 +1062,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       }
     }
     live();
-    await release(row);
+    await release(row, undefined, signal);
     return (await get(row.companyId, row.runId))!;
   }
   /**
@@ -1092,7 +1131,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     }
     return row;
   }
-  async function release(row: Copy, target?: AdapterExecutionTarget | null) {
+  async function release(row: Copy, target?: AdapterExecutionTarget | null, signal?: AbortSignal) {
+    assertHeld(signal);
     row = await settleCompletedCleanupRetry(row);
     // A held save keeps its collector, mirror, remote tree and baseline.
     if (agentFileSaveHeld(row)) return;
@@ -1105,7 +1145,10 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const runtime = transports.get(key(row));
     transports.delete(key(row));
     let cleanupPending = false;
-    await runtime?.cleanupWorkspaceSnapshot?.().catch(() => { cleanupPending = true; });
+    // pl/keepalive5: no host or remote removal once the operation lock is lost.
+    assertHeld(signal);
+    await heldStep(async () => { await runtime?.cleanupWorkspaceSnapshot?.(); }, signal).catch(() => { cleanupPending = true; });
+    assertHeld(signal);
     const cleanupTarget = target ?? runtime?.target;
     const lease = row.location !== "local" ? await ownedRemoteLease(row) : null;
     const terminated = lease && hasRemoteTerminationReceipt(lease);
@@ -1122,20 +1165,24 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       if (row.executionRoot !== expected) throw new Error("Agent directory cleanup path changed");
       const paths = cleanupTarget.transport === "sandbox" ? [expected, sandboxTransferRoot(row, cleanupTarget.remoteCwd)] : [expected];
       const quoted = paths.map(p => `'${p.replaceAll("'", `'"'"'`)}'`).join(" ");
-      const remoteCleanupFailed = await runAdapterExecutionTargetShellCommand(row.runId, cleanupTarget, `rm -rf -- ${quoted}`,
-        { cwd: cleanupTarget.remoteCwd, env: {}, timeoutSec: 15 }).then(result => result.exitCode !== 0 || result.timedOut, () => true);
+      const remoteCleanupFailed = await heldStep(() => runAdapterExecutionTargetShellCommand(row.runId, cleanupTarget, `rm -rf -- ${quoted}`,
+        { cwd: cleanupTarget.remoteCwd, env: {}, timeoutSec: 15 }), signal).then(result => result.exitCode !== 0 || result.timedOut, () => true);
       cleanupPending ||= remoteCleanupFailed;
     } else if (!destroyed && row.processStoppedAt && settled(row) && row.location !== "local") {
       // Rebind only the current host-owned lease. Never acquire a replacement.
-      cleanupPending ||= !await cleanupRemoteAfterRestart(row).catch(() => false);
+      cleanupPending ||= !await heldStep(() => cleanupRemoteAfterRestart(row), signal).catch(() => false);
     }
     if (settled(row) && row.processStoppedAt) {
-      try { await fs.rm(path.dirname(row.localRoot), { recursive: true, force: true }); }
+      assertHeld(signal);
+      try { await heldStep(() => fs.rm(path.dirname(row.localRoot), { recursive: true, force: true }), signal); }
       catch {
+        // pl/keepalive7: a lost lock writes no fallback receipt.
+        assertHeld(signal);
         // Leave the baseline marker so restart recovery retries failed cleanup.
         await patch(row, { receipt: { ...row.receipt, cleanupPending: true } });
         return;
       }
+      assertHeld(signal);
       await patch(row, { receipt: { schema: AGENT_FILES_CONTRACT, state: row.state, appliedCandidateHash: row.candidateHash, storageWarning: row.receipt?.storageWarning ?? null, cleanupPending,
         ...(row.receipt?.discard ? { discard: row.receipt.discard } : {}),
         materializationRunId: row.receipt?.materializationRunId ?? row.runId,
@@ -1167,14 +1214,15 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       current.state === "unavailable" && !current.processStoppedAt;
     // Do not wait for a directory lock when no cleanup can be authorized.
     if (!eligible(row) || !await destroyedRemoteCopy(row)) return;
-    await serial(row, async current => {
+    await serial(row, async (current, signal) => {
       if (!eligible(current) || !await destroyedRemoteCopy(current)) return;
       // The no-execute authority must survive a crash after this update. Every
       // later release, including one with a cached transport, honors it.
+      assertHeld(signal);
       const confirmed = await patch(current, { processStoppedAt: new Date(),
         receipt: { ...current.receipt, cleanupDestroyedOnly: true } });
       // A concurrent preparation can win the receipt CAS. Its bytes stay live.
-      if (confirmed.state === "unavailable" && confirmed.processStoppedAt) await release(confirmed);
+      if (confirmed.state === "unavailable" && confirmed.processStoppedAt) await release(confirmed, undefined, signal);
     }, "agent_directory_release");
   }
   async function ownedRemoteLease(row: Copy) {
@@ -1190,8 +1238,10 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (row.location !== `remote:${lease.environmentId}` && !destroyedWithoutEnvironment) return null;
     return lease;
   }
-  async function recoverStoppedRemote(row: Copy) {
+  async function recoverStoppedRemote(row: Copy, signal?: AbortSignal) {
     const lease = await ownedRemoteLease(row);
+    // pl/keepalive7: no recovery patch (pending_collection / unavailable) and no release after a lock loss.
+    assertHeld(signal);
     const destroyed = lease && hasRemoteTerminationReceipt(lease)
       && (lease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed";
     if (!destroyed) {
@@ -1204,10 +1254,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     }
     // Exact destruction is proven: the remote bytes are already gone. A held
     // save without a verified mirror settles as a truthful loss receipt.
+    assertHeld(signal);
     row = await patch(row, { state: "unavailable", processStoppedAt: row.processStoppedAt ?? new Date(),
       errorCode: "INSTRUCTION_COLLECTION_UNAVAILABLE", errorMessage: "The exact remote sandbox was destroyed before its agent directory was retrieved. No instruction save is claimed.", nextAttemptAt: null,
       ...(agentFileSaveHeld(row) ? { receipt: withoutSaveHold(row.receipt) } : {}) });
-    await release(row);
+    await release(row, undefined, signal);
     return (await get(row.companyId, row.runId))!;
   }
   async function cleanupRemoteAfterRestart(row: Copy): Promise<boolean> {
@@ -1228,12 +1279,16 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       cwd: remoteCwd, env: {}, timeoutMs: 15_000, bypassSession: true });
     return result.exitCode === 0 && !result.timedOut;
   }
-  async function serial<T>(row: Copy, fn: (current: Copy) => Promise<T>, operation: DirectoryMergeLockOperation, signal?: AbortSignal): Promise<T> {
+  async function serial<T>(row: Copy, fn: (current: Copy, signal?: AbortSignal) => Promise<T>, operation: DirectoryMergeLockOperation, signal?: AbortSignal): Promise<T> {
     signal?.throwIfAborted();
-    const run = async () => {
+    // pl/keepalive6: an enclosing held lock's gate, captured before the operation lock connection opens.
+    const parentGate = currentHostMutationDrain();
+    const run = async (lost?: AbortSignal) => {
       const lockRoot = path.resolve(disposableRemoteCopy(row) ? projectionRoot(row) : row.localRoot, "../../..");
       if (disposableRemoteCopy(row)) await fs.mkdir(lockRoot, { recursive: true, mode: 0o700 });
       return withDirectoryMergeLock(lockRoot, async () => {
+        // pl/keepalive5: re-check after the merge-lock wait, before any projection write.
+        lost?.throwIfAborted();
         let current = await get(row.companyId, row.runId);
         if (!current) throw notFound("Agent directory copy not found");
         if (disposableRemoteCopy(current) && current.localRoot !== projectionRoot(current)) {
@@ -1241,10 +1296,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           if (current.localRoot !== projectionRoot(current)) throw conflict("Agent directory projection changed");
           transports.delete(key(current));
         }
-        return fn(current);
+        lost?.throwIfAborted();
+        return fn(current, lost);
       }, process.env, operation);
     };
-    if (!disposableRemoteCopy(row)) return run();
+    if (!disposableRemoteCopy(row)) return run(signal);
     // Different controllers have different cache roots. Serialize their active
     // collection/cleanup operations in Postgres, without holding row locks over I/O.
     // Test instrumentation only (disarmed in production): restart chaos fails the Nth attempt with the lock's own conflict.
@@ -1257,10 +1313,26 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // it conflicts with any transaction-level lock on the same key.
     return withDedicatedDbConnection(db, async dedicated => {
       const [lock] = await dedicated.execute(sql`select pg_try_advisory_lock(hashtextextended(${`agent-directory:${row.companyId}:${row.agentId}`}, 0)) as acquired,
-        (select setting::bigint from pg_settings where name = 'idle_session_timeout') as idle_timeout_ms,
+        -- pl/keepalive5 (target adaptation): the keepalive also detects a lost lock session, so with no
+        -- idle_session_timeout it pings at the idle_in_transaction_session_timeout cadence (unchanged when both are 0).
+        coalesce(nullif((select setting::bigint from pg_settings where name = 'idle_session_timeout'), 0),
+          (select setting::bigint from pg_settings where name = 'idle_in_transaction_session_timeout')) as idle_timeout_ms,
         pg_backend_pid() as pid, (select backend_start::text from pg_stat_activity where pid = pg_backend_pid()) as backend_start`);
       if (lock?.acquired !== true) throw new AgentDirectoryOperationBusyError();
-      const work = withWorkspaceLockKeepalive(dedicated, Number(lock.idle_timeout_ms ?? 0), run);
+      // pl/keepalive6: a failed ping closes the operation's host-mutation gate (joined to any enclosing held lock's);
+      // its writes are refused after the loss and in-flight ones drain before the lock is released.
+      // (target adaptation: the caller's AF-ABORT signal is combined with the gate's signal.)
+      // (target adaptation: this is a SESSION lock, and the client transparently reconnects a terminated session,
+      // so a plain `select 1` would succeed on a new backend that holds no lock. The keepalive ping therefore
+      // checks that it still runs on the backend that took the lock; a replaced backend is a lost lock.)
+      const lockSession: Pick<Db, "execute"> = { execute: (async () => {
+        const rows = await dedicated.execute(sql`select pg_backend_pid() as pid`);
+        if (Number(rows[0]?.pid) !== Number(lock.pid)) throw new AgentDirectoryOperationLockLostError(new Error("agent_directory_lock_session_replaced"));
+        return rows;
+      }) as unknown as Db["execute"] };
+      const work = withHeldLockHostDrain({ lock: lockSession, idleTimeoutMs: Number(lock.idle_timeout_ms ?? 0), parent: parentGate,
+        label: "agent directory operation lock", lostError: cause => new AgentDirectoryOperationLockLostError(cause) },
+      (held) => run(signal ? AbortSignal.any([signal, held]) : held));
       if (!signal) return work;
       // pl/cancel-finalize2 pattern (5e0eac367): the lock session is released
       // at the abort, not when a held provider call returns; the abandoned
@@ -1310,9 +1382,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
   return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, recoverUnavailable, claimConflictNotice, discardHeld,
     /** Exact-allocation destruction proof (the only loss that ends a hold without a save). */
     destroyedRemote: (row: Copy) => destroyedRemoteCopy(row),
-    recoverStoppedRemote: (row: Copy) => serial(row, current => current.receipt?.retainedByRunId ? Promise.resolve(current) : recoverStoppedRemote(current), "agent_directory_collect"),
-    checkpointWarm: (row: Copy, target?: AdapterExecutionTarget | null) => trackAgentFileCheckpoint(serial(row, current => current.receipt?.warm === true ? checkpoint(current, target) : Promise.resolve(current), "agent_directory_checkpoint")),
-    collectStopped: (row: Copy, target?: AdapterExecutionTarget | null, signal?: AbortSignal) => trackAgentFileCheckpoint(serial(row, current => pinnedCollectStopped(current, target, signal), "agent_directory_collect", signal)),
+    recoverStoppedRemote: (row: Copy) => serial(row, (current, signal) => current.receipt?.retainedByRunId ? Promise.resolve(current) : recoverStoppedRemote(current, signal), "agent_directory_collect"),
+    checkpointWarm: (row: Copy, target?: AdapterExecutionTarget | null) => trackAgentFileCheckpoint(serial(row, (current, signal) => current.receipt?.warm === true ? checkpoint(current, target, false, signal) : Promise.resolve(current), "agent_directory_checkpoint")),
+    collectStopped: (row: Copy, target?: AdapterExecutionTarget | null, signal?: AbortSignal) => trackAgentFileCheckpoint(serial(row, (current, held) => pinnedCollectStopped(current, target, held), "agent_directory_collect", signal)),
     release: async (row: Copy) => {
       let current = await get(row.companyId, row.runId);
       if (!current) return;
@@ -1320,7 +1392,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       // This check changes no receipt or bytes. A concurrent stop merely leaves
       // cleanup to its owner or the recovery sweep; it grants no new authority.
       if (releaseIsNoop(current) || agentFileSaveHeld(current)) return;
-      await serial(current, release, "agent_directory_release");
+      await serial(current, (locked, signal) => release(locked, undefined, signal), "agent_directory_release");
     },
   };
 }

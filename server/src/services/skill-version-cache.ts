@@ -14,16 +14,46 @@ import { noteSkillVersionCacheChange } from "./skill-version-retention-notificat
 import { parseNativeExecutionInput } from "../vendor/paperclip-runner/index.js";
 import { beginRunPhase } from "./execution-preparation-timing.js";
 import { noRetainedExecutionPredicate } from "./pre-dispatch-execution-evidence.js";
-import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lock-keepalive.js";
+import { currentHostMutationDrain, withHeldLockHostDrain } from "./native-runtime/held-lock-host-drain.js";
+import { hostCleanup, hostMutation } from "@paperclipai/adapter-utils/host-mutation-drain";
 
 export const SKILL_VERSION_CACHE_IDLE_MS = 60 * 60 * 1000;
-const locks = new AsyncLocalStorage<Array<{ db: Db; companyId: string }>>();
+const locks = new AsyncLocalStorage<Array<{ db: Db; companyId: string; lost?: AbortSignal }>>();
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 export class SkillCacheBusy extends Error {}
+/** pl/keepalive5: the skill-cache lock session died (failed keepalive ping); another owner may hold the lock. */
+export class SkillVersionCacheLockLostError extends Error {
+  override name = "SkillVersionCacheLockLostError";
+  constructor(cause?: unknown) { super("skill_version_cache_lock_lost", { cause }); }
+}
+/** The held company cache lock's lost signal, for cache-file writes deep in the action. */
+export function skillVersionCacheLockSignal(companyId: string): AbortSignal | undefined {
+  return locks.getStore()?.find(lock => lock.companyId === companyId)?.lost;
+}
+/**
+ * pl/keepalive7: ONE host step of a multi-step cache writer (a version materialisation's each file write, its
+ * publication rename). Before the step, the held company cache lock's combined signal (its own loss or an
+ * enclosing lock's) and the held gate's are checked, so a lost lock stops the writer with its typed lost error
+ * before the NEXT step; the step goes through the held gate (refused after a loss, counted by the drain).
+ * Outside a held lock it is fn().
+ */
+export async function skillCacheStep<T>(companyId: string, fn: () => Promise<T>): Promise<T> {
+  skillVersionCacheLockSignal(companyId)?.throwIfAborted();
+  currentHostMutationDrain()?.signal.throwIfAborted();
+  return hostMutation(fn);
+}
 /** Hold through publication AND durable run pinning, not just file creation. */
-export async function withSkillVersionCacheLock<T>(db: Db, companyId: string, action: () => Promise<T>, tryOnly = false): Promise<T> {
+export async function withSkillVersionCacheLock<T>(db: Db, companyId: string, action: (signal?: AbortSignal) => Promise<T>, tryOnly = false): Promise<T> {
   const held = locks.getStore() ?? [];
-  if (held.some(lock => lock.db === db && lock.companyId === companyId)) return action();
+  // pl/keepalive6: an enclosing held lock's gate, captured before the lock connection opens.
+  const parentGate = currentHostMutationDrain();
+  const joined = held.find(lock => lock.db === db && lock.companyId === companyId);
+  if (joined) {
+    joined.lost?.throwIfAborted();
+    const result = await action(joined.lost);
+    joined.lost?.throwIfAborted();
+    return result;
+  }
   // Preparation uses the ordinary pool for version/pin writes. Borrowing a pool
   // connection for this lock would deadlock installations with a one-slot pool.
   const acquired = beginRunPhase("skills.cache.acquire");
@@ -39,8 +69,11 @@ export async function withSkillVersionCacheLock<T>(db: Db, companyId: string, ac
     const settings = await tx.execute<{ idle_timeout_ms: string }>(
       sql`select setting::bigint as idle_timeout_ms from pg_settings where name = 'idle_in_transaction_session_timeout'`,
     );
-    return withWorkspaceLockKeepalive(tx, Number(settings[0]?.idle_timeout_ms),
-      () => locks.run([...held, { db, companyId }], action));
+    // pl/keepalive6: a failed ping closes the cache lock's host-mutation gate (joined to any enclosing held lock's
+    // gate); the action's signal is the combined one; in-flight cache writes drain before the lock is released.
+    return withHeldLockHostDrain({ lock: tx, idleTimeoutMs: Number(settings[0]?.idle_timeout_ms), parent: parentGate,
+      label: "skill version cache lock", lostError: cause => new SkillVersionCacheLockLostError(cause) },
+    (signal) => locks.run([...held, { db, companyId, lost: signal }], () => action(signal)));
   })).catch(error => {
     acquired(true);
     throw error;
@@ -62,11 +95,12 @@ export async function ensureSkillCacheDirectory(directory: string, create = fals
   const root = path.resolve(resolvePaperclipInstanceRoot());
   const relative = path.relative(root, directory);
   if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("Skill cache escaped instance root");
-  if (create) await fs.mkdir(root, { recursive: true });
+  // pl/keepalive6: each level's create goes through the held lock's gate: refused once the lock is lost.
+  if (create) await hostMutation(() => fs.mkdir(root, { recursive: true }));
   let cursor = root;
   for (const part of relative.split(path.sep)) {
     cursor = path.join(cursor, part);
-    if (create) await fs.mkdir(cursor).catch((error: NodeJS.ErrnoException) => {
+    if (create) await hostMutation(() => fs.mkdir(cursor)).catch((error: NodeJS.ErrnoException) => {
       if (error.code !== "EEXIST") throw error;
     });
     const stat = await fs.lstat(cursor);
@@ -76,13 +110,18 @@ export async function ensureSkillCacheDirectory(directory: string, create = fals
 
 export async function touchSkillVersionCache(companyId: string, skillId: string, versionId: string, now = Date.now()) {
   const { access, directory } = skillVersionCachePaths(companyId, skillId, versionId);
+  // pl/keepalive5: under a held company cache lock, no cache write once its lock session died.
+  const lost = skillVersionCacheLockSignal(companyId);
+  lost?.throwIfAborted();
   await ensureSkillCacheDirectory(path.dirname(access), true);
   const temporary = `${access}.${randomUUID()}.tmp`;
   try {
-    await fs.writeFile(temporary, JSON.stringify({ version: 1, lastUsedAt: now }), { flag: "wx", mode: 0o600 });
-    await fs.rename(temporary, access);
+    lost?.throwIfAborted();
+    await hostMutation(() => fs.writeFile(temporary, JSON.stringify({ version: 1, lastUsedAt: now }), { flag: "wx", mode: 0o600 }));
+    lost?.throwIfAborted();
+    await hostMutation(() => fs.rename(temporary, access));
     noteSkillVersionCacheChange(directory, { source: "access", occurredAt: now });
-  } finally { await fs.rm(temporary, { force: true }); }
+  } finally { await hostCleanup(() => fs.rm(temporary, { force: true })); }
 }
 
 export async function lastUsedAt(filename: string): Promise<number | null> {

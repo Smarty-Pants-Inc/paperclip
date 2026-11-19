@@ -1,4 +1,5 @@
 import { withSkillPackageReadScope } from "./skill-package-store.js";
+import { currentHostMutationDrain, hostMutation } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -80,14 +81,27 @@ function errorCode(error: unknown) {
   return (error as NodeJS.ErrnoException | null)?.code;
 }
 
+/** pl/keepalive8: the held cache lock's combined signal (this lock's or any outer lock's loss). */
+function assertCacheLockHeld() {
+  currentHostMutationDrain()?.signal.throwIfAborted();
+}
+
+/** pl/keepalive8: the permission fallback checks the held lock before EACH fs step (lstat, chmod, readdir, descend). */
 async function makeTreeWritable(target: string): Promise<void> {
+  assertCacheLockHeld();
   const stat = await fs.lstat(target).catch(() => null);
   if (!stat || stat.isSymbolicLink()) return;
   if (stat.isDirectory()) {
+    assertCacheLockHeld();
     await fs.chmod(target, 0o700).catch(() => undefined);
+    assertCacheLockHeld();
     const entries = await fs.readdir(target).catch(() => [] as string[]);
-    for (const entry of entries) await makeTreeWritable(path.join(target, entry));
+    for (const entry of entries) {
+      assertCacheLockHeld();
+      await makeTreeWritable(path.join(target, entry));
+    }
   } else {
+    assertCacheLockHeld();
     await fs.chmod(target, 0o600).catch(() => undefined);
   }
 }
@@ -101,12 +115,15 @@ async function removeSnapshotTree(target: string) {
   if (activeTrash.has(target)) return;
   activeTrash.add(target);
   try {
-    await fs.rm(target, { recursive: true, force: true });
+    // pl/keepalive6: under a held cache lock, removals go through its gate (refused after a loss, drained before release).
+    await hostMutation(() => fs.rm(target, { recursive: true, force: true }));
   } catch (error) {
     const code = errorCode(error);
     if (code !== "EACCES" && code !== "EPERM" && code !== "ENOTEMPTY") throw error;
-    await makeTreeWritable(target);
-    await fs.rm(target, { recursive: true, force: true });
+    assertCacheLockHeld();
+    await hostMutation(() => makeTreeWritable(target));
+    assertCacheLockHeld();
+    await hostMutation(() => fs.rm(target, { recursive: true, force: true }));
   } finally {
     activeTrash.delete(target);
   }
@@ -121,7 +138,7 @@ async function removeVersionDirectory(parent: string, name: string): Promise<str
   if (path.dirname(target) !== parent) return null;
   if (versionSnapshotFlights.has(target) || versionSnapshotRemovals.has(target)) return null;
   const trash = path.join(parent, `${TRASH_PREFIX}${randomUUID()}`);
-  const rename = fs.rename(target, trash);
+  const rename = hostMutation(() => fs.rename(target, trash));
   versionSnapshotRemovals.set(target, rename);
   try {
     await rename;

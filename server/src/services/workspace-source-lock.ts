@@ -6,15 +6,26 @@ import path from "node:path";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { canonicalRepositoryRoot } from "./execution-workspace-source-roots.js";
 import { readWorkspaceGitSourceRoots } from "./workspace-git-source-roots.js";
-import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lock-keepalive.js";
+import { currentHostMutationDrain, withHeldLockHostDrain } from "./native-runtime/held-lock-host-drain.js";
 
 type SourceTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type SourceLockScope = { db: Db; companyId: string; keys: Set<string>; transaction: SourceTransaction; active: boolean;
-  wait?: WorkspaceSourceLockWait };
+  wait?: WorkspaceSourceLockWait; lost?: AbortSignal };
 const sourceLocks = new AsyncLocalStorage<SourceLockScope>();
 export class IsolatedRepositorySourceBusy extends Error {
   sqlstate?: string;
 }
+/** pl/keepalive5: the source-lock session died (failed keepalive ping); the locks may now have another owner. */
+export class WorkspaceSourceLockLostError extends Error {
+  override name = "WorkspaceSourceLockLostError";
+  constructor(cause?: unknown) { super("workspace_source_lock_lost", { cause }); }
+}
+
+/** The held source scope's lock-loss signal, for host writes deep in a guarded action. */
+export function workspaceSourceLockSignal(): AbortSignal | undefined {
+  return heldScope()?.lost;
+}
+
 export type WorkspaceSourceLockWait = { waitMs: number; signal?: AbortSignal };
 
 async function acquireQueuedSourceLocks(db: Db, transaction: SourceTransaction, keys: string[], wait: WorkspaceSourceLockWait) {
@@ -84,8 +95,9 @@ function heldScope(): SourceLockScope | undefined {
  * Joining that scope would tie these locks to the other transaction. */
 export function withIndependentWorkspaceSourceLocks<T>(db: Db,
   input: { companyId: string; issueIds?: readonly string[]; projectIds?: readonly string[] },
-  action: (transaction: SourceTransaction) => Promise<T>, tryOnly = false, wait?: WorkspaceSourceLockWait): Promise<T> {
-  return sourceLocks.exit(() => withWorkspaceSourceLocks(db, input, action, tryOnly, wait));
+  action: (transaction: SourceTransaction, signal?: AbortSignal) => Promise<T>, tryOnly = false, wait?: WorkspaceSourceLockWait): Promise<T> {
+  // pl/keepalive6: an independent owner: its host-mutation gate is not joined to an enclosing one.
+  return sourceLocks.exit(() => withWorkspaceSourceLocks(db, input, action, tryOnly, wait, true));
 }
 
 export function withIsolatedRepositorySourceLock<T>(db: Db, companyId: string, issueId: string,
@@ -95,7 +107,10 @@ export function withIsolatedRepositorySourceLock<T>(db: Db, companyId: string, i
 
 export async function withWorkspaceSourceLocks<T>(db: Db,
   input: { companyId: string; issueIds?: readonly string[]; projectIds?: readonly string[] },
-  action: (transaction: SourceTransaction) => Promise<T>, tryOnly = false, wait?: WorkspaceSourceLockWait): Promise<T> {
+  action: (transaction: SourceTransaction, signal?: AbortSignal) => Promise<T>, tryOnly = false, wait?: WorkspaceSourceLockWait,
+  independent = false): Promise<T> {
+  // pl/keepalive6: the enclosing held lock's host-mutation gate, captured before the lock connection opens.
+  const parentGate = independent ? undefined : currentHostMutationDrain();
   if (wait && (!Number.isSafeInteger(wait.waitMs) || wait.waitMs < 1 || wait.waitMs > 2_147_483_647))
     throw new Error("workspace_source_wait_invalid");
   const keys = [...new Set([
@@ -126,19 +141,30 @@ export async function withWorkspaceSourceLocks<T>(db: Db,
     const onlyProjectKeys = keys.filter(key => !held.keys.has(key)).every(key => key.startsWith("managed_project_source:"));
     const alreadyHasProject = [...held.keys].some(key => key.startsWith("managed_project_source:"));
     await acquire(held, !onlyProjectKeys || alreadyHasProject);
-    return action(held.transaction);
+    // pl/keepalive5: re-check after the lock wait, and never report success once the scope's session died.
+    held.lost?.throwIfAborted();
+    const joined = await action(held.transaction, held.lost);
+    held.lost?.throwIfAborted();
+    return joined;
   }
   // The tx network guard's one exemption: this dedicated finalization-lock session (no row locks).
   return withDedicatedDbConnection(db, connection => runInDedicatedLockSession(() => connection.transaction(async transaction => {
-    const scope: SourceLockScope = { db, companyId: input.companyId, transaction, keys: new Set<string>(), active: true, wait };
+    const scope: SourceLockScope = { db, companyId: input.companyId, transaction, keys: new Set<string>(), active: true, wait,
+      lost: parentGate?.signal };
     try {
       if (wait) {
         await acquireQueuedSourceLocks(db, transaction, keys, wait);
         for (const key of keys) scope.keys.add(key);
       } else await acquire(scope, tryOnly);
       const rows = await transaction.execute(sql`select setting::bigint as idle_timeout_ms from pg_settings where name = 'idle_in_transaction_session_timeout'`);
-      return await withWorkspaceLockKeepalive(transaction, Number(rows[0]?.idle_timeout_ms),
-        () => sourceLocks.run(scope, () => action(transaction)));
+      // pl/keepalive6: a failed ping closes this scope's host-mutation gate (joined to any enclosing held
+      // lock's gate); the action's signal is the combined one; in-flight host writes drain before the release.
+      return await withHeldLockHostDrain({ lock: transaction, idleTimeoutMs: Number(rows[0]?.idle_timeout_ms),
+        parent: parentGate, label: "workspace source lock", lostError: cause => new WorkspaceSourceLockLostError(cause) },
+      (signal) => {
+        scope.lost = signal;
+        return sourceLocks.run(scope, () => action(transaction, signal));
+      });
     } finally {
       scope.active = false;
     }

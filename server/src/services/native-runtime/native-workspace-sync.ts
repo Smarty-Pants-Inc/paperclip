@@ -8,6 +8,7 @@ import type { AdapterRuntimeEvent } from "@paperclipai/adapter-utils";
 import type { WorkspaceCheckpointMetrics } from "@paperclipai/adapter-utils/workspace-checkpoint";
 import type { RuntimeSpanRunner } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import fs from "node:fs/promises";
+import { hostCleanup, hostDeferredCleanup, hostMutation } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { createReadStream } from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -247,7 +248,7 @@ async function verifiedDurableSeed(input: {
 }
 
 async function ensurePrivateDirectory(dir: string): Promise<void> {
-  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await hostMutation(() => fs.mkdir(dir, { recursive: true, mode: 0o700 }));
   const stat = await fs.lstat(dir);
   if (stat.isSymbolicLink() || !stat.isDirectory()) {
     throw new Error("native_workspace_sync_state_root_invalid");
@@ -282,13 +283,15 @@ async function writeDescriptor(
     throw new Error("native_workspace_sync_descriptor_digest_collision");
   }
   const tempPath = path.join(dir, `${DESCRIPTOR_NAME}.${randomUUID()}.tmp`);
+  // adopt-drain4: registered with the owner's drain before it is created.
+  const removeTemp = hostDeferredCleanup(() => hostCleanup(() => fs.rm(tempPath, { force: true }).catch(() => undefined)));
   try {
     if (existingBody === null) {
-      await fs.writeFile(tempPath, body, { encoding: "utf8", mode: 0o600 });
-      await fs.rename(tempPath, finalPath);
+      await hostMutation(() => fs.writeFile(tempPath, body, { encoding: "utf8", mode: 0o600 }));
+      await hostMutation(() => fs.rename(tempPath, finalPath));
     }
   } finally {
-    await fs.rm(tempPath, { force: true }).catch(() => undefined);
+    await removeTemp();
   }
   return {
     schema: descriptor.schema,
@@ -398,18 +401,20 @@ async function persistSnapshotManifests(runId: string, snapshot: NonNullable<Pre
     // A shared reference may already have been updated by the baseline.
     if (path.dirname(oldPath) === descriptorDirectory(runId)) continue;
     const temporary = path.join(descriptorDirectory(runId), `manifest.${randomUUID()}.tmp`);
+    // adopt-drain4: registered with the owner's drain before it is created.
+    const removeTemporary = hostDeferredCleanup(() => hostCleanup(() => fs.rm(temporary, { force: true })));
     try {
       const sourceStat = await fs.lstat(oldPath);
       if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error("native_workspace_sync_manifest_invalid");
       assertWorkspaceManifestDiskSpace(descriptorDirectory(runId), sourceStat.size);
-      await fs.copyFile(oldPath, temporary);
-      await fs.chmod(temporary, 0o600);
+      await hostMutation(() => fs.copyFile(oldPath, temporary));
+      await hostMutation(() => fs.chmod(temporary, 0o600));
       const digest = await manifestFileSha256(temporary);
       const target = path.join(descriptorDirectory(runId), `manifest.${digest}.sqlite`);
-      await fs.rename(temporary, target);
+      await hostMutation(() => fs.rename(temporary, target));
       copies.set(oldPath, target);
       manifest.filePath = target;
-    } finally { await fs.rm(temporary, { force: true }); }
+    } finally { await removeTemporary(); }
   }
   // Ownership tracks original scratch directories, never the new durable path.
   await disposeDirectorySnapshot(snapshot.baseline);
@@ -1258,7 +1263,7 @@ export async function resumeNativeWorkspaceSync(input: {
 }
 
 export async function cleanupNativeWorkspaceSync(runId: string): Promise<void> {
-  await fs.rm(descriptorDirectory(runId), { recursive: true, force: true });
+  await hostMutation(() => fs.rm(descriptorDirectory(runId), { recursive: true, force: true }));
 }
 
 export const nativeWorkspaceSyncInternals = {
