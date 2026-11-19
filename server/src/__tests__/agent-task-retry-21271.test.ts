@@ -132,7 +132,7 @@ describe("agent task Retry (#21271)", () => {
     const f = await seed();
     const task = await f.stoppedTask(f.ids.manager);
     const connectionId = randomUUID(), endpointId = randomUUID(), applicationId = randomUUID();
-    await db.insert(toolApplications).values({ id: applicationId, companyId: f.companyId, name: "Slack", type: "native" });
+    await db.insert(toolApplications).values({ id: applicationId, companyId: f.companyId, name: "Slack", type: "chat" });
     await db.insert(toolConnections).values({ id: connectionId, companyId: f.companyId, applicationId,
       name: "Slack", uid: connectionId, transport: "chat_sdk", connectionPurpose: "channel" });
     await db.insert(chatEndpoints).values({ id: endpointId, companyId: f.companyId, connectionId,
