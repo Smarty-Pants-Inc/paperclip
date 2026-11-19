@@ -1,5 +1,6 @@
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, readEnvironmentAcquireErrorDiagnostic, readEnvironmentAcquisitionDiagnostic } from "@paperclipai/plugin-sdk";
 import type { ProviderFailure } from "@paperclipai/shared";
+import { EXECUTION_TARGET_GIT_CONTEXT_UNAVAILABLE_CODE } from "@paperclipai/adapter-utils/execution-target";
 import { getEnvironmentAcquisitionDiagnostic } from "./environment-acquisition-diagnostics.js";
 
 /**
@@ -27,7 +28,7 @@ const TRANSIENT_ERROR_CODES = new Set([
  * the provider reported a provisional creation that did not finish, or a
  * control-plane database query failed while the lease was taken.
  */
-type TransientLeaseFailureReason = "acquisition_incomplete" | "database_error";
+type TransientLeaseFailureReason = "acquisition_incomplete" | "database_error" | "git_context_unavailable";
 type TransientProviderEvidence = { httpStatus?: number; errorCode?: string; acquisitionTimedOut?: true; reason?: TransientLeaseFailureReason };
 
 function own(value: unknown, key: string): unknown {
@@ -122,6 +123,7 @@ export function readTransientLeaseAcquisitionFailure(
 const REASON_LABELS: Record<TransientLeaseFailureReason, string> = {
   acquisition_incomplete: "sandbox creation did not finish",
   database_error: "a database query failed while recording the lease",
+  git_context_unavailable: "the sandbox did not answer its Git context check",
 };
 
 function category(evidence: TransientProviderEvidence): ProviderFailure["category"] {
@@ -163,6 +165,24 @@ export class EnvironmentProviderUnavailableError extends Error {
       retryability: "transient",
     };
   }
+}
+
+/**
+ * A handed-off box whose Git context probe failed on both attempts (the probe
+ * retries once itself) is treated like a provider that did not finish starting
+ * it: no agent work had started, so the run takes the bounded bootstrap retry.
+ * Only the remote probe's final failure qualifies (it records `attempts`); the
+ * controller-local probe shares the code but is not a box failure. The outer
+ * message keeps the probe's redacted diagnosis, as the lease orchestrator does.
+ */
+export function classifyExecutionTargetGitContextFailure(
+  error: unknown,
+  environment: { name: string; driver: string } | null | undefined,
+): unknown {
+  if (!environment || !(error instanceof Error) || own(error, "code") !== EXECUTION_TARGET_GIT_CONTEXT_UNAVAILABLE_CODE
+      || !Number.isSafeInteger(own(error, "attempts"))) return error;
+  return new Error(error.message, { cause: new EnvironmentProviderUnavailableError({ environmentName: environment.name,
+    driver: environment.driver, evidence: { reason: "git_context_unavailable" }, cause: error }) });
 }
 
 /** Find a transient provider refusal through the orchestrator's error wrappers. */

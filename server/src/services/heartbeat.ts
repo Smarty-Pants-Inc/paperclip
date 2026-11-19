@@ -352,6 +352,7 @@ import {
   authorizeFailedChatRunRetryWake,
 } from "./durable-chat-wakeup.js";
 import { prepareHeartbeatGitHubLaunchers, prepareHeartbeatGitHubEnvironment } from "./heartbeat-github-launchers.js";
+import { classifyExecutionTargetGitContextFailure } from "./environment-provider-unavailable-error.js";
 import {
   cleanupGitHubOperationLaunchers,
   startAdapterExecutionTargetPaperclipBridge,
@@ -3526,7 +3527,7 @@ export function heartbeatService(
             (entry): entry is [string, string] => typeof entry[1] === "string")),
           hostCredentials: useHostGitHub,
           networkAccess: trustPreset.kind === "standard" && process.env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled",
-        }));
+        }).catch((error: unknown) => { throw classifyExecutionTargetGitContextFailure(error, selectedEnvironment); }));
         if (useAgentGitHubEnv) githubEnvironment.env.PAPERCLIP_GITHUB_AUTH_MODE = "agent_env";
         runtimeConfig = { ...runtimeConfig, env: githubEnvironment.env };
         if (!useHostGitHub && !providerApiPlacement) {
