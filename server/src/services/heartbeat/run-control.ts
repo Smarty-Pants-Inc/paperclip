@@ -419,6 +419,13 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       status,
       leaseOwnerRun?.errorCode,
     );
+    // A missed provider Stop acknowledgement is not an ordinary warm handoff.
+    // Enter the existing physical stop-and-retain path now, rather than adding
+    // its separate handoff-proof wait after the cancellation cleanup deadline.
+    // The provider receipt and workspace custody fences still own release.
+    if (parseObject(cancelledRun?.resultJson?.nativeCancellation).cleanupTimedOut === true) {
+      providerResourceDisposition = "stop_and_retain";
+    }
     let neverLaunched: boolean | undefined;
     const runnerNeverLaunched = async () => neverLaunched ??= leaseOwnerRun?.runtimeMode === "native"
       && isHeartbeatRunTerminalStatus(status) && await nativeRunNeverLaunchedRunner(db, input.runId, input.companyId);
