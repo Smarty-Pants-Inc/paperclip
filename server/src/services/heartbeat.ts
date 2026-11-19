@@ -64,6 +64,7 @@ import { prepareHeartbeatTaskContext } from "./heartbeat/task-context.js";
 import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
 import { reconcileMuseNativeTerminalRun } from "./native-runtime/muse-terminal-reconciliation.js";
 import { prepareHeartbeatWorkspace, RetryWorkspaceRefused } from "./heartbeat/workspace-preparation.js";
+import { startNativeRunnerIngressPreparation } from "./native-runtime/native-runner-ingress-preparation.js";
 import { nativeRecoveryClaimRelinquished, ownNativeExecutionLeaseLapsed, releaseLapsedNativeRestartClaim } from "./native-runtime/native-execution-lease.js";
 import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorkspaceFinalizeScheduledError } from "./heartbeat/runtime-execution.js";
 import { nativeStopWorkspaceOutcome, preserveNativeFailedWorkspace } from "./native-runtime/native-failed-workspace-recovery.js";
@@ -407,6 +408,7 @@ import {
   prepareNativeWorkspaceSync,
   type NativeRestartRecoveryClaim,
   resolveHeartbeatNativeRuntimeMode,
+  isRunnerIngressAuthorized,
 } from "./native-runtime/index.js";
 
 import { nativeChatWorkspaceCwd } from "./native-runtime/native-chat-workspace.js";
@@ -2141,6 +2143,7 @@ export function heartbeatService(
       }
     };
     let instructionWorkingCopy: ReturnType<typeof createHeartbeatInstructionWorkingCopy> | null = null;
+    const runnerIngressPreparations: Array<{ release: () => Promise<void> }> = [];
     let nativeDispatchStarted = false;
     // Set once the dispatch gate enters the adapter or native executor. Unlike
     // nativeDispatchStarted it also covers a gate that fails after entering.
@@ -2951,6 +2954,32 @@ export function heartbeatService(
       workspaceWaitWasIssueAssignee = issueContext?.assigneeAgentId === agent.id;
       const prepareWorkspace = () => timePreparation("workspace", () => prepareHeartbeatWorkspace(db, {
         run, agent, controllerLease, nativeRunnerPreparationSpans, signal: executionControl.controller.signal,
+        onExecutionTarget: (target, workspaceId) => {
+          if (executionControl.controller.signal.aborted) return target;
+          // Use the SAME native selection policy, never adapter/capability as
+          // authorization. The final running-agent/selection gates stay below.
+          let resolution;
+          try {
+            const experimental = workspaceSelection.resolvedInstanceSettings.experimental;
+            resolution = resolveHeartbeatNativeRuntimeMode({ persisted: run,
+              enabled: experimental.enableNativeRunner === true, museEnabled: experimental.enableMuse === true,
+              grokEnabled: experimental.enableGrokBot === true && experimental.enablePublicMcp === true,
+              dotEnabled: experimental.enableOpenAiDot === true && experimental.enablePublicMcp === true,
+              runtimeConfig: agent.runtimeConfig, adapterConfig: agent.adapterConfig,
+              agent: { id: agent.id, companyId: agent.companyId, status: agent.status, adapterType: agent.adapterType },
+              issue: issueRef, target, workspaceId });
+          } catch {
+            // Eligibility errors must still surface at the original selection
+            // point, not ahead of realization/output/agent admission.
+            return target;
+          }
+          if (resolution.kind !== "native" || !["codex_app_server", "opencode_server", "acpx_runtime", "pi_rpc"].includes(resolution.profile.backend)) return target;
+          const pending = startNativeRunnerIngressPreparation({ target, runId: run.id,
+            runnerIngressAuthorized: isRunnerIngressAuthorized(resolution) });
+          if (!pending) return target;
+          runnerIngressPreparations.push(pending);
+          return pending.target;
+        },
         task: {
           issueRef,
           issueId,
@@ -4129,6 +4158,11 @@ export function heartbeatService(
             logger.warn({ err: error, runId: run.id }, "Failed native recovery preparation could not be settled"));
       }
     } finally {
+      // Preparation failure, Stop, declined dispatch, and selection refusal all
+      // join the outstanding RPC and close its endpoint. Successful registration
+      // already handed it to the ordinary transport release path.
+      await Promise.all(runnerIngressPreparations.map(pending => pending.release().catch(error =>
+        logger.warn({ runId: run.id, err: error }, "Warm runner ingress preparation cleanup failed"))));
       let caseHandoffCleanupSettled = false;
       let failedProcessCancellationSeen = failedProcessRunCancellations.has(run.id);
       await instructionWorkingCopy?.nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));

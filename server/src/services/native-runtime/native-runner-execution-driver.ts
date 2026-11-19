@@ -1,3 +1,5 @@
+import { preparedNativeRunnerIngress, transferPreparedNativeRunnerIngress } from "./native-runner-ingress-preparation.js";
+export { startNativeRunnerIngressPreparation } from "./native-runner-ingress-preparation.js";
 import { markReattachAuthenticated } from "../heartbeat/run-admission.js";
 import { existsSync } from "node:fs";
 import { measureNativeControllerStep } from "./native-controller-step-timing.js";
@@ -149,7 +151,35 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
           })(authority, attachmentIdentity));
         }
       }, { parentName: "runner.session.startup" });
-      return measureNativeRunnerSpan(
+      // Join ingress at the same admission boundary as before: checkpoints and
+      // remote artifact preparation still precede every endpoint failure. Only
+      // the warm provider RPC has moved; connecting waits for BOTH branches.
+      let remoteTransport: PaperclipRunnerTransport | undefined;
+      if (input.target.kind === "remote") {
+        if (!input.prepareRemote) throw new Error("runner_remote_preparation_unavailable");
+        const requiredMode = resolveRemoteRunnerTransportMode({ target: input.target,
+          runnerIngressAuthorized: input.runnerIngressAuthorized === true });
+        const runId = attachmentIdentity?.runId ?? input.binding.runId;
+        if (requiredMode === "dial_wss") {
+          remoteTransport = await measureNativeRunnerSpan(input.trace, "runner.transport.resolve",
+            () => resolveOutboundTransport({ ...input, runId }));
+          await measureNativeRunnerSpan(input.trace, "runner.artifact.prepare", () => input.prepareRemote!(requiredMode));
+        } else {
+          await measureNativeRunnerSpan(input.trace, "runner.artifact.prepare", () => input.prepareRemote!(requiredMode));
+          try {
+            remoteTransport = await (preparedNativeRunnerIngress(input.target, runId, input.trace)
+              ?? measureNativeRunnerSpan(input.trace, "runner.ingress.acquire", () => resolvePaperclipRunnerTransport({
+                target: input.target, runId, localConnectUrl: "ws://127.0.0.1/unused", runnerPublicUrl: input.runnerPublicUrl,
+                runnerCaBundlePath: input.runnerCaBundlePath, runnerIngressAuthorized: true,
+              })));
+          } catch (error) {
+            const failure = readEnvironmentRunnerIngressFailure(error);
+            if (failure) throw new NativeRunnerIngressAcquisitionError(failure);
+            throw error;
+          }
+        }
+      }
+      const registration = await measureNativeRunnerSpan<Awaited<ReturnType<ConnectionRegistration>>>(
         input.trace,
         "runner.transport.connect",
         async () => {
@@ -187,53 +217,7 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
             };
           }
 
-          if (!input.prepareRemote) throw new Error("runner_remote_preparation_unavailable");
-          const requiredMode = resolveRemoteRunnerTransportMode({
-            target: input.target,
-            runnerIngressAuthorized: input.runnerIngressAuthorized === true,
-          });
-          let transport: PaperclipRunnerTransport;
-          if (requiredMode === "dial_wss") {
-            // Validate eligibility before staging any artifact.
-            transport = await measureNativeRunnerSpan(
-              input.trace,
-              "runner.transport.resolve",
-              () => resolveOutboundTransport({ ...input, runId: attachmentIdentity?.runId ?? input.binding.runId }),
-            );
-            await measureNativeRunnerSpan(
-              input.trace,
-              "runner.artifact.prepare",
-              () => input.prepareRemote!(requiredMode),
-            );
-          } else {
-            await measureNativeRunnerSpan(
-              input.trace,
-              "runner.artifact.prepare",
-              () => input.prepareRemote!(requiredMode),
-            );
-            // Provider endpoint acquisition happens only after runnerd is staged
-            // and its listener capability has been verified.
-            try {
-              transport = await measureNativeRunnerSpan(
-                input.trace,
-                "runner.ingress.acquire",
-                () =>
-                  resolvePaperclipRunnerTransport({
-                    target: input.target,
-                    runId: attachmentIdentity?.runId ?? input.binding.runId,
-                    localConnectUrl: "ws://127.0.0.1/unused",
-                    runnerPublicUrl: input.runnerPublicUrl,
-                    runnerCaBundlePath: input.runnerCaBundlePath,
-                    runnerIngressAuthorized: true,
-                  }),
-              );
-            } catch (error) {
-              const failure = readEnvironmentRunnerIngressFailure(error);
-              if (failure) throw new NativeRunnerIngressAcquisitionError(failure);
-              throw error;
-            }
-          }
-
+          const transport = remoteTransport!;
           const selectedAtMs = Date.now();
           await input.trace?.record({
             name: "runner.transport.selected",
@@ -419,6 +403,8 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
           };
         },
       );
+      transferPreparedNativeRunnerIngress(input.target, attachmentIdentity?.runId ?? input.binding.runId);
+      return registration;
     },
   };
   input.sandboxRetention?.bindNativeDriver(driver, next => { input = next; retainedRunAuthority = true; });

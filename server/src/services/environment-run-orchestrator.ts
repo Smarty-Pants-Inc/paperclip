@@ -536,6 +536,8 @@ export function environmentRunOrchestrator(
     runnerTaskProjectIds?: readonly string[];
     signal?: AbortSignal;
     assertOwned?: () => Promise<void>;
+    /** Run-owned warm transport preparation; never grants execution authority. */
+    onExecutionTarget?: (target: AdapterExecutionTarget) => AdapterExecutionTarget;
     /**
      * The host duplex observability recorder for this run. The orchestrator threads
      * it to `resolveEnvironmentExecutionTarget`, which stamps it on the sandbox
@@ -560,15 +562,37 @@ export function environmentRunOrchestrator(
       }
       return { ...target, sandboxLeaseAcquisition: input.sandboxLeaseAcquisition };
     };
+    // A warm sandbox's target/lease inputs are already fixed by acquisition.
+    // Resolve once before realization so its ingress RPC can overlap all later
+    // preparation. Cold/SSH/plugin paths retain their original ordering.
     const remoteAuthority = readRemoteWorkspaceAuthority(persistedExecutionWorkspace?.metadata);
+    const resolveTarget = () => resolveEnvironmentExecutionTarget({ db, companyId, adapterType, environment,
+      leaseId: lease.id, leaseMetadata: lease.metadata, lease, environmentRuntime,
+      ...(!remoteAuthority ? { signal: input.signal } : {}),
+      duplexObservabilityRecorder: input.duplexObservabilityRecorder ?? null });
+    let earlyTarget: { target: AdapterExecutionTarget | null } | { error: unknown } | undefined;
+    const acquisitionOutcome = input.sandboxLeaseAcquisition?.outcome
+      ?? parseObject(lease.metadata?.sandboxLeaseAcquisition).outcome;
+    if (input.onExecutionTarget && adapterType === "paperclip_runner" && environment.driver === "sandbox"
+      && environment.config.runnerLifecycleMode === "warm" && acquisitionOutcome === "resumed") {
+      try {
+        const target = withAcquisitionReceipt(await resolveTarget());
+        earlyTarget = { target: target ? input.onExecutionTarget(target) : null };
+      } catch (error) {
+        // Endpoint/target preparation must not move an error ahead of workspace
+        // realization. Reuse this exact outcome at the original join below.
+        earlyTarget = { error };
+      }
+    }
+    const takeTarget = async () => {
+      if (earlyTarget && "error" in earlyTarget) throw earlyTarget.error;
+      return earlyTarget ? earlyTarget.target : withAcquisitionReceipt(await resolveTarget());
+    };
     if (remoteAuthority && persistedExecutionWorkspace) {
       if (adapterType !== "paperclip_runner" || environment.driver !== "sandbox") {
         throw new EnvironmentRunError("unsupported_adapter_environment", "Remote workspace storage requires a qualified native sandbox");
       }
-      const target = withAcquisitionReceipt(await resolveEnvironmentExecutionTarget({
-        db, companyId, adapterType, environment, leaseId: lease.id, leaseMetadata: lease.metadata,
-        lease, environmentRuntime, duplexObservabilityRecorder: input.duplexObservabilityRecorder ?? null,
-      }));
+      const target = await takeTarget();
       if (!target || target.kind !== "remote" || target.transport !== "sandbox" || !target.runner || target.runnerTask) {
         throw new EnvironmentRunError("transport_resolution_failed", "Remote workspace storage requires a sandbox file transport");
       }
@@ -804,18 +828,7 @@ export function environmentRunOrchestrator(
     // Step 4: Resolve execution target for the adapter
     let executionTarget: AdapterExecutionTarget | null;
     try {
-      executionTarget = withAcquisitionReceipt(await resolveEnvironmentExecutionTarget({
-        db,
-        companyId,
-        adapterType,
-        environment,
-        leaseId: lease.id,
-        leaseMetadata: (lease.metadata as Record<string, unknown> | null) ?? null,
-        lease,
-        environmentRuntime,
-        signal: input.signal,
-        duplexObservabilityRecorder: input.duplexObservabilityRecorder ?? null,
-      }));
+      executionTarget = await takeTarget();
       // The native plugin task bridge owns guest paths. Never fall back to host execution.
       if (executionWorkspace.providerBinding && (executionTarget?.kind !== "remote" ||
           !("runnerTask" in executionTarget) || typeof executionTarget.runnerTask !== "function")) {

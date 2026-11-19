@@ -600,15 +600,15 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       const completedGoalControl =
         sessionGoalControl !== null &&
         taskKey !== null &&
-        (await isRunnerGoalActionCompleted(
+        (await measureRunPhase("execution.goal_control", () => isRunnerGoalActionCompleted(
           db,
           {
             companyId: agent.companyId,
             agentId: agent.id,
             issueId: taskKey,
           },
-          sessionGoalControl.requestId,
-        ));
+          sessionGoalControl!.requestId,
+        )));
       if (completedGoalControl) sessionGoalControl = null;
       // Goal checkpoints already publish their task session. Goal-less turns
       // need the same durable pointer before cleanup can delay host completion.
@@ -657,7 +657,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         }),
       );
       const stopCleanup = runOptions.nativeRestartRecovery?.kind === "reattach_remote_runner"
-        && await readClaimedNativeStopRecovery(db, run, runOptions.nativeLeaseOwner);
+        && await measureRunPhase("execution.stop_cleanup", () => readClaimedNativeStopRecovery(db, run, runOptions.nativeLeaseOwner));
       const guardedDispatch =
         await dispatchWithTiming(
           (markDispatchStarted) => {

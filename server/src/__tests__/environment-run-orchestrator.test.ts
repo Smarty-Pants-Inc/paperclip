@@ -73,6 +73,7 @@ import {
   EnvironmentRunError,
 } from "../services/environment-run-orchestrator.ts";
 import { REMOTE_RUNNER_RECONNECT_GRACE_MS } from "../services/native-runtime/native-runner-recovery-contract.js";
+import { startNativeRunnerIngressPreparation } from "../services/native-runtime/native-runner-ingress-preparation.js";
 import type { Environment, EnvironmentLease, ExecutionWorkspace } from "@paperclipai/shared";
 import type { RealizedExecutionWorkspace } from "../services/workspace-runtime.ts";
 import type { EnvironmentRuntimeService } from "../services/environment-runtime.ts";
@@ -324,6 +325,48 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
       expect(mockUpdateLeaseMetadata).toHaveBeenCalledWith(lease.id, expect.objectContaining({ remoteCwd: remoteRoot }));
       expect(result.lease.metadata?.remoteCwd).toBe(remoteRoot);
     } finally { prepare.mockRestore(); }
+  });
+
+  it.each(["success", "realization failure", "Stop"])("P1 starts warm ingress before realization and joins cleanup on %s", async outcome => {
+    const environment = { ...makeEnvironment("sandbox"), config: { provider: "daytona", runnerLifecycleMode: "warm" } } as Environment;
+    const lease = makeLease({ provider: "daytona", providerLeaseId: "same-box", metadata: {
+      sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "same-box" },
+    } });
+    const close = vi.fn(async () => {});
+    const acquire = vi.fn(async () => ({ kind: "authenticated_websocket" as const, websocketUrl: "wss://sandbox.invalid",
+      secretHeaders: [], generation: "same-box", refresh: vi.fn(), close }));
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue({ kind: "remote", transport: "sandbox", remoteCwd: "/workspace/project",
+      environmentId: environment.id, leaseId: lease.id, runnerLifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
+      sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "same-box" },
+      effectiveCapabilities: { runnerWebSocketIngress: true }, getRunnerIngressEndpoint: acquire });
+    const abort = new AbortController();
+    const runtime = makeMockRuntime({ realizeWorkspace: vi.fn(async () => {
+      expect(acquire).toHaveBeenCalledOnce();
+      await new Promise(resolve => setTimeout(resolve, 60));
+      if (outcome === "realization failure") throw new Error("realize_failed");
+      if (outcome === "Stop") { abort.abort(new Error("native_session_cancelled")); abort.signal.throwIfAborted(); }
+      return { cwd: "/workspace/project", metadata: { workspaceRealization: { version: 1, mode: "copy" } } };
+    }) });
+    let pending: ReturnType<typeof startNativeRunnerIngressPreparation>;
+    try {
+      const realizing = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime }).realizeForRun({
+        ...makeRealizeInput({ environment, lease }), adapterType: "paperclip_runner", signal: abort.signal,
+        onExecutionTarget: target => {
+          pending = startNativeRunnerIngressPreparation({ target, runId: "run-1", runnerIngressAuthorized: true });
+          return pending?.target ?? target;
+        },
+      });
+      if (outcome === "success") {
+        const result = await realizing;
+        expect(result.executionTarget).toMatchObject({ getRunnerIngressEndpoint: pending!.target.kind === "remote"
+          && pending!.target.transport === "sandbox" ? pending!.target.getRunnerIngressEndpoint : undefined });
+      } else await expect(realizing).rejects.toThrow(outcome === "Stop" ? "native_session_cancelled" : "realize_failed");
+    } finally {
+      await pending?.release();
+    }
+    expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledOnce();
+    expect(acquire).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
   });
 
   it("happy path: returns lease, executionTarget, and remoteExecution on successful realization", async () => {

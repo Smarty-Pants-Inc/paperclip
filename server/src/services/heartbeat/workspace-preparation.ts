@@ -1,3 +1,4 @@
+import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { NATIVE_REMOTE_RECOVERY_LEASE_MISMATCH, remoteRecoveryLeaseMismatch } from "../native-runtime/remote-recovery-lease-mismatch.js";
 import { readInheritedRunnerRetainedSandbox } from "../native-runtime/native-inherited-runner-retry.js";
 import { resolveProviderApiPlacement } from "../native-runtime/provider-api-placement.js";
@@ -109,6 +110,8 @@ export class RetryWorkspaceRefused extends Error {}
 /** Prepares the workspace and environment; dispatch and terminal lease release stay with the caller. */
 export interface HeartbeatWorkspacePreparationInput {
   signal?: AbortSignal;
+  /** Warm transport overlap, owned and cleaned up by the heartbeat attempt. */
+  onExecutionTarget?: (target: AdapterExecutionTarget, workspaceId: string | null) => AdapterExecutionTarget;
   run: typeof heartbeatRuns.$inferSelect;
   agent: typeof agents.$inferSelect;
   task: {
@@ -1577,6 +1580,8 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
       runnerTaskProjectIds: resolvedWorkspace.runnerTaskProjectIds,
       ...(input.signal ? { signal: input.signal } : {}),
       assertOwned: remoteAuthority ? assertRemotePreparationOwned : controllerLease.assertOwned,
+      ...(input.onExecutionTarget ? { onExecutionTarget: (target: AdapterExecutionTarget) =>
+        input.onExecutionTarget!(target, persistedExecutionWorkspace?.id ?? null) } : {}),
       duplexObservabilityRecorder,
     }));
     nativeRunnerPreparationSpans.push({

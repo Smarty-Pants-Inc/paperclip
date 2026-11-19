@@ -19854,7 +19854,13 @@ describe("runnerd provider runtime wiring", () => {
     const result = { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" }, turnId: "turn",
       normalizedSessionId: first.session.normalizedSessionId!, providerSessionId: "retained-history",
       driverKind: "codex_app_server", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
-    const identityCheck = vi.fn(async (runnerInstanceId: string) => connected && runnerInstanceId === identity.runnerInstanceId);
+    let releasePreparationRows!: () => void;
+    const preparationRows = new Promise<void>(resolve => { releasePreparationRows = resolve; });
+    onTestFinished(() => releasePreparationRows());
+    const identityCheck = vi.fn(async (runnerInstanceId: string) => {
+      releasePreparationRows();
+      return connected && runnerInstanceId === identity.runnerInstanceId;
+    });
     const events: AdapterRuntimeEvent[] = [];
     state.execute.mockReset().mockImplementationOnce(async options => {
       // beforeConnect records the retained generation; the identity command
@@ -19909,7 +19915,14 @@ describe("runnerd provider runtime wiring", () => {
       target.sandboxLeaseAcquisition.outcome = "resumed";
       await expect(executePaperclipNativeSession({ db: nextDb, execution: next,
         runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target,
-        onEvent: async event => { events.push(event); } })).resolves.toMatchObject({ exitCode: 0 });
+        onEvent: async event => {
+          events.push(event);
+          // A blocked sink for the newly added preparation spans must NOT
+          // gate the runner identity command. finish() still joins the rows.
+          if (connected && resumedFromState === undefined && !lost && event.eventType === "run.performance.span"
+            && ["startup_reuse", "span_persistence", "controller_identity", "controller_process"].some(
+              name => event.payload?.span === `native.controller.${name}`)) await preparationRows;
+        } })).resolves.toMatchObject({ exitCode: 0 });
       const restoreSpan = events.find(event => event.eventType === "run.performance.span"
         && event.payload?.span === "native.controller.warm_restore");
       expect(restoreSpan?.payload).toMatchObject({ outcome: "ok", parentSpan: "task.prepare" });
@@ -19919,6 +19932,15 @@ describe("runnerd provider runtime wiring", () => {
         && event.payload?.span === "native.controller.attachment_staging");
       expect(stagingSpan?.payload).toMatchObject({ outcome: "ok", parentSpan: "task.prepare" });
       expect(stagingSpan?.payload?.durationMs).toBeGreaterThanOrEqual(50);
+      // P1: every controller await on the ordinary warm path between runtime
+      // selection/attachment staging and the identity command has a receipt.
+      for (const name of ["startup_reuse", "span_persistence", "controller_identity", "controller_process"]) {
+        const measured = events.find(event => event.eventType === "run.performance.span"
+          && event.payload?.span === `native.controller.${name}`);
+        expect(measured?.payload, name).toMatchObject({ outcome: "ok" });
+        expect(measured?.payload?.wallStartedAtMs, name).toBeTypeOf("number");
+        expect(measured?.payload?.durationMs, name).toBeGreaterThanOrEqual(0);
+      }
       const spans = events.filter(event => event.eventType === "run.performance.span"
         && event.payload?.span === "native.controller.warm_owner_identity_check");
       expect(spans).toHaveLength(resumedFromState === "stopped" || resumedFromState === "archived" ? 0 : 1);
@@ -21983,6 +22005,87 @@ describe("runnerd provider runtime wiring", () => {
     expect(remoteExecute.mock.calls.some(([request]) => request.args?.includes("paperclip-runner-launch")
       || request.args?.includes("paperclip-runner-claim-unstarted-session"))).toBe(false);
   });
+
+  // P1 case card: real remote warm backend/registration, with one preparation
+  // boundary held at a time. No provider turn or network is used.
+  it.each(["realize", "run_output", "github", "stamp", "runtime_selection"] as const)(
+    "P1 overlaps warm ingress with slow %s preparation and joins before connect", async slowStep => {
+      const previous = scopedNativeExecution(`pipeline-${slowStep}`);
+      previous.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 300_000 };
+      const current = { ...previous, binding: { ...previous.binding, runId: `${previous.binding.runId}-next` } };
+      const identity = { runId: previous.binding.runId, normalizedSessionId: previous.session.normalizedSessionId!,
+        runnerInstanceId: "pipeline-runner", environmentLeaseId: "pipeline-lease", turnId: "prior-turn", itemId: "prior-item" };
+      const root = await initializeScopedRunnerRoot(previous, identity.runnerInstanceId);
+      await writeRunnerAuthority(root, identity, "suspended");
+      const projections = vi.spyOn(controllerRecovery, "resolveNativeControllerRecovery").mockResolvedValue({ kind: "no_prior_execution" });
+      onTestFinished(() => projections.mockRestore());
+      const db = leaseDb(current), ordinarySelect = db.select.bind(db);
+      db.select = ((fields?: Record<string, unknown>) => fields?.status === heartbeatRuns.status && fields?.runnerProfileJson === heartbeatRuns.runnerProfileJson
+        ? priorNativeRunDb(previous).select(fields as never) : ordinarySelect(fields as never)) as Db["select"];
+      const execute = vi.fn(async (request: { args: string[] }) => ({ exitCode: 0, timedOut: false, stderr: "",
+        stdout: request.args[0] === "--build-metadata" ? JSON.stringify({
+          schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+          packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+          durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
+        }) : request.args[0] === "--version" ? "codex-cli 0.160.0" : request.args[1]?.includes("base64")
+          ? Buffer.from(JSON.stringify({ ...identity, lifecycle: "ready", outbox: [], pendingTerminalDelivery: null })).toString("base64")
+          : request.args[1]?.includes("cat --") ? `nonce\n123\n2026-09-19T10:00:00.000Z\n${identity.runnerInstanceId}\nlinux:abcd-1234:100\n` : "" }));
+      let acquireStartedAt = 0, acquireEndedAt = 0;
+      const ingress = { kind: "authenticated_websocket" as const, websocketUrl: "wss://sandbox.invalid/runner",
+        secretHeaders: [], generation: "1", refresh: vi.fn(), close: vi.fn(async () => {}) };
+      const acquire = vi.fn(async () => {
+        acquireStartedAt = performance.now();
+        await new Promise(resolve => setTimeout(resolve, 120));
+        acquireEndedAt = performance.now();
+        return ingress;
+      });
+      const target = { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", environmentId: "environment",
+        leaseId: identity.environmentLeaseId, providerKey: "daytona", effectiveCapabilities: { runnerWebSocketIngress: true },
+        runnerLifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 },
+        sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "pipeline-sandbox" },
+        runner: { execute, syncIn: vi.fn(async () => undefined) }, getRunnerIngressEndpoint: acquire } as const;
+      // On base, the absent pipeline leaves the ordinary target in place:
+      // the timing assertion, not a missing import, must be RED.
+      const prepareIngress = (nativeExecutionDriver as Partial<typeof nativeExecutionDriver>).startNativeRunnerIngressPreparation;
+      const pending = prepareIngress?.({ target: target as never, runId: current.binding.runId, runnerIngressAuthorized: true });
+      onTestFinished(async () => { await pending?.release(); });
+      const preparationStartedAt = performance.now();
+      for (const step of ["realize", "run_output", "github", "stamp", "runtime_selection"]) {
+        if (step === slowStep) await new Promise(resolve => setTimeout(resolve, 180));
+      }
+      const preparationEndedAt = performance.now();
+      const runTrace = createNativeRunTrace({ runId: current.binding.runId, startedAtMs: Date.now() });
+      const measure = runTrace.measure.bind(runTrace);
+      let connectStartedAt = 0;
+      vi.spyOn(runTrace, "measure").mockImplementation((name, work, options) => {
+        if (name === "runner.transport.connect") connectStartedAt = performance.now();
+        return measure(name, work, options);
+      });
+      await createRunnerdBackend({ db, execution: current, runnerInstanceId: identity.runnerInstanceId,
+        runnerIngressAuthorized: true, trace: runTrace,
+        remoteWarmRecovery: { identity, reuseProcess: true, previousExecution: previous, checkpoint: {} as never,
+          remote: { providerLeaseId: "pipeline-sandbox", remoteCwd: "/workspace" }, revalidate: async () => undefined },
+        runnerExecutionTarget: (pending?.target ?? target) as never });
+      state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+      const options = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & {
+        controlPlaneRegistration: NonNullable<import("../../vendor/paperclip-runner/index.js").RunnerExecutionDriver["controlPlaneRegistration"]>;
+      };
+      const controller = new DurablePrpControlPlane({ stateDirectory: join(options.stateDirectory!, "pipeline-control"),
+        identity: options.prpIdentity! as ConstructorParameters<typeof DurablePrpControlPlane>[0]["identity"],
+        expectedRunnerVersion: "pipeline-fixture", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+      let registration: Awaited<ReturnType<typeof options.controlPlaneRegistration>> | undefined;
+      onTestFinished(async () => { await registration?.release(); await controller.stop(); });
+      registration = await options.controlPlaneRegistration(controller, { ...identity, runId: current.binding.runId });
+      const overlapMs = Math.max(0, Math.min(preparationEndedAt, acquireEndedAt) - Math.max(preparationStartedAt, acquireStartedAt));
+      console.info(`P1_OVERLAP ${JSON.stringify({ slowStep, preparationMs: preparationEndedAt - preparationStartedAt,
+        acquireMs: acquireEndedAt - acquireStartedAt, overlapMs, acquireStartedBeforePreparationEnded: acquireStartedAt < preparationEndedAt,
+        connectWaitedForBoth: connectStartedAt >= Math.max(preparationEndedAt, acquireEndedAt) })}`);
+      expect(acquire).toHaveBeenCalledExactlyOnceWith({ leaseId: identity.environmentLeaseId, port: 43_127,
+        path: `/api/runner/v1/connect/${encodeURIComponent(current.binding.runId)}` });
+      expect(acquireStartedAt).toBeLessThan(preparationEndedAt);
+      expect(overlapMs).toBeGreaterThan(80);
+      expect(connectStartedAt).toBeGreaterThanOrEqual(Math.max(preparationEndedAt, acquireEndedAt));
+    });
 
   it.each(["verified", "no-proof", "dead", "stale"] as const)("reuses only verified idle warm process during actual remote preparation: %s", async mode => {
     const previous = scopedNativeExecution(`warm-live-preparation-${mode}`);

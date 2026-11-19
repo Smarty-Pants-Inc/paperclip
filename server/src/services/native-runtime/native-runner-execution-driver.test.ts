@@ -3,7 +3,8 @@ import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/executio
 import type { RunnerIngressEndpoint } from "@paperclipai/adapter-utils/runner-connectivity";
 import pino from "pino";
 import { environmentRunnerIngressErrorData, JsonRpcCallError, PluginEnvironmentRunnerIngressError } from "@paperclipai/plugin-sdk";
-import { NativeRunnerIngressAcquisitionError, prepareNativeRemoteRunner, createNativeRunnerExecutionDriver } from "./native-runner-execution-driver.js";
+import { NativeRunnerIngressAcquisitionError, prepareNativeRemoteRunner, createNativeRunnerExecutionDriver, startNativeRunnerIngressPreparation } from "./native-runner-execution-driver.js";
+import { createNativeRunTrace } from "./native-run-trace.js";
 
 const transport = vi.hoisted(() => ({
   register: vi.fn(),
@@ -40,6 +41,129 @@ beforeEach(() => {
 });
 
 describe("shared Runner execution driver", () => {
+  const warmTarget = (acquire: () => Promise<RunnerIngressEndpoint>): AdapterExecutionTarget => ({ ...sandbox(),
+    runnerLifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
+    sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "same-box" }, getRunnerIngressEndpoint: acquire,
+  } as AdapterExecutionTarget);
+
+  it.each(["preparation failure", "checkpoint failure", "cancelled", "cancelled pending acquire"])(
+    "P1 releases a warm endpoint exactly once after %s", async scenario => {
+      const ingress = endpoint();
+      let acquired!: (endpoint: RunnerIngressEndpoint) => void;
+      const acquire = vi.fn(() => scenario === "cancelled pending acquire"
+        ? new Promise<RunnerIngressEndpoint>(resolve => { acquired = resolve; }) : Promise.resolve(ingress));
+      const pending = startNativeRunnerIngressPreparation({ target: warmTarget(acquire), runId: binding.runId,
+        runnerIngressAuthorized: true })!;
+      const prepareRemote = vi.fn(async () => { if (scenario === "preparation failure") throw new Error("prepare_failed"); });
+      const driver = createNativeRunnerExecutionDriver({ target: pending.target, binding,
+        runnerIngressAuthorized: true, prepareRemote, processStarted: Promise.resolve(),
+        beforeConnect: async () => { if (scenario === "checkpoint failure") throw new Error("checkpoint_failed"); } });
+      if (scenario.startsWith("cancelled")) {
+        const releasing = pending.release();
+        if (scenario === "cancelled pending acquire") acquired(ingress);
+        await releasing;
+        await expect(driver.controlPlaneRegistration!(authority)).rejects.toThrow("native_session_cancelled");
+      } else {
+        await expect(driver.controlPlaneRegistration!(authority)).rejects.toThrow(
+          scenario === "preparation failure" ? "prepare_failed" : "checkpoint_failed");
+      }
+      await pending.release();
+      await pending.release();
+      expect(acquire).toHaveBeenCalledOnce();
+      expect(ingress.close).toHaveBeenCalledOnce();
+      expect(transport.connect).not.toHaveBeenCalled();
+      expect(transport.register).not.toHaveBeenCalled();
+    });
+
+  it.each(["typed", "ordinary", "preparation also fails"])(
+    "P1 observes early %s acquire failure but reports it only at the existing join", async scenario => {
+      const failure = { phase: "private_preview", httpStatus: 502 } as const;
+      const raw = scenario === "ordinary" ? new Error("provider_endpoint_failed") : new JsonRpcCallError({ code: -32000,
+        message: "private provider response", data: environmentRunnerIngressErrorData(new PluginEnvironmentRunnerIngressError(failure)) });
+      const unhandled: unknown[] = [];
+      const observer = (error: unknown) => { unhandled.push(error); };
+      process.on("unhandledRejection", observer);
+      let finishPreparation!: () => void;
+      const preparation = new Promise<void>(resolve => { finishPreparation = resolve; });
+      const pending = startNativeRunnerIngressPreparation({ target: warmTarget(async () => { throw raw; }),
+        runId: binding.runId, runnerIngressAuthorized: true })!;
+      try {
+        // The rejection occurs before a trace/registration exists.
+        await new Promise(resolve => setTimeout(resolve, 60));
+        expect(unhandled).toEqual([]);
+        let settled = false;
+        const prepareRemote = vi.fn(async () => {
+          await preparation;
+          if (scenario === "preparation also fails") throw new Error("prepare_failed_first");
+        });
+        const driver = createNativeRunnerExecutionDriver({ target: pending.target, binding, runnerIngressAuthorized: true,
+          prepareRemote, processStarted: Promise.resolve() });
+        const registration = driver.controlPlaneRegistration!(authority).catch(error => { settled = true; return error; });
+        await vi.waitFor(() => expect(prepareRemote).toHaveBeenCalledOnce());
+        expect(settled).toBe(false);
+        expect(unhandled).toEqual([]);
+        finishPreparation();
+        const error = await registration;
+        if (scenario === "typed") {
+          expect(error).toBeInstanceOf(NativeRunnerIngressAcquisitionError);
+          expect(error.failure).toEqual(failure);
+          expect(error.message).toBe("Runner connection endpoint could not be acquired (HTTP 502).");
+        } else if (scenario === "ordinary") expect(error).toBe(raw);
+        else expect(error.message).toBe("prepare_failed_first");
+        expect(transport.connect).not.toHaveBeenCalled();
+      } finally {
+        finishPreparation();
+        await pending.release();
+        process.removeListener("unhandledRejection", observer);
+      }
+    });
+
+  it("P1 waits for a slower acquisition before connect and transfers cleanup only after registration", async () => {
+    const ingress = endpoint();
+    let acquired!: (endpoint: RunnerIngressEndpoint) => void;
+    const pending = startNativeRunnerIngressPreparation({ target: warmTarget(() =>
+      new Promise<RunnerIngressEndpoint>(resolve => { acquired = resolve; })), runId: binding.runId, runnerIngressAuthorized: true })!;
+    const runTrace = createNativeRunTrace({ runId: binding.runId, startedAtMs: Date.now() });
+    const measure = vi.spyOn(runTrace, "measure");
+    const prepareRemote = vi.fn(async () => {});
+    const driver = createNativeRunnerExecutionDriver({ target: pending.target, binding, runnerIngressAuthorized: true,
+      prepareRemote, processStarted: Promise.resolve(), trace: runTrace });
+    const opening = driver.controlPlaneRegistration!(authority);
+    await vi.waitFor(() => expect(prepareRemote).toHaveBeenCalledOnce());
+    expect(measure.mock.calls.some(([name]) => name === "runner.transport.connect")).toBe(false);
+    expect(transport.connect).not.toHaveBeenCalled();
+    acquired(ingress);
+    const registration = await opening;
+    expect(measure.mock.calls.some(([name]) => name === "runner.transport.connect")).toBe(true);
+    await pending.release();
+    expect(ingress.close).not.toHaveBeenCalled();
+    await registration.release();
+    expect(ingress.close).toHaveBeenCalledOnce();
+  });
+
+  it("P1 releases an acquired endpoint if setup fails after the join", async () => {
+    const ingress = endpoint();
+    const pending = startNativeRunnerIngressPreparation({ target: warmTarget(async () => ingress),
+      runId: binding.runId, runnerIngressAuthorized: true })!;
+    const driver = createNativeRunnerExecutionDriver({ target: pending.target, binding, runnerIngressAuthorized: true,
+      prepareRemote: async () => {}, processStarted: Promise.resolve(), onLog: async () => { throw new Error("setup_failed"); } });
+    await expect(driver.controlPlaneRegistration!(authority)).rejects.toThrow("setup_failed");
+    await pending.release();
+    expect(ingress.close).toHaveBeenCalledOnce();
+  });
+
+  it.each(["unauthorized", "cold", "per_turn", "outbound", "task"])("P1 does not pre-acquire an ineligible %s target", scenario => {
+    const acquire = vi.fn(async () => endpoint());
+    const target = { ...warmTarget(acquire),
+      ...(scenario === "cold" ? { sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: "new-box" } } : {}),
+      ...(scenario === "per_turn" ? { runnerLifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } } : {}),
+      ...(scenario === "outbound" ? { effectiveCapabilities: { runnerWebSocketIngress: false } } : {}),
+      ...(scenario === "task" ? { runnerTask: vi.fn() } : {}),
+    } as AdapterExecutionTarget;
+    expect(startNativeRunnerIngressPreparation({ target, runId: binding.runId, runnerIngressAuthorized: scenario !== "unauthorized" })).toBeUndefined();
+    expect(acquire).not.toHaveBeenCalled();
+  });
+
   it.each(["ingress", "preparation", "unknown"])("limits ingress evidence and public error serialization at %s", async phase => {
     const failure = { phase: "private_preview", httpStatus: 502 } as const;
     const raw = new JsonRpcCallError({ code: -32000, message: "fixture-private-provider-response",
