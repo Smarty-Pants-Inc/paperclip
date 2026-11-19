@@ -117,9 +117,15 @@ export async function acknowledgedNativeApiStopExecutionHasStopped(db: Db, run: 
 export async function acknowledgedNativeStopExecutionHasStopped(db: Db, run: Pick<typeof heartbeatRuns.$inferSelect,
   "id" | "companyId" | "nativeIssueId" | "status" | "resultJson" | "processPid" | "processGroupId">) {
   if (!isAcknowledgedNativeStop(run)) return false;
+  const [warmRun] = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id))).limit(1);
+  const hasRetainedNativeTurnStop = warmRun?.runnerProfileJson?.nativeRetainedIdleCheckpoint
+    ? (await import("./native-runtime/native-session-executor.js")).hasRetainedNativeTurnStop : undefined;
   const leases = await db.select().from(environmentLeases).where(and(
     eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
   ));
+  if (warmRun && hasRetainedNativeTurnStop?.(warmRun) && leases.every(lease =>
+    hasRetainedNativeTurnStop(warmRun, lease) || hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))) return true;
   // Provider PIDs are meaningful only on their own host. A recovered sandbox
   // queued for destroy keeps its verified stop; the destroy is only cleanup.
   if (leases.some(lease => lease.provider !== "local")) {

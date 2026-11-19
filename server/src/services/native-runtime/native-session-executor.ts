@@ -152,6 +152,7 @@ import { selectRemotePiCompanion } from "./remote-pi-companion.js";
 import { scheduledResumeContinuationAllowed } from "./scheduled-resume-continuation.js";
 import { readNativeLocalProcessStop, recordedLocalExecutionStopped, PRIOR_OWNER_FENCE_REFUSED, PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, withReleasedNativeRunProcess } from "../native-local-process-stop.js";
 import { hasRemoteTerminationReceipt, remoteLeaseCleanupScope, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
+import { hasStopOnlyCleanup } from "../sandbox-stop-and-retain.js";
 import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "../reusable-sandbox-kept-marker.js";
 import { connectorToolDefinitionsForSkills } from "../connector-runtime.js";
 import { NATIVE_PREPARATION_FENCING_VERSION, setNativeExecutionActive } from "./native-active-runs.js";
@@ -780,6 +781,8 @@ type WarmNativeSession = {
   sandboxLeaseId?: string;
   sandboxRunner?: { runner: CommandManagedRuntimeRunner; remoteCwd: string };
   closeFailureEvidenceLogged?: boolean;
+  /** Exact turn whose in-bound interrupt and idle snapshot retained this owner. */
+  stoppedTurnRunId?: string;
   /** A successor's retirement of this owner failed; it stays registered for its own sandbox. */
   retirementUnproven?: boolean;
   observabilityCompatibilityKey?: string;
@@ -808,6 +811,27 @@ type WarmNativeSession = {
   idleTimer: ReturnType<typeof setTimeout> | null;
   lastActivityAt: string;
 };
+
+/** Process-local proof, never a physical provider-stop receipt. A restart, a
+ * successor attachment, or an uncertain/closing owner takes the old fallback. */
+export function hasRetainedNativeTurnStop(run: {
+  id: string; companyId: string; nativeIssueId: string | null; status: string;
+  resultJson: Record<string, unknown> | null; runnerProfileJson: Record<string, unknown> | null;
+}, lease?: typeof environmentLeases.$inferSelect): boolean {
+  if (run.status !== "cancelled" || !hasAcknowledgedNativeStopIntent(run)) return false;
+  if (lease && (lease.heartbeatRunId !== run.id || lease.status !== "retained" || lease.releasedAt
+    || lease.cleanupStatus === "failed" || lease.metadata?.pendingCleanupInFlight === true || hasStopOnlyCleanup(lease))) return false;
+  const receipt = record(run.runnerProfileJson?.nativeRetainedIdleCheckpoint);
+  if (receipt.schema !== "paperclip.native-retained-idle-checkpoint.v1" || receipt.runId !== run.id
+    || receipt.companyId !== run.companyId || receipt.issueId !== run.nativeIssueId) return false;
+  return [...warmNativeSessions.values()].some(owner => owner.runId === run.id && owner.stoppedTurnRunId === run.id
+    && owner.companyId === run.companyId && owner.issueId === run.nativeIssueId
+    && owner.normalizedSessionId === receipt.sessionId
+    && (!lease || owner.sandboxLeaseId === lease.id && owner.providerLeaseId === lease.providerLeaseId)
+    && !owner.busy && !owner.preparingRunId
+    && !owner.closeOnReleaseReason && !owner.controllerDetachedForRestart && !owner.retirementUnproven
+    && owner.runnerConnectionLive?.() !== false);
+}
 
 const WARM_CLOSE_FAILURE_DETAIL_MAX = 2_000;
 const WARM_NATIVE_SESSION_CLOSE_CONCURRENCY = 4;
@@ -13861,7 +13885,10 @@ async function executePaperclipNativeSessionAttempt(
                 : owner.closeOnReleaseReason ? "owner_closing"
                 : piCancellationUnsafe ? "pi_cancellation_unsafe" : "retained";
               cancelledSessionRetained = reason === "retained";
-              if (cancelledSessionRetained) retainedCancelledCheckpoint = snapshot;
+              if (cancelledSessionRetained) {
+                retainedCancelledCheckpoint = snapshot;
+                owner!.stoppedTurnRunId = input.execution.binding.runId;
+              }
               return probe(reason, cancelledSessionRetained);
             },
             sessionGoalControl: input.sessionGoalControl,
