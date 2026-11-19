@@ -20,6 +20,9 @@ export type PersonCommentSteeringOptions = {
   /** Internal drain: the existing wake transfers custody in the prepare transaction. */
   fallbackWakeId?: string;
   skipFallbackDrain?: boolean;
+  /** Internal drain snapshot, probed before the issue delivery lock. Dispatch
+   * still revalidates the attached turn after durable custody is prepared. */
+  drainAttachment?: { runId: string; activeTurnId: string };
 };
 
 // The native attachment is process-owned. This promise chain only preserves RPC
@@ -106,9 +109,27 @@ export async function drainFallbackPersonComments(db: Db, runId: string): Promis
   const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId),
     sql`exists (select 1 from ${activityLog} where ${activityLog.runId} = ${runId}
       and ${activityLog.companyId} = ${heartbeatRuns.companyId} and ${activityLog.action} = ${FALLBACK_ACTION}
-      and ${activityLog.details}->>'eligibleForSteering' = 'true')`));
+      and ${activityLog.details}->>'eligibleForSteering' = 'true')`,
+    // Retained history is not pending work. A consumed fallback must not make
+    // every later turn-start observer contend with ordinary Sends forever.
+    sql`exists (select 1 from ${agentWakeupRequests} where
+      ${agentWakeupRequests.companyId} = ${heartbeatRuns.companyId}
+      and ${agentWakeupRequests.agentId} = ${heartbeatRuns.agentId}
+      and ${agentWakeupRequests.status} in ('queued', 'deferred_issue_execution')
+      and ${agentWakeupRequests.runId} is null
+      and ${agentWakeupRequests.payload}->>'issueId' = coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId'))`));
   const issueId = run?.nativeIssueId ?? run?.contextSnapshot?.issueId;
   if (!run || typeof issueId !== "string" || run.status !== "running") return;
+  // A session snapshot may require provider/runner I/O. Never await it while
+  // holding the issue delivery lock: Send/admission and ingestion must progress
+  // even when that probe is stalled. The existing prepare/dispatch fences own
+  // status and actual-turn revalidation if this observation becomes stale.
+  const { getNativeSessionSteeringState } = await import("./native-runtime/native-session-executor.js");
+  let state: Awaited<ReturnType<typeof getNativeSessionSteeringState>>;
+  try { state = await getNativeSessionSteeringState(runId); }
+  catch (error) { logSteeringFailure(error); return; }
+  if (state.disposition !== "available" || !state.activeTurnId) return;
+  const drainAttachment = { runId, activeTurnId: state.activeTurnId };
   await db.transaction(async lock => {
     await lock.execute(sql`select pg_advisory_xact_lock(hashtextextended(${personCommentDeliveryLockKey(issueId)}, 0))`);
     const [issue] = await db.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
@@ -116,7 +137,8 @@ export async function drainFallbackPersonComments(db: Db, runId: string): Promis
     const waiting = await waitingPersonComments(db, issue, run.agentId, run);
     if (waiting.boundary) return;
     for (const item of waiting.fallback) {
-      if (!await trySteerPersonComment(db, item.comment, { lockHeld: true, skipFallbackDrain: true, fallbackWakeId: item.wakeId })) break;
+      if (!await trySteerPersonComment(db, item.comment, { lockHeld: true, skipFallbackDrain: true,
+        fallbackWakeId: item.wakeId, drainAttachment })) break;
     }
   });
 }
@@ -172,7 +194,9 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
   const { getNativeSessionSteeringState, steerNativeSession, NativeSessionSteeringError } = await import("./native-runtime/native-session-executor.js");
   let state: Awaited<ReturnType<typeof getNativeSessionSteeringState>>;
   try {
-    state = await getNativeSessionSteeringState(run.id);
+    state = options.drainAttachment?.runId === run.id
+      ? { disposition: "available", activeTurnId: options.drainAttachment.activeTurnId }
+      : await getNativeSessionSteeringState(run.id);
   } catch (error) {
     // Probe failure precedes custody; ordinary admission still owns the comment.
     logSteeringFailure(error);

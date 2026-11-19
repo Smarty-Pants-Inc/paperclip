@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents, authUsers, companies, companyMemberships, createDb,
@@ -239,17 +239,25 @@ beforeAll(async () => {
     if (input.backend) return realExecute(input);
     const owner = scheduled.get(input.execution.binding.companyId);
     if (!owner) throw new Error("unowned scheduled execution in steer RED");
-    const first = owner.peers.length === 0;
-    const peer = first ? owner.first : new RecordingPiPeer(); owner.peers.push(peer);
-    if (!first) peer.onPrompt = message => setImmediate(() => {
-      const envelope = JSON.parse(message);
-      const prompt = String(envelope.task?.prompt ?? message);
-      peer.boundary();
-      const inputs = owner.bodies.filter(body => prompt.includes(body));
-      if (inputs.length) peer.answer(inputs);
-      peer.finish();
+    const first = owner.executions.length === 0;
+    const execution = Promise.resolve(owner.attachGate).then(async () => {
+      const peer = first ? owner.first : owner.first instanceof B6RealPiPeer
+        ? await (async () => {
+          const actual = new B6RealPiPeer(); actual.bodies = owner.bodies;
+          actual.released = true; actual.finishing = true; await actual.start();
+          return actual as unknown as RecordingPiPeer;
+        })() : new RecordingPiPeer();
+      owner.peers.push(peer);
+      if (!first && !(peer instanceof B6RealPiPeer)) peer.onPrompt = message => setImmediate(() => {
+        const envelope = JSON.parse(message);
+        const prompt = String(envelope.task?.prompt ?? message);
+        peer.boundary();
+        const inputs = owner.bodies.filter(body => prompt.includes(body));
+        if (inputs.length) peer.answer(inputs);
+        peer.finish();
+      });
+      return realExecute({ ...input, useRunnerd: false, backend: backendFor(input.execution, input.runnerInstanceId, peer) });
     });
-    const execution = Promise.resolve(owner.attachGate).then(() => realExecute({ ...input, useRunnerd: false, backend: backendFor(input.execution, input.runnerInstanceId, peer) }));
     owner.executions.push(execution.then(result => owner.outcomes.set(input.execution.binding.runId, { result }),
       error => owner.outcomes.set(input.execution.binding.runId, { error: String(error) })));
     return execution;
@@ -272,8 +280,8 @@ async function fixture(label: string, conversation = true, earlyBodies: string[]
     ...(conversation ? { conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" as const } : {}) });
   const initial = randomUUID();
   await db.insert(issueComments).values({ id: initial, companyId, issueId, authorType: "user", authorUserId: userId, body: "Do the original two-step work." });
-  const peer = process.env.B6_REAL_PI === "1" && label === "B6-starting"
-    ? await (async () => { const actual = new B6RealPiPeer(); await actual.start(); return actual as unknown as RecordingPiPeer; })()
+  const peer = process.env.B6_REAL_PI === "1" && label.startsWith("B6")
+    ? await (async () => { const actual = new B6RealPiPeer(); actual.initialTool = earlyBodies.length === 0; await actual.start(); return actual as unknown as RecordingPiPeer; })()
     : new RecordingPiPeer();
   const owner = { bodies: [] as string[], peers: [] as RecordingPiPeer[], executions: [] as Promise<unknown>[], first: peer, outcomes: new Map<string, Outcome>() };
   let attach!: () => void;
@@ -294,6 +302,20 @@ async function fixture(label: string, conversation = true, earlyBodies: string[]
     contextSnapshot: { issueId, taskId: issueId, wakeCommentId: initial, wakeCommentIds: [initial], skipIssueComment: true } });
   expect(admission, "initial native run must be admitted by the real heartbeat scheduler").not.toBeNull();
   const runId = admission!.id;
+  if (peer instanceof B6RealPiPeer) {
+    peer.bodies = owner.bodies;
+    peer.beforeBoundary = async () => {
+      await vi.waitFor(async () => {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        const steered = (run.contextSnapshot?.steeredCommentIds ?? []) as string[];
+        const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+        for (const id of steered) expect(events.some(event => {
+          const prp = event.payload?.prpEvent as { itemId?: string; payload?: { kind?: string } } | undefined;
+          return prp?.payload?.kind === "steering_acknowledgement" && prp.itemId?.endsWith(`:steer:${id}`);
+        }), `native ACK receipt before controlled model release: ${id}`).toBe(true);
+      }, { timeout: 15_000 });
+    };
+  }
   try {
     if (earlyBodies.length) await vi.waitFor(() => expect(owner.executions).toHaveLength(1), { timeout: 15000 });
     for (const body of earlyBodies) {
@@ -308,8 +330,22 @@ async function fixture(label: string, conversation = true, earlyBodies: string[]
       expect(peer.requests.some(command => command.type === "prompt")).toBe(true);
     }, { timeout: 15_000 });
   } catch (error) {
-    peer.boundary(); peer.finish(); await heartbeat.waitForRunExecutionDrain(runId, { timeoutMs: 15_000 });
-    await peer.close(); scheduled.delete(companyId); throw error;
+    // Preserve the first failed boundary. A cleanup timeout must not overwrite
+    // it or leave this provider/execution alive to poison the following row.
+    if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, `${label}-startup-failure.json`), JSON.stringify({
+      error: error instanceof Error ? { message: error.message, stack: error.stack } : String(error),
+      companyId, issueId, runId, commands: peer.requests, outcomes: [...owner.outcomes],
+      runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)),
+      wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)),
+      events: await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId)),
+    }, null, 2));
+    let cleanupError: unknown;
+    peer.boundary(); peer.finish();
+    try { await heartbeat.waitForRunExecutionDrain(runId, { timeoutMs: 15_000 }); }
+    catch (failure) { cleanupError = failure; }
+    finally { await peer.close(); await Promise.allSettled(owner.executions); scheduled.delete(companyId); }
+    if (cleanupError) throw new AggregateError([error, cleanupError], "native fixture startup failed; cleanup also missed its drain deadline");
+    throw error;
   }
   const running = owner.executions[0];
   const post = async (body: string) => {
@@ -551,6 +587,40 @@ describe("person comment default steering eligibility and asynchronous receipt",
         f.peer.boundary(); await f.assertSteeredOnce([message]); await f.complete();
       } finally { probe.mockRestore(); }
     } finally { await f.close(); }
+  }, 45_000);
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21272
+  it("B6d fallback attachment probe never holds the issue delivery lock", async () => {
+    const f = await fixture("B6d-probe-lock");
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const probing = new Promise<void>(resolve => { entered = resolve; });
+    let draining: Promise<void> | undefined;
+    let probe: { mockRestore: () => void } | undefined;
+    try {
+      await vi.waitFor(async () => expect((await db.select().from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, f.runId))).some(event => event.eventType === "tool.execution.started")).toBe(true), { timeout: 15_000 });
+      const state = await getNativeSessionSteeringState(f.runId);
+      const unavailable = vi.spyOn(nativeExecutor, "getNativeSessionSteeringState")
+        .mockResolvedValue({ disposition: "temporarily_unavailable", activeTurnId: null });
+      let message: { id: string; body: string };
+      try { message = await f.post("B6d-PROBE-LOCK"); } finally { unavailable.mockRestore(); }
+      probe = vi.spyOn(nativeExecutor, "getNativeSessionSteeringState").mockImplementationOnce(async () => {
+        entered(); await gate; return state;
+      });
+      draining = commentSteering.drainFallbackPersonComments(db, f.runId);
+      await probing;
+      const rows = await db.transaction(tx => tx.execute(sql`select pg_try_advisory_xact_lock(
+        hashtextextended(${commentSteering.personCommentDeliveryLockKey(f.issueId)}, 0)) as acquired`));
+      const acquired = rows[0]?.acquired;
+      if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, "B6d-probe-lock.json"),
+        JSON.stringify({ runId: f.runId, issueId: f.issueId, acquiredWhileProbeHeld: acquired }));
+      release(); await draining;
+      expect(acquired, "an unrelated Send must acquire the issue lock while Pi attachment I/O is held").toBe(true);
+      await waitForPendingCommentSteers();
+      expect(f.commands("steer").map(command => command.input?.message)).toEqual([message.body]);
+      f.peer.boundary(); await f.assertSteeredOnce([message]); await f.complete();
+    } finally { release(); probe?.mockRestore(); await draining; await f.close(); }
   }, 45_000);
 
   it("S-task: a person comment on a TASK enters its attached Pi turn, without a wake or a restart", async () => {
