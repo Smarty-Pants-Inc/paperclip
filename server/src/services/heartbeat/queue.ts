@@ -2172,7 +2172,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         or(and(
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
-        ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
+        ), sql`jsonb_typeof(${agentWakeupRequests.payload}->'chatCompletionDeliveryIds') = 'array'
+          and ${agentWakeupRequests.payload}->'chatCompletionDeliveryIds' <> '[]'::jsonb`,
+        sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
         sql`(${agentWakeupRequests.payload}->>'mutation' = 'plugin_wakeup'
           and ${agentWakeupRequests.payload}->>'pluginId' = ${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,pluginId}'
           and ${agentWakeupRequests.payload}->>'pluginKey' = ${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,pluginKey}'
@@ -2199,7 +2201,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const pluginWake = payload.mutation === "plugin_wakeup" && pluginId !== null && pluginKey !== null &&
         context.pluginId === pluginId && context.pluginKey === pluginKey &&
         wake.requestedByActorType === "system" && wake.requestedByActorId === pluginId;
-      if (!pluginWake && !ownerWake && !queuedCommentIdsFromWakePayload(wake.payload).length &&
+      const completionWake = Array.isArray(payload.chatCompletionDeliveryIds) && payload.chatCompletionDeliveryIds.length > 0;
+      if (!completionWake && !pluginWake && !ownerWake && !queuedCommentIdsFromWakePayload(wake.payload).length &&
           !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
       const [latest] = await db.select({
         id: heartbeatRuns.id,

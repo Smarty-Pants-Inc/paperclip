@@ -10,7 +10,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents, authUsers, companies, companyMemberships, createDb,
   heartbeatRunEvents, heartbeatRuns, issueComments, issues,
-  agentWakeupRequests, nativeRunFinalizations,
+  agentWakeupRequests, nativeRunFinalizations, completionContracts, chatCompletionDeliveries, issueRecoveryActions,
 } from "@paperclipai/db";
 import { PiRpcDriver } from "../../../packages/paperclip-runner/src/drivers/pi/pi-rpc-driver.js";
 import type { PiRpcRecord, PiRpcTransport } from "../../../packages/paperclip-runner/src/drivers/pi/pi-rpc-transport.js";
@@ -32,6 +32,18 @@ import { readUnreadSteeredMessages } from "../services/native-runtime/unread-ste
 import { readPersonStopHold } from "../services/acknowledged-native-stop.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { notifyDeferredWakesForIssue } from "../services/deferred-execution-notifications.js";
+import { chatCompletionDeliveryService } from "../services/chat-completion-delivery.js";
+import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
+import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
+import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
+import { finalizeNativeRun } from "../services/native-runtime/native-run-finalizer.js";
+import { withNativeWorkspaceFinalizationOwnership, NativeWorkspaceFinalizationBusyError } from "../services/native-runtime/native-workspace-finalization-ownership.js";
+import { registerNativeResponsePresentationWork } from "../services/native-runtime/native-response-presentation-work.js";
+import { registerNativeCleanupReleaseWake } from "../services/native-runtime/native-cleanup-release-wake.js";
+import { settleOwnableKind } from "../services/recovery/ownership-invariant-report.js";
+import { reconcileNativeFinalizations } from "../services/native-runtime/native-finalization-reconciler.js";
+import { recoveryService } from "../services/recovery/service.js";
+import { CONTROL_PLANE_CONFORMANCE_RESULT, CONTROL_PLANE_CONFORMANCE_TERMINAL } from "../vendor/paperclip-runner/testing.js";
 
 // Keep reason: BRIEF-RED.md S-a..S-e and the recorded 11-17 S9 loss at
 // 0d59da31. Explicitly requested route/native integration REDs, not live model proof.
@@ -196,7 +208,7 @@ let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
 let root: string;
 type Outcome = { result?: Awaited<ReturnType<typeof executePaperclipNativeSession>>; error?: string };
 const scheduled = new Map<string, { bodies: string[]; peers: RecordingPiPeer[]; executions: Promise<unknown>[];
-  first: RecordingPiPeer; outcomes: Map<string, Outcome> }>();
+  first: RecordingPiPeer; outcomes: Map<string, Outcome>; contendAtFinalization?: boolean; deferCommitAtReturn?: boolean }>();
 const realExecute = executePaperclipNativeSession;
 function backendFor(execution: Parameters<typeof realExecute>[0]["execution"], runnerInstanceId: string, peer: RecordingPiPeer) {
   const workspace = execution.workspace.cwd;
@@ -244,7 +256,23 @@ beforeAll(async () => {
       if (inputs.length) peer.answer(inputs);
       peer.finish();
     });
-    const execution = realExecute({ ...input, useRunnerd: false, backend: backendFor(input.execution, input.runnerInstanceId, peer) });
+    const execution = realExecute({ ...input, useRunnerd: false, backend: backendFor(input.execution, input.runnerInstanceId, peer) }).then(async result => {
+      if (owner.deferCommitAtReturn && first) {
+        await db.update(nativeRunFinalizations).set({ phase: "observed", leaseOwner: "native-row-reconciler",
+          leaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(nativeRunFinalizations.runId, input.execution.binding.runId));
+      }
+      if (owner.contendAtFinalization && first) {
+        // Apply the runtime's REAL ownership arbitration at this local backend
+        // seam. Production remote workspace completion does this at runtime-
+        // execution.ts:1097-1100. The competing physical lock is real Postgres;
+        // the error flows through the real runtime/heartbeat busy return.
+        const owned = await withNativeWorkspaceFinalizationOwnership({ db,
+          companyId: input.execution.binding.companyId, runId: input.execution.binding.runId }, async () => undefined);
+        if (!owned.acquired) throw new NativeWorkspaceFinalizationBusyError();
+        throw new Error("completion row expected real finalization contention");
+      }
+      return result;
+    });
     owner.executions.push(execution.then(result => owner.outcomes.set(input.execution.binding.runId, { result }),
       error => owner.outcomes.set(input.execution.binding.runId, { error: String(error) })));
     return execution;
@@ -252,7 +280,7 @@ beforeAll(async () => {
 }, 60_000);
 afterAll(async () => { vi.restoreAllMocks(); await db?.$client.end(); await database?.cleanup(); vi.unstubAllEnvs(); });
 
-async function fixture(label: string, conversation = true) {
+async function fixture(label: string, conversation = true, skipIssueComment = true) {
   const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), userId = randomUUID();
   const workspace = join(root, label); await mkdir(workspace);
   await writeFile(join(workspace, "AGENTS.md"), "Answer each incoming person message exactly once.\n");
@@ -268,10 +296,12 @@ async function fixture(label: string, conversation = true) {
   const initial = randomUUID();
   await db.insert(issueComments).values({ id: initial, companyId, issueId, authorType: "user", authorUserId: userId, body: "Do the original two-step work." });
   const peer = new RecordingPiPeer();
-  const owner = { bodies: [] as string[], peers: [] as RecordingPiPeer[], executions: [] as Promise<unknown>[], first: peer, outcomes: new Map<string, Outcome>() };
+  const owner = { contendAtFinalization: false, deferCommitAtReturn: false, bodies: [] as string[], peers: [] as RecordingPiPeer[], executions: [] as Promise<unknown>[], first: peer, outcomes: new Map<string, Outcome>() };
   scheduled.set(companyId, owner);
   let coordinator: ReturnType<typeof createDeliveryWorkCoordinator> | undefined;
   let work: ReturnType<ReturnType<typeof heartbeatService>["registerDeferredReceiptWork"]> | undefined;
+  let unsubscribeCleanup: (() => void) | undefined;
+  let presentation: ReturnType<typeof registerNativeResponsePresentationWork> | undefined;
   const workerErrors: unknown[] = [];
   const app = express(); app.use(express.json());
   app.use((req, _res, next) => { (req as any).actor = { type: "board", userId, companyIds: [companyId], source: "session", isInstanceAdmin: false,
@@ -281,7 +311,7 @@ async function fixture(label: string, conversation = true) {
   const admission = await heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
     requestedByActorType: "user", requestedByActorId: userId,
     payload: { issueId, commentId: initial, mutation: "comment" },
-    contextSnapshot: { issueId, taskId: issueId, wakeCommentId: initial, wakeCommentIds: [initial], skipIssueComment: true } });
+    contextSnapshot: { issueId, taskId: issueId, wakeCommentId: initial, wakeCommentIds: [initial], skipIssueComment } });
   expect(admission, "initial native run must be admitted by the real heartbeat scheduler").not.toBeNull();
   const runId = admission!.id;
   try {
@@ -310,9 +340,23 @@ async function fixture(label: string, conversation = true) {
     queues.push(view); return view;
   };
   return { companyId, agentId, issueId, runId, userId, initial, peer, app, running, post, commands, comments, wakes, queue, owner,
-    async startDelivery() {
+    async startDelivery(completions = false) {
       coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => workerErrors.push(error) });
+      if (completions) {
+        unsubscribeCleanup = registerNativeCleanupReleaseWake(db, error => workerErrors.push(error));
+        presentation = registerNativeResponsePresentationWork(db, coordinator, () => true); await presentation.ready;
+        const service = chatCompletionDeliveryService(db, heartbeat);
+        await coordinator.register(DELIVERY_QUEUES.chatCompletion, { retryMs: 1000,
+          run: () => service.sweepPending(), hasPending: service.hasPending }).ready;
+      }
       work = heartbeatService(db).registerDeferredReceiptWork(coordinator, () => true); await work.ready;
+      await db.transaction(tx => notifyDeferredWakesForIssue(tx, { companyId, issueId }));
+    },
+    async stopDelivery() {
+      await work?.stop(); await coordinator?.stop(); unsubscribeCleanup?.(); presentation?.stop();
+      work = undefined; coordinator = undefined; unsubscribeCleanup = undefined;
+    },
+    async passDelivery() {
       await db.transaction(tx => notifyDeferredWakesForIssue(tx, { companyId, issueId }));
     },
     async assertAnsweredOnce(messages: Array<{ id: string; body: string }>) {
@@ -336,7 +380,7 @@ async function fixture(label: string, conversation = true) {
     },
     async close() {
       await waitForPendingCommentSteers();
-      await work?.stop(); await coordinator?.stop();
+      await work?.stop(); await coordinator?.stop(); unsubscribeCleanup?.(); presentation?.stop();
       // Teardown must not promote the very deferred input a RED just exposed.
       // Pause admission only AFTER all row assertions, then drain the genuine
       // execution; force-exit the scripted provider if a TASK awaits finish.
@@ -360,11 +404,265 @@ async function fixture(label: string, conversation = true) {
         runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)),
         wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)),
         comments: await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)),
+        completionDeliveries: await db.select().from(chatCompletionDeliveries).where(eq(chatCompletionDeliveries.companyId, companyId)),
+        recoveryActions: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, companyId)),
         events: await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId)),
       }, null, 2));
     },
   };
 }
+
+// Native completion producer: create_task records the handoff; the control-plane
+// result and real native finalizer/committer create its delivery. No hand-made
+// delivery or deferred wake substitutes for either producer.
+async function completionTask(f: Awaited<ReturnType<typeof fixture>>, label: string) {
+  const workerId = randomUUID();
+  await db.insert(agents).values({ id: workerId, companyId: f.companyId, name: `Worker ${label}`,
+    status: "active", adapterType: "paperclip_runner", runtimeConfig: { heartbeat: { enabled: false } } });
+  const authority = new PaperclipRunnerToolAuthority(db, { companyId: f.companyId, issueId: f.issueId,
+    agentId: f.agentId, runId: f.runId });
+  let task: { id: string; identifier: string };
+  try {
+    const receipt = await authority.execute({ tool: "create_task", callId: label,
+      arguments: { idempotencyKey: label, title: label, status: "backlog", assigneeActorId: workerId } }) as { task: typeof task };
+    task = receipt.task;
+  } finally { authority.close(); }
+  f.owner.bodies.push(task.identifier);
+  const contractId = randomUUID(), runId = randomUUID(), sessionId = randomUUID(), runnerInstanceId = randomUUID();
+  const revision = CONTROL_PLANE_CONFORMANCE_RESULT.completionClaim!.contractRevision;
+  await db.insert(completionContracts).values({ id: contractId, companyId: f.companyId, issueId: task.id, revision: 1,
+    schemaVersion: "paperclip.completion-contract.v1", policyVersion: "completion-promotion-row", risk: "low",
+    completionAuthority: "agent_claim_policy", incompleteCriteriaPolicy: "preserve_non_terminal",
+    contractJson: { revision, objective: label, criteria: [{ id: "objective", requirement: "Complete the task" }] },
+    canonicalSha256: contractId, createdByActorType: "system", createdByActorId: "completion-promotion-row" });
+  await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: workerId, runtimeMode: "native",
+    nativeIssueId: task.id, nativeSessionId: sessionId, runnerInstanceId, status: "running", startedAt: new Date(),
+    completionContractId: contractId, completionContractSha256: contractId, contextSnapshot: { issueId: task.id } });
+  const port = new PaperclipControlPlanePort(db, { companyId: f.companyId, issueId: task.id, runId, agentId: workerId,
+    sessionId, completionContractId: contractId, completionContractSha256: contractId,
+    sourceInstanceId: runnerInstanceId, controlPlaneSourceInstanceId: "completion-promotion-row" });
+  await port.openRun({ identity: { runId, sessionId, companyId: f.companyId, issueId: task.id, agentId: workerId },
+    backendKind: "mock", sourceInstanceId: runnerInstanceId });
+  return { ...task, async finish() {
+    await port.completeRun({ result: CONTROL_PLANE_CONFORMANCE_RESULT, terminal: CONTROL_PLANE_CONFORMANCE_TERMINAL,
+      callerResultId: `${runId}:result` });
+    await finalizeNativeRun({ db, runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+    expect((await db.select().from(issues).where(eq(issues.id, task.id)))[0].status).toBe("done");
+    const [delivery] = await db.select().from(chatCompletionDeliveries).where(eq(chatCompletionDeliveries.taskId, task.id));
+    expect(delivery, "the real native Done producer owes a durable completion").toBeDefined();
+    return delivery;
+  } };
+}
+
+// rf-3 11a/11b: native scheduler/executor, native completion producer, outbox,
+// real ownership-registry settlement and shared release drain. The Pi peer is
+// scripted; busy/lease contention is injected at the existing backend seam.
+describe("native completion promotion (rf3-ibpair)", () => {
+  const completionWakes = async (f: Awaited<ReturnType<typeof fixture>>) => (await f.wakes())
+    .filter(wake => Array.isArray(wake.payload?.chatCompletionDeliveryIds));
+  async function assertReported(f: Awaited<ReturnType<typeof fixture>>, task: { id: string; identifier: string }) {
+    await vi.waitFor(async () => {
+      const [delivery] = await db.select().from(chatCompletionDeliveries).where(eq(chatCompletionDeliveries.taskId, task.id));
+      expect(delivery).toMatchObject({ status: "delivered", responseCommentId: expect.any(String) });
+      const comments = await f.comments();
+      const reports = comments.filter(comment => comment.authorType === "agent" && comment.body.includes(`ANSWER:${task.identifier}`));
+      expect(reports).toHaveLength(1);
+      const reply = comments.find(comment => comment.authorType === "agent" && comment.createdByRunId === f.runId);
+      expect(reply, "the owner's reply must be visible before the report").toBeDefined();
+      expect(reply!.createdAt.getTime()).toBeLessThanOrEqual(reports[0].createdAt.getTime());
+    }, { timeout: 15_000 });
+    await heartbeatService(db).drainActiveRunExecutions();
+  }
+  async function settleOwner(f: Awaited<ReturnType<typeof fixture>>) {
+    // The real ownership-registry entry (not heartbeat's directly wired sweep)
+    // must retain the release callback when it wins the guarded lock clear.
+    return settleOwnableKind(db, "issue_execution_lock", { runIds: [f.runId] });
+  }
+  async function finishAcrossAdmissionWindow(f: Awaited<ReturnType<typeof fixture>>) {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let acquired = false;
+    const physicalOwner = withNativeWorkspaceFinalizationOwnership({ db, companyId: f.companyId, runId: f.runId },
+      async () => { acquired = true; await gate; });
+    try {
+      await vi.waitFor(() => expect(acquired).toBe(true));
+      f.owner.contendAtFinalization = true;
+      f.peer.finish(); await f.running;
+      await heartbeatService(db).waitForRunExecutionDrain(f.runId, { timeoutMs: 15_000 });
+      expect(f.owner.outcomes.get(f.runId)?.error).toContain("native_workspace_finalization_busy");
+      expect((await f.wakes()).some(wake => wake.status === "deferred_issue_execution" &&
+        Array.isArray(wake.payload?.chatCompletionDeliveryIds))).toBe(true);
+    } finally { release(); await physicalOwner; }
+    // The durable finalization owner finishes WITHOUT re-entering completeRun.
+    // Then the real ownership-registry settlement must hand the e39 receipt
+    // to the existing release drain, without a new person message.
+    await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+    // The durable owner also settles its environment (the production
+    // settleRecoveredNativeWorkspace tail), not just its result row. Busy
+    // ownership deliberately made the live heartbeat retain this lease.
+    await heartbeatService(db).releaseEnvironmentLeasesForRun({ runId: f.runId, companyId: f.companyId,
+      agentId: f.agentId, status: "succeeded" });
+  }
+  async function answerNewer(f: Awaited<ReturnType<typeof fixture>>, body: string) {
+    const message = await f.post(body);
+    await vi.waitFor(() => expect(f.commands("steer").some(command => command.input?.message === body)).toBe(true));
+    f.peer.boundary();
+    await vi.waitFor(() => expect(f.peer.replies).toContain(`ANSWER:${message.body}`));
+  }
+  async function held(f: Awaited<ReturnType<typeof fixture>>, task: Awaited<ReturnType<typeof completionTask>>) {
+    const delivery = await task.finish();
+    await chatCompletionDeliveryService(db, heartbeatService(db)).deliver(delivery.id);
+    await vi.waitFor(async () => expect(await completionWakes(f)).toHaveLength(1), { timeout: 5000 });
+    const [wake] = await completionWakes(f);
+    expect(wake).toMatchObject({ status: "deferred_issue_execution", runId: null,
+      payload: { issueId: f.issueId, chatCompletionDeliveryIds: [delivery.id],
+        _paperclipWakeContext: { wakeReason: "chat_task_completed" }, interactionOrigin: expect.any(Object) } });
+    expect(wake.payload?.executionWait).toBeUndefined();
+    return { delivery, wake };
+  }
+  it("normal-end control: the existing native end drain still reports a mid-reply completion once", async () => {
+    const f = await fixture("rf3-normal-end", true, false);
+    try {
+      const task = await completionTask(f, "Normal native owner end already worked");
+      await held(f, task);
+      await f.complete();
+      await assertReported(f, task);
+      expect((await completionWakes(f)).filter(wake => wake.runId)).toHaveLength(1);
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it.each([1, 5])("11a / no-live-run: %s real mid-reply completions wait for the native reply, then report in ONE run", async count => {
+    const f = await fixture(`rf3-11a-${count}`, true, false);
+    try {
+      const tasks = [];
+      for (let index = 0; index < count; index++) tasks.push(await completionTask(f, `A short task ${index} finished during Paul's reply`));
+      await f.startDelivery(true);
+      const { wake } = await held(f, tasks[0]);
+      for (const task of tasks.slice(1)) await task.finish();
+      await f.passDelivery();
+      await settleOwner(f);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect((await completionWakes(f))[0]).toMatchObject({ id: wake.id, status: "deferred_issue_execution", runId: null });
+      expect(f.owner.peers).toHaveLength(1);
+      const settledAt = Date.now();
+      await finishAcrossAdmissionWindow(f);
+      await settleOwner(f);
+      for (const task of tasks) await assertReported(f, task);
+      const delivered = await db.select().from(chatCompletionDeliveries).where(eq(chatCompletionDeliveries.companyId, f.companyId));
+      expect(new Set(delivered.map(row => row.targetRunId)).size).toBe(1);
+      console.info("11a completion latency", JSON.stringify({ count, elapsedMs: Date.now() - settledAt }));
+      await f.passDelivery();
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect((await completionWakes(f)).filter(wake => wake.runId)).toHaveLength(1);
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it.each([false, true])("11c: finalizer lease/reconciliation path preBoot=%s retires or reports after commit", async preBoot => {
+    const f = await fixture(`rf3-11c-${preBoot}`, true, false);
+    try {
+      const task = await completionTask(f, "A completion waiting for native reconciliation");
+      const { wake } = await held(f, task);
+      if (preBoot) await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - 3 * 60 * 60_000) })
+        .where(eq(agentWakeupRequests.id, wake.id));
+      await f.startDelivery(true);
+      f.owner.deferCommitAtReturn = true;
+      await f.complete();
+      const [pending] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId));
+      expect(pending).toMatchObject({ phase: "observed", leaseOwner: "native-row-reconciler" });
+      expect((await completionWakes(f))[0]).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      await db.update(nativeRunFinalizations).set({ leaseOwner: null, leaseExpiresAt: null })
+        .where(eq(nativeRunFinalizations.runId, f.runId));
+      // A reconciler between leases still owns the persisted result. The real
+      // registry must not clear its handoff and strand the queue before commit.
+      await settleOwner(f);
+      expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].executionRunId).toBe(f.runId);
+      expect((await completionWakes(f))[0]).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      await reconcileNativeFinalizations(db, [f.runId], {
+        onWorkspaceSettled: input => heartbeatService(db).releaseEnvironmentLeasesForRun({
+          runId: input.runId, companyId: input.companyId, agentId: input.agentId, status: "succeeded" }),
+      });
+      expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))[0].phase).toBe("committed");
+      await settleOwner(f);
+      if (preBoot) await vi.waitFor(async () => {
+        expect((await completionWakes(f))[0]).toMatchObject({ status: "cancelled", runId: null });
+        expect((await f.comments()).filter(row => row.authorType === "system" && row.body.includes(task.identifier))).toHaveLength(1);
+      }, { timeout: 15_000 });
+      else await assertReported(f, task);
+      expect(f.owner.peers).toHaveLength(preBoot ? 1 : 2);
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it.each([
+    { stale: false, orphaned: false }, { stale: true, orphaned: false },
+    { stale: false, orphaned: true }, { stale: true, orphaned: true },
+  ])("boot: old e39 stale=$stale orphaned=$orphaned is safe over two passes", async ({ stale, orphaned }) => {
+    const f = await fixture(`rf3-boot-${stale}-${orphaned}`, true, false);
+    try {
+      const task = await completionTask(f, "Old finished task for the boot row");
+      if (stale) await answerNewer(f, "A newer question that has since been answered");
+      const { wake, delivery } = await held(f, task);
+      await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - 3 * 60 * 60_000) })
+        .where(eq(agentWakeupRequests.id, wake.id));
+      await finishAcrossAdmissionWindow(f);
+      if (orphaned) {
+        // Reproduce a wake ALREADY stranded by the pre-fix bare settlement
+        // entry. Future wiring cannot recover a lock an older server cleared.
+        await recoveryService(db, { enqueueWakeup: async () => null })
+          .sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+        expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].executionRunId).toBeNull();
+        expect((await completionWakes(f))[0]).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      }
+      // Reconstruct through the real registry settlement, not a test-only
+      // heartbeat recovery factory with extra release dependencies.
+      await f.startDelivery(true);
+      await settleOwner(f);
+      {
+        await vi.waitFor(async () => {
+          expect((await completionWakes(f))[0]).toMatchObject({ id: wake.id, status: "cancelled", runId: null });
+          expect((await db.select().from(chatCompletionDeliveries).where(eq(chatCompletionDeliveries.id, delivery.id)))[0].status)
+            .toBe("superseded");
+          const notes = (await f.comments()).filter(comment => comment.authorType === "system" && comment.body.includes(task.identifier));
+          expect(notes).toHaveLength(1); expect(notes[0].body).toContain("Finished earlier");
+        }, { timeout: 15_000 });
+      }
+      await f.stopDelivery(); await f.startDelivery(true); await settleOwner(f); await f.passDelivery();
+      await new Promise(resolve => setTimeout(resolve, 200));
+      expect((await f.comments()).filter(comment => comment.authorType === "system" && comment.body.includes(task.identifier)))
+        .toHaveLength(1);
+      expect(f.owner.peers).toHaveLength(1);
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it.each([false, true])("11b: an old e39 head preBoot=%s becomes ONE naming note, then the new report delivers", async preBoot => {
+    const f = await fixture(`rf3-11b-${preBoot}`, true, false);
+    try {
+      const oldTask = await completionTask(f, "Old finished task whose report was delayed");
+      const newTask = await completionTask(f, "New finished task that must still be reported");
+      await answerNewer(f, "We have since moved on to a different question");
+      const { wake } = await held(f, oldTask);
+      const initialComment = (await f.comments()).find(comment => comment.id === f.initial)!;
+      // Distinguish post-boot newer-answered-person staleness from the pre-boot
+      // gate: either historical head must retire without a late agent turn.
+      await db.update(agentWakeupRequests).set({ requestedAt: preBoot
+        ? new Date(Date.now() - 3 * 60 * 60_000) : new Date(initialComment.createdAt.getTime() + 1) })
+        .where(eq(agentWakeupRequests.id, wake.id));
+      await finishAcrossAdmissionWindow(f);
+      const newDelivery = await newTask.finish();
+      await chatCompletionDeliveryService(db, heartbeatService(db)).deliver(newDelivery.id);
+      expect((await completionWakes(f)).filter(wake => wake.runId)).toHaveLength(0);
+      await f.startDelivery(true);
+      await settleOwner(f);
+      await assertReported(f, newTask);
+      const notes = (await f.comments()).filter(comment => comment.authorType === "system" && comment.body.includes(oldTask.identifier));
+      expect(notes).toHaveLength(1); expect(notes[0].body).toContain("Finished earlier");
+      expect((await completionWakes(f)).find(row => row.id === wake.id)).toMatchObject({ status: "cancelled", runId: null });
+      const replies = (await f.comments()).filter(comment => comment.authorType === "agent" && comment.body.includes(`ANSWER:${oldTask.identifier}`));
+      expect(replies).toHaveLength(0);
+      await f.passDelivery(); await new Promise(resolve => setTimeout(resolve, 100));
+      expect(f.owner.peers).toHaveLength(2);
+    } finally { await f.close(); }
+  }, 60_000);
+});
 
 // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21272
 // B3's explicitly commissioned native integration rows; controlled Pi peer,
