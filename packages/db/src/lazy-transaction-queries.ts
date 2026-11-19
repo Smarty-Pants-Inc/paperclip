@@ -3,6 +3,7 @@ import { RelationalQueryBuilder } from "drizzle-orm/pg-core/query-builders/query
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import type { TableRelationalConfig } from "drizzle-orm";
 import type postgres from "postgres";
+import { runInTransactionContext } from "./transaction-context.js";
 
 type Callback = (tx: Transaction) => unknown;
 type Transaction = {
@@ -58,16 +59,16 @@ export function drizzleWithLazyTransactionQueries<TSchema extends Record<string,
       Object.defineProperty(this, "query", resolved(value));
     },
   };
-  const within = (callback: Callback): Callback => (tx) => {
+  const within = (callback: Callback, savepoint = false): Callback => (tx) => {
     tx._.schema = tables;
     tx._.fullSchema = fullSchema;
     tx._.tableNamesMap = tableNamesMap;
     Object.defineProperty(tx, "query", lazyQuery);
     const savepoint = tx.transaction;
     tx.transaction = function (this: Transaction, nested, ...rest) {
-      return Reflect.apply(savepoint, this, [within(nested), ...rest]);
+      return Reflect.apply(savepoint, this, [within(nested, true), ...rest]);
     };
-    return callback(tx);
+    return runInTransactionContext(() => callback(tx), savepoint);
   };
   (db as unknown as Transaction).transaction = (callback, ...rest) => transactions.transaction(within(callback), ...rest);
   return db;
