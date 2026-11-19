@@ -560,8 +560,6 @@ export const PAPERCLIP_EARLIER_READ_COMMENT_NOTE = "An earlier turn already read
 /** The one prefix line of a carried steer: a person's message steered into a turn that ended without answering it,
  * delivered again in the next turn. Only carried steers get it, never ordinary queued messages. */
 export const PAPERCLIP_RECEIVED_MID_TASK_LABEL = "Received mid-task (while you were working):";
-/** A chat comment wake's one answer-once line: a message steered or carried into the turn is answered where it is taken up, not again at the end. */
-export const PAPERCLIP_ANSWER_ONCE_LINE = "Answer each waiting message once, at the point you take it up. Do not restate earlier answers in your final reply.";
 
 type PaperclipWakeComment = {
   id: string | null;
@@ -2572,8 +2570,6 @@ function renderPaperclipWakePromptBody(
           "",
         ]
       : [];
-  const answerOnceLines = options.conversationMode === true && hasWakeCommentBatch && !externalChatContract
-    ? [PAPERCLIP_ANSWER_ONCE_LINE] : [];
   const lines = resumedSession
     ? [
         "## Paperclip Resume Delta",
@@ -2586,7 +2582,6 @@ function renderPaperclipWakePromptBody(
           : [
               "Fetch the API thread only when `fallbackFetchNeeded` is true or you need broader history than this batch.",
             ]),
-        ...answerOnceLines,
         "",
         ...externalInteractionContinuationLines,
         ...wakeContractLines,
@@ -2608,7 +2603,6 @@ function renderPaperclipWakePromptBody(
                 multipleWakeComments
                   ? "Before generic repo exploration or boilerplate heartbeat updates, answer the new comments in order, oldest first, and explain how each changes your next action."
                   : "Before generic repo exploration or boilerplate heartbeat updates, acknowledge the latest comment and explain how it changes your next action.",
-                ...answerOnceLines,
               ]
           : []),
         externalChatContract
