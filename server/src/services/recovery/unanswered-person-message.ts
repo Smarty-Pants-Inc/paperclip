@@ -13,6 +13,7 @@ import {
   type Db,
 } from "@paperclipai/db";
 import type { AnyPgColumn } from "drizzle-orm/pg-core";
+import type { SavedMessageWaitState } from "@paperclipai/shared";
 import { issueService } from "../issues.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { logActivity } from "../activity-log.js";
@@ -706,7 +707,12 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   // a valid wait (the person was told why the message waits and what starts it), and sending the message again
   // starts nothing while it stands: no note of this sweep beside it. The hold releases with the person's Continue;
   // the carrying run then decides this message as any other.
-  if (activeRecovery && !agentPaused && !settingUp && await messageHeldForPersonContinue(q, issue)) return { kind: "explained" };
+  // The same reading one step EARLIER is a valid wait too: that reply's box is still stopping, and the task, the queue
+  // and the Inbox row say "Waiting for the previous environment to stop. Your message will start automatically."
+  // (savedMessageWait "waiting"). The wait is bounded by that reply's own clocks (the 5-minute person cap and the
+  // 10-minute save deadline end it; the message is then admitted, or held for Continue as above), so "no run started
+  // ... Sending it again is safe" is false beside it, and it would stand beside Continue once the hold forms.
+  if (activeRecovery && !agentPaused && !settingUp && await savedMessageHasValidWait(q, issue)) return { kind: "explained" };
   if (!boardHold && !agentPaused && !settingUp) {
     const wakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status })
       .from(agentWakeupRequests).where(and(
@@ -915,13 +921,17 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
 }
 
 
-/** The task's saved message is HELD for the person's Continue. Read from the hold itself, never from this sweep's own
- * guess: the task's execution blocker (execution-blocker.ts `savedMessageWait`), which reads the gate's own wait saved
- * on the waiting message (reason checkout_continue_required, explicit-native-continuation.ts). It is the SAME reading
- * the thread's card, the queue line and the Inbox row show, so the sweep and the screen cannot disagree. Reads only. */
-async function messageHeldForPersonContinue(q: Db, issue: { id: string; companyId: string }): Promise<boolean> {
+/** The task's saved message is HELD for the person's Continue ("continue_required"), or WAITS for the previous reply's
+ * box to stop and then starts by itself ("waiting"). Read from the task itself, never from this sweep's own guess: the
+ * task's execution blocker (execution-blocker.ts `savedMessageWait`), which reads the gate's own wait saved on the
+ * waiting message (explicit-native-continuation.ts) and the box's stop proof. It is the SAME reading the thread's card,
+ * the queue line and the Inbox row show, so the sweep and the screen cannot disagree. No text is matched. Reads only.
+ * ("starting", the moment the message is admitted, is not a wait: it keeps the sweep's ordinary decision.) */
+const VALID_SAVED_MESSAGE_WAITS: ReadonlyArray<SavedMessageWaitState> = ["continue_required", "waiting"];
+async function savedMessageHasValidWait(q: Db, issue: { id: string; companyId: string }): Promise<boolean> {
   const { getExecutionBlocker } = await import("../execution-blocker.js");
-  return (await getExecutionBlocker(q, issue.companyId, issue.id))?.savedMessageWait === "continue_required";
+  const wait = (await getExecutionBlocker(q, issue.companyId, issue.id))?.savedMessageWait;
+  return wait !== undefined && VALID_SAVED_MESSAGE_WAITS.includes(wait);
 }
 
 /** Resume (paused -> resuming) is an event: every open task of this agent whose
