@@ -143,9 +143,19 @@ function everCarriedSql(m: PersonMessageSql): SQL {
         and (any_wake.idempotency_key = 'conversation-comment:' || ${m.id}::text
           or any_wake.payload->>'commentId' = ${m.id}::text
           or any_wake.payload->'_paperclipWakeContext'->>'wakeCommentId' = ${m.id}::text
-          or coalesce(any_wake.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text))
+          or any_wake.payload->'_paperclipWakeContext'->>'commentId' = ${m.id}::text
+          or coalesce(any_wake.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text
+          or coalesce(any_wake.payload->'commentIds', '[]'::jsonb) ? ${m.id}::text))
     or exists (select 1 from ${heartbeatRuns} any_run
-      where any_run.company_id = ${m.companyId} and ${carriesCommentSql("any_run", m.id, false)}))`;
+      where any_run.company_id = ${m.companyId} and (${carriesCommentSql("any_run", m.id, false)}
+        -- rf-4 F2: every carry field (steered, carried, restored, Stop-restored, Interrupt-carried, acknowledged steers).
+        or coalesce(any_run.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? ${m.id}::text
+        or coalesce(any_run.context_snapshot->'carriedSteeredCommentIds', '[]'::jsonb) ? ${m.id}::text
+        or coalesce(any_run.result_json->'restoredSteeredCommentIds', '[]'::jsonb) ? ${m.id}::text
+        or coalesce(any_run.result_json->'stopRestoredSteeredCommentIds', '[]'::jsonb) ? ${m.id}::text
+        or coalesce(any_run.result_json->'interruptCarriedSteeredCommentIds', '[]'::jsonb) ? ${m.id}::text
+        or (jsonb_typeof(any_run.result_json->'queuedSteeringAcknowledgements') = 'object'
+          and any_run.result_json->'queuedSteeringAcknowledgements' ? ${m.id}::text))))`;
 }
 
 export function personMessageOwedSql(m: PersonMessageSql): SQL {
