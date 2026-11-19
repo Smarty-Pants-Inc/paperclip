@@ -20,6 +20,7 @@ import { nativeManualAdmissionHoldsExecution } from "../../../services/native-ru
 import { readSteeredMessageAnswers } from "../../../services/native-runtime/steered-message-answers.js";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
+import { steeringIngestionPending, waitForSteeringIngestion } from "../../../services/native-runtime/steering-ingestion.js";
 import { isGovernancePauseStop } from "../../../services/governance-pause-stop.js";
 import { agentRunSupersededByFreshContinuation } from "../../../agent-run-cancellation.js";
 import { freshContinuationIsolatesRun } from "../../../services/fresh-continuation-fallback.js";
@@ -956,7 +957,8 @@ function isPersonStoppedChatRun(run: ReleaseRun, issue: IssueRow): boolean {
  * successor already carries, or a waiting wake already holds, is not queued a
  * second time. The answered steers are recorded (answeredSteeredCommentIds):
  * person-message-answer.ts counts a steered id for its run only when listed.
- * The residual is a possible duplicate answer, never a loss.
+ * The release's terminal-ingestion fence precedes this decision; elapsed time
+ * never substitutes for a read fact. Interrupt adopts under the same run lock.
  */
 const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out", "interrupted"];
 async function restoreUnansweredSteersAtRunEnd(tx: Db, run: ReleaseRun, issue: IssueRow, now: Date): Promise<void> {
@@ -970,7 +972,7 @@ async function restoreUnansweredSteersAtRunEnd(tx: Db, run: ReleaseRun, issue: I
   const result = parseObject(current.resultJson);
   const strings = (value: unknown) => Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
   const accounted = new Set([...strings(result.stopRestoredSteeredCommentIds), ...strings(result.restoredSteeredCommentIds),
-    ...strings(context.answeredSteeredCommentIds)]);
+    ...strings(result.interruptCarriedSteeredCommentIds), ...strings(context.answeredSteeredCommentIds)]);
   // In the order they were steered (rf5 F3), never JSONB key order: steeredCommentIds is appended by the
   // steer route in the same transaction that records each acknowledgement, under the run-row lock, and only
   // the queue head can be steered, so it is the person's queue order. Then the ack time, then the id.
@@ -1061,10 +1063,15 @@ async function restoreUnansweredSteersAtRunEnd(tx: Db, run: ReleaseRun, issue: I
     resultJson: { ...result, restoredSteeredCommentIds: [...strings(result.restoredSteeredCommentIds), ...restored] },
     updatedAt: now,
   }).where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id)));
+  // Steering accounting, not ordinary queue coalescing: restored inputs form
+  // ONE next delivery, in steer order, ahead of already-waiting plain input.
+  if (restored.length && issue.conversationAgentId === run.agentId) {
+    await gatherPersonStoppedChatMessages(tx, run, issue, now, restored);
+  }
 }
 
-async function gatherPersonStoppedChatMessages(tx: Db, run: ReleaseRun, issue: IssueRow, now: Date): Promise<void> {
-  if (!isPersonStoppedChatRun(run, issue)) return;
+async function gatherPersonStoppedChatMessages(tx: Db, run: ReleaseRun, issue: IssueRow, now: Date, restoredOrder: string[] = []): Promise<void> {
+  if (!isPersonStoppedChatRun(run, issue) && !restoredOrder.length) return;
   const waiting = await tx.select().from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
     eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS), eq(agentWakeupRequests.requestedByActorType, "user"),
@@ -1074,6 +1081,13 @@ async function gatherPersonStoppedChatMessages(tx: Db, run: ReleaseRun, issue: I
     sql`${agentWakeupRequests.payload} -> 'queuedCommentInterrupt' is null`,
     sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
   )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id)).for("update");
+  if (restoredOrder.length) {
+    const rank = (wake: typeof waiting[number]) => {
+      const ranks = queuedCommentIdsFromWakePayload(wake.payload).map(id => restoredOrder.indexOf(id)).filter(index => index >= 0);
+      return ranks.length ? Math.min(...ranks) : Number.MAX_SAFE_INTEGER;
+    };
+    waiting.sort((left, right) => rank(left) - rank(right));
+  }
   // Only plain person messages join, from the oldest on, and a /new keeps its
   // boundary: the first wake that is not plain ends the queue (as Agent
   // Chat's own deferred merge keeps it), so A, /new, B never share a turn.
@@ -1095,8 +1109,10 @@ async function gatherPersonStoppedChatMessages(tx: Db, run: ReleaseRun, issue: I
   }
   if (messages.length < 2) return;
   const [queue, ...rest] = messages;
-  const ids = [...new Set(messages.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload)))];
+  const all = [...new Set(messages.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload)))];
+  const ids = [...restoredOrder.filter(id => all.includes(id)), ...all.filter(id => !restoredOrder.includes(id))];
   await tx.update(agentWakeupRequests).set({ payload: withQueuedCommentIdsInWakePayload(queue!.payload, ids),
+    requestedAt: new Date(Math.min(...messages.map(wake => wake.requestedAt.getTime()))),
     coalescedCount: (queue!.coalescedCount ?? 0) + rest.length, updatedAt: now })
     .where(and(eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, queue!.id)));
   await tx.update(agentWakeupRequests).set({ status: "coalesced", finishedAt: now, updatedAt: now,
@@ -1511,6 +1527,8 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
 export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAdapterDeps): IssueLockWriter {
   return {
     async withIssueExecutionLock(input, fn): Promise<ReleaseTransactionResult & { run: RunSnapshot }> {
+      // Never wait while holding the issue/run locks needed by ordered ingestion.
+      await waitForSteeringIngestion(db, input);
       return db.transaction(async (rawTx) => {
         const tx = rawTx as unknown as Db;
         const evidence = await readReleaseRun(tx, input);
@@ -1593,6 +1611,17 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
             await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: input.companyId, issueId: issue.id });
             await notifyNativeStatusReassessment(tx, { companyId: input.companyId, issueId: issue.id });
           }
+        }
+        // ONE carry guard, rechecked under the SAME issue -> run locks used by
+        // Interrupt. A bounded wait expiring is not unread evidence: leave the
+        // issue and every steered id HELD. The settled ingestion receipt resumes
+        // this release after the terminal contiguous cursor (or joined crash).
+        const [carryOwner] = await tx.select({ context: heartbeatRuns.contextSnapshot, result: heartbeatRuns.resultJson })
+          .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id))).for("update");
+        if (Array.isArray(carryOwner?.context?.steeredCommentIds) && carryOwner.context.steeredCommentIds.length && steeringIngestionPending(carryOwner.result)) {
+          await tx.update(heartbeatRuns).set({ resultJson: { ...parseObject(carryOwner.result), steeringIngestionReleaseHeld: true } })
+            .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id)));
+          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
         // Two separate updates: a retry can move `executionRunId` to a new run
         // while `checkoutRunId` still points at this one finishing.

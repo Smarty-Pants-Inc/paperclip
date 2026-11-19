@@ -1121,6 +1121,8 @@ export interface IssueComment {
   steeringStatus?: "accepted" | "delivered" | null;
   /** Pi's own persisted userMessage event, not our acknowledgement. */
   steeringDeliveryEventSeq?: number | null;
+  deliveryOutcome?: "steered" | "queued" | "ordinary";
+  steeringUnavailableReason?: string | null;
   clientRequestId?: string | null;
   conversationSessionGeneration?: number | null;
   id: string;

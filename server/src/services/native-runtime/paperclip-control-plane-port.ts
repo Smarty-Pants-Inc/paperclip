@@ -1,5 +1,6 @@
 import { redactSensitiveText } from "../../redaction.js";
 import { recordSteeredMessageEvidence } from "./steered-message-answers.js";
+import { openSteeringIngestion, settleSteeringIngestion } from "./steering-ingestion.js";
 import { notifyNativeResultCommit } from "../native-result-commit-notifications.js";
 import { measureNativeControllerStep } from "./native-controller-step-timing.js";
 import { notifyNativeWorkspaceFinalization } from "../native-workspace-finalization-notifications.js";
@@ -235,6 +236,8 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       throw new Error("native_open_run_not_authorized");
     }
     this.#assertRunAdmissionActive?.();
+    await openSteeringIngestion(this.#db, this.#binding);
+    this.#steeringIngestionOpened = true;
     this.#sessionId = identity.sessionId;
   }
 
@@ -401,6 +404,15 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
     }));
   }
 
+  #steeringIngestionOpened = false;
+  #steeringTerminalSeq: number | undefined;
+
+  /** Called only after the ordered consumer has stopped/joined, including crash
+   * without a terminal. Recovery must settle the old consumer before calling it. */
+  async settleEventIngestion(): Promise<void> {
+    await settleSteeringIngestion(this.#db, { ...this.#binding, noTerminal: true });
+  }
+
   async appendEvent(value: NativeRunEvent | PrpEvent, options?: { signal: AbortSignal; deferPostCommitObservers?: true }) {
     const persistenceStartedAt = Date.now(), persistenceClock = performance.now();
     this.#assertActive(options);
@@ -463,6 +475,11 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       event = { ...event, payload: redactNativeText(event.payload),
         ...(event.debug === undefined ? {} : { debug: redactNativeText(event.debug) }) };
     }
+    if (event.sourceKind !== "control_plane" && (!this.#steeringIngestionOpened || event.eventType === "turn.started")) {
+      await openSteeringIngestion(this.#db, { ...this.#binding, sourceInstanceId: event.sourceInstanceId });
+      this.#steeringIngestionOpened = true;
+      this.#steeringTerminalSeq = undefined;
+    }
     const observerKey = JSON.stringify([event.sourceInstanceId, event.sourceEventId]);
     const pendingObservation = this.#deferredEventObservers.get(observerKey);
     const persisted = await measureNativeControllerStep("event_write", () => appendHeartbeatRunEvent(this.#db, {
@@ -489,6 +506,13 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       (event.eventType === "item.completed" && ["steering_acknowledgement", "agentMessage"].includes(String(event.payload.kind)))) {
       await recordSteeredMessageEvidence(this.#db, this.#binding);
     }
+    if (event.sourceKind !== "control_plane" && (terminalTurn || event.eventType === "session.failed")) {
+      this.#steeringTerminalSeq = event.sourceSeq;
+    }
+    if (event.sourceKind !== "control_plane" && this.#steeringTerminalSeq !== undefined) await settleSteeringIngestion(this.#db, {
+      ...this.#binding, sourceInstanceId: event.sourceInstanceId,
+      terminalSourceSeq: this.#steeringTerminalSeq, highestContiguousSourceSeq: persisted.highestContiguousSourceSeq,
+    });
     const persistenceEndedAt = persistenceStartedAt + performance.now() - persistenceClock;
     let observation = pendingObservation ?? this.#deferredEventObservers.get(observerKey);
     if (!observation) observation = (async () => {

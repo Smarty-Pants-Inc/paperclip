@@ -1,4 +1,5 @@
 import { currentProcessSpaceHash } from "../controller-process-identity.js";
+import { closeSteeringIngestionAfterRecovery } from "./steering-ingestion.js";
 import type { ExecutionReconciliation } from "@paperclipai/shared";
 import { nativeControllerAuthorityDigest, readNativeRemoteExecutionOwnership, isNativeRunnerOwnershipHeld } from "./native-runner-ownership.js";
 import { preserveNativeFailedWorkspace } from "./native-failed-workspace-recovery.js";
@@ -363,6 +364,10 @@ async function settleFailedRunOwner(db: Db, release: Release, now: Date): Promis
     )).returning({ runId: nativeRunFinalizations.runId });
     if (!updated) return false;
     const [settledRun] = await tx.update(heartbeatRuns).set({ nativePhase: "terminal_failure", nativePhaseUpdatedAt: now, updatedAt: now,
+      // All branches above proved this exact owner absent/contained. Recovery's
+      // true terminal line closes the same ingestion fence; it never restores
+      // a message here or invents a provider read/answer.
+      resultJson: closeSteeringIngestionAfterRecovery(run.resultJson),
       ...(release.kind === "stopped_remote_owner" ? { status: "failed", finishedAt: now,
         errorCode: failureCode, error: "The earlier remote allocation is confirmed stopped; its result was not recovered.",
         processPid: null, processGroupId: null, processStartedAt: null, executionControlDeadlineAt: null } : {}),

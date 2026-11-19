@@ -4521,6 +4521,8 @@ export function heartbeatService(
   }
 
   return {
+    // The ordered-ingestion receipt resumes the existing run-release owner.
+    releaseIssueExecutionAndPromote,
     stopInvocationsForAgents,
     agentInvocationStopBlocker,
     waitForRunExecutionDrain: async (
