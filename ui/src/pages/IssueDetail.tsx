@@ -2106,7 +2106,17 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       if (queuedTargetRunId) {
         return nextComment;
       }
+      // SUPERSEDE-STEER-UI-NO-CLIENT-GUESS-1119: no client rule places a
+      // person's message in the waiting list from its time against a live
+      // run. Only the server's queue state (a queued answer, the queued-
+      // comments read, an explicit Queue or the D5 reason) does that.
+      // KEPT, narrowed: the classic task interface has no waiting list and no
+      // queued-comments read (queuedCommentQueueEnabled is false there); for a
+      // non-steering (legacy adapter) run it still labels a message sent
+      // mid-run 'Queued' inline. Never for a steering-capable run.
       if (
+        classicTaskInterfaceEnabled &&
+        interruptibleIssueRun?.adapterType !== "paperclip_runner" &&
         isQueuedIssueComment({
           comment: nextComment,
           activeRunStartedAt,
