@@ -588,7 +588,11 @@ async function recordPendingDecision(db: Db, issue: DecisionIssue, decision: Exc
         .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
       const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, nativeBlockedRepairApplies, stale.messageId);
       if ((fenced.kind !== "pending" && fenced.kind !== "explained") || fenced.retireStale?.noticeId !== stale.noticeId) return;
-      await dropNoticeMember(tx as unknown as Db, issue, stale.noticeId, stale.messageId, now);
+      // The WHOLE note retires: what made it false (the agent is not paused; its run no longer runs) is the same
+      // for every message it names. Its member list stays on the retired row, so a later line for those messages
+      // is written into this row as ONE note again.
+      await tx.update(issueComments).set({ deletedAt: now, updatedAt: now }).where(and(eq(issueComments.id, stale.noticeId),
+        eq(issueComments.companyId, issue.companyId), eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt)));
     });
   }
   if (decision.kind === "explained") return { kind: "explained" };
@@ -610,26 +614,20 @@ async function recordPendingDecision(db: Db, issue: DecisionIssue, decision: Exc
       const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, nativeBlockedRepairApplies,
         decision.cardAnswerId ? undefined : decision.messageId, decision.cardAnswerId);
       if (fenced.kind !== "person_stopped" || fenced.noticeId !== decision.noticeId) return;
-      await dropNoticeMember(tx as unknown as Db, issue, decision.noticeId!, decision.messageId, now);
+      const [notice] = await tx.select({ metadata: issueComments.metadata }).from(issueComments).where(and(
+        eq(issueComments.id, decision.noticeId!), eq(issueComments.companyId, issue.companyId),
+        eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt)));
+      if (!notice) return;
+      const metadata = (notice.metadata ?? {}) as Record<string, unknown>;
+      const listed = metadata[UNANSWERED_MESSAGE_GROUP_KEY];
+      const others = (Array.isArray(listed) ? listed as string[] : []).filter(id => id !== decision.messageId);
+      await tx.update(issueComments).set(others.length ? { updatedAt: now, metadata: { ...metadata,
+        [UNANSWERED_MESSAGE_GROUP_KEY]: others, authorizationReason: `${UNANSWERED_MESSAGE_REASON_PREFIX}${others[others.length - 1]}` } as never }
+        : { deletedAt: now, updatedAt: now }).where(eq(issueComments.id, decision.noticeId!));
     });
     return { kind: "person_stopped" };
   }
   return decision;
-}
-
-/** A live notice stops covering one message (under the caller's issue fence): it retires when it covered only
- * that message; a group notice keeps its other members and is keyed to the latest of them. */
-async function dropNoticeMember(tx: Db, issue: DecisionIssue, noticeId: string, messageId: string, now: Date): Promise<void> {
-  const [notice] = await tx.select({ metadata: issueComments.metadata }).from(issueComments).where(and(
-    eq(issueComments.id, noticeId), eq(issueComments.companyId, issue.companyId),
-    eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt)));
-  if (!notice) return;
-  const metadata = (notice.metadata ?? {}) as Record<string, unknown>;
-  const listed = metadata[UNANSWERED_MESSAGE_GROUP_KEY];
-  const others = (Array.isArray(listed) ? listed as string[] : []).filter(id => id !== messageId);
-  await tx.update(issueComments).set(others.length ? { updatedAt: now, metadata: { ...metadata,
-    [UNANSWERED_MESSAGE_GROUP_KEY]: others, authorizationReason: `${UNANSWERED_MESSAGE_REASON_PREFIX}${others[others.length - 1]}` } as never }
-    : { deletedAt: now, updatedAt: now }).where(eq(issueComments.id, noticeId));
 }
 
 /** One owed group: write its ONE notice under the fence, keyed to its latest member that is still to be noticed. */
@@ -675,8 +673,8 @@ async function writeGroupNotice(db: Db, issue: DecisionIssue, now: Date, nativeB
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
   assigneeAgentId: string | null; assigneeUserId: string | null };
 type WaitRecord = { messageId: string; runId: string | null; waitKind?: "setup"; startedAt?: string; boundMs?: number };
-/** The message's standing waiting-kind note stopped being true and another line already says what is true (the
- * run's header, the saved wake's panel line, another notice): the note stops covering the message. */
+/** The message's standing waiting-kind note stopped being true (the agent is not paused any more; its own run no
+ * longer runs) while the message only waits, or another notice already explains it: the note is retired. */
 type RetireStale = { noticeId: string; messageId: string };
 type Decision = { kind: "none" | "answered" | "noticed_before" | "out_of_scope" }
   | { kind: "explained"; retireStale?: RetireStale }

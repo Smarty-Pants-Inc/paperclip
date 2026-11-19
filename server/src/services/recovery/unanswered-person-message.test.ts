@@ -1748,6 +1748,55 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await one(f)).toEqual([{ id: pausedNote.id, body: WORKING }]);
   });
 
+  it("pause-resume GROUP (merged): two messages while paused share ONE paused note; after the Resume it is retired whole; the run that carried both ends unanswered -> ONE note again, the SAME row, naming both", async () => {
+    const f = await fixture();
+    await pauseRoute(f);
+    const m1 = await f.message("First, while paused");
+    const m2 = await f.message("Second, while paused");
+    await f.sweep();
+    const [pausedNote] = await f.visible();
+    expect((await f.visible()).map(n => ({ body: n.body, members: (n.metadata as Record<string, unknown>).unansweredMessageIds })))
+      .toEqual([{ body: PAUSED_TEXT, members: [m1, m2] }]);
+    await resumeRoute(f);
+    // PLANTED: Resume's one run for both saved messages (as T4b's real run carries both), still queued.
+    const run = await f.run({ commentId: m2, status: "queued" });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: m2, wakeCommentIds: [m1, m2] } })
+      .where(eq(heartbeatRuns.id, run));
+    await f.sweep();
+    expect(await one(f), "waiting: the run's header is the one line").toEqual([]);
+    await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, run));
+    await f.sweep();
+    expect(await one(f)).toEqual([{ id: pausedNote!.id, body: WORKING }]);
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", finishedAt: new Date(Date.now() - 60_000) }).where(eq(heartbeatRuns.id, run));
+    await settleAt(f, 2 * 60_000);
+    await settleAt(f, 11 * 60_000);
+    const after = await f.visible();
+    expect(after.map(n => ({ id: n.id, body: n.body, members: (n.metadata as Record<string, unknown>).unansweredMessageIds })))
+      .toEqual([{ id: pausedNote!.id, body: NOT_ANSWERED, members: [m1, m2] }]);
+    expect(await everNoted(f), "one note row, ever").toEqual([pausedNote!.id]);
+  });
+
+  it("pause-resume GROUP (merged): retired whole, then the run that carried both fails before any sweep saw it running -> ONE note, the SAME row, naming both", async () => {
+    const f = await fixture();
+    await pauseRoute(f);
+    const m1 = await f.message("First, while paused");
+    const m2 = await f.message("Second, while paused");
+    await f.sweep();
+    const [pausedNote] = await f.visible();
+    await resumeRoute(f);
+    const run = await f.run({ commentId: m2, status: "queued" });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: m2, wakeCommentIds: [m1, m2] } })
+      .where(eq(heartbeatRuns.id, run));
+    await f.sweep();
+    expect(await one(f)).toEqual([]);
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", finishedAt: new Date(Date.now() - 60_000) }).where(eq(heartbeatRuns.id, run));
+    await settleAt(f, 2 * 60_000);
+    await settleAt(f, 11 * 60_000);
+    expect((await f.visible()).map(n => ({ id: n.id, body: n.body, members: (n.metadata as Record<string, unknown>).unansweredMessageIds })))
+      .toEqual([{ id: pausedNote!.id, body: NOT_ANSWERED, members: [m1, m2] }]);
+    expect(await everNoted(f), "one note row, ever").toEqual([pausedNote!.id]);
+  });
+
   it("supersedes(pausefix: stale paused note after Resume; RFL record SUPERSEDE-PAUSEFIX-RUNNING-1118): paused agent, then resumed: the saved message's run is the only run (B' starts none), no second note, the answer supersedes it", async () => {
     const f = await fixture();
     await pause(f);
