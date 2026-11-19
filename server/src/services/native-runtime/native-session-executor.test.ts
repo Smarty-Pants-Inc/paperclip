@@ -19129,6 +19129,16 @@ describe("runnerd provider runtime wiring", () => {
         expect(continuationCount).toBe(1);
         // #21273 round 4: the backup is restored through the no-clobber box placement, never syncIn.
         expect(remoteExecute.mock.calls.some(([command]) => command.args?.[2] === "paperclip-runner-restore-place")).toBe(true);
+        // #21273 round 5 (newbox6): before the box is read, the launch's stale-process fence runs for
+        // this session's own Runner binary and state directory.
+        const remoteSession = join(remoteCwd, ".paperclip-runtime/paperclip-runner/sessions",
+          createHash("sha256").update(current.session.normalizedSessionId!).digest("hex"));
+        const steps = remoteExecute.mock.calls.map(([command]) => command.args?.[2]);
+        const fence = remoteExecute.mock.calls.find(([command]) => command.args?.[2] === "paperclip-runner-restore-fence")?.[0];
+        expect(fence?.args?.slice(3)).toEqual([join(remoteSession, "diagnostics"),
+          join(remoteCwd, ".paperclip-runtime/paperclip-runner/bin/paperclip-runnerd"), "--state-dir", join(remoteSession, "runner")]);
+        expect(steps.indexOf("paperclip-runner-restore-fence")).toBeGreaterThanOrEqual(0);
+        expect(steps.indexOf("paperclip-runner-restore-fence")).toBeLessThan(steps.indexOf("paperclip-runner-restore-place"));
       } else {
         const outcome = await run.then(value => ({ value }), error => ({ error }));
         expect(continuationCount, "a reattach claim means prior work; absent backup must not authorize blank bootstrap").toBe(0);

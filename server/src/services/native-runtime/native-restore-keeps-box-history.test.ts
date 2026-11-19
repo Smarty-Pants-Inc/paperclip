@@ -3,6 +3,7 @@
 // which restores the verified failover backup. When the box already holds a
 // different, valid Pi conversation, that restore must never copy the older
 // backup over it. Real shell staging (tar) and the pack's own Pi validator.
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
@@ -10,11 +11,12 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { build } from "esbuild";
-import { afterAll, beforeAll, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { probePiSessionResumeFile } from "./pi-session-file-repair.js";
 import { RESTORE_TARGET_HISTORY_DIFFERS, RESTORE_TARGET_HOLDS_OTHER_CONVERSATION, RESTORE_TARGET_KEPT_PERSON_LINE,
+  RESTORE_TARGET_WRITER_LIVE, RESTORE_TARGET_WRITER_LIVE_PERSON_LINE,
   restoreHarnessBackupKeepingRemoteHistory, restoreTargetHoldsOtherConversationCode } from "./native-session-executor.js";
 
 const roots: string[] = [];
@@ -61,8 +63,13 @@ async function fixture() {
     }
     return { operations: [] } as never;
   } };
+  // The box's Runner state directory and binary: the stale-process fence the
+  // next launch runs is run with them before anything on the box is read.
+  const staleRunnerFence = { binary: join(root, "bin", "paperclip-runnerd"), stateDirectory: join(box, "runner"),
+    diagnosticsDirectory: join(root, "diagnostics") };
   const restore = (via: "command" | "syncIn" = "command") => restoreHarnessBackupKeepingRemoteHistory({
     target: { kind: "remote" } as never, runner: via === "syncIn" ? replacingRunner : runner, backupRoot: backup,
+    staleRunnerFence,
     directories: [{ name: "runner", targetPath: join(box, "runner") }, { name: "pi-agent", targetPath: join(box, "pi-agent") }],
   });
   const validate = (id = sessionId) => probePiSessionResumeFile({ runner, node: process.execPath, providerPackRoot,
@@ -77,7 +84,8 @@ async function fixture() {
     return pi.SessionManager.open(boxSession, boxSessions).buildSessionContext().messages;
   };
   const backupSession = join(backup, "pi-agent", "sessions", filename);
-  return { root, header, older, newer, boxSessions, boxSession, backupSession, runnerState, suspended, restore, validate, nextTurnContext };
+  return { root, header, older, newer, boxSessions, boxSession, backupSession, runnerState, suspended, restore, validate,
+    nextTurnContext, staleRunnerFence };
 }
 
 // smarty-dev#21273 round 3 (rf-3 ruling, #4605 09:05Z): a Retry onto a new
@@ -195,7 +203,7 @@ for (const via of ["syncIn", "command"] as const) {
     let probes = 0;
     const { appendFile } = await import("node:fs/promises");
     const restore = (runner: CommandManagedRuntimeRunner) => restoreHarnessBackupKeepingRemoteHistory({
-      target: { kind: "remote" } as never, backupRoot: join(f.root, "backup"),
+      target: { kind: "remote" } as never, backupRoot: join(f.root, "backup"), staleRunnerFence: f.staleRunnerFence,
       directories: [{ name: "runner", targetPath: join(f.root, "box", "runner") }, { name: "pi-agent", targetPath: join(f.root, "box", "pi-agent") }],
       runner: {
         ...runner,
@@ -238,3 +246,107 @@ for (const via of ["syncIn", "command"] as const) {
     expect((await readdir(f.boxSessions)).sort()).toEqual([f.boxSession.split("/").pop()]);
   });
 }
+
+// smarty-dev#21273 round 5 (newbox6; LIVENESS-RESULT path X): a Retry onto a
+// resumed box whose earlier Runner/Pi survived. rf-3's held-fd appender: an
+// earlier session's writer holds the conversation open and appends right after
+// the placement's last moved-aside check (a PATH `rm` shim fires the append at
+// exactly that point). The restore first runs the same stale-process/lineage
+// fence the next launch runs, so the surviving Runner and its Pi are stopped and
+// proven exited BEFORE anything on the box is read, or the restore refuses with
+// the true line. Every byte the writer wrote stays on the box.
+const PRIOR_WRITER = [
+  "const fs=require('fs'),cp=require('child_process');",
+  "const write=()=>{const fd=fs.openSync(process.env.W_FILE,'a');",
+  "fs.appendFileSync(process.env.W_PIDS,process.pid+' ');",
+  "process.on('SIGUSR1',()=>{const b=Buffer.from(process.env.W_LINE);fs.writeSync(fd,b);fs.appendFileSync(process.env.W_ACK,b)});",
+  "setInterval(()=>{},1000)};",
+  // The Runner keeps its Pi as a child (Pi holds the conversation), or is the writer itself.
+  "if(process.env.W_PI==='1'){fs.appendFileSync(process.env.W_PIDS,process.pid+' ');",
+  "cp.spawn(process.execPath,['-e',process.env.W_SRC],{stdio:'ignore',env:{...process.env,W_PI:'child'}});setInterval(()=>{},1000)}",
+  "else write();",
+].join("");
+
+async function priorRunner(f: Awaited<ReturnType<typeof fixture>>, options: { pi: boolean; reap: Record<string, unknown> }) {
+  const work = join(f.root, "writer");
+  await mkdir(work, { recursive: true });
+  await mkdir(join(f.root, "bin"), { recursive: true });
+  // The box's runnerd binary: only its reap-lineage subcommand is reached.
+  await writeFile(f.staleRunnerFence.binary, `#!/bin/sh\nif test "$1" = reap-lineage; then printf '%s\\n' '${JSON.stringify(options.reap)}'; `
+    + `test '${String(options.reap.verified)}' = true && exit 0; exit 1; fi\nexit 9\n`, { mode: 0o700 });
+  const pids = join(work, "pids"), ack = join(work, "ack");
+  await writeFile(pids, ""); await writeFile(ack, "");
+  // rf-3's window: after the last check of the moved-aside copy, before it is unlinked.
+  const shim = join(work, "shim");
+  await mkdir(shim);
+  await writeFile(join(shim, "rm"), "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in *.paperclip-restore-prev.*) "
+    + `for p in $(cat '${pids}'); do kill -USR1 "$p" 2>/dev/null; done; i=0; while test ! -s '${ack}' && test $i -lt 50; do sleep 0.02; i=$((i+1)); done ;; esac; done\n`
+    + "exec /usr/bin/rm \"$@\"\n", { mode: 0o700 });
+  const line = message("a2", "a1", "assistant", `Written by the earlier session's Pi during the restore: ${"x".repeat(120)}`);
+  const runnerd = spawn(process.execPath, ["-e", PRIOR_WRITER, "--", "--state-dir", f.staleRunnerFence.stateDirectory], {
+    argv0: f.staleRunnerFence.binary, detached: true, stdio: "ignore",
+    env: { ...process.env, W_FILE: f.boxSession, W_PIDS: pids, W_ACK: ack, W_LINE: line, W_PI: options.pi ? "1" : "0", W_SRC: PRIOR_WRITER } });
+  runnerd.unref();
+  const expectedPids = options.pi ? 2 : 1;
+  const readPids = async () => (await readFile(pids, "utf8")).split(/\s+/).filter(Boolean).map(Number);
+  await vi.waitFor(async () => expect(await readPids()).toHaveLength(expectedPids), { timeout: 5_000 });
+  const writerPids = await readPids();
+  expect(writerPids.every(pid => Number.isInteger(pid) && pid > 1)).toBe(true);
+  const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  let aliveAtProbe: boolean[] | null = null;
+  const base: CommandManagedRuntimeRunner = { execute: input => runChildProcess(`restore-writer-${randomUUID()}`,
+    input.command, input.args ?? [], { cwd: f.root, env: { PATH: `${shim}:${process.env.PATH}` },
+      timeoutSec: (input.timeoutMs ?? 60_000) / 1000, graceSec: 1, stdin: input.stdin, onLog: async () => {} }) };
+  const runner: CommandManagedRuntimeRunner = { execute: async input => {
+    if (input.args?.includes("paperclip-runner-restore-history-probe")) aliveAtProbe ??= writerPids.map(alive);
+    return base.execute(input);
+  } };
+  const restore = () => restoreHarnessBackupKeepingRemoteHistory({ target: { kind: "remote" } as never, runner,
+    backupRoot: join(f.root, "backup"), staleRunnerFence: f.staleRunnerFence,
+    directories: [{ name: "runner", targetPath: join(f.root, "box", "runner") }, { name: "pi-agent", targetPath: join(f.root, "box", "pi-agent") }] });
+  const cleanup = () => { for (const pid of writerPids.filter(pid => pid > 1)) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } } };
+  return { restore, writerPids, alive, ack, line, cleanup, aliveAtProbe: () => aliveAtProbe };
+}
+
+it.each([false, true])("(live writer) rf-3's held-fd appender of a surviving earlier Runner (Pi child: %s) is fenced before the restore reads the box: every written byte stays", async pi => {
+  const f = await fixture();
+  await mkdir(f.boxSessions, { recursive: true });
+  // The box holds exactly the backup's conversation: the probe says "stage", the placement moves it aside.
+  await writeFile(f.boxSession, f.older);
+  const prior = await priorRunner(f, { pi, reap: { verified: true } });
+  try {
+    const outcome = await prior.restore().then(value => ({ value }), (error: Error) => ({ error }));
+    const written = await readFile(prior.ack, "utf8");
+    const onBox = await readFile(f.boxSession, "utf8");
+    // Never lost: every byte the earlier session wrote is on the box (rf-3: 213 B lost after the 2nd check).
+    expect({ writtenBytes: Buffer.byteLength(written), keptOnBox: written.length === 0 || onBox.includes(written) })
+      .toEqual({ writtenBytes: Buffer.byteLength(written), keptOnBox: true });
+    // Fenced first: the surviving Runner and its Pi were stopped and proven exited before the box was read.
+    expect(prior.aliveAtProbe()).toEqual(prior.writerPids.map(() => false));
+    expect(prior.writerPids.map(prior.alive)).toEqual(prior.writerPids.map(() => false));
+    expect(written).toBe("");
+    expect(outcome).toEqual({ value: { keptNewerOnBox: [] } });
+    expect(onBox).toBe(f.older);
+    expect(await readFile(f.runnerState, "utf8")).toBe(f.suspended);
+    expect(await f.validate()).toBe("valid");
+  } finally { prior.cleanup(); }
+});
+
+it("(live writer) a surviving earlier Runner whose lineage is not proven stopped refuses the restore with the true line; nothing on the box is touched", async () => {
+  const f = await fixture();
+  await mkdir(f.boxSessions, { recursive: true });
+  await writeFile(f.boxSession, f.older);
+  const prior = await priorRunner(f, { pi: true, reap: { verified: false, reason: "survivors_remaining", remaining: [] } });
+  try {
+    const failure = await prior.restore().then(() => null, (error: Error) => error);
+    expect(failure).not.toBeNull();
+    expect((failure as Error & { code?: string }).code).toBe(RESTORE_TARGET_WRITER_LIVE);
+    expect(failure?.message).toContain(RESTORE_TARGET_WRITER_LIVE_PERSON_LINE);
+    expect(String((failure as Error & { cause?: unknown }).cause)).toContain("runner_stale_lineage_unproven");
+    expect(restoreTargetHoldsOtherConversationCode(failure)).toBeNull();
+    // Refused before the box was read or written.
+    expect(prior.aliveAtProbe()).toBeNull();
+    expect(await readFile(f.boxSession, "utf8")).toBe(f.older + await readFile(prior.ack, "utf8"));
+    expect(existsSync(f.runnerState)).toBe(false);
+  } finally { prior.cleanup(); }
+});

@@ -15995,6 +15995,19 @@ function restoreTargetKeptError(code: string): Error & { code: string } {
   return Object.assign(new Error(`${code}: ${RESTORE_TARGET_KEPT_PERSON_LINE}`), { code });
 }
 
+/** #21273 round 5 (newbox6): an earlier Runner/Pi of this session still runs on
+ * the box and was not proven stopped, so the restore refused before reading or
+ * writing anything there. */
+export const RESTORE_TARGET_WRITER_LIVE = "runner_harness_state_mismatch: restore_target_writer_live" as const;
+export const RESTORE_TARGET_WRITER_LIVE_PERSON_LINE = "This chat's earlier session was still running on the computer and "
+  + "could not be proven stopped, so nothing was copied over its saved conversation and it was left exactly as it was. "
+  + "Press Retry in a minute; if this keeps happening, start a new chat.";
+
+function restoreTargetWriterLiveError(detail: string): Error & { code: string } {
+  return Object.assign(new Error(`${RESTORE_TARGET_WRITER_LIVE}: ${RESTORE_TARGET_WRITER_LIVE_PERSON_LINE}`),
+    { code: RESTORE_TARGET_WRITER_LIVE, cause: new Error(detail) });
+}
+
 /** (b)'s exact code, carried by a structured error or its cause chain. */
 export function restoreTargetHoldsOtherConversationCode(value: unknown, depth = 0): typeof RESTORE_TARGET_HOLDS_OTHER_CONVERSATION | null {
   if (!value || typeof value !== "object" || depth > 5) return null;
@@ -16046,7 +16059,14 @@ export async function restoreHarnessBackupKeepingRemoteHistory(input: {
   runner: CommandManagedRuntimeRunner;
   backupRoot: string;
   directories: readonly { name: string; targetPath: string }[];
+  /** This session's Runner binary and state directory on the box: the stale-process fence runs first. */
+  staleRunnerFence: RestoreStaleRunnerFence;
 }): Promise<{ keptNewerOnBox: string[] }> {
+  // #21273 round 5 (newbox6, LIVENESS-RESULT path X): a resumed box can still
+  // run an earlier Runner of this session and its Pi, holding the conversation
+  // open. Before anything on the box is read, stop that lineage with the same
+  // fence the next launch runs, or refuse. No new mechanism, no other process.
+  await fenceStaleRunnerBeforeRestore({ runner: input.runner, fence: input.staleRunnerFence });
   const keep = new Map<string, string[]>();
   const probed = new Map<string, Map<string, string>>();
   let otherConversation = false;
@@ -17116,6 +17136,38 @@ const REMOTE_RUNNER_STALE_STATE_FENCE_SCRIPT =
   'if test -L "$fence_log" || { test -e "$fence_log" && test ! -f "$fence_log"; }; then fence_log=/dev/null; fi; ' +
   `if ! node -e "${REMOTE_RUNNER_STALE_LINEAGE_STOP_SCRIPT}" "$1" "$state_dir" $stale_pids; then ` +
   'cat -- "$launch_stderr" >> "$fence_log" || true; exit 75; fi; fi; fi; ';
+
+export type RestoreStaleRunnerFence = { binary: string; stateDirectory: string; diagnosticsDirectory: string };
+
+/**
+ * #21273 round 5 (newbox6): the launch's stale-state fence, run verbatim before
+ * a restore. Arguments: <diagnostics directory> <runnerd binary> --state-dir
+ * <state directory>. Exits 0 when no serving Runner holds the state directory,
+ * or when every one found and its lineage were stopped and proven exited; 75
+ * (the fence's own refusal) otherwise. The fence finds Runners through /proc; a
+ * box where /proc cannot be read cannot prove that, so it exits 76.
+ */
+export const RESTORE_STALE_RUNNER_FENCE_SCRIPT =
+  'set -eu; diagnostics_directory=$1; shift; launch_stderr=/dev/null; ' +
+  'test -r /proc/self/cmdline || { echo "runner_restore_fence_unavailable: /proc is not readable" >&2; exit 76; }; ' +
+  REMOTE_RUNNER_STALE_STATE_FENCE_SCRIPT + 'exit 0';
+
+async function fenceStaleRunnerBeforeRestore(input: {
+  runner: CommandManagedRuntimeRunner;
+  fence: RestoreStaleRunnerFence;
+}): Promise<void> {
+  const result = await input.runner.execute({
+    command: "sh",
+    args: ["-c", RESTORE_STALE_RUNNER_FENCE_SCRIPT, "paperclip-runner-restore-fence", input.fence.diagnosticsDirectory,
+      input.fence.binary, "--state-dir", input.fence.stateDirectory],
+    bypassSession: true,
+    // The fence's own bounds: TERM 5 s, KILL 2 s, then reap-lineage 7 s per Runner.
+    timeoutMs: 60_000,
+  }).catch((error: unknown) => ({ exitCode: null, timedOut: false, stdout: "", stderr: String(error) }));
+  if (result.exitCode === 0 && !result.timedOut) return;
+  const detail = (result.stderr ?? "").trim() || (result.timedOut ? "fence_timed_out" : `fence_exit_${result.exitCode}`);
+  throw restoreTargetWriterLiveError(detail);
+}
 
 /**
  * Trace-keep: every launch generation keeps its own durable evidence.
@@ -19777,6 +19829,10 @@ async function createRunnerdBackendWithinSessionClaim(
         target: remoteTarget,
         runner: remoteCommandRunner,
         backupRoot: backup.root,
+        staleRunnerFence: remoteBinary && remoteStateDirectory && remoteSessionRoot
+          ? { binary: remoteBinary, stateDirectory: remoteStateDirectory,
+            diagnosticsDirectory: posix.join(remoteSessionRoot, "diagnostics") }
+          : (() => { throw restoreTargetWriterLiveError("restore_fence_target_unavailable"); })(),
         directories: persistenceProfile.directories.map(directory => {
           const targetPath = remotePersistencePath(directory);
           if (!targetPath) throw new Error("runner_harness_state_mismatch: restore_target_unavailable");
