@@ -93,6 +93,7 @@ export async function openPiSteeringPeer(root: string, runId: string) {
       send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Answered after reading the steer." } });
       send({ type: "message_end", message });
     },
+    endTurn() { send({ type: "turn_end" }); send({ type: "agent_end", messages: [] }); },
     async close() { await session.close({ reason: "boundary peer cleanup" }); await pi.close({ reason: "boundary peer cleanup" }); },
   };
 }
