@@ -17,25 +17,20 @@ export interface SteerAnswerEvent {
 /** A text item's evidence: where its item.started was, and whether it completed with non-empty text. */
 interface TextItem {
   start?: number;
-  completed: boolean;
+  completedAt?: number;
 }
 
 const STEER_ITEM = /:steer:(.+)$/;
-/**
- * Projector kinds of a tool call's item.started (Pi: pi-event-projector.ts toolPayload,
- * "commandExecution" for bash, "tool" otherwise; Codex/OpenCode: mcpToolCall, dynamicToolCall,
- * fileChange, webSearch). tool.execution.started is the Pi execution of a call.
- */
-const TOOL_KINDS = new Set(["commandExecution", "tool", "mcpToolCall", "dynamicToolCall", "fileChange", "webSearch"]);
 const TURN_END = new Set(["turn.completed", "turn.cancelled", "turn.failed"]);
 
 /**
  * The answered rule for steered person messages (never-OK, live on PV2 s3).
  * A steered message B is ANSWERED by its run only when the run log shows an assistant
  * TEXT item (kind agentMessage; never reasoning, never a tool) with a real item.started
- * after B's delivery userMessage and before the next tool call (item.started of a tool
- * kind, or tool.execution.started) or the turn's end, whose same item then COMPLETED
- * (item.completed) with non-empty text.
+ * after B's delivery userMessage and before that turn's end, whose same item then
+ * COMPLETED (item.completed) with non-empty text in that window. Tool calls do not
+ * close the window: every later model request in the Pi session contains B in its
+ * history. A turn.failed or turn.cancelled terminal invalidates that turn's text.
  *
  * Start evidence is required (rf5 F1). The Pi projector (pi-event-projector.ts) emits a
  * streamed text block's item.started at its first text_start/text_delta, i.e. where the
@@ -51,7 +46,7 @@ const TURN_END = new Set(["turn.completed", "turn.cancelled", "turn.failed"]);
  * the oldest undelivered steer of that turn (or one acknowledged right after it). Unlike
  * restart recovery, a completed turn is NOT a read: only a userMessage is. An
  * acknowledgement the log never recorded is never delivered, so never answered.
- * "Read" alone is not "answered": read, then a tool call with no text between, is NOT.
+ * "Read" alone is not "answered": read, then tools with no text before turn end, is NOT.
  */
 export function steeredMessageAnswers(events: Iterable<SteerAnswerEvent>): {
   acknowledged: string[]; delivered: string[]; answered: string[];
@@ -67,7 +62,7 @@ export function steeredMessageAnswers(events: Iterable<SteerAnswerEvent>): {
   // before the assistant message ends and completes its text block. Only a real
   // item.started places it; a completion never invents a start.
   const textItems = new Map<string, TextItem>();
-  const boundaries: number[] = [];
+  const boundaries: Array<{ seq: number; eventType: string }> = [];
   for (const event of list) {
     const turnId = event.turnId ?? null;
     if (event.eventType === "item.completed" && event.kind === "steering_acknowledgement") {
@@ -91,21 +86,22 @@ export function steeredMessageAnswers(events: Iterable<SteerAnswerEvent>): {
     } else if (event.kind === "agentMessage" && (event.eventType === "item.started" || event.eventType === "item.completed")) {
       // An item with no id cannot be matched to its start, so it is never evidence.
       if (!event.itemId) continue;
-      const item = textItems.get(event.itemId) ?? { completed: false };
+      const item = textItems.get(event.itemId) ?? {};
       textItems.set(event.itemId, item);
       if (event.eventType === "item.started") item.start ??= event.seq;
-      else if (event.hasText && item.start !== undefined) item.completed = true;
-    } else if (event.eventType === "tool.execution.started"
-      || (event.eventType === "item.started" && TOOL_KINDS.has(event.kind ?? ""))
-      || TURN_END.has(event.eventType)) {
-      boundaries.push(event.seq);
+      else if (event.hasText && item.start !== undefined) item.completedAt = event.seq;
+    } else if (TURN_END.has(event.eventType)) {
+      boundaries.push({ seq: event.seq, eventType: event.eventType });
     }
   }
   const answered = acknowledged.filter((id) => {
     const at = deliveredAt.get(id);
     if (at === undefined) return false;
-    const end = boundaries.find((seq) => seq > at) ?? Number.POSITIVE_INFINITY;
-    return [...textItems.values()].some((item) => item.completed && item.start! > at && item.start! < end);
+    const terminal = boundaries.find(({ seq }) => seq > at);
+    if (terminal && terminal.eventType !== "turn.completed") return false;
+    const end = terminal?.seq ?? Number.POSITIVE_INFINITY;
+    return [...textItems.values()].some((item) => item.start !== undefined && item.start > at && item.start < end
+      && item.completedAt !== undefined && item.completedAt < end);
   });
   return { acknowledged, delivered: acknowledged.filter((id) => deliveredAt.has(id)), answered,
     deliveredEventSeqs: Object.fromEntries(deliveredAt) };
@@ -149,10 +145,9 @@ export async function readSteeredMessageAnswers(db: Db, input: { companyId: stri
     eq(heartbeatRunEvents.runId, input.runId),
     isNotNull(heartbeatRunEvents.sourceEventId),
     or(
-      sql`${heartbeatRunEvents.eventType} in ('turn.completed', 'turn.cancelled', 'turn.failed', 'tool.execution.started')`,
+      sql`${heartbeatRunEvents.eventType} in ('turn.completed', 'turn.cancelled', 'turn.failed')`,
       and(eq(heartbeatRunEvents.eventType, "item.completed"), sql`${kind} in ('steering_acknowledgement', 'agentMessage')`),
-      and(eq(heartbeatRunEvents.eventType, "item.started"), sql`${kind} in ('userMessage', 'agentMessage', ${sql.join(
-        [...TOOL_KINDS].map((value) => sql`${value}`), sql`, `)})`),
+      and(eq(heartbeatRunEvents.eventType, "item.started"), sql`${kind} in ('userMessage', 'agentMessage')`),
     ),
   )).orderBy(asc(heartbeatRunEvents.seq));
   // A real Pi can read and answer M before the RPC ACK returns (or after its
