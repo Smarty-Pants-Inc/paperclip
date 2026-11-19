@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawnSync, type SpawnSyncOptions } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import express from "express";
@@ -68,7 +68,11 @@ describe.skipIf(!support.supported)("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rea
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sourceId = randomUUID();
     // planted execution identity: a foreground child actually exits. No signal
     // is sent to an unowned process; the real stop-evidence producer observes it.
-    const exited = spawnSync(process.execPath, ["-e", ""], { detached: true, stdio: "ignore" });
+    // `detached` is honoured by Node at run time (child_process normalizeSpawnArguments passes it to spawnSync, so
+    // the child leads its own process group and its pid is that group's id) but @types/node's SpawnSyncOptions does
+    // not declare it: the option is kept, typed here, so the planted identity is unchanged.
+    const exitedOptions: SpawnSyncOptions & { detached: boolean } = { detached: true, stdio: "ignore" };
+    const exited = spawnSync(process.execPath, ["-e", ""], exitedOptions);
     expect(exited.status).toBe(0);
     await db.insert(companies).values({ id: companyId, name: "M10 route fixture", issuePrefix: "WAIT", requireBoardApprovalForNewAgents: false });
     await db.insert(authUsers).values({ id: "m10-person", name: "Planted route actor", email: "m10-person@example.invalid", createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
