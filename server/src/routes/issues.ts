@@ -18147,7 +18147,19 @@ export function issueRoutes(
           throw conflict("This chat is paused. Resume it to send these messages.", { code: "queued_comment_chat_paused" });
         }
       }
-      const actor = getActorInfo(req);
+      const queue = await interruptQueuedComments(issue, getActorInfo(req), req.body);
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+    },
+  );
+
+  // Both explicit entry points use the existing Stop/cleanup/admission owner.
+  // Default Send never calls this operation.
+  async function interruptQueuedComments(
+    issue: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
+    actor: ReturnType<typeof getActorInfo>,
+    body: z.infer<typeof queuedCommentInterruptTargetSchema>,
+  ) {
+      const req = { body };
       // S8q(5): a press with no run to stop and nothing left in the queue keeps
       // the existing 409 queued_comment_not_pending contract, worded plainly so
       // the client can say "Nothing is waiting." instead of showing an error.
@@ -18225,9 +18237,8 @@ export function issueRoutes(
         queue.executionWait = { reason: "first_turn_pending",
           message: "The agent is still starting. These messages will be included in its first turn." };
       }
-      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
-    },
-  );
+      return queue;
+  }
 
   router.post(
     "/issues/:id/queued-comments/:commentId/steer",
@@ -20241,6 +20252,7 @@ export function issueRoutes(
         const actor = getActorInfo(req);
         const userId = req.actor.userId;
         const publications: ActivityPublication[] = [];
+        let newComment = false;
         const comment = await db.transaction(async (tx) => {
           await tx.select({ id: issueRows.id }).from(issueRows).where(and(
             eq(issueRows.id, issue.id), eq(issueRows.companyId, issue.companyId),
@@ -20252,6 +20264,7 @@ export function issueRoutes(
           const saved = await svc.addComment(issue.id, req.body.body, { userId }, {
             clientRequestId: req.body.clientRequestId, authorType: "user", attachmentIds: req.body.attachmentIds,
           }, tx);
+          newComment = !existing;
           if (!existing) await logActivity(tx as unknown as Db, {
             companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
             action: "issue.comment_added", entityType: "issue", entityId: issue.id,
@@ -20263,6 +20276,15 @@ export function issueRoutes(
         for (const publication of publications) publishActivity(publication);
         await issueReferencesSvc.syncComment(comment.id);
         await deliverConversationComments(db, issue, heartbeat.wakeup);
+        if (newComment && (req.body.deliveryIntent === "interrupt" || (!req.body.deliveryIntent && req.body.interrupt))) {
+          const current = await svc.getById(issue.id) ?? issue;
+          const queue = await buildQueuedCommentQueue({ executor: db, issue: current,
+            activeRun: await resolveActiveIssueRun(current), actor });
+          if (queue.state === "deferred" && queue.queueId && queue.entries.length) {
+            await interruptQueuedComments(current, actor, { queueId: queue.queueId,
+              revision: queue.revision, targetRunId: queue.targetRunId });
+          }
+        }
         const [displayComment] = await withSteeredCommentDisplay(db, [comment]);
         // A same-turn steer already has its agent: no independent fast-response
         // attempt may race it or manufacture another answer/run.
