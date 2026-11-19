@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { StorageProvider } from "../storage/types.js";
 import { ObjectJournalBusyError } from "./object-byte-journal.js";
 import { createObjectRunLogStore, readObjectRunLogSpill } from "./object-run-log-store.js";
@@ -11,7 +11,9 @@ import { logger } from "../middleware/logger.js";
 
 vi.mock("../middleware/logger.js", () => ({ logger: { warn: vi.fn(), error: vi.fn() } }));
 // Failure rows keep their admitted bytes in a local spill; never write it under the real instance root.
-process.env.RUN_LOG_SPILL_PATH = mkdtempSync(path.join(os.tmpdir(), "objlog-spill-default-"));
+// One spill root per row: rows reuse run ids over separate in-memory object stores, and a
+// spill belongs to ONE object store (a later begin of the same run stores it in the journal).
+beforeEach(() => { process.env.RUN_LOG_SPILL_PATH = mkdtempSync(path.join(os.tmpdir(), "objlog-spill-default-")); });
 
 async function readBody(body: AsyncIterable<Uint8Array>) {
   const chunks: Buffer[] = [];
