@@ -23,6 +23,7 @@ import {
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { agentRoutes } from "../routes/agents.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -131,6 +132,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       next();
     });
     testApp.use("/api", issueRoutes(db, {} as any, {}));
+    testApp.use("/api", agentRoutes(db));
     testApp.use(errorHandler);
     return testApp;
   }
@@ -541,8 +543,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       { eventType: "item.started", kind: "userMessage", itemId: "turn-1:read-M" },
       { eventType: "turn.cancelled", itemId: "turn-1:end" },
     ]);
-    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(), resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || '{"cancelledByActorType":"user"}'::jsonb` })
-      .where(eq(heartbeatRuns.id, chat.runId));
+    await personStop(chat);
     await releaseRun(chat);
     const { readPersonStopHold } = await import("../services/acknowledged-native-stop.js");
     expect(await readPersonStopHold(db, { companyId: chat.companyId, issueId: chat.issue.id, agentId: chat.agentId, messageId: response.body.id }))
@@ -572,9 +573,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     for (const event of events) await port.appendEvent({ schema: "paperclip.prp.event.v1", schemaVersion: 1,
       runId: chat.runId, normalizedSessionId: "stop-session", turnId: "turn-1", emittedAt: new Date().toISOString(),
       sourceKind: "runner", priority: 0, sourceInstanceId, sourceEventId: randomUUID(), ...event } as PrpEvent);
-    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(),
-      resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || '{"cancelledByActorType":"user"}'::jsonb` })
-      .where(eq(heartbeatRuns.id, chat.runId));
+    await personStop(chat);
     await releaseRun(chat);
     expect((await carriersOf(chat, sent.body.id)).wakes).toHaveLength(0);
     // No append remains in flight. This is the existing executor's stopped/
@@ -1246,7 +1245,9 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     })));
   }
 
-  /** The person's square Stop: the native session acknowledges a run-only stop, then the run is released. */
+  /** The owner's real square Stop POST (ui/src/api/heartbeats.ts); only the native acknowledgement is controlled.
+   * RFL ruling (c), cut C: "ONE readPersonStopHold requires the accepted person_stop row."
+   * The route owns that acceptance; a direct cancel/DB write is not a person's Stop. */
   async function personStop(chat: Chat) {
     mocks.cancel.mockImplementationOnce(async (runId: string) => {
       const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
@@ -1257,8 +1258,14 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       } } }).where(eq(heartbeatRuns.id, runId));
       return { decision: { stopped: true }, auditId: randomUUID() };
     });
-    await heartbeatService(db).cancelRun(chat.runId, "Cancelled by a board operator",
-      { resultJson: { cancelledByActorType: "user", cancelledByUserId: owner } });
+    const response = await request(app(chat.companyId, owner)).post(`/api/heartbeat-runs/${chat.runId}/cancel`)
+      .send({ cancellationRequestId: randomUUID() });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const accepted = await db.select().from(heartbeatRunEvents).where(and(
+      eq(heartbeatRunEvents.runId, chat.runId), eq(heartbeatRunEvents.message, "run.stop.accepted"),
+    ));
+    expect(accepted).toHaveLength(1);
+    expect(accepted[0]!.payload).toMatchObject({ kind: "person_stop", userId: owner, issueId: chat.issue.id });
     const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
     expect(stopped!.status).toBe("cancelled");
   }
