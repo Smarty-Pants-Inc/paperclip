@@ -17,7 +17,7 @@ import { EXECUTION_RECONCILIATION_CAUSES, readRunFailureCause, withoutSqlStateme
 import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA, nativeRunHasNoWorkspaceAccess } from "./workspace-restore-recovery-state.js";
 import { unreconciledNativeExportPredicate } from "./native-runtime/native-workspace-reconstruction.js";
 import { hasRecoveredCleanupStopReceipt, hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
-import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
+import { compareNativeWorkspaceSyncRootWithBaseline, readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { completedWorkspaceRecoveryCondition, hasVerifiedWorkspaceRepair, recoveredWorkMessage, savedWorkOffersRetry, workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
 import { nativeManualAdmissionHoldsExecution } from "./native-runtime/native-runner-ownership.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
@@ -518,7 +518,9 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   // wait line says (the gate's own words, saved on the waiting message by explicit-native-continuation.ts).
   //  - the gate named a wait .............. its words (the mixed-checkout hold names its one action)
   //  - no wait named yet, box not stopped . the wait words (never "starts now" before it is true)
-  //  - the box is stopped ................. "starts now": the message continues on the same checkout
+  //  - no wait named yet, box stopped ..... the gate's own comparison of the checkout with the last saved state,
+  //                                         read here for the short time until the gate runs again: "starts now"
+  //                                         only when the files match; otherwise the hold's sentence and its action
   let savedMessageWait: { state: "waiting" | "starting" | "continue_required"; line: string } | null = null;
   if (saved.length && restoreHold && run && replyFileLineReadsLost(run.resultJson)
       && !savedFilesUnrecoverable(readSystemRecovery(action.evidence))) {
@@ -534,8 +536,13 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
       const stopped = leases.some(lease => lease.provider !== "local")
         ? leases.every(lease => hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))
         : leases.every(lease => Boolean(lease.releasedAt) && lease.cleanupStatus !== "failed");
-      savedMessageWait = stopped ? { state: "starting", line: REPLY_FILES_NOT_SAVED_LINE }
-        : { state: "waiting", line: REPLY_FILES_LOST_WAITING_LINE };
+      if (!stopped) savedMessageWait = { state: "waiting", line: REPLY_FILES_LOST_WAITING_LINE };
+      else {
+        const reference = readNativeWorkspaceSyncReference(run.runnerProfileJson?.nativeWorkspaceSync);
+        const compared = reference ? await compareNativeWorkspaceSyncRootWithBaseline({ companyId, runId: run.id, reference }) : null;
+        savedMessageWait = compared?.state === "matches_last_save" ? { state: "starting", line: REPLY_FILES_NOT_SAVED_LINE }
+          : { state: "continue_required", line: REPLY_FILES_PARTLY_SAVED_LINE };
+      }
     }
   }
 
