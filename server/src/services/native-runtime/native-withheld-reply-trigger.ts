@@ -1,16 +1,21 @@
 /**
  * WHEN the accepted reply of a native run is published.
  *
- *  - "terminal" (today): the committed reply path publishes after the copy-back;
- *    a run that ends without a committed reply publishes at its terminal write.
- *  - "acceptance": the reply is published when the result is accepted; the
+ *  - "acceptance" (the default, Ruling P): the reply is published when the
+ *    result is accepted, while the files are still being copied back; the
  *    committed path then finds it already presented and posts nothing more.
+ *    Publishing ONLY posts the comment and records it as presented: the run's
+ *    status, the task's status, issues.executionRunId and the execution lock
+ *    are left to the commit, so a later message stays parked behind this run
+ *    until its files are committed.
+ *  - "terminal": the committed reply path publishes after the copy-back;
+ *    a run that ends without a committed reply publishes at its terminal write.
  *
  * The one switch. Both settings share publishWithheldAcceptedReply
  * (native-withheld-reply.ts), which is idempotent by (run, resultId, canonicalSha256).
  */
 export type WithheldReplyTrigger = "terminal" | "acceptance";
-export const WITHHELD_REPLY_TRIGGER = "terminal" as WithheldReplyTrigger;
+export const WITHHELD_REPLY_TRIGGER = "acceptance" as WithheldReplyTrigger;
 /** Under "acceptance" the file line starts `saving`; past this it is never shown as "Saving…". */
 export const WITHHELD_REPLY_SAVING_DEADLINE_MS = 10 * 60_000;
 
