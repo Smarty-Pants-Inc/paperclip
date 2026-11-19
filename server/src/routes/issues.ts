@@ -453,6 +453,10 @@ function queuedCommentDiscardDenial(issue: { identifier?: string | null }, comme
 
 const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
 const CHAT_STOPPED_BY_PERSON_MESSAGE = "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it.";
+/** A paused chat agent: the Send route's own code and words (its 409), so the
+ * held bar says it is paused and offers no Send that would be refused. */
+const CHAT_AGENT_PAUSED_REASON = "queued_comment_chat_paused";
+const CHAT_AGENT_PAUSED_MESSAGE = "This agent is paused. Resume it to send these messages.";
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
   revision: z.string().min(1),
@@ -7671,6 +7675,13 @@ export function issueRoutes(
   type IssueQueueDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
   type IssueQueueTx = Parameters<Parameters<Db["transaction"]>[0]>[0];
   type IssueQueueWake = typeof agentWakeupRequests.$inferSelect;
+  /** The one paused reading for a chat's agent: the Send route refuses on it,
+   * and the held bar says so instead of offering that Send. */
+  async function isChatAgentPaused(executor: IssueQueueDb, companyId: string, agentId: string) {
+    const [chatAgent] = await executor.select({ status: agents.status }).from(agents).where(and(
+      eq(agents.companyId, companyId), eq(agents.id, agentId)));
+    return chatAgent?.status === "paused";
+  }
   type IssueQueueRun = typeof heartbeatRuns.$inferSelect;
   type IssueQueueState = {
     wake: Pick<IssueQueueWake, "id" | "companyId" | "payload" | "status" | "runId" | "agentId" | "reason"
@@ -7895,7 +7906,9 @@ export function issueRoutes(
         .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
       const stop = readObject(lastTurn?.resultJson);
       if (lastTurn?.status === "cancelled" && stop.cancelledByActorType === "user" && !stop.queuedCommentInterruptQueueId) {
-        queue.executionWait = { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
+        queue.executionWait = await isChatAgentPaused(input.executor, input.issue.companyId, input.issue.conversationAgentId)
+          ? { reason: CHAT_AGENT_PAUSED_REASON, message: CHAT_AGENT_PAUSED_MESSAGE }
+          : { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
       }
     }
     if (wake && queuedInteractionId(wake.payload)) {
@@ -18093,10 +18106,8 @@ export function issueRoutes(
           throw forbidden("Only the conversation owner can interrupt a chat to send queued messages");
         }
         // A paused chat runs nothing: Send says why and keeps the messages.
-        const [chatAgent] = await db.select({ status: agents.status }).from(agents).where(and(
-          eq(agents.companyId, issue.companyId), eq(agents.id, issue.conversationAgentId)));
-        if (chatAgent?.status === "paused") {
-          throw conflict("This agent is paused. Resume it to send these messages.", { code: "queued_comment_chat_paused" });
+        if (await isChatAgentPaused(db, issue.companyId, issue.conversationAgentId)) {
+          throw conflict(CHAT_AGENT_PAUSED_MESSAGE, { code: CHAT_AGENT_PAUSED_REASON });
         }
         if (await treeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id)) {
           throw conflict("This chat is paused. Resume it to send these messages.", { code: "queued_comment_chat_paused" });

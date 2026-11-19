@@ -8,6 +8,8 @@ import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compa
 import express from "express";
 import request from "supertest";
 import { issueRoutes } from "../routes/issues.js";
+import { agentRoutes } from "../routes/agents.js";
+import { configureAgentLifecycle } from "../services/agent-lifecycle.js";
 import { errorHandler } from "../middleware/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { randomUUID } from "node:crypto";
@@ -801,6 +803,7 @@ import {
           next();
         });
         routeApp.use("/api", issueRoutes(db, { wakeup: async () => null } as never));
+        if (!userId) routeApp.use("/api", agentRoutes(db));
         routeApp.use(errorHandler);
         return routeApp;
       };
@@ -922,9 +925,16 @@ import {
               status: "active", createdByActorType: "user", createdByUserId: "local-board",
               releasePolicy: { strategy: "manual", note: "leaf_pause" } }).returning()
             : [null];
-          if (variant === "agent-paused") await db.update(agents).set({ status: "paused" }).where(eq(agents.id, runtimeAgent));
+          if (variant === "agent-paused") {
+            // The real Pause. The held bar then says the Send route's own
+            // paused line, with the Send route's own code: no Send offered.
+            expect((await request(owner).post(`/api/agents/${runtimeAgent}/pause`).send({})).status).toBe(200);
+            expect((await readQueue()).executionWait).toEqual({ reason: "queued_comment_chat_paused",
+              message: "This agent is paused. Resume it to send these messages." });
+          }
           const refused = await request(owner).post(`${queuePath}/interrupt`).send(sendBody());
           expect(refused.status).toBe(409);
+          expect(refused.body.details?.code).toBe("queued_comment_chat_paused");
           expect(refused.body.error).toBe(variant === "agent-paused"
             ? "This agent is paused. Resume it to send these messages."
             : "This chat is paused. Resume it to send these messages.");
@@ -937,8 +947,20 @@ import {
           // Resumed, the same Send goes.
           if (hold) await db.update(issueTreeHolds).set({ status: "released", releasedAt: new Date() })
             .where(eq(issueTreeHolds.id, hold.id));
-          else await db.update(agents).set({ status: "idle" }).where(eq(agents.id, runtimeAgent));
+          else {
+            // The real Resume; as in agent-report-runtime-autonomy, the test
+            // completes the accepted resume's lifecycle work explicitly.
+            const lifecycle = configureAgentLifecycle(db, { requiredPluginIds: async () => [],
+              runHost: async () => "complete" as const, runPlugin: async () => "complete" as const });
+            try {
+              expect((await request(owner).post(`/api/agents/${runtimeAgent}/resume`).send({})).status).toBe(200);
+              await lifecycle.process(runtimeAgent);
+            } finally { await lifecycle.stop(); }
+          }
+          // Resumed: the stopped line (and its Send) is back.
           queue = await readQueue();
+          expect(queue.executionWait).toEqual({ reason: "stopped_by_person",
+            message: "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it." });
         }
 
         const sent = await request(owner).post(`${queuePath}/interrupt`).send(sendBody());
