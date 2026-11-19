@@ -26,7 +26,7 @@ import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-
 import { assertHandedOffRunTaskOwnership } from "../run-task-ownership.js";
 import { recordNativeHumanSelfHandoff } from "../services/native-runtime/native-human-self-handoff.js";
 import { recordChildTaskRead } from "../services/native-runtime/native-child-completion-delivery.js";
-import { handedOffWarmUnprovenWaitMessage } from "../services/native-runtime/handed-off-warm-lease.js";
+import { readHandedOffWarmWaitLine } from "../services/native-runtime/handed-off-warm-lease.js";
 import { recordCompletedHandoffRead } from "../services/chat-completion-delivery.js";
 import { runRetainsIssueIdentity } from "../services/task-repository-acquisition.js";
 import { withConversationReadState } from "../services/agent-chat-read-state.js";
@@ -7894,11 +7894,19 @@ export function issueRoutes(
     // settling is not something to read about under the composer; the task
     // notice owns any wait that needs the user.
     const interruptHandoff = queueState?.state === "deferred" && readObject(wake?.payload).queuedCommentInterrupt != null;
+    // adopt-words-state: a bounded hand-off wait (unproven or stop-receipt phase) is
+    // one the person must read; its line is projected from the run and lease STATE
+    // now (the same projection admission saves), never from the saved prose, so a
+    // wake saved under older words reads the true line at once.
+    const handoffLine = interruptHandoff
+      ? await readHandedOffWarmWaitLine(input.executor as Db, { companyId: input.issue.companyId, issueId: input.issue.id,
+          targetRunId: (() => { const target = readObject(readObject(wake?.payload).queuedCommentInterrupt).targetRunId;
+            return typeof target === "string" ? target : null; })() })
+      : null;
     const queue = buildQueuedCommentQueueSnapshot({
       issueId: input.issue.id,
-      // adopt-unproven-words: a hand-off waiting inside the unproven bound is a
-      // bounded wait the person must read, so its line (naming the bound) is shown.
-      executionWait: interruptHandoff && !(wait.reason === "remote_cleanup" && wait.message === handedOffWarmUnprovenWaitMessage())
+      executionWait: handoffLine ? { reason: "remote_cleanup", message: handoffLine }
+        : interruptHandoff
         ? QUEUED_INTERRUPT_HANDOFF_WAIT
         : typeof wait.reason === "string" && typeof wait.message === "string"
           ? { reason: wait.reason, message: wait.message } : null,

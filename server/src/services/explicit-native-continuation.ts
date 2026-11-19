@@ -13,7 +13,7 @@ import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-m
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { preserveNativeFailedWorkspace, preserveTaskRemoteWorkspaceWriter } from "./native-runtime/native-failed-workspace-recovery.js";
 import { handedOffWarmLease, handedOffWarmLeaseSettled, handedOffWarmProofInFlight, handedOffWarmStopReceiptOverdue,
-  handedOffWarmUnprovenWaitMessage, HANDED_OFF_WARM_UNPROVEN_SINCE_KEY } from "./native-runtime/handed-off-warm-lease.js";
+  handedOffWarmWaitLine } from "./native-runtime/handed-off-warm-lease.js";
 import { createHash } from "node:crypto";
 import { appendHeartbeatRunEvent, stopAcceptanceEventSql } from "./heartbeat-run-events.js";
 import { canContinueCancelledRun, QUEUED_SEND_AFTER_STOP_KEY, queuedSendAfterStop, userStopBoundaryAt } from "./run-cancellation.js";
@@ -632,12 +632,10 @@ export async function admitExplicitNativeContinuation(input: {
       if (unsettled.length) {
         if (handedOffWarmProofInFlight(run.id) && unsettled.some(lease => handedOffWarmLease(run, lease)))
           return blocked("interrupt_handoff", "Sending your messages.");
-        // adopt-unproven-words: inside the unproven bound the wait is bounded, so say the bound.
-        if (unsettled.some(lease => handedOffWarmLease(run, lease)
-            && (lease.metadata?.[HANDED_OFF_WARM_UNPROVEN_SINCE_KEY] as { runId?: unknown } | undefined)?.runId === run.id)) {
-          return blocked("remote_cleanup", handedOffWarmUnprovenWaitMessage());
-        }
-        return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
+        // adopt-words-state: a bounded hand-off wait (unproven phase or stop-receipt
+        // phase) says its ceiling; the line is projected from state, the same as the queue GET.
+        return blocked("remote_cleanup", handedOffWarmWaitLine(run, unsettled)
+          ?? "Waiting for the previous environment to stop. Your message will start automatically.");
       }
       if (run.runtimeMode === "native" && !input.dryRun && !leases.every(lease => completeTerminatedRemoteNativeSessionCleanup({
         companyId, runId: run.id, remoteCleanupScope: remoteLeaseCleanupScope(lease)!,

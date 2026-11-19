@@ -318,4 +318,112 @@ describe.skipIf(!support.supported)("adopt-hung-stop: Boat never answers the sto
     expect(lease.metadata?.replaceBeforeReuse).toBeUndefined();
     expect(await carryingOf(f)).toHaveLength(0);
   }, 120_000);
+
+  // ---- adopt-words-state: the person's waiting line is projected from STATE, never from saved prose ----
+  const OLD_GENERIC = "Waiting for the previous environment to stop. Your message will start automatically.";
+  const SENDING = "Sending your messages.";
+  const trueLine = () => (handedOff as { handedOffWarmUnprovenWaitMessage: () => string }).handedOffWarmUnprovenWaitMessage();
+  const getLine = async (client: express.Express, issueId: string) =>
+    (await request(client).get(`/api/issues/${issueId}/queued-comments`).expect(200)).body.executionWait ?? null;
+
+  it("WORDS-STATE (2) receipt phase: an admission pass after the stop intent saves, and the GET shows, the true line, never 'Sending'; (3) after the successor, no wait line", async () => {
+    const savedReceiptMs = receiptBound!.ms;
+    receiptBound!.ms = 3 * BOUND_MS;
+    try {
+      const { f, queueId, heartbeat } = await interruptToStopIntent();
+      // The deferred-receipt worker's pass in the receipt phase (no person action): admission re-saves the wait.
+      await heartbeat.resumeQueuedCommentInterrupt(f.companyId, queueId);
+      const lease = await leaseOf(f.leaseId);
+      const saved = (await wakeOf(f.wakeId)).payload?.executionWait as Record<string, unknown> | undefined;
+      const line = await getLine(f.client, f.issueId);
+      await evidence("words_state_receipt_phase", { lease: { status: lease.status, intent: lease.metadata?.sandboxStopAndRetain ?? null,
+        overdue: lease.metadata?.handedOffWarmStopReceiptOverdue ?? null }, saved: saved ?? null, line });
+      expect(lease.status, "receipt phase: stop intent written").toBe("pending_cleanup");
+      expect(lease.metadata?.handedOffWarmStopReceiptOverdue, "receipt phase: before the overdue mark").toBeUndefined();
+      expect(line?.message).not.toBe(SENDING);
+      expect(line).toMatchObject({ reason: "remote_cleanup", message: trueLine() });
+      expect(saved, "the admission writer saves the same projected line").toMatchObject({ reason: "remote_cleanup", message: trueLine() });
+      // (3) the successor is admitted (overdue receipt) -> no wait line.
+      expect(await until(async () => (await carryingOf(f)).length > 0, receiptBound!.ms + N_MS)).toBe(true);
+      const after = await getLine(f.client, f.issueId);
+      await evidence("words_state_after_successor", { line: after, wake: (await wakeOf(f.wakeId)).status });
+      expect(after).toBeNull();
+    } finally {
+      receiptBound!.ms = savedReceiptMs;
+    }
+  }, 120_000);
+
+  it("WORDS-STATE control: an ordinary remote_cleanup wait (no hand-off, no Interrupt) keeps today's saved words", async () => {
+    const f = await seedLiveNativeTurn();
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    await db.update(agentWakeupRequests).set({ payload: { ...wake!.payload, executionWait: { reason: "remote_cleanup", message: OLD_GENERIC } } })
+      .where(eq(agentWakeupRequests.id, f.wakeId));
+    const line = await getLine(f.client, f.issueId);
+    await evidence("words_state_control_plain_wait", { line });
+    expect(line).toEqual({ reason: "remote_cleanup", message: OLD_GENERIC });
+  }, 120_000);
+
+  // LAST in the file: it resets the module graph (the restart).
+  it("WORDS-STATE (1) upgrade trace: a wake saved with the OLD generic text, then a SERVER RESTART over the same DB -> the GET shows the true line at once; then (3) no wait line after the successor", async () => {
+    proc.cause = "runner_stop_failed_or_refused"; proc.liveClaim = false; proc.calls.length = 0;
+    const f = await seedLiveNativeTurn();
+    const { queueId } = await interruptAndHandOff(f);
+    const [stoppedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.liveRunId));
+    // OLD's pass: the proof is unproven, the unproven phase begins.
+    await heartbeatService(db).resumeRemoteStopComments(stoppedRun!);
+    await heartbeatService(db).resumeQueuedCommentInterrupt(f.companyId, queueId);
+    const unproven = await leaseOf(f.leaseId);
+    expect((unproven.metadata?.handedOffWarmUnprovenSince as { runId?: string } | undefined)?.runId).toBe(f.liveRunId);
+    // PLANTED: the wait exactly as the OLD release (a484bfdd, rf-5's OLD) saved it: the generic words.
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    expect(wake!.status).toBe("deferred_issue_execution");
+    await db.update(agentWakeupRequests).set({ payload: { ...wake!.payload, executionWait: { ...(wake!.payload?.executionWait as object),
+      reason: "remote_cleanup", message: OLD_GENERIC } } }).where(eq(agentWakeupRequests.id, f.wakeId));
+    // ---- SERVER RESTART over the same DB: a fresh module graph, fresh pool, fresh routes ----
+    vi.resetModules();
+    const freshDbModule = await import("@paperclipai/db");
+    const freshDb = freshDbModule.createDb(tempDb.connectionString);
+    try {
+      const freshHandedOff = await import("../services/native-runtime/handed-off-warm-lease.js");
+      freshHandedOff.handedOffWarmUnprovenBound.ms = BOUND_MS;
+      freshHandedOff.handedOffWarmStopReceiptBound.ms = RECEIPT_BOUND_MS;
+      const { issueRoutes: freshRoutes } = await import("../routes/issues.js");
+      const { errorHandler: freshErrors } = await import("../middleware/index.js");
+      const { heartbeatService: freshHeartbeat } = await import("../services/heartbeat.js");
+      const client = express();
+      client.use(express.json());
+      client.use((req, _res, next) => {
+        (req as any).actor = { type: "board", source: "session", userId, companyIds: [f.companyId],
+          memberships: [{ companyId: f.companyId, membershipRole: "owner", status: "active" }], isInstanceAdmin: false };
+        next();
+      });
+      client.use("/api", freshRoutes(freshDb, {} as any, {}));
+      client.use(freshErrors);
+      // The FIRST GET after the restart, no person action and no admission pass yet.
+      const first = await getLine(client, f.issueId);
+      const leaseAtFirst = await leaseOf(f.leaseId);
+      await evidence("words_state_upgrade_first_get", { saved: OLD_GENERIC, line: first, lease: { status: leaseAtFirst.status,
+        unprovenSince: leaseAtFirst.metadata?.handedOffWarmUnprovenSince ?? null, intent: leaseAtFirst.metadata?.sandboxStopAndRetain ?? null } });
+      expect(first?.message, "the old-saved wake never reads 'Sending' while nothing can start").not.toBe(SENDING);
+      expect(first).toEqual({ reason: "remote_cleanup", message: freshHandedOff.handedOffWarmUnprovenWaitMessage() });
+      // NEW's own admission pass (the restart path: proof unavailable -> stop intent at once) -> still the true line.
+      const heartbeat = freshHeartbeat(freshDb);
+      await heartbeat.resumeQueuedCommentInterrupt(f.companyId, queueId);
+      const stopping = await leaseOf(f.leaseId);
+      const second = await getLine(client, f.issueId);
+      await evidence("words_state_upgrade_after_pass", { line: second, lease: { status: stopping.status,
+        intent: stopping.metadata?.sandboxStopAndRetain ?? null, overdue: stopping.metadata?.handedOffWarmStopReceiptOverdue ?? null },
+        saved: (await wakeOf(f.wakeId)).payload?.executionWait ?? null });
+      if (!(await carryingOf(f)).length) expect(second).toEqual({ reason: "remote_cleanup", message: freshHandedOff.handedOffWarmUnprovenWaitMessage() });
+      // (3) the successor is admitted (receipt overdue, no receipt) -> no wait line.
+      expect(await until(async () => (await carryingOf(f)).length > 0 || (await heartbeat.resumeQueuedCommentInterrupt(f.companyId, queueId), false),
+        RECEIPT_BOUND_MS + N_MS) ?? (await carryingOf(f)).length > 0).toBe(true);
+      const after = await getLine(client, f.issueId);
+      await evidence("words_state_upgrade_after_successor", { line: after, wake: (await wakeOf(f.wakeId)).status });
+      expect(after).toBeNull();
+      expect(await carryingOf(f)).toHaveLength(1);
+    } finally {
+      await freshDb.$client.end({ timeout: 1 });
+    }
+  }, 120_000);
 });
