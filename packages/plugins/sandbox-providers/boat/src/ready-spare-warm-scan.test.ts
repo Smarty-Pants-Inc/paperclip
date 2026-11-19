@@ -17,7 +17,7 @@ function spare(n: number, sick: boolean): ReadySpare {
   return { id: `bx_scan${n}`, key, state: "idle", warmed: true, expiresAt: expiry, ttlSeconds: 1800,
     name: `paperclip-spare:ready:${key.configHash}`,
     labels: { owner: `paperclip:${key.companyId}`, environment: key.environmentId, purpose: "spare", configHash: key.configHash, expiry },
-    providerObservation: { id: `bx_scan${n}`, stop: sick ? { id: `stop_${n}`, status: "failing" } : null } };
+    providerObservation: { id: `bx_scan${n}`, hydrated: true, hydratedAt: new Date().toISOString(), stop: sick ? { id: `stop_${n}`, status: "failing" } : null } };
 }
 
 function setup(boxes: ReadySpare[], getDelayMs = 0, hangIds = new Set<string>()) {

@@ -9,7 +9,7 @@ const start = Date.parse("2026-11-15T00:00:00.000Z");
 const key: ReadySpareKey = { companyId: "company-a", environmentId: "env-a", configHash: "abc123" };
 function spare(overrides: Partial<ReadySpare> = {}): ReadySpare {
   const labels = { owner: `paperclip:${key.companyId}`, environment: key.environmentId, purpose: "spare", configHash: key.configHash, expiry: new Date(start + 1_800_000).toISOString() };
-  return { id: "bx_abcdefgh", key, state: "running", warmed: true, expiresAt: labels.expiry, name: `paperclip-spare:ready:${key.configHash}`, labels, ...overrides };
+  return { id: "bx_abcdefgh", key, state: "running", warmed: true, expiresAt: labels.expiry, name: `paperclip-spare:ready:${key.configHash}`, labels, providerObservation: { hydrated: true, hydratedAt: new Date(start).toISOString() }, ...overrides };
 }
 function claimStore() {
   const rows = new Set<string>();

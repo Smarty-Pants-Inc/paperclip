@@ -689,11 +689,11 @@ async function resumeOwedSpareStops(config: Config, companyId: string, environme
       }
       if (shuttingDown) return;
       try {
-        // A previously failed persistence may have left only the local debt.
-        // Commit it before retrying the provider, just as the keeper does.
-        await persistOwedSpareStops(companyId, record);
+        // Persist first when possible; state availability never vetoes a safe
+        // stop. Failed writes leave the existing debt in companyOwedStops.
+        try { await persistOwedSpareStops(companyId, record); } catch { /* Retry the stop anyway. */ }
         await stopSandbox(config, entry.spareId);
-        await recordSpareStop({ outcome: "stopped", key, spareId: entry.spareId });
+        try { await recordSpareStop({ outcome: "stopped", key, spareId: entry.spareId }); } catch { /* Confirmed stop; stale durable debt can replay. */ }
       } catch {
         const failures = (record.holds.find(hold => hold.environmentId === environmentId && hold.configHash === entry.configHash)?.failures ?? 0) + 1;
         const until = Date.now() + READY_SPARE_STOP_BACKOFF_MS;
@@ -2068,7 +2068,10 @@ async function createReadySpare(config: Config, key: ReadySpareKey, ttlSeconds: 
   let identity: SpareRefill | undefined;
   try {
     await updateSpareRefills(key, async pending => {
-      identity = pending.find(entry => !busySpareRefills.has(entry.id));
+      // A refused key stays for reconciliation; it must not starve unrelated
+      // capacity. Expired identities are resolved/forgotten by inventory first.
+      identity = pending.find(entry => !busySpareRefills.has(entry.id) && !entry.refused
+        && (Date.now() - entry.at < BOAT_IDEMPOTENCY_KEY_LIFE_MS || entry.sandboxId));
       if (!identity) {
         const id = creationIdentityId();
         const expiry = await creationExpiry(key.companyId, id, ttlSeconds);
@@ -2080,9 +2083,9 @@ async function createReadySpare(config: Config, key: ReadySpareKey, ttlSeconds: 
       busySpareRefills.add(identity.id);
     });
     const refill = identity!;
-    // Boat's key expires after 24h. An unresolved older identity cannot safely
-    // be re-sent or replaced: inventory/operator reconciliation must resolve it.
-    if (refill.refused || Date.now() - refill.at >= BOAT_IDEMPOTENCY_KEY_LIFE_MS) throw new Error("Boat spare refill identity requires reconciliation");
+    // Boat's key expires after 24h: never resend it. An inventory-confirmed
+    // sandboxId can still finish warming without sending a create at all.
+    if (refill.refused || (!refill.sandboxId && Date.now() - refill.at >= BOAT_IDEMPOTENCY_KEY_LIFE_MS)) throw new Error("Boat spare refill identity requires reconciliation");
     const admit = () => admitSpareCreate(key, refill.id);
     if (!await admit()) throw new Error("Boat spare create not admitted at the current target");
     let sandbox: any;
@@ -2098,6 +2101,7 @@ async function createReadySpare(config: Config, key: ReadySpareKey, ttlSeconds: 
       } catch (error) {
         if (boatCreateCode(error) === "idempotency_key_reused") {
           await updateSpareRefills(key, pending => { const entry = pending.find(entry => entry.id === refill.id); if (entry) entry.refused = true; });
+          duplexLogger?.warn("Boat spare refill key refused; retained for reconciliation, not retried", { companyId: key.companyId, environmentId: key.environmentId, refillId: refill.id });
         }
         throw error;
       }
@@ -2167,14 +2171,21 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
           || ["archived", "stopped", "error", "cancelled"].includes(sandbox.state)))
         .map(sandbox => sandbox.labels["paperclip-refill"]).filter((id): id is string => typeof id === "string"));
       const resolving = new Set<string>();
-      if (owned.some(sandbox => typeof sandbox.labels["paperclip-refill"] === "string")) await updateSpareRefills(key, pending => {
+      // OFF must see unfinished paid boxes too, even though positive-target
+      // reconciliation leaves them to their durable refill's warm continuation.
+      const pool = knownSparePools.get(readySparePoolKey(key));
+      const retainPending = !pool || (!pool.retired && pool.baseDesired > 0);
+      await updateSpareRefills(key, pending => {
         for (let i = pending.length - 1; i >= 0; i--) {
           const entry = pending[i];
           if (settled.has(entry.id) && !busySpareRefills.has(entry.id)) { pending.splice(i, 1); continue; }
           const made = owned.find(sandbox => sandbox.labels.configHash === key.configHash && sandbox.labels["paperclip-refill"] === entry.id);
+          if (!made && !busySpareRefills.has(entry.id) && Date.now() - entry.at >= BOAT_IDEMPOTENCY_KEY_LIFE_MS) {
+            pending.splice(i, 1); continue; // Complete scoped inventory: expired key with no labelled box.
+          }
           if (made && !settled.has(entry.id) && !dedupedBoxStop(made)) {
             entry.sandboxId = made.id;
-            resolving.add(made.id);
+            if (retainPending && !entry.refused) resolving.add(made.id);
           }
         }
       });
@@ -2201,13 +2212,13 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       if (patched?.id !== spare.id || !["ready", "idle", "running"].includes(patched.state) || (patched.name && patched.name !== name)) return false;
       // rf-4 U1 F2: a stop Boat recorded after the clean pre-claim GET shows in
       // the PATCH answer or the verification GET. Either one abandons the claim.
-      if (abandonSickClaim(spare, patched, "patch")) return false;
+      if (abandonSickClaim(spare, patched, "patch") || patched.hydrated !== true) return false;
       const observed = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
         method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000),
       }, false, { requireJson: true });
       const sandbox = observed?.sandbox ?? observed;
       if (sandbox?.id !== spare.id || !["ready", "idle", "running"].includes(sandbox.state) || sandbox.name !== name) return false;
-      if (abandonSickClaim(spare, sandbox, "verify")) return false;
+      if (abandonSickClaim(spare, sandbox, "verify") || sandbox.hydrated !== true) return false;
       spare.name = name;
       spare.state = sandbox.state;
       spare.expiresAt = parseDeadline(sandbox.archiveAfter) ?? parseDeadline(sandbox.expiresAt) ?? new Date(Date.now() + claimTtlSeconds * 1000).toISOString();
@@ -2316,6 +2327,16 @@ function queueSpareReconciliation(key: ReadySpareKey, desired: number, ttlSecond
   idleMinutes = readySpareIdleMinutes(undefined), policy = { baseDesired: desired, spareMax: desired, demandWindowMinutes: 10 }): void {
   if (shuttingDown) return;
   if (desired <= 0) {
+    // Remember the environment's effective config while OFF. onConfigChanged
+    // has only company policy (no environment credentials); without this entry
+    // first fill waits until a later acquire teaches the pool, not 15 s.
+    const poolId = readySparePoolKey(key);
+    if (!knownSparePools.has(poolId)) {
+      knownSparePools.set(poolId, { key, ttlSeconds, desired: 0, ...policy, baseDesired: 0, idleMinutes, operations, idleStopped: true });
+      // A restarted worker can hold unfinished inventory from its predecessor.
+      // Its first OFF acquire supplies the credentials needed to retire it.
+      void readySpares.reconcile(key, 0, operations).catch(() => undefined);
+    }
     bumpSpareSettingEpoch(key.companyId, key.environmentId);
     for (const pool of knownSparePools.values()) {
       if (pool.key.companyId !== key.companyId || pool.key.environmentId !== key.environmentId) continue;
@@ -2358,6 +2379,10 @@ async function wakeCompanySparePools(companyId: string): Promise<void> {
     if (pool.key.companyId !== companyId || pool.retired || pool.baseDesired <= 0) continue;
     pool.desired = readySpares.demandTarget(pool.key, pool.baseDesired, pool.spareMax, pool.demandWindowMinutes);
     pool.idleStopped = false;
+    // Activity is not a replacement request. An exhausted budget has no spare
+    // work to wake; let the acquisition's normal path account for the refusal
+    // after admitting its ordinary run (run creates are never blocked).
+    if (readySpares.createCounts(companyId).allCreates >= readySpares.createCeiling(companyId)) continue;
     work.push(readySpares.reconcile(pool.key, pool.desired, pool.operations, true).catch(error => {
       duplexLogger?.warn("Boat ready spare wake reconciliation failed", { companyId, environmentId: pool.key.environmentId });
       throw error;
@@ -2672,6 +2697,11 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     const demandWindowMinutes = readySpareDemandWindowMinutes(newConfig);
     const idleMinutes = readySpareIdleMinutes(newConfig);
     const active = await companySpareIsActive(companyId, idleMinutes);
+    if (configuredCount > 0) for (const environmentId of environments) {
+      if (![...knownSparePools.values()].some(pool => !pool.retired && pool.key.companyId === companyId && pool.key.environmentId === environmentId)) {
+        duplexLogger?.warn("Boat first spare fill awaits an environment acquisition: config changes carry policy, not environment credentials", { companyId, environmentId });
+      }
+    }
     for (const pool of knownSparePools.values()) {
       if (pool.key.companyId !== companyId || pool.retired) continue;
       pool.baseDesired = environments.includes(pool.key.environmentId) ? configuredCount : 0;
@@ -2679,8 +2709,14 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       pool.demandWindowMinutes = demandWindowMinutes;
       pool.desired = readySpares.demandTarget(pool.key, pool.baseDesired, pool.spareMax, pool.demandWindowMinutes);
       pool.idleMinutes = idleMinutes;
+      if (pool.desired > 0) ensureSpareRefreshTimer();
       try {
-        await readySpares.reconcile(pool.key, active ? pool.desired : 0, pool.operations);
+        // An already-exhausted company budget cannot fund an eager first fill.
+        // Still retire/trim inventory; the ordinary acquire keeps the existing
+        // cap-refusal accounting when it next requests a replacement.
+        if (active && pool.desired > 0 && readySpares.createCounts(companyId).allCreates >= readySpares.createCeiling(companyId)) {
+          await readySpares.reconcileTimer(pool.key, pool.desired, pool.operations);
+        } else await readySpares.reconcile(pool.key, active ? pool.desired : 0, pool.operations);
         pool.idleStopped = !active;
       } catch {
         duplexLogger?.warn("Boat ready spare config reconciliation failed", { companyId, environmentId: pool.key.environmentId });
@@ -3027,6 +3063,15 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     } else if (baseSpares === 0) {
       if (spareOperations) queueSpareReconciliation(spareKey, 0, ttl, spareOperations, spareIdleMinutes, policy);
       await recordOutcomeOnce("cold", "spares_disabled");
+    } else if (params.purpose === "login" || params.resolveSnapshotIdentity === true
+        || params.issueId === null) {
+      // Host environment-runtime.ts sends issueId:null for both hire tests and
+      // environment probes. Its runId is a synthetic UUID even without a run
+      // (sandbox-creation-operations.ts), so runId presence proves nothing.
+      // Legacy callers omitting issueId retain their existing run behavior.
+      // Probes may teach/refill a pool, but can NEVER consume its paid spare.
+      if (spareOperations) queueSpares(readySpares.demandTarget(spareKey, baseSpares, spareMax, demandWindowMinutes), spareOperations);
+      await recordOutcomeOnce("cold", "no_ready_spare");
     } else if (spareClaimStore && spareOperations) {
       const desiredSpares = readySpares.demandTarget(spareKey, baseSpares, spareMax, demandWindowMinutes);
       let id: string | undefined;

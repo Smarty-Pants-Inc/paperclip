@@ -31,6 +31,7 @@ const FINAL_SNAPSHOT_FAILED = "Final snapshot failed; stop aborted to protect un
 
 type StopRecord = { id: string; status: "pending" | "failing" | "completed"; error?: string };
 type Box = { id: string; labels: Record<string, string>; name: string; state: string;
+  hydrated: boolean; hydratedAt: string;
   readyAt: number; archiveAfter: string; createdAt: string; team: { id: string }; stop?: StopRecord };
 type LogEntry = { seq: number; at: number; kind: "boat" | "event" | "warn" | "info"; method?: string; path?: string; id?: string; purpose?: string; note?: string };
 /**
@@ -73,6 +74,7 @@ class FakeBoat {
     if (method === "POST" && route === "/sandboxes") {
       const purpose = body.labels.purpose === "spare" ? "spare" : "run";
       const box: Box = { id: `bx_${purpose}${String(++this.counter).padStart(4, "0")}`, labels: { ...body.labels }, name: "",
+        hydrated: true, hydratedAt: new Date().toISOString(),
         state: "creating", readyAt: Date.now() + CREATE_LATENCY_MS,
         archiveAfter: new Date(Date.now() + body.ttlSeconds * 1000).toISOString(), createdAt: new Date().toISOString(), team: { id: "team-spare-safety" } };
       this.boxes.set(box.id, box);

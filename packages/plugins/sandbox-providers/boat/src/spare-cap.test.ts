@@ -29,6 +29,7 @@ const LIVE_RUN_OFFSET_MS = 600; // gate 2: the stop landed 0.6 s after the wake'
 const START = Date.UTC(2026, 10, 15, 23, 0, 0);
 
 type Box = { id: string; labels: Record<string, string>; name: string; state: "creating" | "ready" | "archived";
+  hydrated: boolean; hydratedAt: string;
   readyAt: number; archiveAfter: string; createdAt: string; team: { id: string } };
 type LogEntry = { seq: number; at: number; kind: "boat" | "activity-read" | "event" | "db" | "warn";
   method?: string; path?: string; id?: string; purpose?: string; value?: unknown; note?: string };
@@ -77,6 +78,7 @@ class FakeBoat {
     if (method === "POST" && route === "/sandboxes") {
       const purpose = body.labels.purpose === "spare" ? "spare" : "run";
       const box: Box = { id: `bx_${purpose}${String(++this.counter).padStart(4, "0")}`, labels: { ...body.labels }, name: "",
+        hydrated: true, hydratedAt: new Date().toISOString(),
         state: "creating", readyAt: Date.now() + this.createLatencyMs,
         archiveAfter: new Date(Date.now() + body.ttlSeconds * 1000).toISOString(), createdAt: new Date().toISOString(), team: { id: "team-wake-race" } };
       this.boxes.set(box.id, box);

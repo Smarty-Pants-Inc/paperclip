@@ -26,6 +26,7 @@ const TICK_MS = 15_000;
 const START = Date.UTC(2026, 10, 18, 23, 30, 0);
 
 type Box = { id: string; labels: Record<string, string>; name: string; state: string;
+  hydrated: boolean; hydratedAt: string;
   readyAt: number; archiveAfter: string; createdAt: string; team: { id: string }; stop?: { id: string; status: string } };
 type LogEntry = { seq: number; at: number; kind: "boat" | "event" | "mark"; method?: string; path?: string; id?: string; purpose?: string; configHash?: string; note?: string };
 type Hold = { method: string; path: RegExp; hit: boolean; released: boolean; release(): void; wait: Promise<void> };
@@ -73,6 +74,7 @@ class FakeBoat {
     if (method === "POST" && route === "/sandboxes") {
       const purpose = body.labels.purpose === "spare" ? "spare" : "run";
       const box: Box = { id: `bx_${purpose}${String(++this.counter).padStart(4, "0")}`, labels: { ...body.labels }, name: "",
+        hydrated: true, hydratedAt: new Date().toISOString(),
         state: "creating", readyAt: Date.now() + CREATE_LATENCY_MS,
         archiveAfter: new Date(Date.now() + body.ttlSeconds * 1000).toISOString(), createdAt: new Date().toISOString(), team: { id: "team-spare-off" } };
       this.boxes.set(box.id, box);

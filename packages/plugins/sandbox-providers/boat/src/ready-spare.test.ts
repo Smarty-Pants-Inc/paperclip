@@ -31,7 +31,7 @@ function inventorySpare(options: { hash?: string; environment?: string; company?
     state: options.state ?? "running", warmed: options.warmed ?? true, expiresAt: expiry,
     name: options.warmed === false ? `paperclip-spare:warming:${configHash}` : `paperclip-spare:ready:${configHash}`,
     labels, ttlSeconds: 1800,
-    providerObservation: { id: options.id ?? "bx_warm_0001", state: options.state ?? "running", name: options.warmed === false ? `paperclip-spare:warming:${configHash}` : `paperclip-spare:ready:${configHash}`, labels, team: { id: "team-spare-test" } },
+    providerObservation: { id: options.id ?? "bx_warm_0001", hydrated: true, hydratedAt: new Date().toISOString(), state: options.state ?? "running", name: options.warmed === false ? `paperclip-spare:warming:${configHash}` : `paperclip-spare:ready:${configHash}`, labels, team: { id: "team-spare-test" } },
   };
 }
 function fixture(initial: ReadySpare[] = [], warmExitCode = 0, warmTimedOut = false) {
@@ -50,7 +50,7 @@ function fixture(initial: ReadySpare[] = [], warmExitCode = 0, warmTimedOut = fa
     }
     if (method === "POST" && route === "/sandboxes") {
       const id = body.labels.purpose === "spare" ? `bx_spare_${inventory.length}` : `bx_run_${inventory.length}`;
-      const sb = { id, state: "running", name: "", labels: body.labels, archiveAfter: new Date(Date.now() + body.ttlSeconds * 1000).toISOString(), createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(), team: { id: "team-spare-test" } };
+      const sb = { id, hydrated: true, hydratedAt: new Date().toISOString(), state: "running", name: "", labels: body.labels, archiveAfter: new Date(Date.now() + body.ttlSeconds * 1000).toISOString(), createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(), team: { id: "team-spare-test" } };
       inventory.push(sb);
       return response({ sandbox: sb }, 202);
     }

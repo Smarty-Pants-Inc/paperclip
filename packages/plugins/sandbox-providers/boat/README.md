@@ -93,8 +93,10 @@ Claims replace a spare; they never expand that bound. Acquisition history still
 uses `spareDemandWindowMinutes` for compatibility, but does not scale the pool.
 Set **`spares=0`** to disable creation and retire every unclaimed spare,
 including ready, idle and running boxes, by confirmed, non-force stop (never
-delete). Stop debt is recorded before the request and retained until Boat
-confirms completion. A delivered config change applies it
+delete). Stop debt is recorded before the request when state is available and
+retained until Boat confirms completion. A failed state write never blocks a
+safe stop; debt remains in worker memory and retries still run during the outage.
+An unfinished refill is visible to OFF retirement too, not hidden for warming. A delivered config change applies it
 immediately; the next existing 15-second maintenance tick also re-reads the
 durable setting, so OFF does not depend on delivery of a config event. Once
 retirement/debt settles, the spare timer stops. No environment edit is needed.
@@ -119,7 +121,16 @@ the configured idle window; otherwise it is idle.
 A spare's Boat auto-stop TTL is renewed while its company is active, so a warm
 spare does not silently go cold. Once idle, no renewal occurs; confirmed stop is
 attempted and Boat's existing TTL remains the crash/outage bound. A never-used
-environment is first discovered at its first acquire.
+environment is first discovered at its first acquire. The worker remembers that
+environment's effective create config even while OFF: enabling spares then starts
+fill directly from the config-change event, without waiting for another chat or
+health check. The stateful regression requires first create dispatch within 15 s
+and observes 0 ms of scheduling delay (provider calls/provisioning are external).
+This is not an unconditional hydration deadline. A never-acquired environment,
+or one not yet reacquired after worker restart, has no environment credentials in
+the policy-only config hook: it logs that first fill awaits an acquisition. No
+15-second first-fill promise applies until that prerequisite is met. The existing
+timer does not refill because it cannot use the scoped claim-store path.
 
 The keeper creates each spare from the same environment create body as an
 ordinary lease: configured type/size, effective Boat TTL, resolved snapshot or
@@ -136,8 +147,21 @@ change labels, so claim custody is recorded durably in the sandbox `name` as
 
 Only a ready/idle/running spare whose environment setup completed, expiry is
 still in the future, and company/environment/config hash all match can be claimed.
-A fresh GET, claim PATCH and verification GET must show no stop record. The
-claim is reserved in-process and in the plugin's database before the PATCH.
+A fresh GET, claim PATCH and verification GET must show no stop record and
+Boat's documented `hydrated: true`. A ready name or running state alone does not
+prove snapshot files finished copying. Missing or false hydration evidence takes
+the ordinary create path with **0 ms hydration-wait budget**; the plugin has no
+provider-reported bound on remaining hydration and does not delay a cold create
+on a guess. `hydratedAt` is preserved in the provider observation; Boat documents
+it as null when a fresh box restored nothing, so true/null is valid. The claim is
+reserved in-process and in the plugin's database before the PATCH.
+
+Hire/environment probes never consume spares: the host passes `issueId: null`
+for these no-run allocations even though their `runId` is a synthetic UUID.
+`resolveSnapshotIdentity` probes and login acquisitions also bypass spare claims.
+Legacy callers omitting `issueId` retain their existing run behavior; no ID-prefix
+heuristic is used. Probes still teach the environment config and may refill an
+explicitly enabled pool, but their released leases are ordinary boxes.
 On a cache miss (including worker restart), the acquire first awaits a read-only
 inventory discovery with a 2.5-second aggregate list budget. It tries the ready
 spare **before** any ordinary run create; unreadable inventory or an unhealthy
@@ -153,8 +177,12 @@ visible pending inventory is adopted by that same refill. The run and refill
 paths share the key-making and stable-expiry helpers. The stored body contains
 the configured create fields (including any setup script or labels), not the
 Boat authentication header. Unreadable or unwritable identity state fails closed.
-An unresolved identity past Boat's 24-hour key lifetime, or a key-reused refusal,
-requires reconciliation rather than silently minting a new key. Every send
+A key-reused refusal is logged once and retained for reconciliation, but is not
+selected for another send. Complete scoped inventory forgets an expired identity
+with no labelled box, allowing a new refill. An expired identity with an existing
+labelled box can finish warming that exact sandbox ID without resending the old
+key. Expired keys are never sent again; unreadable inventory never licenses a
+replacement identity. Every send
 re-reads the current target and reserves only its remaining room after ready
 inventory and concurrent sends; a lowered target cannot send the old batch.
 The next maintenance tick retires excess idle inventory by the same owed-stop path.

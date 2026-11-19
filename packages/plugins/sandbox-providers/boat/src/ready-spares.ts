@@ -302,7 +302,12 @@ function stopRequested(spare: ReadySpare): boolean {
 
 /** Claimable now: Boat's fresh record of the box is a ready, idle-clean spare of this pool. */
 function claimableNow(spare: ReadySpare, key: ReadySpareKey, now: number): boolean {
-  return readyAndHealthy(spare, key, now) && !stopRequested(spare);
+  // Boat's ready/running state and our name token do NOT mean snapshot files
+  // finished copying. `hydrated` is Boat's documented end signal; absence is
+  // unknown, never permission to spend a warm claim. No hydration wait: a miss
+  // immediately takes the ordinary create path (gate-6 cold median 5.9 s).
+  return readyAndHealthy(spare, key, now) && !stopRequested(spare)
+    && spare.providerObservation?.hydrated === true;
 }
 
 /**
@@ -618,8 +623,9 @@ export class ReadySpareKeeper {
     }
     this.stoppingSpares.add(spare.id);
     try {
-      // Debt must exist before the side effect, including a worker cutover.
-      await this.stopRecordListener?.({ outcome: "owed", key, spareId: spare.id });
+      // Try durable debt first, but a state outage must not block the safe
+      // direction. The plugin listener keeps the debt in memory before writing.
+      try { await this.stopRecordListener?.({ outcome: "owed", key, spareId: spare.id }); } catch { /* Stop still owed locally. */ }
       await operations.stop(spare);
     }
     catch (error) {
@@ -638,7 +644,7 @@ export class ReadySpareKeeper {
     finally { this.stoppingSpares.delete(spare.id); }
     this.stopBackoffs.delete(readySparePoolKey(key));
     this.stopFailedSpares.delete(spare.id);
-    await this.stopRecordListener?.({ outcome: "stopped", key, spareId: spare.id });
+    try { await this.stopRecordListener?.({ outcome: "stopped", key, spareId: spare.id }); } catch { /* Provider confirmed stop; stale durable debt is safe to replay. */ }
     return true;
   }
 
