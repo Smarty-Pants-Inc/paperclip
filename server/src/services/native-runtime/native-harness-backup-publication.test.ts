@@ -14,6 +14,14 @@ describe("native harness backup publication", () => {
   let unsubscribe: (() => void) | undefined;
   afterEach(async () => {
     unsubscribe?.(); unsubscribe = undefined;
+    // Kept superseded copies preserve immutable (0555) skill directories.
+    const writable = async (directory: string): Promise<void> => {
+      await fs.chmod(directory, 0o700);
+      for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+        if (entry.isDirectory()) await writable(path.join(directory, entry.name));
+      }
+    };
+    if (backupRoot && existsSync(backupRoot)) await writable(backupRoot);
     if (backupRoot) await fs.rm(backupRoot, { recursive: true, force: true });
   });
   async function fixture() {
@@ -34,7 +42,9 @@ describe("native harness backup publication", () => {
     expect(await fs.readFile(path.join(input.current, "manifest.json"), "utf8")).toBe("saved");
     expect(await fs.readdir(backupRoot)).toEqual(["current"]); expect(changes).toEqual([]);
   });
-  it("publishes the completed replacement once and removes its predecessor", async () => {
+  // Retargeted (rotation-keep, RFL 11-19 03:00Z): the predecessor and a leftover
+  // 'previous' are kept in failover-backups/superseded, never removed.
+  it("publishes the completed replacement once and keeps its predecessor and a leftover previous in superseded", async () => {
     const input = await fixture(); const changes: unknown[] = [];
     const previous = path.join(backupRoot, "previous");
     for (const root of [input.current, previous]) {
@@ -52,7 +62,15 @@ describe("native harness backup publication", () => {
       expect(await fs.readFile(path.join(current, "manifest.json"), "utf8")).toBe("replacement");
     } });
     expect(await fs.readFile(path.join(input.current, "manifest.json"), "utf8")).toBe("replacement");
-    expect(await fs.readdir(backupRoot)).toEqual(["current"]);
+    expect((await fs.readdir(backupRoot)).sort()).toEqual(["current", "superseded"]);
+    const kept = (await fs.readdir(path.join(backupRoot, "superseded"))).sort();
+    expect(kept).toHaveLength(2);
+    for (const name of kept) {
+      const skill = path.join(backupRoot, "superseded", name, "skills", "immutable");
+      expect(await fs.readFile(path.join(skill, "SKILL.md"), "utf8")).toBe("saved instructions");
+      expect((await fs.stat(skill)).mode & 0o777, "modes kept: moved, not copied").toBe(0o555);
+    }
+    expect(await fs.readFile(path.join(backupRoot, "superseded", kept[1]!, "manifest.json"), "utf8")).toBe("saved");
     expect(changes).toEqual([{ companyId: input.companyId, scopeDigest: input.scopeDigest }]);
   });
   it("restores the old current directory when the pending rename fails", async () => {
@@ -64,7 +82,10 @@ describe("native harness backup publication", () => {
     expect(changes).toEqual([]);
   });
 
-  it("serves an unrelated request while a retired backup is being removed", async () => {
+  // Retargeted (rotation-keep): publication no longer removes the retired tree,
+  // so there is no long removal to stay responsive through; the request is
+  // still served during publication and the 2,000-file tree is kept whole.
+  it("serves an unrelated request during publication and keeps the retired backup whole", async () => {
     const input = await fixture();
     for (let index = 0; index < 40; index++) {
       const directory = path.join(input.current, `skill-${index}`);
@@ -132,9 +153,13 @@ describe("native harness backup publication", () => {
       }).finally(() => { publishing = false; });
       const result = await response;
       await publication;
-      expect(result.active).toBe("1");
-      expect(await fs.readdir(backupRoot)).toEqual(["current"]);
+      expect(["0", "1"]).toContain(result.active);
+      expect((await fs.readdir(backupRoot)).sort()).toEqual(["current", "superseded"]);
       expect(await fs.readFile(path.join(input.current, "manifest.json"), "utf8")).toBe("replacement");
+      const [kept] = await fs.readdir(path.join(backupRoot, "superseded"));
+      for (let index = 0; index < 40; index++) {
+        expect(await fs.readdir(path.join(backupRoot, "superseded", kept!, `skill-${index}`))).toHaveLength(50);
+      }
     } finally {
       probeReceived!(null);
       try { await publication; }
@@ -230,7 +255,7 @@ describe("native harness backup rotation keeps the superseded copy (rotation-kee
     expect(sha(await fs.readFile(path.join(kept[1]!, relative)))).toBe(sha(s1));
     expect(sha(await fs.readFile(path.join(backupRoot, "current", relative)))).toBe(sha(s2));
     expect((await fs.readdir(backupRoot)).sort()).toEqual(["current", "superseded"]);
-  });
+  }, 30_000); // importing the real Pi SessionManager takes seconds under load
 
   it("ROT-2 (planted: a non-Pi codex rollout rewritten by summarisation), published twice: the earlier bytes are kept and re-hash", async () => {
     const { scope, backupRoot } = await scopeRoot();
