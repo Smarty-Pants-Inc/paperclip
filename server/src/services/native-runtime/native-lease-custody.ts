@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import {
   environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeHarnessBackups, type Db,
 } from "@paperclipai/db";
@@ -33,12 +33,44 @@ export async function nativeLeaseChainCustodyStamp(db: Db, lease: CustodyLease,
   return stamp;
 }
 
-/** Names a native box kept (stopped, not destroyed) because no verified saved
- * harness copy exists. Set on the orphan-recovery marker of the stop intent;
+/** Names a native box kept, never destroyed, because no verified saved harness
+ * copy exists. Addressable boxes are stopped; an unaddressable binding records
+ * retained/unstoppable custody without claiming a stop. Set on the orphan-recovery marker of the stop intent;
  * the retained-orphan settle owns it, counts its custody attempts and
  * escalates after the cleanup cap. */
 export const NATIVE_CUSTODY_UNVERIFIED_KEY = "nativeCustodyUnverified";
 export const NATIVE_CUSTODY_UNVERIFIED_REASON = "native_custody_unverified";
+
+/** A kept, possibly RUNNING allocation, not a termination receipt. Only the
+ * fresh-replacement admission caller may disregard this resource obligation.
+ * Ordinary cleanup, stop-proof and recovery readers must still see it. */
+export function hasRetainedUnaddressableNativeCustody(lease: Pick<typeof environmentLeases.$inferSelect,
+  "status" | "cleanupStatus" | "failureReason" | "heartbeatRunId" | "metadata">): boolean {
+  const recovery = lease.metadata?.orphanedRunLeaseRecovery as Record<string, unknown> | undefined;
+  const replacement = lease.metadata?.replaceBeforeReuse as Record<string, unknown> | undefined;
+  return !!lease.heartbeatRunId && lease.status === "retained" && lease.cleanupStatus === "failed"
+    && lease.failureReason === "native_custody_stop_unavailable"
+    && recovery?.nativeCustodyUnverified === true && recovery.recoveredOrphanedRunLease === true
+    && recovery.ownerProof === NATIVE_CUSTODY_UNVERIFIED_REASON && recovery.runId === lease.heartbeatRunId
+    && recovery.disposition === "retained_unstoppable"
+    && replacement?.schema === "paperclip.replace-before-reuse.v1" && replacement.runId === lease.heartbeatRunId;
+}
+
+/** SQL mirror shared by the retained-orphan owner and environment deletion.
+ * A policy cannot hide this still-live obligation; ordinary released rows do
+ * not qualify, even if they carry old recovery metadata. */
+export function retainedUnaddressableNativeCustodyCondition() {
+  return and(eq(environmentLeases.status, "retained"), eq(environmentLeases.cleanupStatus, "failed"),
+    eq(environmentLeases.failureReason, "native_custody_stop_unavailable"),
+    sql`${environmentLeases.heartbeatRunId} is not null`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,nativeCustodyUnverified}' = 'true'`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,recoveredOrphanedRunLease}' = 'true'`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,ownerProof}' = ${NATIVE_CUSTODY_UNVERIFIED_REASON}`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,runId}' = ${environmentLeases.heartbeatRunId}::text`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,disposition}' = 'retained_unstoppable'`,
+    sql`${environmentLeases.metadata}#>>'{replaceBeforeReuse,schema}' = 'paperclip.replace-before-reuse.v1'`,
+    sql`${environmentLeases.metadata}#>>'{replaceBeforeReuse,runId}' = ${environmentLeases.heartbeatRunId}::text`);
+}
 
 /**
  * THE custody check before any destructive cleanup of a native lease,

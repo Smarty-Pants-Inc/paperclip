@@ -5,6 +5,28 @@ mechanisms to test, not assumptions about the current incident. Read only the
 sections that match the evidence. Resolve current contracts and implementation
 from the repository; no historical task or private conversation is required.
 
+## Native custody cannot address the previous sandbox
+
+**Mechanism:** A failed native predecessor has no verified harness copy, but its
+lease has no provider plugin pin. A stop-only intent cannot be validated. Leaving
+that lease in `pending_cleanup` permanently blocks the ordinary fresh-box retry.
+
+**Prove:** Use real PostgreSQL, predispatch retry, pending-cleanup sweep and queue
+admission. The unpinned predecessor releases cleanup ownership into the existing
+`released` state with a named retained/unstoppable custody obligation. No stop or
+destruction receipt is invented and no destructive call reaches the old box. A
+pinned twin still needs a real stop receipt. The old transcript must publish and
+restore through the existing sealed-session backup owner after selection moves to
+the successor. Removing the custody obligation must revoke this copy-only anchor.
+Also test persisted invalid intents and truthful failure if the new
+allocation cannot start. See `native-lease-custody-unpinned.test.ts`.
+
+**Trap:** `released` describes cleanup ownership, not a stopped provider resource.
+Do not infer safe reuse or deletion from it, remove the custody marker, add a
+cleanup timer, or loosen the backup owner's closed-source checks. A separately
+seeded closed-source archive is not proof that a running successor's predecessor
+was archived automatically.
+
 ## An interrupted turn becomes a permanent task failure
 
 **Mechanism:** A server restart restores session history, but the old active turn

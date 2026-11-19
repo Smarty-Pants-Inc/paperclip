@@ -33,7 +33,7 @@ import { executeEnvironmentTask, pluginEnvironmentSupportsTasks, settleDispatche
 import { allowLegacyShutdownWorkspaceCleanup, legacyShutdownWorkspaceResourceProtected } from "./legacy-shutdown-workspace-settlement.js";
 import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-runtime/native-workspace-finalization-state.js";
 import { hasNativeHarnessBackupMissing } from "./native-runtime/native-harness-backup-missing.js";
-import { nativeCustodyKeptRecovery, nativeLeaseChainCustodyStamp, nativeLeaseCustodyMissing } from "./native-runtime/native-lease-custody.js";
+import { hasRetainedUnaddressableNativeCustody, nativeCustodyKeptRecovery, nativeLeaseChainCustodyStamp, nativeLeaseCustodyMissing } from "./native-runtime/native-lease-custody.js";
 import { abandonedWorkspaceFilesHeldOnLease, abandonedWorkspaceFilesParked, parkAbandonedWorkspaceFilesLease } from "./remote-workspace-abandoned-files-hold.js";
 import { beginIdleTrackedWork } from "./task-admission.js";
 import { historicalProviderCredentials } from "./historical-provider-credentials.js";
@@ -4793,6 +4793,9 @@ export function environmentRuntimeService(
       const released: EnvironmentRuntimeLeaseRecord[] = [];
       for (let leaseRow of leaseRows) {
         try {
+          // This possibly live allocation belongs to retained-orphan tracking,
+          // not ordinary release, even after its sealed transcript is copied.
+          if (hasRetainedUnaddressableNativeCustody(leaseRow)) continue;
           let providerResourceDisposition = desiredProviderResourceDisposition;
           if (providerResourceDisposition !== "stop_and_retain" && providerResourceDisposition !== "keep_running"
             && !hasStopOnlyCleanup(leaseRow) && await nativeWorkspaceExportPendingForLease(db, leaseRow)) continue;
@@ -4829,6 +4832,9 @@ export function environmentRuntimeService(
               custodyKept ? nativeCustodyKeptRecovery() : undefined);
             if (!prepared) continue;
             leaseSnapshot = toEnvironmentLeaseSnapshot(prepared);
+            // Retention without a stop is NOT a successful release receipt.
+            // Its separate retained-orphan owner keeps tracking the live box.
+            if (hasRetainedUnaddressableNativeCustody(prepared)) continue;
             preparedStopAttemptId = prepared.metadata?.pendingCleanupAttemptId;
           }
           if (hasStopOnlyCleanup(leaseSnapshot)) {
@@ -4979,6 +4985,63 @@ export function environmentRuntimeService(
     // record, so a deleted or foreign-bound environment never strands it. The
     // caller owns the lease release; this dispatcher only runs the provider
     // teardown and throws when the driver teardown throws.
+    /** Last, stop-only recovery of an unaddressable custody allocation. This
+     * deliberately does NOT use historical pin/config fallbacks or the normal
+     * release/destroy dispatcher. Ambiguity is a manual-stop obligation. */
+    async stopRetainedCustodyLease(leaseId: string, attemptId: string): Promise<boolean> {
+      const pluginWorkerManager = options.pluginWorkerManager;
+      const lease = await environmentsSvc.getLeaseById(leaseId);
+      const expiry = lease?.metadata?.nativeCustodyExpiry as Record<string, unknown> | undefined;
+      if (!lease || !hasRetainedUnaddressableNativeCustody(lease) || !lease.environmentId || !lease.providerLeaseId
+        || expiry?.state !== "attempting" || expiry.attemptId !== attemptId || !pluginWorkerManager) return false;
+      const environment = await environmentsSvc.getById(lease.environmentId);
+      if (!environment || environment.driver !== "sandbox") return false;
+      // Resolve the provider ONLY from the environment's CURRENT config.
+      // Reject ambiguity before choosing a schema or resolving any credentials.
+      const parsed = parseEnvironmentDriverConfig(environment);
+      if (parsed.driver !== "sandbox" || parsed.config.provider !== lease.provider) return false;
+      const provider = parsed.config.provider;
+      const candidates = await pluginRegistryService(db).list({ sandboxProviderDriverKey: provider });
+      const matches = candidates.flatMap(plugin => (plugin.manifestJson.environmentDrivers ?? [])
+        .filter(driver => driver.driverKey === provider && driver.kind === "sandbox_provider")
+        .map(driver => ({ plugin, driver })));
+      // A disabled/second installation is still ambiguity: never pick first.
+      if (matches.length !== 1) return false;
+      const { plugin } = matches[0]!;
+      const methods = pluginWorkerManager.getWorker(plugin.id)?.supportedMethods ?? [];
+      if (plugin.status !== "ready" || !pluginWorkerManager.isRunning(plugin.id)
+        || !["environmentInspectLease", "environmentStopLease"].every(method => methods.includes(method))) return false;
+      const resolved = await resolveEnvironmentDriverConfigForRuntime(db, lease.companyId, environment,
+        { readOnlyInspection: options.readOnlyInspection });
+      if (resolved.driver !== "sandbox" || resolved.config.provider !== provider) return false;
+      const config = stripSandboxProviderEnvelope(resolved.config);
+      const params = { driverKey: provider, companyId: lease.companyId, environmentId: environment.id,
+        issueId: lease.issueId, config, providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata ?? {} };
+      const observed = await pluginWorkerManager.call(plugin.id, "environmentInspectLease", params, 15_000);
+      const boxId = readString(lease.metadata?.sandboxId) ?? lease.providerLeaseId;
+      // Both identities are required. An echoed lookup id alone does not prove
+      // that this provider found the recorded box (aliases can resolve elsewhere).
+      if (observed.providerLeaseId !== lease.providerLeaseId || observed.boxId !== boxId
+        || !["active", "stopped"].includes(observed.state)) return false;
+      const [current] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+      const [currentEnvironment] = await db.select().from(environments).where(eq(environments.id, environment.id));
+      const [other] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+        ne(environmentLeases.id, leaseId), eq(environmentLeases.provider, provider),
+        eq(environmentLeases.providerLeaseId, lease.providerLeaseId),
+        inArray(environmentLeases.status, ["active", "retained", "pending_cleanup"]))).limit(1);
+      if (!current || !hasRetainedUnaddressableNativeCustody(current) || other
+        || current.provider !== provider || current.providerLeaseId !== lease.providerLeaseId
+        || current.environmentId !== environment.id || (readString(current.metadata?.sandboxId) ?? current.providerLeaseId) !== boxId
+        || (current.metadata?.nativeCustodyExpiry as Record<string, unknown> | undefined)?.attemptId !== attemptId
+        || (current.metadata?.nativeCustodyExpiry as Record<string, unknown> | undefined)?.state !== "attempting"
+        || !currentEnvironment || currentEnvironment.driver !== environment.driver
+        || JSON.stringify(currentEnvironment.config) !== JSON.stringify(environment.config)) return false;
+      if (observed.state === "stopped") return true;
+      const receipt = await pluginWorkerManager.call(plugin.id, "environmentStopLease",
+        { ...params, resourceDisposition: "stop_and_retain", cancelActiveWork: true }, 60_000);
+      return receipt?.providerLeaseId === lease.providerLeaseId && receipt.state === "stopped";
+    },
+
     /**
      * A FRESH provider read of a predecessor run's sandbox, for the shared
      * prior-owner-proven-gone predicate (remoteRunnerGenerationLost). Unlike
