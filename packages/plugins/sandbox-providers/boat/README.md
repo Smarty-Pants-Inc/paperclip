@@ -1,5 +1,45 @@
 # Boat sandbox provider 0.1.16-spare (unreleased)
 
+## Provisioning-tail hedge
+
+An ordinary acquisition whose first box still reports `provisioning` after
+**75 seconds** starts at most **one** hedge create. Both ready observers race
+inside the original **180-second acquisition budget**; `ready`, `idle`, or
+`running` wins. An observed `error` or `archived` primary before the hedge starts
+keeps the existing failure path. Readiness does not wait for hydration, and the
+ready-spare pool's claim rules are unchanged.
+
+Before the hedge POST, company-scoped plugin state (`boat-provision-hedges`)
+stores its own creation identity from the shared key maker, exact request body,
+primary box ID, and original start time. Reacquiring that operation after a
+worker restart repeats the stored key/body and retains the original deadline;
+it cannot allocate a third identity. Both boxes carry the parent
+`paperclip-acquire` label for core's existing creation cleanup. The hedge also
+carries `paperclip-hedge-of` and its own `creation` label/Idempotency-Key. Its create
+is counted as paid run inventory, not as a spare refill. The stored create body
+can include configured setup text/labels, as pending spare refill state already
+does; it contains no authentication header.
+
+The winner decision is persisted before handing off. Losers enter the existing
+durable `stop-owed` queue, with exact known IDs and acquisition ownership; only
+non-force stop is used, never delete. The winner ID is excluded from that debt.
+Missing list entries cannot erase known loser IDs. A refused stop remains owed
+and is retried by the existing maintenance service, including with spares OFF.
+An unanswered hedge POST retains identity-level debt through the shared
+30-minute creation-settle floor so a late box can be found and stopped. Core's
+abandoned-creation inspection reconstructs this debt if the worker died before
+a winner decision. This protocol assumes replacement, not overlapping independent
+workers; the local intent-write serialization is not a distributed compare-and-set.
+
+A plugin context without durable state retains the single-create behavior rather
+than send an unrecoverable hedge. No new background poller is introduced: only
+bounded active readiness waits and unresolved owed stops keep existing work alive.
+The one `boat.acquire.phases` line gains `phasesMs.hedge` (time from hedge start
+to selection/settlement), and `source: "hedge"` when the hedge box wins. Phase
+intervals remain non-overlapping and sum to the acquisition total. Scripted Boat
+rows cover the timing, budget, money, restart and stop-debt boundaries; they are
+not live Boat or installed-chat acceptance evidence.
+
 ## Operator-only fault-proxy API override
 
 Normal environments omit `apiBaseUrl` and use `https://boat.dev/api/v1`; no

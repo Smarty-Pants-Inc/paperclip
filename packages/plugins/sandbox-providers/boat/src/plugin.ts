@@ -577,9 +577,10 @@ async function admitSpareCreate(key: ReadySpareKey, refillId?: string): Promise<
  * each pool's owed-until hold and each spare whose stop is still owed.
  */
 const SPARE_STOP_OWED_STATE_KEY = "stop-owed";
+type AcquisitionStopDebt = { attemptId: string; runId?: string; keepId: string; ids: string[]; settleUntil: number };
 type OwedSpareStops = {
   holds: Array<{ environmentId: string; configHash: string; until: number; failures: number; retries: number }>;
-  owed: Array<{ environmentId: string; configHash: string; spareId: string }>;
+  owed: Array<{ environmentId: string; configHash: string; spareId: string; acquisition?: AcquisitionStopDebt }>;
 };
 const companyOwedStops = new Map<string, OwedSpareStops>();
 const companyOwedStopLoads = new Map<string, Promise<OwedSpareStops>>();
@@ -636,7 +637,13 @@ async function loadOwedSpareStops(companyId: string): Promise<OwedSpareStops> {
       if (Array.isArray(value.owed)) for (const row of value.owed) {
         const owed = row as Record<string, unknown> | null;
         if (owed && text(owed.environmentId) && text(owed.configHash) && text(owed.spareId)) {
-          record.owed.push({ environmentId: owed.environmentId, configHash: owed.configHash, spareId: owed.spareId });
+          const acquisition = owed.acquisition as AcquisitionStopDebt | undefined;
+          if (acquisition !== undefined && (!acquisition || typeof acquisition.attemptId !== "string"
+              || typeof acquisition.keepId !== "string" || !Number.isFinite(acquisition.settleUntil)
+              || !Array.isArray(acquisition.ids) || acquisition.ids.some(id => typeof id !== "string" || !id)
+              || (acquisition.runId !== undefined && typeof acquisition.runId !== "string"))) throw new Error("Boat acquisition stop debt is invalid");
+          record.owed.push({ environmentId: owed.environmentId, configHash: owed.configHash, spareId: owed.spareId,
+            ...(acquisition ? { acquisition } : {}) });
         }
       }
     } catch (error) {
@@ -669,8 +676,9 @@ async function recordSpareStop(record: SpareStopRecord): Promise<void> {
   if (record.outcome === "stopped" && !owed.owed.some(entry => entry.spareId === record.spareId)
       && !owed.holds.some(hold => hold.environmentId === environmentId && hold.configHash === configHash)) return;
   const previous = owed.holds.find(hold => hold.environmentId === environmentId && hold.configHash === configHash);
+  const previousDebt = owed.owed.find(entry => entry.spareId === record.spareId);
   owed.owed = owed.owed.filter(entry => entry.spareId !== record.spareId);
-  if (record.outcome !== "stopped") owed.owed.push({ environmentId, configHash, spareId: record.spareId });
+  if (record.outcome !== "stopped") owed.owed.push({ ...previousDebt, environmentId, configHash, spareId: record.spareId });
   if (record.outcome === "owed") {
     if (owedStopKeys.has(JSON.stringify([companyId, environmentId]))) ensureSpareRefreshTimer();
     await persistOwedSpareStops(companyId, owed);
@@ -722,6 +730,38 @@ async function resumeOwedSpareStops(config: Config, companyId: string, environme
     for (const entry of owed) {
       if (shuttingDown) return;
       const key = { companyId, environmentId, configHash: entry.configHash };
+      // Provisioning hedges use the same durable owed-stop queue, but own an
+      // acquisition (including a create with no HTTP answer), not a spare.
+      // Never apply spare claim/retirement rules to a run's losing allocation.
+      if (entry.acquisition) {
+        try {
+          const debt = entry.acquisition;
+          const listed = await acquisitionMatches(config, debt.attemptId, { companyId, environmentId, runId: debt.runId });
+          // Known IDs are owed even if an eventually consistent list omits one.
+          const ids = new Set([...debt.ids, ...listed]);
+          if (ids.size !== debt.ids.length) {
+            debt.ids = [...ids];
+            await persistOwedSpareStops(companyId, record);
+          }
+          for (const id of ids) {
+            if (id === debt.keepId || shuttingDown) continue;
+            const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`);
+            const sandbox = result.sandbox ?? result;
+            assertSandboxId(sandbox, id);
+            if (sandbox.labels?.owner !== `paperclip:${companyId}` || sandbox.labels?.environment !== environmentId
+                || sandbox.labels?.["paperclip-acquire"] !== debt.attemptId
+                || (debt.runId !== undefined && sandbox.labels?.run !== debt.runId)) throw new Error("Boat hedge stop ownership changed");
+            if (!["archived", "stopped"].includes(sandbox.state)) await stopSandbox(config, id);
+          }
+          // An unanswered create can still appear. Absence before the shared
+          // creation settle floor never discharges that identity's debt.
+          if (Date.now() >= debt.settleUntil) await recordSpareStop({ outcome: "stopped", key, spareId: entry.spareId });
+        } catch {
+          await recordSpareStop({ outcome: "failed", key, spareId: entry.spareId,
+            until: Date.now() + READY_SPARE_STOP_BACKOFF_MS, failures: 1 });
+        }
+        continue;
+      }
       let sandbox: any;
       try {
         const result = await request(config, `/sandboxes/${encodeURIComponent(entry.spareId)}`, { method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000) }, true, { requireJson: true });
@@ -1386,6 +1426,8 @@ class BoatSandboxStateError extends Error {
 // the start of this create attempt.
 const BOAT_CREATE_ATTEMPT_MS = 90_000;
 const BOAT_ACQUIRE_ATTEMPT_BUDGET_MS = 180_000;
+// Most observed creates reach running in 40–90s; one tail gets one hedge at 75s.
+const BOAT_PROVISION_HEDGE_MS = 75_000;
 const BOAT_CREATE_LOOKUP_INTERVAL_MS = 5_000;
 /**
  * A step's own abort signal, never past the acquisition budget's end (rf-4 U3b
@@ -1399,12 +1441,12 @@ function withinBudget(deadline: number, ms: number): AbortSignal {
 }
 /** The acquisition budget's step state: each step enters by name, and no step starts after the budget. */
 type AcquisitionBudget = { deadline: number; enter: (phase: string) => void };
-/** rf-4 U3 C3: the five phases one `boat.acquire.phases` line stamps. */
-const ACQUIRE_PHASES = ["create", "ready", "setup", "sync", "handoff"] as const;
+/** Non-overlapping intervals stamped by the one `boat.acquire.phases` line. */
+const ACQUIRE_PHASES = ["create", "ready", "hedge", "setup", "sync", "handoff"] as const;
 // Budget step name -> stamped phase. "handoff" entered before the handoff's
 // calls starts sync (sentinel, guardian, file writes); "duplex" (binding the
 // lease) starts handoff, which runs until the lease is returned.
-const ACQUIRE_PHASE_OF: Record<string, number> = { create: 0, adopt: 0, ready: 1, setup: 2, handoff: 3, sentinel: 3, guardian: 3, duplex: 4 };
+const ACQUIRE_PHASE_OF: Record<string, number> = { create: 0, adopt: 0, ready: 1, hedge: 2, setup: 3, handoff: 4, sentinel: 4, guardian: 4, duplex: 5 };
 /**
  * The acquisition's phase clock (rf-4 U3 C3). Steps only move forward; a phase
  * never entered is 0 ms, and the phases sum to the total exactly.
@@ -1428,7 +1470,7 @@ function acquirePhaseClock(startedAt: number) {
 }
 type AcquirePhaseStamp = { phasesMs: Record<(typeof ACQUIRE_PHASES)[number], number>; totalMs: number };
 /** What an ordinary create reports to the acquisition's one line. */
-type OrdinaryAcquireStamp = AcquirePhaseStamp & { startedAt: number; source: "created" | "adopted"; outcome: "ok" | "budget" | "error"; failedPhase?: string };
+type OrdinaryAcquireStamp = AcquirePhaseStamp & { startedAt: number; source: "created" | "adopted" | "hedge"; outcome: "ok" | "budget" | "error"; failedPhase?: string };
 /**
  * review-fleet-4 C1 (rf4-u3c F2): the ONE outer `boat.acquire.phases` emitter.
  * It wraps the whole acquisition hook, so every exit (a warmed-spare handoff,
@@ -1449,8 +1491,8 @@ function acquirePhaseLine(params: { companyId: string; environmentId: string }, 
       emitted = true;
       try {
         const endedAt = Date.now();
-        const phasesMs = { preflight: 0, create: 0, ready: 0, setup: 0, sync: 0, handoff: 0 };
-        let source: "created" | "adopted" | "spare" | "none", outcome: "ok" | "budget" | "error", failedPhase: string | undefined;
+        const phasesMs = { preflight: 0, create: 0, ready: 0, hedge: 0, setup: 0, sync: 0, handoff: 0 };
+        let source: "created" | "adopted" | "hedge" | "spare" | "none", outcome: "ok" | "budget" | "error", failedPhase: string | undefined;
         if (ordinary) {
           Object.assign(phasesMs, ordinary.phasesMs);
           phasesMs.preflight = Math.max(0, ordinary.startedAt - startedAt);
@@ -1583,6 +1625,157 @@ async function creationExpiry(companyId: string, creationId: string, ttlSeconds:
   finally { if (createExpiryWrites.get(companyId) === write) createExpiryWrites.delete(companyId); }
   return expiry;
 }
+type ProvisionHedge = {
+  environmentId: string; runId?: string; hedgeId: string; body: string;
+  startedAt: number; firstId: string; hedgeBoxId?: string; winnerId?: string;
+};
+const provisionHedgeWrites = new Map<string, Promise<ProvisionHedge>>();
+function provisionHedgeScope(owner: { companyId: string; environmentId: string }, attemptId: string) {
+  return { scopeKind: "company" as const, scopeId: owner.companyId, namespace: "boat-provision-hedges", stateKey: `${owner.environmentId}:${attemptId}` };
+}
+async function loadProvisionHedge(owner: { companyId: string; environmentId: string; runId?: string }, attemptId: string): Promise<ProvisionHedge | undefined> {
+  const state = pluginContext?.state;
+  if (!state?.get || !state?.set) return undefined;
+  const value = await state.get(provisionHedgeScope(owner, attemptId));
+  if (value == null) return undefined;
+  const record = value as ProvisionHedge;
+  if (record.environmentId !== owner.environmentId || record.runId !== owner.runId || typeof record.hedgeId !== "string"
+      || !record.hedgeId || typeof record.body !== "string" || !Number.isFinite(record.startedAt) || typeof record.firstId !== "string"
+      || (record.hedgeBoxId !== undefined && typeof record.hedgeBoxId !== "string")
+      || record.hedgeId === attemptId || !record.firstId
+      || (record.winnerId !== undefined && (typeof record.winnerId !== "string"
+        || (record.winnerId !== record.firstId && record.winnerId !== record.hedgeBoxId)))) throw new Error("Boat provisioning hedge identity is invalid");
+  let labels: Record<string, unknown>;
+  try { labels = JSON.parse(record.body).labels; }
+  catch { throw new Error("Boat provisioning hedge body is invalid"); }
+  if (!labels || labels.owner !== `paperclip:${owner.companyId}` || labels.environment !== owner.environmentId
+      || labels.run !== owner.runId || labels.creation !== record.hedgeId || labels["paperclip-acquire"] !== attemptId
+      || labels["paperclip-hedge-of"] !== attemptId) throw new Error("Boat provisioning hedge body ownership is invalid");
+  return record;
+}
+async function saveProvisionHedge(owner: { companyId: string; environmentId: string }, attemptId: string, record: ProvisionHedge): Promise<void> {
+  if (!pluginContext?.state?.set) throw new Error("Boat provisioning hedge requires durable plugin state");
+  await pluginContext.state.set(provisionHedgeScope(owner, attemptId), { ...record });
+}
+/** A decision is durable before a loser stop; an unanswered POST keeps its
+ * creation identity owed until the same settle floor core uses for late boxes. */
+async function oweProvisionLosers(config: Config, owner: { companyId: string; environmentId: string; runId?: string }, attemptId: string,
+  record: ProvisionHedge, keepId: string): Promise<void> {
+  const owed = await loadOwedSpareStops(owner.companyId);
+  const spareId = `acquisition:${attemptId}`;
+  const acquisition: AcquisitionStopDebt = { attemptId, runId: owner.runId, keepId,
+    ids: [record.firstId, ...(record.hedgeBoxId ? [record.hedgeBoxId] : [])],
+    settleUntil: record.hedgeBoxId ? Date.now() : record.startedAt + BOAT_CREATION_SETTLE_MS };
+  owed.owed = owed.owed.filter(entry => entry.spareId !== spareId);
+  owed.owed.push({ environmentId: owner.environmentId, configHash: `hedge:${attemptId}`, spareId, acquisition });
+  await persistOwedSpareStops(owner.companyId, owed);
+  // Registers this key even with spare pools OFF, and tracks the bounded stop
+  // work for shutdown; a slow/refused stop never blocks the winning lease.
+  await resumeOwedSpareStops(config, owner.companyId, owner.environmentId);
+}
+/** Independent ready observers race inside ONE acquisition deadline. The
+ * first observer starts exactly one durable hedge only on provisioning >= H.
+ * A worker restart replays that stored POST/key/body, never mints another box.
+ * Both contenders share the parent acquire label so core's existing creation
+ * inspection/cleanup owns both, while Boat dedupes each by its own creation ID. */
+async function waitProvisionWinner(config: Config, first: any, owner: { companyId: string; environmentId: string; runId?: string },
+  attemptId: string, body: string, startedAt: number, deadline: number, saved: ProvisionHedge | undefined, enterHedge: () => void): Promise<{ ready: any; labels: Record<string, string>; hedge: boolean }> {
+  const primaryLabels = JSON.parse(body).labels;
+  const refuseStopped = (sandbox: any) => {
+    const observed = dedupedBoxStop(sandbox);
+    if (observed) throw new BoatDedupedBoxStoppedError(sandbox.id, observed);
+  };
+  if (!pluginContext?.state?.get || !pluginContext?.state?.set) {
+    refuseStopped(first);
+    return { ready: await waitReady(config, first.id, false, { deadline, observe: refuseStopped }), labels: primaryLabels, hedge: false };
+  }
+  if (saved && saved.firstId !== first.id) throw new Error("Boat provisioning primary identity changed");
+  if (saved?.winnerId) {
+    enterHedge();
+    await oweProvisionLosers(config, owner, attemptId, saved, saved.winnerId);
+    const ready = await waitReady(config, saved.winnerId, false, { deadline, startDeadline: deadline, observe: refuseStopped });
+    return { ready, labels: saved.winnerId === first.id ? primaryLabels : JSON.parse(saved.body).labels, hedge: saved.winnerId !== first.id };
+  }
+  const cancel = new AbortController();
+  const signal = AbortSignal.any([cancel.signal, withinBudget(deadline, Math.max(0, deadline - Date.now()))]);
+  let record = saved, hedgeWork: Promise<any> | undefined;
+  let hedgeResolve!: (ready: any) => void, hedgeReject!: (error: unknown) => void;
+  const hedgeReady = new Promise<any>((resolve, reject) => { hedgeResolve = resolve; hedgeReject = reject; });
+  // A primary may win before there is any hedge. Always observe lazy rejection.
+  void hedgeReady.catch(() => undefined);
+  const startHedge = () => {
+    if (hedgeWork || shuttingDown || Date.now() >= deadline) return;
+    enterHedge();
+    hedgeWork = (async () => {
+      if (!record) {
+        const key = JSON.stringify([owner.companyId, owner.environmentId, attemptId]);
+        let preparation = provisionHedgeWrites.get(key);
+        if (!preparation) {
+          preparation = (async () => {
+            const existing = await loadProvisionHedge(owner, attemptId);
+            if (existing) return existing;
+            const hedgeId = creationIdentityId();
+            const parsed = JSON.parse(body);
+            parsed.labels = { ...parsed.labels, creation: hedgeId, "paperclip-hedge-of": attemptId };
+            const intent: ProvisionHedge = { environmentId: owner.environmentId, runId: owner.runId,
+              hedgeId, body: JSON.stringify(parsed), startedAt, firstId: first.id };
+            await saveProvisionHedge(owner, attemptId, intent); // Must precede the POST.
+            return intent;
+          })();
+          provisionHedgeWrites.set(key, preparation);
+          void preparation.finally(() => { if (provisionHedgeWrites.get(key) === preparation) provisionHedgeWrites.delete(key); }).catch(() => undefined);
+        }
+        record = await preparation;
+      }
+      readySpares.admitRunCreate(owner.companyId, owner.environmentId, record.hedgeId);
+      // Body/key are stored byte-for-byte; retries and restarts spend no third ID.
+      const created = await sendCreate(config, record.hedgeId, record.body, Date.now(), deadline);
+      const sandbox = created?.sandbox ?? created;
+      if (typeof sandbox?.id !== "string" || !sandbox.id || sandbox.id === first.id) throw new Error("Boat hedge response omitted a distinct sandbox.id");
+      record.hedgeBoxId = sandbox.id;
+      idleActivity.resource(activityKey(config, sandbox.id));
+      await saveProvisionHedge(owner, attemptId, record);
+      refuseStopped(sandbox);
+      return waitReady(config, sandbox.id, false, { deadline, startDeadline: deadline, signal, observe: refuseStopped });
+    })();
+    void hedgeWork.then(hedgeResolve, hedgeReject);
+  };
+  // A saved intent is not permission to start a fresh box after the primary
+  // has definitively failed; core's creation cleanup still owns that intent.
+  refuseStopped(first);
+  if (first.state === "error") throw new BoatSandboxStateError(first.id, "error");
+  if (saved) startHedge();
+  const primaryReady = (async () => {
+    refuseStopped(first);
+    return waitReady(config, first.id, false, { deadline, startDeadline: deadline, signal, observe: sandbox => {
+      refuseStopped(sandbox);
+      if (sandbox.state === "provisioning" && Date.now() - startedAt >= BOAT_PROVISION_HEDGE_MS) startHedge();
+    } });
+  })();
+  try {
+    // Failure of one contender is not failure of the other. Before H, however,
+    // primary error/archived fails immediately and cannot launch a hedge.
+    const ready = await Promise.race([
+      primaryReady.catch(error => { if (!hedgeWork) throw error; return hedgeReady; }),
+      hedgeReady.catch(() => primaryReady),
+    ]);
+    cancel.abort();
+    await Promise.allSettled([primaryReady, ...(hedgeWork ? [hedgeWork] : [])]);
+    if (record) {
+      record.winnerId = ready.id;
+      await saveProvisionHedge(owner, attemptId, record);
+      await oweProvisionLosers(config, owner, attemptId, record, ready.id);
+    }
+    return { ready, labels: ready.id === first.id ? primaryLabels : JSON.parse(record!.body).labels, hedge: ready.id !== first.id };
+  } catch (error) {
+    cancel.abort();
+    await Promise.allSettled([primaryReady, ...(hedgeWork ? [hedgeWork] : [])]);
+    // The caller's existing cleanup owns the primary; durable debt owns
+    // the hedge, so failure does not send two simultaneous primary stops.
+    if (record) await oweProvisionLosers(config, owner, attemptId, record, first.id);
+    throw error;
+  }
+}
 /**
  * The host sees Boat's idempotency outcome across the worker connection only as
  * the plugin SDK's closed creationIdempotencyCode, which the SDK reads from the
@@ -1673,10 +1866,10 @@ function dedupedBoxStop(sandbox: any): string | undefined {
   if (stop && typeof stop === "object" && (stop.status === "pending" || stop.status === "failing")) return `running with a ${stop.status} stop`;
   return undefined;
 }
-async function waitReady(config: Config, id: string, allowArchived = false, bound: { signal?: AbortSignal; deadline?: number; sendGuard?: () => void; observe?: (sandbox: any) => void } = {}): Promise<any> {
+async function waitReady(config: Config, id: string, allowArchived = false, bound: { signal?: AbortSignal; deadline?: number; startDeadline?: number; sendGuard?: () => void; observe?: (sandbox: any) => void } = {}): Promise<any> {
   // A bounded caller (a 409 recovery) never waits past its call budget, and its
   // admission and lifecycle check runs before every poll (frozen8 F-01/F-03).
-  const until = Math.min(Date.now() + 120_000, bound.deadline ?? Number.POSITIVE_INFINITY);
+  const until = Math.min(bound.startDeadline ?? Date.now() + 120_000, bound.deadline ?? Number.POSITIVE_INFINITY);
   const options: RequestOptions = { ...(bound.deadline !== undefined ? { deadline: bound.deadline } : {}), ...(bound.sendGuard ? { sendGuard: bound.sendGuard } : {}) };
   let lastObservedState: unknown;
   while (Date.now() < until) {
@@ -2756,6 +2949,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     runCreateLedgerReads.clear();
     runLeaseTtlCaps.clear();
     createExpiries.clear();
+    provisionHedgeWrites.clear();
     busySpareRefills.clear(); admittedSpareCreates.clear();
     pluginContext = ctx; duplexContext = ctx.duplexChannel; duplexLogger = ctx.logger;
     for (const unsubscribe of activityUnsubscribers) unsubscribe();
@@ -3041,7 +3235,8 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         ? await creationExpiry(params.companyId, params.creationOperationId, ttl)
         : new Date(Date.now() + ttl * 1000).toISOString()));
       const createBody = JSON.stringify(createSandboxBody(c, ttl, labels, from));
-      const createStartedAt = Date.now();
+      const savedHedge = await loadProvisionHedge(params, attemptId);
+      const createStartedAt = savedHedge?.startedAt ?? Date.now();
       // One budget bounds the whole acquisition: create, adoption, readiness,
       // setup and handoff (rf-4 U3 C1). Daytona: one deadline (daytona
       // plugin.ts:2981-2987) asserted between phases (assertActive, :3011-3013,
@@ -3057,7 +3252,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         code: "ETIMEDOUT", phase, elapsedMs: Math.max(0, Date.now() - createStartedAt), budgetMs: BOAT_ACQUIRE_ATTEMPT_BUDGET_MS });
       // rf-4 U3 C3: one `boat.acquire.phases` line per acquisition, at its end.
       const clock = acquirePhaseClock(createStartedAt);
-      let source: "created" | "adopted" = "created";
+      let source: "created" | "adopted" | "hedge" = "created";
       let endedAt: number | undefined, stampOutcome: "ok" | "budget" | "error" = "error", failedPhase: string | undefined;
       const assertActive = (next: string) => {
         phase = next;
@@ -3072,7 +3267,9 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         if (shuttingDown) throw new Error("Boat provider is shutting down");
         let created: any, adopted = false;
         try {
-          created = await sendCreate(c, attemptId, createBody, createStartedAt, deadline);
+          assertActive("create");
+          created = savedHedge?.winnerId ? { sandbox: { id: savedHedge.firstId } }
+            : await sendCreate(c, attemptId, createBody, createStartedAt, deadline);
         } catch (createError) {
           if (createTimedOut(createError)) noteUnsettledCreate(attemptId, createStartedAt);
           // #20828: adopt the box our timed-out create made; never send a second create.
@@ -3082,27 +3279,25 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         const sb = created?.sandbox ?? created; if (typeof sb?.id !== "string" || !sb.id) throw new Error("Boat create response did not contain sandbox.id");
         id = sb.id;
         idleActivity.resource(activityKey(c, sb.id));
-        // GAP 1: a (deduped) box that is stopped or stopping is never a ready lease;
-        // `id` is set, so the cleanup below still stops it and owns it.
-        const refuseStopped = (sandbox: any) => {
-          const observed = dedupedBoxStop(sandbox);
-          if (observed) throw new BoatDedupedBoxStoppedError(sb.id, observed);
-        };
-        refuseStopped(sb);
-        // A created or adopted box waits for ready inside the acquire budget.
+        // Created/adopted contenders share the acquisition deadline, not two
+        // independent 120s waits. Hydration remains irrelevant to ordinary creates.
         assertActive(adopted ? "adopt" : "create");
         assertActive("ready");
-        const ready = await waitReady(c, sb.id, false, { deadline, observe: refuseStopped }).catch(error => {
+        const winner = await waitProvisionWinner(c, sb, params, attemptId, createBody, createStartedAt, deadline, savedHedge,
+          () => assertActive("hedge")).catch(error => {
           if (error instanceof BoatSandboxStateError && error.state === "error") {
             startFailure = { phase: "create", elapsedMs: Math.min(Math.max(0, Date.now() - createStartedAt), BOAT_ACQUIRE_ATTEMPT_BUDGET_MS - 1),
               budgetMs: BOAT_ACQUIRE_ATTEMPT_BUDGET_MS, providerState: "error" };
           }
           throw error;
         });
+        const ready = winner.ready;
+        id = ready.id;
+        if (winner.hedge) source = "hedge";
         assertActive("setup");
-        const ownershipObservation = c.setupScript !== undefined ? await waitSetup(c, sb.id, deadline) : ready;
+        const ownershipObservation = c.setupScript !== undefined ? await waitSetup(c, id!, deadline) : ready;
         assertActive("handoff");
-        const lease = await finishAcquisition(params, c, sb.id, { ...ready, ...ownershipObservation }, labels, remoteCwd, snapshot, null, undefined, budget);
+        const lease = await finishAcquisition(params, c, id!, { ...ready, ...ownershipObservation }, winner.labels, remoteCwd, snapshot, null, undefined, budget);
         assertActive("handoff");
         endedAt = Date.now(); stampOutcome = "ok";
         return lease;
@@ -3222,6 +3417,13 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     if (params.creationOperation) {
       const owner = { ...params, runId: params.creationOperation.runId };
       const ids = await acquisitionMatches(c, params.creationOperation.id, owner);
+      const hedge = await loadProvisionHedge(owner, params.creationOperation.id);
+      if (hedge) {
+        // This is core reconciling an abandoned creation, not an active lease.
+        // Reconstruct loser/late-create debt even when the killed worker never
+        // reached a winner decision. Core owns the exact row returned below.
+        await oweProvisionLosers(c, owner, params.creationOperation.id, hedge, ids[0] ?? "");
+      }
       // Report operation-scoped absence as destroyed: core owns the settle
       // deadline and bounded absence budget; early absence stays inconclusive there.
       // A create this worker sent that timed out stays inconclusive here until
