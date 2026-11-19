@@ -2548,11 +2548,13 @@ describe("persistent agent directories", () => {
       const realPersist = fileDurability.persistDurableAgentFiles;
       const actualStore = fileStoreModule.agentFileStore;
       let applies = 0, persisted = 0, applyDone: Promise<void> | undefined;
+      let stagedRoot: unknown;
       const persistFault = vi.spyOn(fileDurability, "persistDurableAgentFiles").mockImplementation(async (...args) => {
         const result = await realPersist(...args);
         if (args[3] === true) return result;
         const [pending] = await args[0].select().from(agentFileRoots).where(eq(agentFileRoots.agentId, agentId));
         expect(pending.entries.find(entry => entry.path === "post-persist-note.txt")).toMatchObject({ kind: "file", sha256: fileHash(Buffer.from(note)) });
+        stagedRoot = pending;
         // PLANTED FAULT: durable rows have really been persisted in the open
         // store transaction; locked() has not returned to transaction commit.
         persisted++;
@@ -2578,14 +2580,15 @@ describe("persistent agent directories", () => {
         // wait for the actual apply transaction before observing its outcome.
         await applyDone;
         after = { rows: await canonicalRows(), treeHash: directorySnapshotSha256(await snapshotAgentFiles(root, false)) };
-        await withDedicatedDbConnection(db, async dedicated => {
+        const independent = createDb(external ?? database.connectionString);
+        try {
           const key = `agent-directory:${companyId}:${agentId}`;
-          const [lock] = await dedicated.execute(sql`select pg_try_advisory_lock(hashtextextended(${key}, 0)) as acquired`);
+          const [lock] = await independent.execute(sql`select pg_try_advisory_lock(hashtextextended(${key}, 0)) as acquired`);
           lockReleased = lock?.acquired === true;
-          if (lockReleased) await dedicated.execute(sql`select pg_advisory_unlock(hashtextextended(${key}, 0))`);
-        });
+          if (lockReleased) await independent.execute(sql`select pg_advisory_unlock(hashtextextended(${key}, 0))`);
+        } finally { await independent.$client.end({ timeout: 1 }); }
         await writeJudgeEvidence("rf3-post-persist-abort.json", {
-          applies, persisted, aborted: controller.signal.aborted, error: String(error), before, after, lockReleased,
+          applies, persisted, aborted: controller.signal.aborted, error: String(error), before, stagedRoot, after, lockReleased,
           source: await fs.readFile(path.join(copy.localRoot, "post-persist-note.txt"), "utf8"),
           canonical: await fs.readFile(path.join(root, "post-persist-note.txt"), "utf8").catch(() => null),
         });
