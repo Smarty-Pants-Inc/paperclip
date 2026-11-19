@@ -92,16 +92,24 @@ export function isPendingDelivery(comment: object | null | undefined): boolean {
  * - 'delivered': `steeringStatus` 'delivered' (Pi itself read it).
  * - 'not_delivered': `steeringUnavailableReason` 'run_ended_before_read',
  *   whatever `steeringStatus` says (the server has no carrier for it).
+ * - 'waiting': `deliveryOutcome` 'queued' with no `steeringUnavailableReason`:
+ *   the turn ended before the agent read it, but a live wake still holds it
+ *   to deliver next (neworg/caption-held 8fb2d8bf). It will be answered, so
+ *   it never reads 'Not delivered' (a person who believed that re-sent and
+ *   got two answers). When the queued-comments read lists it, it sits in the
+ *   waiting list instead of the thread.
  * 'pending' only for the client's neutral mark before the POST answers. Null
  * for a message that was not steered.
  */
-export type SteeredDelivery = "pending" | "sent" | "carried" | "delivered" | "not_delivered";
+export type SteeredDelivery = "pending" | "sent" | "carried" | "delivered" | "not_delivered" | "waiting";
 export const STEERED_NOT_DELIVERED_TEXT = "Not delivered: the turn ended before the agent read it.";
+export const STEERED_WAITING_TEXT = "Waiting: it will be answered when the agent is free.";
 export const STEERED_CARRIED_TEXT = "Taken into the next turn";
 export function readSteeredDelivery(comment: object | null | undefined): SteeredDelivery | null {
   if (!comment) return null;
   const fields = comment as DeliveryFields;
   if (fields.steeringUnavailableReason === "run_ended_before_read") return "not_delivered";
+  if (fields.deliveryOutcome === "queued" && !stringOrNull(fields.steeringUnavailableReason)) return "waiting";
   const runId = readSteeredIntoRunId(comment);
   const carriedIntoRunId = stringOrNull(fields.carriedIntoRunId);
   if (fields.steeringStatus === "carried") return "carried";
