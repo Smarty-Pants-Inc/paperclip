@@ -10,6 +10,7 @@ import { isConfirmedCursorCloudTerminalObservation } from "./native-runtime/curs
 import { isAgentLifecycleStopRecord } from "./governance-pause-stop.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { isWellFormedExecutionWait, wellFormedExecutionWaitSql } from "./deferred-execution-wait.js";
+import { userStopBoundaryAt } from "./run-cancellation.js";
 
 export function hasAcknowledgedNativeRunStopRequest(run: {
   id: string; companyId: string; status: string; nativeIssueId: string | null;
@@ -150,7 +151,10 @@ export async function acknowledgedNativeStopExecutionHasStopped(db: Db, run: Pic
  * cause native_continuation_requires_reconciliation, evidence.runId = the run). */
 export const PERSON_STOP_OWN_HOLD_CAUSE = "native_continuation_requires_reconciliation";
 
-export type PersonStopHold = { stoppedRunId: string; wakeIds: string[] };
+/** `stoppedByUserId` and `stopBoundaryAt` are the hold's own facts about WHO pressed Stop and WHEN (the stopped
+ * run's cancelledByUserId and its Stop boundary, run-cancellation.ts userStopBoundaryAt). A reader that tells a
+ * person "you pressed Stop" reads them here, never from a stored wait's text. */
+export type PersonStopHold = { stoppedRunId: string; wakeIds: string[]; stoppedByUserId: string | null; stopBoundaryAt: Date | null };
 
 function personStopWakeCarries(payload: unknown, issueId: string, messageId?: string): boolean {
   const value = parseObject(payload);
@@ -186,7 +190,8 @@ export async function readPersonStopHold(db: Db, input: {
     eq(heartbeatRuns.companyId, input.companyId), or(onIssue, eq(heartbeatRuns.issueId, input.issueId)),
     eq(heartbeatRuns.status, "running"))).limit(1);
   if (running) return null;
-  const [lastTurn] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+  const [lastTurn] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson,
+    finishedAt: heartbeatRuns.finishedAt })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), onIssue))
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
   const stop = parseObject(lastTurn?.resultJson);
@@ -199,7 +204,9 @@ export async function readPersonStopHold(db: Db, input: {
     && (wake.status === "deferred_issue_execution" || isWellFormedExecutionWait(parseObject(wake.payload).executionWait))
     && parseObject(wake.payload).queuedCommentInterrupt == null
     && personStopWakeCarries(wake.payload, input.issueId, input.messageId));
-  return held.length ? { stoppedRunId: lastTurn.id, wakeIds: held.map(wake => wake.id) } : null;
+  return held.length ? { stoppedRunId: lastTurn.id, wakeIds: held.map(wake => wake.id),
+    stoppedByUserId: typeof stop.cancelledByUserId === "string" && stop.cancelledByUserId ? stop.cancelledByUserId : null,
+    stopBoundaryAt: userStopBoundaryAt(lastTurn) } : null;
 }
 
 /** adopt-marker-port (RFL F1): this run is the FIRST turn after a person's Stop when the latest person Stop

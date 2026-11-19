@@ -461,6 +461,18 @@ function queuedCommentDiscardDenial(issue: { identifier?: string | null }, comme
 
 const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
 const CHAT_STOPPED_BY_PERSON_MESSAGE = "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it.";
+// bb-2d-stopwords (RFL 22:22Z): a TASK's waiting messages held by their sender's OWN Stop. The reason is the hold's
+// own, read from the hold (readPersonStopHold: who pressed Stop, and when), never from a stored wait's text. The line
+// names only what works in that hold: the row's Delete, and a new message, which carries the held ones (the wake
+// queue: "An operator stop never promotes old queued work by itself. The next explicit wake adopts those messages").
+// It names no Send: in that hold the queue's Send (POST .../queued-comments/interrupt) can be accepted and start
+// nothing (the gate keeps the wake, controller_settling), so the panel offers none beside this line.
+const TASK_HELD_BY_OWN_STOP_REASON = "held_by_own_stop";
+function taskHeldByOwnStopMessage(count: number): string {
+  return count === 1
+    ? "Not sent, because you pressed Stop. Delete it, or send a new message: this one goes with it."
+    : "Not sent, because you pressed Stop. Delete any, or send a new message: these go with it.";
+}
 /** A paused chat agent: the Send route's own code and words (its 409), so the
  * held bar says it is paused and offers no Send that would be refused. */
 const CHAT_AGENT_PAUSED_REASON = "queued_comment_chat_paused";
@@ -7954,6 +7966,27 @@ export function issueRoutes(
         queue.executionWait = await isChatAgentPaused(input.executor, input.issue.companyId, input.issue.conversationAgentId)
           ? { reason: CHAT_AGENT_PAUSED_REASON, message: CHAT_AGENT_PAUSED_MESSAGE }
           : { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
+      }
+    }
+    // bb-2d-stopwords (RFL 22:22Z): a TASK's messages held by their sender's OWN Stop say so, by the hold's own
+    // reason. The ONE person-Stop reader decides (readPersonStopHold: the assignee's latest turn on the task was
+    // cancelled by a user, nothing runs, this wake carries the task's messages and no Send is delivering it), and
+    // the hold names its reader: the person who pressed Stop (stoppedByUserId) reads their OWN messages, each saved
+    // no later than that Stop (stopBoundaryAt; a message sent after the Stop is new direction and keeps its wait).
+    // No text is matched. The stored wait the Stop's own recovery path writes after it (run-control.ts
+    // resumeRemoteStopComments' default, "Waiting for execution recovery. Your message is saved.") is stale there:
+    // nothing is recovering. Another person, a system cancel, a failed run and every real recovery wait keep the
+    // stored wait as it is; a chat keeps its own bar above.
+    if (wake && queueState?.state === "deferred" && !input.activeRun && !interruptHandoff && comments.length > 0 &&
+        !input.issue.conversationAgentId && input.issue.assigneeAgentId && input.actor.actorType === "user" &&
+        !queuedInteractionId(wake.payload)) {
+      const hold = await readPersonStopHold(input.executor as Db, { companyId: input.issue.companyId, issueId: input.issue.id,
+        agentId: input.issue.assigneeAgentId, wakeId: wake.id });
+      const boundary = hold?.stopBoundaryAt?.getTime();
+      if (hold && boundary !== undefined && hold.stoppedByUserId === input.actor.actorId &&
+          comments.every(comment => comment.authorUserId === input.actor.actorId &&
+            new Date(comment.createdAt).getTime() <= boundary)) {
+        queue.executionWait = { reason: TASK_HELD_BY_OWN_STOP_REASON, message: taskHeldByOwnStopMessage(comments.length) };
       }
     }
     if (wake && queuedInteractionId(wake.payload)) {

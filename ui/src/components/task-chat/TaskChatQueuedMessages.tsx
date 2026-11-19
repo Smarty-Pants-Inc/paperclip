@@ -67,6 +67,11 @@ export function queueHeldByPersonStop(queue: IssueQueuedCommentQueue | null | un
 /** A paused chat agent (the Send route's own 409 code): the bar says the
  * server's paused line and offers no Send. */
 export const CHAT_AGENT_PAUSED_REASON = "queued_comment_chat_paused";
+/** A TASK's messages held by their sender's own Stop (the server's reason, read from
+ * the hold: who pressed Stop, and when). The panel says the server's line and offers
+ * what that line names: each row's Delete. No Send, on the line or on a row: in that
+ * hold the queue's Send can be accepted and start nothing; a new message carries them. */
+export const TASK_HELD_BY_OWN_STOP_REASON = "held_by_own_stop";
 
 export function reorderQueuedMessageEntries(
   entries: IssueQueuedCommentEntry[],
@@ -591,6 +596,10 @@ export function TaskChatQueuedMessages({
   // The paused line is a fact, not a promise: no Send on the bar or on a row.
   const stoppedPaused = queue.executionWait?.reason === CHAT_AGENT_PAUSED_REASON &&
     Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0;
+  // bb-2d-stopwords: a task's messages held by their sender's own Stop. A fact and what
+  // works, never a promise: no Send on the line or on a row.
+  const heldByOwnStop = queue.executionWait?.reason === TASK_HELD_BY_OWN_STOP_REASON &&
+    Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0;
 
   if (entries.length === 0 && !visibleError && !statusMessage && !steeringUnavailableReason) return null;
 
@@ -646,7 +655,7 @@ export function TaskChatQueuedMessages({
                     : undefined
                 }
                 onDiscard={() => void runRowAction(entry.comment.id, "discard")}
-                sendOnLine={stoppedByPerson || stoppedPaused}
+                sendOnLine={stoppedByPerson || stoppedPaused || heldByOwnStop}
               />
             );
           })}
@@ -675,6 +684,9 @@ export function TaskChatQueuedMessages({
       ) : stoppedPaused ? (
         <p role="status" className="border-t border-border px-3 py-1.5 text-xs text-muted-foreground"
           data-testid="task-chat-queued-paused">{queue.executionWait!.message}</p>
+      ) : heldByOwnStop ? (
+        <p role="status" className="border-t border-border px-3 py-1.5 text-xs text-muted-foreground"
+          data-testid="task-chat-queued-own-stop">{queue.executionWait!.message}</p>
       ) : null}
       {visibleError ? (
         <div
