@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { issueRoutes } from "../routes/issues.js";
+import { agentRoutes } from "../routes/agents.js";
 import { errorHandler } from "../middleware/index.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, agentWakeupRequests, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
@@ -161,6 +162,7 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
       next();
     });
     app.use("/api", issueRoutes(db, {} as Parameters<typeof issueRoutes>[1]));
+    app.use("/api", agentRoutes(db, {}));
     app.use(errorHandler);
     const posted = await request(app).post(`/api/issues/${f.issue.id}/comments`).send({ body: "Are you there? Please continue." });
     expect(posted.status, JSON.stringify(posted.body)).toBe(201);
@@ -173,14 +175,49 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
       }
       const swept = await notes(f.issue.id);
       console.log(JSON.stringify({ check: "importpause-live", pause, notes: swept.map(n => n.body) }));
-      // Not 'will run': the import's task never ran, so the paused message's wake is not saved.
-      expect(swept.map(n => n.body)).toEqual([
-        "Import Coder is paused. Your message is saved. Send it again after Import Coder is resumed. "
-        + "A board user or Import Coder's manager can resume Import Coder.",
+      // adopt-cutc2 re-point (stacked on the fold2 pause line, which saves a paused
+      // person's wake): the import-paused message's wake IS saved, so the ONE true
+      // note says 'will run when resumed'. The manual control keeps its note.
+      expect(swept.map(n => n.body)).toEqual([pause === "import"
+        ? "Import Coder is paused. Your message is saved, and it will run when Import Coder is resumed. "
+          + "A board user or Import Coder's manager can resume Import Coder."
+        : "Import Coder is paused. Your message is saved. Send it again after Import Coder is resumed. "
+          + "A board user or Import Coder's manager can resume Import Coder.",
       ]);
       expect((swept[0]!.metadata as Record<string, unknown> | null)?.authorizationReason).toBe(`unanswered_message:${posted.body.id}`);
       expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, f.agentId),
-        eq(agentWakeupRequests.status, "deferred_issue_execution")))).toHaveLength(0);
+        eq(agentWakeupRequests.status, "deferred_issue_execution")))).toHaveLength(pause === "import" ? 1 : 0);
+      if (pause === "import") {
+        // The real import release: POST /agents/:id/resume, then the lifecycle worker to ready.
+        const resumed = await request(app).post(`/api/agents/${f.agentId}/resume`).send({});
+        expect(resumed.status, JSON.stringify(resumed.body)).toBe(200);
+        const worker = configureAgentLifecycle(db, { requiredPluginIds: async () => [],
+          runPlugin: async () => "complete", runHost: async () => "complete" });
+        try {
+          for (let i = 0; i < 5 && (await db.select().from(agents).where(eq(agents.id, f.agentId)))[0]!.lifecycleState !== "ready"; i++)
+            await worker.process(f.agentId);
+        } finally { await worker.stop(); }
+        for (let i = 0; i < 3; i++) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issue.id });
+        // Resume's release drain (resumeDeferredExecutionReceipts, pause_lifted pass) through an
+        // admitting heartbeat (this file's yielding handover keeps admission closed), run twice: ONE run.
+        const releaser = heartbeatService(db);
+        for (let i = 0; i < 2; i++) { await releaser.resumeQueuedRuns(); await releaser.drainActiveRunExecutions(); }
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+        const carriesP = runs.filter(run => {
+          const c = (run.contextSnapshot ?? {}) as Record<string, unknown>;
+          return c.commentId === posted.body.id || c.wakeCommentId === posted.body.id
+            || (Array.isArray(c.wakeCommentIds) && c.wakeCommentIds.includes(posted.body.id));
+        });
+        console.log(JSON.stringify({ check: "importpause-release", runs: runs.map(r => ({ id: r.id, status: r.status, ctx: r.contextSnapshot })) }));
+        // P runs once after the real import release: ONE delivery run of P's released wake. This file's
+        // process adapter ('true') posts no answer, so the disposition repair then retries (retryOfRunId);
+        // P answered ONCE is pause-defer-wake-t4-r2 IMPORT's row (its runner answers).
+        const delivered = carriesP.filter(run => !((run.contextSnapshot ?? {}) as Record<string, unknown>).retryOfRunId);
+        expect(delivered).toHaveLength(1);
+        expect(delivered[0]!.contextSnapshot).toMatchObject({ wakeReason: "issue_commented" });
+        expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, f.agentId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution")))).toHaveLength(0);
+      }
     } finally { await heartbeat.drainActiveRunExecutions(); }
   });
 

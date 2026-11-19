@@ -372,13 +372,15 @@ describe.skipIf(!support.supported)("rf-5 T4 round 2: held messages, double Resu
     await evidence("IMPORT saved", saved.map(w => ({ status: w.status, wait: (w.payload as any)?.executionWait })));
     expect(saved).toEqual([expect.objectContaining({ status: "deferred_issue_execution", runId: null })]);
     expect((saved[0]!.payload as any).executionWait).toMatchObject({ reason: "agent.not_invokable", trigger: "pause_lifted" });
-    // While import-paused: no note on P (the import hold writes none) and no run.
+    // While import-paused: ONE true note on P (its wake IS saved: 'will run when resumed'; adopt-cutc2 re-point
+    // after al/importpause-note 0f56f3df removed the import arm's silence) and no run.
     for (const ms of [2 * 60_000, 11 * 60_000])
       await settleUnansweredPersonMessage(db, { companyId, issueId: task!.id, now: new Date(Date.now() + ms) });
     await s.heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: task!.id });
     const notesWhilePaused = (await db.select().from(issueComments).where(and(eq(issueComments.issueId, task!.id),
       eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt)))).map(n => n.body);
-    expect(notesWhilePaused).toEqual([]);
+    expect(notesWhilePaused).toEqual(["Import Coder is paused. Your message is saved, and it will run when Import Coder is resumed. "
+      + "A board user or Import Coder's manager can resume Import Coder."]);
     expect(await s.runs()).toEqual([]);
     // The import release: the real Resume route (the import UI's scoped resume is this route).
     const resumed = await s.resumeCall();
