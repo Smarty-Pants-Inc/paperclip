@@ -111,6 +111,9 @@ function activityKey(config: Config, id: string): string { return createHash("sh
 const BOAT_409_CODES: ReadonlySet<string> = new Set([
   "sandbox_starting", "sandbox_not_ready", "machine_not_running", "sandbox_stopping", "snapshot_data_expired",
   "resume_failed", "sandbox_securing", "sandbox_resuming",
+  // Create/fork Idempotency-Key answers (https://docs.boat.dev/llms-full.txt
+  // :2242-2243, fetched 2026-11-19): still being created, or same key with another body.
+  "idempotency_in_progress", "idempotency_key_reused",
 ]);
 // API states (readiness.md:15-23) plus the stopping/stopped the 409 texts name.
 const BOAT_STATES: ReadonlySet<string> = new Set([
@@ -1271,6 +1274,104 @@ async function findTimedOutCreation(config: Config, attemptId: string, owner: { 
     await delay(Math.min(BOAT_CREATE_LOOKUP_INTERVAL_MS, remaining));
   }
 }
+// Create-retry money unit (plugin half). Boat returns the same sandbox for a
+// retry with the "same account, key and request body" and answers a changed
+// body with 409 idempotency_key_reused (https://docs.boat.dev/llms-full.txt
+// :2229, :2243). The host re-sends a pending creation under the SAME creation
+// id (= Idempotency-Key), so its body must not change: the only per-call part
+// was the `expiry` label (Date.now() per call). It is fixed at the creation's
+// first send and kept for Boat's 24 h key life (:2246), in memory and in the
+// company's plugin state so a re-send after a worker restart repeats it too.
+const BOAT_IDEMPOTENCY_KEY_LIFE_MS = 24 * 60 * 60 * 1000;
+const CREATE_EXPIRY_NAMESPACE = "boat-create-expiry";
+const CREATE_EXPIRY_STATE_KEY = "by-creation";
+type CreateExpiries = Record<string, { expiry: string; at: number }>;
+const createExpiries = new Map<string, { expiry: string; at: number }>();
+const createExpiryWrites = new Map<string, Promise<void>>();
+async function creationExpiry(companyId: string, creationId: string, ttlSeconds: number): Promise<string> {
+  const now = Date.now(), live = (entry: unknown): entry is { expiry: string; at: number } => !!entry && typeof entry === "object"
+    && typeof (entry as any).expiry === "string" && Number.isFinite(Date.parse((entry as any).expiry))
+    && typeof (entry as any).at === "number" && now - (entry as any).at <= BOAT_IDEMPOTENCY_KEY_LIFE_MS;
+  for (const [key, entry] of createExpiries) if (!live(entry)) createExpiries.delete(key);
+  const memoryKey = `${companyId}\0${creationId}`;
+  const cached = createExpiries.get(memoryKey);
+  if (cached) return cached.expiry;
+  const scope = { scopeKind: "company" as const, scopeId: companyId, namespace: CREATE_EXPIRY_NAMESPACE, stateKey: CREATE_EXPIRY_STATE_KEY };
+  const state = pluginContext?.state;
+  const previous = createExpiryWrites.get(companyId) ?? Promise.resolve();
+  let expiry = "";
+  // One read-modify-write per company at a time, so concurrent creates keep each other's entries.
+  const write = previous.catch(() => undefined).then(async () => {
+    let stored: CreateExpiries = {};
+    if (state?.get) {
+      try { const value = await state.get(scope); if (value && typeof value === "object" && !Array.isArray(value)) stored = value as CreateExpiries; }
+      catch { duplexLogger?.warn("Boat create expiry state read failed", { companyId }); }
+    }
+    const kept: CreateExpiries = Object.fromEntries(Object.entries(stored).filter(([, entry]) => live(entry)));
+    const known = kept[creationId];
+    if (known) { expiry = known.expiry; createExpiries.set(memoryKey, known); return; }
+    const entry = { expiry: new Date(now + ttlSeconds * 1000).toISOString(), at: now };
+    expiry = entry.expiry; createExpiries.set(memoryKey, entry);
+    if (!state?.set) return;
+    try { await state.set(scope, { ...kept, [creationId]: entry }); }
+    catch { duplexLogger?.warn("Boat create expiry state write failed", { companyId }); }
+  });
+  createExpiryWrites.set(companyId, write);
+  try { await write; }
+  finally { if (createExpiryWrites.get(companyId) === write) createExpiryWrites.delete(companyId); }
+  return expiry;
+}
+/** Boat's "Retry shortly with the same key" (:2242) pause between create sends. */
+const BOAT_IDEMPOTENCY_IN_PROGRESS_RESEND_MS = 2_000;
+function boatCreateCode(error: unknown): string | undefined {
+  const fields = error && typeof error === "object" ? error as { status?: unknown; boatCode?: unknown } : {};
+  return fields.status === 409 && typeof fields.boatCode === "string" ? fields.boatCode : undefined;
+}
+/**
+ * One create send per creation, with the SAME key and byte-identical body:
+ * 409 idempotency_in_progress is sent again (:2242) inside the strict create
+ * cap (BOAT_CREATE_ATTEMPT_MS from the first send), then the box the create
+ * returns is the one adopted. 409 idempotency_key_reused (:2243) should never
+ * happen now; it is surfaced as its own named error and NEVER answered by a
+ * create under a new key.
+ *
+ * The cap is strict here as in findTimedOutCreation (rf-4 U3 C1): a resend is
+ * bounded by what remains of the cap (its abort and its send deadline), the
+ * cap is re-checked after every resend and after every pause, and a box a
+ * resend answers with after the cap is never adopted: the 409 that started the
+ * resends is thrown, so the caller's cleanup lists the label and stops it.
+ */
+async function sendCreate(config: Config, attemptId: string, body: string, createStartedAt: number): Promise<any> {
+  const capAt = createStartedAt + BOAT_CREATE_ATTEMPT_MS;
+  let inProgress: unknown;
+  for (;;) {
+    try {
+      // The first send keeps its own 30 s deadline (inside the cap); a resend gets only what remains of the cap.
+      const sendMs = inProgress === undefined ? 30_000 : Math.min(30_000, capAt - Date.now());
+      if (sendMs <= 0) throw inProgress;
+      const created = await request(config, "/sandboxes", { method: "POST", signal: AbortSignal.timeout(sendMs), headers: { "Idempotency-Key": attemptId }, body },
+        false, inProgress === undefined ? {} : { deadline: capAt });
+      if (inProgress !== undefined && Date.now() >= capAt) throw inProgress;
+      return created;
+    } catch (error) {
+      if (error === inProgress) throw error;
+      const code = boatCreateCode(error);
+      if (code === "idempotency_key_reused") {
+        const failure = error as Error & { code?: string };
+        failure.message = `boat_idempotency_key_reused: ${failure.message} (Boat holds this creation's Idempotency-Key with a different request body; no create was sent under a new key)`;
+        if (failure.stack) failure.stack = failure.stack.replace("Error: ", "Error: boat_idempotency_key_reused: ");
+        failure.code = "boat_idempotency_key_reused";
+        throw failure;
+      }
+      if (code !== "idempotency_in_progress" || shuttingDown
+        || Date.now() + BOAT_IDEMPOTENCY_IN_PROGRESS_RESEND_MS >= capAt) throw error;
+      inProgress = error;
+      duplexLogger?.warn("Boat create 409 idempotency_in_progress; sending the same create again", { attemptId });
+      await delay(BOAT_IDEMPOTENCY_IN_PROGRESS_RESEND_MS);
+      if (shuttingDown || Date.now() >= capAt) throw error;
+    }
+  }
+}
 async function waitReady(config: Config, id: string, allowArchived = false, bound: { signal?: AbortSignal; deadline?: number; sendGuard?: () => void } = {}): Promise<any> {
   // A bounded caller (a 409 recovery) never waits past its call budget, and its
   // admission and lifecycle check runs before every poll (frozen8 F-01/F-03).
@@ -2146,6 +2247,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     claimedSpareLeases.clear();
     runCreateLedgerReads.clear();
     runLeaseTtlCaps.clear();
+    createExpiries.clear();
     pluginContext = ctx; duplexContext = ctx.duplexChannel; duplexLogger = ctx.logger;
     for (const unsubscribe of activityUnsubscribers) unsubscribe();
     activityUnsubscribers = [];
@@ -2335,7 +2437,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     const ttl = effectiveTtlSeconds(c);
     const remoteCwd = workspaceDirectory(params.requestedCwd ?? "/home/user/paperclip-workspace");
     const attemptId = params.creationOperationId ?? randomUUID();
-    const labels = { ...c.labels, owner: `paperclip:${params.companyId}`, purpose: params.purpose ?? "run", expiry: params.requestedExpiresAt ?? new Date(Date.now() + ttl * 1000).toISOString(), environment: params.environmentId, run: params.runId, ...(params.creationOperationId ? { creation: params.creationOperationId } : {}), "paperclip-acquire": attemptId };
+    const createLabels = (expiry: string) => ({ ...c.labels, owner: `paperclip:${params.companyId}`, purpose: params.purpose ?? "run", expiry, environment: params.environmentId, run: params.runId, ...(params.creationOperationId ? { creation: params.creationOperationId } : {}), "paperclip-acquire": attemptId });
     // Check outside allocation cleanup: no create was attempted on a failed pin check.
     // Lead measurement 11-12: create.from accepts a NAME, not the snapshot UUID.
     let pinnedIdentity: BoatSnapshotIdentity | undefined;
@@ -2407,6 +2509,11 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       // accepted (gold) because the R1 boat-create-alarm cron reads Boat's inventory
       // directly every 30 minutes and counts every company's runs.
       if (hasSpareSetting) refreshRunCreateLedger(c, params.companyId, params.environmentId);
+      // The money unit: a creation id's re-send repeats its first body byte-for-byte.
+      const labels = createLabels(params.requestedExpiresAt ?? (params.creationOperationId
+        ? await creationExpiry(params.companyId, params.creationOperationId, ttl)
+        : new Date(Date.now() + ttl * 1000).toISOString()));
+      const createBody = JSON.stringify(createSandboxBody(c, ttl, labels, from));
       const createStartedAt = Date.now();
       // Set only when Boat reported the box `error` before it was ready (#22194).
       let startFailure: PluginEnvironmentAcquisitionDiagnostic | undefined;
@@ -2414,7 +2521,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         if (shuttingDown) throw new Error("Boat provider is shutting down");
         let created: any, adopted = false;
         try {
-          created = await request(c, "/sandboxes", { method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": attemptId }, body: JSON.stringify(createSandboxBody(c, ttl, labels, from)) });
+          created = await sendCreate(c, attemptId, createBody, createStartedAt);
         } catch (createError) {
           // #20828: adopt the box our timed-out create made; never send a second create.
           created = { sandbox: { id: await findTimedOutCreation(c, attemptId, params, createError, createStartedAt) } };
