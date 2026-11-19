@@ -286,6 +286,7 @@ import {
 import {
   prepareChatCompletionTurn,
   chatCompletionAlreadyReported,
+  isChatCompletionSuperseded,
 } from "./chat-completion-delivery.js";
 
 import {
@@ -2249,10 +2250,19 @@ export function heartbeatService(
         resumingAdmittedRun: !!runOptions.nativeLeaseOwner,
         conversation: isConversation(conversationIdentity),
       })) return;
-      run = await timePreparation("chat_completion", () => prepareChatCompletionTurn(db, run));
-      if (chatCompletionAlreadyReported(run)) {
-        // An earlier reply in this conversation already reported each completion.
-        await setRunStatus(run.id, "succeeded", { finishedAt: new Date(), resultJson: { chatCompletionAlreadyReported: true }, issueCommentStatus: "not_applicable" });
+      let chatCompletionSuperseded = false;
+      run = await timePreparation("chat_completion", () => prepareChatCompletionTurn(db, run)).catch(error => {
+        if (!isChatCompletionSuperseded(error)) throw error;
+        chatCompletionSuperseded = true;
+        return run;
+      });
+      if (chatCompletionSuperseded || chatCompletionAlreadyReported(run)) {
+        // An earlier reply in this conversation already reported each completion,
+        // or a newer session/turn superseded it: nothing is owed, so this turn is
+        // a no-op, never a failed attempt the person must recover.
+        await setRunStatus(run.id, "succeeded", { finishedAt: new Date(),
+          resultJson: chatCompletionSuperseded ? { chatCompletionSuperseded: true } : { chatCompletionAlreadyReported: true },
+          issueCommentStatus: "not_applicable" });
         await setWakeupStatus(run.wakeupRequestId, "completed", { finishedAt: new Date() });
         await releaseIssueExecutionAndPromote((await getRun(run.id))!, { suppressImmediateRecovery: true });
         await finalizeAgentStatus(agent.id, "succeeded");
