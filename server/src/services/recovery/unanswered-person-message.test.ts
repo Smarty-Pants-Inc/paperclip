@@ -699,34 +699,48 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await readContinuationCommentInput(db, { ...f, runId: failed }), "answered: never carried again").toEqual({});
   });
 
-  // RFL record SUPERSEDE-M1-ANSWER-CHAIN-1119, D1, third case: a REAL path makes a continuation WITHOUT the message.
-  // The native fresh-session retry lanes (provider overloaded, tool-receipt limit, environment blocker:
+  // supersedes(98ea9cee unanswered-person-message.test.ts:707 "SUPERSEDE-M1-ANSWER-CHAIN-1119 D1, a real continuation
+  // WITHOUT the message (the fresh-session retry lane, materializeNativeToolReceiptLimitContinuation): its reply does
+  // not answer -> owed, 1 notice, still carried"; RULING-1119 01:23Z correction: a real producer that CONTINUES M's
+  // turn without writing M into its own input is a PRODUCER GAP; fix the carry, M is then ANSWERED, not owed).
+  // OLD: the native fresh-session retry lanes (provider overloaded, tool-receipt limit, environment blocker:
   // native-provider-capacity-retry.ts materializeNativeFreshSessionRetry, reached from the schedule_retry effect,
-  // status-decision-committer.ts) copy the failed run's context and DELETE wakeCommentId / wakeCommentIds / commentId.
-  // That retry's own input does not name M, so its reply does not answer M: M is owed, 1 notice, and M is carried.
+  // status-decision-committer.ts:942-950) copied the failed run's context and DELETED wakeCommentId / wakeCommentIds /
+  // commentId, so the retry's reply did not answer M: a FALSE notice beside a visible answer.
+  // NEW (bb/tamin6 5cddd3d1 native-provider-capacity-retry.ts:82-103, ported by line): the lane names the origin's
+  // still-pending person input in attributionCommentIds / attributionInteractionIds, for attribution only (no wake
+  // comment, card response or first-turn receipt replays it; history comes from retryOfRunId).
   // The retry is made by the real function below (nothing planted but the failed run and the retry's outcome).
-  it("SUPERSEDE-M1-ANSWER-CHAIN-1119 D1, a real continuation WITHOUT the message (the fresh-session retry lane, materializeNativeToolReceiptLimitContinuation): its reply does not answer -> owed, 1 notice, still carried", async () => {
+  it("supersedes(98ea9cee :707; RULING-1119 01:23Z): the fresh-session retry lane (materializeNativeToolReceiptLimitContinuation) names the message for attribution only -> its reply answers M, 0 notices, not carried again", async () => {
     const f = await fixture();
     const commentId = await f.message("What about my follow-up?");
     const failed = await f.run({ commentId, status: "failed", errorCode: "semantic_tool_turn_receipt_limit" });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: commentId,
+      wakeCommentIds: [commentId], commentId, commentContinuation: true, queuedCommentSourceWakeIds: [randomUUID()] } })
+      .where(eq(heartbeatRuns.id, failed));
     const retryId = await db.transaction(tx => materializeNativeToolReceiptLimitContinuation({ tx: tx as unknown as typeof db,
       companyId: f.companyId, issueId: f.issueId, runId: failed, agentId: f.agentId }));
     const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
     expect(retry).toMatchObject({ retryOfRunId: failed, status: "scheduled_retry" });
     const context = retry!.contextSnapshot as Record<string, unknown>;
-    expect(["wakeCommentId", "wakeCommentIds", "commentId", "conversationReplyBoundaryCommentId", "attributionCommentIds",
-      "firstTurnQueuedInput"].filter(key => key in context), "the real lane's context names no person message").toEqual([]);
+    expect(context.attributionCommentIds, "the real lane names the message, for attribution").toEqual([commentId]);
+    expect(["wakeCommentId", "wakeCommentIds", "commentId", "commentIds", "firstTurnQueuedInput", "commentContinuation",
+      "queuedCommentSourceWakeIds", "interactionId", "interactionIds", "paperclipWake"].filter(key => key in context),
+      "attribution only: nothing in the retry's context sends M to the model again").toEqual([]);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.runId, retryId));
+    expect((wake!.payload as Record<string, unknown>).attributionCommentIds, "the queued wake carries the same context").toEqual([commentId]);
+    // While the retry is scheduled the message is carried by it: no notice.
+    await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId });
+    expect(await f.visible(), "scheduled retry: no notice").toHaveLength(0);
     await db.update(heartbeatRuns).set({ status: "succeeded", error: null, errorCode: null, createdAt: f.at(), startedAt: f.at(),
       finishedAt: f.at() }).where(eq(heartbeatRuns.id, retryId));
     await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.runId, retryId));
     await f.reply(retryId);
     for (let pass = 0; pass < 2; pass++) {
-      await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId });
-      const notes = await f.visible();
-      expect(notes).toHaveLength(1);
-      expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+      expect(await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId })).toEqual({ kind: "answered" });
+      expect(await f.visible(), "no notice beside the retry's visible answer").toHaveLength(0);
     }
-    expect(await readContinuationCommentInput(db, { ...f, runId: failed })).toMatchObject({ wakeCommentIds: [commentId] });
+    expect(await readContinuationCommentInput(db, { ...f, runId: failed }), "answered: never carried again").toEqual({});
   });
 
   // merged9 item 1, the TWO-HOP carry (onm1-13rows.md 'GAP (probe D)'; RULING-1119 01:23Z: a real producer that

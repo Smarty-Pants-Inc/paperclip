@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, type Db } from "@paperclipai/db";
 import { accountingForScheduledRetry, executionFailureRetryCount } from "../execution-recovery-attempt.js";
+import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { NATIVE_PROVIDER_CAPACITY_MAX_RETRIES, NATIVE_PROVIDER_OVERLOADED_CODE, NATIVE_PROVIDER_OVERLOADED_MESSAGE } from "./native-provider-failure.js";
 import { NATIVE_TOOL_RECEIPT_LIMIT_CODE, NATIVE_TOOL_RECEIPT_LIMIT_CONTINUATION_DELAY_MS, NATIVE_TOOL_RECEIPT_LIMIT_HINT,
   NATIVE_TOOL_RECEIPT_LIMIT_MAX_CONTINUATIONS, NATIVE_TOOL_RECEIPT_LIMIT_MESSAGE, nativeRunHasStopRequest } from "./native-tool-receipt-limit.js";
@@ -93,18 +94,33 @@ async function materializeNativeFreshSessionRetry(input: NativeRetryTarget, lane
   const now = new Date();
   const dueAt = new Date(now.getTime() + lane.delayMs(attempt));
   const retryId = randomUUID();
+  // The origin run's own still-pending person input (the ONE carry policy:
+  // not ANSWERED, not sender-stopped). bb/tamin6 5cddd3d1 :82-103, by line.
+  const carried = await readContinuationCommentInput(input.tx, {
+    companyId: input.companyId, issueId: input.issueId, runId: run.id,
+  });
+  const commentIds = Array.isArray(carried.wakeCommentIds) ? carried.wakeCommentIds : [];
+  const interactionIds = Array.isArray(carried.interactionIds) ? carried.interactionIds : [];
   const predecessorContext = { ...run.contextSnapshot };
-  // Resume receipts and delivered wake input belong to the failed run. The
-  // new turn has ordinary task authority; history comes from retryOfRunId.
-  // Match the consumed-input boundary used by native safe replacements.
+  // These lanes follow a provider turn.failed terminal, not a never-started
+  // bootstrap retry (which keeps the same run and its undelivered input).
+  // Keep the origin's own still-pending input for ANSWERED attribution only:
+  // no wake comments, card responses or first-turn receipt may replay it.
+  // The new turn has ordinary task authority; history comes from retryOfRunId.
   for (const key of [
     "explicitUserContinuation", "wakeCommentId", "wakeCommentIds", "commentId",
     "commentIds", "latestCommentId", "resumeIntent", "followUpRequested",
+    "commentContinuation", "firstTurnQueuedInput", "queuedCommentSourceWakeIds",
+    "interactionId", "interactionIds", "interactionStatus",
+    // The origin's own attribution fields are rebuilt from the carry below, never copied stale.
+    "attributionCommentIds", "attributionInteractionIds", "conversationReplyBoundaryCommentId",
     "paperclipWake", "paperclipWakeComment", "paperclipTaskMarkdown", "paperclipTaskMarkdownCompact",
     "paperclipTaskMarkdownAssignment", "paperclipTaskMarkdownAssignmentCompact", "paperclipTurnContext",
   ]) delete predecessorContext[key];
   const contextSnapshot = {
     ...predecessorContext,
+    ...(commentIds.length ? { attributionCommentIds: commentIds } : {}),
+    ...(interactionIds.length ? { attributionInteractionIds: interactionIds } : {}),
     issueId: input.issueId,
     taskId: input.issueId,
     forceFreshSession: true,
