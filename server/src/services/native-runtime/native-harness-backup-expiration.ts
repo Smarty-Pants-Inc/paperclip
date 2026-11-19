@@ -35,6 +35,22 @@ export const NATIVE_HARNESS_BACKUP_EXPIRATION_DEFAULT_DAYS = 7;
 export const NATIVE_RUNNER_EVIDENCE_RETENTION_DEFAULT_DAYS = 7;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * R-keep-all-traces, never-OK (BRIEF backup-gate-delta item 1; rf-3 + RFL pick (a)).
+ * Retention NEVER deletes a native harness backup's local copy. In no-S3 mode the
+ * custody gate (native-turn-custody.ts:107-119) accepts exactly this copy and then
+ * lets the box be destroyed, so it is the only copy of the turn's raw trace. The
+ * blocker below (no live lease) means every copy expiry could reach has no live box
+ * beside it, and a destroyed box's lease row can itself be deleted later, so no
+ * "box destroyed" test is reliable: the copy is kept unconditionally. This one
+ * predicate gates the expiry (expireSession), the scheduler deadline
+ * (reconcileBackup) and leftover settlement (settleLeftovers).
+ */
+export const NATIVE_HARNESS_BACKUP_LOCAL_COPY_KEPT = "native_backup_local_copy_kept";
+function retentionKeepsNativeHarnessBackupLocalCopy(): boolean {
+  return true;
+}
 const SCOPE_PATTERN = /^[0-9a-f]{64}$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CONTINUITY_ARCHIVE_PATTERN = /^(\d{1,15})-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -472,9 +488,12 @@ export function nativeHarnessBackupExpirationService(
       const target = path.join(backupRoot, name);
       if (name.startsWith(RETIRING_PREFIX) && UUID_PATTERN.test(name.slice(RETIRING_PREFIX.length))) {
         if (!(await isRealDirectory(current))) await fs.rename(target, current);
-        else await removeBackupTree(target);
+        else if (!retentionKeepsNativeHarnessBackupLocalCopy()) await removeBackupTree(target);
       } else if (name.startsWith(EXPIRED_PREFIX) && UUID_PATTERN.test(name.slice(EXPIRED_PREFIX.length))) {
-        await removeBackupTree(target);
+        // A leftover of an expiry interrupted before this rule: keep it, and
+        // put it back as the current copy when nothing newer replaced it.
+        if (!retentionKeepsNativeHarnessBackupLocalCopy()) await removeBackupTree(target);
+        else if (!(await isRealDirectory(current))) await fs.rename(target, current);
       }
     }
   }
@@ -516,6 +535,8 @@ export function nativeHarnessBackupExpirationService(
         });
         if ("reason" in blocker) return blocker;
         if ((await fs.stat(current)).mtime >= options.closedBefore) return { reason: "recent_backup" };
+        // Every other blocker reports first; a copy that would now be deleted is kept.
+        if (retentionKeepsNativeHarnessBackupLocalCopy()) return { reason: NATIVE_HARNESS_BACKUP_LOCAL_COPY_KEPT };
         if (options.dryRun) return { cleared: 0, bytes };
         if (options.isSessionBusy(scopeDigest)) return { reason: "session_active" };
         await notifyExternalConversationSettlement(tx, { companyId: blocker.companyId });
@@ -941,6 +962,8 @@ export function nativeHarnessBackupExpirationService(
       scopeDigest, identity, closedBefore: new Date(8_000_000_000_000_000), lock: false,
     }));
     if ("reason" in blocker) return { ...source, dueAt: null };
+    // Never scheduled: retention keeps the copy, so it has no deadline.
+    if (retentionKeepsNativeHarnessBackupLocalCopy()) return { ...source, dueAt: null };
     const retentionMs = Math.max(1, defaults.closedForDays ?? NATIVE_HARNESS_BACKUP_EXPIRATION_DEFAULT_DAYS) * DAY_MS;
     return { ...source, dueAt: Math.max(stat!.mtime.getTime(), blocker.closedAt) + retentionMs + 1 };
   }
