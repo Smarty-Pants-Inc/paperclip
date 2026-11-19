@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
+import fs from "node:fs/promises";
+import { parse as parseEnv } from "dotenv";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { vi } from "vitest";
 import type { StorageProvider } from "../storage/types.js";
-import { createObjectRunLogStore } from "./object-run-log-store.js";
+import { createObjectRunLogStore, readObjectRunLogSpill } from "./object-run-log-store.js";
 
 // Fixture for the run-log spill rows: the PRODUCTION object store and journal
 // over an in-memory provider whose payload PUTs fail with EIO while `down`.
@@ -52,6 +54,51 @@ export const record = (attemptId: string | undefined, seq: number, chunk: string
   `${JSON.stringify({ ts: "2026-11-19T00:00:00Z", attemptId, stream: "stdout", chunk, seq })}\n`);
 export const event = (seq: number, chunk: string) => ({ stream: "stdout" as const, chunk, ts: "2026-11-19T00:00:00Z", seq });
 export const ids = { companyId: "company", agentId: "agent" };
+
+// Real writer, with the same process env a guest loads from its worktree .env.
+// The cleanup server then sees its original env, not the guest's old root.
+export async function contentSpill(workspacePath: string, candidate: string,
+  mode: "guest" | "drift" | "unreadable" | "recovered") {
+  const envPath = path.join(workspacePath, ".env");
+  const guestHome = path.join(candidate, "guest-home");
+  const oldRoot = path.join(candidate, ...Array.from({ length: 16 }, (_, i) => `depth-${i}`), "old-root");
+  await fs.writeFile(envPath, mode === "guest"
+    ? `PAPERCLIP_HOME=${JSON.stringify(guestHome)}\nPAPERCLIP_INSTANCE_ID=guest\n`
+    : `RUN_LOG_SPILL_PATH=${JSON.stringify(oldRoot)}\n`);
+  const keys = ["PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "RUN_LOG_SPILL_PATH", "RUN_LOG_BASE_PATH"];
+  const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  const env = parseEnv(await fs.readFile(envPath, "utf8"));
+  for (const key of keys) {
+    if (env[key] === undefined) delete process.env[key];
+    else process.env[key] = env[key];
+  }
+  try {
+    const m = spillMemory();
+    const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", flushMs: 1000,
+      assertWriterAuthority: async () => undefined });
+    const handle = await store.begin({ companyId: "build", agentId: "node_modules", runId: "content-custody" });
+    m.state.down = true;
+    const receipt = await store.enqueue!(handle, event(1, "source-less bytes: the spill is the ONLY copy"));
+    const settled = receipt.committed.catch(() => undefined);
+    await store.finalize(handle);
+    await settled;
+    const root = mode === "guest" ? path.join(guestHome, "instances/guest/data/run-logs/.spill") : oldRoot;
+    if (mode === "recovered") {
+      m.state.down = false;
+      await store.recoverSpill!({ companyId: "build", agentId: "node_modules", runId: "content-custody" });
+    }
+    const spill = await readObjectRunLogSpill(root, handle.logRef);
+    const bytes = await fs.readFile(spill.path), index = await fs.readFile(spill.indexPath);
+    if (mode !== "guest") await fs.writeFile(envPath, `PAPERCLIP_HOME=${JSON.stringify(path.join(workspacePath, "different-home"))}\n`);
+    if (mode === "unreadable") await fs.chmod(spill.indexPath, 0);
+    return { ...spill, bytes, index };
+  } finally {
+    for (const key of keys) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  }
+}
 // OBJLOG_MUTATION=recovery-off is the mutation row: the spill upload is turned off and these rows go red.
 const recoverSpill = process.env.OBJLOG_MUTATION === "recovery-off" ? false : undefined;
 export const newStore = (m: ReturnType<typeof spillMemory>, spillDir: string) => createObjectRunLogStore({

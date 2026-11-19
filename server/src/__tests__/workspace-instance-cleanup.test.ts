@@ -12,7 +12,7 @@ import {
 import type { WorkspaceOperation } from "@paperclipai/shared";
 import type { WorkspaceOperationRecorder } from "../services/workspace-operations.js";
 import { createObjectRunLogStore, readObjectRunLogSpill } from "../services/object-run-log-store.js";
-import { event, ids, spillMemory } from "../services/object-run-log-spill.fixture.js";
+import { contentSpill, event, ids, spillMemory } from "../services/object-run-log-spill.fixture.js";
 
 const tempRoots = new Set<string>();
 
@@ -222,6 +222,31 @@ describe("worktree instance cleanup", () => {
       expect(operations.at(-1)?.metadata).toMatchObject({ refusalReason: "run_log_spill_unrecovered" });
       expect((await fs.readFile(spill.path)).equals(bytes)).toBe(true);
       expect((await fs.readFile(spill.indexPath)).equals(marker)).toBe(true);
+    }
+  });
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7018965885
+  // Keep reason: NEVER-OK trace custody. Real writer, changed guest env, real recursive removal.
+  it.each(["guest", "drift", "unreadable", "recovered"] as const)("keeps an undiscoverable content spill (%s)", async mode => {
+    const worktreesDir = await makeTempRoot("paperclip-content-instance-");
+    const workspacePath = await makeTempRoot("paperclip-content-workspace-");
+    const instanceId = "content-spill";
+    const instanceRoot = path.join(worktreesDir, "instances", instanceId);
+    await fs.mkdir(instanceRoot, { recursive: true });
+    await writeWorkspaceEnv(workspacePath, worktreesDir, instanceId);
+    const spill = await contentSpill(workspacePath, path.join(instanceRoot, "build"), mode);
+    const result = await cleanupWorktreeInstanceArtifacts({
+      pointer: (await readWorktreeInstancePointer(workspacePath))!, workspaceId: "workspace-1", workspacePath,
+      expectedInstanceId: instanceId, expectedInstanceRoot: instanceRoot, worktreesDir,
+    });
+    const survived = await fs.stat(spill.path).then(() => true, () => false);
+    console.info("content-custody-instance", { mode, result, survived });
+    expect(result.status).toBe(mode === "recovered" ? "removed" : "refused");
+    expect(survived).toBe(mode !== "recovered");
+    if (survived) {
+      await fs.chmod(spill.indexPath, 0o600);
+      expect(await fs.readFile(spill.path)).toEqual(spill.bytes);
+      expect(await fs.readFile(spill.indexPath)).toEqual(spill.index);
     }
   });
 
