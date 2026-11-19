@@ -42,7 +42,7 @@ import {
   stripStandaloneImageEmbeds,
   type AttachmentRef,
 } from "./task-chat-attachments";
-import { STEERED_CARRIED_TEXT, STEERED_NOT_DELIVERED_TEXT } from "@/api/comment-delivery";
+import { STEERED_CARRIED_TEXT, STEERED_NOT_DELIVERED_TEXT, STEERED_WAITING_TEXT } from "@/api/comment-delivery";
 import { TaskChatBubbleActions } from "./TaskChatBubbleActions";
 import { TaskChatSystemNotice } from "./TaskChatSystemNotice";
 import type { TaskChatMessageItem } from "./task-chat-model";
@@ -448,12 +448,14 @@ function TaskChatBubbleContent({
             {item.steeredIntoRunId || (item.steeredDelivery && item.steeredDelivery !== "pending") ? (
               // The server's word, subtle, on the same bubble: 'Sent' once it
               // has it, 'Taken into the next turn' when carried, 'Delivered'
-              // once the agent has read it, 'Not delivered' on run_ended_before_read.
+              // once the agent has read it, 'Not delivered' on run_ended_before_read,
+              // 'Waiting: …' while a live wake still holds it to deliver next.
               <span data-testid="task-chat-steered-delivery" data-delivery={item.steeredDelivery ?? "sent"}>
                 {timestamp ? " · " : null}
                 {item.steeredDelivery === "delivered" ? "Delivered"
                   : item.steeredDelivery === "carried" ? STEERED_CARRIED_TEXT
-                  : item.steeredDelivery === "not_delivered" ? STEERED_NOT_DELIVERED_TEXT : "Sent"}
+                  : item.steeredDelivery === "not_delivered" ? STEERED_NOT_DELIVERED_TEXT
+                  : item.steeredDelivery === "waiting" ? STEERED_WAITING_TEXT : "Sent"}
               </span>
             ) : null}
           </span>
