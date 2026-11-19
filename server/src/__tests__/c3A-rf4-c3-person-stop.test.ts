@@ -13,7 +13,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 // Independent reviewer regression: real person HTTP Stop, real DB cancellation,
 // real release/orchestrator/provider receipts and admission. No release or hold
 // producer is mocked. Only native provider execution/cancel delivery is scripted.
-const fixture = vi.hoisted(() => ({ calls: [] as string[], firstRun: "", onFirst: undefined as undefined | (() => Promise<void>), successorThrows: false }));
+const fixture = vi.hoisted(() => ({ calls: [] as string[], firstRun: "", onFirst: undefined as undefined | (() => Promise<void>), successorThrows: false,
+  firstFails: false, onSuccessor: undefined as undefined | ((binding: { companyId: string; agentId: string; runId: string; issueId: string }) => Promise<void>) }));
 vi.mock("../services/heartbeat/runtime-selection.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../services/heartbeat/runtime-selection.js")>();
   return { ...actual, prepareAndSelectHeartbeatRuntime: (async (db, input, deps) => actual.prepareAndSelectHeartbeatRuntime(db,
@@ -31,8 +32,14 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
     }) as typeof actual.cancelNativeSession,
     executePaperclipNativeSession: (async input => {
       const runId = input.execution.binding.runId; fixture.calls.push(runId);
-      if (runId === fixture.firstRun && fixture.onFirst) { await fixture.onFirst(); throw new actual.NativeCancellationPendingRecoveryError(); }
+      if (runId === fixture.firstRun && fixture.onFirst) {
+        await fixture.onFirst();
+        // P9-60 control: the first turn's provider FAILS (no Stop by anyone).
+        if (fixture.firstFails) throw new Error("p960_first_provider_turn_failed");
+        throw new actual.NativeCancellationPendingRecoveryError();
+      }
       if (fixture.successorThrows) throw new Error("rf4_successor_provider_turn_reached");
+      if (fixture.onSuccessor) await fixture.onSuccessor(input.execution.binding as never);
       return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "rf4 successor answered" };
     }) as typeof actual.executePaperclipNativeSession };
 });
@@ -48,6 +55,11 @@ import { taskInterruptionPresentation } from "../services/task-interruption-pres
 import { getSandboxProvider } from "../services/sandbox-provider-runtime.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { acknowledgedNativeStopExecutionHasStopped } from "../services/acknowledged-native-stop.js";
+import { issueService } from "../services/issues.js";
+import { answeredPersonMessageSql } from "../services/person-message-answer.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { PERSON_STOP_HELD_MESSAGE_NEXT_ACTION, PERSON_STOP_HELD_MESSAGE_TEXT, PERSON_STOP_HELD_MESSAGE_TITLE, settleUnansweredPersonMessage,
+  UNANSWERED_MESSAGE_NO_RUN_TEXT } from "../services/recovery/unanswered-person-message.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 async function waitFor(check: () => Promise<boolean>, ms = 10_000) {
@@ -70,7 +82,10 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
   });
   // a8 (D2): opts.chat makes the task a chat and sends the message through the real chat
   // route POST /api/issues/:id/comments (routes/issues.ts:20130-20162).
-  async function exercise(mode: "waiting" | "mid_turn", label: string, opts: { chat?: boolean } = {}) {
+  // P9-60: opts.messages sends that many messages through the real comment route
+  // (POST /api/issues/:id/comments), on the chat and on a plain task alike;
+  // mode "fails" sends them, then the first turn's provider fails (no Stop).
+  async function exercise(mode: "waiting" | "mid_turn" | "fails", label: string, opts: { chat?: boolean; messages?: number } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID(), wakeId = randomUUID();
     const providerLeaseId = `sandbox://fake/${runId}/${randomUUID()}`;
     const remoteCwd = path.join(home, runId); await fs.mkdir(remoteCwd); await fs.writeFile(path.join(remoteCwd, "notes.md"), "stopped edit\n");
@@ -90,6 +105,12 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     let leaseId = "", stopMs = 0, stopResponse: unknown, waitingWakes: unknown;
     const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: () => ({}) as never, beforeNativeRuntimeSelection: async id => {
       if (id !== runId) return;
+      // P9-60 control: a native turn with no sandbox workspace (no lease to preserve).
+      if (mode === "fails") {
+        await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issueId, nativePhase: "observed" }).where(eq(heartbeatRuns.id, runId));
+        await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, phase: "observed" });
+        return;
+      }
       const [lease] = await db.insert(environmentLeases).values({ companyId, issueId, heartbeatRunId: runId, provider: "fake", providerLeaseId, status: "active", leasePolicy: "reuse_by_environment",
         metadata: { driver: "sandbox", provider: "fake", image: "fixture:test", reuseLease: true, reusableSandboxLease: true, remoteCwd, agentId } }).returning(); leaseId = lease.id;
       const reference = { schema: "paperclip.native-workspace-sync/v3", state: "prepared", descriptorSha256: "a".repeat(64), baselineSha256: "b".repeat(64), finalHostSha256: null,
@@ -100,6 +121,18 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     } });
     let commentId = randomUUID();
     const message = async () => {
+      if (opts.messages) {
+        if (opts.chat) {
+          await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+          await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: "rf4-person", conversationState: "active" }).where(eq(issues.id, issueId));
+        }
+        for (let i = 1; i <= opts.messages; i += 1) {
+          const sent = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: `Held message ${i}`, clientRequestId: randomUUID() });
+          expect(sent.status, JSON.stringify(sent.body)).toBe(201); commentId = sent.body.id;
+          await new Promise(r => setTimeout(r, 20));
+        }
+        return db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      }
       if (opts.chat) {
         await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
         await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: "rf4-person", conversationState: "active" }).where(eq(issues.id, issueId));
@@ -113,6 +146,7 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     };
     fixture.firstRun = runId; fixture.calls = [];
     fixture.onFirst = async () => {
+      if (mode === "fails") { waitingWakes = await message(); return; }
       if (mode === "waiting") waitingWakes = await message();
       const start = Date.now();
       const result = await request(app).post(`/api/heartbeat-runs/${runId}/cancel`).send({});
@@ -127,7 +161,7 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
       await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions();
       const admittedAt = Date.now();
       do { await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions(); if (fixture.calls.length > 1) break; await new Promise(r => setTimeout(r, 100)); } while (Date.now() - admittedAt < 10_000);
-      const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+      const [lease] = leaseId ? await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)) : [];
       const allLeases = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, runId));
       const holds = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
       const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), sql`(${heartbeatRuns.contextSnapshot}->>'commentId' = ${commentId} or ${heartbeatRuns.contextSnapshot}->'wakeCommentIds' ? ${commentId})`));
@@ -136,7 +170,7 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
       const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
       const interruption = await taskInterruptionPresentation(db, task);
       const evidence = { mode, opts, runId, companyId, agentId, issueId, commentId, lease, allLeases, holds, runs, calls: [...fixture.calls], blocker, projection, interruption,
-        stopMs, stopResponse, waitingWakes, stopCalls: stop.mock.calls, observedMs: Date.now() - admittedAt, confirmed: hasConfirmedSandboxStopAndRetain(lease) };
+        stopMs, stopResponse, waitingWakes, stopCalls: stop.mock.calls, observedMs: Date.now() - admittedAt, confirmed: lease ? hasConfirmedSandboxStopAndRetain(lease) : false };
       await fs.writeFile(path.join(process.env.TASK_OUT!, `own-${label}.json`), JSON.stringify(evidence, null, 2));
       return { ...evidence, app, heartbeat };
     } finally { fixture.onFirst = undefined; await heartbeat.drainActiveRunExecutions(); stop.mockRestore(); }
@@ -286,4 +320,120 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     expect(withReceipt, "local released + sandbox receipt: the Stop is proven").toBe(true);
     expect(withoutReceipt, "sandbox lease with no stop receipt: the Stop is NOT proven").toBe(false);
   }, 60_000);
+  // P9-60 (stack-lead's live row on c1): three messages held by a PERSON's Stop, NO Send for 5 min,
+  // then Send. Built from the real producers: the messages through POST /api/issues/:id/comments,
+  // the Stop through POST /api/heartbeat-runs/:runId/cancel (routes/agents.ts, the product's own
+  // cancellation and acknowledgement), the Send through POST /api/issues/:id/queued-comments/interrupt,
+  // the answer through issueService.addComment (the agent comment route's writer) inside the successor
+  // turn, the task's done through PATCH /api/issues/:id. Sweeps: settleUnansweredPersonMessage (the
+  // recovery worker's per-task entry) at simulated +1/+3/+5 min; after the answer, the REAL recovery
+  // worker (heartbeat.registerIssueStateRecoveryWork). What the person sees: GET /api/issues/:id/comments.
+  const unansweredNotes = (comments: any[]) => comments.filter(c => c.authorType === "system"
+    && String(c.metadata?.authorizationReason ?? "").startsWith("unanswered_message:"));
+  const answeredFlags = async (companyId: string, ids: string[]) => Promise.all(ids.map(async id => (await db.select({
+    answered: answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }) })
+    .from(issueComments).where(and(eq(issueComments.companyId, companyId), eq(issueComments.id, id))))[0]!.answered));
+  for (const surface of ["chat", "task"] as const) it(`P9-60 ${surface}: three held by a person's Stop get R3 (never no_run), and every note retires once answered`, async () => {
+    const r = await exercise("waiting", `p960-${surface}`, { chat: surface === "chat", messages: 3 });
+    const evidence: Record<string, unknown> = { holdsAfterStop: r.holds };
+    // The real Stop leaves NO board-owned recovery action (the measured board hold was the harness's).
+    expect(r.holds.filter(h => ["active", "escalated"].includes(h.status)), "the real Stop leaves no board hold").toEqual([]);
+    const messages = (await db.select().from(issueComments).where(and(eq(issueComments.issueId, r.issueId), eq(issueComments.authorType, "user"))))
+      .sort((a, b) => +a.createdAt - +b.createdAt);
+    expect(messages.map(m => m.body)).toEqual(["Held message 1", "Held message 2", "Held message 3"]);
+    const queue = (await request(r.app).get(`/api/issues/${r.issueId}/queued-comments`)).body;
+    expect(queue.state, "held").toBe("deferred");
+    expect(queue.entries.map((e: any) => e.comment.id)).toEqual(messages.map(m => m.id));
+    // NO Send for 5 min of product sweeps.
+    const latest = messages.at(-1)!.createdAt.getTime();
+    const sweeps: unknown[] = [];
+    for (const minutes of [1, 3, 5]) {
+      const outcome = await settleUnansweredPersonMessage(db, { companyId: r.companyId, issueId: r.issueId, now: new Date(latest + minutes * 60_000) });
+      const shown = (await request(r.app).get(`/api/issues/${r.issueId}/comments`).expect(200)).body as any[];
+      sweeps.push({ minutes, outcome, notes: unansweredNotes(shown).map(n => ({ reason: n.metadata.authorizationReason, body: n.body })) });
+      if (minutes === 1) continue;
+      const notes = unansweredNotes(shown);
+      expect(notes.length, `+${minutes} min: one note for the held set`).toBe(1);
+      for (const note of notes) {
+        expect(note.body, "R3 exactly").toBe(PERSON_STOP_HELD_MESSAGE_TEXT);
+        expect(JSON.stringify(note)).toContain(PERSON_STOP_HELD_MESSAGE_TITLE);
+        expect(JSON.stringify(note)).toContain(PERSON_STOP_HELD_MESSAGE_NEXT_ACTION);
+        expect(messages.map(m => `unanswered_message:${m.id}`)).toContain(note.metadata.authorizationReason);
+      }
+      const all = JSON.stringify(shown);
+      expect(all, "no no_run card").not.toContain(UNANSWERED_MESSAGE_NO_RUN_TEXT);
+      expect(all, "never 'assign this agent a new task'").not.toContain("assign this agent a new task");
+    }
+    evidence.sweeps = sweeps;
+    // The person's Send; the successor answers with one reply.
+    fixture.onSuccessor = async binding => { await issueService(db).addComment(binding.issueId, "Answered the held messages.",
+      { agentId: binding.agentId, runId: binding.runId }); };
+    try {
+      const send = await request(r.app).post(`/api/issues/${r.issueId}/queued-comments/interrupt`).send({ queueId: queue.queueId, revision: queue.revision, targetRunId: null });
+      expect(send.status, JSON.stringify(send.body)).toBe(200);
+      await sweepRuns(r, 20_000, runs => runs.some(run => run.id !== r.runId) && fixture.calls.length > 1);
+      await sweepRuns(r, 3_000);
+    } finally { fixture.onSuccessor = undefined; }
+    const successors = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, r.issueId))).filter(run => run.id !== r.runId);
+    const replies = (await db.select().from(issueComments).where(and(eq(issueComments.issueId, r.issueId), eq(issueComments.authorType, "agent"))));
+    evidence.successors = successors.map(run => ({ id: run.id, status: run.status, wakeCommentIds: (run.contextSnapshot as any)?.wakeCommentIds }));
+    evidence.replies = replies.map(c => ({ id: c.id, runId: c.createdByRunId }));
+    expect(successors, "one answer run").toHaveLength(1);
+    for (const m of messages) expect(carries({ ctx: successors[0]!.contextSnapshot }, m.id), "the one run carries every held message").toBe(true);
+    expect(replies.map(c => c.createdByRunId), "answered exactly once").toEqual([successors[0]!.id]);
+    expect(await answeredFlags(r.companyId, messages.map(m => m.id)), "answeredPersonMessageSql: all three answered").toEqual([true, true, true]);
+    if (surface === "task") {
+      const done = await request(r.app).patch(`/api/issues/${r.issueId}`).send({ status: "done" });
+      expect(done.status, JSON.stringify(done.body)).toBe(200);
+    }
+    const [after] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, r.issueId));
+    evidence.statusAfterAnswer = after?.status;
+    // The REAL recovery worker, with no hint for this task: every note on the held messages retires.
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
+    const work = r.heartbeat.registerIssueStateRecoveryWork(coordinator, () => true);
+    let retired = false;
+    try {
+      await work.ready;
+      retired = await waitFor(async () => {
+        work.wake();
+        const live = (await db.select().from(issueComments).where(and(eq(issueComments.issueId, r.issueId), eq(issueComments.authorType, "system"))))
+          .filter(c => String((c.metadata as any)?.authorizationReason ?? "").startsWith("unanswered_message:") && !c.deletedAt);
+        return live.length === 0;
+      }, 20_000).then(() => true, () => false);
+    } finally { await work.stop(); }
+    const notesInDb = (await db.select().from(issueComments).where(and(eq(issueComments.issueId, r.issueId), eq(issueComments.authorType, "system"))))
+      .filter(c => String((c.metadata as any)?.authorizationReason ?? "").startsWith("unanswered_message:"));
+    const shownAfter = (await request(r.app).get(`/api/issues/${r.issueId}/comments`).expect(200)).body as any[];
+    evidence.notesAfterAnswer = notesInDb.map(c => ({ reason: (c.metadata as any).authorizationReason, deletedAt: c.deletedAt, body: c.body }));
+    evidence.shownAfterAnswer = unansweredNotes(shownAfter).map(n => n.body);
+    await fs.writeFile(path.join(process.env.TASK_OUT!, `own-p960-${surface}.json`), JSON.stringify(evidence, null, 2));
+    expect(notesInDb.length, "the held set had a note").toBeGreaterThan(0);
+    expect(retired, `every note retired (status ${after?.status})`).toBe(true);
+    expect(notesInDb.every(c => c.deletedAt), "every note on them is deleted").toBe(true);
+    expect(unansweredNotes(shownAfter), "the person sees no note").toEqual([]);
+  }, 180_000);
+  // P9-60 control (RFL 20:34Z): a REAL board hold with NO person Stop keeps its own card. Producer:
+  // the first turn's provider fails (no Stop by anyone); the wake queue's release writes the board
+  // active_run_watchdog hold (modules/wake-queue/adapters/postgres.ts recordNativeTerminalRecoveryIfNeeded).
+  it("P9-60 control: a real board hold with no person Stop still shows its own card, never R3", async () => {
+    fixture.firstFails = true;
+    let r: Awaited<ReturnType<typeof exercise>>;
+    try { r = await exercise("fails", "p960-control", { messages: 3 }); } finally { fixture.firstFails = false; }
+    const hold = r.holds.find(h => ["active", "escalated"].includes(h.status));
+    const messages = (await db.select().from(issueComments).where(and(eq(issueComments.issueId, r.issueId), eq(issueComments.authorType, "user"))))
+      .sort((a, b) => +a.createdAt - +b.createdAt);
+    const latest = messages.at(-1)!.createdAt.getTime();
+    const sweeps: unknown[] = [];
+    for (const minutes of [1, 3, 5]) sweeps.push({ minutes, outcome: await settleUnansweredPersonMessage(db, { companyId: r.companyId, issueId: r.issueId, now: new Date(latest + minutes * 60_000) }) });
+    const shown = (await request(r.app).get(`/api/issues/${r.issueId}/comments`).expect(200)).body as any[];
+    const notes = unansweredNotes(shown);
+    await fs.writeFile(path.join(process.env.TASK_OUT!, "own-p960-control.json"), JSON.stringify({ hold, holds: r.holds, sweeps, notes, runs: r.runs.map(run => run.status) }, null, 2));
+    expect(hold?.ownerType, "a board hold exists").toBe("board");
+    expect(hold?.kind).toBe("active_run_watchdog");
+    expect(notes.length, "the board hold's own card").toBe(1);
+    expect(notes[0].body, "its own card, unchanged: the no-run card with the hold's rows").toBe(UNANSWERED_MESSAGE_NO_RUN_TEXT);
+    expect(notes[0].body).not.toBe(PERSON_STOP_HELD_MESSAGE_TEXT);
+    expect(JSON.stringify(notes[0]), "the card names the board hold").toContain(hold!.id);
+  }, 180_000);
 });
