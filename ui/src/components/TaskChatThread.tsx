@@ -1257,10 +1257,21 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
   // canonical comment and settled activity are both ready. This state is
   // established in a layout effect so the live lane never disappears for a
   // paint between `liveRun` ending and the persistence handoff beginning.
-  const [settlingRun, setSettlingRun] = useState<{
+  const [settlingRunState, setSettlingRun] = useState<{
     id: string;
     startedAtMs: number | null;
   } | null>(null);
+  // A presented reply ends its turn at once: that run is never a settling
+  // tail (no held live lane, no 'Working'), so the canonical comment and its
+  // file line render in the same commit as the poll that presented it.
+  const settlingRun =
+    settlingRunState && !presentedReplyRunIds.has(settlingRunState.id)
+      ? settlingRunState
+      : null;
+  useLayoutEffect(() => {
+    if (settlingRunState && presentedReplyRunIds.has(settlingRunState.id))
+      setSettlingRun(null);
+  }, [settlingRunState, presentedReplyRunIds]);
   const prevLiveRunRef = useRef<typeof liveRun>(null);
   useLayoutEffect(() => {
     if (liveRun) {
@@ -1272,13 +1283,13 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     }
     const prev = prevLiveRunRef.current;
     prevLiveRunRef.current = null;
-    if (!prev) return;
+    if (!prev || presentedReplyRunIds.has(prev.id)) return;
     setSettlingRun({
       id: prev.id,
       startedAtMs:
         (prev.startedAt ? toMs(prev.startedAt) : null) ?? toMs(prev.createdAt),
     });
-  }, [liveRun]);
+  }, [liveRun, presentedReplyRunIds]);
 
   const heldPaperclipRunnerRunId =
     liveRun && isNativePaperclipRunnerRun(liveRun)
