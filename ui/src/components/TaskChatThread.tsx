@@ -1025,6 +1025,16 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     return ids;
   }, [comments, replyFileLines]);
 
+  // A steer the server still calls 'accepted' into a run the thread's own run
+  // lists show as ended was never read: the bubble says Not delivered.
+  const terminalRunIds = useMemo(() => {
+    const status = new Map<string, string>();
+    for (const run of linkedRuns ?? []) status.set(run.runId, run.status);
+    for (const run of liveRuns ?? []) status.set(run.id, run.status);
+    if (activeRun) status.set(activeRun.id, activeRun.status);
+    return new Set([...status].filter(([, runStatus]) => isTerminalRunStatus(runStatus)).map(([id]) => id));
+  }, [linkedRuns, liveRuns, activeRun]);
+
   const commentItems = useMemo(
     () =>
       commentsToTaskChatItems(renderedComments, {
@@ -1034,8 +1044,10 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
         currentUserId,
         issueAssigneeAgentId,
         verificationCaveatsByRunId,
+        terminalRunIds,
       }),
     [
+      terminalRunIds,
       renderedComments,
       agentMap,
       userLabelMap,

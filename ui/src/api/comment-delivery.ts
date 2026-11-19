@@ -83,11 +83,25 @@ export function isPendingDelivery(comment: object | null | undefined): boolean {
  * (Pi itself read it into the turn: `steeringStatus` 'delivered'). 'pending'
  * only for the client's neutral mark before the POST answers. Null for a
  * message that was not steered.
+ *
+ * 'not_delivered' is derived ONLY from two server facts: the server still says
+ * `steeringStatus` 'accepted' AND the run `steeredIntoRunId` names is terminal
+ * in the issue's runs (`terminalRunIds`). The turn ended before the agent read
+ * it, so it must not keep saying 'Sent'. A later 'delivered', or the server
+ * moving the message (no `steeredIntoRunId`), wins.
  */
-export type SteeredDelivery = "pending" | "sent" | "delivered";
-export function readSteeredDelivery(comment: object | null | undefined): SteeredDelivery | null {
-  if (!readSteeredIntoRunId(comment)) return isPendingDelivery(comment) ? "pending" : null;
-  return (comment as DeliveryFields).steeringStatus === "delivered" ? "delivered" : "sent";
+export type SteeredDelivery = "pending" | "sent" | "delivered" | "not_delivered";
+export const STEERED_NOT_DELIVERED_TEXT = "Not delivered: the turn ended before the agent read it.";
+export function readSteeredDelivery(
+  comment: object | null | undefined,
+  terminalRunIds?: ReadonlySet<string> | null,
+): SteeredDelivery | null {
+  const runId = readSteeredIntoRunId(comment);
+  if (!runId) return isPendingDelivery(comment) ? "pending" : null;
+  const status = (comment as DeliveryFields).steeringStatus;
+  if (status === "delivered") return "delivered";
+  if (status === "accepted" && terminalRunIds?.has(runId)) return "not_delivered";
+  return "sent";
 }
 
 /** Exactly what the server answered for one POST. Nothing here is a client guess. */
