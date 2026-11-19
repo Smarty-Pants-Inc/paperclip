@@ -3679,6 +3679,34 @@ describe("composer Stop", () => {
     } finally { vi.useRealTimers(); }
   });
 
+  // Planted: the warm keep_running shape the real Stop route returns. The
+  // person's Stop (IssueDetail stopResponse) accepts the acknowledged record.
+  it.each([
+    ["acknowledged", "acknowledged", null],
+    ["unacknowledged", "pending", "stop was requested"],
+  ] as const)("the person's Stop on a warm native turn: %s cancellation", async (_label, dispatchState, line) => {
+    vi.useFakeTimers();
+    try {
+      const observed = nativeStopAwaitingContainment();
+      const requested = { ...observed, resultJson: { ...observed.resultJson, nativeCancellation: {
+        ...(observed.resultJson!.nativeCancellation as Record<string, unknown>), dispatchState } } } as HeartbeatRun;
+      const getRun = vi.fn(async () => requested);
+      const onStop = vi.fn(() => waitForStoppedRuns([requested.id], { initialRuns: [requested], getRun,
+        acceptNativeCancellationRecord: true }));
+      render(<TaskChatComposer workMode="standard" onAdd={vi.fn()} onStop={onStop} />);
+      flushSync(() => stopButton()!.click());
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      if (line) expect(container.querySelector('[role="alert"]')?.textContent).toContain(line);
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      if (line) expect(container.querySelector('[role="alert"]')?.textContent).toContain(line);
+      else {
+        expect(container.querySelector('[role="alert"]')).toBeNull();
+        expect(stopButton()?.getAttribute("aria-label")).not.toBe("Stopping…");
+        expect(getRun).not.toHaveBeenCalled();
+      }
+    } finally { vi.useRealTimers(); }
+  });
+
   it("switches Stop to Send with text, whitespace back to Stop, without interrupting on keyboard submit", async () => {
     const onStop = vi.fn(async () => {});
     const onAdd = vi.fn(async () => {});

@@ -4894,7 +4894,9 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const stopResponse = useMutation({
     mutationFn: async (runId: string) => {
       const stoppedRun = await heartbeatsApi.cancel(runId);
-      await waitForStoppedRuns([runId], { initialRuns: [stoppedRun] });
+      // The person's Stop accepts the server's record that the turn's
+      // cancellation was acknowledged; a warm box may never send a stop receipt.
+      await waitForStoppedRuns([runId], { initialRuns: [stoppedRun], acceptNativeCancellationRecord: true });
     },
     onSettled: () => Promise.all([
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(issueId!) }),
