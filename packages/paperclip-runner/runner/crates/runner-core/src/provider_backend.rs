@@ -1404,6 +1404,8 @@ struct CodexProviderState {
     active_provider_result_fingerprint: Option<String>,
     #[serde(default)]
     active_provider_result_disposition: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    awaiting_run_attach: bool,
     #[serde(default)]
     active_terminal_tool_rejected: bool,
     // A Pi client waiter can expire before the dispatched operation settles.
@@ -1473,6 +1475,7 @@ impl CodexProviderState {
         let codex_usage =
             (config.provider == "codex").then(|| CodexRunUsage::new(thread_id.is_some()));
         Self {
+            awaiting_run_attach: false,
             schema: PROVIDER_STATE_SCHEMA.to_owned(),
             lifecycle: "prepared".to_owned(),
             run_identity: None,
@@ -2217,6 +2220,7 @@ pub struct CodexCommandExecutor {
     // Derived again from the saved identities after restart; never persisted
     // into the predecessor's provider state.
     refresh_admission: Option<&'static str>,
+    awaiting_new_run_attach: bool,
     unsaved_frame_state: std::cell::Cell<bool>,
     unsaved_trace_interpretations: Vec<NormalizationTrace>,
     #[cfg(test)]
@@ -2240,6 +2244,7 @@ impl CodexCommandExecutor {
             startup_evidence_error: None,
             recovery_pending_effects: None,
             refresh_admission: None,
+            awaiting_new_run_attach: false,
             unsaved_frame_state: std::cell::Cell::new(false),
             unsaved_trace_interpretations: Vec::new(),
             #[cfg(test)]
@@ -2254,6 +2259,34 @@ impl CodexCommandExecutor {
         executor.opencode_launch_profile = config.opencode_launch_profile.clone();
         executor.cursor_cloud_launch_profile = config.cursor_cloud_launch_profile.clone();
         executor
+    }
+
+    pub fn await_new_run_attach(&self) -> Result<(), DurableRunnerError> {
+        let Ok(mut file) = open_private_regular_file(&self.state_path()) else {
+            return Ok(());
+        };
+        let mut input = Vec::new();
+        if file
+            .metadata()
+            .map_or(true, |metadata| metadata.len() > MAX_PROVIDER_STATE_BYTES)
+            || file.read_to_end(&mut input).is_err()
+        {
+            return Ok(());
+        }
+        let Ok(mut state) = serde_json::from_slice::<Value>(&input) else {
+            return Ok(());
+        };
+        let Some(fields) = state.as_object_mut() else {
+            return Ok(());
+        };
+        if fields.get("awaitingRunAttach") == Some(&Value::Bool(true)) {
+            return Ok(());
+        }
+        fields.insert("awaitingRunAttach".to_owned(), Value::Bool(true));
+        let bytes = serde_json::to_vec(&state).map_err(|error| {
+            DurableRunnerError::invalid(format!("failed to encode Codex provider state: {error}"))
+        })?;
+        self.write_state_bytes(&bytes)
     }
 
     pub(crate) fn observe_recovery_state(&mut self, state: &crate::durable::DurableState) {
@@ -2824,6 +2857,13 @@ impl CodexCommandExecutor {
 
     fn restore_once(&mut self) -> Result<(), DurableRunnerError> {
         self.load_state_without_provider()?;
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.awaiting_run_attach)
+        {
+            self.awaiting_new_run_attach = true;
+        }
         self.retire_orphaned_startup_attempt(
             &|pid| local_process_definitely_gone(pid, false),
             &|group| local_process_definitely_gone(group, true),
@@ -2999,6 +3039,9 @@ impl CodexCommandExecutor {
 
     fn restore_provider_if_needed(&mut self) -> Result<(), DurableRunnerError> {
         self.assert_startup_admitted()?;
+        if self.awaiting_new_run_attach {
+            return Ok(());
+        }
         let Some(state) = self.state.clone() else {
             return Ok(());
         };
@@ -4468,11 +4511,18 @@ impl CodexCommandExecutor {
                         ))
                     })
             }
-        } else if next_state.provider_process_generation > 0
-            && (next_state.lifecycle == "prepared" || settled_exited_checkpoint)
+        } else if (next_state.lifecycle == "prepared"
+            || settled_exited_checkpoint
+            || (self.awaiting_new_run_attach
+                && matches!(
+                    next_state.lifecycle.as_str(),
+                    "session_open" | "provider_exited"
+                )))
+            && next_state.provider_process_generation > 0
         {
             // turn.stop and an observed idle provider exit both retain a
-            // settled thread with no process left to attach. Rebind only its
+            // settled thread with no process left to attach; a new run's
+            // pending attach may also find an open or exited session. Rebind only its
             // validated run-scoped settings here; open_session then restores
             // that same thread under the new authority. Never restart during
             // drain/suspend or require the stopped process to still exist.
@@ -4496,6 +4546,7 @@ impl CodexCommandExecutor {
         next_state
             .pending_events
             .retain(|event| event.event_type != "session.resumed");
+        next_state.awaiting_run_attach = false;
         next_state.lifecycle = if retained_provider {
             "session_open".to_owned()
         } else {
@@ -4505,6 +4556,7 @@ impl CodexCommandExecutor {
         };
         self.persist_state(&next_state)?;
         self.state = Some(next_state);
+        self.awaiting_new_run_attach = false;
         Ok(expired_tool_calls)
     }
 
@@ -6971,6 +7023,25 @@ impl CommandExecutor for CodexCommandExecutor {
             self.save_before_provider_writes(false)?;
             self.restore()?;
             self.maintain_deferred_pi_terminal()?;
+            if self.awaiting_new_run_attach
+                && !matches!(
+                    command.command_type.as_str(),
+                    "run.attach"
+                        | "session.snapshot"
+                        | "session.close"
+                        | "session.destroy"
+                        | "runner.drain"
+                        | "runner.suspend"
+                        | "runner.shutdown"
+                        | "turn.interrupt"
+                        | "run.cancel"
+                        | "turn.stop"
+                )
+            {
+                return Err(DurableRunnerError::invalid(
+                    "Codex durable session requires run.attach before commands from a new run",
+                ));
+            }
             if self
                 .state
                 .as_ref()
@@ -11180,6 +11251,7 @@ done
     fn rejects_inconsistent_provider_state() {
         let state = CodexProviderState {
             run_identity: None,
+            awaiting_run_attach: false,
             startup_attempt: None,
             schema: PROVIDER_STATE_SCHEMA.to_owned(),
             lifecycle: "turn_active".to_owned(),

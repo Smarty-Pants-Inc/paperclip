@@ -40,6 +40,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { agentUrl } from "@/lib/utils";
 import { cn } from "@/lib/utils";
+import { ProviderLimitMessage } from "./ProviderLimitMessage";
 import { Badge } from "@/components/ui/badge";
 import {
   deriveRecoveryDisplayState,
@@ -1341,7 +1342,7 @@ export function IssueRecoveryActionCard({
           </MetadataRow>
         ) : null}
         <MetadataRow label="Next action">
-          {taskRetryRefusal ? <span>{taskRetryRefusal.nextAction}</span> : action.nextAction ? <span>{action.nextAction}</span> : <MissingValue />}
+          {taskRetryRefusal ? <span>{taskRetryRefusal.nextAction}</span> : action.nextAction ? <span><ProviderLimitMessage>{action.nextAction}</ProviderLimitMessage></span> : <MissingValue />}
         </MetadataRow>
         <MetadataRow label="Follow-up">
           <span className="inline-flex flex-wrap items-center gap-1.5">

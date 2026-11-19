@@ -93,26 +93,30 @@ Tasks have parentage. Every task exists in service of a parent task, all the way
 
 The current issue model includes stable issue identifiers, parent/sub-issues, blockers, a single assignee, comments, issue documents, attachments and work products, and review/approval handoffs. That structure keeps work inspectable by both the board and agents while still allowing agents to decompose work into smaller tasks.
 
+Canceling a task with active subtasks opens a modal headed “Cancel N active subtasks?”
+The modal lists each readable active descendant's status icon and title, without task IDs or links.
+Done and canceled tasks are excluded. The person can cancel only the parent,
+cancel the parent and listed subtasks, or dismiss the modal to leave them unchanged.
+
 When an agent creates a subtask or follow-up task, its source task's feed shows
 a linked card at creation time with the current title, task number, and status.
 The Tasks tab keeps the full relationship list and shows each task once. Project
 groups omit tasks already shown in the other sections and disappear when empty.
 
-Sidebar Recents shows readable direct subtasks below a recent parent. Each group
-can fold independently, starts with at most ten children, and loads more on
-request. Waiting external chat children remain visible in explicit child lists.
-A selected child beyond the first ten replaces the last preview row.
-Children already in recent history appear once under their recent root parent.
-Orphans remain in the main list. Standard Recents and Classic Recent Tasks use
-the same groups; Classic keeps its existing parent action menus. Child reads stop
-when a group leaves the viewport. At most three child requests run together.
-Show less discards extra cached pages, so the next refresh reads one preview.
-Live updates refresh the affected child groups and recent summary batches;
-permission changes clear cached children before refetching.
+Sidebar Recents and Classic Recent Tasks show tasks from the viewer’s own
+recent activity as a flat list. A subtask has its own row and its own unread
+marker. Tasks archived from the viewer’s inbox leave Recents. Canceled and
+completed tasks remain eligible. Opening a recent task moves its row to the top
+of Recents.
 
-Unread stays personal to each task. Folding, loading children, and Show more do
-not mark tasks read. A folded group shows its readable unread-child count,
-including children beyond ten, separately from the parent's own unread marker.
+Standard Recents also shows recent chats and projects as individual links.
+Coordinator Recents lets you pin tasks, agent chats, and projects above More.
+The pin button appears on the current row or when a row is hovered or focused
+with the keyboard. Shortcuts share the saved order with pinned pages and stay
+available as Recents changes.
+Project links in Recents and pinned navigation open the project's Tasks tab.
+Both locations have a chevron that shows up to 12 recently updated project tasks.
+The task list loads when expanded and keeps the task status and unread markers.
 
 Agent-owned tasks show **In Progress** only while a task-linked run is queued
 or running. When execution ends, their visible status reflects recovery
@@ -186,6 +190,15 @@ The routine Overview shows its responsible user beside Default agent. People wit
 The change creates a routine revision and applies to future automatic tasks.
 Existing tasks keep their responsibility. Manual runs use the person who starts
 them. Agents cannot transfer routine responsibility.
+
+The Routines list shows the agent and responsible user in adjacent columns.
+People can choose project, agent, responsible user, last run, and enabled columns.
+Search, sort, group, and project, agent, enabled, responsible user, and source
+filters are saved in the URL when changed. A shared filter URL takes precedence
+over locally saved filters. Each signed-in person keeps their latest filters,
+column choices, grouping, sorting, and collapsed groups in local storage for
+each company. An explicit empty filter URL clears saved filters.
+A trusted local installation without accounts uses a local board preference key.
 
 
 ### Task collection creation filters
@@ -459,6 +472,12 @@ data, limited to 500 characters—not instructions or permission to take action.
 Worker titles, comments, document bodies and request prompts are not copied into
 these notifications. Reset conversations do not receive reports from old sessions.
 
+Document links labeled to open in the sidebar keep the conversation on screen
+and show the requested document revision. **Open source task** in the sidebar
+takes the reader to the owning task's detail page with its task breadcrumb.
+The breadcrumb uses the short UUID for conversation-backed tasks without a
+task number.
+
 ### Slack task progress
 
 Slack threads reuse one editable progress message for each active run. Native
@@ -528,6 +547,10 @@ and all owner-only chat write guards remain in force.
 The opt-in API is `GET /companies/:companyId/chats?agentId=<uuid>&members=all`,
 with `limit` (1–100, default 50) and `offset` (default 0). Omitting `members=all`
 retains the existing caller-only result.
+
+When an artifact in the side panel leaves too little room for the conversation,
+the chat list collapses and **Browse chats** opens the chat picker from the
+header. The list returns when you leave the artifact or make more room.
 
 Beside a conversation, the side panel opens on the agent's tasks: one card per
 task the agent created, was assigned, commented on, or acted on, newest first,

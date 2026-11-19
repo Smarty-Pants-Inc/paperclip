@@ -209,7 +209,8 @@ import {
 } from "@paperclipai/shared";
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
-import { withTelemetryCompany } from "../telemetry-company-scope.js";
+import { resolveTelemetryPerson, withTelemetryActor } from "../telemetry-company-scope.js";
+import { emitArtifactCreatedAfterCommit } from "../services/product-telemetry.js";
 import { isUniqueViolation } from "../db-errors.js";
 import type { StorageService } from "../storage/types.js";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
@@ -12904,6 +12905,8 @@ export function issueRoutes(
         });
         return;
       }
+      emitArtifactCreatedAfterCommit({ companyId: product.companyId, type: product.type, provider: product.provider, creationFlow: "promotion",
+        task: issue, runOwnerUserId: actor.actorType === "user" ? actor.actorId : null });
 
       await logActivity(db, {
         companyId: issue.companyId,
@@ -16826,7 +16829,12 @@ export function issueRoutes(
               typeof actorAgent.adapterConfig?.model === "string"
                 ? actorAgent.adapterConfig.model
                 : undefined;
-            withTelemetryCompany(issue.companyId, () => trackAgentTaskCompleted(tc, {
+            const person = resolveTelemetryPerson({
+              taskCreatedByUserId: issue.createdByUserId,
+              taskAssignedByUserId: issue.responsibleUserId,
+              runOwnerUserId: req.actor.type === "agent" ? req.actor.onBehalfOfUserId : null,
+            });
+            withTelemetryActor({ companyId: issue.companyId, person }, () => trackAgentTaskCompleted(tc, {
               agentRole: actorAgent.role,
               agentId: actorAgent.id,
               adapterType: actorAgent.adapterType,
