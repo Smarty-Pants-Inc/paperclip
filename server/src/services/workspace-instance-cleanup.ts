@@ -86,6 +86,57 @@ const defaultPostgresStopDependencies: EmbeddedPostgresStopDependencies = {
   wait: delay,
 };
 
+/**
+ * Raw-trace directories a Paperclip instance writes under its own root, with the
+ * env override its owner reads. Removing an instance root must never delete any
+ * of them (R-keep-all-traces, never-OK), so an instance root that holds one is
+ * kept whole. The defaults come from:
+ * - durable-sessions: native-harness-backup-stamp.ts nativeHarnessStateBase()
+ *   (native harness backups, continuity archives, quarantined session roots and
+ *   conversation evidence; also native-setup-evidence.ts createNativeSetupRuntime())
+ * - provider-traces: provider-trace-store.ts traceRoot()
+ * - run-logs: run-log-store.ts (RUN_LOG_BASE_PATH default)
+ */
+export const WORKTREE_INSTANCE_RAW_TRACE_DIRECTORIES: ReadonlyArray<{ relativePath: string; envOverride: string }> = [
+  { relativePath: path.join("runtime", "paperclip-runner", "durable-sessions"), envOverride: "PAPERCLIP_RUNNER_STATE_DIR" },
+  { relativePath: path.join("data", "provider-traces"), envOverride: "PROVIDER_TRACE_BASE_PATH" },
+  { relativePath: path.join("data", "run-logs"), envOverride: "RUN_LOG_BASE_PATH" },
+];
+
+// A directory with any entry holds trace. A non-directory at the trace path is
+// kept too (fail closed). A symlink is not followed: removal only unlinks it.
+async function holdsRawTrace(directory: string): Promise<boolean> {
+  let metadata: Awaited<ReturnType<typeof fs.lstat>>;
+  try {
+    metadata = await fs.lstat(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  if (metadata.isSymbolicLink()) return false;
+  if (!metadata.isDirectory()) return true;
+  return (await fs.readdir(directory)).length > 0;
+}
+
+/** The raw-trace directories with content inside this instance root. */
+export async function findWorktreeInstanceRawTraces(
+  instanceRoot: string,
+  instanceEnv: Record<string, string | undefined> = {},
+): Promise<string[]> {
+  const found: string[] = [];
+  for (const { relativePath, envOverride } of WORKTREE_INSTANCE_RAW_TRACE_DIRECTORIES) {
+    const candidates = new Set([path.join(instanceRoot, relativePath)]);
+    const override = instanceEnv[envOverride]?.trim();
+    if (override) {
+      const resolved = path.resolve(expandHomePrefix(override));
+      if (path.isAbsolute(expandHomePrefix(override))
+        && (resolved === instanceRoot || isStrictChildPath(resolved, instanceRoot))) candidates.add(resolved);
+    }
+    for (const candidate of candidates) if (await holdsRawTrace(candidate)) found.push(candidate);
+  }
+  return found;
+}
+
 function isStrictChildPath(candidatePath: string, rootPath: string): boolean {
   const relative = path.relative(rootPath, candidatePath);
   return relative.length > 0 && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
@@ -367,6 +418,9 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
 
   const dependencies = input.dependencies ?? defaultCleanupDependencies;
   let postgresStopped = false;
+  let keptRawTraces: string[] = [];
+  const keptWarning = () => `Kept worktree instance directory "${canonicalInstanceRoot}" because it holds raw traces `
+    + `(${keptRawTraces.join(", ")}); the reaper never deletes raw traces.`;
   const cleanup = async () => {
     postgresStopped = await dependencies.stopEmbeddedPostgres(path.join(canonicalInstanceRoot, "db"));
     const [currentManagedInstancesDir, currentInstanceRoot] = await Promise.all([
@@ -380,6 +434,10 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
     ) {
       throw new Error(`Refusing to remove instance directory "${configuredInstanceRoot}" because its canonical path changed during cleanup.`);
     }
+    // R-keep-all-traces (never-OK): an instance root that holds raw traces is
+    // kept whole, checked last, immediately before the removal.
+    keptRawTraces = await findWorktreeInstanceRawTraces(currentInstanceRoot, parseEnvContents(input.pointer.envContents));
+    if (keptRawTraces.length > 0) return;
     await dependencies.removeInstanceRoot(currentInstanceRoot);
   };
 
@@ -396,6 +454,13 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
       },
       run: async () => {
         await cleanup();
+        if (keptRawTraces.length > 0) {
+          return {
+            status: "skipped",
+            system: `${keptWarning()}\n`,
+            metadata: { postgresStopped, refusalReason: "raw_traces_kept", rawTraceDirectories: keptRawTraces },
+          };
+        }
         return {
           status: "succeeded",
           system: `Removed worktree instance directory ${canonicalInstanceRoot}\n`,
@@ -407,5 +472,6 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
     await cleanup();
   }
 
+  if (keptRawTraces.length > 0) return { status: "refused", instanceRoot: canonicalInstanceRoot, warning: keptWarning() };
   return { status: "removed", instanceRoot: canonicalInstanceRoot, postgresStopped };
 }
