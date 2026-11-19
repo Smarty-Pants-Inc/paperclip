@@ -420,7 +420,8 @@ async function fixture(label: string, conversation = true, earlyBodies: string[]
       if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, `${label}.json`), JSON.stringify({
         companyId, agentId, issueId, runId, commands: peer.requests, consumed: peer.consumed, replies: peer.replies, outcome: owner.outcomes.get(runId),
         realPi: peer instanceof B6RealPiPeer ? { command: peer.command, version: "1.5.2", modelRequests: peer.modelRequests } : null,
-        successorPeers: owner.peers.slice(1).map(peer => ({ commands: peer.requests, facadeCalls: peer.facadeCalls, consumed: peer.consumed, replies: peer.replies })), workerErrors,
+        successorPeers: owner.peers.slice(1).map(peer => ({ commands: peer.requests, facadeCalls: peer.facadeCalls, consumed: peer.consumed, replies: peer.replies,
+          realPi: peer instanceof B6RealPiPeer ? { command: peer.command, version: "1.5.2", modelRequests: peer.modelRequests } : null })), workerErrors,
         queues, activity: await db.select().from(activityLog).where(eq(activityLog.companyId, companyId)),
         issue: (await db.select().from(issues).where(eq(issues.id, issueId)))[0],
         finalizations: await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.companyId, companyId)),
@@ -457,6 +458,10 @@ describe("person comment default steering eligibility and asynchronous receipt",
     try {
       const messages = [...f.early, await f.post("B6-M2"), await f.post("B6-M3")];
       await vi.waitFor(() => expect(f.commands("steer").map(c => c.input?.message)).toEqual(messages.map(m => m.body)), { timeout: 5000 });
+      // Transfer the original fallback wake in the SAME prepare transaction,
+      // before provider read/answer or run-end cleanup can hide a missed consume.
+      for (const early of f.early) expect((await f.wakes()).find(wake => JSON.stringify(wake.payload).includes(early.id)))
+        .toMatchObject({ status: "completed", runId: f.runId });
       await waitForPendingCommentSteers(); f.peer.boundary();
       await vi.waitFor(() => expect(f.peer.consumed).toEqual(messages.map(m => m.body)));
       if (process.env.B6_DUPLICATE_PROBE === "1") {
@@ -613,7 +618,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
       const rows = await db.transaction(tx => tx.execute(sql`select pg_try_advisory_xact_lock(
         hashtextextended(${commentSteering.personCommentDeliveryLockKey(f.issueId)}, 0)) as acquired`));
       const acquired = rows[0]?.acquired;
-      if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, "B6d-probe-lock.json"),
+      if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, "B6d-probe-lock-observation.json"),
         JSON.stringify({ runId: f.runId, issueId: f.issueId, acquiredWhileProbeHeld: acquired }));
       release(); await draining;
       expect(acquired, "an unrelated Send must acquire the issue lock while Pi attachment I/O is held").toBe(true);
