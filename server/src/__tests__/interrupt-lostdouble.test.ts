@@ -268,6 +268,31 @@ describe.skipIf(!support.supported)("Interrupt: a failed carrier never loses a m
     expect(retried.length + cards.length, `MSG1 re-owed: ${JSON.stringify(snapshot)}`).toBe(1);
   }, 120_000);
 
+  it("L1b (residual, live 06:15:44Z d2840901): after the failed carrier's card, the person types MSG3 and a run carrying ONLY MSG3 answers ⇒ MSG1 is still re-owed (not 'answered' by the later reply)", async () => {
+    const f = await seedLiveTurn();
+    const [msg1, msg2] = await type(f, ["MSG1", "MSG2"]);
+    await barInterrupt(f, f.liveRunId);
+    await acknowledge(f, f.liveRunId);
+    const successors = await resumeInterrupts(f);
+    const carrying = successors.find(r => ((r.contextSnapshot?.wakeCommentIds as string[]) ?? []).includes(msg1!))!;
+    await failRun(carrying.id);
+    for (const minutes of [30, 60]) await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId,
+      now: new Date(Date.now() + minutes * 60_000) });
+    const cardsBefore = await notices(f);
+    await db.update(issues).set({ executionRunId: null, executionLockedAt: null }).where(eq(issues.id, f.issueId));
+    const msg3 = randomUUID();
+    await db.insert(issueComments).values({ id: msg3, companyId: f.companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: userId, body: "MSG3" });
+    const answerer = await otherRunAnswers(f, [msg3]);
+    await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId, now: new Date(Date.now() + 90 * 60_000) });
+    const cards = await notices(f);
+    const retried = await carriedLater(f, msg1!, [carrying.id, answerer]);
+    const snapshot = { msg1, msg2, msg3, carried: carrying.contextSnapshot?.wakeCommentIds, cardsBefore, cards, retried,
+      unanswered: await unanswered(f, [msg1!, msg2!]) };
+    await evidence("L1b", snapshot);
+    expect(retried.length + cards.filter(id => id === msg1 || id === msg2).length, `MSG1 still re-owed: ${JSON.stringify(snapshot)}`).toBe(1);
+  }, 120_000);
+
   it("D1: chat, MSG1+MSG2 held in separate queues -> Interrupt -> both answered (via whatever wakes); the stale MSG2 queue the chat still lists is Interrupted ⇒ NO later run wakes on either again", async () => {
     const f = await seedLiveTurn();
     const [msg1, msg2] = await type(f, ["MSG1", "MSG2"]);
