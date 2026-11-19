@@ -20,9 +20,10 @@ export const WITHHELD_REPLY_TRIGGER = "acceptance" as WithheldReplyTrigger;
 export const WITHHELD_REPLY_SAVING_DEADLINE_MS = 10 * 60_000;
 
 export const NATIVE_WITHHELD_REPLY_SCHEMA = "paperclip.native_withheld_reply.v1";
-/** The durable outbox entry of publishWithheldAcceptedReply. It is written by
- * the SAME statement that accepts the result ("acceptance") or ends the
- * accepted run without a committed reply ("terminal"), so a crash cannot
+/** The durable outbox entry of publishWithheldAcceptedReply. It is written in
+ * the SAME transaction that accepts the result ("acceptance": every accepting
+ * producer calls writeAcceptanceWithheldReplyEntry, native-withheld-reply-acceptance.ts)
+ * or ends the accepted run without a committed reply ("terminal"), so a crash cannot
  * separate the two; the reply-presentation worker discovers it and publishes once. */
 export function pendingNativeWithheldReply(resultId: string, failureCode: string | null, trigger: WithheldReplyTrigger = "terminal") {
   return { nativeWithheldReply: { schema: NATIVE_WITHHELD_REPLY_SCHEMA, state: "pending", resultId, failureCode, trigger } };
