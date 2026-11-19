@@ -214,7 +214,9 @@ describe.skipIf(!support.supported)("pause completes on the server's own record 
   }, 30_000);
 
   it("R4: a run still EXECUTING here keeps Pause in 'pausing' (run_executing_here) until it settles", async () => {
-    const f = await seed({ withLease: false });
+    // A managed Pi on Boat: the cancelled native run has its remote Boat lease (as R1/R2 seed it),
+    // so the pause skips the provider proof and the host-local native_stop_unproven check does not apply.
+    const f = await seed();
     const worker = lifecycleWorker(f.manager);
     runningProcesses.set(f.runId, { child: { pid: undefined } as never, graceSec: 0, processGroupId: null });
     try {
