@@ -1,4 +1,4 @@
-import { and, desc, eq, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
 import { parseObject } from "../adapters/utils.js";
 import { resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
@@ -192,10 +192,15 @@ function personStopWakeCommentIds(payload: unknown): string[] {
  *   Stop. Another person's message, or anything newer, is not held.
  * A saved wait (execution_active, execution_recovery, stopped_execution) does
  * not undo the Stop: nothing clears it after the Stop, so it is stale.
+ * `admittingTypedCommentIds`: the typed message(s) being admitted right now do
+ * not count as "typed since the Stop", so admission can ask, wake by wake,
+ * whether a saved wake was held by the Stop up to this very message (it runs
+ * first, alone; the held ones follow it).
  * (ported from al/c1-heldstop-sweep-c1d 61f43a23; keyed on S's acceptance row)
  */
 export async function readPersonStopHold(db: Db, input: {
   companyId: string; issueId: string; agentId: string; messageId?: string; wakeId?: string;
+  admittingTypedCommentIds?: string[];
 }): Promise<PersonStopHold | null> {
   const onIssue = or(eq(heartbeatRuns.nativeIssueId, input.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`);
   const [running] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
@@ -220,7 +225,8 @@ export async function readPersonStopHold(db: Db, input: {
   const [typedAfterStop] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     eq(issueComments.authorType, "user"), eq(issueComments.authorUserId, userId), isNull(issueComments.createdByRunId),
-    gt(issueComments.createdAt, acceptedAt))).limit(1);
+    gt(issueComments.createdAt, acceptedAt),
+    input.admittingTypedCommentIds?.length ? notInArray(issueComments.id, input.admittingTypedCommentIds) : undefined)).limit(1);
   if (typedAfterStop) return null;
   const wakes = await db.select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, payload: agentWakeupRequests.payload })
     .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.agentId, input.agentId),
