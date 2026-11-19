@@ -3963,6 +3963,12 @@ exit status under POSIX shells, rather than accepting base64's pipeline status.
 Unreadable sources, a failed inventory, tar failures, or mismatched counts/bytes
 throw and leave destructive cleanup to retain the remote root. Streamed pulls
 verify the private extraction before replacing any previous durable checkpoint.
+If that verification fails, the extraction is moved to the target's sibling
+`superseded/<ms>-<uuid>-failed-verify/payload`, within the same durable-session
+tree. These bytes may be the only surviving trace if the source box is gone.
+A failed move leaves the private extraction in place and logs a warning; even
+if logging fails, the original verification error still surfaces. No failed
+verification payload is deleted.
 The inventory is an immediate completeness check, not a persisted backup format
 or a content hash; existing saved checkpoints keep their current format.
 

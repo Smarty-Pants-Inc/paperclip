@@ -16498,6 +16498,7 @@ export async function syncRemoteRunnerDirectoryOut(input: {
   );
   let previousMoved = false;
   let replacementInstalled = false;
+  let keepFailedVerification = false;
   try {
     mkdirSync(stagedTarget, { recursive: true, mode: input.mode });
     // Extraction runs off the event loop into this call's private staging
@@ -16516,7 +16517,25 @@ export async function syncRemoteRunnerDirectoryOut(input: {
       { input: archive, maxBuffer: 8 * 1024 * 1024, timeout: 60_000 },
     );
     assertSafeExtractedCheckpoint(stagedTarget);
-    await verifyLocalCheckpointManifest(stagedTarget, manifest);
+    try {
+      await verifyLocalCheckpointManifest(stagedTarget, manifest);
+    } catch (error) {
+      // rf-3 / #20787: the source box may be gone. A manifest mismatch does
+      // not prove these bytes disposable; keep the entire extracted payload.
+      // Set this before the rename so a failed keep leaves staging in place.
+      keepFailedVerification = true;
+      try {
+        const kept = join(parent, "superseded");
+        mkdirSync(kept, { recursive: true, mode: 0o700 });
+        renameSync(stagingRoot, join(kept, `${Date.now()}-${randomUUID()}-failed-verify`));
+      } catch (keepError) {
+        try {
+          logger.warn({ event: "native_checkpoint_failed_verify_keep_deferred", stagingRoot,
+            code: (keepError as NodeJS.ErrnoException).code }, "failed-verification checkpoint left in place");
+        } catch { /* Logging must not replace the original verification error. */ }
+      }
+      throw error;
+    }
     chmodSync(stagedTarget, input.mode);
     if (existsSync(input.targetPath)) {
       renameSync(input.targetPath, previousTarget);
@@ -16547,7 +16566,7 @@ export async function syncRemoteRunnerDirectoryOut(input: {
     if (previousMoved && replacementInstalled) {
       rmSync(previousTarget, { recursive: true, force: true });
     }
-    rmSync(stagingRoot, { recursive: true, force: true });
+    if (!keepFailedVerification) rmSync(stagingRoot, { recursive: true, force: true });
   }
 }
 
