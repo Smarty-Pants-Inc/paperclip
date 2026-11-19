@@ -9,6 +9,8 @@ import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.j
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { environmentService } from "../services/environments.js";
+import { recoverSandboxCreations } from "../services/sandbox-creation-operations.js";
+import { EnvironmentProviderUnavailableError, readTransientLeaseAcquisitionFailure } from "../services/environment-provider-unavailable-error.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 // rf-4 U3 C2 (money): a host retry after a timed-out sandbox create must not
@@ -128,6 +130,62 @@ describe("a run retry and its predecessor's pending sandbox creation", () => {
     expect(keys[1]).not.toBe(keys[0]);
     expect(boxes.size).toBe(1);
     expect(lease.providerLeaseId).toBe("box-1");
+  });
+
+  // Risk (1), named: a recovery sweep that inspected the predecessor's creation
+  // before the retry carried it still cleans it up. The retry's person sees the
+  // true reason, the run is retried (environment_provider_unavailable), and the
+  // next retry creates fresh while cleanup stops the reclaimed box.
+  it("R5: recovery reclaims the carried creation; the retry fails with the true reason and the next retry runs", async () => {
+    const { retry } = await timedOutThenRetry();
+    await db.update(sandboxCreationOperations).set({ nextAttemptAt: new Date(0) });
+    let inspected!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { inspected = resolve; });
+    const resume = new Promise<void>(resolve => { release = resolve; });
+    const sweep = recoverSandboxCreations(db, async operation => {
+      inspected(); await resume;
+      return { providerLeaseId: "box-1", state: "active", creationCleanup: { providerLeaseId: "box-1", observedProviderLeaseId: "box-1",
+        companyId, environmentId, runId: operation.runId, attemptId: operation.id, accountFingerprint: "a".repeat(64),
+        labels: { "paperclip-create-attempt": operation.id } } };
+    });
+    await entered;
+    const originalCall = workers.call.bind(workers);
+    workers.call = (async (...args: any[]) => {
+      if (args[1] === "environmentAcquireLease") { release(); await sweep; }
+      return (originalCall as any)(...args);
+    }) as typeof workers.call;
+    const error = await acquire(retry).catch(error => error);
+    workers.call = originalCall;
+    expect(error.message).toBe("Sandbox creation ownership has already transferred");
+    const evidence = readTransientLeaseAcquisitionFailure(error, { id: retry, companyId });
+    expect(evidence).toEqual({ reason: "creation_reclaimed" });
+    // What the orchestrator wraps it in, and so what the person reads.
+    const line = new EnvironmentProviderUnavailableError({ environmentName: "Fixture", driver: "sandbox", evidence: evidence!, cause: error });
+    expect(line).toMatchObject({ code: "environment_provider_unavailable",
+      message: 'Environment provider for "Fixture" was temporarily unavailable (recovery was stopping the earlier attempt\'s sandbox).' });
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, retry));
+    const cleanupLease = (await environmentService(db).getLeaseById((await db.select().from(environmentLeases))[0].id))!;
+    await runtime().retryPendingSandboxTeardown({ environment: (await environmentService(db).getById(environmentId))!, lease: cleanupLease });
+    const { lease } = await acquire(await run(retry));
+    expect(destroyed).toEqual(["box-1"]);
+    expect(lease).toMatchObject({ providerLeaseId: "box-2", status: "active" });
+    console.log("R5_RECLAIMED", JSON.stringify({ line: line.message, keys, boxes: boxes.size, destroyed }));
+  });
+
+  // Risk (2), named: no refusal disposition is stored, so a retry replays a
+  // still-pending refused key. The person's true line is the provider's own
+  // refusal; no box is made, and recovery's absence resolution frees the key.
+  it("R6: a retry replays a refused creation's key and gets the provider's own refusal, with no box", async () => {
+    const first = await run();
+    failBeforeBox = true;
+    await expect(acquire(first)).rejects.toThrow("refused");
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, first));
+    const error = await acquire(await run(first)).catch(error => error);
+    expect(error.message).toBe("Provider refused the create");
+    expect(keys).toHaveLength(2);
+    expect(keys[1]).toBe(keys[0]);
+    expect(boxes.size).toBe(0);
+    console.log("R6_REFUSAL_REPLAY", JSON.stringify({ line: error.message, keys, boxes: boxes.size }));
   });
 
   it("R4: an ordinary first create is unchanged", async () => {
