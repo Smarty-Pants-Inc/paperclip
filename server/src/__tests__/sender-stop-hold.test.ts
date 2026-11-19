@@ -201,6 +201,74 @@ describe.skipIf(!support.supported)("the sender's own Stop wins over the board h
       expect(await f.notes(), "the real sweep writes nothing either").toHaveLength(0);
     }, 60000);
 
+  // RFL 06:11Z (a), the condition on the row above: "answer, then a Stop of the EARLIER run" stays 0 lines only
+  // while the answer still waits behind the answerer's own Stop. Once THAT answer's OWN run exists and ends without
+  // answering (it fails, or someone else stops it), the Stop of the earlier run no longer covers the answer: the ONE
+  // true line shows. Real routes: the answer (POST /issues/:id/interactions/:id/respond, with its real delivery
+  // and wake), the answerer's Stop of the earlier run and, for the "stopped" outcome, ANOTHER board user's Stop of
+  // the answer's own run (POST /heartbeat-runs/:runId/cancel). PLANTED, and named so (no runner or model is launched
+  // in this harness; the same plants as the last row of this file, whose Stop is the real route too): the earlier
+  // Stop's hold ending ("the stop completed"), the answer's own run as the real wake's context names it
+  // (interactionId = the card) with the model's read and first reply item, and the "failed" outcome's status.
+  // The lines are read from the task's comments after each real settle and after two real sweeps.
+  it.each([["CHAT", "FAILS", true], ["TASK", "FAILS", false], ["CHAT", "is STOPPED by another board user", true],
+    ["TASK", "is STOPPED by another board user", false]] as const)(
+    "RFL (a) %s: answer, then the answerer's Stop of the EARLIER run -> 0 lines; the answer's OWN run later %s -> exactly 1 true line for the answer",
+    async (_shape, outcome, chat) => {
+      const f = await seed("native", chat); const cardId = await f.card();
+      await f.answer(cardId); await f.stop();
+      expect(await cardFootprint(f, cardId), "the real routes' footprint: the answer's own wake waits behind the Stop's hold").toEqual({
+        delivery: "fallback_queued", wakes: [["deferred_issue_execution", true]], holds: [["active_run_watchdog", "active", "board", true]] });
+      for (const min of [1, 3, 11, 30]) { await f.settle(min * 60000); expect(lines(await f.notes()), `held, +${min} min`).toHaveLength(0); }
+      // PLANTED: the stop completed (the hold ends) and the answer's own run started from its real wake.
+      await db.update(issueRecoveryActions).set({ status: "resolved", resolvedAt: new Date(), outcome: "planted: the stop completed" })
+        .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      const ownRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: ownRunId, companyId: f.companyId, agentId: f.agentId, runtimeMode: "native",
+        nativeIssueId: f.issueId, scopeKind: "issue", issueId: f.issueId, responsibleUserId: f.sender, status: "running",
+        startedAt: new Date(f.t + 40000), createdAt: new Date(f.t + 40000),
+        contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_commented", source: "issue.interaction.respond",
+          interactionId: cardId, interactionStatus: "answered" } });
+      await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: ownRunId, phase: "observed" });
+      await db.update(issues).set({ executionRunId: ownRunId }).where(eq(issues.id, f.issueId));
+      await db.update(agentWakeupRequests).set({ status: "completed", runId: ownRunId, finishedAt: new Date() }).where(eq(agentWakeupRequests.companyId, f.companyId));
+      await db.update(issueQuestionResponseDeliveries).set({ targetRunId: ownRunId }).where(eq(issueQuestionResponseDeliveries.interactionId, cardId));
+      for (const [index, kind] of ["userMessage", "agentMessage"].entries()) await db.insert(heartbeatRunEvents).values({ companyId: f.companyId,
+        agentId: f.agentId, runId: ownRunId, seq: index + 1, eventType: "item.started", sourceEventId: `source-${randomUUID()}`,
+        payload: { prpEvent: { eventType: "item.started", turnId: `turn-${ownRunId}`, itemId: `item-${index}`, payload: { kind, item: { type: kind } } } } });
+      // While the answer's own run is running, still no line.
+      await f.settle(31 * 60000);
+      expect(lines(await f.notes()), "the answer's own run is running").toHaveLength(0);
+      if (outcome === "FAILS") {
+        // PLANTED outcome: the run failed.
+        await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", error: "adapter_failed: the model call failed",
+          finishedAt: new Date(f.t + 45000) }).where(eq(heartbeatRuns.id, ownRunId));
+      } else {
+        const response = await request(app(f.companyId, f.other)).post(`/api/heartbeat-runs/${ownRunId}/cancel`).send({});
+        expect(response.status, JSON.stringify(response.body)).toBe(200);
+        const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, ownRunId));
+        expect(stopped, "what the real Stop route recorded").toMatchObject({ status: "cancelled",
+          resultJson: { cancelledByActorType: "user", cancelledByUserId: f.other } });
+        await db.update(heartbeatRuns).set({ finishedAt: new Date(f.t + 45000) }).where(eq(heartbeatRuns.id, ownRunId));
+      }
+      await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, f.issueId));
+      // Every unanswered-input line of the task (keyed unanswered_message:<id>), whatever its words.
+      const owed = async () => (await f.notes()).filter(n => String(n.metadata?.authorizationReason).startsWith("unanswered_message:"));
+      const counts: number[] = [];
+      for (const min of [32, 35, 45, 75]) { await f.settle(min * 60000); counts.push((await owed()).length); }
+      expect(counts.at(-1), `the one true line shows: ${JSON.stringify(counts)}`).toBe(1);
+      expect(Math.max(...counts), "never a second line").toBe(1);
+      await f.sweep(); await f.sweep();
+      const notes = await owed();
+      expect(notes, "exactly one line, after two real sweeps too").toHaveLength(1);
+      expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${cardId}`);
+      expect((notes[0]!.metadata as { sourceRunId?: string } | null)?.sourceRunId, "the line names the answer's OWN run, not the earlier stopped run").toBe(ownRunId);
+      // The words follow the own run's REAL outcome (rulings 1, 4): it failed, or it ended (stopped) with no reply.
+      expect(notes[0]!.body).toBe(outcome === "FAILS"
+        ? "Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task."
+        : "This run finished without a reply to your answer. Sending it again is safe.");
+    }, 60000);
+
   // supersedes(d7c310aeb / 98ea9cee sender-stop-hold.test.ts:188 '["CHAT", "Stop, then answer", true] ... no 'no run
   // started' line for the answer at +1/+3/+11/+30 min'; RFL 01:05Z ruling RFL-2 on merged8, "NOT exempt by default":
   // an answer given AFTER the person's own Stop is exempt only if their Stop stopped the run that was ANSWERING that
