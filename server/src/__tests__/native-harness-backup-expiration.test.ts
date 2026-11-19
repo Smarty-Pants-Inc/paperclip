@@ -1419,6 +1419,32 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     await quiet();
   });
 
+  it.each(["continuity", "quarantine"])("RK3 (never-OK): a %s archive holding raw trace bytes is kept in place past 7 days and its bytes are unchanged", async kind => {
+    const session = await seedSession({ issueStatus: "done", closedDaysAgo: 0, backupAgeDays: 0 });
+    const archive = kind === "continuity"
+      ? await seedArchive(session.root, { stampedDaysAgo: 0 })
+      : await seedQuarantine(session.scope, { stampedDaysAgo: 0 });
+    // Raw trace, as the executor moves it there (NATIVE_CONTINUITY_STATE_ENTRIES /
+    // quarantineRunnerdStateRoot): the Codex rollout and the runner's frame journal.
+    const trace = new Map([
+      ["codex-home/sessions/rollout.jsonl", Buffer.from('{"type":"response_item","payload":{"role":"assistant","text":"only copy"}}\n')],
+      ["control-plane/control-plane-state.json", Buffer.from(JSON.stringify({ committedEvents: [{ seq: 1, frame: "agent output" }] }))],
+    ]);
+    for (const [relative, bytes] of trace) {
+      await fs.mkdir(path.dirname(path.join(archive, relative)), { recursive: true });
+      await fs.writeFile(path.join(archive, relative), bytes);
+    }
+    const later = new Date(now.getTime() + 8 * DAY_MS);
+    const retention = evidenceService({ now: later });
+    const pass = await retention.tick();
+    expect(pass).toMatchObject({ evidenceCandidates: 0, evidenceRemoved: 0, failed: 0 });
+    // A second pass much later still keeps it.
+    await evidenceService({ now: new Date(now.getTime() + 3650 * DAY_MS) }).tick();
+    expect(await exists(archive)).toBe(true);
+    for (const [relative, bytes] of trace) expect(await fs.readFile(path.join(archive, relative))).toEqual(bytes);
+    expect(await exists(path.join(stateBase, "conversation-evidence"))).toBe(false);
+  });
+
   it("removes continuity archives older than the retention window and keeps recent ones", async () => {
     const session = await seedSession({ issueStatus: "in_progress" });
     const old = await seedArchive(session.root, { stampedDaysAgo: 9 });
