@@ -78,6 +78,8 @@ const continuationRunFields = {
   executionStage: heartbeatRuns.executionStage,
 };
 const terminal = ["failed", "interrupted", "timed_out", "cancelled"];
+// SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119; wording proposed pending Paul's ruling.
+const REMOTE_CLEANUP_EXECUTION_WAIT_MESSAGE = "Your message is saved. It starts once the stopped run finishes cleaning up.";
 const PREVIOUS_EXECUTION_UNVERIFIED = "Paperclip can't confirm that the previous attempt stopped before it started work, so Retry can't continue from it. Your message is saved.";
 
 export function isUserCommentContinuationReason(reason: string | null | undefined): boolean {
@@ -570,10 +572,10 @@ export async function admitExplicitNativeContinuation(input: {
     const remote = leases.some(lease => lease.provider !== "local");
     if (remote) {
       // Never interpret remote PIDs using the control-plane host's process table.
-      if (!leases.every(lease => hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))) return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
+      if (!leases.every(lease => hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))) return blocked("remote_cleanup", REMOTE_CLEANUP_EXECUTION_WAIT_MESSAGE);
       if (run.runtimeMode === "native" && !input.dryRun && !leases.every(lease => completeTerminatedRemoteNativeSessionCleanup({
         companyId, runId: run.id, remoteCleanupScope: remoteLeaseCleanupScope(lease)!,
-      }))) return refused("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
+      }))) return refused("remote_cleanup", REMOTE_CLEANUP_EXECUTION_WAIT_MESSAGE);
     } else {
       if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return blocked("local_cleanup", "Waiting for the previous environment to finish cleanup. Your message will start automatically.");
       if (!unusedAdmission && !cancelledStartup && !failedPreparation) {
