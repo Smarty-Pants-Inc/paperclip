@@ -5798,8 +5798,10 @@ describe("IssueDetail", () => {
     const optimisticComment = queuedProps.comments?.find(
       (comment) => comment.body === "Queued run message",
     );
-    // supersedes(the optimistic queued projection before the POST answers; RFL CONDITION steer-ui 11-19: the client never decides steer vs queue, and between the click and the POST's answer only the composer's pending state shows)
-    expect(optimisticComment).toBeUndefined();
+    // supersedes(the optimistic queued projection before the POST answers; RFL CONDITION steer-ui 11-19: the client never decides steer vs queue)
+    // supersedes(steer-ui3 11-19: between the click and the POST's answer the thread holds a NEUTRAL pending item, 'Sending…', neither queued nor sent)
+    expect(optimisticComment).toMatchObject({ clientStatus: "pending", clientDelivery: "pending", queueTargetRunId: null });
+    expect(optimisticComment?.queueState).toBeUndefined();
     expect(queuedProps.queuedCommentQueue?.entries ?? []).toHaveLength(0);
 
     await act(async () => {
@@ -6199,10 +6201,12 @@ describe("IssueDetail", () => {
     const optimisticComment = replacementProps.comments?.find(
       (comment) => comment.body === "Keep this bound to the original run",
     );
-    // supersedes(the optimistic queued projection before the POST answers; RFL CONDITION steer-ui 11-19: the client never decides steer vs queue, and between the click and the POST's answer only the composer's pending state shows)
-    // No optimistic queued item exists before the POST answers, so there is no
-    // Interrupt binding to rebind to the replacement run.
-    expect(optimisticComment).toBeUndefined();
+    // supersedes(the optimistic queued projection before the POST answers; RFL CONDITION steer-ui 11-19: the client never decides steer vs queue)
+    // supersedes(steer-ui3 11-19: before the POST answers the thread holds only a NEUTRAL pending item, never queued)
+    // That item is not queued, so there is no Interrupt binding to rebind to
+    // the replacement run.
+    expect(optimisticComment).toMatchObject({ clientStatus: "pending", clientDelivery: "pending", queueTargetRunId: null });
+    expect(optimisticComment?.queueState).toBeUndefined();
     expect(mockIssuesApi.interruptQueuedComments).not.toHaveBeenCalled();
     expect(mockHeartbeatsApi.cancel).not.toHaveBeenCalled();
 
@@ -7116,7 +7120,12 @@ describe("IssueDetail", () => {
   // Derived (named here, nothing invented): before Enter the thread is the planted
   // GET without the new message; between the POST and Pi's read it holds the POST's
   // own body (steeringStatus 'accepted'), as neworg-lead's S-a row reads it.
-  async function renderSteeringPlacement(width: number, flow: "steer" | "queue") {
+  async function renderSteeringPlacement(
+    width: number,
+    flow: "steer" | "queue",
+    // steer-ui3: the POST answer DELAYED (gate 4's hand take: POST 2.67 s), or refused.
+    answer: { delayMs?: number; failStatus?: 500 | 409 } = {},
+  ) {
     const { TaskChatThread } = await vi.importActual<
       typeof import("../components/TaskChatThread")
     >("../components/TaskChatThread");
@@ -7139,6 +7148,12 @@ describe("IssueDetail", () => {
       const method = init?.method ?? "GET";
       if (method === "POST" && /\/api\/issues\/[^/]+\/comments$/.test(url)) {
         posts.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        if (answer.delayMs) await new Promise((resolve) => setTimeout(resolve, answer.delayMs));
+        if (answer.failStatus) {
+          return new Response(JSON.stringify({ error: answer.failStatus === 409 ? "Conflict: the task changed" : "Internal server error" }), {
+            status: answer.failStatus, headers: { "content-type": "application/json" },
+          });
+        }
         state.thread = flow === "steer"
           ? finalThread.map((comment) => comment.id === post.id ? post : comment)
           : [...QUEUE_SF_THREAD_GET];
@@ -7196,7 +7211,8 @@ describe("IssueDetail", () => {
       await act(async () => {
         editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
       });
-      expect(await waitUntil(() => bubbles().some((node) => node.dataset.testid === "task-chat-steered-message"))).toBe(true);
+      // supersedes(steer-ui3): a neutral pending bubble shows first; wait for the server's 'sent'.
+      expect(await waitUntil(() => bubbles().some((node) => node.dataset.testid === "task-chat-steered-message" && node.dataset.delivery === "sent"))).toBe(true);
       const elapsed = performance.now() - started;
       expect(elapsed, `Enter to thread: ${elapsed} ms`).toBeLessThan(1000);
       if (process.env.STEER_UI_EVIDENCE) {
@@ -7257,6 +7273,116 @@ describe("IssueDetail", () => {
       }
     },
     15_000,
+  );
+
+  // steer-ui3 (Paul 11-19, gate 4 hand take: bubble at +2.87 s, POST 2.67 s). The
+  // message is in the thread AT THE KEYDOWN as a NEUTRAL pending bubble ('Sending…';
+  // neither 'Sent' nor 'Queued'), then the server's answer confirms it on the SAME
+  // node (steered), moves it to the waiting list (queued) or fails (error line, text
+  // kept). Every POST answer below is DELAYED 2 s and is a planted server body.
+  const DELAYED_POST_MS = 2000;
+  async function pressEnterAndReadPending(bubbles: () => HTMLElement[], body: string, width: number, label: string) {
+    const editor = container.querySelector<HTMLTextAreaElement>('[data-testid="stand-in-editor"]')!;
+    const started = performance.now();
+    await act(async () => {
+      editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    });
+    expect(await waitUntil(() => bubbles().some((node) => node.dataset.testid === "task-chat-steered-message"), 300)).toBe(true);
+    const elapsed = performance.now() - started;
+    expect(elapsed, `Enter to pending bubble: ${elapsed} ms`).toBeLessThanOrEqual(300);
+    const pending = bubbles();
+    expect(pending).toHaveLength(1);
+    const node = pending[0]!;
+    expect(node.dataset.delivery).toBe("pending");
+    expect(node.textContent).toContain("Sending…");
+    // Neutral: never 'Sent' (RFL S-e) or 'Queued' before the server answers.
+    expect(node.textContent).not.toMatch(/\bSent\b|Delivered|Queued/);
+    expect(node.querySelector('[data-testid="task-chat-steered-delivery"]')).toBeNull();
+    expect(node.dataset.steeredIntoRunId).toBeUndefined();
+    expect(container.querySelector('[data-testid="task-chat-queued-messages"]')?.textContent ?? "").not.toContain(body);
+    if (process.env.STEER_UI_EVIDENCE) {
+      writeFileSync(`${process.env.STEER_UI_EVIDENCE}/pending-${label}-${width}.txt`, `${elapsed.toFixed(1)} ms\n${node.outerHTML}\n`);
+    }
+    return { node, started, elapsed };
+  }
+
+  it.each([390, 1440])(
+    "steer-ui3: Enter while the agent works shows the message in the thread at once as pending ('Sending…'); the delayed steered answer turns the SAME bubble 'Sent' at %i",
+    async (width) => {
+      const { post, runId, posts, bubbles, waitingText } = await renderSteeringPlacement(width, "steer", { delayMs: DELAYED_POST_MS });
+      const { node, started } = await pressEnterAndReadPending(bubbles, post.body, width, "steer");
+      // Still pending well into the POST: nothing claims 'Sent' before the server.
+      await new Promise((resolve) => setTimeout(resolve, DELAYED_POST_MS / 2));
+      await flushReact();
+      expect(bubbles()).toHaveLength(1);
+      expect(bubbles()[0]).toBe(node);
+      expect(node.dataset.delivery).toBe("pending");
+      expect(node.textContent).not.toMatch(/\bSent\b/);
+      expect(await waitUntil(() => bubbles()[0]?.dataset.delivery === "sent", DELAYED_POST_MS + 3000)).toBe(true);
+      const answeredAt = performance.now() - started;
+      expect(answeredAt).toBeGreaterThanOrEqual(DELAYED_POST_MS - 50);
+      expect(posts).toHaveLength(1);
+      expect(posts[0]).not.toHaveProperty("deliveryIntent");
+      const sent = bubbles();
+      expect(sent).toHaveLength(1);
+      // The SAME DOM node: no flicker, no duplicate.
+      expect(sent[0]).toBe(node);
+      expect(node.isConnected).toBe(true);
+      expect(node.dataset.steeredIntoRunId).toBe(runId);
+      expect(node.textContent).not.toMatch(/Sending…|Queued/);
+      expect(node.querySelector('[data-testid="task-chat-steered-delivery"]')?.textContent).toContain("Sent");
+      expect(container.querySelectorAll('[data-testid="task-chat-steered-message"]')).toHaveLength(1);
+      expect(waitingText()).not.toContain(post.body);
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/pending-then-sent-${width}.txt`, `answered at ${answeredAt.toFixed(1)} ms\n${node.outerHTML}\n`);
+      }
+    },
+    20_000,
+  );
+
+  it.each([390, 1440])(
+    "steer-ui3: the delayed QUEUED answer moves the pending bubble out of the thread and into the waiting list at %i",
+    async (width) => {
+      const { post, posts, bubbles, waitingText } = await renderSteeringPlacement(width, "queue", { delayMs: DELAYED_POST_MS });
+      await pressEnterAndReadPending(bubbles, post.body, width, "queue");
+      expect(await waitUntil(() => waitingText().includes(post.body), DELAYED_POST_MS + 3000)).toBe(true);
+      expect(posts).toHaveLength(1);
+      expect(container.querySelector('[data-testid="task-chat-queued-list"]')?.textContent).toContain(post.body);
+      expect(container.querySelectorAll('[data-testid="task-chat-steered-message"]')).toHaveLength(0);
+      expect(bubbles().filter((node) => node.dataset.delivery)).toHaveLength(0);
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/pending-then-queued-${width}.txt`,
+          `${container.querySelector('[data-testid="task-chat-queued-messages"]')!.outerHTML}\n`);
+      }
+    },
+    20_000,
+  );
+
+  it.each([
+    [500, 390], [500, 1440], [409, 390], [409, 1440],
+  ] as const)(
+    "steer-ui3: the delayed %i answer turns the pending bubble into the composer's error line with the text kept, never a silent vanish at %i",
+    async (status, width) => {
+      const { post, bubbles } = await renderSteeringPlacement(width, "steer", { delayMs: DELAYED_POST_MS, failStatus: status });
+      mockPushToast.mockClear();
+      await pressEnterAndReadPending(bubbles, post.body, width, `error${status}`);
+      const editorText = () => container.querySelector<HTMLTextAreaElement>('[data-testid="stand-in-editor"]')?.value ?? "";
+      const errorShown = () => status === 500
+        ? container.querySelector('[data-testid="pending-send-notice"]') !== null
+        : mockPushToast.mock.calls.some(([toast]) => (toast as { tone?: string }).tone === "error");
+      expect(await waitUntil(() => errorShown() && editorText() === post.body, DELAYED_POST_MS + 3000)).toBe(true);
+      // The text is kept in the composer to retry or edit; the thread claims nothing.
+      expect(editorText()).toBe(post.body);
+      expect(container.querySelectorAll('[data-testid="task-chat-steered-message"]')).toHaveLength(0);
+      expect(container.textContent ?? "").not.toMatch(/· Sent|· Delivered/);
+      if (process.env.STEER_UI_EVIDENCE) {
+        const line = status === 500
+          ? container.querySelector('[data-testid="pending-send-notice"]')!.outerHTML
+          : JSON.stringify(mockPushToast.mock.calls.at(-1)?.[0]);
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/pending-then-error${status}-${width}.txt`, `editor: ${editorText()}\n${line}\n`);
+      }
+    },
+    20_000,
   );
 
   it("confirms the composer Stop from the authoritative cancellation response during a status outage", async () => {

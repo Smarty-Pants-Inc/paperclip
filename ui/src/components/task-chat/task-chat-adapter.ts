@@ -146,7 +146,9 @@ export function commentsToTaskChatItems(
       queueTargetRunId: queued ? comment.queueTargetRunId ?? null : null,
       ...(kind === "human" && readSteeredIntoRunId(comment)
         ? { steeredIntoRunId: readSteeredIntoRunId(comment), steeredDelivery: readSteeredDelivery(comment) ?? "sent" }
-        : {}),
+        : kind === "human" && readSteeredDelivery(comment) === "pending"
+          ? { steeredDelivery: "pending" as const }
+          : {}),
       verificationCaveats: sourceRunId
         ? ctx.verificationCaveatsByRunId?.get(sourceRunId)
         : undefined,

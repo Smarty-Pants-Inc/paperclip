@@ -76,7 +76,7 @@ import {
 } from "@/hooks/useSharedPolling";
 import { ApiError } from "../api/client";
 import { issuesApi } from "../api/issues";
-import { readCommentDelivery, readSteeredIntoRunId, type CommentDeliveryIntent } from "../api/comment-delivery";
+import { isPendingDelivery, pendingDeliveryFields, readCommentDelivery, readSteeredIntoRunId, type CommentDeliveryIntent } from "../api/comment-delivery";
 import { classifySendFailure } from "../lib/pending-send";
 import { useUpdateIssueMutation } from "../hooks/useUpdateIssueMutation";
 import { describeInteractionResolutionFailure, interactionResolutionErrorMessage } from "../lib/interaction-resolution-error";
@@ -2083,6 +2083,10 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           queueReason: undefined,
         };
       }
+      // Sent while the agent works and the server has not answered yet: a
+      // neutral pending bubble ('Sending…'). It claims neither sent nor
+      // queued, so no client rule may call it queued either.
+      if (isPendingDelivery(nextComment)) return nextComment;
       const locallyQueuedComment = applyLocalQueuedIssueCommentState(
         nextComment,
         {
@@ -5212,22 +5216,27 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         queryKeys.issues.detail(issueId!),
       );
       // While the agent works, the SERVER decides steer vs queue (steering
-      // is the default). Until its answer the composer shows its pending
-      // state only: no bubble in the thread and no row in the waiting list.
+      // is the default). Until its answer the thread shows a NEUTRAL pending
+      // bubble ('Sending…'): neither 'Sent' nor 'Queued', and no row in the
+      // waiting list. The answer confirms it (steered: the same bubble) or
+      // moves it (queued: the waiting list).
       const workingRun = !interrupt
         ? readIssueRunStateFromCache(queryClient, issueId!, issue)
             .interruptibleIssueRun
         : null;
       const queuedComment = null as { id: string } | null;
-      const optimisticComment = issue && !workingRun
-        ? createOptimisticIssueComment({
-            companyId: issue.companyId,
-            issueId: issue.id,
-            body,
-            authorUserId: currentUserId,
-            clientStatus: queuedComment ? "queued" : "pending",
-            queueTargetRunId: queuedComment?.id ?? null,
-          })
+      const optimisticComment = issue
+        ? {
+            ...createOptimisticIssueComment({
+              companyId: issue.companyId,
+              issueId: issue.id,
+              body,
+              authorUserId: currentUserId,
+              clientStatus: queuedComment ? "queued" : "pending",
+              queueTargetRunId: queuedComment?.id ?? null,
+            }),
+            ...(workingRun ? pendingDeliveryFields() : {}),
+          }
         : null;
 
       if (optimisticComment) {
@@ -5288,6 +5297,15 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         setSteeringUnavailableReason(
           delivery.kind === "queued" ? delivery.steeringUnavailableReason : null,
         );
+        if (delivery.kind !== "steered" && context.optimisticCommentId) {
+          // Not steered: the pending bubble leaves the thread now; the
+          // waiting list shows the message from the server's answer.
+          const pendingId = context.optimisticCommentId;
+          setOptimisticComments((current) =>
+            current.filter((entry) => entry.clientId !== pendingId),
+          );
+          context.optimisticCommentId = null;
+        }
         if (delivery.kind === "queued") {
           setLocallyQueuedCommentRunIds((current) => {
             const next = new Map(current);
