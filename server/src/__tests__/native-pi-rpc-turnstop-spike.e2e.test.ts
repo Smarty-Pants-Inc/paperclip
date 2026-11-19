@@ -407,11 +407,26 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
     const issue = await api("POST", `/companies/${companyId}/issues`, { title: "Reply through native Pi", description: "Reply with the local faux token.", status: "todo", assigneeAgentId: agentId }, 201);
     issueId = issue.id;
     await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: "local-board", conversationState: "active" }).where(eq(issues.id, issueId));
+    const drainControl = async (runId: string, label: string) => {
+      const { heartbeatService } = await import("../services/heartbeat.js");
+      const startedAt = Date.now();
+      stage("CONTROL drain started", { runId, label, startedAt });
+      try {
+        await heartbeatService(db!).waitForRunExecutionDrain(runId, { timeoutMs: 15_000 });
+        stage("CONTROL drain completed", { runId, label, elapsedMs: Date.now() - startedAt });
+      } catch (error) {
+        const [run] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        const finalizations = await db!.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+        const events = await db!.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+        const leases = await db!.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, runId));
+        await writeFile(join(root, `drain-timeout-${runId}.json`), JSON.stringify({ label, startedAt, run, finalizations, events, leases }, null, 2));
+        throw error;
+      }
+    };
     for (let turn = 1; turn < stopTurn; turn++) {
       const warmup = await waitFor(`warmup ${turn} settled`, async () => (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
         .find(run => run.status === "succeeded" && !warmupRunIds.has(run.id)) ?? null);
-      const { heartbeatService } = await import("../services/heartbeat.js");
-      await heartbeatService(db).waitForRunExecutionDrain(warmup.id, { timeoutMs: 15_000 });
+      await drainControl(warmup.id, `warmup ${turn}`);
       warmupRunIds.add(warmup.id);
       const runnerPid = bundles.at(-1)?.transport.processInfo?.()?.pid;
       const piPid = runnerPid ? piDescendant(runnerPid) : null;
@@ -436,9 +451,8 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
     const launchEnvironment = readPiEnvironment();
     stage("AGENT_HOME proc at launch", { piPid: pid.piPid, agentHome: launchEnvironment.AGENT_HOME || "EMPTY", tmpdir: launchEnvironment.TMPDIR || "EMPTY" });
     if (scenario === "finished") {
-      const { heartbeatService } = await import("../services/heartbeat.js");
       const finished = await waitFor("ordinary finished control", async () => (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.id))).find(row => row.status === "succeeded") ?? null);
-      await heartbeatService(db).waitForRunExecutionDrain(finished.id, { timeoutMs: 15000 });
+      await drainControl(finished.id, "finished");
       expect(piDescendant(warmupIdentities[0]!.runnerPid)).toBe(warmupIdentities[0]!.piPid);
       expect(stopCalls).toEqual([]);
       stage("CONTROL GREEN", { pid, finished: finished.id });
