@@ -1406,7 +1406,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   // RFL 04:58Z: a PAUSED agent's chat. "Sending it again is safe" is false
   // advice there; the note says the agent is paused and who can resume it.
   const WORKING = UNANSWERED_MESSAGE_WORKING_TEXT("Managed Pi");
-  const PAUSED_TEXT = "Managed Pi is paused. Your message is saved, and it will run when Managed Pi is resumed. "
+  // No wake of the message is saved for a pause Resume drains in these rows
+  // (the pause is written directly), so the paused note promises no run
+  // (rf-2 on 50b1e878; 9bc65f30's words). The saved case: 'pwords (1)'.
+  const PAUSED_TEXT = "Managed Pi is paused. Your message is saved. Send it again after Managed Pi is resumed. "
     + "A board user or Managed Pi's manager can resume Managed Pi.";
   const pause = (f: { agentId: string }) => db.update(agents).set({ status: "paused", lifecycleState: "paused",
     lifecycleHolds: ["manual"], pauseReason: "manual" }).where(eq(agents.id, f.agentId));
@@ -2656,7 +2659,8 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         await settleAt(f, ms);
         const notes = await f.visible();
         const pNotes = notes.filter(n => (n.metadata as Record<string, unknown> | null)?.authorizationReason === `unanswered_message:${P}`);
-        expect(pNotes.map(n => n.body), `+${ms}`).toEqual([PAUSED_TEXT]);
+        // P's wake is saved (M's turn is a prior run of the task): 'will run'.
+        expect(pNotes.map(n => n.body), `+${ms}`).toEqual([WILL_RUN_NOTE]);
         console.log("pausenote-r3 row 2 P note", ms, JSON.stringify(pNotes[0]!.metadata));
         // rf-5 T4 fix: P is deferred, so its note says it will run (pause-defer-wake-t4.test.ts proves the run).
         expect(pNotes[0]!.body).toBe("Managed Pi is paused. Your message is saved, and it will run when Managed Pi is resumed. "
@@ -2667,6 +2671,98 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         expect(JSON.stringify(notes.filter(n => n !== pNotes[0]))).not.toContain("will run");
       }
     }, 120_000);
+
+    // rf-2 on 50b1e878: the paused note's words follow the SAVE. It promises
+    // 'will run when <name> is resumed' only when P's OWN wake is saved
+    // (deferred_issue_execution carrying P) for a pause Resume drains; else
+    // 9bc65f30's resend words. P is posted through the REAL comment route on a
+    // task that has never run; Pause and Resume through the real routes and
+    // the real lifecycle worker (as T4's rows).
+    const WILL_RUN_NOTE = "Managed Pi is paused. Your message is saved, and it will run when Managed Pi is resumed. "
+      + "A board user or Managed Pi's manager can resume Managed Pi.";
+    const RESEND_NOTE = "Managed Pi is paused. Your message is saved. Send it again after Managed Pi is resumed. "
+      + "A board user or Managed Pi's manager can resume Managed Pi.";
+    const taskRoutes = (f: { companyId: string; userId: string }) => {
+      const app = express(); app.use(express.json());
+      app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: f.userId, companyIds: [f.companyId],
+        memberships: [{ companyId: f.companyId, membershipRole: "owner", status: "active" }], isInstanceAdmin: true } as never; next(); });
+      app.use("/api", issueRoutes(db, {} as never, {})); app.use("/api", agentRoutes(db, {} as never)); app.use(errorHandler);
+      return app;
+    };
+    // The comment route's wake is fire-and-forget: wait (bounded) for its outcome.
+    const postP = async (f: { issueId: string; agentId: string }, app: express.Express) => {
+      const res = await request(app).post(`/api/issues/${f.issueId}/comments`)
+        .send({ body: "P: please check this while you're paused.", clientRequestId: randomUUID() });
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      const P = res.body.id as string;
+      const carrying = async () => (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId)))
+        .filter(wake => (wake.payload as { commentId?: string } | null)?.commentId === P);
+      const t0 = Date.now();
+      while (Date.now() - t0 < 3_000 && !(await carrying()).length) await new Promise(resolve => setTimeout(resolve, 50));
+      return { P, wakes: await carrying() };
+    };
+    const pNotesOf = async (f: Awaited<ReturnType<typeof fixture>>, P: string) => (await f.visible())
+      .filter(n => (n.metadata as Record<string, unknown> | null)?.authorizationReason === `unanswered_message:${P}`);
+    const neverRunTask = async () => {
+      const f = await fixture({ chat: false, status: "todo" });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+      return f;
+    };
+
+    it("pwords (1): PAUSED + never-run task: P's wake is saved (agent.not_invokable -> pause_lifted), so P's note says it will run when resumed", async () => {
+      const f = await neverRunTask();
+      const app = taskRoutes(f);
+      const paused = await request(app).post(`/api/agents/${f.agentId}/pause`).send({});
+      expect(paused.status, JSON.stringify(paused.body)).toBe(200);
+      await lifecycleWorker().process(f.agentId);
+      expect((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0]).toMatchObject({ lifecycleState: "paused" });
+      const { P, wakes } = await postP(f, app);
+      console.log("pwords row 1 wakes", JSON.stringify(wakes.map(w => ({ status: w.status, wait: (w.payload as any)?.executionWait }))));
+      expect(wakes).toEqual([expect.objectContaining({ status: "deferred_issue_execution", runId: null })]);
+      expect((wakes[0]!.payload as any).executionWait).toMatchObject({ reason: "agent.not_invokable", trigger: "pause_lifted" });
+      for (const ms of [2 * 60_000, 11 * 60_000]) {
+        await settleAt(f, ms);
+        const notes = await pNotesOf(f, P);
+        expect(notes.map(n => n.body), `+${ms}`).toEqual([WILL_RUN_NOTE]);
+        expect(JSON.stringify(notes[0])).toContain("Ask a board user or Managed Pi's manager to resume Managed Pi.");
+        expect(JSON.stringify(notes[0])).not.toContain("then send it again");
+      }
+    }, 60_000);
+
+    it("pwords (2): PAUSING (lifecycle not yet 'paused') + never-run task: no wake of P is saved, so P's note says send it again, never 'will run'", async () => {
+      const f = await neverRunTask();
+      const app = taskRoutes(f);
+      const paused = await request(app).post(`/api/agents/${f.agentId}/pause`).send({});
+      expect(paused.status, JSON.stringify(paused.body)).toBe(200);
+      // The lifecycle worker has not processed the Pause yet.
+      expect((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0]).toMatchObject({ lifecycleState: "pausing" });
+      const { P, wakes } = await postP(f, app);
+      console.log("pwords row 2 wakes", JSON.stringify(wakes.map(w => ({ status: w.status, wait: (w.payload as any)?.executionWait }))));
+      expect(wakes.filter(w => ["deferred", "deferred_issue_execution"].includes(w.status))).toEqual([]);
+      for (const ms of [2 * 60_000, 11 * 60_000]) {
+        await settleAt(f, ms);
+        const notes = await pNotesOf(f, P);
+        expect(notes.map(n => n.body), `+${ms}`).toEqual([RESEND_NOTE]);
+        expect(JSON.stringify(notes)).not.toContain("will run");
+        expect(JSON.stringify(notes[0])).toContain("Ask a board user or Managed Pi's manager to resume Managed Pi, then send it again.");
+      }
+    }, 60_000);
+
+    it("pwords (3): a BUDGET pause + never-run task: Resume does not drain it, so P's note says send it again, never 'will run'", async () => {
+      const f = await neverRunTask();
+      const app = taskRoutes(f);
+      // The budget hold as the lifecycle store applies it (adapters/postgres.ts :284-285), as the budget control row above.
+      await db.update(agents).set({ status: "paused", lifecycleState: "paused", lifecycleHolds: ["budget"], pauseReason: "budget" })
+        .where(eq(agents.id, f.agentId));
+      const { P, wakes } = await postP(f, app);
+      console.log("pwords row 3 wakes", JSON.stringify(wakes.map(w => ({ status: w.status, wait: (w.payload as any)?.executionWait }))));
+      for (const ms of [2 * 60_000, 11 * 60_000]) {
+        await settleAt(f, ms);
+        const notes = await pNotesOf(f, P);
+        expect(notes.map(n => n.body), `+${ms}`).toEqual([RESEND_NOTE]);
+        expect(JSON.stringify(notes)).not.toContain("will run");
+      }
+    }, 60_000);
 
     it("control: a FAILED (not paused) turn carrying M keeps its resend card", async () => {
       const f = await fixture();
