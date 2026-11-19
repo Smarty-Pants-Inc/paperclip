@@ -5,7 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createObjectRunLogStore, readObjectRunLogSpill } from "../services/object-run-log-store.js";
-import { findWorktreeInstanceRawTraces } from "../services/workspace-instance-cleanup.js";
+import { listWorktreeRunLogSpillRoots } from "../services/workspace-instance-cleanup.js";
 import { event, ids, spillMemory } from "../services/object-run-log-spill.fixture.js";
 import {
   WORKSPACE_COMPACTION_TRASH_DIR,
@@ -98,6 +98,7 @@ describe("findRegenerableWorkspaceDirs", () => {
     }
     await write(path.join(worktreePath, "build", "regenerable.js"));
     await write(path.join(worktreePath, "dist", "regenerable.js"));
+    await write(path.join(worktreePath, "packages", "control", "build", "regenerable.js"));
     const staleCandidates = source === "late" ? await findRegenerableWorkspaceDirs(worktreePath) : null;
     vi.stubEnv(key, value);
     const m = spillMemory();
@@ -113,7 +114,7 @@ describe("findRegenerableWorkspaceDirs", () => {
     const spill = await readObjectRunLogSpill(undefined, handle.logRef);
     expect(spill.unrecovered.length).toBeGreaterThan(0);
     const bytes = await fs.readFile(spill.path), index = await fs.readFile(spill.indexPath);
-    expect(await findWorktreeInstanceRawTraces(instanceRoot, { [key]: value }))
+    expect(await listWorktreeRunLogSpillRoots({ workspacePath: worktreePath }))
       .toContain(source === "base" ? path.join(value, ".spill") : value);
     if (["pointer", "instance", "cwd"].includes(source)) {
       const envPath = source === "pointer" ? path.join(worktreePath, ".paperclip/.env")
@@ -133,6 +134,9 @@ describe("findRegenerableWorkspaceDirs", () => {
     if (source === "late") expect(candidates).toContain("build");
     else expect(candidates).not.toContain("build");
     expect(move.moved.map(entry => entry.relativePath)).not.toContain("build");
+    expect(move.moved.map(entry => entry.relativePath)).toContain("packages/control/build");
+    expect(await fs.stat(path.join(worktreePath, "packages", "control", "build")).then(() => true, () => false)).toBe(false);
+    expect(await fs.stat(path.join(worktreePath, "dist")).then(() => true, () => false)).toBe(false);
   });
 
   it("does not follow or return a symlinked directory", async () => {
