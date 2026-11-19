@@ -291,13 +291,15 @@ function noticeKeyIsCardSql(n: string): SQL {
     and key_card.issue_id = ${notice}.issue_id
     and key_card.id::text = substr(${notice}.metadata->>'authorizationReason', strpos(${notice}.metadata->>'authorizationReason', ':') + 1))`;
 }
-/** SQL: MESSAGE notice row n (alias) cites no message row any more: the queued Delete REMOVED every message it
- * names (routes/issues.ts DELETE comment, the discard path), so it has no input left to be owed (RETIRE_ON_DELETE). */
-function noticeMessagesRemovedSql(n: string): SQL {
-  const notice = sql.raw(n);
-  return sql`(not ${noticeKeyIsCardSql(n)} and not exists (select 1 from ${issueComments} gone
-    where gone.company_id = ${notice}.company_id and gone.issue_id = ${notice}.issue_id and ${noticeCoversSql(n, sql.raw("gone.id"))}))`;
-}
+/** SQL: a note's cited message is gone: its person deleted it (tombstoned by the ordinary Delete, or removed by the
+ * queued Delete, routes/issues.ts DELETE comment). Its note retires (RETIRE_ON_DELETE). The same rule, name and
+ * placement as tB2's f9d45d53 (al/norun-lossguard-2c): OR'd into the ONE retire and into discovery. On this line a
+ * note can name a GROUP of messages, so 'gone' is: NO message it covers has a live row (a single-message note: its
+ * one cited message, exactly tB2's read). A group with a deleted member and a live one is not gone: it drops the
+ * member (noticeInputsSql). Never a card-answer note (its input is a card, not a message). */
+const citedMessageGoneSql = (n: string) => sql`(not ${noticeKeyIsCardSql(n)} and not exists (select 1 from ${issueComments} g
+  where g.company_id = ${sql.raw(n)}.company_id and g.issue_id = ${sql.raw(n)}.issue_id and g.deleted_at is null
+    and ${noticeCoversSql(n, sql.raw("g.id"))}))`;
 /** SQL (a derived table): EVERY person input notice row n (alias) covers, each with the one function's verdict.
  * ONE family per notice, the one its key names (noticeKeyIsCardSql): a message notice's members are the typed
  * messages (comments) its key or member list names, a card-answer notice's members are the card answers (the
@@ -308,14 +310,15 @@ function noticeMessagesRemovedSql(n: string): SQL {
  * is not a member. */
 function noticeInputsSql(n: string): SQL {
   const notice = sql.raw(n);
-  // RETIRE_ON_DELETE: a member its author deleted is no longer owed; it settles like an answered one (the notice
-  // drops it, and retires when no member is left owed).
-  return sql`(select m.id, m.created_at as input_at, (m.deleted_at is not null or ${answeredSql(rawMessage("m"))}) as answered from ${issueComments} m
+  // RETIRE_ON_DELETE, the group case: `gone` marks a member its author deleted (tombstoned). It is no longer owed:
+  // a group notice drops it like an answered member. Whether the notice RETIRES for a delete is citedMessageGoneSql's
+  // read (no live message left), OR'd into the one retire.
+  return sql`(select m.id, m.created_at as input_at, ${answeredSql(rawMessage("m"))} as answered, (m.deleted_at is not null) as gone from ${issueComments} m
       where m.company_id = ${notice}.company_id and m.issue_id = ${notice}.issue_id and ${noticeCoversSql(n, sql.raw("m.id"))}
         and not ${noticeKeyIsCardSql(n)}
     union all
     select ca.id, ca.resolved_at as input_at, ${answeredSql({ id: sql.raw("ca.id"), companyId: sql.raw("ca.company_id"),
-        issueId: sql.raw("ca.issue_id"), createdAt: sql.raw("ca.resolved_at") })} as answered from ${issueThreadInteractions} ca
+        issueId: sql.raw("ca.issue_id"), createdAt: sql.raw("ca.resolved_at") })} as answered, false as gone from ${issueThreadInteractions} ca
       where ca.company_id = ${notice}.company_id and ca.issue_id = ${notice}.issue_id and ca.resolved_at is not null
         and ${noticeCoversSql(n, sql.raw("ca.id"))} and ${noticeKeyIsCardSql(n)})`;
 }
@@ -349,8 +352,9 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
       and (m.deleted_at is not null or ${answeredSql(rawMessage("m"))}))
     or exists (select 1 from ${issueComments} n where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
-      and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and ${noticeMessagesRemovedSql("n")})
+      and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+        or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
+      and ${citedMessageGoneSql("n")})
     or exists (select 1 from ${issueThreadInteractions} owed_card where owed_card.company_id = ${companyId}
       and owed_card.issue_id = ${issueId} and ${unnoticedOwedCardAnswerSql("owed_card", new Date())})
     or exists (select 1 from ${issueComments} n where n.company_id = ${companyId} and n.issue_id = ${issueId}
@@ -368,7 +372,7 @@ export function answeredNoticeToRetireCondition(issueId: AnyPgColumn, companyId:
   return sql`exists (select 1 from ${issueComments} n where n.company_id = ${companyId} and n.issue_id = ${issueId}
     and n.author_type = 'system' and n.deleted_at is null
     and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-    and (exists (select 1 from ${noticeInputsSql("n")} covered where covered.answered) or ${noticeMessagesRemovedSql("n")}))`;
+    and (exists (select 1 from ${noticeInputsSql("n")} covered where covered.answered or covered.gone) or ${citedMessageGoneSql("n")}))`;
 }
 
 /**
@@ -396,8 +400,11 @@ export function unansweredPersonMessageCommentCondition(): SQL {
         where m.company_id = ${issueComments.companyId} and m.issue_id = ${issueComments.issueId}
           and ${noticeCoversSql(`"issue_comments"`, sql.raw("m.id"))}
           and (m.deleted_at is not null or ${answeredSql(rawMessage("m"))}))
-        or ${noticeMessagesRemovedSql(`"issue_comments"`)}
-        or ${noticeCoversAnsweredCardSql(`"issue_comments"`)})))`;
+        or ${noticeCoversAnsweredCardSql(`"issue_comments"`)}))
+    or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
+      and (starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+        or starts_with(${issueComments.metadata}->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
+      and ${citedMessageGoneSql(`"issue_comments"`)}))`;
 }
 
 export type UnansweredMessageOutcome =
@@ -464,7 +471,8 @@ export async function settleUnansweredPersonMessage(
       .sort((a, b) => a.recheckAt - b.recheckAt)[0] ?? last;
 }
 
-/** Retire every live notice whose inputs are ALL answered; shrink a group notice with an answered member and a
+/** Retire every live notice whose inputs are ALL answered, or whose cited message is gone (citedMessageGoneSql:
+ * the person's own Delete; the ONE retire below, UPDATE ... SET deleted_at, serves both); shrink a group notice with an answered member and a
  * still-owed one to the still-owed (it STAYS and stays true). No task-status or cutoff condition. */
 async function retireAnsweredNotices(db: Db, issue: { id: string; companyId: string }, now: Date): Promise<void> {
   const [liveNotice] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
@@ -480,17 +488,17 @@ async function retireAnsweredNotices(db: Db, issue: { id: string; companyId: str
     where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
       and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
         or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
-      and (exists (select 1 from ${noticeInputsSql("n")} covered where covered.answered) or ${noticeMessagesRemovedSql("n")})
-      and not exists (select 1 from ${noticeInputsSql("n")} covered where not covered.answered)`);
-    // A group notice with an answered member and a still-owed one STAYS and stays true: it names only the still-owed.
+      and (exists (select 1 from ${noticeInputsSql("n")} covered where covered.answered) or ${citedMessageGoneSql("n")})
+      and not exists (select 1 from ${noticeInputsSql("n")} covered where not covered.answered and not covered.gone)`);
+    // A group notice with an answered (or deleted) member and a still-owed one STAYS and stays true: it names only the still-owed.
     await tx.execute(sql`update ${issueComments} n set updated_at = ${now.toISOString()}::timestamptz,
       metadata = n.metadata || (select jsonb_build_object(${UNANSWERED_MESSAGE_GROUP_KEY}::text, jsonb_agg(covered.id::text order by covered.input_at, covered.id),
           'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX}::text || (array_agg(covered.id::text order by covered.input_at desc, covered.id desc))[1])
-        from ${noticeInputsSql("n")} covered where not covered.answered)
+        from ${noticeInputsSql("n")} covered where not covered.answered and not covered.gone)
     where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX}) and n.metadata ? ${UNANSWERED_MESSAGE_GROUP_KEY}::text
-      and exists (select 1 from ${noticeInputsSql("n")} covered where covered.answered)
-      and exists (select 1 from ${noticeInputsSql("n")} covered where not covered.answered)`);
+      and exists (select 1 from ${noticeInputsSql("n")} covered where covered.answered or covered.gone)
+      and exists (select 1 from ${noticeInputsSql("n")} covered where not covered.answered and not covered.gone)`);
   });
 }
 

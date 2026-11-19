@@ -6,7 +6,7 @@ import { expect, it, vi } from "vitest";
 import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
-import { UNANSWERED_MESSAGE_TEXT } from "../services/recovery/unanswered-person-message.js";
+import { UNANSWERED_MESSAGE_TEXT, unansweredPersonMessageCommentCondition, unansweredPersonMessageCondition } from "../services/recovery/unanswered-person-message.js";
 import { describeIssueRecovery, issueRecoveryFixture } from "./issue-recovery.test-fixture.js";
 
 // Keep (never-OK rule: no "wasn't answered" note stays on a thread about a message its author DELETED). rf-5 m9
@@ -105,6 +105,12 @@ describeIssueRecovery("an unanswered-message note retires when its message is de
 
     await f.remove(m);
     expect((await f.thread()).filter(comment => comment.id === m && !comment.deletedAt), "M is deleted on the thread").toEqual([]);
+    // As tB2's row expects of a single-message note (f9d45d53 R5, citedMessageGoneSql): once M is gone, the worker's
+    // batched page query flags the task BY the note itself, and the task-level discovery visits it.
+    expect(await f.db.select({ id: issueComments.id }).from(issueComments)
+      .where(and(eq(issueComments.id, noticed[0]!.id), unansweredPersonMessageCommentCondition())), "flagged by the note itself").toHaveLength(1);
+    expect(await f.db.select({ id: issues.id }).from(issues)
+      .where(and(eq(issues.id, f.issueId), unansweredPersonMessageCondition(issues.id, issues.companyId))), "the task is discovered").toHaveLength(1);
     await f.worker(async () => expect(await f.notes(), "the note about the deleted message retired at the next sweep").toEqual([]));
     await f.worker(); await f.worker();
     expect(await f.notes(), "and it is never re-posted").toEqual([]);
