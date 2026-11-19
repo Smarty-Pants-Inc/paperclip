@@ -254,3 +254,54 @@ describe("rf-4 F4: cleanup stops retrying at Boat's refusal", () => {
     expect(Date.now() - refusedAt).toBeLessThan(200);
   }, 10_000);
 });
+
+// Keep: rf-4's delta review of Boat unit #2 (RF4-U2B S1/C1, S2/C2, S3/J2). A setup failure's
+// provider text and a cached refusal leave the worker verbatim through the SDK's RPC
+// message, so both go through the one redactor. Synthetic keys and sentinels only.
+describe("rf-4 U2b: setup errors and the cached refusal go through the one redactor", () => {
+  const SETUP_LEAK = `download failed Authorization: Bearer SETUP_OTHER_BEARER_SECRET; api key ${KEY}`;
+  for (const [form, setup] of [
+    ["setupError", { setupError: SETUP_LEAK }],
+    ["setupErrorText", { setupErrorText: SETUP_LEAK }],
+    ["error string", { error: SETUP_LEAK }],
+    ["error.message", { error: { message: SETUP_LEAK } }],
+  ] as const) {
+    it(`C1 a planted bearer and the configured key in Boat's setup failure (${form}) never reach the thrown message or stack; Boat's words do`, async () => {
+      let created = false;
+      fakeBoat({ record: (stopId) => json({ stop: { id: stopId, status: "completed" } }),
+        extra: (method, route) => {
+          if (method === "POST" && route === "/sandboxes") { created = true; return json({ sandbox: { id } }); }
+          if (method === "GET" && route === `/sandboxes/${id}` && created) return json({ sandbox: { id, state: "ready", setupStatus: "failed", ...setup } });
+          return undefined;
+        } });
+      const error = await plugin.definition.onEnvironmentAcquireLease!({ ...scope, runId: "run", creationOperationId: "attempt", config: { ...config, setupScript: "false" } } as any).catch(e => e);
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toContain(`Boat sandbox ${id} setup failed: download failed`);
+      const text = outbound(error);
+      expect(text).not.toContain("SETUP_OTHER_BEARER_SECRET");
+      expect(text).not.toContain(KEY);
+    }, 10_000);
+  }
+
+  it("C2 the cached refusal inside the back-off never rebuilds the raw provider id (same normaliser as the first refusal)", async () => {
+    id = `bx_${KEY}`;
+    fakeBoat({ record: failingRecord() });
+    const first = await stopLease().catch(e => e);
+    expect(first).toBeInstanceOf(BoatStopRefusedError);
+    noSecrets(outbound(first));
+    const again = await stopLease().catch(e => e);
+    expect(again).toBeInstanceOf(BoatStopRefusedError);
+    noSecrets(outbound(again));
+    expect(again.message).toBe(first.message);
+  }, 10_000);
+
+  it("J2 (superseded wording, SUPERSEDE-BOAT-U2-F2-STOPFAIL-1118) an unknown future stop status reads 'entered unrecognised (...)' and is never a stopped receipt", async () => {
+    fakeBoat({ record: (stopId) => json({ stop: { id: stopId, status: "unexpected-future-status" } }) });
+    const result = await stopLease().then(lease => ({ lease }), error => ({ error }));
+    expect(result).not.toHaveProperty("lease");
+    const error = (result as { error: any }).error;
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(PluginEnvironmentStopError);
+    expect(error.message).toMatch(/^Boat stop stop_0+1 entered unrecognised \(unexpected-future-status\)$/);
+  }, 10_000);
+});
