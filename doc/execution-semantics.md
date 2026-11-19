@@ -5932,7 +5932,10 @@ A same-turn input joins `wakeCommentIds` and `steeredCommentIds`; it never
 changes the conversation's timestamp reply boundary. The comment read exposes
 `steeredIntoRunId`, `steeredAt`, `steeringStatus` and `steeringDeliveryEventSeq`.
 `accepted` means custody only; `delivered` requires Pi's own persisted input-read
-event, not the RPC acknowledgement. An uncertain RPC timeout retains run custody
+event, not the RPC acknowledgement. POST and thread GET also expose
+`deliveryOutcome: 'steered' | 'queued' | 'ordinary'` and
+`steeringUnavailableReason: string | null`; explicit Queue has no unavailability
+reason. An uncertain RPC timeout retains run custody
 until its ordinary end restores the input, instead of risking a second dispatch.
 
 A steered message counts as answered by its turn only when the run log shows
@@ -5946,10 +5949,30 @@ never gets that line. If the turn that carries it ends failed or cancelled
 without answering it and nothing else will deliver it, the person gets exactly
 one notice for that message ("Your message (received mid-task) wasn't answered
 because the run failed. Sending it again is safe."), never a silent answered
-mark. The residual is a possible duplicate, never a loss: when the provider's
-read of a steered message (its `userMessage` event) is ingested after the run
-end's release has already decided, the message is restored and answered again
-by the next turn, so steering is not exactly-once.
+mark. Run-end release makes its carry decision only after the ordered native
+stream's durable contiguous source cursor reaches its terminal event. On pinned
+Pi, low-level `agent_end` is a continuation boundary, not terminal authority;
+`agent_settled` produces the PRP `turn.completed`/failed/cancelled terminal.
+The readiness wait is bounded by `STEERING_INGESTION_WAIT_MS = 1000` ms, outside
+issue/run locks. At expiry, the ONE transaction guard keeps the issue and input
+HELD, with no restored wake or successor. The ingestion receipt resumes the
+existing release owner after the terminal is ingested. No late-read pull-back
+guard exists. If the stream has no terminal (crash/lost connection), a stopped
+and joined consumer, or the existing recovery owner's proved absence/containment
+and true terminal line, closes this same fence. Only retained read/text facts
+then decide; if both read and answer were lost, carrying the message is correct.
+
+Interrupt adopts steered-but-unread PERSON comment ids through
+`readUnreadSteeredForInterrupt(tx, { issueId, runId }): Promise<string[]>`.
+It takes the same `issues FOR UPDATE -> heartbeat_runs FOR UPDATE` locks as
+run-end restoration, returns steer order, and records
+`interruptCarriedSteeredCommentIds` in the caller's transaction. The caller must
+include those ids in its successor input before committing. A subsequent
+Interrupt read or run-end restore cannot carry those ids again. Read/answered
+inputs are excluded through the durable read evidence and the one
+`answeredPersonMessageSql` predicate. Restored chat steers form one next input
+in steer order ahead of already-waiting plain input, without crossing `/new`;
+ordinary queued input is not otherwise coalesced.
 
 ### Preserve work across handoff and deliver requested files
 
