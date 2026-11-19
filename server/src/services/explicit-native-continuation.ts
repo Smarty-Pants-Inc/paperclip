@@ -20,6 +20,7 @@ import { isCancelledNativeStartup, isFailedNativePreparation, isFailedNativePrep
 import { hasNativeLocalProcessStop, hasHistoricalSuspendedNativeSession, nativeGatedRunNeverLaunched, nativeRunNeverLaunched, recordedLocalExecutionStopped, recordUnidentifiedLocalRunnerStop } from "./native-local-process-stop.js";
 import { completeTerminatedLocalNativeSessionCleanup, completeTerminatedRemoteNativeSessionCleanup, nativeSessionCleanupBlock } from "../vendor/paperclip-runner/index.js";
 import { hasRecoveredCleanupStopReceipt, hasRemoteTerminationReceipt, remoteLeaseCleanupScope } from "./remote-execution-termination.js";
+// SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119, RFL 01:31Z: one ruled copy owner.
 import { REMOTE_CLEANUP_EXECUTION_WAIT_MESSAGE } from "./deferred-execution-wait.js";
 import { z } from "zod";
 import { and, desc, eq, gt, inArray, isNull, ne, not, or, sql, type SQL } from "drizzle-orm";
@@ -79,9 +80,6 @@ const continuationRunFields = {
   executionStage: heartbeatRuns.executionStage,
 };
 const terminal = ["failed", "interrupted", "timed_out", "cancelled"];
-// SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119; wording proposed pending Paul's ruling.
-// Ruled words are shared with the queue's bounded person-facing projection.
-// Kept in the existing execution-wait owner, not a separate notice writer.
 const PREVIOUS_EXECUTION_UNVERIFIED = "Paperclip can't confirm that the previous attempt stopped before it started work, so Retry can't continue from it. Your message is saved.";
 
 export function isUserCommentContinuationReason(reason: string | null | undefined): boolean {
