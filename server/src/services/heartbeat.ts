@@ -1036,6 +1036,7 @@ export function heartbeatService(
     // Bound at call time: the heartbeat recovery module is created below.
     settleLostRunProcess: scope => recoverActiveExecutions(scope),
     settleExplicitContinuationRetry: releaseIssueExecutionAndPromote,
+    releaseTerminalExecutionOwner: run => releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true }),
     scheduleRecoveryRetry: async (runId, outcome) => {
       const [run] = await db
         .select()
