@@ -1,0 +1,36 @@
+{
+  "comments": [
+    {
+      "authorType": "agent",
+      "body": "Done. I renamed the helper and updated its two callers.\n\n- `src/util.ts`\n- `src/app.ts`  \nTests pass ✅",
+      "byRun": true,
+      "isMessage": false
+    },
+    {
+      "authorType": "user",
+      "body": "Please rename the helper.",
+      "byRun": false,
+      "isMessage": true
+    }
+  ],
+  "issueStatus": "blocked",
+  "run": {
+    "status": "failed",
+    "replyFileLine": {
+      "onTheReply": true,
+      "state": "kept",
+      "deadlineAfterAcceptanceMs": null
+    }
+  },
+  "recoveryAction": {
+    "kind": "active_run_watchdog",
+    "status": "active",
+    "ownerType": "board",
+    "cause": "native_workspace_sync_out_retry_exhausted",
+    "nextAction": "Finalization retry budget exhausted. Retry workspace export and merge from the retained sandbox; do not submit another provider turn.",
+    "evidenceRunIsThisRun": true,
+    "workspaceRecovery": null,
+    "systemRecovery": null,
+    "sourceInspection": "verified"
+  }
+}

@@ -2970,3 +2970,5 @@ export {
 export { recognizeLinkPreview, type LinkPreviewTarget, type LinkPreviewState, type LinkPreview, type LinkPreviewResult } from "./link-preview.js";
 export * from "./mcp-apps.js";
 export * from "./mcp-skills.js";
+export { REPLY_FILE_LINE_STATES, FILE_LINE_LOST, FILE_LINE_KEPT, FILE_LINE_KEPT_NO_BUTTON, FILE_LINE_SAVING, FILE_LINE_NOT_SAVED_YET,
+  readReplyFileLine, replyFileLineSavingExpired, replyFileLineText, type ReplyFileLine, type ReplyFileLineState } from "./reply-file-line.js";
