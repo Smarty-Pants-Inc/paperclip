@@ -764,6 +764,7 @@ describe.skipIf(!fixtureUrl)("recovery deadline producer, proof and resumed exec
     const report = await proof();
     expect(report.backgroundWork, JSON.stringify(report.diagnostics)).toBe("none");
     expect(report.scheduledWake?.nextWakeAt).toBe(reset.toISOString());
+    const [historicalState] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
     await issueService(db).update(f.issue.id, { status: "done", actorUserId: "recovery-test-user", companyGuard: f.companyId });
     await vi.waitFor(() => expect(monitorWorker!.reconciliationSnapshot().reconciled).toBe(true));
     await settled();
@@ -771,8 +772,13 @@ describe.skipIf(!fixtureUrl)("recovery deadline producer, proof and resumed exec
       claim: issues.monitorWakeRequestedAt, execution: issues.executionRunId, checkout: issues.checkoutRunId, state: issues.executionState })
       .from(issues).where(eq(issues.id, f.issue.id));
     process.stderr.write(`quota completed history audit ${JSON.stringify(completed)}\n`);
-    expect(completed).toMatchObject({ status: "done", at: reset, claim: null, execution: null, checkout: null, state: { status: "idle" } });
-    expect(completed.policy?.monitor).toMatchObject({ serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME, externalRef: f.source.id });
+    expect(completed).toMatchObject({ status: "done", at: null, claim: null, execution: null, checkout: null,
+      state: { status: "idle", monitor: { status: "cleared", nextCheckAt: null, clearReason: "done" } } });
+    expect(completed.policy?.monitor).toBeUndefined();
+    // Seed historical retained state directly, without rebinding the source or using a Done write.
+    await db.insert(issues).values({ ...historicalState, status: "done" }).onConflictDoUpdate({ target: issues.id,
+      set: { executionPolicy: historicalState.executionPolicy, executionState: historicalState.executionState,
+        monitorNextCheckAt: historicalState.monitorNextCheckAt } });
     const final = await proof();
     expect(final.backgroundWork, JSON.stringify(final.diagnostics)).toBe("none");
     expect(final.scheduledWake).toBeUndefined();
@@ -800,6 +806,18 @@ describe.skipIf(!fixtureUrl)("recovery deadline producer, proof and resumed exec
       })).rejects.toThrow(rollback.message);
     }
   }, 20_000);
+
+  it("keeps the quota producer's monitor while the task remains in_progress", async () => {
+    const reset = new Date(Date.now() + 600_000);
+    const f = await fixture({ retainedSourceLock: false, quotaResetAt: reset });
+    const produced = await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issue.id });
+    expect(produced.providerQuotaMonitored).toBe(1);
+    await issueService(db).update(f.issue.id, { status: "in_progress", actorUserId: "recovery-test-user", companyGuard: f.companyId });
+    const [kept] = await db.select({ status: issues.status, policy: issues.executionPolicy, at: issues.monitorNextCheckAt })
+      .from(issues).where(eq(issues.id, f.issue.id));
+    expect(kept).toMatchObject({ status: "in_progress", at: reset });
+    expect(kept.policy?.monitor).toMatchObject({ serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME, externalRef: f.source.id });
+  });
 
   it("reconciles a configured watchdog through real review completion and retains quiet reviewed history", async () => {
     const f = await fixture({ retainedSourceLock: false });
@@ -885,6 +903,7 @@ describe.skipIf(!fixtureUrl)("recovery deadline producer, proof and resumed exec
     const f = await fixture({ retainedSourceLock: false, quotaResetAt: reset });
     const produced = await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issue.id });
     expect(produced.providerQuotaMonitored).toBe(1);
+    const [historicalState] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
     await issueService(db).update(f.issue.id, { status: "done", actorUserId: "recovery-test-user", companyGuard: f.companyId });
     const growHistory = async (count: number) => {
       await db.execute(sql`
@@ -910,8 +929,13 @@ describe.skipIf(!fixtureUrl)("recovery deadline producer, proof and resumed exec
     };
     const [template] = await db.select({ status: issues.status, policy: issues.executionPolicy,
       state: issues.executionState, at: issues.monitorNextCheckAt }).from(issues).where(eq(issues.id, f.issue.id));
-    expect(template).toMatchObject({ status: "done", at: reset, state: { status: "idle" } });
-    expect(template.policy?.monitor).toMatchObject({ serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME, externalRef: f.source.id });
+    expect(template).toMatchObject({ status: "done", at: null,
+      state: { status: "idle", monitor: { status: "cleared", nextCheckAt: null, clearReason: "done" } } });
+    expect(template.policy?.monitor).toBeUndefined();
+    // Seed the old retained shape directly, preserving the one-source-per-history scale fixture.
+    await db.insert(issues).values({ ...historicalState, status: "done" }).onConflictDoUpdate({ target: issues.id,
+      set: { executionPolicy: historicalState.executionPolicy, executionState: historicalState.executionState,
+        monitorNextCheckAt: historicalState.monitorNextCheckAt } });
     await growHistory(9_999);
     const [count] = await db.execute<{ count: number }>(sql`SELECT count(*)::integer AS count FROM issues WHERE company_id = ${f.companyId}::uuid`);
     expect(count.count).toBe(10_000);
