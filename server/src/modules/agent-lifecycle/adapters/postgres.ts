@@ -200,7 +200,10 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   let next = command === "reconcile"
     ? blockingHolds.length && !["pausing", "paused"].includes(agent.lifecycleState) ? "pausing" as const
       : !holds.length && agent.lifecycleState === "paused" ? "resuming" as const : agent.lifecycleState
-    : command === "resume" && (holds.length || agent.lifecycleState === "pausing") ? agent.lifecycleState
+    : command === "resume" && holds.length ? agent.lifecycleState
+    // Resume always works at once: with no hold left it cancels an in-flight pause.
+    // The new operation id and version fence the old pause's lease (claim/complete).
+    : command === "resume" && agent.lifecycleState === "pausing" ? "resuming" as const
     : transition(agent.lifecycleState, command, agent.lifecycleOperation?.resumeState);
   if (restartPause && next === "paused") next = "pausing";
   if (command === "complete" && next === "ready" && holds.length) next = "pausing";
