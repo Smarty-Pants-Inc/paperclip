@@ -1,5 +1,5 @@
 import { and, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
-import { agentWakeupRequests, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueTreeHolds, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, agents, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueTreeHolds, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { parseObject } from "../adapters/utils.js";
 import { resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
@@ -221,10 +221,19 @@ export async function isPersonAcceptedStartupStop(db: Db, input: {
   if (input.status !== "cancelled" || input.errorCode !== "cancelled" || !input.issueId) return false;
   // Callers hold partial or redacted run shapes; read the stored row once.
   const [stored] = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
-    status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, error: heartbeatRuns.error, resultJson: heartbeatRuns.resultJson })
+    status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, error: heartbeatRuns.error, resultJson: heartbeatRuns.resultJson,
+    runtimeMode: heartbeatRuns.runtimeMode })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.id)));
   if (!stored || stored.status !== "cancelled" || stored.errorCode !== "cancelled"
     || Object.keys(parseObject(stored.resultJson?.startupCancellation)).length === 0) return false;
+  // Before native selection (run-control beforeNativeSelection) runtimeMode is
+  // still the 'legacy' default. Only a native-bound (paperclip_runner) agent's
+  // run has that shape, and only the person's own Stop settles it; a direct
+  // adapter's legacy run and any other legacy cancel never match.
+  const preselection = stored.runtimeMode !== "native";
+  if (preselection && (parseObject(stored.resultJson?.startupCancellation).beforeNativeSelection !== true
+    || (await db.select({ adapterType: agents.adapterType }).from(agents).where(and(eq(agents.companyId, stored.companyId),
+      eq(agents.id, stored.agentId))))[0]?.adapterType !== "paperclip_runner")) return false;
   const run = { ...stored, issueId: input.issueId };
   const { adapterExecutionControls } = await import("./adapter-execution-control.js");
   if (adapterExecutionControls.has(run.id)) return false;
@@ -233,7 +242,7 @@ export async function isPersonAcceptedStartupStop(db: Db, input: {
   if (coordinator?.leaseOwner) return false;
   const personStop = (await readPersonStopHold(db, { companyId: run.companyId, issueId: run.issueId,
     agentId: run.agentId, sendingWakeId: options.sendingWakeId }))?.stoppedRunId === run.id;
-  if (!personStop && !(await isPersonTreePauseCancel(db, run))) return false;
+  if (!personStop && (preselection || !(await isPersonTreePauseCancel(db, run)))) return false;
   const { provesNoNativeRunProviderWork } = await import("./native-runtime/native-provider-work-proof.js");
   return provesNoNativeRunProviderWork(db, { companyId: run.companyId, runId: run.id });
 }

@@ -534,10 +534,9 @@ export async function admitExplicitNativeContinuation(input: {
     // A person's own accepted Stop (or task-tree Pause) of this run in startup
     // is proven by the one fact the release and the projection also read; the
     // person's Send then starts one successor with the held messages.
-    // Native shape only: a Stop before native selection (runtimeMode still
-    // 'legacy') is released by the legacy path, which does not gather the held
-    // messages into the Send's queue, so it keeps today's admission.
-    const personStartupStop = Boolean(nativeQueuedSend && run.runtimeMode === "native" &&
+    // A Stop before native selection (runtimeMode still 'legacy') counts only
+    // for a native-bound agent; its legacy release gathered the held messages.
+    const personStartupStop = Boolean(nativeQueuedSend &&
       await isPersonAcceptedStartupStop(db, { ...run, issueId }, { sendingWakeId: input.queuedCommentInterruptId }));
     const cancelledStartup = await isCancelledNativeStartup(db, run, coordinator) || personStartupStop;
     if (partiallyDeliveredQueue && run.runtimeMode !== "native" && !unusedAdmission && !cancelledStartup && !failedPreparation) return null;
