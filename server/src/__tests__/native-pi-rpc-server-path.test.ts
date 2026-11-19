@@ -123,6 +123,8 @@ vi.mock("../services/native-runtime/paperclip-control-plane-port.js", async impo
       await this.options?.onCommittedEvent?.(event, ++this.cursor);
       return { cursor: this.cursor, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" };
     }
+    // This fake commits appendEvent inline, so there is no pending ingestion.
+    async settleEventIngestion() {}
     async completeRun() { await this.options?.onResultCommitted?.(); }
   } };
 });
