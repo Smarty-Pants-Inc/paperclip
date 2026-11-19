@@ -39,14 +39,14 @@ export class SandboxCreationReclaimedError extends Error {
 
 /**
  * The provider refused a retry's carried creation key as reused with a
- * different body (Boat's 409 idempotency_key_reused). The earlier create with
- * that key may have made a box, so the creation is neither spent nor created
- * afresh until recovery has handed that box to cleanup.
+ * different body (Boat's 409 idempotency_key_reused). The creation is spent
+ * like a firm refusal and that key is never sent again: the host's next retry
+ * mints a fresh key. A box the earlier create may have made self-stops at its ttl.
  */
 export class SandboxCreationKeyReusedError extends Error {
   readonly code = "sandbox_creation_key_reused";
   constructor(cause: unknown) {
-    super("The sandbox provider refused the retried creation key as reused (409 idempotency_key_reused); the earlier attempt's sandbox is handed to cleanup before a new one is created", { cause });
+    super("The sandbox provider refused the retried creation key as reused (409 idempotency_key_reused); the next attempt uses a fresh creation key", { cause });
     this.name = "SandboxCreationKeyReusedError";
   }
 }
@@ -102,8 +102,8 @@ const CARRIED_CLIENT_STATUSES = new Set([408, 409, 425, 429, 499]);
  *   409 idempotency_in_progress: the outcome may have made a box.
  * - refused / box_stopped (spent): a FIRM refusal (any other 4xx: Boat said no and made nothing) or the
  *   plugin's typed boat_idempotency_box_stopped. The next retry mints a fresh key.
- * - key_reused: Boat's 409 idempotency_key_reused. The earlier create with that
- *   key may have made a box; it is spent only once cleanup owns that box.
+ * - key_reused: Boat's 409 idempotency_key_reused. Spent like a refusal and
+ *   reported as its own named error; the next retry mints a fresh key.
  * Typed idempotency codes are authoritative; then any carried evidence on the
  * chain wins over a refusal. Message text is never parsed.
  */
@@ -172,8 +172,8 @@ export function readTransientLeaseAcquisitionFailure(
 ): TransientProviderEvidence | null {
   const provider = readTransientEnvironmentProviderFailure(error);
   if (provider) return provider;
-  // The retry re-sends the same key: Boat's documented "retry shortly", and a
-  // reused key whose earlier box recovery hands to cleanup before a fresh create.
+  // The host retries: in_progress re-sends the same key (Boat's documented
+  // "retry shortly"); a reused key is spent, so that retry mints a fresh key.
   for (let cause = error, depth = 0; cause && depth < 5; cause = own(cause, "cause"), depth++) {
     if (cause instanceof SandboxCreationKeyReusedError) return { reason: "creation_key_reused" };
   }
@@ -195,7 +195,7 @@ const REASON_LABELS: Record<TransientLeaseFailureReason, string> = {
   database_error: "a database query failed while recording the lease",
   creation_reclaimed: "recovery was stopping the earlier attempt's sandbox",
   creation_in_progress: "the provider was still creating the sandbox",
-  creation_key_reused: "the provider refused the retried creation key as reused; the earlier attempt's sandbox is handed to cleanup first",
+  creation_key_reused: "the provider refused the retried creation key as reused; the next attempt uses a fresh key",
 };
 
 function category(evidence: TransientProviderEvidence): ProviderFailure["category"] {
