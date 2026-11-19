@@ -3,6 +3,7 @@ import { activityLog, agents, agentWakeupRequests, heartbeatRuns, issueComments,
 import { acceptSteeredIdentity, reconcileSteeredIdentity, rejectSteeredIdentity, reserveSteeredIdentity, storedSteeringAcknowledgement } from "./run-identity.js";
 import { nativeRunHasStopRequest } from "./native-runtime/native-run-stop-request.js";
 import { logger } from "../middleware/logger.js";
+import { publishLiveEvent } from "./live-events.js";
 
 /** Existing outbox lock; shared with task-comment admission and run-end adoption. */
 export const personCommentDeliveryLockKey = (issueId: string): string => `conversation-delivery:${issueId}`;
@@ -162,7 +163,8 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
       if (!(error instanceof NativeSessionSteeringError)) logSteeringFailure(error);
       if (!options.onRejected) return; // fail closed: still owed at run end
       if (identity) await rejectSteeredIdentity(db, identity);
-      await db.transaction(async lock => {
+      const steeringUnavailableReason = error instanceof NativeSessionSteeringError ? error.code : "steering_error";
+      const queued = await db.transaction(async lock => {
         await lock.execute(sql`select pg_advisory_xact_lock(hashtextextended(${personCommentDeliveryLockKey(issue.id)}, 0))`);
         // Admit before dropping custody. A pause can refuse admission without
         // throwing; only a real durable wake receipt permits releasing custody.
@@ -171,17 +173,28 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
           where company_id = ${issue.companyId}::uuid and agent_id = ${agentId}::uuid
             and idempotency_key = ${`conversation-comment:${comment.id}`}
             and status in ('queued', 'deferred_issue_execution', 'claimed', 'coalesced', 'completed') limit 1`);
-        if (!admitted.length) return;
-        await db.transaction(async tx => {
+        if (!admitted.length) return false;
+        return db.transaction(async tx => {
           const [current] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).for("no key update");
-          if (!current) return;
+          if (!current) return false;
           const context = object(current.contextSnapshot), result = object(current.resultJson), acks = object(result.queuedSteeringAcknowledgements);
           await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context,
             wakeCommentIds: ids(context.wakeCommentIds).filter(id => id !== comment.id), steeredCommentIds: ids(context.steeredCommentIds).filter(id => id !== comment.id),
-          }, resultJson: { ...result, queuedSteeringAcknowledgements: { ...acks, [comment.id]: { ...object(acks[comment.id]), status: "rejected" } } } })
+          }, resultJson: { ...result, queuedSteeringAcknowledgements: { ...acks, [comment.id]: { ...object(acks[comment.id]), status: "rejected", steeringUnavailableReason } } } })
             .where(eq(heartbeatRuns.id, run.id));
+          return true;
         });
       });
+      if (queued) {
+        // Reannounce this saved comment through the thread's existing keyed
+        // comment hydration channel, AFTER ordinary admission and cleanup commit.
+        // No second comment/audit insert and no body/provider error is emitted.
+        publishLiveEvent({ companyId: issue.companyId, type: "activity.logged", payload: {
+          action: "issue.comment_added", entityType: "issue", entityId: issue.id,
+          actorType: "system", actorId: "conversation-steering", responsibleUserId: comment.authorUserId,
+          details: { commentId: comment.id, source: "steering.refused", deliveryOutcome: "queued", steeringUnavailableReason },
+        } });
+      }
     }
   }).catch(error => {
     logger.error({ err: error, runId: run.id, commentId: comment.id }, "comment steer reconciliation failed; durable custody retained");
@@ -241,12 +254,15 @@ export async function withSteeredCommentDisplay<T extends { id: string; issueId:
     const run = runs.find(run => ids(run.contextSnapshot?.steeredCommentIds).includes(comment.id));
     const ack = object(object(run?.resultJson?.queuedSteeringAcknowledgements)[comment.id]);
     const seq = object(run?.contextSnapshot?.steeredDeliveryEventSeqs)[comment.id];
+    const refused = runs.map(run => object(object(run.resultJson?.queuedSteeringAcknowledgements)[comment.id]))
+      .find(ack => ack.status === "rejected" && typeof ack.steeringUnavailableReason === "string");
     const deliveredAt = object(run?.contextSnapshot?.steeredDeliveredAts)[comment.id];
     return { ...comment, steeredIntoRunId: run?.id ?? null, steeredAt: typeof ack.acknowledgedAt === "string" ? ack.acknowledgedAt : null,
       steeringStatus: run ? typeof seq === "number" ? "delivered" : "accepted" : null,
       steeringDeliveryEventSeq: typeof seq === "number" ? seq : null,
       steerDeliveredAt: typeof deliveredAt === "string" ? deliveredAt : null,
       deliveryOutcome: run ? "steered" : waiting.has(comment.id) ? "queued" : "ordinary",
-      steeringUnavailableReason: !run && waiting.has(comment.id) && intents.get(comment.id) === "steer" ? unavailable : null };
+      steeringUnavailableReason: !run && waiting.has(comment.id) && intents.get(comment.id) === "steer"
+        ? typeof refused?.steeringUnavailableReason === "string" ? refused.steeringUnavailableReason : unavailable : null };
   });
 }
