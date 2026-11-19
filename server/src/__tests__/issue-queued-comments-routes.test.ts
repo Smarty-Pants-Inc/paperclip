@@ -3,7 +3,7 @@ import { runningProcesses } from "../adapters/index.js";
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { createFullDatabaseResponseCapture, installDatabaseResponseCapture } from "./helpers/full-database-response-capture.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -43,7 +43,7 @@ import { claimFirstTurnQueuedInput } from "../services/native-runtime/first-turn
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { registerDeferredReceiptWork } from "../services/heartbeat/deferred-receipt-work.js";
 import { notifyDeferredExecutionWork, notifyDeferredWakesForIssue } from "../services/deferred-execution-notifications.js";
-import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition, unansweredPersonMessageCondition } from "../services/recovery/unanswered-person-message.js";
 import { answeredPersonMessageSql } from "../services/person-message-answer.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -3517,5 +3517,82 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     // A held message's Delete discards it from the queue (the row is removed, its wake cancelled).
     expect(!row || !!row.deletedAt, JSON.stringify(row)).toBe(true);
     expect(seen.map(s => s.notes), JSON.stringify(seen)).toEqual([[], [], []]);
+  });
+
+  // rf-2 on ab4d297d (lossguard r2): the person's own Delete of a message whose
+  // card already shows retires that card at the next sweep (the SAME retire the
+  // answered path uses: settleUnansweredPersonMessage's one UPDATE ... SET
+  // deleted_at). REAL: comment POST, Stop route, tree Pause/release, DELETE,
+  // the comments GET and the sweep (worker discovery + per-task entry).
+  // PLANTED (named): as seedStoppableTurn. Samples are SECONDS after the
+  // message's own createdAt (the no-run grace is 120 s).
+  const cardsByGet = async (f: { companyId: string; issueId: string }) => {
+    const got = await request(boardApp(f.companyId, "queue-owner")).get(`/api/issues/${f.issueId}/comments`);
+    expect(got.status, JSON.stringify(got.body)).toBe(200);
+    const rows = (Array.isArray(got.body) ? got.body : got.body.comments ?? got.body.items ?? []) as any[];
+    return rows.filter(c => c.authorType === "system" && !c.deletedAt
+      && /^(unanswered|retrying)_message:/.test(String(c.metadata?.authorizationReason ?? "")))
+      .map(c => ({ id: c.id as string, message: String(c.metadata.authorizationReason).replace(/^[a-z_]+:/, "") }));
+  };
+  /** The worker's sweep at logical `at`: discovery (both batched conditions), then the per-task entry. */
+  async function sweepSeconds(f: { companyId: string; issueId: string }, at: Date) {
+    const discovered = (await db.select({ id: issues.id }).from(issues)
+      .where(and(eq(issues.id, f.issueId), unansweredPersonMessageCondition(issues.id, issues.companyId)))).length > 0;
+    const flagged = (await db.select({ id: issueComments.id }).from(issueComments)
+      .where(and(eq(issueComments.issueId, f.issueId), unansweredPersonMessageCommentCondition()))).length > 0;
+    const outcome = discovered && flagged
+      ? (await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId, now: at })).kind : "not_visited";
+    return { discovered, flagged, outcome, cards: await cardsByGet(f) };
+  }
+  async function loseHeldByTreePause(f: { companyId: string; issueId: string }) {
+    const client = treeApp(f.companyId, "queue-owner");
+    const paused = await request(client).post(`/api/issues/${f.issueId}/tree-holds`).send({ mode: "pause", reason: "lossguard R5" });
+    expect(paused.status, JSON.stringify(paused.body)).toBeLessThan(300);
+    const released = await request(client).post(`/api/issues/${f.issueId}/tree-holds/${paused.body.hold.id}/release`).send({ reason: "lossguard R5 release" });
+    expect(released.status, JSON.stringify(released.body)).toBeLessThan(300);
+  }
+  const createdAt = async (id: string) => (await db.select().from(issueComments).where(eq(issueComments.id, id)))[0]!.createdAt.getTime();
+
+  it.each(["chat", "task"] as const)("lossguard R5 %s: A's card shows, the person's own DELETE of A: at the next sweep A's card is retired (seconds); B's card on the same issue is untouched", async (surface) => {
+    const f = await seedStoppableTurn(surface);
+    const a = await postMessage(f, "Reply exactly A");
+    await stopByRoute(f, "queue-owner");
+    await loseHeldByTreePause(f);
+    const tA = await createdAt(a);
+    const shown: any[] = [];
+    for (const s of [119, 121]) shown.push({ s, ...await sweepSeconds(f, new Date(tA + s * 1000)) });
+    expect(shown.map(x => x.cards.map((c: { message: string }) => c.message)), JSON.stringify(shown)).toEqual([[], [a]]);
+    const cardA = shown[1].cards[0].id as string;
+    // Control: B, a second message on the same issue, lost the same way, gets its own card.
+    const b = await postMessage(f, "Reply exactly B");
+    await loseHeldByTreePause(f);
+    const tB = await createdAt(b);
+    // B's wake became a run that the Pause cancelled: B's card comes by its own (ended-run) path, by +360 s.
+    const bSamples: ({ s: number } & Awaited<ReturnType<typeof sweepSeconds>>)[] = [];
+    for (const s of [121, 360]) bSamples.push({ s, ...await sweepSeconds(f, new Date(tB + s * 1000)) });
+    const both = bSamples[1];
+    const cardB = both.cards.find(c => c.message === b)?.id;
+    expect(cardB, JSON.stringify(both)).toBeTruthy();
+    expect(both.cards.map(c => c.id).sort(), JSON.stringify(both)).toEqual([cardA, cardB].sort());
+    // The person's own Delete of A (real route).
+    const deleted = await request(boardApp(f.companyId, "queue-owner")).delete(`/api/issues/${f.issueId}/comments/${a}`);
+    expect(deleted.status, JSON.stringify(deleted.body)).toBeLessThan(300);
+    const [row] = await db.select().from(issueComments).where(eq(issueComments.id, a));
+    // The worker's batched page query (work.ts) flags the task BY A's card itself: the card's message is gone.
+    const flaggedByCardA = (await db.select({ id: issueComments.id }).from(issueComments)
+      .where(and(eq(issueComments.id, cardA), unansweredPersonMessageCommentCondition()))).length;
+    expect(flaggedByCardA).toBe(1);
+    const tDel = Date.now();
+    const after: any[] = [];
+    for (const s of [1, 2, 11, 660, 1800]) after.push({ s, ...await sweepSeconds(f, new Date(tDel + s * 1000)) });
+    process.stdout.write(`LOSSGUARD-R5 ${surface} ${JSON.stringify({ a, b, cardA, cardB, shown, bSamples,
+      row: row ? { deletedAt: row.deletedAt } : "removed", after })}\n`);
+    // The next sweep visits the task (both discovery conditions) and retires A's card; B's card keeps its id.
+    expect(after[0].discovered && after[0].flagged, JSON.stringify(after)).toBe(true);
+    expect(after.map(x => x.cards.map((c: { id: string }) => c.id)), JSON.stringify(after)).toEqual(after.map(() => [cardB]));
+    const [retired] = await db.select().from(issueComments).where(eq(issueComments.id, cardA));
+    expect(retired.deletedAt, JSON.stringify(retired)).not.toBeNull();
+    const [kept] = await db.select().from(issueComments).where(eq(issueComments.id, cardB!));
+    expect(kept.deletedAt).toBeNull();
   });
 });
