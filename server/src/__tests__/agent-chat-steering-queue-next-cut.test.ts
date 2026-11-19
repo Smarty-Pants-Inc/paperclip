@@ -72,8 +72,6 @@ vi.mock("../services/native-runtime/native-session-executor.js", async (importOr
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
-// B5: these ten explicit Queue rows are reachable, including at 69c95176.
-// Keep their pre-existing RED expectations visible for the Queue unit judge.
 describeEmbeddedPostgres("agent chat steering queue next cut", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -337,9 +335,14 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
       const queue = (await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200)).body;
       if (selectedId) expect(queue.entries.map((entry: any) => entry.comment.id).sort()).toEqual([...expected].sort());
       else expect(queue.entries.map((entry: any) => entry.comment.id)).toEqual(expected);
-      await request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/queued-comments/interrupt`)
-        .send({ queueId: queue.queueId, revision: queue.revision,
-          targetRunId: selectedId ? chat.runId : null, ...(selectedId ? { commentId: selectedId } : {}) }).expect(200);
+      if (selectedId) {
+        await request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/queued-comments/interrupt`)
+          .send({ queueId: queue.queueId, revision: queue.revision, targetRunId: chat.runId, commentId: selectedId }).expect(200);
+      } else {
+        // DESIGN D5: "will send after this turn". The release above promotes
+        // the successor; use the real dispatch owner, not an idle Interrupt.
+        await heartbeat.resumeQueuedRunsForAgent(chat.companyId, chat.agentId);
+      }
       const deadline = Date.now() + 20_000;
       while (true) {
         const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, chat.agentId));
@@ -381,7 +384,7 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
   }
 
   // RFL SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118: outcomes, not persisted wake count.
-  it("supersedes(keeps plain chat messages sent during a turn in one ordered queue the owner can see and edit; RFL record SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118)", async () => {
+  it('D5 "will send after this turn": keeps explicit Queue messages in one ordered editable queue' , async () => {
     const chat = await seedChat();
     const sent = await send(chat, ["Second", "Third", "Fourth"]);
     const wakes = await deferredWakes(chat);
@@ -397,7 +400,7 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
   
 
   // RED 2 + RFL (2) merge boundary: plain runs merge on each side of a reset only.
-  it("supersedes(merges plain messages on each side of a /new without crossing it; RFL record SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118)", async () => {
+  it('D1 "/new row is Queue only": merges plain messages on each side without crossing the reset' , async () => {
     const chat = await seedChat();
     const sent = await send(chat, ["One", "Two", "/new", "Three", "Four"]);
     const queue = (await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200)).body;
@@ -436,7 +439,7 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
   
 
   // RFL (3): merged messages are each answered once, none lost, none doubled.
-  it("supersedes(answers each merged message once: none lost and none doubled; RFL record SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118)", async () => {
+  it('D5 "Nothing is dropped": answers each merged message once in bar order after the turn' , async () => {
     const chat = await seedChat();
     const sent = await send(chat, ["Second", "Third", "Fourth"]);
     // A repeated delivery pass is idempotent.
