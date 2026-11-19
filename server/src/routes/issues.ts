@@ -18297,11 +18297,12 @@ export function issueRoutes(
           ? await interruptedTurnUnansweredCommentIds(tx as unknown as Db, { companyId: issue.companyId,
             issueId: issue.id, run: locked.activeRun, held: heldIds })
           : [];
-        // S-d2 (adopt-lead by-line rule (b)): right after the cut turn's own message, the steered
-        // messages that turn never read (steering follow-up A; adopts them in this transaction, same
-        // issues -> heartbeat_runs lock order), then the held ones; deduped by comment id.
+        // S-d2 / adopt-carry-adopt (neworg-lead 11:56Z): right after the cut turn's own message, EVERY
+        // steered message of that turn the ONE answer function says is unanswered, read or unread (adopted
+        // in this transaction, same issues -> heartbeat_runs lock order; the run-end restore then skips them),
+        // then the held ones; deduped by comment id.
         const steeredUnreadIds = locked.activeRun?.status === "running"
-          ? await readUnreadSteeredForInterrupt(tx, { issueId: issue.id, runId: locked.activeRun.id })
+          ? await readUnreadSteeredForInterrupt(tx, { issueId: issue.id, runId: locked.activeRun.id, carryWakeId: locked.wake.id })
           : [];
         const carriedIds = [...new Set([...interruptedIds, ...steeredUnreadIds, ...heldIds])];
         const wakePayload = interruptedIds.length || steeredUnreadIds.length
