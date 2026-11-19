@@ -1,10 +1,13 @@
 import { beginIdleTrackedWork } from "./task-admission.js";
 import { createHash, randomUUID } from "node:crypto";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { logger } from "../middleware/logger.js";
 import type { StorageProvider } from "../storage/types.js";
 import type { RunLogStore, RunLogHandle, RunLogBeginInput } from "./run-log-store.js";
-import { createObjectByteJournal, ObjectJournalSourcePrefixProofUnavailableError, type ObjectJournalIOPriority, type ObjectJournalWriter } from "./object-byte-journal.js";
+import { createObjectByteJournal, ObjectJournalConflictError, ObjectJournalSourcePrefixProofUnavailableError, type ObjectJournalIOPriority, type ObjectJournalWriter } from "./object-byte-journal.js";
 import { MAX_RUN_LOG_RECORD_BYTES } from "./run-log-record-limits.js";
 import { notFound } from "../errors.js";
 
@@ -16,6 +19,13 @@ const ALIGN_WINDOW_BYTES = 32_000;
 // body read. Longer records continue with ALIGN_WINDOW_BYTES windows.
 const ALIGN_FIRST_LOOKBACK_BYTES = 4096;
 const DIGEST_ATTEMPTS = 3;
+// A failed flush or close keeps what it holds and is retried this many times,
+// with backoff, before the batch is spilled to the kept local file.
+const FLUSH_ATTEMPTS = 3;
+const CLOSE_ATTEMPTS = 3;
+const RETRY_BACKOFF_MS = 100;
+// One journal append takes at most 8 MiB; kept batches stay under that.
+const MAX_KEPT_BATCH_BYTES = MAX_RUN_LOG_RECORD_BYTES;
 
 function finalizationError(error: unknown) {
   const cause = error as { name?: unknown; code?: unknown; message?: unknown;
@@ -32,9 +42,73 @@ function finalizationError(error: unknown) {
     statusCode: typeof cause?.$metadata?.httpStatusCode === "number" ? cause.$metadata.httpStatusCode : undefined,
   };
 }
+/**
+ * Where admitted bytes go when object storage keeps refusing them. For a run
+ * `<company>/<agent>/<run>` the spill is `<dir>/<company>/<agent>/<run>.ndjson`
+ * (the exact admitted NDJSON bytes, append-only) and its record is
+ * `<run>.index.ndjson` (append-only: which bytes were spilled, at which journal
+ * offset, why, and whether a later flush stored them). Nothing in this module
+ * deletes or truncates either file.
+ */
+export function resolveObjectRunLogSpillDir(spillDir?: string) {
+  return spillDir ?? process.env.RUN_LOG_SPILL_PATH
+    ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-log-spill");
+}
+function spillPaths(spillDir: string | undefined, logRef: string) {
+  const segments = logRef.split("/");
+  if (segments.length !== 3 || segments.some(segment => !/^[a-zA-Z0-9._-]+$/.test(segment) || /^\.+$/.test(segment)))
+    throw new Error("Invalid object log reference");
+  const base = path.resolve(resolveObjectRunLogSpillDir(spillDir), ...segments);
+  return { path: `${base}.ndjson`, indexPath: `${base}.index.ndjson` };
+}
+export interface ObjectRunLogSpillRecord {
+  v: 1;
+  event: "spilled" | "recovered";
+  at: string;
+  logRef: string;
+  attemptId?: string;
+  /** Offset of these bytes in the spill file. */
+  spillStart: number;
+  bytes: number;
+  sha256: string;
+  /** Object-journal end when the batch was spilled (spilled) or after it was stored (recovered). */
+  journalEnd: number;
+  cause?: ReturnType<typeof finalizationError>;
+}
+/**
+ * Read a run's kept spill. `unrecovered` is every spilled range that no later
+ * flush stored, in order: the stored object log followed by `unrecovered` is
+ * the admitted byte stream.
+ */
+export async function readObjectRunLogSpill(spillDir: string | undefined, logRef: string) {
+  const paths = spillPaths(spillDir, logRef);
+  const index = await fs.readFile(paths.indexPath, "utf8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
+  const records = index.split("\n").filter(Boolean).map(line => JSON.parse(line) as ObjectRunLogSpillRecord);
+  const recovered = new Set(records.filter(entry => entry.event === "recovered").map(entry => entry.spillStart));
+  const open = records.filter(entry => entry.event === "spilled" && !recovered.has(entry.spillStart));
+  const parts: Buffer[] = [];
+  if (open.length) {
+    const file = await fs.open(paths.path, "r");
+    try {
+      for (const entry of open) {
+        const bytes = Buffer.alloc(entry.bytes);
+        const { bytesRead } = await file.read(bytes, 0, entry.bytes, entry.spillStart);
+        if (bytesRead !== entry.bytes || createHash("sha256").update(bytes).digest("hex") !== entry.sha256)
+          throw new Error("object_run_log_spill_integrity_error");
+        parts.push(bytes);
+      }
+    } finally { await file.close(); }
+  }
+  return { ...paths, records, unrecovered: Buffer.concat(parts) };
+}
 export interface ObjectRunLogStoreOptions {
   provider: StorageProvider;
   keyPrefix: string;
+  /** Root of the kept local spill; see resolveObjectRunLogSpillDir. */
+  spillDir?: string;
   flushMs?: number;
   segmentBytes?: number;
 
@@ -47,7 +121,24 @@ interface PendingAppend {
   resolve: (bytes: number) => void;
   reject: (error: unknown) => void;
 }
+/**
+ * Admitted bytes that object storage refused. They stay here, in order, until a
+ * later flush stores them. `bytes` is held in memory only until the batch is
+ * durably in the spill file; after that a retry reads it back from there.
+ */
+interface KeptBatch {
+  bytes?: Buffer;
+  length: number;
+  sha256: string;
+  sequence: number;
+  sourceCursor: number;
+  spillStart?: number;
+}
 interface WriterState {
+  handle: RunLogHandle;
+  kept: KeptBatch[];
+  flushAttempt: number;
+  finalized: boolean;
   journal: ReturnType<typeof createObjectByteJournal>;
   writer: ObjectJournalWriter;
   pending: PendingAppend[];
@@ -126,66 +217,227 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       void flush(state).catch(() => undefined);
     }, flushMs);
   }
+  const runIdOf = (state: WriterState) => state.handle.logRef.split("/")[2];
+  // Retrying cannot help a lost ownership, a cancelled run or a stalled store
+  // (each stalled attempt would cost its whole deadline). Those keep the batch
+  // and go straight to the spill; a later flush still retries it.
+  function retryableStorageFailure(error: unknown, signal?: AbortSignal) {
+    const name = (error as { name?: unknown } | null)?.name;
+    return !signal?.aborted && !(error instanceof ObjectJournalConflictError) &&
+      name !== "TimeoutError" && name !== "AbortError";
+  }
+  /** Append one batch to the journal. A failed attempt keeps the bytes and retries, bounded. */
+  async function storeBatch(state: WriterState, bytes: Buffer, sequence: number, sourceCursor: number) {
+    for (let attempt = 1; ; attempt++) {
+      state.flushAttempt = attempt;
+      let release: (() => void) | undefined;
+      try {
+        release = await acquireUpload(state.signal);
+        // The append is idempotent for the same writer and bytes: payload and
+        // index objects are content-addressed, and the head publication is a
+        // compare-and-swap that recognises its own earlier success.
+        state.writer = await state.journal.append(
+          state.writer, bytes, state.signal,
+          Math.max(sequence, state.writer.head.sequence),
+          Math.max(sourceCursor, state.writer.head.sourceCursor),
+        );
+        return;
+      } catch (error) {
+        if (attempt >= FLUSH_ATTEMPTS || !retryableStorageFailure(error, state.signal)) throw error;
+        logger.warn({ runId: runIdOf(state), step: "flush", attempt, maxAttempts: FLUSH_ATTEMPTS,
+          err: finalizationError(error) }, "Object run log flush failed; keeping the batch and retrying");
+      } finally { release?.(); }
+      await delay(RETRY_BACKOFF_MS * 2 ** (attempt - 1), undefined, { signal: state.signal }).catch(() => undefined);
+    }
+  }
+  async function recordProof(state: WriterState) {
+    if (!state.sourcePrefixVerified) return;
+    try {
+      state.writer = await state.journal.recordVerifiedSourcePrefix(
+        state.writer, state.writer.head.sourceCursor, state.signal,
+      );
+    } catch (error) {
+      if (!(error instanceof ObjectJournalSourcePrefixProofUnavailableError)) throw error;
+      // The byte/index/head append is already committed. Lose only the
+      // optional provenance optimization; later appends remain deliverable.
+      state.writer = error.writer;
+      state.sourcePrefixVerified = false;
+      state.coverageEligible = false;
+    }
+  }
+  const released = (state: WriterState, bytes: number) => {
+    state.pendingBytes -= bytes;
+    totalPendingBytes -= bytes;
+  };
+  async function appendDurably(file: string, bytes: Buffer) {
+    const handle = await fs.open(file, "a", 0o600);
+    try {
+      const start = (await handle.stat()).size;
+      await handle.appendFile(bytes);
+      await handle.sync();
+      return start;
+    } finally { await handle.close(); }
+  }
+  /**
+   * Write one kept batch to the run's spill file and record it. Returns false
+   * when the local disk refused too; the batch then stays in memory.
+   */
+  async function spill(state: WriterState, kept: KeptBatch, cause: unknown) {
+    if (!kept.bytes || kept.spillStart !== undefined) return true;
+    try {
+      const paths = spillPaths(options.spillDir, state.handle.logRef);
+      await fs.mkdir(path.dirname(paths.path), { recursive: true, mode: 0o700 });
+      // Append-only. A torn write leaves bytes no record points at; it is never truncated.
+      const spillStart = await appendDurably(paths.path, kept.bytes);
+      const entry: ObjectRunLogSpillRecord = {
+        v: 1, event: "spilled", at: new Date().toISOString(), logRef: state.handle.logRef,
+        attemptId: state.handle.attemptId, spillStart, bytes: kept.length, sha256: kept.sha256,
+        journalEnd: state.writer.head.end, cause: finalizationError(cause),
+      };
+      await appendDurably(paths.indexPath, Buffer.from(`${JSON.stringify(entry)}\n`));
+      kept.spillStart = spillStart;
+      kept.bytes = undefined;
+      released(state, kept.length);
+      logger.warn({ runId: runIdOf(state), step: "flush", err: finalizationError(cause),
+        spill: { path: paths.path, start: spillStart, bytes: kept.length, journalEnd: entry.journalEnd } },
+        "Object run log batch kept in the local spill file");
+      return true;
+    } catch (error) {
+      logger.error({ runId: runIdOf(state), step: "spill", bytes: kept.length, err: finalizationError(error) },
+        "Object run log spill failed; the batch stays in memory");
+      return false;
+    }
+  }
+  async function keptBytes(state: WriterState, kept: KeptBatch) {
+    if (kept.bytes) return kept.bytes;
+    const bytes = Buffer.alloc(kept.length);
+    const file = await fs.open(spillPaths(options.spillDir, state.handle.logRef).path, "r");
+    try {
+      const { bytesRead } = await file.read(bytes, 0, kept.length, kept.spillStart!);
+      if (bytesRead !== kept.length || createHash("sha256").update(bytes).digest("hex") !== kept.sha256)
+        throw new Error("object_run_log_spill_integrity_error");
+    } finally { await file.close(); }
+    return bytes;
+  }
+  /**
+   * Take custody of admitted records that could not be stored: keep them in
+   * order, spill them, and only then tell their producers they are not in
+   * object storage. Nothing admitted is discarded here.
+   */
+  async function keep(state: WriterState, items: PendingAppend[], error: unknown) {
+    state.failure = error;
+    let group: PendingAppend[] = [], size = 0;
+    const groups: PendingAppend[][] = [];
+    for (const item of items) {
+      if (group.length && size + item.bytes.length > MAX_KEPT_BATCH_BYTES) {
+        groups.push(group);
+        group = [];
+        size = 0;
+      }
+      group.push(item);
+      size += item.bytes.length;
+    }
+    if (group.length) groups.push(group);
+    for (const members of groups) {
+      const bytes = Buffer.concat(members.map(item => item.bytes));
+      const kept: KeptBatch = {
+        bytes, length: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+        sequence: members.reduce((cursor, item) => Math.max(cursor, item.sequence), 0),
+        sourceCursor: members.reduce((cursor, item) => Math.max(cursor, item.sourceCursor), 0),
+      };
+      state.kept.push(kept);
+      await spill(state, kept, error);
+    }
+    for (const item of items) item.reject(error);
+  }
+  /** Store every kept batch, oldest first, before any newer bytes. */
+  async function storeKept(state: WriterState) {
+    while (state.kept.length) {
+      const kept = state.kept[0]!;
+      try {
+        await storeBatch(state, await keptBytes(state, kept), kept.sequence, kept.sourceCursor);
+      } catch (error) {
+        state.failure = error;
+        // An earlier spill may have failed; the local disk gets another chance.
+        for (const waiting of state.kept) await spill(state, waiting, error);
+        throw error;
+      }
+      state.kept.shift();
+      if (kept.spillStart === undefined) released(state, kept.length);
+      else {
+        // The spill file is kept as it is; the record says these bytes are now stored.
+        const entry: ObjectRunLogSpillRecord = {
+          v: 1, event: "recovered", at: new Date().toISOString(), logRef: state.handle.logRef,
+          attemptId: state.handle.attemptId, spillStart: kept.spillStart, bytes: kept.length,
+          sha256: kept.sha256, journalEnd: state.writer.head.end,
+        };
+        try {
+          await appendDurably(spillPaths(options.spillDir, state.handle.logRef).indexPath,
+            Buffer.from(`${JSON.stringify(entry)}\n`));
+        } catch (error) {
+          logger.error({ runId: runIdOf(state), step: "spill", bytes: kept.length, err: finalizationError(error) },
+            "Object run log spill recovery record failed; the stored log is complete");
+        }
+      }
+    }
+    // The journal again holds every admitted byte in order: admission may resume.
+    state.failure = undefined;
+  }
+  const holdsBytes = (state: WriterState) => state.kept.some(kept => kept.bytes) || state.pending.length > 0;
+  function retire(state: WriterState) {
+    // A finalized writer leaves only when it holds nothing in memory.
+    if (state.finalized && !holdsBytes(state) && !state.flushing && writers.get(state.handle) === state)
+      writers.delete(state.handle);
+  }
   async function flush(state: WriterState): Promise<void> {
     if (state.timer) {
       clearTimeout(state.timer);
       state.timer = undefined;
     }
     if (state.flushing) {
-      await state.flushing;
+      // Another flush failing is not a reason to skip this one's own pass:
+      // it re-reads the kept and pending bytes below.
+      await state.flushing.catch(() => undefined);
       return flush(state);
     }
-    if (state.failure) throw state.failure;
-    if (!state.pending.length) return;
-    const batch = state.pending.splice(0);
-    const bytes = Buffer.concat(batch.map((p) => p.bytes));
+    if (!state.kept.length) {
+      if (state.failure) throw state.failure;
+      if (!state.pending.length) return;
+    }
     state.flushing = (async () => {
-      let release: (() => void) | undefined;
+      let batch: PendingAppend[] = [];
       try {
-        release = await acquireUpload(state.signal);
-        state.writer = await state.journal.append(
-          state.writer,
-          bytes,
-          state.signal,
-          batch.reduce(
-            (cursor, item) => Math.max(cursor, item.sequence),
-            state.writer.head.sequence,
-          ),
-          batch.reduce(
-            (cursor, item) => Math.max(cursor, item.sourceCursor),
-            state.writer.head.sourceCursor,
-          ),
+        await storeKept(state);
+        batch = state.pending.splice(0);
+        if (!batch.length) return;
+        const bytes = Buffer.concat(batch.map((p) => p.bytes));
+        await storeBatch(
+          state, bytes,
+          batch.reduce((cursor, item) => Math.max(cursor, item.sequence), 0),
+          batch.reduce((cursor, item) => Math.max(cursor, item.sourceCursor), 0),
         );
-        if (state.sourcePrefixVerified) {
-          try {
-            state.writer = await state.journal.recordVerifiedSourcePrefix(
-              state.writer, state.writer.head.sourceCursor, state.signal,
-            );
-          } catch (error) {
-            if (!(error instanceof ObjectJournalSourcePrefixProofUnavailableError)) throw error;
-            // The byte/index/head append is already committed. Lose only the
-            // optional provenance optimization; later appends remain deliverable.
-            state.writer = error.writer;
-            state.sourcePrefixVerified = false;
-            state.coverageEligible = false;
-          }
+        // Stored. From here the batch must never be appended again.
+        const stored = batch;
+        batch = [];
+        released(state, bytes.length);
+        try {
+          await recordProof(state);
+        } catch (error) {
+          for (const item of stored) item.reject(error);
+          throw error;
         }
-        for (const item of batch) item.resolve(item.bytes.length);
+        for (const item of stored) item.resolve(item.bytes.length);
       } catch (error) {
         state.failure = error;
-        const waiting = state.pending.splice(0);
-        const waitingBytes = waiting.reduce((sum, item) => sum + item.bytes.length, 0);
-        state.pendingBytes -= waitingBytes;
-        totalPendingBytes -= waitingBytes;
-        for (const item of [...batch, ...waiting]) item.reject(error);
+        // The failed batch and everything admitted behind it are kept, in order.
+        const held = [...batch, ...state.pending.splice(0)];
+        if (held.length) await keep(state, held, error);
         throw error;
       } finally {
-        state.pendingBytes -= bytes.length;
-        totalPendingBytes -= bytes.length;
         capacityChanged();
-        release?.();
         state.flushing = undefined;
         schedule(state);
+        retire(state);
       }
     })();
     await state.flushing;
@@ -290,6 +542,10 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
         initialSourcePrefixVerified: sourcePrefixVerified,
       };
       writers.set(handle, {
+        handle,
+        kept: [],
+        flushAttempt: 1,
+        finalized: false,
         journal: store,
         writer,
         pending: [],
@@ -351,23 +607,39 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       state.closed = true;
       capacityChanged();
       let step = "flush", attempt = 1;
+      const maxAttempts = () => step === "digest" ? DIGEST_ATTEMPTS : step === "close" ? CLOSE_ATTEMPTS
+        : step === "flush" ? FLUSH_ATTEMPTS : 1;
       const diagnostic = (error: unknown) => ({
-        runId: handle.logRef.split("/")[2], step, attempt,
-        maxAttempts: step === "digest" ? DIGEST_ATTEMPTS : 1,
+        runId: handle.logRef.split("/")[2], step, attempt: step === "flush" ? state.flushAttempt : attempt,
+        maxAttempts: maxAttempts(),
         err: finalizationError(error),
       });
       try {
-        await flush(state);
+        // A failure here keeps its batch (in memory or in the spill). Do not
+        // stop: the second flush below retries the kept batch first.
+        await flush(state).catch(() => undefined);
         step = "admissions";
         await Promise.allSettled([...state.admitting]);
         step = "flush";
         await flush(state);
+        // Never close a journal that lacks admitted bytes: the open head marks it incomplete.
+        if (state.kept.length || state.pending.length) throw state.failure ?? new Error("object_journal_kept_bytes");
         step = "close";
-        state.writer = await state.journal.close(state.writer, state.signal);
+        for (;; attempt++) {
+          try {
+            // Publishing the closed head is idempotent, so a failed close is retried.
+            state.writer = await state.journal.close(state.writer, state.signal);
+            break;
+          } catch (error) {
+            if (attempt >= CLOSE_ATTEMPTS || !retryableStorageFailure(error, state.signal)) throw error;
+            logger.warn(diagnostic(error), "Object run log close failed; retrying");
+            await delay(RETRY_BACKOFF_MS * 2 ** (attempt - 1), undefined, { signal: state.signal }).catch(() => undefined);
+          }
+        }
         if (finalizeOptions?.computeDigest === false)
           return { bytes: state.writer.head.end, sha256: null, compressed: false };
         step = "digest";
-        for (;; attempt++) {
+        for (attempt = 1; ; attempt++) {
           try {
             // Retry only this read-only pass against the already closed snapshot.
             // Restart the hash too: an earlier range may have succeeded last time.
@@ -385,13 +657,33 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
           }
         }
       } catch (error) {
-        logger.warn(diagnostic(error), "Object run log finalization failed");
+        // Whatever is still only in memory goes to the kept spill before the writer is released.
+        const waiting = state.pending.splice(0);
+        if (waiting.length) await keep(state, waiting, error);
+        for (const kept of state.kept) await spill(state, kept, error);
+        const spilled = state.kept.filter(kept => kept.spillStart !== undefined);
+        const unspilledBytes = state.kept.reduce((sum, kept) => sum + (kept.bytes ? kept.length : 0), 0);
+        logger.warn({
+          ...diagnostic(error),
+          ...(spilled.length ? { spill: {
+            path: spillPaths(options.spillDir, handle.logRef).path,
+            start: spilled[0]!.spillStart, bytes: spilled.reduce((sum, kept) => sum + kept.length, 0),
+            journalEnd: state.writer.head.end,
+          } } : {}),
+          ...(unspilledBytes ? { unspilledBytes } : {}),
+        }, "Object run log finalization failed");
+        if (unspilledBytes)
+          logger.error({ runId: handle.logRef.split("/")[2], step: "spill", bytes: unspilledBytes },
+            "Object run log bytes are held in memory only; the writer is kept until they are stored or spilled");
         process.emitWarning(
           "Run log persistence is incomplete; final size and digest are unknown.",
         );
         return { bytes: null, sha256: null, compressed: false };
       } finally {
-        writers.delete(handle);
+        // Bytes that neither object storage nor the local disk accepted stay with
+        // this writer. flushInflightMirrors (shutdown) and any later flush retry them.
+        state.finalized = true;
+        retire(state);
       }
     },
     async read(handle, opts = {}) {
@@ -461,7 +753,9 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       };
     },
     async flushInflightMirrors() {
-      await Promise.all([...writers.values()].map(flush));
+      // Every writer gets its pass, including finalized ones that still hold bytes.
+      const results = await Promise.allSettled([...writers.values()].map(flush));
+      for (const result of results) if (result.status === "rejected") throw result.reason;
     },
   };
 }
