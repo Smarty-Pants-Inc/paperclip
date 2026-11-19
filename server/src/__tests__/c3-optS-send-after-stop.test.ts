@@ -337,6 +337,45 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
       const after = (await request(s.client).get(`/api/issues/${s.f.issueId}/queued-comments`).expect(200)).body;
       expect(after.entries).toEqual([]);
       expect(after.executionWait ?? null).toBeNull();
+      // heldbar-sharp (RFL 04:47Z): the guards are keyed to the STOPPED run,
+      // not to "this issue once had a person's Stop". The successor the Send
+      // started REALLY FAILS. Planted: only the harness's existing provider
+      // edge above (executePaperclipNativeSession throws
+      // Error("successor_provider_turn_reached") for every successor turn); the
+      // run's failure, the queue and the issue's interruption are product code.
+      // From the real GETs 10 s and 2 min after the failure (the server's own
+      // sweeps run at each time): no stopped bar, and the true failure state.
+      const successor = turns[0]!.runId;
+      const [failedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor));
+      await evidence("heldbar-sharp successor", { id: successor, status: failedRun?.status, errorCode: failedRun?.errorCode,
+        error: failedRun?.error, finishedAt: failedRun?.finishedAt });
+      expect([failedRun?.status, failedRun?.error]).toEqual(["failed", expect.stringContaining("successor_provider_turn_reached")]);
+      const failedAt = (failedRun!.finishedAt ?? new Date()).getTime();
+      vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true });
+      try {
+        for (const [label, offset] of [["+10s", 10_000], ["+2min", 120_000]] as const) {
+          vi.setSystemTime(failedAt + offset);
+          await s.heartbeat.resumeQueuedRuns();
+          await s.heartbeat.drainActiveRunExecutions();
+          await s.heartbeat.tickAgentTimers(new Date());
+          await s.heartbeat.tickIssueMonitors(new Date());
+          const bar = (await request(s.client).get(`/api/issues/${s.f.issueId}/queued-comments`).expect(200)).body;
+          const page = (await request(s.client).get(`/api/issues/${s.f.issueId}`).expect(200)).body;
+          const runs = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+            .from(heartbeatRuns).where(eq(heartbeatRuns.companyId, s.f.companyId));
+          await evidence(`heldbar-sharp failure ${label}`, { get: bar, interruption: page.interruption ?? null,
+            executionBlocker: page.executionBlocker ?? null, providerCalls: fixture.calls.length, runs });
+          // The stopped bar is gone: the queue's reason is no longer stopped_by_person.
+          expect([label, bar.executionWait?.reason ?? null, bar.entries]).toEqual([label, null, []]);
+          // The true failure state: the successor's failure, Retry allowed.
+          expect([label, page.interruption]).toEqual([label, expect.objectContaining({ responsibility: "system",
+            state: "failed", canRetry: true, observedRunId: successor, sourceRunIds: [successor] })]);
+          expect([label, page.executionBlocker]).toEqual([label, expect.objectContaining({ runId: successor,
+            runStatus: "failed", runError: "successor_provider_turn_reached", canRetry: true })]);
+          expect(runs.find(run => run.id === s.f.runId)?.status).toBe("cancelled");
+          expect(runs.find(run => run.id === successor)?.status).toBe("failed");
+        }
+      } finally { vi.useRealTimers(); }
     } finally { s.done(); }
   }, 120_000);
 
