@@ -461,6 +461,7 @@ import {
   takeRemoteBootstrapRestartProof,
   unidentifiedLocalRunnerProvenAbsent,
   executePaperclipNativeSession,
+  handedOffWarmOwnerRunnerExited,
   sessionToolAuthorityCount,
   detachNativeSessionsForRestart,
   NativeControllerDetachedForRestartError,
@@ -14950,8 +14951,22 @@ describe("native warm session supervision", () => {
         { holder: "exits-on-stop", delaySeconds: 0, answered: true, control: "queued-send" },
         { holder: "already-exited", delaySeconds: 30, answered: true, control: "queued-send" },
         { holder: "busy", delaySeconds: 0, answered: false, control: "queued-send" },
+        // adopt-retire-unproven (gate 7 T1, run 46079de8 failed 14 s after the
+        // Interrupt's cut): the hand-off proof (handedOffWarmOwnerRunnerExited)
+        // STOPPED the idle Runner and said "exited"; the successor on the SAME
+        // box then closed the warm owner, whose Runner could no longer suspend:
+        // NativeSessionCloseUnrecoverableError ("runner did not durably suspend
+        // before checkpoint"), not the fence's superseded refusal. The same
+        // exit proof decides; a Runner not proven exited stays refused.
+        { holder: "exits-on-stop", delaySeconds: 0, answered: true, control: "interrupt", closeError: "unsuspended" },
+        { holder: "already-exited", delaySeconds: 0, answered: true, control: "interrupt", closeError: "unsuspended" },
+        { holder: "busy", delaySeconds: 0, answered: false, control: "interrupt", closeError: "unsuspended" },
+        { holder: "exit-unproven", delaySeconds: 0, answered: false, control: "interrupt", closeError: "unsuspended" },
+        { holder: "no-sandbox-runner", delaySeconds: 0, answered: false, control: "interrupt", closeError: "unsuspended" },
       ] as const)("pl/s3-fence $control -> message +$delaySeconds s, Runner $holder: answered on the first run = $answered",
-        async ({ holder, delaySeconds, answered, control }) => {
+        async (row) => {
+          const { holder, delaySeconds, answered, control } = row;
+          const closeError = "closeError" in row ? row.closeError : "fence";
           const { companies, agents } = await import("@paperclipai/db");
           const fixed = fixture(`s3f-${control}-${holder}-${delaySeconds}`);
           const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
@@ -15064,7 +15079,10 @@ describe("native warm session supervision", () => {
           let checkpointError: unknown;
           // The transport contract: checkpoint("unsettled"), force-stop in
           // finally, rethrow the fence's ORDINARY refusal.
-          const close = vi.fn(async () => { try { await registration.checkpoint!("unsettled"); }
+          const close = vi.fn(async () => {
+            // adopt-retire-unproven: a Runner already stopped cannot suspend.
+            if (closeError === "unsuspended") throw new NativeSessionCloseUnrecoverableError({ runnerSuspended: false, runnerRetained: false });
+            try { await registration.checkpoint!("unsettled"); }
             catch (error) { checkpointError = error; throw error; } });
           const cancel = vi.fn(() => ({ cleanup: Promise.resolve() }));
           const turns = new Map<string, number>();
@@ -15072,7 +15090,7 @@ describe("native warm session supervision", () => {
           state.execute.mockReset().mockImplementationOnce(async options => { await options.onSession?.({ close, cancel });
             countTurn(base.binding.runId);
             expect(await cancelNativeSession(base.binding.runId,
-              control === "queued-send" ? "Interrupted to send queued messages" : "Stop")).toBe(true);
+              control !== "stop" ? "Interrupted to send queued messages" : "Stop")).toBe(true);
             taskRunId = next.binding.runId; coordinator.phase = "terminal_failure"; coordinator.leaseOwner = null;
             return { ...result, terminal: { runTerminalState: "cancelled" } };
           }).mockImplementationOnce(async () => { countTurn(next.binding.runId); return result; });
@@ -15089,6 +15107,10 @@ describe("native warm session supervision", () => {
             Object.assign(runDb, { select: proofDb.select.bind(proofDb), insert: proofDb.insert.bind(proofDb),
               update: proofDb.update.bind(proofDb), execute: proofDb.execute.bind(proofDb), transaction: proofDb.transaction.bind(proofDb) });
             collectStopped.mockClear(); sandboxRunner.syncIn.mockClear(); signals.length = 0;
+            // adopt-retire-unproven: the Interrupt's hand-off proof runs first and says "exited" (or not).
+            if (closeError === "unsuspended") {
+              expect(await handedOffWarmOwnerRunnerExited({ runId: base.binding.runId, providerLeaseId: "s3f-box" })).toBe(answered);
+            }
             if (delaySeconds > 0) { vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(Date.now() + delaySeconds * 1_000); }
             const followUp = { ...next, session: base.session };
             const attempt = executePaperclipNativeSession({ db: leaseDb(followUp), execution: followUp, runnerInstanceId: "runner",
@@ -15098,7 +15120,7 @@ describe("native warm session supervision", () => {
               // fence's superseded refusal of an unsettled Runner as its cause.
               expect(await attempt.then(() => "answered", (error: Error & { code?: string }) =>
                 `${error.code ?? error.name}: ${String(error.cause)}`)).toBe("answered");
-              expect(String(checkpointError)).toContain("native_harness_storage_owner_superseded");
+              if (closeError === "fence") expect(String(checkpointError)).toContain("native_harness_storage_owner_superseded");
               // ONE run answers on its first wake; the predecessor ran once.
               expect(Object.fromEntries(turns)).toEqual({ [base.binding.runId]: 1, [next.binding.runId]: 1 });
               expect(collectStopped).toHaveBeenCalled();
@@ -15118,7 +15140,8 @@ describe("native warm session supervision", () => {
             }
             // No data touched: nothing copied over the last durable backup, the
             // unsynced file is byte-for-byte unchanged, nothing removed remotely.
-            expect(validate).toHaveBeenCalled(); expect(backup).not.toHaveBeenCalled();
+            if (closeError === "fence") expect(validate).toHaveBeenCalled();
+            expect(backup).not.toHaveBeenCalled();
             expect(await sha()).toBe(unsyncedSha);
             expect(remoteCommands.filter(command => /\brm\b|rmdir|unlink/.test(command))).toEqual([]);
             expect(signals).not.toContain("KILL");
