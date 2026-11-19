@@ -323,9 +323,13 @@ The host re-reads the plugin's stored company configuration for each explicit
 company reference in a job or proactive host RPC. Config saves and removals made
 through another server process therefore apply without restarting the worker;
 if that read fails, the call is denied rather than using cached authority.
-Unconfigured companies and wildcard company access remain denied. Calls without
-invocation IDs keep the existing proactive-call checks; unknown or retired
-invocation IDs remain denied.
+Unconfigured companies and wildcard company access remain denied. Timer-driven
+`state.get`, `state.set`, and `state.delete` calls without an invocation ID may
+access only the calling plugin's own company-scoped state for a configured
+company, even while an agent invocation is active. The host derives this
+proactive scope from the state key's `scopeId`; it carries no agent or person
+identity. Other calls without invocation IDs remain refused while an agent-origin
+invocation is active. Unknown or retired invocation IDs remain denied.
 
 ### Scoped plugin API routes
 
