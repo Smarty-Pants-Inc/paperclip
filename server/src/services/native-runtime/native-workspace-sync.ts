@@ -638,8 +638,7 @@ async function persistRunReference(
       .then((rows) => rows[0] ?? null);
     if (!run) throw new Error("native_workspace_sync_run_missing");
     await notifyCancelledWorkspacePreservation(tx, { companyId: run.companyId, runId });
-    const owner = sql`${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceFinalizationOwner'`;
-    const published = await tx
+    const write = tx
       .update(heartbeatRuns)
       .set({
         runnerProfileJson: {
@@ -647,13 +646,16 @@ async function persistRunReference(
           nativeWorkspaceSync: reference,
         },
         updatedAt: new Date(),
-      })
-      .where(and(eq(heartbeatRuns.id, runId), ...(finalized ? [
-        sql`${owner}->>'fenced' is distinct from 'true'`,
-        ...(finalized.ownerToken ? [sql`${owner}->>'token' = ${finalized.ownerToken}`] : []),
-      ] : [])))
+      });
+    if (!finalized) {
+      await write.where(eq(heartbeatRuns.id, runId));
+      return;
+    }
+    const owner = sql`${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceFinalizationOwner'`;
+    const published = await write
+      .where(and(eq(heartbeatRuns.id, runId), sql`${owner}->>'fenced' is distinct from 'true'`,
+        finalized.ownerToken ? sql`${owner}->>'token' = ${finalized.ownerToken}` : undefined))
       .returning({ id: heartbeatRuns.id });
-    if (!finalized) return;
     // Nothing of a fenced copy-back is published: not the reference, not the lease stamp.
     if (!published.length) throw new Error(NATIVE_WORKSPACE_SYNC_PUBLICATION_FENCED);
     await writeLeaseStamp(tx, finalized);

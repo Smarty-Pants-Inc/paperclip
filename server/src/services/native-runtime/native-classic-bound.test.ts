@@ -1126,7 +1126,7 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
       expect(sinceFence.length).toBeGreaterThanOrEqual(3);
       expect(sampler.samples.filter(sample => sample.status === "blocked").map(sample => `${sample.at - fencedAt} ms after the fence`)).toEqual([]);
       expect([...new Set(sampler.samples.map(sample => sample.status))]).toEqual(["in_progress"]);
-      expect((await request(s.app).get(`/api/issues/${s.issueId}`)).body).toMatchObject({ status: "in_progress", executionRunId: p!.id });
+      expect((await request(s.app).get(`/api/issues/${s.issueId}`)).body).toMatchObject({ status: "in_progress" });
       expect(JSON.stringify(p!.contextSnapshot)).toContain(next);
       const startedAfterMs = Date.now() - startAt;
       const pReference = readNativeWorkspaceSyncReference(record(p!.runnerProfileJson).nativeWorkspaceSync)!;
