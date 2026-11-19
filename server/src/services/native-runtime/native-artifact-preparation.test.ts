@@ -88,6 +88,63 @@ afterEach(async () => {
 });
 
 describe("remote native artifact preparation", () => {
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21267
+  // Real preparation executor and shell/hash/metadata processes. Only the
+  // provider RTT is injected; the asserted bytes and inventory are real.
+  it("batches retained runner hash and fresh pack inventory in one remote round trip", async () => {
+    const f = await fixture({ before: async () => { await new Promise(resolve => setTimeout(resolve, 160)); } });
+    const installation = { root: "/opt/paperclip-runner/provider-pack", immutable: true, manifest: { digest: "warm" } };
+    const script = `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify({ ...metadata, providerPacks: [installation] })}'\n`;
+    await writeFile(f.runnerSource, script, { mode: 0o700 });
+    await mkdir(join(f.options.remoteRuntimeRoot, "bin"), { recursive: true });
+    await writeFile(f.runnerTarget, script, { mode: 0o700 });
+    const artifacts = createRemoteNativeArtifactPreparation({ ...f.options, remoteCodexBinary: null,
+      reuseRetainedRunner: true, providerPackRoots: [installation.root] });
+    const started = performance.now();
+    await artifacts.prepare("listen_ws");
+    const elapsedMs = performance.now() - started;
+    process.stdout.write(JSON.stringify({ measurement: "retained-artifact", injectedRttMs: 160, elapsedMs, roundTrips: f.requests.length }) + "\n");
+    expect(artifacts.providerPackInventory()).toEqual([installation]);
+    expect(await readFile(f.runnerTarget, "utf8")).toBe(script);
+    expect(f.active()).toBe(0);
+    expect(f.requests).toHaveLength(1);
+  });
+
+  it.each(["binary", "capabilities", "pack-root", "old-runner"] as const)("keeps retained runner mutation fences: %s", async mutation => {
+    const f = await fixture();
+    const installation = { root: "/changed/pack", immutable: true, manifest: { digest: "changed" } };
+    const changedMetadata = { ...metadata,
+      ...(mutation === "capabilities" ? { prpTransportModes: ["dial_wss"] } : {}),
+      providerPacks: [installation] };
+    const script = `#!/bin/sh\n${mutation === "old-runner" ? '[ "$#" = 1 ] || exit 17\n' : ""}printf '%s\\n' '${JSON.stringify(changedMetadata)}'\n`;
+    await writeFile(f.runnerSource, script, { mode: 0o700 });
+    await mkdir(join(f.options.remoteRuntimeRoot, "bin"), { recursive: true });
+    await writeFile(f.runnerTarget, mutation === "binary" ? "#!/bin/sh\nexit 19\n" : script, { mode: 0o700 });
+    const artifacts = createRemoteNativeArtifactPreparation({ ...f.options, remoteCodexBinary: null,
+      reuseRetainedRunner: true, providerPackRoots: [mutation === "pack-root" ? "/old/pack" : installation.root] });
+    if (mutation === "capabilities") await expect(artifacts.prepare("listen_ws")).rejects.toThrow("runner_remote_transport_capability_missing:listen_ws");
+    else {
+      await artifacts.prepare("listen_ws");
+      expect(await readFile(f.runnerTarget, "utf8")).toBe(script);
+      expect(artifacts.providerPackInventory()).toEqual(mutation === "pack-root" ? [] : [installation]);
+      if (mutation === "binary") expect(f.requests.length).toBeGreaterThan(1);
+    }
+    expect(f.active()).toBe(0);
+  });
+
+  it("falls back to full install after a retained artifact RPC failure", async () => {
+    const f = await fixture({ before: async request => {
+      if (request.args?.[2] === "paperclip-runner-retained-artifact") throw new Error("transient retained probe failure");
+    } });
+    await mkdir(join(f.options.remoteRuntimeRoot, "bin"), { recursive: true });
+    await writeFile(f.runnerTarget, f.runnerScript, { mode: 0o700 });
+    await createRemoteNativeArtifactPreparation({ ...f.options, remoteCodexBinary: null, reuseRetainedRunner: true }).prepare("listen_ws");
+    expect(f.requests.length).toBeGreaterThan(1);
+    expect(await readFile(f.runnerTarget, "utf8")).toBe(f.runnerScript);
+    expect(f.requests.some(request => request.command === f.runnerTarget && request.args?.[0] === "--build-metadata")).toBe(true);
+    expect(f.active()).toBe(0);
+  });
+
   it("overlaps the default runner and harness while retaining both executable checks", async () => {
     const f = await fixture();
     await createRemoteNativeArtifactPreparation(f.options).prepare("listen_ws");

@@ -27331,7 +27331,11 @@ describe("runnerd provider runtime wiring", () => {
           if (fault && image.endsWith("-error")) throw new Error("checksum unavailable");
           return {
             exitCode: 0, signal: null, timedOut: fault && image.endsWith("-timeout"), stderr: "",
-            stdout: `${createHash("sha256").update(fault && image.endsWith("-mismatch") ? "stale artifact" : "fixture runner artifact").digest("hex")}  ${command.args?.[3]}\n`,
+            stdout: `${createHash("sha256").update(fault && image.endsWith("-mismatch") ? "stale artifact" : "fixture runner artifact").digest("hex")}  ${command.args?.[3]}\n${command.args?.[2] === "paperclip-runner-retained-artifact" ? JSON.stringify({
+              schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+              packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+              durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
+            }) : ""}`,
           };
         } else if (script.includes("cp --preserve=mode") && image.startsWith("preinstalled-copy-")) {
           return { exitCode: 1, signal: null, timedOut: image.endsWith("-timeout"), stdout: "", stderr: "copy failed" };
@@ -27433,10 +27437,12 @@ describe("runnerd provider runtime wiring", () => {
     }
     if (exactRetained) {
       expect(remoteExecute.mock.calls.some(([call]) => call.args?.[1]?.includes("command -v paperclip-runnerd"))).toBe(false);
-      expect(remoteExecute).toHaveBeenCalledWith(expect.objectContaining({
-        command: "/workspace/.paperclip-runtime/paperclip-runner/bin/paperclip-runnerd",
-        args: ["--build-metadata"],
-      }));
+      const retainedProbes = remoteExecute.mock.calls.filter(([call]) => call.args?.[2] === "paperclip-runner-retained-artifact");
+      expect(retainedProbes).toHaveLength(1);
+      expect(retainedProbes[0]![0]).toMatchObject({ command: "sh", bypassSession: true });
+      expect(retainedProbes[0]![0].args?.[1]).toContain('--build-metadata');
+      expect(retainedProbes[0]![0].args?.[3]).toBe("/workspace/.paperclip-runtime/paperclip-runner/bin/paperclip-runnerd");
+      expect(remoteExecute.mock.calls.some(([call]) => call.command.endsWith("/paperclip-runnerd") && call.args?.[0] === "--build-metadata")).toBe(false);
     }
     expect(remoteExecute).toHaveBeenCalledWith(
       expect.objectContaining({
