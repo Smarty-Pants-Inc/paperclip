@@ -202,7 +202,7 @@ const scheduled = new Map<string, { bodies: string[]; peers: RecordingPiPeer[]; 
   first: RecordingPiPeer; outcomes: Map<string, Outcome>; attachGate?: Promise<void> }>();
 const realExecute = executePaperclipNativeSession;
 function backendFor(execution: Parameters<typeof realExecute>[0]["execution"], runnerInstanceId: string, peer: RecordingPiPeer) {
-  const workspace = execution.workspace.cwd;
+  const workspace = execution.workspace.cwd!;
   const driver = new PiRpcDriver({ model: execution.provider.kind === "pi_rpc" ? execution.provider.model : undefined,
     piRpcThinkingLevel: "off", runtimeDirectory: workspace, runnerInstanceId,
     ...(peer instanceof B6RealPiPeer ? { command: peer.command } : {}),
