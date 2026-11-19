@@ -55,6 +55,10 @@ describe("agent directory collection aborted after the canonical commit boundary
   let cleanupFault: { armed: boolean; controller: AbortController; reason: Error; reached: () => void; gate: Promise<void> } | null = null;
   /** R8: counts remote capture commands; the second one (the retry's) aborts and hangs. */
   let captureFault: { captures: number; controller: AbortController; reason: Error; reached: () => void; gate: Promise<void> } | null = null;
+  /** R11: while armed, the object-store stand-in rejects every upload (PLANTED at its putFile line below). */
+  let objectStoreFault: { armed: boolean; rejected: number } | null = null;
+  /** R10-R14: SQL that removes a fault planted in PostgreSQL; always run after the row. */
+  const plantedInPostgres: string[] = [];
 
   const evidence = async (name: string, proof: unknown) => {
     if (process.env.TASK_OUT) await fs.writeFile(path.join(process.env.TASK_OUT, name), JSON.stringify(proof, null, 2));
@@ -65,6 +69,10 @@ describe("agent directory collection aborted after the canonical commit boundary
   const memoryStorage = () => ({
     provider: "s3" as const,
     async putFile(input: { companyId: string; namespace: string; body: Readable; byteSize: number; sha256: string }) {
+      if (objectStoreFault?.armed) {
+        objectStoreFault.rejected++;
+        throw new Error("PLANTED persist failure: object storage rejects the upload"); // PLANTED FAILURE (R11): every upload while armed
+      }
       const chunks: Buffer[] = [];
       for await (const chunk of input.body) chunks.push(Buffer.from(chunk));
       const body = Buffer.concat(chunks);
@@ -118,7 +126,7 @@ describe("agent directory collection aborted after the canonical commit boundary
 
   /** A warm copy on a remote sandbox of an ephemeral server: the path whose
    * collector takes the session advisory lock on a dedicated connection. */
-  async function stoppedRunWithUnsavedNote(options: { agentFileLateAbortSettleMs: number }) {
+  async function stoppedRunWithUnsavedNote(options: { agentFileLateAbortSettleMs: number }, warm = true) {
     const executionTarget = { kind: "remote" as const, transport: "sandbox" as const, environmentId: randomUUID(), leaseId: randomUUID(), remoteCwd, runner };
     await db.insert(environments).values({ id: executionTarget.environmentId, name: `Late abort fixture ${executionTarget.environmentId}`, driver: "sandbox" });
     const runId = randomUUID();
@@ -126,7 +134,7 @@ describe("agent directory collection aborted after the canonical commit boundary
     await db.insert(environmentLeases).values({ id: executionTarget.leaseId, companyId, environmentId: executionTarget.environmentId,
       heartbeatRunId: runId, provider: "daytona", providerLeaseId: `late-abort-${runId}` });
     const service = agentInstructionWorkingCopyService(db, options as Parameters<typeof agentInstructionWorkingCopyService>[1]);
-    const copy = (await service.prepare({ companyId, agentId, runId, cwd: home, target: executionTarget, warm: true }))!;
+    const copy = (await service.prepare({ companyId, agentId, runId, cwd: home, target: executionTarget, warm }))!;
     const note = `late abort run bytes ${randomUUID()}\n`;
     await fs.writeFile(path.join(copy.executionRoot, noteName), note);
     return { service, copy, executionTarget, runId, note };
@@ -229,7 +237,7 @@ describe("agent directory collection aborted after the canonical commit boundary
     vi.stubEnv("PAPERCLIP_EPHEMERAL_SERVER", "true");
     vi.stubEnv("PAPERCLIP_DURABLE_AGENT_FILES", "true");
     vi.spyOn(storageModule, "getStorageService").mockImplementation(() => memoryStorage() as unknown as ReturnType<typeof storageModule.getStorageService>);
-    abortSignal = null; cleanupFault = null; captureFault = null; runnerCalls.length = 0; releases.length = 0; objects.clear();
+    abortSignal = null; cleanupFault = null; captureFault = null; objectStoreFault = null; runnerCalls.length = 0; releases.length = 0; objects.clear();
     applyCount.started = 0; applyCount.settled = 0; lastApplySettledAt = 0;
     const actualStore = fileStoreModule.agentFileStore;
     vi.spyOn(fileStoreModule, "agentFileStore").mockImplementation((...args) => {
@@ -260,6 +268,8 @@ describe("agent directory collection aborted after the canonical commit boundary
   afterEach(async () => {
     // Never leave a planted hang or a background save behind for the next row.
     for (const release of releases) release();
+    if (objectStoreFault) objectStoreFault.armed = false;
+    for (const statement of plantedInPostgres.splice(0)) await db.execute(sql.raw(statement));
     await drainAgentFileCheckpoints();
     await appliesSettled();
     vi.restoreAllMocks();
@@ -732,6 +742,308 @@ describe("agent directory collection aborted after the canonical commit boundary
     expect.soft(sourceKept, "the source copy is kept").toBe(note);
     expect.soft(after.manifestHash, "DB and tree agree after the store's existing restore: durable manifest == on-disk tree hash").toBe(after.treeHash);
     expect.soft(after).toMatchObject({ generation: before.generation, manifestHasNote: false, treeHasNote: false });
+    expect.soft(lockFreeAfter).toBe(true);
+  }, 60_000);
+
+  // PERSIST FAILURE after the commit boundary (rf-3, smarty-dev#20787: "row 2"
+  // and "R7 with a failure already recorded"). Person case: the stopped
+  // agent's working copy is collected, the tree merge has written files, and
+  // then the canonical persist FAILS. Same boundary as the rows above, with a
+  // REAL persist failure: no row below throws from a wrapper around the
+  // persist. The failure is raised inside the real persistDurableAgentFiles,
+  // by PostgreSQL (a planted trigger on agent_file_roots) or by the object
+  // store stand-in (its putFile). Every tree observation is raw: the real
+  // files on disk and the committed manifest from the independent pool, with
+  // no store read (which would restore the tree) before it.
+
+  /**
+   * PLANTED FAULT, named at its line: PostgreSQL itself rejects the durable
+   * head of THIS agent. The real persistDurableAgentFiles then fails at its
+   * own `tx.insert(agentFileRoots)...onConflictDoUpdate(...)` statement, after
+   * the tree merge, and its transaction is aborted by the database.
+   */
+  async function plantDurableHeadRejection() {
+    const name = "planted_agent_file_head_rejection";
+    await db.execute(sql.raw(`create or replace function ${name}() returns trigger language plpgsql as $$
+      begin if new.agent_id = '${agentId}'::uuid then raise exception 'PLANTED persist failure: PostgreSQL rejects the durable agent-file head'; end if; return new; end $$`));
+    await db.execute(sql.raw(`create trigger ${name} before insert or update on agent_file_roots for each row execute function ${name}()`)); // PLANTED FAILURE
+    const remove = `drop function if exists ${name}() cascade`;
+    plantedInPostgres.push(remove);
+    return { disarm: () => db.execute(sql.raw(remove)) };
+  }
+  /**
+   * PLANTED ABORT (and optional hang), named at its line: raised as the real
+   * persistDurableAgentFiles of the collection's store transaction STARTS,
+   * i.e. after the tree merge (past the canonical commit boundary). Nothing is
+   * thrown here: the real persist is then called and fails by itself.
+   */
+  function plantAbortAsPersistStarts(note: string, hang: boolean) {
+    const controller = new AbortController();
+    abortSignal = controller.signal;
+    const reason = new Error("PERSIST-FAILURE fixture: abort after the tree merge, as the persist starts");
+    const fault = { get applies() { return applyCount.started; }, get appliesSettled() { return applyCount.settled; }, realPersistCalls: 0, treeMergedAtPersist: false, abortedAt: 0, armed: true };
+    let reached!: () => void, release!: () => void;
+    const persisting = new Promise<void>(resolve => { reached = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    releases.push(release);
+    const realPersist = fileDurability.persistDurableAgentFiles;
+    vi.spyOn(fileDurability, "persistDurableAgentFiles").mockImplementation(async (...args) => {
+      if (args[3] === true || !fault.armed || args[1].id !== agentId) return realPersist(...args);
+      fault.armed = false;
+      fault.treeMergedAtPersist = await fs.readFile(path.join(root, noteName), "utf8").then(body => body === note, () => false);
+      fault.abortedAt = performance.now();
+      controller.abort(reason); // PLANTED ABORT: after the tree merge, before the real persist runs
+      reached();
+      if (hang) await gate; // PLANTED HANG: the apply stays in flight until release()
+      fault.realPersistCalls++;
+      return realPersist(...args); // the REAL persist; it fails by itself (plantDurableHeadRejection)
+    });
+    return { controller, reason, fault, persisting, release };
+  }
+  /** PLANTED HANG, named at its line: the collection's own bookkeeping after its
+   * outcome is recorded (dropping its lease pin) stays in flight until release(). */
+  function plantLingeringUnpin() {
+    const state = { reached: false, returned: false };
+    let reached!: () => void, release!: () => void;
+    const inUnpin = new Promise<void>(resolve => { reached = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    releases.push(release);
+    const realUnpin = saveHold.unpinLeaseForCollection;
+    vi.spyOn(saveHold, "unpinLeaseForCollection").mockImplementation(async (...args) => {
+      state.reached = true;
+      reached();
+      await gate; // PLANTED HANG
+      try { return await realUnpin(...args); } finally { state.returned = true; }
+    });
+    return { state, inUnpin, release };
+  }
+  /** The real canonical tree as it is on disk now (no store read): every entry with kind, content hash and mode. */
+  const rawTree = async () => [...(await snapshotAgentFiles(root, false)).entries]
+    .map(([name, entry]) => [name, entry.kind, entry.kind === "file" ? entry.hash : null, entry.kind === "file" ? (entry.mode & 0o777).toString(8) : null] as const)
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  /** Anything a save left beside the canonical tree (undo or restore scratch). */
+  const scratchBesideTree = async () => (await fs.readdir(path.dirname(root))).filter(name => name.startsWith(".agent-files"));
+  /** Polls the collector's key from the independent pool. At the FIRST moment
+   * that pool can take it, reads the committed manifest and the raw tree. */
+  async function atFirstUnlock(note: string) {
+    for (let i = 0; i < 3_000; i++) {
+      if (await independentPoolCanTakeLock()) return { lockFree: true, ...await canonical(note), tree: await rawTree() };
+      await sleep(5);
+    }
+    return { lockFree: false, ...await canonical(note), tree: await rawTree() };
+  }
+  const leasePins = async (leaseId: string) => {
+    const [lease] = await observer.select({ metadata: environmentLeases.metadata }).from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    return Object.keys((lease?.metadata as { agentFileCollectionPins?: Record<string, string> } | null)?.agentFileCollectionPins ?? {});
+  };
+  const briefRow = (row: Awaited<ReturnType<typeof copyRow>> | null | undefined) => row && { state: row.state, errorCode: row.errorCode,
+    abortCameTooLate: row.receipt?.abortCameTooLate ?? null, savePending: row.receipt?.savePending ?? null, held: agentFileSaveHeld(row) };
+  const failedHold = { state: "unavailable", errorCode: "AGENT_FILES_SAVE_FAILED", receipt: { savePending: { code: "AGENT_FILES_SAVE_FAILED" } } };
+
+  it("R10 a REAL persist failure after the commit boundary (PostgreSQL rejects the durable head; late abort, apply held past the bound): the merged tree is rolled back, the lock is never free while manifest != tree, never 'saved'", async () => {
+    const { service, copy, executionTarget, runId, note } = await stoppedRunWithUnsavedNote({ agentFileLateAbortSettleMs: 200 });
+    const before = await canonical(note), treeBefore = await rawTree();
+    expect(before, "fixture: the durable manifest equals the canonical tree before the collection").toMatchObject({ manifestHash: before.treeHash, manifestHasNote: false, treeHasNote: false });
+    const entryInode = async () => (await fs.stat(path.join(root, entryFile), { bigint: true })).ino.toString();
+    const entryInodeBefore = await entryInode();
+    await plantDurableHeadRejection();
+    const { controller, reason, fault, persisting, release } = plantAbortAsPersistStarts(note, true);
+    const collection = outcomeOf(service.collectStopped({ companyId, runId, target: executionTarget, signal: controller.signal }));
+    await Promise.race([persisting, collection]);
+    // The late window: the tree is merged, the real persist has not run yet (planted hang).
+    const atBound = await Promise.race([collection, sleep(2_000).then(() => null)]);
+    const lockFreeAtBound = await independentPoolCanTakeLock();
+    const half = await canonical(note);
+    release();
+    const unlocked = await atFirstUnlock(note);
+    await collection;
+    await drainAgentFileCheckpoints();
+    await appliesSettled();
+    // RAW: no store read between the failed apply and these observations.
+    const after = await canonical(note), treeAfter = await rawTree(), scratch = await scratchBesideTree(), entryInodeAfter = await entryInode();
+    const lockFreeAfter = await independentPoolCanTakeLock();
+    const recorded = await copyRow(runId);
+    const sourceKept = await fs.readFile(path.join(copy.executionRoot, noteName), "utf8").catch(() => null);
+    await evidence("r10-real-persist-failure-late-abort.json", { entryInodeBefore, entryInodeAfter, fault, boundMs: 200, atBound: atBound && { error: atBound.error ? String(atBound.error) : null, row: briefRow(atBound.row) },
+      lockFreeAtBound, half, unlocked, recorded: briefRow(recorded), before, after, treeBefore, treeAfter, scratch, lockFreeAfter, sourceKept: sourceKept === note });
+    expect.soft(fault, "fixture: one apply; the abort came after the tree merge; the REAL persist ran once and failed").toMatchObject({ applies: 1, appliesSettled: 1, realPersistCalls: 1, treeMergedAtPersist: true });
+    expect.soft(half, "fixture: the late window really is a merged tree with an uncommitted manifest").toMatchObject({ treeHasNote: true, manifestHasNote: false, generation: before.generation });
+    expect.soft(atBound, "the collection answers at the bound: still saving, never 'cancelled'").toMatchObject({ error: null, row: { state: "unavailable", errorCode: "AGENT_FILES_SAVE_STILL_RUNNING" } });
+    expect.soft(atBound?.error).not.toBe(reason);
+    expect.soft(lockFreeAtBound, "the lock is KEPT while the write is still landing").toBe(false);
+    expect.soft(recorded, "the settled record is the failed-save hold").toMatchObject(failedHold);
+    expect.soft(String((recorded.receipt?.savePending as { reason?: unknown } | undefined)?.reason), "and it names the REAL persist failure: the durable-head upsert PostgreSQL rejected").toMatch(/insert into "agent_file_roots"/);
+    expect.soft(recorded.state, "never 'saved'").not.toBe("saved");
+    expect.soft(agentFileSaveHeld(recorded), "its source is held for the durable retry").toBe(true);
+    expect.soft(sourceKept).toBe(note);
+    expect.soft(unlocked.lockFree, "the lock is released once the failed write settled").toBe(true);
+    expect.soft(unlocked.manifestHash, "at the FIRST moment an independent pool can take the lock, manifest == on-disk tree").toBe(unlocked.treeHash);
+    expect.soft(unlocked.tree, "and that tree is the pre-merge tree").toEqual(treeBefore);
+    expect.soft(after.manifestHash, "raw DB and raw tree agree after the failed apply, with no restoring store read").toBe(after.treeHash);
+    expect.soft(after, "PostgreSQL rolled back and nothing of the failed save is left on disk").toMatchObject({ generation: before.generation, manifestHasNote: false, treeHasNote: false });
+    expect.soft(treeAfter, "the canonical tree is exactly its pre-merge state (names, kinds, bytes, modes)").toEqual(treeBefore);
+    expect.soft(entryInodeAfter, "a file the merge did not touch is not rewritten by the rollback").toBe(entryInodeBefore);
+    expect.soft(scratch, "no undo or restore scratch is left beside the tree").toEqual([]);
+    expect.soft(lockFreeAfter).toBe(true);
+  }, 60_000);
+
+  it.each([
+    ["PostgreSQL rejects the durable head upsert", "warm"], ["PostgreSQL rejects the durable head upsert", "cold"],
+    ["object storage rejects the upload", "warm"], ["object storage rejects the upload", "cold"],
+  ] as const)("R11 a REAL persist failure on every attempt, no abort (%s; %s stopped copy): each failed merge (edit, delete, add, mode, file<->folder swap, conflict copy) is rolled back whole, then a later collection saves it once", async (failure, kind) => {
+    // The canonical tree before the run, adopted with the copy below.
+    const seed: Record<string, string> = { "memory/keep.md": "keep\n", "memory/edit.md": "v1\n", "memory/gone.md": "gone\n", "old-dir/a.md": "a\n", "old-dir/sub/b.md": "b\n",
+      "swap-file": "was a file\n", "swap-dir/x.md": "x\n", "mode.sh": "#!/bin/sh\n", "memory/conflict.md": "base\n" };
+    for (const [name, body] of Object.entries(seed)) {
+      await fs.mkdir(path.dirname(path.join(root, name)), { recursive: true });
+      await fs.writeFile(path.join(root, name), body, { mode: 0o644 });
+    }
+    const { service, copy, executionTarget, runId, note } = await stoppedRunWithUnsavedNote({ agentFileLateAbortSettleMs: 30_000 }, kind === "warm");
+    // Another writer saves memory/conflict.md after the run started.
+    await fileStoreModule.agentFileStore(db).write({ companyId, agentId, path: "memory/conflict.md", bytes: Buffer.from("other writer\n"), baseHash: fileHash(Buffer.from("base\n")) }, board());
+    // The stopped run's own changes, in its working copy.
+    const run = (name: string) => path.join(copy.executionRoot, name);
+    await fs.writeFile(run("memory/edit.md"), "v2 by the run\n");
+    await fs.rm(run("memory/gone.md"));
+    await fs.rm(run("old-dir"), { recursive: true });
+    await fs.mkdir(run("new/deep"), { recursive: true });
+    await fs.writeFile(run("new/deep/file.md"), "new\n");
+    await fs.rm(run("swap-file"));
+    await fs.mkdir(run("swap-file"));
+    await fs.writeFile(run("swap-file/inner.md"), "inner\n");
+    await fs.rm(run("swap-dir"), { recursive: true });
+    await fs.writeFile(run("swap-dir"), "now a file\n");
+    await fs.chmod(run("mode.sh"), 0o755);
+    await fs.writeFile(run("memory/conflict.md"), "run version\n");
+    const before = await canonical(note), treeBefore = await rawTree();
+    expect(before.manifestHash, "fixture: manifest == tree before the collection").toBe(before.treeHash);
+    const pg = failure.startsWith("PostgreSQL") ? await plantDurableHeadRejection() : null;
+    if (!pg) objectStoreFault = { armed: true, rejected: 0 };
+    const collection = outcomeOf(service.collectStopped({ companyId, runId, target: executionTarget }));
+    for (let i = 0; i < 2_000 && applyCount.started === 0; i++) await sleep(5);
+    const unlocked = await atFirstUnlock(note);
+    const { row, error } = await collection;
+    await drainAgentFileCheckpoints();
+    await appliesSettled();
+    // RAW: no store read between the failed applies and these observations.
+    const failedApplies = { ...applyCount };
+    const after = await canonical(note), treeAfter = await rawTree(), scratch = await scratchBesideTree();
+    const recorded = await copyRow(runId);
+    const sourceKept = await fs.readFile(run(noteName), "utf8").catch(() => null);
+    // The fault is removed; the durable retry owner's later collection saves the held copy.
+    await pg?.disarm();
+    if (objectStoreFault) objectStoreFault.armed = false;
+    const retried = await outcomeOf(service.collectStopped({ companyId, runId, target: executionTarget }));
+    await drainAgentFileCheckpoints();
+    await appliesSettled();
+    const saved = await canonical(note), treeSaved = await rawTree(), final = await copyRow(runId);
+    const savedNames = treeSaved.map(([name]) => name);
+    const conflictCopies = savedNames.filter(name => /^memory\/conflict\.conflict-/.test(name));
+    const read = (name: string) => fs.readFile(path.join(root, name), "utf8").catch(() => null);
+    const savedTree = { edit: await read("memory/edit.md"), gone: await read("memory/gone.md"), oldDir: savedNames.filter(name => name.startsWith("old-dir")),
+      added: await read("new/deep/file.md"), swapFile: await read("swap-file/inner.md"), swapDir: await read("swap-dir"),
+      mode: treeSaved.find(([name]) => name === "mode.sh")?.[3] ?? null, conflict: await read("memory/conflict.md"),
+      conflictCopy: conflictCopies.length === 1 ? await read(conflictCopies[0]!) : null, note: await read(noteName) };
+    await evidence(`r11-real-persist-failure-${failure.startsWith("PostgreSQL") ? "postgres" : "object-store"}-${kind}.json`, { failure, kind, failedApplies,
+      objectUploadsRejected: objectStoreFault?.rejected ?? null, error: error ? String(error) : null, returned: briefRow(row), recorded: briefRow(recorded), unlocked,
+      before, after, treeBefore, treeAfter, scratch, sourceKept: sourceKept === note,
+      retried: { error: retried.error ? String(retried.error) : null, row: briefRow(retried.row) }, applies: { ...applyCount }, saved, treeSaved, conflictCopies, savedTree, final: briefRow(final) });
+    expect.soft(error, "the collection is not rejected").toBeNull();
+    expect.soft(row, "never 'saved': the failed save is reported as held").toMatchObject(failedHold);
+    expect.soft(recorded).toMatchObject(failedHold);
+    expect.soft(String((recorded.receipt?.savePending as { reason?: unknown } | undefined)?.reason), "the hold names the REAL persist failure")
+      .toMatch(pg ? /insert into "agent_file_roots"/ : /PLANTED persist failure: object storage rejects the upload/);
+    expect.soft(failedApplies, "fixture: every attempt of the collection passed the boundary and failed in the real persist").toEqual({ started: 3, settled: 3 });
+    expect.soft(sourceKept, "the source is kept for the retry").toBe(note);
+    expect.soft(unlocked.lockFree).toBe(true);
+    expect.soft(unlocked.manifestHash, "at the FIRST moment an independent pool can take the lock, manifest == on-disk tree").toBe(unlocked.treeHash);
+    expect.soft(after.manifestHash, "raw DB and raw tree agree after the failed applies, with no restoring store read").toBe(after.treeHash);
+    expect.soft(after.generation, "PostgreSQL kept the committed head").toBe(before.generation);
+    expect.soft(treeAfter, "the canonical tree is exactly its pre-merge state: nothing of the failed save is left (no merged file, no conflict copy, no new folder)").toEqual(treeBefore);
+    expect.soft(scratch, "no undo or restore scratch is left beside the tree").toEqual([]);
+    expect.soft(retried, "the later collection saves it").toMatchObject({ error: null, row: { state: "saved", errorCode: null } });
+    expect.soft(final.receipt).not.toHaveProperty("savePending");
+    expect.soft(saved.manifestHash, "DB and tree agree: durable manifest == on-disk tree hash").toBe(saved.treeHash);
+    expect.soft(saved.generation).not.toBe(before.generation);
+    expect.soft(savedTree, "the save landed whole, once: the other writer's file kept, the run's version in exactly one conflict copy").toEqual({ edit: "v2 by the run\n", gone: null, oldDir: [],
+      added: "new\n", swapFile: "inner\n", swapDir: "now a file\n", mode: "755", conflict: "other writer\n", conflictCopy: "run version\n", note });
+    expect.soft(conflictCopies).toHaveLength(1);
+  }, 90_000);
+
+  it("R13 a REAL persist failure after a late abort, then the collection's lease-unpin bookkeeping lingers: the failed-save hold is durable and the collection ANSWERS with it at the bound; the bookkeeping continues after", async () => {
+    const BOUND_MS = 200, OBSERVE_MS = 1_500;
+    const { service, executionTarget, runId, note } = await stoppedRunWithUnsavedNote({ agentFileLateAbortSettleMs: BOUND_MS });
+    await plantDurableHeadRejection();
+    const { controller, reason, fault } = plantAbortAsPersistStarts(note, false);
+    const unpin = plantLingeringUnpin();
+    const collection = outcomeOf(service.collectStopped({ companyId, runId, target: executionTarget, signal: controller.signal }));
+    await Promise.race([unpin.inUnpin, collection]);
+    const recordedWhileLingering = await copyRow(runId);
+    const answer = await Promise.race([collection.then(value => ({ ...value, at: performance.now() })), sleep(BOUND_MS + OBSERVE_MS).then(() => null)]);
+    const unpinWhenAnswered = { ...unpin.state }, pinsWhenAnswered = await leasePins(executionTarget.leaseId);
+    const lockFreeWhileLingering = await independentPoolCanTakeLock();
+    unpin.release();
+    const result = await collection;
+    await drainAgentFileCheckpoints();
+    await appliesSettled();
+    const recorded = await copyRow(runId), pinsAfter = await leasePins(executionTarget.leaseId), lockFreeAfter = await independentPoolCanTakeLock();
+    await evidence("r13-failed-outcome-answers-at-the-bound.json", { fault: { ...fault, abortedAt: undefined }, boundMs: BOUND_MS, observedMs: BOUND_MS + OBSERVE_MS,
+      answered: answer !== null, answeredAfterAbortMs: answer ? answer.at - fault.abortedAt : null, error: answer?.error ? String(answer.error) : null, reported: briefRow(answer?.row),
+      recordedWhileLingering: briefRow(recordedWhileLingering), unpinWhenAnswered, pinsWhenAnswered, lockFreeWhileLingering,
+      result: { error: result.error ? String(result.error) : null, row: briefRow(result.row) }, recorded: briefRow(recorded), unpinAfter: { ...unpin.state }, pinsAfter, lockFreeAfter });
+    expect.soft(fault, "fixture: one apply, aborted after the tree merge, whose REAL persist failed").toMatchObject({ applies: 1, realPersistCalls: 1, treeMergedAtPersist: true });
+    expect.soft(recordedWhileLingering, "fixture: the failed-save hold is already durable while the unpin lingers").toMatchObject({ ...failedHold, receipt: { abortCameTooLate: true, savePending: { code: "AGENT_FILES_SAVE_FAILED" } } });
+    expect.soft(answer, `the collection answers within its ${BOUND_MS} ms bound (+ ${OBSERVE_MS} ms observed), not when its lingering bookkeeping ends`).not.toBeNull();
+    expect.soft(unpinWhenAnswered, "the bookkeeping was still in flight when the collection answered").toEqual({ reached: true, returned: false });
+    expect.soft(answer?.error, "never 'cancelled'").toBeNull();
+    expect.soft(answer?.error).not.toBe(reason);
+    expect.soft(answer?.row, "the answer is the recorded failed-save hold: never 'saved', never 'still saving'").toMatchObject({ ...failedHold, receipt: { abortCameTooLate: true, savePending: { code: "AGENT_FILES_SAVE_FAILED" } } });
+    expect.soft(result).toMatchObject({ error: null, row: failedHold });
+    expect.soft(recorded, "the durable record stays the failed-save hold").toMatchObject(failedHold);
+    expect.soft(pinsWhenAnswered, "fixture: the lease pin was still set when the collection answered").toHaveLength(1);
+    expect.soft({ unpin: unpin.state, pinsAfter }, "the bookkeeping continued after the answer: the lease pin is dropped").toEqual({ unpin: { reached: true, returned: true }, pinsAfter: [] });
+    expect.soft(lockFreeAfter).toBe(true);
+  }, 60_000);
+
+  it("R14 the failed-save hold is still being WRITTEN when the bound passes (PostgreSQL delays that write), then the unpin lingers: the collection answers as soon as the hold is durable, not when its bookkeeping ends", async () => {
+    const BOUND_MS = 200, RECORD_MS = 700, OBSERVE_MS = 1_500;
+    const { service, executionTarget, runId, note } = await stoppedRunWithUnsavedNote({ agentFileLateAbortSettleMs: BOUND_MS });
+    await plantDurableHeadRejection();
+    // PLANTED DELAY, named at its line: PostgreSQL holds the UPDATE that writes
+    // this company's failed-save hold on the copy row for RECORD_MS.
+    const slow = "planted_slow_failed_save_record";
+    await db.execute(sql.raw(`create or replace function ${slow}() returns trigger language plpgsql as $$
+      begin if new.company_id = '${companyId}'::uuid and new.error_code = 'AGENT_FILES_SAVE_FAILED' and old.error_code is distinct from 'AGENT_FILES_SAVE_FAILED'
+        then perform pg_sleep(${RECORD_MS / 1000}); end if; return new; end $$`));
+    await db.execute(sql.raw(`create trigger ${slow} before update on agent_instruction_working_copies for each row execute function ${slow}()`)); // PLANTED DELAY
+    plantedInPostgres.push(`drop function if exists ${slow}() cascade`);
+    const { controller, fault } = plantAbortAsPersistStarts(note, false);
+    const unpin = plantLingeringUnpin();
+    const collection = outcomeOf(service.collectStopped({ companyId, runId, target: executionTarget, signal: controller.signal }));
+    await Promise.race([sleep(15_000), collection, (async () => { while (!fault.abortedAt) await sleep(5); })()]);
+    await sleep(Math.max(0, fault.abortedAt + BOUND_MS + 100 - performance.now()));
+    // Just past the bound: the hold write is still in flight in PostgreSQL.
+    const recordedPastBound = await copyRow(runId), answeredPastBound = await Promise.race([collection.then(() => true), sleep(0).then(() => false)]);
+    const answer = await Promise.race([collection.then(value => ({ ...value, at: performance.now() })), sleep(RECORD_MS + OBSERVE_MS).then(() => null)]);
+    const unpinWhenAnswered = { ...unpin.state }, recordedWhenAnswered = await copyRow(runId);
+    unpin.release();
+    await collection;
+    await drainAgentFileCheckpoints();
+    await appliesSettled();
+    const recorded = await copyRow(runId), pinsAfter = await leasePins(executionTarget.leaseId), lockFreeAfter = await independentPoolCanTakeLock();
+    await evidence("r14-failed-outcome-recorded-past-the-bound.json", { fault: { ...fault, abortedAt: undefined }, boundMs: BOUND_MS, recordDelayMs: RECORD_MS,
+      recordedPastBound: briefRow(recordedPastBound), answeredPastBound, answered: answer !== null, answeredAfterAbortMs: answer ? answer.at - fault.abortedAt : null,
+      error: answer?.error ? String(answer.error) : null, reported: briefRow(answer?.row), unpinWhenAnswered, recordedWhenAnswered: briefRow(recordedWhenAnswered),
+      recorded: briefRow(recorded), pinsAfter, lockFreeAfter });
+    expect.soft(fault).toMatchObject({ applies: 1, realPersistCalls: 1, treeMergedAtPersist: true });
+    expect.soft({ errorCode: recordedPastBound.errorCode, answeredPastBound }, "fixture: just past the bound the failed-save hold is not on the row yet, and nothing is answered before it is").toEqual({ errorCode: null, answeredPastBound: false });
+    expect.soft(answer, "the collection answers once the hold is durable, not when its lingering bookkeeping ends").not.toBeNull();
+    expect.soft(unpinWhenAnswered, "the bookkeeping was still in flight when the collection answered").toEqual({ reached: true, returned: false });
+    expect.soft(answer?.error, "never 'cancelled'").toBeNull();
+    expect.soft(answer?.row, "the answer is the recorded failed-save hold: never 'saved', never 'still saving'").toMatchObject({ ...failedHold, receipt: { abortCameTooLate: true, savePending: { code: "AGENT_FILES_SAVE_FAILED" } } });
+    expect.soft(recordedWhenAnswered, "and that hold was durable when it answered").toMatchObject(failedHold);
+    expect.soft(recorded).toMatchObject(failedHold);
+    expect.soft(pinsAfter, "the bookkeeping continued after the answer").toEqual([]);
     expect.soft(lockFreeAfter).toBe(true);
   }, 60_000);
 });
