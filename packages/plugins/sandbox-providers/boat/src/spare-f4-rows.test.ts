@@ -1,0 +1,376 @@
+import { writeFileSync } from "node:fs";
+// rf-4 U1c (review-fleet-4's last two Boat unit #1 conditions, C1 and C2).
+// C1 / row I: a provider 429 on a spare create must not be resent after a
+//   delivered OFF; the spare setting is re-read at the send boundary, after
+//   every wait and before every resend. A person's run create is never held by
+//   spare policy (control).
+// C2 / row K: with the last pool OFF, a spare whose stop failed is retried from
+//   the maintenance tick (no acquire, no other ON pool), under the same
+//   15-minute back-off and the same ownership check by id.
+// The harness is judge-extra.test.ts's (the plugin's REAL hooks, keeper and
+// request retry code against a stateful fake Boat on one fake clock), copied
+// unchanged so the judge file stays byte-for-byte as supplied.
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("node:timers/promises", () => ({
+  setTimeout: (ms = 0, value?: unknown, options?: { signal?: AbortSignal }) => new Promise((resolve, reject) => {
+    if (options?.signal?.aborted) { reject(options.signal.reason); return; }
+    const handle = globalThis.setTimeout(() => resolve(value), ms);
+    options?.signal?.addEventListener?.("abort", () => { globalThis.clearTimeout(handle); reject(options.signal!.reason); }, { once: true });
+  }),
+}));
+
+import plugin from "./plugin.js";
+import { READY_SPARE_STOP_BACKOFF_MS } from "./ready-spares.js";
+
+const apiKey = "boat_spare_off_test";
+const baseConfig = { apiKey, type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const IDLE_MINUTES = 15;
+const CREATE_LATENCY_MS = 2_000;
+const TICK_MS = 15_000;
+const START = Date.UTC(2026, 10, 18, 23, 30, 0);
+
+type Box = { id: string; labels: Record<string, string>; name: string; state: string;
+  readyAt: number; archiveAfter: string; createdAt: string; team: { id: string }; stop?: { id: string; status: string } };
+type LogEntry = { seq: number; at: number; kind: "boat" | "event" | "mark"; method?: string; path?: string; id?: string; purpose?: string; configHash?: string; note?: string };
+type Hold = { method: string; path: RegExp; hit: boolean; released: boolean; release(): void; wait: Promise<void> };
+
+const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+
+class FakeBoat {
+  readonly boxes = new Map<string, Box>();
+  readonly log: LogEntry[] = [];
+  readonly holds: Hold[] = [];
+  private seq = 0;
+  private counter = 0;
+
+  record(entry: Omit<LogEntry, "seq" | "at">): LogEntry {
+    const full = { seq: ++this.seq, at: Date.now(), ...entry };
+    this.log.push(full);
+    return full;
+  }
+  mark(note: string): number { return this.record({ kind: "mark", note }).seq; }
+  observe(box: Box): Box {
+    if (box.state === "creating" && Date.now() >= box.readyAt) box.state = "ready";
+    return box;
+  }
+  /** Hold the next matching request until released (a Boat call in flight). */
+  hold(method: string, path: RegExp): Hold {
+    let release!: () => void;
+    const wait = new Promise<void>(resolve => { release = resolve; });
+    const hold: Hold = { method, path, hit: false, released: false, wait, release: () => { hold.released = true; release(); } };
+    this.holds.push(hold);
+    return hold;
+  }
+  spareCreates(afterSeq = 0) { return this.log.filter(e => e.kind === "boat" && e.method === "POST" && e.path === "/sandboxes" && e.purpose === "spare" && e.seq > afterSeq); }
+  spareIds() { return [...this.boxes.values()].filter(box => box.labels.purpose === "spare").map(box => box.id); }
+  /** Unclaimed spare boxes still running at Boat (a claimed spare is renamed paperclip-claim:... and is a run's box). */
+  liveSpares() { return this.spareIds().filter(id => this.boxes.get(id)!.state !== "archived" && !this.boxes.get(id)!.name.startsWith("paperclip-claim:")); }
+
+  readonly fetch = async (input: unknown, init: RequestInit = {}) => {
+    const url = new URL(String(input));
+    const method = (init.method ?? "GET").toUpperCase();
+    const route = url.pathname.replace("/api/v1", "");
+    const body = typeof init.body === "string" && init.body ? JSON.parse(init.body) : undefined;
+    const id = /^\/sandboxes\/([^/]+)/.exec(route)?.[1];
+    const hold = this.holds.find(h => !h.hit && h.method === method && h.path.test(route));
+    if (hold) { hold.hit = true; await hold.wait; }
+    if (method === "POST" && route === "/sandboxes") {
+      const purpose = body.labels.purpose === "spare" ? "spare" : "run";
+      const box: Box = { id: `bx_${purpose}${String(++this.counter).padStart(4, "0")}`, labels: { ...body.labels }, name: "",
+        state: "creating", readyAt: Date.now() + CREATE_LATENCY_MS,
+        archiveAfter: new Date(Date.now() + body.ttlSeconds * 1000).toISOString(), createdAt: new Date().toISOString(), team: { id: "team-spare-off" } };
+      this.boxes.set(box.id, box);
+      this.record({ kind: "boat", method, path: route, id: box.id, purpose, configHash: body.labels.configHash });
+      return response({ sandbox: { ...box } }, 202);
+    }
+    this.record({ kind: "boat", method, path: route, ...(id ? { id } : {}) });
+    if (method === "GET" && route === "/sandboxes") {
+      const labels = url.searchParams.getAll("label").map(label => label.split("="));
+      const matching = [...this.boxes.values()].map(box => this.observe(box))
+        .filter(box => labels.every(([key, ...rest]) => box.labels[key] === rest.join("=")));
+      return response({ sandboxes: matching.map(box => ({ ...box })), pageInfo: { nextCursor: null } });
+    }
+    const box = id ? this.boxes.get(id) : undefined;
+    if (id && !box) return response({ error: "not_found" }, 404);
+    if (method === "POST" && box && route.endsWith("/stop")) {
+      box.state = "archived"; box.stop = { id: `stop_${box.id}`, status: "completed" };
+      return response({ stop: { id: `stop_${box.id}`, status: "pending" } }, 202);
+    }
+    if (method === "POST" && box && route.endsWith("/resume")) { box.state = "ready"; return response({ sandbox: { ...box } }, 202); }
+    if (method === "GET" && box && route === `/sandboxes/${id}`) return response({ sandbox: { ...this.observe(box) } });
+    if (method === "PATCH" && box && route === `/sandboxes/${id}`) {
+      this.observe(box);
+      if (box.state !== "archived") {
+        if (body?.name) box.name = body.name;
+        if (body?.ttlSeconds) box.archiveAfter = new Date(Date.now() + body.ttlSeconds * 1000).toISOString();
+      }
+      return response({ sandbox: { ...box } });
+    }
+    if (method === "PUT" && route.endsWith("/files")) return response({ success: true });
+    if (method === "POST" && route.endsWith("/commands")) return response({ exitCode: 0, timedOut: false, stdout: "{}\n", stderr: "" });
+    return response({ error: "unsupported_in_fake" }, 400);
+  };
+}
+
+type SpareConfig = { spares?: number; spareMax?: number; spareDemandWindowMinutes?: number; spareEnvironmentIds?: string[]; spareIdleMinutes?: number };
+type Harness = {
+  boat: FakeBoat; company: string; env: string; config: SpareConfig;
+  /** A second company whose spares stay on (its pool keeps maintenance running). */
+  otherCompany: string; otherEnv: string; acquireOther(runId: string): Promise<{ providerLeaseId: string | null }>;
+  configChanged(): Promise<void>;
+  failActivityRead?: boolean;
+  activityReadFailures?: number;
+  configReadHook?: (companyId?: string) => Promise<Record<string, unknown>>;
+  restart(deliverConfig: boolean): Promise<void>;
+  emit(eventType: string): Promise<void>;
+  acquire(runId: string, config?: Record<string, unknown>): Promise<{ providerLeaseId: string | null }>;
+};
+
+const eventHandlers = new Map<string, (event: unknown) => Promise<void>>();
+const advance = (ms: number) => vi.advanceTimersByTimeAsync(ms);
+
+async function settle<T>(promise: Promise<T>, stepMs = 100, limitMs = 300_000): Promise<T> {
+  let done = false, value: T | undefined, error: unknown, failed = false;
+  void promise.then(v => { done = true; value = v; }, e => { done = true; failed = true; error = e; });
+  for (let waited = 0; !done && waited < limitMs; waited += stepMs) await advance(stepMs);
+  if (!done) throw new Error("operation did not settle on the fake clock");
+  if (failed) throw error;
+  return value as T;
+}
+async function until(check: () => boolean, label: string, stepMs = 10, limitMs = 60_000): Promise<void> {
+  for (let waited = 0; !check(); waited += stepMs) {
+    if (waited >= limitMs) throw new Error(`never reached: ${label}`);
+    await advance(stepMs);
+  }
+}
+
+async function harness(name: string): Promise<Harness> {
+  const boat = new FakeBoat();
+  vi.stubGlobal("fetch", boat.fetch);
+  const company = `company-${name}`, env = `environment-${name}`;
+  const state = new Map<string, unknown>();
+  const claims = new Set<string>();
+  const db = { namespace: "boat_sandbox_provider", execute: async (_sql: string, params: unknown[] = []) => {
+    if (claims.has(String(params[0]))) return { rowCount: 0 };
+    claims.add(String(params[0]));
+    return { rowCount: 1 };
+  } };
+  const config: SpareConfig = { spares: 1, spareMax: 3, spareDemandWindowMinutes: 10, spareEnvironmentIds: [env], spareIdleMinutes: IDLE_MINUTES };
+  const otherCompany = `other-${name}`, otherEnv = `other-environment-${name}`;
+  const otherConfig: SpareConfig = { ...config, spareEnvironmentIds: [otherEnv] };
+  const ctx = {
+    config: { get: async (companyId?: string) => h.configReadHook ? h.configReadHook(companyId) : companyId === otherCompany ? { ...otherConfig } : { ...config } },
+    logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    db,
+    events: { on: (eventType: string, _filter: unknown, handler: (event: unknown) => Promise<void>) => {
+      eventHandlers.set(eventType, handler);
+      return () => eventHandlers.delete(eventType);
+    } },
+    state: {
+      get: async (key: { scopeId?: string; stateKey: string }) => { if (h.failActivityRead && key.stateKey === "company-activity") { h.activityReadFailures = (h.activityReadFailures ?? 0) + 1; throw new Error("JUDGE injected activity read rejection"); } return state.get(`${key.scopeId}:${key.stateKey}`) ?? null; },
+      set: async (key: { scopeId?: string; stateKey: string }, value: unknown) => { state.set(`${key.scopeId}:${key.stateKey}`, value); },
+    },
+  };
+  await plugin.definition.setup(ctx as any);
+  const h: Harness = {
+    boat, company, env, config, otherCompany, otherEnv,
+    acquireOther(runId) {
+      return plugin.definition.onEnvironmentAcquireLease!({ driverKey: "boat", companyId: otherCompany, environmentId: otherEnv, runId,
+        creationOperationId: `attempt-${runId}`, config: baseConfig } as any) as Promise<{ providerLeaseId: string | null }>;
+    },
+    configChanged: () => plugin.definition.onConfigChanged!({ ...config }, { companyId: company } as any) as Promise<void>,
+    async restart(deliverConfig) {
+      boat.mark("worker restart");
+      await settle(Promise.resolve(plugin.definition.onShutdown?.()));
+      eventHandlers.clear();
+      await plugin.definition.setup(ctx as any);
+      if (deliverConfig) await settle(h.configChanged());
+    },
+    emit(eventType) {
+      const handler = eventHandlers.get(eventType);
+      if (!handler) throw new Error(`no handler for ${eventType}`);
+      boat.record({ kind: "event", note: eventType });
+      return handler({ eventId: `${eventType}-${Date.now()}`, eventType, companyId: company, occurredAt: new Date().toISOString() });
+    },
+    acquire(runId, leaseConfig = baseConfig) {
+      return plugin.definition.onEnvironmentAcquireLease!({ driverKey: "boat", companyId: company, environmentId: env, runId,
+        creationOperationId: `attempt-${runId}`, config: leaseConfig } as any) as Promise<{ providerLeaseId: string | null }>;
+    },
+  };
+  await settle(h.configChanged());
+  return h;
+}
+
+/** One cold run lease teaches the plugin the pool; spare S1 becomes ready. Returns S1 and the run box. */
+async function seed(h: Harness): Promise<{ s1: string; run: string }> {
+  const lease = await settle(h.acquire("run-seed"));
+  await advance(5_000);
+  const spares = h.boat.liveSpares();
+  expect(spares).toHaveLength(1);
+  expect(h.boat.boxes.get(spares[0])!.name).toMatch(/^paperclip-spare:ready:/);
+  return { s1: spares[0], run: lease.providerLeaseId! };
+}
+
+type OffPath = "config" | "acquire-planted" | "removal-config" | "removal-acquire-planted";
+/**
+ * Turn spares off. "config": the real path, the host delivers onConfigChanged
+ * with spares 0. "acquire-planted": planted, the company setting reads 0 with
+ * no onConfigChanged delivered; a run acquire is the real reader. "removal-*":
+ * the spares key is deleted (not set to 0), delivered the same two ways.
+ */
+async function turnOff(h: Harness, path: OffPath): Promise<number> {
+  if (path.startsWith("removal")) delete h.config.spares;
+  else h.config.spares = 0;
+  const offAt = h.boat.mark(`spares off by ${path}`);
+  if (path === "config" || path === "removal-config") await settle(h.configChanged());
+  else {
+    const lease = await settle(h.acquire(`run-off-${path}`));
+    expect(h.boat.boxes.get(lease.providerLeaseId!)!.labels.purpose, "spares off: the run is a cold create").toBe("run");
+  }
+  await advance(5_000);
+  return offAt;
+}
+
+type Wake = "acquire" | "resume" | "release" | "health" | "timer" | "issue.comment.created" | "agent.run.started" | "issue.created";
+const WAKES: Wake[] = ["acquire", "resume", "release", "health", "timer", "issue.comment.created", "agent.run.started", "issue.created"];
+const leaseParams = (h: Harness, providerLeaseId: string | null) => ({ driverKey: "boat", companyId: h.company, environmentId: h.env, config: baseConfig, providerLeaseId });
+
+/** Drive one real wake path (acquire ~:1838, resume ~:2025, release ~:2115, maintainReadySpares via onHealth and the 15 s timer, the activity events). */
+async function wake(h: Harness, path: Wake, runBox: string): Promise<void> {
+  h.boat.mark(`wake ${path}`);
+  if (path === "acquire") await settle(h.acquire(`run-wake-${Date.now()}`));
+  else if (path === "resume") {
+    await settle(Promise.resolve(plugin.definition.onEnvironmentResumeLease!({ ...leaseParams(h, runBox), runId: "run-resume", leaseMetadata: {} } as any)).catch(() => undefined));
+  } else if (path === "release") {
+    await settle(Promise.resolve(plugin.definition.onEnvironmentReleaseLease!(leaseParams(h, null) as any)).catch(() => undefined));
+  } else if (path === "health") await settle(Promise.resolve(plugin.definition.onHealth!()));
+  else if (path === "timer") { /* the refresh timer only */ }
+  else if (eventHandlers.has(path)) await settle(h.emit(path));
+  // else: this worker has no subscription for the event (no onConfigChanged
+  // since its start), so that wake path does not exist in it.
+  else h.boat.mark(`wake ${path}: no subscription in this worker`);
+  await advance(4 * TICK_MS);
+}
+
+beforeEach(() => {
+  vi.useFakeTimers({ now: START, toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+});
+
+afterEach(async () => {
+  if (current && process.env.JUDGE_TRACE_DIR) writeFileSync(`${process.env.JUDGE_TRACE_DIR}/${current.company}.json`, JSON.stringify({ log: current.boat.log, boxes: [...current.boat.boxes.values()] }, null, 2));
+  for (const hold of current?.boat.holds ?? []) hold.release();
+  await settle(Promise.resolve(plugin.definition.onShutdown?.()));
+  eventHandlers.clear();
+  current = undefined;
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
+});
+let current: Harness | undefined;
+async function start(name: string): Promise<Harness> { current = await harness(name); return current; }
+
+const TOO_MANY = (code: string, retryAfter: string) => new Response(JSON.stringify({ code }), { status: 429,
+  headers: { "content-type": "application/json", "Retry-After": retryAfter } });
+const bodyOf = (init: RequestInit) => typeof init.body === "string" && init.body ? JSON.parse(init.body) : undefined;
+
+describe("rf-4 U1c C1: a spare create re-checks the setting before every resend", () => {
+  it("ROW I a spare create refused 429 rate_limited (Retry-After 2) is not resent after a delivered OFF", async () => {
+    const h = await start("f4-row-i-429-off");
+    const { s1 } = await seed(h);
+    let refused = 0;
+    vi.stubGlobal("fetch", async (input: unknown, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      if (init.method === "POST" && url.pathname.endsWith("/sandboxes") && bodyOf(init)?.labels?.purpose === "spare" && refused === 0) {
+        refused++;
+        h.boat.record({ kind: "boat", method: "POST", path: "/sandboxes", note: "ROW I injected 429 rate_limited, Retry-After 2, on the replacement spare create" });
+        return TOO_MANY("rate_limited", "2");
+      }
+      return h.boat.fetch(input, init);
+    });
+    const claimed = h.acquire("run-claim-row-i");
+    await until(() => refused > 0, "the replacement spare POST is refused with 429");
+    // OFF is delivered by the real host path while the create waits out Retry-After.
+    const offAt = await turnOff(h, "config");
+    const lease = await settle(claimed);
+    await advance(4 * TICK_MS);
+    expect(lease.providerLeaseId, "the run still gets the claimed spare").toBe(s1);
+    expect(refused, "the 429 fault really fired").toBe(1);
+    expect(h.boat.spareCreates(offAt).map(e => e.id), "no spare create is sent after a delivered OFF, resend included").toEqual([]);
+    expect(h.boat.liveSpares()).toEqual([]);
+  });
+
+  it("ROW I-RUN control: a person's run create refused 429 is still resent while spares are OFF", async () => {
+    const h = await start("f4-row-i-run-control");
+    await seed(h);
+    await turnOff(h, "config");
+    let refused = 0;
+    vi.stubGlobal("fetch", async (input: unknown, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      if (init.method === "POST" && url.pathname.endsWith("/sandboxes") && bodyOf(init)?.labels?.purpose !== "spare" && refused === 0) {
+        refused++;
+        h.boat.record({ kind: "boat", method: "POST", path: "/sandboxes", note: "ROW I-RUN injected 429 rate_limited, Retry-After 1, on a run create" });
+        return TOO_MANY("rate_limited", "1");
+      }
+      return h.boat.fetch(input, init);
+    });
+    const runAt = h.boat.mark("ROW I-RUN run acquire while spares are off");
+    const lease = await settle(h.acquire("run-cold-row-i"));
+    expect(refused, "the 429 fault really fired").toBe(1);
+    const runCreates = h.boat.log.filter(e => e.kind === "boat" && e.method === "POST" && e.path === "/sandboxes" && e.purpose === "run" && e.seq > runAt);
+    expect(runCreates.map(e => e.id), "spare policy never blocks a run's resend").toEqual([lease.providerLeaseId]);
+    expect(h.boat.spareCreates(runAt)).toEqual([]);
+  });
+});
+
+describe("rf-4 U1c C2: the maintenance tick services owed stops, OFF pools included", () => {
+  async function offWithFailedStop(name: string) {
+    const h = await start(name);
+    const { s1 } = await seed(h);
+    const state = { stops: 0, refuse: true };
+    vi.stubGlobal("fetch", async (input: unknown, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      if (init.method === "POST" && url.pathname.endsWith(`/sandboxes/${s1}/stop`)) {
+        state.stops++;
+        if (state.refuse) {
+          h.boat.record({ kind: "boat", method: "POST", path: `/sandboxes/${s1}/stop`, id: s1, note: "ROW K injected stop refusal HTTP 400" });
+          return response({ error: "ROW K injected stop refusal" }, 400);
+        }
+      }
+      return h.boat.fetch(input, init);
+    });
+    await turnOff(h, "config");
+    expect(state.stops, "the OFF stop was attempted and refused").toBeGreaterThan(0);
+    expect(h.boat.boxes.get(s1)!.state).not.toBe("archived");
+    state.refuse = false;
+    return { h, s1, state, refusedStops: state.stops };
+  }
+
+  it("ROW K last pool OFF + one failed-stop spare owed: the next maintenance tick after the back-off retries its stop (no acquire, no other pool)", async () => {
+    const { h, s1, state, refusedStops } = await offWithFailedStop("f4-row-k-off-owed");
+    const owedAt = h.boat.mark("ROW K owed stop recorded; no acquire and no other pool from here");
+    // The same 15-minute back-off: no retry inside it.
+    await advance(READY_SPARE_STOP_BACKOFF_MS - 60_000);
+    expect(state.stops, "no retry inside the back-off").toBe(refusedStops);
+    await advance(60_000 + 2 * TICK_MS);
+    expect(state.stops, "the maintenance tick retried the owed stop").toBe(refusedStops + 1);
+    expect(h.boat.boxes.get(s1)!.state).toBe("archived");
+    const after = h.boat.log.filter(e => e.seq > owedAt && e.kind === "boat");
+    const read = after.findIndex(e => e.method === "GET" && e.path === `/sandboxes/${s1}`);
+    const stop = after.findIndex(e => e.method === "POST" && e.path === `/sandboxes/${s1}/stop`);
+    expect(read, "ownership is checked by id before the stop").toBeGreaterThanOrEqual(0);
+    expect(read).toBeLessThan(stop);
+    expect(h.boat.spareCreates(owedAt), "servicing the debt creates nothing").toEqual([]);
+    expect(after.filter(e => e.method === "PATCH" && e.id === s1), "servicing the debt renews nothing").toEqual([]);
+    // Paid: the debt is cleared, so later ticks send nothing more.
+    await advance(READY_SPARE_STOP_BACKOFF_MS + 2 * TICK_MS);
+    expect(state.stops).toBe(refusedStops + 1);
+  });
+
+  it("ROW K-OWNER guard: an owed spare that is no longer an unclaimed spare by id is not stopped by the tick", async () => {
+    const { h, s1, state, refusedStops } = await offWithFailedStop("f4-row-k-owner");
+    h.boat.boxes.get(s1)!.name = "paperclip-claim:planted-run";
+    await advance(READY_SPARE_STOP_BACKOFF_MS + 2 * TICK_MS);
+    expect(state.stops, "a box that is now a run's is never stopped as owed").toBe(refusedStops);
+    expect(h.boat.boxes.get(s1)!.state).not.toBe("archived");
+  });
+});
