@@ -1,8 +1,9 @@
+import { getServerProcessStartedAt } from "../server-info.js";
 import { insertIssueComment } from "./issue-comment-writes.js";
 import { notifyDeliveryWork, DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { notifyNativeResponsePresentation } from "./native-response-presentation-notifications.js";
 import { nativeResponsePresentationCandidates } from "./native-runtime/native-response-presentation-query.js";
-import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, or, sql } from "drizzle-orm";
 import { agents, agentWakeupRequests, approvals, chatCompletionDeliveries as deliveries, chatTaskHandoffs as handoffs,
   heartbeatRunEvents, heartbeatRuns, issueApprovals, issueComments, issueDocuments, issueRelations, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
 import { extractIssueReferenceMatches } from "@paperclipai/shared";
@@ -105,18 +106,24 @@ export function clipForNote(text: string | null | undefined, max = 60): string {
   return line.length > max ? `${line.slice(0, max - 1).trimEnd()}…` : line;
 }
 
-/** Retire ONLY the pending deliveries named by this stale wake, in the
- * cancellation transaction. The status CAS is also the note's idempotency gate:
+/** Retire this stale wake's deliveries AND the conversation's pre-boot backlog
+ * in the cancellation transaction. Post-boot siblings retain ordinary carry.
+ * The status CAS is also the note's idempotency gate:
  * a retry (or a second wake naming D) cannot write the same finished-task news.
  * Completion display text stays here, not in the wake-queue orchestrator. */
 export async function supersedeStaleChatCompletionWake(tx: Connection, input: {
   companyId: string; conversationId: string; agentId: string; wakeId: string; deliveryIds: string[];
 }): Promise<void> {
-  if (!input.deliveryIds.length) return;
+  const boot = new Date(getServerProcessStartedAt());
+  // Serialize the worker's no-head path with wake cancellation. The delivery
+  // status CAS below is the one-note gate even when several workers saw the batch.
+  await tx.select({ id: issues.id }).from(issues).where(and(eq(issues.companyId, input.companyId),
+    eq(issues.id, input.conversationId))).for("update");
   const rows = await tx.select({ delivery: deliveries, task: issues }).from(deliveries)
     .innerJoin(handoffs, and(eq(handoffs.taskId, deliveries.taskId), eq(handoffs.companyId, deliveries.companyId)))
     .innerJoin(issues, and(eq(issues.id, deliveries.taskId), eq(issues.companyId, deliveries.companyId)))
-    .where(and(eq(deliveries.companyId, input.companyId), inArray(deliveries.id, input.deliveryIds),
+    .where(and(eq(deliveries.companyId, input.companyId),
+      or(inArray(deliveries.id, input.deliveryIds), lt(deliveries.createdAt, boot)),
       eq(handoffs.conversationId, input.conversationId), eq(handoffs.agentId, input.agentId),
       inArray(deliveries.status, [...pending]))).orderBy(asc(deliveries.createdAt), asc(deliveries.id));
   const named: string[] = [];
@@ -136,7 +143,7 @@ export async function supersedeStaleChatCompletionWake(tx: Connection, input: {
     // and delivery CAS still arbitrate concurrent workers.
     await tx.update(deliveries).set({ nextAttemptAt: new Date() }).where(and(
       eq(deliveries.companyId, input.companyId), eq(deliveries.status, "pending"),
-      isNull(deliveries.targetRunId),
+      gte(deliveries.createdAt, boot), isNull(deliveries.targetRunId),
       sql`exists (select 1 from ${handoffs} h where h.company_id = ${input.companyId}
         and h.task_id = ${deliveries.taskId} and h.conversation_id = ${input.conversationId}
         and h.agent_id = ${input.agentId})`,
@@ -399,6 +406,15 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
       if (!(await instanceSettingsService(db).getExperimental()).enableAgentChat) return;
       const [agent] = await db.select().from(agents).where(and(eq(agents.id, row.handoff.agentId), eq(agents.companyId, claimed.companyId)));
       if (!agent || ["paused", "terminated"].includes(agent.status)) return;
+      // The same boot boundary as deferred admission: an old outbox row is
+      // historical news even if no deferred head survived. Never create a wake.
+      if (claimed.createdAt < new Date(getServerProcessStartedAt()) && !claimed.targetRunId) {
+        await db.transaction(tx => supersedeStaleChatCompletionWake(tx, {
+          companyId: claimed.companyId, conversationId: row.handoff.conversationId,
+          agentId: row.handoff.agentId, wakeId: `delivery:${id}`, deliveryIds: [id],
+        }));
+        return;
+      }
       const key = `chat-completion:${id}:${claimed.attempts}`;
       const wakes = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, claimed.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
       const runId = claimed.targetRunId ?? wakes.find(w => w.runId)?.runId;
