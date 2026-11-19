@@ -127,7 +127,7 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
     await createAgentLifecycle(db).pauseAgent(f.agentId, "manual");
     await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issue.id });
     expect((await notes(f.issue.id)).map(n => n.body)).toEqual([
-      "Import Coder is paused. Your message is saved, and it will run when Import Coder is resumed. "
+      "Import Coder is paused. Your message is saved. Send it again after Import Coder is resumed. "
       + "A board user or Import Coder's manager can resume Import Coder.",
     ]);
     expect((await notes(f.issue.id)).filter(n => (n.metadata as Record<string, unknown> | null)?.authorizationReason
