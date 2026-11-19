@@ -7,10 +7,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ONBOARDING_FIRST_TASK_ORIGIN_KIND } from "@paperclipai/shared";
 import type { HealthStatus } from "@/api/health";
 import { GitHubStarPrompt, STAR_PROMPT_SEEN_KEY } from "./GitHubStarPrompt";
+import { BoardDialogs } from "./BoardDialogs";
 
 const state = vi.hoisted(() => ({ companyId: "company", loading: false, onboardingOpen: false, onboardingStatus: null as string | null, done: 5, listCompact: vi.fn() }));
 vi.mock("@/context/CompanyContext", () => ({ useCompany: () => ({ selectedCompanyId: state.companyId, loading: state.loading }) }));
-vi.mock("@/context/DialogContext", () => ({ useDialogState: () => ({ onboardingOpen: state.onboardingOpen }) }));
+vi.mock("@/context/DialogContext", () => ({
+  useDialogState: () => ({ onboardingOpen: state.onboardingOpen, newIssueOpen: false, newProjectOpen: false, newGoalOpen: false, newAgentOpen: false }),
+  useDialogActions: () => ({ closeNewIssue: vi.fn(), closeNewProject: vi.fn(), closeNewGoal: vi.fn(), closeNewAgent: vi.fn() }),
+}));
+vi.mock("./NewIssueDialog", () => ({ NewIssueDialog: () => null }));
+vi.mock("./NewProjectDialog", () => ({ NewProjectDialog: () => null }));
+vi.mock("./NewGoalDialog", () => ({ NewGoalDialog: () => null }));
+vi.mock("./NewAgentDialog", () => ({ NewAgentDialog: () => null }));
 vi.mock("@/api/issues", () => ({ issuesApi: {
   list: () => Promise.resolve(state.onboardingStatus ? [{ id: "onboarding", originKind: ONBOARDING_FIRST_TASK_ORIGIN_KIND, status: state.onboardingStatus }] : []),
   listCompact: (...args: unknown[]) => {
@@ -25,11 +33,11 @@ describe("GitHub star prompt", () => {
   let root: Root;
   let navigate: NavigateFunction | null = null;
   function NavigateHandle() { navigate = useNavigate(); return null; }
-  const render = async (health: Partial<HealthStatus> | null = { deploymentMode: "local_trusted" }, path = "/CHA/dashboard") => {
+  const render = async (health: Partial<HealthStatus> | null = { deploymentMode: "local_trusted" }, path = "/CHA/dashboard", board = false) => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     if (health) client.setQueryData(["health"], health);
     await act(async () => root.render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[path]}>
-      <NavigateHandle /><GitHubStarPrompt />
+      <NavigateHandle />{board ? <BoardDialogs /> : <GitHubStarPrompt />}
     </MemoryRouter></QueryClientProvider>));
     // Let the onboarding and done-count queries settle, however slow the run.
     for (let idle = 0, tick = 0; idle < 2 && tick < 100; tick++) {
@@ -44,7 +52,30 @@ describe("GitHub star prompt", () => {
     window.localStorage.clear();
     container = document.createElement("div"); document.body.append(container); root = createRoot(container);
   });
-  afterEach(async () => { await act(async () => root.unmount()); container.remove(); });
+  afterEach(async () => { await act(async () => root.unmount()); container.remove(); vi.unstubAllEnvs(); });
+
+  // catch: https://github.com/Smarty-Pants-Inc/paperclip/blob/e8de03bc033cee15de9a35ed4015619ea7687573/ui/src/components/BoardDialogs.tsx#L19
+  it("does not prompt on our default self-hosted board after five done tasks", async () => {
+    vi.stubEnv("VITE_PAPERCLIP_GITHUB_STAR_PROMPT", undefined);
+    await render(undefined, "/CHA/dashboard", true);
+    expect(visible()).toBe(false);
+    expect(state.listCompact).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem(STAR_PROMPT_SEEN_KEY)).toBeNull();
+  });
+
+  it("keeps the upstream prompt behind an explicit board opt-in", async () => {
+    vi.stubEnv("VITE_PAPERCLIP_GITHUB_STAR_PROMPT", "true");
+    await render(undefined, "/CHA/dashboard", true);
+    expect(visible()).toBe(true);
+    expect(document.querySelector('[data-testid="github-star-prompt"]')?.textContent).toContain("You completed 5 tasks!");
+  });
+
+  it.each(["false", "0"])("does not enable the board prompt for %s", async (setting) => {
+    vi.stubEnv("VITE_PAPERCLIP_GITHUB_STAR_PROMPT", setting);
+    await render(undefined, "/CHA/dashboard", true);
+    expect(visible()).toBe(false);
+    expect(state.listCompact).not.toHaveBeenCalled();
+  });
 
   it("opens once a self-hosted company has five done tasks, and only once", async () => {
     await render();
