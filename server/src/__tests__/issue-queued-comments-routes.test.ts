@@ -3435,4 +3435,67 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(listed, JSON.stringify(queue.body)).toEqual(expect.arrayContaining(held));
     expect(JSON.stringify(queue.body.executionWait ?? null)).not.toMatch(/will start|starting|starts (soon|shortly|next)|about to start/i);
   });
+
+  // bb-2d-stopwords (RFL 22:22Z): where the queue's Send works, the Stop line names it and the panel offers it; where
+  // it does not, the line names none.
+  // REAL: the held messages (POST /api/issues/:id/comments), the Stop (POST /api/heartbeat-runs/:runId/cancel, as the
+  // sender), the panel (GET /api/issues/:id/queued-comments), Delete (DELETE /api/issues/:id/queued-comments/:commentId),
+  // Send (POST /api/issues/:id/queued-comments/interrupt), admission (heartbeat.resumeQueuedRuns).
+  // PLANTED (named): the person's first message and the native turn running it (seedStoppableTurn); after the Stop
+  // route, the runner's acknowledgement and the executor's release with the finalization in terminal_failure
+  // (stopByRoute "ends"), or a cleanup that never ends (stopByRoute "never_ends"); the agent's one slot is occupied,
+  // so the run Send starts stays queued and no provider is launched.
+  it("STOP-WORDS task: held by the sender's own Stop with the stopped run's cleanup verified -> 'Not sent, because you pressed Stop.' with Send and Delete; Delete removes that message; Send starts exactly ONE run with what is left. Cleanup never ends -> the line names no Send", async () => {
+    const heldBehindTurn = async (f: Awaited<ReturnType<typeof seedStoppableTurn>>, ids: string[]) => vi.waitFor(async () => {
+      const saved = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)))
+        .filter(wake => wake.status === "deferred_issue_execution").map(wake => JSON.stringify(wake.payload)).join(" ");
+      expect(ids.filter(id => !saved.includes(id))).toEqual([]);
+    }, { timeout: 10_000, interval: 50 });
+    const ids = (body: { entries: Array<{ comment: { id: string } }> }) => body.entries.map(entry => entry.comment.id);
+    const f = await seedStoppableTurn("task");
+    const held = [await postMessage(f, "Reply exactly H1"), await postMessage(f, "Reply exactly H2")];
+    // Both are saved behind the running turn BEFORE the Stop (a wake that arrives after a Stop is new direction).
+    await heldBehindTurn(f, held);
+    await stopByRoute(f, "queue-owner");
+    const read = async (g = f) => (await request(g.client).get(`/api/issues/${g.issueId}/queued-comments`).expect(200)).body;
+    const runsOf = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter(run => run.contextSnapshot?.issueId === f.issueId && run.id !== f.runId);
+    const panel = await read();
+    process.stdout.write(`STOPWORDS2-GET ${JSON.stringify(panel)}\n`);
+    expect(ids(panel), JSON.stringify(panel)).toEqual(held);
+    // What the GET says is asserted once, at the end: both actions are pressed through their real routes whatever it reads.
+    const said: Record<string, unknown> = { held: panel.executionWait ?? null };
+    // DELETE (the row's trash): that message is gone, the other stays held, nothing starts.
+    const removed = await request(f.client).delete(`/api/issues/${f.issueId}/queued-comments/${held[1]}`)
+      .send({ queueId: panel.queueId, revision: panel.revision });
+    expect(removed.status, JSON.stringify(removed.body)).toBe(200);
+    const afterDelete = await read();
+    expect(ids(afterDelete), JSON.stringify(afterDelete)).toEqual([held[0]]);
+    said.afterDelete = afterDelete.executionWait ?? null;
+    expect(await runsOf()).toEqual([]);
+    // SEND (the line's button): exactly ONE run, carrying what is left.
+    const sent = await request(f.client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
+      .send({ queueId: afterDelete.queueId, revision: afterDelete.revision, targetRunId: null });
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    for (let pass = 0; pass < 6; pass += 1) { await heartbeatService(db).resumeQueuedRuns(); await new Promise(resolve => setTimeout(resolve, 300)); }
+    expect((await runsOf()).map(run => [run.status, run.contextSnapshot?.wakeCommentIds])).toEqual([["queued", [held[0]]]]);
+    const afterSend = await read();
+    said.afterSend = afterSend.executionWait ?? null;
+    // The same hold where the Stop's cleanup never ends: the queue's Send would start nothing, so the line names none.
+    const g = await seedStoppableTurn("task");
+    const waiting = [await postMessage(g, "Reply exactly H1")];
+    await heldBehindTurn(g, waiting);
+    await stopByRoute(g, "queue-owner", "never_ends");
+    const hung = await read(g);
+    process.stdout.write(`STOPWORDS2-GET-NEVER-ENDS ${JSON.stringify(hung)}\n`);
+    expect(ids(hung), JSON.stringify(hung)).toEqual(waiting);
+    said.cleanupNeverEnds = hung.executionWait ?? null;
+    process.stdout.write(`STOPWORDS2-SAID ${JSON.stringify(said)}\n`);
+    expect(said).toEqual({
+      held: { reason: "held_by_own_stop_send", message: "Not sent, because you pressed Stop. Send them now, or delete any." },
+      afterDelete: { reason: "held_by_own_stop_send", message: "Not sent, because you pressed Stop. Send it now, or delete it." },
+      afterSend: null,
+      cleanupNeverEnds: { reason: "held_by_own_stop", message: "Not sent, because you pressed Stop. Delete it, or send a new message: this one goes with it." },
+    });
+  });
 });

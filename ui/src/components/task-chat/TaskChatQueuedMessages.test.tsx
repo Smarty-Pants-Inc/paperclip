@@ -785,6 +785,49 @@ describe("TaskChatQueuedMessages", () => {
     }
   });
   // bb-2d-stopwords: end of the row.
+  // bb-2d-stopwords: the same hold where the queue's Send works (the stopped run's cleanup is verified). The body is
+  // planted verbatim from the real route: GET /api/issues/:id/queued-comments in issue-queued-comments-routes.test.ts's
+  // "STOP-WORDS task" row (real comment POSTs, the real Stop route as the sender; the runner's acknowledgement and the
+  // executor's release are planted there, by name), read at 6172d49a8 (before the Send line).
+  it("a task's messages held by the person's own Stop where the queue's Send works: the panel says 'Not sent, because you pressed Stop. Send them now, or delete any.' once, with ONE Send and each row's Delete, both pressed (390 and 1440)", async () => {
+    const sendGet = JSON.parse(`{"issueId":"cc3fc892-c96d-4842-823d-6f088f3de487","queueId":"c5a915a1-f09d-4edf-9188-0880743d607f","state":"deferred","targetRunId":null,"revision":"97914fcc03b2d15833e1fb0efbc1b5e1","protocol":"paperclip_runner_v1","steeringDisposition":"temporarily_unavailable","executionWait":{"reason":"held_by_own_stop","message":"Not sent, because you pressed Stop. Delete any, or send a new message: these go with it."},"entries":[{"comment":{"id":"420d69a6-7ed2-45a8-8d48-9ed7fbfe45a4","companyId":"aa2210b5-e56b-41cd-aa6f-85ee40bf79c8","issueId":"cc3fc892-c96d-4842-823d-6f088f3de487","authorAgentId":null,"authorUserId":"queue-owner","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"a8d8e02d-010b-4ef7-a77b-7e2ef8599f15","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"Reply exactly H1","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T23:28:28.813Z","updatedAt":"2026-11-19T23:28:28.813Z"},"position":0,"canEdit":true,"canDiscard":true},{"comment":{"id":"e7fba2cc-231c-44de-8562-d73644fb22c5","companyId":"aa2210b5-e56b-41cd-aa6f-85ee40bf79c8","issueId":"cc3fc892-c96d-4842-823d-6f088f3de487","authorAgentId":null,"authorUserId":"queue-owner","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"22505ede-5d06-4339-8945-e4b2d02470e3","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"Reply exactly H2","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T23:28:28.915Z","updatedAt":"2026-11-19T23:28:28.915Z"},"position":1,"canEdit":true,"canDiscard":true}]}`) as IssueQueuedCommentQueue;
+    const line = "Not sent, because you pressed Stop. Send them now, or delete any.";
+    const width = window.innerWidth;
+    try {
+      for (const innerWidth of [390, 1440]) {
+        Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: innerWidth });
+        window.dispatchEvent(new Event("resize"));
+        // A fresh mount per width: a pressed Send keeps its rows as sent for the life of the panel.
+        flushSync(() => root.unmount());
+        root = createRoot(container);
+        const onInterrupt = vi.fn().mockResolvedValue(undefined);
+        const props = render({ queue: sendGet, onInterrupt });
+        await act(async () => {});
+        expect([innerWidth, container.textContent!.split("Not sent, because you pressed Stop.").length - 1]).toEqual([innerWidth, 1]);
+        expect(container.querySelector('[data-testid="task-chat-queued-stopped"] p[role="status"]')?.textContent).toBe(line);
+        expect(container.textContent).not.toMatch(/execution recovery/i);
+        // ONE Send, on the line; each row keeps its Delete and has no Send of its own.
+        const sends = [...container.querySelectorAll("button")].filter(button => /Send|Steer|Interrupt/.test(button.textContent ?? ""));
+        expect(sends.map(button => [button.getAttribute("data-testid"), button.textContent, button.disabled])).toEqual([["task-chat-queued-stopped-send", "Send", false]]);
+        for (const entry of sendGet.entries) {
+          expect(container.querySelector(`[data-testid="task-chat-queued-message-${entry.comment.id}"]`)?.textContent).toContain(entry.comment.body);
+          expect(container.querySelector(`[data-testid="task-chat-queued-interrupt-${entry.comment.id}"]`)).toBeNull();
+          expect(container.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-discard-${entry.comment.id}"]`)?.disabled).toBe(false);
+        }
+        // Delete, pressed: the panel asks the real discard for that message at the GET's revision, and sends nothing.
+        const last = sendGet.entries.at(-1)!.comment.id;
+        await act(async () => { container.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-discard-${last}"]`)!.click(); });
+        expect(props.onDiscard).toHaveBeenCalledWith(last, sendGet.revision);
+        expect(onInterrupt).not.toHaveBeenCalled();
+        // Send, pressed: the panel asks the queue's Send once.
+        await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-stopped-send"]')!.click(); });
+        expect(onInterrupt).toHaveBeenCalledOnce();
+      }
+    } finally {
+      Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: width });
+    }
+  });
+  // bb-2d-stopwords: end of the Send row.
   // heldbar-r2 (B), org 11-19 04:36Z: after a person's own Stop the page
   // shows the stopped bar and NOT the pink "Couldn't finish this attempt"
   // banner with Retry. The bodies are planted verbatim from the real routes in
