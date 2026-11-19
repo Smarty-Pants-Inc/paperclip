@@ -52,6 +52,7 @@ import {
   isAcknowledgedNativeStop,
   acknowledgedNativeApiStopExecutionHasStopped,
   acknowledgedNativeStopExecutionHasStopped,
+  readPersonStopHold,
 } from "../acknowledged-native-stop.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../../vendor/paperclip-runner/index.js";
 import {
@@ -741,6 +742,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         await resumeQueuedCommentInterrupt(wake.companyId, wake.id);
         continue;
       }
+      // Stop means stop: a message held by a person's Stop waits for that person's Send or next message.
+      if (await readPersonStopHold(db, { companyId: run.companyId, issueId, agentId: run.agentId, wakeId: wake.id })) continue;
       let context = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
       let commentId = deriveCommentId(context, payload);
       let requestedByActorId = wake.requestedByActorId;
@@ -897,6 +900,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     // authorize continuation across a stopped execution; ordinary completion
     // uses normal deferred-wake promotion.
     if (response && !interrupted) return;
+    // Stop means stop: only the person's Send (interrupted) delivers messages their Stop holds.
+    if (!interrupted && await readPersonStopHold(db, { companyId, issueId, agentId: wake.agentId, wakeId: wake.id })) return;
     if (!interrupted) {
       commentIds = await undeliveredLegacyUserCommentIds(db, companyId, issueId, wake.agentId, commentIds);
       if (!commentIds.length) return;
