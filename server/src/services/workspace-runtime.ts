@@ -1,3 +1,4 @@
+import { candidateHoldsUnrecoveredRunLogSpill } from "./object-run-log-store.js";
 import { formatCommandForDisplay } from "./workspace-command-display.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { insertIssueComment } from "./issue-comment-writes.js";
@@ -4412,6 +4413,17 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   if (readRemoteWorkspaceAuthority(input.workspace.metadata)) throw new Error("Remote workspace cleanup requires its sandbox lifecycle");
   const warnings: string[] = [];
   const workspacePath = input.workspace.providerRef ?? input.workspace.cwd;
+  const keptForContentSpill = async () => {
+    if (!workspacePath || !(await candidateHoldsUnrecoveredRunLogSpill(workspacePath))) return null;
+    return { cleanedPath: workspacePath, cleaned: false,
+      warnings: [...warnings, `Kept workspace "${workspacePath}" because its content may hold an unrecovered run-log spill.`] };
+  };
+  if (input.workspace.providerType === "git_worktree"
+    || (input.workspace.providerType === "local_fs" && input.workspace.metadata?.createdByRuntime === true)) {
+    // Check before custom teardown too; a root setting may have changed since writing.
+    const kept = await keptForContentSpill();
+    if (kept) return kept;
+  }
   const isolatedSource = await verifiedRecordedIsolatedRemoteSource(input.workspace);
   const repoRoot = input.workspace.providerType === "git_worktree" && workspacePath
     ? await resolveGitRepoRootForWorkspaceCleanup(
@@ -4510,6 +4522,8 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
       } else {
         try {
           await input.assertSafeToCleanup?.();
+          const kept = await keptForContentSpill();
+          if (kept) return kept;
           await recordGitOperation(input.recorder, {
             phase: "worktree_cleanup",
             args: [
@@ -4582,6 +4596,8 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
       warnings.push(`Refusing to remove path "${workspacePath}" because it contains the project workspace.`);
     } else {
       await input.assertSafeToCleanup?.();
+      const kept = await keptForContentSpill();
+      if (kept) return kept;
       await fs.rm(resolvedWorkspacePath, { recursive: true, force: true });
       if (input.recorder) {
         await input.recorder.recordOperation({

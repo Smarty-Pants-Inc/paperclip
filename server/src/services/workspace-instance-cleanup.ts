@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
 import { expandHomePrefix } from "../home-paths.js";
 import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
-import { listUnrecoveredObjectRunLogSpills, resolveObjectRunLogSpillDir } from "./object-run-log-store.js";
+import { candidateHoldsUnrecoveredRunLogSpill, listUnrecoveredObjectRunLogSpills, resolveObjectRunLogSpillDir } from "./object-run-log-store.js";
 
 const execFileAsync = promisify(execFile);
 const INSTANCE_ID_RE = /^[A-Za-z0-9_-]+$/;
@@ -417,8 +417,15 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
     return { status: "refused", instanceRoot: configuredInstanceRoot, warning };
   }
 
+  const contentSpillWarning = `Refusing to remove instance directory "${canonicalInstanceRoot}" because its content may hold an unrecovered run-log spill.`;
+  if (await candidateHoldsUnrecoveredRunLogSpill(canonicalInstanceRoot)) {
+    await recordRefusal({ canonicalInstanceRoot, refusalReason: "run_log_spill_content_kept" }, contentSpillWarning);
+    return { status: "refused", instanceRoot: canonicalInstanceRoot, warning: contentSpillWarning };
+  }
+
   const dependencies = input.dependencies ?? defaultCleanupDependencies;
   let postgresStopped = false;
+  let contentSpillKept = false;
   const cleanup = async () => {
     postgresStopped = await dependencies.stopEmbeddedPostgres(path.join(canonicalInstanceRoot, "db"));
     const [currentManagedInstancesDir, currentInstanceRoot] = await Promise.all([
@@ -432,6 +439,9 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
     ) {
       throw new Error(`Refusing to remove instance directory "${configuredInstanceRoot}" because its canonical path changed during cleanup.`);
     }
+    // Recheck after stopping Postgres and verifying identity, at the removal.
+    contentSpillKept = await candidateHoldsUnrecoveredRunLogSpill(currentInstanceRoot);
+    if (contentSpillKept) return;
     await dependencies.removeInstanceRoot(currentInstanceRoot);
   };
 
@@ -448,6 +458,10 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
       },
       run: async () => {
         await cleanup();
+        if (contentSpillKept) return {
+          status: "skipped", system: `${contentSpillWarning}\n`,
+          metadata: { postgresStopped, refusalReason: "run_log_spill_content_kept" },
+        };
         return {
           status: "succeeded",
           system: `Removed worktree instance directory ${canonicalInstanceRoot}\n`,
@@ -459,5 +473,6 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
     await cleanup();
   }
 
+  if (contentSpillKept) return { status: "refused", instanceRoot: canonicalInstanceRoot, warning: contentSpillWarning };
   return { status: "removed", instanceRoot: canonicalInstanceRoot, postgresStopped };
 }
