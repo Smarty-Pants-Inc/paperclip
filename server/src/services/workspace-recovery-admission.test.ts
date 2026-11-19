@@ -726,7 +726,7 @@ describe("automatic retained workspace recovery", () => {
       source: "automation", reason: "issue_commented", status: "deferred_issue_execution",
       requestedByActorType: "user", requestedByActorId: "operator",
       payload: { issueId: f.issueId, commentId: comment.id, _paperclipWakeContext: context,
-        executionWait: { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." } } }).returning();
+        executionWait: { reason: "execution_recovery", message: "Your message is saved. It's waiting until the previous run is recovered." } } }).returning();
     await recoverRetainedWorkspace(f.input);
     expect(readSystemRecovery((await action(f.actionId)).evidence)).toMatchObject({ state: "complete" });
     await scheduleRecoveredWorkspaceCleanup(db, await run(f.runId));

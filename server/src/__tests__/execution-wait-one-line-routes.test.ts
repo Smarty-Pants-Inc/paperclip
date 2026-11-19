@@ -6,15 +6,16 @@ import express from "express";
 import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentWakeupRequests, companies, companyMemberships, createDb, environmentLeases,
+import { agents, agentWakeupRequests, authUsers, companies, companyMemberships, createDb, environmentLeases,
   heartbeatRuns, issueComments, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { agentRoutes } from "../routes/agents.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { configureAgentLifecycle } from "../services/agent-lifecycle.js";
+import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recordNativeLocalProcessStop } from "../services/native-local-process-stop.js";
-import { writeDeferredExecutionWait } from "../services/deferred-execution-wait.js";
 import { evaluateAgentInvokabilityFromDb } from "../services/agent-invokability.js";
 import { environmentService } from "../services/environments.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
@@ -33,9 +34,9 @@ const REMOTE_EXPIRED_WORDS = "Your message is saved, but the run you stopped sti
 const reasons = ["remote_cleanup", "execution_recovery", "execution_active", "agent.not_invokable"] as const;
 const words: Record<typeof reasons[number], string> = {
   remote_cleanup: REMOTE_WORDS,
-  execution_recovery: "Waiting for execution recovery. Your message is saved.",
-  execution_active: "Waiting for the current run. Your message is saved.",
-  "agent.not_invokable": "Agent is not invokable in its current state",
+  execution_recovery: "Your message is saved. It's waiting until the previous run is recovered.",
+  execution_active: "Your message is saved. It's waiting for the current run to finish.",
+  "agent.not_invokable": "Your message is saved. This agent is paused, so it starts when the agent is resumed.",
 };
 
 describe.skipIf(!support.supported)("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 real routes", () => {
@@ -51,10 +52,12 @@ describe.skipIf(!support.supported)("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rea
     await db?.$client.end(); await database?.cleanup();
   });
 
-  function api(companyId: string) {
+  function api(companyId: string, agentActor?: { agentId: string; runId: string }) {
     const app = express(); app.use(express.json());
-    app.use((req, _res, next) => { (req as any).actor = { type: "board", source: "session", userId: "m10-person",
-      companyIds: [companyId], memberships: [{ companyId, status: "active", membershipRole: "operator" }], isInstanceAdmin: true }; next(); });
+    app.use((req, _res, next) => { (req as any).actor = agentActor
+      ? { type: "agent", source: "api_key", companyId, ...agentActor }
+      : { type: "board", source: "session", userId: "m10-person",
+        companyIds: [companyId], memberships: [{ companyId, status: "active", membershipRole: "operator" }], isInstanceAdmin: true }; next(); });
     app.use("/api", issueRoutes(db, {} as any, {})); app.use("/api", agentRoutes(db));
     app.use((error: unknown, _req: express.Request, _res: express.Response, next: express.NextFunction) => { console.error("M10 unexpected route error", error); next(error); });
     app.use(errorHandler);
@@ -68,6 +71,7 @@ describe.skipIf(!support.supported)("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rea
     const exited = spawnSync(process.execPath, ["-e", ""], { detached: true, stdio: "ignore" });
     expect(exited.status).toBe(0);
     await db.insert(companies).values({ id: companyId, name: "M10 route fixture", issuePrefix: "WAIT", requireBoardApprovalForNewAgents: false });
+    await db.insert(authUsers).values({ id: "m10-person", name: "Planted route actor", email: "m10-person@example.invalid", createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
     await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "m10-person", status: "active", membershipRole: "operator" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Managed Pi", status: "idle", adapterType: "paperclip_runner",
       adapterConfig: { provider: "pi_rpc", lifecycleMode: "warm", instructionsBundleMode: "managed", instructionsEntryFile: "AGENTS.md" },
@@ -132,7 +136,7 @@ describe.skipIf(!support.supported)("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rea
         // planted: an earlier queued turn on this task, not carrying M. M's
         // admission must defer, rather than invent a run for the new input.
         await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
-          runtimeMode: "native", status: "queued", contextSnapshot: { issueId: f.issueId } });
+          runtimeMode: "legacy", status: "queued", contextSnapshot: { issueId: f.issueId } });
       }
       const issueBeforeSend = (await request(f.client).get(`/api/issues/${f.issueId}`).expect(200)).body;
       let { message, wake } = await send(f);
@@ -144,11 +148,16 @@ describe.skipIf(!support.supported)("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rea
         const [paused] = await db.select().from(agents).where(eq(agents.id, f.agentId));
         const gate = await evaluateAgentInvokabilityFromDb(db, paused);
         if (gate.invokable) throw new Error("Real pause did not close admission");
-        // The production admission writer stores the actual gate's words;
-        // neither the wait condition nor its text is a hand-written fixture.
-        expect(await writeDeferredExecutionWait(db, { companyId: f.companyId, requestId: wake.id }, {
-          reason: "agent.not_invokable", message: gate.message,
-        })).toBe(true);
+        // The invokability error is a machine-facing contract, NOT panel copy.
+        expect(gate.message).toBe("Agent is not invokable in its current state");
+        // A planted remote provider response is normalized by the real cleanup
+        // producer. Its real consumer re-enters admission, which observes the
+        // actual pause and stores the panel line on this very receipt.
+        const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, f.sourceId));
+        const receipt = remoteTerminationReceipt(lease, { providerLeaseId: lease.providerLeaseId, state: "destroyed" });
+        await environmentService(db).releaseLease(lease.id, "released", { cleanupStatus: "success", remoteExecutionTermination: receipt });
+        await expect(heartbeatService(db).resumeRemoteStopComments((await heartbeatService(db).getRun(f.sourceId))!))
+          .rejects.toThrow("Agent is not invokable in its current state");
         wake = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id)))[0];
       }
       expect(wake.status).toBe("deferred_issue_execution");
@@ -163,7 +172,7 @@ describe.skipIf(!support.supported)("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rea
         await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId });
         const queue = (await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
         const comments = (await request(f.client).get(`/api/issues/${f.issueId}/comments`).expect(200)).body;
-        samples.push({ producer: reason === "agent.not_invokable" ? "POST /issues/:id/comments; POST /agents/:id/pause; evaluateAgentInvokabilityFromDb -> writeDeferredExecutionWait" : "POST /issues/:id/comments -> heartbeat enqueueWakeup", surface: chat ? "chat" : "task", reason,
+        samples.push({ producer: reason === "agent.not_invokable" ? "POST /issues/:id/comments; POST /agents/:id/pause; remoteTerminationReceipt (planted provider response) -> environmentService.releaseLease -> heartbeatService.resumeRemoteStopComments -> enqueueWakeup" : "POST /issues/:id/comments -> heartbeat enqueueWakeup", surface: chat ? "chat" : "task", reason,
           elapsed, readAt: new Date().toISOString(), expectedLine: reason === "remote_cleanup" && elapsed >= 600_000 ? REMOTE_EXPIRED_WORDS : words[reason],
           issueBeforeSend, issueAfterSend, messageId: message.id, queue, comments });
         expect.soft(queue.executionWait).toEqual({ reason, message: reason === "remote_cleanup" && elapsed >= 600_000 ? REMOTE_EXPIRED_WORDS : words[reason] });
@@ -171,7 +180,87 @@ describe.skipIf(!support.supported)("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rea
         expect.soft(queue.entries.map((entry: any) => entry.comment.id)).toContain(message.id);
         expect.soft(comments.filter((row: any) => row.authorType === "system" && row.metadata?.recoveryResponsibility !== "system")).toEqual([]);
       }
+      if (reason === "execution_active") {
+        // E3.04: end the planted earlier holder through the REAL cancel route.
+        // M has not started: the agent's other task still occupies its slot.
+        const [holder] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+          eq(heartbeatRuns.nativeIssueId, f.issueId), eq(heartbeatRuns.status, "queued")));
+        expect(holder.contextSnapshot).not.toHaveProperty("wakeCommentId", message.id);
+        await request(f.client).post(`/api/heartbeat-runs/${holder.id}/cancel`).send({}).expect(200);
+        await heartbeatService(db).resumeRemoteStopComments((await heartbeatService(db).getRun(f.sourceId))!);
+        const after = (await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
+        expect(after.executionWait?.message).not.toBe(words.execution_active);
+        const delivered = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+          .filter(run => JSON.stringify(run.contextSnapshot).includes(message.id));
+        expect(delivered).toHaveLength(1);
+        expect(delivered[0].status).toBe("queued");
+        expect(delivered[0].startedAt).toBeNull();
+        samples.push({ producer: "REAL POST /heartbeat-runs/:holder/cancel -> heartbeatService.resumeRemoteStopComments -> enqueueWakeup; GET queued-comments",
+          surface: chat ? "chat" : "task", reason: "holder_ended", messageId: message.id, queue: after,
+          comments: (await request(f.client).get(`/api/issues/${f.issueId}/comments`).expect(200)).body,
+          holder: (await request(f.client).get(`/api/heartbeat-runs/${holder.id}`).expect(200)).body,
+          run: delivered[0], admittedRunCount: delivered.length });
+      }
     });
+  }
+
+  for (const chat of [false]) {
+    it(`${chat ? "chat" : "task"}: real pause -> saved panel -> POST resume runs the message once and retires the line`, async () => {
+      const f = await plantedHistory(chat, true);
+      // Planted successful history, with no live process or execution holder.
+      // The observed message, pause, resume, dispatch and result are all real.
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.companyId, f.companyId));
+      await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, f.issueId));
+      await db.update(agents).set({ adapterType: "process", adapterConfig: { command: process.execPath,
+        args: ["-e", "console.log('m10c-resumed-message-ran'); setTimeout(() => {}, 3000)"], cwd: process.cwd() } }).where(eq(agents.id, f.agentId));
+      const lifecycle = configureAgentLifecycle(db, createLifecycleDriver(db, {} as never));
+      const heartbeat = heartbeatService(db);
+      try {
+        await request(f.client).post(`/api/agents/${f.agentId}/pause`).send({}).expect(200);
+        await lifecycle.process(f.agentId);
+        const { message, wake } = await send(f);
+        expect(wake.runId).toBeNull();
+        const before = (await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
+        expect(before.executionWait).toEqual({ reason: "agent.not_invokable", message: words["agent.not_invokable"] });
+        const resumed = await request(f.client).post(`/api/agents/${f.agentId}/resume`).send({}).expect(200);
+        await lifecycle.process(f.agentId);
+        // Real production saved-receipt and dispatch producers, twice, to prove
+        // adoption is idempotent. The controlled process really exits 0.
+        await heartbeat.resumeQueuedRuns();
+        let executing: typeof heartbeatRuns.$inferSelect | undefined;
+        await vi.waitFor(async () => {
+          executing = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+            .find(run => JSON.stringify(run.contextSnapshot).includes(message.id) && run.status === "running");
+          expect(executing).toBeTruthy();
+        }, { timeout: 10_000 });
+        // A process adapter cannot author task replies on stdout. Exercise the
+        // REAL agent comment route for its reply while this run is still live;
+        // otherwise unfinished-task recovery correctly asks it to answer again.
+        const agentClient = api(f.companyId, { agentId: f.agentId, runId: executing!.id });
+        await request(agentClient).post(`/api/issues/${f.issueId}/comments`).send({ body: "I used your saved direction." }).expect(201);
+        await request(agentClient).patch(`/api/issues/${f.issueId}`).send({ status: "done" }).expect(200);
+        await vi.waitFor(async () => expect((await heartbeat.getRun(executing!.id))?.status).toBe("succeeded"), { timeout: 15_000 });
+        await heartbeat.drainActiveRunExecutions();
+        await heartbeat.resumeQueuedRuns();
+        await heartbeat.drainActiveRunExecutions();
+        const delivered = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+          .filter(run => JSON.stringify(run.contextSnapshot).includes(message.id));
+        expect(delivered).toHaveLength(1);
+        expect(delivered[0], JSON.stringify(delivered[0])).toMatchObject({ status: "succeeded", stdoutExcerpt: expect.stringContaining("m10c-resumed-message-ran") });
+        expect(delivered[0].startedAt).not.toBeNull();
+        const after = (await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
+        expect(after.executionWait).toBeFalsy();
+        samples.push({ producer: "REAL POST /agents/:id/pause; lifecycle.process (createLifecycleDriver); POST /issues/:id/comments; POST /agents/:id/resume; lifecycle.process; heartbeat.resumeQueuedRuns (twice) -> real process adapter; GET queued-comments",
+          surface: chat ? "chat" : "task", reason: "agent_resumed", messageId: message.id, queue: after, beforeQueue: before,
+          comments: (await request(f.client).get(`/api/issues/${f.issueId}/comments`).expect(200)).body,
+          resumeResponse: resumed.body, run: delivered[0], admittedRunCount: delivered.length,
+          completionProducer: "REAL agent POST /issues/:id/comments and PATCH /issues/:id (done) while the controlled process runs" });
+      } finally {
+        await lifecycle.stop();
+        await heartbeat.drainActiveRunExecutions();
+      }
+    }, 45_000);
   }
 
   async function savedBehindCleanup(chat: boolean) {

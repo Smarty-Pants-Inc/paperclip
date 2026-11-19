@@ -10,6 +10,12 @@ export const REMOTE_CLEANUP_PERSON_WAIT_MS = PENDING_WAIT_START_BOUND_MS;
 export const REMOTE_CLEANUP_EXECUTION_WAIT_MESSAGE = "Your message is saved. The run you stopped is still shutting down, so your message hasn't started yet.";
 export const REMOTE_CLEANUP_PERSON_WAIT_EXPIRED_MESSAGE = "Your message is saved, but the run you stopped still hasn't shut down, so it can't start yet. You can delete it if you no longer need it.";
 
+// RFL 03:34Z, SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119. Stored panel copy only;
+// the invokability error remains unchanged for its other consumers.
+export const PAUSED_EXECUTION_WAIT_MESSAGE = "Your message is saved. This agent is paused, so it starts when the agent is resumed.";
+export const RECOVERY_EXECUTION_WAIT_MESSAGE = "Your message is saved. It's waiting until the previous run is recovered.";
+export const ACTIVE_EXECUTION_WAIT_MESSAGE = "Your message is saved. It's waiting for the current run to finish.";
+
 /** Person-facing projection of the saved receipt, not a second notice or timer.
  * The receipt's immutable request time owns the clock: recovery retries and
  * repeated GETs cannot restart it. Admission still owns releasing the hold

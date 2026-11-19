@@ -20,7 +20,7 @@ import { QUEUED_RUN_AGING_MS, RECOVERY_WAKE_REASONS, createQueuedRunDispatcher, 
 import { reserveAutomaticRunStart } from "../recovery/automatic-run-brake.js";
 import { queuedRunDispatchFacts } from "./queued-run-line.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
-import { PersistedExecutionWaitRefusal, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
+import { PAUSED_EXECUTION_WAIT_MESSAGE, RECOVERY_EXECUTION_WAIT_MESSAGE, PersistedExecutionWaitRefusal, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import { assignmentWakePayloadSql, isAssignmentWakePayload, notifyDeferredExecutionWork } from "../deferred-execution-notifications.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { notifyQueuedRunDispatch, notifyRunDispatch } from "../run-dispatch-notifications.js";
@@ -3182,7 +3182,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (caseRequest) return { created: false };
       if (executionWaitRequestId) {
         const waitSaved = await writeDeferredExecutionWait(db, { companyId: agent.companyId, requestId: executionWaitRequestId }, {
-          reason: skipReason, message: patch.error ?? (skipReason === "issue_tree_hold_active"
+          reason: skipReason, message: skipReason === "agent.not_invokable" && waitCondition?.reason === "paused"
+            ? PAUSED_EXECUTION_WAIT_MESSAGE : patch.error ?? (skipReason === "issue_tree_hold_active"
             ? "This task is paused. Resume it to send your saved message."
             : "Waiting for task execution to be enabled. Your message is saved."),
         });
@@ -3257,7 +3258,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     };
     const saveDeferredMessage = async (refusal: string, message: string, details: Record<string, unknown> = {}) => {
       const savedIssueId = issueId!;
-      const condition = deferredWorkIntentWait(refusal, `${message} Your message is saved.`, details);
+      const condition = deferredWorkIntentWait(refusal,
+        refusal === "agent.not_invokable" && details.reason === "paused"
+          ? PAUSED_EXECUTION_WAIT_MESSAGE : `${message} Your message is saved.`, details);
       await db.transaction(async tx => {
         await tx.execute(sql`select id from issues where id = ${savedIssueId} and company_id = ${agent.companyId} for update`);
         await notifyDeferredExecutionWork(tx, { companyId: agent.companyId });
@@ -4212,7 +4215,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             reconciledSourceRunId = sourceRunId;
           }
 
-          let continuationWait = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
+          let continuationWait = { reason: "execution_recovery", message: RECOVERY_EXECUTION_WAIT_MESSAGE };
           let continuationBlocked = false;
           const deferBlockedExecution = async (
             executionBlocker: Pick<NonNullable<Awaited<ReturnType<typeof getExecutionBlocker>>>, "recoveryActionId" | "cause" | "nextAction">,

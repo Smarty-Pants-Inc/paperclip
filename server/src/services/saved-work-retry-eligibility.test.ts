@@ -256,7 +256,7 @@ describe("Retry of a task whose saved work recovery settled", () => {
     await db.insert(agentWakeupRequests).values({ id: requestId, companyId: f.companyId, agentId: agent.id, source: "on_demand",
       triggerDetail: "manual", reason: "task_retry", status: "deferred_issue_execution", requestedByActorType: "user",
       requestedByActorId: actorId, idempotencyKey: `task-retry:${randomUUID()}`,
-      payload: { issueId: f.issueId, executionWait: { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." },
+      payload: { issueId: f.issueId, executionWait: { reason: "execution_recovery", message: "Your message is saved. It's waiting until the previous run is recovered." },
         taskRetry: { schema: "paperclip.task-retry.v1", generationId: requestId, sourceRunId: f.heldId, actorId,
           actorSource: "local_implicit", strategy: "evaluate" } } });
     const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
