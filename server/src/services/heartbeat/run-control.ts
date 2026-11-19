@@ -6,6 +6,8 @@ import { instanceSettingsService } from "../instance-settings.js";
 import { isWellFormedExecutionWait, wellFormedExecutionWaitSql, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { observeStoppedWorkspaceRecovery } from "../workspace-recovery.js";
+import { answeredCarriedCommentIds } from "../interrupted-turn-input.js";
+import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/domain/policy.js";
 import { notifyScheduledRetryCancellation } from "../scheduled-retry-cancellation-notifications.js";
 import { notifyChatInboundWakeNotices } from "../chat-inbound-wake-notice-notifications.js";
 import { resumeDeferredChatWake } from "../durable-chat-wakeup.js";
@@ -897,6 +899,19 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     // authorize continuation across a stopped execution; ordinary completion
     // uses normal deferred-wake promotion.
     if (response && !interrupted) return;
+    if (interrupted && !response) {
+      // A saved Interrupt whose messages another wake already carried and
+      // answered must not wake the agent on them again (no double answer).
+      const answered = await answeredCarriedCommentIds(db, { companyId, issueId, commentIds });
+      commentIds = commentIds.filter(id => !answered.has(id));
+      if (!commentIds.length) {
+        const now = new Date();
+        await db.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: now, updatedAt: now,
+          error: QUEUED_MESSAGES_DELIVERED_REASON }).where(and(eq(agentWakeupRequests.id, queueId),
+          eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+        return;
+      }
+    }
     if (!interrupted) {
       commentIds = await undeliveredLegacyUserCommentIds(db, companyId, issueId, wake.agentId, commentIds);
       if (!commentIds.length) return;
