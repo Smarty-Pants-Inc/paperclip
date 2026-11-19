@@ -9,10 +9,13 @@ export const COMPANY_IMPORTED_ACTION = "company.imported";
 
 type PersonMessageSql = { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL };
 
-function carriesCommentSql(alias: string, commentId: SQL): SQL {
+function carriesCommentSql(alias: string, commentId: SQL, requireSteeredText: boolean): SQL {
   const context = sql`${sql.identifier(alias)}.context_snapshot`;
-  return sql`((not coalesce(${context}->'steeredCommentIds', '[]'::jsonb) ? ${commentId}::text
-      or coalesce(${context}->'answeredSteeredCommentIds', '[]'::jsonb) ? ${commentId}::text)
+  const steeredText = requireSteeredText
+    ? sql`(not coalesce(${context}->'steeredCommentIds', '[]'::jsonb) ? ${commentId}::text
+      or coalesce(${context}->'answeredSteeredCommentIds', '[]'::jsonb) ? ${commentId}::text)`
+    : sql`true`;
+  return sql`(${steeredText}
     and (${context}->>'wakeCommentId' = ${commentId}::text or ${context}->>'commentId' = ${commentId}::text
     or ${context}->>'conversationReplyBoundaryCommentId' = ${commentId}::text
     or coalesce(${context}->'wakeCommentIds', '[]'::jsonb) ? ${commentId}::text
@@ -22,13 +25,13 @@ function carriesCommentSql(alias: string, commentId: SQL): SQL {
 /** A reply/card can belong to a later run without copying the original input
  * ids. Follow durable continuation and answered-interaction edges, never mere
  * session identity or a later run's timestamp. UNION makes cycles terminate. */
-function chainCarriesCommentSql(alias: string, commentId: SQL, m: PersonMessageSql): SQL {
-  return sql`(${carriesCommentSql(alias, commentId)} or exists (
+function chainCarriesCommentSql(alias: string, commentId: SQL, m: PersonMessageSql, requireSteeredText = true): SQL {
+  return sql`(${carriesCommentSql(alias, commentId, requireSteeredText)} or exists (
     ${freshContinuationSourceChainSql({ companyId: m.companyId, issueId: m.issueId,
       runId: sql`${sql.identifier(alias)}.id` }, true)}
     select 1 from source_chain input
       join ${heartbeatRuns} carrying on carrying.id = input.id and carrying.company_id = ${m.companyId}
-      where ${carriesCommentSql("carrying", commentId)}))`;
+      where ${carriesCommentSql("carrying", commentId, requireSteeredText)}))`;
 }
 
 // A presented card and either kind of reply remain an answer to the input
@@ -72,8 +75,10 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
           or (q.status = 'cancelled' and q.resolved_by_user_id is not null
             and (q.result->>'outcome' in ('skipped', 'withdrawn') or q.result->>'cancelled' = 'true')))
         and q.created_at > ${m.createdAt}
-        -- A card answers only inputs carried on its chain, never queued inputs by time.
-        and ${chainCarriesCommentSql("r", m.id, m)})
+        -- Preserve c3's explicit interaction-answer contract (PV2 card-answer):
+        -- a published card is already a response to its own carried input.
+        -- Only the generic reply arm needs the new streamed-text guard.
+        and ${chainCarriesCommentSql("r", m.id, m, false)})
     or ${importedPersonHistorySql(m)})`;
 }
 

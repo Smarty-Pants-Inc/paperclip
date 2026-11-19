@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
@@ -42,6 +42,9 @@ import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-uti
 import { waitForPendingRunFailureReports } from "../services/run-failure-report.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { createPiEventProjector } from "../../../packages/paperclip-runner/src/drivers/pi/pi-event-projector.js";
+import { openPiSteeringPeer } from "./helpers/pi-steering-peer.js";
+import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
+import type { PrpEvent } from "../vendor/paperclip-runner/index.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -290,6 +293,71 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     expect(await answered(response.body.id)).toBe(false); // acceptance is NOT delivery or an answer
   });
 
+  it.each([true, false])("S-a2: production Pi drivers, proxy and event ingestion prove delivery at the tool boundary (following text=%s)", async reply => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const root = await mkdtemp(join(tmpdir(), "chat-pi-boundary-"));
+    const peer = await openPiSteeringPeer(root, chat.runId);
+    const events: PrpEvent[] = [];
+    let port: PaperclipControlPlanePort | undefined;
+    let pumpError: unknown;
+    const pump = (async () => {
+      for await (const event of peer.session.events()) {
+        port ??= new PaperclipControlPlanePort(db, { companyId: chat.companyId, issueId: chat.issue.id,
+          runId: chat.runId, agentId: chat.agentId, sessionId: event.normalizedSessionId,
+          completionContractId: randomUUID(), completionContractSha256: `sha256:${"a".repeat(64)}`,
+          sourceInstanceId: event.sourceInstanceId, controlPlaneSourceInstanceId: event.sourceInstanceId });
+        await port.appendEvent(event);
+        events.push(event);
+      }
+    })().catch(error => { pumpError = error; });
+    try {
+      const { turnId } = await peer.session.startTurn({ message: { role: "user", text: chat.first.body } });
+      await vi.waitFor(() => {
+        if (pumpError) throw pumpError;
+        expect(events.some(event => event.eventType === "tool.execution.started")).toBe(true);
+      });
+      mocks.probe.mockResolvedValue({ disposition: "available", activeTurnId: turnId });
+      mocks.steer.mockImplementation(async (input: { message: string; correlationId: string }) => {
+        await peer.session.steer!({ turnId, message: { role: "user", text: input.message }, correlationId: input.correlationId });
+        return { turnId };
+      });
+      const started = performance.now();
+      const response = await postDefault(chat, "Pi must read this after the held tool").expect(201);
+      const postMs = performance.now() - started;
+      expect(postMs).toBeLessThan(1000);
+      expect(await deferredWakes(chat)).toHaveLength(0);
+      expect(await answered(response.body.id)).toBe(false);
+      expect(events.filter(event => event.eventType === "item.started" && event.payload.kind === "userMessage")).toHaveLength(1);
+      peer.releaseBoundary(reply);
+      await vi.waitFor(async () => {
+        if (pumpError) throw pumpError;
+        const comments = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/comments`).expect(200);
+        expect(comments.body.find((comment: any) => comment.id === response.body.id)).toMatchObject({
+          steeredIntoRunId: chat.runId, steeringStatus: "delivered", steeringDeliveryEventSeq: expect.any(Number),
+        });
+        expect(await answered(response.body.id)).toBe(reply);
+      }, { timeout: 5000 });
+      // The production facade deliberately projects an input receipt rather
+      // than echoing its text. Its second userMessage is paired to M's real
+      // correlation acknowledgement by the production evidence reader.
+      const ownRead = events.filter(event => event.eventType === "item.started" && event.payload.kind === "userMessage")[1];
+      expect(ownRead).toMatchObject({ runId: chat.runId, turnId });
+      const toolEnd = events.findIndex(event => event.eventType === "tool.execution.completed" ||
+        (event.eventType === "item.completed" && event.payload.kind === "commandExecution"));
+      expect(toolEnd).toBeGreaterThanOrEqual(0);
+      expect(events.indexOf(ownRead!)).toBeGreaterThan(toolEnd);
+      expect(peer.commands.filter(command => ["prompt", "steer", "abort", "follow_up"].includes(command.type)).map(command => command.type)).toEqual(["prompt", "steer"]);
+      expect(await deferredWakes(chat)).toHaveLength(0);
+      const persisted = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, chat.runId)).orderBy(asc(heartbeatRunEvents.seq));
+      if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `S-a2-pi-peer-${reply ? "answered" : "tool-next"}.json`),
+        JSON.stringify({ fixture: "real routes + real Pi and Codex facade drivers + proxy + production event ingestion; only native-session registry and Pi RPC peer controlled", postMs,
+          comment: response.body, commands: peer.commands, events, persisted }, null, 2));
+    } finally {
+      await peer.close(); await pump;
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it("S-a RED: a reply which started before M was read never answers M, even if published afterwards", async () => {
     const chat = await seedChat(); await attachSteerable(chat);
     const response = await postDefault(chat, "Tuesday's lost message").expect(201);
@@ -375,6 +443,32 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     expect(mocks.steer).not.toHaveBeenCalled();
     const carriers = await carriersOf(chat, response.body.id);
     expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+  });
+
+  it("S-f: explicit Interrupt uses the existing stop/admission path, and a POST retry does not stop the successor", async () => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    mocks.cancel.mockImplementationOnce(async (runId: string) => {
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      await db.update(heartbeatRuns).set({ resultJson: { ...(run!.resultJson ?? {}), nativeCancellation: {
+        schema: "paperclip.native-cancellation.v1", runId, companyId: chat.companyId, issueId: chat.issue.id,
+        scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+        intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(),
+      } } }).where(eq(heartbeatRuns.id, runId));
+      return { decision: { stopped: true }, auditId: randomUUID() };
+    });
+    const clientRequestId = randomUUID();
+    const first = await postDefault(chat, "Interrupt deliberately", { deliveryIntent: "interrupt", clientRequestId }).expect(201);
+    expect(mocks.steer).not.toHaveBeenCalled();
+    expect(mocks.cancel).toHaveBeenCalledTimes(1);
+    const [original] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    expect(original!.status).toBe("cancelled");
+    const retry = await postDefault(chat, "Interrupt deliberately", { deliveryIntent: "interrupt", clientRequestId }).expect(201);
+    expect(retry.body.id).toBe(first.body.id);
+    expect(mocks.cancel).toHaveBeenCalledTimes(1);
+    const receipts = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, chat.companyId),
+      eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${first.body.id}`)));
+    expect(receipts).toHaveLength(1);
+    await joinOwnedWork();
   });
 
   /** Real admission + process-adapter drain. Replies record the exact carried
@@ -913,7 +1007,9 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
     expect((stopped!.contextSnapshot as any).wakeCommentIds)
       .toEqual(variant === "read-answered" ? [chat.first.id, b!.id] : [chat.first.id]);
-    expect(await answered(b!.id)).toBe(false);
+    // The shared predicate now recognizes durable streamed text immediately;
+    // neither an acknowledgement nor a userMessage alone is an answer.
+    expect(await answered(b!.id)).toBe(variant === "read-answered");
 
     // The owner's Send: one turn with the waiting messages, each once, in order.
     const sent = await request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/queued-comments/interrupt`)
