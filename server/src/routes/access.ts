@@ -50,7 +50,7 @@ import {
   PERMISSION_KEYS,
   isUuidLike,
 } from "@paperclipai/shared";
-import type { DeploymentExposure, DeploymentMode, HumanCompanyMembershipRole } from "@paperclipai/shared";
+import type { DeploymentExposure, DeploymentMode, HumanCompanyMembershipRole, UpdateCompanyMember } from "@paperclipai/shared";
 import {
   forbidden,
   conflict,
@@ -1294,11 +1294,12 @@ async function getProtectedMemberReason(
   req: Request,
   access: ReturnType<typeof accessService>,
   companyId: string,
-  member: { principalId: string; principalType: string; membershipRole: string | null },
+  member: { principalId: string; principalType: string; membershipRole: string | null; status: string },
   opts?: {
     actorRole?: HumanCompanyMembershipRole | null;
     instanceAdminUserIds?: ReadonlySet<string>;
     operation?: "archive" | "update";
+    update?: UpdateCompanyMember;
   },
 ): Promise<string | null> {
   if (member.principalType !== "user") return opts?.operation === "update"
@@ -1306,16 +1307,20 @@ async function getProtectedMemberReason(
     : "Only human company members can be removed.";
   if (req.actor.type !== "board") return "Board access is required to remove members.";
   if (member.principalId === req.actor.userId) return "You cannot remove yourself.";
-  const isTargetInstanceAdmin = opts?.instanceAdminUserIds
-    ? opts.instanceAdminUserIds.has(member.principalId)
-    : await access.isInstanceAdmin(member.principalId);
-  if (isTargetInstanceAdmin) {
-    return "Instance admins cannot be removed from company access.";
-  }
-
   const targetRole = member.membershipRole
     ? normalizeHumanRole(member.membershipRole, "operator")
     : "operator";
+  const isTargetInstanceAdmin = opts?.instanceAdminUserIds
+    ? opts.instanceAdminUserIds.has(member.principalId)
+    : await access.isInstanceAdmin(member.principalId);
+  const isRoleRaise = opts?.operation === "update"
+    && member.status === "active"
+    && (opts.update?.status === undefined || opts.update.status === member.status)
+    && opts.update?.membershipRole != null
+    && humanRoleRank[opts.update.membershipRole] > humanRoleRank[targetRole];
+  if (isTargetInstanceAdmin && !isRoleRaise) {
+    return "Instance admins cannot be removed from company access.";
+  }
   if (opts?.operation === "archive") {
     if (targetRole === "owner") return "Board owners cannot be removed from company access.";
     if (targetRole === "admin") return "Company admins cannot be removed from company access.";
@@ -1334,10 +1339,11 @@ async function assertCanManageCompanyMember(
   req: Request,
   access: ReturnType<typeof accessService>,
   companyId: string,
-  member: { principalId: string; principalType: string; membershipRole: string | null },
+  member: { principalId: string; principalType: string; membershipRole: string | null; status: string },
   operation: "archive" | "update" = "update",
+  update?: UpdateCompanyMember,
 ) {
-  const reason = await getProtectedMemberReason(req, access, companyId, member, { operation });
+  const reason = await getProtectedMemberReason(req, access, companyId, member, { operation, update });
   if (reason) throw forbidden(reason);
 }
 
@@ -4484,7 +4490,7 @@ export function accessRoutes(
       await assertCompanyPermission(req, companyId, "users:manage_permissions");
       const memberToUpdate = await access.getMemberById(companyId, memberId);
       if (!memberToUpdate) throw notFound("Member not found");
-      await assertCanManageCompanyMember(req, access, companyId, memberToUpdate);
+      await assertCanManageCompanyMember(req, access, companyId, memberToUpdate, "update", req.body);
 
       const updated = await access.updateMember(companyId, memberId, req.body);
       if (!updated) throw notFound("Member not found");
@@ -4519,7 +4525,7 @@ export function accessRoutes(
       await assertCompanyPermission(req, companyId, "users:manage_permissions");
       const memberToUpdate = await access.getMemberById(companyId, memberId);
       if (!memberToUpdate) throw notFound("Member not found");
-      await assertCanManageCompanyMember(req, access, companyId, memberToUpdate);
+      await assertCanManageCompanyMember(req, access, companyId, memberToUpdate, "update", req.body);
 
       const updated = await access.updateMemberAndPermissions(
         companyId,
