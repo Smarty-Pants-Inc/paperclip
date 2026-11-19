@@ -24,6 +24,7 @@ import {
   resolveFenceHolders,
   type InProgressRecord,
   type OwnableKind,
+  type OwnershipSettleEffects,
   type RecordOwner,
 } from "./ownership-registry.js";
 
@@ -228,10 +229,11 @@ async function applyOwnerGoneAttestations(db: Db, kind: OwnableKind, records: re
 /** Settles a proven-gone record, or surfaces the operator action for an
  * unprovable one. A failure is logged and retried on a later pass. */
 async function settleOrSurface(db: Db, kind: OwnableKind, record: InProgressRecord, proof: Classification,
-  now: Date): Promise<"settled" | "kept" | "unwatched" | "failed"> {
+  now: Date, effects: OwnershipSettleEffects = {}): Promise<"settled" | "kept" | "unwatched" | "failed"> {
   try {
     if (proof.verdict === "gone" && kind.settle) {
-      const outcome = await kind.settle(db, record, { now, proof: proof as OwnerProof });
+      const outcome = await kind.settle(db, record, { now, proof: proof as OwnerProof,
+        stopRetainedCustody: effects.stopRetainedCustody });
       return outcome.settled ? "settled" : outcome.watch === false ? "unwatched" : "kept";
     }
     if (proof.verdict === "unprovable" && kind.onUnprovable) await kind.onUnprovable(db, record, { now, proof: proof as OwnerProof });
@@ -257,7 +259,7 @@ export async function settleOwnableKind(db: Db, kindId: string, options: {
    * here, so its owner is gone (`current_process_idle`). The periodic pass
    * cannot know this process's executions and never concludes it. */
   currentProcessIdle?: boolean;
-} = {}): Promise<SettledRecord[]> {
+} & OwnershipSettleEffects = {}): Promise<SettledRecord[]> {
   return (await settleKind(db, kindId, options)).settled;
 }
 
@@ -266,7 +268,7 @@ export async function settleOwnableKind(db: Db, kindId: string, options: {
  * `settle`, through their own (indexed) listings, without the full report pass
  * or the global invariant checks. Returns how many records are still watched.
  */
-export async function recheckSettlingKinds(db: Db, options: { now?: Date; probe?: ProcessProbe; kinds?: readonly OwnableKind[] } = {}):
+export async function recheckSettlingKinds(db: Db, options: { now?: Date; probe?: ProcessProbe; kinds?: readonly OwnableKind[] } & OwnershipSettleEffects = {}):
   Promise<{ settled: SettledRecord[]; watched: number }> {
   const settled: SettledRecord[] = [];
   let watched = 0;
@@ -281,7 +283,7 @@ export async function recheckSettlingKinds(db: Db, options: { now?: Date; probe?
 async function settleKind(db: Db, kindId: string, options: {
   now?: Date; runIds?: readonly string[]; skipRunIds?: { has(runId: string): boolean }; probe?: ProcessProbe;
   currentProcessIdle?: boolean;
-}, explicitKind?: OwnableKind): Promise<{ settled: SettledRecord[]; watched: number }> {
+} & OwnershipSettleEffects, explicitKind?: OwnableKind): Promise<{ settled: SettledRecord[]; watched: number }> {
   const kind = explicitKind ?? OWNABLE_KINDS.find(candidate => candidate.id === kindId);
   if (!kind?.listInProgress || !kind.settle) throw new Error(`ownership kind ${kindId} has no settle path`);
   const now = options.now ?? new Date();
@@ -314,7 +316,7 @@ async function settleKind(db: Db, kindId: string, options: {
       proof = { verdict: "gone", reason: "current_process_idle" };
     }
     if (options.currentProcessIdle) proof = { ...proof, localExecutionsKnown: true };
-    const outcome = await settleOrSurface(db, kind, record, proof, now);
+    const outcome = await settleOrSurface(db, kind, record, proof, now, options);
     if (outcome === "settled") {
       settled.push({ kind: kind.id, recordId: record.recordId, runId: record.runId, reason: proof.reason });
     } else if (outcome !== "unwatched" && proof.verdict !== "unprovable") {
@@ -692,7 +694,7 @@ export async function runOwnershipReconciliationPass(db: Db, options: {
    * their unprovable operator actions. Defaults to `record`; a read-only pass
    * never changes a record. */
   settle?: boolean;
-}): Promise<OwnershipReport> {
+} & OwnershipSettleEffects): Promise<OwnershipReport> {
   const now = options.now ?? new Date();
   const limit = options.limitPerKind ?? 200;
   const kinds = options.kinds ?? OWNABLE_KINDS;
@@ -756,7 +758,7 @@ export async function runOwnershipReconciliationPass(db: Db, options: {
         }
       }
       if (settleRecords && kind.settle) {
-        const outcome = await settleOrSurface(db, kind, record, proof, now);
+        const outcome = await settleOrSurface(db, kind, record, proof, now, options);
         if (outcome === "settled") { report.settled += 1; continue; }
         if (outcome === "failed") retryNeeded = true;
         // An unprovable owner changes only by operator action, which signals;

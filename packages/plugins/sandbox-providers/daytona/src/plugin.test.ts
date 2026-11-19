@@ -50,7 +50,7 @@ describe("Daytona read-only resource inspection", () => {
   afterEach(() => { vi.clearAllMocks(); vi.unstubAllEnvs(); __resetDaytonaSandboxHandleCacheForTest(); });
   it.each(["started", "stopped"])("observes a %s sandbox without lifecycle calls", async state => {
     const sandbox = createMockSandbox({ state }); mockGet.mockResolvedValue(sandbox);
-    expect(await plugin.definition.onEnvironmentInspectLease!(params)).toEqual({ providerLeaseId: "sandbox-123", state: state === "stopped" ? "stopped" : "active" });
+    expect(await plugin.definition.onEnvironmentInspectLease!(params)).toEqual({ providerLeaseId: "sandbox-123", boxId: "sandbox-123", state: state === "stopped" ? "stopped" : "active" });
     expect(mockGet).toHaveBeenLastCalledWith("sandbox-123");
     for (const method of [sandbox.start, sandbox.stop, sandbox.delete, sandbox.archive, sandbox.refreshData]) expect(method).not.toHaveBeenCalled();
     expect(mockCreate).not.toHaveBeenCalled();
@@ -60,7 +60,7 @@ describe("Daytona read-only resource inspection", () => {
     if (state === "active") mockGet.mockResolvedValue(createMockSandbox());
     else mockGet.mockRejectedValue(new MockDaytonaNotFoundError("gone"));
     expect(await plugin.definition.onEnvironmentInspectLease!({ ...params, leaseMetadata: provenance }))
-      .toEqual({ providerLeaseId: "sandbox-123", state });
+      .toEqual({ providerLeaseId: "sandbox-123", ...(state === "active" ? { boxId: "sandbox-123" } : {}), state });
     expect(mockGet).toHaveBeenCalledExactlyOnceWith("sandbox-123");
     expect(mockCreate).not.toHaveBeenCalled();
     if (state === "destroyed") expect(await plugin.definition.onIdleDrain!(new AbortController().signal)).toBe("none");
