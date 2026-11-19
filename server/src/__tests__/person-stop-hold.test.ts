@@ -1124,4 +1124,97 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
       runId: after!.id, runCreatedAt: after!.createdAt })).toBe(true);
   }, 120_000);
 
+  // adopt-marker-rows (RFL's added rows for the F1 stop marker): Stop with held messages then the person's Send;
+  // no false card for the stopped request; an Interrupt's successor unchanged; the 'continue' control.
+  const WASNT_ANSWERED = "wasn't answered";
+  /** M0 runs, H1..H3 are held behind it, the person's real Stop, then the person's real Send of the held queue. */
+  const stopThenSend = async () => {
+    const r = await stopWithHeld();
+    const stoppedRequest = fixture.calls[0]!.ids[0]!;
+    await r.drive(1_000);
+    expect(successorCalls(), "nothing ran by itself before the Send").toEqual([]);
+    const q = await r.queue();
+    expect(q.executionWait?.reason, JSON.stringify(q)).toBe("stopped_by_person");
+    const sent = await request(r.client).post(`/api/issues/${r.issueId}/queued-comments/interrupt`)
+      .send({ queueId: q.queueId, revision: q.revision, targetRunId: null });
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    await waitFor(async () => {
+      await r.drive(300);
+      return r.held.every(id => answeredIds().includes(id));
+    }, 30_000).catch(() => undefined);
+    await r.drive(1_000);
+    return { ...r, stoppedRequest };
+  };
+
+  it("marker-rows (i): Stop with 3 held (H1..H3), then the person's Send: the next turn's input has the marker ONCE and carries H1..H3 (each once, thread order) as owed; the stopped request is not owed", async () => {
+    const r = await stopThenSend();
+    const [next] = successorCalls();
+    await evidence("marker-rows-i", { stoppedRequest: r.stoppedRequest, held: r.held, calls: fixture.calls.map(call => ({ runId: call.runId,
+      ids: call.ids, ordered: call.ordered, marker: markerCount(call.prompt), head: call.prompt?.slice(0, 1200) })) });
+    expect(r.stoppedRequest, "the stopped turn carried M0").toBeTruthy();
+    expect(markerCount(fixture.calls[0]?.prompt), "the stopped turn's own input had no marker").toBe(0);
+    expect(next, JSON.stringify(fixture.calls.map(call => call.ids))).toBeTruthy();
+    expect(markerCount(next!.prompt), next!.prompt).toBe(1);
+    expect(next!.ordered, JSON.stringify(next)).toEqual(r.held);
+    expect(next!.ids.slice().sort()).toEqual(r.held.slice().sort());
+    expect(next!.ids, "the stopped request is not carried as owed").not.toContain(r.stoppedRequest);
+    // Each held message once across every turn; the stopped request never re-carried by any later turn.
+    for (const id of r.held) expect(answeredIds().filter(a => a === id).length, JSON.stringify(fixture.calls)).toBe(1);
+    expect(answeredIds(), JSON.stringify(fixture.calls)).not.toContain(r.stoppedRequest);
+    expect(successorCalls().length, JSON.stringify(fixture.calls)).toBe(1);
+  }, 120_000);
+
+  it("marker-rows (ii): after (i) and later sweep passes: no 'Your message wasn't answered' card for the stopped request, none for H1..H3 once answered", async () => {
+    const r = await stopThenSend();
+    for (const id of r.held) expect(answeredIds(), JSON.stringify(fixture.calls)).toContain(id);
+    await r.tenMinutesPass();
+    await sweep(r, 3); await sweep(r, 11);
+    const all = await comments(r);
+    const systemNotes = all.filter(c => c.authorType === "system" && !c.deletedAt)
+      .map(c => ({ reason: c.metadata?.authorizationReason, body: c.body }));
+    await evidence("marker-rows-ii", { stoppedRequest: r.stoppedRequest, held: r.held, systemNotes, calls: fixture.calls.map(call => call.ids) });
+    expect(await cards(r, [r.stoppedRequest]), "no card for the stopped request").toEqual([]);
+    expect(await cards(r, r.held), "no card for the answered held messages").toEqual([]);
+    expect(systemNotes.filter(note => String(note.body).includes(WASNT_ANSWERED)), JSON.stringify(systemNotes)).toEqual([]);
+  }, 120_000);
+
+  it("marker-rows (iii): an Interrupt with M1/M2 queued: the successors carry M1/M2 as today (each once, thread order), with NO person-stop marker (control)", async () => {
+    const r = await stopWithHeld({ stopKind: "interrupt", count: 2 });
+    const cutInput = fixture.calls[0]!.ids;
+    // Boat's stop completes (as R1 / C1 R13b): the warm box's stop receipt lands, so the successor is not
+    // parked on the retained box's cleanup; then the real workers run.
+    await r.boatStopAnswers();
+    await r.tenMinutesPass();
+    await waitFor(async () => {
+      await r.drive(300);
+      return r.held.every(id => answeredIds().includes(id));
+    }, 30_000).catch(() => undefined);
+    await r.drive(1_000);
+    await sweep(r, 3); await sweep(r, 11);
+    // Recorded, not asserted: whether today's Interrupt successor re-carries the cut turn's own input (M0), and its card.
+    await evidence("marker-rows-iii", { cutInput, held: r.held, calls: fixture.calls.map(call => ({ runId: call.runId, ids: call.ids,
+      ordered: call.ordered, marker: markerCount(call.prompt) })), wakes: await r.wakes(),
+      cutInputCarried: answeredIds().filter(id => cutInput.includes(id)).length, cutInputCards: await cards(r, cutInput) });
+    expect(successorCalls().length, JSON.stringify(fixture.calls.map(call => call.ids))).toBeGreaterThan(0);
+    for (const id of r.held) expect(answeredIds().filter(a => a === id).length, JSON.stringify(fixture.calls)).toBe(1);
+    expect(answeredIds().filter(id => r.held.includes(id)), "thread order").toEqual(r.held);
+    // The control: an Interrupt is not a person's Stop, so no successor's input carries the marker.
+    for (const call of successorCalls()) expect(markerCount(call.prompt), call.prompt).toBe(0);
+  }, 120_000);
+
+  it("marker-rows (iv): the 'continue' control: the person's next message after the Stop is 'continue': its turn's input carries the marker (the wording permits resuming on ask)", async () => {
+    const r = await stopWithHeld();
+    await r.tenMinutesPass();
+    expect(successorCalls(), "nothing ran by itself").toEqual([]);
+    const typed = (await r.post("continue").expect(201)).body.id as string;
+    await r.drive(4_000);
+    await evidence("marker-rows-iv", { typed, calls: fixture.calls.map(call => ({ runId: call.runId, ids: call.ids,
+      marker: markerCount(call.prompt) })) });
+    const [next] = successorCalls();
+    expect(next?.ids, JSON.stringify(fixture.calls.map(call => call.ids))).toEqual([typed]);
+    expect(markerCount(next?.prompt), next?.prompt).toBe(1);
+    expect(next!.prompt).toContain("continue");
+    expect(STOP_MARKER).toContain("unless they ask");
+  }, 120_000);
+
 });
