@@ -70,6 +70,7 @@ import { deferredWakeHoldsNoOtherConversation, otherConversationCommentIds, spli
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
 import {
+  DEFERRED_WAKE_STATUS,
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
   isConfigurationIncompleteFailedRun,
   isWorkspaceValidationFailedRun,
@@ -92,7 +93,6 @@ import type {
 } from "../application/ports.js";
 import type { RunSummary } from "../application/types.js";
 
-const DEFERRED_WAKE_STATUS = "deferred_issue_execution";
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 
