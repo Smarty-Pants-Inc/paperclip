@@ -13604,10 +13604,10 @@ export function issueService(db: Db) {
       const [enrichedComment] = await enrichCommentsWithDerivedAgentAttribution(
         [projectedComment ?? comment],
       );
-      return redactIssueComment(
+      const [displayComment] = await withSteeredCommentDisplay(db, [
         enrichedComment ?? projectedComment ?? comment,
-        censorUsernameInLogs,
-      );
+      ]);
+      return redactIssueComment(displayComment!, censorUsernameInLogs);
     },
 
     removeComment: async (commentId: string, actorAgentId?: string | null) => {
