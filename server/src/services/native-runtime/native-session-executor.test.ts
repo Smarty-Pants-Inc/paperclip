@@ -27124,6 +27124,10 @@ describe("runnerd provider runtime wiring", () => {
       if (command.args?.[1]?.includes("base64")) return {
         exitCode: 1, timedOut: false, stdout: "", stderr: "",
       };
+      // The replacement box holds none of the backup's conversations.
+      if (command.args?.[2] === "paperclip-runner-restore-history-probe") return {
+        exitCode: 0, timedOut: false, stdout: (command as { stdin?: string }).stdin!.split("\n").filter(Boolean).map(() => "A\n").join(""), stderr: "",
+      };
       return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
     });
     const checkpointSink = vi.fn(async () => undefined);

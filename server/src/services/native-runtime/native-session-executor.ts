@@ -15977,6 +15977,81 @@ async function removeRemoteCheckpointSnapshot(
     .catch(() => undefined);
 }
 
+/** The restore owner's refusal: the box already holds another conversation. */
+export const RESTORE_TARGET_HISTORY_DIFFERS = "runner_harness_state_mismatch: restore_target_history_differs";
+
+// Prints, per relative path on stdin, `A` (absent), `X` (not a plain file, a
+// symlink, or no hash tool) or `<bytes> <sha256>` of the box's copy.
+const REMOTE_HISTORY_PROBE_SCRIPT =
+  'set -u; while IFS= read -r rel; do f="$1/$rel"; ' +
+  'if test -L "$f"; then echo X; elif test ! -e "$f"; then echo A; elif test ! -f "$f"; then echo X; ' +
+  'elif command -v sha256sum >/dev/null 2>&1; then printf "%s %s\\n" "$(wc -c < "$f" | tr -d " ")" "$(sha256sum < "$f" | cut -d " " -f1)"; ' +
+  'elif command -v shasum >/dev/null 2>&1; then printf "%s %s\\n" "$(wc -c < "$f" | tr -d " ")" "$(shasum -a 256 < "$f" | cut -d " " -f1)"; ' +
+  'else echo X; fi; done';
+
+function localConversationHistoryFiles(root: string, prefix = ""): string[] {
+  if (!existsSync(root)) return [];
+  return readdirSync(root, { withFileTypes: true }).flatMap(entry => {
+    const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) return localConversationHistoryFiles(join(root, entry.name), relative);
+    return entry.isFile() && entry.name.endsWith(".jsonl") ? [relative] : [];
+  });
+}
+
+/**
+ * #21273 (review-fleet-3): stage a verified failover backup onto a box only
+ * when doing so loses no conversation the box already holds. Before anything
+ * is staged, each conversation history in the backup (a `.jsonl` file) is
+ * compared with the same path on the box: the box's copy must be absent or a
+ * byte prefix of the backup's copy (an older state of the same history). Any
+ * other copy, a newer or a different conversation, is kept as it is and the
+ * restore is refused with RESTORE_TARGET_HISTORY_DIFFERS. Nothing is
+ * overwritten, moved or deleted on that refusal.
+ */
+export async function restoreHarnessBackupKeepingRemoteHistory(input: {
+  target: Extract<AdapterExecutionTarget, { kind: "remote" }>;
+  runner: CommandManagedRuntimeRunner;
+  backupRoot: string;
+  directories: readonly { name: string; targetPath: string }[];
+}): Promise<void> {
+  for (const directory of input.directories) {
+    const sourceRoot = resolve(input.backupRoot, directory.name);
+    const histories = localConversationHistoryFiles(sourceRoot);
+    if (histories.length === 0) continue;
+    if (histories.some(relative => relative.includes("\n"))) throw nativeReconciliationError(RESTORE_TARGET_HISTORY_DIFFERS);
+    const probe = await input.runner.execute({
+      command: "sh",
+      args: ["-c", REMOTE_HISTORY_PROBE_SCRIPT, "paperclip-runner-restore-history-probe", directory.targetPath],
+      stdin: `${histories.join("\n")}\n`,
+      bypassSession: true,
+      timeoutMs: 30_000,
+    });
+    const lines = probe.stdout.split("\n").filter(line => line.length > 0);
+    if (probe.exitCode !== 0 || probe.timedOut || lines.length !== histories.length) {
+      throw new Error("runner_harness_state_mismatch: restore_target_unreadable");
+    }
+    histories.forEach((relative, index) => {
+      const line = lines[index]!;
+      if (line === "A") return;
+      const match = /^(\d+) ([0-9a-f]{64})$/.exec(line);
+      const backupBytes = readFileSync(join(sourceRoot, relative));
+      const boxBytes = match ? Number(match[1]) : -1;
+      const losesNothing = match !== null && boxBytes <= backupBytes.length
+        && createHash("sha256").update(backupBytes.subarray(0, boxBytes)).digest("hex") === match[2];
+      if (!losesNothing) throw nativeReconciliationError(RESTORE_TARGET_HISTORY_DIFFERS);
+    });
+  }
+  for (const directory of input.directories) {
+    await stageRemoteRunnerDirectory({
+      target: input.target,
+      runner: input.runner,
+      sourcePath: resolve(input.backupRoot, directory.name),
+      targetPath: directory.targetPath,
+      mode: 0o700,
+    });
+  }
+}
+
 export async function stageRemoteRunnerDirectory(input: {
   target: Extract<AdapterExecutionTarget, { kind: "remote" }>;
   runner: CommandManagedRuntimeRunner;
@@ -19569,19 +19644,16 @@ async function createRunnerdBackendWithinSessionClaim(
     await measureNativeRunnerSpan(
       input.trace,
       "harness_state.failover_restore",
-      async () => {
-        for (const directory of persistenceProfile.directories) {
+      () => restoreHarnessBackupKeepingRemoteHistory({
+        target: remoteTarget,
+        runner: remoteCommandRunner,
+        backupRoot: backup.root,
+        directories: persistenceProfile.directories.map(directory => {
           const targetPath = remotePersistencePath(directory);
           if (!targetPath) throw new Error("runner_harness_state_mismatch: restore_target_unavailable");
-          await stageRemoteRunnerDirectory({
-            target: remoteTarget,
-            runner: remoteCommandRunner,
-            sourcePath: resolve(backup.root, directory.name),
-            targetPath,
-            mode: 0o700,
-          });
-        }
-      },
+          return { name: directory.name, targetPath };
+        }),
+      }),
       {
         attributes: {
           provider: input.execution.provider.kind,
