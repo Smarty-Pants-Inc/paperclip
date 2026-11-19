@@ -20,7 +20,7 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { logActivity } from "../activity-log.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { isWellFormedExecutionWait, wellFormedExecutionWaitSql } from "../deferred-execution-wait.js";
-import { readPersonStopHold } from "../acknowledged-native-stop.js";
+import { isStoppingPersonsOwn, readPersonStopHold } from "../acknowledged-native-stop.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
 import { PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "../native-runtime/native-provider-failure.js";
@@ -819,6 +819,12 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     && (runCarriesMessage(latest.contextSnapshot, message.id)
       || await readPersonStopHold(q, { companyId: issue.companyId, issueId: issue.id, agentId, messageId: message.id })))
     return { kind: "explained" };
+  // R17 (3d): the sender's Stop of the ALREADY-ENDED latest run (the system ended it; no cancel was theirs) is
+  // the same acceptance row; while the ONE reader holds this message under it, the held bar explains it.
+  if (latest && message.authorUserId) {
+    const hold = await readPersonStopHold(q, { companyId: issue.companyId, issueId: issue.id, agentId, messageId: message.id });
+    if (hold && hold.stoppedRunId === latest.id && isStoppingPersonsOwn(message.authorUserId, hold.userId)) return { kind: "explained" };
+  }
   // A tree Pause keeps a person's parked message saved (its wake stays
   // deferred: cancelUnclaimedWakeupsForTree, mode "pause"); the release
   // drains it once. While paused, "no run started... send again" is false.

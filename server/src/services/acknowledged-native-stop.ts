@@ -10,7 +10,7 @@ import { isConfirmedCursorCloudTerminalObservation } from "./native-runtime/curs
 import { isAgentLifecycleStopRecord } from "./governance-pause-stop.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { PERSON_STOP_HOLDABLE_WAKE_STATUSES } from "../modules/wake-queue/domain/values.js";
-import { stopAcceptanceEventSql } from "./heartbeat-run-events.js";
+import { appendHeartbeatRunEvent, stopAcceptanceEventSql } from "./heartbeat-run-events.js";
 import { QUEUED_SEND_AFTER_STOP_KEY, recordedUserStop } from "./run-cancellation.js";
 
 export function hasAcknowledgedNativeRunStopRequest(run: {
@@ -362,10 +362,60 @@ export async function readAcceptedPersonStop(db: Db, input: { companyId: string;
   const acceptedAt = typeof accepted.acceptedAt === "string" ? new Date(accepted.acceptedAt) : null;
   if (!stop || accepted.schema !== "paperclip.stop-acceptance.v1" || accepted.kind !== "person_stop" ||
       accepted.issueId !== input.issueId || !userId || !acceptedAt || !Number.isFinite(acceptedAt.getTime())) return null;
+  // R17 (3d): a person's Stop of an ALREADY-ENDED latest run is the same acceptance row, marked endedRun;
+  // the run's own cancel was not theirs (the system ended it), so only its terminal state is read.
+  if (accepted.endedRun === true) {
+    if (!(HEARTBEAT_RUN_ENDED_STATUSES as readonly string[]).includes(stop.status) ||
+        parseObject(stop.resultJson).queuedCommentInterruptQueueId) return null;
+    return { runId: stop.runId, userId, acceptedAt };
+  }
   const stopped = recordedUserStop(stop);
   if (!stopped || stopped.source !== "operator" || parseObject(stop.resultJson).cancelledByUserId !== userId ||
       parseObject(stop.resultJson).queuedCommentInterruptQueueId) return null;
   return { runId: stop.runId, userId, acceptedAt };
+}
+
+const HEARTBEAT_RUN_ENDED_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
+
+/**
+ * R17 (adopt-cutc2 3d; adopt-lead's pick, conditions rf-3 + rf-4 09:26Z): a board person's Stop of a run that
+ * had ALREADY ENDED (e.g. the system cancelled it and its remote cleanup still parks the next message) counts as
+ * that person's Stop for the hold. It writes the SAME `run.stop.accepted` person_stop row the one reader
+ * (readAcceptedPersonStop) reads, marked `endedRun: true`; no cancel, the run is already terminal. Only when:
+ * - the ended run is the LATEST run of this agent on the task (no successor since); an older run is a no-op;
+ * - the one hold reader then holds at least one of THAT person's own waiting messages (another person's are
+ *   never held); with nothing waiting it is a no-op (the row is rolled back: no hold, no card).
+ * Returns whether the Stop now holds. Send / typing release it exactly as a live-run Stop.
+ */
+export async function recordPersonStopOfEndedRun(db: Db, input: {
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "status" | "createdAt" | "contextSnapshot" | "nativeIssueId">;
+  userId: string;
+}): Promise<boolean> {
+  const { run, userId } = input;
+  if (!(HEARTBEAT_RUN_ENDED_STATUSES as readonly string[]).includes(run.status) || !userId) return false;
+  const context = parseObject(run.contextSnapshot);
+  const issueId = typeof context.issueId === "string" && context.issueId ? context.issueId : run.nativeIssueId;
+  if (!issueId) return false;
+  const rollback = new Error("person_stop_of_ended_run_holds_nothing");
+  try {
+    return await db.transaction(async tx => {
+      const onIssue = or(eq(heartbeatRuns.nativeIssueId, issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`);
+      const [successor] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId), onIssue,
+        sql`${heartbeatRuns.id} <> ${run.id}`, gt(heartbeatRuns.createdAt, run.createdAt))).limit(1);
+      if (successor) return false;
+      await appendHeartbeatRunEvent(tx as unknown as Db, {
+        companyId: run.companyId, runId: run.id, agentId: run.agentId, eventType: "lifecycle", stream: "system", level: "info",
+        message: "run.stop.accepted", payload: { schema: "paperclip.stop-acceptance.v1", kind: "person_stop", issueId, userId,
+          acceptedAt: new Date().toISOString(), endedRun: true }, keepRunUpdatedAt: true });
+      const hold = await readPersonStopHold(tx as unknown as Db, { companyId: run.companyId, issueId, agentId: run.agentId });
+      if (!hold || !isStoppingPersonsOwn(hold.userId, userId)) throw rollback;
+      return true;
+    });
+  } catch (error) {
+    if (error === rollback) return false;
+    throw error;
+  }
 }
 
 /** The Stop's OWN board hold: the release wrote it for the very run the person

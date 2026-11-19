@@ -967,5 +967,52 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
   }, 120_000);
 
 
+  // 3d (adopt-lead's pick; rf-3 + rf-4 09:26Z conditions): a person's Stop of an ALREADY-ENDED latest run.
+  const endedRunAcceptances = async (runId: string) => (await db.select().from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.runId, runId), eq(heartbeatRunEvents.message, "run.stop.accepted")))).map(row => row.payload as any);
+  it("3d control (1): a Stop on an OLDER ended run (a successor started since) is a no-op: nothing held, no acceptance, the person's message is not kept waiting", async () => {
+    const r = await stopWithHeld({ stopKind: "system", count: 0 });
+    const p = (await r.post("PERSON request while previous run is saving").expect(201)).body.id as string;
+    await r.drive(400);
+    // A later run of this agent on the task (a successor since the system-cancelled one), already ended.
+    const [first] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, r.firstRunId));
+    await db.insert(heartbeatRuns).values({ companyId: r.companyId, agentId: r.agentId, status: "failed",
+      invocationSource: "automation", contextSnapshot: { issueId: r.issueId }, createdAt: new Date(first!.createdAt.getTime() + 1_000),
+      startedAt: new Date(), finishedAt: new Date() } as any);
+    const stopped = await request(r.client).post(`/api/heartbeat-runs/${r.firstRunId}/cancel`).send({});
+    expect(stopped.status, JSON.stringify(stopped.body)).toBe(200);
+    expect(await endedRunAcceptances(r.firstRunId)).toEqual([]);
+    expect(await readPersonStopHold(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId, messageId: p })).toBeNull();
+    expect((await r.queue()).executionWait?.reason).not.toBe("stopped_by_person");
+  }, 120_000);
+
+  it("3d control (4): a Stop on the latest ended run with NOTHING waiting is a no-op: no acceptance row, no hold, no card", async () => {
+    const r = await stopWithHeld({ stopKind: "system", count: 0 });
+    // The system-cancelled turn's own message (M0) already has its true card; the no-op Stop adds or retires nothing.
+    const systemCards = async () => (await comments(r)).filter(c => c.authorType === "system" && !c.deletedAt)
+      .map(c => `${c.metadata?.authorizationReason}|${c.body}`).sort();
+    await sweep(r, 3); await sweep(r, 11);
+    const before = await systemCards();
+    const stopped = await request(r.client).post(`/api/heartbeat-runs/${r.firstRunId}/cancel`).send({});
+    expect(stopped.status, JSON.stringify(stopped.body)).toBe(200);
+    expect(await endedRunAcceptances(r.firstRunId)).toEqual([]);
+    expect(await readPersonStopHold(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId })).toBeNull();
+    await sweep(r, 3); await sweep(r, 11);
+    expect(await systemCards()).toEqual(before);
+    // A message the person sends after that no-op Stop is not held by it.
+    const later = (await r.post("PERSON after the no-op Stop").expect(201)).body.id as string;
+    expect(await readPersonStopHold(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId, messageId: later })).toBeNull();
+  }, 120_000);
+
+  it("3d control: ANOTHER person's Stop of the latest ended run does not hold MY waiting message", async () => {
+    const r = await stopWithHeld({ stopKind: "system", count: 0 });
+    const p = (await r.post("PERSON request while previous run is saving").expect(201)).body.id as string;
+    await r.drive(400);
+    const stopped = await request(r.otherClient).post(`/api/heartbeat-runs/${r.firstRunId}/cancel`).send({});
+    expect(stopped.status, JSON.stringify(stopped.body)).toBe(200);
+    expect(await endedRunAcceptances(r.firstRunId)).toEqual([]);
+    expect(await readPersonStopHold(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId, messageId: p })).toBeNull();
+    expect((await r.queue()).executionWait?.reason).not.toBe("stopped_by_person");
+  }, 120_000);
 
 });
