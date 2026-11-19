@@ -71,6 +71,48 @@ const taskChatComposerFixture = vi.hoisted(() => ({
 vi.mock("../hooks/useCoordinatorWorkspaceEnabled", () => ({
   useCoordinatorWorkspaceEnabled: () => coordinatorPreference,
 }));
+// Set by the steering placement rows to the REAL TaskChatThread (vi.importActual);
+// the TaskChatThread stub then renders it with IssueDetail's own props.
+const taskChatThreadFixture = vi.hoisted(() => ({
+  Real: null as null | ((props: Record<string, unknown>) => ReactElement | null),
+}));
+// The real composer's rich editor cannot take typing under jsdom. When `stub`
+// is on, a plain stand-in keeps the composer's own value/onChange/onSubmit
+// contract (Enter = submit), as TaskChatThread.test's editor stand-in does.
+const markdownEditorFixture = vi.hoisted(() => ({ stub: false, change: (_value: string) => {} }));
+vi.mock("@/components/MarkdownEditor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/components/MarkdownEditor")>();
+  const React = await import("react");
+  const StandIn = React.forwardRef(function StandInMarkdownEditor(
+    props: { value: string; onChange: (value: string) => void; onSubmit?: () => void },
+    ref: React.ForwardedRef<unknown>,
+  ) {
+    React.useImperativeHandle(ref, () => ({ insertMarkdown: () => {}, focus: () => {}, clear: () => props.onChange("") }));
+    markdownEditorFixture.change = props.onChange;
+    return React.createElement("textarea", {
+      "data-testid": "stand-in-editor",
+      value: props.value,
+      readOnly: true,
+      onKeyDown: (event: KeyboardEvent) => {
+        if (event.key === "Enter" && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey) {
+          event.preventDefault();
+          props.onSubmit?.();
+        }
+      },
+    });
+  });
+  const MarkdownEditor = React.forwardRef(function MarkdownEditorSwitch(props: never, ref) {
+    return markdownEditorFixture.stub
+      ? React.createElement(StandIn, { ...(props as object), ref } as never)
+      : React.createElement(actual.MarkdownEditor, { ...(props as object), ref } as never);
+  });
+  return { ...actual, MarkdownEditor };
+});
+// The real issuesApi.addComment (its own request body and receipt check), kept
+// before the file's mocks replace it; the steering rows replay it through fetch.
+const realIssuesApiFns = vi.hoisted(() => ({
+  addComment: null as null | ((...args: unknown[]) => Promise<unknown>),
+}));
 
 const mockGrokBotApi = vi.hoisted(() => ({ stop: vi.fn().mockResolvedValue({ stopped: true }) }));
 vi.mock("../api/grokBot", () => ({ grokBotApi: mockGrokBotApi }));
@@ -218,6 +260,7 @@ class ResizeObserverStub {
 
 vi.mock("../api/issues", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/issues")>();
+  realIssuesApiFns.addComment = actual.issuesApi.addComment as never;
   // Keep composed API operations real while replacing their request methods.
   // This also exercises the current-revision check used by both queue surfaces.
   return { ...actual, issuesApi: Object.assign(actual.issuesApi, mockIssuesApi) };
@@ -472,6 +515,8 @@ vi.mock("../components/TaskChatThread", () => ({
     footer?: ReactNode;
   }) => {
     mockIssueChatThreadRender(props);
+    const RealThread = taskChatThreadFixture.Real;
+    if (RealThread) return <RealThread {...(props as Record<string, unknown>)} />;
     const RealComposer = taskChatComposerFixture.Real;
     return (
       <div data-testid="task-chat-thread">
@@ -656,7 +701,12 @@ vi.mock("../components/Identity", () => ({
   ),
 }));
 
-vi.mock("@/components/ui/button", () => ({
+vi.mock("@/components/ui/button", async (importOriginal) => {
+  // While the steering rows render the REAL thread, every export is the real one;
+  // otherwise the stubs below, and any export they do not replace stays real.
+  const actual = await importOriginal<Record<string, unknown>>();
+  const React = await import("react");
+  const stubs: Record<string, unknown> = {
   buttonVariants: () => "",
   Button: ({
     children,
@@ -676,21 +726,51 @@ vi.mock("@/components/ui/button", () => ({
       {children}
     </button>
   ),
-}));
+  };
+  return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
+    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
+      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+    }) : Stub])) };
+});
 
-vi.mock("@/components/ui/separator", () => ({
+vi.mock("@/components/ui/separator", async (importOriginal) => {
+  // While the steering rows render the REAL thread, every export is the real one;
+  // otherwise the stubs below, and any export they do not replace stays real.
+  const actual = await importOriginal<Record<string, unknown>>();
+  const React = await import("react");
+  const stubs: Record<string, unknown> = {
   Separator: () => <hr />,
-}));
+  };
+  return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
+    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
+      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+    }) : Stub])) };
+});
 
-vi.mock("@/components/ui/popover", () => ({
+vi.mock("@/components/ui/popover", async (importOriginal) => {
+  // While the steering rows render the REAL thread, every export is the real one;
+  // otherwise the stubs below, and any export they do not replace stays real.
+  const actual = await importOriginal<Record<string, unknown>>();
+  const React = await import("react");
+  const stubs: Record<string, unknown> = {
   Popover: ({ children }: { children?: ReactNode }) => <>{children}</>,
   PopoverTrigger: ({ children }: { children?: ReactNode }) => <>{children}</>,
   PopoverContent: ({ children }: { children?: ReactNode }) => (
     <div>{children}</div>
   ),
-}));
+  };
+  return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
+    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
+      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+    }) : Stub])) };
+});
 
-vi.mock("@/components/ui/dialog", () => ({
+vi.mock("@/components/ui/dialog", async (importOriginal) => {
+  // While the steering rows render the REAL thread, every export is the real one;
+  // otherwise the stubs below, and any export they do not replace stays real.
+  const actual = await importOriginal<Record<string, unknown>>();
+  const React = await import("react");
+  const stubs: Record<string, unknown> = {
   Dialog: ({ children, open }: { children?: ReactNode; open?: boolean }) =>
     open ? <div>{children}</div> : null,
   DialogContent: ({
@@ -732,9 +812,19 @@ vi.mock("@/components/ui/dialog", () => ({
     children?: ReactNode;
     className?: string;
   }) => <h2 className={className}>{children}</h2>,
-}));
+  };
+  return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
+    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
+      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+    }) : Stub])) };
+});
 
-vi.mock("@/components/ui/sheet", () => ({
+vi.mock("@/components/ui/sheet", async (importOriginal) => {
+  // While the steering rows render the REAL thread, every export is the real one;
+  // otherwise the stubs below, and any export they do not replace stays real.
+  const actual = await importOriginal<Record<string, unknown>>();
+  const React = await import("react");
+  const stubs: Record<string, unknown> = {
   Sheet: ({ children, open }: { children?: ReactNode; open?: boolean }) =>
     open ? <div>{children}</div> : null,
   SheetContent: ({
@@ -760,17 +850,47 @@ vi.mock("@/components/ui/sheet", () => ({
     <p>{children}</p>
   ),
   SheetTitle: ({ children }: { children?: ReactNode }) => <h2>{children}</h2>,
-}));
+  };
+  return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
+    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
+      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+    }) : Stub])) };
+});
 
-vi.mock("@/components/ui/scroll-area", () => ({
+vi.mock("@/components/ui/scroll-area", async (importOriginal) => {
+  // While the steering rows render the REAL thread, every export is the real one;
+  // otherwise the stubs below, and any export they do not replace stays real.
+  const actual = await importOriginal<Record<string, unknown>>();
+  const React = await import("react");
+  const stubs: Record<string, unknown> = {
   ScrollArea: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
-}));
+  };
+  return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
+    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
+      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+    }) : Stub])) };
+});
 
-vi.mock("@/components/ui/skeleton", () => ({
+vi.mock("@/components/ui/skeleton", async (importOriginal) => {
+  // While the steering rows render the REAL thread, every export is the real one;
+  // otherwise the stubs below, and any export they do not replace stays real.
+  const actual = await importOriginal<Record<string, unknown>>();
+  const React = await import("react");
+  const stubs: Record<string, unknown> = {
   Skeleton: () => <div data-testid="skeleton" />,
-}));
+  };
+  return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
+    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
+      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+    }) : Stub])) };
+});
 
-vi.mock("@/components/ui/tabs", () => ({
+vi.mock("@/components/ui/tabs", async (importOriginal) => {
+  // While the steering rows render the REAL thread, every export is the real one;
+  // otherwise the stubs below, and any export they do not replace stays real.
+  const actual = await importOriginal<Record<string, unknown>>();
+  const React = await import("react");
+  const stubs: Record<string, unknown> = {
   Tabs: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
   TabsContent: ({
     children,
@@ -789,13 +909,28 @@ vi.mock("@/components/ui/tabs", () => ({
   TabsTrigger: ({ children }: { children?: ReactNode }) => (
     <button type="button">{children}</button>
   ),
-}));
+  };
+  return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
+    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
+      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+    }) : Stub])) };
+});
 
-vi.mock("@/components/ui/textarea", () => ({
+vi.mock("@/components/ui/textarea", async (importOriginal) => {
+  // While the steering rows render the REAL thread, every export is the real one;
+  // otherwise the stubs below, and any export they do not replace stays real.
+  const actual = await importOriginal<Record<string, unknown>>();
+  const React = await import("react");
+  const stubs: Record<string, unknown> = {
   Textarea: (props: React.TextareaHTMLAttributes<HTMLTextAreaElement>) => (
     <textarea {...props} />
   ),
-}));
+  };
+  return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
+    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
+      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+    }) : Stub])) };
+});
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -1363,6 +1498,20 @@ async function waitForAssertion(assertion: () => void, attempts = 20) {
   throw lastError;
 }
 
+// Steering placement (steer-ui2). PLANTED, verbatim: the bodies the REAL
+// server at neworg/steer-server-c3 (69c95176) answered in neworg-lead's own
+// rows in server/src/__tests__/agent-chat-steering.test.ts, captured once with
+// a temporary hook (since removed):
+//   S-a2 (following text=true): its default POST (steeringStatus 'accepted')
+//     and the later thread GET (steeringStatus 'delivered', seq 18);
+//   S-f explicit Queue: its POST (deliveryIntent 'queue'), the thread GET and
+//     the queued-comments GET.
+const STEER_A2_POST_RESPONSE = {"id": "9583981a-c88f-4b2c-baf8-7267730ebdb9", "companyId": "ef9c2ddd-2e52-4280-b50e-9f012683b3f8", "issueId": "bb0c55ce-d401-42e1-b4c9-d24ac00ae59a", "authorAgentId": null, "authorUserId": "chat-owner", "onBehalfOfUserId": null, "authorType": "user", "createdByRunId": null, "derivedAuthorAgentId": null, "derivedCreatedByRunId": null, "derivedAuthorSource": null, "clientRequestId": "9beb8f07-4ea4-49b8-95e7-6aee3f6e971f", "conversationSessionGeneration": null, "origin": "comment", "fastResponseRequestId": null, "body": "Pi must read this after the held tool", "presentation": null, "metadata": null, "deletedAt": null, "deletedByType": null, "deletedByAgentId": null, "deletedByUserId": null, "deletedByRunId": null, "sourceTrust": null, "createdAt": "2026-11-19T07:43:59.580Z", "updatedAt": "2026-11-19T07:43:59.580Z", "steeredIntoRunId": "b28003b2-ffb0-4baa-b81a-0959f15d5966", "steeredAt": "2026-11-19T07:43:59.598Z", "steeringStatus": "accepted", "steeringDeliveryEventSeq": null} as const;
+const STEER_A2_THREAD_GET_DELIVERED = [{"id": "9583981a-c88f-4b2c-baf8-7267730ebdb9", "companyId": "ef9c2ddd-2e52-4280-b50e-9f012683b3f8", "issueId": "bb0c55ce-d401-42e1-b4c9-d24ac00ae59a", "authorAgentId": null, "authorUserId": "chat-owner", "onBehalfOfUserId": null, "authorType": "user", "createdByRunId": null, "derivedAuthorAgentId": null, "derivedCreatedByRunId": null, "derivedAuthorSource": null, "clientRequestId": "9beb8f07-4ea4-49b8-95e7-6aee3f6e971f", "conversationSessionGeneration": null, "origin": "comment", "fastResponseRequestId": null, "body": "Pi must read this after the held tool", "presentation": null, "metadata": null, "deletedAt": null, "deletedByType": null, "deletedByAgentId": null, "deletedByUserId": null, "deletedByRunId": null, "sourceTrust": null, "createdAt": "2026-11-19T07:43:59.580Z", "updatedAt": "2026-11-19T07:43:59.580Z", "steeredIntoRunId": "b28003b2-ffb0-4baa-b81a-0959f15d5966", "steeredAt": "2026-11-19T07:43:59.598Z", "steeringStatus": "delivered", "steeringDeliveryEventSeq": 18}, {"id": "25718a32-40e5-4482-98ce-e4c641e3da2c", "companyId": "ef9c2ddd-2e52-4280-b50e-9f012683b3f8", "issueId": "bb0c55ce-d401-42e1-b4c9-d24ac00ae59a", "authorAgentId": null, "authorUserId": "chat-owner", "onBehalfOfUserId": null, "authorType": "user", "createdByRunId": null, "derivedAuthorAgentId": null, "derivedCreatedByRunId": null, "derivedAuthorSource": null, "clientRequestId": null, "conversationSessionGeneration": null, "origin": "comment", "fastResponseRequestId": null, "body": "First message", "presentation": null, "metadata": null, "deletedAt": null, "deletedByType": null, "deletedByAgentId": null, "deletedByUserId": null, "deletedByRunId": null, "sourceTrust": null, "createdAt": "2026-11-19T07:43:59.459Z", "updatedAt": "2026-11-19T07:43:59.459Z", "steeredIntoRunId": null, "steeredAt": null, "steeringStatus": null, "steeringDeliveryEventSeq": null}] as const;
+const QUEUE_SF_POST_RESPONSE = {"id": "aa2e7da8-2ed1-4854-a6e8-a255289791c6", "companyId": "4dd77ee4-6ac3-4727-ae38-39b73985af2e", "issueId": "dd731e54-4d0f-4462-bb3f-8da5e3e31352", "authorAgentId": null, "authorUserId": "chat-owner", "onBehalfOfUserId": null, "authorType": "user", "createdByRunId": null, "derivedAuthorAgentId": null, "derivedCreatedByRunId": null, "derivedAuthorSource": null, "clientRequestId": "ab689719-04b5-4271-b65b-cb7abecf83f4", "conversationSessionGeneration": null, "origin": "comment", "fastResponseRequestId": null, "body": "Queue deliberately", "presentation": null, "metadata": null, "deletedAt": null, "deletedByType": null, "deletedByAgentId": null, "deletedByUserId": null, "deletedByRunId": null, "sourceTrust": null, "createdAt": "2026-11-19T07:44:01.735Z", "updatedAt": "2026-11-19T07:44:01.735Z", "steeredIntoRunId": null, "steeredAt": null, "steeringStatus": null, "steeringDeliveryEventSeq": null} as const;
+const QUEUE_SF_THREAD_GET = [{"id": "aa2e7da8-2ed1-4854-a6e8-a255289791c6", "companyId": "4dd77ee4-6ac3-4727-ae38-39b73985af2e", "issueId": "dd731e54-4d0f-4462-bb3f-8da5e3e31352", "authorAgentId": null, "authorUserId": "chat-owner", "onBehalfOfUserId": null, "authorType": "user", "createdByRunId": null, "derivedAuthorAgentId": null, "derivedCreatedByRunId": null, "derivedAuthorSource": null, "clientRequestId": "ab689719-04b5-4271-b65b-cb7abecf83f4", "conversationSessionGeneration": null, "origin": "comment", "fastResponseRequestId": null, "body": "Queue deliberately", "presentation": null, "metadata": null, "deletedAt": null, "deletedByType": null, "deletedByAgentId": null, "deletedByUserId": null, "deletedByRunId": null, "sourceTrust": null, "createdAt": "2026-11-19T07:44:01.735Z", "updatedAt": "2026-11-19T07:44:01.735Z", "steeredIntoRunId": null, "steeredAt": null, "steeringStatus": null, "steeringDeliveryEventSeq": null}, {"id": "a34b1ede-69b0-4c65-a68a-ec54fce4dbb5", "companyId": "4dd77ee4-6ac3-4727-ae38-39b73985af2e", "issueId": "dd731e54-4d0f-4462-bb3f-8da5e3e31352", "authorAgentId": null, "authorUserId": "chat-owner", "onBehalfOfUserId": null, "authorType": "user", "createdByRunId": null, "derivedAuthorAgentId": null, "derivedCreatedByRunId": null, "derivedAuthorSource": null, "clientRequestId": null, "conversationSessionGeneration": null, "origin": "comment", "fastResponseRequestId": null, "body": "First message", "presentation": null, "metadata": null, "deletedAt": null, "deletedByType": null, "deletedByAgentId": null, "deletedByUserId": null, "deletedByRunId": null, "sourceTrust": null, "createdAt": "2026-11-19T07:44:01.695Z", "updatedAt": "2026-11-19T07:44:01.695Z", "steeredIntoRunId": null, "steeredAt": null, "steeringStatus": null, "steeringDeliveryEventSeq": null}] as const;
+const QUEUE_SF_QUEUED_COMMENTS_GET = {"issueId": "dd731e54-4d0f-4462-bb3f-8da5e3e31352", "queueId": "40779553-6ebe-4b70-98fe-0b3d25c5da98", "state": "deferred", "targetRunId": "52289e09-b836-4484-abd1-e420b9886128", "revision": "a0320dbbe9024a480a94dd567a02c8a9", "protocol": "paperclip_runner_v1", "steeringDisposition": "available", "entries": [{"comment": {"id": "aa2e7da8-2ed1-4854-a6e8-a255289791c6", "companyId": "4dd77ee4-6ac3-4727-ae38-39b73985af2e", "issueId": "dd731e54-4d0f-4462-bb3f-8da5e3e31352", "authorAgentId": null, "authorUserId": "chat-owner", "onBehalfOfUserId": null, "authorType": "user", "createdByRunId": null, "derivedAuthorAgentId": null, "derivedCreatedByRunId": null, "derivedAuthorSource": null, "clientRequestId": "ab689719-04b5-4271-b65b-cb7abecf83f4", "conversationSessionGeneration": null, "origin": "comment", "fastResponseRequestId": null, "body": "Queue deliberately", "presentation": null, "metadata": null, "deletedAt": null, "deletedByType": null, "deletedByAgentId": null, "deletedByUserId": null, "deletedByRunId": null, "sourceTrust": null, "createdAt": "2026-11-19T07:44:01.735Z", "updatedAt": "2026-11-19T07:44:01.735Z"}, "position": 0, "canEdit": true, "canDiscard": true, "behindReset": false}]} as const;
+
 describe("IssueDetail", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -1379,6 +1528,8 @@ describe("IssueDetail", () => {
     Object.assign(coordinatorPreference, { enabled: false, loaded: true });
     inlineEditorFixture.real = false;
     taskChatComposerFixture.Real = null;
+    taskChatThreadFixture.Real = null;
+    markdownEditorFixture.stub = false;
     mockTaskPluginPanels.panels = []; mockTaskPluginPanels.isLoading = false;
     localStorage.clear();
     sessionStorage.clear();
@@ -6951,6 +7102,157 @@ describe("IssueDetail", () => {
       expect(header.find((item) => item.text === "Resume work")).toBeUndefined();
       expect(header.find((item) => item.text === "Pause work")).toMatchObject({ disabled: false });
     },
+  );
+
+  // Steering placement end to end (steer-ui2, Paul 11-19). The REAL TaskChatThread
+  // (vi.importActual; the TaskChatThread stub renders it via taskChatThreadFixture
+  // with IssueDetail's own props), the REAL TaskChatComposer inside it (Enter / Send ▾),
+  // IssueDetail's real addComment mutation and the real issuesApi.addComment request
+  // body, replayed through fetch. Every server answer is a PLANTED body above.
+  // Derived (named here, nothing invented): before Enter the thread is the planted
+  // GET without the new message; between the POST and Pi's read it holds the POST's
+  // own body (steeringStatus 'accepted'), as neworg-lead's S-a row reads it.
+  async function renderSteeringPlacement(width: number, flow: "steer" | "queue") {
+    const { TaskChatThread } = await vi.importActual<
+      typeof import("../components/TaskChatThread")
+    >("../components/TaskChatThread");
+    taskChatThreadFixture.Real = TaskChatThread as never;
+    markdownEditorFixture.stub = true;
+    mockSidebarState.isMobile = width < 768;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    const post = flow === "steer" ? STEER_A2_POST_RESPONSE : QUEUE_SF_POST_RESPONSE;
+    const finalThread: readonly { id: string }[] = flow === "steer" ? STEER_A2_THREAD_GET_DELIVERED : QUEUE_SF_THREAD_GET;
+    const runId = flow === "steer" ? STEER_A2_POST_RESPONSE.steeredIntoRunId : QUEUE_SF_QUEUED_COMMENTS_GET.targetRunId;
+    const emptyQueue = createQueuedCommentQueue({ queueId: null, state: null, targetRunId: null, entries: [] });
+    const state = {
+      thread: finalThread.filter((comment) => comment.id !== post.id) as unknown[],
+      queue: emptyQueue as unknown,
+    };
+    const posts: Array<Record<string, unknown>> = [];
+    const fetched: string[] = [];
+    vi.mocked(globalThis.fetch).mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (method === "POST" && /\/api\/issues\/[^/]+\/comments$/.test(url)) {
+        posts.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        state.thread = flow === "steer"
+          ? finalThread.map((comment) => comment.id === post.id ? post : comment)
+          : [...QUEUE_SF_THREAD_GET];
+        state.queue = flow === "steer" ? emptyQueue : QUEUE_SF_QUEUED_COMMENTS_GET;
+        return new Response(JSON.stringify(post), { status: 201, headers: { "content-type": "application/json" } });
+      }
+      fetched.push(`${method} ${url}`);
+      const body = /pending-questions|\/browsers(\?|$)|\/mcp-app-views/.test(url) ? [] : { items: [], nextCursor: null };
+      return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    mockIssuesApi.addComment.mockReset().mockImplementation((...args: unknown[]) => realIssuesApiFns.addComment!(...args));
+    mockIssuesApi.listComments.mockImplementation(async () => state.thread);
+    mockIssuesApi.getQueuedComments.mockImplementation(async () => state.queue);
+    const activeRun = {
+      id: runId, runtimeMode: "native", status: "running", invocationSource: "issue", triggerDetail: null,
+      contextCommentId: null, contextWakeCommentId: null, startedAt: "2026-11-19T07:43:59.400Z", finishedAt: null,
+      createdAt: "2026-11-19T07:43:59.400Z", agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner",
+      issueId: "issue-1",
+    };
+    mockIssuesApi.get.mockResolvedValue(createIssue({
+      status: "in_progress", assigneeAgentId: "agent-1", executionRunId: runId,
+    }));
+    mockAgentsApi.list.mockResolvedValue([createAgent({ adapterType: "paperclip_runner" })]);
+    mockHeartbeatsApi.activeRunForIssue.mockResolvedValue(activeRun);
+    mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([activeRun]);
+    mockAuthApi.getSession.mockResolvedValue({ session: { userId: "chat-owner" }, user: { id: "chat-owner" } });
+
+    await act(async () => { renderIssueView(); });
+    await flushReact();
+    await flushReact();
+    await waitForAssertion(() => expect(container.querySelector('[data-testid="stand-in-editor"]')).not.toBeNull());
+    await act(async () => { markdownEditorFixture.change(post.body); });
+    await flushReact();
+    const bubbles = () => Array.from(container.querySelectorAll<HTMLElement>('[data-conversation-message="human"]'))
+      .filter((node) => node.textContent?.includes(post.body));
+    const waitingText = () => container.querySelector('[data-testid="task-chat-queued-messages"]')?.textContent ?? "";
+    return { post, runId, posts, state, bubbles, waitingText, finalThread };
+  }
+
+  async function waitUntil(check: () => boolean, timeoutMs = 3000) {
+    const started = performance.now();
+    while (!check()) {
+      if (performance.now() - started > timeoutMs) return false;
+      await flushReact();
+    }
+    return true;
+  }
+
+  it.each([390, 1440])(
+    "steering placement: Enter while the agent works puts the message in the thread as sent within 1 s (real server bodies), then the same bubble shows delivered at %i",
+    async (width) => {
+      const { post, runId, posts, state, bubbles, waitingText, finalThread } = await renderSteeringPlacement(width, "steer");
+      const editor = container.querySelector<HTMLTextAreaElement>('[data-testid="stand-in-editor"]')!;
+      const started = performance.now();
+      await act(async () => {
+        editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+      });
+      expect(await waitUntil(() => bubbles().some((node) => node.dataset.testid === "task-chat-steered-message"))).toBe(true);
+      const elapsed = performance.now() - started;
+      expect(elapsed, `Enter to thread: ${elapsed} ms`).toBeLessThan(1000);
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/enter-to-thread-${width}.txt`, `${elapsed.toFixed(1)} ms\n${bubbles()[0]!.outerHTML}\n`);
+      }
+      // The default Send names no intent: the server decides.
+      expect(posts).toHaveLength(1);
+      expect(posts[0]).toMatchObject({ body: post.body });
+      expect(posts[0]).not.toHaveProperty("deliveryIntent");
+      const sent = bubbles();
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.dataset.steeredIntoRunId).toBe(runId);
+      expect(sent[0]!.dataset.delivery).toBe("sent");
+      // Steered is sent, never 'Queued' or 'Sending…' (the old client rule called it queued).
+      expect(sent[0]!.textContent).not.toMatch(/Queued|Sending…|Interrupt/);
+      expect(sent[0]!.querySelector('[data-testid="task-chat-steered-delivery"]')?.textContent).toContain("Sent");
+      // No waiting row for a steered message.
+      expect(waitingText()).not.toContain(post.body);
+      // Pi reads it: the next thread GET (planted) says delivered.
+      state.thread = [...finalThread];
+      await act(async () => {
+        await queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments("PAP-1") });
+      });
+      expect(await waitUntil(() => bubbles()[0]?.dataset.delivery === "delivered")).toBe(true);
+      const delivered = bubbles();
+      expect(delivered).toHaveLength(1);
+      expect(delivered[0]!.dataset.steeredIntoRunId).toBe(runId);
+      expect(delivered[0]!.querySelector('[data-testid="task-chat-steered-delivery"]')?.textContent).toContain("Delivered");
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/delivered-bubble-${width}.txt`, `${delivered[0]!.outerHTML}\n`);
+      }
+      expect(waitingText()).not.toContain(post.body);
+      expect(container.querySelectorAll('[data-testid="task-chat-steered-message"]')).toHaveLength(1);
+    },
+    15_000,
+  );
+
+  it.each([390, 1440])(
+    "steering placement: Send ▾ Queue while the agent works puts the message in the waiting list (real server bodies), never as a steered thread item at %i",
+    async (width) => {
+      const { post, posts, bubbles, waitingText } = await renderSteeringPlacement(width, "queue");
+      const toggle = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-send-menu-toggle"]');
+      expect(toggle).not.toBeNull();
+      await act(async () => { toggle!.click(); });
+      await flushReact();
+      const queueItem = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-send-menu-queue"]');
+      expect(queueItem).not.toBeNull();
+      await act(async () => { queueItem!.click(); });
+      expect(await waitUntil(() => waitingText().includes(post.body))).toBe(true);
+      expect(posts).toHaveLength(1);
+      expect(posts[0]).toMatchObject({ body: post.body, deliveryIntent: "queue" });
+      expect(container.querySelector('[data-testid="task-chat-queued-list"]')?.textContent).toContain(post.body);
+      expect(container.querySelectorAll('[data-testid="task-chat-steered-message"]')).toHaveLength(0);
+      expect(bubbles().filter((node) => node.dataset.delivery)).toHaveLength(0);
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/queued-list-${width}.txt`,
+          `${container.querySelector('[data-testid="task-chat-queued-messages"]')!.outerHTML}\n`);
+      }
+    },
+    15_000,
   );
 
   it("confirms the composer Stop from the authoritative cancellation response during a status outage", async () => {
