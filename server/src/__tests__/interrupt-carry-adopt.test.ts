@@ -19,10 +19,12 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { agentRoutes } from "../routes/agents.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -134,6 +136,7 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
       next();
     });
     testApp.use("/api", issueRoutes(db, {} as any, {}));
+    testApp.use("/api", agentRoutes(db));
     testApp.use(errorHandler);
     return testApp;
   }
@@ -590,6 +593,67 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     // Either the queue's own wake became the carry, or it is retired into the carry: never a second live carrier.
     if (named[0]!.id !== carry.id) expect([named[0]!.status, named[0]!.error]).toEqual(["coalesced", "Sent with the chat's other queued messages"]);
     expect((await carriersAfterCut(chat, [steerId], carry.id))[steerId], "STEER's carriers after the cut").toEqual(["carry"]);
+  });
+
+  /** The person's own steer cards (the per-message sweep's system comment naming the id). */
+  const cardsFor = async (chat: Chat, id: string) => (await db.select().from(issueComments).where(and(
+    eq(issueComments.issueId, chat.issue.id), eq(issueComments.authorType, "system"),
+    sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + id}`)));
+
+  /** The carry's ONE successor ends FAILED with no reply (no assistant text, no agent comment), and is released. */
+  async function successorFails(chat: Chat, run: typeof heartbeatRuns.$inferSelect) {
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), errorCode: "adapter_failed",
+      error: "provider exited" }).where(eq(heartbeatRuns.id, run.id));
+    const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    await settleConversationTurn(db, ended!);
+    await createWakeQueue(db, releaseDeps as never).releaseIssueExecution({ companyId: chat.companyId, runId: run.id, now: new Date() });
+  }
+
+  it("R7 (rf-4 bppc3 F1): a READ steer adopted by the Interrupt; the ONE successor FAILS without answering ⇒ the failed run's Retry (real route) carries STEER; answered once, no card", async () => {
+    const chat = await seedChat();
+    const { steerId, msgId, cut, carry } = await steerThenInterrupt(chat, "read");
+    expect((cut.resultJson as any).interruptCarriedReadSteeredCommentIds).toEqual([steerId]);
+    const successor = await admitSuccessor(chat, carry);
+    // The real admission of the carry settles the cut run's hold (explicit-native-continuation.ts ~:796:
+    // resolved / cancelled); admitSuccessor is the dispatcher's claim only, so the row applies that settlement.
+    await db.update(issueRecoveryActions).set({ status: "resolved", outcome: "cancelled", resolvedAt: new Date(), updatedAt: new Date() })
+      .where(and(eq(issueRecoveryActions.sourceIssueId, chat.issue.id), eq(issueRecoveryActions.status, "active")));
+    expect((successor.contextSnapshot as any).wakeCommentIds, "the successor's input names the adopted steer").toContain(steerId);
+    // The cut run's release first (the press's cancel), then the dispatcher's claim: the successor owns the task's execution.
+    await releaseRun(chat);
+    await db.update(issues).set({ executionRunId: successor.id, executionAgentNameKey: null, executionLockedAt: new Date() })
+      .where(eq(issues.id, chat.issue.id));
+    await successorFails(chat, successor);
+    expect(await answered(steerId), "a failed successor answered nothing").toBe(false);
+    const retried = await request(app(chat.companyId)).post(`/api/agents/${chat.agentId}/wakeup`)
+      .send({ source: "on_demand", triggerDetail: "manual", reason: "retry_failed_run", failedRunId: successor.id });
+    expect(retried.status, JSON.stringify(retried.body)).toBe(202);
+    const retryRunId = retried.body.id as string;
+    expect(retryRunId, `the Retry started a run: cut=${chat.runId} successor=${successor.id} ${JSON.stringify(retried.body)}`).toBeTruthy();
+    expect([chat.runId, successor.id]).not.toContain(retryRunId);
+    const [retryRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryRunId));
+    const ids = (retryRun!.contextSnapshot as any).wakeCommentIds as string[];
+    expect(ids, "the Retry's new wake ids carry the adopted READ steer").toContain(steerId);
+    expect(ids).toContain(msgId);
+    expect(ids.filter(id => id === steerId), "carried once").toHaveLength(1);
+    // The Retry answers (reply + run end) ⇒ the ONE answered function says answered; nothing else wakes on it, no card.
+    await successorAnswers(chat, retryRun!);
+    expect(await answered(steerId)).toBe(true);
+    await advanceThreeMinutes(chat);
+    expect(await liveWakesNaming(chat, steerId)).toEqual([]);
+    expect(await cardsFor(chat, steerId), "no steer card once the Retry answered it").toEqual([]);
+  });
+
+  it("R7c (control): READ steer adopted; the successor ANSWERS ⇒ answered once, no card, nothing to retry", async () => {
+    const chat = await seedChat();
+    const { steerId, carry } = await steerThenInterrupt(chat, "read");
+    const successor = await admitSuccessor(chat, carry);
+    await successorAnswers(chat, successor);
+    await releaseRun(chat);
+    expect(await answered(steerId)).toBe(true);
+    await advanceThreeMinutes(chat);
+    expect(await liveWakesNaming(chat, steerId)).toEqual([]);
+    expect(await cardsFor(chat, steerId)).toEqual([]);
   });
 
   it("R6b: a QUEUED (not yet admitted) conversation-comment wake for STEER is retired into the carry at the press", async () => {
