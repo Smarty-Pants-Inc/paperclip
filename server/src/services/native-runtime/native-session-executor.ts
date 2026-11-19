@@ -27,7 +27,7 @@ import { providerFailureFromError } from "../../vendor/paperclip-runner/index.js
 import { readProviderFailure } from "@paperclipai/shared";
 import { nativeCancellationHasUnsettledOwner, notifyNativeCancellation, waitForNativeCancellation } from "./native-cancellation-delivery.js";
 import { readClaimedNativeStopRecovery } from "./native-cancellation-request.js";
-import { publishNativeHarnessBackup } from "./native-harness-backup-publication.js";
+import { keepFailedNativeHarnessBackupCapture, publishNativeHarnessBackup } from "./native-harness-backup-publication.js";
 import { markNativeHarnessBackupMissing, type NativeHarnessBackupMissingReason } from "./native-harness-backup-missing.js";
 import { restartRecoveryMeasurementFor, speedBudgetAdapter } from "./native-speed-budgets.js";
 import { getStartupRecoveryState } from "../../startup-recovery-state.js";
@@ -369,7 +369,6 @@ import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
 import { HELD_CONVERSATION_NOTICE_REASON_PREFIX, materializePiSessionRecoveryNotice, piSessionRecovery,
   readUnsupersededHeldConversationNotice, writeRestoreUnavailableContinuationNotice } from "./pi-session-recovery-notice.js";
 import { resolvePredecessorRunnerLease } from "./predecessor-runner-lease.js";
-import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
 import { applyRunnerGoalPrpEvent } from "../runner-goals.js";
 import { currentControllerProcessStamp, currentProcessSpaceHash } from "../controller-process-identity.js";
@@ -20040,7 +20039,9 @@ async function createRunnerdBackendWithinSessionClaim(
               // read. Without this, one reset loses the only copy of the
               // provider session when the per-turn sandbox is released.
               const captureSettledState = async () => {
-                rmSync(pendingRoot, { recursive: true, force: true });
+                // A failed earlier attempt's staging is kept, never deleted
+                // (pending-keep); an empty one is removed.
+                keepFailedNativeHarnessBackupCapture(backupRoot, pendingRoot);
                 const verified = await measureNativeRunnerSpan(input.trace, "harness_state.inspect", () => inspectRemoteHarnessState());
                 if (
                   !verified.complete ||
@@ -20129,7 +20130,14 @@ async function createRunnerdBackendWithinSessionClaim(
                   } : undefined,
                 });
               } finally {
-                await removeNativeHarnessBackup(pendingRoot);
+                // pending-keep (rf-3, never-OK): after a published capture the
+                // staging is gone. After a failed one it can be the only copy of
+                // this turn's trace: move it into superseded, never delete it.
+                try { keepFailedNativeHarnessBackupCapture(backupRoot, pendingRoot); } catch (error) {
+                  // The staging stays where it is; the capture's own error wins.
+                  await input.onLog?.("stderr", `[paperclip-runner] failed checkpoint staging left in place: ${
+                    (error as NodeJS.ErrnoException).code ?? "unknown"}\n`);
+                }
               }
             },
             {

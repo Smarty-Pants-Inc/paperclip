@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, constants as fsConstants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, renameSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, renameSync, rmdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { logger } from "../../middleware/logger.js";
 import { noteNativeHarnessBackupChange } from "../native-harness-backup-expiration-notifications.js";
@@ -34,15 +34,34 @@ function syncDirectory(directory: string): void {
 
 /** Atomic rename within the backup root: no copy, no delete. A failure leaves
  * `root` where it is. */
-function keepSupersededNativeHarnessBackup(backupRoot: string, root: string): string | null {
+function keepSupersededNativeHarnessBackup(backupRoot: string, root: string, suffix = ""): string | null {
   if (!present(root)) return null;
   const kept = resolve(backupRoot, NATIVE_HARNESS_BACKUP_SUPERSEDED_DIRECTORY);
   mkdirSync(kept, { recursive: true, mode: 0o700 });
-  const destination = resolve(kept, `${Date.now()}-${randomUUID()}`);
+  const destination = resolve(kept, `${Date.now()}-${randomUUID()}${suffix}`);
   renameSync(root, destination);
   syncDirectory(kept);
   syncDirectory(backupRoot);
   return destination;
+}
+
+/**
+ * BRIEF pending-keep (rf-3, never-OK): the capture stages into
+ * `failover-backups/.pending-<uuid>`. When it fails after writing there and the
+ * source box is gone, that staging is the only copy of the turn's trace. It is
+ * moved into `superseded/<ms>-<uuid>-failed-capture` by the same same-tree
+ * rename, never deleted. Only a staging with nothing in it is removed, and
+ * rmdir cannot remove a directory that has entries. Returns the kept path.
+ */
+export function keepFailedNativeHarnessBackupCapture(backupRoot: string, pendingRoot: string): string | null {
+  if (!present(pendingRoot)) return null;
+  if (lstatSync(pendingRoot).isDirectory() && readdirSync(pendingRoot).length === 0) {
+    try { rmdirSync(pendingRoot); return null; } catch (error) {
+      // Something was written after the check: keep it.
+      if (!["ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+    }
+  }
+  return keepSupersededNativeHarnessBackup(backupRoot, pendingRoot, "-failed-capture");
 }
 
 export async function publishNativeHarnessBackup(input: {
