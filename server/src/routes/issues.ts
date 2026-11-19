@@ -85,6 +85,7 @@ import { z } from "zod";
 import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { readPersonStopHold } from "../services/acknowledged-native-stop.js";
+import { isNativeAdmissionAdapter } from "../services/explicit-native-continuation.js";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
   activityLog,
@@ -7895,7 +7896,12 @@ export function issueRoutes(
       actorType: input.actor.actorType,
       actorId: input.actor.actorId,
     });
+    // The stopped bar offers Send, so it wins over a stored wait only where that
+    // Send can admit: S's native admission path (isNativeAdmissionAdapter). A
+    // legacy/process chat keeps the base gate: a stored wait (for example its
+    // live reconciliation hold after the Stop) keeps the wait line, no bar.
     if (wake && queueState?.state === "deferred" && !input.activeRun && !interruptHandoff && comments.length > 0 &&
+        (!queue.executionWait || isNativeAdmissionAdapter(assignedAgent?.adapterType)) &&
         input.issue.conversationAgentId && input.issue.conversationAgentId === input.issue.assigneeAgentId &&
         !queuedInteractionId(wake.payload)) {
       // Stop means stop (org 11-17): after a person's Stop the chat's waiting
