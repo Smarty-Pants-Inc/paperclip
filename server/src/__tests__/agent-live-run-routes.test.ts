@@ -370,10 +370,24 @@ describe("agent live run routes", () => {
         throw error;
       });
       if (kind === "native-source") expect(spill.unrecovered.length).toBe(0);
+      const restored = makeStore();
+      vi.doMock("../services/run-log-store.js", async () => ({ ...(await vi.importActual<typeof import("../services/run-log-store.js")>("../services/run-log-store.js")), getRunLogStore: () => restored }));
+      const { heartbeatService } = await vi.importActual<typeof import("../services/heartbeat.js")>("../services/heartbeat.js");
+      const real = heartbeatService(db);
+      mockHeartbeatService.getRunLogAccess.mockImplementation(real.getRunLogAccess);
+      mockHeartbeatService.readLog.mockImplementation(real.readLog);
+      const app = await createApp(db as any, { type: "board", userId: "local-board", companyIds: [companyId], source: "local_implicit", isInstanceAdmin: false });
+      const get = () => requestApp(app, url => request(url).get(`/api/heartbeat-runs/${runId}/log?limitBytes=256000`));
+      if (kind !== "native-source") {
+        const incomplete = await get();
+        expect(incomplete.status, JSON.stringify(incomplete.body)).toBe(200);
+        expect(incomplete.body.content).toBe("");
+        expect(incomplete.body.incomplete).toMatchObject({ bytes: expected.length,
+          causes: [{ code: "object_run_log_finalize_admission_timeout" }] });
+      }
       m.state.down = false;
       peerSpillENOSPC.mockRestore();
       await store.flushInflightMirrors!();
-      const restored = makeStore();
       if (kind === "native-source") {
         // Real exporter re-reads the durable native source after the refused cursor.
         const resumed = createHeartbeatRunOutput(db, { run: run!, runId, issueId: null, runLogStore: restored,
@@ -388,16 +402,11 @@ describe("agent live run routes", () => {
         const summary = await restored.finalize(resumed.handle!);
         await db.execute(sql`update heartbeat_runs set log_bytes=${summary.bytes},log_sha256=${summary.sha256} where id=${runId}`);
       }
-      vi.doMock("../services/run-log-store.js", async () => ({ ...(await vi.importActual<typeof import("../services/run-log-store.js")>("../services/run-log-store.js")), getRunLogStore: () => restored }));
-      const { heartbeatService } = await vi.importActual<typeof import("../services/heartbeat.js")>("../services/heartbeat.js");
-      const real = heartbeatService(db);
-      mockHeartbeatService.getRunLogAccess.mockImplementation(real.getRunLogAccess);
-      mockHeartbeatService.readLog.mockImplementation(real.readLog);
-      const app = await createApp(db as any, { type: "board", userId: "local-board", companyIds: [companyId], source: "local_implicit", isInstanceAdmin: false });
-      const get = () => requestApp(app, url => request(url).get(`/api/heartbeat-runs/${runId}/log?limitBytes=256000`));
       const response = await get(), again = await get();
       expect(response.status, JSON.stringify(response.body)).toBe(200);
       expect(again.body.content).toBe(response.body.content);
+      expect(response.body).not.toHaveProperty("incomplete");
+      expect(again.body).not.toHaveProperty("incomplete");
       const served = Buffer.from(response.body.content);
       const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex");
       console.info("BOUND_CUSTODY_BEFORE_ASSERT", JSON.stringify({ kind, expectedBytes: expected.length,
