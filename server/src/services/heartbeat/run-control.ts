@@ -27,6 +27,7 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "../heartbeat-run-status-payload.js";
 import { publishLiveEvent } from "../live-events.js";
 import { DEFERRED_WAKE_CONTEXT_KEY } from "./queue.js";
+import { liftRecoveredWorkspaceBlock, recordRecoveredWorkspaceRequeue, recoveredWorkspaceOwedMessages } from "../recovered-workspace-requeue.js";
 import { CANCELLABLE_HEARTBEAT_RUN_STATUSES } from "./recovery.js";
 import {
   type WakeupOptions,
@@ -805,6 +806,34 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         idempotencyKey: `remote-stop-comment:${run.id}:${wake.id}` }, wake.id);
       break;
     }
+    await requeueRecoveredWorkspaceMessages(run, issueId);
+  }
+
+  /** adopt-resolved-nothing2: a failed run whose saved work was recovered
+   * promised "your message is kept and runs when it's back". When no saved
+   * wake is left to resume (the carrying wake failed with the run), ONE wake
+   * carries every still-owed message, in thread order, through the ordinary
+   * admission. A refusal is recorded on the hold and each message keeps its
+   * own card (the unanswered-message sweep). */
+  async function requeueRecoveredWorkspaceMessages(run: { id: string; companyId: string; agentId: string; status: string;
+    contextSnapshot: unknown }, issueId: string) {
+    const owed = await recoveredWorkspaceOwedMessages(db, run, issueId);
+    if (!owed) return;
+    await liftRecoveredWorkspaceBlock(db, owed, run.id);
+    const ids = owed.commentIds;
+    const source = parseObject(run.contextSnapshot);
+    const reason = readNonEmptyString(source.wakeReason) ?? "issue_commented";
+    const context = withQueuedCommentIdsInRunContext({ ...owed.input, issueId, taskId: issueId,
+      wakeReason: reason, previousRunId: run.id, source: "workspace.recovered", recoveryActionId: owed.hold.id }, ids);
+    const payload = withQueuedCommentIdsInWakePayload({ issueId, commentId: ids.at(-1) }, ids);
+    const queued = await enqueueWakeup(run.agentId, { source: "on_demand", triggerDetail: "manual", reason, payload,
+      contextSnapshot: { ...context, wakeCommentIds: ids, wakeCommentId: ids.at(-1), commentId: ids.at(-1) },
+      requestedByActorType: "user", requestedByActorId: owed.authorUserId,
+      idempotencyKey: `recovered-workspace-requeue:${owed.hold.id}` }).catch(err => {
+      logger.warn({ err, runId: run.id }, "recovered work's owed messages could not be queued");
+      return null;
+    });
+    await recordRecoveredWorkspaceRequeue(db, owed.hold.id, { runId: queued?.id ?? null, commentIds: ids });
   }
 
   /** One writer per native session: the acknowledged Stop, a released
