@@ -1,6 +1,6 @@
 {
-  "id": "11c8ac1b-1c8e-49af-b57e-8822270cb7cd",
-  "prevId": "349cdd89-db04-4340-a5d3-3b877bf7227d",
+  "id": "408fd684-6e88-4c4d-8b5b-70d9b116f268",
+  "prevId": "d726c05c-f0b5-44c0-b9e5-ef9536cffd8a",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -16390,6 +16390,12 @@
           "notNull": true,
           "default": 0
         },
+        "default_environment_id": {
+          "name": "default_environment_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
         "default_responsible_user_id": {
           "name": "default_responsible_user_id",
           "type": "text",
@@ -16479,7 +16485,21 @@
           "with": {}
         }
       },
-      "foreignKeys": {},
+      "foreignKeys": {
+        "companies_default_environment_id_environments_id_fk": {
+          "name": "companies_default_environment_id_environments_id_fk",
+          "tableFrom": "companies",
+          "tableTo": "environments",
+          "columnsFrom": [
+            "default_environment_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
@@ -29348,6 +29368,12 @@
           "primaryKey": true,
           "notNull": true,
           "default": "gen_random_uuid()"
+        },
+        "company_id": {
+          "name": "company_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
         },
         "name": {
           "name": "name",
@@ -64128,6 +64154,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": false
+        },
+        "agent_reasoning_display": {
+          "name": "agent_reasoning_display",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::jsonb"
         },
         "created_at": {
           "name": "created_at",

@@ -17,6 +17,7 @@ import { and, count, eq, gte, inArray, isNull, lt, notInArray, sql } from "drizz
 import type { Db } from "@paperclipai/db";
 import {
   companies,
+  environments,
   companyLogos,
   assets,
   agents,
@@ -126,6 +127,7 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
     issueCounter: companies.issueCounter,
     budgetMonthlyCents: companies.budgetMonthlyCents,
     spentMonthlyCents: companies.spentMonthlyCents,
+    defaultEnvironmentId: companies.defaultEnvironmentId,
     defaultResponsibleUserId: companies.defaultResponsibleUserId,
     defaultDecisionOwnerUserId: companies.defaultDecisionOwnerUserId,
     budgetOwnerUserId: companies.budgetOwnerUserId,
@@ -324,6 +326,14 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
           .then((rows) => rows[0] ?? null);
         if (!existing) return null;
 
+        if (data.defaultEnvironmentId) {
+          const [environment] = await tx.select({ companyId: environments.companyId }).from(environments)
+            .where(eq(environments.id, data.defaultEnvironmentId));
+          if (!environment) throw unprocessable("Selected environment was not found");
+          if (environment.companyId && environment.companyId !== id) {
+            throw unprocessable("This environment belongs to another company");
+          }
+        }
         const { logoAssetId, ...companyPatch } = data;
         const willReactivate = existing.status !== "active" && companyPatch.status === "active";
         const willArchive = existing.status !== "archived" && companyPatch.status === "archived";

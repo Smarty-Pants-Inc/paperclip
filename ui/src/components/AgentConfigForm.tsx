@@ -370,7 +370,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const showCreateRunPolicySection = props.showCreateRunPolicySection ?? true;
   const hideInstructionsFile = props.hideInstructionsFile ?? false;
   const canConfigureProviderTrace = props.canConfigureProviderTrace === true;
-  const { selectedCompanyId } = useCompany();
+  const { selectedCompanyId, selectedCompany } = useCompany();
   const queryClient = useQueryClient();
   const environmentVariablesEditorRef = useRef<EnvironmentVariablesEditorHandle | null>(null);
 
@@ -446,12 +446,12 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     queryKey: queryKeys.instance.generalSettings,
     queryFn: () => instanceSettingsApi.getGeneral(),
   });
-  const { data: instanceSettings } = useQuery({
+  const { data: instanceSettings, isSuccess: instanceSettingsLoaded } = useQuery({
     queryKey: queryKeys.instance.settings,
     queryFn: () => instanceSettingsApi.get(),
   });
 
-  const { data: environments = [] } = useQuery<Environment[]>({
+  const { data: environments = [], isSuccess: environmentsLoaded } = useQuery<Environment[]>({
     queryKey: selectedCompanyId ? queryKeys.environments.list(selectedCompanyId) : ["environments", "none"],
     queryFn: () => environmentsApi.list(selectedCompanyId!),
     // Load environments when the picker is enabled OR when execution is forced
@@ -876,12 +876,30 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     () => environments.find((environment) => environment.id === currentDefaultEnvironmentId) ?? null,
     [currentDefaultEnvironmentId, environments],
   );
+  const companyDefaultEnvironmentId = selectedCompany?.id === selectedCompanyId
+    ? selectedCompany.defaultEnvironmentId ?? null : null;
   const instanceDefaultEnvironmentId = useMemo(() => {
     const environmentId = instanceSettings?.defaultEnvironmentId ?? null;
     if (!environmentId) return "";
     const selected = environments.find((environment) => environment.id === environmentId) ?? null;
-    return selected?.driver === "local" ? "" : environmentId;
-  }, [environments, instanceSettings?.defaultEnvironmentId]);
+    return !selected || selected.driver === "local" || (selected.companyId && selected.companyId !== selectedCompanyId)
+      ? "" : environmentId;
+  }, [environments, instanceSettings?.defaultEnvironmentId, selectedCompanyId]);
+  // Initialize a new draft once, after both asynchronous inputs have arrived.
+  // Never reapply defaults over an explicit choice (including a later clear).
+  const initializedEnvironmentCompany = useRef<string | null>(null);
+  useEffect(() => {
+    if (props.mode !== "create" || !selectedCompanyId || selectedCompany?.id !== selectedCompanyId
+      || !environmentsLoaded || !instanceSettingsLoaded || initializedEnvironmentCompany.current === selectedCompanyId) return;
+    initializedEnvironmentCompany.current = selectedCompanyId;
+    if (props.values.defaultEnvironmentId || forcedKubernetes || isCursorCloudRunner) return;
+    const preferred = environments.find(environment => environment.id === companyDefaultEnvironmentId);
+    const companyDefault = preferred && preferred.driver !== "local"
+      && (!preferred.companyId || preferred.companyId === selectedCompanyId) ? preferred.id : "";
+    const environmentId = companyDefault || instanceDefaultEnvironmentId;
+    if (environmentId) props.onChange({ defaultEnvironmentId: environmentId });
+  }, [props, selectedCompanyId, selectedCompany?.id, environmentsLoaded, instanceSettingsLoaded, environments,
+    companyDefaultEnvironmentId, instanceDefaultEnvironmentId, forcedKubernetes, isCursorCloudRunner]);
   const instanceDefaultEnvironment = useMemo(
     () => environments.find((environment) => environment.id === instanceDefaultEnvironmentId) ?? null,
     [environments, instanceDefaultEnvironmentId],
@@ -1016,21 +1034,22 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
 
   const runnableEnvironments = useMemo(
     () => environments.filter((environment) => {
+      if (environment.companyId && environment.companyId !== selectedCompanyId) return false;
       if (!supportedEnvironmentDrivers.has(environment.driver)) return false;
       if (environment.driver === "local") return false;
       if (environment.driver !== "sandbox") return true;
       const provider = typeof environment.config?.provider === "string" ? environment.config.provider : null;
       return provider !== null && provider !== "fake";
     }),
-    [environments, supportedEnvironmentDrivers],
+    [environments, supportedEnvironmentDrivers, selectedCompanyId],
   );
   const environmentOptions = useMemo(() => {
-    if (!currentDefaultEnvironment) return runnableEnvironments;
+    if (!currentDefaultEnvironment || (currentDefaultEnvironment.companyId && currentDefaultEnvironment.companyId !== selectedCompanyId)) return runnableEnvironments;
     if (runnableEnvironments.some((environment) => environment.id === currentDefaultEnvironment.id)) {
       return runnableEnvironments;
     }
     return [...runnableEnvironments, currentDefaultEnvironment];
-  }, [currentDefaultEnvironment, runnableEnvironments]);
+  }, [currentDefaultEnvironment, runnableEnvironments, selectedCompanyId]);
   // `runnableEnvironments` excludes the always-available Local environment, so a
   // single entry already means the user has more than one environment configured
   // (Local + that environment) and the override selector is meaningful.

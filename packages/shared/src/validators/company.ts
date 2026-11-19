@@ -38,6 +38,7 @@ export const updateCompanySchema = objectWithoutDefaults(
       spentMonthlyCents: z.number().int().nonnegative().optional(),
       // PAP-749 task 1d-lite: the default decision owner (a user). `null` clears
       // it, sending ownerless cards back to Unassigned.
+      defaultEnvironmentId: z.string().uuid().nullable().optional(),
       defaultDecisionOwnerUserId: z.string().min(1).nullable().optional(),
       // PAP-749 task 1d: the budget owner (a user). `null` leaves budget hard
       // stops in the Company view only.

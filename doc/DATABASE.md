@@ -1,5 +1,23 @@
 # Database
 
+### Company environment defaults
+
+`environments.company_id` is nullable: `NULL` means instance-shared; a company ID
+restricts new agent selections to that company. Migration 0493 assigns an owner
+only when exactly one company already references a non-Local environment through
+`agents.default_environment_id`. Unused, multiply-used and Local environments
+remain shared. Saved agent targets are not rewritten. Reads, runs and unrelated
+edits of historical cross-company selections remain supported; explicitly
+selecting another company's environment returns HTTP 422.
+
+`companies.default_environment_id` is an optional environment reference, cleared
+when that environment is deleted. Migration 0494 initializes it only for a
+company with exactly one owned, active, non-Local environment. Ambiguous companies
+remain unset. Operators can set or clear it through the existing
+`PATCH /api/companies/:companyId` route using `defaultEnvironmentId`; foreign
+owned targets are rejected. Ownership intentionally retains a deleted company's
+ID rather than silently converting its environments into shared resources.
+
 ### Better Auth 1.7.16 upgrade
 
 Better Auth 1.7.3 and later identify accounts by `provider_id` and `account_id`.

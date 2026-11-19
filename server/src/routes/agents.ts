@@ -4445,6 +4445,8 @@ export function agentRoutes(
     if (!rollbackConfig) {
       throw unprocessable("Invalid revision snapshot");
     }
+    await assertAgentDefaultEnvironmentSelection(existing.companyId,
+      typeof rollbackConfig.defaultEnvironmentId === "string" ? rollbackConfig.defaultEnvironmentId : null);
     if (typeof rollbackConfig.budgetMonthlyCents === "number" && rollbackConfig.budgetMonthlyCents !== existing.budgetMonthlyCents) {
       assertBoard(req, agentBudgetPage(existing.id));
     }
@@ -4697,6 +4699,8 @@ export function agentRoutes(
     }
     if (inheritRuntimeFrom === "caller" && hireRunner !== undefined) throw unprocessable("inheritRuntimeFrom=caller cannot be combined with runner");
     let configurationWarnings: AgentConfigurationWarning[] = [];
+    // Check the requested computer before runner normalization can replace it.
+    await assertAgentDefaultEnvironmentSelection(companyId, hireInput.defaultEnvironmentId);
     Object.assign(hireInput, await resolveNewAgentRunnerForCompany(db, companyId, { ...hireInput, runner: hireRunner,
       onConfigurationWarnings: warnings => { configurationWarnings = warnings; } }));
     hireInput.adapterType = await assertSelectableAdapterType(hireInput.adapterType, hireInput.adapterConfig, companyId);
@@ -5033,6 +5037,7 @@ export function agentRoutes(
     assertNoAgentProcessAdapterMutation(req, createInput.adapterType ?? "process", Object.keys(requestedCreateConfig).length > 0);
     assertExternalInstructionsAdmin(req, { id: agentId, companyId, name: createInput.name, adapterConfig: requestedCreateConfig });
     let configurationWarnings: AgentConfigurationWarning[] = [];
+    await assertAgentDefaultEnvironmentSelection(companyId, createInput.defaultEnvironmentId);
     Object.assign(createInput, await resolveNewAgentRunnerForCompany(db, companyId, { ...createInput, runner: createRunner, setupOnly: Boolean(setupId),
       onConfigurationWarnings: warnings => { configurationWarnings = warnings; } }));
     createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType, createInput.adapterConfig, companyId);
@@ -5747,6 +5752,9 @@ export function agentRoutes(
     const patchData = runtimeSettings
       ? prepareRuntimeSettingsPatch(existing, req.body)
       : { ...(req.body as Record<string, unknown>) };
+    if (hasOwn(patchData, "defaultEnvironmentId")) {
+      await assertAgentDefaultEnvironmentSelection(existing.companyId, patchData.defaultEnvironmentId as string | null);
+    }
     const runner = patchData.runner as AgentRunnerChoice | undefined;
     delete patchData.runner;
     const expectedConfigurationRevision = patchData.expectedConfigurationRevision as string | undefined;
@@ -5981,11 +5989,6 @@ export function agentRoutes(
       && (touchesAdapterConfiguration || Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId"))) {
       requestedRuntimeConfig = { ...(requestedRuntimeConfig ?? existing.runtimeConfig),
         aiConnection: { provider: "github", method: "api_key", mode: "responsible_user" } };
-    }
-    // Reject an explicit foreign selection before any account validation or
-    // provider work can obscure the plain company-boundary error.
-    if (Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")) {
-      await assertAgentDefaultEnvironmentSelection(existing.companyId, patchData.defaultEnvironmentId as string | null);
     }
     const nextAiBinding = aiRuntimeConnectionBindingSchema.safeParse(requestedRuntimeConfig ? requestedRuntimeConfig.aiConnection : existing.runtimeConfig.aiConnection).data;
     if (nextAiBinding) {

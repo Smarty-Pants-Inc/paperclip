@@ -8,6 +8,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentConfigRevisions,
   agents,
   companies,
   companyMemberships,
@@ -18,6 +19,7 @@ import {
   createDb,
   environments,
   approvals,
+  budgetPolicies,
   principalPermissionGrants,
   userSecretDeclarations,
   userSecretDefinitions,
@@ -26,6 +28,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { expectNoTokenLeak } from "./helpers/token-leak.js";
 import { errorHandler } from "../middleware/index.js";
 import { agentRoutes } from "../routes/agents.js";
+import { companyRoutes } from "../routes/companies.js";
 import { secretService } from "../services/secrets.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -88,6 +91,7 @@ function createApp(db: Db, actor: Express.Request["actor"]) {
     next();
   });
   app.use("/api", agentRoutes(db));
+  app.use("/api/companies", companyRoutes(db));
   app.use(errorHandler);
   return app;
 }
@@ -119,6 +123,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
     await db.delete(agents);
+    await db.delete(budgetPolicies);
     await db.delete(environments);
     await db.delete(companies);
   });
@@ -212,6 +217,63 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     const edited = await request(app).patch(`/api/agents/${parent.id}`).send({ name: "Existing cross-company agent" });
     expect(edited.status, JSON.stringify(edited.body)).toBe(200);
     expect(edited.body.defaultEnvironmentId).toBe(environment.id);
+  });
+
+  it.each(["agents", "agent-hires"])("company environment: /%s rejects a foreign selection before runner normalization", async route => {
+    const companyId = await seedCompany();
+    const otherCompanyId = await seedCompany();
+    const [environment] = await db.insert(environments).values({ name: `Foreign target ${randomUUID()}`,
+      driver: "sandbox", config: { provider: "daytona" } }).returning();
+    await db.execute(sql`UPDATE environments SET company_id = ${otherCompanyId} WHERE id = ${environment.id}`);
+    const response = await request(createApp(db, userActor())).post(`/api/companies/${companyId}/${route}`)
+      .send({ name: "Foreign Cursor", role: "engineer", adapterType: "paperclip_runner", runner: "paperclip",
+        adapterConfig: { provider: "cursor_cloud", model: "auto", repoUrl: "https://github.com/example/company-env" }, defaultEnvironmentId: environment.id });
+    expect(response.status, JSON.stringify(response.body)).toBe(422);
+    expect(response.body.error).toBe("This environment belongs to another company");
+  });
+
+  it("company environment: rollback cannot restore a foreign target", async () => {
+    const companyId = await seedCompany();
+    const otherCompanyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "codex_local", {});
+    const [environment] = await db.insert(environments).values({ name: `Foreign revision target ${randomUUID()}`,
+      driver: "sandbox", config: { provider: "daytona" } }).returning();
+    await db.execute(sql`UPDATE environments SET company_id = ${otherCompanyId} WHERE id = ${environment.id}`);
+    const [revision] = await db.insert(agentConfigRevisions).values({ companyId, agentId: parent.id,
+      beforeConfig: {}, afterConfig: { name: parent.name, role: parent.role, budgetMonthlyCents: 0,
+        adapterType: "codex_local", adapterConfig: {}, defaultEnvironmentId: environment.id } }).returning();
+    const response = await request(createApp(db, userActor()))
+      .post(`/api/agents/${parent.id}/config-revisions/${revision.id}/rollback`).send({});
+    expect(response.status, JSON.stringify(response.body)).toBe(422);
+    expect(response.body.error).toBe("This environment belongs to another company");
+    expect((await db.select().from(agents).where(eq(agents.id, parent.id)))[0].defaultEnvironmentId).toBeNull();
+  });
+
+  it("company environment: company defaults persist through API reads and reject foreign targets", async () => {
+    const companyId = await seedCompany();
+    const otherCompanyId = await seedCompany();
+    const app = createApp(db, userActor());
+    for (const ownership of ["own", "shared", "foreign"]) {
+      const [environment] = await db.insert(environments).values({ name: `Default target ${randomUUID()}`,
+        driver: "sandbox", config: { provider: "daytona" } }).returning();
+      const owner = ownership === "foreign" ? otherCompanyId : ownership === "own" ? companyId : null;
+      await db.execute(sql`UPDATE environments SET company_id = ${owner} WHERE id = ${environment.id}`);
+      const response = await request(app).patch(`/api/companies/${companyId}`).send({ defaultEnvironmentId: environment.id });
+      expect(response.status, JSON.stringify(response.body)).toBe(ownership === "foreign" ? 422 : 200);
+      if (ownership === "foreign") expect(response.body.error).toBe("This environment belongs to another company");
+      else {
+        expect(response.body.defaultEnvironmentId).toBe(environment.id);
+        const read = await request(app).get(`/api/companies/${companyId}`);
+        expect(read.status).toBe(200);
+        expect(read.body.defaultEnvironmentId).toBe(environment.id);
+      }
+    }
+    const cleared = await request(app).patch(`/api/companies/${companyId}`).send({ defaultEnvironmentId: null });
+    expect(cleared.status, JSON.stringify(cleared.body)).toBe(200);
+    expect(cleared.body.defaultEnvironmentId).toBeNull();
+    const missing = await request(app).patch(`/api/companies/${companyId}`).send({ defaultEnvironmentId: randomUUID() });
+    expect(missing.status, JSON.stringify(missing.body)).toBe(422);
+    expect(missing.body.error).toBe("Selected environment was not found");
   });
 
   function childEnvOf(res: request.Response): Record<string, unknown> {

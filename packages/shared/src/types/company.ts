@@ -25,6 +25,8 @@ export interface Company {
   issueCounter: number;
   budgetMonthlyCents: number;
   spentMonthlyCents: number;
+  /** Preferred environment for new agent drafts; absent on older servers. */
+  defaultEnvironmentId?: string | null;
   defaultResponsibleUserId: string | null;
   /**
    * PAP-749 task 1d-lite: the company's default decision owner. When set,

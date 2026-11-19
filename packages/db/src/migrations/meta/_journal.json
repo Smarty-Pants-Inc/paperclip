@@ -3382,6 +3382,13 @@
       "when": 1795122879046,
       "tag": "0493_nervous_stellaris",
       "breakpoints": true
+    },
+    {
+      "idx": 494,
+      "version": "7",
+      "when": 1795123088734,
+      "tag": "0494_rainy_lionheart",
+      "breakpoints": true
     }
   ]
 }

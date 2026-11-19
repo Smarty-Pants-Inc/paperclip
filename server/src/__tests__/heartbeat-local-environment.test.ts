@@ -167,6 +167,34 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
     });
   });
 
+  it("company environment: an existing foreign-owned target still executes and releases normally", async () => {
+    const companyId = randomUUID();
+    const ownerCompanyId = randomUUID();
+    for (const id of [companyId, ownerCompanyId]) {
+      await db.insert(companies).values({ id, name: "Existing environment company", issuePrefix: `C${id.slice(0, 7)}`,
+        defaultResponsibleUserId: "responsible-user" });
+    }
+    const [local] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    const [target] = local ? [local] : await db.insert(environments).values({ name: "Local", driver: "local" }).returning();
+    // Retained historical state: admission must not become a runtime owner check.
+    await db.update(environments).set({ companyId: ownerCompanyId }).where(eq(environments.id, target.id));
+    const directory = await mkdtemp(join(tmpdir(), "paperclip-existing-foreign-environment-"));
+    const proof = join(directory, "proof.txt");
+    const [agent] = await db.insert(agents).values({ companyId, name: "Existing foreign-target agent", status: "idle",
+      adapterType: "process", defaultEnvironmentId: target.id, adapterConfig: { command: process.execPath,
+        args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(proof)}, 'existing agent ran')`] } }).returning();
+    const queued = await heartbeat.invoke(agent.id, "on_demand", {}, "manual");
+    expect(queued).not.toBeNull();
+    const finished = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(finished?.status, JSON.stringify(finished)).toBe("succeeded");
+    expect(await readFile(proof, "utf8")).toBe("existing agent ran");
+    const leases = await waitForRunLeasesToRelease(db, queued!.id);
+    expect(leases).toHaveLength(1);
+    expect(leases[0]).toMatchObject({ environmentId: target.id, companyId, status: "released" });
+    const [saved] = await db.select().from(agents).where(eq(agents.id, agent.id));
+    expect(saved.defaultEnvironmentId).toBe(target.id);
+  });
+
   it("injects run-scoped Paperclip env into process agents", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

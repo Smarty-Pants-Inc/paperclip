@@ -105,11 +105,13 @@ vi.mock("../lib/clipboard", () => ({
   copyTextToClipboard: mockClipboard.copyTextToClipboard,
 }));
 
+const mockCompanyDefault = vi.hoisted(() => ({ id: "company-1", defaultEnvironmentId: null as string | null }));
+
 vi.mock("../context/CompanyContext", () => ({
   useCompany: () => ({
     companies: [{ id: "company-1", name: "Paperclip", issuePrefix: "CO" }],
-    selectedCompanyId: "company-1",
-    selectedCompany: { id: "company-1", name: "Paperclip", issuePrefix: "CO" },
+    selectedCompanyId: mockCompanyDefault.id,
+    selectedCompany: { name: "Paperclip", issuePrefix: "CO", ...mockCompanyDefault },
     selectionSource: "bootstrap",
     loading: false,
     error: null,
@@ -368,7 +370,7 @@ async function renderForm(
 async function renderCreateForm(
   environments: Environment[],
   valueOverrides: Partial<typeof defaultCreateValues> = {},
-  options: { showAdapterTestEnvironmentButton?: boolean } = {},
+  options: { showAdapterTestEnvironmentButton?: boolean; stateful?: boolean } = {},
 ) {
   mockEnvironmentsApi.list.mockResolvedValue(environments);
 
@@ -383,18 +385,23 @@ async function renderCreateForm(
     ...valueOverrides,
   };
   const onChange = vi.fn();
+  function Draft() {
+    const [draft, setDraft] = useState(values);
+    return <AgentConfigForm
+      mode="create"
+      values={draft}
+      onChange={change => {
+        onChange(change);
+        if (options.stateful) setDraft(previous => ({ ...previous, ...change }));
+      }}
+      hidePromptTemplate
+      showAdapterTypeField={false}
+      showAdapterTestEnvironmentButton={options.showAdapterTestEnvironmentButton ?? false}
+    />;
+  }
 
   await act(async () => {
-    renderFormView(root, queryClient,
-      <AgentConfigForm
-        mode="create"
-        values={values}
-        onChange={onChange}
-        hidePromptTemplate
-        showAdapterTypeField={false}
-        showAdapterTestEnvironmentButton={options.showAdapterTestEnvironmentButton ?? false}
-      />
-    );
+    renderFormView(root, queryClient, <Draft />);
   });
 
   await flushReact();
@@ -644,6 +651,47 @@ async function flushUntil(check: () => boolean, timeoutMs = 4000) {
 }
 
 describe("AgentConfigForm environment selector", () => {
+  it.each([
+    { companyDefault: "test-env", instanceDefault: "paul-env", expected: "test-env" },
+    { companyDefault: null, instanceDefault: "shared-env", expected: "shared-env" },
+    { companyDefault: null, instanceDefault: "paul-env", expected: "" },
+    { companyDefault: null, instanceDefault: "local-1", expected: "" },
+    { companyId: "company-other", companyDefault: "paul-env", instanceDefault: "test-env", expected: "paul-env" },
+    { companyDefault: "paul-env", instanceDefault: "shared-env", expected: "shared-env" },
+  ])("company environment: preselects $expected (company=$companyDefault instance=$instanceDefault)", async ({ companyId, companyDefault, instanceDefault, expected }) => {
+    mockCompanyDefault.id = companyId ?? "company-1";
+    mockCompanyDefault.defaultEnvironmentId = companyDefault;
+    mockInstanceSettingsApi.get.mockResolvedValue({ defaultEnvironmentId: instanceDefault });
+    const result = await renderCreateForm([
+      makeEnvironment({ id: "local-1", driver: "local" }),
+      makeEnvironment({ id: "test-env", name: "TEST computer", driver: "sandbox", companyId: "company-1", config: { provider: "daytona" } } as Partial<Environment>),
+      makeEnvironment({ id: "paul-env", name: "Paul computer", driver: "sandbox", companyId: "company-other", config: { provider: "daytona" } } as Partial<Environment>),
+      makeEnvironment({ id: "shared-env", name: "Shared computer", driver: "sandbox", config: { provider: "daytona" } }),
+    ], {}, { stateful: true });
+    try {
+      if (expected) expect(result.onChange).toHaveBeenCalledWith({ defaultEnvironmentId: expected });
+      else expect(result.onChange.mock.calls.flatMap(([change]) => change.defaultEnvironmentId ? [change.defaultEnvironmentId] : [])).toEqual([]);
+      const picker = result.container.querySelector('[aria-label="Environment override"]');
+      expect(picker).not.toBeNull();
+      expect(picker!.textContent).toContain(expected === "test-env" ? "TEST computer" : expected === "paul-env" ? "Paul computer" : expected === "shared-env" ? "Shared computer" : "Default: Local");
+      await clickElement(picker);
+      const ownEnvironment = companyId === "company-other" ? "paul-env" : "test-env";
+      const foreignEnvironment = companyId === "company-other" ? "test-env" : "paul-env";
+      expect(document.querySelector(`[role="option"][data-value="${ownEnvironment}"]`)).not.toBeNull();
+      expect(document.querySelector(`[role="option"][data-value="${foreignEnvironment}"]`)).toBeNull();
+      if (expected) {
+        await clickElement(document.querySelector('[role="option"][data-value=""]'));
+        expect(result.onChange).toHaveBeenCalledWith({ defaultEnvironmentId: "" });
+        await flushReact();
+        expect(result.container.querySelector('[aria-label="Environment override"]')?.textContent).toContain("Default:");
+      }
+    } finally {
+      mockCompanyDefault.id = "company-1";
+      mockCompanyDefault.defaultEnvironmentId = null;
+      await act(async () => result.root.unmount());
+      result.container.remove();
+    }
+  });
   let roots: Root[] = [];
 
   it.each(["paperclip", "legacy"] as const)("uses the resolved %s Claude form to preserve the correct turn limit", async defaultRunner => {

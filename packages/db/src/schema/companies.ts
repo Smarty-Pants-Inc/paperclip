@@ -1,6 +1,8 @@
 import type { InteractionResolverGovernance } from "@paperclipai/shared";
 import { numeric, pgTable, uuid, text, integer, timestamp, boolean, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
 
+import { environments } from "./environments.js";
+
 export const companies = pgTable(
   "companies",
   {
@@ -15,6 +17,7 @@ export const companies = pgTable(
     budgetMonthlyCents: integer("budget_monthly_cents").notNull().default(0),
     spendMonthUtc: text("spend_month_utc"),
     spentMonthlyCents: numeric("spent_monthly_cents", { precision: 24, scale: 7, mode: "number" }).notNull().default(0),
+    defaultEnvironmentId: uuid("default_environment_id").references(() => environments.id, { onDelete: "set null" }),
     defaultResponsibleUserId: text("default_responsible_user_id"),
     // PAP-749 task 1d-lite: the company's default decision owner. When set,
     // ownerless "Needs You" cards route to this user's "For you" list instead of
