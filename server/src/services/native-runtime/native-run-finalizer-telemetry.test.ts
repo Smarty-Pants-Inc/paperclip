@@ -222,9 +222,12 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
     expect((await db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]).toMatchObject({
       status: "done", executionRunId: null, checkoutRunId: null,
     });
+    // K12 (SUPERSEDE-BB-NOFLIP-EXPECTED-FLIP-1119, extended at the d2 compose to the executor-failed run): the run
+    // that had ended failed is not turned `succeeded`; the result is committed and the task settles as before.
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId)))[0]).toMatchObject({
-      status: "succeeded", errorCode: null, error: null,
-      resultJson: { recoveredExecutionFailure: { errorCode: "provider_transport_failed" } },
+      status: "failed", errorCode: "provider_transport_failed",
+      error: "provider_transport_failed: runner did not durably suspend before checkpoint",
+      resultJson: { endedRunKept: { schema: "paperclip.ended-run-kept.v1", status: "failed" }, finalizationPhase: "committed" },
     });
     const assessments = await db.select().from(workAssessments).where(eq(workAssessments.runId, fixture.runId));
     expect(assessments).toHaveLength(2);

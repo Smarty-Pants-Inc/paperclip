@@ -1076,6 +1076,12 @@ export const NATIVE_RUN_ENDED_STATUSES = ["failed", "timed_out", "interrupted", 
 export function nativeRunAlreadyEndedSql() {
   return sql`(${heartbeatRuns.finishedAt} is not null and ${heartbeatRuns.status} in ('failed', 'timed_out', 'interrupted', 'succeeded', 'cancelled'))`;
 }
+/** The run ended WITHOUT success before this commit: its own executor (or restart recovery) wrote that outcome while
+ * the accepted result's finalization was still pending. The commit keeps it (K12), as it keeps a late save's. */
+export function nativeRunEndedUnsuccessfullySql(projectedStatus: "succeeded" | "failed" | "cancelled") {
+  return sql`(${heartbeatRuns.finishedAt} is not null and ${heartbeatRuns.status} in ('failed', 'timed_out', 'interrupted')
+    and ${heartbeatRuns.status} is distinct from ${projectedStatus})`;
+}
 
 /** An existing selected answer, including a subsequently deleted one, must
  * never be replaced or resurrected. The ONE never-twice guard shared by the
@@ -2241,14 +2247,20 @@ async function finalizeNativeRunAndProject(input: {
       // reconciler, Retry export, a late copy-back) may commit this run's
       // accepted result and save its files; the run keeps the status, error,
       // failure code and end time it ended with. Evaluated on the locked row.
-      // Scope: a LATE SAVE, that is a finalization that had reached its terminal
-      // verdict and was reopened only to save the files (the preserved-result
-      // resumption or Retry export). A run whose finalization was still pending
-      // when its executor failed keeps the existing recovered-failure rule.
+      // Two scopes. (1) A LATE SAVE, that is a finalization that had reached its
+      // terminal verdict and was reopened only to save the files (the
+      // preserved-result resumption or Retry export): any ended run is kept.
+      // (2) Any other commit: a run that had ended WITHOUT success (its
+      // executor, or restart recovery, failed it while this finalization was
+      // still pending) and that this commit would turn into another status is
+      // kept too; it is no longer turned `succeeded` with a
+      // recoveredExecutionFailure note. Every other run (still running, already
+      // `succeeded`, or already in the projected status) keeps the ordinary
+      // commit, byte for byte.
       const lateSave = coordinator.recoveryHistory.some(entry => entry.kind === "preserved_result_finalization")
         || record(coordinator.failureDetail).workspaceExportRetry != null
         || record(run.resultJson).workspaceExportRetry != null;
-      const runAlreadyEnded = lateSave ? nativeRunAlreadyEndedSql() : sql`false`;
+      const runAlreadyEnded = lateSave ? nativeRunAlreadyEndedSql() : nativeRunEndedUnsuccessfullySql(projectedStatus);
       const projectedRunStatus = sql`case when ${heartbeatRuns.status} = 'cancelled' or ${runAlreadyEnded}
         then ${heartbeatRuns.status} else ${projectedStatus} end`;
       // Decision (i): a run cancelled after its result was accepted keeps
