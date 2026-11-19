@@ -422,6 +422,47 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     expect(notesInDb.every(c => c.deletedAt), "every note on them is deleted").toBe(true);
     expect(unansweredNotes(shownAfter), "the person sees no note").toEqual([]);
   }, 180_000);
+  // RFL ruling (c1d conds): ONE R3 note, on the LATEST held message, is the design. A plain TASK, three
+  // messages through the real comment POST, the real person Stop (POST /api/heartbeat-runs/:runId/cancel),
+  // and the product sweep on the P9-60 rows' simulated clock at +3 and +11 min after the latest message.
+  // What the person sees: GET /api/issues/:id/queued-comments and GET /api/issues/:id/comments.
+  it("RFL task: after a person's Stop the stopped queue lists ALL held messages with Send/Delete, and R3 sits on the LATEST only (+3, +11 min)", async () => {
+    const r = await exercise("waiting", "rfl-task-latest", { messages: 3 });
+    const messages = (await db.select().from(issueComments).where(and(eq(issueComments.issueId, r.issueId), eq(issueComments.authorType, "user"))))
+      .sort((a, b) => +a.createdAt - +b.createdAt);
+    expect(messages.map(m => m.body)).toEqual(["Held message 1", "Held message 2", "Held message 3"]);
+    const latest = messages.at(-1)!, earlierIds = messages.slice(0, -1).map(m => m.id);
+    const reads: unknown[] = [];
+    // As the P9-60 rows: the +1 min sweep records the wait's start (PENDING_WAIT_BOUND_MS); +3 and +11 are read.
+    for (const minutes of [1, 3, 11]) {
+      const outcome = await settleUnansweredPersonMessage(db, { companyId: r.companyId, issueId: r.issueId, now: new Date(latest.createdAt.getTime() + minutes * 60_000) });
+      if (minutes === 1) { reads.push({ minutes, outcome }); continue; }
+      const queue = (await request(r.app).get(`/api/issues/${r.issueId}/queued-comments`).expect(200)).body;
+      const shown = (await request(r.app).get(`/api/issues/${r.issueId}/comments`).expect(200)).body as any[];
+      const notes = unansweredNotes(shown);
+      reads.push({ minutes, outcome, queue: { state: queue.state, targetRunId: queue.targetRunId, executionWait: queue.executionWait,
+        entries: (queue.entries ?? []).map((e: any) => ({ id: e.comment.id, canDiscard: e.canDiscard })) },
+        notes: notes.map(n => ({ reason: n.metadata.authorizationReason, body: n.body, title: n.presentation?.title })) });
+      await fs.writeFile(path.join(process.env.TASK_OUT!, "own-rfl-task-latest-reads.json"), JSON.stringify({ messages: messages.map(m => m.id), reads }, null, 2));
+      // The stopped queue: every held message, each with Delete; the queue's Send (no run to interrupt).
+      expect(queue.state, `+${minutes} min: held`).toBe("deferred");
+      expect(queue.targetRunId, `+${minutes} min: Send, not Interrupt`).toBeNull();
+      expect(queue.executionWait, `+${minutes} min: the stopped line`).toEqual(STOPPED_BAR);
+      expect(queue.entries.map((e: any) => e.comment.id), `+${minutes} min: ALL held messages listed`).toEqual(messages.map(m => m.id));
+      expect(queue.entries.every((e: any) => e.canDiscard === true), `+${minutes} min: each can be deleted`).toBe(true);
+      // R3 on the LATEST only; messages 1..n-1 carry no note and no false card.
+      expect(notes.map(n => n.metadata.authorizationReason), `+${minutes} min: one R3, on the latest`).toEqual([`unanswered_message:${latest.id}`]);
+      expect(notes[0].body, "R3 exactly").toBe(PERSON_STOP_HELD_MESSAGE_TEXT);
+      expect(notes[0].presentation?.title).toBe(PERSON_STOP_HELD_MESSAGE_TITLE);
+      expect(JSON.stringify(notes[0])).toContain(PERSON_STOP_HELD_MESSAGE_NEXT_ACTION);
+      const onEarlier = shown.filter(c => c.authorType === "system" && earlierIds.some(id => JSON.stringify(c.metadata ?? {}).includes(id)));
+      expect(onEarlier, `+${minutes} min: messages 1..n-1 have no note or card`).toEqual([]);
+      const all = JSON.stringify(shown);
+      expect(all, "no no_run card").not.toContain(UNANSWERED_MESSAGE_NO_RUN_TEXT);
+      expect(all, "never 'assign this agent a new task'").not.toContain("assign this agent a new task");
+    }
+  }, 180_000);
+  const STOPPED_BAR = { reason: "stopped_by_person", message: "Stopped. These messages are waiting: Send them, or delete any first." };
   // P9-60 control (RFL 20:34Z): a REAL board hold with NO person Stop keeps its own card. Producer:
   // the first turn's provider fails (no Stop by anyone); the wake queue's release writes the board
   // active_run_watchdog hold (modules/wake-queue/adapters/postgres.ts recordNativeTerminalRecoveryIfNeeded).
@@ -506,7 +547,6 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     app.use("/api", agentRoutes(db, {})); app.use("/api", issueRoutes(db, {} as any, {})); app.use(errorHandler);
     return { app, companyId, agentId, issueId };
   }
-  const STOPPED_BAR = { reason: "stopped_by_person", message: "Stopped. These messages are waiting: Send them, or delete any first." };
   // R2 (SECONDARY, the board-hold shape, H2-RESULT row (i) ordering): the acknowledgement lands AFTER
   // the release, so the Stop's OWN native_continuation_requires_reconciliation hold is active. The
   // person-Stop held state wins over it through the ONE reader (readPersonStopHold): R3, never no_run.
