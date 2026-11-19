@@ -196,6 +196,10 @@ export function approvalService(db: Db) {
       const result = await decideHire({ approvalId: id }, status, userId, note);
       return { approval: result!.approval!, applied: result!.applied };
     }
+    // An approved create_company card must carry its one created organization;
+    // only approveCompanyCreation (POST /api/approvals/:id/approve) records it.
+    if (approval.type === "create_company" && status === "approved" && approval.status !== "approved")
+      throw unprocessable("Approve this organization request from its approval card.");
     return resolveApproval(id, status, userId, note);
   }
   return { ...records,

@@ -75,7 +75,7 @@ const blockerRunFields = {
 
 /** Appended when the person can retry the stopped run on this task. */
 export const EXECUTION_BLOCKER_PERSON_RETRY_ACTION =
-  "A person can use Retry on this task, or send it a new message, to continue once the previous execution has stopped. Agents cannot retry it for them.";
+  "Retry on this task, or a new message to it, continues it once the previous execution has stopped. A person can use Retry; so can the agent assigned to it or an agent that manages that agent, unless the task is a chat, whose Retry is its owner's.";
 
 export async function hasPendingRunCleanup(db: Db, companyId: string, runId: string): Promise<boolean> {
   if (await nativeManualAdmissionHoldsExecution(db, { companyId, runId })) return true;

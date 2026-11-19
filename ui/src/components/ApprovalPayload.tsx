@@ -1,4 +1,4 @@
-import { UserPlus, Lightbulb, ShieldAlert, ShieldCheck } from "lucide-react";
+import { Building2, UserPlus, Lightbulb, ShieldAlert, ShieldCheck } from "lucide-react";
 import { MarkdownBody } from "./MarkdownBody";
 import { formatCents, formatConfiguredCents } from "../lib/utils";
 
@@ -7,6 +7,7 @@ export const typeLabel: Record<string, string> = {
   approve_ceo_strategy: "CEO Strategy",
   budget_override_required: "Budget Override",
   request_board_approval: "Board Approval",
+  create_company: "Create Organization",
 };
 
 function firstNonEmptyString(...values: unknown[]): string | null {
@@ -42,6 +43,7 @@ export const typeIcon: Record<string, typeof UserPlus> = {
   approve_ceo_strategy: Lightbulb,
   budget_override_required: ShieldAlert,
   request_board_approval: ShieldCheck,
+  create_company: Building2,
 };
 
 export const defaultTypeIcon = ShieldCheck;
@@ -252,5 +254,23 @@ export function ApprovalPayloadRenderer({
   if (type === "request_board_approval") {
     return <BoardApprovalPayload payload={payload} hideTitle={hidePrimaryTitle} />;
   }
+  if (type === "create_company") return <CreateCompanyPayload payload={payload} />;
   return <CeoStrategyPayload payload={payload} />;
+}
+
+/** One new organization, exactly as approved (#21271). Creation can't be undone on hq. */
+export function CreateCompanyPayload({ payload }: { payload: Record<string, unknown> }) {
+  const budget = typeof payload.budgetMonthlyCents === "number" && payload.budgetMonthlyCents > 0
+    ? `${formatConfiguredCents(payload.budgetMonthlyCents)} / month` : null;
+  const notice = firstNonEmptyString(payload.irreversibleNotice)
+    ?? "Approving creates this new organization right away. A new organization can't be deleted on hq.";
+  return (
+    <div className="mt-3 space-y-1.5 text-sm">
+      <PayloadField label="Name" value={payload.name} />
+      <PayloadField label="Description" value={payload.description} />
+      <PayloadField label="Owner" value={payload.ownerUserId} />
+      <PayloadField label="Budget" value={budget} />
+      <p className="mt-2 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-foreground">{notice}</p>
+    </div>
+  );
 }
