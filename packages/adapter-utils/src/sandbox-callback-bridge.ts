@@ -752,12 +752,26 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       const uploadPath = `${remotePath}.${randomUUID()}.paperclip-upload`;
       const tempPath = `${uploadPath}.b64`;
       const decodedPath = `${uploadPath}.decoded`;
+      const base64Body = toBuffer(Buffer.from(body, "utf8")).toString("base64");
+      // Cold bridge startup/attachment writes tiny state markers. Do not pay
+      // prepare + append + finalize RPCs for one bounded command's worth of
+      // bytes. Keep the same private attempt path and atomic publish fence;
+      // a timeout is still an unknown write, never retried here.
+      if (base64Body.length <= REMOTE_WRITE_BASE64_CHUNK_SIZE) {
+        await runChecked(`write ${remotePath}`, [
+          "set -eu; umask 077",
+          `trap ${shellQuote(`rm -f -- ${shellQuote(decodedPath)}`)} EXIT HUP INT TERM`,
+          `mkdir -p ${shellQuote(remoteDir)}`,
+          `printf '%s' ${shellQuote(base64Body)} | base64 -d > ${shellQuote(decodedPath)}`,
+          `mv -- ${shellQuote(decodedPath)} ${shellQuote(remotePath)}`,
+        ].join("\n"));
+        return;
+      }
       try {
         await runChecked(
           `prepare upload ${remotePath}`,
           `mkdir -p ${shellQuote(remoteDir)} && rm -f ${shellQuote(tempPath)} ${shellQuote(decodedPath)} && : > ${shellQuote(tempPath)}`,
         );
-        const base64Body = toBuffer(Buffer.from(body, "utf8")).toString("base64");
         for (const chunk of base64Chunks(base64Body)) {
           await runChecked(
             `append upload chunk ${remotePath}`,

@@ -2159,6 +2159,45 @@ describe("sandbox callback bridge", () => {
     }
   });
 
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21267
+  it.each([false, true])("publishes a small bridge generation in one RPC without exposing partial bytes (decode fails=%s)", async corrupt => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "cold-bridge-marker-"));
+    cleanupDirs.push(root);
+    const destination = path.join(root, "run-state.json");
+    await writeFile(destination, "paused");
+    const real = createExecRunner();
+    const execute = vi.fn(async (input: Parameters<typeof real.execute>[0]) => real.execute(corrupt
+      ? { ...input, args: input.args?.map(arg => arg.replaceAll("base64 -d", "false")) } : input));
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({ runner: { execute }, remoteCwd: root });
+    const write = client.writeTextFile(destination, "attached:current-generation");
+    if (corrupt) {
+      await expect(write).rejects.toThrow();
+      expect(await readFile(destination, "utf8")).toBe("paused");
+    } else {
+      await write;
+      expect(await readFile(destination, "utf8")).toBe("attached:current-generation");
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect((await fs.stat(destination)).mode & 0o777).toBe(0o600);
+    }
+    expect((await readdir(root)).filter(name => name.includes("paperclip-upload"))).toEqual([]);
+  });
+
+  it("does not retry a small marker after an unknown control-RPC timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      let finish!: (result: RunProcessResult) => void;
+      const runner = { execute: vi.fn(() => new Promise<RunProcessResult>(resolve => { finish = resolve; })) };
+      const client = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: "/workspace", timeoutMs: 100 });
+      const write = client.writeTextFile("/workspace/run-state.json", "attached:current").catch(error => error);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(await write).toEqual(new Error("Sandbox bridge control command timed out after 100ms."));
+      finish({ exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null, startedAt: new Date().toISOString() });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runner.execute).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
   it("abandons a timed-out upload without replaying it or continuing after a late response", async () => {
     vi.useFakeTimers();
     try {
@@ -2179,7 +2218,7 @@ describe("sandbox callback bridge", () => {
         runner, remoteCwd: "/workspace", timeoutMs: 4 * 60 * 60 * 1000,
       });
       let error: unknown;
-      const write = client.writeTextFile("/workspace/stdin/1.json", "sensitive-input")
+      const write = client.writeTextFile("/workspace/stdin/1.json", "sensitive-input".repeat(4096))
         .catch((caught) => { error = caught; });
       await vi.advanceTimersByTimeAsync(30_000);
       expect(error).toEqual(new Error("Sandbox bridge control command timed out after 30000ms."));
