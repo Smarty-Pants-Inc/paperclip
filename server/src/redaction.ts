@@ -1145,7 +1145,7 @@ interface CredentialSpan { start: number; end: number; replacement: string }
 
 // Both scanners keep whole-line context. V1 removes terminal controls (including
 // codes inside credentials); V2 substitutes ASCII space U+0020 for bare-token
-// matching and strict Bearer bodies only at an immediate CSI boundary. General
+// matching and strict Bearer bodies only at an immediate escape boundary. General
 // schemes, assignments and context-sensitive prose rules remain V1-only.
 // Original OSC payloads are scanned so stripping a hyperlink cannot hide a key.
 /**
@@ -1171,9 +1171,7 @@ export function redactSensitiveText(input: string, context?: { quotedLeaf?: bool
   for (const escape of terminalEscapes(input)) {
     append(copiedThrough, escape.start);
     copiedThrough = escape.end;
-    if (input[escape.start] === "\u009b" || input.startsWith("\u001b[", escape.start)) {
-      boundary.escapeBoundaries!.add(boundary.text.length);
-    }
+    boundary.escapeBoundaries!.add(boundary.text.length);
     boundary.text += " ";
     boundary.starts.push(escape.start);
     boundary.ends.push(copiedThrough);
@@ -1339,19 +1337,21 @@ function redactTokenPatterns(input: string, apply: ApplyRedactionStage, patterns
 }
 
 // Match Bearer's case-insensitive scheme, but not its broad uncoloured body
-// parser: that would promote `standard<CSI>bearer abc123def` into a credential.
+// parser: that would promote `standard<escape>bearer abc123def` into a credential.
 // Share its one-or-more inline spaces/tabs; unquotedCredentialEnd consumes any
 // trailing `=` padding. Only the body retains V2's stricter 20-character floor.
-const CSI_BOUNDARY_BEARER_RE = new RegExp(
+const ESCAPE_BOUNDARY_BEARER_RE = new RegExp(
   String.raw`\b(Bearer${INLINE_WHITESPACE_RE.source}+)([A-Za-z0-9._~+/-]{20,}=*)(?![A-Za-z0-9._~+/=-])`,
   "gi",
 );
 
 function redactBoundaryTokenRanges(input: string, apply: ApplyRedactionStage, view?: AnsiCredentialView): string {
   // Run first, while match offsets still address the original boundary view.
-  // Only a substituted CSI may introduce a Bearer scheme. The original-byte
-  // token pass has no view and never acquires synthetic scheme boundaries.
-  const text = apply(input, (value, replace) => value.replace(CSI_BOUNDARY_BEARER_RE,
+  // Only a recognized escape immediately before the scheme may introduce it.
+  // Mark substitutions explicitly: even a single-byte stray ESC recognized
+  // before a credential is a boundary, but an ordinary space is not. The
+  // original-byte token pass has no view and acquires no synthetic boundaries.
+  const text = apply(input, (value, replace) => value.replace(ESCAPE_BOUNDARY_BEARER_RE,
     (match: string, prefix: string, _token: string, index: number) => {
       if (!view?.escapeBoundaries?.has(index - 1)) return match;
       return prefix + replace(index + prefix.length, index + match.length, REDACTED_EVENT_VALUE);
