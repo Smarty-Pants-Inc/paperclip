@@ -22,12 +22,13 @@ export async function openSteeringIngestion(db: Db, input: { companyId: string; 
 
 /** The native consumer is ordered. A terminal receipt closes the fence ONLY
  * when the transport's durable contiguous cursor reaches that terminal sequence.
- * A crashed/no-terminal consumer calls this only AFTER it is stopped and joined;
- * then exactly the retained read/text facts decide, not guessed lost output.
+ * A stopped consumer calls this only AFTER it is stopped and joined, including
+ * Stop with a gapped terminal; retained read/text facts then decide, not guessed
+ * lost output. This proof is independent of the source cursor.
  */
 export async function settleSteeringIngestion(db: Db, input: {
   companyId: string; runId: string; sourceInstanceId: string;
-  terminalSourceSeq?: number; highestContiguousSourceSeq?: number; noTerminal?: true;
+  terminalSourceSeq?: number; highestContiguousSourceSeq?: number; consumerStopped?: true;
 }) {
   const release = await db.transaction(async tx => {
     const [run] = await tx.select({ result: heartbeatRuns.resultJson, status: heartbeatRuns.status }).from(heartbeatRuns)
@@ -37,10 +38,15 @@ export async function settleSteeringIngestion(db: Db, input: {
     if (prior.sourceInstanceId !== input.sourceInstanceId) return false;
     const terminal = input.terminalSourceSeq ?? prior.terminalSourceSeq;
     const contiguous = Math.max(Number(prior.highestContiguousSourceSeq ?? 0), input.highestContiguousSourceSeq ?? 0);
-    const settled = typeof terminal === "number" ? contiguous >= terminal : input.noTerminal === true;
+    const terminalIngested = typeof terminal === "number" && contiguous >= terminal;
+    // Stop can retain a terminal after cancellation discarded part of its source
+    // suffix. Once the ordered consumer is stopped/joined, those gaps cannot
+    // deliver more read/text facts. Its closure proof wins over a cursor that
+    // can never become contiguous; natural completion still requires that cursor.
+    const settled = terminalIngested || input.consumerStopped === true;
     await tx.update(heartbeatRuns).set({ resultJson: { ...result, [STEERING_INGESTION_KEY]: {
       ...prior, terminalSourceSeq: terminal ?? null, highestContiguousSourceSeq: contiguous,
-      state: settled ? typeof terminal === "number" ? "terminal_ingested" : "closed_without_terminal" : "open",
+      state: terminalIngested ? "terminal_ingested" : settled ? "consumer_stopped" : "open",
     } } }).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
     return settled && result.steeringIngestionReleaseHeld === true && ["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status);
   });
