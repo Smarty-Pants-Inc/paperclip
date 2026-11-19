@@ -326,8 +326,8 @@ async function fixture(label: string, conversation = true, skipIssueComment = tr
     await peer.close(); scheduled.delete(companyId); throw error;
   }
   const running = owner.executions[0];
-  const post = async (body: string) => {
-    const receipt = await request(app).post(`/api/issues/${issueId}/comments`).send({ body, clientRequestId: randomUUID() });
+  const post = async (body: string, deliveryIntent?: "queue") => {
+    const receipt = await request(app).post(`/api/issues/${issueId}/comments`).send({ body, deliveryIntent, clientRequestId: randomUUID() });
     expect(receipt.status, JSON.stringify(receipt.body)).toBe(201);
     owner.bodies.push(body); return receipt.body as { id: string; body: string };
   };
@@ -478,7 +478,7 @@ describe("native completion promotion (rf3-ibpair)", () => {
     // must retain the release callback when it wins the guarded lock clear.
     return settleOwnableKind(db, "issue_execution_lock", { runIds: [f.runId] });
   }
-  async function finishAcrossAdmissionWindow(f: Awaited<ReturnType<typeof fixture>>) {
+  async function finishAcrossAdmissionWindow(f: Awaited<ReturnType<typeof fixture>>, heldKind: "completion" | "person" = "completion") {
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     let acquired = false;
@@ -491,7 +491,8 @@ describe("native completion promotion (rf3-ibpair)", () => {
       await heartbeatService(db).waitForRunExecutionDrain(f.runId, { timeoutMs: 15_000 });
       expect(f.owner.outcomes.get(f.runId)?.error).toContain("native_workspace_finalization_busy");
       expect((await f.wakes()).some(wake => wake.status === "deferred_issue_execution" &&
-        Array.isArray(wake.payload?.chatCompletionDeliveryIds))).toBe(true);
+        (heldKind === "completion" ? Array.isArray(wake.payload?.chatCompletionDeliveryIds)
+          : wake.idempotencyKey?.startsWith("conversation-comment:")))).toBe(true);
     } finally { release(); await physicalOwner; }
     // The durable finalization owner finishes WITHOUT re-entering completeRun.
     // Then the real ownership-registry settlement must hand the e39 receipt
@@ -520,6 +521,38 @@ describe("native completion promotion (rf3-ibpair)", () => {
     expect(wake.payload?.executionWait).toBeUndefined();
     return { delivery, wake };
   }
+  it("p-deferred: last-second person Queue leaves a REAL busy-deferred wake; busy return delivers and answers it ONCE", async () => {
+    const f = await fixture("wire-person-deferred", true, false);
+    try {
+      const message = await f.post("P-DEFERRED: answer this last-second person question", "queue");
+      await waitForPendingCommentSteers();
+      const personWakes = () => f.wakes().then(rows => rows.filter(w => w.idempotencyKey === `conversation-comment:${message.id}`));
+      await vi.waitFor(async () => expect(await personWakes()).toHaveLength(1), { timeout: 5000 });
+      expect((await personWakes())[0]).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect(f.peer.consumed).not.toContain(message.body);
+      expect(f.commands("steer")).toEqual([]);
+      expect(f.owner.peers).toHaveLength(1);
+      const started = Date.now();
+      await finishAcrossAdmissionWindow(f, "person");
+      await settleOwner(f);
+      await vi.waitFor(async () => { await f.assertAnsweredOnce([message]); }, { timeout: 30_000 });
+      await heartbeatService(db).drainActiveRunExecutions();
+      expect(Date.now() - started).toBeLessThan(30_000);
+      const successors = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+        .filter(run => run.id !== f.runId);
+      expect(successors).toHaveLength(1);
+      expect(successors[0].contextSnapshot?.wakeCommentIds).toContain(message.id);
+      expect(f.owner.peers.slice(1).flatMap(peer => peer.requests.filter(r => r.type === "prompt"))
+        .filter(r => String(r.input?.message).includes(message.body))).toHaveLength(1);
+      await settleOwner(f);
+      await f.startDelivery(); await f.passDelivery();
+      await new Promise(resolve => setTimeout(resolve, 100));
+      await f.assertAnsweredOnce([message]);
+      console.info("P-DEFERRED persisted proof", JSON.stringify({ elapsedMs: Date.now() - started, messageId: message.id,
+        wake: (await personWakes())[0], successor: successors[0].id, successorContext: successors[0].contextSnapshot }));
+    } finally { await f.close(); }
+  }, 60_000);
+
   it("normal-end control: the existing native end drain still reports a mid-reply completion once", async () => {
     const f = await fixture("rf3-normal-end", true, false);
     try {
