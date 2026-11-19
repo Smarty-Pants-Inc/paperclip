@@ -281,6 +281,20 @@ function noticeCoversAnsweredCardSql(n: string): SQL {
     and ${answeredSql({ id: sql.raw("ca.id"), companyId: sql.raw("ca.company_id"), issueId: sql.raw("ca.issue_id"),
       createdAt: sql.raw("ca.resolved_at") })})`;
 }
+/** SQL (a derived table): EVERY person input notice row n (alias) covers, each with the one function's verdict: the
+ * typed messages (comments) and the card answers (the card's id, at its answer time) its key or member list names.
+ * Retirement and the mixed-group shrink read it for every notice family (failed run, no run, no reply, waiting
+ * note, card answer), so a card answer is a member like a message: never retired or dropped with another's answer. */
+function noticeInputsSql(n: string): SQL {
+  const notice = sql.raw(n);
+  return sql`(select m.id, m.created_at as input_at, ${answeredSql(rawMessage("m"))} as answered from ${issueComments} m
+      where m.company_id = ${notice}.company_id and m.issue_id = ${notice}.issue_id and ${noticeCoversSql(n, sql.raw("m.id"))}
+    union all
+    select ca.id, ca.resolved_at as input_at, ${answeredSql({ id: sql.raw("ca.id"), companyId: sql.raw("ca.company_id"),
+        issueId: sql.raw("ca.issue_id"), createdAt: sql.raw("ca.resolved_at") })} as answered from ${issueThreadInteractions} ca
+      where ca.company_id = ${notice}.company_id and ca.issue_id = ${notice}.issue_id and ca.resolved_at is not null
+        and ${noticeCoversSql(n, sql.raw("ca.id"))})`;
+}
 /** SQL over issue_thread_interactions rows (the outer table): an owed card answer with no notice yet. The recovery
  * worker reads it with one batched query per page, beside unansweredPersonMessageCommentCondition's (work.ts). */
 export function owedCardAnswerInteractionCondition(now: Date = new Date()): SQL {
@@ -317,17 +331,16 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
       and ${noticeCoversAnsweredCardSql("n")}))`;
 }
 
-/** SQL: this issue row has a LIVE unanswered-message notice whose inputs the one function now says are ALL answered
- * (the notice is due to retire). It holds on ANY task status: the recovery worker's page query also loads a task
- * that is done or cancelled while this is true, so the notice retires (RETIRE_ON_ANY_STATUS, P9-60). */
+/** SQL: this issue row has a LIVE unanswered-message notice (any family) with an input the one function now says is
+ * answered: the notice is due to RETIRE (every input answered) or, a group notice, to SHRINK to its still-owed
+ * members. It holds on ANY task status: the recovery worker's page query also loads a task that is done or
+ * cancelled while this is true, so the notice never stays false on a finished task (RETIRE_ON_ANY_STATUS, P9-60).
+ * After the worker's pass it is false again (retired, or no answered member left), so the task is not reloaded. */
 export function answeredNoticeToRetireCondition(issueId: AnyPgColumn, companyId: AnyPgColumn): SQL {
   return sql`exists (select 1 from ${issueComments} n where n.company_id = ${companyId} and n.issue_id = ${issueId}
     and n.author_type = 'system' and n.deleted_at is null
     and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-    and (exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
-      and ${noticeCoversSql("n", sql.raw("m.id"))} and ${answeredSql(rawMessage("m"))}) or ${noticeCoversAnsweredCardSql("n")})
-    and not exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
-      and ${noticeCoversSql("n", sql.raw("m.id"))} and not ${answeredSql(rawMessage("m"))}))`;
+    and exists (select 1 from ${noticeInputsSql("n")} covered where covered.answered))`;
 }
 
 /**
@@ -420,6 +433,36 @@ export async function settleUnansweredPersonMessage(
       .sort((a, b) => a.recheckAt - b.recheckAt)[0] ?? last;
 }
 
+/** Retire every live notice whose inputs are ALL answered; shrink a group notice with an answered member and a
+ * still-owed one to the still-owed (it STAYS and stays true). No task-status or cutoff condition. */
+async function retireAnsweredNotices(db: Db, issue: { id: string; companyId: string }, now: Date): Promise<void> {
+  const [liveNotice] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+    eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+    or(sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
+      sql`starts_with(${reasonOf(issueComments.metadata)}, ${RETRYING_MESSAGE_REASON_PREFIX})`))).limit(1);
+  if (!liveNotice) return;
+  await db.transaction(async tx => {
+    await tx.select({ id: issues.id }).from(issues)
+      .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
+    await tx.execute(sql`update ${issueComments} n set deleted_at = ${now.toISOString()}::timestamptz, updated_at = ${now.toISOString()}::timestamptz
+    where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
+      and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+        or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
+      and exists (select 1 from ${noticeInputsSql("n")} covered where covered.answered)
+      and not exists (select 1 from ${noticeInputsSql("n")} covered where not covered.answered)`);
+    // A group notice with an answered member and a still-owed one STAYS and stays true: it names only the still-owed.
+    await tx.execute(sql`update ${issueComments} n set updated_at = ${now.toISOString()}::timestamptz,
+      metadata = n.metadata || (select jsonb_build_object(${UNANSWERED_MESSAGE_GROUP_KEY}::text, jsonb_agg(covered.id::text order by covered.input_at, covered.id),
+          'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX}::text || (array_agg(covered.id::text order by covered.input_at desc, covered.id desc))[1])
+        from ${noticeInputsSql("n")} covered where not covered.answered)
+    where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
+      and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX}) and n.metadata ? ${UNANSWERED_MESSAGE_GROUP_KEY}::text
+      and exists (select 1 from ${noticeInputsSql("n")} covered where covered.answered)
+      and exists (select 1 from ${noticeInputsSql("n")} covered where not covered.answered)`);
+  });
+}
+
 /** The task's owed set, one entry per message (the joint rule): every earlier person message discovery flags
  * (unansweredPersonMessageCommentCondition: in scope, unanswered by the one function, no notice yet), oldest
  * first, then the latest message LAST. Each gets its own decision; each owed GROUP gets ONE notice. */
@@ -434,40 +477,16 @@ async function settleOwedPersonMessages(
     assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId, createdAt: issues.createdAt,
   }).from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)));
   if (!issue) return [{ kind: "none" }];
-  if (input.issueCreatedAtGte && issue.createdAt < input.issueCreatedAtGte) return [{ kind: "out_of_scope" }];
-
-  // An answer to a message supersedes that message's notice (and its
-  // retrying line): the relation is message -> answer, not the notice's time.
-  // Written under the same issue fence, in the same order (issue row, then its
+  // An answer to an input supersedes that input's notice (and its retrying line): the relation is input -> answer,
+  // not the notice's time. RETIRE_ON_ANY_STATUS: this runs FIRST, on every task status (done and cancelled too) and
+  // before the worktree execution cutoff below, which decides only what may be NOTICED: a notice that is already
+  // on the thread must never stay false. Every family retires here: the inputs are the notice's messages AND card
+  // answers (noticeInputsSql). Written under the same issue fence, in the same order (issue row, then its
   // comments) as the notice writers.
-  const [liveNotice] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
-    eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-    eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
-    or(sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
-      sql`starts_with(${reasonOf(issueComments.metadata)}, ${RETRYING_MESSAGE_REASON_PREFIX})`))).limit(1);
-  if (liveNotice) await db.transaction(async tx => {
-    await tx.select({ id: issues.id }).from(issues)
-      .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
-    await tx.execute(sql`update ${issueComments} n set deleted_at = ${now.toISOString()}::timestamptz, updated_at = ${now.toISOString()}::timestamptz
-    where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
-      and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-        or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
-      and (exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
-        and ${noticeCoversSql("n", sql.raw("m.id"))} and ${answeredSql(rawMessage("m"))})
-        or ${noticeCoversAnsweredCardSql("n")})
-      and not exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
-        and ${noticeCoversSql("n", sql.raw("m.id"))} and not ${answeredSql(rawMessage("m"))})`);
-    // A group notice with an answered member and a still-owed one STAYS and stays true: it names only the still-owed.
-    await tx.execute(sql`update ${issueComments} n set updated_at = ${now.toISOString()}::timestamptz,
-      metadata = n.metadata || (select jsonb_build_object(${UNANSWERED_MESSAGE_GROUP_KEY}::text, jsonb_agg(m.id::text order by m.created_at, m.id),
-          'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX}::text || (array_agg(m.id::text order by m.created_at desc, m.id desc))[1])
-        from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
-          and ${noticeCoversSql("n", sql.raw("m.id"))} and not ${answeredSql(rawMessage("m"))})
-    where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
-      and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX}) and n.metadata ? ${UNANSWERED_MESSAGE_GROUP_KEY}::text
-      and exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
-        and ${noticeCoversSql("n", sql.raw("m.id"))} and ${answeredSql(rawMessage("m"))})`);
-  });
+  await retireAnsweredNotices(db, issue, now);
+  if (input.issueCreatedAtGte && issue.createdAt < input.issueCreatedAtGte) return [{ kind: "out_of_scope" }];
+  // Nothing is noticed on a finished task (decideUnansweredMessage): the retirement above was its whole step.
+  if (["done", "cancelled"].includes(issue.status)) return [{ kind: "out_of_scope" }];
 
   const earlierOwed = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id), eq(issueComments.authorType, "user"),
@@ -1068,14 +1087,15 @@ export async function settleUnansweredPersonMessages(
   const candidates = await db.select({ id: issues.id, companyId: issues.companyId }).from(issues).where(and(
     input.companyId ? eq(issues.companyId, input.companyId) : undefined,
     input.issueId ? eq(issues.id, input.issueId) : undefined,
-    input.issueCreatedAtGte ? sql`${issues.createdAt} >= ${input.issueCreatedAtGte.toISOString()}::timestamptz` : undefined,
-    unansweredPersonMessageCondition(issues.id, issues.companyId),
+    // The execution cutoff decides what may be NOTICED; a notice due to retire is settled on any task (old, done).
+    or(and(input.issueCreatedAtGte ? sql`${issues.createdAt} >= ${input.issueCreatedAtGte.toISOString()}::timestamptz` : undefined,
+      unansweredPersonMessageCondition(issues.id, issues.companyId)), answeredNoticeToRetireCondition(issues.id, issues.companyId)),
   )).limit(200);
   const result = { noticed: 0, pending: 0 };
   const notices = new Set<string>(); // one notice covers a whole owed group: count it once
   for (const candidate of candidates) {
     for (const outcome of await settleOwedPersonMessages(db, { companyId: candidate.companyId, issueId: candidate.id, now: input.now,
-      nativeBlockedRepairApplies: input.nativeBlockedRepairApplies })) {
+      issueCreatedAtGte: input.issueCreatedAtGte, nativeBlockedRepairApplies: input.nativeBlockedRepairApplies })) {
       if (outcome.kind === "noticed" && !notices.has(outcome.commentId)) { notices.add(outcome.commentId); result.noticed += 1; }
       if (outcome.kind === "pending") {
         result.pending += 1;
