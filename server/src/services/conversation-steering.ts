@@ -1,5 +1,5 @@
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
-import { activityLog, agents, agentWakeupRequests, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, heartbeatRunEvents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { acceptSteeredIdentity, reconcileSteeredIdentity, rejectSteeredIdentity, reserveSteeredIdentity, storedSteeringAcknowledgement } from "./run-identity.js";
 import { nativeRunHasStopRequest } from "./native-runtime/native-run-stop-request.js";
 import { logger } from "../middleware/logger.js";
@@ -15,8 +15,11 @@ export type PersonCommentSteeringOptions = {
   /** Only the existing conversation outbox, while holding the lock above. */
   lockHeld?: boolean;
   deliveryIntent?: "steer" | "queue" | "interrupt";
-  /** Definite provider refusal uses the caller's ordinary, idempotent admission. */
+  /** Fallback/refusal uses the caller's ordinary, idempotent admission. */
   onRejected?: () => Promise<unknown>;
+  /** Internal drain: the existing wake transfers custody in the prepare transaction. */
+  fallbackWakeId?: string;
+  skipFallbackDrain?: boolean;
 };
 
 // The native attachment is process-owned. This promise chain only preserves RPC
@@ -42,9 +45,74 @@ const ids = (value: unknown): string[] => Array.isArray(value) ? value.filter((i
 async function deliveryIntent(db: Db, comment: SteerablePersonComment) {
   const [receipt] = await db.select({ details: activityLog.details }).from(activityLog).where(and(
     eq(activityLog.companyId, comment.companyId), eq(activityLog.entityId, comment.issueId),
-    eq(activityLog.action, "issue.comment_added"), sql`${activityLog.details}->>'commentId' = ${comment.id}`,
+    inArray(activityLog.action, ["issue.comment_added", FALLBACK_ACTION]), sql`${activityLog.details}->>'commentId' = ${comment.id}`,
   )).orderBy(desc(activityLog.createdAt)).limit(1);
   return receipt?.details?.deliveryIntent;
+}
+
+const FALLBACK_ACTION = "issue.comment_steering_deferred";
+
+/** Persist the admission observation, not a guess from the run's later phase. */
+async function deferPersonComment(db: Db, comment: SteerablePersonComment, runId: string, reason: string, eligibleForSteering: boolean) {
+  const [prior] = await db.select({ id: activityLog.id }).from(activityLog).where(and(
+    eq(activityLog.companyId, comment.companyId), eq(activityLog.entityId, comment.issueId), eq(activityLog.runId, runId),
+    eq(activityLog.action, FALLBACK_ACTION), sql`${activityLog.details}->>'commentId' = ${comment.id}`,
+  )).limit(1);
+  if (!prior) await db.insert(activityLog).values({ companyId: comment.companyId, actorType: "system", actorId: "comment-steering",
+    action: FALLBACK_ACTION, entityType: "issue", entityId: comment.issueId, runId,
+    details: { commentId: comment.id, deliveryIntent: "steer", steeringUnavailableReason: reason, eligibleForSteering } });
+  return false;
+}
+
+/** Normal chat admission saves one wake per comment. Mixed/response/reset and
+ * non-person wakes are not default fallback input; keep their ordering fence. */
+async function waitingPersonComments(db: Db, issue: typeof issues.$inferSelect, agentId: string, run: typeof heartbeatRuns.$inferSelect) {
+  const waiting = await db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+    inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`, sql`${agentWakeupRequests.runId} is null`,
+  )).orderBy(agentWakeupRequests.createdAt, agentWakeupRequests.id);
+  const fallback: Array<{ comment: typeof issueComments.$inferSelect; wakeId: string }> = [];
+  for (const wake of waiting) {
+    const payload = object(wake.payload), context = object(payload._paperclipWakeContext);
+    const commentIds = [...new Set([...ids(payload.commentIds), ...ids(context.wakeCommentIds),
+      ...[payload.commentId, context.commentId, context.wakeCommentId].filter((id): id is string => typeof id === "string")])];
+    if (wake.requestedByActorType !== "user" || (context.wakeReason ?? wake.reason) !== "issue_commented" || commentIds.length !== 1 ||
+      payload.interactionId || context.interactionId || payload.forceFreshSession || context.forceFreshSession) return { boundary: true, fallback };
+    const [saved] = await db.select().from(issueComments).where(and(eq(issueComments.companyId, issue.companyId),
+      eq(issueComments.issueId, issue.id), eq(issueComments.id, commentIds[0]!)));
+    if (!saved || !saved.authorUserId || saved.authorAgentId || saved.deletedAt || saved.body.trim() === "/new") return { boundary: true, fallback };
+    const intent = await deliveryIntent(db, saved);
+    // Queue stays queued for a later run; choosing Send afterwards may still steer.
+    if (intent === "queue") continue;
+    if (intent !== "steer") return { boundary: true, fallback };
+    const [receipt] = await db.select({ details: activityLog.details, runId: activityLog.runId }).from(activityLog).where(and(
+      eq(activityLog.companyId, issue.companyId), eq(activityLog.entityId, issue.id), eq(activityLog.action, FALLBACK_ACTION),
+      sql`${activityLog.details}->>'commentId' = ${saved.id}`,
+    )).orderBy(desc(activityLog.createdAt)).limit(1);
+    if (!ids(run.contextSnapshot?.steeredCommentIds).includes(saved.id) &&
+      (receipt?.runId !== run.id || receipt.details?.eligibleForSteering !== true)) return { boundary: true, fallback };
+    fallback.push({ comment: saved, wakeId: wake.id });
+  }
+  fallback.sort((a, b) => a.comment.createdAt.getTime() - b.comment.createdAt.getTime() || a.comment.id.localeCompare(b.comment.id));
+  return { boundary: false, fallback };
+}
+
+/** Existing accepted turn.started is the trigger; no polling or new dispatcher. */
+export async function drainFallbackPersonComments(db: Db, runId: string): Promise<void> {
+  const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+  const issueId = run?.nativeIssueId ?? run?.contextSnapshot?.issueId;
+  if (!run || typeof issueId !== "string" || run.status !== "running") return;
+  await db.transaction(async lock => {
+    await lock.execute(sql`select pg_advisory_xact_lock(hashtextextended(${personCommentDeliveryLockKey(issueId)}, 0))`);
+    const [issue] = await db.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
+    if (!issue || issue.executionRunId !== runId) return;
+    const waiting = await waitingPersonComments(db, issue, run.agentId, run);
+    if (waiting.boundary) return;
+    for (const item of waiting.fallback) {
+      if (!await trySteerPersonComment(db, item.comment, { lockHeld: true, skipFallbackDrain: true, fallbackWakeId: item.wakeId })) break;
+    }
+  });
 }
 
 /** Default Send adopts Pi's existing steer command. The conversation outbox
@@ -65,7 +133,17 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
     sql`(${heartbeatRuns.nativeIssueId} = ${comment.issueId}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${comment.issueId})`,
     sql`coalesce(${heartbeatRuns.contextSnapshot}->'steeredCommentIds', '[]'::jsonb) ? ${comment.id}`,
   )).limit(1);
-  if (carrying) return true;
+  if (carrying) {
+    if (options.fallbackWakeId) await db.transaction(async tx => {
+      await tx.select({ id: issues.id }).from(issues).where(and(eq(issues.id, comment.issueId), eq(issues.companyId, comment.companyId))).for("no key update");
+      const [current] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, carrying.id), eq(heartbeatRuns.companyId, comment.companyId))).for("no key update");
+      if (ids(current?.contextSnapshot?.steeredCommentIds).includes(comment.id)) await tx.update(agentWakeupRequests)
+        .set({ status: "completed", runId: carrying.id, finishedAt: new Date(), updatedAt: new Date() }).where(and(
+          eq(agentWakeupRequests.id, options.fallbackWakeId!), eq(agentWakeupRequests.companyId, comment.companyId),
+          inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]), sql`${agentWakeupRequests.runId} is null`));
+    });
+    return true;
+  }
   const intent = options.deliveryIntent ?? await deliveryIntent(db, comment);
   if (intent === "queue" || intent === "interrupt") return false;
   const [issue] = await db.select().from(issues).where(and(eq(issues.id, comment.issueId), eq(issues.companyId, comment.companyId)));
@@ -78,15 +156,8 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
   const [agent] = await db.select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig }).from(agents)
     .where(and(eq(agents.id, agentId), eq(agents.companyId, issue.companyId)));
   if (agent?.adapterType !== "paperclip_runner" || object(agent.adapterConfig).provider !== "pi_rpc") return false;
-  // An explicit queued message (especially /new or a fresh-session response)
-  // is an ordering boundary. Default Send never jumps across it.
-  const waiting = await db.execute(sql`select 1 from agent_wakeup_requests w
-    where w.company_id = ${issue.companyId}::uuid and w.agent_id = ${agentId}::uuid
-      and w.status in ('queued', 'deferred_issue_execution') and w.payload->>'issueId' = ${issue.id}
-      and w.run_id is null limit 1`);
-  if (waiting.length) return false;
   const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId),
-    eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "running"),
+    eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.runtimeMode, "native"), inArray(heartbeatRuns.status, ["running", "queued"]),
     sql`(${heartbeatRuns.nativeIssueId} = ${issue.id}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id})`,
     issue.executionRunId ? eq(heartbeatRuns.id, issue.executionRunId) : undefined,
   )).orderBy(desc(heartbeatRuns.createdAt)).limit(1);
@@ -101,13 +172,51 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
     logSteeringFailure(error);
     return false;
   }
-  if (state?.disposition !== "available" || !state.activeTurnId) return false; // includes provider-ended / saving-files
+  if (state.disposition !== "available" || !state.activeTurnId) {
+    const events = await db.select({ eventType: heartbeatRunEvents.eventType }).from(heartbeatRunEvents).where(and(
+      eq(heartbeatRunEvents.companyId, issue.companyId), eq(heartbeatRunEvents.runId, run.id),
+      inArray(heartbeatRunEvents.eventType, ["turn.started", "turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"]),
+    ));
+    const finishing = events.some(event => event.eventType !== "turn.started");
+    const eligible = state.disposition !== "unsupported" && !finishing;
+    await deferPersonComment(db, comment, run.id, finishing ? "run finishing" : state.disposition === "unsupported" ? "steering unsupported"
+      : !events.length || run.status === "queued" || run.nativePhase === "starting" ? "run starting" : "steering unavailable", eligible);
+    // Close the attach/admission race: a turn attaching now waits on this same
+    // issue lock until the caller's EXISTING ordinary wake is durable. Returning
+    // handled avoids a second queue admission; GET still honestly reports queued.
+    if (eligible && options.onRejected && !options.fallbackWakeId) {
+      await options.onRejected();
+      const admitted = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${comment.id}`),
+        inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution", "claimed", "coalesced", "completed"]),
+      )).limit(1);
+      if (admitted.length) return true;
+    }
+    return false;
+  }
+  if (!options.skipFallbackDrain) {
+    const waiting = await waitingPersonComments(db, issue, agentId, run);
+    if (waiting.boundary) return deferPersonComment(db, comment, run.id, "ordered queue boundary", false);
+    for (const item of waiting.fallback) {
+      if (!await trySteerPersonComment(db, item.comment, { lockHeld: true, skipFallbackDrain: true, fallbackWakeId: item.wakeId })) return false;
+      if (item.comment.id === comment.id) return true;
+    }
+  }
   const prepared = await db.transaction(async tx => {
     const [currentIssue] = await tx.select().from(issues).where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
     const [current] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, issue.companyId))).for("no key update");
     if (!current || current.status !== "running" || nativeRunHasStopRequest(current.resultJson) ||
       currentIssue?.executionRunId !== run.id || currentIssue.assigneeAgentId !== agentId ||
       (issue.conversationAgentId && currentIssue.conversationSessionGeneration !== issue.conversationSessionGeneration)) return false;
+    if (options.fallbackWakeId) {
+      const [wake] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.id, options.fallbackWakeId), eq(agentWakeupRequests.companyId, issue.companyId),
+        eq(agentWakeupRequests.agentId, agentId), inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+        sql`${agentWakeupRequests.runId} is null`,
+      )).for("update");
+      if (!wake) return false;
+    }
     const context = object(current.contextSnapshot), result = object(current.resultJson);
     const now = new Date();
     await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context,
@@ -116,6 +225,8 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
     }, resultJson: { ...result, queuedSteeringAcknowledgements: { ...object(result.queuedSteeringAcknowledgements),
       [comment.id]: { status: "pending", queueId: null, turnId: state.activeTurnId, acknowledgedAt: now.toISOString(), deliveryIntent: "steer" },
     } }, updatedAt: now }).where(eq(heartbeatRuns.id, run.id));
+    if (options.fallbackWakeId) await tx.update(agentWakeupRequests).set({ status: "completed", runId: run.id,
+      finishedAt: now, updatedAt: now }).where(and(eq(agentWakeupRequests.id, options.fallbackWakeId), eq(agentWakeupRequests.companyId, issue.companyId)));
     return true;
   });
   if (!prepared) return false;
@@ -235,10 +346,12 @@ export async function withSteeredCommentDisplay<T extends { id: string; issueId:
       ...[payload?.commentId, context.wakeCommentId, context.commentId].filter((id): id is string => typeof id === "string")];
   }));
   const receipts = await db.select({ details: activityLog.details }).from(activityLog).where(and(
-    eq(activityLog.companyId, first.companyId), eq(activityLog.entityId, first.issueId), eq(activityLog.action, "issue.comment_added"),
+    eq(activityLog.companyId, first.companyId), eq(activityLog.entityId, first.issueId), inArray(activityLog.action, ["issue.comment_added", FALLBACK_ACTION]),
     sql`${activityLog.details}->>'commentId' in (${sql.join(comments.map(comment => sql`${comment.id}`), sql`, `)})`,
-  ));
+  )).orderBy(activityLog.createdAt);
   const intents = new Map(receipts.map(({ details }) => [String(details?.commentId), details?.deliveryIntent]));
+  const reasons = new Map(receipts.filter(({ details }) => typeof details?.steeringUnavailableReason === "string")
+    .map(({ details }) => [String(details?.commentId), String(details?.steeringUnavailableReason)]));
   const [chat] = await db.select({ agentId: issues.conversationAgentId }).from(issues)
     .where(and(eq(issues.companyId, first.companyId), eq(issues.id, first.issueId)));
   const [agent] = chat?.agentId ? await db.select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig }).from(agents)
@@ -263,6 +376,6 @@ export async function withSteeredCommentDisplay<T extends { id: string; issueId:
       steerDeliveredAt: typeof deliveredAt === "string" ? deliveredAt : null,
       deliveryOutcome: run ? "steered" : waiting.has(comment.id) ? "queued" : "ordinary",
       steeringUnavailableReason: !run && waiting.has(comment.id) && intents.get(comment.id) === "steer"
-        ? typeof refused?.steeringUnavailableReason === "string" ? refused.steeringUnavailableReason : unavailable : null };
+        ? typeof refused?.steeringUnavailableReason === "string" ? refused.steeringUnavailableReason : reasons.get(comment.id) ?? unavailable : null };
   });
 }
