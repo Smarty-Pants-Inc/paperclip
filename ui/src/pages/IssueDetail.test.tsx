@@ -6679,6 +6679,99 @@ describe("IssueDetail", () => {
     },
   );
 
+  // Planted: the run body below is reduced from what the REAL
+  // POST /api/issues/:id/tree-holds (mode pause) then GET /api/heartbeat-runs/:id
+  // returned on a warm keep_running native turn: executionCancellation requested,
+  // nativeCancellation acknowledged, lease retained, no termination receipt.
+  // fetch replays it through the real issues and heartbeats API clients.
+  it.each([
+    ["acknowledged", 1440], ["acknowledged", 390],
+    ["unacknowledged", 1440], ["unacknowledged", 390],
+    ["legacy", 1440], ["legacy", 390],
+  ] as const)("the person's tree Pause on a warm native turn: %s cancellation at %i px", async (kind, width) => {
+    // The file merges mockIssuesApi into the real issuesApi; createTreeHold's own body is api.post.
+    const { api } = await vi.importActual<typeof import("../api/client")>("../api/client");
+    const { heartbeatsApi: realHeartbeatsApi } =
+      await vi.importActual<typeof import("../api/heartbeats")>("../api/heartbeats");
+    mockSidebarState.isMobile = width < 768;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    const runId = "efd1bbd0-971b-463c-b1d0-14cd9564a148";
+    const pausePreview = createPausePreview();
+    pausePreview.activeRuns = [{ id: runId, issueId: "issue-1", agentId: "agent-1", status: "running",
+      startedAt: "2026-11-19T00:59:44.634Z", createdAt: "2026-11-19T00:59:44.491Z" }] as never;
+    const pauseHold = createPauseHold({ id: "pause-hold-warm", mode: "pause", reason: null,
+      releasePolicy: { strategy: "manual", note: "leaf_pause" }, members: [] });
+    const run: Record<string, unknown> = {
+      id: runId, companyId: "company-1", status: "cancelled", runtimeMode: "native",
+      error: "Cancelled by a board operator's subtree pause",
+      resultJson: {
+        stopReason: "paused", cancelledByActorType: "user",
+        executionCancellation: { state: "requested", requestedAt: "2026-11-19T00:59:45.156Z" },
+        nativeCancellation: {
+          schema: "paperclip.native-cancellation.v1", runId, companyId: "company-1", scope: "run",
+          effects: ["release_run_resources"], dispatched: true, reasonCode: "cancellation_run_only",
+          dispatchState: kind === "unacknowledged" ? "pending" : "acknowledged",
+          ...(kind === "unacknowledged" ? {} : { acknowledgedAt: "2026-11-19T00:59:45.176Z" }),
+        },
+      },
+    };
+    if (kind === "legacy") {
+      run.runtimeMode = "legacy";
+      delete (run.resultJson as Record<string, unknown>).nativeCancellation;
+    }
+    const requests: string[] = [];
+    vi.mocked(globalThis.fetch).mockImplementation(async (input, init) => {
+      const url = String(input);
+      requests.push(`${init?.method ?? "GET"} ${url}`);
+      const body = url.endsWith("/tree-holds") ? { hold: pauseHold, preview: pausePreview }
+        : url.endsWith(`/heartbeat-runs/${runId}`) ? run : null;
+      if (!body) return new Response("{}", { status: 404, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify(body), { status: url.endsWith("/tree-holds") ? 201 : 200,
+        headers: { "content-type": "application/json" } });
+    });
+    mockIssuesApi.createTreeHold.mockReset().mockImplementation((id: string, data: unknown) =>
+      api.post(`/issues/${id}/tree-holds`, data));
+    mockHeartbeatsApi.get.mockReset().mockImplementation((id: string) => realHeartbeatsApi.get(id));
+    mockIssuesApi.get.mockResolvedValue(createIssue({
+      status: "in_progress", assigneeAgentId: "agent-1", executionRunId: runId,
+    }));
+    mockAgentsApi.list.mockResolvedValue([createAgent()]);
+    mockAuthApi.getSession.mockResolvedValue({ session: { userId: "user-1" }, user: { id: "user-1" } });
+
+    await act(async () => { renderIssueView(); });
+    await flushReact();
+    await flushReact();
+    const moreButton = container.querySelector('button[aria-label="More task actions"]') as HTMLButtonElement | null;
+    expect(moreButton).toBeTruthy();
+    await act(async () => {
+      moreButton!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    await flushReact();
+    const pauseMenuButton = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "Pause work");
+    expect(pauseMenuButton).toBeTruthy();
+    const line = "The stop was requested, but work is still stopping";
+    const alerts = () => Array.from(container.querySelectorAll('[role="alert"]')).map((node) => node.textContent ?? "");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      await act(async () => { pauseMenuButton!.click(); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_500); });
+      const at30 = alerts();
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      const at60 = alerts();
+      expect(requests).toContain("POST /api/issues/PAP-1/tree-holds");
+      expect(requests).toContain(`GET /api/heartbeat-runs/${runId}`);
+      if (kind === "acknowledged") {
+        expect(at30.some((text) => text.includes(line))).toBe(false);
+        expect(at60.some((text) => text.includes(line))).toBe(false);
+      } else {
+        expect(at30.some((text) => text.includes(line))).toBe(true);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("confirms the composer Stop from the authoritative cancellation response during a status outage", async () => {
     mockIssuesApi.update.mockClear();
     mockAuthApi.getSession.mockResolvedValue({ session: { userId: "user-1" }, user: { id: "user-1" } });
