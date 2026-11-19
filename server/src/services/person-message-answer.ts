@@ -130,12 +130,28 @@ function liveMessageCustodySql(m: PersonMessageSql): SQL {
         and ${carriesCommentSql("live_run", m.id, false)}))`;
 }
 
+/**
+ * Option (B) (adopt-lead 15:11Z): m was EVER handed to the agent: a wake of any status, or a run, carried it.
+ * The moved-on floor applies only to such messages; a never-carried message keeps its one true card.
+ */
+function everCarriedSql(m: PersonMessageSql): SQL {
+  return sql`(exists (select 1 from ${agentWakeupRequests} any_wake
+      where any_wake.company_id = ${m.companyId}
+        and (any_wake.idempotency_key = 'conversation-comment:' || ${m.id}::text
+          or any_wake.payload->>'commentId' = ${m.id}::text
+          or any_wake.payload->'_paperclipWakeContext'->>'wakeCommentId' = ${m.id}::text
+          or coalesce(any_wake.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text))
+    or exists (select 1 from ${heartbeatRuns} any_run
+      where any_run.company_id = ${m.companyId} and ${carriesCommentSql("any_run", m.id, false)}))`;
+}
+
 export function personMessageOwedSql(m: PersonMessageSql): SQL {
   return sql`(not ${answeredPersonMessageSql(m)}
     and (${liveMessageCustodySql(m)} or not exists (select 1 from ${heartbeatRuns} moved_on
       where moved_on.company_id = ${m.companyId}
         and (moved_on.native_issue_id = ${m.issueId} or moved_on.context_snapshot->>'issueId' = ${m.issueId}::text)
         and moved_on.status = 'succeeded' and moved_on.started_at > ${m.createdAt}
+        and ${everCarriedSql(m)}
         and exists (select 1 from ${issueComments} moved_reply where moved_reply.company_id = moved_on.company_id
           and moved_reply.issue_id = ${m.issueId} and moved_reply.created_by_run_id = moved_on.id
           and moved_reply.author_type = 'agent' and moved_reply.deleted_at is null)
