@@ -19,7 +19,6 @@ import { verifiedResourceCleanup } from "./cleanup-verification-proof.js";
 import { companyHoldMismatch } from "../modules/agent-lifecycle/index.js";
 import { pendingBudgetRunCancellationExistsQuery } from "./heartbeat/budget-cancellation.js";
 import { nativeResponsePresentationPendingQuery } from "./native-runtime/native-response-presentation-query.js";
-import { nativeWithheldReplyCandidates } from "./native-runtime/native-withheld-reply.js";
 import { passiveIdleConversation } from "./conversation-idle-proof.js";
 import { idleChatHistoryChecks } from "./chat-channels/idle-history-proof.js";
 import { idleToolActionHistoryChecks } from "./tool-action-idle-proof.js";
@@ -451,8 +450,6 @@ export async function readIdleSleepSafety(
         WHERE ${companyHoldMismatch()}`));
       checks.push(workCheck("heartbeat_runs.budget_cancellation", pendingBudgetRunCancellationExistsQuery()));
       checks.push(workCheck("native_response_presentation", nativeResponsePresentationPendingQuery()));
-      // An accepted answer whose run ended without a committed reply is still owed to the person.
-      checks.push(workCheck("native_withheld_reply", nativeWithheldReplyCandidates()));
       // Only the current worker's owned runtime drain can exempt a plugin.
       // Missing workers, old SDKs, and newly installed plugins still block.
       checks.push(workCheck("plugins", quietPlugins.length === 0
