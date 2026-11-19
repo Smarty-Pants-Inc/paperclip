@@ -1741,8 +1741,9 @@ const DELETE_METHOD = "DELETE" as never;
     await db.insert(tables.agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
       idempotencyKey: `conversation-comment:${comment.id}`, source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
       status: "completed", finishedAt: now, runId, payload: { issueId: conversation.id } });
+    // The agent comment route writes the author type; the one function (which now settles the turn) reads it.
     await db.insert(tables.issueComments).values({ companyId: f.companyId, issueId: conversation.id,
-      authorAgentId: f.agentId, createdByRunId: runId, body: "The question is answered." });
+      authorType: "agent", authorAgentId: f.agentId, createdByRunId: runId, body: "The question is answered." });
     await db.update(tables.issues).set({ conversationState: "active", status: "in_progress" }).where(eq(tables.issues.id, conversation.id));
     expect(await settleConversationTurn(db, run)).toBe(true);
     expect(await read()).toEqual({ version: 1, backgroundWork: "none" });
