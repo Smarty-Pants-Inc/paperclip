@@ -274,7 +274,7 @@ describe("board retry of accepted workspace export", () => {
     try { await retryNativeWorkspaceExport(f.request); } finally { release(); }
     await lateFailure; interception.mockRestore();
     expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))[0]).toMatchObject({ phase: "result_accepted", failureCode: null, nextAttemptAt: null });
-    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]).toMatchObject({ status: "running", nativePhase: "result_accepted" });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]).toMatchObject({ status: "failed", nativePhase: "result_accepted" }); // K12: Retry export never makes an ended run `running` again
   });
   it.each(["foreign_company", "missing_result", "newer_run", "lease_rebound", "other_lease", "retained_lease", "unconfirmed_stop", "destroyed"])("rejects %s before probing or changing finalization", async (kind) => {
     const f = await seed();

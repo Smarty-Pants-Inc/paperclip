@@ -69,7 +69,8 @@ export function nativeRunProjectionNeedsRepair(projectedStatus: "succeeded" | "f
     // K12 (RFL 11-19): a run that had already ended when its late save
     // committed keeps the status it ended with (ENDED_RUN_KEPT_KEY, written by
     // that commit). It is not a missed projection, so it is never "repaired".
-    sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? ${ENDED_RUN_KEPT_KEY})`,
+    sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? ${ENDED_RUN_KEPT_KEY}
+      and ${heartbeatRuns.nativePhase} = 'committed' and ${heartbeatRuns.resultJson}->>'finalizationPhase' = 'committed')`,
     or(
       inArray(heartbeatRuns.status, ["queued", "running", "failed"]),
       and(eq(heartbeatRuns.status, projectedStatus),
