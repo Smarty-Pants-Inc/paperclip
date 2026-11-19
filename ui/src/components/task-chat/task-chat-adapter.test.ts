@@ -2,8 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { IssueChatComment } from "@/lib/issue-chat-messages";
 import {
   commentsToTaskChatItems,
-  formatTaskChatTimestamp,
-} from "./task-chat-adapter";
+  formatTaskChatTimestamp, acceptedRunResultVerdict } from "./task-chat-adapter";
 
 describe("commentsToTaskChatItems", () => {
   // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4605
@@ -146,6 +145,21 @@ describe("commentsToTaskChatItems", () => {
       kind: "message",
       verificationCaveats,
     })]);
+  });
+
+  it("shows a finished review's FAIL verdict on the reply its run wrote", () => {
+    const resultJson = { nativeResult: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", verdict: "fail",
+      summary: "Review complete. Verdict: FAIL.", verification: [{ commandOrCheck: "pnpm test", status: "failed" }] } };
+    expect(acceptedRunResultVerdict(resultJson)).toBe("fail");
+    expect(acceptedRunResultVerdict({ nativeResult: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done" } })).toBeUndefined();
+    expect(acceptedRunResultVerdict({ nativeResult: { schema: "paperclip.run_result.v1", verdict: "FAILED" } })).toBeUndefined();
+    const comments = [{
+      id: "c-review", body: "Review complete. Verdict: FAIL.", authorType: "agent", authorAgentId: "agent-1",
+      createdByRunId: "run-1", createdAt: "2026-11-19T07:15:00.000Z",
+    } as unknown as IssueChatComment];
+    const items = commentsToTaskChatItems(comments, { reviewVerdictByRunId: new Map([["run-1", "fail" as const]]) });
+    expect(items).toEqual([expect.objectContaining({ kind: "message", reviewVerdict: "fail" })]);
+    expect(commentsToTaskChatItems(comments)).toEqual([expect.not.objectContaining({ reviewVerdict: expect.anything() })]);
   });
 
   it("carries presentation, metadata, and the raw timestamp for system comments", () => {

@@ -389,6 +389,14 @@ function TaskChatBubbleContent({
           </AttachmentGroup>
         </div>
       ) : null}
+      {!isHuman && item.reviewVerdict ? (
+        <div
+          className={`mx-1 w-fit rounded-md border px-2 py-1 text-xs font-medium ${item.reviewVerdict === "fail" ? "border-red-500/30 bg-red-500/5 text-red-800 dark:text-red-200" : "border-emerald-500/30 bg-emerald-500/5 text-emerald-800 dark:text-emerald-200"}`}
+          data-testid="task-chat-review-verdict"
+        >
+          {item.reviewVerdict === "fail" ? "Verdict: FAIL" : "Verdict: PASS"}
+        </div>
+      ) : null}
       {!isHuman && item.verificationCaveats?.length ? (
         <div
           className="mx-1 w-(--sz-calc-7) rounded-md border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-xs"

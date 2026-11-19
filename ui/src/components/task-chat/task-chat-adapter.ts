@@ -25,6 +25,21 @@ export interface TaskChatAdapterContext {
    */
   issueAssigneeAgentId?: string | null;
   verificationCaveatsByRunId?: ReadonlyMap<string, TaskChatMessageItem["verificationCaveats"]>;
+  reviewVerdictByRunId?: ReadonlyMap<string, NonNullable<TaskChatMessageItem["reviewVerdict"]>>;
+}
+
+/** The verdict an accepted run result recorded, read from the run's resultJson. */
+export function acceptedRunResultVerdict(resultJson: unknown): "pass" | "fail" | undefined {
+  if (!resultJson || typeof resultJson !== "object" || Array.isArray(resultJson)) return undefined;
+  const run = resultJson as Record<string, unknown>;
+  const semantic = run.semanticResult && typeof run.semanticResult === "object" ? (run.semanticResult as Record<string, unknown>).result : null;
+  for (const candidate of [run.nativeResult, run.acceptedResult, semantic]) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const result = candidate as Record<string, unknown>;
+    if (result.schema !== "paperclip.run_result.v1") continue;
+    return result.verdict === "pass" || result.verdict === "fail" ? result.verdict : undefined;
+  }
+  return undefined;
 }
 
 function effectiveAgentId(comment: IssueChatComment): string | null {
@@ -146,6 +161,9 @@ export function commentsToTaskChatItems(
       verificationCaveats: sourceRunId
         ? ctx.verificationCaveatsByRunId?.get(sourceRunId)
         : undefined,
+      ...(kind === "agent" && sourceRunId && ctx.reviewVerdictByRunId?.get(sourceRunId)
+        ? { reviewVerdict: ctx.reviewVerdictByRunId.get(sourceRunId) }
+        : {}),
       agentIcon,
       onBehalfOfUserName,
       ...(kind === "agent" && sourceRunId ? { sourceRunId } : {}),

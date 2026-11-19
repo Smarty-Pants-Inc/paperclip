@@ -226,6 +226,7 @@ Before exiting, persist the appropriate waiting path: a saved pending interactio
 Before ending any heartbeat, apply this final-disposition checklist:
 
 - `done`: the requested work is complete, verification is recorded, and no follow-up remains on this issue.
+- Report every check truthfully. If your task is a review, audit, or other verdict on work you did not produce and it found failures, the review itself is done: finish it as `done` with `verdict: "fail"` on `paperclip_finish`, keep each check that found a defect `failed`, and state the findings. Never relabel a failed check `passed` to get a report accepted; a failed check without `verdict: "fail"` means your own work is not done.
 - `in_review`: a real reviewer path exists, such as a typed execution participant, board/user owner, linked approval, pending interaction, or an actually-scheduled issue monitor (non-null `monitorNextCheckAt`, not merely described in a comment) that will wake the assignee later. Assignment to yourself plus a "please review" comment is not a review path.
 - `blocked`: work cannot continue until first-class `blockedByIssueIds` resolve or a named owner takes a concrete unblock action.
 - If work is delegated, use blockers when the current issue must wait for that work. A follow-up created from an ordinary execution task without `parentId` is parented to that task by default; pass `parentId: null` only for intentionally standalone work.

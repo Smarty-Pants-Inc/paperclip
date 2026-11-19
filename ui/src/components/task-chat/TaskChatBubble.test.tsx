@@ -524,6 +524,29 @@ describe("TaskChatBubble verification caveats", () => {
   });
 });
 
+describe("TaskChatBubble review verdict", () => {
+  it("shows a finished review's FAIL verdict truthfully beneath its reply", () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    flushSync(() => root.render(
+      <ThemeProvider>
+        <TaskChatBubble item={{ id: "review", kind: "message", author: "agent", authorName: "Reviewer",
+          text: "Review complete. Three refund tests fail.", reviewVerdict: "fail" }} />
+      </ThemeProvider>,
+    ));
+    expect(container.querySelector('[data-testid="task-chat-review-verdict"]')?.textContent).toBe("Verdict: FAIL");
+    flushSync(() => root.render(
+      <ThemeProvider>
+        <TaskChatBubble item={{ id: "impl", kind: "message", author: "agent", authorName: "Builder", text: "Implemented." }} />
+      </ThemeProvider>,
+    ));
+    expect(container.querySelector('[data-testid="task-chat-review-verdict"]')).toBeNull();
+    flushSync(() => root.unmount());
+    container.remove();
+  });
+});
+
 describe("TaskChatBubble interstitial self-talk (PAP-357)", () => {
   let container: HTMLDivElement;
   let root: Root | null = null;

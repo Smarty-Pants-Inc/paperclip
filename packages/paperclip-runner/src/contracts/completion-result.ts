@@ -3,7 +3,7 @@ export const PRP_COMPLETION_TOOL_NAME = "paperclip_finish" as const;
 export const PRP_BLOCK_TOOL_NAME = "paperclip_block" as const;
 /** Native Runner guidance; legacy adapters use their own skill/API completion paths. */
 export const PRP_COMPLETION_TOOL_DESCRIPTION =
-  "Report completed work (done), work requiring review (needs_review), or an explicit wait (yielded with response_wake for a response, monitor after set_task_monitor confirms a schedule on this task, or omit continuation to use this run's authorized published-review wait or saved repository-preparation continuation). Use the current completion contract and supporting evidence. If rejected, correct the report and retry. After acceptance, read the returned outcome; do not claim completion while gated. Explain any required approval with its supplied link and action, then write the final response and end the turn without further tool calls.";
+  "Report completed work (done), work requiring review (needs_review), or an explicit wait (yielded with response_wake for a response, monitor after set_task_monitor confirms a schedule on this task, or omit continuation to use this run's authorized published-review wait or saved repository-preparation continuation). Use the current completion contract and supporting evidence. If rejected, correct the report and retry. After acceptance, read the returned outcome; do not claim completion while gated. Explain any required approval with its supplied link and action, then write the final response and end the turn without further tool calls. Report every check truthfully. If your work is a review, audit, or other verdict on work you did not produce and it found failures, that is finished work: report done with verdict \"fail\" and keep the checks that found defects failed. Never relabel a failed check passed to get a report accepted.";
 export const PRP_BLOCK_TOOL_DESCRIPTION =
   "Report work that cannot continue because of a concrete blocker. Routine repository preparation is not a blocker: use paperclip_finish with yielded and omit continuation to resume through the saved workspace continuation. Identify the blocker, its owner, and the action needed to unblock it; use the current completion contract and supporting evidence. If rejected, correct the report and retry. After acceptance, read the returned outcome, explain the blocker and any required action in the final response, and end the turn without further tool calls.";
 export const PRP_SEMANTIC_RESULT_CONFLICT_MESSAGE = "A different semantic result was already committed";
@@ -101,10 +101,20 @@ const evidenceSchema = {
   },
 } as const;
 
+const VERIFICATION_DESCRIPTION =
+  "Checks used to verify the work. Use failed only when the check actually ran and found a defect in the work. If a check could not run or complete because the environment, tool, dependency, permission, credential, policy, external service, or budget was unavailable, use not_run with reasonCode even when the attempted command exited non-zero. When your work is a review or audit of other work, list the checks you ran on it here; a check that found a defect is failed, and the report carries verdict \"fail\". Never relabel a failed check passed.";
+
+/** Optional outcome of a task whose deliverable is itself a verdict on other work. */
+export const PRP_RESULT_VERDICTS = ["pass", "fail"] as const;
+const verdictSchema = {
+  enum: [...PRP_RESULT_VERDICTS],
+  description:
+    "Only when this task's deliverable is a verdict on work you did not produce (a review, audit, acceptance check, or investigation). fail: you finished that work and it found the subject failing; report done, keep each check that found a defect failed, and state the findings in summary. pass: the subject passed every check. Omit it for your own implementation work, whose failed checks mean the work is not done. Never relabel a failed check passed.",
+} as const;
+
 const verificationSchema = {
   type: "array",
-  description:
-    "Checks used to verify the work. Use failed only when the check actually ran and found a defect in the work. If a check could not run or complete because the environment, tool, dependency, permission, credential, policy, external service, or budget was unavailable, use not_run with reasonCode even when the attempted command exited non-zero.",
+  description: VERIFICATION_DESCRIPTION,
   items: {
     type: "object",
     additionalProperties: false,
@@ -212,6 +222,7 @@ export const PRP_COMPLETION_RESULT_OUTPUT_SCHEMA = {
   properties: {
     ...commonResultProperties,
     reportedWorkDisposition: { enum: ["done", "needs_review", "yielded"] },
+    verdict: verdictSchema,
     continuation: waitContinuationSchema,
   },
   allOf: [
@@ -272,8 +283,7 @@ export const PRP_BLOCK_RESULT_OUTPUT_SCHEMA = {
 
 const providerVerificationCompatibilitySchema = {
   type: "array",
-  description:
-    "Checks used to verify the work. Use failed only when the check actually ran and found a defect in the work. If a check could not run or complete because the environment, tool, dependency, permission, credential, policy, external service, or budget was unavailable, use not_run with reasonCode even when the attempted command exited non-zero.",
+  description: VERIFICATION_DESCRIPTION,
   items: {
     type: "object",
     additionalProperties: true,
@@ -381,6 +391,7 @@ export const PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA = {
   properties: {
     ...providerCommonResultProperties,
     reportedWorkDisposition: { enum: ["done", "needs_review", "yielded", "completed"] },
+    verdict: verdictSchema,
     verification: providerVerificationCompatibilitySchema,
     attentionRequests: providerAttentionCompatibilitySchema,
     // Responses-compatible gateways can require every declared property in

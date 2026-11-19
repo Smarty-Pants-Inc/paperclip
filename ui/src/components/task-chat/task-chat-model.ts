@@ -154,6 +154,11 @@ export interface TaskChatMessageItem {
     reasonCode?: string | null;
     detail?: string | null;
   }>;
+  /**
+   * Verdict the run reported when its deliverable was a verdict on other work
+   * (a review or audit). "fail" is a finished review that found failures.
+   */
+  reviewVerdict?: "pass" | "fail";
   /** Assigned agent icon name (AgentIconName) for the avatar header. */
   agentIcon?: string | null;
   agent?: import("../AgentAvatar").AvatarAgent;

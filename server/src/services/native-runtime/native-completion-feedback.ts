@@ -176,6 +176,12 @@ export async function nativeCompletionFeedback(
     }
   }
   const signals = normalizePrpResultSignals(result);
+  // A finished review (or other verdict on work this agent did not produce)
+  // that found failures reports verdict "fail"; its failed checks are the
+  // findings, not unfinished work. Without that verdict, a failed check still
+  // means the agent's own work is not done.
+  const failedVerification = result.verdict !== "fail" &&
+    signals.verification.some((entry) => entry.status === "failed");
   if (
     result.reportedWorkDisposition === "done" &&
     (!result.completionClaim.objectiveSatisfied ||
@@ -185,7 +191,7 @@ export async function nativeCompletionFeedback(
       result.completionClaim.remainingWork.some(
         (entry) => entry.blocksCompletion,
       ) ||
-      signals.verification.some((entry) => entry.status === "failed") ||
+      failedVerification ||
       signals.actionableAttentionRequests.length > 0)
   ) {
     const toolAction = record(run.contextSnapshot?.toolAction);
@@ -196,12 +202,12 @@ export async function nativeCompletionFeedback(
       !result.completionClaim.objectiveSatisfied && "completionClaim.objectiveSatisfied.false",
       result.completionClaim.criteria.some((entry) => entry.status !== "satisfied") && "completionClaim.criteria.unsatisfied",
       result.completionClaim.remainingWork.some((entry) => entry.blocksCompletion) && "completionClaim.remainingWork.blocksCompletion",
-      signals.verification.some((entry) => entry.status === "failed") && "verification.failed",
+      failedVerification && "verification.failed",
       signals.actionableAttentionRequests.length > 0 && "attentionRequests.actionable",
     ].filter(Boolean).join(", ") : "";
     if (result.completionClaim.objectiveSatisfied &&
         result.completionClaim.criteria.every(entry => entry.status === "satisfied") &&
-        !signals.verification.some(entry => entry.status === "failed") &&
+        !failedVerification &&
         signals.actionableAttentionRequests.every(request => request.kind === "review") &&
         issue.executionState?.status !== "pending" && !isConversation(issue) &&
         completionReviewStageEntry(issue, run.agentId).kind === "starts") {
@@ -209,6 +215,7 @@ export async function nativeCompletionFeedback(
     }
     throw new Error(
       "The done report includes unfinished work, failed verification, or an outstanding decision. Finish the work or report the concrete blocker/reviewer request. No human completion approval was created." +
+      " Report the failure truthfully. If your work is a review, audit, or other verdict on work you did not produce and it found failures, that is finished work: report done with verdict \"fail\" and keep those checks failed. Never change a failed check to passed." +
       (failedActionChat ? ` Rejection fields: ${rejectionReasons}.` + " This chat turn may finish with a truthful report of the failed approved action; that does not mean the external action succeeded. Keep the failure, observed state, and unresolved work explicit in the summary. Verify the observed state factually. Use not_run with a truthful reason only for a check that could not run or complete because its dependency was unavailable. Do not change a failed check to passed or hide incomplete work. Do not automatically replay the action or request approval again to force success; report the outcome and let the user decide whether to retry." : ""),
     );
   }

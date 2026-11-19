@@ -2214,6 +2214,28 @@ describe("TaskChatThread runtime transcript selection", () => {
     }
   });
 
+  it("shows a finished review's recorded FAIL verdict on its saved reply", () => {
+    const run = nativeRunningRun();
+    const body = "Review complete. Verdict: FAIL. Three refund tests fail.";
+    nativeTranscriptState.terminalHydratedRunIds = new Set([run.id]);
+    nativeTranscriptState.transcriptByRun.set(run.id, []);
+    const reply: NonNullable<ComponentProps<typeof TaskChatThread>["comments"]>[number] = {
+      id: "review-reply", companyId: "company", issueId: "issue", runId: run.id,
+      authorType: "agent", authorAgentId: run.agentId, authorUserId: null,
+      body, presentation: null, metadata: null,
+      createdAt: new Date("2026-11-19T07:15:10.000Z"), updatedAt: new Date("2026-11-19T07:15:10.000Z"),
+    };
+    const linkedRun = (verdict?: string) => ({
+      ...run, runId: run.id, status: "succeeded", finishedAt: "2026-11-19T07:15:10.000Z",
+      resultJson: { nativeResult: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: body,
+        ...(verdict ? { verdict } : {}), verification: [{ commandOrCheck: "pnpm test", status: "failed" }] } },
+    });
+    renderThread({ comments: [reply], onAdd: async () => {}, issueStatus: "done", linkedRuns: [linkedRun("fail")] });
+    expect(container.querySelector('[data-testid="task-chat-review-verdict"]')?.textContent).toBe("Verdict: FAIL");
+    renderThread({ comments: [reply], onAdd: async () => {}, issueStatus: "done", linkedRuns: [linkedRun()] });
+    expect(container.querySelector('[data-testid="task-chat-review-verdict"]')).toBeNull();
+  });
+
   it("keeps runner layout during admission and native transcripts scoped to native runs", () => {
     nativeTranscriptState.transcriptByRun.set("native-run", [
       assistantEntry("2026-08-25T18:00:01.000Z", "Checking the task.", "progress"),

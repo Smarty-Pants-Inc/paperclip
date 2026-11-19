@@ -55,7 +55,7 @@ import {
   TaskChatTurnStatusIsland,
   taskChatTurnStatusModel,
 } from "@/components/task-chat/TaskChatTurnStatusIsland";
-import { commentsToTaskChatItems } from "@/components/task-chat/task-chat-adapter";
+import { acceptedRunResultVerdict, commentsToTaskChatItems } from "@/components/task-chat/task-chat-adapter";
 import {
   taskChatStatusRelevance,
   withoutHistoricalRunStatus,
@@ -946,6 +946,15 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     return map;
   }, [linkedRuns]);
 
+  const reviewVerdictByRunId = useMemo(() => {
+    const map = new Map<string, "pass" | "fail">();
+    for (const run of linkedRuns ?? []) {
+      const verdict = acceptedRunResultVerdict(run.resultJson);
+      if (verdict) map.set(run.runId, verdict);
+    }
+    return map;
+  }, [linkedRuns]);
+
   // Historical placeholder comments remain untouched in storage. Projection
   // prefers the accepted semantic result so runs such as DOT-20 recover their
   // real upstream response without a data migration.
@@ -1033,6 +1042,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
         currentUserId,
         issueAssigneeAgentId,
         verificationCaveatsByRunId,
+        reviewVerdictByRunId,
       }),
     [
       renderedComments,
@@ -1042,6 +1052,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
       currentUserId,
       issueAssigneeAgentId,
       verificationCaveatsByRunId,
+      reviewVerdictByRunId,
     ],
   );
 

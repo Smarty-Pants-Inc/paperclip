@@ -4685,6 +4685,13 @@ export const resultSchema = {
       "minLength": 1,
       "maxLength": 12000
     },
+    "verdict": {
+      "enum": [
+        "pass",
+        "fail"
+      ],
+      "description": "Optional. Set only when the task's deliverable is a verdict on work the agent did not produce (a review, audit, acceptance check, or investigation). fail records a finished review that found the subject failing; its failed checks are findings, not unfinished work."
+    },
     "completionClaim": {
       "type": "object",
       "required": [
