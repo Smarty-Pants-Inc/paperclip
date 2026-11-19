@@ -14,6 +14,8 @@ import { completeSetupTokenAiConnection } from "../services/setup-token-ai-conne
 import { connectionManagementService, continuingConnectionManagement } from "../services/connection-management.js";
 import { connectionManagementGuard, connectionRequestContext, connectionRequestUserId, aiLoginUserAction } from "./connection-management-authz.js";
 import { cancellationRequestId } from "../services/native-runtime/native-cancellation-request.js";
+import { recordPersonStopOfEndedRun } from "../services/acknowledged-native-stop.js";
+import { CANCELLABLE_HEARTBEAT_RUN_STATUSES } from "../services/heartbeat/recovery.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE } from "../services/native-runtime/completed-turn-cleanup.js";
 import { agentHarnessType, isEnvironmentDriverSupportedForAdapter, normalizeClaudeRunnerOptions, type AgentConfigurationWarning, type AgentRunnerChoice } from "@paperclipai/shared";
 import { resolveNewAgentRunnerForCompany } from "../services/agent-runner-selection.js";
@@ -7558,6 +7560,11 @@ export function agentRoutes(
     if (!(await assertRunReadAllowed(req, res, existing))) return;
     const requestId = cancellationRequestId(req.body?.cancellationRequestId);
     const actor = getActorInfo(req);
+    // R17: a board person's Stop of a run that had ALREADY ENDED (nothing to cancel) counts as their Stop
+    // for the hold when it is the task's latest run and holds their own waiting messages; it returns as today.
+    if (req.actor.type === "board" && req.actor.userId
+      && !(CANCELLABLE_HEARTBEAT_RUN_STATUSES as readonly string[]).includes(existing.status))
+      await recordPersonStopOfEndedRun(db, { run: existing, userId: req.actor.userId });
     // Recovery already treats operator_interrupted as an intentional stop.
     // Keep that stop intent for a managing agent without attributing it to a user.
     const run = await heartbeat.cancelRun(runId, req.actor.type === "agent"
