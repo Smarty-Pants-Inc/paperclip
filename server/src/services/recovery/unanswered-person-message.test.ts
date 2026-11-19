@@ -111,11 +111,23 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         finishedAt: ["running", "queued", "scheduled_retry"].includes(r.status) ? null : finishedAt }).returning();
       return row!.id;
     };
-    // createdAt: the fixture clock (in the past), or a given time for a reply that follows a REAL route's write
-    // (a real card answer is stamped now: a reply to it is dated after it, as in production).
+    // createdAt: the fixture clock (in the past) for a reply among fixture-clock rows.
     const reply = async (runId: string, createdAt: Date = at()) => {
       await db.insert(issueComments).values({ companyId, issueId, body: "Here is my answer.", authorType: "agent", authorAgentId: agentId,
         createdByRunId: runId, createdAt });
+    };
+    // A reply that follows a REAL route's write (merged9 item 4): NO date is set by hand. The reply row takes its
+    // own insert timestamp (issue_comments.created_at default now(), as the real comment insert does), and the
+    // order is asserted from the two writers' own stamps: the card's resolvedAt, written by the real
+    // answerQuestions, and this row's createdAt.
+    const replyAfterRealAnswer = async (runId: string, cardId: string) => {
+      const [card] = await db.select({ resolvedAt: issueThreadInteractions.resolvedAt }).from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, cardId));
+      expect(card?.resolvedAt, "the real answer route stamped the answer").toBeInstanceOf(Date);
+      const [row] = await db.insert(issueComments).values({ companyId, issueId, body: "Here is my answer.", authorType: "agent",
+        authorAgentId: agentId, createdByRunId: runId }).returning();
+      expect(row!.createdAt.getTime(), "the reply's own insert stamp follows the answer's own stamp").toBeGreaterThan(card!.resolvedAt!.getTime());
+      return row!;
     };
     // A retry continuation whose input is built by the REAL producer (record SUPERSEDE-M1-ANSWER-CHAIN-1119, D1):
     // every real retry / recovery seed spreads the ONE carry over the run it continues, readContinuationCommentInput
@@ -185,7 +197,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         .where(eq(heartbeatRuns.id, target));
       return target;
     };
-    return { companyId, agentId, issueId, userId, message, run, reply, boardHold, sweep, visible, at, nativeSuccessor, retryContinuation };
+    return { companyId, agentId, issueId, userId, message, run, reply, replyAfterRealAnswer, boardHold, sweep, visible, at, nativeSuccessor, retryContinuation };
   }
 
   const codeOf = (comment: { metadata: unknown }) => {
@@ -1642,7 +1654,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const successor = await f.nativeSuccessor(resume, "succeeded", { fromProducer: true });
       expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor)))[0]!.contextSnapshot,
         "the real native-status continuation names the card answer it continues").toMatchObject({ attributionInteractionIds: [card!.id] });
-      await f.reply(successor, new Date()); // after the real answer (stamped now by the answer route)
+      await f.replyAfterRealAnswer(successor, card!.id); // dated by its own insert, after the real answer's own stamp
       expect(await freshContinuationDescendsFrom(db, { companyId: f.companyId, issueId: f.issueId,
         runId: successor, ancestorRunId: carryingRunId, includeAnswerLineage: true })).toBe(true);
       await f.sweep();
@@ -1812,10 +1824,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await noticesEver()).toHaveLength(0);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, first!.targetRunId!));
     await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.id, wakes[0]!.id));
-    // The reply follows the REAL answer (answerQuestions stamps it now), as in production: a reply dated before the
-    // answer it answers never counts (the one rule, and the card-answer duty, RFL ruling 4, would owe the answer).
-    await f.reply(first!.targetRunId!, new Date());
+    // The reply follows the REAL answer, as in production: a reply dated before the answer it answers never counts
+    // (the one rule, and the card-answer duty, RFL ruling 4, would owe the answer). merged9 item 4: no date here is
+    // set by hand; the reply takes its own insert stamp and its order after the answer route's own resolvedAt is
+    // asserted (fixture replyAfterRealAnswer).
+    await f.replyAfterRealAnswer(first!.targetRunId!, card!.id);
     await f.sweep();
+    expect(await noticesEver()).toHaveLength(0);
+    // ...and later too: past the start bound, still answered, still no notice.
+    expect(await settleUnansweredPersonMessage(db, { ...f, now: new Date(Date.now() + PENDING_WAIT_START_BOUND_MS + 60_000) })).toEqual({ kind: "answered" });
     expect(await noticesEver()).toHaveLength(0);
     expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent"))))
       .toHaveLength(1);
