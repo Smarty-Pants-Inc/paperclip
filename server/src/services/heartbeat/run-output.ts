@@ -144,29 +144,40 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
     if (run.logStore != null && !isRunLogStoreType(run.logStore))
       throw new Error("Run log backend is not supported");
     const previousStore = run.logStore ?? undefined;
-    handle = await storageOutageWaitFor("starting the run log", () => retryThroughStorageOutage(() => runLogStore.begin({
-      companyId: run.companyId,
-      agentId: run.agentId,
-      runId,
-      newRun: isNewRunLog(run),
-      assertWriterAuthority: input.assertWriterAuthority,
-      previousStore,
-      signal: input.signal,
-    }), input.signal));
+    // The current privacy policy does not depend on the log claim. Read it
+    // alongside claim/publication, but expose NO handlers until both succeed.
+    // Join failures too: neither storage work nor a policy read may outlive begin.
+    const [logReady, redactionReady] = await Promise.allSettled([
+      (async () => {
+        handle = await storageOutageWaitFor("starting the run log", () => retryThroughStorageOutage(() => runLogStore.begin({
+          companyId: run.companyId,
+          agentId: run.agentId,
+          runId,
+          newRun: isNewRunLog(run),
+          assertWriterAuthority: input.assertWriterAuthority,
+          previousStore,
+          signal: input.signal,
+        }), input.signal));
 
-    outputSeq = handle.initialSequence ?? outputSeq;
-    persistedLogBytes = handle.initialBytes ?? persistedLogBytes;
-    await db
-      .update(heartbeatRuns)
-      .set({
-        logStore: handle.store,
-        logRef: handle.logRef,
-        ...(handle.store === "s3_segments" ? { logBytes: null, logSha256: null } : {}),
-        updatedAt: new Date(),
-      })
-      .where(eq(heartbeatRuns.id, runId));
-
-    const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
+        outputSeq = handle.initialSequence ?? outputSeq;
+        persistedLogBytes = handle.initialBytes ?? persistedLogBytes;
+        await db
+          .update(heartbeatRuns)
+          .set({
+            logStore: handle.store,
+            logRef: handle.logRef,
+            ...(handle.store === "s3_segments" ? { logBytes: null, logSha256: null } : {}),
+            updatedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, runId));
+        return handle;
+      })(),
+      getCurrentUserRedactionOptions(),
+    ]);
+    if (logReady.status === "rejected") throw logReady.reason;
+    handle = logReady.value;
+    if (redactionReady.status === "rejected") throw redactionReady.reason;
+    const currentUserRedactionOptions = redactionReady.value;
     const reportRecordingFailure = async () => {
       if (recordingFailureReported) return;
       recordingFailureReported = true;

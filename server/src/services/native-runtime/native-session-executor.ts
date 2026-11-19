@@ -21349,6 +21349,18 @@ export function createRemoteNativeArtifactPreparation(input: {
   const remoteCodexNpmSpec = input.runnerRemoteCodexNpmSpec?.trim() || null;
   if (explicitRemoteCodex && remoteCodexNpmSpec) throw new Error("runner_remote_codex_source_conflict");
   let providerPackInventory: ProviderPackInstallation[] = [];
+  const acceptRunnerMetadata = (stdout: string, requiredMode: "dial_wss" | "listen_ws", inspectProviderPacks: boolean) => {
+    let metadata: Record<string, unknown>;
+    try { metadata = JSON.parse(stdout) as Record<string, unknown>; }
+    catch (error) { throw new Error("runner_remote_artifact_metadata_invalid", { cause: error }); }
+    assertRemoteRunnerBuildMetadata(metadata, requiredMode);
+    if (inspectProviderPacks) {
+      providerPackInventory = Array.isArray(metadata.providerPacks)
+        ? metadata.providerPacks.filter((pack): pack is ProviderPackInstallation =>
+            typeof pack?.root === "string" && input.providerPackRoots?.includes(pack.root) === true
+            && typeof pack.immutable === "boolean") : [];
+    }
+  };
   const verifyRemoteRunner = async (
     requiredMode: "dial_wss" | "listen_ws",
     executable = remoteBinary,
@@ -21370,21 +21382,7 @@ export function createRemoteNativeArtifactPreparation(input: {
     if (metadataResult.exitCode !== 0 || metadataResult.timedOut) {
       throw new Error("runner_remote_artifact_verification_failed");
     }
-    let metadata: Record<string, unknown>;
-    try {
-      metadata = JSON.parse(metadataResult.stdout) as Record<string, unknown>;
-    } catch (error) {
-      throw new Error("runner_remote_artifact_metadata_invalid", {
-        cause: error,
-      });
-    }
-    assertRemoteRunnerBuildMetadata(metadata, requiredMode);
-    if (inspectProviderPacks) {
-      providerPackInventory = Array.isArray(metadata.providerPacks)
-        ? metadata.providerPacks.filter((pack): pack is ProviderPackInstallation =>
-            typeof pack?.root === "string" && input.providerPackRoots?.includes(pack.root) === true
-            && typeof pack.immutable === "boolean") : [];
-    }
+    acceptRunnerMetadata(metadataResult.stdout, requiredMode, inspectProviderPacks);
   };
 
   const reportedCodexVersions = new Set<string | null>();
@@ -21492,16 +21490,47 @@ export function createRemoteNativeArtifactPreparation(input: {
         return false;
       }
     };
+    const verifyRetainedRunner = async (): Promise<boolean> => {
+      const expected = (await cachedFileSha256(controllerRunnerBinary)).slice("sha256:".length);
+      // One provider RPC, not one for the hash followed by one for metadata.
+      // No memo: changed bytes, capabilities and requested pack roots are still
+      // inspected on EVERY use. Only an exact controller artifact gets this path.
+      const probe = await remoteCommandRunner.execute({
+        command: "sh",
+        args: ["-c", [
+          'test -x "$1" || exit 1',
+          'if command -v sha256sum >/dev/null 2>&1; then hash=$(sha256sum "$1"); else hash=$(shasum -a 256 "$1"); fi || exit 1',
+          'printf "%s\\n" "$hash"',
+          '[ "${hash%% *}" = "$2" ] || exit 1',
+          'binary=$1; shift 2',
+          // Old runnerd versions can reject --provider-pack-root; preserve the
+          // same optional-argument fallback as the ordinary metadata verifier.
+          'metadata=$("$binary" --build-metadata "$@") || { [ "$#" -gt 0 ] && metadata=$("$binary" --build-metadata); } || exit 1',
+          'printf "%s\\n" "$metadata"',
+        ].join("; "), "paperclip-runner-retained-artifact", remoteBinary, expected,
+          ...(input.providerPackRoots ?? []).flatMap(root => ["--provider-pack-root", root])],
+        cwd: remoteTarget.remoteCwd, bypassSession: true, timeoutMs: 30_000,
+      }).catch(() => null);
+      // A failed retained probe remains a miss, as on the ordinary hash path;
+      // install/verify must still get its chance after a transient RPC failure.
+      if (!probe || probe.timedOut || probe.signal) return false;
+      const newline = probe.stdout.indexOf("\n");
+      if (newline < 0 || probe.stdout.slice(0, newline).trim().split(/\s+/)[0] !== expected) return false;
+      if (probe.exitCode !== 0) throw new Error("runner_remote_artifact_verification_failed");
+      acceptRunnerMetadata(probe.stdout.slice(newline + 1), requiredMode, true);
+      return true;
+    };
     const prepareRunner = async () => {
       let runnerArtifactPrepared = false;
+      let retainedMetadataVerified = false;
       if (
         input.reuseRetainedRunner === true &&
         existsSync(controllerRunnerBinary)
       ) {
-        runnerArtifactPrepared = await measureNativeRunnerSpan(
+        runnerArtifactPrepared = retainedMetadataVerified = await measureNativeRunnerSpan(
           input.trace,
           "runner.artifact.verify_retained",
-          () => matchesControllerRunnerArtifact(remoteBinary),
+          verifyRetainedRunner,
         );
       }
       const explicitRemoteBinary = input.runnerRemoteBinaryPath?.trim() || null;
@@ -21593,7 +21622,7 @@ export function createRemoteNativeArtifactPreparation(input: {
           mode: 0o700,
         });
       }
-      await measureNativeRunnerSpan(input.trace, "runner.artifact.verify", () =>
+      if (!retainedMetadataVerified) await measureNativeRunnerSpan(input.trace, "runner.artifact.verify", () =>
         verifyRemoteRunner(requiredMode, undefined, true),
       );
     };

@@ -76,6 +76,78 @@ const newRunRow = {
   lastOutputAt: null,
 } as Partial<Run>;
 
+// catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21267
+// Exercise the production output executor and its durable-handle/redaction
+// barriers, not a standalone promise helper.
+describe("run output preparation critical path", () => {
+  it("overlaps log claim/publication with fresh redaction and keeps both safety barriers", async () => {
+    let releaseLog!: () => void;
+    const gate = new Promise<void>(resolve => { releaseLog = resolve; });
+    const row = { ...newRunRow };
+    let redactionStarted = false, logFinished = false, begun = false;
+    const recorder = createHeartbeatRunOutput(createRunRowDb(row), {
+      run: row as Run, runId: row.id!, issueId: null,
+      runLogStore: { begin: async () => { await gate; logFinished = true; return { store: "local_file", logRef: "parallel-log" }; },
+        append: async () => 0, flush: async () => undefined },
+      identityRedactor: { chunk: (_stream, chunk) => chunk, redact: value => value }, secretKeys: new Set(),
+      appendRunEvent: vi.fn(), getCurrentUserRedactionOptions: async () => {
+        redactionStarted = true; return { enabled: true, userNames: ["changed-user"], homeDirs: ["/home/changed-user"] };
+      },
+    });
+    const work = recorder.begin(row as Run).then(value => { begun = true; return value; });
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      expect(redactionStarted).toBe(true);
+      expect(logFinished).toBe(false);
+      expect(begun).toBe(false);
+      expect(row.logRef).toBeNull();
+    } finally { releaseLog(); await work; }
+    const handlers = await work;
+    expect(handlers.currentUserRedactionOptions).toMatchObject({ userNames: ["changed-user"] });
+    expect(row.logRef).toBe("parallel-log");
+  });
+
+  it.each(["log", "redaction"] as const)("joins both preparations before returning a %s failure", async failure => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const error = new Error(`${failure} preparation failure`);
+    let pendingFinished = false, returned = false;
+    const recorder = createHeartbeatRunOutput(createRunRowDb({ ...newRunRow }), {
+      run: newRunRow as Run, runId: "run-1", issueId: null,
+      runLogStore: { begin: async () => {
+        if (failure === "log") throw error;
+        await gate; pendingFinished = true; return { store: "local_file", logRef: "parallel-log" };
+      }, append: async () => 0, flush: async () => undefined },
+      identityRedactor: { chunk: (_stream, chunk) => chunk, redact: value => value }, secretKeys: new Set(),
+      appendRunEvent: vi.fn(), getCurrentUserRedactionOptions: async () => {
+        if (failure === "redaction") throw error;
+        await gate; pendingFinished = true; return { enabled: false };
+      },
+    });
+    const work = recorder.begin({ ...newRunRow } as Run).catch(err => { returned = true; return err; });
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      expect(returned).toBe(false);
+      expect(pendingFinished).toBe(false);
+    } finally { release(); expect(await work).toBe(error); }
+    expect(pendingFinished).toBe(true);
+  });
+
+  it("measures the overlapped log and redaction work", async () => {
+    const delay = () => new Promise<void>(resolve => setTimeout(resolve, 160));
+    const recorder = createHeartbeatRunOutput(createRunRowDb({ ...newRunRow }), {
+      run: newRunRow as Run, runId: "run-1", issueId: null,
+      runLogStore: { begin: async () => { await delay(); return { store: "local_file", logRef: "timed-log" }; },
+        append: async () => 0, flush: async () => undefined },
+      identityRedactor: { chunk: (_stream, chunk) => chunk, redact: value => value }, secretKeys: new Set(),
+      appendRunEvent: vi.fn(), getCurrentUserRedactionOptions: async () => { await delay(); return { enabled: false }; },
+    });
+    const started = performance.now();
+    await recorder.begin({ ...newRunRow } as Run);
+    process.stdout.write(JSON.stringify({ measurement: "run-output", injectedStepMs: 160, elapsedMs: performance.now() - started }) + "\n");
+  });
+});
+
 describe("claiming the run log during a storage outage (storage chaos ST1)", () => {
   const outage = () => withS3FailureDiagnostics("put_object", async () => {
     throw Object.assign(new Error("Injected storage outage"), { name: "ServiceUnavailable", $metadata: { httpStatusCode: 503 } });
