@@ -1378,8 +1378,9 @@ describe("ECMA-48 credential views beyond 7-bit CSI", () => {
       { kind, shape, position: "inside after prefix", input: `${prefix}${open}${tail}${close}`,
         expected: `${prefix === "Bearer " ? `Bearer ${open}${REDACTED_EVENT_VALUE}` : masked}${close}` },
       { kind, shape, position: "word+escape+key", input: `task${open}${key}${close}`,
-        // Schemes remain V1-only: controls must not promote taskBearer to Bearer.
-        expected: prefix === "Bearer " ? `task${open}${key}${close}` : `task${open}${masked}${close}` },
+        // Supersedes the non-CSI follow-up's glued-Bearer negative: an
+        // immediate recognized escape now admits the same strict V2 body.
+        expected: `task${open}${masked}${close}` },
       { kind, shape, position: "around key", input: `log ${open}${key}${close} done`, expected: `log ${open}${masked}${close} done` },
       { kind, shape, position: "line start", input: `${open}${key}`, expected: `${open}${masked}` },
       { kind, shape, position: "inside body", input: `${open}${prefix}${tail.slice(0, 3)}${open}${tail.slice(3)}${close}`,
@@ -1452,5 +1453,94 @@ describe("ECMA-48 credential views beyond 7-bit CSI", () => {
     const close = "\u001b]8;;\u001b\\";
     expect(redactSensitiveText(`🙂 ${open}sk-proj-${body.slice(0, 8)}\u001b(B${body.slice(8)}${close} task\u009b31mgithub_pat_${body}\u009b0m`))
       .toBe(`🙂 \u001b]8;;https://docs.example/?token=${REDACTED_EVENT_VALUE}\u001b\\${REDACTED_EVENT_VALUE}${close} task\u009b31m${REDACTED_EVENT_VALUE}\u009b0m`);
+  });
+});
+
+// catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21230
+// Keep reason: never disclose credentials at terminal boundaries, without
+// promoting short non-keys or changing the whole-line V1 prose policy.
+describe("strict V2 Bearer after any immediate recognized terminal escape", () => {
+  const token = "0123456789".repeat(5);
+  const controls = [
+    ["CSI7", "\u001b[31m", "\u001b[0m"],
+    ["CSI8", "\u009b31m", "\u009b0m"],
+    ["tput sgr0", "\u001b(B\u001b[m", "\u001b(B\u001b[m"],
+    ["nF", "\u001b(B", "\u001b(B"],
+    ["nF multi-intermediate", "\u001b( B", "\u001b(B"],
+    ["Fp save", "\u001b7", "\u001b8"],
+    ["Fp restore", "\u001b8", "\u001b7"],
+    ["Fe", "\u001bM", "\u001bM"],
+    ["Fs", "\u001bc", "\u001bc"],
+    ["OSC BEL", "\u001b]8;;https://docs.example/guide\u0007", "\u001b]8;;\u0007"],
+    ["OSC ST", "\u001b]8;;https://docs.example/guide\u001b\\", "\u001b]8;;\u001b\\"],
+    ["stray ESC before scheme", "\u001b", "\u001b[0m"],
+  ] as const;
+  const positions = [
+    ["word boundary", "prefix", ""],
+    ["line start", "", ""],
+    ["wrapped", "log ", " done"],
+  ] as const;
+  const rows = controls.flatMap(([kind, open, close]) => positions.map(([position, before, after]) => ({
+    kind, position, prefix: `${before}${open}Bearer `, suffix: `${close}${after}`,
+  })));
+  it.each(rows)("$kind / $position masks the complete 50-character body", ({ prefix, suffix }) => {
+    expect(redactSensitiveText(`${prefix}${token}${suffix}`))
+      .toBe(`${prefix}${REDACTED_EVENT_VALUE}${suffix}`);
+  });
+
+  it.each(controls)("%s preserves the strict body's threshold, charset, JWT and bare-prefix rules", (_kind, open, close) => {
+    for (const body of [
+      "a".repeat(20), "a".repeat(19) + "1", "a".repeat(20) + "=", "Ab9._~+/-".repeat(3),
+      "sk-" + "a".repeat(12), "ghp_" + "a".repeat(20), "github_pat_" + "a".repeat(20),
+      "AKIA" + "A".repeat(16),
+      "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJyZjJzeW50aGV0aWMifQ.c3ludGhldGljU2lnbmF0dXJl",
+    ]) {
+      expect(redactSensitiveText(`prefix${open}Bearer ${body}${close}`))
+        .toBe(`prefix${open}Bearer ${REDACTED_EVENT_VALUE}${close}`);
+    }
+  });
+
+  it.each(controls)("%s does not promote short bodies or prose at the V2 boundary", (_kind, open, close) => {
+    for (const body of ["abc123def", "a".repeat(19), "of good news", "authentication", "bond matured", "A", "word.", "Well-known", "", "short-123"]) {
+      const input = `standard${open}bearer ${body}${close}`;
+      expect(redactSensitiveText(input)).toBe(input);
+    }
+  });
+
+  // Supersedes the earlier single-space/single-padding exclusions while
+  // retaining those exact inputs: bv3 shares the uncoloured inline grammar.
+  const grammarRows = controls.flatMap(([kind, open, close]) => [
+    { form: "two spaces", separator: "  ", body: token },
+    { form: "TAB", separator: "\t", body: token },
+    { form: "double padding", separator: " ", body: "a".repeat(20) + "==" },
+  ].map(form => ({ kind, open, close, ...form })));
+  it.each(grammarRows)("$kind masks bv3 $form at the immediate escape boundary", ({ open, close, separator, body }) => {
+    expect(redactSensitiveText(`prefix${open}Bearer${separator}${body}${close}`))
+      .toBe(`prefix${open}Bearer${separator}${REDACTED_EVENT_VALUE}${close}`);
+  });
+
+  it.each(controls)("%s does not relax V2 newline or scheme exclusions", (_kind, open, close) => {
+    for (const [scheme, body] of [
+      ["Bearer\n", token], ["minibearer ", token], ["Bearerish ", token],
+    ]) {
+      const input = `prefix${open}${scheme}${body}${close}`;
+      expect(redactSensitiveText(input)).toBe(input);
+    }
+  });
+
+  it.each(controls)("%s requires an escape immediately before Bearer, not elsewhere", (_kind, open, close) => {
+    for (const input of [
+      `${open}prefixBearer ${token}${close}`,
+      `prefix${open}xxBearer ${token}${close}`,
+      `prefixBearer ${token}${open}${close}`,
+      `prefix${open} Bearer ${token}${close}`,
+    ]) {
+      // A complete control followed by whitespace retains a real V1 word
+      // boundary. Raw ESC + space + B is instead one nF control, so it must
+      // not be misreported as a standalone ESC before a complete scheme.
+      const expected = _kind !== "stray ESC before scheme" && input === `prefix${open} Bearer ${token}${close}`
+        ? `prefix${open} Bearer ${REDACTED_EVENT_VALUE}${close}` : input;
+      expect(redactSensitiveText(input)).toBe(expected);
+    }
   });
 });
