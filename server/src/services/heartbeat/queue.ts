@@ -1,4 +1,5 @@
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { turnAuthorityRevocation } from "../native-runtime/turn-authority-revocation.js";
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
@@ -112,6 +113,7 @@ import {
   isNull,
   lte,
   ne,
+  not,
   notInArray,
   or,
   sql,
@@ -1205,6 +1207,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       // provider suspension, and lease release finish. A queued comment must
       // not acquire a fresh sandbox while its predecessor still owns that work.
       // The executor's finally block retries this agent after removing its owner.
+      // Pause only: a predecessor cancelled by a Pause whose exact executor
+      // carries turnAuthorityRevoked no longer holds the next input; its
+      // teardown (box stop_and_retain) continues and is never reused.
+      const pauseRevoked = [...activeRunExecutions].filter(id => turnAuthorityRevocation(id) !== null);
       const [settlingOwner] = await db.select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
         .where(and(
@@ -1213,6 +1219,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           eq(heartbeatRuns.runtimeMode, "native"),
           inArray(heartbeatRuns.id, [...activeRunExecutions]),
           sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+          pauseRevoked.length ? not(and(inArray(heartbeatRuns.id, pauseRevoked), eq(heartbeatRuns.status, "cancelled"),
+            eq(heartbeatRuns.errorCode, "agent_paused"))!) : undefined,
         ))
         .limit(1);
       if (settlingOwner) {
@@ -1410,7 +1418,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         return declined("task_chat_retry_source_cleanup_pending");
       }
       const predecessorHold = await queuedRunPredecessorHold(tx, { run, issueId, ownsIssue,
-        executionRunId: owner?.executionRunId, isTerminal: isHeartbeatRunTerminalStatus, isLive: id => liveRunExecutions.has(id) });
+        executionRunId: owner?.executionRunId, isTerminal: isHeartbeatRunTerminalStatus, isLive: id => liveRunExecutions.has(id),
+        pauseRevoked: id => turnAuthorityRevocation(id) !== null });
       if (predecessorHold) return declined(predecessorHold.reason, predecessorHold.predecessorRunId);
       return { ownsIssue, blocked: false };
     }
