@@ -1,7 +1,7 @@
 import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { heartbeatRuns, issueComments, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { carryContinuationCommentInput } from "../modules/wake-queue/domain/continuation-comment-input.js";
-import { answeredPersonMessageSql } from "./person-message-answer.js";
+import { personMessageOwedSql } from "./person-message-answer.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -34,8 +34,10 @@ async function pendingPersonCommentInput(db: Pick<Db, "select">, input: {
     inArray(issueComments.id, candidates), isNull(issueComments.deletedAt),
     // Only still-pending input: a comment with a PUBLISHED agent answer attributed to it (or to a later person
     // input) is never re-presented, or every continuation re-answers it (the re-wake loop, org 19:48Z).
-    sql`not ${answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
-      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}`,
+    // rf-4 C-R: the ONE owed floor (person-message-answer.ts), as the sweep reads it: a carried message the chat
+    // moved on past (a later succeeded replying turn, no later carrier) is never re-presented to a successor.
+    personMessageOwedSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }),
   )).orderBy(asc(issueComments.createdAt), asc(issueComments.id));
   const commentIds = rows.map(row => row.id);
   if (commentIds.length === 0) return {};
