@@ -245,9 +245,11 @@ function TaskChatBubbleContent({
   return (
     <div
       data-conversation-message={isHuman ? "human" : "agent"}
-      data-testid={item.steeredIntoRunId ? "task-chat-steered-message" : undefined}
+      data-testid={item.steeredIntoRunId || item.steeredDelivery === "pending" ? "task-chat-steered-message" : undefined}
       data-steered-into-run-id={item.steeredIntoRunId ?? undefined}
-      data-delivery={item.steeredIntoRunId ? item.steeredDelivery ?? "sent" : undefined}
+      data-delivery={item.steeredIntoRunId
+        ? item.steeredDelivery === "delivered" ? "delivered" : "sent"
+        : item.steeredDelivery === "pending" ? "pending" : undefined}
       ref={readRef}
       className={cn(
         "flex w-full flex-col gap-1",
