@@ -1,0 +1,1012 @@
+{
+ "terminalMoment_base": {
+  "source": "live-none.json [before]",
+  "issue": {
+   "id": "00000000-0000-4000-8000-000000000014",
+   "companyId": "00000000-0000-4000-8000-000000000016",
+   "status": "blocked",
+   "interruption": {
+    "intentId": "00000000-0000-4000-8000-000000000001",
+    "responsibility": "system",
+    "state": "failed",
+    "nextRetryAt": null,
+    "canRetry": false,
+    "userAction": null,
+    "sourceRunIds": [
+     "00000000-0000-4000-8000-000000000005"
+    ],
+    "observedRunId": "00000000-0000-4000-8000-000000000005"
+   },
+   "executionBlocker": {
+    "recoveryActionId": "00000000-0000-4000-8000-000000000002",
+    "runId": "00000000-0000-4000-8000-000000000005",
+    "agentId": "00000000-0000-4000-8000-000000000003",
+    "cause": "native_workspace_sync_out_retry_exhausted",
+    "nextAction": "Finalization retry budget exhausted. Create a new task to continue the work.",
+    "runStatus": "failed",
+    "runError": "Saving the workspace failed after 3 attempts. The agent's result is kept; follow the run's recovery action to repair the workspace.",
+    "canContinue": false,
+    "canRetry": false,
+    "workspaceRepairRequired": true,
+    "canRecordWorkspaceRepair": false,
+    "savedMessageCount": 1
+   },
+   "activeRecoveryAction": {
+    "id": "00000000-0000-4000-8000-000000000002",
+    "companyId": "00000000-0000-4000-8000-000000000016",
+    "sourceIssueId": "00000000-0000-4000-8000-000000000014",
+    "recoveryIssueId": null,
+    "kind": "active_run_watchdog",
+    "status": "active",
+    "ownerType": "board",
+    "ownerAgentId": null,
+    "ownerUserId": null,
+    "previousOwnerAgentId": null,
+    "returnOwnerAgentId": "00000000-0000-4000-8000-000000000003",
+    "cause": "native_workspace_sync_out_retry_exhausted",
+    "fingerprint": "26574ef7a0e586163e12092245ba2d70e5dbf594d57e4f4f1f0326ac93fc3b1d",
+    "evidence": {
+     "runId": "00000000-0000-4000-8000-000000000005",
+     "coordinatorAttempt": 0,
+     "originalFailureCode": "native_workspace_sync_out_failed",
+     "workspaceFinalizeAttempt": 3,
+     "workspaceFinalizationBlock": {
+      "runId": "00000000-0000-4000-8000-000000000005",
+      "schema": "paperclip.native-workspace-finalization-block.v1",
+      "agentId": "00000000-0000-4000-8000-000000000003",
+      "issueId": "00000000-0000-4000-8000-000000000014",
+      "resultId": "00000000-0000-4000-8000-000000000012",
+      "companyId": "00000000-0000-4000-8000-000000000016",
+      "contractId": "00000000-0000-4000-8000-000000000006",
+      "resultSha256": "5fd18e12a23030f86b5a83ef2f8b5839c976a6b2b456908f5d1cc314937b2e4c",
+      "statusVersion": 4,
+      "contractSha256": "f9c262062eb76412e593aaa785ad2ab62472070023e77b8963d26b83a1f98cef",
+      "priorDecisionId": "00000000-0000-4000-8000-000000000004",
+      "identityContextId": "00000000-0000-4000-8000-000000000013",
+      "responsibleUserId": "classic-bound-person"
+     }
+    },
+    "nextAction": "Finalization retry budget exhausted. Retry workspace export and merge from the retained sandbox; do not submit another provider turn.",
+    "wakePolicy": null,
+    "monitorPolicy": null,
+    "attemptCount": 1,
+    "maxAttempts": 3,
+    "timeoutAt": null,
+    "lastAttemptAt": "2026-11-19T10:35:15.581Z",
+    "outcome": null,
+    "resolutionNote": null,
+    "resolvedAt": null,
+    "createdAt": "2026-11-19T10:35:15.540Z",
+    "updatedAt": "2026-11-19T10:35:15.540Z"
+   }
+  },
+  "comments": [
+   {
+    "id": "00000000-0000-4000-8000-000000000009",
+    "body": "Done. I rewrote the report and added the notes file.",
+    "authorType": "agent",
+    "createdByRunId": "00000000-0000-4000-8000-000000000005",
+    "createdAt": "2026-11-19T10:35:15.907Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000007",
+    "body": "Also add a summary section to the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T10:34:53.732Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000011",
+    "body": "Please rewrite the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T10:34:52.247Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000008",
+    "body": "Done. I wrote the report.",
+    "authorType": "agent",
+    "createdByRunId": "00000000-0000-4000-8000-000000000010",
+    "createdAt": "2026-11-19T10:34:51.904Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000015",
+    "body": "Please write the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T10:34:49.112Z"
+   }
+  ],
+  "runs": [
+   {
+    "runId": "00000000-0000-4000-8000-000000000005",
+    "status": "failed",
+    "createdAt": "2026-11-19T10:34:52.320Z",
+    "startedAt": "2026-11-19T10:34:52.559Z",
+    "finishedAt": "2026-11-19T10:35:15.540Z",
+    "replyFileLine": {
+     "state": "lost",
+     "commentId": "00000000-0000-4000-8000-000000000009"
+    }
+   },
+   {
+    "runId": "00000000-0000-4000-8000-000000000010",
+    "status": "succeeded",
+    "createdAt": "2026-11-19T10:34:49.224Z",
+    "startedAt": "2026-11-19T10:34:49.545Z",
+    "finishedAt": "2026-11-19T10:34:51.673Z",
+    "replyFileLine": null
+   }
+  ],
+  "queue": {
+   "issueId": "00000000-0000-4000-8000-000000000014",
+   "queueId": "00000000-0000-4000-8000-000000000001",
+   "state": "deferred",
+   "targetRunId": null,
+   "revision": "5bfb97826b22801fb6d61b59ec3829b8",
+   "protocol": "paperclip_runner_v1",
+   "steeringDisposition": "temporarily_unavailable",
+   "entries": [
+    {
+     "comment": {
+      "id": "00000000-0000-4000-8000-000000000007",
+      "companyId": "00000000-0000-4000-8000-000000000016",
+      "issueId": "00000000-0000-4000-8000-000000000014",
+      "authorAgentId": null,
+      "authorUserId": "classic-bound-person",
+      "onBehalfOfUserId": null,
+      "authorType": "user",
+      "createdByRunId": null,
+      "derivedAuthorAgentId": null,
+      "derivedCreatedByRunId": null,
+      "derivedAuthorSource": null,
+      "clientRequestId": "00000000-0000-4000-8000-000000000000",
+      "conversationSessionGeneration": null,
+      "origin": "comment",
+      "fastResponseRequestId": null,
+      "body": "Also add a summary section to the report.",
+      "presentation": null,
+      "metadata": null,
+      "deletedAt": null,
+      "deletedByType": null,
+      "deletedByAgentId": null,
+      "deletedByUserId": null,
+      "deletedByRunId": null,
+      "sourceTrust": null,
+      "createdAt": "2026-11-19T10:34:53.732Z",
+      "updatedAt": "2026-11-19T10:34:53.732Z"
+     },
+     "position": 0,
+     "canEdit": true,
+     "canDiscard": true
+    }
+   ]
+  },
+  "rRunId": "00000000-0000-4000-8000-000000000005"
+ },
+ "afterWorkers_base_boxStopped": {
+  "source": "live-stopped.json [after]",
+  "issue": {
+   "id": "00000000-0000-4000-8000-000000000006",
+   "companyId": "00000000-0000-4000-8000-000000000002",
+   "status": "blocked",
+   "interruption": {
+    "intentId": "00000000-0000-4000-8000-000000000018",
+    "responsibility": "system",
+    "state": "failed",
+    "nextRetryAt": null,
+    "canRetry": true,
+    "userAction": null,
+    "sourceRunIds": [
+     "00000000-0000-4000-8000-000000000011"
+    ],
+    "observedRunId": "00000000-0000-4000-8000-000000000011"
+   },
+   "executionBlocker": {
+    "recoveryActionId": "00000000-0000-4000-8000-000000000008",
+    "runId": "00000000-0000-4000-8000-000000000011",
+    "agentId": "00000000-0000-4000-8000-000000000012",
+    "cause": "native_workspace_sync_out_retry_exhausted",
+    "nextAction": "Paperclip refused to recover the saved files: the recorded source of the saved files does not match the run that saved them. Automatic recovery does not repeat this check, because the same saved state gives the same result. Retry runs the check again. The agent's result is saved, and the agent will not repeat its work.",
+    "workspaceRecovery": {
+     "status": "blocked",
+     "stage": "verifying_stop",
+     "canRetry": true,
+     "message": "Paperclip refused to recover the saved files: the recorded source of the saved files does not match the run that saved them. Automatic recovery does not repeat this check, because the same saved state gives the same result. Retry runs the check again. The agent's result is saved, and the agent will not repeat its work."
+    },
+    "runStatus": "failed",
+    "runError": "Saving the workspace failed after 3 attempts. The agent's result is kept; follow the run's recovery action to repair the workspace.",
+    "canContinue": false,
+    "canRetry": true,
+    "workspaceRepairRequired": true,
+    "canRecordWorkspaceRepair": false,
+    "savedMessageCount": 1
+   },
+   "activeRecoveryAction": {
+    "id": "00000000-0000-4000-8000-000000000008",
+    "companyId": "00000000-0000-4000-8000-000000000002",
+    "sourceIssueId": "00000000-0000-4000-8000-000000000006",
+    "recoveryIssueId": null,
+    "kind": "active_run_watchdog",
+    "status": "active",
+    "ownerType": "board",
+    "ownerAgentId": null,
+    "ownerUserId": null,
+    "previousOwnerAgentId": null,
+    "returnOwnerAgentId": "00000000-0000-4000-8000-000000000012",
+    "cause": "native_workspace_sync_out_retry_exhausted",
+    "fingerprint": "c78505264cc177f44c008aa6b69213f506a6b0e5d37651b598a77b3b415340f8",
+    "evidence": {
+     "runId": "00000000-0000-4000-8000-000000000011",
+     "systemRecovery": {
+      "phase": "verify_execution",
+      "state": "exhausted",
+      "schema": "paperclip.system-recovery.v1",
+      "failure": {
+       "code": "source_binding_invalid",
+       "retryClass": "service_required",
+       "sourceVerification": {
+        "reason": "lease_cwd_invalid"
+       },
+       "evidenceFingerprint": "1a869563e1f4ac20e21030bcfc591b70bf8dc0ae8aec4075c45628f79eeb1519"
+      },
+      "attempts": 1,
+      "intentId": null,
+      "revision": 2,
+      "attemptId": "00000000-0000-4000-8000-000000000005",
+      "deadlineAt": 1795087785543,
+      "retriesUsed": 0,
+      "sourceRunId": "00000000-0000-4000-8000-000000000011",
+      "generationId": "00000000-0000-4000-8000-000000000001",
+      "nextAttemptAt": null,
+      "policyVersion": 1,
+      "firstFailureAt": 1795085985543,
+      "freshAttemptRunId": null,
+      "providerCooldownAt": null,
+      "capturePolicyVersion": 2,
+      "preservationOperationIds": []
+     },
+     "workspaceRecovery": {
+      "runId": "00000000-0000-4000-8000-000000000011",
+      "stage": "verifying_stop",
+      "schema": "paperclip.workspace-recovery.v1",
+      "status": "blocked",
+      "attempt": 1,
+      "message": "Paperclip refused to recover the saved files: the recorded source of the saved files does not match the run that saved them. Automatic recovery does not repeat this check, because the same saved state gives the same result. Retry runs the check again. The agent's result is saved, and the agent will not repeat its work.",
+      "retryable": true,
+      "requestIds": [],
+      "attemptLimit": 6
+     },
+     "coordinatorAttempt": 0,
+     "originalFailureCode": "native_workspace_sync_out_failed",
+     "systemRecoveryActiveAt": 1795085985531,
+     "workspaceFinalizeAttempt": 3,
+     "previousWorkspaceRecovery": null,
+     "workspaceFinalizationBlock": {
+      "runId": "00000000-0000-4000-8000-000000000011",
+      "schema": "paperclip.native-workspace-finalization-block.v1",
+      "agentId": "00000000-0000-4000-8000-000000000012",
+      "issueId": "00000000-0000-4000-8000-000000000006",
+      "resultId": "00000000-0000-4000-8000-000000000016",
+      "companyId": "00000000-0000-4000-8000-000000000002",
+      "contractId": "00000000-0000-4000-8000-000000000007",
+      "resultSha256": "ae8fcf4088000685e45640fbfaef4c179b86836e611c845221ded9cd91a7d248",
+      "statusVersion": 4,
+      "contractSha256": "f9c262062eb76412e593aaa785ad2ab62472070023e77b8963d26b83a1f98cef",
+      "priorDecisionId": "00000000-0000-4000-8000-000000000004",
+      "identityContextId": "00000000-0000-4000-8000-000000000013",
+      "responsibleUserId": "classic-bound-person"
+     }
+    },
+    "nextAction": "Paperclip refused to recover the saved files: the recorded source of the saved files does not match the run that saved them. Automatic recovery does not repeat this check, because the same saved state gives the same result. Retry runs the check again. The agent's result is saved, and the agent will not repeat its work.",
+    "wakePolicy": null,
+    "monitorPolicy": null,
+    "attemptCount": 1,
+    "maxAttempts": 3,
+    "timeoutAt": null,
+    "lastAttemptAt": "2026-11-19T10:59:44.760Z",
+    "outcome": null,
+    "resolutionNote": null,
+    "resolvedAt": null,
+    "createdAt": "2026-11-19T10:59:44.695Z",
+    "updatedAt": "2026-11-19T10:59:45.546Z"
+   }
+  },
+  "comments": [
+   {
+    "id": "00000000-0000-4000-8000-000000000009",
+    "body": "Done. I rewrote the report and added the notes file.",
+    "authorType": "agent",
+    "createdByRunId": "00000000-0000-4000-8000-000000000011",
+    "createdAt": "2026-11-19T10:59:45.101Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000015",
+    "body": "Also add a summary section to the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T10:59:22.748Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000017",
+    "body": "Please rewrite the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T10:59:20.906Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000000",
+    "body": "Done. I wrote the report.",
+    "authorType": "agent",
+    "createdByRunId": "00000000-0000-4000-8000-000000000003",
+    "createdAt": "2026-11-19T10:59:20.384Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000014",
+    "body": "Please write the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T10:59:17.516Z"
+   }
+  ],
+  "runs": [
+   {
+    "runId": "00000000-0000-4000-8000-000000000011",
+    "status": "failed",
+    "createdAt": "2026-11-19T10:59:20.963Z",
+    "startedAt": "2026-11-19T10:59:21.297Z",
+    "finishedAt": "2026-11-19T10:59:44.694Z",
+    "replyFileLine": {
+     "state": "lost",
+     "commentId": "00000000-0000-4000-8000-000000000009"
+    }
+   },
+   {
+    "runId": "00000000-0000-4000-8000-000000000003",
+    "status": "succeeded",
+    "createdAt": "2026-11-19T10:59:17.660Z",
+    "startedAt": "2026-11-19T10:59:18.009Z",
+    "finishedAt": "2026-11-19T10:59:20.271Z",
+    "replyFileLine": null
+   }
+  ],
+  "queue": {
+   "issueId": "00000000-0000-4000-8000-000000000006",
+   "queueId": "00000000-0000-4000-8000-000000000018",
+   "state": "deferred",
+   "targetRunId": null,
+   "revision": "572c943b80f4012fd26cd6f6fea620ac",
+   "protocol": "paperclip_runner_v1",
+   "steeringDisposition": "temporarily_unavailable",
+   "executionWait": {
+    "reason": "saved_work_recovery_refused",
+    "message": "Paperclip refused to recover the saved files because a safety check on them cannot pass. Your Retry is saved."
+   },
+   "entries": [
+    {
+     "comment": {
+      "id": "00000000-0000-4000-8000-000000000015",
+      "companyId": "00000000-0000-4000-8000-000000000002",
+      "issueId": "00000000-0000-4000-8000-000000000006",
+      "authorAgentId": null,
+      "authorUserId": "classic-bound-person",
+      "onBehalfOfUserId": null,
+      "authorType": "user",
+      "createdByRunId": null,
+      "derivedAuthorAgentId": null,
+      "derivedCreatedByRunId": null,
+      "derivedAuthorSource": null,
+      "clientRequestId": "00000000-0000-4000-8000-000000000010",
+      "conversationSessionGeneration": null,
+      "origin": "comment",
+      "fastResponseRequestId": null,
+      "body": "Also add a summary section to the report.",
+      "presentation": null,
+      "metadata": null,
+      "deletedAt": null,
+      "deletedByType": null,
+      "deletedByAgentId": null,
+      "deletedByUserId": null,
+      "deletedByRunId": null,
+      "sourceTrust": null,
+      "createdAt": "2026-11-19T10:59:22.748Z",
+      "updatedAt": "2026-11-19T10:59:22.748Z"
+     },
+     "position": 0,
+     "canEdit": true,
+     "canDiscard": true
+    }
+   ]
+  },
+  "rRunId": "00000000-0000-4000-8000-000000000011"
+ },
+ "afterRetry_base_boxStopped": {
+  "source": "live-stopped+retry.json [after]",
+  "issue": {
+   "id": "00000000-0000-4000-8000-000000000010",
+   "companyId": "00000000-0000-4000-8000-000000000017",
+   "status": "blocked",
+   "interruption": {
+    "intentId": "00000000-0000-4000-8000-000000000003",
+    "responsibility": "system",
+    "state": "failed",
+    "nextRetryAt": null,
+    "canRetry": true,
+    "userAction": null,
+    "sourceRunIds": [
+     "00000000-0000-4000-8000-000000000013"
+    ],
+    "observedRunId": "00000000-0000-4000-8000-000000000013",
+    "retryWait": {
+     "reason": "saved_work_recovery_refused",
+     "message": "Paperclip refused to recover the saved files because a safety check on them cannot pass. Retry checks the saved files again. The agent's result is saved, and the agent will not repeat its work."
+    }
+   },
+   "executionBlocker": {
+    "recoveryActionId": "00000000-0000-4000-8000-000000000015",
+    "runId": "00000000-0000-4000-8000-000000000013",
+    "agentId": "00000000-0000-4000-8000-000000000002",
+    "cause": "native_workspace_sync_out_retry_exhausted",
+    "nextAction": "Paperclip refused to recover the saved files: the recorded source of the saved files does not match the run that saved them. Automatic recovery does not repeat this check, because the same saved state gives the same result. Retry runs the check again. The agent's result is saved, and the agent will not repeat its work.",
+    "workspaceRecovery": {
+     "status": "blocked",
+     "stage": "verifying_stop",
+     "canRetry": true,
+     "message": "Paperclip refused to recover the saved files: the recorded source of the saved files does not match the run that saved them. Automatic recovery does not repeat this check, because the same saved state gives the same result. Retry runs the check again. The agent's result is saved, and the agent will not repeat its work."
+    },
+    "runStatus": "failed",
+    "runError": "Saving the workspace failed after 3 attempts. The agent's result is kept; follow the run's recovery action to repair the workspace.",
+    "canContinue": false,
+    "canRetry": true,
+    "workspaceRepairRequired": true,
+    "canRecordWorkspaceRepair": false,
+    "savedMessageCount": 1
+   },
+   "activeRecoveryAction": {
+    "id": "00000000-0000-4000-8000-000000000015",
+    "companyId": "00000000-0000-4000-8000-000000000017",
+    "sourceIssueId": "00000000-0000-4000-8000-000000000010",
+    "recoveryIssueId": null,
+    "kind": "active_run_watchdog",
+    "status": "active",
+    "ownerType": "board",
+    "ownerAgentId": null,
+    "ownerUserId": null,
+    "previousOwnerAgentId": null,
+    "returnOwnerAgentId": "00000000-0000-4000-8000-000000000002",
+    "cause": "native_workspace_sync_out_retry_exhausted",
+    "fingerprint": "a651c79c979c39fd9502c1eb55313cadb9327a77117e16afdddbdc92f1ad833d",
+    "evidence": {
+     "runId": "00000000-0000-4000-8000-000000000013",
+     "systemRecovery": {
+      "phase": "verify_execution",
+      "state": "exhausted",
+      "schema": "paperclip.system-recovery.v1",
+      "failure": {
+       "code": "source_binding_invalid",
+       "retryClass": "service_required",
+       "sourceVerification": {
+        "reason": "lease_cwd_invalid"
+       },
+       "evidenceFingerprint": "967cba03434053e186546a422a666eab2d9a5a940c0ebe4609760575ec934261"
+      },
+      "attempts": 1,
+      "intentId": null,
+      "revision": 2,
+      "attemptId": "00000000-0000-4000-8000-000000000018",
+      "deadlineAt": 1795087834323,
+      "retriesUsed": 0,
+      "sourceRunId": "00000000-0000-4000-8000-000000000013",
+      "generationId": "00000000-0000-4000-8000-000000000000",
+      "nextAttemptAt": null,
+      "policyVersion": 1,
+      "firstFailureAt": 1795086034323,
+      "freshAttemptRunId": null,
+      "providerCooldownAt": null,
+      "capturePolicyVersion": 2,
+      "preservationOperationIds": []
+     },
+     "workspaceRecovery": {
+      "runId": "00000000-0000-4000-8000-000000000013",
+      "stage": "verifying_stop",
+      "schema": "paperclip.workspace-recovery.v1",
+      "status": "blocked",
+      "attempt": 1,
+      "message": "Paperclip refused to recover the saved files: the recorded source of the saved files does not match the run that saved them. Automatic recovery does not repeat this check, because the same saved state gives the same result. Retry runs the check again. The agent's result is saved, and the agent will not repeat its work.",
+      "retryable": true,
+      "requestIds": [],
+      "attemptLimit": 6
+     },
+     "coordinatorAttempt": 0,
+     "originalFailureCode": "native_workspace_sync_out_failed",
+     "systemRecoveryActiveAt": 1795086034314,
+     "workspaceFinalizeAttempt": 3,
+     "previousWorkspaceRecovery": null,
+     "workspaceFinalizationBlock": {
+      "runId": "00000000-0000-4000-8000-000000000013",
+      "schema": "paperclip.native-workspace-finalization-block.v1",
+      "agentId": "00000000-0000-4000-8000-000000000002",
+      "issueId": "00000000-0000-4000-8000-000000000010",
+      "resultId": "00000000-0000-4000-8000-000000000016",
+      "companyId": "00000000-0000-4000-8000-000000000017",
+      "contractId": "00000000-0000-4000-8000-000000000012",
+      "resultSha256": "3c6baa90982f320ada346226b77ed0d2b13a6e1dcdb10cbcf6beeeadd307e22f",
+      "statusVersion": 4,
+      "contractSha256": "f9c262062eb76412e593aaa785ad2ab62472070023e77b8963d26b83a1f98cef",
+      "priorDecisionId": "00000000-0000-4000-8000-000000000011",
+      "identityContextId": "00000000-0000-4000-8000-000000000019",
+      "responsibleUserId": "classic-bound-person"
+     }
+    },
+    "nextAction": "Paperclip refused to recover the saved files: the recorded source of the saved files does not match the run that saved them. Automatic recovery does not repeat this check, because the same saved state gives the same result. Retry runs the check again. The agent's result is saved, and the agent will not repeat its work.",
+    "wakePolicy": null,
+    "monitorPolicy": null,
+    "attemptCount": 1,
+    "maxAttempts": 3,
+    "timeoutAt": null,
+    "lastAttemptAt": "2026-11-19T11:00:33.645Z",
+    "outcome": null,
+    "resolutionNote": null,
+    "resolvedAt": null,
+    "createdAt": "2026-11-19T11:00:33.594Z",
+    "updatedAt": "2026-11-19T11:00:34.325Z"
+   }
+  },
+  "comments": [
+   {
+    "id": "00000000-0000-4000-8000-000000000009",
+    "body": "Done. I rewrote the report and added the notes file.",
+    "authorType": "agent",
+    "createdByRunId": "00000000-0000-4000-8000-000000000013",
+    "createdAt": "2026-11-19T11:00:33.974Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000006",
+    "body": "Also add a summary section to the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T11:00:11.794Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000004",
+    "body": "Please rewrite the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T11:00:10.518Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000005",
+    "body": "Done. I wrote the report.",
+    "authorType": "agent",
+    "createdByRunId": "00000000-0000-4000-8000-000000000014",
+    "createdAt": "2026-11-19T11:00:10.316Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000007",
+    "body": "Please write the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T11:00:08.029Z"
+   }
+  ],
+  "runs": [
+   {
+    "runId": "00000000-0000-4000-8000-000000000013",
+    "status": "failed",
+    "createdAt": "2026-11-19T11:00:10.562Z",
+    "startedAt": "2026-11-19T11:00:10.746Z",
+    "finishedAt": "2026-11-19T11:00:33.585Z",
+    "replyFileLine": {
+     "state": "lost",
+     "commentId": "00000000-0000-4000-8000-000000000009"
+    }
+   },
+   {
+    "runId": "00000000-0000-4000-8000-000000000014",
+    "status": "succeeded",
+    "createdAt": "2026-11-19T11:00:08.067Z",
+    "startedAt": "2026-11-19T11:00:08.244Z",
+    "finishedAt": "2026-11-19T11:00:10.165Z",
+    "replyFileLine": null
+   }
+  ],
+  "queue": {
+   "issueId": "00000000-0000-4000-8000-000000000010",
+   "queueId": "00000000-0000-4000-8000-000000000008",
+   "state": "deferred",
+   "targetRunId": null,
+   "revision": "d97a8fdad17f33681e19ef5713d60de1",
+   "protocol": "paperclip_runner_v1",
+   "steeringDisposition": "temporarily_unavailable",
+   "executionWait": {
+    "reason": "saved_work_recovery_refused",
+    "message": "Paperclip refused to recover the saved files because a safety check on them cannot pass. Your Retry is saved."
+   },
+   "entries": [
+    {
+     "comment": {
+      "id": "00000000-0000-4000-8000-000000000006",
+      "companyId": "00000000-0000-4000-8000-000000000017",
+      "issueId": "00000000-0000-4000-8000-000000000010",
+      "authorAgentId": null,
+      "authorUserId": "classic-bound-person",
+      "onBehalfOfUserId": null,
+      "authorType": "user",
+      "createdByRunId": null,
+      "derivedAuthorAgentId": null,
+      "derivedCreatedByRunId": null,
+      "derivedAuthorSource": null,
+      "clientRequestId": "00000000-0000-4000-8000-000000000001",
+      "conversationSessionGeneration": null,
+      "origin": "comment",
+      "fastResponseRequestId": null,
+      "body": "Also add a summary section to the report.",
+      "presentation": null,
+      "metadata": null,
+      "deletedAt": null,
+      "deletedByType": null,
+      "deletedByAgentId": null,
+      "deletedByUserId": null,
+      "deletedByRunId": null,
+      "sourceTrust": null,
+      "createdAt": "2026-11-19T11:00:11.794Z",
+      "updatedAt": "2026-11-19T11:00:11.794Z"
+     },
+     "position": 0,
+     "canEdit": true,
+     "canDiscard": true
+    }
+   ]
+  },
+  "rRunId": "00000000-0000-4000-8000-000000000013"
+ },
+ "parked_head_boxNotStopped": {
+  "source": "head/live-none.json [after]",
+  "issue": {
+   "id": "00000000-0000-4000-8000-000000000001",
+   "companyId": "00000000-0000-4000-8000-000000000002",
+   "status": "blocked",
+   "interruption": {
+    "intentId": "00000000-0000-4000-8000-000000000011",
+    "responsibility": "system",
+    "state": "failed",
+    "nextRetryAt": null,
+    "canRetry": true,
+    "userAction": null,
+    "sourceRunIds": [
+     "00000000-0000-4000-8000-000000000018"
+    ],
+    "observedRunId": "00000000-0000-4000-8000-000000000018"
+   },
+   "executionBlocker": {
+    "recoveryActionId": "00000000-0000-4000-8000-000000000008",
+    "runId": "00000000-0000-4000-8000-000000000018",
+    "agentId": "00000000-0000-4000-8000-000000000012",
+    "cause": "native_workspace_sync_out_retry_exhausted",
+    "nextAction": "Paperclip refused to recover the saved files: the recorded source of the saved files does not match the run that saved them. Automatic recovery does not repeat this check, because the same saved state gives the same result. Retry runs the check again. The agent's result is saved, and the agent will not repeat its work.",
+    "workspaceRecovery": {
+     "status": "blocked",
+     "stage": "verifying_stop",
+     "canRetry": true,
+     "message": "Paperclip refused to recover the saved files: the recorded source of the saved files does not match the run that saved them. Automatic recovery does not repeat this check, because the same saved state gives the same result. Retry runs the check again. The agent's result is saved, and the agent will not repeat its work."
+    },
+    "runStatus": "failed",
+    "runError": "Saving the workspace failed after 3 attempts. The agent's result is kept; follow the run's recovery action to repair the workspace.",
+    "canContinue": false,
+    "canRetry": true,
+    "workspaceRepairRequired": true,
+    "canRecordWorkspaceRepair": false,
+    "savedMessageCount": 1
+   },
+   "activeRecoveryAction": {
+    "id": "00000000-0000-4000-8000-000000000008",
+    "companyId": "00000000-0000-4000-8000-000000000002",
+    "sourceIssueId": "00000000-0000-4000-8000-000000000001",
+    "recoveryIssueId": null,
+    "kind": "active_run_watchdog",
+    "status": "active",
+    "ownerType": "board",
+    "ownerAgentId": null,
+    "ownerUserId": null,
+    "previousOwnerAgentId": null,
+    "returnOwnerAgentId": "00000000-0000-4000-8000-000000000012",
+    "cause": "native_workspace_sync_out_retry_exhausted",
+    "fingerprint": "46cc386a33a9ca8036c75e3f0915f4f96093fd854365d6e570fed2e31974b254",
+    "evidence": {
+     "runId": "00000000-0000-4000-8000-000000000018",
+     "systemRecovery": {
+      "phase": "verify_execution",
+      "state": "exhausted",
+      "schema": "paperclip.system-recovery.v1",
+      "failure": {
+       "code": "source_binding_invalid",
+       "retryClass": "service_required",
+       "sourceVerification": {
+        "reason": "lease_cwd_invalid"
+       },
+       "evidenceFingerprint": "4e155e975c5543ad4023f8514e078f70e42a4ad33bf59846c2e38aaa37283ec0"
+      },
+      "attempts": 1,
+      "intentId": null,
+      "revision": 2,
+      "attemptId": "00000000-0000-4000-8000-000000000015",
+      "deadlineAt": 1795088204054,
+      "retriesUsed": 0,
+      "sourceRunId": "00000000-0000-4000-8000-000000000018",
+      "generationId": "00000000-0000-4000-8000-000000000016",
+      "nextAttemptAt": null,
+      "policyVersion": 1,
+      "firstFailureAt": 1795086404054,
+      "freshAttemptRunId": null,
+      "providerCooldownAt": null,
+      "capturePolicyVersion": 2,
+      "preservationOperationIds": []
+     },
+     "workspaceRecovery": {
+      "runId": "00000000-0000-4000-8000-000000000018",
+      "stage": "verifying_stop",
+      "schema": "paperclip.workspace-recovery.v1",
+      "status": "blocked",
+      "attempt": 1,
+      "message": "Paperclip refused to recover the saved files: the recorded source of the saved files does not match the run that saved them. Automatic recovery does not repeat this check, because the same saved state gives the same result. Retry runs the check again. The agent's result is saved, and the agent will not repeat its work.",
+      "retryable": true,
+      "requestIds": [],
+      "attemptLimit": 6
+     },
+     "coordinatorAttempt": 0,
+     "originalFailureCode": "native_workspace_sync_out_failed",
+     "systemRecoveryActiveAt": 1795086404043,
+     "workspaceFinalizeAttempt": 3,
+     "previousWorkspaceRecovery": null,
+     "workspaceFinalizationBlock": {
+      "runId": "00000000-0000-4000-8000-000000000018",
+      "schema": "paperclip.native-workspace-finalization-block.v1",
+      "agentId": "00000000-0000-4000-8000-000000000012",
+      "issueId": "00000000-0000-4000-8000-000000000001",
+      "resultId": "00000000-0000-4000-8000-000000000000",
+      "companyId": "00000000-0000-4000-8000-000000000002",
+      "contractId": "00000000-0000-4000-8000-000000000017",
+      "resultSha256": "97d0cd04a5c28e627609f0c6aebb8a3dda1c0d954431b10f6e53d1796c2bc41e",
+      "statusVersion": 4,
+      "contractSha256": "f9c262062eb76412e593aaa785ad2ab62472070023e77b8963d26b83a1f98cef",
+      "priorDecisionId": "00000000-0000-4000-8000-000000000010",
+      "identityContextId": "00000000-0000-4000-8000-000000000005",
+      "responsibleUserId": "classic-bound-person"
+     }
+    },
+    "nextAction": "Paperclip refused to recover the saved files: the recorded source of the saved files does not match the run that saved them. Automatic recovery does not repeat this check, because the same saved state gives the same result. Retry runs the check again. The agent's result is saved, and the agent will not repeat its work.",
+    "wakePolicy": null,
+    "monitorPolicy": null,
+    "attemptCount": 1,
+    "maxAttempts": 3,
+    "timeoutAt": null,
+    "lastAttemptAt": "2026-11-19T11:06:43.470Z",
+    "outcome": null,
+    "resolutionNote": null,
+    "resolvedAt": null,
+    "createdAt": "2026-11-19T11:06:43.429Z",
+    "updatedAt": "2026-11-19T11:06:44.057Z"
+   }
+  },
+  "comments": [
+   {
+    "id": "00000000-0000-4000-8000-000000000004",
+    "body": "Done. I rewrote the report and added the notes file.",
+    "authorType": "agent",
+    "createdByRunId": "00000000-0000-4000-8000-000000000018",
+    "createdAt": "2026-11-19T11:06:43.782Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000014",
+    "body": "Also add a summary section to the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T11:06:21.654Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000003",
+    "body": "Please rewrite the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T11:06:20.335Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000009",
+    "body": "Done. I wrote the report.",
+    "authorType": "agent",
+    "createdByRunId": "00000000-0000-4000-8000-000000000013",
+    "createdAt": "2026-11-19T11:06:20.094Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000007",
+    "body": "Please write the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T11:06:18.087Z"
+   }
+  ],
+  "runs": [
+   {
+    "runId": "00000000-0000-4000-8000-000000000018",
+    "status": "failed",
+    "createdAt": "2026-11-19T11:06:20.379Z",
+    "startedAt": "2026-11-19T11:06:20.573Z",
+    "finishedAt": "2026-11-19T11:06:43.429Z",
+    "replyFileLine": {
+     "state": "lost",
+     "commentId": "00000000-0000-4000-8000-000000000004"
+    }
+   },
+   {
+    "runId": "00000000-0000-4000-8000-000000000013",
+    "status": "succeeded",
+    "createdAt": "2026-11-19T11:06:18.140Z",
+    "startedAt": "2026-11-19T11:06:18.333Z",
+    "finishedAt": "2026-11-19T11:06:20.022Z",
+    "replyFileLine": null
+   }
+  ],
+  "queue": {
+   "issueId": "00000000-0000-4000-8000-000000000001",
+   "queueId": "00000000-0000-4000-8000-000000000011",
+   "state": "deferred",
+   "targetRunId": null,
+   "revision": "f49103cce5db801b1d2b54c6e836bb98",
+   "protocol": "paperclip_runner_v1",
+   "steeringDisposition": "temporarily_unavailable",
+   "executionWait": {
+    "reason": "remote_cleanup",
+    "message": "Waiting for the previous environment to stop. Your message will start automatically."
+   },
+   "entries": [
+    {
+     "comment": {
+      "id": "00000000-0000-4000-8000-000000000014",
+      "companyId": "00000000-0000-4000-8000-000000000002",
+      "issueId": "00000000-0000-4000-8000-000000000001",
+      "authorAgentId": null,
+      "authorUserId": "classic-bound-person",
+      "onBehalfOfUserId": null,
+      "authorType": "user",
+      "createdByRunId": null,
+      "derivedAuthorAgentId": null,
+      "derivedCreatedByRunId": null,
+      "derivedAuthorSource": null,
+      "clientRequestId": "00000000-0000-4000-8000-000000000006",
+      "conversationSessionGeneration": null,
+      "origin": "comment",
+      "fastResponseRequestId": null,
+      "body": "Also add a summary section to the report.",
+      "presentation": null,
+      "metadata": null,
+      "deletedAt": null,
+      "deletedByType": null,
+      "deletedByAgentId": null,
+      "deletedByUserId": null,
+      "deletedByRunId": null,
+      "sourceTrust": null,
+      "createdAt": "2026-11-19T11:06:21.654Z",
+      "updatedAt": "2026-11-19T11:06:21.654Z"
+     },
+     "position": 0,
+     "canEdit": true,
+     "canDiscard": true
+    }
+   ]
+  },
+  "rRunId": "00000000-0000-4000-8000-000000000018"
+ },
+ "answered_head_boxStopped": {
+  "source": "head/live-stopped.json [after]",
+  "issue": {
+   "id": "00000000-0000-4000-8000-000000000001",
+   "companyId": "00000000-0000-4000-8000-000000000010",
+   "status": "in_progress",
+   "interruption": {
+    "intentId": null,
+    "responsibility": "system",
+    "state": "resolved",
+    "nextRetryAt": null,
+    "canRetry": false,
+    "userAction": null,
+    "sourceRunIds": [
+     "00000000-0000-4000-8000-000000000005"
+    ],
+    "observedRunId": "00000000-0000-4000-8000-000000000005"
+   },
+   "executionBlocker": null,
+   "activeRecoveryAction": null
+  },
+  "comments": [
+   {
+    "id": "00000000-0000-4000-8000-000000000004",
+    "body": "next turn answered",
+    "authorType": "agent",
+    "createdByRunId": "00000000-0000-4000-8000-000000000005",
+    "createdAt": "2026-11-19T11:05:47.228Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000003",
+    "body": "Paperclip could not recover the unsaved files from the previous run: the recorded source of the saved files does not match the run that saved them. Retry continued this task in a new workspace from its recorded work: comments, documents, attachments and pushed commits. Files that run did not save or push are not included. Its completed actions stay recorded and are not repeated.",
+    "authorType": "system",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T11:05:45.581Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000006",
+    "body": "Done. I rewrote the report and added the notes file.",
+    "authorType": "agent",
+    "createdByRunId": "00000000-0000-4000-8000-000000000000",
+    "createdAt": "2026-11-19T11:05:44.818Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000008",
+    "body": "Also add a summary section to the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T11:05:22.571Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000009",
+    "body": "Please rewrite the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T11:05:20.887Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000011",
+    "body": "Done. I wrote the report.",
+    "authorType": "agent",
+    "createdByRunId": "00000000-0000-4000-8000-000000000002",
+    "createdAt": "2026-11-19T11:05:20.432Z"
+   },
+   {
+    "id": "00000000-0000-4000-8000-000000000007",
+    "body": "Please write the report.",
+    "authorType": "user",
+    "createdByRunId": null,
+    "createdAt": "2026-11-19T11:05:17.489Z"
+   }
+  ],
+  "runs": [
+   {
+    "runId": "00000000-0000-4000-8000-000000000005",
+    "status": "succeeded",
+    "createdAt": "2026-11-19T11:05:45.379Z",
+    "startedAt": "2026-11-19T11:05:45.710Z",
+    "finishedAt": "2026-11-19T11:05:47.167Z",
+    "replyFileLine": null
+   },
+   {
+    "runId": "00000000-0000-4000-8000-000000000000",
+    "status": "failed",
+    "createdAt": "2026-11-19T11:05:20.963Z",
+    "startedAt": "2026-11-19T11:05:21.263Z",
+    "finishedAt": "2026-11-19T11:05:44.438Z",
+    "replyFileLine": {
+     "state": "lost",
+     "commentId": "00000000-0000-4000-8000-000000000006"
+    }
+   },
+   {
+    "runId": "00000000-0000-4000-8000-000000000002",
+    "status": "succeeded",
+    "createdAt": "2026-11-19T11:05:17.596Z",
+    "startedAt": "2026-11-19T11:05:17.931Z",
+    "finishedAt": "2026-11-19T11:05:20.256Z",
+    "replyFileLine": null
+   }
+  ],
+  "queue": {
+   "issueId": "00000000-0000-4000-8000-000000000001",
+   "queueId": null,
+   "state": null,
+   "targetRunId": null,
+   "revision": "5e99497165f934b249e2d2ffb7532e93",
+   "protocol": "paperclip_runner_v1",
+   "steeringDisposition": "temporarily_unavailable",
+   "entries": []
+  },
+  "rRunId": "00000000-0000-4000-8000-000000000000"
+ }
+}
