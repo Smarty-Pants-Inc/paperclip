@@ -1229,6 +1229,63 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect((await environmentService(db).getById(environment.id))?.config.reuseLease).toBe(false);
   });
 
+  // bd4 (rf-3 item 4): the GENERIC-PLUGIN warm ACQUISITION resume (driver "plugin": the plugin driver's
+  // acquireRunLease calls environmentResumeLease on the retained box) must re-arm a LEASE-GONE hold bound to
+  // that box, like the built-in acquisition resume and resumeRunLease. Real runtime + orchestrator + DB; the
+  // plugin worker is the deterministic fake of the "legacy resume" row below. PLANTED: the retained box's
+  // task identity (as that row plants it) and the parked hold row (a LEASE-GONE stopped collection on the
+  // retained warm box: retryOn lease_active, no timer).
+  it("BD4-PLUGIN-ACQUIRE-RESUME: the generic-plugin warm acquisition resume re-arms a parked LEASE-GONE agent-file hold on the same box", async () => {
+    const pluginId = randomUUID();
+    const pluginKey = "paperclip.test-bd4-resume";
+    const seeded = await seedEnvironment({ driver: "plugin", config: { pluginKey, driverKey: "tasks", runnerLifecycleMode: "warm" } });
+    await insertSandboxProviderPlugin(pluginId, { pluginKey, environmentDrivers: [{
+      driverKey: "tasks", kind: "sandbox_provider", supportsTasks: true, warmTaskVersion: 1, sessionHandoffVersion: 1,
+    }] });
+    const issueId = randomUUID(), sessionId = randomUUID(), nextRunId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId: seeded.companyId, title: "Plugin resume re-arm", status: "in_progress" });
+    await db.insert(heartbeatRuns).values({ id: nextRunId, companyId: seeded.companyId, agentId: seeded.agentId, status: "running" });
+    let acquisitions = 0;
+    const call = vi.fn(async (_plugin: string, method: string, _params?: unknown) => {
+      if (method === "environmentAcquireLease") return { providerLeaseId: `bd4-sandbox-${++acquisitions}`, metadata: {} };
+      if (method === "environmentResumeLease") return { providerLeaseId: "bd4-sandbox-1", metadata: {} };
+      throw new Error(`Unexpected plugin method: ${method}`);
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call, getWorker: () => ({ supportedMethods: ["environmentResumeLease"] }),
+    } as unknown as PluginWorkerManager });
+    const orchestrator = environmentRunOrchestrator(db, { environmentRuntime: runtime });
+    const acquisitionInput = { companyId: seeded.companyId, environment: seeded.environment, issueId, agentId: seeded.agentId,
+      persistedExecutionWorkspace: null, adapterType: "paperclip_runner", selectedEnvironmentId: seeded.environment.id,
+      localEnvironmentId: randomUUID(), admittedLifecycleMode: "warm" as const, executionWorkspaceSettings: null };
+    const first = await orchestrator.acquireForRun({ ...acquisitionInput, heartbeatRunId: seeded.runId });
+    expect(first.lease.providerLeaseId).toBe("bd4-sandbox-1");
+    await db.update(environmentLeases).set({ status: "retained", metadata: { ...first.lease.metadata, runnerTaskIdentity: { sessionId } } })
+      .where(eq(environmentLeases.id, first.lease.id));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, seeded.runId));
+    await db.insert(agentInstructionWorkingCopies).values({ runId: seeded.runId, companyId: seeded.companyId, agentId: seeded.agentId, responsibleUserId: "user-1",
+      entryFile: "AGENTS.md", baseHash: "base", localRoot: "/tmp/bd4/held", executionRoot: "/workspace/.paperclip-runtime/agent-files/bd4",
+      location: `remote:${seeded.environment.id}`, state: "unavailable", processStoppedAt: new Date(), nextAttemptAt: null,
+      receipt: { schema: "paperclip.agent-files.v1", warm: true, cleanup: { leaseId: first.lease.id, remoteCwd: "." },
+        savePending: { code: "AGENT_FILES_SAVE_FAILED", reason: "Boat sandbox lease is no longer active.", retryOn: "lease_active", failures: 1, since: new Date().toISOString() } } });
+    const [parked] = await db.select().from(agentInstructionWorkingCopies).where(eq(agentInstructionWorkingCopies.runId, seeded.runId));
+    expect(parked!.nextAttemptAt).toBeNull();
+    expect((parked!.receipt?.savePending as { retryOn?: unknown }).retryOn).toBe("lease_active");
+    // The generic-plugin warm ACQUISITION resume of the same box.
+    const next = await orchestrator.acquireForRun({ ...acquisitionInput, heartbeatRunId: nextRunId, runnerTaskResumeSessionId: sessionId });
+    const [after] = await db.select().from(agentInstructionWorkingCopies).where(eq(agentInstructionWorkingCopies.runId, seeded.runId));
+    const methods = call.mock.calls.map(([, method]) => method);
+    console.log("BD4_PLUGIN_ACQUIRE_RESUME", JSON.stringify({ methods, firstLeaseId: first.lease.id, nextLeaseId: next.lease.id,
+      providerLeaseId: next.lease.providerLeaseId, runnerTaskReused: next.lease.metadata?.runnerTaskReused ?? null,
+      nextAttemptAt: after!.nextAttemptAt, savePending: after!.receipt?.savePending }));
+    expect(methods).toEqual(["environmentAcquireLease", "environmentResumeLease"]);
+    expect(next.lease.providerLeaseId).toBe("bd4-sandbox-1");
+    expect(next.lease.metadata?.runnerTaskReused).toBe(true);
+    expect((after!.receipt?.savePending as { retryOn?: unknown }).retryOn).toBeUndefined();
+    expect(after!.nextAttemptAt).toBeInstanceOf(Date);
+    expect(after!.receipt?.savePending).toMatchObject({ reason: "Boat sandbox lease is no longer active." });
+  });
+
   it.each(["stopped", "missing", "wrong-lease", "error"])(
     "startup cancellation is run-scoped and needs a matching receipt: %s",
     async (outcome) => {
