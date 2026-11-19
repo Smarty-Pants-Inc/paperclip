@@ -36,9 +36,17 @@ export interface RunLogReadOptions {
   priority?: ObjectJournalIOPriority;
 }
 
+export interface RunLogPersistenceCause {
+  name: string;
+  code?: string;
+  reason?: string;
+  statusCode?: number;
+}
 export interface RunLogReadResult {
   content: string;
   nextOffset?: number;
+  /** Writer-owned bytes not yet in object storage. Absent for a complete log. */
+  incomplete?: { bytes: number; causes: RunLogPersistenceCause[] };
 }
 
 interface RunLogByteRange {
