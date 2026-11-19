@@ -59,7 +59,7 @@ import { issueService } from "../services/issues.js";
 import { answeredPersonMessageSql } from "../services/person-message-answer.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { PERSON_STOP_HELD_MESSAGE_NEXT_ACTION, PERSON_STOP_HELD_MESSAGE_TEXT, PERSON_STOP_HELD_MESSAGE_TITLE, settleUnansweredPersonMessage,
-  UNANSWERED_MESSAGE_NO_RUN_TEXT } from "../services/recovery/unanswered-person-message.js";
+  UNANSWERED_MESSAGE_NO_RUN_NEW_TASK_TEXT, UNANSWERED_MESSAGE_NO_RUN_TEXT } from "../services/recovery/unanswered-person-message.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 async function waitFor(check: () => Promise<boolean>, ms = 10_000) {
@@ -420,7 +420,9 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     expect(notesInDb.length, "the held set had a note").toBeGreaterThan(0);
     expect(retired, `every note retired (status ${after?.status})`).toBe(true);
     expect(notesInDb.every(c => c.deletedAt), "every note on them is deleted").toBe(true);
-    expect(unansweredNotes(shownAfter), "the person sees no note").toEqual([]);
+    // c4 (c2b base): the comments GET returns a deleted note as a tombstone (deletedAt set, body ""). The person
+    // sees no note text: every shown unanswered note is that deleted tombstone.
+    expect(unansweredNotes(shownAfter).filter((n: any) => !n.deletedAt || n.body), "the person sees no note").toEqual([]);
   }, 180_000);
   // P9-60 control (RFL 20:34Z): a REAL board hold with NO person Stop keeps its own card. Producer:
   // the first turn's provider fails (no Stop by anyone); the wake queue's release writes the board
@@ -441,7 +443,10 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     expect(hold?.ownerType, "a board hold exists").toBe("board");
     expect(hold?.kind).toBe("active_run_watchdog");
     expect(notes.length, "the board hold's own card").toBe(1);
-    expect(notes[0].body, "its own card, unchanged: the no-run card with the hold's rows").toBe(UNANSWERED_MESSAGE_NO_RUN_TEXT);
+    // c4 (c2b base, held banner RF2): under this board hold a new message is deferred, so the no-run card names
+    // the new task (UNANSWERED_MESSAGE_NO_RUN_NEW_TASK_TEXT), never 'Sending it again is safe'.
+    expect(notes[0].body, "its own card, unchanged: the no-run card with the hold's rows").toBe(UNANSWERED_MESSAGE_NO_RUN_NEW_TASK_TEXT);
+    expect(notes[0].body).not.toBe(UNANSWERED_MESSAGE_NO_RUN_TEXT);
     expect(notes[0].body).not.toBe(PERSON_STOP_HELD_MESSAGE_TEXT);
     expect(JSON.stringify(notes[0]), "the card names the board hold").toContain(hold!.id);
   }, 180_000);
