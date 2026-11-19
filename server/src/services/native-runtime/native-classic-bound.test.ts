@@ -133,7 +133,9 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("native-classic-bound-");
     db = createDb(database.connectionString);
-    root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "classic-bound-")));
+    root = await fs.realpath(await fs.mkdtemp(path.join(process.env.CLASSIC_BOUND_EVIDENCE
+      ? path.dirname(process.env.CLASSIC_BOUND_EVIDENCE) : os.tmpdir(), "classic-bound-")));
+    if (process.env.CLASSIC_BOUND_EVIDENCE) vi.stubEnv("PAPERCLIP_HOME", path.join(root, "retained-home"));
     vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "62".repeat(32));
     vi.stubEnv("DATABASE_URL", database.connectionString);
     await db.insert(authUsers).values({ id: PERSON, name: "Person", email: "classic@example.invalid", emailVerified: true,
@@ -627,6 +629,19 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
       const taskAtCut = await s.issue();
       expect(taskAtCut).toMatchObject({ executionRunId: null, executionWorkspaceId: null });
       const frozen = { status: (await s.run()).status, errorCode: (await s.run()).errorCode };
+      // REAL: after the cut (nobody was parked at it), the person starts P on the saved state.
+      const sent = await request(s.app).post(`/api/issues/${s.issueId}/comments`)
+        .send({ body: "Read the saved report and summarize it.", clientRequestId: randomUUID() });
+      expect(sent.status).toBe(201);
+      const started = await parkedMessageStarts(s, sent.body.id);
+      expect(started.successors).toHaveLength(1);
+      expect(started.providerInputs).toHaveLength(1);
+      const pWorkspaceId = (await s.issue()).executionWorkspaceId!;
+      const [pWorkspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, pWorkspaceId));
+      const pRoot = pWorkspace.cwd!;
+      expect(pRoot).not.toBe(s.hostDir);
+      expect(await listing(pRoot)).toEqual(SAVED);
+      const pRootBefore = await treeSha256(pRoot);
       // The old root is now quarantine, not the task's saved workspace. The late apply may only land there.
       stall.release();
       await vi.waitFor(async () => expect(await s.attempts()).toEqual(["failed"]), { timeout: 30_000, interval: 50 });
@@ -636,9 +651,11 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
       await reconcileNativeFinalizations(db, [s.runId], { environmentRuntime: {} as never });
       await s.presentationWorker();
       expect({ status: (await s.run()).status, errorCode: (await s.run()).errorCode }).toEqual(frozen);
-      expect((await s.issue()).executionWorkspaceId).toBeNull();
+      expect((await s.issue()).executionWorkspaceId).toBe(pWorkspaceId);
+      expect(await treeSha256(pRoot)).toBe(pRootBefore);
+      expect(await listing(pRoot)).toEqual(SAVED);
       expect(await s.servedLine()).toEqual(line);
-      expect(await s.replies()).toHaveLength(1);
+      expect((await s.replies()).filter(reply => reply.createdByRunId === s.runId)).toHaveLength(1);
       // NEVER-OK: bytes are kept in the retained old root AND box, not deleted on refusal.
       expect(await fs.readFile(path.join(s.hostDir, "notes.md"), "utf8")).toBe("R's new notes (unsaved)\n");
       expect(await fs.readFile(path.join(s.remoteCwd, "notes.md"), "utf8")).toBe("R's new notes (unsaved)\n");
@@ -646,7 +663,8 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
       if (process.env.CLASSIC_BOUND_EVIDENCE) await fs.cp(s.hostDir, `${process.env.CLASSIC_BOUND_EVIDENCE}.K10c-retained`, { recursive: true });
       evidence.K10 = { acceptedAt: accepted.createdAt, deadlineAt: new Date(clock), line, run: frozen,
         downloadOrCaptureCallsAfterDeadlineBeforeLateRelease: retryCallsAfterDeadline,
-        retryCallsAfterDeadline, late: { stderr: late.stderrExcerpt, status: late.status, kept, root: s.hostDir, box: s.remoteCwd } };
+        retryCallsAfterDeadline, nextRun: { id: started.successor.id, root: pRoot, beforeSha256: pRootBefore, afterSha256: await treeSha256(pRoot) },
+        late: { stderr: late.stderrExcerpt, status: late.status, kept, root: s.hostDir, box: s.remoteCwd } };
     } finally { stall.release(); await checking.catch(() => undefined);
       await vi.waitFor(async () => expect(await s.attempts()).not.toContain("running"), { timeout: 30_000, interval: 50 }); }
   }, 120_000);

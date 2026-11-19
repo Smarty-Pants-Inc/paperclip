@@ -67,6 +67,7 @@ import { heartbeatService } from "../heartbeat.js";
 import { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { agentRoutes } from "../../routes/agents.js";
 import { issueRoutes } from "../../routes/issues.js";
+import { activityRoutes } from "../../routes/activity.js";
 import { errorHandler } from "../../middleware/index.js";
 import { createStorageService } from "../../storage/service.js";
 import { createLocalDiskStorageProvider } from "../../storage/local-disk-provider.js";
@@ -104,7 +105,9 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("native-copyout-bound-");
     db = createDb(database.connectionString);
-    root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "copyout-bound-")));
+    root = await fs.realpath(await fs.mkdtemp(path.join(process.env.COPYOUT_BOUND_EVIDENCE
+      ? path.dirname(process.env.COPYOUT_BOUND_EVIDENCE) : os.tmpdir(), "copyout-bound-")));
+    if (process.env.COPYOUT_BOUND_EVIDENCE) vi.stubEnv("PAPERCLIP_HOME", path.join(root, "retained-home"));
     vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "62".repeat(32));
     vi.stubEnv("DATABASE_URL", database.connectionString);
     box.storage = { ...createStorageService(createLocalDiskStorageProvider(path.join(root, "objects"))), provider: "s3" as const };
@@ -134,7 +137,8 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
     const app = express(); app.use(express.json());
     app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: PERSON, companyIds: [companyId],
       memberships: [{ companyId, membershipRole: "owner", status: "active" }], isInstanceAdmin: true }; next(); });
-    app.use("/api", agentRoutes(db, {} as never)); app.use("/api", issueRoutes(db, {} as never, {})); app.use(errorHandler);
+    app.use("/api", agentRoutes(db, {} as never)); app.use("/api", issueRoutes(db, {} as never, {}));
+    app.use("/api", activityRoutes(db)); app.use(errorHandler);
 
     const [contract] = await db.insert(completionContracts).values({ companyId, issueId, revision: 1,
       schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "standard", completionAuthority: "server_arbiter",
