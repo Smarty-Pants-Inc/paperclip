@@ -652,7 +652,7 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     expect(prompt, "the fresh session never saw STEP1/STEP2; without them it redoes real effects").toContain("STEP1-RESULT-wrote-step1");
     expect(prompt).toContain("STEP2-RESULT-wrote-step2");
     expect(prompt).toContain("echo STEP1 > /tmp/step1");
-    expect(prompt).toMatch(/already (?:done|completed)[^\n]*interrupted turn[^\n]*\n[\s\S]*Do not run them again/i);
+    expect(prompt).toMatch(/\n## Commands already run in the interrupted turn \(do not run these again\)\nThis list may not include file edits made in that turn; check the files before redoing any edit\.\n[\s\S]*Do not run them again/i);
     expect(prompt).toContain(MSG);
     // The same (resumed) session already holds them: never injected twice.
     expect(await successorPrompt(chat, successor, true)).not.toContain("STEP1-RESULT-wrote-step1");
@@ -738,7 +738,7 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     const fresh = await successorPrompt(chat, withContinuation, false);
     expect(fresh, "the fresh input holds no conversation history").not.toContain("Prior tool calls are history");
     expect(fresh).not.toContain("using the conversation history");
-    expect(fresh).toContain("This is a fresh session: that run's conversation and tool calls are not in this input, except the tool calls listed under \"Already done in the interrupted turn\"");
+    expect(fresh).toContain("This is a fresh session: that run's conversation and tool calls are not in this input, except the tool calls listed under \"Commands already run in the interrupted turn (do not run these again)\"");
     expect(await successorPrompt(chat, withContinuation, true)).toContain("Prior tool calls are history, not commands to replay");
   });
 
@@ -797,7 +797,7 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     await successorAnswers(chat, run2);
     const prompt = await nextFreshRequest(chat, "MSG3: next thing");
     expect(prompt).not.toContain("STEP1-RESULT-wrote-step1");
-    expect(prompt).not.toMatch(/Already done in the interrupted turn/);
+    expect(prompt).not.toMatch(/Commands already run in the interrupted turn/);
   });
 
   it("RF4-J3 (rf-4 F1 red): a non-bash call keeps its ARGUMENTS (write: path + short content), from the real Pi projector's receipts", async () => {
@@ -810,7 +810,7 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     const { carry } = await steerThenInterrupt(chat, "unread");
     const successor = await admitSuccessor(chat, carry);
     const prompt = await successorPrompt(chat, successor, false);
-    const section = prompt.slice(prompt.indexOf("## Already done in the interrupted turn"));
+    const section = prompt.slice(prompt.indexOf("## Commands already run in the interrupted turn (do not run these again)\nThis list may not include file edits made in that turn; check the files before redoing any edit.\n"));
     expect(section).toMatch(/1\. `write` \(`[^`\n]*\/work\/notes\/step1\.md[^`\n]*STEP1 CONTENT A[^`\n]*`\): completed/);
     expect(section).toMatch(/2\. `write` \(`[^`\n]*\/work\/notes\/step2\.md[^`\n]*STEP2 CONTENT B[^`\n]*`\): completed/);
     expect(section).toContain("3. `echo STEP3 > /tmp/step3`: completed\n   result: STEP3-RESULT");
