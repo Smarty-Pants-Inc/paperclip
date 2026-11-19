@@ -569,11 +569,11 @@ describe("TaskChatQueuedMessages", () => {
   // stay listed with ONE line and ONE Send; Send sends them all, once.
   it("after a person's Stop lists the waiting messages with one line and one Send", async () => {
     const stopped: IssueQueuedCommentQueue = { ...queue, targetRunId: null, protocol: "legacy", steeringDisposition: "unsupported",
-      executionWait: { reason: "stopped_by_person", message: "Stopped. These messages are waiting: Send them, or delete any first." } };
+      executionWait: { reason: "stopped_by_person", message: "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it." } };
     const onInterrupt = vi.fn().mockResolvedValue(undefined);
     render({ queue: stopped, onInterrupt });
     const line = container.querySelector('[data-testid="task-chat-queued-stopped"]');
-    expect(line?.querySelector('p[role="status"]')?.textContent).toBe("Stopped. These messages are waiting: Send them, or delete any first.");
+    expect(line?.querySelector('p[role="status"]')?.textContent).toBe("Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it.");
     expect(container.textContent).toContain("First queued message");
     expect(container.textContent).toContain("Second queued message");
     // One Send, on the line; each row keeps its delete.
@@ -589,9 +589,38 @@ describe("TaskChatQueuedMessages", () => {
     expect(container.querySelector('[data-testid="task-chat-queued-stopped"]')).toBeNull();
     expect(container.textContent).not.toContain("Stopped. These messages are waiting");
   });
+  // STOP_TYPE (gate 3): after a person's Stop, a typed message is answered
+  // first and the held batch then runs by itself, so the bar says so. The
+  // queue body is planted verbatim from the real route: the JSON body of
+  // GET /api/issues/:id/queued-comments in agent-conversations.test.ts's
+  // "after a person's Stop nothing is sent ... (send)" row, read at head.
+  it("after a person's Stop the held bar says a typed message goes first, once, with Send and Delete (390 and 1440)", () => {
+    const realGet = JSON.parse(`{"issueId":"b8bbcfc4-c6b4-4261-8492-2ae7a1596df0","queueId":"d1de84f7-58a0-4f1f-87d4-0336814dd9a3","state":"deferred","targetRunId":null,"revision":"79e84f3ab9ae4fe0502dd9c7995b1cf5","protocol":"legacy","steeringDisposition":"unsupported","entries":[{"comment":{"id":"c8193316-38ad-4c00-b027-0b761bd921f2","companyId":"8da26771-e465-4d0a-b8e1-f74958dda5db","issueId":"b8bbcfc4-c6b4-4261-8492-2ae7a1596df0","authorAgentId":null,"authorUserId":"local-board","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"8dc969cb-2d62-4114-ba7e-1e4d659b9c5d","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"A","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T01:44:07.583Z","updatedAt":"2026-11-19T01:44:07.583Z"},"position":0,"canEdit":true,"canDiscard":true,"behindReset":false},{"comment":{"id":"671bd64f-d7dc-4c08-bcbf-de2edeecfbb3","companyId":"8da26771-e465-4d0a-b8e1-f74958dda5db","issueId":"b8bbcfc4-c6b4-4261-8492-2ae7a1596df0","authorAgentId":null,"authorUserId":"local-board","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"08e20d19-f1c4-4158-96bd-dcae2d05b429","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"B","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T01:44:07.659Z","updatedAt":"2026-11-19T01:44:07.659Z"},"position":1,"canEdit":true,"canDiscard":true,"behindReset":false},{"comment":{"id":"10193588-7d6b-431c-8a39-cff9397c5d0e","companyId":"8da26771-e465-4d0a-b8e1-f74958dda5db","issueId":"b8bbcfc4-c6b4-4261-8492-2ae7a1596df0","authorAgentId":null,"authorUserId":"local-board","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"eeca787b-547a-47de-8042-d0c8baa9ac61","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"C","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T01:44:07.722Z","updatedAt":"2026-11-19T01:44:07.722Z"},"position":2,"canEdit":true,"canDiscard":true,"behindReset":false}],"executionWait":{"reason":"stopped_by_person","message":"Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it."}}`) as IssueQueuedCommentQueue;
+    const bar = "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it.";
+    const width = window.innerWidth;
+    try {
+      for (const innerWidth of [390, 1440]) {
+        Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: innerWidth });
+        window.dispatchEvent(new Event("resize"));
+        render({ queue: realGet, onInterrupt: vi.fn().mockResolvedValue(undefined) });
+        expect(container.textContent!.split(bar)).toHaveLength(2);
+        expect(container.querySelector('[data-testid="task-chat-queued-stopped"] p[role="status"]')?.textContent).toBe(bar);
+        expect(container.textContent).not.toContain("delete any first");
+        const send = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-stopped-send"]');
+        expect(send?.textContent).toBe("Send");
+        expect(send?.disabled).toBe(false);
+        for (const entry of realGet.entries) {
+          expect(container.querySelector(`[data-testid="task-chat-queued-message-${entry.comment.id}"]`)?.textContent).toContain(entry.comment.body);
+          expect(container.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-discard-${entry.comment.id}"]`)?.disabled).toBe(false);
+        }
+      }
+    } finally {
+      Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: width });
+    }
+  });
   it("says why Send is refused while the chat is paused, and keeps the messages", async () => {
     const stopped: IssueQueuedCommentQueue = { ...queue, targetRunId: null, protocol: "legacy", steeringDisposition: "unsupported",
-      executionWait: { reason: "stopped_by_person", message: "Stopped. These messages are waiting: Send them, or delete any first." } };
+      executionWait: { reason: "stopped_by_person", message: "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it." } };
     const refusal = Object.assign(new Error("Conflict"), { status: 409, body: {
       error: "This agent is paused. Resume it to send these messages.", details: { code: "queued_comment_chat_paused" } } });
     render({ queue: stopped, onInterrupt: vi.fn().mockRejectedValue(refusal) });

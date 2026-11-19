@@ -892,7 +892,7 @@ import {
         expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(queuedIds);
         expect(queue.entries.every((entry: { queueId?: string }) => !entry.queueId || entry.queueId === queue.queueId)).toBe(true);
         expect(queue.executionWait).toEqual({ reason: "stopped_by_person",
-          message: "Stopped. These messages are waiting: Send them, or delete any first." });
+          message: "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it." });
         const reloaded = await readQueue();
         expect(reloaded.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(queuedIds);
         expect(reloaded.executionWait?.reason).toBe("stopped_by_person");

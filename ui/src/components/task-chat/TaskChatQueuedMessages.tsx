@@ -47,7 +47,7 @@ import {
 
 type QueueAction = "steer" | "interrupt" | "discard" | null;
 export const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
-export const CHAT_STOPPED_BY_PERSON_LINE = "Stopped. These messages are waiting: Send them, or delete any first.";
+export const CHAT_STOPPED_BY_PERSON_LINE = "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it.";
 
 export function reorderQueuedMessageEntries(
   entries: IssueQueuedCommentEntry[],
