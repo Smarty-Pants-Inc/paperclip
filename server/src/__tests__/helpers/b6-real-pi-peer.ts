@@ -10,7 +10,15 @@ export class B6RealPiPeer {
   facadeCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
   consumed: string[] = []; replies: string[] = []; pending: string[] = [];
   sessionFile?: string; transport?: PiRpcTransport; active = false;
-  held?: () => void; released = false; finishing = false;
+  held?: () => void; released = false; finishing = false; initialTool = false;
+  bodies: string[] = [];
+  beforeBoundary?: () => Promise<void>;
+  releasing?: Promise<void>;
+  closeGate?: Promise<void>;
+  holdClose() {
+    let release!: () => void; this.closeGate = new Promise<void>(resolve => { release = resolve; });
+    return release;
+  }
   seen = new Set<string>(); answered = new Set<string>(); modelRequests: unknown[] = [];
   get pid() { return this.transport?.pid ?? null; }
   get exited() { return this.transport?.exited ?? false; }
@@ -22,16 +30,18 @@ export class B6RealPiPeer {
         const parsed = JSON.parse(body); this.modelRequests.push(parsed);
         for (const message of parsed.messages ?? []) if (message.role === "user") {
           const content = typeof message.content === "string" ? message.content : (message.content ?? []).filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n");
-          for (const marker of ["B6-M1", "B6-M2", "B6-M3"]) if (content.trim() === marker) this.seen.add(marker);
+          let initialPrompt: string | undefined;
+          try { initialPrompt = JSON.parse(content).task?.prompt; } catch { /* An ordinary steered user message is plain text. */ }
+          for (const marker of this.bodies) if (content.trim() === marker || initialPrompt?.includes(marker)) this.seen.add(marker);
         }
         const respond = () => {
-          const done = this.seen.has("B6-M3") || (this.finishing && !this.pending.length && !this.seen.size);
+          const done = (this.bodies.length > 0 && this.bodies.every(body => this.seen.has(body))) || (this.finishing && !this.pending.length);
           const fresh = [...this.seen].filter(s => !this.answered.has(s));
           for (const marker of fresh) { this.answered.add(marker); this.replies.push(`ANSWER:${marker}`); }
           const text = fresh.length ? fresh.map(s => `ANSWER:${s}`).join("\n") : done ? "ORIGINAL_WORK_FINISHED" : undefined;
           this.respond(res, parsed.model, text, !done);
         };
-        if (!this.released) this.held = respond; else respond();
+        if (!this.released && !(this.initialTool && this.modelRequests.length === 1)) this.held = respond; else respond();
       } catch (error) { res.writeHead(500).end(String(error)); }
     });
   });
@@ -64,12 +74,25 @@ export class B6RealPiPeer {
       yield event;
     }
   }
-  boundary() { this.released = true; const held = this.held; this.held = undefined; held?.(); }
+  boundary() {
+    this.releasing ??= (async () => {
+      // The loopback model is a controlled boundary, not a speed benchmark.
+      // Release only after the fixture's native ACK receipts have caught up;
+      // raw Pi reads must not race an unrelated initial event-ingestion backlog.
+      await this.beforeBoundary?.();
+      this.released = true; const held = this.held; this.held = undefined; held?.();
+    })();
+    void this.releasing.catch(() => undefined); // close joins and reports it
+  }
   finish() { this.finishing = true; this.boundary(); }
   send(event: PiRpcRecord) { if (event.type === "process_exit") void this.transport?.close(); }
   async close() {
-    await this.transport?.close();
-    await new Promise<void>((resolve, reject) => this.server.close(error => error && (error as any).code !== "ERR_SERVER_NOT_RUNNING" ? reject(error) : resolve()));
+    try { await this.releasing; await this.closeGate; }
+    finally {
+      await this.transport?.close();
+      this.server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => this.server.close(error => error && (error as any).code !== "ERR_SERVER_NOT_RUNNING" ? reject(error) : resolve()));
+    }
   }
   respond(res: ServerResponse, model: unknown, text: string | undefined, keepGoing: boolean) {
     res.writeHead(200, { "content-type": "text/event-stream" });
