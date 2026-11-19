@@ -69,6 +69,7 @@ import {
 import { Buffer } from "node:buffer";
 import { isDeepStrictEqual } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
+import { nativeResponseItems } from "./native-runtime/native-response-items.js";
 import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 import { isExplicitContinuationRetryClaim } from "./explicit-continuation-retry-claim.js";
 import { nativeManualAdmissionHoldsExecution } from "./native-runtime/native-runner-ownership.js";
@@ -13725,6 +13726,8 @@ export function issueService(db: Db) {
         authorizationReason?: string | null;
         /** Server-only final assistant response, never a tool/progress comment. */
         completionReply?: boolean;
+        /** Server-only durable native reply identity; scoped to actor.runId. */
+        completionReplyItemId?: string;
         /** Server-only: the server publishes the answer a run had ACCEPTED before
          * it was cancelled (native-withheld-reply.ts). A cancel revokes the
          * agent's own writes; it does not un-accept an answer the person already
@@ -13843,7 +13846,30 @@ export function issueService(db: Db) {
         }
       }
       if (options?.completionReply && actor.agentId && actor.runId) {
-        const delivered = await existingChatCompletionReply(dbOrTx, actor.runId, issueId);
+        const [nativeRun] = await dbOrTx.select({ runtimeMode: heartbeatRuns.runtimeMode }).from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.id, actor.runId), eq(heartbeatRuns.companyId, issue.companyId)));
+        if (nativeRun?.runtimeMode === "native" && !options.completionReplyItemId) {
+          const items = await nativeResponseItems(dbOrTx, { companyId: issue.companyId, runId: actor.runId, text: body });
+          if (items.length > 1) {
+            let reply: IssueComment | undefined;
+            // UI chronology is millisecond timestamps, then UUID. Distinct
+            // timestamps preserve item order even for very fast inserts.
+            const firstCreatedAt = options.createdAt ? new Date(options.createdAt).getTime() : Date.now();
+            for (const [index, item] of items.entries()) reply = await addComment(issueId, item.text, actor,
+              { ...options, completionReplyItemId: item.itemId,
+                createdAt: new Date(firstCreatedAt + index) }, dbOrTx);
+            return reply!;
+          }
+        }
+        if (options.completionReplyItemId) {
+          const [existing] = await dbOrTx.select().from(issueComments).where(and(
+            eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issueId),
+            eq(issueComments.createdByRunId, actor.runId),
+            eq(issueComments.clientRequestId, `native-reply:${actor.runId}:${options.completionReplyItemId}`)));
+          // Deleted replies retain their item receipt too: never resurrect one.
+          if (existing) return redactIssueComment(existing, currentUserRedactionOptions.enabled);
+        }
+        const delivered = options.completionReplyItemId ? null : await existingChatCompletionReply(dbOrTx, actor.runId, issueId);
         if (delivered) return redactIssueComment(delivered, currentUserRedactionOptions.enabled);
       }
       const authorType = issueCommentAuthorTypeSchema.parse(
@@ -13973,7 +13999,7 @@ export function issueService(db: Db) {
             : (options?.metadata ?? null),
         );
       let comment: typeof issueComments.$inferSelect | null = null;
-      if (createdByRunId && !options?.proactiveChatMessage && !(actor.userId && options?.clientRequestId)) {
+      if (createdByRunId && !options?.completionReplyItemId && !options?.proactiveChatMessage && !(actor.userId && options?.clientRequestId)) {
         const existing = await dbOrTx
           .select()
           .from(issueComments)
@@ -14066,7 +14092,8 @@ export function issueService(db: Db) {
           authorType,
           createdByRunId,
           body: redactedBody,
-          clientRequestId: options?.clientRequestId ?? null,
+          clientRequestId: options?.completionReplyItemId && actor.runId
+            ? `native-reply:${actor.runId}:${options.completionReplyItemId}` : options?.clientRequestId ?? null,
           presentation,
           metadata,
           sourceTrust: options?.sourceTrust ?? null,
