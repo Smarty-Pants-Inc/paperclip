@@ -1004,6 +1004,27 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
     expect(await readPersonStopHold(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId, messageId: later })).toBeNull();
   }, 120_000);
 
+  // adopt-cutc3 (1), R17 bound (a) (RFL 09:27Z): only a SYSTEM-ended latest run (cancelled / timed out, no person's
+  // cancel) counts. A Stop on the latest run that SUCCEEDED (answered long ago) holds nothing: no row, no hold, no card.
+  it("3d control (a): a Stop on the latest SUCCEEDED run is a no-op: nothing held, no acceptance row, no card", async () => {
+    const r = await stopWithHeld({ stopKind: "system", count: 0 });
+    // The latest run of this agent on the task SUCCEEDED (its answer is long given); it is the only run after the cancelled one.
+    const [first] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, r.firstRunId));
+    const [done] = await db.insert(heartbeatRuns).values({ companyId: r.companyId, agentId: r.agentId, status: "succeeded",
+      invocationSource: "automation", contextSnapshot: { issueId: r.issueId }, createdAt: new Date(first!.createdAt.getTime() + 1_000),
+      startedAt: new Date(Date.now() - 60 * 60_000), finishedAt: new Date(Date.now() - 60 * 60_000) } as any).returning();
+    const p = (await r.post("PERSON request after an answered turn").expect(201)).body.id as string;
+    await sweep(r, 3); await sweep(r, 11);
+    const cardsBefore = await cards(r, [p]);
+    const stopped = await request(r.client).post(`/api/heartbeat-runs/${done!.id}/cancel`).send({});
+    expect(stopped.status, JSON.stringify(stopped.body)).toBe(200);
+    expect(await endedRunAcceptances(done!.id)).toEqual([]);
+    expect(await readPersonStopHold(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId, messageId: p })).toBeNull();
+    expect((await r.queue()).executionWait?.reason).not.toBe("stopped_by_person");
+    await sweep(r, 3); await sweep(r, 11);
+    expect(await cards(r, [p])).toEqual(cardsBefore);
+  }, 120_000);
+
   it("3d control: ANOTHER person's Stop of the latest ended run does not hold MY waiting message", async () => {
     const r = await stopWithHeld({ stopKind: "system", count: 0 });
     const p = (await r.post("PERSON request while previous run is saving").expect(201)).body.id as string;
