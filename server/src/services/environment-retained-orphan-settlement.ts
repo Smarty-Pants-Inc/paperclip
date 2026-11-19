@@ -90,7 +90,7 @@ function orphanedRunSandboxCondition() {
     sql`${environmentLeases.heartbeatRunId} is not null`, sql`${environmentLeases.provider} is not null`,
     sql`${environmentLeases.providerLeaseId} is not null`,
     sql`${environmentLeases.metadata} ? ${ORPHANED_SANDBOX_RECOVERY_KEY}`,
-    sql`${environmentLeases.metadata} ? 'sandboxStopAndRetainReceipt'`);
+    sql`${environmentLeases.metadata}->'sandboxStopAndRetainReceipt'->>'runId' = ${environmentLeases.heartbeatRunId}::text`);
 }
 
 /** SQL mirror of the "held only while the stop is a usable source" checks in

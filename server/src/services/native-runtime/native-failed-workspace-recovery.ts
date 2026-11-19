@@ -20,6 +20,7 @@ import { pinFailedObservedWorkspace } from "./native-observed-workspace-preserva
 import { hasConfirmedSandboxStopAndRetain } from "../sandbox-stop-and-retain.js";
 import { preparedRemoteWorkspaceSource } from "../remote-workspace-lifecycle.js";
 import { releaseUnchangedRemoteWorkspaceWriterById } from "../remote-workspaces.js";
+import { ownLeaseStopRecord } from "../environment-lease-handoff.js";
 import { isSupersededWorkspaceExport, markSupersededWorkspaceExportHold } from "./native-superseded-workspace-export.js";
 
 const reusableLeasePolicies = ["reuse_by_environment", "reuse_by_execution_workspace"];
@@ -48,19 +49,21 @@ export function nativeStopWorkspaceOutcome(input: {
    * executor's cancellation-pending-recovery signal after one. */
   stopped: boolean;
   /** The run's source lease when known; it must still be the running box. */
-  source?: Pick<typeof environmentLeases.$inferSelect, "status" | "metadata"> | null;
+  source?: Pick<typeof environmentLeases.$inferSelect, "status" | "metadata" | "heartbeatRunId"> | null;
 }): NativeStopWorkspaceOutcome {
   if (input.admittedDisposition !== "keep_running" || !input.stopped) return "preserve";
   const source = input.source;
+  // adopt-receipt-own-run: only a receipt naming THIS lease's run is this box's
+  // stop; a hand-off once copied the previous cut run's receipt onto its successor.
   if (source && (!["active", "retained"].includes(source.status)
-    || (source.metadata?.remoteExecutionTermination as Record<string, unknown> | undefined)?.state === "stopped"
-    || source.metadata?.sandboxStopAndRetainReceipt != null)) return "preserve";
+    || ownLeaseStopRecord(source, "remoteExecutionTermination")?.state === "stopped"
+    || ownLeaseStopRecord(source, "sandboxStopAndRetainReceipt") != null)) return "preserve";
   return "handoff";
 }
 
 function cancelledNativeRunWorkspaceOutcome(run: Pick<typeof heartbeatRuns.$inferSelect,
   "id" | "companyId" | "status" | "nativeIssueId" | "resultJson" | "runnerProfileJson">,
-  source: Pick<typeof environmentLeases.$inferSelect, "status" | "metadata">) {
+  source: Pick<typeof environmentLeases.$inferSelect, "status" | "metadata" | "heartbeatRunId">) {
   return nativeStopWorkspaceOutcome({ admittedDisposition: admittedNativeResourceDisposition(run.runnerProfileJson),
     stopped: run.status === "cancelled" && hasAcknowledgedNativeRunStopRequest(run), source });
 }
