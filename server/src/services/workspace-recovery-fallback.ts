@@ -64,6 +64,12 @@ export function isUnverifiableSourceFailure(failure: SystemRecoveryState["failur
     && (PERMANENT_SOURCE_RETRY_CLASSES as readonly string[]).includes(failure.retryClass));
 }
 
+/** The ruled line for a previous run whose file changes were not saved: the
+ * task continues from the last saved version. One copy, reused verbatim. */
+export function previousRunUnsavedFilesLine(could: "could not save" | "could not verify") {
+  return `Paperclip ${could} the previous run's unsaved files, so the task continues from the last saved version.`;
+}
+
 /** Text the agent receives with its continuation. It names no person who must act. */
 export function retainedSourceFallbackNote(input: { runId: string; snapshotId: string | null; quarantine: Quarantine }) {
   const from = input.snapshotId ? `the last saved version of the workspace (snapshot ${input.snapshotId})` : "the workspace's original source";
@@ -351,8 +357,8 @@ export async function continueFromLastSavedWorkspace(input: Source & {
     // A superseded export's files were not unverifiable: saving them kept failing.
     const could = isSupersededWorkspaceExportHold(action.evidence) ? "could not save" : "could not verify";
     const userText = quarantine.state === "captured"
-      ? `Paperclip ${could} the previous run's unsaved files, so the task continues from the last saved version. Those files are attached to the task, unapplied.`
-      : `Paperclip ${could} the previous run's unsaved files, so the task continues from the last saved version. Those files could not be read.`;
+      ? `${previousRunUnsavedFilesLine(could)} Those files are attached to the task, unapplied.`
+      : `${previousRunUnsavedFilesLine(could)} Those files could not be read.`;
     const evidence = { ...action.evidence, automaticRecovery: undefined, [RETAINED_SOURCE_FALLBACK_CHECK_KEY]: undefined,
       retainedSourceFallback: { ...fallback, failureCode: current.system.failure?.code ?? null, recordedAt: now.toISOString() },
       workspaceRecovery: { ...(readWorkspaceRecovery(action.evidence) ?? {}), message: userText, retryable: false },

@@ -160,6 +160,7 @@ import type { createHeartbeatLifecycle } from "./run-lifecycle.js";
 import type { createHeartbeatRetries, HeartbeatRetryDependencies } from "./retries.js";
 import type { createHeartbeatQueue } from "./queue.js";
 import type { createHeartbeatRecovery } from "./recovery.js";
+import { notePauseCancellation } from "../native-runtime/turn-authority-revocation.js";
 import type { createWakeQueue, PostCommitEffect as WakeQueuePostCommitEffect } from "../../modules/wake-queue/index.js";
 import type { environmentRunOrchestrator } from "../environment-run-orchestrator.js";
 
@@ -1698,6 +1699,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
               await dependencies.verifyStartupCleanup(startupCleanupRun);
             } else {
               try {
+                // Pause only: the certificate this cancel sets is a Pause's.
+                if (options.errorCode === "agent_paused") notePauseCancellation(run.id);
                 await cancelHeartbeatNativeRun({
                   db,
                   runId: run.id,

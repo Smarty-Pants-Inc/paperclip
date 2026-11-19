@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { pauseRevokedTurn } from "./turn-authority-revocation.js";
 import { isDeepStrictEqual } from "node:util";
 import { and, desc, eq, exists, inArray, isNotNull, ne, not, notInArray, or, sql } from "drizzle-orm";
 import {
@@ -710,6 +711,10 @@ export function rebindNativeSessionCheckpoint(input: {
   // The source's result was accepted, but its provider state was never saved
   // and its sandbox is gone. Resuming would only fail, so start fresh now.
   if (isNativeProviderStateUnsaved(previousProfile)) return null;
+  // A person's Pause revoked the source's turn (exact-owner certificate) and
+  // its own teardown still holds that provider session: never recover, adopt
+  // or wait for it; start a fresh session from the saved state.
+  if (pauseRevokedTurn(input.previousRun.id)) return null;
   if (
     previousProfile.nativeToolContractFingerprint !==
     nativeToolContractFingerprintForTarget(input.executionTargetKind ?? "local", input.currentExecution.provider.kind)
