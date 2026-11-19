@@ -202,6 +202,76 @@ export async function readPersonStopHold(db: Db, input: {
   return held.length ? { stoppedRunId: lastTurn.id, wakeIds: held.map(wake => wake.id) } : null;
 }
 
+/** adopt-marker-port (RFL F1): this run is the FIRST turn after a person's Stop when the latest person Stop
+ * acceptance (run-control's server-owned run.stop.accepted row, kind person_stop, by a user) on this issue and
+ * agent names a run before this one, and no run of this agent on the issue between that stopped run and this one
+ * started a provider turn. Its input then says so once (PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE), as Claude
+ * Code's '[Request interrupted by user]' does. A run in between that ENDED (failed / cancelled / timed out) without
+ * starting a provider turn never showed the marker, so the first run that does start a turn carries it. A later
+ * turn, an Interrupt, an agent's or the system's cancel never match. */
+export async function readPersonStoppedPreviousTurn(db: Db, input: {
+  companyId: string; issueId: string; agentId: string; runId: string; runCreatedAt: Date;
+}): Promise<boolean> {
+  const { stopAcceptanceEventSql } = await import("./heartbeat-run-events.js");
+  const onIssue = or(eq(heartbeatRuns.nativeIssueId, input.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`);
+  const [stop] = await db.select({ runId: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt, resultJson: heartbeatRuns.resultJson,
+    payload: heartbeatRunEvents.payload })
+    .from(heartbeatRunEvents).innerJoin(heartbeatRuns, and(eq(heartbeatRuns.id, heartbeatRunEvents.runId),
+      eq(heartbeatRuns.companyId, heartbeatRunEvents.companyId)))
+    .where(and(eq(heartbeatRunEvents.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), onIssue,
+      stopAcceptanceEventSql(), sql`${heartbeatRunEvents.payload}->>'kind' = 'person_stop'`))
+    .orderBy(desc(heartbeatRunEvents.createdAt), desc(heartbeatRunEvents.id)).limit(1);
+  if (!stop || stop.runId === input.runId) return false;
+  const accepted = parseObject(stop.payload);
+  if (accepted.schema !== "paperclip.stop-acceptance.v1" || accepted.issueId !== input.issueId
+    || typeof accepted.userId !== "string" || !accepted.userId
+    || parseObject(stop.resultJson).queuedCommentInterruptQueueId) return false;
+  if (stop.createdAt.getTime() > input.runCreatedAt.getTime()) return false;
+  const between = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), onIssue,
+    sql`${heartbeatRuns.id} <> ${input.runId}`, sql`${heartbeatRuns.id} <> ${stop.runId}`,
+    sql`${heartbeatRuns.createdAt} >= ${stop.createdAt.toISOString()}::timestamptz`,
+    sql`${heartbeatRuns.createdAt} <= ${input.runCreatedAt.toISOString()}::timestamptz`));
+  for (const run of between) {
+    // Only an ENDED-unsuccessful run that never started a provider TURN leaves the marker for the next one; a run
+    // that succeeded, is still live, or started (or may have started) a turn consumed (or may yet consume) it.
+    if (!MARKER_PASSING_RUN_STATUSES.includes(run.status)) return false;
+    if (await startedProviderTurnForStopMarker(db, { companyId: input.companyId, runId: run.id })) return false;
+  }
+  return true;
+}
+
+/** A run between the stopped run and this one that ended in these states, without starting a provider turn,
+ * never showed the provider the Stop marker. */
+const MARKER_PASSING_RUN_STATUSES: readonly string[] = ["failed", "cancelled", "timed_out"];
+
+/** adopt-marker2 (rf4-bppd F4.1): the Stop marker's OWN 'consumed' test. The marker is shown to the provider only
+ * inside a turn's input, so a run in between consumed it only when it started a provider TURN: a turn / item / tool /
+ * semantic tool / run result event, a tool call, an accepted or finalized result, or a session checkpoint with an
+ * active (or settled) turn. Readiness alone (harness.ready, session.started, session.resumed) is NOT a turn.
+ * Unreadable rows count as a started turn (fail closed: the marker is never shown twice). */
+async function startedProviderTurnForStopMarker(db: Db, input: { companyId: string; runId: string }): Promise<boolean> {
+  const { companyId, runId } = input;
+  const result = await db.execute(sql`select
+    exists (select 1 from heartbeat_run_events event where event.company_id = ${companyId} and event.run_id = ${runId}
+      and event.event_type ~ '^(turn|item|tool|semantic_tool|run[.]result)[.]') as "turnEvent",
+    exists (select 1 from tool_invocations invocation where invocation.company_id = ${companyId}
+      and invocation.run_id = ${runId}) as "toolInvocation",
+    exists (select 1 from native_run_results result where result.company_id = ${companyId}
+      and result.run_id = ${runId}) as "acceptedResult",
+    exists (select 1 from native_run_finalizations coordinator where coordinator.run_id = ${runId}
+      and coordinator.result_id is not null) as "finalizedResult",
+    exists (select 1 from heartbeat_runs run where run.company_id = ${companyId} and run.id = ${runId}
+      and (run.runner_profile_json->'sessionCheckpoint'->>'activeTurnId' is not null
+        or (jsonb_typeof(run.runner_profile_json->'sessionCheckpoint'->'terminalTurns') = 'array'
+          and jsonb_array_length(run.runner_profile_json->'sessionCheckpoint'->'terminalTurns') > 0))) as "checkpointTurn"`);
+  const rows = (Array.isArray(result) ? result : (result as { rows?: unknown[] }).rows ?? []) as Array<Record<string, unknown>>;
+  const row = rows[0];
+  if (!row) return true;
+  return [row.turnEvent, row.toolInvocation, row.acceptedResult, row.finalizedResult, row.checkpointTurn]
+    .some(value => value !== false);
+}
+
 /** The Stop's OWN board hold: the release wrote it for the very run the person
  * stopped (the acknowledgement landed after the release). Any other hold (a
  * real failure, or a person Stop of a different run) is not this. */

@@ -35,6 +35,7 @@ import type { createHeartbeatRetries } from "./retries.js";
 import type { createHeartbeatLifecycle } from "./run-lifecycle.js";
 import { createHeartbeatPreparationTiming } from "./preparation-timing.js";
 import { mcpAppViewsService, renderMcpAppRunContext } from "../mcp-app-views.js";
+import { readPersonStoppedPreviousTurn } from "../acknowledged-native-stop.js";
 import {
   ConfigurationIncompleteFailure, applyRunScopedMentionedSkillKeys, resolveExecutionRunAdapterConfig,
   resolveRunScopedMentionedSkillKeys, type createHeartbeatRunPreparation, type resolveAcceptedPlanWakeRoutingDecision,
@@ -467,6 +468,9 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
     ...parseObject(context.paperclipWake),
     connectorSkillInstructions: connectorDelivery.instructions,
     mcpAppContext: await mcpAppContextPreparation,
+    // Server-owned (adopt-marker-port): the first turn after a person's Stop says so, once.
+    personStoppedPreviousTurn: issueId && await readPersonStoppedPreviousTurn(db, { companyId: agent.companyId, issueId,
+      agentId: agent.id, runId: run.id, runCreatedAt: run.createdAt }) ? true : undefined,
   };
   let runtimeConfig = await prepareConnectionInstructionDelivery({
     resolve: async () => preparedInstructions.value,
