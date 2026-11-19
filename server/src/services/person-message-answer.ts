@@ -1,5 +1,5 @@
 import { and, eq, inArray, sql, type SQL } from "drizzle-orm";
-import { activityLog, heartbeatRuns, issueComments, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, heartbeatRuns, issueComments, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
 import { freshContinuationSourceChainSql } from "./fresh-continuation-chain.js";
 
 /** The import's per-task arrival record: one activity row per issue a company import creates (issues.importIssues). */
@@ -112,15 +112,40 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
  *   in the thread (SMA-4 11-19 13:53Z: three 11-17 messages answered by later turns, re-sent at boot);
  * - it is not behind the chat's latest /new boundary (issues.conversation_boundary_comment_id).
  */
+/**
+ * neworg-floor-custody: m is in LIVE custody (never floor-skipped): a wake that still holds it
+ * (queued / deferred / claimed: the person-Stop hold included) or a run carrying it that has not
+ * finished. Its owner delivers it; the floor only judges messages nothing holds.
+ */
+function liveMessageCustodySql(m: PersonMessageSql): SQL {
+  return sql`(exists (select 1 from ${agentWakeupRequests} live_wake
+      where live_wake.company_id = ${m.companyId}
+        and live_wake.status in ('queued', 'deferred_issue_execution', 'claimed')
+        and (live_wake.idempotency_key = 'conversation-comment:' || ${m.id}::text
+          or live_wake.payload->>'commentId' = ${m.id}::text
+          or live_wake.payload->'_paperclipWakeContext'->>'wakeCommentId' = ${m.id}::text
+          or coalesce(live_wake.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text))
+    or exists (select 1 from ${heartbeatRuns} live_run
+      where live_run.company_id = ${m.companyId} and live_run.status in ('queued', 'running')
+        and ${carriesCommentSql("live_run", m.id, false)}))`;
+}
+
 export function personMessageOwedSql(m: PersonMessageSql): SQL {
   return sql`(not ${answeredPersonMessageSql(m)}
-    and not exists (select 1 from ${heartbeatRuns} moved_on
+    and (${liveMessageCustodySql(m)} or not exists (select 1 from ${heartbeatRuns} moved_on
       where moved_on.company_id = ${m.companyId}
         and (moved_on.native_issue_id = ${m.issueId} or moved_on.context_snapshot->>'issueId' = ${m.issueId}::text)
         and moved_on.status = 'succeeded' and moved_on.started_at > ${m.createdAt}
         and exists (select 1 from ${issueComments} moved_reply where moved_reply.company_id = moved_on.company_id
           and moved_reply.issue_id = ${m.issueId} and moved_reply.created_by_run_id = moved_on.id
-          and moved_reply.author_type = 'agent' and moved_reply.deleted_at is null))
+          and moved_reply.author_type = 'agent' and moved_reply.deleted_at is null)
+        -- neworg-floor-custody: a run that carries m and started at or after this run (a Stop-held
+        -- README's carrier after the '9 + 10' turn) owns m; the chat has not moved on past it,
+        -- so that carrier's failure still cards (G1).
+        and not exists (select 1 from ${heartbeatRuns} later_carrier
+          where later_carrier.company_id = moved_on.company_id
+            and later_carrier.started_at >= moved_on.started_at
+            and ${carriesCommentSql("later_carrier", m.id, false)})))
     and not exists (select 1 from ${issues} reset_issue
       join ${issueComments} reset_boundary on reset_boundary.id = reset_issue.conversation_boundary_comment_id
         and reset_boundary.company_id = reset_issue.company_id and reset_boundary.issue_id = reset_issue.id
