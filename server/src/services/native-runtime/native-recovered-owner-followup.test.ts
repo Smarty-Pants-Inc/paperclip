@@ -114,7 +114,8 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
    * Only the database controller checkpoint and recovery pointer survive. */
   async function seedRecoveredPriorRun(control: "settled" | "pending-command" | "unanswered-tool"
     | "failed-turn-start" | "rejected-turn-start" | "indeterminate-turn-start" | "unknown-outcome-turn-start"
-    | "unsuperseded-unknown-outcome-turn-start" | "failed-suspend" | "pending-attach" | "pending-tool-result" | "pending-suspend" = "settled",
+    | "unsuperseded-unknown-outcome-turn-start" | "failed-suspend" | "pending-attach" | "pending-tool-result" | "pending-suspend"
+    | "pending-turn-interrupt" | "pending-turn-stop" = "settled",
     options: { controller?: { bootId: string; pid: number; processStartedAt: Date }; provider?: "codex" | "acpx" | "opencode" | "pi_rpc";
       lifecycle?: "warm"; governedWait?: boolean; issueId?: string } = {}) {
     const issueId = options.issueId ?? randomUUID(), workspaceId = randomUUID(), runId = randomUUID();
@@ -162,12 +163,16 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
         "unknown-outcome-turn-start": unknownOutcome,
       } as const;
       const answered = answers as Record<string, unknown>;
+      const personStopPending: Record<string, string> = { "pending-suspend": "runner.suspend",
+        "pending-turn-interrupt": "turn.interrupt", "pending-turn-stop": "turn.stop" };
       // A warm Runner stays ready after its turn: its controller sends no suspend.
       const commands = ["run.prepare", "session.open", ...(control in answered ? ["turn.start"] : []), "turn.start",
         // pending-suspend: a person's Stop closed the session; its close barrier
-        // queued runner.suspend and the Runner never answered it.
-        ...(options.lifecycle === "warm" && control !== "pending-suspend" ? [] : ["runner.suspend"])].map(type => controller.queueCommand(type));
-      for (const command of control === "pending-command" || control === "pending-suspend" ? commands.slice(0, -1) : commands) {
+        // queued runner.suspend and the Runner never answered it. pending-turn-*:
+        // the Stop/Interrupt's own turn command the Runner never answered.
+        ...(options.lifecycle === "warm" && !(control in personStopPending) ? [] : [personStopPending[control] ?? "runner.suspend"])]
+        .map(type => controller.queueCommand(type));
+      for (const command of control === "pending-command" || control in personStopPending ? commands.slice(0, -1) : commands) {
         Object.assign(command, { status: "completed", result: { status: "completed" } });
       }
       if (control in answered) Object.assign(commands[2]!, answers[control as keyof typeof answers]);
@@ -1282,7 +1287,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
   // NEW box. The pending suspend is settled only because that Runner is known
   // gone (the same fact admission reads); a person's Stop alone never settles it.
   async function stoppedWithPendingSuspend(stop: Parameters<typeof stopSettledOwner>[1] | false = {}, options: {
-    control?: "pending-suspend" | "pending-command";
+    control?: "pending-suspend" | "pending-command" | "pending-turn-interrupt" | "pending-turn-stop";
     lease?: "proof-own" | "proof-other-run" | "retained-no-proof" | "active-no-proof" } = {}) {
     const prior = await seedRecoveredPriorRun(options.control ?? "pending-suspend", { provider: "pi_rpc", lifecycle: "warm" });
     const followUp = await admitFollowUp(prior);
@@ -1354,6 +1359,29 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const { followUp } = await stoppedWithPendingSuspend(stop, { lease });
     expect(await followUp.start("created")).toBe(stranded("journal_commands_unsettled(runner.suspend.pending)"));
     expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
+  }, 60_000);
+
+  // adopt-fence-turn (rf5 F1, R1 capture replay): the same person Stop/Interrupt
+  // can leave its own turn.interrupt or turn.stop unanswered by a Runner that
+  // is known gone. The same rule settles it: the message runs once.
+  it.each(["pending-turn-interrupt", "pending-turn-stop"] as const)(
+    "adopt-fence-turn: %s with a RETAINED lease and this run's hand-off proof; the next message runs once", async control => {
+      const { prior, followUp } = await stoppedWithPendingSuspend({}, { control });
+      expect(await followUp.start("created")).toBe(ADMITTED);
+      expect(followUp.logs.join("")).not.toContain("retirement_refused");
+      expect(await archivedOwners(await sessionRoot())).toEqual([prior.runId]);
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, prior.issueId))).toEqual([]);
+    }, 60_000);
+
+  it.each<[string, "pending-turn-interrupt" | "pending-turn-stop", false | Parameters<typeof stopSettledOwner>[1],
+    "proof-own" | "retained-no-proof" | "proof-other-run", string]>([
+    ["no person Stop, turn.interrupt pending", "pending-turn-interrupt", false, "proof-own", "turn.interrupt"],
+    ["an unacknowledged Stop, turn.stop pending", "pending-turn-stop", { ack: "none" }, "proof-own", "turn.stop"],
+    ["a RETAINED lease with no proof, turn.interrupt pending", "pending-turn-interrupt", {}, "retained-no-proof", "turn.interrupt"],
+    ["a proof for ANOTHER run, turn.stop pending", "pending-turn-stop", {}, "proof-other-run", "turn.stop"],
+  ])("adopt-fence-turn control: %s still refuses", async (_label, control, stop, lease, type) => {
+    const { followUp } = await stoppedWithPendingSuspend(stop, { control, lease });
+    expect(await followUp.start("created")).toBe(stranded(`journal_commands_unsettled(${type}.pending)`));
   }, 60_000);
 
   /** H6 (recovery/service.ts): a warm Stop whose release was skipped raises

@@ -6435,6 +6435,10 @@ const LOCAL_RUNNER_LIFECYCLE_COMMANDS = new Set(["runner.suspend", "runner.drain
  * sandbox lease ended on another sandbox, no process remains to receive them. */
 const GONE_REMOTE_RUNNER_DELIVERY_COMMANDS = new Set(["run.attach", "semantic_tool.result", "session.snapshot",
   "session.goal.get"]);
+/** What a person's acknowledged Stop or Interrupt itself asked of this run's
+ * Runner: its own turn.interrupt/turn.stop and its close barrier's lifecycle
+ * commands. Once that Runner is known gone, the Stop settles them. */
+const PERSON_STOP_SETTLED_COMMANDS = new Set([...LOCAL_RUNNER_LIFECYCLE_COMMANDS, "turn.interrupt", "turn.stop"]);
 
 function readSettledRunnerdProjection(root: string, identity: Record<string, string>,
   options: { localRunner?: boolean; controlBytes?: string; remoteRunnerGone?: boolean; remoteRunnerStopped?: boolean; parkedGovernedWait?: boolean;
@@ -6472,10 +6476,11 @@ function readSettledRunnerdProjection(root: string, identity: Record<string, str
     // queued the Runner's own suspend (drain, shutdown), which a Runner on a
     // stopping box may never answer. That Stop, not the Runner, settles the
     // turn; the caller still proves the Stop settled cleanly and the controller
-    // stopped. Only a still-pending lifecycle command; every other command,
-    // and a failed or indeterminate suspend, still counts.
+    // stopped. Only a still-pending command that Stop asked for (its
+    // turn.interrupt/turn.stop, its lifecycle commands); every other command,
+    // and a failed or indeterminate one, still counts.
     const settledCommands = options.personStopped
-      ? runnerSettled.filter(command => !(LOCAL_RUNNER_LIFECYCLE_COMMANDS.has(String(command.type)) && command.status === "pending"))
+      ? runnerSettled.filter(command => !(PERSON_STOP_SETTLED_COMMANDS.has(String(command.type)) && command.status === "pending"))
       : runnerSettled;
     const settledControl = settledCommands === commands ? control : { ...control, commands: settledCommands };
     // The controller journals a tool's answer after the tool ran. Only its
@@ -6619,7 +6624,9 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
   let projection = readSettledRunnerdProjection(input.root, identity, projectionOptions);
   // adopt-suspend-pending: a person's Stop leaves its Runner's suspend
   // pending when that Runner never answers. Read the Stop receipt, then
-  // apply the same proof with that Stop settling only the lifecycle commands.
+  // apply the same proof with that Stop settling only what it asked of the
+  // Runner (PERSON_STOP_SETTLED_COMMANDS). A board Interrupt records the same
+  // acknowledged receipt (cancelRun stopAcceptance), so one rule covers both.
   // adopt-fence-narrow: ONLY when the stopped run's Runner is known gone
   // (remoteRunnerGone: its lease released/expired, or this run's persisted
   // hand-off proof). A person's Stop alone never settles them.
