@@ -158,7 +158,9 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
     app.use("/api", agentRoutes(db, {} as never)); app.use("/api", issueRoutes(db, {} as never, {}));
     app.use("/api", activityRoutes(db)); app.use("/api", issueTreeControlRoutes(db)); app.use(errorHandler);
     // Every box is a local directory. Only R's box carries the fault, armed after R accepted.
-    const fault = { stall: null as null | { entered: () => void; release: Promise<void> }, fail: false, calls: 0 };
+    const fault = { stall: null as null | { entered: () => void; release: Promise<void> }, fail: false, calls: 0,
+      /** EXECUTOR-FAILS (named injection): R's provider turn reports a failure AFTER it accepted its own result. */
+      executorFails: null as null | { errorCode: string; errorMessage: string } };
     const boxes: Array<{ providerLeaseId: string; cwd: string; leaseIds: string[] }> = [];
     type Execute = NonNullable<AdapterSandboxExecutionTarget["runner"]>["execute"];
     box.nextBox = async (leaseId, real, lease) => {
@@ -248,6 +250,7 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
       await fs.writeFile(path.join(boxCwd, "notes.md"), "R's new notes (unsaved)\n");
       faultedBox.index = boxIndex;
       fault.stall = { entered: reached, release: stallRelease };
+      if (fault.executorFails) return { exitCode: 1, signal: null, timedOut: false, ...fault.executorFails };
       return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Rewrote the report." };
     };
     const runs = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)))
@@ -276,8 +279,9 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
 
   /** REAL up to here: turn 0 saved; M woke R through the queue; R (a real run of the real executor) accepted its result
    * and hangs in its own teardown copy-back (CLASSIC-STALL-1); the person's next message is parked behind it. */
-  async function hungRWithParkedMessage(capMs: number, park = true) {
+  async function hungRWithParkedMessage(capMs: number, park = true, executorFails: null | { errorCode: string; errorMessage: string } = null) {
     const s = await liveScenario();
+    s.fault.executorFails = executorFails;
     const errors: unknown[] = [];
     const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: () => ({}) as never });
     const delivery = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => errors.push(error) });
@@ -601,6 +605,55 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
       expect((await h.agentComments()).filter(comment => comment.createdByRunId === p.id)).toHaveLength(1);
       evidence.RETRY_EXPORT_WINDOW = { R: frozen, windowWakes, inWindow: inWindow.map(brief), P: brief(p), pRoot, rRoot: h.hostDir };
     } finally { releaseReopened(); await h.stop(); }
+  }, 300_000);
+
+  // K12, THE EXECUTOR-FAILED RUN (noflip limit 1; rf-5 06:48Z (1)). R accepted its result; then its own executor ended it
+  // FAILED while its finalization was still pending. The real reconciler later commits the accepted result (the files
+  // are saved, the task settles): R's row is not rewritten.
+  // REAL: turn 0 and R (the real executor: the queue's claim, preparation, R's own teardown copy-back, and the
+  //   executor's own failure write), reconcileNativeFinalizations (the call the finalization worker and the startup
+  //   reconcile make) -> the finalizer's commit; outcomes from GET /api/issues/:id/runs and /comments.
+  // NAMED INJECTIONS: EXECUTOR-FAILS (R's scripted provider turn reports provider_transport_failed after it accepted its
+  //   own result through PaperclipControlPlanePort); CLASSIC-STALL-1 (held, then released, so the failure lands first).
+  // PLANTED: nothing.
+  it("K12 EXECUTOR-FAILED: R's executor ends it FAILED after its result was accepted, its finalization still pending -> the reconciler commits the result and saves the files; R stays FAILED with the error, code and end time it ended with; its reply stays once", async () => {
+    const FAILURE = { errorCode: "provider_transport_failed", errorMessage: "provider_transport_failed: runner did not durably suspend before checkpoint" };
+    const h = await hungRWithParkedMessage(NO_CAP, false, FAILURE);
+    try {
+      expect(await h.coordinator(h.r.id)).toMatchObject({ phase: "workspace_finalizing", resultId: expect.any(String) });
+      // The held box call returns; R's own executor then ends R as failed (its provider turn failed).
+      h.s.releaseStall();
+      await h.heartbeat.drainActiveRunExecutions();
+      const ended = await h.run(h.r.id);
+      expect(ended).toMatchObject({ status: "failed", errorCode: FAILURE.errorCode, error: FAILURE.errorMessage, finishedAt: expect.any(Date) });
+      expect((await h.coordinator(h.r.id)).phase).not.toBe("committed");
+      const frozen = brief(ended);
+      expect((await h.s.servedLine(h.r.id)).status).toBe("failed");
+      // REAL: the reconciler (twice: the second pass is the replay / the committed-projection repair's chance).
+      await reconcileNativeFinalizations(db, [h.r.id], { environmentRuntime: {} as never });
+      await h.present();
+      expect(await h.coordinator(h.r.id)).toMatchObject({ phase: "committed" });
+      await reconcileNativeFinalizations(db, [h.r.id], { environmentRuntime: {} as never });
+      await h.heartbeat.resumeQueuedRuns();
+      await h.present();
+      // R is as it ended: status, error, code, end time. The commit left its receipt.
+      const after = await h.run(h.r.id);
+      expect(brief(after)).toEqual(frozen);
+      expect(record(after.resultJson).endedRunKept).toMatchObject({ schema: "paperclip.ended-run-kept.v1", status: "failed" });
+      expect(record(after.resultJson).recoveredExecutionFailure).toBeUndefined();
+      // What the person reads (real GETs): the run Failed, no unsaved-files line, the reply once, the files saved.
+      const served = await h.s.servedLine(h.r.id);
+      expect(served.status).toBe("failed");
+      expect(served.shown).toBeNull();
+      expect(["saved", null]).toContain(served.state);
+      expect(await listing(h.hostDir)).toMatchObject({ "report.md": "report, REWRITTEN BY R (unsaved)\n", "notes.md": "R's new notes (unsaved)\n" });
+      const thread = await h.thread();
+      expect(thread.filter(comment => comment.createdByRunId === h.r.id && comment.authorType === "agent").map(comment => comment.body)).toEqual([ANSWER]);
+      expect((await h.s.issue()).executionRunId).toBeNull();
+      expect(h.errors).toEqual([]);
+      evidence.K12_EXECUTOR_FAILED = { R: frozen, receipt: record(after.resultJson).endedRunKept, served, agent: await h.agentRead(), task: (await h.s.issue()).status,
+        thread: thread.map(comment => ({ by: comment.authorType, body: comment.body.slice(0, 120) })) };
+    } finally { await h.stop(); }
   }, 300_000);
 
   it("CONTROL: an unrelated LIVE predecessor still blocks. After R ended and the parked message's run P started, a third message stays parked behind the live P and starts only when P ends", async () => {
