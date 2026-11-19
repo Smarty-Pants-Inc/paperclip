@@ -59,7 +59,10 @@ export function createNativeToolTrace(trace: NativeRunTrace, now = Date.now) {
         outcome = "failed";
         throw error;
       } finally {
-        await trace.end(scope, { endedAtMs: now(), outcome });
+        // A diagnostic write must not hold an already-committed tool result.
+        // The trace owner drains deferred rows at finish; durable tool receipts
+        // and PRP result checkpoints remain on their ordinary awaited paths.
+        await trace.end(scope, { endedAtMs: now(), outcome, deferRunLog: true });
       }
     },
   };
