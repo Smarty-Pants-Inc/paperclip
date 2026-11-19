@@ -552,6 +552,10 @@ type PaperclipWakeExecutionStage = {
   allowedActions: string[];
 };
 
+/** adopt-stop-marker: the first turn after a person's Stop (server-owned wake field
+ * `personStoppedPreviousTurn`). Claude Code's '[Request interrupted by user]' shape; Pi drops
+ * its own aborted assistant message from the model's input (pi-ai transform-messages). */
+export const PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE = "The person stopped your previous turn. Do not resume or redo that work unless they ask; answer their new message.";
 export const PAPERCLIP_EARLIER_READ_COMMENT_NOTE = "An earlier turn already read this comment and may have applied it. Check the current task state first, and do not repeat work that is already done.";
 
 type PaperclipWakeComment = {
@@ -809,6 +813,8 @@ type PaperclipWakePayload = {
   externalChatProvider: PaperclipExternalChatProvider | null;
   externalChatQuestionResponse: PaperclipWakeExternalChatQuestionResponse | null;
   skillTest: boolean;
+  /** Server-owned: this is the first turn after a person's Stop of the previous one. */
+  personStoppedPreviousTurn: boolean;
   // Experimental: write user-interaction content in ASD-STE100 Simplified
   // Technical English with brief decision context.
   simplifiedEnglishInteractions: boolean;
@@ -1902,6 +1908,7 @@ export function normalizePaperclipWakePayload(
       payload.externalChatQuestionResponse,
     ),
     skillTest,
+    personStoppedPreviousTurn: payload.personStoppedPreviousTurn === true,
     simplifiedEnglishInteractions: asBoolean(
       payload.simplifiedEnglishInteractions,
       false,
@@ -2575,6 +2582,8 @@ function renderPaperclipWakePromptBody(
         ...wakeSummaryLines,
       ];
 
+  // Said once, right under the heading, before any 'continue the task' wording.
+  if (normalized.personStoppedPreviousTurn) lines.splice(2, 0, PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE);
   for (const config of normalized.githubReviewConfigurations) {
     lines.push("", "## Configured GitHub review instructions", config.instructions);
   }
