@@ -9,6 +9,7 @@ import { createRemoteNativeArtifactPreparation, syncRemoteRunnerDirectoryOut } f
 
 type Request = Parameters<CommandManagedRuntimeRunner["execute"]>[0];
 const roots: string[] = [];
+const auditMetadata = `printf 'metadata %s\\n' "$0 $*" >> "$PAPERCLIP_ARTIFACT_TEST_AUDIT"\n`;
 const metadata = {
   schema: "paperclip-runner/runnerd-build-metadata/v1",
   binaryName: "paperclip-runnerd",
@@ -31,7 +32,9 @@ async function fixture(input: {
   await mkdir(cwd);
   const runnerSource = join(bin, "paperclip-runnerd");
   const codexSource = join(bin, "codex");
-  const runnerScript = `#!/bin/sh\n[ "$1" = --build-metadata ] || exit 17\nprintf '%s\\n' '${JSON.stringify(metadata)}'\n`;
+  const auditPath = join(root, "artifact-audit.log");
+  await writeFile(join(bin, "sha256sum"), `#!/bin/sh\nprintf 'hash %s\\n' "$1" >> "$PAPERCLIP_ARTIFACT_TEST_AUDIT"\nPATH="$PAPERCLIP_ARTIFACT_TEST_ORIGINAL_PATH"; export PATH\nif command -v sha256sum >/dev/null 2>&1; then exec sha256sum "$@"; else exec shasum -a 256 "$@"; fi\n`, { mode: 0o700 });
+  const runnerScript = `#!/bin/sh\n${auditMetadata}[ "$1" = --build-metadata ] || exit 17\nprintf '%s\\n' '${JSON.stringify(metadata)}'\n`;
   await writeFile(runnerSource, runnerScript, { mode: 0o700 });
   await writeFile(codexSource, "#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.160.0'\n", { mode: 0o700 });
   let active = 0;
@@ -49,7 +52,9 @@ async function fixture(input: {
           const startedAt = new Date().toISOString();
           const child = execFile(request.command, request.args ?? [], {
             cwd: request.cwd ?? cwd,
-            env: { HOME: home, PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}` },
+            env: { HOME: home, PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+              PAPERCLIP_ARTIFACT_TEST_AUDIT: auditPath,
+              PAPERCLIP_ARTIFACT_TEST_ORIGINAL_PATH: process.env.PATH ?? "/usr/bin:/bin" },
             timeout: 10_000,
           }, (error, stdout, stderr) => {
             if (error && typeof error.code !== "number") return reject(error);
@@ -77,7 +82,8 @@ async function fixture(input: {
     targetPlatformArtifactVerified: true,
   };
   return { options, requests, runnerSource, runnerTarget, codexSource, codexTarget,
-    runnerScript, active: () => active, maxActive: () => maxActive };
+    runnerScript, active: () => active, maxActive: () => maxActive,
+    audit: async () => (await readFile(auditPath, "utf8")).trim().split("\n") };
 }
 
 const discovers = (request: Request, name: string) => request.command === "sh"
@@ -132,7 +138,7 @@ describe("remote native artifact preparation", () => {
     expect(f.active()).toBe(0);
   });
 
-  it("falls back to full install after a retained artifact RPC failure", async () => {
+  it("falls back to verified image preparation after a retained artifact RPC failure", async () => {
     const f = await fixture({ before: async request => {
       if (request.args?.[2] === "paperclip-runner-retained-artifact") throw new Error("transient retained probe failure");
     } });
@@ -141,7 +147,8 @@ describe("remote native artifact preparation", () => {
     await createRemoteNativeArtifactPreparation({ ...f.options, remoteCodexBinary: null, reuseRetainedRunner: true }).prepare("listen_ws");
     expect(f.requests.length).toBeGreaterThan(1);
     expect(await readFile(f.runnerTarget, "utf8")).toBe(f.runnerScript);
-    expect(f.requests.some(request => request.command === f.runnerTarget && request.args?.[0] === "--build-metadata")).toBe(true);
+    expect(f.requests.filter(request => request.args?.[1]?.includes("# paperclip-runner-prepare/v1"))).toHaveLength(1);
+    expect(await f.audit()).toContain(`metadata ${f.runnerTarget} --build-metadata`);
     expect(f.active()).toBe(0);
   });
 
@@ -152,10 +159,14 @@ describe("remote native artifact preparation", () => {
     expect(f.active()).toBe(0);
     expect((await lstat(f.runnerTarget)).isFile()).toBe(true);
     expect(await readFile(f.runnerTarget, "utf8")).toBe(f.runnerScript);
-    expect(f.requests.filter(request => request.args?.[1]?.includes('sha256sum "$1"')).map(request => request.args?.[3]))
-      .toEqual([f.runnerSource, f.runnerTarget]);
+    // Observe actual shell children, not source substrings: both hashes and
+    // both metadata executions must complete inside the single image RPC.
+    expect(await f.audit()).toEqual([
+      `metadata ${f.runnerSource} --build-metadata`, `hash ${f.runnerSource}`,
+      `hash ${f.runnerTarget}`, `metadata ${f.runnerTarget} --build-metadata`,
+    ]);
     expect(await readFile(f.runnerSource, "utf8")).toBe(f.runnerScript);
-    expect(f.requests.filter(request => request.command === f.runnerTarget && request.args?.[0] === "--build-metadata")).toHaveLength(1);
+    expect(f.requests.filter(request => request.args?.[1]?.includes("# paperclip-runner-prepare/v1"))).toHaveLength(1);
     expect(f.requests.filter(request => request.command === f.codexTarget && request.args?.[0] === "--version")).toHaveLength(1);
     expect(f.requests.some(request => request.command === "npm")).toBe(false);
   });
@@ -172,7 +183,7 @@ describe("remote native artifact preparation", () => {
     expect(await readFile(f.runnerSource, "utf8")).toBe(f.runnerScript);
     expect((await readdir(join(f.options.remoteRuntimeRoot, "bin"))).sort()).toEqual(["codex", "paperclip-runnerd"]);
     const copy = f.requests.find(request => request.args?.[1]?.includes("cp --preserve=mode"));
-    expect(copy).toMatchObject({ command: "sh", bypassSession: true, timeoutMs: 10_000 });
+    expect(copy).toMatchObject({ command: "sh", bypassSession: true, timeoutMs: 30_000 });
     expect(copy?.args?.[1]).toContain("mktemp");
     expect(copy?.args?.[1]).toContain("mv -f");
     // Both remaining "link" callers write a regular Codex launcher, which
@@ -185,17 +196,32 @@ describe("remote native artifact preparation", () => {
     expect(await readFile(join(checkpoint, "bin", "codex"), "utf8")).toBe(await readFile(f.codexTarget, "utf8"));
   });
 
-  it("reads installed pack metadata in the existing final runner probe", async () => {
+  it("reads installed pack metadata in the destination phase of the image transaction", async () => {
     const f = await fixture();
     const installation = { root: "/opt/paperclip-runner/provider-pack", manifest: { digest: "selected" }, immutable: true };
-    await writeFile(f.runnerSource, `#!/bin/sh\n[ "$1" = --build-metadata ] || exit 17\nprintf '%s\\n' '${JSON.stringify({ ...metadata, providerPacks: [installation, { ...installation, root: "/unrequested" }] })}'\n`, { mode: 0o700 });
+    await writeFile(f.runnerSource, `#!/bin/sh\n${auditMetadata}[ "$1" = --build-metadata ] || exit 17\nprintf '%s\\n' '${JSON.stringify({ ...metadata, providerPacks: [installation, { ...installation, root: "/unrequested" }] })}'\n`, { mode: 0o700 });
     const artifacts = createRemoteNativeArtifactPreparation({ ...f.options, providerPackRoots: [installation.root] });
     await artifacts.prepare("listen_ws");
     expect(artifacts.providerPackInventory()).toEqual([installation]);
-    const probes = f.requests.filter(request => request.command === f.runnerTarget && request.args?.[0] === "--build-metadata");
-    expect(probes).toHaveLength(1);
-    expect(probes[0].args).toEqual(["--build-metadata", "--provider-pack-root", installation.root]);
+    expect((await f.audit()).filter(line => line.startsWith(`metadata ${f.runnerTarget} `)))
+      .toEqual([`metadata ${f.runnerTarget} --build-metadata --provider-pack-root ${installation.root}`]);
+    expect(f.requests.filter(request => request.args?.[1]?.includes("# paperclip-runner-prepare/v1"))).toHaveLength(1);
     expect(f.requests.some(request => request.args?.includes("--version") && request.command.includes("provider-pack"))).toBe(false);
+  });
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21267
+  it("does not reuse image verification after falling back because its success log failed", async () => {
+    const f = await fixture();
+    let firstLog = true;
+    await createRemoteNativeArtifactPreparation({ ...f.options, remoteCodexBinary: null,
+      onLog: async () => { if (firstLog) { firstLog = false; throw new Error("log unavailable"); } },
+    }).prepare("listen_ws");
+    expect(await readFile(f.runnerTarget, "utf8")).toBe(f.runnerScript);
+    // The image was verified, but an upload replaced it after the log miss.
+    // Those replacement bytes still need their own metadata/capability check.
+    expect(f.requests.some(request => request.command === f.runnerTarget && request.args?.[0] === "--build-metadata")).toBe(true);
+    expect((await f.audit()).filter(line => line === `metadata ${f.runnerTarget} --build-metadata`)).toHaveLength(2);
+    expect(f.active()).toBe(0);
   });
 
   it("reattaches an older runner without the optional pack metadata argument", async () => {
@@ -219,7 +245,8 @@ describe("remote native artifact preparation", () => {
     const f = await fixture();
     await createRemoteNativeArtifactPreparation({ ...f.options, runnerRemoteCodexPath: f.codexSource }).prepare("listen_ws");
     expect(f.maxActive()).toBe(1);
-    const verified = f.requests.findIndex(request => request.command === f.runnerTarget);
+    const verified = f.requests.findIndex(request => request.args?.[1]?.includes("# paperclip-runner-prepare/v1"));
+    expect(await f.audit()).toContain(`metadata ${f.runnerTarget} --build-metadata`);
     const harness = f.requests.findIndex(request => request.command === f.codexTarget);
     expect(verified).toBeGreaterThan(-1);
     expect(harness).toBeGreaterThan(verified);
@@ -231,7 +258,9 @@ describe("remote native artifact preparation", () => {
     const harnessGate = new Promise<void>(resolve => { releaseHarness = resolve; });
     let harnessStarted = false;
     const f = await fixture({ before: async request => {
-      if (discovers(request, "paperclip-runnerd")) throw failure;
+      // An image miss is now recoverable. Make the mandatory post-upload
+      // verifier fail too, so this remains a terminal runner failure.
+      if (discovers(request, "paperclip-runnerd") || request.args?.[0] === "--build-metadata") throw failure;
       if (discovers(request, "codex")) { harnessStarted = true; await harnessGate; }
     } });
     let rejected = false;
@@ -255,7 +284,7 @@ describe("remote native artifact preparation", () => {
     const runnerFailure = new Error("runner discovery unavailable");
     const harnessFailure = new Error("harness discovery unavailable");
     const f = await fixture({ before: async request => {
-      if (discovers(request, "paperclip-runnerd")) throw runnerFailure;
+      if (discovers(request, "paperclip-runnerd") || request.args?.[0] === "--build-metadata") throw runnerFailure;
       if (discovers(request, "codex")) throw harnessFailure;
     } });
     await expect(createRemoteNativeArtifactPreparation(f.options).prepare("listen_ws")).rejects.toBe(runnerFailure);

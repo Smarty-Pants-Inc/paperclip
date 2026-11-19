@@ -13370,7 +13370,7 @@ async function executePaperclipNativeSessionAttempt(
           onLog: input.onLog,
         }));
         executionContext?.assertOpen();
-        releaseGitHubRun = await githubAccess.activate(input.execution.binding);
+        releaseGitHubRun = await timeController("github_activate", () => githubAccess!.activate(input.execution.binding));
         input = { ...input, runnerEnvironment: { ...input.runnerEnvironment, ...githubAccess.env } };
       }
       return input.runnerEnvironment;
@@ -16575,6 +16575,30 @@ export async function syncRemoteRunnerDirectoryOut(input: {
   }
 }
 
+// inspectRemoteHarnessState has already checked both paths in one remote
+// command. Read their bytes in ONE native transfer without exposing private
+// checkpoint JSON on stdout. Failed batches retain the same late-writer fence
+// as an individual state read. Propagate failures to the checkpoint retry owner
+// rather than silently consuming its transport-reset observation.
+async function readRemoteHarnessStatePair(runner: CommandManagedRuntimeRunner, paths: readonly string[]): Promise<string[]> {
+  sweepNativeStateStaging();
+  const entries: ReturnType<typeof createNativeStateStaging>[] = [];
+  try {
+    for (const _path of paths) entries.push(createNativeStateStaging());
+    await runner.syncOut!([{ operationId: "native-session-state-read", files: paths.map((sourcePath, index) => ({
+      sourcePath, targetPath: entries[index]!.targetPath, kind: "file" as const, mode: 0o600,
+    })) }]);
+  } catch (error) {
+    for (const entry of entries) fenceNativeStateStagingQuietly(entry.staging);
+    throw error;
+  }
+  try {
+    return entries.map(entry => { chmodSync(entry.targetPath, 0o600); return readFileSync(entry.targetPath, "utf8"); });
+  } finally {
+    for (const entry of entries) removeNativeStateStaging(entry.staging);
+  }
+}
+
 export async function readRemoteRunnerStateFile(input: {
   runner: CommandManagedRuntimeRunner;
   remotePath: string;
@@ -19248,10 +19272,20 @@ async function createRunnerdBackendWithinSessionClaim(
         incompleteReason: "unavailable",
       };
     }
+    const transferred = remoteCommandRunner.syncOut
+      ? await readRemoteHarnessStatePair(remoteCommandRunner, [runnerStatePath,
+          posix.join(remoteStateDirectory, runnerProviderStateFilename(input.execution))]).catch(error => {
+          // Keep the checkpoint retry owner's reset observation/log. For a
+          // non-transport miss, the original individual readers distinguish
+          // missing runner state from unreadable provider state and bootstrap.
+          if (isTransientRemoteCheckpointReadFailure(error)) throw error;
+          return null;
+        })
+      : null;
     let runnerState: Record<string, unknown>;
     try {
       runnerState = remoteCommandRunner.syncOut
-        ? await readRemoteRunnerStateFile({ runner: remoteCommandRunner, remotePath: runnerStatePath })
+        ? transferred ? record(JSON.parse(transferred[0]!)) : await readRemoteRunnerStateFile({ runner: remoteCommandRunner, remotePath: runnerStatePath })
         : record(JSON.parse(Buffer.from(inspected.stdout.replace(/\s+/g, ""), "base64").toString("utf8")));
     } catch (error) {
       if (error instanceof SyntaxError) throw new Error("runner_harness_state_mismatch: runner_state_invalid_json");
@@ -19286,7 +19320,7 @@ async function createRunnerdBackendWithinSessionClaim(
     }
     let providerState: Record<string, unknown>;
     try {
-      providerState = await readRemoteRunnerProviderState({
+      providerState = transferred ? record(JSON.parse(transferred[1]!)) : await readRemoteRunnerProviderState({
         runner: remoteCommandRunner,
         stateDirectory: remoteStateDirectory,
         execution: input.execution,
@@ -19590,16 +19624,18 @@ async function createRunnerdBackendWithinSessionClaim(
       input.trace,
       "harness_state.failover_restore",
       async () => {
-        for (const directory of persistenceProfile.directories) {
+        const files = persistenceProfile.directories.map(directory => {
           const targetPath = remotePersistencePath(directory);
           if (!targetPath) throw new Error("runner_harness_state_mismatch: restore_target_unavailable");
-          await stageRemoteRunnerDirectory({
-            target: remoteTarget,
-            runner: remoteCommandRunner,
-            sourcePath: resolve(backup.root, directory.name),
-            targetPath,
-            mode: 0o700,
-          });
+          return { sourcePath: resolve(backup.root, directory.name), targetPath, kind: "directory" as const, mode: 0o700 };
+        });
+        if (remoteCommandRunner.syncIn) {
+          // One provider transfer for the whole checkpoint. Keep the provider's
+          // existing directory-copy semantics (including current authority
+          // files); replacing the entire session tree would erase that fence.
+          await remoteCommandRunner.syncIn([{ operationId: `runner-restore-${randomUUID()}`, files }]);
+        } else {
+          for (const file of files) await stageRemoteRunnerDirectory({ target: remoteTarget, runner: remoteCommandRunner, ...file });
         }
       },
       {
@@ -21445,54 +21481,51 @@ export function createRemoteNativeArtifactPreparation(input: {
     }
   };
 
-  // Setup cleanup archives the whole runtime under strict no-link rules.
-  // Copy in-box (not an upload), preserving executability and replacing any
-  // previous destination atomically without ever writing through its symlink.
-  const copyPreinstalledRunnerExecutable = async (sourcePath: string) => {
+  // One control RPC, not discovery + metadata + hash + copy + hash + metadata.
+  // Nothing is admitted until BOTH metadata documents and BOTH byte checks pass.
+  // Copy in-box via a unique temp/rename: never write through the old target's
+  // symlink, and never mistake source integrity for post-copy integrity.
+  const preparePreinstalledRunner = async (requiredMode: "dial_wss" | "listen_ws") => {
     const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
-    const result = await remoteCommandRunner.execute({
-      command: "sh",
-      args: ["-c",
-        `umask 077; mkdir -p ${quote(posix.dirname(remoteBinary))} && ` +
-        `[ ! -d ${quote(remoteBinary)} ] && ` +
-        `paperclip_runner_copy_tmp=$(mktemp ${quote(remoteBinary + ".tmp.XXXXXX")}) && ` +
-        `trap 'rm -f "$paperclip_runner_copy_tmp"' 0 && ` +
-        `cp --preserve=mode -- ${quote(sourcePath)} "$paperclip_runner_copy_tmp" && ` +
-        `mv -f -- "$paperclip_runner_copy_tmp" ${quote(remoteBinary)}`],
-      cwd: remoteTarget.remoteCwd,
-      bypassSession: true,
-      timeoutMs: 10_000,
-    });
-    if (result.exitCode !== 0 || result.timedOut) {
-      throw new Error("runner_remote_preinstalled_copy_failed");
+    const expected = existsSync(controllerRunnerBinary)
+      ? (await cachedFileSha256(controllerRunnerBinary)).slice("sha256:".length) : "";
+    const packArgs = (input.providerPackRoots ?? []).flatMap(root => ["--provider-pack-root", root]).map(quote).join(" ");
+    const script = [
+      "# paperclip-runner-prepare/v1",
+      "set -eu; umask 077",
+      'source_path=; for candidate in /opt/paperclip-runner/bin/paperclip-runnerd "$HOME/.local/bin/paperclip-runnerd"; do if [ -x "$candidate" ]; then source_path=$candidate; break; fi; done',
+      'if [ -z "$source_path" ]; then source_path=$(command -v paperclip-runnerd 2>/dev/null) || exit 1; fi',
+      'case "$source_path" in /*) ;; *) exit 1 ;; esac; case "$source_path" in *[!A-Za-z0-9_./+@-]*) exit 1 ;; esac; [ "${#source_path}" -le 4096 ]',
+      'hash_file() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi; }',
+      'source_metadata=$("$source_path" --build-metadata)',
+      expected ? `source_hash=$(hash_file "$source_path"); source_hash=\${source_hash%% *}; [ "$source_hash" = ${quote(expected)} ]` : "source_hash=unchecked",
+      `mkdir -p ${quote(posix.dirname(remoteBinary))}; [ ! -d ${quote(remoteBinary)} ]`,
+      `paperclip_runner_copy_tmp=$(mktemp ${quote(remoteBinary + ".tmp.XXXXXX")})`,
+      `trap 'rm -f "$paperclip_runner_copy_tmp"' EXIT HUP INT TERM`,
+      'cp --preserve=mode -- "$source_path" "$paperclip_runner_copy_tmp"',
+      `mv -f -- "$paperclip_runner_copy_tmp" ${quote(remoteBinary)}`,
+      expected ? `target_hash=$(hash_file ${quote(remoteBinary)}); target_hash=\${target_hash%% *}; [ "$target_hash" = ${quote(expected)} ]` : "target_hash=unchecked",
+      packArgs ? `if target_metadata=$(${quote(remoteBinary)} --build-metadata ${packArgs}); then :; else status=$?; [ "$status" -lt 128 ] || exit "$status"; target_metadata=$(${quote(remoteBinary)} --build-metadata); fi`
+        : `target_metadata=$(${quote(remoteBinary)} --build-metadata)`,
+      `printf '%s\\n' 'paperclip-runner-prepare/v1' "$source_path" "$source_hash" "$target_hash"`,
+      `printf '%s' "$source_metadata" | base64 | tr -d '\\r\\n'; printf '\\n'`,
+      `printf '%s' "$target_metadata" | base64 | tr -d '\\r\\n'; printf '\\n'`,
+    ].join("\n");
+    const result = await remoteCommandRunner.execute({ command: "sh", args: ["-c", script],
+      cwd: remoteTarget.remoteCwd, bypassSession: true, timeoutMs: 30_000 });
+    if (result.exitCode !== 0 || result.timedOut || result.signal) throw new Error("runner_remote_preinstalled_copy_failed");
+    const lines = result.stdout.trim().split(/\r?\n/);
+    if (lines.length !== 6 || lines[0] !== "paperclip-runner-prepare/v1" || !parseRemoteExecutableCandidate(lines[1]!)) {
+      throw new Error("runner_remote_artifact_metadata_invalid");
     }
+    if (lines[2] !== (expected || "unchecked") || lines[3] !== (expected || "unchecked")) {
+      throw new Error("runner_remote_preinstalled_artifact_mismatch");
+    }
+    acceptRunnerMetadata(Buffer.from(lines[4]!, "base64").toString("utf8"), requiredMode, false);
+    acceptRunnerMetadata(Buffer.from(lines[5]!, "base64").toString("utf8"), requiredMode, true);
   };
 
   const prepare = async (requiredMode: "dial_wss" | "listen_ws") => {
-    const matchesControllerRunnerArtifact = async (executable: string): Promise<boolean> => {
-      // Streamed once per boot and reused while the binary is unchanged; a
-      // synchronous 31 MB read here blocked the event loop on every run.
-      const expected = (await cachedFileSha256(controllerRunnerBinary)).slice("sha256:".length);
-      try {
-        const probe = await remoteCommandRunner.execute({
-          command: "sh",
-          args: [
-            "-c",
-            'test -x "$1" || exit 1; if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi',
-            "paperclip-runner-artifact",
-            executable,
-          ],
-          cwd: remoteTarget.remoteCwd,
-          bypassSession: true,
-          timeoutMs: 10_000,
-        });
-        return probe.exitCode === 0 && !probe.timedOut &&
-          /^[a-f0-9]{64}\s/.test(probe.stdout) &&
-          probe.stdout.trim().split(/\s+/)[0] === expected;
-      } catch {
-        return false;
-      }
-    };
     const verifyRetainedRunner = async (): Promise<boolean> => {
       const expected = (await cachedFileSha256(controllerRunnerBinary)).slice("sha256:".length);
       // One provider RPC, not one for the hash followed by one for metadata.
@@ -21525,12 +21558,14 @@ export function createRemoteNativeArtifactPreparation(input: {
     };
     const prepareRunner = async () => {
       let runnerArtifactPrepared = false;
-      let retainedMetadataVerified = false;
+      // Both the retained batch and the image transaction admit metadata and
+      // inventory themselves; uploads still require the final verifier below.
+      let runnerArtifactVerified = false;
       if (
         input.reuseRetainedRunner === true &&
         existsSync(controllerRunnerBinary)
       ) {
-        runnerArtifactPrepared = retainedMetadataVerified = await measureNativeRunnerSpan(
+        runnerArtifactPrepared = runnerArtifactVerified = await measureNativeRunnerSpan(
           input.trace,
           "runner.artifact.verify_retained",
           verifyRetainedRunner,
@@ -21538,41 +21573,14 @@ export function createRemoteNativeArtifactPreparation(input: {
       }
       const explicitRemoteBinary = input.runnerRemoteBinaryPath?.trim() || null;
       if (!runnerArtifactPrepared && mayUsePreinstalledRunnerArtifact(explicitRemoteBinary)) {
-        const preinstalledRunner = await measureNativeRunnerSpan(
-          input.trace,
-          "runner.artifact.discover",
-          () => discoverPreinstalledExecutable("paperclip-runnerd"),
-        );
-        if (preinstalledRunner) {
-          try {
-            await measureNativeRunnerSpan(
-              input.trace,
-              "runner.artifact.verify_preinstalled",
-              () => verifyRemoteRunner(requiredMode, preinstalledRunner),
-            );
-            if (existsSync(controllerRunnerBinary) &&
-                !await matchesControllerRunnerArtifact(preinstalledRunner)) {
-              throw new Error("runner_remote_preinstalled_artifact_mismatch");
-            }
-            await measureNativeRunnerSpan(
-              input.trace,
-              "runner.artifact.copy",
-              () => copyPreinstalledRunnerExecutable(preinstalledRunner),
-            );
-            // The source check cannot attest the copied bytes (or a source
-            // changed during cp). Treat a failed post-copy check as a miss.
-            if (existsSync(controllerRunnerBinary) &&
-                !await matchesControllerRunnerArtifact(remoteBinary)) {
-              throw new Error("runner_remote_preinstalled_artifact_mismatch");
-            }
-            runnerArtifactPrepared = true;
-            await input.onLog?.(
-              "stderr",
-              "[paperclip-runner] using preinstalled runnerd from the sandbox image\n",
-            );
-          } catch {
-            runnerArtifactPrepared = false;
-          }
+        try {
+          await measureNativeRunnerSpan(input.trace, "runner.artifact.prepare_preinstalled", () => preparePreinstalledRunner(requiredMode));
+          runnerArtifactPrepared = runnerArtifactVerified = true;
+          await input.onLog?.("stderr", "[paperclip-runner] using preinstalled runnerd from the sandbox image\n");
+        } catch {
+          // Any fallback upload replaces the admitted bytes, including when a
+          // post-admission log callback failed. Verify the replacement anew.
+          runnerArtifactPrepared = runnerArtifactVerified = false;
         }
       }
       if (!runnerArtifactPrepared) {
@@ -21625,7 +21633,7 @@ export function createRemoteNativeArtifactPreparation(input: {
           mode: 0o700,
         });
       }
-      if (!retainedMetadataVerified) await measureNativeRunnerSpan(input.trace, "runner.artifact.verify", () =>
+      if (!runnerArtifactVerified) await measureNativeRunnerSpan(input.trace, "runner.artifact.verify", () =>
         verifyRemoteRunner(requiredMode, undefined, true),
       );
     };
