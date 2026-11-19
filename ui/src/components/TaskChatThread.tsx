@@ -3092,12 +3092,22 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
       throw error;
     }
   } : undefined, [liveRunId, onCancelRun]);
+  // A 'working' body that only says its observed run is still running (no
+  // input waits on it, no recovery step) is not a turn starting once this
+  // thread holds that run as succeeded with its reply: the body predates the
+  // run's end (gate 4 t1: 'Working' below DONE). A person's input still is.
+  const workingObservedRunId = props.interruption?.state === "working" && !props.interruption.intentId
+    && !props.interruption.recoveryStep ? props.interruption.observedRunId : null;
+  const interruptionRunAnswered = Boolean(workingObservedRunId && (presentedReplyRunIds.has(workingObservedRunId) ||
+    (runs.find((run) => run.id === workingObservedRunId)?.status === "succeeded" &&
+      comments.some((comment) => !comment.deletedAt && comment.authorType === "agent" &&
+        (comment.createdByRunId ?? comment.runId) === workingObservedRunId))));
   const optimisticRunnerStartup =
     hasAgentAssignee &&
     !startupBlocked &&
     !tailRunId &&
     (props.retryPreparing ||
-      (props.interruption?.state === "working" &&
+      (props.interruption?.state === "working" && !interruptionRunAnswered &&
         !(personStoppedRunId && props.interruption.observedRunId === personStoppedRunId)) ||
       runnerSubmissionPending ||
       commentItems.some(

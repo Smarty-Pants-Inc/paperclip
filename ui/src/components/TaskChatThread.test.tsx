@@ -6572,6 +6572,85 @@ describe("TaskChatThread composer execution controls", () => {
     });
   });
 
+  // gate 4 t1 (afterdone/GRADE.md, v185 at 3:05, gone by v195 at 3:15): DONE, then a bare 'Working'/'Thinking'
+  // below it with no new run. Bodies from capture gate4-steer-hand-v1 (texts redacted there; these are the
+  // frame's words, same lengths). The issue body is what the server answered while run fcdf9174 was still
+  // finishing (task-interruption-presentation.ts: running run -> 'working', no wait: intentId null);
+  // task-interruption-query.test.ts derives it from the capture loaded into real PostgreSQL.
+  describe.each([{ width: 390, mobile: true }, { width: 1440, mobile: false }])("a settled reply at $width", ({ mobile }) => {
+    const runId = "fcdf9174-b883-404d-85fa-46f9b22d2895";
+    const agent = { id: "4f7a3c27-9504-4b36-bbaf-96929c7a9127", name: "Runner", adapterType: "paperclip_runner" } as Agent;
+    const comment = (id: string, authorType: "user" | "agent", body: string, createdAt: string) => ({ id, companyId: "company",
+      issueId: "issue", authorType, authorAgentId: authorType === "agent" ? agent.id : null,
+      authorUserId: authorType === "user" ? "user-1" : null, createdByRunId: authorType === "agent" ? runId : null,
+      runId: authorType === "agent" ? runId : null, body, presentation: null, metadata: null,
+      createdAt: new Date(createdAt), updatedAt: new Date(createdAt) });
+    const comments = [
+      comment("930fb800-d875-48ca-9daa-8e2c113cd3d4", "user", "Please do six steps, each a SEPARATE shell call. After all six, reply DONE.", "2026-11-19T08:33:59.413Z"),
+      comment("1d278747-bf32-469d-b649-e2ae977a1a74", "user", "While you work: also reply with the word BANANA when you next write anything.", "2026-11-19T08:36:13.894Z"),
+      comment("52e50ac9-9c6f-4aab-a7ce-8721c970f307", "agent", "DONE", "2026-11-19T08:36:28.699Z"),
+    ];
+    const live = { id: runId, runtimeMode: "native" as const, status: "running", invocationSource: "on_demand",
+      triggerDetail: null, startedAt: "2026-11-19T08:33:59.817Z", finishedAt: null, createdAt: "2026-11-19T08:33:59.535Z",
+      agentId: agent.id, agentName: agent.name, adapterType: "paperclip_runner" };
+    const settled = { runId, runtimeMode: "native" as const, status: "succeeded", agentId: agent.id, adapterType: "paperclip_runner",
+      createdAt: live.createdAt, startedAt: live.startedAt, finishedAt: "2026-11-19T08:36:35.135Z" };
+    const working = { intentId: null, responsibility: "system" as const, state: "working" as const,
+      nextRetryAt: null, canRetry: false, userAction: null, sourceRunIds: [runId], observedRunId: runId };
+    const base = { comments, onAdd: async () => {}, issueId: "issue", issueStatus: "in_progress", companyId: "company",
+      issueAssigneeAgentId: agent.id, agentMap: new Map([[agent.id, agent]]) };
+    const liveLane = () => container.querySelector('[data-testid="task-chat-live-transcript"]');
+    const plantTranscript = () => nativeTranscriptState.transcriptByRun.set(runId, [
+      assistantEntry("2026-11-19T08:36:25.603Z", "BANANA", "final"),
+      { kind: "run_terminal", ts: "2026-11-19T08:36:35.135Z", turnState: "completed", runState: "succeeded", disposition: "completed" },
+    ]);
+
+    it("shows no 'Working' below DONE for 20 s after the run ends, while the issue body still says 'working'", async () => {
+      sidebarState.isMobile = mobile;
+      plantTranscript();
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+      try {
+        vi.setSystemTime(new Date("2026-11-19T08:36:34.900Z"));
+        render(<TaskChatThread {...base} activeRun={live} interruption={working} />);
+        expect(liveLane()).not.toBeNull();
+        // The run ends: the live run is dropped at once; the cached issue body still reads 'working'.
+        vi.setSystemTime(new Date("2026-11-19T08:36:35.200Z"));
+        render(<TaskChatThread {...base} linkedRuns={[settled]} interruption={working} />);
+        await act(async () => {});
+        for (let sample = 0; sample <= 100; sample += 1) {
+          expect(container.textContent?.split("DONE").length, `sample ${sample}`).toBeGreaterThan(1);
+          expect(liveLane(), `sample ${sample * 200} ms`).toBeNull();
+          expect(container.textContent, `sample ${sample * 200} ms`).not.toContain("Working");
+          expect(container.textContent, `sample ${sample * 200} ms`).not.toContain("Thinking");
+          await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+        }
+      } finally { vi.useRealTimers(); }
+    });
+
+    it("control: a person's new message right after DONE shows its 'Working' at once", async () => {
+      sidebarState.isMobile = mobile;
+      plantTranscript();
+      render(<TaskChatThread {...base} linkedRuns={[settled]} interruption={working} />);
+      await act(async () => {});
+      expect(container.textContent).not.toContain("Thinking");
+      await act(async () => { editorCallbacks.change("What is 17 + 25?"); });
+      await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-send"]')!.click(); });
+      expect(container.textContent).toContain("Working");
+      expect(container.textContent).toContain("Thinking");
+    });
+
+    it("control: a person's message waiting to start (its wait) keeps the startup lane", async () => {
+      sidebarState.isMobile = mobile;
+      plantTranscript();
+      render(<TaskChatThread {...base} linkedRuns={[settled]}
+        interruption={{ ...working, intentId: "0f47f964-1362-43fd-8f2d-009e2355b11a" }} />);
+      await act(async () => {});
+      expect(liveLane()).not.toBeNull();
+      expect(container.textContent).toContain("Working");
+      expect(container.textContent).toContain("Thinking");
+    });
+  });
+
   it("reconciles a timed-out Stop from exact company-bound historical proof after its live action disappears", async () => {
     vi.useFakeTimers();
     try {
