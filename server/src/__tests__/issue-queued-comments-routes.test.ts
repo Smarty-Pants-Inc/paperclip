@@ -2719,6 +2719,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
         .send({ queueId: seeded.wakeId, targetRunId: seeded.runId, revision: boardQueue.body.revision })
         .expect(callerKind === "another-company" ? 404 : 403);
 
+      // RFL SUPERSEDE-ACCESS-OVERLAY-404-CONTRACT-1119 (assertion changed in 6764e1f7: 403 board_access_required -> 404 Issue not found).
       // access-overlay F10: the read gate runs FIRST, so another company's agent
       // gets the same tenant 404 a missing task gets; same-company agents that
       // can read the task still reach the board-only preflight.

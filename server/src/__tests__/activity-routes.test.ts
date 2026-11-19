@@ -178,10 +178,11 @@ describe("activity routes", () => {
     mockAccessService.decide.mockResolvedValue({ allowed: false });
     const app = await createApp({ type: "agent", companyId: "company-1", agentId: "agent-1" });
     const res = await requestApp(app, baseUrl => request(baseUrl).get("/api/issues/issue-1/activity"));
-    expect(res.status).toBe(kind === "company" ? 404 : 403);
+    // RFL SUPERSEDE-ACCESS-OVERLAY-404-CONTRACT-1119: an unreadable task answers as a missing one.
+    expect(res.status).toBe(404);
     expect(mockActivityService.forIssue).not.toHaveBeenCalled();
     const inputs = await requestApp(app, baseUrl => request(baseUrl).get("/api/issues/issue-1/activity?view=comment-inputs"));
-    expect(inputs.status).toBe(kind === "company" ? 404 : 403);
+    expect(inputs.status).toBe(404);
     expect(mockActivityService.inputFactsForIssue).not.toHaveBeenCalled();
   });
 
@@ -215,6 +216,8 @@ describe("activity routes", () => {
       actorScope: "all",
       limit: 50,
       caseReadCondition,
+      // RFL SUPERSEDE-ACCESS-OVERLAY-404-CONTRACT-1119: the task read predicate rides on the audit list.
+      issueReadCondition: {},
     });
     expect(res.body.items[0]).toMatchObject({
       actorType: "plugin",
@@ -265,6 +268,8 @@ describe("activity routes", () => {
       actorType: "system",
       limit: 50,
       caseReadCondition,
+      // RFL SUPERSEDE-ACCESS-OVERLAY-404-CONTRACT-1119: the task read predicate rides on the audit list.
+      issueReadCondition: {},
     });
     expect(res.body.items[0]).toMatchObject({
       agentId: "agent-1",
@@ -380,7 +385,8 @@ describe("activity routes", () => {
     mockAccessService.decide.mockResolvedValue({ allowed: false, reason: "denied", explanation: "Denied by test policy." });
     const app = await createApp();
     const res = await request(app).get("/api/issues/TEST-1/runs");
-    expect(res.status).toBe(403);
+    // RFL SUPERSEDE-ACCESS-OVERLAY-404-CONTRACT-1119: an unreadable task answers as a missing one.
+    expect(res.status).toBe(404);
     expect(mockActivityService.runsForIssue).not.toHaveBeenCalled();
   });
 
