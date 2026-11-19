@@ -26,8 +26,9 @@ function field(value: unknown, key: string): unknown {
 /**
  * Closed set of provider idempotency outcomes a failed create may name (as the
  * thrown error's or a cause's string `code`). The host decides from it whether
- * a retry re-sends the creation key (in_progress), retires it (box_stopped),
- * or must first hand the earlier creation's box to cleanup (key_reused).
+ * a retry re-sends the creation key (in_progress) or spends it (box_stopped,
+ * key_reused): key_reused is spent and reported as its own named error, and
+ * the host's next retry mints a fresh creation key.
  */
 export const ENVIRONMENT_CREATION_IDEMPOTENCY_CODES = ["idempotency_in_progress", "idempotency_key_reused", "boat_idempotency_box_stopped"] as const;
 export type EnvironmentCreationIdempotencyCode = typeof ENVIRONMENT_CREATION_IDEMPOTENCY_CODES[number];
