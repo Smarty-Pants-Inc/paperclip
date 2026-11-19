@@ -439,6 +439,13 @@ purpose alone cannot certify termination. Ordinary execution retains its existin
 semantic dispatcher requirement. Missing usage remains pending accounting debt;
 a complete receipt settles the original reservation and charge once.
 
+A native interrupt RPC that never acknowledges must not leave its execution
+owner waiting for a terminal event forever. When the existing cancellation
+cleanup deadline expires, the owner enters the normal idempotent session close
+and its stop/checkpoint fences. Timeout never qualifies a warm session or proves
+process exit. New user input still passes those fences; a fresh Pi successor
+records an honest stop-timeout notice and leaves the old session file in custody.
+
 A recovery setup failure does not establish that the original execution never
 started. A same-run, company- and issue-bound coordinator attempt proves that
 native execution or result finalization was entered; selected input alone does

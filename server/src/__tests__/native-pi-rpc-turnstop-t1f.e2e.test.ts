@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
@@ -56,7 +56,7 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "R-no-ack", "finished"] as const)(`warm turnstop T1-F: %s (real Runner/Pi, two prior turns)`, async scenario => {
+it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "R-no-ack", "R-no-ack-double", "R-no-ack-restart", "finished"] as const)(`warm turnstop T1-F: %s (real Runner/Pi, two prior turns)`, async scenario => {
   const stopTurn = 3;
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("responses");
@@ -203,7 +203,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
           return;
         }
         const step = [1, 2, 3, 4, 5, 6].find(value => !completed.includes(value));
-        const plainQuestion = scenario === "R-stop" && turn === 1;
+        const plainQuestion = (scenario === "R-stop" || scenario.startsWith("R-no-ack")) && turn === 1;
         const useTool = !warmup && scenario !== "finished" && !plainQuestion && step !== undefined;
         const reply = warmup ? `WARMUP_${warmupCount}` : plainQuestion ? "T1F_PLAIN_ANSWER: six is an even number."
           : useTool ? `Perform STEP${step}` : `T1F_SIX_STEPS_DONE_${turn}`;
@@ -362,7 +362,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
           const result = await request(method, params);
           if (method === "turn/interrupt") {
             const receivedAt = Date.now();
-            await new Promise(resolve => setTimeout(resolve, 3_000));
+            await new Promise(resolve => setTimeout(resolve, 2_000));
             stage("late interrupt RPC reply delivered", { receivedAt, deliveredAt: Date.now() });
           }
           return result;
@@ -380,7 +380,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
           return request(method, params);
         };
       }
-      if (scenario === "R-no-ack") {
+      if (scenario.startsWith("R-no-ack")) {
         const request = bundle.transport.request.bind(bundle.transport);
         bundle.transport.request = (method, params) => {
           if (method === "turn/interrupt") {
@@ -394,6 +394,26 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         };
       }
       bundles.push(bundle); return bundle;
+    });
+    const fileWork = await import("../services/native-runtime/off-loop-file-work.js");
+    const fingerprint = fileWork.artifactMetadataFingerprint;
+    const fingerprints: Array<{ path: string; tree: boolean; value: string }> = [];
+    vi.spyOn(fileWork, "artifactMetadataFingerprint").mockImplementation(async (path, tree) => {
+      const value = await fingerprint(path, tree);
+      fingerprints.push({ path, tree, value });
+      await writeFile(join(root, "pack-metadata-fingerprints.json"), JSON.stringify(fingerprints, null, 2));
+      return value;
+    });
+    const harnessTests = await import("../services/agent-environment-test.js");
+    const realHarnessTests = harnessTests.agentEnvironmentTestService;
+    vi.spyOn(harnessTests, "agentEnvironmentTestService").mockImplementation((...args) => {
+      const service = realHarnessTests(...args);
+      const test = service.testManagedEnvironment.bind(service);
+      return { ...service, testManagedEnvironment: async (...input) => {
+        const result = await test(...input);
+        await writeFile(join(root, "hire-probe-result.json"), JSON.stringify(result, null, 2));
+        return result;
+      } };
     });
     app = await createApp(db, {
       uiMode: "none", serverPort: 0, storageService: createStorageService(createLocalDiskStorageProvider(join(root, "storage"))),
@@ -501,13 +521,29 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     }
     const { heartbeatService } = await import("../services/heartbeat.js");
     let current = admitted;
-    if (scenario === "R-no-ack") {
+    if (scenario.startsWith("R-no-ack")) {
       await waitFor("completed tools before no-ack press", async () => barriers[0] ?? null);
+      const sessions = join(remoteWorkspace, ".paperclip-runtime/paperclip-runner/sessions");
+      const originalFile = readdirSync(sessions, { recursive: true }).map(file => join(sessions, String(file)))
+        .find(file => file.endsWith(`/pi/${admitted.nativeSessionId}.jsonl`));
+      expect(originalFile, "the original Pi session file is in the old allocation").toBeDefined();
+      const originalInode = statSync(originalFile!).ino;
+      const originalBytes = readFileSync(originalFile!, "utf8");
       const pressAt = Date.now();
       let terminalAt: number | undefined, admittedAt: number | undefined;
-      const route = api("POST", `/heartbeat-runs/${current.id}/cancel`, { cancellationRequestId: randomUUID() })
+      const cancellationRequestId = randomUUID();
+      const cancel = () => api("POST", `/heartbeat-runs/${current.id}/cancel`, { cancellationRequestId })
         .then(result => ({ result, at: Date.now() }), error => ({ error: String(error), at: Date.now() }));
+      const route = cancel();
       await waitFor("real interrupt dispatch entered", async () => stages.find(row => row.stage === "I-B turn.interrupt never resolves") ?? null, 10_000);
+      const duplicate = scenario === "R-no-ack-double" ? cancel() : Promise.resolve(null);
+      const restart = scenario === "R-no-ack-restart" ? (async () => {
+        stage("I-B graceful restart detach entered during hanging Stop");
+        const { detachNativeSessionsForRestart } = await import("../services/native-runtime/native-session-executor.js");
+        const result = await detachNativeSessionsForRestart([current.id]);
+        stage("I-B graceful restart detach settled", result);
+        return result;
+      })() : Promise.resolve(null);
       const message = await api("POST", `/issues/${issueId}/comments`, { body: "T1F_INPUT_1: Answer this new message in the safe successor." }, 201);
       const terminal = waitFor("no-ack predecessor terminal", async () => {
         const [run] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, current.id));
@@ -520,11 +556,13 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         if (!run) return null;
         admittedAt = Date.now(); return run;
       }, 60_000);
-      const results = await Promise.allSettled([terminal, successor, route]);
+      const results = await Promise.allSettled([terminal, successor, route, duplicate, restart]);
       stage("I-B no-ack bound observation", { pressAt, terminalAt, admittedAt,
         terminalMs: terminalAt && terminalAt - pressAt, admissionMs: admittedAt && admittedAt - pressAt,
         results: results.map(result => result.status === "rejected" ? { status: result.status, reason: String(result.reason) } : result) });
-      await writeFile(join(root, "no-ack-bound.json"), JSON.stringify({ pressAt, terminalAt, admittedAt, results }, null, 2));
+      await writeFile(join(root, "no-ack-bound.json"), JSON.stringify({ scenario, pressAt, terminalAt, admittedAt,
+        originalFile, originalInode, results: results.map(result => result.status === "rejected"
+          ? { status: result.status, reason: String(result.reason) } : result) }, null, 2));
       expect(results[1]!.status, "authorized successor starts despite a never-resolving interrupt").toBe("fulfilled");
       expect(admittedAt! - pressAt, "one press-to-successor bound").toBeLessThanOrEqual(30_000);
       const next = (results[1] as PromiseFulfilledResult<typeof current>).value;
@@ -532,9 +570,30 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const bound = next.contextSnapshot?.commentId === message.id || next.contextSnapshot?.wakeCommentId === message.id
         || Array.isArray(next.contextSnapshot?.wakeCommentIds) && next.contextSnapshot.wakeCommentIds.includes(message.id);
       expect(bound, "successor carries the new authorized message receipt").toBe(true);
-      const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-      expect(notes.some(row => /didn.t confirm the stop|stop.*fresh session|fresh session.*stop/i.test(row.body)), "true fresh-session note is durable").toBe(true);
+      const notes = await waitFor("true fresh-session note is durable", async () => {
+        const comments = await db!.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+        return comments.some(row => /didn.t confirm the stop|stop.*fresh session|fresh session.*stop/i.test(row.body)) ? comments : null;
+      }, Math.max(1, 30_000 - (Date.now() - pressAt)));
+      if (scenario === "R-no-ack-double") expect(results[3]!.status).toBe("fulfilled");
+      if (scenario === "R-no-ack-restart") {
+        expect(results[4]!.status).toBe("fulfilled");
+        expect((results[4] as PromiseFulfilledResult<{ inactiveRunIds: string[] }>).value.inactiveRunIds).toContain(current.id);
+      }
       await heartbeatService(db).waitForRunExecutionDrain(next.id, { timeoutMs: 30_000 });
+      const request = requests.find(row => row.turn === 1);
+      expect(request, "the actual fresh Pi received the authorized input").toBeDefined();
+      expect(request!.completed, "fresh fallback never claims warm tool context").toEqual([]);
+      const [settledNext] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.id));
+      expect(settledNext?.status).toBe("succeeded");
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+        .filter(run => !warmupRunIds.has(run.id) && run.id !== current.id)).toHaveLength(1);
+      expect(statSync(originalFile!).ino, "old session file stays in place for custody").toBe(originalInode);
+      expect(readFileSync(originalFile!, "utf8").startsWith(originalBytes), "old session bytes are preserved").toBe(true);
+      const live = bundles.map(bundle => bundle.transport.processInfo?.()?.pid).filter((value): value is number => !!value)
+        .map(runnerPid => ({ runnerPid, piPid: piDescendant(runnerPid) })).find(value => value.piPid !== null);
+      expect(live?.piPid, "uncertain resident is not reused").not.toBe(pid.piPid);
+      stage("I-B FALLBACK GREEN", { scenario, admissionMs: admittedAt! - pressAt, originalIdentity, live,
+        originalFile, originalInode, successorRunId: next.id, requestAt: request!.at, notes: notes.filter(row => row.authorType === "system").map(row => row.body) });
       return;
     }
     const interrupts = scenario === "R-double" ? 2 : 1;

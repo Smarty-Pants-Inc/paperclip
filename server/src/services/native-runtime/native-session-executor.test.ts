@@ -11236,6 +11236,25 @@ describe("native session cancellation", () => {
     } finally { releaseCleanup(); state.release?.(); await running; }
   });
 
+  it("retires the exact owner when interrupt cleanup never acknowledges and joins repeated Stop", async () => {
+    state.cancel.mockReturnValue({ cleanup: new Promise<void>(() => {}) });
+    const close = vi.fn(async () => { state.release?.(); });
+    const execute = state.execute.getMockImplementation()!;
+    state.execute.mockImplementationOnce(options => execute({ ...options,
+      onSession: (session: NativeSession | null) => options.onSession?.(session ? { ...session, close } : null),
+    }));
+    const running = executePaperclipNativeSession({ db: leaseDb(), execution, runnerInstanceId: "runner" });
+    await vi.waitFor(() => expect(state.release).toBeTypeOf("function"));
+    try {
+      const first = cancelNativeSession(execution.binding.runId, "operator Stop");
+      const duplicate = cancelNativeSession(execution.binding.runId, "repeated Stop");
+      await Promise.all([first, duplicate, running]);
+      expect(state.cancel).toHaveBeenCalledOnce();
+      expect(close).toHaveBeenCalledExactlyOnceWith({ reason: "native stop acknowledgement deadline expired" });
+      expect(state.cancel.mock.calls[0]![0].signal.aborted).toBe(true);
+    } finally { state.release?.(); await running; }
+  });
+
   it("allows cancellation to be retried when the session dispatch fails", async () => {
     state.cancel.mockImplementationOnce(() => {
       throw new Error("transport unavailable");
