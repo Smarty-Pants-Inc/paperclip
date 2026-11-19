@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { environmentAcquireErrorData, JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, readEnvironmentCreationIdempotencyCode } from "@paperclipai/plugin-sdk";
 import plugin from "./plugin.js";
+
+/** What the host reads after the worker RPC host wraps the acquire error (worker-rpc-host: data = environmentAcquireErrorData(err)). */
+const hostIdempotencyCode = (error: unknown) => readEnvironmentCreationIdempotencyCode(new JsonRpcCallError({
+  code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR, message: String((error as Error)?.message), data: environmentAcquireErrorData(error) }));
 
 // The plugin polls with node:timers/promises; keep it on the global timer
 // (the create-idem.test.ts pattern). Only Date is faked below, so waits are real.
@@ -170,6 +175,26 @@ describe("GAP 1: a re-send whose deduped box our cleanup stopped is never a read
     expect(codeOf((outcome as { error: any }).error)).toContain("boat_idempotency_box_stopped");
     expect(new Set(boat.creates.map(c => c.body)).size, "the restart re-sent the same body").toBe(1);
     expect(boat.resumes).toEqual([]);
+  }, 20_000);
+});
+
+// The server spends a box_stopped creation and mints a fresh key only if it can
+// SEE the typed failure across the worker connection: the SDK's closed creationIdempotencyCode.
+describe("box_stopped reaches the host as creationIdempotencyCode", () => {
+  it("G2-stopped: the deduped stopped box's typed failure carries creationIdempotencyCode boat_idempotency_box_stopped (SDK reader)", async () => {
+    const boat = fakeBoat({ stopOutcome: "completed" });
+    await timeOutAtCapAndStop(boat);
+    const error = await plugin.definition.onEnvironmentAcquireLease!(params).then(() => undefined, e => e);
+    expect(codeOf(error)).toContain("boat_idempotency_box_stopped");
+    expect(hostIdempotencyCode(error)).toBe("boat_idempotency_box_stopped");
+  }, 20_000);
+
+  it("G2-refused: with our stop refused (the cleanup envelope case) it still carries boat_idempotency_box_stopped (SDK reader)", async () => {
+    const boat = fakeBoat({ stopOutcome: "failing" });
+    await timeOutAtCapAndStop(boat);
+    const error = await plugin.definition.onEnvironmentAcquireLease!(params).then(() => undefined, e => e);
+    expect(error?.cleanup).toMatchObject({ providerLeaseId: "bx_1", attemptId: "op-1" });
+    expect(hostIdempotencyCode(error)).toBe("boat_idempotency_box_stopped");
   }, 20_000);
 });
 

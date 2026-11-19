@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { environmentAcquireErrorData, JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, readEnvironmentCreationIdempotencyCode } from "@paperclipai/plugin-sdk";
 import plugin from "./plugin.js";
+
+/** What the host reads after the worker RPC host wraps the acquire error (worker-rpc-host: data = environmentAcquireErrorData(err)). */
+const hostIdempotencyCode = (error: unknown) => readEnvironmentCreationIdempotencyCode(new JsonRpcCallError({
+  code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR, message: String((error as Error)?.message), data: environmentAcquireErrorData(error) }));
 
 // The plugin polls with node:timers/promises; keep it on the global timer
 // (the create-adopt.test.ts pattern). Only Date is faked below, so waits are real.
@@ -159,5 +164,38 @@ describe("Boat create re-sent under the same creation id (create-retry money uni
     expect(boat.creates).toHaveLength(1);
     expect(boat.creates.map(c => c.key)).toEqual(["op-1"]);
     expect(boat.boxes).toEqual(["bx_old"]);
+  });
+
+  // The server spends a key_reused creation and mints a fresh key only if it can
+  // SEE Boat's code across the worker connection: the SDK's closed creationIdempotencyCode.
+  it("R5: 409 idempotency_key_reused reaches the host as creationIdempotencyCode idempotency_key_reused (SDK reader)", async () => {
+    fakeBoat({ preseed: { key: "op-1", body: "{\"other\":true}" } });
+    const error = await plugin.definition.onEnvironmentAcquireLease!(params).then(() => undefined, e => e);
+    expect(error).toMatchObject({ status: 409, boatCode: "idempotency_key_reused", code: "boat_idempotency_key_reused" });
+    expect(hostIdempotencyCode(error)).toBe("idempotency_key_reused");
+    expect(environmentAcquireErrorData(error)).toMatchObject({ providerDiagnostic: { httpStatus: 409 }, creationIdempotencyCode: "idempotency_key_reused" });
+  });
+
+  it("R6: a key still in progress at the create cap reaches the host as creationIdempotencyCode idempotency_in_progress (SDK reader)", async () => {
+    fakeBoat({ firstAnswerLost: true, inProgressRepeats: 1_000 });
+    await expect(plugin.definition.onEnvironmentAcquireLease!(params)).rejects.toMatchObject({ status: 503 });
+    const fetch = globalThis.fetch as any;
+    const original = fetch.getMockImplementation();
+    fetch.mockImplementation(async (input: any, init: any = {}) => {
+      if ((init.method ?? "GET") === "POST" && new URL(String(input)).pathname.endsWith("/sandboxes")) vi.setSystemTime(new Date(Date.now() + 30_000));
+      return original(input, init);
+    });
+    const error = await plugin.definition.onEnvironmentAcquireLease!(params).then(() => undefined, e => e);
+    expect(error).toMatchObject({ status: 409, boatCode: "idempotency_in_progress" });
+    expect(hostIdempotencyCode(error)).toBe("idempotency_in_progress");
+  }, 20_000);
+
+  it("R6-GUARD: an in-progress key that finishes inside the cap is a lease, and a plain failure names no idempotency code", async () => {
+    fakeBoat({ firstAnswerLost: true, inProgressRepeats: 1 });
+    const lost = await plugin.definition.onEnvironmentAcquireLease!(params).then(() => undefined, e => e);
+    expect(lost).toMatchObject({ status: 503 });
+    expect(hostIdempotencyCode(lost)).toBeNull();
+    vi.setSystemTime(new Date(Date.now() + 40_000));
+    await expect(plugin.definition.onEnvironmentAcquireLease!(params)).resolves.toMatchObject({ providerLeaseId: "bx_1" });
   });
 });
