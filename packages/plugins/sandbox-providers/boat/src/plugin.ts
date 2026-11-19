@@ -945,6 +945,33 @@ function withinBudget(deadline: number, ms: number): AbortSignal {
 }
 /** The acquisition budget's step state: each step enters by name, and no step starts after the budget. */
 type AcquisitionBudget = { deadline: number; enter: (phase: string) => void };
+/** rf-4 U3 C3: the five phases one `boat.acquire.phases` line stamps. */
+const ACQUIRE_PHASES = ["create", "ready", "setup", "sync", "handoff"] as const;
+// Budget step name -> stamped phase. "handoff" entered before the handoff's
+// calls starts sync (sentinel, guardian, file writes); "duplex" (binding the
+// lease) starts handoff, which runs until the lease is returned.
+const ACQUIRE_PHASE_OF: Record<string, number> = { create: 0, adopt: 0, ready: 1, setup: 2, handoff: 3, sentinel: 3, guardian: 3, duplex: 4 };
+/**
+ * The acquisition's phase clock (rf-4 U3 C3). Steps only move forward; a phase
+ * never entered is 0 ms, and the phases sum to the total exactly.
+ */
+function acquirePhaseClock(startedAt: number) {
+  const starts = [startedAt];
+  return {
+    enter(step: string): void {
+      const index = ACQUIRE_PHASE_OF[step];
+      if (index === undefined || index < starts.length) return;
+      const now = Date.now();
+      while (starts.length <= index) starts.push(now);
+    },
+    current: (): (typeof ACQUIRE_PHASES)[number] => ACQUIRE_PHASES[starts.length - 1],
+    stamp(endedAt: number) {
+      const phasesMs = Object.fromEntries(ACQUIRE_PHASES.map((name, i) =>
+        [name, i >= starts.length ? 0 : Math.max(0, (i + 1 < starts.length ? starts[i + 1] : endedAt) - starts[i])])) as Record<(typeof ACQUIRE_PHASES)[number], number>;
+      return { phasesMs, totalMs: Math.max(0, endedAt - startedAt) };
+    },
+  };
+}
 /** Our create POST reached its own 30 s deadline (or a transport ETIMEDOUT)
  * with no HTTP answer: Boat may still be creating the box, as Daytona's create
  * is still pending at its cap. Any other failure is a create that failed, which
@@ -2013,8 +2040,13 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       let phase = "create";
       const budgetError = (detail?: string) => Object.assign(new Error(`Boat lease acquisition exceeded ${BOAT_ACQUIRE_ATTEMPT_BUDGET_MS} ms during ${phase}${detail ? `: ${detail}` : ""}`), {
         code: "ETIMEDOUT", phase, elapsedMs: Math.max(0, Date.now() - createStartedAt), budgetMs: BOAT_ACQUIRE_ATTEMPT_BUDGET_MS });
+      // rf-4 U3 C3: one `boat.acquire.phases` line per acquisition, at its end.
+      const clock = acquirePhaseClock(createStartedAt);
+      let source: "created" | "adopted" = "created";
+      let endedAt: number | undefined, stampOutcome: "ok" | "budget" | "error" = "error", failedPhase: string | undefined;
       const assertActive = (next: string) => {
         phase = next;
+        clock.enter(next);
         if (Date.now() < deadline) return;
         throw budgetError();
       };
@@ -2029,7 +2061,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         } catch (createError) {
           // #20828: adopt the box our timed-out create made; never send a second create.
           created = { sandbox: { id: await findTimedOutCreation(c, attemptId, params, createError, createStartedAt) } };
-          adopted = true;
+          adopted = true; source = "adopted";
         }
         const sb = created?.sandbox ?? created; if (typeof sb?.id !== "string" || !sb.id) throw new Error("Boat create response did not contain sandbox.id");
         id = sb.id;
@@ -2049,8 +2081,11 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         assertActive("handoff");
         const lease = await finishAcquisition(params, c, sb.id, { ...ready, ...ownershipObservation }, labels, remoteCwd, snapshot, null, undefined, budget);
         assertActive("handoff");
+        endedAt = Date.now(); stampOutcome = "ok";
         return lease;
       } catch (caught) {
+        // The stamp ends where the acquisition failed, before its cleanup.
+        endedAt ??= Date.now(); failedPhase = clock.current();
         // A step that ended at (or after) the budget fails as the budget, typed
         // ETIMEDOUT, so the host retries it (rf-4 U3b F2: readiness exhaustion
         // was a plain Error the host reader could not see). A box Boat could
@@ -2058,6 +2093,8 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         const timedOutCode = caught && typeof caught === "object" && (caught as { code?: unknown }).code === "ETIMEDOUT";
         const error = id && !startFailure && Date.now() >= deadline && !(timedOutCode && (caught as { phase?: unknown }).phase !== undefined)
           ? budgetError(caught instanceof Error ? caught.message : undefined) : caught;
+        const typed = error && typeof error === "object" ? error as { code?: unknown; budgetMs?: unknown } : {};
+        stampOutcome = typed.code === "ETIMEDOUT" && typed.budgetMs === BOAT_ACQUIRE_ATTEMPT_BUDGET_MS ? "budget" : "error";
         if (shuttingDown && !id) throw error;
         const ids = id ? [id] : await acquisitionMatches(c, attemptId, params).catch(lookupError => {
           // frozen7-VERDICT F2: Boat definitely refused this create. A failing
@@ -2086,6 +2123,14 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         if (startFailure && id) throw new PluginEnvironmentCreationCleanupError([error],
           `Boat sandbox ${id} entered error; Boat could not start it, and it was stopped.`, cleanupIdentity(c, id, params, attemptId), startFailure);
         throw error;
+      } finally {
+        // rf-4 U3 C3: the budget's gate window, one line per acquisition (ok or
+        // not). Numbers and fixed words only: no provider text reaches it.
+        try {
+          duplexLogger?.info("boat.acquire.phases", { companyId: params.companyId, environmentId: params.environmentId,
+            source, outcome: stampOutcome, ...(failedPhase ? { failedPhase } : {}),
+            ...clock.stamp(endedAt ?? Date.now()), budgetMs: BOAT_ACQUIRE_ATTEMPT_BUDGET_MS });
+        } catch { /* Logging never changes allocation outcome. */ }
       }
     };
     if (!hasSpareSetting) await recordOutcomeOnce("cold", "config_mismatch");

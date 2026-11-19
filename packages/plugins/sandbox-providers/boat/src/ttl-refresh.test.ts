@@ -175,10 +175,12 @@ describe("Boat warm reuse TTL refresh", () => {
     const lease = await acquire(config);
     await plugin.definition.onEnvironmentResumeLease!({ ...scope, config, providerLeaseId: id, leaseMetadata: lease.metadata });
     const log = status === "ok" ? logger.info : logger.warn;
-    expect(log).toHaveBeenCalledExactlyOnceWith("Boat warm lease TTL refresh", {
+    // Only the refresh lines: the acquire's own boat.acquire.phases line (rf-4 U3 C3) is not one.
+    const refreshLines = (fn: typeof log) => fn.mock.calls.filter(([message]) => message === "Boat warm lease TTL refresh");
+    expect(refreshLines(log)).toEqual([["Boat warm lease TTL refresh", {
       providerLeaseId: id, status, category: status === "failed" ? "http_error" : status === "unconfirmed" ? "deadline_mismatch" : null,
-    });
-    expect(status === "ok" ? logger.warn : logger.info).not.toHaveBeenCalled();
+    }]]);
+    expect(refreshLines(status === "ok" ? logger.warn : logger.info)).toEqual([]);
     expect(JSON.stringify([...logger.info.mock.calls, ...logger.warn.mock.calls])).not.toContain(apiKey);
   });
   it("records null when the failed refresh has no pre-PATCH archiveAfter", async () => {
