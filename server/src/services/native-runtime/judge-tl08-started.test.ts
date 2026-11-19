@@ -1684,7 +1684,11 @@ describe.skipIf(!existsSync("/proc/self/cmdline"))("remote runner launch stale s
       } else {
         expect(result.stdout).toBe("launched");
         expect((await readFile(join(root, "identity"), "utf8")).split("\n")[0]).toBe("nonce");
-        expect(await readFile(log, "utf8")).toContain(`runner_stale_lineage_partial: runner ${stale.pid}:`);
+        // Same detached-copy race as 3342cd0f (ISOLATE-REAP-ROWS-1119):
+        // launch may return before this fixture's stderr log is published.
+        await vi.waitFor(async () => {
+          expect(await readFile(log, "utf8")).toContain(`runner_stale_lineage_partial: runner ${stale.pid}:`);
+        }, { timeout: 5_000 });
       }
       for (const survivor of [other, trimmer, unknown]) expect(gone(survivor.pid!)).toBe(false);
     } finally {
