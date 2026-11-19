@@ -1124,7 +1124,7 @@ describe("PaperclipRunnerToolAuthority", () => {
   it("marks host-owned tools core and passes pinned connection provenance only to Pi", () => {
     const assignedTool = { name: "app_github_read", description: "Read GitHub", inputSchema: { type: "object" }, paperclipToolSource: { kind: "core" } };
     const source = { connectionId: "github-id", connectionName: "Renamed GitHub", installedAt: "2026-01-01T00:00:00.000Z" };
-    const assignedMcpTools = { definitions: () => [assignedTool], has: (name: string) => name === assignedTool.name, execute: vi.fn(), provenance: () => source };
+    const assignedMcpTools = { definitions: () => [assignedTool], has: (name: string) => name === assignedTool.name, authorize: vi.fn(), execute: vi.fn(), provenance: () => source };
     const binding = { companyId, agentId, issueId, runId, assignedMcpTools };
     const ordinary = new PaperclipRunnerToolAuthority(db, binding).definitions();
     const pi = new PaperclipRunnerToolAuthority(db, { ...binding, toolProvenance: true }).definitions();
@@ -1138,9 +1138,10 @@ describe("PaperclipRunnerToolAuthority", () => {
   it("relays assigned MCP calls only while the native run still owns its task", async () => {
     const tool = { name: "app_mem0_recall", description: "Recall memory", inputSchema: { type: "object" } };
     const execute = vi.fn().mockResolvedValue({ content: "synthetic memory" });
+    const authorize = vi.fn();
     const authority = new PaperclipRunnerToolAuthority(db, {
       companyId, agentId, issueId, runId,
-      assignedMcpTools: { definitions: () => [tool], has: (name) => name === tool.name, execute, provenance: () => undefined },
+      assignedMcpTools: { definitions: () => [tool], has: (name) => name === tool.name, authorize, execute, provenance: () => undefined },
     });
     expect(authority.definitions()).toContainEqual(tool);
     const call = { tool: tool.name, callId: "assigned-mcp", arguments: { query: "compass" } };

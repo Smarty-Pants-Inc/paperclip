@@ -271,7 +271,25 @@ export async function createAssignedMcpTools(input: {
     return { tools: page, nextOffset: nextOffset < matches.length ? nextOffset : null };
   }
 
+  function authorize(call: { tool: string; arguments: unknown }, currentWorkMode?: WorkMode) {
+    if (call.tool === SEARCH_TOOL) return false;
+    let name = call.tool;
+    if (name === CALL_TOOL) {
+      const args = object(call.arguments);
+      if (typeof args.name !== "string") throw new Error("assigned_mcp_tool_invalid_arguments");
+      object(args.arguments);
+      name = args.name;
+    }
+    const descriptor = tools.get(name);
+    if (!descriptor) throw new Error("assigned_mcp_tool_unknown");
+    if (!permits(descriptor) || !permits(descriptor, currentWorkMode)) throw new Error("paperclip_runner_tool_mode_denied");
+    return descriptor.risk !== "read";
+  }
+
   return {
+    // Receipt replay still checks the current mode without redispatching an
+    // external effect merely to authorize a previously completed result.
+    authorize,
     definitions(fits?: (definitions: ToolDefinition[]) => boolean): ToolDefinition[] {
       const direct = [...tools].filter(([, tool]) => permits(tool)).map(([name, tool]) => definition(name, tool, schemas.get(name)!));
       if (input.delivery !== "on_demand" && unchecked.length === 0 && (!fits || fits(direct))) return direct;
@@ -289,6 +307,7 @@ export async function createAssignedMcpTools(input: {
       return tools.has(name) || name === SEARCH_TOOL || name === CALL_TOOL;
     },
     async execute(call: { tool: string; arguments: unknown }, currentWorkMode?: WorkMode): Promise<unknown> {
+      authorize(call, currentWorkMode);
       if (call.tool === SEARCH_TOOL) return search(call.arguments, currentWorkMode);
       let name = call.tool;
       let parameters = call.arguments;
@@ -300,7 +319,6 @@ export async function createAssignedMcpTools(input: {
       }
       const descriptor = tools.get(name);
       if (!descriptor) throw new Error("assigned_mcp_tool_unknown");
-      if (!permits(descriptor) || !permits(descriptor, currentWorkMode)) throw new Error("paperclip_runner_tool_mode_denied");
       // Reauthorize through the existing gateway on every call. Discovery is
       // not a grant: revocation, policy, approval, and audit remain server-owned.
       const result = await input.gateway.executeTool({
