@@ -7537,6 +7537,60 @@ describe("IssueDetail", () => {
     15_000,
   );
 
+  // Old chat (RFL 14:57Z delivery-truth list; testing-lead's gate-4 capture, build s-steer2, pre-A2r3):
+  // Paul opens a chat whose steered messages were sent on older builds and were ANSWERED. SYNTHETIC
+  // bodies shaped like the fixed A2r3 comment GET (carried-steer.ts withCarriedSteerDisplay with the
+  // ONE answered predicate) recorded on that capture: no capture data here.
+  // - 'absent': steering fields missing (or null) on the comment: no label at all.
+  // - 'accepted-answered': the old build kept no read seq ('accepted'); the run answered it, so the
+  //   server says 'delivered' with no seq: the old 'Delivered' label, never 'Sent' forever.
+  const OLD_CHAT_ABSENT = (comment: Record<string, unknown>) => {
+    const { steeredIntoRunId: _r, steeredAt: _a, steeringStatus: _s, steeringDeliveryEventSeq: _q, ...rest } = comment;
+    return rest;
+  };
+  const OLD_CHAT_NULL = { steeredIntoRunId: null, steeredAt: null, steeringStatus: null, steeringDeliveryEventSeq: null,
+    carriedIntoRunId: null, deliveryOutcome: "ordinary", steeringUnavailableReason: null };
+  const OLD_CHAT_ACCEPTED_ANSWERED = { steeringStatus: "delivered", steeringDeliveryEventSeq: null, carriedIntoRunId: null,
+    deliveryOutcome: "steered", steeringUnavailableReason: null };
+  it.each([
+    [390, "absent"], [1440, "absent"], [390, "null"], [1440, "null"],
+    [390, "accepted-answered"], [1440, "accepted-answered"],
+  ] as const)(
+    "old chat: an answered steered message from a pre-A2r3 build is never newly 'Not delivered', 'Taken into the next turn' or 'Sent' forever at %i (%s)",
+    async (width, shape) => {
+      const { post, runId, state, bubbles } = await renderSteeringPlacement(width, "steer");
+      // Opened days later: the turn ended long ago; the thread GET is all the client has.
+      await endTheSteeredRun(runId, "succeeded");
+      const old = STEER_A2_THREAD_GET_DELIVERED[0] as Record<string, unknown>;
+      state.thread = [
+        shape === "absent" ? OLD_CHAT_ABSENT(old) : { ...old, ...(shape === "null" ? OLD_CHAT_NULL : OLD_CHAT_ACCEPTED_ANSWERED) },
+        STEER_A2_THREAD_GET_DELIVERED[1],
+      ];
+      await act(async () => { await queryClient.invalidateQueries(); });
+      expect(await waitUntil(() => bubbles().length === 1)).toBe(true);
+      await flushReact();
+      const bubble = bubbles()[0]!;
+      const label = bubble.querySelector('[data-testid="task-chat-steered-delivery"]');
+      expect(bubble.textContent).not.toContain("Not delivered");
+      expect(bubble.textContent).not.toContain("Taken into the next turn");
+      expect(bubble.textContent).not.toMatch(/\bSent\b/);
+      if (shape === "accepted-answered") {
+        expect(bubble.dataset.steeredIntoRunId).toBe(runId);
+        expect(bubble.dataset.delivery).toBe("delivered");
+        expect(label?.textContent).toContain("Delivered");
+      } else {
+        expect(label).toBeNull();
+        expect(bubble.dataset.delivery).toBeUndefined();
+      }
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/old-chat-${shape}-${width}.txt`, `${bubble.outerHTML}\n`);
+      }
+      expect(post.body).toBe(old.body);
+    },
+    15_000,
+  );
+
+
   it.each([390, 1440])(
     "steering placement: Send ▾ Queue while the agent works puts the message in the waiting list (real server bodies), never as a steered thread item at %i",
     async (width) => {
