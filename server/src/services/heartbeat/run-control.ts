@@ -1998,9 +1998,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
           isNull(agentWakeupRequests.runId),
           // A pause is temporary: a message it deferred waits for the pause to
-          // lift (work-intent outbox), so the pause's own stop keeps it.
+          // lift (work-intent outbox), so the pause's own stop keeps it. So does
+          // a message already saved under its own wait (executionWait, e.g. the
+          // queue a person's Stop holds for Send): the pause is not its trigger
+          // (rf-4 C2).
           options.preservePauseDeferred ? sql`not (${agentWakeupRequests.status} = 'deferred_issue_execution'
-            and coalesce(${agentWakeupRequests.payload}->'executionWait'->>'trigger', '') = 'pause_lifted')` : undefined,
+            and ${agentWakeupRequests.payload} ? 'executionWait')` : undefined,
         ));
       if (!wakeups.length) return 0;
       for (const companyId of new Set(wakeups.map(row => row.companyId))) {
