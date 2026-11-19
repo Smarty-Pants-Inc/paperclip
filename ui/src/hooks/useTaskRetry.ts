@@ -7,7 +7,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { createUuid } from "../lib/uuid";
 
 type RetryRequest = { issueId: string; identifier?: string | null; idempotencyKey: string; observedRunId: string | null;
-  retryAction?: "move_forward" };
+  retryAction?: "move_forward" | "continue_with_files" };
 type RetryResult = Awaited<ReturnType<typeof issuesApi.retryTask>>;
 
 export const STALE_TASK_RETRY_MESSAGE = "This attempt was already replaced, so Retry did not start new work. The task now shows its current state.";
@@ -100,7 +100,9 @@ export function useTaskRetry(issue: Issue | undefined) {
     mutation.reset();
     request.current ??= { issueId: issue.id, identifier: issue.identifier, idempotencyKey: createUuid(),
       observedRunId: issue.interruption?.observedRunId ?? issue.executionBlocker?.runId ?? null,
-      ...(issue.interruption?.retryAction === "move_forward" ? { retryAction: "move_forward" as const } : {}) };
+      // A message held on a mixed checkout: the press is the person's "Continue with the files as they are".
+      ...(issue.executionBlocker?.savedMessageWait === "continue_required" ? { retryAction: "continue_with_files" as const }
+        : issue.interruption?.retryAction === "move_forward" ? { retryAction: "move_forward" as const } : {}) };
     setOptimistic(true);
     setTakingLonger(false);
     mutation.mutate(request.current);

@@ -32,6 +32,7 @@ import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
 import { agentChatDraft } from "@/lib/agent-chat-draft";
 import { trackRecentProject } from "@/lib/recent-projects";
 import { ExecutionBlockerNotice } from "../components/ExecutionBlockerNotice";
+import { readSavedMessageWait } from "../lib/saved-message-wait";
 import type { TaskComposerPause } from "../components/task-chat/TaskChatPausedTakeover";
 import { TaskDetailTasksPanel } from "@/components/task-detail/TaskDetailTasksPanel";
 import { IssueCreatedFromNote } from "@/components/task-detail/IssueCreatedFromNote";
@@ -1256,6 +1257,7 @@ type IssueDetailChatTabProps = {
   successfulRunHandoff: Issue["successfulRunHandoff"] | null;
   scheduledRetry: Issue["scheduledRetry"] | null;
   recoveryAction: Issue["activeRecoveryAction"];
+  savedMessageWait?: { line: string; continueLabel: string | null; onContinue?: () => void; continuePending?: boolean } | null;
   onResolveRecoveryAction?: (
     outcome: import("../components/IssueRecoveryActionCard").RecoveryResolveOutcome,
   ) => void;
@@ -1424,6 +1426,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   successfulRunHandoff,
   scheduledRetry,
   recoveryAction,
+  savedMessageWait,
   onResolveRecoveryAction,
   onReissueIsolatedRecoveryAction,
   reissueIsolatedRecoveryActionPending,
@@ -2788,6 +2791,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             successfulRunHandoff={successfulRunHandoff}
             scheduledRetry={scheduledRetry}
             recoveryAction={isPreviousServerStopCause(recoveryAction?.cause) ? null : recoveryAction ?? null}
+            savedMessageWait={savedMessageWait ?? null}
             onResolveRecoveryAction={onResolveRecoveryAction}
             onReissueIsolatedRecoveryAction={onReissueIsolatedRecoveryAction}
             reissueIsolatedRecoveryActionPending={
@@ -3488,6 +3492,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     setLoadingTitleIssueId((current) => editing ? loadingTitleOwner : current === loadingTitleOwner ? null : current);
   }, [loadingTitleOwner]);
   const taskRetry = useTaskRetry(issue ?? undefined);
+  const savedMessageWait = readSavedMessageWait(issue?.executionBlocker);
   const resolveWritableIssueId = async () => {
     if (!conversation) return issueId!;
     const resolved = await conversation.ensureIssue();
@@ -8360,11 +8365,12 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               issueId={issue.id} companyId={issue.companyId}
               showStatus={!issue.interruption && !issue.executionBlocker?.workspaceRecovery}
               onRecoveryControlChange={setRetainedRecoveryOwnsRetry}
-              action={issue.activeRecoveryAction ?? null} />
+              // The thread's recovery card says the task's ONE sentence for this state; no second status beside it.
+              action={savedMessageWait ? null : issue.activeRecoveryAction ?? null} />
           )}
           {resolvedDetailTab === "chat" && (
             // TODO(D10): replace Retry with a fresh thread from history.
-            <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption} blockers={issue.blockedBy}
+            <ExecutionBlockerNotice className={shellSectionClass} presentation={savedMessageWait ? null : issue.interruption} blockers={issue.blockedBy}
               issueId={issue.id} companyId={issue.companyId} agentName={agentMap.get(issue.assigneeAgentId ?? "")?.name} projectName={issue.project?.name}
               canRetry={canResolveBoardRecoveryAction &&
                 !(issue.executionBlocker?.canRetry === false &&
@@ -8770,6 +8776,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                       ? null
                       : issue.activeRecoveryAction ?? null
                   }
+                  savedMessageWait={savedMessageWait ? { ...savedMessageWait,
+                    ...(canResolveBoardRecoveryAction ? { onContinue: taskRetry.retry } : {}), continuePending: taskRetry.optimistic } : null}
                   onResolveRecoveryAction={handleResolveRecoveryAction}
                   onReissueIsolatedRecoveryAction={
                     handleReissueIsolatedRecoveryAction

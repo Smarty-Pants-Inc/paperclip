@@ -87,6 +87,8 @@ export interface IssueRecoveryActionCardProps {
   /** The task's own true line for this state. It replaces the generic headline (never "needs a human decision"
    * where no decision is asked of the person). */
   headline?: string | null;
+  /** The ONE action this state offers the person (with `headline`). The card's other actions are not offered beside it. */
+  primaryAction?: { label: string; onClick: () => void; pending?: boolean } | null;
   /** Preferred state hint (e.g. observe_only when watchdog tone is requested). Falls back to derived state. */
   forcedState?: RecoveryCardCardState;
   /** Optional click handler for resolve menu actions. If omitted, the buttons are not rendered. */
@@ -1012,6 +1014,7 @@ export function IssueRecoveryActionCard({
   agentMap,
   scheduledRetry = null,
   headline: headlineOverride = null,
+  primaryAction = null,
   forcedState,
   onResolve,
   onReissueIsolated,
@@ -1189,6 +1192,10 @@ export function IssueRecoveryActionCard({
             ) : null}
           </div>
           <p className="mt-1 text-sm leading-6">{headline}</p>
+          {primaryAction && cardState !== "resolved" ? (
+            <Button type="button" size="sm" variant="default" className="mt-2" data-testid="recovery-action-primary"
+              disabled={primaryAction.pending} onClick={primaryAction.onClick}>{primaryAction.label}</Button>
+          ) : null}
         </div>
       </header>
       {variant === "compact" ? null : (
