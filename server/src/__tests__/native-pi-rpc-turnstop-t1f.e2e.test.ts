@@ -56,7 +56,7 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "finished"] as const)(`warm turnstop T1-F: %s (real Runner/Pi, two prior turns)`, async scenario => {
+it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "R-no-ack", "finished"] as const)(`warm turnstop T1-F: %s (real Runner/Pi, two prior turns)`, async scenario => {
   const stopTurn = 3;
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("responses");
@@ -380,6 +380,19 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
           return request(method, params);
         };
       }
+      if (scenario === "R-no-ack") {
+        const request = bundle.transport.request.bind(bundle.transport);
+        bundle.transport.request = (method, params) => {
+          if (method === "turn/interrupt") {
+            stage("I-B turn.interrupt never resolves", { at: Date.now() });
+            // Real pending Runner-transport RPC, not a rejection or late ACK.
+            // Nothing is delivered to Runner, so neither its terminal event
+            // nor an RPC reply can accidentally qualify this owner for reuse.
+            return new Promise<Record<string, unknown>>(() => {});
+          }
+          return request(method, params);
+        };
+      }
       bundles.push(bundle); return bundle;
     });
     app = await createApp(db, {
@@ -488,6 +501,42 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     }
     const { heartbeatService } = await import("../services/heartbeat.js");
     let current = admitted;
+    if (scenario === "R-no-ack") {
+      await waitFor("completed tools before no-ack press", async () => barriers[0] ?? null);
+      const pressAt = Date.now();
+      let terminalAt: number | undefined, admittedAt: number | undefined;
+      const route = api("POST", `/heartbeat-runs/${current.id}/cancel`, { cancellationRequestId: randomUUID() })
+        .then(result => ({ result, at: Date.now() }), error => ({ error: String(error), at: Date.now() }));
+      await waitFor("real interrupt dispatch entered", async () => stages.find(row => row.stage === "I-B turn.interrupt never resolves") ?? null, 10_000);
+      const message = await api("POST", `/issues/${issueId}/comments`, { body: "T1F_INPUT_1: Answer this new message in the safe successor." }, 201);
+      const terminal = waitFor("no-ack predecessor terminal", async () => {
+        const [run] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, current.id));
+        if (run?.status !== "cancelled") return null;
+        terminalAt = Date.now(); return run;
+      }, 60_000);
+      const successor = waitFor("no-ack successor admitted within 60s", async () => {
+        const run = (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+          .find(row => !warmupRunIds.has(row.id) && row.id !== current.id && row.startedAt);
+        if (!run) return null;
+        admittedAt = Date.now(); return run;
+      }, 60_000);
+      const results = await Promise.allSettled([terminal, successor, route]);
+      stage("I-B no-ack bound observation", { pressAt, terminalAt, admittedAt,
+        terminalMs: terminalAt && terminalAt - pressAt, admissionMs: admittedAt && admittedAt - pressAt,
+        results: results.map(result => result.status === "rejected" ? { status: result.status, reason: String(result.reason) } : result) });
+      await writeFile(join(root, "no-ack-bound.json"), JSON.stringify({ pressAt, terminalAt, admittedAt, results }, null, 2));
+      expect(results[1]!.status, "authorized successor starts despite a never-resolving interrupt").toBe("fulfilled");
+      expect(admittedAt! - pressAt, "one press-to-successor bound").toBeLessThanOrEqual(30_000);
+      const next = (results[1] as PromiseFulfilledResult<typeof current>).value;
+      expect(next.contextSnapshot?.forceFreshSession).toBe(true);
+      const bound = next.contextSnapshot?.commentId === message.id || next.contextSnapshot?.wakeCommentId === message.id
+        || Array.isArray(next.contextSnapshot?.wakeCommentIds) && next.contextSnapshot.wakeCommentIds.includes(message.id);
+      expect(bound, "successor carries the new authorized message receipt").toBe(true);
+      const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(notes.some(row => /didn.t confirm the stop|stop.*fresh session|fresh session.*stop/i.test(row.body)), "true fresh-session note is durable").toBe(true);
+      await heartbeatService(db).waitForRunExecutionDrain(next.id, { timeoutMs: 30_000 });
+      return;
+    }
     const interrupts = scenario === "R-double" ? 2 : 1;
     for (let press = 1; press <= interrupts; press++) {
       const boundary = await waitFor(`completed tool boundary ${press}`, async () => barriers[press - 1] ?? null);
