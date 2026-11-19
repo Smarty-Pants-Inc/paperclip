@@ -1815,7 +1815,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
   // adapter-utils producer builds the error; the server classifies it the way
   // the heartbeat setup step does before it reaches the setup failure path.
   const boatEnvironment = { id: "boat-environment", name: "Boat", driver: "sandbox" };
-  const probeFailure = async (outcome: { exitCode: number | null; timedOut: boolean; stdout: string }) => {
+  const probeFailure = async (outcome: { exitCode: number | null; timedOut: boolean; stdout: string }, extra: object = {}) => {
     const execute = vi.fn(async () => ({ signal: null, stderr: "fatal: exec channel closed", pid: null,
       startedAt: new Date().toISOString(), ...outcome }));
     vi.useFakeTimers({ toFake: ["setTimeout"] });
@@ -1824,7 +1824,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
         target: { kind: "remote", transport: "sandbox", providerKey: "boat", remoteCwd: "/workspace", runner: { execute } } as never,
         cwd: "/controller/workspace", env: {}, hostCredentials: false, networkAccess: true,
         // heartbeat.ts passes the selected environment, so the seam classifies the immediate call.
-        ...({ environment: boatEnvironment, providerLeaseId: "box-1" } as object),
+        ...({ environment: boatEnvironment, providerLeaseId: "box-1", ...extra } as object),
       }).then(() => { throw new Error("expected the probe to fail"); }, (error: unknown) => error);
       await vi.advanceTimersByTimeAsync(2_000);
       const error = await settled;
@@ -1854,6 +1854,16 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
       providerFailure: { provider: "sandbox", phase: "startup", providerCode: "git_context_unavailable", retryability: "transient" } });
     expect(f.deps.scheduleBoundedRetryForRun).toHaveBeenCalledTimes(1);
     expect(f.deps.scheduleBoundedRetryForRun).toHaveBeenCalledWith(expect.objectContaining({ id: f.run.id }), f.agent);
+  });
+
+  it("GP-R5: a legacy run's immediate call (heartbeat passes native: false) keeps fix B's transient classification", async () => {
+    const f = await fixture();
+    const error = await probeFailure({ exitCode: 1, timedOut: false, stdout: "" }, { native: false });
+    expect((error as { name?: string }).name).not.toBe("NativeFailedBeforeProviderTurnError");
+    f.deps.scheduleBoundedRetryForRun.mockResolvedValueOnce({ outcome: "scheduled", runId: randomUUID(), issueId: null } as never);
+    await f.completion.failRunSetup(f.setup(error));
+    expect(await read(f.run.id)).toMatchObject({ status: "failed", errorCode: "environment_provider_unavailable" });
+    expect(f.deps.scheduleBoundedRetryForRun).toHaveBeenCalledTimes(1);
   });
 
   it("GP-R3: the person's line for a final Git probe failure names the sandbox, says no work started and that it retries", async () => {
