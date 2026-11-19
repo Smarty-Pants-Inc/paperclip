@@ -7,7 +7,7 @@ import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, authUsers, companies, companyMemberships, completionContracts, createDb, environmentLeases, environments,
-  heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
+  heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, workspaceOperations, agentWakeupRequests, type Db } from "@paperclipai/db";
 import type { PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 
@@ -30,12 +30,14 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 // PLANTED (named, no real-path twin in this file; see result.md): the run row that carries M
 // and its sandbox lease. The heartbeat executor that would create them needs a live provider.
 const box = vi.hoisted(() => ({ resume: vi.fn() }));
-// The ONE switch, WITHHELD_REPLY_TRIGGER. It ships as "terminal" (row T0 reads the real module);
-// the acceptance rows flip it here, exactly as the one-line change would.
-const setting = vi.hoisted(() => ({ trigger: "terminal" as "terminal" | "acceptance" }));
+// The ONE switch, WITHHELD_REPLY_TRIGGER. It ships as "acceptance" (Ruling P; row T0 reads the real
+// module). "shipped" = the REAL exported value, unmocked: every acceptance row (A*, P*) runs on it,
+// so turning the shipped switch back to "terminal" turns them red. The R rows pass the other
+// setting, "terminal", as a parameter here.
+const setting = vi.hoisted(() => ({ trigger: "terminal" as "terminal" | "shipped" }));
 vi.mock("./native-withheld-reply-trigger.js", async importOriginal => {
   const original = await importOriginal<typeof import("./native-withheld-reply-trigger.js")>();
-  return { ...original, get WITHHELD_REPLY_TRIGGER() { return setting.trigger; } };
+  return { ...original, get WITHHELD_REPLY_TRIGGER() { return setting.trigger === "shipped" ? original.WITHHELD_REPLY_TRIGGER : setting.trigger; } };
 });
 vi.mock("../environment-execution-target.js", async importOriginal => ({
   ...await importOriginal<typeof import("../environment-execution-target.js")>(),
@@ -62,6 +64,8 @@ import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
 import { nativeResponsePresentationWork } from "./native-response-presentation-work.js";
 import { retryNativeWorkspaceExport } from "./native-workspace-export-retry.js";
 import { remoteTerminationReceipt } from "../remote-execution-termination.js";
+import { heartbeatService } from "../heartbeat.js";
+import os from "node:os";
 
 // The words are RFL's to finalize; every one lives in packages/shared/src/reply-file-line.ts.
 import { FILE_LINE_KEPT, FILE_LINE_LOST } from "./native-withheld-reply.js";
@@ -97,7 +101,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
   const STREAM = ["Done. I renamed the helper ", "and updated its two callers.\n\n", "- `src/util.ts`\n- `src/app.ts`  \n", "Tests pass ✅"];
   const ANSWER = STREAM.join("");
 
-  async function scenario(options: { chat?: boolean } = {}) {
+  async function scenario(options: { chat?: boolean; wakeOnDemand?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     const sessionId = randomUUID(), runnerId = randomUUID(), leaseId = randomUUID(), providerLeaseId = `sandbox-${randomUUID()}`;
     await db.insert(companies).values({ id: companyId, name: "Withheld reply", issuePrefix: `W${companyId.slice(0, 6)}`,
@@ -137,6 +141,9 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, issueId, heartbeatRunId: runId, provider: "daytona",
       providerLeaseId, status: "active", leasePolicy: "ephemeral", metadata: { pluginId: "plugin-test", remoteCwd: "/work" } });
     await db.update(issues).set({ executionRunId: runId, status: "in_progress" }).where(eq(issues.id, issueId));
+    // The planted run R stands for M's own wake, so M's wake stays off above. From here on the
+    // agent wakes on a person's message, as in production (P-c).
+    if (options.wakeOnDemand) await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } }).where(eq(agents.id, agentId));
 
     const store = new NativeRunCoordinatorStore(db, { companyId, issueId, runId, agentId, normalizedSessionId: sessionId,
       runnerSourceInstanceId: runnerId, completionContractId: contract.id, completionContractSha256: contract.canonicalSha256,
@@ -288,7 +295,31 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
         .send({ actionId: action.id, runId, idempotencyKey: randomUUID() });
       return { status: got.status, state: got.body.status as string | undefined };
     }
-    return { task, servedRun, fileLine, line, acceptedAt, publishAgain, expectRenderFixture, savedFilesSource, recoverSavedFiles, app, companyId, agentId, issueId, runId, leaseId, messageId, streamAndAccept, copyBack, coordinator, run, presentationWorker,
+    /** Everything about the task, the run and the agent that publishing must NOT touch (condition (vi)). */
+    async function untouchedByPublish() {
+      const [{ updatedAt: _i, ...issue }] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const [{ updatedAt: _r, resultJson: _j, ...runRow }] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      const [{ updatedAt: _a, ...agent }] = await db.select().from(agents).where(eq(agents.id, agentId));
+      const [{ updatedAt: _c, ...finalization }] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+      const wakes = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).length;
+      const runs = (await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).length;
+      return { issue, run: runRow, agent, finalization, wakes, runs };
+    }
+    /** REAL: a later message from the person (POST /api/issues/:id/comments). */
+    async function personSays(body: string) {
+      const got = await request(app).post(`/api/issues/${issueId}/comments`).send({ body, clientRequestId: randomUUID() });
+      expect(got.status, JSON.stringify(got.body)).toBe(201);
+      return got.body.id as string;
+    }
+    /** The wakes and runs that message caused: [wake status, its run's status or null]. */
+    async function wakesFor(commentId: string) {
+      const rows = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+      const mine = rows.filter(wake => JSON.stringify(wake.payload ?? {}).includes(commentId));
+      return Promise.all(mine.map(async wake => ({ status: wake.status, runId: wake.runId,
+        run: wake.runId ? (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake.runId)))[0] ?? null : null })));
+    }
+    const otherRuns = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).filter(row => row.id !== runId);
+    return { untouchedByPublish, personSays, wakesFor, otherRuns, task, servedRun, fileLine, line, acceptedAt, publishAgain, expectRenderFixture, savedFilesSource, recoverSavedFiles, app, companyId, agentId, issueId, runId, leaseId, messageId, streamAndAccept, copyBack, coordinator, run, presentationWorker,
       thread, replies, answered, expectAnsweredOnceAndNoNotice, failCopyBackThreeTimes, boardRetrySucceeds };
   }
 
@@ -485,7 +516,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
   }, 120_000);
 
   it("RENDERED source, SAVING (acceptance): the real GETs after publishing at acceptance are the fixture the ui rows render", async () => {
-    setting.trigger = "acceptance";
+    setting.trigger = "shipped";
     const s = await scenario();
     await s.streamAndAccept();
     await s.presentationWorker();
@@ -494,9 +525,9 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     expect(fixture.recoveryAction).toBeNull();
   }, 120_000);
 
-  it("T0: the switch ships as 'terminal', and under it nothing is published or marked at acceptance", async () => {
+  it("T0: the switch ships as 'acceptance' (Ruling P); with 'terminal' passed instead, nothing is published or marked at acceptance", async () => {
     const shipped = await vi.importActual<typeof import("./native-withheld-reply-trigger.js")>("./native-withheld-reply-trigger.js");
-    expect(shipped.WITHHELD_REPLY_TRIGGER).toBe("terminal");
+    expect(shipped.WITHHELD_REPLY_TRIGGER).toBe("acceptance");
     expect(shipped.WITHHELD_REPLY_SAVING_DEADLINE_MS).toBe(SAVING_DEADLINE_MS);
     const s = await scenario();
     await s.streamAndAccept();
@@ -508,7 +539,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
   }, 120_000);
 
   it("A1 (acceptance, healthy): the registered worker posts the reply at acceptance with 'Saving…'; the commit clears the line and posts nothing more", async () => {
-    setting.trigger = "acceptance";
+    setting.trigger = "shipped";
     const s = await scenario();
     const errors: unknown[] = [];
     const delivery = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => errors.push(error) });
@@ -555,7 +586,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
   }, 120_000);
 
   it("A2 (acceptance -> terminal failure, box retained): still exactly 1 reply; 'Saving…' settles to the KEPT line", async () => {
-    setting.trigger = "acceptance";
+    setting.trigger = "shipped";
     const s = await scenario();
     await s.streamAndAccept();
     await s.presentationWorker();
@@ -586,7 +617,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
   }, 120_000);
 
   it("A3 (acceptance -> pause -> the box is gone): still exactly 1 reply; 'Saving…' settles to the LOST line", async () => {
-    setting.trigger = "acceptance";
+    setting.trigger = "shipped";
     const s = await scenario();
     await s.streamAndAccept();
     await Promise.all([s.presentationWorker(), s.presentationWorker(), s.presentationWorker(), s.presentationWorker()]);
@@ -610,7 +641,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
   }, 120_000);
 
   it("A4 (acceptance -> pause before the worker -> the retried copy-back succeeds): exactly 1 reply, no line", async () => {
-    setting.trigger = "acceptance";
+    setting.trigger = "shipped";
     const s = await scenario();
     await s.streamAndAccept();
     const paused = await request(s.app).post(`/api/agents/${s.agentId}/pause`).send({});
@@ -630,7 +661,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
   }, 120_000);
 
   it("A5 (acceptance, healthy, the commit races the workers): exactly 1 reply and no line left", async () => {
-    setting.trigger = "acceptance";
+    setting.trigger = "shipped";
     const s = await scenario();
     await s.streamAndAccept();
     box.resume.mockResolvedValue(true);
@@ -647,7 +678,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
   }, 120_000);
 
   it("A6 (acceptance, the deadline; FAKE CLOCK, for the deadline only): past acceptance + 10 min the line is never 'Saving…'", async () => {
-    setting.trigger = "acceptance";
+    setting.trigger = "shipped";
     const s = await scenario();
     await s.streamAndAccept();
     await s.presentationWorker();
@@ -672,5 +703,147 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     expect(await s.coordinator()).toMatchObject({ phase: "committed" });
     expect(await s.line()).toBeNull();
     expect((await s.replies()).map(comment => comment.id)).toEqual([reply.id]);
+  }, 120_000);
+
+  // ---- Ruling P: the accepted answer is published at acceptance, by default (the SHIPPED switch). ----
+  // Never twice (d), on the shipped switch: acceptance + commit = A1, A5, A6; acceptance + terminal
+  // failure = A2, A3; four workers racing = A3, A4, A5 and P-b below.
+
+  it("P-a (shipped default): acceptance -> exactly 1 reply within seconds, the turn is no longer 'Working', 'Saving…' then cleared by the commit; publishing touches nothing else", async () => {
+    setting.trigger = "shipped";
+    const s = await scenario();
+    const errors: unknown[] = [];
+    const delivery = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => errors.push(error) });
+    const worker = nativeResponsePresentationWork(db).register(delivery, () => true);
+    try {
+      await worker.ready;
+      // Condition (vi): everything but the comment and the run's resultJson, read just before acceptance completes...
+      await s.streamAndAccept();
+      const before = await s.untouchedByPublish();
+      const acceptedAt = performance.now();
+      await vi.waitFor(async () => expect(await s.replies()).toHaveLength(1), { timeout: 5_000, interval: 20 });
+      const tookMs = performance.now() - acceptedAt;
+      timing("P-a acceptance -> published reply (registered worker)", acceptedAt);
+      expect(tookMs).toBeLessThan(5_000);
+      const [reply] = await s.replies();
+      expect(reply).toMatchObject({ body: ANSWER, createdByRunId: s.runId });
+      // ...and just after the publish: the same. No run status, no task status, no executionRunId,
+      // no execution lock, no finalizer phase or lease, no agent status, no wake, no new run.
+      expect(await s.untouchedByPublish()).toEqual(before);
+      expect(before).toMatchObject({ issue: { status: "in_progress", executionRunId: s.runId }, run: { status: "running", nativePhase: "workspace_finalizing" },
+        finalization: { phase: "workspace_finalizing" }, runs: 1 });
+      // 'Working' gone: the thread's live-turn reader skips a run whose presented reply is in the thread
+      // (TaskChatThread presentedReplyRunIds reads this served state). The real GETs here ARE the fixture
+      // whose rendered row asserts no 'Working' (TaskChatThread.withheld-reply.test.tsx, SAVING).
+      expect(await s.fileLine()).toMatchObject({ commentId: reply.id, state: "saving" });
+      expect(await s.line()).toBe(FILE_LINE_SAVING);
+      const fixture = await s.expectRenderFixture("withheld-reply-saving-thread.json");
+      expect(fixture.run).toMatchObject({ status: "running", replyFileLine: { onTheReply: true, state: "saving" } });
+      box.resume.mockResolvedValue(true);
+      await s.copyBack();
+      await vi.waitFor(async () => expect((await s.run()).status).toBe("succeeded"), { timeout: 15_000, interval: 25 });
+      expect(errors).toEqual([]);
+    } finally { worker.stop(); await delivery.stop(); }
+    await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
+    expect(await s.publishAgain()).toEqual([false, false]);
+    expect(await s.replies()).toHaveLength(1);
+    expect(await s.line()).toBeNull();
+    expect((await s.fileLine())?.state).toBe("saved");
+    await s.expectAnsweredOnceAndNoNotice();
+  }, 120_000);
+
+  it("P-b (shipped default; NAMED INJECTION 'hanging copy-out'): while the copy-out hangs, the answer still shows within seconds and the turn is no longer 'Working', exactly once", async () => {
+    setting.trigger = "shipped";
+    const s = await scenario();
+    // NAMED INJECTION 'hanging copy-out': the box's export (resumeNativeWorkspaceSync, the faked box) is
+    // entered and never returns until `release` is called. Everything around it is the real finalizer.
+    let release!: (ok: boolean) => void;
+    const hung = new Promise<boolean>(resolve => { release = resolve; });
+    box.resume.mockImplementation(() => hung);
+    await s.streamAndAccept();
+    let copyBackEnded = false;
+    const copying = s.copyBack().finally(() => { copyBackEnded = true; });
+    await vi.waitFor(() => expect(box.resume).toHaveBeenCalledTimes(1), { timeout: 15_000, interval: 20 });
+    // The finalizer is inside the copy-out now.
+    expect(await s.coordinator()).toMatchObject({ phase: "workspace_finalizing" });
+    const hangingSince = performance.now();
+    // Four workers at once, while it hangs.
+    await Promise.all([s.presentationWorker(), s.presentationWorker(), s.presentationWorker(), s.presentationWorker()]);
+    const tookMs = performance.now() - hangingSince;
+    timing("P-b copy-out hanging -> published reply (four worker passes)", hangingSince);
+    expect(tookMs).toBeLessThan(5_000);
+    const [reply] = await s.replies();
+    expect(await s.replies()).toHaveLength(1);
+    expect(reply.body).toBe(ANSWER);
+    expect(copyBackEnded).toBe(false);
+    expect(await s.coordinator()).toMatchObject({ phase: "workspace_finalizing" });
+    expect(await s.task()).toEqual({ status: "in_progress", executionRunId: s.runId });
+    expect((await s.run()).status).toBe("running");
+    // 'Working' ended: the served state the thread's live-turn reader skips on.
+    expect(await s.fileLine()).toMatchObject({ commentId: reply.id, state: "saving" });
+    expect(await s.answered()).toEqual([true]);
+    // A copy-out that stays hung past the deadline never says 'Saving…' for ever (bounded state).
+    expect(await s.line({ nowMs: await s.acceptedAt() + SAVING_DEADLINE_MS })).toBe(FILE_LINE_NOT_SAVED_YET);
+    await s.presentationWorker();
+    expect(await s.publishAgain()).toEqual([false, false]);
+    expect(await s.replies()).toHaveLength(1);
+    // The hang ends; the copy-out succeeds; the commit posts nothing more.
+    release(true);
+    await copying;
+    expect(await s.coordinator()).toMatchObject({ phase: "committed" });
+    await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
+    expect((await s.replies()).map(comment => comment.id)).toEqual([reply.id]);
+    expect(await s.line()).toBeNull();
+    await s.expectAnsweredOnceAndNoNotice();
+  }, 120_000);
+
+  it("P-c (shipped default): a person's message during workspace_finalizing is PARKED behind R; the task is freed only after R committed, with the file R wrote on disk", async () => {
+    setting.trigger = "shipped";
+    const s = await scenario({ wakeOnDemand: true });
+    // The faked box: its export writes the file R changed into the host workspace, as the real sync-out does.
+    const hostWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "withheld-reply-host-"));
+    const fileOfR = path.join(hostWorkspace, "src-util.ts"), contentOfR = `// renamed by run ${s.runId}\nexport const helper2 = 1;\n`;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    box.resume.mockImplementation(async () => { await gate; await fs.writeFile(fileOfR, contentOfR); return true; });
+    await s.streamAndAccept();
+    const copying = s.copyBack();
+    await vi.waitFor(() => expect(box.resume).toHaveBeenCalledTimes(1), { timeout: 15_000, interval: 20 });
+    await s.presentationWorker();
+    expect(await s.replies()).toHaveLength(1);
+    expect(await s.coordinator()).toMatchObject({ phase: "workspace_finalizing" });
+    // The answer is on the thread and R is still copying. The person writes again.
+    const followUp = await s.personSays("Thanks. Now also update the README.");
+    // The route queues the message's wake after it answers the request.
+    await vi.waitFor(async () => expect(await s.wakesFor(followUp)).toHaveLength(1), { timeout: 15_000, interval: 25 });
+    // REAL: the stale-lock sweep that frees a task whose run has ended. R has not ended: nothing is freed.
+    const heartbeat = heartbeatService(db);
+    await heartbeat.sweepStaleIssueLocks({ companyId: s.companyId, issueId: s.issueId });
+    // PARKED: the message's wake is deferred behind R; no second run exists; R still owns the task.
+    expect((await s.wakesFor(followUp)).map(wake => [wake.status, wake.runId])).toEqual([["deferred_issue_execution", null]]);
+    expect(await s.otherRuns()).toEqual([]);
+    expect(await s.task()).toEqual({ status: "in_progress", executionRunId: s.runId });
+    await expect(fs.readFile(fileOfR, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    // R's copy-out ends and R commits.
+    release();
+    await copying;
+    expect(await s.coordinator()).toMatchObject({ phase: "committed" });
+    expect((await s.run()).status).toBe("succeeded");
+    const committedAt = (await s.coordinator()).updatedAt.getTime();
+    // REAL: the same sweep now finds R ended, releases the task and promotes the parked message.
+    // PARKED until the commit, never earlier: the file R wrote is on disk before anything frees the task.
+    expect(await fs.readFile(fileOfR, "utf8")).toBe(contentOfR);
+    expect(await s.task()).toEqual({ status: "in_progress", executionRunId: s.runId });
+    expect((await s.wakesFor(followUp)).map(wake => [wake.status, wake.runId])).toEqual([["deferred_issue_execution", null]]);
+    // REAL: the ended-run sweep (heartbeat.reapOrphanedRuns -> releaseIssueExecutionAndPromote) frees the
+    // task now that R has ended. R's own executor, which makes this call in production, is PLANTED here.
+    await heartbeat.reapOrphanedRuns();
+    expect((await s.task()).executionRunId).toBeNull();
+    // LIMIT (named): the parked wake is still saved and unstarted here; this file does not run its promotion
+    // into the next run (that needs the run-dispatch workers and a live provider). No message was lost.
+    expect(await s.wakesFor(followUp)).toHaveLength(1);
+    expect(committedAt).toBeGreaterThan(0);
+    expect(await s.replies()).toHaveLength(1);
+    await fs.rm(hostWorkspace, { recursive: true, force: true });
   }, 120_000);
 });
