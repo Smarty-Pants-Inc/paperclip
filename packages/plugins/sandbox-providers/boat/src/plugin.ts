@@ -614,6 +614,9 @@ async function recordSpareStop(record: SpareStopRecord): Promise<void> {
     owed.owed.push({ environmentId, configHash, spareId: record.spareId });
     // rf-4 U1c C2: a stop owed under a held key keeps the maintenance tick on, even with every pool off.
     if (owedStopKeys.has(JSON.stringify([companyId, environmentId]))) ensureSpareRefreshTimer();
+  } else if (!owed.owed.some(entry => entry.environmentId === environmentId && entry.configHash === configHash)) {
+    // #21251: the pool owes no stop any more, so its spare creates may resume.
+    readySpares.clearOwedStopRetryFailures(record.key);
   }
   await persistOwedSpareStops(companyId, owed);
 }
@@ -635,6 +638,10 @@ async function resumeOwedSpareStops(config: Config, companyId: string, environme
     const hold = record.holds.find(entry => entry.environmentId === environmentId && entry.configHash === configHash);
     readySpares.restoreStopBackoff({ companyId, environmentId, configHash }, hold?.until ?? 0, hold?.failures ?? 1,
       record.owed.filter(entry => entry.environmentId === environmentId && entry.configHash === configHash).map(entry => entry.spareId));
+    // #21251: a previous worker's failed retries of this pool's owed stop still hold its creates back.
+    if (hold && record.owed.some(entry => entry.environmentId === environmentId && entry.configHash === configHash)) {
+      readySpares.restoreOwedStopRetryFailures({ companyId, environmentId, configHash }, hold.failures - 1);
+    }
   }
   const owed = record.owed.filter(entry => entry.environmentId === environmentId);
   const retryId = JSON.stringify([companyId, environmentId]);
@@ -666,6 +673,10 @@ async function resumeOwedSpareStops(config: Config, companyId: string, environme
         // rf-4 U1c C2: a tick retry keeps the debt (never renewed) and retries after
         // the same back-off; only a stop the keeper or an acquire saw fail holds creates back.
         readySpares.restoreStopBackoff(key, fromTick ? 0 : until, failures, [entry.spareId]);
+        // #21251: but a pool whose own owed stop keeps failing on retry (two or more
+        // retries, the tick's included) makes no new spare create until a stop succeeds.
+        readySpares.noteOwedStopRetryFailed(key);
+        readySpares.restoreOwedStopRetryFailures(key, failures - 1);
         await recordSpareStop({ outcome: "failed", key, spareId: entry.spareId, until, failures });
       }
     }
