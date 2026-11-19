@@ -17,12 +17,25 @@ send_chat_message({ "body": "These three PRs need review…", "idempotencyKey": 
 ```
 
 HTTP agents use `POST /api/agents/me/chat/messages` with the same JSON body and
-authenticated task-run credentials. There are no destination parameters. The
-server resolves company, agent and the task's responsible person, atomically
-creating a waiting conversation when needed. A task without a responsible person,
-or a missing or revoked recipient, fails explicitly; there is no fallback
-recipient. The run's execution identity still authorizes and attributes the
-message.
+authenticated task-run credentials. Omit `recipient` (or use `"task_person"`)
+to keep the default above. Deliberately choose `"recipient": "my_principal"`
+to message the person whose primary agent you are in this company, even on a
+fleet-created task whose responsible person is ops:
+
+```json
+send_chat_message({ "body": "Paul, here is the update…", "idempotencyKey": "principal-update-1", "recipient": "my_principal" })
+```
+
+The server resolves the principal from the saved primary-agent preference, not
+from the task, run, creator or a guessed owner. If there is no unique principal,
+it refuses with "This agent has no principal to message". No user ID or other
+destination override is accepted. The selected recipient must be an active
+company member. The server atomically creates a waiting conversation when
+needed and revalidates the selected person under the write locks. A default
+send on a task without a responsible person also fails; neither choice has a
+fallback. The run's execution identity still authorizes and attributes the
+message. The Runner tool description/schema update ships with P1c5i; this change
+does not rebuild or deploy a Runner pack.
 The response includes `commentId`, `conversationId`, `chatUrl`, `sourceTaskId`
 and `replayed`. Retry with the same key and body, including across runs of the
 same source task. Changed content with a used key conflicts, and so does a key

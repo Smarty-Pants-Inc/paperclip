@@ -68,6 +68,7 @@ import {
 import { Buffer } from "node:buffer";
 import { isDeepStrictEqual } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
+import { resolveAgentChatPrincipal } from "./agent-chat-principal.js";
 import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 import { isExplicitContinuationRetryClaim } from "./explicit-continuation-retry-claim.js";
 import { nativeManualAdmissionHoldsExecution } from "./native-runtime/native-runner-ownership.js";
@@ -13732,7 +13733,7 @@ export function issueService(db: Db) {
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
         clientRequestId?: string;
-        proactiveChatMessage?: { sourceTaskId: string; userId: string };
+        proactiveChatMessage?: { sourceTaskId: string; userId: string; recipient?: "task_person" | "my_principal" };
         /** Server-only: authenticated Paperclip messages also belong in the Slack thread. */
         mirrorToSlack?: boolean;
       },
@@ -13826,16 +13827,18 @@ export function issueService(db: Db) {
         if (agentRunWritesRevoked(run) && !publishesAcceptedReplyOfCancelledRun(run, options)) throw conflict("This conversation turn was cancelled; it cannot post a reply");
         const runTaskId = run?.nativeIssueId ?? run?.issueId ?? run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
         if (options?.proactiveChatMessage) {
-          // The destination is the source task's persisted responsible
-          // person (company-scoped, owned by this agent), not the run's
-          // execution identity, which may be whoever instructed the work.
+          // Revalidate the selected persisted recipient, not the execution
+          // identity. The sending service already holds agent/source locks.
           const [proactiveSource] = await dbOrTx.select({ responsibleUserId: issues.responsibleUserId, assigneeAgentId: issues.assigneeAgentId })
             .from(issues).where(and(eq(issues.id, options.proactiveChatMessage.sourceTaskId), eq(issues.companyId, issue.companyId)));
+          const recipientUserId = options.proactiveChatMessage.recipient === "my_principal" && actor.agentId
+            ? await resolveAgentChatPrincipal(dbOrTx as Db, issue.companyId, actor.agentId, true)
+            : proactiveSource?.responsibleUserId;
           if (run?.status !== "running" || run.agentId !== actor.agentId || run.companyId !== issue.companyId
             || runTaskId !== options.proactiveChatMessage.sourceTaskId || runTaskId === issueId
             || current.conversationUserId !== options.proactiveChatMessage.userId
-            || !proactiveSource?.responsibleUserId || proactiveSource.assigneeAgentId !== actor.agentId
-            || proactiveSource.responsibleUserId !== current.conversationUserId) {
+            || !recipientUserId || proactiveSource?.assigneeAgentId !== actor.agentId
+            || recipientUserId !== current.conversationUserId) {
             throw forbidden("Invalid background chat message authority");
           }
         } else if (run && runTaskId !== issueId) {

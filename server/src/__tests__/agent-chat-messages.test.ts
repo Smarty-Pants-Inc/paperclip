@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
-import { activityLog, agentApiKeys, agents, authUsers, chatCompletionDeliveries, chatTaskHandoffs, companyMemberships, heartbeatRuns, issueComments, issueThreadInteractions, issues, projects } from "@paperclipai/db";
+import { activityLog, agentApiKeys, agents, authUsers, chatCompletionDeliveries, chatTaskHandoffs, companyMemberships, heartbeatRuns, issueComments, issueThreadInteractions, issues, projects, userCompanyPreferences } from "@paperclipai/db";
 import type { AgentApiKeyScope } from "@paperclipai/shared";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { sendAgentChatMessage } from "../services/agent-chat-messages.js";
+import { initializePrimaryAgent } from "../services/primary-agent.js";
 import { withConversationReadState } from "../services/agent-chat-read-state.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
@@ -483,6 +484,142 @@ import { recoveryPostgresSupport as support } from "./helpers/recovery-postgres.
     const detail = await fetch(`${server.apiUrl}/api/companies/${f.companyId}/chats/${f.agentId}`, { headers: { Cookie: cookie } });
     expect(detail.status).toBe(200);
     expect(await detail.json()).toMatchObject({ id: a.conversationId, unreadMessageCount: 0 });
+  });
+
+  describe("explicit principal recipient on fleet-created tasks", () => {
+    const fleetFixture = async (principal = true) => {
+      const original = await fixture(), paul = original.responsibleUserId!, ops = await member(original, "Fleet ops");
+      if (principal) await initializePrimaryAgent(server.db, original.companyId, paul, original.agentId);
+      const task = await taskFor(original, ops, ops);
+      await server.db.update(issues).set({ createdByAgentId: original.agentId, createdByUserId: null }).where(eq(issues.id, task.issueId));
+      await initializeRunIdentity(server.db, { companyId: original.companyId, runId: task.runId, issueId: task.issueId,
+        responsibleUserId: ops, cause: "instruction" });
+      const authority = new PaperclipRunnerToolAuthority(server.db, { companyId: original.companyId, agentId: original.agentId,
+        issueId: task.issueId, runId: task.runId, apiUrl: server.apiUrl, apiToolsEnabled: false });
+      return { ...original, ...task, authority, responsibleUserId: ops, paul, ops };
+    };
+    const principalInput = { ...input, recipient: "my_principal" };
+    const deliver = async (transport: string, f: Fixture, value: unknown): Promise<ChatMessageReceipt> => {
+      if (transport === "native") return f.authority.execute({ tool: "send_chat_message", arguments: value as Record<string, unknown>, callId: randomUUID() }) as Promise<ChatMessageReceipt>;
+      if (transport === "service") return (await send(f, value))!;
+      const response = await httpSend(f, value);
+      expect(response.status, await response.clone().text()).toBe(201);
+      return response.json();
+    };
+
+    it.each(["native", "http", "service"])("a/e: %s deliberately reaches Paul's own chat once, keeping ops attribution", async transport => {
+      const f = await fleetFixture();
+      const paulChat = await issueService(server.db).create(f.companyId, { title: "Paul's own chat", assigneeAgentId: f.agentId,
+        conversationAgentId: f.agentId, conversationUserId: f.paul, conversationState: "waiting", status: "in_review" });
+      const receipt = await deliver(transport, f, principalInput);
+      expect(receipt).toMatchObject({ conversationId: paulChat.id, replayed: false, sourceTaskId: f.issueId });
+      const retry = await httpSend(f, principalInput);
+      expect(retry.status).toBe(200);
+      expect(await retry.json()).toMatchObject({ commentId: receipt.commentId, conversationId: paulChat.id, replayed: true });
+      expect(await f.authority.recover({ tool: "send_chat_message", arguments: principalInput, callId: randomUUID() }))
+        .toMatchObject({ result: { commentId: receipt.commentId, replayed: true } });
+      expect((await chatsOf(f)).map(chat => chat.conversationUserId)).toEqual([f.paul]);
+      const comments = await server.db.select().from(issueComments).where(eq(issueComments.issueId, paulChat.id));
+      expect(comments).toHaveLength(1);
+      expect(comments[0]).toMatchObject({ authorAgentId: f.agentId, createdByRunId: f.runId, onBehalfOfUserId: f.ops, body: input.body });
+      expect(await issueService(server.db).getById(f.issueId)).toMatchObject({ responsibleUserId: f.ops, createdByAgentId: f.agentId });
+      // Real human chat reads select by the logged-in person, not by run identity.
+      for (const userId of transport === "native" ? [f.paul, f.ops] : []) {
+        const cookie = await server.humanSession(userId);
+        const response = await fetch(`${server.apiUrl}/api/companies/${f.companyId}/chats`, { headers: { Cookie: cookie } });
+        expect(response.status).toBe(200);
+        const chats = await response.json() as { id: string }[];
+        expect(chats.map(chat => chat.id)).toEqual(userId === f.paul ? [paulChat.id] : []);
+      }
+    });
+
+    it.each(["native", "http", "service"])("b: %s without a choice still reaches ops, not the principal", async transport => {
+      const f = await fleetFixture();
+      const receipt = await deliver(transport, f, input);
+      expect((await issueService(server.db).getById(receipt.conversationId))!.conversationUserId).toBe(f.ops);
+      expect((await chatsOf(f)).map(chat => chat.conversationUserId)).toEqual([f.ops]);
+      expect(await send(f, { ...input, recipient: "task_person" })).toMatchObject({ commentId: receipt.commentId, replayed: true });
+    });
+
+    it("a/e: concurrently creates the principal chat once when no chat exists", async () => {
+      const f = await fleetFixture();
+      const [a, b] = await Promise.all([send(f, principalInput), send(f, principalInput)]);
+      expect(a!.commentId).toBe(b!.commentId);
+      expect((await chatsOf(f)).map(chat => chat.conversationUserId)).toEqual([f.paul]);
+      expect(await server.db.select().from(issueComments).where(eq(issueComments.authorAgentId, f.agentId))).toHaveLength(1);
+    });
+
+    it.each(["absent", "ambiguous", "other-company", "inactive"])("c: a %s principal is a true error, with no fallback or delivery", async kind => {
+      const f = await fleetFixture(kind === "ambiguous" || kind === "inactive");
+      if (kind === "ambiguous") await initializePrimaryAgent(server.db, f.companyId, f.ops, f.agentId);
+      if (kind === "other-company") await initializePrimaryAgent(server.db, f.foreignCompanyId, f.paul, f.agentId);
+      if (kind === "inactive") await server.db.update(companyMemberships).set({ status: "inactive" })
+        .where(eq(companyMemberships.principalId, f.paul));
+      const message = kind === "inactive" ? "The responsible human is no longer an active company member" : "This agent has no principal to message";
+      await expect(send(f, principalInput)).rejects.toMatchObject({ status: 403, message });
+      await expect(f.authority.execute({ tool: "send_chat_message", arguments: principalInput, callId: randomUUID() }))
+        .rejects.toMatchObject({ status: 403, message });
+      const response = await httpSend(f, principalInput);
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ error: message });
+      expect(await chatsOf(f)).toEqual([]);
+      expect(await server.db.select().from(issueComments).where(eq(issueComments.authorAgentId, f.agentId))).toEqual([]);
+    });
+
+    it.each(["task-first", "principal-first"])("e: recipient change for the same key is 409, %s, across all paths", async order => {
+      const f = await fleetFixture(), first = order === "task-first" ? input : principalInput;
+      const second = order === "task-first" ? principalInput : input;
+      const original = (await send(f, first))!;
+      const shape = { status: 409, details: { code: "chat_message_recipient_changed", commentId: original.commentId } };
+      await expect(send(f, second)).rejects.toMatchObject(shape);
+      await expect(f.authority.execute({ tool: "send_chat_message", arguments: second, callId: randomUUID() })).rejects.toMatchObject(shape);
+      await expect(f.authority.recover({ tool: "send_chat_message", arguments: second, callId: randomUUID() })).rejects.toMatchObject(shape);
+      const response = await httpSend(f, second);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ code: "chat_message_recipient_changed" });
+      expect(await chatsOf(f)).toHaveLength(1);
+      expect(await server.db.select().from(issueComments).where(eq(issueComments.authorAgentId, f.agentId))).toHaveLength(1);
+    });
+
+    it.each(["changed", "cleared", "ambiguous"])("revalidates a %s principal after waiting for the destination lock", async kind => {
+      const f = await fleetFixture(), receipt = (await send(f, principalInput))!;
+      let unlock!: () => void, ready!: (pid: number) => void;
+      const locked = new Promise<number>(resolve => { ready = resolve; });
+      const release = new Promise<void>(resolve => { unlock = resolve; });
+      const gate = server.db.transaction(async tx => {
+        const [{ pid }] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+        await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, receipt.conversationId)).for("update");
+        ready(pid); await release;
+      });
+      const pid = await locked;
+      const delivery = httpSend(f, { ...principalInput, idempotencyKey: "principal-after-wait" });
+      try {
+        await vi.waitFor(async () => {
+          const [row] = await server.db.execute(sql<{ blocked: boolean }>`select exists(select 1 from pg_stat_activity
+            where datname=current_database() and ${pid}=any(pg_blocking_pids(pid))) as blocked`);
+          expect(row.blocked).toBe(true);
+        }, { timeout: 5_000, interval: 10 });
+        if (kind !== "ambiguous") await server.db.update(userCompanyPreferences).set({ primaryAgentId: null })
+          .where(eq(userCompanyPreferences.userId, f.paul));
+        if (kind !== "cleared") await initializePrimaryAgent(server.db, f.companyId, f.ops, f.agentId);
+        unlock(); await gate;
+        const response = await delivery;
+        expect(response.status).toBe(403);
+        expect(await response.json()).toMatchObject({ error: kind === "changed"
+          ? "The agent's principal changed before this message was saved" : "This agent has no principal to message" });
+        expect(await server.db.select().from(issueComments).where(eq(issueComments.authorAgentId, f.agentId))).toHaveLength(1);
+      } finally { unlock(); await gate; await delivery; }
+    }, 30_000);
+
+    it("rejects invalid recipient values rather than silently using a default", async () => {
+      const f = await fleetFixture();
+      for (const recipient of [null, "paul", "", f.paul]) {
+        expect((await httpSend(f, { ...input, recipient })).status).toBe(400);
+        await expect(f.authority.execute({ tool: "send_chat_message", arguments: { ...input, recipient }, callId: randomUUID() }))
+          .rejects.toMatchObject({ status: 400 });
+      }
+      expect(await chatsOf(f)).toEqual([]);
+    });
   });
 
   describe("recipient is the source task's responsible person (CHATROUTE sections 4-5)", () => {

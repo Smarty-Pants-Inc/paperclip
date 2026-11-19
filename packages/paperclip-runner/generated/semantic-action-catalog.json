@@ -4,7 +4,7 @@
       "standard",
       "skill_test"
     ],
-    "description": "Save newly authored content as a reusable single-file skill in the company library. To add an existing skill, use source import or catalog install via search_api and call_api so source provenance is retained. A skill already exists when its SKILL.md is in a local directory, repository, URL or catalog, even when the company library has no match; import it instead of copying its content here. Supply a complete SKILL.md whose name and description match the inputs. This saves the skill and shows a card; it does not assign the skill to any agent. Reuse idempotencyKey on retries.",
+    "description": "Save newly authored content as a reusable single-file skill in the company library. To add an existing skill, use source import or catalog install via search_api and call_api so source provenance is retained. A skill already exists when its SKILL.md is in a local directory, repository, URL or catalog, even when the company library has no match; import it instead of copying its content here. Supply a complete SKILL.md whose name and description match the inputs. This saves the skill and shows a card; it does not assign the skill to any agent. To assign it, list its key in desiredSkills (Latest); a versionId pin needs Beta skills. Reuse idempotencyKey on retries.",
     "effect": "write",
     "inputSchema": {
       "additionalProperties": false,
@@ -539,7 +539,7 @@
     "allowedModes": [
       "standard"
     ],
-    "description": "Send a Markdown message directly to your own persistent chat with this task's responsible person: the person recorded as responsible on the task, not whoever commented on, woke or instructed this run. The destination is automatic and fails if the task has no responsible person. Use this, not comment_on_task, to message your person from an execution task. Use for requested digests and proactive task updates; report_progress writes to this task and comment_on_task writes to a chosen task. This sends no message to other agents, starts no chat run, and changes no task status. Reuse idempotencyKey on retries.",
+    "description": "Send a Markdown message directly to your own persistent chat with this task's responsible person: the person recorded as responsible on the task, not whoever commented on, woke or instructed this run. This is the default (recipient: task_person) and fails if the task has no responsible person. Choose recipient: my_principal deliberately to message the unique person whose primary agent you are in this company, even when working a task for someone else. If you have no unique principal, delivery fails with no fallback. The recipient must be an active company member; attribution remains the run's execution person. Use this, not comment_on_task, to message a person from an execution task. Use for requested digests and proactive task updates; report_progress writes to this task and comment_on_task writes to a chosen task. This sends no message to other agents, starts no chat run, and changes no task status. Reuse idempotencyKey on retries; a key already delivered to a different recipient returns chat_message_recipient_changed, not a second delivery.",
     "effect": "write",
     "inputSchema": {
       "additionalProperties": false,
@@ -554,6 +554,15 @@
           "description": "Stable key for this message within the source task, including across run retries.",
           "maxLength": 240,
           "minLength": 1,
+          "type": "string"
+        },
+        "recipient": {
+          "default": "task_person",
+          "description": "Default: the task's responsible person. Choose my_principal to message the unique person whose primary agent you are; no fallback.",
+          "enum": [
+            "task_person",
+            "my_principal"
+          ],
           "type": "string"
         }
       },

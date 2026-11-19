@@ -1,12 +1,14 @@
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
+import { sendChatMessageSchema } from "@paperclipai/shared";
+import { validate } from "../middleware/validate.js";
 import { forbidden } from "../errors.js";
 import { sendAgentChatMessage } from "../services/agent-chat-messages.js";
 import { assertCompanyAccess } from "./authz.js";
 
 export function agentChatMessageRoutes(db: Db) {
   const router = Router();
-  router.post("/agents/me/chat/messages", async (req, res) => {
+  router.post("/agents/me/chat/messages", validate(sendChatMessageSchema), async (req, res) => {
     if (req.actor.type !== "agent" || !req.actor.agentId || !req.actor.companyId || !req.actor.runId) {
       throw forbidden("An authenticated task run is required");
     }

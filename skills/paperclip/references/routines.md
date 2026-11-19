@@ -238,11 +238,20 @@ to that agent's chat with the source task's responsible person (not whoever
 woke or instructed the run), including before that person has opened the chat. No recipient lookup or destination ID is needed. Retain a
 stable key across retries of the source task; changed content with that key conflicts.
 
+To deliberately message your own principal instead (including on a routine
+whose task is responsible to ops), pass `recipient: "my_principal"`. This means
+the unique person whose saved primary agent you are in this company, not a
+person inferred from this run. No unique principal, or an inactive recipient,
+is a true delivery error with no fallback. Omitting the field or choosing
+`recipient: "task_person"` preserves the default above. Attribution stays with
+the run's execution person. Reusing a key already sent to another recipient
+returns 409 `chat_message_recipient_changed`, never a second delivery.
+
 For a morning PR review, gather the PRs, send a concise Markdown digest with
 links, then finish the task separately. Delivery commits immediately, marks the
 chat unread and includes a source-task link. It neither wakes the chat agent nor
 suppresses ordinary handoff completion notifications. Agent Chat must be enabled,
 the run must be active in standard mode, and the source task must be suitable
-for the company-visible chat. A task with no responsible person, missing or
-revoked recipients and restricted tasks
-fail explicitly; never select a replacement recipient.
+for the company-visible chat. A default send on a task with no responsible
+person, missing or revoked recipients and restricted tasks fail explicitly;
+never select a replacement recipient as a fallback.

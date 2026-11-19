@@ -13,7 +13,7 @@ import { withOperationAccountingTransaction } from "../accounting-transaction.js
 import { notifyStatusCardIssueChange } from "../status-card-notifications.js";
 import { nativeRunKeyScope, nativeSkillTestToolAllowed, assertNativeSkillTestTool } from "./native-skill-test-scope.js";
 import { notifyAttentionRetentionWork } from "../retention-work-notifications.js";
-import { requiredQualityReviewSchema, type RequestCheckboxConfirmationOption } from "@paperclipai/shared";
+import { requiredQualityReviewSchema, sendChatMessageSchema, type RequestCheckboxConfirmationOption } from "@paperclipai/shared";
 import { priorRecoveryApiReceipt } from "../recovery-effect-receipts.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import { caseHandoffService } from "../case-handoffs.js";
@@ -1995,8 +1995,10 @@ export class PaperclipRunnerToolAuthority {
   }
 
   async #sendChatMessage(input: Record<string, unknown>, actor: AuthorizationActor, receiptOnly = false) {
+    const parsed = sendChatMessageSchema.safeParse(input);
+    if (!parsed.success) throw badRequest("Chat messages require body, idempotencyKey and an optional valid recipient", parsed.error.issues);
     const result = await sendAgentChatMessage(this.db, { ...this.binding, keyScope: actor.keyScope,
-      onBehalfOfUserId: actor.onBehalfOfUserId, authorizingUserId: actor.authorizingUserId, source: actor.source }, input, {
+      onBehalfOfUserId: actor.onBehalfOfUserId, authorizingUserId: actor.authorizingUserId, source: actor.source }, parsed.data, {
       authorizeNative: tx => this.#lockAuthorizedMutationContext(tx), receiptOnly,
     });
     return result ?? undefined;

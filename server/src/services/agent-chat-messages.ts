@@ -8,6 +8,7 @@ import { withTransactionRetry } from "./transaction-retry.js";
 import { authorizationService, canActorReadIssuePrivacy, type AuthorizationActor } from "./authorization.js";
 import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { resolveAgentChatPrincipal } from "./agent-chat-principal.js";
 import { issueService } from "./issues.js";
 import { issueTreeControlService } from "./issue-tree-control.js";
 import { resolveActorSourceTrustForIssue } from "./source-trust.js";
@@ -38,7 +39,7 @@ export async function sendAgentChatMessage(
   options: { authorizeNative?: (tx: Db) => Promise<unknown>; receiptOnly?: boolean } = {},
 ): Promise<ChatMessageReceipt | null> {
   const parsed = sendChatMessageSchema.safeParse(value);
-  if (!parsed.success) throw badRequest("Chat messages require body and idempotencyKey only", parsed.error.issues);
+  if (!parsed.success) throw badRequest("Chat messages require body, idempotencyKey and an optional valid recipient", parsed.error.issues);
   if (![actor.companyId, actor.agentId, actor.runId].every(isUuidLike)) throw forbidden("An authenticated task run is required");
   const credentialScope = agentApiKeyScopeSchema.safeParse(actor.keyScope ?? { kind: "standard" });
   if (!credentialScope.success) throw forbidden("The agent credential scope is invalid");
@@ -95,15 +96,15 @@ async function sendAgentChatMessageOnce(
     const [initialContext] = await contextQuery();
     const context = validateContext(initialContext);
     if (!(await instanceSettingsService(tx).getExperimental()).enableAgentChat) throw notFound("Agent Chat is disabled");
-    // Two people, never conflated: the run's execution identity (who this
-    // work is done for: authority, attribution, influence) and the recipient,
-    // the source task's persisted responsible person. The recipient has no
-    // fallback: not the instructor, a commenter, the company default or a
-    // guessed principal.
+    // Execution identity continues to govern authority, attribution and
+    // influence. The optional recipient choice never changes that identity.
+    // Both choices use persisted records, with no fallback or guessed person.
     const executionUserId = context.run.responsibleUserId;
     if (!executionUserId) throw forbidden("This run has no responsible human execution identity");
     if (actor.onBehalfOfUserId !== undefined && actor.onBehalfOfUserId !== executionUserId) throw forbidden("The authenticated responsible human no longer matches this run");
-    const recipientUserId = source.responsibleUserId;
+    const recipientUserId = input.recipient === "my_principal"
+      ? await resolveAgentChatPrincipal(tx, actor.companyId, actor.agentId)
+      : source.responsibleUserId;
     if (!recipientUserId) throw forbidden("This task has no responsible person to receive the message");
     const assertCurrentKey = async (lock: boolean) => {
       if (!actor.agentApiKeyId) return;
@@ -163,7 +164,13 @@ async function sendAgentChatMessageOnce(
     const [lockedContext] = await contextQuery().for("update", { of: heartbeatRuns });
     const current = validateContext(lockedContext);
     if (current.run.responsibleUserId !== executionUserId) throw forbidden("The responsible human changed before this message was saved");
-    if (source.responsibleUserId !== recipientUserId) throw forbidden("The task's responsible person changed before this message was saved");
+    if (input.recipient === "my_principal") {
+      if (await resolveAgentChatPrincipal(tx, actor.companyId, actor.agentId, true) !== recipientUserId) {
+        throw forbidden("The agent's principal changed before this message was saved");
+      }
+    } else if (source.responsibleUserId !== recipientUserId) {
+      throw forbidden("The task's responsible person changed before this message was saved");
+    }
     await assertCurrentKey(true);
     if ((await resolveTaskWatchdogMutationScope(tx, { ...actor, type: "agent" })).kind !== "none") {
       throw forbidden("Chat delivery requires an ordinary task in standard execution mode");
@@ -185,14 +192,14 @@ async function sendAgentChatMessageOnce(
       eq(issueComments.authorAgentId, actor.agentId), eq(issueComments.clientRequestId, requestId)));
     const elsewhere = priors.find(row => row.issueId !== conversation?.id);
     if (elsewhere) {
-      throw conflict("This chat message key was already delivered to a different person's chat; the task's responsible person changed. Use a new idempotencyKey to send it to the current responsible person",
+      throw conflict("This chat message key was already delivered to a different person's chat. Use a new idempotencyKey to send it to the selected recipient",
         { code: "chat_message_recipient_changed", commentId: elsewhere.id, conversationId: elsewhere.issueId });
     }
     if (!conversation) return null;
     await authorize(conversation.id, "issue:comment");
     const recipientDecision = await authorizationService(tx).decide({ actor: { type: "board", userId: recipientUserId, source: "session", ignoreInstanceAdmin: true },
       action: "issue:read", resource: { type: "issue", companyId: actor.companyId, issueId: conversation.id } });
-    if (!recipientDecision.allowed) throw forbidden("The task's responsible person cannot access this chat");
+    if (!recipientDecision.allowed) throw forbidden("The selected recipient cannot access this chat");
     const [prior] = priors;
     const [company] = await tx.select({ prefix: companies.issuePrefix }).from(companies).where(eq(companies.id, actor.companyId));
     const receipt = (commentId: string, replayed: boolean): ChatMessageReceipt => ({ commentId, conversationId: conversation!.id,
@@ -216,7 +223,7 @@ async function sendAgentChatMessageOnce(
     const sourceTrust = await resolveActorSourceTrustForIssue({ db: tx, issue: source,
       actor: { actorType: "agent", actorId: actor.agentId, agentId: actor.agentId, runId: actor.runId } });
     const comment = await svc.addComment(conversation.id, input.body, { agentId: actor.agentId, runId: actor.runId }, {
-      clientRequestId: requestId, sourceTrust, proactiveChatMessage: { sourceTaskId: source.id, userId: recipientUserId },
+      clientRequestId: requestId, sourceTrust, proactiveChatMessage: { sourceTaskId: source.id, userId: recipientUserId, recipient: input.recipient },
       metadata: { version: 1, chatMessage: { sourceTaskId: source.id, sourceTaskIdentifier: source.identifier!, sourceRunId: actor.runId, contentHash },
         sections: [{ rows: [{ type: "issue_link", issueId: source.id, identifier: source.identifier, label: "Source task" }] }] },
     }, tx);

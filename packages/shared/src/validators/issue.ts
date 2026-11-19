@@ -1214,6 +1214,7 @@ export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
 export const sendChatMessageSchema = z.object({
   body: multilineTextSchema.pipe(z.string().trim().min(1).max(20000)),
   idempotencyKey: z.string().trim().min(1).max(240),
+  recipient: z.enum(["task_person", "my_principal"]).default("task_person"),
 }).strict();
 
 export const markIssueReadSchema = z.object({ throughCommentId: z.uuid().optional() }).strict();
