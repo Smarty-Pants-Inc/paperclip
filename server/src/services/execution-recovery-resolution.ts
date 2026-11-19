@@ -889,9 +889,13 @@ export async function settleUnrecoverableExecutions(
         // waiting for a person.
         // A preparation that never started provider work keeps its own replay
         // lane, which takes over the settled hold; the held sweep follows it.
+        // The fallback's refusal, kept on the resolved hold so the DB says why
+        // nothing continued (adopt-resolved-nothing2: it was stored nowhere).
+        let freshRefusal: { kind: string; reason: string | null } | null = null;
         if (current && !isInterruptedNativePreparationCandidate(run)) {
           const fresh = await continueFreshInTransaction(tx as unknown as Db, { companyId: task.companyId, runId: run.id,
             trigger: "recovery_refused", now });
+          freshRefusal = { kind: fresh.kind, reason: "reason" in fresh && typeof fresh.reason === "string" ? fresh.reason : null };
           if (["continued", "already_continued", "successor_exists"].includes(fresh.kind)) return;
           if (fresh.kind === "backoff" || fresh.kind === "exact_recovery_pending") {
             await recordFreshContinuationCheck(tx as unknown as Db, { companyId: task.companyId, actionId: action.id }, fresh, now);
@@ -952,6 +956,7 @@ export async function settleUnrecoverableExecutions(
               ...(nativeFailureBlock ? { nativeFailureBlock } : {}),
               ...(nativeBootstrapFailureBlock ? { nativeBootstrapFailureBlock } : {}),
               ...(legacyCancellationBlock ? { legacyCancellationBlock } : {}),
+              ...(freshRefusal ? { freshContinuationRefusal: { ...freshRefusal, recordedAt: now.toISOString() } } : {}),
               automaticRecovery: {
                 policy: "preserve_without_replay_v1",
                 runId: run.id,
