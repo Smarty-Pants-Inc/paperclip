@@ -544,9 +544,9 @@ export async function admitExplicitNativeContinuation(input: {
     // A person's own accepted Stop (or task-tree Pause) of this run in startup
     // is proven by the one fact the release and the projection also read; the
     // person's Send then starts one successor with the held messages.
-    // Native shape only: a Stop before native selection (runtimeMode still
-    // 'legacy') is released by the legacy path, which does not gather the held
-    // messages into the Send's queue, so it keeps today's admission.
+    // No native-only limit here: the predicate is false unless native, except
+    // a person's own Stop before native selection of a paperclip_runner agent's
+    // run, whose legacy release gathered the held messages into the Send's queue.
     // The Send-er must be the person who stopped (the one same-person fact).
     const personStartupStop = Boolean(nativeQueuedSend && await isPersonAcceptedStartupStop(db, { ...run, issueId },
       { sendingWakeId: input.queuedCommentInterruptId, sendingUserId: actorId }));

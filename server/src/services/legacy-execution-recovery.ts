@@ -122,6 +122,11 @@ export function legacyExecutionNeedsReconciliation(
  * The synchronous classifier stays conservative for callers without a DB proof. */
 export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run: Run): Promise<boolean> {
   if (await isInterruptedNativePreparation(db, run)) return false;
+  // A person's own Stop before native selection is that person's stop, not an
+  // unreconciled run: settled as the native startup Stop (the one fact).
+  const issueId = run.contextSnapshot?.issueId;
+  if (typeof issueId === "string" && (run.resultJson?.startupCancellation as Record<string, unknown> | undefined)?.beforeNativeSelection === true
+    && await (await import("./acknowledged-native-stop.js")).isPersonAcceptedStartupStop(db, { ...run, issueId })) return false;
   return await hasUnrestoredRemoteWorkspace(db, run) ||
     (legacyExecutionNeedsReconciliation(run) && !(await isPreDispatchReviewWaitVerified(db, run))
       && !(await isPreDispatchExecutionWaitVerified(db, run)));
