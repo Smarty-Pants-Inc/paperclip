@@ -44,9 +44,15 @@ it.each([
 });
 
 // #20990: another member's Smarty opens only that member's read-only chat.
-const smarty = vi.hoisted(() => ({ primaries: [] as Array<{ userId: string; agentId: string }> }));
-vi.mock("../api/auth", () => ({ authApi: { getSession: async () => ({ user: { id: "viewer-a" } }) } }));
-vi.mock("../api/primaryAgent", () => ({ primaryAgentApi: { list: async () => smarty.primaries } }));
+const smarty = vi.hoisted(() => ({ primaries: [] as Array<{ userId: string; agentId: string }>, failOwnership: false, failSession: false }));
+vi.mock("../api/auth", () => ({ authApi: { getSession: async () => {
+  if (smarty.failSession) throw new Error("Session unavailable");
+  return { user: { id: "viewer-a" } };
+} } }));
+vi.mock("../api/primaryAgent", () => ({ primaryAgentApi: { list: async () => {
+  if (smarty.failOwnership) throw new Error("Ownership unavailable");
+  return smarty.primaries;
+} } }));
 vi.mock("../api/agents", async importOriginal => {
   const actual = await importOriginal<typeof import("../api/agents")>();
   return { ...actual, agentsApi: { ...actual.agentsApi, get: async () => ({ id: "agent-b", companyId: "company-1", name: "Bea's Smarty",
@@ -103,4 +109,34 @@ it.each([
     expect(page.where()).toBe("/TEST/agents/beas-smarty/overview");
     expect([...page.element.querySelectorAll("button")].map(b => b.textContent)).toContain("New task");
   } finally { await page.cleanup(); }
+});
+
+// #20990c: if ownership can't be read, fail closed: Retry, never the owner's actions.
+it.each(["failOwnership", "failSession"] as const)("shows Couldn't load this chat with Retry, no Chat or New task, when %s; Retry lands on the read-only chat", async failure => {
+  smarty[failure] = true;
+  const page = await openAgentPage("/TEST/agents/beas-smarty/overview", [{ userId: "member-b", agentId: "agent-b" }]);
+  try {
+    await vi.waitFor(async () => { await page.settle(); expect(page.element.querySelector("[role=alert]")?.textContent).toContain("Couldn't load this chat"); });
+    const labels = [...page.element.querySelectorAll("button")].map(b => b.textContent?.trim());
+    expect(labels).toContain("Retry");
+    expect(labels).not.toContain("New task");
+    expect(page.element.querySelector("[aria-label='Chat with Bea\\'s Smarty']")).toBeNull();
+    expect(page.element.querySelector("[aria-label='Suggested tasks']")).toBeNull();
+    expect(page.element.querySelector("textarea")).toBeNull();
+    expect(page.where()).toBe("/TEST/agents/beas-smarty/overview");
+    smarty[failure] = false;
+    await act(async () => { [...page.element.querySelectorAll("button")].find(b => b.textContent?.trim() === "Retry")!.click(); });
+    await vi.waitFor(async () => { await page.settle(); expect(page.where()).toBe("/TEST/chats/beas-smarty"); });
+    expect(page.element.textContent).toContain("Read-only chat route");
+  } finally { smarty[failure] = false; await page.cleanup(); }
+});
+
+it("offers no Chat or New task on a settings tab when ownership can't be read", async () => {
+  smarty.failOwnership = true;
+  const page = await openAgentPage("/TEST/agents/beas-smarty/permissions", [{ userId: "member-b", agentId: "agent-b" }]);
+  try {
+    await vi.waitFor(async () => { await page.settle(); expect(page.element.querySelector("[aria-label='Open actions for Bea\\'s Smarty']")).not.toBeNull(); });
+    expect(page.element.querySelector("[aria-label='Chat with Bea\\'s Smarty']")).toBeNull();
+    expect([...page.element.querySelectorAll("button")].map(b => b.textContent)).not.toContain("New task");
+  } finally { smarty.failOwnership = false; await page.cleanup(); }
 });

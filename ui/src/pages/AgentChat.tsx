@@ -38,8 +38,10 @@ export function AgentChat() {
   const agent = rosterAgent ?? (historyAgent.data?.companyId === selectedCompanyId ? historyAgent.data : undefined);
   // A shared primary is still interactive for its own member. Otherwise open
   // only the other member's conversation, never the viewer's chat by accident.
-  const { session, userId, primaries, otherOwnerId } = usePrimaryAgentOwner(selectedCompanyId, agent?.id, enabled);
-  const ownChatEnabled = enabled && !!agent && session.isSuccess && primaries.isSuccess && !otherOwnerId;
+  // An unreadable ownership answer fails closed: never the composer.
+  const ownership = usePrimaryAgentOwner(selectedCompanyId, agent?.id, enabled);
+  const { session, userId, primaries, ownerId: otherOwnerId } = ownership;
+  const ownChatEnabled = enabled && !!agent && (ownership.status === "mine" || ownership.status === "nobody");
   const chatKey = queryKeys.agentChats.detail(selectedCompanyId, userId, agent?.id);
   const chat = useQuery({
     queryKey: chatKey,
@@ -66,7 +68,7 @@ export function AgentChat() {
         if (page.length < 100) return null;
       }
     },
-    enabled: enabled && !!agent && session.isSuccess && primaries.isSuccess && !!otherOwnerId,
+    enabled: enabled && !!agent && ownership.status === "other",
   });
   const directory = useQuery({
     queryKey: queryKeys.access.companyUserDirectory(selectedCompanyId!),
@@ -114,6 +116,8 @@ export function AgentChat() {
         {" "}Your workspace preference does not change Chat availability. Existing history remains available through task links.
       </p>
     );
+  if (enabled && agent && ownership.status === "error")
+    return <QueryErrorState size="page" error={ownership.error} action="load this chat" onRetry={ownership.retry} retrying={ownership.retrying} />;
   const failed = relevantViews.find(view => view.kind === "error");
   if (failed)
     return <QueryErrorState size="page" error={failed.error} action="load this conversation" onRetry={failed.retry} retrying={failed.isFetching} />;

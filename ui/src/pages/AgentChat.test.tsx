@@ -201,6 +201,27 @@ it("shows ownership lookup errors instead of falling back to an interactive view
   expect(api.getChat).not.toHaveBeenCalled();
 });
 
+it.each(["primaries", "session"] as const)("#20990c: %s read fails (5xx): the unavailable state with Retry, never the composer; Retry opens the read-only chat", async failing => {
+  paulSmarty(); client.removeQueries({ queryKey: ["primary-agent"] });
+  const owners = [{ userId: "paul", agentId }];
+  if (failing === "session") { client.removeQueries({ queryKey: queryKeys.auth.session }); api.session.mockRejectedValue(new ApiError("Unavailable", 503, {})); }
+  api.primaries.mockImplementation(async () => { if (failing === "primaries") throw new ApiError("Bad gateway", 502, {}); return owners; });
+  render();
+  await waitFor(() => expect(container.querySelector('[role="alert"][data-query-view="error"]')).not.toBeNull());
+  expect([...container.querySelectorAll("button")].map(button => button.textContent?.trim())).toContain("Retry");
+  expect(container.querySelector("textarea")).toBeNull();
+  expect(container.querySelector("[data-issue-id]")).toBeNull();
+  expect(api.getChat).not.toHaveBeenCalled();
+  expect(api.ensure).not.toHaveBeenCalled();
+  api.session.mockResolvedValue({ user: { id: "viewer-a" } });
+  api.primaries.mockResolvedValue(owners);
+  flushSync(() => [...container.querySelectorAll("button")].find(button => button.textContent?.trim() === "Retry")!.click());
+  await waitFor(() => expect(container.textContent).toContain("Paul's chat with Paul's Smarty"));
+  expect(container.querySelector('[data-issue-id="paul-chat"]')).not.toBeNull();
+  expect(container.querySelector("textarea")).toBeNull();
+  expect(api.getChat).not.toHaveBeenCalled();
+});
+
 it("does not reuse another account's cached conversation", async () => {
   client.setQueryData(queryKeys.agents.list("company-a"), [{ id: agentId, companyId: "company-a", name: "Helper" }]);
   client.setQueryData(queryKeys.agentChats.list("company-a", "viewer-b"), [{
