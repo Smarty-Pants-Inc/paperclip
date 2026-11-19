@@ -3077,11 +3077,28 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     (body: string, clientRequestId: string) => handleThreadAdd(body, undefined, undefined, undefined, clientRequestId),
     [handleThreadAdd],
   );
+  // The run the person stopped here. Stop means stop: the server's 'working'
+  // projection for that run (its held messages are a fresh wait) is not a turn
+  // starting, so it shows no 'Working' lane. A new message still does.
+  const [personStoppedRunId, setPersonStoppedRunId] = useState<string | null>(null);
+  const liveRunId = liveRun?.id ?? null;
+  const stopLiveRun = useMemo(() => liveRunId && onCancelRun ? async () => {
+    setPersonStoppedRunId(liveRunId);
+    try {
+      await onCancelRun();
+    } catch (error) {
+      setPersonStoppedRunId(current => current === liveRunId ? null : current);
+      throw error;
+    }
+  } : undefined, [liveRunId, onCancelRun]);
   const optimisticRunnerStartup =
     hasAgentAssignee &&
     !startupBlocked &&
     !tailRunId &&
-    (props.retryPreparing || props.interruption?.state === "working" || runnerSubmissionPending ||
+    (props.retryPreparing ||
+      (props.interruption?.state === "working" &&
+        !(personStoppedRunId && props.interruption.observedRunId === personStoppedRunId)) ||
+      runnerSubmissionPending ||
       commentItems.some(
         (item) =>
           item.kind === "message" &&
@@ -3839,6 +3856,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                           onInterrupt={
                             onInterruptQueued && queuedMessageQueue?.queueId
                               ? async () => {
+                                  setPersonStoppedRunId(null);
                                   return onInterruptQueued(
                                     queuedMessageQueue.targetRunId,
                                   );
@@ -3867,7 +3885,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                             comment.authorUserId === currentUserId && comment.clientRequestId &&
                             !("clientStatus" in comment && comment.clientStatus)
                           ).map((comment) => comment.clientRequestId!))}
-                          onStop={liveRun ? onCancelRun : undefined}
+                          onStop={stopLiveRun}
                           confirmedStoppedRunIds={confirmedStoppedRunIds}
                           stopPending={stopPending}
                           stopScope={stopScope}
