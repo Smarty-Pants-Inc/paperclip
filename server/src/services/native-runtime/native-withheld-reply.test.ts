@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import type { AdapterSandboxExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
+import type { EnvironmentLease } from "@paperclipai/shared";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,9 +30,11 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 //   answered / the sweep ........ answeredPersonMessageSql / settleUnansweredPersonMessagesForTask
 // FAKED: only the box. resolveEnvironmentExecutionTarget and resumeNativeWorkspaceSync (the
 // sandbox export) are scripted; the board Retry gets a scripted environment runtime.
+// L3 P-c exception: real prepare/resumeNativeWorkspaceSync and real lease-cleanup
+// producers; only sandbox command execution/stop are substituted at the box boundary.
 // PLANTED (named, no real-path twin in this file; see result.md): the run row that carries M
 // and its sandbox lease. The heartbeat executor that would create them needs a live provider.
-const box = vi.hoisted(() => ({ resume: vi.fn() }));
+const box = vi.hoisted(() => ({ resume: vi.fn(), targets: new Map<string, AdapterSandboxExecutionTarget>() }));
 // The ONE switch, WITHHELD_REPLY_TRIGGER. It ships as "acceptance" (Ruling P; row T0 reads the real
 // module). "shipped" = the REAL exported value, unmocked: every acceptance row (A*, P*) runs on it,
 // so turning the shipped switch back to "terminal" turns them red. The R rows pass the other
@@ -41,7 +46,7 @@ vi.mock("./native-withheld-reply-trigger.js", async importOriginal => {
 });
 vi.mock("../environment-execution-target.js", async importOriginal => ({
   ...await importOriginal<typeof import("../environment-execution-target.js")>(),
-  resolveEnvironmentExecutionTarget: async () => ({ kind: "remote", transport: "sandbox", remoteCwd: "/work",
+  resolveEnvironmentExecutionTarget: async (input: { leaseId?: string }) => box.targets.get(input.leaseId!) ?? ({ kind: "remote", transport: "sandbox", remoteCwd: "/work",
     runner: { execute: async () => ({ exitCode: 0, timedOut: false }) } }),
 }));
 vi.mock("./native-workspace-sync.js", async importOriginal => ({
@@ -65,6 +70,10 @@ import { nativeResponsePresentationWork } from "./native-response-presentation-w
 import { retryNativeWorkspaceExport } from "./native-workspace-export-retry.js";
 import { remoteTerminationReceipt } from "../remote-execution-termination.js";
 import { heartbeatService } from "../heartbeat.js";
+import { registerRunDispatchWork } from "../heartbeat/dispatch-work.js";
+import { environmentRuntimeService, type EnvironmentRuntimeDriver } from "../environment-runtime.js";
+import { environmentService } from "../environments.js";
+import { issueService } from "../issues.js";
 import os from "node:os";
 
 // The words are RFL's to finalize; every one lives in packages/shared/src/reply-file-line.ts.
@@ -80,6 +89,11 @@ function timing(label: string, since: number) {
   const file = process.env.WITHHELD_REPLY_TIMINGS;
   if (file) void fs.appendFile(file, `${label}: ${Math.round(performance.now() - since)} ms\n`);
 }
+async function l3Evidence(label: string, value: unknown) {
+  const line = `${label} ${JSON.stringify(value)}\n`;
+  console.log(line.trimEnd());
+  if (process.env.L3_EVIDENCE) await fs.appendFile(process.env.L3_EVIDENCE, line);
+}
 const support = await getEmbeddedPostgresTestSupport();
 
 describe.skipIf(!support.supported)("withheld accepted reply: published once when the run ends without a committed reply", () => {
@@ -94,14 +108,17 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     await db.insert(environments).values({ id: environmentId, name: `Box ${environmentId}`, driver: "sandbox" });
     await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
   }, 120_000);
-  afterEach(() => { vi.useRealTimers(); box.resume.mockReset(); setting.trigger = "terminal"; });
-  afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); });
+  afterEach(() => { vi.useRealTimers(); box.resume.mockReset(); box.targets.clear(); setting.trigger = "terminal"; });
+  afterAll(async () => {
+    if (db) await heartbeatService(db).drainActiveRunExecutions();
+    await db?.$client.end({ timeout: 1 }); await database?.cleanup();
+  });
 
   // The streamed answer, in the pieces the person watched arrive.
   const STREAM = ["Done. I renamed the helper ", "and updated its two callers.\n\n", "- `src/util.ts`\n- `src/app.ts`  \n", "Tests pass ✅"];
   const ANSWER = STREAM.join("");
 
-  async function scenario(options: { chat?: boolean; wakeOnDemand?: boolean } = {}) {
+  async function scenario(options: { chat?: boolean; wakeOnDemand?: boolean; realSync?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     const sessionId = randomUUID(), runnerId = randomUUID(), leaseId = randomUUID(), providerLeaseId = `sandbox-${randomUUID()}`;
     await db.insert(companies).values({ id: companyId, name: "Withheld reply", issuePrefix: `W${companyId.slice(0, 6)}`,
@@ -135,7 +152,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
       status: "running", runtimeMode: "native", responsibleUserId: PERSON, startedAt: new Date(),
       contextSnapshot: { issueId, source: "assignment", wakeReason: "issue_commented", wakeCommentId: messageId, commentId: messageId,
         ...(options.chat ? { conversationSessionGeneration: generation } : {}) },
-      runnerProfileJson: { nativeWorkspaceSync: { schema: "paperclip.native-workspace-sync/v1", state: "prepared",
+      runnerProfileJson: options.realSync ? {} : { nativeWorkspaceSync: { schema: "paperclip.native-workspace-sync/v1", state: "prepared",
         descriptorSha256: "a".repeat(64), baselineSha256: "b".repeat(64), finalHostSha256: null, workspaceId: randomUUID(),
         leaseId, providerLeaseId, remoteCwd: "/work", resourceDisposition: "destroy" } } });
     await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, issueId, heartbeatRunId: runId, provider: "daytona",
@@ -314,7 +331,8 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     /** The wakes and runs that message caused: [wake status, its run's status or null]. */
     async function wakesFor(commentId: string) {
       const rows = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
-      const mine = rows.filter(wake => JSON.stringify(wake.payload ?? {}).includes(commentId));
+      // A coalesced receipt is delivery history, not a second parked message.
+      const mine = rows.filter(wake => wake.status !== "coalesced" && JSON.stringify(wake.payload ?? {}).includes(commentId));
       return Promise.all(mine.map(async wake => ({ status: wake.status, runId: wake.runId,
         run: wake.runId ? (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake.runId)))[0] ?? null : null })));
     }
@@ -709,6 +727,30 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
   // Never twice (d), on the shipped switch: acceptance + commit = A1, A5, A6; acceptance + terminal
   // failure = A2, A3; four workers racing = A3, A4, A5 and P-b below.
 
+  it("L3 never-twice: two real publishers, replay, then real commit retain one canonical reply", async () => {
+    setting.trigger = "shipped";
+    const s = await scenario();
+    await s.streamAndAccept();
+    const published = await Promise.all([
+      publishWithheldAcceptedReply(db, s, "acceptance"),
+      publishWithheldAcceptedReply(db, s, "acceptance"),
+    ]);
+    const first = await s.replies();
+    await l3Evidence("L3 never-twice two real publishers", { mutation: process.env.L3_MUTATION ?? "none",
+      runId: s.runId, published, replyCount: first.length, replies: first.map(({ id, body }) => ({ id, body })) });
+    expect(first).toHaveLength(1);
+    await s.presentationWorker();
+    await s.publishAgain();
+    box.resume.mockResolvedValue(true);
+    await s.copyBack();
+    await s.presentationWorker();
+    await s.copyBack();
+    expect((await s.coordinator()).phase).toBe("committed");
+    expect((await s.replies()).map(comment => comment.id)).toEqual([first[0].id]);
+    await l3Evidence("L3 never-twice after replay and real commit", { mutation: process.env.L3_MUTATION ?? "none",
+      replyCount: (await s.replies()).length, canonicalCommentId: first[0].id });
+  }, 120_000);
+
   it("P-a (shipped default): acceptance -> exactly 1 reply within seconds, the turn is no longer 'Working', 'Saving…' then cleared by the commit; publishing touches nothing else", async () => {
     setting.trigger = "shipped";
     const s = await scenario();
@@ -799,31 +841,91 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
 
   it("P-c (shipped default): a person's message during workspace_finalizing is PARKED behind R; the task is freed only after R committed, with the file R wrote on disk", async () => {
     setting.trigger = "shipped";
-    const s = await scenario({ wakeOnDemand: true });
-    // The faked box: its export writes the file R changed into the host workspace, as the real sync-out does.
-    const hostWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "withheld-reply-host-"));
+    const s = await scenario({ wakeOnDemand: true, realSync: true });
+    // FAKED BOX transport only: commands run in a separate local directory.
+    // REAL prepareNativeWorkspaceSync + resumeNativeWorkspaceSync copy R's file,
+    // persist the finalized reference, and unblock the real lease cleanup owner.
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "withheld-reply-host-"));
+    const hostWorkspace = path.join(root, "host"), remoteWorkspace = path.join(root, "box");
+    await fs.mkdir(hostWorkspace);
     const fileOfR = path.join(hostWorkspace, "src-util.ts"), contentOfR = `// renamed by run ${s.runId}\nexport const helper2 = 1;\n`;
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, s.leaseId));
+    const target: AdapterSandboxExecutionTarget = { kind: "remote", transport: "sandbox", providerKey: "test",
+      leaseId: s.leaseId, remoteCwd: remoteWorkspace, timeoutMs: 30_000,
+      runner: { execute: input => new Promise(resolve => {
+        const child = execFile(input.command, input.args ?? [], { cwd: input.cwd, env: { ...process.env, ...input.env },
+          timeout: input.timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => resolve({
+            exitCode: error ? 1 : 0, signal: error?.signal ?? null, timedOut: error?.killed ?? false,
+            stdout, stderr, pid: child.pid ?? null, startedAt: new Date().toISOString(),
+          }));
+        child.stdin?.on("error", () => undefined); child.stdin?.end(input.stdin ?? "");
+      }) },
+    };
+    box.targets.set(s.leaseId, target);
+    const realSync = await vi.importActual<typeof import("./native-workspace-sync.js")>("./native-workspace-sync.js");
+    await realSync.prepareNativeWorkspaceSync({ db, companyId: s.companyId, workspaceId: s.issueId,
+      workspaceLocalDir: hostWorkspace, runId: s.runId, lease: lease as EnvironmentLease, target, resourceDisposition: "destroy" });
+    await fs.writeFile(path.join(remoteWorkspace, "src-util.ts"), contentOfR);
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
-    box.resume.mockImplementation(async () => { await gate; await fs.writeFile(fileOfR, contentOfR); return true; });
+    box.resume.mockImplementation(async input => { await gate; return realSync.resumeNativeWorkspaceSync(input); });
     await s.streamAndAccept();
     const copying = s.copyBack();
+    let heartbeatForCleanup: ReturnType<typeof heartbeatService> | null = null;
+    try {
     await vi.waitFor(() => expect(box.resume).toHaveBeenCalledTimes(1), { timeout: 15_000, interval: 20 });
-    await s.presentationWorker();
-    expect(await s.replies()).toHaveLength(1);
+    expect(await s.replies()).toHaveLength(0);
     expect(await s.coordinator()).toMatchObject({ phase: "workspace_finalizing" });
-    // The answer is on the thread and R is still copying. The person writes again.
+    // F3: the REAL person's POST arrives BEFORE early publication, while R copies.
     const followUp = await s.personSays("Thanks. Now also update the README.");
     // The route queues the message's wake after it answers the request.
     await vi.waitFor(async () => expect(await s.wakesFor(followUp)).toHaveLength(1), { timeout: 15_000, interval: 25 });
     // REAL: the stale-lock sweep that frees a task whose run has ended. R has not ended: nothing is freed.
-    const heartbeat = heartbeatService(db);
+    // FAKED BOX ONLY: the driver reports its sandbox stopped. The real runtime
+    // releaseRunLeases + environmentService.releaseLease persist cleanup and receipt.
+    const teardown = environmentRuntimeService(db, { drivers: [{
+      driver: "sandbox",
+      releaseRunLease: async ({ lease, status }) => environmentService(db).releaseLease(lease.id, status, {
+        cleanupStatus: "success",
+        remoteExecutionTermination: remoteTerminationReceipt(lease, { providerLeaseId: lease.providerLeaseId, state: "stopped" }),
+      }),
+    } as EnvironmentRuntimeDriver] });
+    const heartbeat = heartbeatForCleanup = heartbeatService(db, { environmentRuntime: teardown });
     await heartbeat.sweepStaleIssueLocks({ companyId: s.companyId, issueId: s.issueId });
     // PARKED: the message's wake is deferred behind R; no second run exists; R still owns the task.
     expect((await s.wakesFor(followUp)).map(wake => [wake.status, wake.runId])).toEqual([["deferred_issue_execution", null]]);
     expect(await s.otherRuns()).toEqual([]);
     expect(await s.task()).toEqual({ status: "in_progress", executionRunId: s.runId });
     await expect(fs.readFile(fileOfR, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    // REAL F3 fanout consumer: dispatch-work.ts's queuedRunDispatch handler calls
+    // the real heartbeat.resumeQueuedRunsAfterDrain, not a mock dispatch counter.
+    const errors: unknown[] = [], dispatches: unknown[] = [];
+    const delivery = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => errors.push(error) });
+    const dispatch = registerRunDispatchWork(delivery, {
+      promoteDueScheduledRetries: async () => undefined,
+      nextScheduledRetryAt: async () => null,
+      schedulingSuppressed: async () => false,
+      resumeQueuedRunsAfterDrain: async scope => {
+        await heartbeat.resumeQueuedRunsAfterDrain(scope);
+        dispatches.push({ scope, task: await s.task(), wakes: await s.wakesFor(followUp), runs: await s.otherRuns() });
+      },
+    }, () => true);
+    try {
+      await dispatch.ready;
+      const before = dispatches.length;
+      await l3Evidence("L3 F3 before publish", { messageId: followUp, task: await s.task(), wakes: await s.wakesFor(followUp), runs: await s.otherRuns() });
+      await s.presentationWorker();
+      await vi.waitFor(() => expect(dispatches.length).toBeGreaterThan(before), { timeout: 10_000 });
+      await l3Evidence("L3 F3 after publish real queuedRunDispatch", { dispatches: dispatches.slice(before),
+        task: await s.task(), wakes: await s.wakesFor(followUp), runs: await s.otherRuns(),
+        finalizationPhase: (await s.coordinator()).phase,
+        filePresent: await fs.stat(fileOfR).then(() => true, () => false) });
+      expect(await s.replies()).toHaveLength(1);
+      expect((await s.wakesFor(followUp)).map(wake => [wake.status, wake.runId])).toEqual([["deferred_issue_execution", null]]);
+      expect(await s.otherRuns()).toEqual([]);
+      expect(await s.task()).toEqual({ status: "in_progress", executionRunId: s.runId });
+      expect(errors).toEqual([]);
+    } finally { await dispatch.stop(); await delivery.stop(); }
     // R's copy-out ends and R commits.
     release();
     await copying;
@@ -835,15 +937,38 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     expect(await fs.readFile(fileOfR, "utf8")).toBe(contentOfR);
     expect(await s.task()).toEqual({ status: "in_progress", executionRunId: s.runId });
     expect((await s.wakesFor(followUp)).map(wake => [wake.status, wake.runId])).toEqual([["deferred_issue_execution", null]]);
-    // REAL: the ended-run sweep (heartbeat.reapOrphanedRuns -> releaseIssueExecutionAndPromote) frees the
-    // task now that R has ended. R's own executor, which makes this call in production, is PLANTED here.
-    await heartbeat.reapOrphanedRuns();
+    // REAL terminal-lock + stranded-queue recovery substitutes for the PLANTED
+    // executor's missing finally; no hand edit to the task or parked wake.
+    // REAL lease cleanup producer, after copy-out committed. Provider is the
+    // faked box above; there is no hand edit to the lease/execution/message state.
+    await heartbeat.releaseEnvironmentLeasesForRun({ runId: s.runId, companyId: s.companyId, agentId: s.agentId, status: "succeeded" });
+    // REAL terminal-lock service used by issue admission/recovery, followed by
+    // the REAL stranded-queue recovery. The reaper's unrelated status-intent
+    // dispatcher is not a stand-in for the missing planted executor's finally.
+    await issueService(db).clearExecutionRunIfTerminal(s.issueId);
     expect((await s.task()).executionRunId).toBeNull();
-    // LIMIT (named): the parked wake is still saved and unstarted here; this file does not run its promotion
-    // into the next run (that needs the run-dispatch workers and a live provider). No message was lost.
-    expect(await s.wakesFor(followUp)).toHaveLength(1);
+    // REAL restart/stranded-queue recovery: queue.ts resumeDeferredExecutionReceipts
+    // (called by resumeQueuedRuns) releases/promotes through the production wake queue.
+    await heartbeat.resumeQueuedRuns();
+    const promoted = await s.otherRuns();
+    await l3Evidence("L3 F3 after commit promotion", { messageId: followUp, committedAt, task: await s.task(), wakes: await s.wakesFor(followUp), promoted,
+      fileReadByHarness: { path: fileOfR, body: await fs.readFile(fileOfR, "utf8") },
+      limitation: "promoted run row + dispatch input contextSnapshot; no live provider/model file read" });
+    expect(promoted).toHaveLength(1);
+    // LIMIT NAMED: no live provider/Runner is attached. This is the promoted RUN ROW
+    // plus its durable dispatch INPUT (contextSnapshot), not a claimed model/file read.
+    expect(JSON.stringify(promoted[0].contextSnapshot)).toContain(followUp);
+    expect(promoted[0].createdAt.getTime()).toBeGreaterThanOrEqual(committedAt);
+    expect(await fs.readFile(fileOfR, "utf8")).toBe(contentOfR);
+    if (process.env.L3_EVIDENCE) await fs.copyFile(fileOfR, path.join(path.dirname(process.env.L3_EVIDENCE), "l3-exported-file.txt"));
     expect(committedAt).toBeGreaterThan(0);
     expect(await s.replies()).toHaveLength(1);
-    await fs.rm(hostWorkspace, { recursive: true, force: true });
+    } finally {
+      release();
+      await copying;
+      await heartbeatForCleanup?.drainActiveRunExecutions();
+      await realSync.cleanupNativeWorkspaceSync(s.runId);
+      await fs.rm(root, { recursive: true, force: true });
+    }
   }, 120_000);
 });
