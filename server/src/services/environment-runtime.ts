@@ -2205,7 +2205,7 @@ function createSandboxEnvironmentDriver(
             heartbeatRunId: input.heartbeatRunId });
         }
         const reuseProbeReasons = new Map<string, string>();
-        let reuseProbeLeases: EnvironmentLease[] = [];
+        let reuseProbeLeases: EnvironmentLease[] | null = null;
         const acquisitionStartedAt = Date.now();
         const reusableCandidateLeases =
           declaredReusableLeases &&
@@ -2602,17 +2602,16 @@ function createSandboxEnvironmentDriver(
         // Read-only diagnosis at this instant, before retirement mutates the source.
         if (input.heartbeatRunId && input.agentId) {
           try {
-            if (!reuseProbeLeases.length) reuseProbeLeases = await environmentsSvc.listLeases(input.environment.id);
-            const predecessor = rolloverLease ?? reusableLease ?? reuseProbeLeases
-              .filter(lease => lease.heartbeatRunId !== input.heartbeatRunId &&
+            const predecessor = rolloverLease ?? reusableLease ?? reuseProbeLeases?.filter(lease => lease.heartbeatRunId !== input.heartbeatRunId &&
                 (input.executionWorkspaceId !== null ? lease.executionWorkspaceId === input.executionWorkspaceId : lease.issueId === input.issueId))
               .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
             const reason = !declaredReusableLeases ? "reuse_not_declared" : !supportsReusableLeases ? "reuse_methods_unverified"
               : !parsed.config.reuseLease ? "reuse_disabled"
               : input.executionWorkspaceId === null && input.issueId === null ? "no_workspace_or_issue"
               : replacementReason ?? (rolloverLease ? "compatible_environment_change"
-              : predecessor ? reuseProbeReasons.get(predecessor.id) ?? "no_provider_lease_id" : "no_predecessor_lease");
-            await recordWarmRetentionProbe(db, { companyId: input.companyId, runId: input.heartbeatRunId, agentId: input.agentId,
+              : predecessor ? reuseProbeReasons.get(predecessor.id) ?? "no_provider_lease_id"
+              : reuseProbeLeases === null ? null : "no_predecessor_lease");
+            recordWarmRetentionProbe(db, { companyId: input.companyId, runId: input.heartbeatRunId, agentId: input.agentId,
               predecessorRunId: predecessor?.heartbeatRunId ?? null, leaseId: recordedLease.id },
             { phase: "acquisition", acquisition: rolloverLease || (!providerLease && reusableLease) ? "replaced" : providerLease ? "resumed" : "created",
               reason: providerLease ? "reused" : reason, predecessorLeaseId: predecessor?.id ?? null,

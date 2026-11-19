@@ -55,6 +55,7 @@ import {
 } from "../services/environment-runtime.ts";
 import * as sandboxProviderRuntime from "../services/sandbox-provider-runtime.ts";
 import * as environmentsModule from "../services/environments.ts";
+import * as runEventWriter from "../services/heartbeat-run-events.js";
 import { logger } from "../middleware/logger.ts";
 import { agentEnvironmentTestService } from "../services/agent-environment-test.js";
 import { resolveRunnerEnvironmentForRun } from "../services/runner-environment-lifecycle.js";
@@ -1178,6 +1179,53 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect((await environmentService(db).getLeaseById(first.lease.id))?.status).toBe("failed");
   });
 
+  it.each([true, false].flatMap(reuse => ["normal", "held", "throwing"].map(sink => ({ reuse, sink }))))(
+    "acquisition diagnostics add no selection reads and cannot block ($reuse / $sink)", async ({ reuse, sink }) => {
+      const seeded = await seedReusablePluginSandboxLease("paperclip_runner");
+      // Empty selection is important: it is not a reason to repeat listLeases.
+      await db.delete(environmentLeases).where(eq(environmentLeases.id, seeded.reusableLease.id));
+      const environment = { ...seeded.environment, config: { ...seeded.environment.config, reuseLease: reuse } };
+      const realService = environmentsModule.environmentService;
+      const list = vi.fn<(environmentId: string) => Promise<Awaited<ReturnType<ReturnType<typeof environmentService>["listLeases"]>>>>();
+      const factory = vi.spyOn(environmentsModule, "environmentService").mockImplementation(database => {
+        const real = realService(database);
+        list.mockImplementation(id => real.listLeases(id));
+        return { ...real, listLeases: list };
+      });
+      let release!: () => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      const probe = vi.spyOn(runEventWriter, "appendHeartbeatRunEvent").mockImplementation(async () => {
+        if (sink === "held") await held;
+        if (sink === "throwing") throw new Error("private event store error");
+        return {} as never;
+      });
+      const worker = createFreshPluginLeaseWorker(seeded.pluginId);
+      const runtime = environmentRuntimeService(db, { pluginWorkerManager: worker });
+      const started = performance.now();
+      const acquisition = runtime.acquireRunLease({ companyId: seeded.companyId, environment,
+        agentId: seeded.agentId, issueId: null, adapterType: "paperclip_runner", heartbeatRunId: seeded.runId,
+        persistedExecutionWorkspace: { id: seeded.executionWorkspaceId, mode: "shared_workspace" } });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const decision = await Promise.race([acquisition, new Promise<"probe blocked acquisition">(resolve => {
+          timer = setTimeout(() => resolve("probe blocked acquisition"), 1_000);
+        })]);
+        expect(decision).not.toBe("probe blocked acquisition");
+        if (typeof decision === "string") throw new Error(decision);
+        expect(decision.lease.providerLeaseId).toBe("fresh-plugin-lease");
+        expect(worker.call).toHaveBeenCalledExactlyOnceWith(seeded.pluginId, "environmentAcquireLease", expect.any(Object), expect.any(Number));
+        // Existing reads: settling cleanup + candidate selection. No fallback
+        // read is allowed just because candidate selection returned [].
+        expect(list).toHaveBeenCalledTimes(reuse ? 2 : 0);
+        process.stdout.write(`acquisition-probe ${JSON.stringify({ reuse, sink, elapsedMs: performance.now() - started, selectionReads: list.mock.calls.length })}\n`);
+      } finally {
+        clearTimeout(timer); release(); await acquisition;
+        await new Promise<void>(resolve => setImmediate(resolve));
+        factory.mockRestore(); probe.mockRestore();
+      }
+    },
+  );
+
   it("acquires and resumes a reusable lease after a task changes from per-turn to warm", async () => {
     const { heartbeatRunEvents } = await import("@paperclipai/db");
     const seeded = await seedReusablePluginSandboxLease("paperclip_runner");
@@ -1210,9 +1258,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     };
     const cold = await runtime.acquireRunLease({ ...input, environment, heartbeatRunId: seeded.runId });
     expect(cold.lease.leasePolicy).toBe("ephemeral");
-    const [coldProbe] = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, seeded.runId),
-      eq(heartbeatRunEvents.eventType, "native.warm_retention.probe")));
-    expect(coldProbe?.payload).toMatchObject({ phase: "acquisition", acquisition: "created", reason: "reuse_disabled",
+    await expect.poll(async () => {
+      const [event] = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, seeded.runId),
+        eq(heartbeatRunEvents.eventType, "native.warm_retention.probe")));
+      return event?.payload;
+    }).toMatchObject({ phase: "acquisition", acquisition: "created", reason: "reuse_disabled",
       runId: seeded.runId, predecessorRunId: null, leaseId: cold.lease.id, elapsedMs: expect.any(Number) });
     await runtime.releaseRunLeases(seeded.runId, "released");
     const warmEnvironment = resolveRunnerEnvironmentForRun(environment, "paperclip_runner", { lifecycleMode: "warm" }, undefined, "selected-account:generation");
@@ -1221,9 +1271,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const warm = await runtime.acquireRunLease({ ...input, environment: warmEnvironment, heartbeatRunId: warmRunId });
     warmProviderLeaseId = warm.lease.providerLeaseId!;
     expect(warm.lease.leasePolicy).toBe("reuse_by_environment");
-    const [warmProbe] = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, warmRunId),
-      eq(heartbeatRunEvents.eventType, "native.warm_retention.probe")));
-    expect(warmProbe?.payload).toMatchObject({ phase: "acquisition", acquisition: "created", reason: "lease_policy",
+    await expect.poll(async () => {
+      const [event] = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, warmRunId),
+        eq(heartbeatRunEvents.eventType, "native.warm_retention.probe")));
+      return event?.payload;
+    }).toMatchObject({ phase: "acquisition", acquisition: "created", reason: "lease_policy",
       predecessorRunId: seeded.runId, predecessorLeaseId: cold.lease.id, predecessorLeaseStatus: "released" });
     expect(warm.lease.executionWorkspaceId).toBe(seeded.executionWorkspaceId);
     expect((await runtime.resolveCapabilities({ environment: warmEnvironment, lease: warm.lease }))?.reusableLeases).toBe(true);
@@ -1234,9 +1286,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(next.lease.providerLeaseId).toBe(warmProviderLeaseId);
     expect(next.lease.heartbeatRunId).toBe(nextRunId);
     expect(next.lease.id).not.toBe(warm.lease.id);
-    const [nextProbe] = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, nextRunId),
-      eq(heartbeatRunEvents.eventType, "native.warm_retention.probe")));
-    expect(nextProbe?.payload).toMatchObject({ phase: "acquisition", acquisition: "resumed", reason: "reused",
+    await expect.poll(async () => {
+      const [event] = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, nextRunId),
+        eq(heartbeatRunEvents.eventType, "native.warm_retention.probe")));
+      return event?.payload;
+    }).toMatchObject({ phase: "acquisition", acquisition: "resumed", reason: "reused",
       predecessorRunId: warmRunId, predecessorLeaseId: warm.lease.id, predecessorLeaseStatus: "released", leaseId: next.lease.id });
     expect(acquisitions).toBe(2);
     expect((await environmentService(db).getById(environment.id))?.config.reuseLease).toBe(false);

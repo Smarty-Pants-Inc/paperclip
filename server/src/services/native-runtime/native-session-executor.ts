@@ -1439,7 +1439,7 @@ export async function handedOffWarmOwnerRunnerExited(input: { runId: string; pro
     if (entry.busy || entry.preparingRunId) return false;
     const startedAt = Date.now();
     const stopped = await supersededOwnerRunnerExited(entry);
-    if (entry.sandboxLeaseDb) await recordWarmRetentionProbe(entry.sandboxLeaseDb,
+    if (entry.sandboxLeaseDb) recordWarmRetentionProbe(entry.sandboxLeaseDb,
       { companyId: entry.companyId, agentId: entry.agentId, runId: entry.runId,
         leaseId: entry.sandboxLeaseId ?? null },
       { phase: "proof_runner_stop", outcome: stopped ? "stopped_runner" : "unproven",
@@ -12839,7 +12839,7 @@ async function executePaperclipNativeSessionAttempt(
           const context = record(event.payload.context);
           const admission = record(record(event.payload.providerDescriptor).piNativeAdmission ?? context.piNativeAdmission);
           const identity = record(admission.piProcessIdentity ?? context.piProcessIdentity);
-          await recordWarmRetentionProbe(input.db, { ...input.execution.binding,
+          recordWarmRetentionProbe(input.db, { ...input.execution.binding,
             leaseId: input.runnerExecutionTarget?.kind === "remote" ? input.runnerExecutionTarget.leaseId ?? null : null },
           { phase: "admission", boot_id: typeof identity.boot_id === "string" ? identity.boot_id : null,
             piPid: typeof identity.piPid === "number" ? identity.piPid : null,
@@ -13748,8 +13748,8 @@ async function executePaperclipNativeSessionAttempt(
               // clean abort ladder certifies reusable idle after child cleanup;
               // other providers and every uncertain/error path keep retiring.
               const active = activeNativeSessions.get(input.execution.binding.runId);
-              const probe = async (reason: string, retained = false) => {
-                await recordWarmRetentionProbe(input.db, { ...input.execution.binding,
+              const probe = (reason: string, retained = false) => {
+                recordWarmRetentionProbe(input.db, { ...input.execution.binding,
                   leaseId: input.runnerExecutionTarget?.kind === "remote" ? input.runnerExecutionTarget.leaseId ?? null : null },
                 { phase: "retention", retained, reason,
                   elapsedMs: Math.max(0, Date.now() - (active?.cancellationRequestedAtMs ?? Date.now())) });

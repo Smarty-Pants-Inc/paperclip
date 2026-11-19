@@ -17645,9 +17645,22 @@ describe("native session bounded recovery", () => {
   // unresolved requests that the real same-PID board-Stop flow cannot force.
   it.each(["clean", "warm-checkpoint", "escalated", "uncertain", "failed", "codex", "instruction-edits", "diagnostic",
     "cleanup-timeout", "not-warm", "terminal-run", "terminal-session", "snapshot-run", "snapshot-session",
-    "snapshot-busy", "pending-unknown", "active-session", "not-user-stop", "probe-write-failed"] as const)("board Stop retains only the clean Pi warm owner: %s", async mode => {
+    "snapshot-busy", "pending-unknown", "active-session", "not-user-stop", "probe-write-failed", "probe-held", "probe-twice"] as const)("board Stop retains only the clean Pi warm owner: %s", async mode => {
     const probe = vi.spyOn(runEventWriter, "appendHeartbeatRunEvent").mockResolvedValue({} as never);
     if (mode === "probe-write-failed") probe.mockRejectedValue(new Error("private error text"));
+    let releaseProbe!: () => void;
+    const heldProbe = new Promise<void>(resolve => { releaseProbe = resolve; });
+    if (mode === "probe-held") probe.mockImplementation(async (_db, event) => {
+      if (event.eventType === "native.warm_retention.probe") await heldProbe;
+      return {} as never;
+    });
+    // A diagnostic hold must not consume the cancellation cleanup budget.
+    const withoutProbeWait = async <T,>(promise: Promise<T>): Promise<T> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try { return await Promise.race([promise, new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("decision waited for probe sink")), 500);
+      })]); } finally { clearTimeout(timer); }
+    };
     const name = `pi-board-stop-${mode}`;
     const current = { ...execution, provider: mode === "codex" ? execution.provider : { kind: "pi_rpc", model: "provider/model" },
       binding: { ...execution.binding, runId: name, executionWorkspaceId: name },
@@ -17675,7 +17688,7 @@ describe("native session bounded recovery", () => {
       eventType, schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(), payload: {} });
     state.execute.mockReset().mockImplementationOnce(async options => {
       await options.onSession(session);
-      if (mode === "clean") await accountingEvents.committed?.({ ...event("session.started"), payload: {
+      if (["clean", "probe-held"].includes(mode)) await accountingEvents.committed?.({ ...event("session.started"), payload: {
         providerDescriptor: { piNativeAdmission: { piProcessIdentity: { boot_id: "box-boot", piPid: 314, piProcessStartTicks: "1234" } } },
       } });
       opened(); await ended;
@@ -17685,8 +17698,12 @@ describe("native session bounded recovery", () => {
       if (mode === "terminal-session") terminal.normalizedSessionId = "wrong-session";
       const savedCancellation = runResultJson.nativeCancellation;
       if (mode === "not-user-stop") delete runResultJson.nativeCancellation;
+      const retentionStarted = performance.now();
       retained = await options.retainCancelledSession({ session: mode === "active-session" ? {} : session,
         signal: new AbortController().signal, terminalEvent: terminal });
+      if (mode === "probe-twice") expect(await options.retainCancelledSession({ session,
+        signal: new AbortController().signal, terminalEvent: terminal })).toBe(retained);
+      if (mode === "probe-held") process.stdout.write(`retention-held-sink ${JSON.stringify({ retained, elapsedMs: performance.now() - retentionStarted })}\n`);
       if (mode === "not-user-stop") runResultJson.nativeCancellation = savedCancellation;
       throw new Error("native_finalization_missing: session returned no semantic result");
     });
@@ -17697,21 +17714,26 @@ describe("native session bounded recovery", () => {
     const persistence = cancellationDb({ runId: current.binding.runId,
       resultJson: { cancelledByActorType: "user", cancelledByUserId: "board" } });
     try {
-      await Promise.race([ready, running.then(error => { throw error; })]);
+      const prepared = Promise.race([ready, running.then(error => { throw error; })]);
+      await (mode === "probe-held" ? withoutProbeWait(prepared) : prepared);
       await expect(cancelNativeSession(current.binding.runId, "Board Stop", { db: persistence.db, scope: "run" }))
         .resolves.toMatchObject({ dispatched: true });
       Object.assign(runResultJson, persistence.getResultJson());
       end();
-      const outcome = await running;
+      const outcome = await (mode === "probe-held" ? withoutProbeWait(running) : running);
       if (!["no-cancel", "not-user-stop"].includes(mode) && !(outcome instanceof NativeCancellationPendingRecoveryError)) throw outcome;
-      expect(retained).toBe(["clean", "warm-checkpoint", "probe-write-failed"].includes(mode));
+      expect(retained).toBe(["clean", "warm-checkpoint", "probe-write-failed", "probe-held", "probe-twice"].includes(mode));
+      // Assertions observe eventual diagnostics, never make the decision wait.
+      releaseProbe();
+      await new Promise<void>(resolve => setImmediate(resolve));
       const reason = ({ clean: "retained", "warm-checkpoint": "retained", escalated: "cleanup_failed",
         uncertain: "pending_requests", failed: "no_turn_cancelled", codex: "not_pi_rpc",
         "instruction-edits": "instruction_checkpoint_failed", diagnostic: "pi_cancellation_unsafe",
         "cleanup-timeout": "cleanup_race_lost_2s", "not-warm": "not_warm", "terminal-run": "terminal_run_mismatch",
         "terminal-session": "terminal_session_mismatch", "snapshot-run": "snapshot_run_mismatch", "snapshot-session": "snapshot_session_mismatch",
         "snapshot-busy": "snapshot_not_idle", "pending-unknown": "pending_requests_unknown",
-        "active-session": "active_session_mismatch", "not-user-stop": "not_user_stop", "probe-write-failed": "retained" } as const)[mode];
+        "active-session": "active_session_mismatch", "not-user-stop": "not_user_stop", "probe-write-failed": "retained",
+        "probe-held": "retained", "probe-twice": "retained" } as const)[mode];
       if (mode === "clean") expect(probe).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
         eventType: "native.warm_retention.probe", payload: expect.objectContaining({ phase: "admission",
           runId: name, leaseId: null, boot_id: "box-boot", piPid: 314, piProcessStartTicks: "1234" }),
@@ -17722,10 +17744,19 @@ describe("native session bounded recovery", () => {
           leaseId: null, retained, reason, elapsedMs: expect.any(Number) }),
       }));
       if (!["not-warm", "not-user-stop"].includes(mode)) {
-        expect(close).toHaveBeenCalledTimes(["clean", "warm-checkpoint", "probe-write-failed"].includes(mode) ? 0 : 1);
+        expect(close).toHaveBeenCalledTimes(["clean", "warm-checkpoint", "probe-write-failed", "probe-held", "probe-twice"].includes(mode) ? 0 : 1);
         expect(updates.some(update => update.table === heartbeatRuns && update.values.status === "failed")).toBe(false);
       }
-    } finally { end(); await running; await closeIdleWarmNativeSessionsForRestart(); probe.mockRestore(); }
+      expect(probe.mock.calls.filter(([, event]) => event.eventType === "native.warm_retention.probe"
+        && event.payload?.phase === "retention")).toHaveLength(1);
+    } finally {
+      releaseProbe();
+      if (mode === "probe-held" && retained === undefined) {
+        await cancelNativeSession(current.binding.runId, "Board Stop", { db: persistence.db, scope: "run" });
+        Object.assign(runResultJson, persistence.getResultJson());
+      }
+      end(); await running; await closeIdleWarmNativeSessionsForRestart(); probe.mockRestore();
+    }
   });
 
   // H1 (restart chaos): a budget pause's lifecycle Stop interrupted a Codex

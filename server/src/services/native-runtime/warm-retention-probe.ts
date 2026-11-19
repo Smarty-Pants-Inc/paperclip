@@ -5,11 +5,46 @@ import { logger } from "../../middleware/logger.js";
 
 export const WARM_RETENTION_PROBE = "native.warm_retention.probe";
 
-/** Diagnostic only. Never changes a lease, admission, run activity time or a gate's answer. */
-export async function recordWarmRetentionProbe(db: Db, input: {
+type ProbePhase = "acquisition" | "admission" | "retention" | "proof" | "proof_runner_stop";
+type ProbeInput = {
   companyId: string; runId: string; agentId?: string; predecessorRunId?: string | null;
   leaseId: string | null;
-}, fields: Record<string, string | number | boolean | null>): Promise<void> {
+};
+type ProbeFields = Record<string, string | number | boolean | null> & { phase: ProbePhase };
+type ProbeRun = { phases: Set<ProbePhase>; tail: Promise<void> };
+const probeRuns = new WeakMap<Db, Map<string, ProbeRun>>();
+// Fail closed on saturation rather than evicting and allowing another write for
+// an old run. Diagnostics must not grow without bound, even with a held store.
+const MAX_PROBE_RUNS = 10_000;
+
+/** Best effort, process-local: at most one attempt per phase per run (including
+ * failed attempts). All I/O is detached, including enrichment reads. Never await
+ * this from a decision or attach it to trace.finish(), which would backpressure
+ * cancellation. Per-run ordering preserves retention -> runner-stop enrichment.
+ * A saturated recorder drops new runs until this Db is collected/restarted. */
+export function recordWarmRetentionProbe(db: Db, input: ProbeInput, fields: ProbeFields): void {
+  try {
+    let runs = probeRuns.get(db);
+    if (!runs) { runs = new Map(); probeRuns.set(db, runs); }
+    const key = `${input.companyId}:${input.runId}`;
+    let run = runs.get(key);
+    if (!run) {
+      if (runs.size >= MAX_PROBE_RUNS) return;
+      run = { phases: new Set(), tail: Promise.resolve() };
+      runs.set(key, run);
+    }
+    if (run.phases.has(fields.phase)) return;
+    run.phases.add(fields.phase);
+    // The callback starts after the decision stack; even a synchronous sink or
+    // warning failure is contained. A held sink queues at most five callbacks.
+    run.tail = run.tail.then(() => persistWarmRetentionProbe(db, input, fields)).catch(() => {});
+  } catch {
+    // Diagnostic bookkeeping must not throw into the decision either.
+  }
+}
+
+/** Never changes a lease, admission, run activity time or a gate's answer. */
+async function persistWarmRetentionProbe(db: Db, input: ProbeInput, fields: ProbeFields): Promise<void> {
   try {
     let agentId = input.agentId;
     if (!agentId) {

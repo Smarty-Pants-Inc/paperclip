@@ -201,7 +201,7 @@ export function proveHandedOffWarmLeases(db: Db, run: Run, opts?: { redispatch?:
     for (const lease of all) await armHandedOffStopReceiptDeadline(db, run, lease);
     const leases = all.filter(lease => handedOffWarmLease(run, lease) && !handedOffWarmLeaseSettled(run, lease));
     if (!leases.length) {
-      for (const lease of all) await recordWarmRetentionProbe(db, { companyId: run.companyId, runId: run.id, leaseId: lease.id },
+      for (const lease of all) recordWarmRetentionProbe(db, { companyId: run.companyId, runId: run.id, leaseId: lease.id },
         { phase: "proof", outcome: "skipped", elapsedMs: 0 });
       return "none";
     }
@@ -218,14 +218,14 @@ export function proveHandedOffWarmLeases(db: Db, run: Run, opts?: { redispatch?:
         new Promise<"timeout">(resolve => { timer = setTimeout(() => resolve("timeout"), handedOffWarmProofTimeout.ms); }),
       ]).finally(() => clearTimeout(timer));
       if (answer === true) {
-        await probe("proven");
+        probe("proven");
         await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
           [HANDED_OFF_WARM_EXIT_KEY]: { runId: run.id, provenAt: new Date().toISOString() } })}::jsonb`, updatedAt: new Date() })
           .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, run.companyId)));
         continue;
       }
       if (answer === "timeout") {
-        await probe("unproven");
+        probe("unproven");
         await requestHandedOffWarmLeaseStop(db, run, lease, { [HANDED_OFF_WARM_STOP_KEY]: true, proofTimedOutMs: handedOffWarmProofTimeout.ms }, "proof timed out");
         return "timed_out";
       }
@@ -239,7 +239,7 @@ export function proveHandedOffWarmLeases(db: Db, run: Run, opts?: { redispatch?:
         for (const unavailable of leases.slice(index))
           if (handedOffByAnotherBoot(unavailable) && handedOffWarmOwnerProofUnavailable({ runId: run.id, providerLeaseId: unavailable.providerLeaseId }))
             {
-              await recordWarmRetentionProbe(db, { companyId: run.companyId, runId: run.id, leaseId: unavailable.id },
+              recordWarmRetentionProbe(db, { companyId: run.companyId, runId: run.id, leaseId: unavailable.id },
                 { phase: "proof", outcome: "unavailable", elapsedMs: Math.max(0, Date.now() - proofStartedAt) });
               await requestHandedOffWarmLeaseStop(db, run, unavailable, { [HANDED_OFF_WARM_UNAVAILABLE_STOP_KEY]: true }, "proof unavailable");
             }
@@ -250,7 +250,7 @@ export function proveHandedOffWarmLeases(db: Db, run: Run, opts?: { redispatch?:
       // would wait for warm expiry. Bound it: past handedOffWarmUnprovenBound the
       // stop-only owner stops and keeps the box; before it, ONE re-proof is
       // scheduled at the bound. Never for a box another live turn uses.
-      await probe("unproven");
+      probe("unproven");
       if (await boundUnprovenHandedOffWarmLease(db, run, lease, opts?.redispatch)) return "stop_requested";
       outcome = "unproven";
       break;
