@@ -601,6 +601,20 @@ export async function admitExplicitNativeContinuation(input: {
           run.status === "cancelled" && !coordinator.leaseOwner
             ? "The cancelled run still needs verified cleanup. Your message is saved. Inspect the run and its environment for details."
             : "Waiting for the previous run to finish recovery. Your message will start automatically.");
+    // This exact live owner has already ended its turn and released its writer
+    // like a finished warm run. No old result is accepted or replayed. A missing
+    // live proof (including a restart) retains all existing teardown gates.
+    const hasRetainedNativeTurnStop = run.runnerProfileJson?.nativeRetainedIdleCheckpoint
+      ? (await import("./native-runtime/native-session-executor.js")).hasRetainedNativeTurnStop : undefined;
+    if (hasRetainedNativeTurnStop?.(run)) {
+      const retainedLeases = await db.select().from(environmentLeases).where(and(
+        eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, run.id)));
+      if (retainedLeases.every(lease => hasRetainedNativeTurnStop(run, lease)
+        || hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))) {
+        sources.push(run);
+        continue;
+      }
+    }
     const preserved = hasRequiredWorkspaceRecovery(run.resultJson) ? null
       : await preserveNativeFailedWorkspace(db, run);
     if (preserved && hasRequiredWorkspaceRecovery(preserved.resultJson)) return blocked("workspace_repair_required",
