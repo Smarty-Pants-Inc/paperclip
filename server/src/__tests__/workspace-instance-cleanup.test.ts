@@ -164,6 +164,7 @@ describe("worktree instance cleanup", () => {
     ["inside", "process", false], ["outside", "process", false],
     ["base", "process", false], ["default", "process", false],
     ["inside", "pointer", false], ["outside", "instance", false],
+    ["inside", "cwd", false], ["inside", "relative", false],
     ["inside", "process", true],
   ] as const)("keeps a configured %s spill from %s until recovered=%s", async (location, source, recovered) => {
     const worktreesDir = await makeTempRoot("paperclip-configured-spill-");
@@ -182,7 +183,8 @@ describe("worktree instance cleanup", () => {
     vi.stubEnv("RUN_LOG_BASE_PATH", undefined);
     // Product keys: resolveObjectRunLogSpillDir reads RUN_LOG_SPILL_PATH before RUN_LOG_BASE_PATH.
     const key = location === "base" ? "RUN_LOG_BASE_PATH" : "RUN_LOG_SPILL_PATH";
-    const value = location === "base" ? path.dirname(spillRoot) : spillRoot;
+    const value = source === "relative" ? path.relative(process.cwd(), spillRoot)
+      : location === "base" ? path.dirname(spillRoot) : spillRoot;
     if (location !== "default") vi.stubEnv(key, value);
     const m = spillMemory();
     const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", flushMs: 1000,
@@ -202,8 +204,9 @@ describe("worktree instance cleanup", () => {
       expect((await readObjectRunLogSpill(undefined, handle.logRef)).unrecovered.length).toBe(0);
     }
     const bytes = await fs.readFile(spill.path), marker = await fs.readFile(spill.indexPath);
-    if (source !== "process") {
-      const envPath = source === "pointer" ? path.join(workspacePath, ".paperclip/.env") : path.join(instanceRoot, ".env");
+    if (source !== "process" && source !== "relative") {
+      const envPath = source === "pointer" ? path.join(workspacePath, ".paperclip/.env")
+        : source === "cwd" ? path.join(workspacePath, ".env") : path.join(instanceRoot, ".env");
       await fs.appendFile(envPath, `${key}=${JSON.stringify(value)}\n`);
       vi.stubEnv(key, undefined);
     }
