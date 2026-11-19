@@ -216,7 +216,9 @@ export function activityRoutes(db: Db) {
       },
     });
     if (decision.allowed) return true;
-    res.status(403).json({ error: "Issue activity is outside this actor's authorization boundary" });
+    // Same status and body as the missing-task 404 of getAccessibleResource on
+    // these routes, so a private task's existence is not observable.
+    res.status(404).json({ error: "Issue not found" });
     return false;
   }
 

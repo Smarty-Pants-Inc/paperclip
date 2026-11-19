@@ -1528,6 +1528,77 @@ export function agentRoutes(
     if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
+  /**
+   * A wake that names a task (payload issueId/taskId) needs that task. The
+   * agent:wake decision carries the private-task overlay through scope.issueId;
+   * when the caller's wake authority came from elsewhere (self wake, lifecycle
+   * manager) the same overlay is reached through issue:read. Private and
+   * missing tasks get the same 404 before any wake, run or response detail.
+   */
+  async function assertWakeTaskReadable(
+    req: Request,
+    res: Response,
+    agent: { id: string; companyId: string },
+    payload: unknown,
+  ): Promise<boolean> {
+    const record = asRecord(payload) ?? {};
+    const taskIds = [...new Set([record.issueId, record.taskId].filter((value): value is string =>
+      typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.trim()))
+      .map((value) => value.trim()))];
+    for (const taskId of taskIds) {
+      const issue = await issueService(db).getById(taskId);
+      if (!issue || issue.companyId !== agent.companyId) {
+        // taskId is also a free-form task key; only a named issueId must exist.
+        if (taskId !== record.issueId) continue;
+        res.status(404).json({ error: "Issue not found" });
+        return false;
+      }
+      const wake = await access.decide({
+        actor: req.actor, action: "agent:wake",
+        resource: { type: "agent", companyId: agent.companyId, agentId: agent.id },
+        scope: { issueId: issue.id },
+      });
+      const readable = wake.allowed || (wake.reason !== "deny_issue_private" && (await access.decide({
+        actor: req.actor, action: "issue:read",
+        resource: {
+          type: "issue", companyId: issue.companyId, issueId: issue.id, projectId: issue.projectId,
+          parentIssueId: issue.parentId, assigneeAgentId: issue.assigneeAgentId,
+          assigneeUserId: issue.assigneeUserId, status: issue.status,
+        },
+      })).allowed);
+      if (!readable) {
+        res.status(404).json({ error: "Issue not found" });
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** getAccessibleResource for an issue plus the private-task read gate (same 404 as missing). */
+  async function getReadableIssue<T extends {
+    id: string; companyId: string; projectId: string | null; parentId: string | null;
+    assigneeAgentId: string | null; assigneeUserId: string | null; status: string;
+  }>(req: Request, res: Response, resource: T | null | undefined | Promise<T | null | undefined>): Promise<T | null> {
+    const issue = await getAccessibleResource(req, res, resource, "Issue not found");
+    if (!issue) return null;
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "issue:read",
+      resource: {
+        type: "issue", companyId: issue.companyId, issueId: issue.id, projectId: issue.projectId,
+        parentIssueId: issue.parentId, assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId, status: issue.status,
+      },
+      scope: {
+        issueId: issue.id, projectId: issue.projectId, parentIssueId: issue.parentId,
+        assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId,
+      },
+    });
+    if (decision.allowed) return issue;
+    res.status(404).json({ error: "Issue not found" });
+    return null;
+  }
+
   async function assertCanManageAdapterLogin(
     req: Request,
     companyId: string,
@@ -6439,6 +6510,7 @@ export function agentRoutes(
     } else {
       await assertBoardCanWakeAgent(req, agent);
     }
+    if (!req.body.failedRunId && !(await assertWakeTaskReadable(req, res, agent, req.body.payload))) return;
     if (req.body.debug?.providerTrace === "raw") {
       assertInstanceAdmin(req);
     }
@@ -6504,6 +6576,7 @@ export function agentRoutes(
             assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId, status: issue.status,
           },
         });
+        if (!decision.allowed && decision.reason === "deny_issue_private") throw notFound("Task not found");
         if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
         const savedReviewContext = readNativeReviewAssignmentContext(failedContext);
         if (failedRun.runtimeMode === "native" && failedRun.status === "failed" &&
@@ -6716,6 +6789,7 @@ export function agentRoutes(
     } else {
       await assertBoardCanWakeAgent(req, agent);
     }
+    if (!(await assertWakeTaskReadable(req, res, agent, req.body?.payload))) return;
     const providerTraceRequested = req.body?.debug?.providerTrace === "raw";
     if (providerTraceRequested) {
       assertInstanceAdmin(req);
@@ -8167,7 +8241,7 @@ export function agentRoutes(
   });
 
   router.get("/issues/:issueId/execution", async (req, res) => {
-    const issue = await getAccessibleResource(req, res, issueService(db).getById(req.params.issueId as string), "Issue not found");
+    const issue = await getReadableIssue(req, res, issueService(db).getById(req.params.issueId as string));
     if (!issue) return;
     const [run] = await db.select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, issue.companyId),
@@ -8180,11 +8254,10 @@ export function agentRoutes(
     const rawId = req.params.issueId as string;
     const issueSvc = issueService(db);
     const identifier = normalizeIssueIdentifier(rawId);
-    const issue = await getAccessibleResource(
+    const issue = await getReadableIssue(
       req,
       res,
       identifier ? issueSvc.getByIdentifier(identifier) : issueSvc.getById(rawId),
-      "Issue not found",
     );
     if (!issue) return;
     res.json(await issueRunPresence.activeRun(issue));

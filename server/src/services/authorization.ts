@@ -3023,17 +3023,24 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
       });
       if (privacyDecision) return privacyDecision;
     }
+    // The private-task overlay is one rule for every issue-scoped decision, not
+    // only issue:read: whoever may not read a private task may not comment on it,
+    // change it, assign it, write its workspace or wake an agent for it either.
+    // agent:wake names its task through scope.issueId (the resource is the agent).
+    const privacyIssueId = input.resource.type === "issue"
+      ? input.resource.issueId ?? null
+      : input.action === "agent:wake" && typeof input.scope?.issueId === "string"
+        ? input.scope.issueId
+        : null;
     if (
-      input.action !== "issue:read"
-      || input.resource.type !== "issue"
-      || !input.resource.issueId
+      !privacyIssueId
       || !intersectedDecision.allowed
       || intersectedDecision.reason === "allow_instance_admin"
       || intersectedDecision.reason === "allow_local_board"
       || (!input.actor.authorizingUserId && issuePrivacyMode() === "off")
     ) return intersectedDecision;
 
-    const resource = input.resource;
+    const resource = { companyId: input.resource.companyId, issueId: privacyIssueId };
     return measureWorkspaceAuthorization("authorization.task_privacy", async () => {
       const retainedIssue = readSnapshot?.issues.get(resource.issueId!);
       const issue = retainedIssue?.companyId === resource.companyId ? retainedIssue : await db
