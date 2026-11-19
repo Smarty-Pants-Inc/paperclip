@@ -24,6 +24,7 @@ import {
   companyMemberships,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueTreeHolds,
@@ -57,6 +58,7 @@ import { classifyIssueGraphLiveness } from "../services/recovery/issue-graph-liv
 import { NATIVE_STATUS_ARBITER_POLICY_VERSION } from "../services/native-runtime/status-arbiter.js";
 import { runningProcesses } from "../adapters/index.js";
 import { CONVERSATION_CONTINUATION_POLICY } from "../services/conversation-continuation.js";
+import { readPersonStopHold } from "../services/acknowledged-native-stop.js";
 import {
   buildPaperclipTaskMarkdown,
   buildPaperclipWakePayload,
@@ -757,12 +759,19 @@ import {
     // each once; a message deleted first is not sent. A paused or held chat
     // refuses Send with its reason and runs nothing until it is resumed. A
     // task keeps its rule: a Stop holds its queued comments for the next wake.
-    it.each(["task", "send", "delete-then-send", "agent-paused", "chat-held", "recovery-wait"] as const)("after a person's Stop nothing is sent; the owner's Send starts one turn with the waiting messages (%s)", async (variant) => {
+    // adopt-stophold-2cp (D1, ruling (c)): S records person_stop only for a NATIVE run
+    // (run-control.ts native path), and the stopped bar is native-only (b1bc4168). The
+    // variants send / delete-then-send / agent-paused / chat-held stopped this legacy
+    // `process` run with a direct cancel, so they are RETARGETED, assertions unchanged,
+    // to a native run stopped through the real Stop route: person-stop-hold.test.ts
+    // "D1 Stop row (<variant>)". Here, "legacy-no-hold": a legacy process Stop through
+    // the real Stop route is NOT a hold: the base wait line, no stopped bar and no Send.
+    it.each(["task", "legacy-no-hold", "recovery-wait"] as const)("after a person's Stop nothing is sent; the owner's Send starts one turn with the waiting messages (%s)", async (variant) => {
       const chatMode = variant !== "task";
       const runtimeCompany = randomUUID();
       const runtimeAgent = randomUUID();
       await db.insert(companies).values({ id: runtimeCompany, name: "Stop row",
-        issuePrefix: { task: "STPT", send: "STPS", "delete-then-send": "STPD", "agent-paused": "STPA", "chat-held": "STPH", "recovery-wait": "STPR" }[variant], requireBoardApprovalForNewAgents: false });
+        issuePrefix: { task: "STPT", "legacy-no-hold": "STPL", "recovery-wait": "STPR" }[variant], requireBoardApprovalForNewAgents: false });
       const turns: { runId: string; commentIds: string[] }[] = [];
       const app = express();
       app.use(express.json());
@@ -874,7 +883,7 @@ import {
         if (variant !== "recovery-wait") await db.update(heartbeatRuns).set({ resultJson: { ...(running.resultJson ?? {}),
           conversationContinuation: CONVERSATION_CONTINUATION_POLICY } }).where(eq(heartbeatRuns.id, stoppedRunId));
         // The square Stop, and nothing else.
-        if (variant === "recovery-wait") {
+        if (variant === "recovery-wait" || variant === "legacy-no-hold") {
           // The real Stop route (the board's square Stop).
           expect((await request(routes(null)).post(`/api/heartbeat-runs/${stoppedRunId}/cancel`).send({})).status).toBe(200);
         } else await heartbeat.cancelRun(stoppedRunId, "Cancelled by a board operator",
@@ -934,6 +943,26 @@ import {
           expect(live).toMatchObject({ cause: "legacy_execution_requires_reconciliation", status: "active" });
           expect(turns).toHaveLength(1);
           expect(await liveRuns()).toHaveLength(0);
+          return;
+        }
+        if (variant === "legacy-no-hold") {
+          // A legacy process Stop is no hold (ruling (c)): the ONE reader holds nothing,
+          // the bar keeps the base wait line (no stopped line, so no Send offered), the
+          // messages stay listed and nothing runs.
+          expect(await readPersonStopHold(db, { companyId: runtimeCompany, issueId: issue.id, agentId: runtimeAgent })).toBeNull();
+          const accepted = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, stoppedRunId),
+            eq(heartbeatRunEvents.message, "run.stop.accepted")));
+          expect(accepted.map((row) => (row.payload as Record<string, unknown>)?.kind)).not.toContain("person_stop");
+          for (const at of [0, 1500]) {
+            if (at) await new Promise((resolve) => setTimeout(resolve, at));
+            const bar = await readQueue();
+            expect(bar.executionWait?.reason ?? null).not.toBe("stopped_by_person");
+            expect(JSON.stringify(bar.executionWait ?? null)).not.toContain("Send them now");
+            expect(bar.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(queuedIds);
+          }
+          expect(turns).toHaveLength(1);
+          expect(await liveRuns()).toHaveLength(0);
+          expect(await heldIds()).toEqual(queuedIds);
           return;
         }
         let queue = await readQueue();

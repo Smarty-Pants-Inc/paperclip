@@ -164,7 +164,7 @@ function personStopWakeCarries(payload: unknown, issueId: string, messageId?: st
   return messageId ? ids.includes(messageId) : ids.length > 0;
 }
 
-function personStopWakeCommentIds(payload: unknown): string[] {
+export function personStopWakeCommentIds(payload: unknown): string[] {
   const value = parseObject(payload);
   const nested = parseObject(value._paperclipWakeContext);
   return [...new Set([...queuedCommentIdsFromWakePayload(value), value.commentId, nested.wakeCommentId,
