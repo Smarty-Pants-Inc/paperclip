@@ -18491,8 +18491,9 @@ export function issueRoutes(
           if (steeringIdentity)
             await acceptSteeredIdentity(tx, steeringIdentity);
           acknowledgedTurnId = acknowledgement.turnId;
-          const remainingIds = locked.queue.entries
-            .map((candidate) => candidate.comment.id)
+          // The screen can include later chat wakes. Mutate only this wake;
+          // copying its visible tail into the head would duplicate queued input.
+          const remainingIds = queuedCommentIdsFromWakePayload(locked.wake.payload)
             .filter((candidateId) => candidateId !== commentId);
           const now = new Date();
           const nextWake =
@@ -18558,7 +18559,7 @@ export function issueRoutes(
             actor,
             queueState: nextWake
               ? { wake: nextWake, state: "deferred", queueRun: null }
-              : null,
+              : issue.conversationAgentId ? undefined : null,
           });
         });
       } catch (error) {
