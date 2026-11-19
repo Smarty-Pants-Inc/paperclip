@@ -1420,7 +1420,10 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
             Object.assign(command, { status: "completed", result: { status: "completed" } });
           }
         }
-        await writeFile(path, JSON.stringify(state));
+        // Atomic, like the controller's own journal write (temporary + rename):
+        // a poll must never read a torn journal the real writer never leaves.
+        await writeFile(`${path}.tmp`, JSON.stringify(state));
+        await rename(`${path}.tmp`, path);
       })();
     }, 10);
     return () => clearInterval(timer);
@@ -1463,6 +1466,45 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       // The trio's 'runner gone' gate is untouched: the unproven owner is not retired.
       expect(await quarantined()).toEqual([]);
       expect(await archivedOwners(await sessionRoot())).toEqual([]);
+    }, 60_000);
+
+  // s6409-recheck: the same wait, but the old Runner's exit proof LANDS while
+  // the successor waits (the server persists handedOffWarmOwnerRunnerExited for
+  // THIS run at +10 s; the suspend itself never answers). The fence's own
+  // 'runner gone' proof now holds, so the turn proceeds within ~1 s of it,
+  // not at the 30 s bound.
+  it.each(["own", "successor"] as const)(
+    "s6409-recheck: the stopped Runner's exit proof lands at +10 s during the wait (%s box); the next message proceeds within ~1 s of it, not at the bound",
+    async box => {
+      const { prior, followUp } = await stoppedWithPendingSuspend(stopBeforeSuspend(), { lease: "retained-no-proof", box });
+      expect(warmSessionReleaseWait.timeoutMs).toBe(30_000);
+      let provedAt = 0;
+      let landing: Promise<void> | undefined;
+      const timer = setInterval(() => {
+        if (landing || !followUp.logs.join("").includes(STOP_WAIT_LOG)) return;
+        landing = (async () => {
+          await new Promise(resolve => setTimeout(resolve, 10_000));
+          const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, prior.runId));
+          await db.update(environmentLeases).set({ metadata: { ...lease.metadata,
+            [HANDED_OFF_WARM_EXIT_KEY]: { runId: prior.runId, provedAt: new Date().toISOString() } } })
+            .where(eq(environmentLeases.id, lease.id));
+          provedAt = Date.now();
+        })();
+      }, 10);
+      let admittedAt = 0;
+      try {
+        expect(await followUp.start("created")).toBe(ADMITTED);
+        admittedAt = Date.now();
+      } finally {
+        clearInterval(timer);
+        await landing;
+      }
+      expect(provedAt).toBeGreaterThan(0);
+      expect(admittedAt - provedAt).toBeLessThanOrEqual(1_500);
+      expect(followUp.logs.join("")).toContain(STOP_WAIT_LOG);
+      expect(followUp.logs.join("")).not.toContain("retirement_refused");
+      expect(await archivedOwners(await sessionRoot())).toEqual([prior.runId]);
+      expect(followUp.selectedRunId).toBe(prior.runId);
     }, 60_000);
 
   it.each<[string, Parameters<typeof stopSettledOwner>[1], "pending-suspend" | "pending-command", string]>([

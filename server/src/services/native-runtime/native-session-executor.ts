@@ -6965,6 +6965,9 @@ async function pendingLifecycleCommandsIssuedByStop(db: Db, root: string, identi
  * At the bound, while the Stop's own command is still pending, defer this run
  * through the typed recovery wait (never a failed run). Commands the Stop did
  * not issue keep the ordinary refusal. */
+/** s6409-recheck: how often the Stop-issued lifecycle wait re-reads the fence's proof. */
+export const stopIssuedLifecycleWaitProofRecheck = { ms: 500 };
+
 async function retireAfterStopIssuedLifecycleCommands(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0],
   refused: string): Promise<{ retired: true } | { retired: false; refused: string }> {
   const companyId = input.execution.binding.companyId;
@@ -6975,8 +6978,17 @@ async function retireAfterStopIssuedLifecycleCommands(input: Parameters<typeof i
   const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
   await input.onLog?.("stderr", `[paperclip-runner] waiting for the Stop's runner lifecycle command of run ${String(input.identity.runId)}\n`);
   await waitForWarmNativeSessionSettled(nativeSessionScopeKey(input.execution));
+  // s6409-recheck: the old Runner's exit proof can be persisted while we wait
+  // (handedOffWarmLeaseSettled, read by the fence as remoteRunnerGone). Each
+  // poll also re-reads the fence's own proof (inspectFinishedPerTurnRunnerdOwner,
+  // throttled), so the turn proceeds as soon as it holds, not at the bound.
+  let proofCheckAt = 0;
   while (Date.now() < deadline
     && await pendingLifecycleCommandsIssuedByStop(input.db, input.root, input.identity, companyId)) {
+    if (Date.now() >= proofCheckAt) {
+      proofCheckAt = Date.now() + stopIssuedLifecycleWaitProofRecheck.ms;
+      if ((await inspectFinishedPerTurnRunnerdOwner(input)).finished) break;
+    }
     await new Promise(resolve => setTimeout(resolve, warmSessionReleaseWait.pollMs));
   }
   const retirement = await retireFinishedPerTurnRunnerdOwner(input);
