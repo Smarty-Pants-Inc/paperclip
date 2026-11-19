@@ -10,12 +10,15 @@ import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 export async function startHireBoatHttpStandin() {
   type Box = { id: string; state: string; stoppedAt: string | null; stop?: { id: string; status: string }; team: { id: string }; labels: Record<string, string>; createdAt: string };
   const boxes = new Map<string, Box>();
-  const calls: Array<{ method: string; path: string; boxId: string | null; command?: string; status?: number }> = [];
+  const calls: Array<{ method: string; path: string; boxId: string | null; atNs: string; command?: string; status?: number }> = [];
   let faultBox: string | null = null;
   let inject = false;
+  let closedGate = false;
   let faulted = false;
   let inspectState: "stopped" | "active" = "stopped";
   let previewPort = 0;
+  let releaseStop: (() => void) | undefined;
+  let releaseManifest: (() => void) | undefined;
   const transfers = new Map<string, string>();
   const guestPids = new Map<string, number>();
   function terminateGuest(id: string) {
@@ -30,7 +33,7 @@ export async function startHireBoatHttpStandin() {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     const route = url.pathname.replace(/^\/api\/v1/, "");
     const boxId = /^\/sandboxes\/([^/]+)/.exec(route)?.[1] ?? null;
-    const call: typeof calls[number] = { method: req.method ?? "GET", path: route, boxId }; calls.push(call);
+    const call: typeof calls[number] = { method: req.method ?? "GET", path: route, boxId, atNs: process.hrtime.bigint().toString() }; calls.push(call);
     console.info("BOAT_HTTP", JSON.stringify(call));
     try {
       const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -53,7 +56,7 @@ export async function startHireBoatHttpStandin() {
         return send(res, 200, { sandbox: observed });
       }
       if (route.endsWith("/host")) {
-        if (inject && boxId === faultBox) {
+        if (inject && !closedGate && boxId === faultBox) {
           faulted = true; call.status = 503;
           if (inspectState === "stopped") terminateGuest(boxId!);
           return send(res, 503, { ok: false, error: { code: "unavailable", message: "Boat sandbox lease is no longer active." } });
@@ -61,10 +64,15 @@ export async function startHireBoatHttpStandin() {
         return send(res, 200, { url: "https://hire-row-43127.on.boat.dev/?_token=local-only", port: 43127, access: "private", isProtected: true });
       }
       if (route.endsWith("/stop")) {
-        box.state = "archived"; box.stoppedAt = new Date().toISOString();
+        // The real terminal hook has already CLOSED admission before this
+        // request. Hold only its HTTP response, leaving Core's lease active
+        // until a concurrent same-account hire reaches the real plugin gate.
+        if (closedGate && boxId === faultBox) await new Promise<void>(resolve => { releaseStop = resolve; });
+        const refused = faulted && boxId === faultBox && inspectState === "active";
+        box.state = refused ? "ready" : "archived"; box.stoppedAt = refused ? null : new Date().toISOString();
         // In the never-hide control Boat refuses the stop and keeps its box
         // active. Do not fabricate a successful stop/retirement receipt.
-        box.stop = { id: `stop_${box.id}`, status: faulted && boxId === faultBox && inspectState === "active" ? "failed" : "completed" };
+        box.stop = { id: `stop_${box.id}`, status: refused ? "failed" : "completed" };
         return send(res, 200, { sandbox: box, stop: box.stop });
       }
       if (route.includes("/stops/")) return send(res, 200, { stop: box.stop });
@@ -84,10 +92,19 @@ export async function startHireBoatHttpStandin() {
       }
       if (route.endsWith("/commands") && req.method === "POST") {
         call.command = body.command;
+        // Hold the first real evidence command through the probe's ordinary
+        // cleanup deadline. Only the observed REAL release RPC lets the test
+        // answer it. Retirement cannot finish before release closes admission;
+        // no timer, plugin state, callback or database row is manufactured.
+        if (closedGate && !faulted && boxId === faultBox && String(body.command).includes("paperclip-probe-static-manifest")) {
+          faulted = true;
+          await new Promise<void>(resolve => { releaseManifest = resolve; });
+          return send(res, 200, { exitCode: 1, timedOut: false, stdout: "", stderr: "evidence filesystem temporarily unavailable" });
+        }
         // A provider outage ends guest access as well as ingress. The real
         // plugin's later release closes its admission gate; retained attempts
         // then fail at that gate, before sending another HTTP command.
-        if (faulted && boxId === faultBox) { call.status = 503; return send(res, 503, { ok: false, error: { code: "unavailable" } }); }
+        if (!closedGate && faulted && boxId === faultBox) { call.status = 503; return send(res, 503, { ok: false, error: { code: "unavailable" } }); }
         const result = await runChildProcess(`hire-boat-${randomUUID()}`, "/bin/sh", ["-c", body.command], {
           cwd: body.cwd ?? "/home/user", env: { HOME: "/home/user", PI_OFFLINE: "1", OTEL_SDK_DISABLED: "true" },
           timeoutSec: Math.min(body.timeoutSeconds ?? 60, 120), graceSec: 1, onLog: async () => {},
@@ -104,10 +121,15 @@ export async function startHireBoatHttpStandin() {
   const address = server.address(); if (!address || typeof address === "string") throw new Error("Missing Boat listener");
   return {
     baseUrl: `http://127.0.0.1:${address.port}/api/v1`, boxes, calls,
-    begin(state: "healthy" | "stopped" | "active") {
+    begin(state: "healthy" | "stopped" | "active", mechanism: "ingress-503" | "closed-gate" = "ingress-503") {
+      closedGate = mechanism === "closed-gate";
       inject = state !== "healthy"; inspectState = state === "active" ? "active" : "stopped";
-      faulted = false; faultBox = null; calls.length = 0;
+      faulted = false; faultBox = null; calls.length = 0; releaseStop = undefined; releaseManifest = undefined;
     },
+    get manifestHeld() { return releaseManifest !== undefined; },
+    failManifest() { const resolve = releaseManifest; releaseManifest = undefined; resolve?.(); },
+    get stopHeld() { return releaseStop !== undefined; },
+    finishStop() { const resolve = releaseStop; releaseStop = undefined; resolve?.(); },
     get faulted() { return faulted; }, get faultBox() { return faultBox; },
     setPreviewPort(port: number) { previewPort = port; },
     async serveStorage(req: IncomingMessage, res: ServerResponse) {
@@ -123,6 +145,6 @@ export async function startHireBoatHttpStandin() {
         } else { const content = await readFile(path); res.writeHead(200, { "content-type": "application/octet-stream" }).end(content); }
       } catch (error) { res.writeHead(500).end(String(error)); }
     },
-    async close() { for (const id of guestPids.keys()) terminateGuest(id); server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); },
+    async close() { releaseManifest?.(); releaseStop?.(); for (const id of guestPids.keys()) terminateGuest(id); server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); },
   };
 }

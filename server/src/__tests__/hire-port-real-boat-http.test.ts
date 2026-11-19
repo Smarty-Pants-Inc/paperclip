@@ -15,9 +15,10 @@ import { execFileSync } from "node:child_process";
 import WebSocket, { WebSocketServer, type RawData } from "ws";
 import { agents, authUsers, companies, companyMemberships, createDb, environmentLeases, environments, type Db } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { secretService } from "../services/secrets.js";
+import { reconcileRetainedAiCleanup } from "../services/retained-ai-credential-cleanup.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { startRealPluginLoader } from "./helpers/plugin-real-loader.js";
 import { respondToNativePiHello } from "./helpers/native-pi-hello-model.js";
@@ -35,16 +36,22 @@ describe("real hire route / real Boat worker / Boat HTTP", () => {
   let root: string;
   let pluginId: string;
   let rpcErrorsPath: string;
+  let rpcRequestsPath: string;
   let rpcErrorOffset = 0;
   let model: ReturnType<typeof createServer>;
   let preview: ReturnType<typeof createHttpsServer>;
   const sockets = new Set<WebSocket>();
-  const ws = new WebSocketServer({ noServer: true });
+  let ws: WebSocketServer;
   const previousCAs = getCACertificates("default");
   let modelUrl: string;
   let hellos = 0;
 
-  beforeAll(async () => {
+  // A deferred A has a REAL scheduled retry. Isolate whole cases so an old
+  // company's retry cannot create boxes inside the next never-hide window.
+  // Within each case A and B share this uninterrupted app/database/worker.
+  beforeEach(async () => {
+    ws = new WebSocketServer({ noServer: true });
+    sockets.clear(); hellos = 0; rpcErrorOffset = 0;
     expect(process.env.PAPERCLIP_HIRE_BOAT_NAMESPACE, "Run through fixtures/hire-boat-namespace.sh; never use the host guest path").toBe("1");
     expect(process.env.PAPERCLIP_RUNNER_BINARY).toBeTruthy();
     expect(process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH).toBeTruthy();
@@ -63,11 +70,14 @@ describe("real hire route / real Boat worker / Boat HTTP", () => {
     await writeFile(allowed, `${boat.baseUrl}\n`);
     await writeFile(mountinfo, `1 0 0:1 / ${root} ro - tmpfs tmpfs ro\n`);
     rpcErrorsPath = join(root, "boat-rpc-errors.jsonl");
+    await writeFile(rpcErrorsPath, "");
+    rpcRequestsPath = join(root, "boat-rpc-requests.jsonl");
+    await writeFile(rpcRequestsPath, "");
     const packageRoot = join(root, "boat-package");
     await cp(boatSource!, packageRoot, { recursive: true, dereference: false });
     // Boat's documented test-only URL-authority seam, evaluated inside the
     // real subprocess before its unchanged plugin is passed to runWorker.
-    await writeFile(join(packageRoot, "dist", "worker.js"), `import {runWorker} from '@paperclipai/plugin-sdk';\nimport {readFileSync,appendFileSync} from 'node:fs';\nconst output=process.stdout.write.bind(process.stdout);process.stdout.write=(chunk,...args)=>{try{for(const line of chunk.toString().trim().split('\\n')){const message=JSON.parse(line);if(message.error)appendFileSync(${JSON.stringify(rpcErrorsPath)},JSON.stringify(message)+'\\n')}}catch{}return output(chunk,...args)};\nimport {getCACertificates,setDefaultCACertificates} from 'node:tls';\nimport plugin,{setFaultProxyPathsForTest} from './plugin.js';\nsetDefaultCACertificates([...getCACertificates('default'),readFileSync(${JSON.stringify(join(root, "cert.pem"))},'utf8')]);\nprocess.env.NODE_ENV='test';\nsetFaultProxyPathsForTest(${JSON.stringify({ allowedFile: allowed, mountinfoFile: mountinfo })});\nrunWorker(plugin,import.meta.url);\n`);
+    await writeFile(join(packageRoot, "dist", "worker.js"), `import {runWorker} from '@paperclipai/plugin-sdk';\nimport {readFileSync,appendFileSync} from 'node:fs';\nconst requests=new Map();let input='';process.stdin.on('data',chunk=>{input+=chunk.toString();let end;while((end=input.indexOf('\\n'))>=0){const line=input.slice(0,end);input=input.slice(end+1);try{const message=JSON.parse(line);if(message.method){const request={method:message.method,providerLeaseId:message.params?.lease?.providerLeaseId??message.params?.providerLeaseId,receivedAtNs:process.hrtime.bigint().toString()};requests.set(message.id,request);appendFileSync(${JSON.stringify(rpcRequestsPath)},JSON.stringify(request)+'\\n')}}catch{}}});\nconst output=process.stdout.write.bind(process.stdout);process.stdout.write=(chunk,...args)=>{try{for(const line of chunk.toString().trim().split('\\n')){const message=JSON.parse(line);if(message.error)appendFileSync(${JSON.stringify(rpcErrorsPath)},JSON.stringify({...message,request:requests.get(message.id),atNs:process.hrtime.bigint().toString()})+'\\n')}}catch{}return output(chunk,...args)};\nimport {getCACertificates,setDefaultCACertificates} from 'node:tls';\nimport plugin,{setFaultProxyPathsForTest} from './plugin.js';\nsetDefaultCACertificates([...getCACertificates('default'),readFileSync(${JSON.stringify(join(root, "cert.pem"))},'utf8')]);\nprocess.env.NODE_ENV='test';\nsetFaultProxyPathsForTest(${JSON.stringify({ allowedFile: allowed, mountinfoFile: mountinfo })});\nrunWorker(plugin,import.meta.url);\n`);
     const packageJson = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
     expect(packageJson.version).toBe("0.1.17-spare.6");
     model = createServer(async (req, res) => {
@@ -112,7 +122,9 @@ describe("real hire route / real Boat worker / Boat HTTP", () => {
     const plugin = await app.install(packageRoot); pluginId = plugin.id;
   }, 120_000);
 
-  afterAll(async () => {
+  afterEach(async () => {
+    boat?.failManifest();
+    boat?.finishStop();
     await app?.close();
     for (const socket of sockets) socket.terminate();
     ws.close();
@@ -194,31 +206,83 @@ describe("real hire route / real Boat worker / Boat HTTP", () => {
     return dashboard.worker.pid;
   }
 
-  for (const state of ["stopped", "active"] as const) {
-    it(`${state === "stopped" ? "FAULT ROW" : "NEVER HIDE"}: same-grant B after A's lease is gone; Boat inspect=${state}`, async () => {
-      boat.begin(state);
+  for (const mechanism of ["closed-gate", "ingress-503"] as const) for (const state of ["stopped", "active"] as const) {
+    it(`${mechanism} / ${state === "stopped" ? "FAULT ROW" : "NEVER HIDE"}: same-grant B after A's lease is gone; Boat inspect=${state}`, async () => {
+      boat.begin(state, mechanism);
       rpcErrorOffset = (await readFile(rpcErrorsPath, "utf8").catch(() => "")).length;
       const beforePid = await workerPid();
       const f = await fixture();
       const a = await f.hire(`Gone A (${state})`);
+      if (mechanism === "closed-gate") {
+        const deadline = Date.now() + 90_000;
+        // Observe, never invoke or replace, the release of A's actual lease.
+        // Its real cleanup deadline expires while the Boat response is held.
+        let release;
+        do {
+          release = (await readFile(rpcRequestsPath, "utf8")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line))
+            .find(request => request.method === "environmentReleaseLease" && request.providerLeaseId === boat.faultBox);
+          if (release) break;
+          await pause(20);
+        } while (Date.now() < deadline);
+        expect(release, "the real setup-test release must reach the unchanged worker").toBeDefined();
+        expect(boat.manifestHeld, "retirement's first HTTP response is still held at release").toBe(true);
+        boat.failManifest();
+        while (!boat.stopHeld && Date.now() < deadline) await pause(20);
+        expect(boat.stopHeld, "the real release must close admission, drain, and reach POST /stop").toBe(true);
+        console.info("REAL_BOAT_RELEASE_BARRIER", JSON.stringify(release));
+      } else await pending(f, a);
+      let [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.environmentId, f.environment.id));
+      const readErrors = async () => (await readFile(rpcErrorsPath, "utf8")).slice(rpcErrorOffset).trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+      let boundaryNs: bigint;
+      if (mechanism === "closed-gate") {
+        // The plugin's REAL terminal hook has closed admission. Hold its
+        // already-sent stop response so the database release cannot yet fence
+        // the concurrent retirement call before it reaches the plugin itself.
+        expect(boat.calls.filter(call => call.boxId === lease!.providerLeaseId && call.path.endsWith("/stop"))).toHaveLength(1);
+        expect(lease!.releasedAt).toBeNull();
+        // Join the ACTUAL retained owner installed by A's real probe. This
+        // invokes its real retryRetirement closure; no cleanup, lease or RPC
+        // is manufactured. The lifecycle worker itself remains untouched.
+        const deadline = Date.now() + 20_000;
+        let rejection;
+        let retirementFailure: unknown;
+        do {
+          // The initial retired promise can still be settling when POST /stop
+          // arrives. Join it through the real reconciler, never mutate its map.
+          retirementFailure = await reconcileRetainedAiCleanup({ companyId: f.companyId, accountKey: f.account.grantId }).catch(error => error);
+          rejection = (await readErrors()).find(message => message.error.code === -32002 && message.error.message === "Boat sandbox lease is no longer active.");
+          if (rejection) break;
+          await pause(20);
+        } while (Date.now() < deadline);
+        expect(rejection, "the real retained retirement must reach Boat's CLOSED activity gate").toBeDefined();
+        expect(rejection.error).toEqual({ code: -32002, message: "Boat sandbox lease is no longer active." });
+        expect(rejection.request).toMatchObject({ method: "environmentExecute", providerLeaseId: lease!.providerLeaseId });
+        // hrtime is host-monotonic across these actual processes. The window
+        // starts when the worker emits the rejection, NOT when polling sees it.
+        boundaryNs = BigInt(rejection.atNs);
+        console.info("REAL_BOAT_GATE_REJECTION", JSON.stringify(rejection));
+        boat.finishStop();
+        expect(retirementFailure).toMatchObject({ status: 422, details: { code: "ai_credential_cleanup_pending" } });
+      } else {
+        const leaseGone = (await readErrors()).filter(message => message.error.code === -32002);
+        console.info("REAL_BOAT_RPC_LEASE_GONE", JSON.stringify(leaseGone));
+        expect(leaseGone.length, "the separate R1 ingress-503 control is preserved").toBeGreaterThan(0);
+        boundaryNs = process.hrtime.bigint();
+      }
+      const observedCalls = () => boat.calls.filter(call => BigInt(call.atNs) >= boundaryNs);
       const afterA = await pending(f, a);
+      [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.environmentId, f.environment.id));
       expect(boat.faulted).toBe(true);
       expect(afterA.lifecycleState).toBe("verifying");
       expect(afterA.harnessVerifiedAt).toBeNull();
-      const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.environmentId, f.environment.id));
       expect(lease).toMatchObject({ heartbeatRunId: null, leasePolicy: "ephemeral", providerLeaseId: boat.faultBox });
       expect(lease!.releasedAt).toBeTruthy();
-      const rpcErrors = (await readFile(rpcErrorsPath, "utf8")).slice(rpcErrorOffset).trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
-      const leaseGone = rpcErrors.filter(message => message.error.code === -32002);
-      console.info("REAL_BOAT_RPC_LEASE_GONE", JSON.stringify(leaseGone));
-      expect(leaseGone.length, "the unchanged Boat worker really returned JSON-RPC -32002").toBeGreaterThan(0);
-      const boundary = boat.calls.length;
       const beforeHellos = hellos;
       const b = await f.hire(`Same-grant B (${state})`);
       let afterB: Awaited<ReturnType<typeof f.row>>;
       if (state === "stopped") {
         try { afterB = await f.ready(b); }
-        catch (error) { console.info("REAL_HIRE_FAULT", JSON.stringify({ state, a: afterA, b: await f.row(b), lease, calls: boat.calls.slice(boundary), beforePid, afterPid: await workerPid() })); throw error; }
+        catch (error) { console.info("REAL_HIRE_FAULT", JSON.stringify({ state, a: afterA, b: await f.row(b), lease, calls: observedCalls(), beforePid, afterPid: await workerPid() })); throw error; }
         expect(afterB.harnessVerifiedAt).toBeNull(); expect(afterB.harnessVerifiedDigest).toBeNull();
         expect(hellos).toBeGreaterThan(beforeHellos);
       } else {
@@ -231,12 +295,12 @@ describe("real hire route / real Boat worker / Boat HTTP", () => {
       const [proved] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease!.id));
       if (state === "stopped") expect(proved!.metadata?.remoteExecutionTermination).toMatchObject({ runId: null, leaseId: lease!.id, providerLeaseId: lease!.providerLeaseId, state: "stopped" });
       else expect(proved!.metadata?.remoteExecutionTermination).toBeUndefined();
-      const after = boat.calls.slice(boundary);
+      const after = observedCalls();
       expect(after.filter(call => call.boxId === boat.faultBox && call.method !== "GET"), "no execute/destroy/stop/resume after the real -32002").toEqual([]);
       expect(after.filter(call => call.path === "/sandboxes" && call.method === "POST")).toHaveLength(state === "stopped" ? 1 : 0);
       expect(afterB.runtimeConfig).toMatchObject({ aiConnection: { grantId: f.account.grantId } });
       const afterPid = await workerPid(); expect(afterPid).toBe(beforePid);
-      console.info("REAL_HIRE_FAULT", JSON.stringify({ state, a: { id: a, state: afterA.lifecycleState, error: afterA.lifecycleError }, b: { id: b, state: afterB.lifecycleState, error: afterB.lifecycleError, verifiedAt: afterB.harnessVerifiedAt, digest: afterB.harnessVerifiedDigest }, grant: f.account.grantId, lease: proved, calls: after.map(({ command, ...call }) => call), beforePid, afterPid }));
+      console.info("REAL_HIRE_FAULT", JSON.stringify({ mechanism, boundaryNs: boundaryNs.toString(), state, a: { id: a, state: afterA.lifecycleState, error: afterA.lifecycleError }, b: { id: b, state: afterB.lifecycleState, error: afterB.lifecycleError, verifiedAt: afterB.harnessVerifiedAt, digest: afterB.harnessVerifiedDigest }, grant: f.account.grantId, lease: proved, calls: after.map(({ command, ...call }) => call), beforePid, afterPid }));
     }, 420_000);
   }
 });

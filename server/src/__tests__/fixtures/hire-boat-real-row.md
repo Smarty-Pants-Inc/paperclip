@@ -8,8 +8,8 @@ worker manager, and a separately built Boat plugin. No plugin call, environment
 service, lifecycle effect, or ready agent is substituted. The external Boat and
 model APIs are loopback stand-ins. Guest commands, runnerd, Pi, TLS and WebSockets
 run for real. The worker entry wrapper only selects Boat's exported test-only
-URL-authority file seam, trusts the disposable TLS certificate, and records actual
-JSON-RPC error responses without changing the bytes delivered to Core.
+URL-authority file seam, trusts the disposable TLS certificate, and observes actual
+JSON-RPC requests/errors without changing protocol bytes delivered to Core or Boat.
 
 ## Prerequisites / command
 
@@ -52,21 +52,51 @@ under `TMPDIR`. Optional `PAPERCLIP_HIRE_BOAT_GUEST_ROOT` reuses prepared guest 
 The provider pack is preinstalled, but the normal runtime verifies its bytes and
 stages the actual runner binary through the real Boat HTTP file protocol.
 
-## Reading evidence and qualification limits
+## Deterministic closed-gate row
 
+The stand-in holds the first real evidence-manifest command response through the
+probe's normal cleanup deadline. The test waits for an observed
+`environmentReleaseLease` request for A's provider lease before returning a failed
+command result. This prevents retirement completing before the real release.
+Boat closes its own admission gate and drains that command before POST `/stop`.
+The stand-in holds the stop response, so Core's database lease remains active
+while Boat's gate is CLOSED. No plugin state or retained-cleanup entry is planted.
+
+While that stop response is held, the test joins Core's real retained-cleanup
+reconciler for A's grant. It retries the actual callback retained by A's probe;
+no replacement callback, RPC, lease, or service is manufactured. The worker must
+return exactly `{code:-32002,message:'Boat sandbox lease is no longer active.'}`
+on `environmentExecute` for A's own provider lease. The observation window starts
+at the worker's monotonic emission timestamp, not when the test notices it.
+Only then is the already-issued stop allowed to finish. A real HTTP hire B on the
+same grant must become ready without restarting the app or Boat worker. No new
+mutation request for A's box is permitted after that rejection; read-only typed
+inspection and completion of the already-issued stop response are permitted.
+
+- `REAL_BOAT_RELEASE_BARRIER`: the real release request that opens the held
+  command response barrier (not a fabricated plugin lifecycle transition).
+- `REAL_BOAT_GATE_REJECTION`: exact real JSON-RPC error, request method, provider
+  lease ID and monotonic receive/emission timestamps.
 - `REAL_HIRE_HEALTHY`: real A/B state, selected grant, hello count and plugin ID.
-- `REAL_BOAT_RPC_LEASE_GONE`: observed real worker error responses, **not** an
-  assertion that the worker returned the exact closed-admission-gate message.
-- `REAL_HIRE_FAULT`: A/B states, actual harness-cache fields, own lease/receipt,
-  provider calls and worker PID before/after. The call assertion starts after
-  A's initial release, not at the first earlier ingress RPC failure.
+- `REAL_BOAT_RPC_LEASE_GONE`: the separate ingress-503 controls, whose message is
+  `Runner connection endpoint could not be acquired (HTTP 503).` They are not
+  substitutes for the closed-gate row.
+- `REAL_HIRE_FAULT`: mechanism, boundary timestamp, A/B states, actual
+  harness-cache fields, own lease/receipt, provider calls and unchanged worker PID.
 
-This first real-boundary fixture injects HTTP 503 at A's private-preview endpoint.
-The real worker reports JSON-RPC `-32002` with `Runner connection endpoint could
-not be acquired (HTTP 503).` It is **not yet the exact** live retirement failure
-`Boat sandbox lease is no longer active.` Do not claim exact-case certification
-from a green run of this fixture. Capturing that later closed-gate retirement
-failure and moving the no-mutation observation boundary to it remains required.
+Each case owns a fresh real app/database/Boat worker. This prevents a previous
+case's legitimate scheduled A retry from creating boxes inside another case's
+never-hide window. A and B always share the same uninterrupted app/database and
+worker within their case; the PID assertion enforces no A-to-B restart.
+
+The whole file includes healthy A/B, stopped and ACTIVE closed-gate cases, and
+both original ingress-503 controls. Run it three consecutive times at the fixed
+head with zero retries. Copy these exact test/helper files to baseline `c3c15054`:
+B must remain verifying in the stopped fault row (the ready assertion goes red),
+while healthy and never-hide controls remain green. Disabling only the
+`entry.proveRetired` branch in `retained-ai-credential-cleanup.ts` must likewise
+leave B verifying and turn the stopped fault row red. Restore that mutation;
+product source is not part of this test-only change.
 
 Boat supplies no immutable image identity in this fixture. Core deliberately
 records `harnessVerifiedAt = null` / `harnessVerifiedDigest = null`; readiness and
