@@ -120,6 +120,12 @@ describe("paperclip_runner sandbox lifecycle", () => {
     expect(providerResourceDispositionForTerminalRun("stop_and_retain", "failed", "adapter_failed")).toBe("stop_and_retain");
   });
 
+  it("GP-R2: stops the box of a run whose final Git probe failed, so it is not kept running for the retry", () => {
+    // run-control.ts releaseEnvironmentLeasesForRun -> environment-runtime.ts releaseRunLeases passes this disposition to the driver.
+    expect(providerResourceDispositionForTerminalRun("keep_running", "failed", "environment_provider_unavailable", false)).toBe("stop_and_retain");
+    expect(providerResourceDispositionForTerminalRun(undefined, "failed", "environment_provider_unavailable", false)).toBeUndefined();
+  });
+
   it("stops a selected warm sandbox only for a never-started adapter_failed preparation", () => {
     expect(providerResourceDispositionForTerminalRun("keep_running", "failed", "adapter_failed", false)).toBe("stop_and_retain");
     for (const workStarted of [undefined, null, true, "false", 0, {}]) {
