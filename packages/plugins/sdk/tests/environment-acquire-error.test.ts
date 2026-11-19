@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { definePlugin } from "../src/define-plugin.js";
-import { readEnvironmentAcquireErrorDiagnostic } from "../src/environment-acquire-error.js";
+import { readEnvironmentAcquireErrorDiagnostic, readEnvironmentCreationIdempotencyCode } from "../src/environment-acquire-error.js";
 import { PluginEnvironmentCreationCleanupError, readEnvironmentCreationCleanupError } from "../src/environment-creation-cleanup.js";
 import { createRequest, isJsonRpcResponse, JsonRpcCallError, parseMessage, serializeMessage, type JsonRpcResponse } from "../src/protocol.js";
 import { startWorkerRpcHost } from "../src/worker-rpc-host.js";
@@ -67,5 +67,16 @@ describe("environment acquisition refusal diagnostics", () => {
     expect(readEnvironmentAcquireErrorDiagnostic(forged({ schema: "other", providerDiagnostic: { httpStatus: 502 } }))).toBeNull();
     expect(readEnvironmentAcquireErrorDiagnostic(forged({ schema: "paperclip/environment-acquire-error/v1",
       providerDiagnostic: { httpStatus: 9000, errorCode: "EVIL" } }))).toBeNull();
+  });
+
+  it("SUPERSEDE-RF4-J7-REFUSAL-SPENT-1119: carries a closed creation idempotency code across the acquire RPC", async () => {
+    const reused = await acquire(Object.assign(new Error("Boat create failed (HTTP 409)"), { status: 409, code: "idempotency_key_reused" }));
+    expect(readEnvironmentAcquireErrorDiagnostic(reused)).toEqual({ httpStatus: 409 });
+    expect(readEnvironmentCreationIdempotencyCode(reused)).toBe("idempotency_key_reused");
+    const stopped = await acquire(new PluginEnvironmentCreationCleanupError([Object.assign(new Error("stopped"),
+      { status: 409, code: "boat_idempotency_box_stopped" })], "Boat box stopped; cleanup could not be confirmed", cleanup));
+    expect(readEnvironmentCreationIdempotencyCode(stopped)).toBe("boat_idempotency_box_stopped");
+    expect(readEnvironmentCreationIdempotencyCode(await acquire(Object.assign(new Error("x"), { status: 409, code: "something_else" })))).toBeNull();
+    expect(readEnvironmentCreationIdempotencyCode(Object.assign(new Error("x"), { data: { schema: "other", creationIdempotencyCode: "idempotency_key_reused" } }))).toBeNull();
   });
 });
