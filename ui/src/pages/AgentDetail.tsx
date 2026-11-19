@@ -428,11 +428,14 @@ export function AgentDetail() {
   // Another member's Smarty lands only on that member's read-only chat. Its
   // settings tabs stay reachable by URL for people who manage agents.
   const { enabled: agentChatEnabled } = useAgentChatEnabled();
-  const { session: ownerSession, primaries: ownerPrimaries, otherOwnerId } =
-    usePrimaryAgentOwner(resolvedCompanyId, agent?.id, agentChatEnabled && !!agent);
+  // The owner's actions show only on a known answer ("mine" or "nobody"). An
+  // unreadable answer fails closed: the landing view shows Retry, never the overview.
+  const ownership = usePrimaryAgentOwner(resolvedCompanyId, agent?.id, agentChatEnabled && !!agent);
   const landingView = !urlRunId && activeView === "overview";
-  const ownershipPending = agentChatEnabled && !!agent && ownerPrimaries.isPending && !ownerSession.isError;
-  const opensOwnerChat = landingView && agentChatEnabled && !!otherOwnerId;
+  const ownershipPending = ownership.status === "pending";
+  const ownershipFailed = ownership.status === "error";
+  const ownerActions = ownership.status === "mine" || ownership.status === "nobody";
+  const opensOwnerChat = landingView && ownership.status === "other";
   const handleLegacyTabChange = useCallback((next: string) => {
     if (!prepareAgentNavigation()) return;
     navigate(`/agents/${canonicalAgentRef || routeAgentRef}/${next}`);
@@ -609,7 +612,7 @@ export function AgentDetail() {
       navigate(`/chats/${canonicalAgentRef}`, { replace: true });
       return;
     }
-    if (landingView && ownershipPending) return;
+    if (landingView && (ownershipPending || ownershipFailed)) return;
     if (activeView === "advanced" && (configSaving || configDirty)) return;
     if (urlRunId) {
       if (routeAgentRef !== canonicalAgentRef) {
@@ -622,7 +625,7 @@ export function AgentDetail() {
       navigate(`${agentDetailHref(canonicalAgentRef, canonicalTab)}${location.search}`, { replace: true });
       return;
     }
-  }, [agent, routeAgentRef, canonicalAgentRef, urlRunId, urlTab, activeView, configSaving, configDirty, navigate, location.search, opensOwnerChat, landingView, ownershipPending]);
+  }, [agent, routeAgentRef, canonicalAgentRef, urlRunId, urlTab, activeView, configSaving, configDirty, navigate, location.search, opensOwnerChat, landingView, ownershipPending, ownershipFailed]);
 
   useEffect(() => {
     if (!agent?.companyId || agent.companyId === selectedCompanyId) return;
@@ -805,6 +808,9 @@ export function AgentDetail() {
     return <QueryErrorState size="page" error={error} action="load this agent" onRetry={agentView.retry} retrying={agentView.isFetching} />;
   }
   if (!agent) return null;
+  if (landingView && ownershipFailed) {
+    return <QueryErrorState size="page" error={ownership.error} action="load this chat" onRetry={ownership.retry} retrying={ownership.retrying} />;
+  }
   if (opensOwnerChat || (landingView && ownershipPending)) return <PageSkeleton variant="detail" />;
   if (!urlRunId && !urlTab) {
     return <Navigate to={agentDetailHref(canonicalAgentRef)} replace />;
@@ -938,8 +944,8 @@ export function AgentDetail() {
           assignLabel="New task"
           size="default"
           assignIcon={Paperclip}
-          showChat={!otherOwnerId && !ownershipPending}
-          showAssign={!otherOwnerId && !ownershipPending}
+          showChat={ownerActions}
+          showAssign={ownerActions}
           showStatus={false}
           workActionsInMenu
           menuItems={[{ label: "Agent history", icon: HistoryIcon, onSelect: () => setHistoryOpen(true) }]}
