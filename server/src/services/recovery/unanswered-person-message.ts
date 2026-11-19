@@ -84,6 +84,11 @@ export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";
 export const UNANSWERED_MESSAGE_AGENT_SETUP_CODE = "agent_setup";
 /** A resumed agent's own pause stopped this message's run, not a failure. */
 const PAUSE_STOPPED_CODE = "agent_pause_stopped";
+/** The same, while the agent is STILL paused (RFL 11-19 04:52Z): Resume never
+ * re-runs the cancelled run, so '<agent> is paused … it will run when resumed'
+ * would be a false promise. Carries the waiting marker so the SAME note is
+ * upgraded in place to PAUSE_STOPPED's words once the agent is not paused. */
+const PAUSE_STOPPED_WHILE_PAUSED_CODE = "agent_pause_stopped_paused";
 export const SETUP_WAIT_BOUND_MS = 10 * 60_000;
 /** A run whose OWN input carries the message is RUNNING: the agent is working
  * on it (the note a Resume's stale paused note becomes). Waiting-kind, so the
@@ -712,13 +717,19 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   if (agentPaused && agentRow?.pauseReason === "import" && (agentRow.lifecycleHolds ?? []).every(hold => hold === "import")) {
     return { kind: "none" };
   }
+  // M's OWN run was cancelled by the agent's Pause (heartbeat.cancelActiveForAgent,
+  // errorCode agent_paused). Resume does not re-run it: M is not deferred work.
+  const pauseCancelledOwnRun = Boolean(run && run.status === "cancelled" && run.errorCode === "agent_paused");
   if (agentPaused) {
     const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
     if (due > now.getTime()) return { kind: "pending", recheckAt: due };
     // The standing recheck stays 5 min: a Resume does not wait for it. The
     // resume transition's own effect (notifyPausedNoteResume) hands each of
     // the agent's tasks with this note to the sweep's per-issue entry now.
-    if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE) {
+    // A standing '<agent> is paused' note on M (written before this fix) is
+    // not true for M: it is upgraded in place to the while-paused words.
+    if (upgrading && standingWaitingCode === (pauseCancelledOwnRun
+      ? PAUSE_STOPPED_WHILE_PAUSED_CODE : UNANSWERED_MESSAGE_AGENT_PAUSED_CODE)) {
       return { kind: "pending", recheckAt: now.getTime() + 5 * 60_000 };
     }
   }
@@ -740,7 +751,8 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     }
   }
 
-  if (lifecycleTransit && !waitingToStart) {
+  // A resume in progress does not make M's pause-cancelled run wait to start.
+  if (lifecycleTransit && !waitingToStart && !pauseCancelledOwnRun) {
     const wait = await bounded(now.getTime() + 30_000);
     if (wait) return wait;
     waitingToStart = true;
@@ -779,7 +791,10 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   if (settingUp) {
     code = UNANSWERED_MESSAGE_AGENT_SETUP_CODE;
   } else if (agentPaused) {
-    code = UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
+    // Only a message that is really deferred (it WILL run on Resume) gets the
+    // paused note; M, whose own run the Pause cancelled, is pause-stopped even
+    // while paused.
+    code = pauseCancelledOwnRun ? PAUSE_STOPPED_WHILE_PAUSED_CODE : UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   } else if (waitingToStart) {
     // The ordinary carrying-run start bound is unchanged. A known queued
     // continuation keeps the waiting note until it starts or terminates;
@@ -928,15 +943,17 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     && run && TERMINAL.includes(run.status));
   // The ONE bound: the message's automatic lineage used its K=2 fresh
   // continuations and the last one failed. Nothing further starts by itself.
-  const pauseStopped = code === PAUSE_STOPPED_CODE;
+  const pauseStoppedWhilePaused = code === PAUSE_STOPPED_WHILE_PAUSED_CODE;
+  const pauseStopped = code === PAUSE_STOPPED_CODE || pauseStoppedWhilePaused;
   const boundReached = Boolean(!paused && !pauseStopped && !waiting && run && TERMINAL.includes(run.status) && run.status !== "succeeded"
     && (await freshContinuationChain(q as Db, { companyId: issue.companyId, issueId: issue.id, runId: run.id })).attempts
       >= FRESH_CONTINUATION_BOUND);
   // Server-local HH:MM: the instance's time zone, not an assumed UTC zone.
   const since = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
   const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
-    : paused ? agentPausedText(pausedName)
+    : pauseStoppedWhilePaused ? `${pausedName} was paused before it answered your message. Send it again after ${pausedName} is resumed.`
     : pauseStopped ? `${pausedName} was paused before it answered your message. Send it again to continue.`
+    : paused ? agentPausedText(pausedName)
     : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
@@ -951,8 +968,9 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
       tone: paused ? "warning" : waiting ? "info" : "warning",
       nextAction: policyRefused ? "Automatic retry is disabled for this request."
         : settingUp ? "No action is needed; your message is saved."
-        : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
+        : pauseStoppedWhilePaused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}, then send it again.`
         : pauseStopped ? "Send it again to continue."
+        : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : waiting ? "No action is needed; it will start by itself."
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : held || boundReached ? "Send a new message to try again."
@@ -966,6 +984,9 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     failureCode: waiting || pauseStopped ? undefined : run ? undefined : code,
   });
   if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
+  // Not a waiting note in its words, but an open one: the marker keeps it
+  // upgradable in place to the post-Resume words.
+  if (pauseStoppedWhilePaused) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
   return { kind: "notice", reason, code, notice, ...(setupWaitRecord ? { recordWait: setupWaitRecord } : {}),
     ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
 }
@@ -978,13 +999,15 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
  * in the lifecycle transaction (services/agent-lifecycle.ts recordStatus). */
 export async function notifyPausedNoteResume(tx: Db, scope: { companyId: string; agentId: string }): Promise<void> {
   const pausedRow = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL, value: UNANSWERED_MESSAGE_AGENT_PAUSED_CODE }] }]);
+  const pauseStoppedRow = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL, value: PAUSE_STOPPED_WHILE_PAUSED_CODE }] }]);
   const rows = await tx.selectDistinct({ id: issues.id }).from(issues)
     .innerJoin(issueComments, and(eq(issueComments.companyId, issues.companyId), eq(issueComments.issueId, issues.id)))
     .where(and(eq(issues.companyId, scope.companyId), eq(issues.assigneeAgentId, scope.agentId), isNull(issues.hiddenAt),
       inArray(issues.status, ["todo", "in_progress", "in_review", "blocked"]),
       eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
       sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
-      sql`coalesce(${issueComments.metadata}->'sections' @> ${pausedRow}::jsonb, false)`)).limit(200);
+      sql`(coalesce(${issueComments.metadata}->'sections' @> ${pausedRow}::jsonb, false)
+        or coalesce(${issueComments.metadata}->'sections' @> ${pauseStoppedRow}::jsonb, false))`)).limit(200);
   for (const row of rows) {
     await notifyDeliveryWork(tx, DELIVERY_QUEUES.strandedAssignments, JSON.stringify({ companyId: scope.companyId, issueId: row.id }));
   }
