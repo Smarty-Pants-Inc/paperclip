@@ -54,6 +54,7 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import * as instanceSettingsModule from "../services/instance-settings.js";
 import { connectionIntentService } from "../services/connection-intents.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
+import { flushSecretResolutionWrites } from "../services/secret-resolution-writes.js";
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
 import { errorHandler } from "../middleware/index.js";
@@ -413,6 +414,8 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     await instanceSettingsService(db).updateExperimental({ enablePaperclipNotebook: false });
+    // Secret resolutions enqueue secret_access_events rows on a timer; land them before deleting companies.
+    await flushSecretResolutionWrites(db);
     await db.delete(toolCallEvents);
     await db.delete(toolInvocations);
     await db.delete(toolActionRequests);
@@ -440,6 +443,9 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
     await db.delete(agents);
+    // Late producers can enqueue after the first flush; drain and clear again just before the FK target goes.
+    await flushSecretResolutionWrites(db);
+    await db.delete(secretAccessEvents);
     await db.delete(companies);
     await db.delete(authUsers);
   });
