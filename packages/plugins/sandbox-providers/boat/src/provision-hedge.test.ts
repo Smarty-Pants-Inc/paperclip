@@ -26,7 +26,7 @@ beforeEach(async () => {
   });
 });
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
-function world(readyAfter: number[], options: { errorAt?: number; archivedAt?: number; refuseStops?: boolean; hangHedge?: boolean; omitLoser?: boolean; hedgeVisibleAt?: number; listGate?: () => Promise<void> } = {}) {
+function world(readyAfter: number[], options: { errorAt?: number; archivedAt?: number; refuseStops?: boolean; hangHedge?: boolean; omitLoser?: boolean; hedgeVisibleAt?: number; hedgePostDelayMs?: number; listGate?: () => Promise<void> } = {}) {
   const creates: { at: number; key: string; body: string }[] = [], stops: { id: string; body: any }[] = [];
   const boxes = new Map<string, { key: string; labels: any; at: number; stopped: boolean }>();
   const state = (id: string, b: any) => b.stopped || (id === "bx_hedge0" && Date.now() >= (options.archivedAt ?? Infinity)) ? "archived" : id === "bx_hedge0" && Date.now() >= (options.errorAt ?? Infinity) ? "error"
@@ -37,7 +37,12 @@ function world(readyAfter: number[], options: { errorAt?: number; archivedAt?: n
       const key = new Headers(init.headers).get("Idempotency-Key")!, body = JSON.parse(init.body);
       creates.push({ at: Date.now(), key, body: init.body });
       let existing = [...boxes].find(([, b]) => b.key === key);
+      const firstSend = !existing;
       if (!existing) { const id = `bx_hedge${boxes.size}`; boxes.set(id, { key, labels: body.labels, at: Date.now(), stopped: false }); existing = [id, boxes.get(id)!]; }
+      if (options.hedgePostDelayMs && firstSend && existing[0] === "bx_hedge1") await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, options.hedgePostDelayMs);
+        init.signal.addEventListener("abort", () => { clearTimeout(timer); reject(init.signal.reason); }, { once: true });
+      });
       if (options.hangHedge && existing[0] === "bx_hedge1") return await new Promise<Response>((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
       return res({ sandbox: { id: existing[0], state: state(...existing) } }, 202);
     }
@@ -58,6 +63,87 @@ function world(readyAfter: number[], options: { errorAt?: number; archivedAt?: n
   return { creates, stops, boxes };
 }
 const settle = (work: Promise<unknown>) => work.then(lease => ({ lease }), error => ({ error }));
+// Keep: never-OK winner-stop and paid-loser guards from rf-4's spare.13 verdict.
+it("same-worker same run + creation operation coalesces re-entry onto one winner, never stopping a returned box", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  // The original hedge POST answers slowly, but its replay answers immediately.
+  // Hold cleanup inventory until both decisions so a stop cannot mask the race.
+  const w = world([77_000, 0], { hedgePostDelayMs: 4_000, listGate: () => gate });
+  const first = settle(plugin.definition.onEnvironmentAcquireLease!(params));
+  await vi.advanceTimersByTimeAsync(76_000);
+  const second = settle(plugin.definition.onEnvironmentAcquireLease!(params));
+  await vi.advanceTimersByTimeAsync(4_000);
+  const a: any = await first, b: any = await second;
+  release(); await vi.advanceTimersByTimeAsync(10_000);
+  expect(a.error).toBeUndefined(); expect(b.error).toBeUndefined();
+  const returned = [a.lease.providerLeaseId, b.lease.providerLeaseId];
+  console.info("same-worker Boat boundary", JSON.stringify({ returned, stops: w.stops, boxes: [...w.boxes].map(([id, b]) => ({ id, stopped: b.stopped })) }));
+  expect(returned[1]).toBe(returned[0]);
+  expect(w.stops.filter(stop => returned.includes(stop.id))).toEqual([]);
+  expect(w.boxes.get(returned[0])!.stopped).toBe(false);
+  expect([...w.boxes].filter(([id, box]) => !returned.includes(id) && !box.stopped)).toEqual([]);
+  expect(w.creates).toHaveLength(2); money(w);
+});
+it("two simultaneous same-operation callers share the slow primary + hedge acquisition", async () => {
+  const w = world([240_000, 40_000]);
+  const first = settle(plugin.definition.onEnvironmentAcquireLease!(params));
+  const second = settle(plugin.definition.onEnvironmentAcquireLease!({ ...params }));
+  await vi.advanceTimersByTimeAsync(179_000);
+  const a: any = await first, b: any = await second;
+  expect(a.error).toBeUndefined(); expect(b.error).toBeUndefined();
+  expect(a.lease.providerLeaseId).toBe("bx_hedge1");
+  expect(b.lease.providerLeaseId).toBe(a.lease.providerLeaseId);
+  expect(w.stops).toEqual([{ id: "bx_hedge0", body: {} }]);
+  expect(w.boxes.get("bx_hedge1")!.stopped).toBe(false);
+  expect(w.creates).toHaveLength(2); money(w);
+});
+it("different creation operations remain independent", async () => {
+  const w = world([0, 0]);
+  const first = settle(plugin.definition.onEnvironmentAcquireLease!(params));
+  const second = settle(plugin.definition.onEnvironmentAcquireLease!({ ...params, creationOperationId: "other-op", runId: "other-run" }));
+  await vi.advanceTimersByTimeAsync(1_000);
+  const a: any = await first, b: any = await second;
+  expect(a.error).toBeUndefined(); expect(b.error).toBeUndefined();
+  expect(b.lease.providerLeaseId).not.toBe(a.lease.providerLeaseId);
+  expect(w.boxes.size).toBe(2); expect(w.stops).toEqual([]);
+});
+it("a rejected acquisition is evicted so a corrected retry can proceed", async () => {
+  const w = world([0]);
+  const first = await settle(plugin.definition.onEnvironmentAcquireLease!({ ...params, requestedExpiresAt: "2030-01-01T00:00:00Z" }));
+  expect(first).toHaveProperty("error"); expect(w.boxes.size).toBe(0);
+  const next = settle(plugin.definition.onEnvironmentAcquireLease!(params));
+  await vi.advanceTimersByTimeAsync(1_000);
+  const result: any = await next;
+  expect(result.error).toBeUndefined(); expect(result.lease.providerLeaseId).toBe("bx_hedge0");
+  expect(w.stops).toEqual([]);
+});
+it.each([false, true])("replacement autonomously stops surviving late loser debt within one backoff, with no further acquisition (spare setting present: %s)", async hasSpareSetting => {
+  const w = world([100_000, 40_000, 0], { hangHedge: true, hedgeVisibleAt: 200_000 });
+  const r = await acquire(130_000);
+  expect(r.error).toBeUndefined(); expect(r.lease.providerLeaseId).toBe("bx_hedge0");
+  expect(w.stops).toEqual([]);
+  vi.clearAllTimers(); vi.resetModules();
+  const restarted = (await import("./plugin.js")).default;
+  vi.useFakeTimers(); vi.setSystemTime(130_000);
+  await restarted.definition.setup({ ...context, ...(hasSpareSetting ? { config: { get: async () => ({ readySpareCount: 0 }) } } : {}) });
+  // The replacement's sole acquire supplies credentials before the late box
+  // is visible. No subsequent acquire, inspection or health call may drive retry.
+  const next = settle(restarted.definition.onEnvironmentAcquireLease!({ ...params, runId: "next-run", creationOperationId: "next-op" }));
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect((await next as any).error).toBeUndefined();
+  expect(w.stops).toEqual([]);
+  await vi.advanceTimersByTimeAsync(900_000 + 15_000);
+  expect(w.stops).toEqual([{ id: "bx_hedge1", body: {} }]);
+  expect(w.boxes.get("bx_hedge1")!.stopped).toBe(true);
+  expect(w.boxes.get("bx_hedge0")!.stopped).toBe(false);
+  await vi.advanceTimersByTimeAsync(900_000 + 15_000);
+  const debt: any = [...storage.entries()].find(([key]) => key.includes("stop-owed"))?.[1];
+  expect(debt.owed).toEqual([]);
+  const requests = vi.mocked(fetch).mock.calls.length;
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(vi.mocked(fetch).mock.calls.length).toBe(requests);
+});
 async function acquire(ms = 179_000) { const work = settle(plugin.definition.onEnvironmentAcquireLease!(params)); await vi.advanceTimersByTimeAsync(ms); return work as Promise<any>; }
 function money(w: ReturnType<typeof world>) { expect(w.boxes.size).toBeLessThanOrEqual(2); expect(new Set(w.creates.map(c => c.key)).size).toBeLessThanOrEqual(2); }
 it("slow first + 40s hedge: returns hedge; one non-force owed stop for the first", async () => {

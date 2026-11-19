@@ -1,4 +1,4 @@
-# Boat sandbox provider 0.1.17-spare.13 (unreleased)
+# Boat sandbox provider (unreleased)
 
 ## Provisioning-tail hedge
 
@@ -20,11 +20,22 @@ is counted as paid run inventory, not as a spare refill. The stored create body
 can include configured setup text/labels, as pending spare refill state already
 does; it contains no authentication header.
 
+Concurrent callers in one worker for the same company, environment, run and
+creation operation share the entire in-flight acquisition, including its winner,
+preparation and cleanup. They cannot run separate readiness races or stop each
+other's returned box. Different creation operations remain independent; a settled
+success or failure is removed from the in-flight map so a later retry can proceed.
+This is worker-local coalescing, not cross-worker arbitration.
+
 The winner decision is persisted before handing off. Losers enter the existing
 durable `stop-owed` queue, with exact known IDs and acquisition ownership; only
 non-force stop is used, never delete. The winner ID is excluded from that debt.
 Missing list entries cannot erase known loser IDs. A refused stop remains owed
 and is retried by the existing maintenance service, including with spares OFF.
+A replacement's credentialed acquisition restores and arms maintenance for its
+surviving debt even without a spare setting or a currently visible loser. Retry
+uses the existing 15-minute backoff (observed on the 15-second maintenance tick),
+without requiring another acquisition or inspection; settlement makes it idle.
 An unanswered hedge POST retains identity-level debt through the shared
 30-minute creation-settle floor so a late box can be found and stopped. Core's
 abandoned-creation inspection reconstructs this debt if the worker died before

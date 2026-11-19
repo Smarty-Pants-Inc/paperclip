@@ -157,6 +157,10 @@ let shuttingDown = false;
 let boatRateLimitPauseUntil = 0;
 const preparedEnvDirectories = new Map<string, string>();
 const inFlightAcquisitions = new Set<Promise<PluginEnvironmentLease>>();
+// One worker, one acquisition decision per run/creation operation. Coalesce the
+// whole hook, not merely hedge intent writes: independent readiness races can
+// otherwise choose opposite winners and stop a box already handed to a caller.
+const acquisitionsByCreation = new Map<string, Promise<PluginEnvironmentLease>>();
 function subscribeCompanyActivity(companyId: string): void {
   if (!pluginContext?.events?.on || activitySubscriptionCompanies.has(companyId)) return;
   for (const eventType of SPARE_ACTIVITY_EVENTS) {
@@ -711,6 +715,9 @@ function trackOwedStopWork(work: Promise<void>): void {
 async function resumeOwedSpareStops(config: Config, companyId: string, environmentId: string, fromTick = false): Promise<void> {
   owedStopKeys.set(JSON.stringify([companyId, environmentId]), { config, companyId, environmentId });
   const record = await loadOwedSpareStops(companyId);
+  // Loading replacement debt is itself a pending maintenance obligation. An
+  // invisible late loser need not fail a stop (or create a pool) to arm retry.
+  if (heldStopDebt()) ensureSpareRefreshTimer();
   const now = Date.now();
   const hashes = new Set([...record.holds, ...record.owed].filter(entry => entry.environmentId === environmentId).map(entry => entry.configHash));
   for (const configHash of hashes) {
@@ -2956,6 +2963,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     runLeaseTtlCaps.clear();
     createExpiries.clear();
     provisionHedgeWrites.clear();
+    acquisitionsByCreation.clear();
     busySpareRefills.clear(); admittedSpareCreates.clear();
     pluginContext = ctx; duplexContext = ctx.duplexChannel; duplexLogger = ctx.logger;
     for (const unsubscribe of activityUnsubscribers) unsubscribe();
@@ -3138,6 +3146,10 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     }
   },
   onEnvironmentAcquireLease(params: PluginEnvironmentAcquireLeaseParams): Promise<PluginEnvironmentLease> {
+    const acquisitionKey = params.creationOperationId
+      ? JSON.stringify([params.companyId, params.environmentId, params.runId, params.creationOperationId]) : undefined;
+    const pending = acquisitionKey === undefined ? undefined : acquisitionsByCreation.get(acquisitionKey);
+    if (pending && !shuttingDown) return pending;
     const acquiredAt = Date.now();
     // review-fleet-4 C1: one line per acquisition, from this hook's every exit.
     const phases = acquirePhaseLine(params, acquiredAt);
@@ -3194,11 +3206,10 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       } catch { duplexLogger?.warn("Boat ready spare setting lookup failed", { companyId: params.companyId }); }
     }
     const spareOperations = hasSpareSetting ? createReadySpareOperations(c, spareKey, ttl, from) : undefined;
-    // rf-4 U1 F5 / U1B row D: a previous worker's hold and owed stops, on or off.
-    if (hasSpareSetting) {
-      try { await resumeOwedSpareStops(c, params.companyId, params.environmentId); }
-      catch { duplexLogger?.warn("Boat spare stop record resume failed", { companyId: params.companyId, environmentId: params.environmentId }); }
-    }
+    // A previous worker's hold and owed stops, even with no spare setting:
+    // acquisition hedge debt also needs this environment's credentials.
+    try { await resumeOwedSpareStops(c, params.companyId, params.environmentId); }
+    catch { duplexLogger?.warn("Boat spare stop record resume failed", { companyId: params.companyId, environmentId: params.environmentId }); }
     const policy = { baseDesired: baseSpares, spareMax, demandWindowMinutes };
     /** Queue spares from this acquire's setting read, unless 'off' or a newer setting landed since. */
     const queueSpares = (desired: number, operations: ReadySpareOperations) => {
@@ -3411,12 +3422,18 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     }
     return await createOrdinaryLease();
     };
-    const work = acquire().then(lease => { phases.emit(true); return lease; }, error => { phases.emit(false); throw error; });
+    // Publish the shared promise before entering any async state/provider work.
+    const work = Promise.resolve().then(acquire).then(lease => { phases.emit(true); return lease; }, error => { phases.emit(false); throw error; });
     const countedWork = work.then(lease => { startRunLeaseTtlRefresh(params, parse(params.config), lease, acquiredAt); return lease; }).finally(async () => {
       if (!outcomeRecorded) await recordOutcomeOnce("cold", "config_mismatch");
     });
     inFlightAcquisitions.add(countedWork);
-    return countedWork.finally(() => { inFlightAcquisitions.delete(countedWork); });
+    const result = countedWork.finally(() => {
+      inFlightAcquisitions.delete(countedWork);
+      if (acquisitionKey !== undefined && acquisitionsByCreation.get(acquisitionKey) === result) acquisitionsByCreation.delete(acquisitionKey);
+    });
+    if (acquisitionKey !== undefined) acquisitionsByCreation.set(acquisitionKey, result);
+    return result;
   },
   async onEnvironmentInspectLease(params: PluginEnvironmentInspectLeaseParams): Promise<PluginEnvironmentLeaseObservation> {
     const c = parse(params.config);
