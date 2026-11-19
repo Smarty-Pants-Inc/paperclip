@@ -2770,6 +2770,39 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           idempotencyKey: opts.idempotencyKey ?? null, error: SENT_WITH_OTHER_QUEUED_MESSAGES, finishedAt: now, updatedAt: now });
         return null;
       }
+      // FOLD (adopt-fold-refilter (1), 390 B''a 12:57:55): while the person's Interrupt
+      // carry still waits (any wait: remote_cleanup, handoff, ...), a NEW person
+      // message never starts its own run around it. Its ids join the carry in thread
+      // order; the carry keeps its place first and answers everything once.
+      const fresh = ids.filter(id => !carried.has(id));
+      if (issueRow && !sameKey && fresh.length) {
+        const taskId = issueId;
+        const folded = await db.transaction(async tx => {
+          const [carry] = await tx.select().from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.companyId, issueRow.companyId), eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"), sql`${agentWakeupRequests.runId} is null`,
+            sql`${agentWakeupRequests.payload}->>'issueId' = ${taskId}`,
+            sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null`,
+          )).orderBy(asc(agentWakeupRequests.requestedAt)).limit(1).for("update");
+          if (!carry) return null;
+          const union = [...new Set([...queuedCommentIdsFromWakePayload(carry.payload), ...fresh])];
+          const rows = await tx.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments)
+            .where(and(eq(issueComments.companyId, issueRow.companyId), eq(issueComments.issueId, taskId),
+              inArray(issueComments.id, union.filter(id => isUuidLike(id)))));
+          const at = new Map(rows.map(row => [row.id, +row.createdAt]));
+          const ordered = union.map((id, i) => ({ id, i, t: at.get(id) ?? Number.POSITIVE_INFINITY }))
+            .sort((a, b) => a.t - b.t || a.i - b.i).map(entry => entry.id);
+          const now = new Date();
+          await tx.update(agentWakeupRequests).set({ payload: withQueuedCommentIdsInWakePayload(parseObject(carry.payload), ordered),
+            updatedAt: now }).where(eq(agentWakeupRequests.id, carry.id));
+          await tx.insert(agentWakeupRequests).values({ companyId: issueRow.companyId, agentId, source, triggerDetail, reason,
+            payload: { ...payload, coalescedIntoWakeupRequestId: carry.id }, status: "coalesced",
+            requestedByActorType: opts.requestedByActorType, requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null, error: SENT_WITH_OTHER_QUEUED_MESSAGES, finishedAt: now, updatedAt: now });
+          return carry.id;
+        });
+        if (folded) return null;
+      }
     }
     let taskRetryActorId: string | null = null;
     delete enrichedContextSnapshot.boardMessageRetry;

@@ -600,5 +600,83 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
       .toEqual([["coalesced", "Sent with the chat's other queued messages"]]);
   });
 
+  // ---- adopt-fold-refilter rows (testing-lead B''a, T1-new 390: cut 6034d3ad, carry b4c1bd88 waiting in
+  // remote_cleanup; msg4 started b60db0eb at once, the carry 8bbe7c07 answered [1,2,3] again, msg5 c56e1a08) ----
 
+  /** The burst through the real routes: msg1 running; msg2 steered in (unread); msg3 sent with Interrupt;
+   * the cut run ends while the carry still waits; msg4 then msg5 (default Send) while nothing runs; the outbox runs. */
+  async function burst(chat: Chat) {
+    await attachSteerable(chat);
+    const m2 = (await postDefault(chat, "M2: also this").expect(201)).body;
+    expect(m2.steeredIntoRunId).toBe(chat.runId);
+    await runLog(chat, [
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
+      { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${m2.id}` },
+    ]);
+    mocks.cancel.mockImplementationOnce(async (runId: string) => {
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      await db.update(heartbeatRuns).set({ resultJson: { ...(run!.resultJson ?? {}), nativeCancellation: {
+        schema: "paperclip.native-cancellation.v1", runId, companyId: chat.companyId, issueId: chat.issue.id,
+        scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+        intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(),
+      } } }).where(eq(heartbeatRuns.id, runId));
+      return { decision: { stopped: true }, auditId: randomUUID() };
+    });
+    const m3 = (await postDefault(chat, "M3: stop, do this instead", { deliveryIntent: "interrupt" }).expect(201)).body;
+    const [cut] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    expect(cut!.status).toBe("cancelled");
+    await releaseRun(chat); // the cut run's end; the carry keeps waiting (remote_cleanup in the take)
+    const [waiting] = await carryWakes(chat);
+    expect(waiting?.status, "the carry still waits").toBe("deferred_issue_execution");
+    const m4 = (await postDefault(chat, "M4: one more thing").expect(201)).body;
+    const m5 = (await postDefault(chat, "M5: and this").expect(201)).body; // 0.4 s later in the take
+    const [issue] = await db.select().from(issues).where(eq(issues.id, chat.issue.id));
+    for (let i = 0; i < 2; i++) await deliverConversationComments(db, issue!, heartbeatService(db).wakeup);
+    await joinOwnedWork();
+    return { ids: [chat.first.id, m2.id, m3.id, m4.id, m5.id] as string[] };
+  }
+
+  it("F-a (B''a red): Interrupt, then two messages while the carry waits ⇒ ONE successor carrying 1-5 once, in order", async () => {
+    const chat = await seedChat();
+    const { ids } = await burst(chat);
+    const carries = await carryWakes(chat);
+    expect(carries, "ONE carry").toHaveLength(1);
+    const carry = carries[0]!;
+    const runsBefore = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId))).map(r => r.id);
+    if (process.env.FOLD_EVIDENCE) await writeFile(process.env.FOLD_EVIDENCE, JSON.stringify({ ids, carry: { id: carry.id,
+      status: carry.status, wakeCommentIds: wakeCommentIds(carry) }, runsBefore,
+      carriers: await carriersAfterCut(chat, ids, carry.id) }, null, 1) + "\n");
+    expect(runsBefore, "nothing started around the waiting carry (b60db0eb / c56e1a08)").toEqual([chat.runId]);
+    expect(carry.status).toBe("deferred_issue_execution");
+    expect(wakeCommentIds(carry), "the carry holds 1-5 once, in thread order").toEqual(ids);
+    const carriers = await carriersAfterCut(chat, ids, carry.id);
+    for (const id of ids) expect(carriers[id], `only the carry holds ${id}`).toEqual(["carry"]);
+    const successor = await admitSuccessor(chat, carry);
+    expect((successor.contextSnapshot as any).wakeCommentIds, "the ONE successor carries 1-5").toEqual(ids);
+    await successorAnswers(chat, successor);
+    await releaseRun(chat);
+    await advanceThreeMinutes(chat);
+    await joinOwnedWork();
+    const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId))).map(r => r.id);
+    expect(runs.sort(), "ONE successor, ONE reply; no second or third run").toEqual([chat.runId, successor.id].sort());
+    const replies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+      eq(issueComments.authorType, "agent")));
+    expect(replies, "ONE reply").toHaveLength(1);
+    for (const id of ids) expect(await answered(id), `${id} answered`).toBe(true);
+  });
+
+  it("F-control: no carry pending ⇒ a plain message wakes the agent as today", async () => {
+    const chat = await seedChat();
+    await finishTurn(chat);
+    const plain = (await postDefault(chat, "A plain follow-up").expect(201)).body;
+    const [issue] = await db.select().from(issues).where(eq(issues.id, chat.issue.id));
+    await deliverConversationComments(db, issue!, heartbeatService(db).wakeup);
+    const own = await commentWakes(chat, plain.id);
+    expect(own.map(w => w.status), "its own wake is not folded").not.toContain("coalesced");
+    const { wakes, runs } = await carriersOf(chat, plain.id);
+    const started = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId)))
+      .filter(r => r.id !== chat.runId && [...((r.contextSnapshot as any)?.wakeCommentIds ?? []),
+        (r.contextSnapshot as any)?.wakeCommentId].includes(plain.id));
+    expect(wakes.length + runs.length + started.length, "the plain message is carried by its own wake/run").toBeGreaterThan(0);
+  });
 });

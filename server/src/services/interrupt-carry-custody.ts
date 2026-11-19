@@ -1,6 +1,7 @@
 import { and, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, type Db } from "@paperclipai/db";
 import { answeredPersonMessageIds } from "./person-message-answer.js";
+import { SENT_WITH_OTHER_QUEUED_MESSAGES_REASON } from "../modules/wake-queue/domain/policy.js";
 
 /**
  * ONE successor per Interrupt (adopt-one-successor, 390 take 11:16-11:20Z).
@@ -28,7 +29,7 @@ export function commentCarriedSql(companyId: string, issueId: string, id: SQL): 
 }
 
 /** The coalesce reason the queue already uses for messages another wake sends. */
-export const SENT_WITH_OTHER_QUEUED_MESSAGES = "Sent with the chat's other queued messages";
+export const SENT_WITH_OTHER_QUEUED_MESSAGES = SENT_WITH_OTHER_QUEUED_MESSAGES_REASON;
 
 /**
  * Dispatch re-filter: of `commentIds`, the ones a new person-comment wake must
@@ -38,7 +39,12 @@ export const SENT_WITH_OTHER_QUEUED_MESSAGES = "Sent with the chat's other queue
  */
 export async function commentIdsCarriedElsewhere(
   db: Pick<Db, "select">,
-  input: { companyId: string; issueId: string; commentIds: string[]; idempotencyKey?: string | null },
+  input: { companyId: string; issueId: string; commentIds: string[]; idempotencyKey?: string | null;
+    /** adopt-fold-refilter (2): the same predicate read when a SAVED wake is promoted
+     *  or claimed. Only the canonical answer, a live/pending run, and (for a wake that
+     *  is not itself the carry) a pending Interrupt carry take an id away from it;
+     *  another plain saved wake never does (no two wakes dropping each other). */
+    promotion?: { wakeId: string; carry: boolean; excludeRunId?: string | null } },
 ): Promise<Set<string>> {
   const ids = [...new Set(input.commentIds.filter(id => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)))];
   if (!ids.length) return new Set();
@@ -46,12 +52,16 @@ export async function commentIdsCarriedElsewhere(
   const issueRun = sql`(${heartbeatRuns.nativeIssueId} = ${input.issueId}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId})`;
   const runs = await db.select({ status: heartbeatRuns.status, contextSnapshot: heartbeatRuns.contextSnapshot,
     resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), issueRun,
-    sql`(${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')
+    input.promotion?.excludeRunId ? sql`${heartbeatRuns.id} <> ${input.promotion.excludeRunId}::uuid` : undefined,
+    input.promotion ? sql`${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')`
+      : sql`(${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')
       or ${heartbeatRuns.resultJson} ? 'interruptCarriedSteeredCommentIds')`));
-  const wakes = await db.select({ payload: agentWakeupRequests.payload, idempotencyKey: agentWakeupRequests.idempotencyKey })
+  const wakes = input.promotion?.carry ? [] : await db.select({ payload: agentWakeupRequests.payload, idempotencyKey: agentWakeupRequests.idempotencyKey })
     .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, input.companyId),
       inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued"]), sql`${agentWakeupRequests.runId} is null`,
-      sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`));
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`,
+      input.promotion ? sql`${agentWakeupRequests.id} <> ${input.promotion.wakeId}::uuid
+        and ${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null` : undefined));
   const strings = (value: unknown) => Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
   const held = new Set<string>([
     ...runs.flatMap(({ status, contextSnapshot, resultJson }) => {
@@ -60,7 +70,7 @@ export async function commentIdsCarriedElsewhere(
         ...(["queued", "running", "scheduled_retry"].includes(status)
           ? [...strings(context.wakeCommentIds), ...strings([context.wakeCommentId, context.commentId])] : [])];
     }),
-    ...wakes.filter(wake => !input.idempotencyKey || wake.idempotencyKey !== input.idempotencyKey).flatMap(({ payload }) =>
+    ...wakes.filter(wake => input.promotion || !input.idempotencyKey || wake.idempotencyKey !== input.idempotencyKey).flatMap(({ payload }) =>
       strings(((payload ?? {}) as Record<string, any>)._paperclipWakeContext?.wakeCommentIds)),
   ]);
   for (const id of ids) if (held.has(id)) out.add(id);

@@ -127,8 +127,12 @@ export interface WakeQueueTransaction {
     queuedCommentIds: string[];
     /** A resolved card still needs its live message edge for chat authorization. */
     retainDeliveredCommentBindings?: boolean;
+    /** adopt-fold-refilter (2): the promoted wake, re-filtered by the ONE carried-elsewhere predicate. */
+    wake?: { id: string; carry: boolean };
   }): Promise<{
     liveNonSelfCommentIds: string[];
+    /** Ids dropped because they are answered or another live run / the pending carry holds them. */
+    carriedElsewhereCommentIds?: string[];
     containedSelfAuthoredComment: boolean;
     /** Live comment ids a succeeded run of the wake's agent already received in its prompt. */
     deliveredCommentIds?: string[];
@@ -140,6 +144,8 @@ export interface WakeQueueTransaction {
     agentId: string;
     reason: string;
     now: Date;
+    /** Completes the wake as coalesced (its messages are sent elsewhere) instead of cancelled. */
+    coalesced?: boolean;
   }): Promise<boolean>;
   normalizeDeferredWakeCommentIds(input: {
     companyId: string;

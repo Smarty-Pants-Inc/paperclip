@@ -15,6 +15,8 @@
 
 /** The error a saved wake records when a completed run already received all of its messages. */
 export const QUEUED_MESSAGES_DELIVERED_REASON = "Queued messages were already delivered to a completed run";
+/** A saved wake whose every message another wake or run already carries (adopt-fold-refilter). */
+export const SENT_WITH_OTHER_QUEUED_MESSAGES_REASON = "Sent with the chat's other queued messages";
 
 export type WakeAdmissionFacts = {
   /** True when the active execution run's agent and this wake's own agent share an execution-agent-name key. */

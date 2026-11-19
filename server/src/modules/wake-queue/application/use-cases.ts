@@ -1,6 +1,6 @@
 import { readWakeChatConversationId } from "../../run-dispatch/index.js";
 import { enrichPromotedWakeContext, wakeMustNotJoinActiveRun, withMergedWakeReasons } from "../domain/context.js";
-import { QUEUED_MESSAGES_DELIVERED_REASON } from "../domain/policy.js";
+import { QUEUED_MESSAGES_DELIVERED_REASON, SENT_WITH_OTHER_QUEUED_MESSAGES_REASON } from "../domain/policy.js";
 import {
   decideQueuedCommentAction,
   decideReleaseRecovery,
@@ -229,7 +229,8 @@ async function runReleaseDrain(
       continue;
     }
 
-    let liveness: { liveNonSelfCommentIds: string[]; containedSelfAuthoredComment: boolean; deliveredCommentIds?: string[] } =
+    let liveness: { liveNonSelfCommentIds: string[]; containedSelfAuthoredComment: boolean; deliveredCommentIds?: string[];
+      carriedElsewhereCommentIds?: string[] } =
       { liveNonSelfCommentIds: candidate.queuedCommentIds, containedSelfAuthoredComment: false };
     // The message is an authorization edge for this independent response,
     // even when an earlier turn already received the message itself.
@@ -249,6 +250,7 @@ async function runReleaseDrain(
         finishingRunAgentId: run.agentId,
         queuedCommentIds: candidate.queuedCommentIds,
         ...(retainDeliveredCommentBindings ? { retainDeliveredCommentBindings: true } : {}),
+        wake: { id: candidate.id, carry: candidate.payload.queuedCommentInterrupt != null },
       });
     }
     // Retained messages a run already received only authorize the response.
@@ -286,8 +288,12 @@ async function runReleaseDrain(
           ? "Deferred wake contained only comments authored by the finishing run"
           : liveness.deliveredCommentIds?.length
             ? QUEUED_MESSAGES_DELIVERED_REASON
-            : "Queued messages were discarded before promotion",
+            : liveness.carriedElsewhereCommentIds?.length
+              ? SENT_WITH_OTHER_QUEUED_MESSAGES_REASON
+              : "Queued messages were discarded before promotion",
         now: input.now,
+        ...(!commentAction.selfAuthored && !liveness.deliveredCommentIds?.length && liveness.carriedElsewhereCommentIds?.length
+          ? { coalesced: true } : {}),
       });
       continue;
     }

@@ -18,6 +18,7 @@ import { currentConversationCommentCondition, isConversationReset } from "../../
 import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
 import { nativeManualAdmissionHoldsExecution } from "../../../services/native-runtime/native-runner-ownership.js";
 import { readSteeredMessageAnswers } from "../../../services/native-runtime/steered-message-answers.js";
+import { commentIdsCarriedElsewhere } from "../../../services/interrupt-carry-custody.js";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
 import { steeringIngestionPending, waitForSteeringIngestion } from "../../../services/native-runtime/steering-ingestion.js";
@@ -406,7 +407,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       }
     },
 
-    async getQueuedCommentLiveness({ companyId, issueId, wakeAgentId, finishingRunId, finishingRunAgentId, queuedCommentIds, retainDeliveredCommentBindings }) {
+    async getQueuedCommentLiveness({ companyId, issueId, wakeAgentId, finishingRunId, finishingRunAgentId, queuedCommentIds, retainDeliveredCommentBindings, wake }) {
       // Malformed ids (for example an 8-char short form written into a wake
       // payload) can never match a comment row, but Postgres rejects the whole
       // `inArray` statement on the first invalid uuid and blocks every queued
@@ -428,21 +429,30 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       // received would deliver them twice and can reopen finished work.
       const delivered = await deliveredQueuedCommentIds(tx, { companyId, issueId, agentId: wakeAgentId,
         commentIds: liveAndUnauthored });
-      const liveNonSelfCommentIds = retainDeliveredCommentBindings
+      const undelivered = retainDeliveredCommentBindings
         ? liveAndUnauthored
         : liveAndUnauthored.filter(commentId => !delivered.has(commentId));
+      // adopt-fold-refilter (2): a saved wake, when promoted, drops what the ONE
+      // carried-elsewhere predicate (enqueueWakeup's own filter) says is answered or
+      // held by a live run / the pending Interrupt carry. Nothing left: coalesced.
+      const carried = wake && !retainDeliveredCommentBindings && undelivered.length
+        ? await commentIdsCarriedElsewhere(tx, { companyId, issueId, commentIds: undelivered,
+          promotion: { wakeId: wake.id, carry: wake.carry, excludeRunId: finishingRunId } })
+        : new Set<string>();
+      const liveNonSelfCommentIds = undelivered.filter(commentId => !carried.has(commentId));
       const containedSelfAuthoredComment = rows.some(
         (row) => targetsFinishingRunAgent && !row.deletedAt && row.createdByRunId === finishingRunId,
       );
-      return { liveNonSelfCommentIds, containedSelfAuthoredComment, deliveredCommentIds: [...delivered] };
+      return { liveNonSelfCommentIds, containedSelfAuthoredComment, deliveredCommentIds: [...delivered],
+        carriedElsewhereCommentIds: undelivered.filter(commentId => carried.has(commentId)) };
     },
 
-    async cancelDeferredWake({ companyId, wakeId, agentId, reason, now }) {
+    async cancelDeferredWake({ companyId, wakeId, agentId, reason, now, coalesced }) {
       await notifyStrandedAgentStatus(tx, { companyId, agentId });
       await notifyChatInboundWakeNotices(tx, { companyId });
       const rows = await tx
         .update(agentWakeupRequests)
-        .set({ status: "cancelled", finishedAt: now, error: reason, updatedAt: now })
+        .set({ status: coalesced ? "coalesced" : "cancelled", finishedAt: now, error: reason, updatedAt: now })
         .where(
           and(
             eq(agentWakeupRequests.id, wakeId),
