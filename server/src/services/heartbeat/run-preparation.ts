@@ -2352,45 +2352,79 @@ export async function readHeartbeatWakeComments(db: Db, companyId: string, issue
 
 const MAX_INTERRUPTED_TURN_TOOLS = 32;
 const MAX_INTERRUPTED_TURN_TOOL_OUTPUT_CHARS = 600;
+const MAX_INTERRUPTED_TURN_CHAIN_RUNS = 16;
 
-/** The immediate predecessor run on this task, when the person's Interrupt cut it, and the tool
- * calls its cut turn completed (durable receipts, in order). A STOP, a failure or any other end: none. */
-export async function readInterruptCutCompletedTools(db: Db, input: { companyId: string; issueId: string; currentRunId: string }) {
+export type InterruptedTurnToolCall = {
+  name: string;
+  target: string | null;
+  /** completed: done. failed: ran and failed. interrupted: cut mid-flight; it may or may not have taken effect. */
+  status: "completed" | "failed" | "interrupted";
+  output: string;
+  outputTruncated: boolean;
+};
+
+function interruptCut(run: { status: string; resultJson: unknown }) {
+  const result = parseObject(run.resultJson);
+  return run.status === "cancelled" && result.operatorInterrupted === true &&
+    result.interruptionSource === "issue_comment_interrupt";
+}
+
+/** adopt-receipts2: the person's Interrupt chain that ends at this run. Walking back from the immediate
+ * predecessor on this task, every run the person's Interrupt cut belongs to the chain; the first run that
+ * ended any other way (an agent reply, a STOP, a failure) ends it. Each chained run's tool calls are read
+ * from their durable receipts, oldest run first, in order, once each: completed calls are done, failed calls
+ * failed, and a call cut mid-flight (started with no completed receipt, or completed as interrupted /
+ * cancelled / aborted) is interrupted. A STOP or any other end right before this run: none. */
+export async function readInterruptCutToolCalls(db: Db, input: { companyId: string; issueId: string; currentRunId: string }) {
   const [current] = await db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.currentRunId)));
   if (!current) return [];
-  const [previous] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
+  const previous = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
     resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId),
     sql`(${heartbeatRuns.nativeIssueId} = ${input.issueId}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId})`,
     sql`${heartbeatRuns.id} <> ${input.currentRunId}`,
     sql`${heartbeatRuns.createdAt} <= ${current.createdAt.toISOString()}::timestamptz`,
-  )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-  const result = parseObject(previous?.resultJson);
-  if (!previous || previous.status !== "cancelled" || result.operatorInterrupted !== true ||
-      result.interruptionSource !== "issue_comment_interrupt") return [];
-  const events = await db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
-    eq(heartbeatRunEvents.companyId, input.companyId), eq(heartbeatRunEvents.runId, previous.id),
-    eq(heartbeatRunEvents.eventType, "tool.execution.completed"),
-  )).orderBy(asc(heartbeatRunEvents.seq)).limit(MAX_INTERRUPTED_TURN_TOOLS * 4);
-  const seen = new Set<string>();
-  const tools: Array<{ name: string; status: "completed"; output: string; outputTruncated: boolean }> = [];
-  for (const event of events) {
-    const stored = parseObject(event.payload);
-    const prp = parseObject(stored.prpEvent);
-    const tool = Object.keys(parseObject(prp.payload)).length ? parseObject(prp.payload) : stored;
-    if (tool.schema !== "paperclip.tool.execution.v1" || tool.status !== "completed") continue;
-    const id = readNonEmptyString(tool.executionId);
-    if (id && seen.has(id)) continue;
-    if (id) seen.add(id);
-    const name = readNonEmptyString(tool.name) ?? "tool";
-    const output = typeof tool.output === "string" ? tool.output : "";
-    tools.push({ name: name.slice(0, 300), status: "completed",
-      output: output.slice(0, MAX_INTERRUPTED_TURN_TOOL_OUTPUT_CHARS),
-      outputTruncated: output.length > MAX_INTERRUPTED_TURN_TOOL_OUTPUT_CHARS || tool.outputTruncated === true });
-    if (tools.length >= MAX_INTERRUPTED_TURN_TOOLS) break;
+  )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(MAX_INTERRUPTED_TURN_CHAIN_RUNS + 1);
+  const chain: string[] = [];
+  for (const run of previous) {
+    if (!interruptCut(run) || chain.length >= MAX_INTERRUPTED_TURN_CHAIN_RUNS) break;
+    chain.unshift(run.id);
   }
-  return tools;
+  if (chain.length === 0) return [];
+  const events = await db.select({ runId: heartbeatRunEvents.runId, eventType: heartbeatRunEvents.eventType,
+    payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.companyId, input.companyId), inArray(heartbeatRunEvents.runId, chain),
+    inArray(heartbeatRunEvents.eventType, ["tool.execution.started", "tool.execution.completed"]),
+  )).orderBy(asc(heartbeatRunEvents.seq)).limit(MAX_INTERRUPTED_TURN_TOOLS * 8);
+  const calls = new Map<string, InterruptedTurnToolCall>();
+  for (const runId of chain) {
+    for (const event of events) {
+      if (event.runId !== runId) continue;
+      const stored = parseObject(event.payload);
+      const prp = parseObject(stored.prpEvent);
+      const tool = Object.keys(parseObject(prp.payload)).length ? parseObject(prp.payload) : stored;
+      if (tool.schema !== "paperclip.tool.execution.v1") continue;
+      const key = `${runId}:${readNonEmptyString(tool.executionId) ?? readNonEmptyString(prp.itemId) ?? calls.size}`;
+      const known = calls.get(key);
+      if (known && known.status !== "interrupted") continue;
+      const completed = event.eventType === "tool.execution.completed";
+      const reported = typeof tool.status === "string" ? tool.status.toLowerCase() : "";
+      const status: InterruptedTurnToolCall["status"] = !completed ? "interrupted"
+        : reported === "completed" || reported === "success" ? "completed"
+          : reported === "failed" || reported === "error" ? "failed" : "interrupted";
+      if (!known && calls.size >= MAX_INTERRUPTED_TURN_TOOLS) continue;
+      const output = typeof tool.output === "string" ? tool.output : known?.output ?? "";
+      calls.set(key, {
+        name: (readNonEmptyString(tool.name) ?? known?.name ?? "tool").slice(0, 300),
+        target: (readNonEmptyString(tool.target) ?? known?.target ?? null)?.slice(0, 300) ?? null,
+        status,
+        output: output.slice(0, MAX_INTERRUPTED_TURN_TOOL_OUTPUT_CHARS),
+        outputTruncated: output.length > MAX_INTERRUPTED_TURN_TOOL_OUTPUT_CHARS || tool.outputTruncated === true,
+      });
+    }
+  }
+  return [...calls.values()];
 }
 
 export async function buildPaperclipWakePayload(input: {
@@ -2492,11 +2526,12 @@ export async function buildPaperclipWakePayload(input: {
       .flatMap(({ result }) => { const ids = parseObject(result).interruptCarriedReadSteeredCommentIds;
         return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : []; }))
     : new Set<string>();
-  // adopt-redo-fresh: the tool calls the Interrupt-cut turn already COMPLETED, from its own durable
-  // tool.execution.completed receipts. The renderer injects them only into a fresh session (new box),
-  // which never saw them; a resumed session already holds them. Never invented: receipts only.
-  const interruptedTurnCompletedTools = issueId && input.runId
-    ? await readInterruptCutCompletedTools(input.db, { companyId: input.companyId, issueId, currentRunId: input.runId })
+  // adopt-receipts2: every tool call of the person's Interrupt chain (each cut turn since the last run that
+  // ended another way), from their own durable tool.execution receipts: done, failed, or cut mid-flight. The
+  // renderer injects them only into a fresh session (new box), which never saw them; a resumed session
+  // already holds them. Never invented: receipts only.
+  const interruptedTurnToolCalls = issueId && input.runId
+    ? await readInterruptCutToolCalls(input.db, { companyId: input.companyId, issueId, currentRunId: input.runId })
     : [];
   const issueDescription = conversationMode ? null : issueSummary?.description ?? null;
   const issueDescriptionTruncated =
@@ -2981,7 +3016,7 @@ export async function buildPaperclipWakePayload(input: {
           updatedAt: safeContinuationSummary.updatedAt.toISOString(),
         }
       : null,
-    ...(interruptedTurnCompletedTools.length ? { interruptedTurnCompletedTools } : {}),
+    ...(interruptedTurnToolCalls.length ? { interruptedTurnToolCalls } : {}),
     commentIds,
     latestCommentId: commentIds[commentIds.length - 1] ?? null,
     comments,

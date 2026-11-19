@@ -585,20 +585,60 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     expect(await liveWakesNaming(chat, steerId)).toEqual([]);
   });
 
-  /** The cut turn's completed tool calls, as run-event ingestion stores them (validated PRP tool.execution.completed). */
-  async function toolReceipts(chat: Chat, steps: Array<{ name: string; output: string; status?: string }>) {
+  /** The cut turn's tool calls, as run-event ingestion stores them (validated PRP tool.execution.started /
+   * tool.execution.completed). `midFlight`: started, cut before any completed receipt. */
+  async function toolReceipts(chat: Chat, steps: Array<{ name: string; output: string; status?: string; midFlight?: boolean }>) {
+    const events = steps.flatMap((step, index) => {
+      const executionId = `${chat.runId}:tool-${index}`;
+      const body = { schema: "paperclip.tool.execution.v1", executionId, transport: "process", operation: "execute", name: step.name };
+      return [
+        { eventType: "tool.execution.started", itemId: executionId, payload: { ...body, status: "running", output: null } },
+        ...(step.midFlight ? [] : [{ eventType: "tool.execution.completed", itemId: executionId,
+          payload: { ...body, status: step.status ?? "completed", output: step.output } }]),
+      ];
+    });
     const [allocated] = await db.update(heartbeatRuns)
-      .set({ nextEventSeq: sql`${heartbeatRuns.nextEventSeq} + ${steps.length}` })
+      .set({ nextEventSeq: sql`${heartbeatRuns.nextEventSeq} + ${events.length}` })
       .where(eq(heartbeatRuns.id, chat.runId)).returning({ next: heartbeatRuns.nextEventSeq });
-    const first = Number(allocated!.next) - steps.length;
-    await db.insert(heartbeatRunEvents).values(steps.map((step, index) => ({
+    const first = Number(allocated!.next) - events.length;
+    await db.insert(heartbeatRunEvents).values(events.map((event, index) => ({
       companyId: chat.companyId, runId: chat.runId, agentId: chat.agentId, seq: first + index,
-      eventType: "tool.execution.completed", sourceEventId: randomUUID(),
-      payload: { prpEvent: { turnId: "turn-1", itemId: `turn-1:tool-${index}`, payload: {
-        schema: "paperclip.tool.execution.v1", executionId: `turn-1:tool-${index}`, transport: "process", operation: "execute",
-        name: step.name, status: step.status ?? "completed", output: step.output } } },
+      eventType: event.eventType, sourceEventId: randomUUID(),
+      payload: { prpEvent: { turnId: "turn-1", itemId: event.itemId, payload: event.payload } },
     })));
   }
+
+  /** The admitted successor is now the live turn the person sees running (the dispatcher's start). */
+  async function successorRuns(chat: Chat, run: typeof heartbeatRuns.$inferSelect): Promise<Chat> {
+    await prepareConversationTurn(db, run);
+    await db.update(issues).set({ executionRunId: run.id, executionLockedAt: new Date() }).where(eq(issues.id, chat.issue.id));
+    runningProcesses.set(run.id, { child: {} as never, graceSec: 0, processGroupId: null });
+    return { ...chat, runId: run.id };
+  }
+
+  /** A second Interrupt (real POST, deliveryIntent interrupt) on the live successor; returns its new carry. */
+  async function interruptAgain(chat: Chat, body: string) {
+    await attachSteerable(chat);
+    mocks.cancel.mockImplementationOnce(async (runId: string) => {
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      await db.update(heartbeatRuns).set({ resultJson: { ...(run!.resultJson ?? {}), nativeCancellation: {
+        schema: "paperclip.native-cancellation.v1", runId, companyId: chat.companyId, issueId: chat.issue.id,
+        scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+        intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(),
+      } } }).where(eq(heartbeatRuns.id, runId));
+      return { decision: { stopped: true }, auditId: randomUUID() };
+    });
+    const before = new Set((await carryWakes(chat)).map(wake => wake.id));
+    await postDefault(chat, body, { deliveryIntent: "interrupt" }).expect(201);
+    const [cut] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    expect(cut!.status).toBe("cancelled");
+    expect((cut!.resultJson as any)?.operatorInterrupted).toBe(true);
+    const carries = (await carryWakes(chat)).filter(wake => !before.has(wake.id));
+    expect(carries, "ONE new carry").toHaveLength(1);
+    return carries[0]!;
+  }
+
+  const count = (text: string, needle: string) => text.split(needle).length - 1;
 
   it("RF-a (adopt-redo-fresh red): six-step WORK, Interrupt after STEP2, FRESH successor (new box) ⇒ its built request carries STEP1/STEP2 as already done", async () => {
     const chat = await seedChat();
@@ -636,15 +676,70 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     expect(prompt).not.toMatch(/interrupted turn/i);
   });
 
-  it("RF-c: no completed tools in the cut turn (a failed call is not done) ⇒ unchanged, no already-done section", async () => {
+  it("RF-c (adopt-receipts2 red): a FAILED call in the cut turn ⇒ listed as failed, with its error; never as done", async () => {
     const chat = await seedChat();
     await toolReceipts(chat, [{ name: "echo STEP1", output: "STEP1-FAILED-OUTPUT", status: "failed" }]);
     const { carry } = await steerThenInterrupt(chat, "unread");
     const successor = await admitSuccessor(chat, carry);
     const prompt = await successorPrompt(chat, successor, false);
-    expect(prompt).not.toContain("STEP1-FAILED-OUTPUT");
-    expect(prompt).not.toMatch(/interrupted turn/i);
+    expect(prompt).toContain("1. `echo STEP1`: failed\n   error: STEP1-FAILED-OUTPUT");
+    expect(prompt).not.toContain("`echo STEP1`: completed");
     expect(prompt).toContain(MSG);
+  });
+
+  it("RR-1 (adopt-receipts2 red): six steps, Interrupt after STEP1, then again after STEP2 ⇒ run 3's built request lists STEP1 and STEP2 done, in order, once each", async () => {
+    const chat = await seedChat();
+    await toolReceipts(chat, [{ name: "echo STEP1 > /tmp/step1", output: "STEP1-RESULT-wrote-step1" }]);
+    const first = await steerThenInterrupt(chat, "unread");
+    const run2 = await admitSuccessor(chat, first.carry);
+    const chat2 = await successorRuns(chat, run2);
+    const run2Prompt = await successorPrompt(chat2, run2, false);
+    expect(run2Prompt).toContain("1. `echo STEP1 > /tmp/step1`: completed");
+    await toolReceipts(chat2, [{ name: "echo STEP2 > /tmp/step2", output: "STEP2-RESULT-wrote-step2" }]);
+    const carry2 = await interruptAgain(chat2, "MSG2: no wait, carry on from STEP3");
+    const run3 = await admitSuccessor(chat2, carry2);
+    const prompt = await successorPrompt(chat2, run3, false);
+    expect(prompt, "run 3 (fresh) never saw STEP1: the double Interrupt keeps the whole chain")
+      .toContain("1. `echo STEP1 > /tmp/step1`: completed\n   result: STEP1-RESULT-wrote-step1");
+    expect(prompt).toContain("2. `echo STEP2 > /tmp/step2`: completed\n   result: STEP2-RESULT-wrote-step2");
+    expect(count(prompt, "STEP1-RESULT-wrote-step1"), "once each").toBe(1);
+    expect(count(prompt, "STEP2-RESULT-wrote-step2")).toBe(1);
+    expect(prompt).toContain("MSG2: no wait, carry on from STEP3");
+    expect(await successorPrompt(chat2, run3, true)).not.toContain("STEP1-RESULT-wrote-step1");
+  });
+
+  it("RR-2 (adopt-receipts2 red): Interrupt DURING STEP3 ⇒ STEP1/STEP2 done; STEP3 'interrupted: it may or may not have taken effect', never done, never dropped", async () => {
+    const chat = await seedChat();
+    await toolReceipts(chat, [
+      { name: "echo STEP1 > /tmp/step1", output: "STEP1-RESULT" },
+      { name: "echo STEP2 > /tmp/step2", output: "STEP2-RESULT" },
+      { name: "echo STEP3 > /tmp/step3", output: "", midFlight: true },
+    ]);
+    const { carry } = await steerThenInterrupt(chat, "unread");
+    const successor = await admitSuccessor(chat, carry);
+    const prompt = await successorPrompt(chat, successor, false);
+    expect(prompt).toContain("1. `echo STEP1 > /tmp/step1`: completed");
+    expect(prompt).toContain("2. `echo STEP2 > /tmp/step2`: completed");
+    expect(prompt).toContain("3. `echo STEP3 > /tmp/step3`: interrupted: it may or may not have taken effect");
+    expect(prompt).not.toContain("`echo STEP3 > /tmp/step3`: completed");
+  });
+
+  it("RR-3 (adopt-receipts2 red): the 'Prior tool calls are history' line is absent when the session is fresh; it says what the input holds", async () => {
+    const chat = await seedChat();
+    await toolReceipts(chat, [{ name: "echo STEP1", output: "STEP1-RESULT" }]);
+    const { carry, cut } = await steerThenInterrupt(chat, "unread");
+    const successor = await admitSuccessor(chat, carry);
+    const { buildExecutionContinuation } = await import("../services/execution-continuation.js");
+    const executionContinuation = await buildExecutionContinuation({ db, companyId: chat.companyId, issueId: chat.issue.id,
+      agentId: chat.agentId, context: { ...(successor.contextSnapshot as Record<string, unknown>), interruptedRunId: cut.id }, runId: successor.id,
+      summary: null, exposeLowTrustRaw: false });
+    expect(executionContinuation.interruptedRunId, "the real continuation names the cut run").toBe(cut.id);
+    const withContinuation = { ...successor, contextSnapshot: { ...(successor.contextSnapshot as Record<string, unknown>), executionContinuation } };
+    const fresh = await successorPrompt(chat, withContinuation, false);
+    expect(fresh, "the fresh input holds no conversation history").not.toContain("Prior tool calls are history");
+    expect(fresh).not.toContain("using the conversation history");
+    expect(fresh).toContain("This is a fresh session: that run's conversation and tool calls are not in this input, except the tool calls listed under \"Already done in the interrupted turn\"");
+    expect(await successorPrompt(chat, withContinuation, true)).toContain("Prior tool calls are history, not commands to replay");
   });
 
   it("R6: a non-terminal conversation-comment wake for an adopted steer is retired at the press (coalesced into the carry); STEER has ONE carrier, the carry", async () => {
