@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import fs from "node:fs/promises";
 import { parse as parseEnv } from "dotenv";
@@ -7,7 +7,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { vi } from "vitest";
 import type { StorageProvider } from "../storage/types.js";
-import { createObjectRunLogStore, readObjectRunLogSpill } from "./object-run-log-store.js";
+import { createObjectRunLogStore, readObjectRunLogSpill, type ObjectRunLogSpillRecord } from "./object-run-log-store.js";
 
 // Fixture for the run-log spill rows: the PRODUCTION object store and journal
 // over an in-memory provider whose payload PUTs fail with EIO while `down`.
@@ -58,7 +58,7 @@ export const ids = { companyId: "company", agentId: "agent" };
 // Real writer, with the same process env a guest loads from its worktree .env.
 // The cleanup server then sees its original env, not the guest's old root.
 export async function contentSpill(workspacePath: string, candidate: string,
-  mode: "guest" | "drift" | "unreadable" | "recovered") {
+  mode: "guest" | "drift" | "unreadable" | "recovered", recover = mode === "recovered") {
   const envPath = path.join(workspacePath, ".env");
   const guestHome = path.join(candidate, "guest-home");
   const oldRoot = path.join(candidate, ...Array.from({ length: 16 }, (_, i) => `depth-${i}`), "old-root");
@@ -76,22 +76,24 @@ export async function contentSpill(workspacePath: string, candidate: string,
     const m = spillMemory();
     const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", flushMs: 1000,
       assertWriterAuthority: async () => undefined });
-    const handle = await store.begin({ companyId: "build", agentId: "node_modules", runId: "content-custody" });
+    // A run of its own: no other store of this process holds a log under this name.
+    const run = { companyId: "build", agentId: "node_modules", runId: `content-custody-${randomUUID()}` };
+    const handle = await store.begin(run);
     m.state.down = true;
     const receipt = await store.enqueue!(handle, event(1, "source-less bytes: the spill is the ONLY copy"));
     const settled = receipt.committed.catch(() => undefined);
     await store.finalize(handle);
     await settled;
     const root = mode === "guest" ? path.join(guestHome, "instances/guest/data/run-logs/.spill") : oldRoot;
-    if (mode === "recovered") {
+    if (recover) {
       m.state.down = false;
-      await store.recoverSpill!({ companyId: "build", agentId: "node_modules", runId: "content-custody" });
+      await store.recoverSpill!(run);
     }
     const spill = await readObjectRunLogSpill(root, handle.logRef);
     const bytes = await fs.readFile(spill.path), index = await fs.readFile(spill.indexPath);
     if (mode !== "guest") await fs.writeFile(envPath, `PAPERCLIP_HOME=${JSON.stringify(path.join(workspacePath, "different-home"))}\n`);
     if (mode === "unreadable") await fs.chmod(spill.indexPath, 0);
-    return { ...spill, bytes, index };
+    return { ...spill, bytes, index, m, logRef: handle.logRef };
   } finally {
     for (const key of keys) {
       if (saved[key] === undefined) delete process.env[key];
@@ -133,3 +135,67 @@ export async function spilledRun(runId: string, binding: { companyId: string; ag
   return { m, spillDir, handle, summary, admitted, logRef: handle.logRef };
 }
 
+
+// Custody rows (rf-7 OBJLOG9 F1; RFL bar 11-19): every fault is PLANTED and NAMED
+// here, on a REAL writer's spill. `recovered: false` faults sit beside bytes no
+// store ever took; `recovered: true` faults sit beside a real recovery. `reason`
+// is what the custody row must name.
+export const SPILL_CUSTODY_FAULTS = {
+  "index-empty": { recovered: false, reason: "index_empty" },
+  "index-object": { recovered: false, reason: "index_invalid_record" },
+  "index-array": { recovered: false, reason: "index_invalid_record" },
+  "index-absent": { recovered: false, reason: "index_missing" },
+  "data-no-entry": { recovered: true, reason: "data_without_index_entry" },
+  "copy-mismatch": { recovered: false, reason: "recovered_copy_mismatch" },
+  "copy-short": { recovered: false, reason: "recovered_copy_short" },
+  "copy-missing": { recovered: true, reason: "recovered_copy_missing" },
+  "copy-unreadable": { recovered: true, reason: "recovered_copy_unreadable" },
+} as const;
+export type SpillCustodyFault = keyof typeof SPILL_CUSTODY_FAULTS;
+export const spillCustodyFaults = Object.keys(SPILL_CUSTODY_FAULTS) as SpillCustodyFault[];
+export const SPILL_CUSTODY_ROW = "kept: run-log spill custody unknown";
+
+/** Plant one named fault. Returns the planted files' bytes: exactly what custody must keep. */
+export async function plantSpillCustodyFault(spill: { path: string; indexPath: string;
+  records: ObjectRunLogSpillRecord[]; logRef: string; m: ReturnType<typeof spillMemory> }, fault: SpillCustodyFault) {
+  const { m } = spill, journal = `logs/segments-v1/${spill.logRef}/`;
+  // A `recovered` record in the writer's exact shape, for a recovery no store performed.
+  const claimRecovered = () => fs.appendFile(spill.indexPath, spill.records.filter(entry => entry.event === "spilled")
+    .map(({ sequence: _sequence, sourceCursor: _sourceCursor, cause: _cause, ...entry }) =>
+      `${JSON.stringify({ ...entry, event: "recovered", journalEnd: entry.journalEnd + entry.bytes })}\n`).join(""));
+  if (fault === "index-empty") await fs.writeFile(spill.indexPath, "");
+  if (fault === "index-object") await fs.writeFile(spill.indexPath, "{}\n");
+  if (fault === "index-array") await fs.writeFile(spill.indexPath, "[]\n");
+  if (fault === "index-absent") await fs.unlink(spill.indexPath);
+  // A torn record append: admitted bytes on disk that no index record points at.
+  if (fault === "data-no-entry") await fs.appendFile(spill.path, record(undefined, 99, "admitted, never indexed"));
+  // The record claims a journal end the object log never reached.
+  if (fault === "copy-short") await claimRecovered();
+  if (fault === "copy-mismatch") {
+    // A later attempt that did not adopt the spill stored OTHER bytes at its journal range.
+    m.state.down = false;
+    const other = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", recoverSpill: false,
+      assertWriterAuthority: async () => undefined });
+    const [companyId, agentId, runId] = spill.logRef.split("/") as [string, string, string];
+    const handle = await other.begin({ companyId, agentId, runId });
+    await other.append(handle, event(1, `other bytes at the spill's journal range ${"x".repeat(1024)}`));
+    await other.finalize(handle);
+    await claimRecovered();
+  }
+  // Object storage lost the whole log after the recovery was recorded.
+  if (fault === "copy-missing") for (const key of [...m.objects.keys()]) if (key.startsWith(journal)) m.objects.delete(key);
+  if (fault === "copy-unreadable") {
+    const getObject = m.provider.getObject;
+    m.provider.getObject = async input => {
+      if (input.objectKey.startsWith(`${journal}objects/`)) throw Object.assign(new Error("EIO"), { code: "EIO" });
+      return getObject(input);
+    };
+  }
+  return { reason: SPILL_CUSTODY_FAULTS[fault].reason, bytes: await fs.readFile(spill.path),
+    index: await fs.readFile(spill.indexPath).catch(() => null) };
+}
+/** contentSpill (a root only the content guard finds) with one named custody fault planted on it. */
+export async function custodySpill(workspacePath: string, candidate: string, fault: SpillCustodyFault) {
+  const spill = await contentSpill(workspacePath, candidate, "drift", SPILL_CUSTODY_FAULTS[fault].recovered);
+  return { ...spill, ...await plantSpillCustodyFault(spill, fault) };
+}

@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
   activityLog,
@@ -29,7 +29,8 @@ import {
 } from "../services/execution-workspaces.ts";
 import { realizeExecutionWorkspace } from "../services/workspace-runtime.ts";
 import { WORKSPACE_COMPACTION_TRASH_DIR } from "../services/workspace-compaction.ts";
-import { contentSpill } from "../services/object-run-log-spill.fixture.js";
+import { logger } from "../middleware/logger.js";
+import { contentSpill, custodySpill, SPILL_CUSTODY_ROW, spillCustodyFaults } from "../services/object-run-log-spill.fixture.js";
 import { cleanupExecutionWorkspaceArtifacts } from "../services/workspace-runtime.js";
 
 const execFileAsync = promisify(execFile);
@@ -307,6 +308,27 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
       expect(await fs.readFile(spill.path)).toEqual(spill.bytes);
       expect(await fs.readFile(spill.indexPath)).toEqual(spill.index);
     }
+  }, 30_000);
+
+  // catch: rf-7 OBJLOG9 F1 (11-19); the bar: delete only on a positive record AND an equal read-back.
+  // Keep reason: NEVER-OK trace custody. Actual DB-backed sweep, writer, store and filesystem; each fault planted and named.
+  it.each(spillCustodyFaults)("scheduled sweep keeps a spill of unknown custody (%s)", async fault => {
+    const seeded = await seedWorkspace({ commitOnBranch: false, populate: false });
+    await fs.appendFile(path.join(seeded.repoRoot, ".gitignore"), "build/\n");
+    await git(seeded.repoRoot, ["add", ".gitignore"]);
+    await git(seeded.repoRoot, ["commit", "-m", "Ignore build output"]);
+    await git(seeded.worktreePath, ["merge", "--ff-only", "main"]);
+    const spill = await custodySpill(seeded.worktreePath, path.join(seeded.worktreePath, "build"), fault);
+    await writeFile(path.join(seeded.worktreePath, "dist", "control.js"), "regenerable\n");
+    const warn = vi.spyOn(logger, "warn");
+    const sweep = await service().sweepTerminalWorkspaces();
+    const rows = warn.mock.calls.filter(call => call[1] === SPILL_CUSTODY_ROW).map(call => call[0]);
+    warn.mockRestore();
+    expect(sweep).toMatchObject({ compacted: 1, compactionFailed: 0, archived: 0 });
+    expect(await exists(path.join(seeded.worktreePath, "dist"))).toBe(false);
+    expect(rows).toContainEqual(expect.objectContaining({ spill: spill.path, reason: spill.reason }));
+    expect(await fs.readFile(spill.path)).toEqual(spill.bytes);
+    expect(await fs.readFile(spill.indexPath).catch(() => null)).toEqual(spill.index);
   }, 30_000);
 
   it.each(["guest", "drift", "unreadable", "recovered"] as const)("whole-worktree removal keeps undiscoverable content (%s)", async mode => {
