@@ -221,4 +221,45 @@ describePostgres("automatic chat-completion turns on a person's chat", () => {
     expect(runs[0]!.contextSnapshot?.wakeCommentIds, `the person's message runs first: ${JSON.stringify(snapshot)}`).toEqual([held.commentId]);
     expect(wakes.find(w => w.id === automation.id)?.runId ?? null, JSON.stringify(snapshot)).not.toBe(runs[0]!.id);
   }, 180_000);
+
+  it("NEWER-FIRST: an answered old held entry plus the person's newer waiting message (held with execution_recovery) ⇒ the new one runs, the old entry is cancelled as delivered", async () => {
+    const f = await seedChat();
+    let release!: () => void;
+    gates.set(f.chatId, new Promise<void>(resolve => { release = resolve; }));
+    await heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
+      requestedByActorType: "user", requestedByActorId: f.userId,
+      payload: { issueId: f.chatId }, contextSnapshot: { issueId: f.chatId, taskId: f.chatId, wakeReason: "issue_commented" } });
+    const live = await (async () => { for (let i = 0; i < 400; i += 1) {
+      const [run] = (await chatRuns(f)).filter(r => r.status === "running");
+      if (run && dispatched.some(d => d.runId === run.id)) return run;
+      await new Promise(resolve => setTimeout(resolve, 25)); } throw new Error("no live turn"); })();
+    // Live 1433198e: an OLD message whose held entry stayed saved after a run carried and answered it.
+    const old = await holdPersonMessage(f);
+    await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, old.wakeId));
+    await db.update(issueComments).set({ createdAt: new Date(Date.now() - 60_000), updatedAt: new Date(Date.now() - 60_000) })
+      .where(eq(issueComments.id, old.commentId));
+    const [answeredBy] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+      invocationSource: "on_demand", startedAt: new Date(Date.now() - 50_000), finishedAt: new Date(Date.now() - 40_000),
+      contextSnapshot: { issueId: f.chatId, wakeCommentId: old.commentId, wakeCommentIds: [old.commentId], conversationSessionGeneration: 0 } }).returning();
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.chatId, authorAgentId: f.agentId, authorType: "agent",
+      createdByRunId: answeredBy.id, body: "answer to the old message" });
+    // Live 99678ffc: the person's NEWER message, held with execution_recovery.
+    const newer = await holdPersonMessage(f);
+    const [newerWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, newer.wakeId));
+    await db.update(agentWakeupRequests).set({ payload: { ...(newerWake.payload as Record<string, unknown>),
+      executionWait: { reason: "execution_recovery", message: "Recovering the last turn." } } }).where(eq(agentWakeupRequests.id, newer.wakeId));
+    gates.delete(f.chatId);
+    release();
+    await heartbeat.drainActiveRunExecutions();
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    const runs = (await chatRuns(f)).filter(run => run.id !== live.id && run.id !== answeredBy.id && run.createdAt >= live.createdAt)
+      .sort((a, b) => +a.createdAt - +b.createdAt);
+    const snapshot = { old, newer, wakes: wakes.map(w => ({ id: w.id, reason: w.reason, status: w.status, error: w.error, runId: w.runId })),
+      runs: runs.map(r => ({ id: r.id, status: r.status, ids: r.contextSnapshot?.wakeCommentIds })) };
+    expect(runs.length, JSON.stringify(snapshot)).toBeGreaterThan(0);
+    expect(runs[0]!.contextSnapshot?.wakeCommentIds, `the newer message runs: ${JSON.stringify(snapshot)}`).toEqual([newer.commentId]);
+    expect(runs.filter(r => ((r.contextSnapshot?.wakeCommentIds as string[] | undefined) ?? []).includes(old.commentId)),
+      `the old message is never re-delivered: ${JSON.stringify(snapshot)}`).toEqual([]);
+    expect(wakes.find(w => w.id === old.wakeId), JSON.stringify(snapshot)).toMatchObject({ status: "cancelled" });
+  }, 180_000);
 });
