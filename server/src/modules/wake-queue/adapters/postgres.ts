@@ -1209,15 +1209,19 @@ async function gatherPersonStoppedChatMessages(tx: Db, run: ReleaseRun, issue: I
   // another person's held input stays where it is and never rides this Send.
   const stoppedBy = parseObject(run.resultJson).cancelledByUserId;
   const stopUserId = typeof stoppedBy === "string" ? stoppedBy : null;
+  // compose-C: the same-person filter is the Stop's. Steering's run-end restore
+  // (restoreUnansweredSteersAtRunEnd, restoredOrder) also calls here on an end that
+  // is NOT a person's Stop; there is no stopping person, so its plain join stays.
+  const stopScoped = !restoredOrder.length || isPersonStoppedChatRun(run, issue);
   const messages: typeof waiting = [];
   for (const wake of waiting) {
     const ids = queuedCommentIdsFromWakePayload(wake.payload);
-    if (ids.length > 0 && ids.every((id) => { const comment = byId.get(id);
+    if (stopScoped && ids.length > 0 && ids.every((id) => { const comment = byId.get(id);
       return comment && !comment.deletedAt && !isStoppingPersonsOwn(comment.authorUserId, stopUserId); })) continue;
     const plain = ids.length > 0 && parseObject(parseObject(wake.payload)[DEFERRED_WAKE_CONTEXT_KEY]).forceFreshSession !== true &&
       ids.every((id) => { const comment = byId.get(id);
         return comment && !comment.deletedAt && (comment.authorType ?? (comment.authorAgentId ? "agent" : "user")) === "user" &&
-          isStoppingPersonsOwn(comment.authorUserId, stopUserId) && !isConversationReset(comment.body); });
+          (!stopScoped || isStoppingPersonsOwn(comment.authorUserId, stopUserId)) && !isConversationReset(comment.body); });
     if (!plain) break;
     messages.push(wake);
   }
