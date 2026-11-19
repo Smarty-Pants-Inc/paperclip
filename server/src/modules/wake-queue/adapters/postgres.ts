@@ -23,7 +23,7 @@ import { and, asc, desc, eq, inArray, isNotNull, isNull, notInArray, or, sql } f
 import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
 import { steeringIngestionPending, waitForSteeringIngestion } from "../../../services/native-runtime/steering-ingestion.js";
 import { isGovernancePauseStop } from "../../../services/governance-pause-stop.js";
-import { agentRunSupersededByFreshContinuation } from "../../../agent-run-cancellation.js";
+import { agentRunFilesSetAsideByCopyOutBound, agentRunSupersededByFreshContinuation } from "../../../agent-run-cancellation.js";
 import { freshContinuationIsolatesRun } from "../../../services/fresh-continuation-fallback.js";
 import { hasNativePreDispatchFailureRecord } from "../../../services/heartbeat/run-failure-cause.js";
 import { canBypassFailedNativePredecessor } from "../../../services/native-runtime/native-provider-work-proof.js";
@@ -1589,7 +1589,10 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // A run the fresh-continuation fallback replaced is settled for good: its
         // finalization may stay terminal_failure (restart recovery ended it), and
         // the saved input queued behind it is now the task's next turn.
-        if (input.resumeStrandedQueue && run.runtimeMode === "native" && !agentRunSupersededByFreshContinuation(run)) {
+        // So is a run the copy-out no-progress bound ended: its files are set aside
+        // behind an abandoned epoch, and the input saved behind it starts next.
+        const filesSetAside = agentRunFilesSetAsideByCopyOutBound(run);
+        if (input.resumeStrandedQueue && run.runtimeMode === "native" && !agentRunSupersededByFreshContinuation(run) && !filesSetAside) {
           const [finalized] = contextIssueId && run.nativeIssueId === contextIssueId
             ? await tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
                 eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.runId, run.id),
@@ -1603,7 +1606,8 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // reuses none of them, so they no longer hold the task's next turn; any
         // other replacement still waits for them.
         const isolatedReplacement = agentRunSupersededByFreshContinuation(run)
-          ? await freshContinuationIsolatesRun(tx, { companyId: input.companyId, runId: run.id }) : false;
+          ? await freshContinuationIsolatesRun(tx, { companyId: input.companyId, runId: run.id })
+          : filesSetAside ? { continuationPending: false } : false;
         if (!isolatedReplacement && await nativeManualAdmissionHoldsExecution(tx, { companyId: input.companyId, runId: run.id })) {
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
@@ -1782,7 +1786,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         }
         // The fallback already decided this run's continuation; a reconciliation
         // incident would re-block the task it just released.
-        if (!handoffAssigneeAgentId && !agentRunSupersededByFreshContinuation(run)
+        if (!handoffAssigneeAgentId && !agentRunSupersededByFreshContinuation(run) && !filesSetAside
           && await recordNativeTerminalRecoveryIfNeeded(tx, run, issueRow, input.now)) {
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }

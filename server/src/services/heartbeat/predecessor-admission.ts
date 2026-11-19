@@ -1,12 +1,22 @@
 import { and, asc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
-import { agentRunWritesRevoked, FRESH_CONTINUATION_SUPERSEDED_KEY, lockAgentForRunWrite } from "../../agent-run-cancellation.js";
+import { agentRunFilesSetAsideByCopyOutBound, agentRunWritesRevoked, FRESH_CONTINUATION_SUPERSEDED_KEY, lockAgentForRunWrite,
+  WORKSPACE_SYNC_OUT_STALL_KEY } from "../../agent-run-cancellation.js";
 import { conflict } from "../../errors.js";
 import { logActivity } from "../activity-log.js";
 import { FRESH_CONTINUATION_ACTOR, FRESH_CONTINUATION_CAUSE, FRESH_CONTINUATION_SCHEMA } from "../fresh-continuation-fallback.js";
 import { fenceSourceWorkspace } from "../remote-workspace-epoch-abandonment.js";
 import { hasNativeLocalProcessStop } from "../native-local-process-stop.js";
 import { remoteExecutionHasStopped } from "../remote-execution-termination.js";
+
+/** The one-time notice a run reads when its predecessor's copy-out was ended by the no-progress bound. */
+export const PREVIOUS_TURN_FILES_SET_ASIDE_NOTICE = "Your previous turn's file changes were not saved: they were set aside and are "
+  + "kept for recovery. This workspace holds the last saved version without them. Work from the files as they are now, and do "
+  + "not claim or assume those edits.";
+export function readPreviousTurnWorkspaceNotice(context: Record<string, unknown> | null | undefined): string | null {
+  const notice = context?.previousTurnWorkspaceNotice as { text?: unknown } | null | undefined;
+  return typeof notice?.text === "string" && notice.text.trim() ? notice.text : null;
+}
 
 /** Execution admission, not a wake/notice policy. Every new successor passes
  * here before selecting a conversation, session or workspace. A terminal run
@@ -37,13 +47,30 @@ export async function fenceUnverifiedPredecessorsAtAdmission(db: Db, candidate: 
       inArray(heartbeatRuns.status, ["failed", "timed_out", "interrupted", "cancelled"]),
       sql`${heartbeatRuns.createdAt} <= ${run.createdAt.toISOString()}::timestamptz`,
       sql`jsonb_typeof(${heartbeatRuns.resultJson}->${FRESH_CONTINUATION_SUPERSEDED_KEY}) is distinct from 'string'`,
-      sql`(coalesce(${heartbeatRuns.error}, '') || ' ' || coalesce(${heartbeatRuns.errorCode}, ''))
-        ~ '(^|[[:space:]:])runner_process_(termination_unconfirmed|supervision_budget_exhausted)(:|[[:space:]]|$)'`,
+      sql`((coalesce(${heartbeatRuns.error}, '') || ' ' || coalesce(${heartbeatRuns.errorCode}, ''))
+        ~ '(^|[[:space:]:])runner_process_(termination_unconfirmed|supervision_budget_exhausted)(:|[[:space:]]|$)'
+        or (jsonb_typeof(${heartbeatRuns.resultJson}->${WORKSPACE_SYNC_OUT_STALL_KEY}) = 'object'
+          and not exists (select 1 from heartbeat_runs told where told.company_id = ${heartbeatRuns.companyId}
+            and told.status = 'succeeded'
+            and told.context_snapshot #>> '{previousTurnWorkspaceNotice,runId}' = ${heartbeatRuns.id}::text)))`,
     )).orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id)).for("update");
     let context = run.contextSnapshot ?? {};
     let detachWorkspace = false;
     let fencedAny = false;
     for (const source of predecessors) {
+      // A copy-out that made no progress was fenced (fenceSourceWorkspace) by
+      // the write that ended its run, and its accepted reply stays its own to
+      // publish, so it is not superseded here. Each next run is told that the
+      // previous turn's files are not in its workspace, until one succeeds.
+      if (agentRunFilesSetAsideByCopyOutBound(source)) {
+        await tx.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(${heartbeatRuns.resultJson},
+          array[${WORKSPACE_SYNC_OUT_STALL_KEY}, 'noticeRunId'], ${JSON.stringify(run.id)}::jsonb)`, updatedAt: new Date() })
+          .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, source.id)));
+        context = { ...context, previousRunId: source.id,
+          previousTurnWorkspaceNotice: { runId: source.id, text: PREVIOUS_TURN_FILES_SET_ASIDE_NOTICE } };
+        fencedAny = true;
+        continue;
+      }
       // Failure text is historical: recovery may have since proved this exact
       // process stopped. A later launch invalidates either kind of receipt.
       if (source.finishedAt && (await hasNativeLocalProcessStop(tx, source.companyId, source.id, source.finishedAt)

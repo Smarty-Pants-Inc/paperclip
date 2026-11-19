@@ -25,6 +25,18 @@ export async function isAbandonedPreparedRemoteWorkspace(db: Db, run: Run): Prom
   });
 }
 
+/** The set-aside files of this run's abandoned epoch are still held (not recovered, discarded or expired). */
+export async function abandonedRemoteWorkspaceFilesHeldForRun(db: Db, run: Run): Promise<boolean> {
+  const parsed = remoteWorkspaceRunReferenceSchema.safeParse(run.runnerProfileJson?.remoteWorkspace);
+  if (!parsed.success || !await isAbandonedPreparedRemoteWorkspace(db, run)) return false;
+  const [workspace] = await db.select({ metadata: executionWorkspaces.metadata }).from(executionWorkspaces).where(and(
+    eq(executionWorkspaces.companyId, run.companyId), eq(executionWorkspaces.id, parsed.data.workspaceId)));
+  const receipts = Array.isArray(workspace?.metadata?.remoteWorkspaceAbandonedEpochs)
+    ? workspace!.metadata!.remoteWorkspaceAbandonedEpochs as Array<Record<string, unknown>> : [];
+  return receipts.some(receipt => receipt?.schema === REMOTE_WORKSPACE_ABANDONED_EPOCH_SCHEMA && receipt.runId === run.id
+    && receipt.epoch === parsed.data.epoch && receipt.released == null);
+}
+
 export function abandonedPreparedRemoteWorkspaceExists() {
   const reference = sql`${heartbeatRuns.runnerProfileJson}->'remoteWorkspace'`;
   return sql`(${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync' is null and ${reference}->>'state' = 'prepared'

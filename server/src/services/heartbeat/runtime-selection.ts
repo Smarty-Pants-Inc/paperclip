@@ -1,4 +1,5 @@
 import { assertPaperclipRunnerBinaryConfiguration } from "../native-runtime/native-codex-runner.js";
+import { readPreviousTurnWorkspaceNotice } from "./predecessor-admission.js";
 import { readNativeWorkspaceMigration, migratedNativeExecutionCwd } from "../native-runtime/native-workspace-migration.js";
 import { resolveProviderApiPlacement } from "../native-runtime/provider-api-placement.js";
 import { readClaimedNativeStopRecovery } from "../native-runtime/native-cancellation-request.js";
@@ -875,7 +876,8 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
                 configuredSecretGuidance(input.config.configuredSecretNames ?? []),
               ].filter(Boolean).join("\n\n"),
               initialCommunicationGuidance: nativeReviewRequest ? null : readNonEmptyString(context.paperclipTaskCommunicationGuidance),
-              agentFileConflictNotice: readNonEmptyString(context.paperclipAgentFileConflictNotice),
+              agentFileConflictNotice: [readNonEmptyString(context.paperclipAgentFileConflictNotice),
+                readPreviousTurnWorkspaceNotice(context)].filter(Boolean).join("\n\n") || null,
               wakePayload: context.paperclipWake,
               caseContext: nativeReviewRequest ? null : context.paperclipCase as CaseExecutionContext | undefined,
               turnContext: context.paperclipTurnContext,

@@ -74,7 +74,7 @@ import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
 import { nativeResponsePresentationWork } from "./native-response-presentation-work.js";
 import { nativeWorkspaceFinalizationWork } from "./native-workspace-finalization-work.js";
 import { withNativeWorkspaceFinalizationOwnership } from "./native-workspace-finalization-ownership.js";
-import * as withheld from "./native-withheld-reply.js";
+import { FILE_LINE_KEPT_NO_BUTTON, readReplyFileLine, replyFileLineText } from "@paperclipai/shared";
 
 // At the base commit these names do not exist; the drafts stand in and every row is red on behaviour.
 const workModule = "./native-workspace-finalization-work.js";
@@ -83,8 +83,10 @@ const admissionModule = "../heartbeat/predecessor-admission.js";
 const admission: { PREVIOUS_TURN_FILES_SET_ASIDE_NOTICE?: string; readPreviousTurnWorkspaceNotice?: (context: unknown) => string | null;
   fenceUnverifiedPredecessorsAtAdmission: (db: Db, run: typeof heartbeatRuns.$inferSelect) => Promise<typeof heartbeatRuns.$inferSelect> }
   = await import(/* @vite-ignore */ admissionModule);
-const FILE_LINE_KEPT_SET_ASIDE = (withheld as { FILE_LINE_KEPT_SET_ASIDE?: string }).FILE_LINE_KEPT_SET_ASIDE
-  ?? "The file changes from this reply aren't saved yet. They're kept, and we can recover them.";
+// Cut 2a: the kept line without a Recover button (the board does not read a set-aside epoch) is the shared renderer's.
+const FILE_LINE_KEPT_SET_ASIDE = FILE_LINE_KEPT_NO_BUTTON;
+const renderedFileLine = (resultJson: unknown) => replyFileLineText(
+  readReplyFileLine(record(record(resultJson).presentationDecision).fileLine), { nowMs: Date.now(), recoverSavedFilesShown: false });
 const STALLED = "native_workspace_sync_out_stalled";
 const PERSON = "copyout-bound-person";
 const exec = promisify(execFile);
@@ -315,8 +317,10 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
     await s.presentationWorker();
     const [reply, ...more] = await s.replies();
     expect(more).toEqual([]);
-    expect(reply).toMatchObject({ body: `${ANSWER}\n\n${FILE_LINE_KEPT_SET_ASIDE}`, createdByRunId: s.runId });
+    // Cut 2a: the body is the answer alone; the line is rendered from the state on the presentation decision.
+    expect(reply).toMatchObject({ body: ANSWER, createdByRunId: s.runId });
     expect((await s.run()).resultJson).toMatchObject({ nativeWithheldReply: { state: "published", fileLine: "kept" } });
+    expect(renderedFileLine((await s.run()).resultJson)).toBe(FILE_LINE_KEPT_SET_ASIDE);
 
     // Row 3: the capture returns after the bound. Its save is refused at publication and changes nothing.
     stall.release();

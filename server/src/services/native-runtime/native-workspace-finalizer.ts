@@ -1,7 +1,7 @@
 import { classifyNativeWorkspaceFailure } from "./native-workspace-failure.js";
 import { readRemoteWorkspaceAuthority, saveRemoteWorkspace } from "../remote-workspaces.js";
 import { remoteWorkspaceFailureCause } from "../remote-workspace-transport.js";
-import { recordNativeFinalizationFailure } from "./native-run-finalizer.js";
+import { NATIVE_WORKSPACE_SYNC_OUT_STALLED, recordNativeFinalizationFailure } from "./native-run-finalizer.js";
 import { inspectPluginWorkspaceForFinalization } from "./native-plugin-workspace-finalization.js";
 import { resolvePluginWorkspaceFinalization, type WorkspaceWorkers } from "../plugin-workspaces.js";
 import { restoreNativeWorkspaceBestEffort } from "./native-workspace-best-effort.js";
@@ -402,11 +402,13 @@ export function recordNativeWorkspaceFinalizationFailure(db: Db, runId: string,
   const unrecoverable = operation.stderrExcerpt?.includes("workspace_sync_out_unrecoverable");
   const pluginFailure = operation.stderrExcerpt?.trim();
   const pluginRepair = pluginFailure === "plugin_workspace_branch_mismatch" || pluginFailure === "plugin_workspace_owner_mismatch";
+  // The no-progress bound's own cause (native-workspace-finalization-work.ts); no copy-out reports it.
+  const stalled = pluginFailure === "workspace_sync_out_stalled";
   return recordNativeFinalizationFailure({
     db, runId,
-    error: new Error(pluginRepair ? `native_${pluginFailure}` : unrecoverable
+    error: new Error(pluginRepair ? `native_${pluginFailure}` : stalled ? NATIVE_WORKSPACE_SYNC_OUT_STALLED : unrecoverable
       ? "native_workspace_sync_out_unrecoverable" : "native_workspace_sync_out_failed"),
-    projectRunStatus: true, failureScope: "workspace", permanent: unrecoverable,
+    projectRunStatus: true, failureScope: "workspace", permanent: unrecoverable || stalled,
     failureCause: readString(record(record(operation.metadata).workspaceSync).cause),
   });
 }
