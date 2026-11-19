@@ -18,14 +18,14 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
  * leases and their termination receipt are left to the lease sweep; local
  * process, local lease and native owner proof are still checked here. */
 export async function agentExecutionStopBlocker(db: Db, agentIds: string[],
-  { skipRemoteProviderProof = false } = {}): Promise<string | null> {
+  { skipRemoteProviderProof = false, revokedTurnRunIds = [] as string[] } = {}): Promise<string | null> {
   if (!agentIds.length) return null;
   const condition = inArray(heartbeatRuns.agentId, agentIds);
   const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(condition);
   return executionStopBlocker(db, condition, or(
     inArray(environmentLeases.heartbeatRunId, runIds),
     inArray(sql`${environmentLeases.metadata}->>'agentId'`, agentIds),
-  )!, undefined, true, skipRemoteProviderProof);
+  )!, undefined, true, skipRemoteProviderProof, skipRemoteProviderProof ? new Set(revokedTurnRunIds) : new Set());
 }
 
 /** Task recovery uses read-only Stop proof, scoped to its owners rather than
@@ -67,8 +67,15 @@ function provedWarmTurnHandoff(run: Run, runLeases: Lease[], coordinator: Coordi
 }
 
 async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
-  expectedRunCount?: number, settleCoordinators = true, skipRemoteProviderProof = false): Promise<string | null> {
-  const runs = await db.select().from(heartbeatRuns).where(condition);
+  expectedRunCount?: number, settleCoordinators = true, skipRemoteProviderProof = false,
+  revokedTurnRunIds: ReadonlySet<string> = new Set()): Promise<string | null> {
+  const allRuns = await db.select().from(heartbeatRuns).where(condition);
+  // Pause only: a run whose exact in-process owner carries turnAuthorityRevoked
+  // is re-read here and must still be cancelled; its own executor keeps its
+  // coordinator, lease and process proof (never cleared or settled here).
+  const revoked = new Set(allRuns.filter(run => revokedTurnRunIds.has(run.id) && run.status === "cancelled"
+    && run.runtimeMode === "native").map(run => run.id));
+  const runs = allRuns.filter(run => !revoked.has(run.id));
   // A missing or cross-company binding cannot establish execution Stop.
   if (expectedRunCount !== undefined && runs.length !== expectedRunCount) return "run_binding_unproven";
   const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(condition);
@@ -80,13 +87,16 @@ async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
   const handedOff = new Set(settleCoordinators ? [] : runs.filter(run => provedWarmTurnHandoff(run,
     allLeases.filter(lease => lease.heartbeatRunId === run.id),
     coordinatorRows.find(row => row.runId === run.id))).map(run => run.id));
-  const leases = allLeases.filter(lease => !lease.heartbeatRunId || !handedOff.has(lease.heartbeatRunId));
+  // A revoked owner's leases are released by its own executor's teardown,
+  // which records the outcome on the run; Pause never waits on that teardown.
+  const leases = allLeases.filter(lease => !lease.heartbeatRunId || (!handedOff.has(lease.heartbeatRunId)
+    && !revoked.has(lease.heartbeatRunId)));
   const proofLeases = leases.filter(lease => !skipRemoteProviderProof || !lease.provider || lease.provider === "local");
   const deferred = proofLeases.find(lease => lease.status === "active" && readLeaseReleaseDeferral(lease.metadata));
   if (deferred) return `environment_lease_release_deferred:${readLeaseReleaseDeferral(deferred.metadata)!.reason}`;
   if (proofLeases.some(lease => (!lease.releasedAt && !(lease.status === "retained" && lease.cleanupStatus === "success")) || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed")) return "environment_lease_unreleased";
-  const coordinators = await db.select().from(nativeRunFinalizations)
-    .where(inArray(nativeRunFinalizations.runId, runIds));
+  const coordinators = (await db.select().from(nativeRunFinalizations)
+    .where(inArray(nativeRunFinalizations.runId, runIds))).filter(row => !revoked.has(row.runId));
   const now = new Date();
   const abandoned = coordinators.filter(row => row.leaseOwner);
   if (abandoned.some(row => !row.leaseExpiresAt || row.leaseExpiresAt > now || row.resultId ||
@@ -101,6 +111,9 @@ async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
     if (!observed || !coordinator.controllerProcessStartedAt ||
         new Date(observed).getTime() === coordinator.controllerProcessStartedAt.getTime()) return "native_controller_alive";
   }
+  // Host-local process proof still holds for a revoked owner.
+  if (allRuns.some(run => revoked.has(run.id) && ((run.processPid && !absent(run.processPid))
+    || (run.processGroupId && !absent(-run.processGroupId))))) return "run_process_alive";
   for (const run of runs) {
     if (!["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status)) return "run_not_terminal";
     if (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date()) return "run_controller_lease_held";

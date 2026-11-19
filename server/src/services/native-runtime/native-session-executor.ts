@@ -406,6 +406,7 @@ import {
   type NativeRestartRecoveryClaim,
   carriesSettledPredecessorSession,
 } from "./native-restart-recovery.js";
+import { resetTurnAuthority, revokeTurnAuthority } from "./turn-authority-revocation.js";
 
 type ActiveNativeSession = {
   session: NativeSession;
@@ -680,6 +681,11 @@ const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set([
   "timed_out",
 ]);
 const NATIVE_SESSION_CANCELLATION_CLEANUP_GRACE_MS = 2_000;
+/** C1: the longest a Stop waits for a runner `interrupt` to return before the
+ * server revokes the turn by its own fence (cancelRequested + the DB cancel)
+ * and records turnAuthorityRevoked. A hung box/unreachable runner then cannot
+ * hold the cancel; the late interrupt result is only observed. */
+const NATIVE_TURN_AUTHORITY_REVOCATION_BOUND_MS = 2_000;
 const NATIVE_RUNTIME_REQUEST_RESOLUTION_CACHE_MAX = 256;
 type NativeRuntimeRequestResolution = {
   runId: string;
@@ -11011,6 +11017,9 @@ async function performNativeCancellation(
               reason,
               signal: cancellationAbort.signal,
             }).cleanup;
+            // The synchronous cancel is the turn-authority transition
+            // (NativeSessionCancellation); its cleanup below is passive.
+            revokeTurnAuthority(runId, "session_cancel");
             let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
             const settled = await Promise.race([
               cleanup.then(
@@ -11034,8 +11043,24 @@ async function performNativeCancellation(
               void cleanup.catch(() => undefined);
             }
           } else if (active.session.interrupt) {
-            await active.session.interrupt({ reason });
-            active.cancellationCleanupSucceeded = true;
+            const interrupted = active.session.interrupt({ reason });
+            let boundTimer: ReturnType<typeof setTimeout> | undefined;
+            const returned = await Promise.race([
+              interrupted.then(() => true),
+              new Promise<false>((resolve) => {
+                boundTimer = setTimeout(() => resolve(false), NATIVE_TURN_AUTHORITY_REVOCATION_BOUND_MS);
+              }),
+            ]).finally(() => { if (boundTimer) clearTimeout(boundTimer); });
+            if (returned) {
+              active.cancellationCleanupSucceeded = true;
+              revokeTurnAuthority(runId, "interrupt");
+            } else {
+              // The runner did not answer within the bound: the server's own
+              // fence revokes the turn; a late result certifies nothing.
+              active.cancellationCleanupSucceeded = false;
+              revokeTurnAuthority(runId, "revocation_bound");
+              void interrupted.catch(() => undefined);
+            }
           }
         } catch (error) {
           active.cancelRequested = false;
@@ -13916,6 +13941,7 @@ async function executePaperclipNativeSessionAttempt(
               }
               if (session) {
                 const active: ActiveNativeSession = { session, cancelRequested: false, admissionAbort: new AbortController() };
+                resetTurnAuthority(input.execution.binding.runId);
                 activeNativeSessions.set(input.execution.binding.runId, active);
                 const startup = nativeSessionStartups.get(input.execution.binding.runId);
                 const stopBeforeProviderTurn = startup?.stopRequested === true && startup.sessionPublished !== true

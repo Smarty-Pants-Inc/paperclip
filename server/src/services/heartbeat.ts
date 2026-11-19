@@ -1,4 +1,5 @@
 import { registerHeldPreparationResumer } from "./interrupted-preparation-hold-settlement.js";
+import { beginTurnAuthorityEpoch, endTurnAuthorityEpoch, turnAuthorityRevocation } from "./native-runtime/turn-authority-revocation.js";
 import { agentFileHoldInstruction, agentFileSaveHeld } from "./agent-directory-working-copies.js";
 import { registerCompletedTurnCleanupResumer } from "./native-runtime/completed-turn-cleanup-hold-settlement.js";
 import { endStorageOutageWaitOn, reportStorageOutageWaitsTo, runInOwnStorageScope } from "../storage/storage-unavailable.js";
@@ -2103,6 +2104,7 @@ export function heartbeatService(
     if (run.runtimeMode === "legacy" && run.controllerBootId &&
         run.controllerBootId !== legacyControllerBootId) return;
     activeRunExecutions.add(run.id);
+    const turnAuthorityEpoch = beginTurnAuthorityEpoch(run.id);
     const timePreparation = createHeartbeatPreparationTiming(run.id);
     const executionControl = createAdapterExecutionControl();
     endStorageOutageWaitOn(executionControl.controller.signal);
@@ -4378,6 +4380,7 @@ export function heartbeatService(
       } finally {
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
+        endTurnAuthorityEpoch(run.id, turnAuthorityEpoch);
         heartbeatQueue.releaseClaimBackoffsForTask(run);
         if (restartClaimLapsed || detachedWithoutHandoff) scheduleNativeSessionResumeDispatch(run.id, new Date(), "restart");
         // A failed owned Stop remains visible until this exact executor settles,
@@ -4486,8 +4489,12 @@ export function heartbeatService(
             or coalesce(${environmentLeases.metadata}->'releaseDeferral'->'triggers', '[]'::jsonb) ? ${options.trigger ?? ""}::text))`));
     const needsRelease = new Set(leasesToRelease.map(lease => lease.runId));
     let blocker: string | null = null;
+    // Pause completes on the DB cancel, like Stop it never waits on the
+    // provider-bound teardown of a run whose turn authority is revoked.
+    const revokedHere = new Set(options.serverRecordOnly ? runs.filter(pauseRevokedNativeOwner).map(run => run.id) : []);
     for (const run of runs) {
       const runBlocker = !isHeartbeatRunTerminalStatus(run.status) ? "run_not_terminal"
+        : revokedHere.has(run.id) ? null
         : liveRunExecutions.has(run.id) || adapterExecutionControls.has(run.id) || processRunCancellationSettlements.has(run.id)
           ? "run_executing_here"
           : run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date() ? "run_controller_lease_held" : null;
@@ -4495,6 +4502,9 @@ export function heartbeatService(
         blocker ??= runBlocker;
         continue;
       }
+      // Its own executor still owns its teardown and lease release (outcome
+      // recorded on the run); the sweep is not hinted to race it.
+      if (revokedHere.has(run.id)) continue;
       if (needsRelease.has(run.id) && options.serverRecordOnly) {
         // Pause never awaits the provider. The orphan-lease sweep (recovery.ts
         // retryTerminalRunLeaseRelease) releases it through this same path.
@@ -4508,7 +4518,23 @@ export function heartbeatService(
           ...(options.trigger ? { trigger: options.trigger } : {}) });
       }
     }
-    return blocker ?? agentExecutionStopBlocker(db, agentIds, { skipRemoteProviderProof: options.serverRecordOnly });
+    return blocker ?? agentExecutionStopBlocker(db, agentIds, { skipRemoteProviderProof: options.serverRecordOnly,
+      revokedTurnRunIds: [...revokedHere] });
+  }
+
+  /** The exact-owner certificate for a person's Pause (serverRecordOnly only):
+   * the run is cancelled in the DB by a Pause (errorCode agent_paused, which
+   * only the pause cancel writes: cancelActiveForAgentInternal below),
+   * native, executing in THIS process only as its own executor (no legacy
+   * process/adapter control/process-cancellation barrier), and that executor's
+   * current epoch carries turnAuthorityRevoked. A run whose cancel has not
+   * landed, or any other owner, still blocks. */
+  function pauseRevokedNativeOwner(run: typeof heartbeatRuns.$inferSelect) {
+    return run.status === "cancelled" && run.runtimeMode === "native"
+      && run.errorCode === "agent_paused"
+      && activeRunExecutions.has(run.id) && !runningProcesses.has(run.id)
+      && !adapterExecutionControls.has(run.id) && !processRunCancellationSettlements.has(run.id)
+      && turnAuthorityRevocation(run.id) !== null;
   }
 
   async function stopInvocationsForAgents(agentIds: string[], reason: string, options: StopInvocationOptions = {}) {
