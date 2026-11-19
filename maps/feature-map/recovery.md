@@ -25,6 +25,16 @@ Agent access: [companion](../agent-access-map/recovery.md).
   Restart recovery respects live heartbeat preparation before workspace
   synchronization finishes. PostgreSQL regressions cover unchanged ownership,
   no duplicate dispatch, and later recovery after preparation leaves the registry.
+  When an unsaved native predecessor cannot be addressed through its recorded
+  provider binding, its lease releases cleanup ownership while retaining a named
+  custody obligation. This allows a fresh allocation without claiming that the
+  old sandbox stopped or authorizing its destruction. The existing sealed-file
+  backup owner can anchor to that exact released native custody obligation after
+  selection moves to the successor; run, coordinator, lease, manifest and inactive
+  writer checks still apply, including rechecking the obligation at publication.
+  Pinned predecessors retain
+  the real stop-and-receipt path. Local PostgreSQL regressions are in
+  [unpinned native custody](../../server/src/__tests__/native-lease-custody-unpinned.test.ts).
 - `source-action`: `recovery/source-action` — source-scoped recovery actions remain attached to the task;
   independent repair work may have its own issue and return owner.
 - `exhaustion`: `recovery/exhaustion` — a run stopped for a reason only a person can resolve offers ordinary Retry;

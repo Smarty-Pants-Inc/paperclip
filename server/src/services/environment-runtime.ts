@@ -4865,6 +4865,13 @@ export function environmentRuntimeService(
               custodyKept ? nativeCustodyKeptRecovery() : undefined);
             if (!prepared) continue;
             leaseSnapshot = toEnvironmentLeaseSnapshot(prepared);
+            // An unaddressable custody hold releases ownership, never the box.
+            // Do not fall through to the ordinary destructive release driver.
+            if (prepared.status === "released") {
+              if (environment) released.push({ environment, lease: leaseSnapshot,
+                leaseContext: { executionWorkspaceId: prepared.executionWorkspaceId, executionWorkspaceMode: null } });
+              continue;
+            }
             preparedStopAttemptId = prepared.metadata?.pendingCleanupAttemptId;
           }
           if (hasStopOnlyCleanup(leaseSnapshot)) {
