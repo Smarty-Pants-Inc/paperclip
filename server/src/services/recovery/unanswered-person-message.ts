@@ -742,12 +742,10 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     }
     settingUp = true;
   }
-  // Import intentionally parks automations until activation. It lost neither
-  // the message nor an attempt: do not annotate every carried-over open task.
-  // Resume's existing eligibility notification rechecks the saved work.
-  if (agentPaused && agentRow?.pauseReason === "import" && (agentRow.lifecycleHolds ?? []).every(hold => hold === "import")) {
-    return { kind: "none" };
-  }
+  // An import-safety pause is a pause like any other here. Carried-over tasks
+  // get no note because their bundle messages are imported history, answered
+  // by definition (person-message-answer.ts importedPersonHistorySql). A LIVE
+  // message posted to an import-paused agent gets the one paused note.
   // M's OWN run was cancelled by the agent's Pause (heartbeat.cancelActiveForAgent,
   // errorCode agent_paused). Resume does not re-run it: M is not deferred work.
   const pauseCancelledOwnRun = Boolean(run && run.status === "cancelled" && run.errorCode === "agent_paused");
