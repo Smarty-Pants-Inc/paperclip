@@ -25,6 +25,7 @@ import {
   executePaperclipNativeSession, getNativeSessionSteeringState,
 } from "../services/native-runtime/native-session-executor.js";
 import * as nativeExecutor from "../services/native-runtime/native-session-executor.js";
+import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { waitForPendingCommentSteers } from "../services/conversation-steering.js";
@@ -55,12 +56,14 @@ class RecordingPiPeer {
   wake?: () => void;
   active = false;
   closeGate?: Promise<void>;
+  closing?: () => void;
   steerAckGate?: Promise<void>;
   dropSteer = false;
   steerError?: Error;
   holdClose() {
     let release!: () => void; this.closeGate = new Promise<void>(resolve => { release = resolve; });
-    return release;
+    const entered = new Promise<void>(resolve => { this.closing = resolve; });
+    return Object.assign(release, { entered });
   }
   onPrompt?: (message: string) => void;
   facadeCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
@@ -116,7 +119,7 @@ class RecordingPiPeer {
     else if (type === "get_messages") data = { messages: [] };
     return { type: "response", command: type, success: true, data };
   }
-  boundary(answer = true) {
+  boundary(answer = true): void | Promise<void> {
     this.toolEnd("step-1"); this.toolStart("step-2"); this.toolEnd("step-2");
     this.send({ type: "turn_end", toolResults: [] });
     const inputs = this.pending.splice(0);
@@ -153,7 +156,7 @@ class RecordingPiPeer {
       await new Promise<void>(resolve => { this.wake = resolve; });
     }
   }
-  async close() { await this.closeGate; this.closed = this.exited = true; this.wake?.(); }
+  async close() { this.closing?.(); await this.closeGate; this.closed = this.exited = true; this.wake?.(); }
   async sendExtensionUiResponse() {}
 }
 
@@ -201,6 +204,7 @@ type Outcome = { result?: Awaited<ReturnType<typeof executePaperclipNativeSessio
 const scheduled = new Map<string, { bodies: string[]; peers: RecordingPiPeer[]; executions: Promise<unknown>[];
   first: RecordingPiPeer; outcomes: Map<string, Outcome>; attachGate?: Promise<void> }>();
 const realExecute = executePaperclipNativeSession;
+const nativeEventAppends = new Map<string, Array<{ eventType: string; emittedAt?: string; enteredAt: number; settledAt?: number }>>();
 function backendFor(execution: Parameters<typeof realExecute>[0]["execution"], runnerInstanceId: string, peer: RecordingPiPeer) {
   const workspace = execution.workspace.cwd;
   if (!workspace) throw new Error("native steering fixture requires a workspace cwd");
@@ -232,6 +236,16 @@ beforeAll(async () => {
   vi.stubEnv("PAPERCLIP_AGENT_JWT_SECRET", randomUUID().repeat(2));
   database = await startEmbeddedPostgresTestDatabase("steer-default-red-db-"); db = createDb(database.connectionString);
   await instanceSettingsService(db).updateExperimental({ enableAgentChat: true, enableNativeRunner: true });
+  // Diagnostic only: distinguish provider admission from an in-flight durable append.
+  const append = PaperclipControlPlanePort.prototype.appendEvent;
+  vi.spyOn(PaperclipControlPlanePort.prototype, "appendEvent").mockImplementation(async function (this: PaperclipControlPlanePort, value, options) {
+    const event = value as { runId: string; eventType: string; emittedAt?: string };
+    const observation = { eventType: event.eventType, emittedAt: event.emittedAt, enteredAt: Date.now(), settledAt: undefined as number | undefined };
+    const observations = nativeEventAppends.get(event.runId) ?? [];
+    observations.push(observation); nativeEventAppends.set(event.runId, observations);
+    try { return await append.call(this, value, options); }
+    finally { observation.settledAt = Date.now(); }
+  });
   // Forward the scheduler's exact native input into the SAME product executor,
   // replacing only its provider backend at the documented test seam. No wake,
   // run admission, completion, answer or Stop outcome is mocked.
@@ -328,6 +342,14 @@ async function fixture(label: string, conversation = true, earlyBodies: string[]
       if (["failed", "cancelled", "timed_out"].includes(run.status)) throw new Error(`native fixture failed: ${run.errorCode}: ${run.error}`);
       expect(await getNativeSessionSteeringState(runId)).toMatchObject({ disposition: "available" });
       expect(peer.requests.some(command => command.type === "prompt")).toBe(true);
+      // A sent prompt/allocated turn is not the fixture's busy-provider boundary.
+      // Join real ingestion before a row mutates or finishes that active turn.
+      const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+      expect(events.some(event => event.eventType === "turn.started")).toBe(true);
+      if (peer instanceof B6RealPiPeer) {
+        expect(peer.modelRequests.length).toBeGreaterThan(0);
+        if (peer.initialTool) expect(events.some(event => event.eventType === "tool.execution.started")).toBe(true);
+      } else expect(events.some(event => event.eventType === "tool.execution.started")).toBe(true);
     }, { timeout: 15_000 });
   } catch (error) {
     // Preserve the first failed boundary. A cleanup timeout must not overwrite
@@ -335,6 +357,11 @@ async function fixture(label: string, conversation = true, earlyBodies: string[]
     if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, `${label}-startup-failure.json`), JSON.stringify({
       error: error instanceof Error ? { message: error.message, stack: error.stack } : String(error),
       companyId, issueId, runId, commands: peer.requests, outcomes: [...owner.outcomes],
+      requestSettlements: peer instanceof B6RealPiPeer ? peer.requestSettlements : undefined,
+      nativeEventAppends: nativeEventAppends.get(runId),
+      databaseActivity: await db.execute(sql`select pid, state, wait_event_type, wait_event,
+        pg_blocking_pids(pid) as blocking_pids, left(query, 400) as query
+        from pg_stat_activity where datname = current_database() and pid <> pg_backend_pid()`),
       runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)),
       wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)),
       events: await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId)),
@@ -419,6 +446,8 @@ async function fixture(label: string, conversation = true, earlyBodies: string[]
       scheduled.delete(companyId);
       if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, `${label}.json`), JSON.stringify({
         companyId, agentId, issueId, runId, commands: peer.requests, consumed: peer.consumed, replies: peer.replies, outcome: owner.outcomes.get(runId),
+        requestSettlements: peer instanceof B6RealPiPeer ? peer.requestSettlements : undefined,
+        nativeEventAppends: nativeEventAppends.get(runId),
         realPi: peer instanceof B6RealPiPeer ? { command: peer.command, version: "1.5.2", modelRequests: peer.modelRequests } : null,
         successorPeers: owner.peers.slice(1).map(peer => ({ commands: peer.requests, facadeCalls: peer.facadeCalls, consumed: peer.consumed, replies: peer.replies,
           realPi: peer instanceof B6RealPiPeer ? { command: peer.command, version: "1.5.2", modelRequests: peer.modelRequests } : null })), workerErrors,
@@ -462,7 +491,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
       // before provider read/answer or run-end cleanup can hide a missed consume.
       for (const early of f.early) expect((await f.wakes()).find(wake => JSON.stringify(wake.payload).includes(early.id)))
         .toMatchObject({ status: "completed", runId: f.runId });
-      await waitForPendingCommentSteers(); f.peer.boundary();
+      await waitForPendingCommentSteers(); await f.peer.boundary();
       await vi.waitFor(() => expect(f.peer.consumed).toEqual(messages.map(m => m.body)));
       if (process.env.B6_DUPLICATE_PROBE === "1") {
         await vi.waitFor(async () => {
@@ -483,7 +512,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
     const f = await fixture("B6-lone", true, ["B6-LONE"]);
     try {
       await vi.waitFor(() => expect(f.commands("steer").map(c => c.input?.message)).toEqual(["B6-LONE"]), { timeout: 5000 });
-      await waitForPendingCommentSteers(); f.peer.boundary();
+      await waitForPendingCommentSteers(); await f.peer.boundary();
       await f.assertSteeredOnce(f.early); await f.complete();
     } finally { await f.close(); }
   }, 45_000);
@@ -514,7 +543,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
       const second = await f.post("B6-FOLLOWING");
       await waitForPendingCommentSteers();
       expect(f.commands("steer").map(c => c.input?.message)).toEqual([first.body, second.body]);
-      f.peer.boundary(); await f.assertSteeredOnce([first, second]); await f.complete();
+      await f.peer.boundary(); await f.assertSteeredOnce([first, second]); await f.complete();
     } finally { unavailable.mockRestore(); await f.close(); }
   }, 45_000);
 
@@ -523,6 +552,9 @@ describe("person comment default steering eligibility and asynchronous receipt",
     const release = f.peer.holdClose();
     try {
       f.peer.finish();
+      // Join the held teardown boundary, not a 1s race against provider/event ingestion.
+      // No late POST is allowed until this run has actually entered finishing.
+      await release.entered;
       await vi.waitFor(async () => expect((await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId))).some(e => e.eventType === "turn.completed")).toBe(true));
       await vi.waitFor(async () => expect((await getNativeSessionSteeringState(f.runId)).disposition).not.toBe("available"));
       const message = await f.post("B6-LATE");
@@ -556,7 +588,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
       release(); expect(await handling).toBe(true); await draining;
       await waitForPendingCommentSteers();
       expect(f.commands("steer").map(c => c.input?.message)).toEqual([message.body]);
-      f.peer.boundary(); await f.assertSteeredOnce([message]); await f.complete();
+      await f.peer.boundary(); await f.assertSteeredOnce([message]); await f.complete();
     } finally { release(); unavailable.mockRestore(); await handling; await draining; await f.close(); }
   }, 45_000);
 
@@ -589,7 +621,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
               wakeCommentId: message.id, wakeCommentIds: [message.id], source: "issue.comment" } }) })).toBe(true);
         await waitForPendingCommentSteers();
         expect(f.commands("steer").map(command => command.input?.message)).toEqual([message.body]);
-        f.peer.boundary(); await f.assertSteeredOnce([message]); await f.complete();
+        await f.peer.boundary(); await f.assertSteeredOnce([message]); await f.complete();
       } finally { probe.mockRestore(); }
     } finally { await f.close(); }
   }, 45_000);
@@ -624,7 +656,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
       expect(acquired, "an unrelated Send must acquire the issue lock while Pi attachment I/O is held").toBe(true);
       await waitForPendingCommentSteers();
       expect(f.commands("steer").map(command => command.input?.message)).toEqual([message.body]);
-      f.peer.boundary(); await f.assertSteeredOnce([message]); await f.complete();
+      await f.peer.boundary(); await f.assertSteeredOnce([message]); await f.complete();
     } finally { release(); probe?.mockRestore(); await draining; await f.close(); }
   }, 45_000);
 
@@ -637,7 +669,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
       expect(f.commands("abort")).toEqual([]);
       expect((await f.wakes()).filter(wake => JSON.stringify(wake.payload).includes(message.id))).toEqual([]);
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
-      f.peer.boundary();
+      await f.peer.boundary();
       await vi.waitFor(async () => {
         const thread = (await request(f.app).get(`/api/issues/${f.issueId}/comments`).expect(200)).body;
         expect(thread.find((comment: any) => comment.id === message.id)).toMatchObject({
@@ -669,7 +701,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
         expect(f.commands("steer").map(command => command.input?.message)).toEqual([body]);
         expect((await f.wakes()).filter(wake => JSON.stringify(wake.payload).includes(responses[0].body.id))).toEqual([]);
         expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
-        f.peer.boundary();
+        await f.peer.boundary();
         await vi.waitFor(async () => {
           const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
           expect(run.contextSnapshot?.answeredSteeredCommentIds).toEqual([responses[0].body.id]);
@@ -694,7 +726,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
       expect(f.commands("steer")).toHaveLength(1);
       const [pending] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
       expect((pending.resultJson?.queuedSteeringAcknowledgements as any)[message.id].status).toBe("pending");
-      f.peer.boundary();
+      await f.peer.boundary();
       if (took) {
         // B5: RPC timed out; hold the ACK through terminal settlement/release.
         // Actual Pi read/text, not the still-pending ACK, must discharge M.
@@ -740,7 +772,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
         });
         expect((await f.queue()).entries.map((entry: any) => entry.comment.id)).toContain(message.id);
       }
-      f.peer.boundary();
+      await f.peer.boundary();
       await f.complete();
       await f.startDelivery();
       await vi.waitFor(async () => { await f.assertAnsweredOnce([message]); }, { timeout: 15_000 });
@@ -776,7 +808,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
       expect((await f.wakes()).filter(wake => messages.some(message => JSON.stringify(wake.payload).includes(message.id)))).toEqual([]);
       release();
       await vi.waitFor(() => expect(f.commands("steer").map(command => command.input?.message)).toEqual(messages.map(message => message.body)), { timeout: 10_000 });
-      f.peer.boundary();
+      await f.peer.boundary();
       await vi.waitFor(async () => {
         const thread = (await request(f.app).get(`/api/issues/${f.issueId}/comments`).expect(200)).body;
         for (const message of messages) expect(thread.find((comment: any) => comment.id === message.id)).toMatchObject({
