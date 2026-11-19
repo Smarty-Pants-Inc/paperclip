@@ -20946,7 +20946,7 @@ export function issueRoutes(
       // Route authorization/pause/status handling above stays authoritative.
       // An active native run already owns this input: no goal RPC, independent
       // fast response or ordinary assignee wake may race its pending hand-off.
-      if (actor.actorType === "user" && !interruptRequested) {
+      if (actor.actorType === "user" && !interruptRequested && currentIssue.executionRunId) {
         goalCommentSteered = await trySteerPersonComment(db, comment, {
           deliveryIntent: req.body.deliveryIntent ?? "steer",
           onRejected: async () => {
