@@ -11,6 +11,13 @@
 // built by the real producer helper remoteTerminationReceipt. The same-shape
 // REAL-ROUTE companion (SEND -> LEASE -> FAIL -> STOP -> SEND) is NOT in this
 // file; see result.md.
+//
+// build-7e625560c: N4 (P's controller journal / its one quarantine copy read
+// READ-ONLY at admission: only lifecycle commands may be pending) and F2 at the
+// actual session.startTurn envelope (executeNativeSession -> fake Pi session's
+// startTurn) across server-restart cuts. Every select() takes a Q5 per-file
+// sha256 inventory of the runner state base before/after. P's journal and copy
+// are PLANTED (Q1 shape: canonical absent, one identity_indeterminate copy).
 import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, readdir, readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -25,6 +32,10 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { PI_CONVERSATION_KEY, selectPiConversation } from "./native-runtime/pi-conversation-record.js";
 import { createNativeSessionHandoffLoader } from "./native-runtime/native-session-handoff.js";
+import { buildNativeExecutionInput } from "./native-runtime/native-execution-input.js";
+import { scopedRunnerdStateRoot } from "./native-runtime/native-session-executor.js";
+import { nativeRuntimeContextFixture } from "./native-runtime/runtime-context.test-fixture.js";
+import { executeNativeSession, parseNativeExecutionInput } from "../vendor/paperclip-runner/index.js";
 
 const FACT = "The previous turn did not finish and produced no accepted result.";
 const NOTE = `${FACT} The earlier provider thread could not be safely restored. Starting a fresh thread in this conversation from its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.`;
@@ -34,7 +45,10 @@ const support = await getEmbeddedPostgresTestSupport();
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   const dirs: string[] = [];
+  let stateBase = "";
   beforeAll(async () => {
+    stateBase = await mkdtemp(join(tmpdir(), "unfinished-turn-state-")); dirs.push(stateBase);
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = stateBase;
     database = await startEmbeddedPostgresTestDatabase("unfinished-turn-fresh-");
     db = createDb(database.connectionString);
   }, 90_000);
@@ -44,7 +58,22 @@ const support = await getEmbeddedPostgresTestSupport();
   });
 
   type Variant = { pReceipt?: boolean; s0Receipt?: boolean; laterHolderOn?: "p" | "s0"; successorBox?: string;
-    s0Result?: boolean; pointer?: "p" | "none"; s0LiveLease?: boolean; successorEnvironment?: "other" };
+    s0Result?: boolean; pointer?: "p" | "none"; s0LiveLease?: boolean; successorEnvironment?: "other";
+    /** P's controller journal (PLANTED). Default: lifecycle-only pending (turn.interrupt/turn.stop/runner.suspend). */
+    journal?: "lifecycle" | "turn.start" | "external_provider.operation" | "semantic_tool.result" | "tool_input" | "none";
+    journalAt?: "copy" | "root" };
+
+  async function inventory(root: string) {
+    const out: string[] = [];
+    const walk = async (dir: string): Promise<void> => {
+      for (const entry of (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) { out.push(`d ${path}`); await walk(path); }
+        else out.push(`f ${path} ${createHash("sha256").update(await readFile(path)).digest("hex")}`);
+      }
+    };
+    await walk(root); return out;
+  }
 
   async function seed(v: Variant = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), commentId = randomUUID();
@@ -55,6 +84,35 @@ const support = await getEmbeddedPostgresTestSupport();
       status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
     await db.insert(issues).values({ id: issueId, companyId, title: "Paul's chat", status: "blocked", assigneeAgentId: agentId });
     const [environment] = await db.insert(environments).values({ name: `boat-${issueId}`, driver: "sandbox" }).returning();
+    const pRunner = randomUUID();
+    const pExecution = buildNativeExecutionInput({ companyId, agentId, runId: P, provider: "pi_rpc", model: "paperclip/faux",
+      piRpcThinkingLevel: "xhigh", issue: { id: issueId, identifier: "U-1", title: "Paul's chat", description: null, workMode: "standard" },
+      taskPrompt: "P's turn", workspace: { id: randomUUID(), cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      normalizedSessionId: sessionId, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 }, runtimeContext: nativeRuntimeContextFixture(),
+      completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1",
+        contract: { revision: "1", objective: "Answer", criteria: [{ id: "work", requirement: "Answer" }] } } } as never);
+    if (v.journal !== "none") {
+      const scoped = scopedRunnerdStateRoot(pExecution as never);
+      const root = v.journalAt === "root" ? scoped
+        : join(stateBase, "quarantine", `${scoped.split("/").pop()}.identity_indeterminate.1794879872395.7`);
+      await mkdir(join(root, "control-plane"), { recursive: true, mode: 0o700 });
+      await mkdir(join(stateBase, "quarantine"), { recursive: true, mode: 0o700 });
+      const commands: Array<Record<string, unknown>> = [
+        { seq: 1, type: "session.open", status: "completed" }, { seq: 2, type: "turn.start", status: "completed" },
+        { seq: 230, type: "turn.interrupt", status: "pending" }, { seq: 231, type: "turn.stop", status: "pending" },
+        { seq: 232, type: "runner.suspend", status: "pending" }];
+      const committedEvents: Array<Record<string, unknown>> = [{ eventType: "turn.started", sourceEventId: "e1" }];
+      if (v.journal === "turn.start") commands.push({ seq: 233, type: "turn.start", status: "pending" });
+      if (v.journal === "external_provider.operation") commands.push({ seq: 233, type: "external_provider.operation", status: "dispatched" });
+      if (v.journal === "semantic_tool.result") commands.push({ seq: 233, type: "semantic_tool.result", status: "pending", payload: { sourceEventId: "e2" } });
+      if (v.journal === "tool_input") committedEvents.push({ eventType: "semantic_tool.input", sourceEventId: "e3" });
+      await writeFile(join(root, "control-plane", "control-plane-state.json"), JSON.stringify({
+        schema: "paperclip.runner.durable.control-plane-state.v2",
+        identity: { runId: P, normalizedSessionId: sessionId, runnerInstanceId: pRunner, environmentLeaseId: randomUUID() },
+        commands, committedEvents }));
+      await mkdir(join(root, "control-plane", "failover-backups"), { recursive: true, mode: 0o700 });
+      for (let i = 0; i < 3; i++) await writeFile(join(root, "control-plane", "failover-backups", `b${i}.json`), `backup ${i} ${P}`);
+    }
     const at = (min: number) => new Date(Date.parse("2026-11-17T01:00:00.000Z") + min * 60_000);
     const failed = (id: string, created: number, finished: number, extra: Record<string, unknown> = {}) => ({ id, companyId, agentId,
       nativeIssueId: issueId, runtimeMode: "native" as const, status: "failed" as const,
@@ -62,7 +120,8 @@ const support = await getEmbeddedPostgresTestSupport();
       startedAt: at(created), finishedAt: at(finished), ...extra });
     await db.insert(heartbeatRuns).values([
       failed(earlier, -8, 2, { status: "succeeded", errorCode: null }),
-      failed(P, 3, 34, { nativeSessionId: sessionId, runnerInstanceId: randomUUID() }),
+      failed(P, 3, 34, { nativeSessionId: sessionId, runnerInstanceId: pRunner,
+        runnerProfileJson: { nativeExecutionInput: pExecution } }),
       failed(S0, 44, 45, { nativeSessionId: sessionId }),
     ]);
     await db.insert(nativeRunFinalizations).values([
@@ -105,8 +164,15 @@ const support = await getEmbeddedPostgresTestSupport();
       taskKey: issueId, lastRunId: P, sessionParamsJson: { sessionId, [PI_CONVERSATION_KEY]: { schema: "paperclip.pi-conversation.v1",
         id: sessionId, generation: 1, boundary: { provider: "pi_rpc", cwd: "/workspace", remoteCwd: null, workspaceId: null, trust: "t" },
         previousId: null, reason: "first_message", runId: P } } });
-    const select = () => selectPiConversation(db, { companyId, agentId, issueId, runId: S,
-      boundary: { provider: "pi_rpc", cwd: "/workspace", remoteCwd: "/workspace", workspaceId: null, trust: "t" } });
+    // Q5 in every row: the runner state base (P's copy included) is byte-identical across admission.
+    const select = async (client: ReturnType<typeof createDb> = db) => {
+      const before = await inventory(stateBase);
+      const result = await selectPiConversation(client, { companyId, agentId, issueId, runId: S,
+        boundary: { provider: "pi_rpc", cwd: "/workspace", remoteCwd: "/workspace", workspaceId: null, trust: "t" } }).catch(error => error as Error);
+      expect(await inventory(stateBase), "Q5: P's journal/copy untouched").toEqual(before);
+      if (result instanceof Error) throw result;
+      return result;
+    };
     return { companyId, agentId, issueId, commentId, P, S0, S, sessionId, select };
   }
   type F = Awaited<ReturnType<typeof seed>>;
@@ -238,5 +304,89 @@ const support = await getEmbeddedPostgresTestSupport();
     const record = await f.select().catch(error => error as Error);
     if (!(record instanceof Error)) expect(record.reason).not.toMatch(/^fresh_continuation:/);
     expect(await actions(f)).toEqual([]);
+  });
+
+  // N4 (PLANTED journal; real admission through selectPiConversation). The passing lifecycle-only mate is R-planted
+  // (copy) and the canonical-root mate below; each non-lifecycle pending entry refuses BEFORE any provider start.
+  it("N4 mate: lifecycle-only pending commands in P's canonical root admit (one fresh thread)", async () => {
+    const f = await seed({ journalAt: "root" });
+    expect((await f.select()).reason).toMatch(/^fresh_continuation:/);
+  });
+  for (const journal of ["turn.start", "external_provider.operation", "semantic_tool.result", "tool_input"] as const) {
+    it(`N4: a pending ${journal} in P's quarantine copy refuses; the copy is read, never settled`, async () => {
+      await expectRefused(await seed({ journal }));
+    });
+  }
+  it("N4: a pending turn.start in P's canonical root refuses", async () => {
+    await expectRefused(await seed({ journal: "turn.start", journalAt: "root" }));
+  });
+  it("N4: no journal and no copy for P holds (no invented empty journal)", async () => {
+    await expectRefused(await seed({ journal: "none" }));
+  });
+
+  // F2 at the ACTUAL session.startTurn envelope, across server-restart cuts. Cut 1: admission commits, the server
+  // restarts (new DB client, new loader: no module memo survives), selection re-runs for the same S. Cut 2: S's
+  // native input is persisted, the server restarts, and executeNativeSession (the runner's production entry,
+  // native-session-runtime.ts:3535) submits the persisted input to the Pi session's startTurn. The prompt assembly
+  // mirrors runtime-selection.ts:891 (header, unfinished-turn packet) and is the only replicated step.
+  async function submitted(f: F, client: ReturnType<typeof createDb>) {
+    const record = await f.select(client); // same S after the restart: same id, no second boundary
+    const { readUnfinishedTurnEntry } = await import("./fresh-continuation-fallback.js");
+    const entry = await readUnfinishedTurnEntry(client, { companyId: f.companyId, runId: f.S, actionId: record.reason.slice("fresh_continuation:".length) });
+    const s = (await client.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.S)))[0]!;
+    const packet = entry ? await createNativeSessionHandoffLoader({ db: client, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId,
+      before: s.createdAt, throughCommentId: f.commentId })(entry as never) : null;
+    const execution = buildNativeExecutionInput({ companyId: f.companyId, agentId: f.agentId, runId: f.S, provider: "pi_rpc", model: "paperclip/faux",
+      piRpcThinkingLevel: "xhigh", issue: { id: f.issueId, identifier: "U-1", title: "Paul's chat", description: null, workMode: "standard" },
+      taskPrompt: ["# U-1: Paul's chat", packet].filter(Boolean).join("\n\n"),
+      workspace: { id: randomUUID(), cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, normalizedSessionId: record.id,
+      lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 }, runtimeContext: nativeRuntimeContextFixture(),
+      completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1",
+        contract: { revision: "1", objective: "Answer", criteria: [{ id: "work", requirement: "Answer" }] } } } as never);
+    await client.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: execution } }).where(eq(heartbeatRuns.id, f.S));
+    return record;
+  }
+  async function startTurnInput(connection: string, runId: string) {
+    const client = createDb(connection); // cut 2: a restarted server reads S's persisted input
+    try {
+      const [s] = await client.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      const input = parseNativeExecutionInput(s!.runnerProfileJson?.nativeExecutionInput);
+      const starts: Array<{ message: { text: string } }> = [];
+      const identity = { runId, sessionId: input.session.normalizedSessionId, companyId: input.binding.companyId,
+        issueId: input.binding.issueId, agentId: input.binding.agentId };
+      let ended: () => void = () => undefined;
+      const capabilities = { resume: false, typedEvents: true, steering: false, interruption: true, structuredResult: true };
+      const session = { identity: () => identity, async capabilities() { return capabilities; },
+        async *events() { await new Promise<void>(resolve => { ended = resolve; }); },
+        async startTurn(value: { message: { text: string } }) { starts.push(structuredClone(value)); ended(); return { turnId: "turn-1" }; },
+        async interrupt() { ended(); }, async result() { return null; },
+        async snapshot() { return { backendKind: "mock", sessionId: identity.sessionId, identity, providerSessionId: "p", cursor: "0",
+          activeTurnId: null, pendingRuntimeRequests: [], lineage: [] }; }, async close() { ended(); } };
+      const outcome = await executeNativeSession({ input,
+        backend: { async descriptor() { return { kind: "mock", name: "pi-capture", version: "1", capabilities,
+          runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" } }; }, async openSession() { return session; } },
+        controlPlane: { async openRun() {}, async checkpointSession() {},
+          async appendEvent(value: { sourceSeq: number }) { return { cursor: value.sourceSeq, highestContiguousSourceSeq: value.sourceSeq, disposition: "committed" }; },
+          async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; }, async completeRun() {} },
+        runnerInstanceId: "runner-capture", controlPlaneInstanceId: "control-capture", timeoutMs: 5_000 } as never)
+        .then(() => "finalized", (error: unknown) => String(error instanceof Error ? error.message : error));
+      return Object.assign(starts, { outcome });
+    } finally { await client.$client.end(); }
+  }
+  it("F2-startTurn: the unfinished_turn fact is in the envelope the Pi session's startTurn receives, across restart cuts", async () => {
+    const f = await seed();
+    await f.select(); // admission commits the boundary
+    const restarted = createDb(database.connectionString); // cut 1: server restart between admission and start
+    try { await submitted(f, restarted); } finally { await restarted.$client.end(); }
+    const starts = await startTurnInput(database.connectionString, f.S);
+    expect(starts, starts.outcome).toHaveLength(1);
+    const envelope = JSON.parse(starts[0]!.message.text);
+    expect(envelope.task.prompt).toContain(FACT);
+    expect(envelope.task.prompt).toMatch(/unfinished_turn/);
+    // Faked completion would be a different, false fact: the submitted input never claims completion or no actions.
+    expect(envelope.task.prompt).not.toMatch(/previous turn (completed|finished)|took no actions|produced an accepted result/i);
+    expect(envelope.schema).not.toBe("paperclip.native-continuation.v1");
+    expect(await actions(f)).toHaveLength(1);
+    expect(await notes(f)).toHaveLength(1);
   });
 });
