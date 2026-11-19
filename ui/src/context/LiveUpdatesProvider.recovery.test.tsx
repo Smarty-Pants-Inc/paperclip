@@ -437,6 +437,73 @@ describe("LiveUpdatesProvider connection recovery", () => {
     expect(container.textContent).not.toContain("new-run");
   });
 
+  // C8 second page (live FAIL 06:00Z gate3): another open page of the same chat
+  // is visible but has no focus, so the visible-route patch does not apply.
+  // Planted: GET /issues/:id/live-runs and /active-run return the running native
+  // run; then every later read is held pending and the server's own
+  // heartbeat.run.status 'cancelled' event (setRunStatus's publish) arrives.
+  it.each([390, 1440])("C8: a second, unfocused page drops the run the person stopped as soon as its status event arrives, at %i", async (width) => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    vi.stubGlobal("WebSocket", Socket);
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    routeSelection.pathname = "/PAP/chats/agent-1";
+    const run = { id: "run-1", status: "running", agentId: "agent-1", issueId: "issue-1", adapterType: "paperclip_runner", runtimeMode: "native",
+      invocationSource: "on_demand", triggerDetail: "manual", startedAt: "2026-11-19T05:59:29.194Z", finishedAt: null, createdAt: "2026-11-19T05:59:28.969Z" };
+    const runRead = vi.fn<() => Promise<unknown>>().mockResolvedValue([run]);
+    const activeRead = vi.fn<() => Promise<unknown>>().mockResolvedValue(run);
+    function SecondPage() {
+      const connected = useTaskRunLiveUpdates({ companyId: "company-1", issueId: "issue-1", issueQueryRef: "issue-1", assigneeAgentId: "agent-1" });
+      const runs = useQuery<Array<{ id: string; status: string }>>({ queryKey: queryKeys.issues.liveRuns("issue-1"), queryFn: runRead as () => Promise<Array<{ id: string; status: string }>>,
+        refetchInterval: (query) => liveRunRefetchInterval(connected, query.state, 1000) });
+      const active = useQuery<{ id: string; status: string } | null>({ queryKey: queryKeys.issues.activeRun("issue-1"), queryFn: activeRead as () => Promise<{ id: string; status: string } | null>,
+        refetchInterval: (query) => runs.data?.length ? false : liveRunRefetchInterval(connected, query.state, 1000) });
+      // TaskChatThread's live lane rule: the active run, else a live list run.
+      const lane = [active.data, ...(runs.data ?? [])].find((item) => item?.status === "running");
+      return <span>{lane ? `Working · ${lane.id}` : "no lane"}</span>;
+    }
+    await act(async () => root.render(<QueryClientProvider client={client}><LiveUpdatesProvider><SecondPage /></LiveUpdatesProvider></QueryClientProvider>));
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    const socket = Socket.instances[0];
+    await act(async () => socket.onopen?.());
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(container.textContent).toBe("Working · run-1");
+    const held = new Promise<never>(() => undefined);
+    runRead.mockReturnValue(held);
+    activeRead.mockReturnValue(held);
+    await act(async () => socket.onmessage?.({ data: JSON.stringify({ id: 1, companyId: "company-1", type: "heartbeat.run.status",
+      createdAt: "2026-11-19T06:00:06.765Z", payload: { runId: "run-1", agentId: "agent-1", issueId: "issue-1", status: "cancelled",
+        startedAt: "2026-11-19T05:59:29.194Z", finishedAt: "2026-11-19T06:00:06.765Z" } }) }));
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(container.textContent).toBe("no lane");
+    expect(client.getQueryData(queryKeys.issues.liveRuns("issue-1"))).toEqual([]);
+    expect(client.getQueryData(queryKeys.issues.activeRun("issue-1"))).toBeNull();
+  });
+
+  it.each([390, 1440])("C8 control: a non-terminal status event leaves the second page's lane until the server says otherwise, at %i", async (width) => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    vi.stubGlobal("WebSocket", Socket);
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const run = { id: "run-1", status: "running", agentId: "agent-1", issueId: "issue-1" };
+    const runRead = vi.fn<() => Promise<unknown>>().mockResolvedValue([run]);
+    function SecondPage() {
+      const connected = useTaskRunLiveUpdates({ companyId: "company-1", issueId: "issue-1", issueQueryRef: "issue-1", assigneeAgentId: "agent-1" });
+      const runs = useQuery<Array<{ id: string; status: string }>>({ queryKey: queryKeys.issues.liveRuns("issue-1"), queryFn: runRead as () => Promise<Array<{ id: string; status: string }>>,
+        refetchInterval: (query) => liveRunRefetchInterval(connected, query.state, 1000) });
+      const lane = runs.data?.find((item) => item.status === "running");
+      return <span>{lane ? `Working · ${lane.id}` : "no lane"}</span>;
+    }
+    await act(async () => root.render(<QueryClientProvider client={client}><LiveUpdatesProvider><SecondPage /></LiveUpdatesProvider></QueryClientProvider>));
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    const socket = Socket.instances[0];
+    await act(async () => socket.onopen?.());
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    runRead.mockReturnValue(new Promise<never>(() => undefined));
+    await act(async () => socket.onmessage?.({ data: JSON.stringify({ id: 1, companyId: "company-1", type: "heartbeat.run.status",
+      createdAt: "2026-11-19T06:00:06.765Z", payload: { runId: "run-1", agentId: "agent-1", issueId: "issue-1", status: "running" } }) }));
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(container.textContent).toBe("Working · run-1");
+  });
+
   it.each(["initial", "background", "connection setup"])("refetches after an older empty %s read settles when run events arrive during it", async (phase) => {
     vi.stubGlobal("WebSocket", Socket);
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
