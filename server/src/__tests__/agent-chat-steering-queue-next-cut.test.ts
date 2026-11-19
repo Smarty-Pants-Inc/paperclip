@@ -43,6 +43,7 @@ import { waitForPendingRunFailureReports } from "../services/run-failure-report.
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { createPiEventProjector } from "../../../packages/paperclip-runner/src/drivers/pi/pi-event-projector.js";
 import { openPiSteeringPeer } from "./helpers/pi-steering-peer.js";
+import { capturePiModelInput, type CapturedPiModelRequest } from "./helpers/pi-model-input-peer.js";
 import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
 import type { PrpEvent } from "../vendor/paperclip-runner/index.js";
 import {
@@ -291,14 +292,22 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
 
 
 
-  /** Real admission + process-adapter drain. Replies record the exact carried
-   * input ids and session; no saved wake shape is assumed by this witness. */
+  /** Real admission and adapter drain. Keep the historical id/session checks,
+   * but count delivery only from the real Pi model's captured HTTP request.
+   * The adapter edge renders the context production admission actually supplied;
+   * it never constructs model input from expected ids or a DB-id echo reply. */
   async function drainVisibleQueue(chat: Chat, expected: string[], deleted: string[] = [], selectedId?: string) {
     const seen: { runId: string; ids: string[]; generation: number; input: string }[] = [];
+    const modelRequests: Array<CapturedPiModelRequest & { runId: string }> = [];
     const adapter = getServerAdapter("process");
     const received = new Map<string, Record<string, unknown>>();
+    const modelRoot = await mkdtemp(join(tmpdir(), "queue-model-input-"));
+    let afterTurnAt = 0;
     registerServerAdapter({ ...adapter, execute: async ctx => {
       received.set(ctx.runId, structuredClone(ctx.context));
+      const input = renderPaperclipWakePrompt(ctx.context.paperclipWake, { conversationMode: true });
+      const captured = await capturePiModelInput(modelRoot, ctx.runId, input);
+      modelRequests.push(...captured.map(request => ({ ...request, runId: ctx.runId })));
       return adapter.execute(ctx);
     } });
     const responder = createServer(async (req, res) => {
@@ -325,6 +334,7 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
     try {
       await db.update(agents).set({ adapterConfig: { command: process.execPath, args: ["-e", script], cwd },
         runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } } }).where(eq(agents.id, chat.agentId));
+      afterTurnAt = Date.now();
       if (selectedId) {
         runningProcesses.delete(chat.runId);
         await db.update(heartbeatRuns).set({ runtimeMode: "legacy" }).where(eq(heartbeatRuns.id, chat.runId));
@@ -351,11 +361,25 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
         if (Date.now() > deadline) throw Error(JSON.stringify({ seen, waiting, runs }));
         await new Promise(resolve => setTimeout(resolve, 25));
       }
+      const [originalTurn] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+      expect(["succeeded", "cancelled"]).toContain(originalTurn!.status);
+      expect(originalTurn!.finishedAt).not.toBeNull();
+      afterTurnAt = originalTurn!.finishedAt!.getTime();
       const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, chat.issue.id));
       const byId = new Map(comments.map(comment => [comment.id, comment]));
       const messages = expected.filter(id => !/^\s*\/new\s*$/.test(byId.get(id)!.body));
       expect(seen.flatMap(turn => turn.ids)).toEqual(messages);
       expect(new Set(seen.flatMap(turn => turn.ids)).size).toBe(messages.length);
+      // RFL correction (3): the model, not a DB id echo, received each body in
+      // exactly ONE request, after the original turn, in visible queue order.
+      for (const id of messages) {
+        const matches = modelRequests.filter(request => request.input.includes(byId.get(id)!.body));
+        expect(matches, `model request containing ${id}`).toHaveLength(1);
+        expect(matches[0]!.runId).not.toBe(chat.runId);
+        expect(matches[0]!.at).toBeGreaterThanOrEqual(afterTurnAt);
+      }
+      expect(modelRequests.flatMap(request => messages.filter(id => request.input.includes(byId.get(id)!.body))
+        .sort((a, b) => request.input.indexOf(byId.get(a)!.body) - request.input.indexOf(byId.get(b)!.body)))).toEqual(messages);
       const replies = comments.filter(comment => seen.some(turn => turn.runId === comment.createdByRunId));
       expect(replies).toHaveLength(seen.length);
       for (const turn of seen) {
@@ -369,12 +393,13 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
       }
       for (const id of deleted) {
         expect(seen.flatMap(turn => turn.ids)).not.toContain(id);
+        expect(modelRequests.some(request => request.input.includes(byId.get(id)!.body))).toBe(false);
         expect(await answered(id)).toBe(false);
       }
       expect((await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200)).body.entries).toEqual([]);
       if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `Q1-delivery-${chat.issue.id}.json`),
-        JSON.stringify({ fixture: "real routes + PostgreSQL + process adapter; responder records carried ids in replies",
-          expected, deleted, seen, comments }, null, 2));
+        JSON.stringify({ fixture: "real routes + PostgreSQL + adapter edge + real Pi + controlled SSE model; model HTTP input is the delivery witness, id echo retained only as a regression check",
+          expected, deleted, seen, afterTurnAt, modelRequests, comments }, null, 2));
       return seen;
     } finally {
       await heartbeat.cancelActiveForAgent(chat.agentId).catch(() => undefined);
@@ -383,6 +408,7 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
       responder.closeAllConnections();
       await new Promise<void>((resolve, reject) => responder.close(error => error ? reject(error) : resolve()));
       await rm(cwd, { recursive: true, force: true });
+      await rm(modelRoot, { recursive: true, force: true });
     }
   }
 
@@ -533,7 +559,7 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
     const chat = await seedChat();
     await attachSteerable(chat);
     const root = await mkdtemp(join(tmpdir(), "q1-pi-boundary-"));
-    const peer = await openPiSteeringPeer(root, chat.runId);
+    const peer = await openPiSteeringPeer(root, chat.runId, { captureModelInput: true });
     const events: PrpEvent[] = [];
     let port: PaperclipControlPlanePort | undefined;
     let pumpError: unknown;
@@ -566,6 +592,9 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
       expect(response.status, JSON.stringify(response.body)).toBe(200);
       expect(response.body.entries).toEqual([]);
       expect(await answered(message!.id)).toBe(false);
+      expect(peer.modelRequests).toHaveLength(1);
+      expect(peer.modelRequests[0]!.input).not.toContain(message!.body);
+      const boundaryReleasedAt = Date.now();
       peer.releaseBoundary(true);
       await vi.waitFor(async () => {
         if (pumpError) throw pumpError;
@@ -573,10 +602,13 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
       }, { timeout: 5000 });
       expect(peer.commands.filter(command => ["prompt", "steer", "abort", "follow_up"].includes(command.type))
         .map(command => command.type)).toEqual(["prompt", "steer"]);
+      const receivedByModel = peer.modelRequests.filter(request => request.input.includes(message!.body));
+      expect(receivedByModel).toHaveLength(1);
+      expect(receivedByModel[0]!.at).toBeGreaterThanOrEqual(boundaryReleasedAt);
       const persisted = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, chat.runId)).orderBy(asc(heartbeatRunEvents.seq));
       if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, "Q1-pi-queue-steer.json"), JSON.stringify({
-        fixture: "real routes, PostgreSQL, Pi/Codex drivers, proxy and event ingestion; controlled Pi RPC peer and native-session registry",
-        message, queue, response: response.body, commands: peer.commands, events, persisted,
+        fixture: "real routes, PostgreSQL, real Pi/Codex drivers, proxy, Pi process and event ingestion; controlled SSE model and native-session registry",
+        message, queue, response: response.body, commands: peer.commands, modelRequests: peer.modelRequests, boundaryReleasedAt, events, persisted,
       }, null, 2));
     } finally {
       await peer.close();
