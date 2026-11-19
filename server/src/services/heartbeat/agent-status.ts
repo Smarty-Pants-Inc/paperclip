@@ -25,9 +25,9 @@ function errorReason(reason: string | null | undefined) {
 
 /**
  * A failed run whose answer the person already has: its accepted reply is published (the withheld-reply path) and
- * only saving its files failed. That is not an agent error, so the agent settles idle. The codes are
- * NATIVE_WITHHELD_REPLY_FAILURE_CODES (native-run-finalizer.ts), read by value here to keep this module free of
- * the finalizer's imports; agent-status.test.ts holds the two lists equal.
+ * only saving its files failed. That is not an agent error, so the agent settles idle. The codes are those of
+ * NATIVE_WITHHELD_REPLY_FAILURE_CODES (native-run-finalizer.ts), repeated by value to keep this module free of
+ * the finalizer's imports. A code added there must be added here.
  */
 export const ANSWERED_RUN_SAVE_FAILURE_CODES: readonly string[] = [
   "native_workspace_sync_out_retry_exhausted", "native_workspace_sync_out_unrecoverable", "native_workspace_sync_out_stalled",
