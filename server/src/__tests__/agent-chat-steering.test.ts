@@ -415,7 +415,14 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const carriers = await carriersOf(chat, response.body.id);
     expect(carriers.wakes.length + carriers.runs.length).toBe(1);
     expect(await answered(response.body.id)).toBe(false);
-    expect(response.body).toMatchObject({ deliveryOutcome: "queued", steeringUnavailableReason: expect.any(String) });
+    // An RPC refusal occurs after POST's custody decision. Depending on whether
+    // its reconciliation beat response projection, the receipt is still pending
+    // or already queued; neither is a delivered/Sent claim. The joined GET below
+    // must always show the one ordinary queue receipt after refusal.
+    if (variant === "stale-turn" && response.body.deliveryOutcome === "steered") {
+      expect(response.body).toMatchObject({ steeredIntoRunId: chat.runId, steeringStatus: "accepted",
+        steeringDeliveryEventSeq: null, steerDeliveredAt: null, steeringUnavailableReason: null });
+    } else expect(response.body).toMatchObject({ deliveryOutcome: "queued", steeringUnavailableReason: expect.any(String) });
     const thread = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/comments`).expect(200);
     expect(thread.body.find((comment: any) => comment.id === response.body.id)).toMatchObject({
       deliveryOutcome: "queued", steeringUnavailableReason: expect.any(String),
@@ -636,6 +643,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
         return { turnId };
       });
       const response = await postDefault(chat, "Read before agent_end, ingested afterwards").expect(201);
+      await waitForPendingCommentSteers(); // POST returns custody before the native RPC ACK.
       peer.releaseBoundary(true); peer.endTurn(); // Producer has ended while its read is still held.
       await vi.waitFor(() => expect(readPaused).toBe(true));
       await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, chat.runId));
@@ -661,6 +669,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   it.each([false, true])("S-j no terminal: a closed crashed stream uses only ingested facts, once (read/text retained=%s)", async retained => {
     const chat = await seedChat(); await attachSteerable(chat);
     const response = await postDefault(chat, "Read and answer may both be lost on crash").expect(201);
+    await waitForPendingCommentSteers(); // Join dispatch before injecting its later crash facts.
     const sourceInstanceId = randomUUID();
     const port = new PaperclipControlPlanePort(db, { companyId: chat.companyId, issueId: chat.issue.id,
       runId: chat.runId, agentId: chat.agentId, sessionId: "crashed-pi-session",
@@ -694,6 +703,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const chat = await seedChat(); await attachSteerable(chat);
     const sent = [];
     for (const text of ["read and answered", "unread first", "unread second"]) sent.push((await postDefault(chat, text).expect(201)).body);
+    await waitForPendingCommentSteers(); // Run-log facts follow ordered dispatch, not just custody.
     await runLog(chat, [
       { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
       { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${sent[0].id}` },
@@ -1489,6 +1499,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const chat = await seedChat(); await attachSteerable(chat);
     const one = (await postDefault(chat, "First default steer").expect(201)).body;
     const two = (await postDefault(chat, "Second default steer").expect(201)).body;
+    await waitForPendingCommentSteers(); // The synthetic tied ACKs must follow actual dispatch.
     const [waiting] = await send(chat, ["Waiting explicit Queue"]);
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
     const acks = (run!.resultJson as any).queuedSteeringAcknowledgements;
