@@ -11,7 +11,7 @@ import fs from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { environmentLeases, heartbeatRuns } from "@paperclipai/db";
 import { retryUnlessTransactionBound } from "../transaction-retry.js";
@@ -99,7 +99,7 @@ export interface NativeWorkspaceSyncReference {
 export interface PreparedNativeWorkspaceSync {
   mode: WorkspaceInboundMode;
   reference: NativeWorkspaceSyncReference;
-  restoreWorkspace(assertOwnership?: () => Promise<void>): Promise<void>;
+  restoreWorkspace(assertOwnership?: () => Promise<void>, ownerToken?: string): Promise<void>;
   cleanup(): Promise<void>;
 }
 
@@ -611,10 +611,21 @@ async function readDescriptor(input: {
   };
 }
 
+/** A copy-back's publication found its ownership gone: a newer owner, or the copy-back bound's tombstone. */
+export const NATIVE_WORKSPACE_SYNC_PUBLICATION_FENCED = "native_workspace_sync_publication_fenced";
+
+/**
+ * Writes the run's sync reference. A FINALIZED reference is a publication (`finalized`): it and the lease stamp are
+ * written in ONE transaction, and the reference write is ONE statement conditional on the run's copy-back owner
+ * (never a tombstone; the caller's token when it holds one). The owner key is on the same row the copy-back bound
+ * rewrites (isolateClassicSourceWorkspace), so the two serialize on the row lock: a publication released after the
+ * fence writes nothing, and the bound refuses a run whose publication committed first.
+ */
 async function persistRunReference(
   db: Db,
   runId: string,
   reference: NativeWorkspaceSyncReference,
+  finalized?: { ownerToken?: string; leaseId: string; stamp: Record<string, unknown> },
 ): Promise<void> {
   // DB-only run write; a 40P01/40001 is retried from a fresh transaction (smarty-dev#20454).
   await retryUnlessTransactionBound(db, () => db.transaction(async (tx) => {
@@ -627,7 +638,8 @@ async function persistRunReference(
       .then((rows) => rows[0] ?? null);
     if (!run) throw new Error("native_workspace_sync_run_missing");
     await notifyCancelledWorkspacePreservation(tx, { companyId: run.companyId, runId });
-    await tx
+    const owner = sql`${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceFinalizationOwner'`;
+    const published = await tx
       .update(heartbeatRuns)
       .set({
         runnerProfileJson: {
@@ -636,7 +648,15 @@ async function persistRunReference(
         },
         updatedAt: new Date(),
       })
-      .where(eq(heartbeatRuns.id, runId));
+      .where(and(eq(heartbeatRuns.id, runId), ...(finalized ? [
+        sql`${owner}->>'fenced' is distinct from 'true'`,
+        ...(finalized.ownerToken ? [sql`${owner}->>'token' = ${finalized.ownerToken}`] : []),
+      ] : [])))
+      .returning({ id: heartbeatRuns.id });
+    if (!finalized) return;
+    // Nothing of a fenced copy-back is published: not the reference, not the lease stamp.
+    if (!published.length) throw new Error(NATIVE_WORKSPACE_SYNC_PUBLICATION_FENCED);
+    await writeLeaseStamp(tx, finalized);
   }));
 }
 
@@ -646,7 +666,12 @@ async function persistLeaseStamp(input: {
   stamp: Record<string, unknown>;
 }): Promise<void> {
   // DB-only lease write; a 40P01/40001 is retried from a fresh transaction (smarty-dev#20454).
-  await retryUnlessTransactionBound(input.db, () => input.db.transaction(async (tx) => {
+  await retryUnlessTransactionBound(input.db, () => input.db.transaction(tx => writeLeaseStamp(tx, input)));
+}
+
+async function writeLeaseStamp(tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+  input: { leaseId: string; stamp: Record<string, unknown> }): Promise<void> {
+  {
     const lease = await tx
       .select({ metadata: environmentLeases.metadata, companyId: environmentLeases.companyId, heartbeatRunId: environmentLeases.heartbeatRunId })
       .from(environmentLeases)
@@ -666,7 +691,7 @@ async function persistLeaseStamp(input: {
         updatedAt: new Date(),
       })
       .where(eq(environmentLeases.id, input.leaseId));
-  }));
+  }
 }
 
 function providerLeaseIdFor(input: {
@@ -856,6 +881,8 @@ async function finalizePreparedRuntime(input: {
   runtime: PreparedAdapterExecutionTargetRuntime;
   descriptor: NativeWorkspaceSyncDescriptor;
   assertOwnership?: () => Promise<void>;
+  /** The copy-back owner's token (withNativeWorkspaceFinalizationOwnership): the publication is conditional on it. */
+  ownerToken?: string;
   onPhase?: RuntimeSpanRunner;
   onCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
 }): Promise<NativeWorkspaceSyncReference> {
@@ -886,13 +913,11 @@ async function finalizePreparedRuntime(input: {
       finalHostSha256,
     };
     await input.assertOwnership?.();
+    // The descriptor file is content-addressed and unread until a reference names it. The reference and the lease
+    // stamp are the publication: one transaction, conditional on the copy-back owner (persistRunReference).
     const reference = await writeDescriptor(finalizedDescriptor);
-    await persistRunReference(input.db, input.runId, reference);
-    await persistLeaseStamp({
-      db: input.db,
-      leaseId: input.descriptor.binding.leaseId,
-      stamp,
-    });
+    await persistRunReference(input.db, input.runId, reference, {
+      ownerToken: input.ownerToken, leaseId: input.descriptor.binding.leaseId, stamp });
     return reference;
   });
 }
@@ -1126,7 +1151,7 @@ export async function prepareNativeWorkspaceSync(input: {
     get reference() {
       return reference;
     },
-    restoreWorkspace: async (assertOwnership) => {
+    restoreWorkspace: async (assertOwnership, ownerToken) => {
       if (!restorePromise) {
         restorePromise = finalizePreparedRuntime({
           db: input.db,
@@ -1135,6 +1160,7 @@ export async function prepareNativeWorkspaceSync(input: {
           runtime: preparedRuntime,
           descriptor,
           assertOwnership,
+          ownerToken,
           onPhase: input.onPhase,
           onCheckpoint: input.onCheckpoint,
         })
@@ -1184,6 +1210,7 @@ export async function resumeNativeWorkspaceSync(input: {
   runId: string;
   target: AdapterExecutionTarget;
   assertOwnership?: () => Promise<void>;
+  ownerToken?: string;
   onPhase?: RuntimeSpanRunner;
   onCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
 }): Promise<boolean> {
@@ -1251,6 +1278,7 @@ export async function resumeNativeWorkspaceSync(input: {
     runtime,
     descriptor: existing.descriptor,
     assertOwnership: input.assertOwnership,
+    ownerToken: input.ownerToken,
     onPhase: input.onPhase,
     onCheckpoint: input.onCheckpoint,
   });

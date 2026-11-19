@@ -65,13 +65,18 @@ export async function isolateClassicSourceWorkspace(tx: Db, run: typeof heartbea
     eq(executionWorkspaces.companyId, run.companyId), eq(executionWorkspaces.id, reference.workspaceId)));
   if (!workspace || !await isTaskOwnRoot(workspace, issueId)) return null;
   const recordedAt = new Date();
+  // The tombstone first, in ONE statement conditional on the reference the caller read: a copy-back whose
+  // publication committed since (its reference is `finalized`, native-workspace-sync.ts persistRunReference) saved
+  // its files, so this run is not isolated and nothing below is written. The two serialize on this row.
+  const [tombstoned] = await tx.update(heartbeatRuns).set({ runnerProfileJson: sql`jsonb_set(coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb),
+    '{nativeWorkspaceFinalizationOwner}', ${JSON.stringify({ fenced: true, at: recordedAt.toISOString() })}::jsonb)` })
+    .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id),
+      sql`${heartbeatRuns.runnerProfileJson} #>> '{nativeWorkspaceSync,state}' = 'prepared'`)).returning({ id: heartbeatRuns.id });
+  if (!tombstoned) return null;
   // Detach the task from this root (a task already bound elsewhere keeps that binding).
   await tx.update(issues).set({ executionWorkspaceId: null,
     workspaceBindingRevision: sql`${issues.workspaceBindingRevision} + 1`, updatedAt: recordedAt }).where(and(
     eq(issues.companyId, run.companyId), eq(issues.id, issueId), eq(issues.executionWorkspaceId, workspace.id)));
-  await tx.update(heartbeatRuns).set({ runnerProfileJson: sql`jsonb_set(coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb),
-    '{nativeWorkspaceFinalizationOwner}', ${JSON.stringify({ fenced: true, at: recordedAt.toISOString() })}::jsonb)` })
-    .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id)));
   // The root is ABANDONED, durably: its row is closed and names why. Every reader that picks a task's root (the
   // Files fallback, the task workspace selectors, the open-workspace lists) takes open rows only, so none presents
   // this root as the task's files again. It is closed, NOT archived: an archived row would hand the directory to
