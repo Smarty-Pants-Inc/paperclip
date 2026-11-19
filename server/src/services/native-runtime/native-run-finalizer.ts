@@ -1792,7 +1792,11 @@ async function finalizeNativeRunAndProject(input: {
       .then((rows) => rows[0] ?? null);
     if (!authoritativeIssue)
       throw new Error("native_finalization_issue_missing");
-    const preservedResultFinalization = run.status !== "running"
+    // Retry export reopens the finalization suffix of an ended run without
+    // making the run `running` again (K12); it is the ordinary commit, not a
+    // preserved-result resumption.
+    const exportRetryReopened = record(coordinator.failureDetail).workspaceExportRetry != null;
+    const preservedResultFinalization = run.status !== "running" && !exportRetryReopened
       ? await readPreservedNativeResultFinalization(input.db, {
           companyId: run.companyId, issueId: authoritativeIssue.id, runId: run.id, agentId: run.agentId,
         }) : null;
@@ -2203,7 +2207,14 @@ async function finalizeNativeRunAndProject(input: {
       // reconciler, Retry export, a late copy-back) may commit this run's
       // accepted result and save its files; the run keeps the status, error,
       // failure code and end time it ended with. Evaluated on the locked row.
-      const runAlreadyEnded = nativeRunAlreadyEndedSql();
+      // Scope: a LATE SAVE, that is a finalization that had reached its terminal
+      // verdict and was reopened only to save the files (the preserved-result
+      // resumption or Retry export). A run whose finalization was still pending
+      // when its executor failed keeps the existing recovered-failure rule.
+      const lateSave = coordinator.recoveryHistory.some(entry => entry.kind === "preserved_result_finalization")
+        || record(coordinator.failureDetail).workspaceExportRetry != null
+        || record(run.resultJson).workspaceExportRetry != null;
+      const runAlreadyEnded = lateSave ? nativeRunAlreadyEndedSql() : sql`false`;
       const projectedRunStatus = sql`case when ${heartbeatRuns.status} = 'cancelled' or ${runAlreadyEnded}
         then ${heartbeatRuns.status} else ${projectedStatus} end`;
       // Decision (i): a run cancelled after its result was accepted keeps
