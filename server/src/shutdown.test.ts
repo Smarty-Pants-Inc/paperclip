@@ -256,7 +256,7 @@ describe("finalizeServerShutdown", () => {
 
     expect(shutdownAppServices).toHaveBeenCalledOnce();
     expect(shutdownInstrumentation).toHaveBeenCalledOnce();
-    expect(log.info).not.toHaveBeenCalled();
+    expect(log.info).not.toHaveBeenCalledWith(expect.anything(), "Stopping embedded PostgreSQL");
   });
 });
 

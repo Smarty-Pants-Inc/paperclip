@@ -1,3 +1,5 @@
+import { drainNativeRunDiagnostics } from "./services/native-runtime/native-run-trace.js";
+
 type HotRestartShutdownPreparation = {
   skipDrain: boolean;
 };
@@ -249,6 +251,12 @@ export async function finalizeServerShutdown(input: {
       input.log.error({ err, signal }, "run-failure report drain failed");
     }
   }
+
+  // Hot-restart detaches can skip trace.finish(). Drain every queued native
+  // diagnostic before its database sink disappears, with one shared deadline
+  // across all runs. A stuck sink must never hold shutdown indefinitely.
+  await runBoundedShutdownStep({ step: "native_run_diagnostics", signal, timeoutMs: 2_000,
+    run: drainNativeRunDiagnostics, log: input.log });
 
   // End the client pools once nothing needs them any more. Without this the
   // process exit leaves the pooled backends to PostgreSQL's own TCP keepalive

@@ -5442,6 +5442,18 @@ disk full, the hold rests again as `sandbox_disk_full` with its Retry.
 A reclaim whose outcome is unknown keeps the scheduled retry, because its journal
 resumes on the next attempt and can still free space.
 
+Native assigned app mutations reserve a run-scoped `bridgeToolReceipts` entry
+before dispatch. A completed receipt replays the saved result (including null)
+for the same call ID and arguments without another provider call. A typed gateway
+refusal attested before dispatch settles the receipt as `refused`; retries raise
+the saved status, reason, message and details, and interrupted-call recovery
+returns that refusal as a tool error. Error text never establishes dispatch
+state. An unknown or post-dispatch error stays pending and replays an unknown
+outcome, not permission to repeat the action. Current run/tool authorization and
+argument-digest checks still apply. Previous-release completed and pending
+receipts keep their meaning; historical pending entries cannot be reclassified
+without proof and remain unknown. No schema migration or receipt deletion occurs.
+
 Native assigned app tools save governed responses above 500,000 encoded bytes before returning
 a bounded reference through PRP. `read_tool_result` retrieves the saved JSON in
 UTF-8 pages under the same task, agent, and responsible-user access checks.

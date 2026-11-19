@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { writeFile } from "node:fs/promises";
+import { logger } from "../../middleware/logger.js";
+import { finalizeServerShutdown } from "../../shutdown.js";
 
 import type { AdapterRuntimeEvent } from "../../adapters/index.js";
 import { getActiveStepContext } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
@@ -609,6 +611,52 @@ describe("time to first token anchor", () => {
 });
 
 describe("deferred diagnostics", () => {
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21269 (WATCH row 5)
+  it("logs a rejected span sink once per run with its span and error class, never its payload", async () => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    const traces = ["sink-failure-one", "sink-failure-two"].map(runId => createNativeRunTrace({ runId,
+      traceContext: createRecordingTraceContext().traceContext,
+      onEvent: async () => { throw new TypeError("private sink payload must never be logged"); } }));
+    try {
+      for (const trace of traces) {
+        await trace.record({ name: "tool.execute", startedAtMs: 1, endedAtMs: 2 }, { deferRunLog: true });
+        await trace.record({ name: "runner.turn.submit", startedAtMs: 2, endedAtMs: 3 });
+        await trace.finish("ok");
+      }
+      expect(warn).toHaveBeenCalledTimes(2);
+      for (const [fields, message] of warn.mock.calls) {
+        expect(fields).toEqual({ runIdHash: expect.stringMatching(/^[a-f0-9]{12}$/), span: expect.stringMatching(/^(tool.execute|runner.turn.submit)$/), errorClass: "TypeError" });
+        expect(message).toBe("Native run span sink failed");
+      }
+      expect(JSON.stringify(warn.mock.calls)).not.toContain("private sink payload");
+    } finally { warn.mockRestore(); }
+  });
+
+  it("bounds the shared shutdown diagnostic drain to two seconds across runs", async () => {
+    vi.useFakeTimers();
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const traces = ["hung-one", "hung-two"].map(runId => createNativeRunTrace({ runId,
+      traceContext: createRecordingTraceContext().traceContext, onEvent: async () => held }));
+    try {
+      for (const trace of traces) await trace.record({ name: "tool.execute", startedAtMs: 1, endedAtMs: 2 }, { deferRunLog: true });
+      let closed = false;
+      const shutdown = finalizeServerShutdown({ signal: "SIGTERM", shutdownAppServices: async () => {},
+        closeDatabase: async () => { closed = true; }, stopEmbeddedPostgres: null,
+        shutdownInstrumentation: async () => {}, shutdownSentry: async () => {}, log: { info() {}, error() {} } });
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(closed).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await shutdown;
+      expect(closed).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      release();
+      for (const trace of traces) await trace.finish("ok");
+      vi.useRealTimers();
+    }
+  });
+
   it("never blocks the caller and settles before the trace finishes", async () => {
     const events: AdapterRuntimeEvent[] = [];
     const trace = createNativeRunTrace({

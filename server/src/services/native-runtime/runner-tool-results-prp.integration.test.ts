@@ -8,7 +8,11 @@ import { createRunnerdCodexTransport, defaultCapabilityRunnerdBinary } from "../
 import { createAssignedMcpTools } from "./assigned-mcp-tools.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { RUNNER_TOOL_RESULT_MAX_BYTES } from "./runner-tool-results.js";
-import type { ToolGatewayService } from "../tool-gateway.js";
+import { createToolGatewayService, ToolGatewayHttpError, type ToolGatewayService } from "../tool-gateway.js";
+import { connectionGrants, heartbeatRunEvents, heartbeatRuns, toolCatalogEntries, toolConnections, toolProfiles } from "@paperclipai/db";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { eq } from "drizzle-orm";
+import { finalizeServerShutdown } from "../../shutdown.js";
 import { createNativeRunTrace } from "./native-run-trace.js";
 import { createNativeToolTrace } from "./native-tool-trace.js";
 
@@ -136,6 +140,90 @@ for await (const line of createInterface({input:process.stdin})) {
     expect(await reopened.execute(nullCall)).toBeNull();
     expect(await reopened.recover(nullCall)).toEqual({ result: null });
     expect(effects).toBe(2);
+  });
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21269 (WATCH row 5)
+  it.each(["policy", "session", "grant"] as const)("replays a definite pre-dispatch %s refusal, never an unknown outcome", async kind => {
+    const fixture = await server.fixture({ connectionScenario: "ready", disableWakeOnDemand: true });
+    await server.db.update(toolCatalogEntries).set({ riskLevel: "write" }).where(eq(toolCatalogEntries.companyId, fixture.companyId));
+    const provider = vi.fn(async () => { throw new Error("provider must not be called"); });
+    const gateway = createToolGatewayService(server.db, { remoteHttpRequest: provider });
+    const session = await gateway.createSession(fixture);
+    // Adapt only named-gateway discovery/session addressing; use the real
+    // gateway's policy, dispatch boundary, audit and PostgreSQL receipts.
+    let token = session.token;
+    const assigned = await createAssignedMcpTools({ gatewayPublicId: "fixture", bearerToken: "fixture",
+      gateway: {
+        listToolsForNamedGateway: async () => (await gateway.listToolsForSession(session.token)).filter(tool => tool.connectionId),
+        executeTool: (input: { tool: string; parameters: unknown }) => gateway.executeTool({ sessionToken: token, tool: input.tool, parameters: input.parameters }),
+      } as unknown as ToolGatewayService });
+    expect(assigned.definitions()).toHaveLength(1);
+    if (kind === "policy") await server.db.update(toolProfiles).set({ defaultAction: "deny" }).where(eq(toolProfiles.companyId, fixture.companyId));
+    else if (kind === "session") token = "invalid-session";
+    // The fixture has only a personal grant; its shared connection needs an
+    // organization grant. This typed executor preflight also precedes dispatch.
+    const binding = { ...fixture.authority.binding, assignedMcpTools: assigned };
+    const call = { tool: String(assigned.definitions()[0]!.name), callId: `refused-${kind}`, arguments: {} };
+    const first = await new PaperclipRunnerToolAuthority(server.db, binding).execute(call).catch(error => error);
+    expect(first).toBeInstanceOf(ToolGatewayHttpError);
+    if (!(first instanceof ToolGatewayHttpError)) throw new Error("Expected typed refusal");
+    expect(first.status).toBeGreaterThanOrEqual(400);
+    const reopened = new PaperclipRunnerToolAuthority(server.db, binding);
+    await expect(reopened.execute(call)).rejects.toMatchObject({ status: first.status, reasonCode: first.reasonCode, message: first.message, details: first.details });
+    expect(await reopened.recover(call)).toEqual({ isError: true, result: { success: false, contentItems: [{ type: "inputText", text: first.message }] } });
+    await expect(reopened.execute({ ...call, arguments: { changed: true } })).rejects.toThrow("different arguments");
+    const [run] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+    const receipt = Object.values(run!.resultJson!.bridgeToolReceipts as Record<string, unknown>);
+    expect(receipt).toEqual([expect.objectContaining({ state: "refused" })]);
+    expect(JSON.stringify(receipt)).not.toContain("may have succeeded");
+    expect(provider).not.toHaveBeenCalled();
+    console.log("ROW5_REFUSAL_PROOF", JSON.stringify({ kind, reasonCode: first.reasonCode, receiptState: "refused", providerCalls: provider.mock.calls.length, retry: "same refusal" }));
+  });
+
+  it("keeps a typed gateway failure after dispatch pending rather than fabricating a refusal", async () => {
+    const fixture = await server.fixture({ connectionScenario: "ready", disableWakeOnDemand: true });
+    await server.db.update(toolCatalogEntries).set({ riskLevel: "write" }).where(eq(toolCatalogEntries.companyId, fixture.companyId));
+    await server.db.update(connectionGrants).set({ kind: "organization", subjectUserId: null, isDefault: true }).where(eq(connectionGrants.companyId, fixture.companyId));
+    await server.db.update(toolConnections).set({ config: { url: "http://127.0.0.1:1/fixture-mcp", sourceTemplateKey: "notion" } }).where(eq(toolConnections.companyId, fixture.companyId));
+    const provider = vi.fn(async () => { throw new ToolGatewayHttpError(403, "Policy denial after provider accepted effect", "policy_denied"); });
+    const gateway = createToolGatewayService(server.db, { remoteHttpRequest: provider });
+    const session = await gateway.createSession(fixture);
+    const assigned = await createAssignedMcpTools({ gatewayPublicId: "fixture", bearerToken: "fixture",
+      gateway: {
+        listToolsForNamedGateway: async () => (await gateway.listToolsForSession(session.token)).filter(tool => tool.connectionId),
+        executeTool: (input: { tool: string; parameters: unknown }) => gateway.executeTool({ sessionToken: session.token, tool: input.tool, parameters: input.parameters }),
+      } as unknown as ToolGatewayService });
+    const binding = { ...fixture.authority.binding, assignedMcpTools: assigned };
+    const call = { tool: String(assigned.definitions()[0]!.name), callId: "typed-after-dispatch", arguments: {} };
+    await expect(new PaperclipRunnerToolAuthority(server.db, binding).execute(call)).rejects.toThrow("Policy denial");
+    const reopened = new PaperclipRunnerToolAuthority(server.db, binding);
+    expect(await reopened.execute(call)).toMatchObject({ outcome: "unknown" });
+    expect(await reopened.recover(call)).toBeNull();
+    expect(provider).toHaveBeenCalledOnce();
+  });
+
+  it("drains held diagnostic rows on SIGTERM before closing PostgreSQL without finish", async () => {
+    const fixture = await server.fixture({ disableWakeOnDemand: true });
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const trace = createNativeRunTrace({ runId: fixture.runId, onEvent: async event => {
+      await held;
+      await appendHeartbeatRunEvent(server.db, { companyId: fixture.companyId, agentId: fixture.agentId, runId: fixture.runId, ...event });
+    } });
+    for (const name of ["tool.execute", "runner.turn.submit"]) {
+      await trace.record({ name, startedAtMs: 1_000, endedAtMs: 1_100 }, { deferRunLog: true });
+    }
+    let atDatabaseClose: string[] = [];
+    const shutdown = finalizeServerShutdown({ signal: "SIGTERM", shutdownAppServices: async () => {},
+      closeDatabase: async () => { const rows = await server.db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, fixture.runId)).orderBy(heartbeatRunEvents.seq); atDatabaseClose = rows.map(row => String(row.payload?.span)); },
+      stopEmbeddedPostgres: null, shutdownInstrumentation: async () => {}, shutdownSentry: async () => {}, log: { info() {}, error() {} } });
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      release();
+      await shutdown;
+      expect(atDatabaseClose).toEqual(["tool.execute", "runner.turn.submit"]);
+      console.log("ROW5_SHUTDOWN_PROOF", JSON.stringify({ signal: "SIGTERM", finishCalled: false, persistedBeforeDatabaseClose: atDatabaseClose }));
+    } finally { release(); await shutdown; await trace.finish("ok"); }
   });
 
   it("never repeats an assigned effect whose provider reply was lost before receipt completion", async () => {

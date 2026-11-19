@@ -1,4 +1,5 @@
 import { getRunExecutionTraceContext } from "../execution-preparation-timing.js";
+import { logger } from "../../middleware/logger.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { runWithRunnerOperationRecorder } from "./runner-operation-timing.js";
 import { createHash } from "node:crypto";
@@ -20,6 +21,15 @@ import {
 
 export const NATIVE_RUN_SPAN_EVENT_TYPE = "run.performance.span";
 export const NATIVE_RUN_TRACE_SCHEMA_VERSION = 3;
+
+// Keep only in-flight diagnostic work, not every live trace. A hot-restart
+// detach can skip finish(); the coordinated shutdown must still drain its rows.
+const pendingNativeRunDiagnostics = new Set<Promise<void>>();
+
+/** Called before the database closes, inside shutdown's shared 2 s budget. */
+export async function drainNativeRunDiagnostics(): Promise<void> {
+  while (pendingNativeRunDiagnostics.size > 0) await Promise.all([...pendingNativeRunDiagnostics]);
+}
 
 export type NativeRunSpanOutcome = "ok" | "failed";
 
@@ -418,6 +428,7 @@ export function createNativeRunTrace(input: {
     }
   };
 
+  let sinkFailureLogged = false;
   const emitCompletedSpanEvent = async (
     span: NativeRunHistoricalSpan,
   ): Promise<void> => {
@@ -448,8 +459,16 @@ export function createNativeRunTrace(input: {
           wallStartedAtMs: startedAtMs,
         },
       });
-    } catch {
-      // A diagnostic sink failure must not fail the task.
+    } catch (error) {
+      // One content-free warning per run, even if every queued span fails.
+      // Do not log the error object/message: it may contain a tool payload.
+      if (!sinkFailureLogged) {
+        sinkFailureLogged = true;
+        try {
+          logger.warn({ runIdHash, span: span.name, errorClass: error instanceof Error ? error.constructor.name : typeof error },
+            "Native run span sink failed");
+        } catch { /* Diagnostics must never fail the task, including logging. */ }
+      }
     }
   };
 
@@ -662,8 +681,10 @@ export function createNativeRunTrace(input: {
       })
       .finally(() => {
         pendingDiagnostics.delete(pending);
+        pendingNativeRunDiagnostics.delete(pending);
       });
     pendingDiagnostics.add(pending);
+    pendingNativeRunDiagnostics.add(pending);
   };
 
   // Deferred run-log rows are written one at a time, in the order their spans

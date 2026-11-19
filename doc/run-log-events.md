@@ -114,6 +114,16 @@ The preparation spans of a native run (`heartbeat.queue`, `heartbeat.prepare_*`,
 provider starts, and before the run's trace finishes. They can appear after the
 first Runner events of the run.
 
+Deferred native diagnostics are drained at trace finish and on coordinated
+SIGINT/SIGTERM shutdown, before the database pools close. Shutdown shares one
+2-second drain budget across all runs, including traces detached without
+`finish()`. A stuck sink cannot extend that budget. The queue is in memory:
+crashes, SIGKILL, a timed-out shutdown drain, or a rejected sink can still lose
+uncommitted rows. A rejected span sink logs one content-free warning per run
+trace with the hashed run ID, span name and error class, never the error message,
+payload or stack. Queue order is local to deferred diagnostics, not a guarantee
+of global event chronology.
+
 `run.performance.span` also records `task.time_to_first_token` once per native
 dispatch at the first newly committed deliverable text: assistant or reasoning
 `item.delta`/`item.completed`, a redaction tail released at completion, or an

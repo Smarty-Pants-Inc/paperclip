@@ -43,6 +43,7 @@ import { agentCommentaryToolInputSchema } from "@paperclipai/shared";
 import { submitAgentCommentary } from "../agent-commentary.js";
 import { sendAgentChatMessage } from "../agent-chat-messages.js";
 import type { createAssignedMcpTools } from "./assigned-mcp-tools.js";
+import { ToolGatewayPreDispatchError } from "../tool-gateway.js";
 import { captureRunnerToolResult, fitRunnerToolResultPage, READ_TOOL_RESULT, READ_TOOL_RESULT_DEFINITION, readToolResultSchema, RUNNER_TOOL_RESULT_MAX_BYTES } from "./runner-tool-results.js";
 import { assertAssignableAgent } from "../agent-assignability.js";
 import { approvalReadSqlCondition, canActorReadApproval, authorizationService, issueReadSqlCondition, type AuthorizationActor } from "../authorization.js";
@@ -146,6 +147,14 @@ import {
 import { commentsArrivedDuringRun, recordTaskHistoryRead, taskHistoryHandlingGuidance } from "../queued-comment-delivery.js";
 import { recordChildTaskRead } from "./native-child-completion-delivery.js";
 import { logger } from "../../middleware/logger.js";
+
+function bridgeToolRefusal(receipt: Record<string, unknown>): ToolGatewayPreDispatchError | null {
+  const refusal = record(receipt.refusal);
+  return receipt.state === "refused" && typeof refusal.status === "number"
+    && typeof refusal.message === "string" && typeof refusal.reasonCode === "string"
+    ? new ToolGatewayPreDispatchError(refusal.status, refusal.message, refusal.reasonCode, record(refusal.details))
+    : null;
+}
 
 const EXTERNAL_WORKSPACE_OPERATIONS = new Set(["get_workspace", "list_workspaces", "select_workspace", "prepare_repository", "register_deliverable"]);
 const IMPLEMENTED_OPERATIONS = new Set([
@@ -579,9 +588,13 @@ export class PaperclipRunnerToolAuthority {
     }
     if (call.tool === "workspace_write" || call.tool === "workspace_run" || this.binding.assignedMcpTools?.has(call.tool)) {
       const bridge = record(record(run.resultJson?.bridgeToolReceipts)[callKey]);
-      if (bridge.state === "completed" && bridge.tool === call.tool
-        && bridge.digest === toolInputDigest({ tool: call.tool, arguments: call.arguments })
-        && Object.hasOwn(bridge, "result")) return { result: bridge.result };
+      if (bridge.tool === call.tool && bridge.digest === toolInputDigest({ tool: call.tool, arguments: call.arguments })) {
+        if (bridge.state === "completed" && Object.hasOwn(bridge, "result")) return { result: bridge.result };
+        const refusal = bridgeToolRefusal(bridge);
+        if (refusal) return { isError: true, result: {
+          success: false, contentItems: [{ type: "inputText", text: refusal.message }],
+        } };
+      }
     }
     return null;
   }
@@ -1189,29 +1202,39 @@ export class PaperclipRunnerToolAuthority {
       const old = record(receipts[key]);
       if (receipts[key]) {
         if (old.digest !== digest) throw badRequest("Call ID reused with different arguments");
-        return { result: old.state === "completed" && Object.hasOwn(old, "result") ? old.result : { outcome: "unknown", guidance: source === "workspace"
-          ? "A workspace effect may have occurred. Inspect files and state before issuing another mutation; this call will not execute again."
-          : "Tool outcome unknown, may have succeeded: check before retrying. This call will not execute again." } };
+        return old;
       }
       if (Object.keys(receipts).length >= 1000) throw badRequest("Run tool mutation limit reached");
       receipts[key] = { digest, tool: call.tool, state: "pending" };
       await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, bridgeToolReceipts: receipts } }).where(eq(heartbeatRuns.id, this.binding.runId));
       return null;
     }));
-    if (prior) return prior.result;
+    if (prior) {
+      const refusal = bridgeToolRefusal(prior);
+      if (refusal) throw refusal;
+      return prior.state === "completed" && Object.hasOwn(prior, "result") ? prior.result : { outcome: "unknown", guidance: source === "workspace"
+        ? "A workspace effect may have occurred. Inspect files and state before issuing another mutation; this call will not execute again."
+        : "Tool outcome unknown, may have succeeded: check before retrying. This call will not execute again." };
+    }
     let result: unknown;
+    let refusal: ToolGatewayPreDispatchError | undefined;
     try { result = await execute(); } catch (error) {
-      // A gateway rejection may follow a committed external effect. Preserve
-      // its pending receipt rather than storing a fabricated final failure.
-      if (source === "assigned_tool") throw error;
-      result = { outcome: "failed", message: error instanceof Error ? error.message : "Workspace operation failed" };
+      // Only the gateway's dispatch boundary can attest that no provider was
+      // called. Unknown and post-dispatch errors keep their pending receipt.
+      if (source === "assigned_tool") {
+        if (!(error instanceof ToolGatewayPreDispatchError)) throw error;
+        refusal = error;
+      } else result = { outcome: "failed", message: error instanceof Error ? error.message : "Workspace operation failed" };
     }
     await withTransactionRetry(this.db, () => this.db.transaction(async tx => {
       const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, this.binding.runId), eq(heartbeatRuns.companyId, this.binding.companyId))).for("update");
       const resultJson = record(run?.resultJson), receipts = record(resultJson.bridgeToolReceipts);
-      receipts[key] = { digest, tool: call.tool, state: "completed", result };
+      receipts[key] = refusal
+        ? { digest, tool: call.tool, state: "refused", refusal: { status: refusal.status, message: refusal.message, reasonCode: refusal.reasonCode, details: refusal.details } }
+        : { digest, tool: call.tool, state: "completed", result };
       await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, bridgeToolReceipts: receipts } }).where(eq(heartbeatRuns.id, this.binding.runId));
     }));
+    if (refusal) throw refusal;
     if (source === "workspace") await logActivity(this.db, { companyId: this.binding.companyId, actorType: "agent", actorId: this.binding.agentId, runId: this.binding.runId,
       action: "runner.workspace_operation", entityType: "issue", entityId: this.binding.issueId, details: { tool: call.tool, requestFingerprint: digest, outcome: record(result).outcome ?? "completed" } });
     return result;

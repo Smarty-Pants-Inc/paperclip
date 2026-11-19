@@ -457,6 +457,12 @@ export class ToolGatewayHttpError extends Error {
   }
 }
 
+/** A typed refusal from this gateway before provider dispatch began. */
+export class ToolGatewayPreDispatchError extends ToolGatewayHttpError {}
+
+// HTTP normalization must not turn an unknown failure into a typed refusal.
+class ToolGatewayUnknownError extends ToolGatewayHttpError {}
+
 /** Repeated discovery rows are one tool; conflicting bindings stay ambiguous. */
 export function deduplicateToolDescriptors(tools: readonly ToolGatewayDescriptor[]): ToolGatewayDescriptor[] {
   const unique = new Map<string, ToolGatewayDescriptor>();
@@ -7538,6 +7544,7 @@ export function createToolGatewayService(
     useDefaultTimeout = false,
     /** `run` aborts when the run is stopped (the task is cancelled); `caller` when the caller leaves (it is kept). */
     taskSignals: { run?: AbortSignal; caller?: AbortSignal; attachToTaskRecordId?: string | null } = {},
+    onDispatch: () => void = () => {},
   ): Promise<RemoteHttpExecutionResult> {
     const { entry, connection, sourceTemplateKey } = await resolveConnectedRemoteTool(
       session,
@@ -7561,6 +7568,7 @@ export function createToolGatewayService(
       const client = restConnector.client(connection, await resolveCredentialHeaders(session, connection, grant),
         (url, init) => options.remoteHttpRequest ? options.remoteHttpRequest(url, init)
           : guardedRemoteHttpFetch(url, init, remoteHttpFetchOptions()), signal, deadlineAt);
+      onDispatch();
       const data = await client.invoke(entry.toolName, parameters);
       return { result: { content: JSON.stringify(data), data: { structuredContent: data, transport: "rest_api" } } };
     }
@@ -7569,14 +7577,17 @@ export function createToolGatewayService(
       const budgetMs = Math.min(ms, 30_000);
       const deadlineAt = Date.now() + budgetMs;
       const signal = AbortSignal.timeout(budgetMs);
+      const providerHeaders = await resolveCredentialHeaders(session, connection, grant);
+      onDispatch();
       const data = await nativeProvider.execute({ binding: session, connection,
-        headers: await resolveCredentialHeaders(session, connection, grant),
+        headers: providerHeaders,
         request: (url, init) => options.remoteHttpRequest ? options.remoteHttpRequest(url, init)
           : guardedRemoteHttpFetch(url, init, remoteHttpFetchOptions()),
         toolName: entry.toolName, parameters, signal, deadlineAt });
       return { result: { content: JSON.stringify(data), data: { structuredContent: data, transport: "rest_api" } } };
     }
     if (isBrowserUseConnection(connection)) {
+      onDispatch();
       const data = await browserUseService(db, options.remoteHttpRequest).execute(session, grant, invocationId!, entry.toolName, parameters);
       return { result: { content: JSON.stringify(data), data: { structuredContent: data, transport: "rest_api" } } };
     }
@@ -7640,6 +7651,7 @@ export function createToolGatewayService(
             throw new ToolGatewayHttpError(403, "This Google action is not covered by the current permission grant.", "oauth_insufficient_scope");
           }
         }
+        onDispatch();
         return options.remoteHttpRequest
           ? options.remoteHttpRequest(target, init)
           : guardedRemoteHttpFetch(target, init, {
@@ -7684,11 +7696,15 @@ export function createToolGatewayService(
           signal: controller.signal,
           request: dispatchRemote,
           runCommand: ssh?.grantId === grant.id && ssh?.enabled === true && sshRef
-            ? async (input) => runRailwaySshCommand({
-                ...input,
-                privateKey: await resolveGrantSecretValue(session, connection, grant, sshRef),
-                knownHosts: typeof ssh.knownHosts === "string" ? ssh.knownHosts : "",
-              })
+            ? async (input) => {
+                const privateKey = await resolveGrantSecretValue(session, connection, grant, sshRef);
+                onDispatch();
+                return runRailwaySshCommand({
+                  ...input,
+                  privateKey,
+                  knownHosts: typeof ssh.knownHosts === "string" ? ssh.knownHosts : "",
+                });
+              }
             : undefined,
         });
         const data = await client.call(entry.toolName, parameters);
@@ -8146,7 +8162,9 @@ export function createToolGatewayService(
       if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
         if (mcpSession) forgetMcpHttpSession(mcpSession);
         execution.failureKind = "invocation_timeout";
-        throw new ToolGatewayHttpError(504, "Remote MCP tool call timed out", "tool_timeout", {
+        const TimeoutError = error instanceof ToolGatewayHttpError || error instanceof RailwayError
+          ? ToolGatewayHttpError : ToolGatewayUnknownError;
+        throw new TimeoutError(504, "Remote MCP tool call timed out", "tool_timeout", {
           connectionId: connection.id, catalogEntryId: entry.id, execution, failureKind: "invocation_timeout",
         });
       }
@@ -8186,7 +8204,7 @@ export function createToolGatewayService(
         await markCallHealth("error", "Remote MCP session authorization failed.");
       }
       if (mcpSession) forgetMcpHttpSession(mcpSession);
-      throw new ToolGatewayHttpError(
+      throw new ToolGatewayUnknownError(
         502,
         "Remote MCP tool call failed",
         "mcp_remote_fetch_failed",
@@ -8207,6 +8225,7 @@ export function createToolGatewayService(
     parameters: unknown,
     ms: number,
     useProviderDefaultTimeout = false,
+    onDispatch: () => void = () => {},
   ): Promise<RemoteHttpExecutionResult> {
     const { entry, connection } = await resolveConnectedLocalStdioTool(
       session,
@@ -8220,8 +8239,11 @@ export function createToolGatewayService(
       template,
       grant,
     );
-    const invoke = () => callLocalStdioMcp({ connection, entry, template, env, parameters,
-      timeoutMs: useProviderDefaultTimeout && template.templateId === "paperclip.cognee-cloud" ? 60_000 : ms });
+    const invoke = () => {
+      onDispatch();
+      return callLocalStdioMcp({ connection, entry, template, env, parameters,
+        timeoutMs: useProviderDefaultTimeout && template.templateId === "paperclip.cognee-cloud" ? 60_000 : ms });
+    };
     // Cognee is a bundled HTTP client. Provider failures are tool failures, not
     // crashed local processes, and must never consume slots or restart budgets.
     const result = template.templateId === "paperclip.cognee-cloud"
@@ -12250,6 +12272,12 @@ export function createToolGatewayService(
     },
 
     async executeTool(input: ExecuteGatewayToolInput) {
+      // A typed error alone is not proof of refusal: providers and post-effect
+      // bookkeeping also throw them. The dispatch boundary owns this bit.
+      let dispatched = false;
+      const onDispatch = () => { dispatched = true; };
+      const dispatch = <T>(call: () => Promise<T>) => { onDispatch(); return call(); };
+      try {
       const session = await getActiveSession(input.sessionToken, {
         gatewayId: input.gatewayId ?? null,
         gatewayPublicId: input.gatewayPublicId ?? null,
@@ -13112,6 +13140,7 @@ export function createToolGatewayService(
                   caller: input.signal,
                   attachToTaskRecordId: retryingMcpTaskRecordId,
                 },
+                onDispatch,
               )
             : tool.providerType === "mcp_local_stdio"
               ? await executeLocalStdioTool(
@@ -13120,13 +13149,14 @@ export function createToolGatewayService(
                   effectiveParameters,
                   executionTimeoutMs,
                   input.timeoutMs === undefined,
+                  onDispatch,
                 )
               : null;
         const result = recoveredGitHubPublication ?? (connectedMcpExecution
           ? connectedMcpExecution.result
           : tool.providerType === "paperclip_plugin"
             ? await runWithTimeout(
-                pluginToolDispatcher!.executeTool(
+                dispatch(() => pluginToolDispatcher!.executeTool(
                   tool.name,
                   effectiveParameters,
                   {
@@ -13135,11 +13165,11 @@ export function createToolGatewayService(
                     companyId: session.companyId,
                     projectId: session.projectId ?? "",
                   },
-                ),
+                )),
                 executionTimeoutMs,
               )
             : await runWithTimeout(
-                executeBuiltinTool(session, tool, effectiveParameters, invocationId),
+                dispatch(() => executeBuiltinTool(session, tool, effectiveParameters, invocationId)),
                 executionTimeoutMs,
               ));
 
@@ -13398,6 +13428,21 @@ export function createToolGatewayService(
           });
         }
         throw normalizedError;
+      }
+      } catch (error) {
+        if (!dispatched && !(error instanceof ToolGatewayUnknownError)) {
+          if (error instanceof ToolGatewayHttpError || error instanceof ToolRuntimeSupervisorError) {
+            throw new ToolGatewayPreDispatchError(error.status, error.message, error.reasonCode, error.details);
+          }
+          if (error instanceof HttpError) {
+            throw new ToolGatewayPreDispatchError(error.status, error.message, "tool_request_refused", asRecord(error.details) ?? {});
+          }
+          if (error instanceof ToolContentValidationError) {
+            throw new ToolGatewayPreDispatchError(422, error.message, error.reasonCode, { findings: error.findings });
+          }
+        }
+        // Unknown failures and anything after dispatch remain uncertain.
+        throw error;
       }
     },
 
