@@ -465,19 +465,31 @@ function failAt(
     throw new Error(`native_status_failpoint:${actual}`);
 }
 
-/** The native-status continuation (schedule_retry) successor's OWN pending CARD ANSWERS, for ANSWERED attribution
- * ONLY (the card half of bb/tamin6 5cddd3d1 status-decision-committer.ts:483-498 nativeContinuationAttributionContext).
- * The successor continues the SAME conversation, so the person's answer is not sent again: its id goes in
- * attributionInteractionIds, which only the one answered function (person-message-answer.ts) and the sweep's carrier
- * lookup read, never interactionId(s) (runtime-selection.ts builds the prompt from those). Without it the
- * card-answer duty (RFL ruling 4) would say "Your answer wasn't acted on" after the continuation acted on it.
- * Collected by the one carry (readContinuationCommentInput): still pending, not ANSWERED, not sender-stopped. */
-export async function nativeContinuationCardAnswerAttribution(
+/** The native-status continuation (schedule_retry: output cap, EOF, failed turn) successor's OWN pending person
+ * input, for ANSWERED attribution ONLY (bb/tamin6 5cddd3d1 status-decision-committer.ts:483-498
+ * nativeContinuationAttributionContext, both halves; record SUPERSEDE-M1-ANSWER-CHAIN-1119, D1: M is answered when
+ * the replying run's OWN input names M). The successor continues the SAME conversation, so nothing is sent again:
+ * - the TYPED messages go in attributionCommentIds (ALL of them: a batched M1+M2 on a failed turn) and the latest in
+ *   conversationReplyBoundaryCommentId (agent-conversations.ts reads it as the turn boundary); never
+ *   wakeCommentId(s) / commentId (paperclipWake comments -> the wake prompt) or firstTurnQueuedInput (first-turn
+ *   re-delivery). Without them the continuation's reply would not answer the message it continues: a false
+ *   "wasn't answered" notice after the person got their answer.
+ * - the CARD ANSWERS go in attributionInteractionIds, never interactionId(s) (runtime-selection.ts builds the
+ *   prompt from those). Without it the card-answer duty (RFL ruling 4) would say "Your answer wasn't acted on"
+ *   after the continuation acted on it.
+ * Only the one answered function (person-message-answer.ts) and the sweep's carrier lookups read the attribution
+ * fields. Collected by the one carry (readContinuationCommentInput): still pending, not ANSWERED, not sender-stopped. */
+export async function nativeContinuationAttributionContext(
   tx: Pick<Db, "select">, input: { companyId: string; issueId: string; originRunId: string },
 ): Promise<Record<string, unknown>> {
   const carried = await readContinuationCommentInput(tx, { companyId: input.companyId, issueId: input.issueId, runId: input.originRunId });
+  const ids = Array.isArray(carried.wakeCommentIds) ? carried.wakeCommentIds.filter((id): id is string => typeof id === "string") : [];
   const cards = Array.isArray(carried.interactionIds) ? carried.interactionIds.filter((id): id is string => typeof id === "string") : [];
-  return cards.length ? { attributionInteractionIds: cards } : {};
+  const latest = ids.at(-1);
+  return {
+    ...(latest ? { conversationReplyBoundaryCommentId: latest, attributionCommentIds: ids } : {}),
+    ...(cards.length ? { attributionInteractionIds: cards } : {}),
+  };
 }
 
 export async function enqueueWake(input: {
@@ -947,7 +959,7 @@ async function materializeDecisionEffect(input: {
       reason: "issue_status_changed",
       idempotencyKey: `native-status:${input.decisionId}:retry`,
       originRunId: input.runId,
-      contextSnapshot: await nativeContinuationCardAnswerAttribution(input.tx, {
+      contextSnapshot: await nativeContinuationAttributionContext(input.tx, {
         companyId: input.companyId, issueId: input.issue.id, originRunId: input.runId }),
       payload: {
         nativeDecisionId: input.decisionId,

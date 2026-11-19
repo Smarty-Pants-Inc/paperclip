@@ -9,12 +9,14 @@ export const ISSUE_IMPORTED_ACTION = "issue.imported";
 export const COMPANY_IMPORTED_ACTION = "company.imported";
 
 /** SQL: run r's OWN input names person input `id` (a typed message's comment id, or a card answer's interaction id).
- * attributionInteractionIds: the card answers a native-status continuation (schedule_retry) carries from the run it
- * continues, for this attribution only (status-decision-committer.ts nativeContinuationCardAnswerAttribution). */
+ * attributionCommentIds / attributionInteractionIds: the typed messages and the card answers a native-status
+ * continuation (schedule_retry) carries from the run it continues, for this attribution only
+ * (status-decision-committer.ts nativeContinuationAttributionContext). */
 const ownInputNamesSql = (id: SQL) => sql`(r.context_snapshot->>'wakeCommentId' = ${id}::text or r.context_snapshot->>'commentId' = ${id}::text
   or r.context_snapshot->>'conversationReplyBoundaryCommentId' = ${id}::text
   or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${id}::text
   or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${id}::text
+  or coalesce(r.context_snapshot->'attributionCommentIds', '[]'::jsonb) ? ${id}::text
   or r.context_snapshot->>'interactionId' = ${id}::text
   or coalesce(r.context_snapshot->'interactionIds', '[]'::jsonb) ? ${id}::text
   or coalesce(r.context_snapshot->'attributionInteractionIds', '[]'::jsonb) ? ${id}::text)`;
@@ -160,6 +162,8 @@ function failedOwnPersonMessagePageSql(input: { companyId: string; issueId: stri
         union all select f.context_snapshot->>'conversationReplyBoundaryCommentId'
         union all select jsonb_array_elements_text(case when jsonb_typeof(f.context_snapshot->'wakeCommentIds') = 'array'
           then f.context_snapshot->'wakeCommentIds' else '[]'::jsonb end)
+        union all select jsonb_array_elements_text(case when jsonb_typeof(f.context_snapshot->'attributionCommentIds') = 'array'
+          then f.context_snapshot->'attributionCommentIds' else '[]'::jsonb end)
         union all select jsonb_array_elements_text(case when jsonb_typeof(f.context_snapshot->'firstTurnQueuedInput'->'commentIds') = 'array'
           then f.context_snapshot->'firstTurnQueuedInput'->'commentIds' else '[]'::jsonb end)) named
       where named.id ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'

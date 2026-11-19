@@ -248,6 +248,7 @@ function inScopeSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }
       and coalesce(r.finished_at, r.updated_at) > ${since}::timestamptz
       and (r.context_snapshot->>'wakeCommentId' = ${m.id}::text or r.context_snapshot->>'commentId' = ${m.id}::text
         or r.context_snapshot->>'conversationReplyBoundaryCommentId' = ${m.id}::text
+        or coalesce(r.context_snapshot->'attributionCommentIds', '[]'::jsonb) ? ${m.id}::text
         or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text
         or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${m.id}::text))
     or exists (select 1 from ${agentWakeupRequests} w where w.company_id = ${m.companyId} and w.updated_at > ${since}::timestamptz
@@ -387,6 +388,8 @@ function runCarriesMessage(contextSnapshot: unknown, messageId: string): boolean
     ...(Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds : []),
     ...(Array.isArray(firstTurn.commentIds) ? firstTurn.commentIds : []),
     context.wakeCommentId, context.commentId, context.conversationReplyBoundaryCommentId,
+    // The native-status continuation's attribution-only typed ids (status-decision-committer.ts).
+    ...(Array.isArray(context.attributionCommentIds) ? context.attributionCommentIds : []),
     // A person's card answer is the run's own input too: the answer-resume run's interactionId, a carry's interactionIds.
     context.interactionId, ...(Array.isArray(context.interactionIds) ? context.interactionIds : []),
     ...(Array.isArray(context.attributionInteractionIds) ? context.attributionInteractionIds : []),
@@ -811,9 +814,13 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       // this message's attempt even when its context no longer copies m.
       // Keep the ordinary start bound, but a proven successor is waiting
       // work, not a reason to resend its predecessor's input.
-      const descendant = Boolean(messageRun && candidate.id !== messageRun.id
+      // The successor may name m itself (the native-status continuation's attribution ids, the retry carry): then
+      // it is the NEWEST carrier (messageRun), and it is still a continuation of the EARLIER run that carried m.
+      const carriedBefore = candidate.id !== messageRun?.id ? messageRun
+        : runs.find(earlier => earlier.id !== candidate.id && runCarriesMessage(earlier.contextSnapshot, message.id)) ?? null;
+      const descendant = Boolean(carriedBefore
         && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
-          runId: candidate.id, ancestorRunId: messageRun.id, includeAnswerLineage: true }));
+          runId: candidate.id, ancestorRunId: carriedBefore.id, includeAnswerLineage: true }));
       if (runCarriesMessage(candidate.contextSnapshot, message.id) || descendant) waitingToStart = true;
       if (descendant) { continuationWaiting = true; break; }
     }

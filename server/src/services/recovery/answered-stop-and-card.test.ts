@@ -301,7 +301,7 @@ describe.skipIf(!support.supported)("the sender's own Stop and an answerable car
     const f = await cardFixture();
     await f.resumeRun(f.cardId, "failed");
     // The schedule_retry successor continues the same conversation: it names the answer in attributionInteractionIds only
-    // (status-decision-committer.ts nativeContinuationCardAnswerAttribution), never as prompt input.
+    // (status-decision-committer.ts nativeContinuationAttributionContext), never as prompt input.
     const successor = await f.resumeRun(f.cardId, "succeeded", true);
     await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_status_changed",
       source: "native_status_decision", attributionInteractionIds: [f.cardId] } }).where(eq(heartbeatRuns.id, successor));
