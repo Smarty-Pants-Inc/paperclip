@@ -567,6 +567,42 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
     expect(q.executionWait?.reason ?? null, JSON.stringify(q.executionWait)).not.toBe("stopped_by_person");
   }, 120_000);
 
+  // C1 (R13b, review-fleet-5): on a TASK, A and B both post while the turn runs (a task's wake can carry both
+  // authors). A presses the real Stop, then the real row Send. A's Send carries ONLY A's held message (the ONE
+  // same-person fact: author == the Stop's person == the Send-er); B's message runs on its own path after, once,
+  // never lost or doubled.
+  it("C1 R13b (task): A and B post while it runs; A's Stop then A's Send carries ONLY A's held message; B's runs on its own path after, once", async () => {
+    let theirs = "";
+    const r = await stopWithHeld({ task: true, heldCount: 1, beforeStop: async ctx => {
+      theirs = (await ctx.post("HB other person", ctx.otherClient).expect(201)).body.id;
+    } });
+    const mine = r.held[0]!;
+    await r.drive(1_000);
+    // Boat's stop completes: the warm box's stop receipt lands (as R1), so the Send is not waiting on cleanup.
+    await r.boatStopAnswers();
+    await r.drive(1_000);
+    expect(successorCalls(), "nothing runs by itself before the Send").toEqual([]);
+    const queue = await r.queue();
+    await evidence("C1-before-send", { mine, theirs, queue, wakes: await r.wakes() });
+    expect((queue.entries ?? []).map((entry: any) => entry.comment?.id), JSON.stringify(queue)).toContain(mine);
+    const sent = await request(r.client).post(`/api/issues/${r.issueId}/queued-comments/interrupt`)
+      .send({ queueId: queue.queueId, revision: queue.revision, targetRunId: null });
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    await waitFor(async () => {
+      await r.drive(300);
+      return answeredIds().includes(mine) && answeredIds().includes(theirs);
+    }, 30_000).catch(() => undefined);
+    await r.drive(1_000);
+    await r.tenMinutesPass();
+    await evidence("C1-after-send", { mine, theirs, calls: fixture.calls, wakes: await r.wakes() });
+    // A's Send: ONE successor carrying ONLY A's message.
+    expect(successorCalls()[0]?.ids, JSON.stringify(fixture.calls)).toEqual([mine]);
+    // B's message: its own run, after, once; never lost, never doubled.
+    expect(successorCalls().find(call => call.ids.includes(theirs))?.ids, JSON.stringify(fixture.calls)).toEqual([theirs]);
+    for (const id of [mine, theirs]) expect(answeredIds().filter(a => a === id).length, JSON.stringify(fixture.calls)).toBe(1);
+    expect(successorCalls().length, JSON.stringify(fixture.calls)).toBe(2);
+  }, 120_000);
+
   // ---- adopt-stophold-2cp: adopt-lead's decisions D1-D3 (cut 2c') ----
   const STOPPED_LINE = "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it.";
   /** The sweep (settleUnansweredPersonMessage) at +2 and +11 minutes; returns every 'no run started' note it wrote. */
