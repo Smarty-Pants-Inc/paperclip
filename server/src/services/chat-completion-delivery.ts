@@ -6,6 +6,8 @@ import { agents, agentWakeupRequests, approvals, chatCompletionDeliveries as del
   heartbeatRunEvents, heartbeatRuns, issueApprovals, issueComments, issueDocuments, issueRelations, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
 import { extractIssueReferenceMatches } from "@paperclipai/shared";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
+import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
+import { deliveredQueuedCommentIds } from "./queued-comment-delivery.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { activeIssueInteractionCondition } from "./issue-question-context.js";
 import { conflict, forbidden, notFound } from "../errors.js";
@@ -316,6 +318,17 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
   source: "automation"; triggerDetail: "system"; reason: string; idempotencyKey: string; allowRunCoalescing: boolean;
   requestedByActorType: "system"; requestedByActorId: string; payload: Record<string, unknown>; contextSnapshot: Record<string, unknown>;
 }): Promise<{ id: string } | null> }) {
+  async function personMessageWaiting(companyId: string, issueId: string, agentId: string) {
+    const held = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"), eq(agentWakeupRequests.requestedByActorType, "user"),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`)).limit(20);
+    const commentIds = [...new Set(held.flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)))];
+    if (commentIds.length === 0) return false;
+    // A receipt whose messages an earlier turn already took is stale, not waiting.
+    const delivered = await deliveredQueuedCommentIds(db, { companyId, issueId, agentId, commentIds });
+    return commentIds.some(commentId => !delivered.has(commentId));
+  }
   async function deliver(id: string): Promise<void> {
     // Lease outbox work before leaving the transaction; recovery reuses the same wake key.
     const claimed = await db.update(deliveries).set({ nextAttemptAt: new Date(Date.now() + LEASE_MS) })
@@ -406,6 +419,9 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
       if (siblings.some(s => s.run && activeRuns.includes(s.run.status) &&
         !Array.isArray(s.run.contextSnapshot?.chatCompletionUpdates))) return;
       if (siblings.find(s => !s.delivery.targetRunId)?.delivery.id !== id) return;
+      // A person's waiting message on this conversation is answered first; the
+      // completion keeps its lease and attempt and is delivered after that turn.
+      if (await personMessageWaiting(claimed.companyId, row.handoff.conversationId, row.handoff.agentId)) return;
       const run = await heartbeat.wakeup(row.handoff.agentId, {
         source: "automation", triggerDetail: "system", reason: CHAT_COMPLETION_WAKE_REASON, idempotencyKey: key, allowRunCoalescing: false,
         requestedByActorType: "system", requestedByActorId: "chat_completion_delivery",
