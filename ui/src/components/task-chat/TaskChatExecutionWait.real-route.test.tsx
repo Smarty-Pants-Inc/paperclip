@@ -34,6 +34,8 @@ vi.mock("@/components/MarkdownEditor", () => ({ MarkdownEditor: forwardRef(funct
 type Sample = {
   producer: string; surface: "task" | "chat"; reason: string; elapsed: number; readAt: string;
   expectedLine?: string; messageId: string; queue?: IssueQueuedCommentQueue; comments: IssueComment[]; run?: HeartbeatRun;
+  deleteRoute?: string; beforeQueue?: IssueQueuedCommentQueue; beforeComments?: IssueComment[];
+  laterQueue?: IssueQueuedCommentQueue; admittedRunCount?: number; laterAdmittedRunCount?: number;
 };
 // Fixture provenance: execution-wait-one-line-routes.test.ts writes these exact
 // GET bodies after real comment admission / Stop / pause. To refresh, set
@@ -65,7 +67,9 @@ describe("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rendered real GET rows", () =>
   it("has real-route evidence for every deferred reason and both surfaces", () => {
     expect(new Set(deferred.map(row => row.reason))).toEqual(new Set(["remote_cleanup", "execution_recovery", "execution_active", "agent.not_invokable"]));
     expect(new Set(deferred.map(row => row.surface))).toEqual(new Set(["task", "chat"]));
-    expect(new Set(deferred.map(row => row.elapsed))).toEqual(new Set([10_000, 120_000, 600_000, 660_000]));
+    expect(new Set(deferred.map(row => row.elapsed))).toEqual(new Set([10_000, 120_000, 599_999, 600_000, 660_000]));
+    expect(samples.filter(row => row.reason === "message_deleted")).toHaveLength(4);
+    expect(samples.filter(row => row.reason === "cleanup_finished")).toHaveLength(2);
   });
 
   for (const width of [1440, 390]) for (const row of deferred) {
@@ -85,6 +89,44 @@ describe("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rendered real GET rows", () =>
       expect(container.textContent?.split(row.expectedLine!)).toHaveLength(2);
       expect(container.textContent).not.toContain("no run started");
       if (row.reason === "remote_cleanup") expect(container.textContent).not.toContain("Waiting for the current run");
+    });
+  }
+
+  for (const width of [1440, 390]) for (const row of samples.filter(row => row.reason === "cleanup_finished" || row.reason === "message_deleted")) {
+    it(`${row.surface} ${row.reason} ${row.deleteRoute ?? "cleanup"} at ${width}: line retires using the REAL route GET`, async () => {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: width }); viewport.mobile = width < 768;
+      let currentQueue = row.beforeQueue ?? row.queue!;
+      let currentComments = row.beforeComments ?? row.comments;
+      const paint = () => render(<TaskChatThread comments={currentComments.map(comment => ({ ...comment,
+        createdAt: new Date(comment.createdAt), updatedAt: new Date(comment.updatedAt) }))} onAdd={async () => {}}
+        conversationMode={row.surface === "chat"} conversationOwnerId={row.surface === "chat" ? "m10-person" : undefined}
+        currentUserId="m10-person" issueStatus="in_progress" queuedCommentQueue={currentQueue} queuedMessageAutoSteerDelayMs={null}
+        onDiscardQueuedComment={async (commentId, revision) => {
+          // Component replay of the captured REAL DELETE + GET pair, NOT a
+          // replacement route test: the server row already called that route.
+          expect(commentId).toBe(row.messageId); expect(revision).toBe(row.beforeQueue!.revision);
+          currentQueue = row.queue!; currentComments = row.comments; paint();
+        }} />);
+      paint(); await act(async () => {});
+      if (row.reason === "message_deleted" && row.deleteRoute === "queued-panel") {
+        const discard = container.querySelector(`[data-testid="task-chat-queued-discard-${row.messageId}"]`) as HTMLButtonElement;
+        expect(discard).not.toBeNull(); expect(discard.disabled).toBe(false);
+        expect(container.textContent).toContain("You can delete it if you no longer need it.");
+        await act(async () => { discard.click(); });
+      } else if (row.reason === "message_deleted") {
+        // The separate comment-delete route has the same actual post-delete GET.
+        currentQueue = row.queue!; currentComments = row.comments; paint(); await act(async () => {});
+      }
+      expect(container.querySelector('[data-testid="task-chat-queued-messages"] p[role="status"]')).toBeNull();
+      expect(container.textContent).not.toContain("The run you stopped is still shutting down");
+      expect(container.textContent).not.toContain("still hasn't shut down");
+      expect(container.textContent).not.toContain("no run started");
+      if (row.reason === "message_deleted") {
+        expect(row.laterAdmittedRunCount).toBe(0);
+        expect(row.laterQueue?.entries).toEqual([]);
+        expect(container.querySelector(`[data-testid="task-chat-queued-discard-${row.messageId}"]`)).toBeNull();
+      } else expect(row.admittedRunCount).toBe(1);
+      rendered.push({ surface: row.surface, reason: row.reason, deleteRoute: row.deleteRoute, width, domText: container.textContent });
     });
   }
 
