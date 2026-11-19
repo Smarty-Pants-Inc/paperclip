@@ -1,3 +1,4 @@
+import { assertOutboxEquivalence } from "../../__tests__/helpers/assert-outbox-equivalence.js";
 import { randomUUID } from "node:crypto";
 import {
   activityLog,
@@ -62,7 +63,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     database = await startEmbeddedPostgresTestDatabase("unanswered-person-message-");
     db = createDb(database.connectionString);
   }, 60_000);
-  afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
+  // The equality audit visits all retained fixture issues twice; bound that
+  // audit separately from the unchanged per-test behavior deadlines.
+  afterAll(async () => { await assertOutboxEquivalence(db, "unanswered-person-message"); await db?.$client.end(); await database?.cleanup(); }, 180_000);
 
   async function fixture(input: { status?: string; chat?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), userId = `user-${randomUUID()}`;

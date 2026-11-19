@@ -1,3 +1,4 @@
+import { assertOutboxEquivalence } from "../../../__tests__/helpers/assert-outbox-equivalence.js";
 import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../../../services/recovery/unanswered-person-message.js";
 import { readPersonStopHold } from "../../../services/acknowledged-native-stop.js";
 import { answeredPersonMessageSql, deferredWakeIsStaleSql, personMessageOwedSql } from "../../../services/person-message-answer.js";
@@ -73,6 +74,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await assertOutboxEquivalence(db, "wake-queue.postgres");
     await db.delete(activityLog);
     await db.delete(issueComments);
     await db.delete(heartbeatRunEvents);
@@ -1816,7 +1818,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-stale-deferred-wake-");
     db = createDb(tempDb.connectionString);
   }, 60_000);
-  afterEach(async () => { vi.restoreAllMocks(); await db.execute(sql`TRUNCATE TABLE companies CASCADE`); });
+  afterEach(async () => { await assertOutboxEquivalence(db, "wake-queue.outbox"); vi.restoreAllMocks(); await db.execute(sql`TRUNCATE TABLE companies CASCADE`); });
   afterAll(async () => { await db?.$client.end(); await tempDb?.cleanup(); });
 
   async function seed() {
