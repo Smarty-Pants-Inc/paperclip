@@ -486,4 +486,30 @@ describeEmbeddedPostgres("ONE successor per Interrupt (adopt-one-successor, 390 
         wakeCommentId: first, wakeCommentIds: [first] } })).toBeNull();
     expect((await commentWakes(chat, first)).filter(w => w.status !== "coalesced")).toEqual([]);
   });
+
+  it("(c) a shared-question answer's continuation wake is new input: admitted even though its source message is answered", async () => {
+    // agent-chat-projects.spec.ts:508: Paul's message -> the agent's reply ASKS a question (so the message is
+    // answered) -> Paul submits answers -> question-response-delivery wakes with wakeCommentIds = [that message].
+    const chat = await seedChat();
+    const asked = await issueService(db).addComment(chat.issue.id, "which project?", { userId: owner });
+    const [done] = await db.insert(heartbeatRuns).values({ companyId: chat.companyId, agentId: chat.agentId, status: "succeeded",
+      startedAt: new Date(), finishedAt: new Date(), contextSnapshot: { issueId: chat.issue.id, wakeCommentIds: [asked.id] } }).returning();
+    await db.insert(issueComments).values({ companyId: chat.companyId, issueId: chat.issue.id, authorType: "agent",
+      authorAgentId: chat.agentId, createdByRunId: done!.id, body: "Pick a project" });
+    const interactionId = randomUUID();
+    const key = `question-response:${interactionId}`;
+    const run = await heartbeatService(db).wakeup(chat.agentId, { source: "automation", triggerDetail: "system",
+      reason: "issue_commented", idempotencyKey: key, requestedByActorType: "user", requestedByActorId: owner,
+      payload: { issueId: chat.issue.id, interactionId, interactionKind: "ask_user_questions", interactionStatus: "answered",
+        sourceCommentId: asked.id, wakeCommentId: asked.id, wakeCommentIds: [asked.id], mutation: "interaction" },
+      contextSnapshot: { issueId: chat.issue.id, taskId: chat.issue.id, interactionId, interactionKind: "ask_user_questions",
+        interactionStatus: "answered", mutation: "interaction", sourceCommentId: asked.id, wakeCommentId: asked.id,
+        wakeCommentIds: [asked.id], wakeReason: "issue_commented", source: "issue.interaction.respond" } });
+    const wakes = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, chat.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
+    // Admitted: ONE wake row that is not coalesced/skipped (it runs now, or defers behind a live turn).
+    expect(wakes.map(w => [w.status, w.error]), "the answer's continuation was coalesced away").toHaveLength(1);
+    expect(["coalesced", "skipped", "failed"]).not.toContain(wakes[0]!.status);
+    expect(run !== null || wakes[0]!.status === "deferred_issue_execution", `wake ${wakes[0]!.status} has no run`).toBe(true);
+  });
 });
