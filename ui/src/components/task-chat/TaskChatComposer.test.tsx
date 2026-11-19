@@ -3887,4 +3887,93 @@ describe("steering by default: Send ▾ and its keys (Paul 11-19)", () => {
     await flushAsync();
     expect(onAdd.mock.calls[0]).toEqual(["hello", undefined, undefined, undefined, expect.any(String)]);
   });
+
+  // A second Enter while the first send is still in flight: refused out loud,
+  // its text kept, never glued onto the first and never sent before it settles.
+  function slowAdd(outcome: "ok" | "500" = "ok") {
+    const log: string[] = [];
+    const settles: Array<() => void> = [];
+    const onAdd = vi.fn((body: string, ..._rest: unknown[]) => new Promise<void>((resolve, reject) => {
+      log.push(`start:${body}`);
+      settles.push(() => {
+        log.push(`settle:${body}`);
+        if (outcome === "500" && settles.length === 1) reject(Object.assign(new Error("Internal Server Error"), { status: 500 }));
+        else resolve();
+      });
+    }));
+    return { onAdd, log, settles };
+  }
+  const refusal = () => container.querySelector('[data-testid="task-chat-composer-inflight-refused"]');
+
+  it.each([
+    [390, "enter"], [1440, "enter"], [390, "queue"], [1440, "queue"],
+  ] as const)("a second send while the first is in flight is refused visibly, kept, then sent next in order at %ipx (%s)", async (width, second) => {
+    onMac(true);
+    const { onAdd, log, settles } = slowAdd();
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" mobile={width < 640} {...working()} />);
+    typeText("Now that the run is ending, say FINISHED.");
+    pressKey("Enter");
+    await flushAsync();
+    expect(onAdd).toHaveBeenCalledTimes(1);
+    expect(editable().textContent).toBe("");
+    typeText("what is the capital of France?");
+    if (second === "queue") chord({ ctrlKey: true, metaKey: true }); else pressKey("Enter");
+    await flushAsync();
+    expect(onAdd).toHaveBeenCalledTimes(1);
+    expect(refusal()?.textContent).toBe("Wait — your last message is still sending.");
+    expect(editable().textContent).toBe("what is the capital of France?");
+    settles[0]();
+    await flushAsync();
+    await flushAsync();
+    expect(refusal()).toBeNull();
+    expect(editable().textContent).toBe("what is the capital of France?");
+    if (second === "queue") chord({ ctrlKey: true, metaKey: true }); else pressKey("Enter");
+    await flushAsync();
+    expect(onAdd).toHaveBeenCalledTimes(2);
+    expect(onAdd.mock.calls[0][0]).toBe("Now that the run is ending, say FINISHED.");
+    expect(onAdd.mock.calls[1][0]).toBe("what is the capital of France?");
+    expect(onAdd.mock.calls[1][6]).toBe(second === "queue" ? "queue" : undefined);
+    expect(log).toEqual([
+      "start:Now that the run is ending, say FINISHED.",
+      "settle:Now that the run is ending, say FINISHED.",
+      "start:what is the capital of France?",
+    ]);
+    settles[1]();
+    await flushAsync();
+    expect(editable().textContent).toBe("");
+  });
+
+  it("a first send that fails with 500 keeps the second message, not lost and not doubled", async () => {
+    onMac(true);
+    const { onAdd, settles } = slowAdd("500");
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" {...working()} />);
+    typeText("first");
+    pressKey("Enter");
+    await flushAsync();
+    typeText("second");
+    pressKey("Enter");
+    await flushAsync();
+    expect(refusal()).not.toBeNull();
+    settles[0]();
+    await flushAsync();
+    await flushAsync();
+    expect(onAdd).toHaveBeenCalledTimes(1);
+    expect(refusal()).toBeNull();
+    expect(editable().textContent).toContain("first");
+    expect(editable().textContent).toContain("second");
+    expect(editable().textContent!.match(/second/g)).toHaveLength(1);
+  });
+
+  it("control: a single Enter sends once and shows no refusal", async () => {
+    const { onAdd, settles } = slowAdd();
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" />);
+    typeText("only one");
+    pressKey("Enter");
+    await flushAsync();
+    expect(refusal()).toBeNull();
+    settles[0]();
+    await flushAsync();
+    expect(onAdd).toHaveBeenCalledTimes(1);
+    expect(editable().textContent).toBe("");
+  });
 });

@@ -473,6 +473,10 @@ export function TaskChatComposer({
   const setRunSettings = creation ? creation.onRunSettingsChange : setLocalRunSettings;
   useEffect(() => setLocalRunSettings(null), [draftKey, currentAssigneeValue]);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [inflightRefused, setInflightRefused] = useState(false);
+  useEffect(() => {
+    if (!submitting) setInflightRefused(false);
+  }, [submitting]);
   const [attachments, setAttachmentState] = useState<ComposerAttachment[]>(
     () =>
       draftKey
@@ -954,6 +958,12 @@ export function TaskChatComposer({
   async function submit(deliveryIntent?: CommentDeliveryIntent) {
     setSendMenuOpen(false);
     if (disabled || (pause && !canResetPausedConversation)) return;
+    // One send at a time. An Enter while the last message is still sending is
+    // refused out loud and its text stays here, never glued to the last one.
+    if ((submittingRef.current || submitting) && bodyRef.current.trim()) {
+      setInflightRefused(true);
+      return;
+    }
     if (creation) {
       if (submittingRef.current || uploadPending || uploadFailed || creation.submitDisabled || (!bodyRef.current.trim() && !creation.canSubmitWithoutBody)) return;
       submittingRef.current = true;
@@ -1512,6 +1522,12 @@ export function TaskChatComposer({
               }
             />
           </div>
+
+          {inflightRefused && submitting ? (
+            <p className="px-1 text-xs text-muted-foreground" role="status" data-testid="task-chat-composer-inflight-refused">
+              Wait — your last message is still sending.
+            </p>
+          ) : null}
 
           {actionError ? (
             <p
