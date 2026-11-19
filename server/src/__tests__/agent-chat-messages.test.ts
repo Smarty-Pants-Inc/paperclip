@@ -324,7 +324,19 @@ import { recoveryPostgresSupport as support } from "./helpers/recovery-postgres.
     const c = await send({ ...f, agentId: agent.id, runId });
     expect(new Set([a!.conversationId, b!.conversationId, c!.conversationId]).size).toBe(3);
     await expect(issueService(server.db).addComment(a!.conversationId, "Wrong agent", { agentId: agent.id, runId })).rejects.toThrow(/Only this conversation/);
-    await expect(issueService(server.db).addComment(b!.conversationId, "Bypass", { agentId: f.agentId, runId: f.runId })).rejects.toThrow(/earlier session/);
+    await expect(issueService(server.db).addComment(b!.conversationId, "Bypass", { agentId: f.agentId, runId: f.runId })).rejects.toThrow(/send_chat_message/);
+  });
+
+  it("names the other-task cause, not a session reset, when a task run posts a plain reply into its chat", async () => {
+    const f = await fixture();
+    const receipt = await send(f);
+    const [before] = await server.db.select().from(issues).where(eq(issues.id, receipt!.conversationId));
+    const error = await issueService(server.db).addComment(receipt!.conversationId, "SMA-611 is done", { agentId: f.agentId, runId: f.runId })
+      .then(() => null, (caught: unknown) => caught as { status?: number; message?: string; details?: unknown });
+    const [after] = await server.db.select().from(issues).where(eq(issues.id, receipt!.conversationId));
+    expect({ status: error?.status, message: error?.message, details: error?.details, generationBefore: before.conversationSessionGeneration, generationAfter: after.conversationSessionGeneration })
+      .toEqual({ status: 409, message: "This run belongs to another task; post to your chat with send_chat_message",
+        details: { code: "chat_reply_from_other_task", sourceTaskId: f.issueId }, generationBefore: 0, generationAfter: 0 });
   });
 
   it("delivers to its own chat while preserving pending questions and the original handoff completion", async () => {
