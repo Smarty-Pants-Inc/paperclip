@@ -36,7 +36,13 @@ describe("native Pi Git environment startup placement", () => {
   it("surfaces a deferred discovery error instead of launching with empty sandbox boundaries", async () => {
     const { execute, options } = input();
     const plan = await prepareHeartbeatGitHubEnvironment(options);
-    execute.mockResolvedValueOnce({ exitCode: 0, timedOut: false, signal: null, stderr: "", stdout: "unframed" });
-    await expect(plan.prepare!()).rejects.toThrow("Could not read execution-target Git context");
+    const unframed = { exitCode: 0, timedOut: false, signal: null, stderr: "", stdout: "unframed" };
+    execute.mockResolvedValueOnce(unframed).mockResolvedValueOnce(unframed);
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const failure = expect(plan.prepare!()).rejects.toThrow("Could not read execution-target Git context");
+      await vi.advanceTimersByTimeAsync(2_000);
+      await failure;
+    } finally { vi.useRealTimers(); }
   });
 });
