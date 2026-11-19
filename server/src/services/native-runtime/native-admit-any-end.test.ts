@@ -70,7 +70,7 @@ import { agentRoutes } from "../../routes/agents.js";
 import { issueRoutes } from "../../routes/issues.js";
 import { activityRoutes } from "../../routes/activity.js";
 import { issueTreeControlRoutes } from "../../routes/issue-tree-control.js";
-import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_TASK_PAUSED_TEXT } from "../recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessagesForTask } from "../recovery/unanswered-person-message.js";
 import { errorHandler } from "../../middleware/index.js";
 import { materializeIsolatedTaskDirectory } from "../isolated-task-directory.js";
 import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
@@ -117,7 +117,7 @@ async function listing(root: string) {
 }
 
 const support = await getEmbeddedPostgresTestSupport();
-describe.skipIf(!support.supported)("a parked person's message after R ends by any path (retry exhausted, Stop, cap); a terminal run never flips; a Pause-cancelled wake is never silent", () => {
+describe.skipIf(!support.supported)("a parked person's message after R ends by any path (retry exhausted, Stop, cap); a terminal run never flips", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: Db, root: string;
   beforeAll(async () => {
@@ -503,32 +503,10 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
     } finally { await h.stop(); }
   }, 300_000);
 
-  it("PAUSE (F3): a cleanup Pause cancels the parked message's wake -> ONE true line at once, the same line after Resume, never silence; sent again after Resume, it is answered once", async () => {
-    const h = await hungRWithParkedMessage(NO_CAP);
-    try {
-      // REAL: the cleanup's Pause of the task.
-      const paused = await request(h.s.app).post(`/api/issues/${h.s.issueId}/tree-holds`).send({ mode: "pause", reason: "cleanup" });
-      expect(paused.status, JSON.stringify(paused.body)).toBe(201);
-      await vi.waitFor(async () => expect((await h.wakesOf(h.next)).map(wake => ({ status: wake.status, error: wake.error }))).toEqual([
-        { status: "cancelled", error: "Cancelled because an active subtree pause hold was created" }]), { timeout: 10_000, interval: 50 });
-      await vi.waitFor(async () => expect((await h.run(h.r.id)).status).toBe("cancelled"), { timeout: 10_000, interval: 50 });
-      // The sweep at the real clock: the line is due now, not after the no-run grace.
-      const lines = async () => (await h.thread()).filter(comment => comment.authorType === "system" && /your message/i.test(comment.body)).map(comment => comment.body);
-      expect(await h.sweepUnanswered()).toEqual({ noticed: 1, pending: 0 });
-      expect(await lines()).toEqual([UNANSWERED_MESSAGE_TASK_PAUSED_TEXT]);
-      expect(await h.sweepUnanswered(new Date(Date.now() + 10 * 60_000))).toEqual({ noticed: 0, pending: 0 });
-      expect(await lines()).toEqual([UNANSWERED_MESSAGE_TASK_PAUSED_TEXT]);
-      // Resume. The cancelled wake does not come back (not the product's path); the line is still the one true line.
-      h.s.releaseStall();
-      await h.heartbeat.drainActiveRunExecutions();
-      const released = await request(h.s.app).post(`/api/issues/${h.s.issueId}/tree-holds/${paused.body.hold.id}/release`).send({ reason: "cleanup done" });
-      expect(released.status, JSON.stringify(released.body)).toBe(200);
-      const resumed = await h.admitParked(5_000);
-      await h.sweepUnanswered(new Date(Date.now() + 10 * 60_000));
-      expect(await lines()).toEqual([UNANSWERED_MESSAGE_TASK_PAUSED_TEXT]);
-      evidence.PAUSE = { line: (await lines())[0], runsAfterResume: resumed.runs.map(brief), wake: (await h.wakesOf(h.next)).map(wake => ({ status: wake.status, error: wake.error })) };
-    } finally { await h.stop(); }
-  }, 300_000);
+  // PAUSE (F3) is NOT in this compose. Under RFL's ruling 3B (05:33Z) a tree Pause leaves a deferred wake that
+  // carries a PERSON's message deferred, and release drains it once: adopt-lead's hold compose owns that change and
+  // its row K16 (issue-tree-control.ts :1338-1349). The "one true line at once" fix and its PAUSE row live at
+  // bb/admit fdefdda2 (+ the row in 217557c96) as the FALLBACK if K16 ever goes red.
 
   it("CONTROL: an unrelated LIVE predecessor still blocks. After R ended and the parked message's run P started, a third message stays parked behind the live P and starts only when P ends", async () => {
     const h = await hungRWithParkedMessage(NO_CAP);
