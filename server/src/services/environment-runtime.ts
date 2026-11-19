@@ -4192,7 +4192,7 @@ function createPluginEnvironmentDriver(
           : {}),
       } as PluginEnvironmentAcquireLeaseParams, ...timeoutOverride));
 
-      return await environmentsSvc.acquireLease({
+      const recordedLease = await environmentsSvc.acquireLease({
         creationOperationId: resumed ? undefined : providerLease.metadata?.creationOperationId as string | undefined,
         companyId: input.companyId,
         environmentId: input.environment.id,
@@ -4222,6 +4222,13 @@ function createPluginEnvironmentDriver(
           driverKey: parsed.config.driverKey,
         },
       });
+      // B0b (rf-3 item 4): the plugin resumed the exact retained box: re-arm its LEASE-GONE holds.
+      if (resumed && previous && resumed.providerLeaseId === previous.providerLeaseId) {
+        await rearmAgentFileHoldsOnLeaseActive(db, { id: previous.id, companyId: previous.companyId,
+          providerLeaseId: previous.providerLeaseId, heartbeatRunId: previous.heartbeatRunId })
+          .catch(error => logger.warn({ err: error, leaseId: previous.id }, "Agent-file LEASE-GONE holds not re-armed on resume"));
+      }
+      return recordedLease;
     },
 
     releaseRunLease(input) {
