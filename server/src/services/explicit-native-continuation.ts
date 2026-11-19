@@ -192,6 +192,22 @@ export function isNativeAdmissionAdapter(adapterType: string | null | undefined)
   return adapterType === "paperclip_runner";
 }
 
+/**
+ * The startup-cleanup exemption of a person's own accepted startup Stop
+ * (rf-5 R16, adopt-cutc 3c): every lease of the stopped run is the run's OWN
+ * and already released, with nothing left to clean (not active or
+ * pending_cleanup, cleanup not failed, no cleanup in flight). The real
+ * producer leaves exactly that released local lease; no lease at all is the
+ * empty case. A live, pending or failed lease never passes.
+ */
+export function personStartupStopLeasesReleased(runId: string, leases: ReadonlyArray<{
+  heartbeatRunId: string | null; releasedAt: Date | null; status: string; cleanupStatus: string | null; metadata: unknown;
+}>): boolean {
+  return leases.every(lease => lease.heartbeatRunId === runId && lease.releasedAt != null
+    && lease.status !== "active" && lease.status !== "pending_cleanup" && lease.cleanupStatus !== "failed"
+    && String((lease.metadata as Record<string, unknown> | null)?.pendingCleanupInFlight ?? "false") === "false");
+}
+
 export async function admitExplicitNativeContinuation(input: {
   db: Db; companyId: string; issueId: string; agentId: string;
   actorType: string | null | undefined; actorId: string | null | undefined;
@@ -720,8 +736,11 @@ export async function admitExplicitNativeContinuation(input: {
       stoppedSessions.push(stopped);
     }
     // That Stop leaves its coordinator 'observed' (no controller ever claimed
-    // it); with no lease and no workspace finalizer there is nothing to clean.
-    if ((nativeQueuedSend || retainedTurnStops.size > 0) && !(personStartupStop && !leases.length
+    // it). The real producer also leaves the stopped run's OWN local lease,
+    // already RELEASED (rf-5 R16): every lease of this run released, none
+    // active/pending/failed/in flight, and no workspace finalizer means there
+    // is nothing to clean. 'No lease' is only the empty case of this rule.
+    if ((nativeQueuedSend || retainedTurnStops.size > 0) && !(personStartupStop && personStartupStopLeasesReleased(run.id, leases)
         && run.runnerProfileJson?.nativeWorkspaceFinalizationOwner == null)
         && await hasPendingRunCleanup(db, companyId, run.id))
       return blocked("cleanup_pending", "Waiting for the previous run to finish cleanup. Your message is saved.");
