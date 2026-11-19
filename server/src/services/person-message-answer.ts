@@ -11,22 +11,6 @@ export const COMPANY_IMPORTED_ACTION = "company.imported";
 type PersonMessageSql = { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL };
 type DeferredWakeSql = { companyId: SQL; agentId: SQL; issueId: SQL; requestedAt: SQL; payload: SQL };
 
-/** A later turn moved the thread on only when it STARTED after the boundary,
- * succeeded, and published a live agent reply on this issue. Reply time alone
- * cannot discard input that arrived while that turn was already running. */
-export function conversationMovedOnSql(m: Pick<PersonMessageSql, "companyId" | "issueId" | "createdAt">, commentId?: SQL): SQL {
-  return sql`exists (select 1 from ${heartbeatRuns} moved_on
-    where moved_on.company_id = ${m.companyId}
-      and (moved_on.native_issue_id = ${m.issueId} or moved_on.context_snapshot->>'issueId' = ${m.issueId}::text)
-      and moved_on.status = 'succeeded' and moved_on.started_at > ${m.createdAt}
-      and exists (select 1 from ${issueComments} moved_reply where moved_reply.company_id = moved_on.company_id
-        and moved_reply.issue_id = ${m.issueId} and moved_reply.created_by_run_id = moved_on.id
-        and moved_reply.author_type = 'agent' and moved_reply.deleted_at is null)
-      ${commentId ? sql`and not exists (select 1 from ${heartbeatRuns} later_carrier
-        where later_carrier.company_id = moved_on.company_id and later_carrier.started_at >= moved_on.started_at
-          and ${carriesCommentSql("later_carrier", commentId, false)})` : sql``})`;
-}
-
 /** RFL 17:07Z: a deferred receipt ages only when a succeeded replying turn
  * actually claimed a newer PERSON input. Starting later is not evidence: a
  * queued successor may start after messages that are still waiting behind it.
