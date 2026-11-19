@@ -1344,6 +1344,51 @@ function acquirePhaseClock(startedAt: number) {
     },
   };
 }
+type AcquirePhaseStamp = { phasesMs: Record<(typeof ACQUIRE_PHASES)[number], number>; totalMs: number };
+/** What an ordinary create reports to the acquisition's one line. */
+type OrdinaryAcquireStamp = AcquirePhaseStamp & { startedAt: number; source: "created" | "adopted"; outcome: "ok" | "budget" | "error"; failedPhase?: string };
+/**
+ * review-fleet-4 C1 (rf4-u3c F2): the ONE outer `boat.acquire.phases` emitter.
+ * It wraps the whole acquisition hook, so every exit (a warmed-spare handoff,
+ * a preflight, validation or admission refusal, and an ordinary create) emits
+ * exactly one line. `preflight` is the time before the create or spare handoff
+ * began (setting reads, owed stops, the spare claim); the phases sum to totalMs.
+ * An ordinary create reports its own stamp here instead of logging it.
+ */
+function acquirePhaseLine(params: { companyId: string; environmentId: string }, startedAt: number) {
+  let ordinary: OrdinaryAcquireStamp | undefined;
+  let spareHandoffAt: number | undefined;
+  let emitted = false;
+  return {
+    ordinary(stamp: OrdinaryAcquireStamp): void { ordinary = stamp; },
+    spareHandoff(): void { spareHandoffAt ??= Date.now(); },
+    emit(ok: boolean): void {
+      if (emitted) return;
+      emitted = true;
+      try {
+        const endedAt = Date.now();
+        const phasesMs = { preflight: 0, create: 0, ready: 0, setup: 0, sync: 0, handoff: 0 };
+        let source: "created" | "adopted" | "spare" | "none", outcome: "ok" | "budget" | "error", failedPhase: string | undefined;
+        if (ordinary) {
+          Object.assign(phasesMs, ordinary.phasesMs);
+          phasesMs.preflight = Math.max(0, ordinary.startedAt - startedAt);
+          ({ source, outcome, failedPhase } = ordinary);
+        } else if (spareHandoffAt !== undefined) {
+          phasesMs.preflight = Math.max(0, spareHandoffAt - startedAt);
+          phasesMs.handoff = Math.max(0, endedAt - spareHandoffAt);
+          source = "spare"; outcome = ok ? "ok" : "error"; failedPhase = ok ? undefined : "handoff";
+        } else {
+          phasesMs.preflight = Math.max(0, endedAt - startedAt);
+          source = "none"; outcome = ok ? "ok" : "error"; failedPhase = ok ? undefined : "preflight";
+        }
+        const totalMs = Object.values(phasesMs).reduce((total, ms) => total + ms, 0);
+        // Numbers and fixed words only: no provider text reaches it.
+        duplexLogger?.info("boat.acquire.phases", { companyId: params.companyId, environmentId: params.environmentId,
+          source, outcome, ...(failedPhase ? { failedPhase } : {}), phasesMs, totalMs, budgetMs: BOAT_ACQUIRE_ATTEMPT_BUDGET_MS });
+      } catch { /* Logging never changes allocation outcome. */ }
+    },
+  };
+}
 /** Our create POST reached its own 30 s deadline (or a transport ETIMEDOUT)
  * with no HTTP answer: Boat may still be creating the box, as Daytona's create
  * is still pending at its cap. Any other failure is a create that failed, which
@@ -2491,15 +2536,20 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     }
   },
   onEnvironmentAcquireLease(params: PluginEnvironmentAcquireLeaseParams): Promise<PluginEnvironmentLease> {
-    if (shuttingDown) return Promise.reject(new Error("Boat provider is shutting down"));
     const acquiredAt = Date.now();
+    // review-fleet-4 C1: one line per acquisition, from this hook's every exit.
+    const phases = acquirePhaseLine(params, acquiredAt);
+    if (shuttingDown) {
+      phases.emit(false);
+      return Promise.reject(new Error("Boat provider is shutting down"));
+    }
     let outcomeRecorded = false;
     const recordOutcomeOnce = async (outcome: "spare" | "cold", reason?: AcquireOutcomeReason) => {
       if (outcomeRecorded) return;
       outcomeRecorded = true;
       await recordAcquireOutcome(params.companyId, params.environmentId, outcome, reason);
     };
-    const work = (async (): Promise<PluginEnvironmentLease> => {
+    const acquire = async (): Promise<PluginEnvironmentLease> => {
       await recordCompanySpareActivity(params.companyId, true);
     const c = parse(params.config);
     const snapshotError = snapshotConfigError(params.config);
@@ -2683,13 +2733,12 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
           `Boat sandbox ${id} entered error; Boat could not start it, and it was stopped.`, cleanupIdentity(c, id, params, attemptId), startFailure);
         throw error;
       } finally {
-        // rf-4 U3 C3: the budget's gate window, one line per acquisition (ok or
-        // not). Numbers and fixed words only: no provider text reaches it.
+        // rf-4 U3 C3: the budget's gate window (ok or not), reported to the
+        // acquisition's one outer line (review-fleet-4 C1), never logged here.
         try {
-          duplexLogger?.info("boat.acquire.phases", { companyId: params.companyId, environmentId: params.environmentId,
-            source, outcome: stampOutcome, ...(failedPhase ? { failedPhase } : {}),
-            ...clock.stamp(endedAt ?? Date.now()), budgetMs: BOAT_ACQUIRE_ATTEMPT_BUDGET_MS });
-        } catch { /* Logging never changes allocation outcome. */ }
+          phases.ordinary({ startedAt: createStartedAt, source, outcome: stampOutcome, ...(failedPhase ? { failedPhase } : {}),
+            ...clock.stamp(endedAt ?? Date.now()) });
+        } catch { /* Stamping never changes allocation outcome. */ }
       }
     };
     if (!hasSpareSetting) await recordOutcomeOnce("cold", "config_mismatch");
@@ -2713,6 +2762,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       const claimResult = await readySpares.claimWithOutcome(spareKey, claimAttempt, ttl, spareOperations, params.runId ?? "unknown");
       if (shuttingDown) throw new Error("Boat provider is shutting down");
       if (claimResult.outcome === "spare") {
+        phases.spareHandoff();
         const claimedSpare = claimResult.spare;
         readySpares.recordDemand({ companyId: params.companyId, environmentId: params.environmentId });
         const demandedSpares = readySpares.demandTarget(spareKey, baseSpares, spareMax, demandWindowMinutes);
@@ -2738,7 +2788,8 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       await recordOutcomeOnce("cold", "no_ready_spare");
     }
     return await createOrdinaryLease();
-    })();
+    };
+    const work = acquire().then(lease => { phases.emit(true); return lease; }, error => { phases.emit(false); throw error; });
     const countedWork = work.then(lease => { startRunLeaseTtlRefresh(params, parse(params.config), lease, acquiredAt); return lease; }).finally(async () => {
       if (!outcomeRecorded) await recordOutcomeOnce("cold", "config_mismatch");
     });
