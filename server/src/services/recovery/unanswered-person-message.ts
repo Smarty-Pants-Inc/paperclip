@@ -1125,10 +1125,16 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? (workingEnded ? UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT : UNANSWERED_MESSAGE_NO_REPLY_TEXT)
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
       : held ? HELD_PREDECESSOR_NOTICE : workingEnded ? UNANSWERED_MESSAGE_STARTED_FAILED_TEXT : UNANSWERED_MESSAGE_TEXT;
+  // A later successful run can hide this failed carrier's own failure card
+  // without answering its person input. Its one standing note must name that
+  // saved input, using the failure card's already-approved quote and words.
+  const savedMessage = run && TERMINAL.includes(run.status) && run.status !== "succeeded"
+    && latest?.status === "succeeded" && latest.id !== run.id && !waiting
+    ? `Your message is saved: “${(await import("../task-interruption-presentation.js")).carriedMessageQuote(message.body)}”. ` : "";
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
       title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",
-      body,
+      body: savedMessage + body,
       tone: paused ? "warning" : waiting ? "info" : "warning",
       nextAction: policyRefused ? "Automatic retry is disabled for this request."
         : settingUp ? "No action is needed; your message is saved."
