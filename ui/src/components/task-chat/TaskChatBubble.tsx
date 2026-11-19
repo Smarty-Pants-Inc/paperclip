@@ -42,6 +42,7 @@ import {
   stripStandaloneImageEmbeds,
   type AttachmentRef,
 } from "./task-chat-attachments";
+import { STEERED_NOT_DELIVERED_TEXT } from "@/api/comment-delivery";
 import { TaskChatBubbleActions } from "./TaskChatBubbleActions";
 import { TaskChatSystemNotice } from "./TaskChatSystemNotice";
 import type { TaskChatMessageItem } from "./task-chat-model";
@@ -248,7 +249,7 @@ function TaskChatBubbleContent({
       data-testid={item.steeredIntoRunId || item.steeredDelivery === "pending" ? "task-chat-steered-message" : undefined}
       data-steered-into-run-id={item.steeredIntoRunId ?? undefined}
       data-delivery={item.steeredIntoRunId
-        ? item.steeredDelivery === "delivered" ? "delivered" : "sent"
+        ? item.steeredDelivery === "delivered" || item.steeredDelivery === "not_delivered" ? item.steeredDelivery : "sent"
         : item.steeredDelivery === "pending" ? "pending" : undefined}
       ref={readRef}
       className={cn(
@@ -451,7 +452,8 @@ function TaskChatBubbleContent({
               // 'Delivered' once the agent has read it. Subtle, same bubble.
               <span data-testid="task-chat-steered-delivery" data-delivery={item.steeredDelivery ?? "sent"}>
                 {timestamp ? " · " : null}
-                {item.steeredDelivery === "delivered" ? "Delivered" : "Sent"}
+                {item.steeredDelivery === "delivered" ? "Delivered"
+                  : item.steeredDelivery === "not_delivered" ? STEERED_NOT_DELIVERED_TEXT : "Sent"}
               </span>
             ) : null}
           </span>
