@@ -280,6 +280,30 @@ it("joins and closes a late real bridge when parallel launcher staging fails", a
   await expect(access(directory!)).rejects.toThrow();
 });
 
+// Keep reason: real-shell restore bridge RPC budget, with per-RPC transport latency.
+it("bounds non-warm GitHub preparation and activation over a real shell at 150ms per RPC", async () => {
+  const startedAt = performance.now();
+  const b = await broker(undefined, true, false, undefined, undefined, 150);
+  const accessMs = performance.now() - startedAt;
+  const accessRpcs = b.execute.mock.calls.length;
+  expect(b.ready).toBe(true);
+  expect((await request(b)).status).toBe(403);
+  const activatingAt = performance.now();
+  const release = await b.activate(run("restored"));
+  const activationMs = performance.now() - activatingAt;
+  // Includes the first runtime long-list dispatch. resume waits for dispatch,
+  // NOT for that list's five-second idle window to finish.
+  const activationRpcs = b.execute.mock.calls.length - accessRpcs;
+  console.log(JSON.stringify({ row: "non-warm-github-150ms", accessRpcs, accessMs: Math.round(accessMs),
+    activationRpcs, activationMs: Math.round(activationMs), firstPollIncluded: true }));
+  expect.soft(accessRpcs).toBeLessThanOrEqual(4);
+  expect.soft(activationRpcs).toBeLessThanOrEqual(3);
+  // The actual gateway, worker and authenticated broker must still serve work.
+  expect(await (await request(b)).json()).toMatchObject({ env: { GH_TOKEN: "fixture-restored" } });
+  await release();
+  expect((await request(b)).status).toBe(503);
+}, 30000);
+
 it("rejects other scopes, concurrent bindings, browser requests and forged authority", async () => {
   const b = await broker();
   for (const field of ["companyId", "agentId", "issueId"] as const) {

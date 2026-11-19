@@ -2183,6 +2183,82 @@ describe("sandbox callback bridge", () => {
     expect((await readdir(root)).filter(name => name.includes("paperclip-upload"))).toEqual([]);
   });
 
+  // Keep reason: a batched write failure cannot publish a partial generation.
+  it.each([0, 1])("keeps the paused generation private when batch decode %s fails", async failingDecode => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "bridge-batch-failure-"));
+    cleanupDirs.push(root);
+    const runState = path.join(root, "run-state.json");
+    const everAttached = `${runState}.ever-attached`;
+    await writeFile(runState, "paused", { mode: 0o600 });
+    await writeFile(everAttached, "unattached", { mode: 0o600 });
+    const real = createExecRunner();
+    let decode = 0;
+    const execute = vi.fn(async (input: Parameters<typeof real.execute>[0]) => real.execute({ ...input,
+      args: input.args?.map(arg => arg.replaceAll("base64 -d", () => decode++ === failingDecode ? "false" : "base64 -d")),
+    }));
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({ runner: { execute }, remoteCwd: root });
+    await expect(client.writeTextFiles!([
+      { remotePath: everAttached, body: "attached" }, { remotePath: runState, body: "attached:new-generation" },
+    ])).rejects.toThrow();
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(await readFile(runState, "utf8")).toBe("paused");
+    expect(await readFile(everAttached, "utf8")).toBe(failingDecode === 0 ? "unattached" : "attached");
+    expect((await fs.stat(runState)).mode & 0o777).toBe(0o600);
+    expect((await readdir(root)).sort()).toEqual(["run-state.json", "run-state.json.ever-attached"]);
+  });
+
+  it("does not replay a batched generation after an unknown control-RPC timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      let finish!: (result: RunProcessResult) => void;
+      const runner = { execute: vi.fn(() => new Promise<RunProcessResult>(resolve => { finish = resolve; })) };
+      const client = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: "/workspace", timeoutMs: 100 });
+      const write = client.writeTextFiles!([
+        { remotePath: "/workspace/ever-attached", body: "attached" },
+        { remotePath: "/workspace/run-state.json", body: "attached:current" },
+      ]).catch(error => error);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(await write).toEqual(new Error("Sandbox bridge control command timed out after 100ms."));
+      finish({ exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null, startedAt: new Date().toISOString() });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runner.execute).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  // Keep reason: restore startup/control RPC budget at the real shell boundary.
+  it("batches paused queue setup and generation publication at 150ms per RPC", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "bridge-worker-rpc-"));
+    cleanupDirs.push(root);
+    const queueDir = path.join(root, "queue");
+    const real = createExecRunner();
+    const execute = vi.fn(async (input: Parameters<typeof real.execute>[0]) => {
+      await new Promise(resolve => setTimeout(resolve, 150));
+      return real.execute(input);
+    });
+    const startedAt = performance.now();
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createCommandManagedSandboxCallbackBridgeQueueClient({ runner: { execute }, remoteCwd: root }),
+      queueDir, startPaused: true, handleRequest: async () => { throw new Error("no request expected"); },
+    });
+    cleanupFns.push(() => worker.stop());
+    const setupMs = Math.round(performance.now() - startedAt);
+    const setupRpcs = execute.mock.calls.length;
+    expect(await readFile(path.join(queueDir, "run-state.json"), "utf8")).toBe("paused");
+    const resumingAt = performance.now();
+    await worker.resume("fresh-generation");
+    const activationMs = Math.round(performance.now() - resumingAt);
+    const activationRpcs = execute.mock.calls.length - setupRpcs;
+    console.log(JSON.stringify({ row: "worker-control-150ms", setupRpcs, setupMs, activationRpcs, activationMs, firstPollIncluded: true }));
+    expect.soft(setupRpcs).toBe(1);
+    expect.soft(activationRpcs).toBe(3);
+    expect(await readFile(path.join(queueDir, "run-state.json"), "utf8")).toBe("attached:fresh-generation");
+    expect(await readFile(path.join(queueDir, "run-state.json.ever-attached"), "utf8")).toBe("attached");
+    for (const file of ["run-state.json", "run-state.json.ever-attached"]) {
+      expect((await fs.stat(path.join(queueDir, file))).mode & 0o777).toBe(0o600);
+    }
+  });
+
   // Keep reason: readiness must report a real listener, not just a launched PID.
   it.each(["sh", "bash"] as const)("starts and admits a delayed gateway in one %s RPC at 150ms latency", async shellCommand => {
     const root = await mkdtemp(path.join(os.tmpdir(), "bridge-ready-rpc-"));

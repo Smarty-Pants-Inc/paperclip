@@ -307,6 +307,9 @@ export interface SandboxCallbackBridgeQueueClient {
   fileSize?(remotePath: string): Promise<number>;
   readTextFile(remotePath: string, maxBytes?: number): Promise<string>;
   writeTextFile(remotePath: string, body: string): Promise<void>;
+  /** Bounded small-file batch; preserves file order and each atomic publish.
+   * Older clients fall back to makeDirs/writeTextFile without changing behavior. */
+  writeTextFiles?(files: Array<{ remotePath: string; body: string }>, ensureDirectories?: string[]): Promise<void>;
   writeResponseFile?(
     responsePath: string,
     body: string,
@@ -651,6 +654,17 @@ export function createFileSystemSandboxCallbackBridgeQueueClient(): SandboxCallb
   };
 }
 
+function smallRemoteTextWriteScript(remotePath: string, base64Body: string): string {
+  const decodedPath = `${remotePath}.${randomUUID()}.paperclip-upload.decoded`;
+  return [
+    "set -eu; umask 077",
+    `trap ${shellQuote(`rm -f -- ${shellQuote(decodedPath)}`)} EXIT HUP INT TERM`,
+    `mkdir -p ${shellQuote(path.posix.dirname(remotePath))}`,
+    `printf '%s' ${shellQuote(base64Body)} | base64 -d > ${shellQuote(decodedPath)}`,
+    `mv -- ${shellQuote(decodedPath)} ${shellQuote(remotePath)}`,
+  ].join("\n");
+}
+
 export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
   runner: CommandManagedRuntimeRunner;
   remoteCwd: string;
@@ -758,13 +772,7 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       // bytes. Keep the same private attempt path and atomic publish fence;
       // a timeout is still an unknown write, never retried here.
       if (base64Body.length <= REMOTE_WRITE_BASE64_CHUNK_SIZE) {
-        await runChecked(`write ${remotePath}`, [
-          "set -eu; umask 077",
-          `trap ${shellQuote(`rm -f -- ${shellQuote(decodedPath)}`)} EXIT HUP INT TERM`,
-          `mkdir -p ${shellQuote(remoteDir)}`,
-          `printf '%s' ${shellQuote(base64Body)} | base64 -d > ${shellQuote(decodedPath)}`,
-          `mv -- ${shellQuote(decodedPath)} ${shellQuote(remotePath)}`,
-        ].join("\n"));
+        await runChecked(`write ${remotePath}`, smallRemoteTextWriteScript(remotePath, base64Body));
         return;
       }
       try {
@@ -795,6 +803,22 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
         ).catch(() => undefined);
         throw error;
       }
+    },
+    writeTextFiles: async (files, ensureDirectories = []) => {
+      if (files.length < 1 || files.length > 16) throw new Error("Bridge text batch requires 1 to 16 files");
+      const writes = files.map(({ remotePath, body }) => {
+        const base64Body = Buffer.from(body, "utf8").toString("base64");
+        if (base64Body.length > REMOTE_WRITE_BASE64_CHUNK_SIZE) throw new Error("Bridge text batch file exceeds small-write limit");
+        // Each subshell owns its temporary path and cleanup trap. A later
+        // failure cannot publish partial bytes or replay an earlier write.
+        return `(\n${smallRemoteTextWriteScript(remotePath, base64Body)}\n)`;
+      });
+      const script = ["set -eu; umask 077",
+        ...(ensureDirectories.length ? [`mkdir -p -- ${ensureDirectories.map(shellQuote).join(" ")}`] : []),
+        ...writes,
+      ].join("\n");
+      if (Buffer.byteLength(script, "utf8") > 1024 * 1024) throw new Error("Bridge text batch exceeds 1 MiB");
+      await runChecked("write bridge text batch", script);
     },
     writeResponseFile: async (responsePath, body, options = {}) => {
       const responseDir = path.posix.dirname(responsePath);
@@ -945,30 +969,31 @@ export async function startSandboxCallbackBridgeWorker(input: {
   // during initialization. Both transports share the host process memory ceiling.
   const { createBridgeBodyReservation } = await import("./http2-bridge-server.js");
   const directories = sandboxCallbackBridgeDirectories(input.queueDir);
+  const runStatePath = path.posix.join(directories.rootDir, "run-state.json");
+  const everAttachedPath = `${runStatePath}.ever-attached`;
   const queueDirectories = [
     directories.rootDir,
     directories.requestsDir,
     directories.responsesDir,
     directories.logsDir,
   ];
-  if (input.client.makeDirs) {
-    await input.client.makeDirs(queueDirectories);
+  if (input.startPaused && input.client.writeTextFiles) {
+    await input.client.writeTextFiles([{ remotePath: runStatePath, body: "paused" }], queueDirectories);
   } else {
-    // Backward-compatible fallback for a queue client that omits the batched
-    // makeDirs method. Create each queue directory with a single makeDir.
-    for (const directory of queueDirectories) {
-      await input.client.makeDir(directory);
+    if (input.client.makeDirs) {
+      await input.client.makeDirs(queueDirectories);
+    } else {
+      for (const directory of queueDirectories) await input.client.makeDir(directory);
     }
+    if (input.startPaused) await input.client.writeTextFile(runStatePath, "paused");
   }
-  const runStatePath = path.posix.join(directories.rootDir, "run-state.json");
-  const everAttachedPath = `${runStatePath}.ever-attached`;
   let runStateManaged = Boolean(input.startPaused);
   let runStateWriteFailureLogged = false;
-  const writeRunStateBestEffort = async (remotePath: string, value: string): Promise<void> => {
+  const writeRunStateBestEffort = async (write: () => Promise<void>): Promise<void> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
-        input.client.writeTextFile(remotePath, value),
+        write(),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new Error("run-state write timed out")), 5_000);
         }),
@@ -982,10 +1007,6 @@ export async function startSandboxCallbackBridgeWorker(input: {
       if (timer) clearTimeout(timer);
     }
   };
-  if (input.startPaused) {
-    await input.client.writeTextFile(runStatePath, "paused");
-  }
-
   let stopping = false;
   let paused = input.startPaused ?? false;
   let polling = false;
@@ -1794,7 +1815,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       if (stopping || paused) return;
       paused = true;
       runStateManaged = true;
-      await writeRunStateBestEffort(runStatePath, "paused");
+      await writeRunStateBestEffort(() => input.client.writeTextFile(runStatePath, "paused"));
       pausedPromise ??= new Promise<void>((resolve) => { resumePolling = resolve; });
       if (sleepTimer) clearTimeout(sleepTimer);
       sleepTimer = null;
@@ -1819,8 +1840,16 @@ export async function startSandboxCallbackBridgeWorker(input: {
     resume: async (generation?: string) => {
       if (stopping || !paused) return;
       await failPendingRequests("Bridge request belongs to a detached run.", { abandonInFlight: true });
-      await writeRunStateBestEffort(everAttachedPath, "attached");
-      await writeRunStateBestEffort(runStatePath, generation ? `attached:${generation}` : "attached");
+      const state = generation ? `attached:${generation}` : "attached";
+      if (input.client.writeTextFiles) {
+        await writeRunStateBestEffort(() => input.client.writeTextFiles!([
+          { remotePath: everAttachedPath, body: "attached" },
+          { remotePath: runStatePath, body: state },
+        ]));
+      } else {
+        await writeRunStateBestEffort(() => input.client.writeTextFile(everAttachedPath, "attached"));
+        await writeRunStateBestEffort(() => input.client.writeTextFile(runStatePath, state));
+      }
       idlePollIntervalMs = pollIntervalMs;
       resetIdleOnNextEmpty = true;
       const pollStarted = new Promise<void>((resolve) => { pollStartedResolve = resolve; });
