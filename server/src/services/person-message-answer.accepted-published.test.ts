@@ -86,7 +86,7 @@ describe.skipIf(!support.supported)("ANSWERED: the run's accepted result, publis
     const later = (status: string, errorCode: string) => db.update(heartbeatRuns).set({ status, errorCode,
       error: status === "cancelled" ? null : `${errorCode}: the run ended after it published`, finishedAt: new Date(t + 120_000),
       updatedAt: new Date(t + 120_000) }).where(eq(heartbeatRuns.id, runId));
-    return { companyId, issueId, agentId, runId, m: m!, t, acceptAndPublish, answered, carried, notices, later };
+    return { companyId, issueId, agentId, runId, sessionId, runnerId, contract: contract!, m: m!, t, acceptAndPublish, answered, carried, notices, later };
   }
 
   it("the real producers store what the rule keys on: an accepted result row and the published comment's id on the run", async () => {
@@ -112,6 +112,92 @@ describe.skipIf(!support.supported)("ANSWERED: the run's accepted result, publis
     expect.soft(await f.answered(), `published accepted result answers M though the run is ${status}`).toBe(true);
     expect.soft(await f.carried(), "the carry reads the same answer").toEqual([]);
     expect(await f.notices(), "no \"wasn't answered\" line beside the published answer").toEqual([]);
+  });
+
+  // RFL-1 (RFL 01:05Z ruling on merged8, "EQUIVALENT"): the counted comment must be the one the publisher /
+  // finalizer posted FOR the accepted result, not any comment the run wrote. This fixture is a TASK (no
+  // conversation): the real task-path publisher is finalizeNativeRun's committed-task-response writer
+  // (native-run-finalizer.ts:1343-1351), which records ONLY presentationDecision.commentId on the run; it writes no
+  // nativeCommittedChatResponse (that record is the chat publisher's, :1421-1429). The task path's key is therefore
+  // native_run_results (schema_status 'accepted') + native_run_finalizations.result_id.
+  it("RFL-1 (a): a TASK path's accepted reply is counted ONCE, by the native_run_results / native_run_finalizations.result_id key; the counted comment is the one the finalizer posted for that result", async () => {
+    const f = await fixture();
+    const p = await f.acceptAndPublish(); // REAL: completeRun (accepted row) + finalizeNativeRun (commit + the one publication)
+    const result = p.run.resultJson as Record<string, any>;
+    expect((await db.select({ conversationAgentId: issues.conversationAgentId }).from(issues).where(eq(issues.id, f.issueId)))[0]!.conversationAgentId,
+      "a task, not a conversation").toBeNull();
+    expect(result.nativeCommittedChatResponse, "the task-path publisher records no (resultId, canonicalSha256) of its own").toBeUndefined();
+    expect(result.presentationDecision, "the finalizer's task-response writer published it").toMatchObject({ commentId: p.reply.id,
+      reasonCodes: expect.arrayContaining(["committed_task_response_recovered"]) });
+    expect(p.finalization.resultId, "the key: the finalization committed the accepted result").toBe(p.accepted.id);
+    await f.later("failed", "adapter_failed"); // PLANTED later status
+    // The run ALSO wrote another comment (planted): it is not the publication, so it is not counted.
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
+      createdByRunId: f.runId, body: "Leftover partial text.", createdAt: new Date() });
+    // Counted ONCE: exactly one comment of the task satisfies the rule's accepted-published arm, the finalizer's.
+    const counted = [...await db.execute(sql`select a.id from issue_comments a join heartbeat_runs r on r.id = a.created_by_run_id
+      where a.issue_id = ${f.issueId}::uuid and a.author_type = 'agent' and a.deleted_at is null
+        and r.result_json#>>'{presentationDecision,commentId}' = a.id::text
+        and exists (select 1 from native_run_results accepted join native_run_finalizations committed
+          on committed.run_id = accepted.run_id and committed.result_id = accepted.id
+          where accepted.run_id = r.id and accepted.schema_status = 'accepted')`)].map(row => (row as { id: string }).id);
+    expect(counted, "one comment, the one posted for the committed accepted result").toEqual([p.reply.id]);
+    expect(await f.answered(), "answered by the published accepted result though the run later failed").toBe(true);
+    expect(await f.carried()).toEqual([]);
+    expect(await f.notices(), "0 notices").toEqual([]);
+    // Key controls, PLANTED and named (beside the real row above):
+    // - the run's own (resultId, canonicalSha256), where a publisher recorded it, must be THIS accepted result's.
+    const withOwn = (own: Record<string, unknown>) => db.update(heartbeatRuns).set({ resultJson: sql`${heartbeatRuns.resultJson} || ${JSON.stringify({
+      nativeCommittedChatResponse: own })}::jsonb` }).where(eq(heartbeatRuns.id, f.runId));
+    await withOwn({ resultId: p.accepted.id, canonicalSha256: p.accepted.canonicalSha256 });
+    expect(await f.answered(), "the run's own key names the accepted result -> counted").toBe(true);
+    await withOwn({ resultId: randomUUID(), canonicalSha256: p.accepted.canonicalSha256 });
+    expect(await f.answered(), "the run's own resultId names ANOTHER result -> not counted").toBe(false);
+    await withOwn({ resultId: p.accepted.id, canonicalSha256: "sha256:another" });
+    expect(await f.answered(), "the run's own canonicalSha256 differs -> not counted").toBe(false);
+    await db.update(heartbeatRuns).set({ resultJson: sql`${heartbeatRuns.resultJson} - 'nativeCommittedChatResponse'` }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await f.answered(), "control restored").toBe(true);
+    // - the finalization committed ANOTHER result id (planted on the real finalization row; the FK is deferred to a
+    //   real second result row of this run, copied from the accepted one): the comment is not that result's.
+    const [second] = await db.insert(nativeRunResults).values({ ...p.accepted, id: randomUUID(), serverFingerprint: `planted-${randomUUID()}`,
+      schemaStatus: "rejected", rejectionCode: "schema_invalid", canonicalSha256: "sha256:planted-second",
+      callerResultId: null, callerDedupeKey: null }).returning();
+    await db.update(nativeRunFinalizations).set({ resultId: second!.id }).where(eq(nativeRunFinalizations.runId, f.runId));
+    expect(await f.answered(), "the finalization's result_id is not the accepted result's -> not counted").toBe(false);
+    expect(await f.carried(), "and the carry reads the same: M is owed input again").toEqual([f.m.id]);
+  });
+
+  it("RFL-1 (b): a task-path PROGRESS comment from a run whose accepted result was never published -> M is owed: exactly 1 notice", async () => {
+    // REAL: the run submits its result and it is ACCEPTED (NativeRunCoordinatorStore.completeRun -> native_run_results).
+    // The finalizer never runs, so nothing is published: no presentationDecision. PLANTED, named: the run's progress
+    // comment (with its report_progress tool receipt, as the run's own tool writes it; and, second fixture, a plain
+    // run comment with no receipt) and the run's later failed status.
+    for (const receipt of [true, false]) {
+      const f = await fixture();
+      const port = new NativeRunCoordinatorStore(db, { companyId: f.companyId, issueId: f.issueId, runId: f.runId, agentId: f.agentId,
+        normalizedSessionId: f.sessionId, runnerSourceInstanceId: f.runnerId, completionContractId: f.contract.id,
+        completionContractSha256: f.contract.canonicalSha256, completionContractRevision: "test", completionContractCriterionIds: [] });
+      await port.completeRun({ result: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "blocked", summary,
+        blocker: { reasonCode: "access", owner: { kind: "user", name: "Board operator" }, unblockAction: "Confirm the release notes", scope: "task_wide" },
+        completionClaim: { contractRevision: "test", objectiveSatisfied: false, criteria: [], remainingWork: [] },
+        evidence: [], verification: [], attentionRequests: [], artifacts: [] },
+        terminal: { schema: "paperclip.prp.terminal.v1", runTerminalState: "succeeded", turnTerminalState: "completed", reportedWorkDisposition: "blocked" },
+        turnId: "release-turn" });
+      const [accepted] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, f.runId));
+      expect(accepted, "the result was accepted").toMatchObject({ schemaStatus: "accepted" });
+      const [progress] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
+        createdByRunId: f.runId, body: "Progress: the pipeline is at step 3 of 5.", createdAt: new Date(f.t + 30_000) }).returning();
+      await f.later("failed", "adapter_failed");
+      if (receipt) await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+        semanticToolReceipts: { "call-1": { operationId: "report_progress", result: { commentId: progress!.id } } } })}::jsonb` }).where(eq(heartbeatRuns.id, f.runId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect((run!.resultJson as Record<string, unknown> | null)?.presentationDecision, "never published").toBeUndefined();
+      expect(await f.answered(), `receipt=${receipt}: a progress comment is not the accepted result's publication`).toBe(false);
+      expect(await f.carried(), "still carried").toEqual([f.m.id]);
+      const notices = await f.notices();
+      expect(notices, `receipt=${receipt}: exactly one notice`).toHaveLength(1);
+      expect(await f.notices(), "and never a second").toHaveLength(1);
+    }
   });
 
   it("non-accepted text from a failed run -> M is still owed: exactly one notice, and it is carried again", async () => {
