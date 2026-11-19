@@ -33,6 +33,8 @@ import {
 } from "@paperclipai/db";
 import { recoveryPostgresSupport as embeddedPostgresSupport, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
 import { nativeHarnessBackupExpirationService } from "../services/native-runtime/native-harness-backup-expiration.ts";
+import { buildNativeHarnessBackupManifest } from "../services/native-runtime/native-session-executor.ts";
+import { createNativeHarnessBackupStamp, verifyNativeHarnessBackupStamp } from "../services/native-runtime/native-harness-backup-stamp.ts";
 import { createNativeSetupRuntime } from "../services/native-runtime/native-setup-evidence.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { logger } from "../middleware/logger.js";
@@ -72,7 +74,7 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
   afterEach(async () => {
     await backupWorker?.stop(); backupWorker = undefined; backupErrors.length = 0;
     worker?.unsubscribe(); await coordinator?.stop(); coordinator = undefined; worker = undefined; admitted = true;
-    vi.useRealTimers(); vi.restoreAllMocks();
+    vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllEnvs();
     await db.delete(agentTaskSessions);
     await db.delete(nativeRunFinalizations);
     await db.delete(environmentLeases);
@@ -142,7 +144,8 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
         leaseOwner: input.finalization.leaseOwner ?? null,
       });
     }
-    const scope = createHash("sha256").update(randomUUID()).digest("hex");
+    const scopeId = randomUUID();
+    const scope = createHash("sha256").update(scopeId).digest("hex");
     const root = path.join(stateBase, scope);
     const current = path.join(root, "failover-backups", "current");
     await fs.mkdir(path.join(root, "control-plane"), { recursive: true });
@@ -163,7 +166,29 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
         metadata: { nativeHarnessBackup: { sessionScopeSha256: scope } },
       });
     }
-    return { companyId, agentId: agent!.id, issueId: issue!.id, runId: run!.id, sessionId, scope, root, current };
+    return { companyId, agentId: agent!.id, issueId: issue!.id, runId: run!.id, sessionId, scopeId, scope, root, current };
+  }
+
+  /** The real producers behind a stamp: buildNativeHarnessBackupManifest writes the
+   * manifest of `current`, createNativeHarnessBackupStamp stamps it (as the executor
+   * does, exec:20079-20129), so verifyNativeHarnessBackupStamp re-hashes the bytes. */
+  async function stampBackup(session: Awaited<ReturnType<typeof seedSession>>) {
+    vi.stubEnv("PAPERCLIP_RUNNER_STATE_DIR", stateBase);
+    await fs.mkdir(path.join(session.current, "runner"), { recursive: true });
+    await fs.writeFile(path.join(session.current, "runner", "runner-state.json"), JSON.stringify({ runId: session.runId }));
+    const runnerInstanceId = randomUUID(), providerLeaseId = randomUUID();
+    const execution = { provider: { kind: "codex" }, binding: { companyId: session.companyId, issueId: session.issueId,
+      runId: session.runId, agentId: session.agentId, executionWorkspaceId: randomUUID() },
+      workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      session: { normalizedSessionId: session.sessionId, driverKind: "codex_app_server",
+        protocolVersion: 1, lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } } } as never;
+    const manifest = buildNativeHarnessBackupManifest({ backupRoot: session.current, execution, runnerInstanceId,
+      providerSessionIdentity: { providerSessionId: randomUUID() }, sourceProviderLeaseId: providerLeaseId });
+    await fs.writeFile(path.join(session.current, "manifest.json"), JSON.stringify(manifest));
+    const stamp = createNativeHarnessBackupStamp({ manifestPath: path.join(session.current, "manifest.json"),
+      sessionScopeId: session.scopeId, authorizedProviderLeaseId: providerLeaseId, runnerInstanceId,
+      normalizedSessionId: session.sessionId, completedAt: manifest.completedAt });
+    return { stamp, providerLeaseId };
   }
 
   function service() {
@@ -420,6 +445,27 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     expect(await exists(path.join(session.root, "control-plane", "control-plane-state.json"))).toBe(true);
     expect(await fs.readdir(path.join(session.root, "failover-backups"))).toEqual([]);
     expect(await taskSessionCount(session.agentId)).toBe(0);
+  });
+
+  it("RK1 (never-OK, no S3): a destroyed box's backup, issue closed, no live lease, clock +8 days: tick, expireBackup and reconcileBackup keep it current and it re-hashes to its stamp", async () => {
+    expect(process.env.PAPERCLIP_STORAGE_PROVIDER ?? "local_disk").not.toBe("s3");
+    // Issue closed now, backup written now; the box's lease ended "expired" (what the
+    // turn-end destroy leaves, environment-runtime releaseRunLeases): no live lease.
+    const session = await seedSession({ closedDaysAgo: 0, backupAgeDays: 0, leaseStatus: "expired",
+      finalization: { phase: "committed" } });
+    const backup = await stampBackup(session);
+    expect(verifyNativeHarnessBackupStamp(backup.stamp, backup.providerLeaseId)).toBe(true);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(Date.now() + 8 * DAY_MS));
+    const retention = nativeHarnessBackupExpirationService(db, { stateBase, closedForDays: 7, isSessionBusy: () => false });
+    const pass = await retention.tick();
+    expect(pass).toMatchObject({ candidates: 0, expired: 0, failed: 0 });
+    expect((await retention.expireBackup(session.scope)).expired).toBe(0);
+    expect((await retention.reconcileBackup(session.scope))?.dueAt).toBeNull();
+    expect(await exists(path.join(session.current, "manifest.json"))).toBe(true);
+    expect(await fs.readdir(path.join(session.root, "failover-backups"))).toEqual(["current"]);
+    expect(verifyNativeHarnessBackupStamp(backup.stamp, backup.providerLeaseId)).toBe(true);
+    expect(await taskSessionCount(session.agentId)).toBe(1);
   });
 
   // Data-safety regression: exercise the actual DB decision and recursive
