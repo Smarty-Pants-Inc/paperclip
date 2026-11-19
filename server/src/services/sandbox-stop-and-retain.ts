@@ -212,7 +212,10 @@ export async function prepareUnconfirmedSourceSandboxStop(db: Db, lease: typeof 
     // A proof reader must never invalidate an ended allocation's bound receipt,
     // including older idle/warm releases without a retain-dispatch receipt.
     || ["released", "expired"].includes(lease.status)
-    || (lease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed") return null;
+    // adopt-foreign-receipt F2: only THIS lease's bound destroy (own run, lease and
+    // provider) means no stop is owed; another run's copied record never vetoes it.
+    || (hasBoundRemoteStopReceipt(lease)
+      && (lease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed")) return null;
   return prepareStopAndRetain(db, lease, lease.status);
 }
 
@@ -233,7 +236,9 @@ export async function prepareCleanupGateOwnerStop(db: Db, lease: typeof environm
     || hasStopOnlyCleanup(lease)
     // An active lease's bound receipt already proves the stop; keep that proof.
     || (lease.status === "active" && hasBoundRemoteStopReceipt(lease))
-    || (lease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed"
+    // adopt-foreign-receipt F2: a foreign run's destroyed record is not this lease's destroy.
+    || (hasBoundRemoteStopReceipt(lease)
+      && (lease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed")
     || lease.metadata?.pluginLeaseCleanupMethod !== undefined || lease.metadata?.runnerTaskRetiring === true) return null;
   return prepareStopAndRetain(db, lease, lease.status, { [NATIVE_CLEANUP_GATE_OWNER_STOP_KEY]: true });
 }
