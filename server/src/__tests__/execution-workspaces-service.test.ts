@@ -1470,6 +1470,119 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect(sweep).toMatchObject({ archived: 0, skippedCooldown: 1 });
       expect(await statusOf(seeded.executionWorkspaceId)).toBe("active");
     }, 20_000);
+
+    // A managed-worktree Paperclip instance (worktree `.paperclip/.env` ->
+    // PAPERCLIP_HOME/instances/<id>) keeps its own durable-sessions at the
+    // default path. The reaper removes the owned instance root after the default
+    // one-day cooldown; it must never take the raw traces with it
+    // (R-keep-all-traces, never-OK).
+    async function attachManagedWorktreeInstance(seeded: Awaited<ReturnType<typeof seedTerminalWorkspace>>) {
+      const worktreesDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reaper-instances-"));
+      tempDirs.add(worktreesDir);
+      const { deriveWorktreeInstanceId } = await import("../services/workspace-instance-cleanup.ts");
+      const instanceId = deriveWorktreeInstanceId(seeded.worktreePath);
+      const instanceRoot = path.join(worktreesDir, "instances", instanceId);
+      await fs.mkdir(path.join(instanceRoot, "db"), { recursive: true });
+      await fs.writeFile(path.join(instanceRoot, "config.json"), "{}\n", "utf8");
+      // The real repo ignores `.paperclip/`; keep the pointer out of git status.
+      await fs.appendFile(path.join(seeded.repoRoot, ".git", "info", "exclude"), ".paperclip/\n", "utf8");
+      await fs.mkdir(path.join(seeded.worktreePath, ".paperclip"), { recursive: true });
+      await fs.writeFile(path.join(seeded.worktreePath, ".paperclip", ".env"),
+        `PAPERCLIP_HOME=${JSON.stringify(worktreesDir)}\nPAPERCLIP_INSTANCE_ID=${JSON.stringify(instanceId)}\n`, "utf8");
+      await db.update(executionWorkspaces).set({ metadata: { worktreeInstanceRoot: instanceRoot } })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      return { worktreesDir, instanceId, instanceRoot };
+    }
+
+    async function withEnv<T>(values: Record<string, string | undefined>, run: () => Promise<T>): Promise<T> {
+      const previous = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]));
+      for (const [key, value] of Object.entries(values)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      try {
+        return await run();
+      } finally {
+        for (const [key, value] of Object.entries(previous)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+    }
+
+    async function readTree(root: string): Promise<Map<string, string>> {
+      const files = new Map<string, string>();
+      const visit = async (directory: string) => {
+        for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+          const full = path.join(directory, entry.name);
+          if (entry.isDirectory()) await visit(full);
+          else files.set(path.relative(root, full),
+            createHash("sha256").update(await fs.readFile(full)).digest("hex"));
+        }
+      };
+      await visit(root);
+      return files;
+    }
+
+    async function seedPastCooldown() {
+      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      await db.update(executionWorkspaces).set({ updatedAt: new Date(nowMs - DAY_MS) })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      // Terminal two days ago: past the default one-day cooldown.
+      await db.update(issues).set({ completedAt: new Date(nowMs - 2 * DAY_MS) })
+        .where(eq(issues.id, seeded.sourceIssueId));
+      return seeded;
+    }
+
+    it("R1 (never-OK): an owned worktree instance holding durable-sessions past the cooldown is archived but its raw traces survive byte for byte", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      const durableSessions = path.join(instance.instanceRoot, "runtime", "paperclip-runner", "durable-sessions");
+      // Real producers, run as the guest instance: the native setup probe creates
+      // its scratch under the instance's own durable-sessions, and its retirement
+      // moves the whole tree into conversation-evidence. The diagnostic bytes the
+      // probe would have written are planted (named): a raw provider stderr line.
+      const evidence = await withEnv({ PAPERCLIP_HOME: instance.worktreesDir, PAPERCLIP_INSTANCE_ID: instance.instanceId,
+        PAPERCLIP_RUNNER_STATE_DIR: undefined }, async () => {
+        const { createNativeSetupRuntime, cleanupNativeSetupRuntime } = await import("../services/native-runtime/native-setup-evidence.ts");
+        const scratch = await createNativeSetupRuntime(seeded.companyId);
+        expect(scratch.startsWith(`${durableSessions}${path.sep}`)).toBe(true);
+        await fs.writeFile(path.join(scratch, "provider-stderr.log"), "planted raw trace: provider said no\n", { mode: 0o600 });
+        await cleanupNativeSetupRuntime(scratch, true);
+        return readTree(durableSessions);
+      });
+      expect([...evidence.keys()].some((name) => name.startsWith(`conversation-evidence${path.sep}`)
+        && name.endsWith("provider-stderr.log"))).toBe(true);
+
+      const sweep = await withEnv({ PAPERCLIP_WORKTREES_DIR: instance.worktreesDir }, () =>
+        cooldownService(1).sweepTerminalWorkspaces());
+
+      // Everything else the reaper does stays: the workspace is archived and its
+      // worktree removed.
+      expect(sweep).toMatchObject({ archived: 1, skippedCooldown: 0, cleanupFailed: 0 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+      // The raw traces survive, unchanged.
+      expect(await readTree(durableSessions)).toEqual(evidence);
+      const [row] = await db.select({ cleanupReason: executionWorkspaces.cleanupReason }).from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      expect(row?.cleanupReason).toContain("raw traces");
+    }, 30_000);
+
+    it("R2 (control): an owned worktree instance without traces past the cooldown is reaped as today", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      // An empty durable-sessions folder holds no trace.
+      await fs.mkdir(path.join(instance.instanceRoot, "runtime", "paperclip-runner", "durable-sessions"), { recursive: true });
+
+      const sweep = await withEnv({ PAPERCLIP_WORKTREES_DIR: instance.worktreesDir }, () =>
+        cooldownService(1).sweepTerminalWorkspaces());
+
+      expect(sweep).toMatchObject({ archived: 1, skippedCooldown: 0, cleanupFailed: 0 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+      await expect(fs.lstat(instance.instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    }, 30_000);
   });
 
   it("does not treat an unrelated inbound issue mention as delivery evidence", async () => {
