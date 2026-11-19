@@ -292,7 +292,8 @@ export function registerIssueRecoveryWork(
           statuses
             ? alsoBlockedWhen
               // RETIRE_ON_ANY_STATUS: a done or cancelled task is loaded too while it shows a live unanswered-message
-              // notice whose messages are all answered, so the notice retires (it used to stay on a finished task).
+              // notice (any family) with an answered input, so the notice retires, or a group notice shrinks to its
+              // still-owed members (it used to stay, false, on a finished task).
               ? or(inArray(issues.status, statuses), and(eq(issues.status, "blocked"), alsoBlockedWhen()),
                 and(inArray(issues.status, ["done", "cancelled"]), answeredNoticeToRetireCondition(issues.id, issues.companyId)))
               : inArray(issues.status, statuses)
