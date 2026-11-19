@@ -10,7 +10,7 @@ import { eq } from "drizzle-orm";
 import https, { createServer as createHttpsServer } from "node:https";
 import { getCACertificates, setDefaultCACertificates } from "node:tls";
 import WebSocket, { WebSocketServer, type RawData } from "ws";
-import { PAPERCLIP_RUNNER_INGRESS_PORT } from "@paperclipai/adapter-utils/runner-connectivity";
+import { PAPERCLIP_RUNNER_INGRESS_PORT, type RunnerIngressEndpoint } from "@paperclipai/adapter-utils/runner-connectivity";
 import { environmentService } from "../services/environments.js";
 import { agents, authUsers, createDb, heartbeatRuns, heartbeatRunEvents, issueComments, agentWakeupRequests, environments, environmentLeases, issues, workspaceOperations, nativeRunFinalizations } from "@paperclipai/db";
 import { expect, it, vi } from "vitest";
@@ -73,7 +73,9 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
   };
   const bundles: Bundle[] = [];
   const assistantFact = `ASSISTANT_ONLY_STOP_FACT_${randomUUID()}`;
-  const requests: Array<{ at: number; firstWordsAt: number; path: string; model: unknown; lastMessage: unknown; tools: string[]; recalledAssistantFact: boolean }> = [];
+  const requests: Array<{ at: number; firstWordsAt: number; deliveredAt?: number; path: string; model: unknown; input: unknown; lastMessage: unknown; tools: string[]; recalledAssistantFact: boolean }> = [];
+  const boxBootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  const birth = (pid: number) => readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1]!.split(" ")[19];
   const packVerificationCommands: Array<Record<string, unknown>> = [];
   let stopRetainedPostgres: (() => Promise<void>) | undefined;
   let helloProbeRequests = 0;
@@ -175,7 +177,7 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
         const warmup = warmupCount < stopTurn - 1;
         if (warmup) warmupCount++;
         const useTool = !warmup && requests.length === 0 && scenario !== "finished";
-        if (!warmup) requests.push({ at: submittedAt, firstWordsAt: Date.now(), path: req.url!, model: parsed.model, lastMessage: parsed.input?.at(-1),
+        if (!warmup) requests.push({ at: submittedAt, firstWordsAt: 0, path: req.url!, model: parsed.model, input: parsed.input, lastMessage: parsed.input?.at(-1),
           tools: (parsed.tools ?? []).map((tool: { name?: string }) => tool.name ?? ""),
           recalledAssistantFact: (parsed.input ?? []).some((message: { role: string; content: unknown }) => message.role === "assistant" && JSON.stringify(message.content).includes(assistantFact)) });
         const reply = warmup ? `WARMUP_${warmupCount}` : useTool ? assistantFact
@@ -190,7 +192,10 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
         emit("response.created", { response: { ...response, status: "in_progress", output: [] } });
         emit("response.output_item.added", { output_index: 0, item: { ...message, status: "in_progress", content: [] } });
         emit("response.content_part.added", { item_id: message.id, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
-        emit("response.output_text.delta", { item_id: message.id, output_index: 0, content_index: 0, delta: reply });
+        // Timestamp the first actual socket write, not generation before SSE.
+        res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", item_id: message.id, output_index: 0, content_index: 0, delta: reply })}\n\n`, () => {
+          if (!warmup) requests.find(request => request.at === submittedAt)!.firstWordsAt = Date.now();
+        });
         emit("response.output_text.done", { item_id: message.id, output_index: 0, content_index: 0, text: reply });
         emit("response.content_part.done", { item_id: message.id, output_index: 0, content_index: 0, part: message.content[0] });
         emit("response.output_item.done", { output_index: 0, item: message });
@@ -283,7 +288,7 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
         const lease = await envService.acquireLease({ companyId: input.companyId, environmentId,
           heartbeatRunId: input.heartbeatRunId, executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId,
           provider: "boat", providerLeaseId: prior?.providerLeaseId ?? box, leasePolicy: "reuse_by_environment",
-          ...(prior ? { reusesReusableLeaseId: prior.id } : {}), metadata: { remoteCwd: remoteWorkspace, agentId: input.agentId,
+          ...(prior ? { replacesReusableLeaseId: prior.id } : {}), metadata: { remoteCwd: remoteWorkspace, agentId: input.agentId,
             sandboxLeaseAcquisition: { outcome: prior ? "resumed" : "created", providerLeaseId: box } } });
         stage("allocation", { leaseId: lease.id, box: lease.providerLeaseId, runId: input.heartbeatRunId, warm: !!prior });
         return lease;
@@ -297,15 +302,17 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
         const number = ++commandCount;
         const result = await runChildProcess(`box-command-${randomUUID()}`, input.command, input.args ?? [], { cwd: input.cwd ?? remoteWorkspace,
           env: input.env ?? {}, stdin: input.stdin, timeoutSec: (input.commandTimeoutMs ?? input.timeoutMs ?? 30000) / 1000,
-          graceSec: 1, onLog: input.onLog ?? (async () => {}) });
+          graceSec: 1, onLog: async (stream, chunk) => { await input.onLog?.(stream, chunk); } });
         await writeFile(join(root, `command-${number}.json`), JSON.stringify({ input, durationMs: Date.now() - startedAt, result }, null, 2));
         if (result.exitCode !== 0) stage("command failed", { number, durationMs: Date.now() - startedAt, result });
         return result;
       },
       getRunnerIngressEndpoint: async input => {
         ingressBindings.set(input.path, input.lease.id);
-        return { kind: "authenticated_websocket", websocketUrl: `wss://127.0.0.1:${previewAddress.port}${input.path}`,
-          secretHeaders: [{ name: "X-Spike-Lease", value: input.lease.id }], generation: input.lease.id, close: async () => {} };
+        const endpoint: RunnerIngressEndpoint = { kind: "authenticated_websocket", websocketUrl: `wss://127.0.0.1:${previewAddress.port}${input.path}`,
+          secretHeaders: [{ name: "X-Spike-Lease", value: input.lease.id }], generation: input.lease.id,
+          refresh: async () => endpoint, close: async () => {} };
+        return endpoint;
       },
       retryPendingSandboxTeardown: async ({ lease }) => { stopCalls.push(lease.id); stage("provider stop requested", { leaseId: lease.id }); return { providerLeaseId: lease.providerLeaseId!, state: "stopped" }; },
     }];
@@ -349,7 +356,9 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
     setupRunnerPrpWebSocketServer(http, { apiUrl });
     stage("full Paperclip server up", { apiUrl });
     const api = async (method: string, path: string, body?: unknown, expected = 200, timeoutMs = 30_000) => {
-      const response = await fetch(`${apiUrl}/api${path}`, { method, headers: { "content-type": "application/json", origin: apiUrl }, signal: AbortSignal.timeout(timeoutMs), ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+      const requestBody = method === "POST" && path.endsWith("/comments") && body && typeof body === "object"
+        ? { ...body, clientRequestId: randomUUID() } : body;
+      const response = await fetch(`${apiUrl}/api${path}`, { method, headers: { "content-type": "application/json", origin: apiUrl }, signal: AbortSignal.timeout(timeoutMs), ...(requestBody === undefined ? {} : { body: JSON.stringify(requestBody) }) });
       const text = await response.text();
       expect(response.status, `${method} ${path}: ${text}`).toBe(expected);
       return JSON.parse(text);
@@ -358,7 +367,14 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
     companyId = company.id;
     await api("PATCH", `/companies/${companyId}`, { requireBoardApprovalForNewAgents: false });
     await db.insert(authUsers).values({ id: "local-board", name: "Local proof operator", email: "local-pi@example.invalid", createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
-    unsubscribe = subscribeCompanyLiveEvents(companyId, () => changed?.());
+    unsubscribe = subscribeCompanyLiveEvents(companyId, event => {
+      const text = JSON.stringify(event.payload);
+      if (text.includes("LOCAL_PI_FULL_SERVER_REPLY_")) {
+        const request = requests.at(-1);
+        if (request && !request.deliveredAt) request.deliveredAt = Date.now();
+      }
+      changed?.();
+    });
     const connection = await api("POST", `/companies/${companyId}/ai-connections`, {
       provider: "openai", method: "api_key", name: "Loopback faux only", ownership: "personal", routing: {
         kind: "local", protocol, baseUrl, auth: "none", models: [{ id: "faux", label: "Local faux", thinkingLevels: [thinking] }],
@@ -453,8 +469,15 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
     expect(alive(bashPid)).toBe(true);
     const [beforeStopLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, admitted.id));
     expect(beforeStopLease).toBeDefined();
-    stage("Stop before real cancel route", { ...pid, bashPid, sleepPid, leaseId: beforeStopLease!.id, boxId: beforeStopLease!.providerLeaseId });
-    if (scenario === "interrupt") await api("POST", `/issues/${issueId}/comments`, { body: "Interrupt carry: next local faux token, no tool.", deliveryIntent: "queue" }, 201);
+    const piBirth = birth(pid.piPid);
+    stage("Stop before real cancel route", { ...pid, piBirth, boxBootId, bashPid, sleepPid, leaseId: beforeStopLease!.id, boxId: beforeStopLease!.providerLeaseId });
+    const successorDirection = scenario === "interrupt" ? "Interrupt carry: next local faux token, no tool." : "What is two plus two?";
+    let successorCommentId: string | undefined;
+    if (scenario === "interrupt") {
+      const saved = await api("POST", `/issues/${issueId}/comments`, { body: successorDirection, deliveryIntent: "queue" }, 201);
+      successorCommentId = saved.id;
+      expect(successorCommentId).toBeTruthy();
+    }
     const queue = scenario === "interrupt" ? await api("GET", `/issues/${issueId}/queued-comments`) : null;
     const started = Date.now();
     const cancelled = scenario === "interrupt"
@@ -467,19 +490,33 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
     const cancelMs = Date.now() - started;
     stage("Stop route returned and run cancelled", { runId: stopped.id, status: stopped.status, cancelMs, routeStatus: cancelled.status,
       bashAlive: alive(bashPid), residentAlive: alive(pid.piPid), runnerAlive: alive(pid.runnerPid) });
-    expect(cancelMs, "real cancel route + persisted cancelled status in 5s").toBeLessThan(5000);
+    // Keep observing identity/fallback even when latency fails; assert the
+    // one-second settlement floor once the end-to-end row is captured.
     await waitFor("bash and sleep processes gone", async () => alive(bashPid) || alive(sleepPid) ? null : true, Math.max(1, 5000 - (Date.now() - started)));
     stage("bash and sleep gone within Stop budget", { bashPid, sleepPid, elapsedMs: Date.now() - started });
     const { heartbeatService } = await import("../services/heartbeat.js");
     await heartbeatService(db).waitForRunExecutionDrain(admitted.id, { timeoutMs: 15_000 });
     stage("Stop drained before NEW wake", { residentAlive: alive(pid.piPid), runnerAlive: alive(pid.runnerPid), bashAlive: alive(bashPid), bundles: bundles.length });
+    const [drainedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.id));
+    const drainedLeases = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, admitted.id));
+    const executor = await import("../services/native-runtime/native-session-executor.js") as unknown as {
+      hasRetainedNativeTurnStop?: (run: NonNullable<typeof drainedRun>, lease: typeof drainedLeases[number]) => boolean;
+    };
+    stage("retained qualification after drain (read-only)", { checkpoint: drainedRun?.runnerProfileJson?.nativeRetainedIdleCheckpoint,
+      leases: drainedLeases.map(lease => ({ id: lease.id, status: lease.status, metadata: lease.metadata,
+        retained: drainedRun && executor.hasRetainedNativeTurnStop?.(drainedRun, lease) })) });
     if (scenario !== "no-ack") {
       expect(alive(pid.piPid), "Stop must keep Pi alive after server run drain, before harness teardown").toBe(true);
       expect(alive(pid.runnerPid), "Stop must keep the original runnerd warm").toBe(true);
     }
     expect(existsSync(join(root, "after-stop.txt")), "cancelled command cannot run its trailing effect").toBe(false);
     const successorPressAt = scenario === "interrupt" ? started : Date.now();
-    if (scenario !== "interrupt") await api("POST", `/issues/${issueId}/comments`, { body: "New turn after Stop: reply with the next local faux token. No tool needed." }, 201);
+    stage("successor authorization", { successorPressAt, stopToSendMs: successorPressAt - started, drainedAt: Date.now() });
+    if (scenario !== "interrupt") {
+      const saved = await api("POST", `/issues/${issueId}/comments`, { body: successorDirection }, 201);
+      successorCommentId = saved.id;
+      expect(successorCommentId).toBeTruthy();
+    }
     const reply = await waitFor("NEW turn after Stop completes", async () => {
       const rows = await db!.select().from(issueComments).where(eq(issueComments.issueId, issueId));
       return rows.find(row => row.authorAgentId === agentId && row.body.includes("LOCAL_PI_FULL_SERVER_REPLY_1")) ?? null;
@@ -496,19 +533,38 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
     expect(replacement, "next run uses the same healthy resident").toBeDefined();
     const [nextLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, final.id));
     expect(nextLease).toBeDefined();
+    const successor = requests[1]!;
+    const requestHasAuthorizedDirection = JSON.stringify(successor.input).includes(successorDirection);
+    const commentBoundToSuccessor = final.contextSnapshot?.commentId === successorCommentId
+      || final.contextSnapshot?.wakeCommentId === successorCommentId
+      || Array.isArray(final.contextSnapshot?.wakeCommentIds) && final.contextSnapshot.wakeCommentIds.includes(successorCommentId);
+    stage("successor authorized-input coverage", { successorCommentId, requestHasAuthorizedDirection, commentBoundToSuccessor,
+      requestedDirectionSha256: createHash("sha256").update(successorDirection).digest("hex"),
+      actualCommentId: final.contextSnapshot?.commentId, actualWakeCommentId: final.contextSnapshot?.wakeCommentId });
+    const modelTtftMs = successor.firstWordsAt - successor.at;
+    const firstDeliveredMs = (successor.deliveredAt ?? Date.now()) - successorPressAt;
+    const overheadMs = firstDeliveredMs - modelTtftMs;
+    stage("TIMING MEASURED (live delivery, not browser render)", { scenario, cancelMs, submittedMs: successor.at - successorPressAt,
+      firstDeliveredMs, modelTtftMs, overheadMs, original: { ...pid, piBirth, boxBootId },
+      replacement: { ...replacement, piBirth: birth(replacement.piPid!), boxBootId },
+      beforeLeaseId: beforeStopLease!.id, nextLeaseId: nextLease!.id, beforeBoxId: beforeStopLease!.providerLeaseId, nextBoxId: nextLease!.providerLeaseId });
+    expect(commentBoundToSuccessor, "the apparent reply belongs to the newly authorized comment, not an old restored wake").toBe(true);
+    expect(requestHasAuthorizedDirection, "the real model request contains the newly authorized direction").toBe(true);
     if (scenario === "no-ack") {
       expect(nextLease!.id).not.toBe(beforeStopLease!.id);
       expect(replacement.piPid).not.toBe(pid.piPid);
       stage("FALLBACK GREEN", { original: pid, replacement, stopCalls });
     } else {
-      expect(nextLease!.id).toBe(beforeStopLease!.id);
+      // A new durable lease row is the ordinary cross-run handoff, not a new
+      // physical box. Qualify allocation identity and the actual process birth.
       expect(nextLease!.providerLeaseId).toBe(beforeStopLease!.providerLeaseId);
       expect(replacement.piPid).toBe(pid.piPid);
       expect(replacement.runnerPid).toBe(pid.runnerPid);
-      expect(requests[1]!.at - successorPressAt, "successor submitted within 3s").toBeLessThan(3000);
-      expect(requests[1]!.firstWordsAt - successorPressAt, "first words in model time +1s").toBeLessThan(3000);
+      expect(birth(replacement.piPid!)).toBe(piBirth);
+      expect(successor.deliveredAt, "first-word live-event delivery was observed").toBeDefined();
+      expect(overheadMs, "first delivered words minus actual successor model TTFT <=1s").toBeLessThanOrEqual(1000);
+      expect(cancelMs, "real cancel route + persisted cancellation <=1s").toBeLessThanOrEqual(1000);
       expect(stopCalls).toEqual([]);
-      stage("TIMING GREEN", { scenario, submittedMs: requests[1]!.at - successorPressAt, firstWordsMs: requests[1]!.firstWordsAt - successorPressAt, original: pid, replacement });
     }
 
     expect(requests[1]!.recalledAssistantFact, "private assistant history, not echoed in user input").toBe(true);
@@ -542,6 +598,9 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
     await writeFile(join(root, "proof.json"), JSON.stringify({ scenario, stopTurn, warmupIdentities, stages, requests }, null, 2) + "\n");
     await writeFile(join(root, "remote-pack-verification.json"), JSON.stringify(packVerificationCommands, null, 2) + "\n");
     if (db && agentId) {
+      await writeFile(join(root, "comments.json"), JSON.stringify(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)), null, 2));
+      await writeFile(join(root, "wakeups.json"), JSON.stringify(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId)), null, 2));
+      await writeFile(join(root, "leases.json"), JSON.stringify(await db.select().from(environmentLeases).where(eq(environmentLeases.companyId, companyId)), null, 2));
       const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
       await writeFile(join(root, "runs.json"), JSON.stringify(runs, null, 2));
       for (const run of runs) await writeFile(join(root, `events-${run.id}.json`), JSON.stringify(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, run.id)), null, 2));
