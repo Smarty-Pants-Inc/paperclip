@@ -117,6 +117,9 @@ export type EnvironmentDeleteBlockedReason =
  */
 export interface EnvironmentDeleteReusableLeaseHolder {
   leaseId: string;
+  /** Possibly live box retained for unaddressable native custody, regardless
+   * of policy. Ordinary teardown consent cannot discharge this obligation. */
+  hasUnaddressableCustody?: boolean;
   /** `reuse_by_environment`: a warm sandbox for the next turn (its workspace
    * provisions a fresh one). `retain_on_failure`: a stopped sandbox kept as the
    * only copy of a failed run's workspace files (destroying it loses them). */
@@ -154,8 +157,8 @@ export interface EnvironmentDeleteBlastRadius {
    */
   pendingCleanupLeaseCount: number;
   /**
-   * Count of reusable sandbox leases whose provider resource is still live.
-   * Deleting the environment would remove the context used by their normal
+   * Count of kept sandbox holders, including unaddressable native custody
+   * under any policy. Deleting the environment would remove the context used by their normal
    * release and destroy paths, so these leases block deletion.
    */
   reusableSandboxLeaseCount: number;

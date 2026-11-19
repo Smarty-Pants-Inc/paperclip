@@ -1,3 +1,4 @@
+import { retainedUnaddressableNativeCustodyCondition } from "./native-runtime/native-lease-custody.js";
 import { AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY } from "./agent-file-save-hold.js";
 import { notifyEnvironmentConfigChange, withEnvironmentConfigChange } from "./environment-config-revision.js";
 import { carryReusableLeasePreparation, createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
@@ -14,7 +15,7 @@ import { withEnvironmentLeaseController } from "./environment-lease-controller.j
 import { randomUUID } from "node:crypto";
 
 import { SANDBOX_PLATFORM_PROBE_METADATA_KEY } from "./environment-custom-image-runtime.js";
-import { and, asc, desc, eq, inArray, isNull, ne, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, ne, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -68,6 +69,15 @@ import {
  * delete blast radius, the atomic delete guard and the consented teardown must
  * all use this one list, or a delete can orphan a sandbox. */
 export const KEPT_SANDBOX_LEASE_POLICIES = ["reuse_by_environment", "retain_on_failure"] as const;
+
+/** Kept resource holders, including policy-independent, unaddressable custody.
+ * Share this between the summary and atomic DELETE guard. Consent to ordinary
+ * reusable teardown never grants destruction of the custody obligation. */
+function keptSandboxLeaseCondition() {
+  return or(and(inArray(environmentLeases.leasePolicy, [...KEPT_SANDBOX_LEASE_POLICIES]),
+    inArray(environmentLeases.status, ["active", "released", "retained", "failed"])),
+  retainedUnaddressableNativeCustodyCondition());
+}
 
 export async function attachSandboxCreation(db: Db, id: string, scope: { companyId: string; environmentId: string; heartbeatRunId?: string | null },
   attach: (tx: Db) => Promise<EnvironmentLease>): Promise<EnvironmentLease> {
@@ -1325,8 +1335,7 @@ export function environmentService(db: Db) {
             sql`not exists (
               select 1 from ${environmentLeases}
               where ${environmentLeases.environmentId} = ${environments.id}
-                and ${inArray(environmentLeases.leasePolicy, [...KEPT_SANDBOX_LEASE_POLICIES])}
-                and ${environmentLeases.status} in ('active', 'released', 'retained', 'failed')
+                and ${keptSandboxLeaseCondition()}
             )`,
           ),
         )
@@ -1429,6 +1438,7 @@ export function environmentService(db: Db) {
           .select({
             leaseId: environmentLeases.id,
             leasePolicy: environmentLeases.leasePolicy,
+            hasUnaddressableCustody: sql<boolean>`coalesce(${retainedUnaddressableNativeCustodyCondition()}, false)`,
             executionWorkspaceId: environmentLeases.executionWorkspaceId,
             executionWorkspaceName: executionWorkspaces.name,
             issueId: environmentLeases.issueId,
@@ -1441,8 +1451,7 @@ export function environmentService(db: Db) {
           .where(
             and(
               eq(environmentLeases.environmentId, id),
-              inArray(environmentLeases.leasePolicy, [...KEPT_SANDBOX_LEASE_POLICIES]),
-              inArray(environmentLeases.status, ["active", "released", "retained", "failed"]),
+              keptSandboxLeaseCondition(),
             ),
           ),
         db
@@ -1462,6 +1471,7 @@ export function environmentService(db: Db) {
       const reusableSandboxLeaseHolders = reusableSandboxLeaseRows.map((row) => ({
         leaseId: row.leaseId,
         leasePolicy: row.leasePolicy,
+        ...(row.hasUnaddressableCustody ? { hasUnaddressableCustody: true } : {}),
         executionWorkspaceId: row.executionWorkspaceId,
         executionWorkspaceName: row.executionWorkspaceName,
         issueId: row.issueId,

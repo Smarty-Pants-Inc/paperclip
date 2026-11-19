@@ -660,6 +660,9 @@ export function environmentRoutes(
       return "Cannot delete this environment while a sandbox cleanup is pending. Wait for the cleanup sweep to destroy the orphan sandbox, then retry.";
     }
     if (impact.reusableSandboxLeaseCount > 0) {
+      if (impact.reusableSandboxLeaseHolders.some(holder => holder.hasUnaddressableCustody)) {
+        return "Cannot delete this environment while it holds an unresolved native custody obligation. The kept box may still be running; its stop and saved files require operator recovery, not destructive teardown.";
+      }
       if (impact.reusableSandboxLeaseHolders.some(holder => holder.leasePolicy === "retain_on_failure")) {
         return "Cannot delete this environment while it keeps a failed run's workspace copy (a stopped sandbox kept for file recovery). Deleting the environment with consent destroys that sandbox and the files only it holds.";
       }
@@ -1402,6 +1405,11 @@ export function environmentRoutes(
     // sandboxes belonged to the environment the operator consented to
     // destroy; the rejection reports the count so nothing is silent.
     let destroyedReusableSandboxLeaseCount = 0;
+    // This live debt is not ordinary reusable teardown. Reject before ANY
+    // consented release/destroy work, including other holders in this environment.
+    if (impact.reusableSandboxLeaseHolders.some(holder => holder.hasUnaddressableCustody)) {
+      rejectEnvironmentDelete({ actor, environment: existing, impact });
+    }
     // The same consent covers a pending sandbox cleanup: it is the environment's
     // own sandbox, already queued for teardown. Run one attempt now instead of
     // waiting out the retry cooldown. An attempt in flight elsewhere is not taken

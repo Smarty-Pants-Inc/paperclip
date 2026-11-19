@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import {
   environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeHarnessBackups, type Db,
 } from "@paperclipai/db";
@@ -53,6 +53,22 @@ export function hasRetainedUnaddressableNativeCustody(lease: Pick<typeof environ
     && recovery.ownerProof === NATIVE_CUSTODY_UNVERIFIED_REASON && recovery.runId === lease.heartbeatRunId
     && recovery.disposition === "retained_unstoppable"
     && replacement?.schema === "paperclip.replace-before-reuse.v1" && replacement.runId === lease.heartbeatRunId;
+}
+
+/** SQL mirror shared by the retained-orphan owner and environment deletion.
+ * A policy cannot hide this still-live obligation; ordinary released rows do
+ * not qualify, even if they carry old recovery metadata. */
+export function retainedUnaddressableNativeCustodyCondition() {
+  return and(eq(environmentLeases.status, "retained"), eq(environmentLeases.cleanupStatus, "failed"),
+    eq(environmentLeases.failureReason, "native_custody_stop_unavailable"),
+    sql`${environmentLeases.heartbeatRunId} is not null`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,nativeCustodyUnverified}' = 'true'`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,recoveredOrphanedRunLease}' = 'true'`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,ownerProof}' = ${NATIVE_CUSTODY_UNVERIFIED_REASON}`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,runId}' = ${environmentLeases.heartbeatRunId}::text`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,disposition}' = 'retained_unstoppable'`,
+    sql`${environmentLeases.metadata}#>>'{replaceBeforeReuse,schema}' = 'paperclip.replace-before-reuse.v1'`,
+    sql`${environmentLeases.metadata}#>>'{replaceBeforeReuse,runId}' = ${environmentLeases.heartbeatRunId}::text`);
 }
 
 /**

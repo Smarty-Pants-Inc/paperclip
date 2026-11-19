@@ -3456,7 +3456,7 @@ const plugin = definePlugin(trackDaytonaHooks({
       if (sandbox.state === "stopped" || sandbox.state === "archived") {
         idleActivity.confirm(proof, true);
       }
-      return { providerLeaseId: sandbox.id, state: sandbox.state === "stopped" ? "stopped" : "active" };
+      return { providerLeaseId: sandbox.id, boxId: sandbox.id, state: sandbox.state === "stopped" ? "stopped" : "active" };
     } catch (error) {
       if (error instanceof DaytonaNotFoundError) {
         idleActivity.confirm(proof, true);
