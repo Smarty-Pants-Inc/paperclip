@@ -10,7 +10,7 @@ import { parse as parseEnvContents } from "dotenv";
 import { expandHomePrefix } from "../home-paths.js";
 import { INSTANCE_HEARTBEAT_RUN_MARKER } from "./instance-run-marker.js";
 import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
-import { listUnrecoveredObjectRunLogSpills, RUN_LOG_SPILL_SUBDIR } from "./object-run-log-store.js";
+import { listUnrecoveredObjectRunLogSpills, resolveObjectRunLogSpillDir } from "./object-run-log-store.js";
 
 const execFileAsync = promisify(execFile);
 const INSTANCE_ID_RE = /^[A-Za-z0-9_-]+$/;
@@ -520,13 +520,23 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
     return { status: "refused", instanceRoot: configuredInstanceRoot, warning };
   }
 
-  // Run-log bytes that object storage refused exist only in the kept spill
-  // under this root (data/run-logs/.spill). They are never removed with it:
-  // the instance stays until its spill is stored in the object log.
+  // Never remove an instance while its only copy is in a kept spill. Check
+  // defaults AND configured roots (even outside the instance); the writer's
+  // resolver owns precedence and relative-path semantics, not this cleanup.
   let unrecoveredRunLogSpills: string[];
   try {
-    unrecoveredRunLogSpills = await listUnrecoveredObjectRunLogSpills(
-      path.join(canonicalInstanceRoot, "data", "run-logs", RUN_LOG_SPILL_SUBDIR));
+    const instanceEnv = await fs.readFile(path.join(configuredInstanceRoot, ".env"), "utf8")
+      .then(parseEnvContents, (error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return {};
+        throw error;
+      });
+    const envs = [{}, process.env, instanceEnv, parseEnvContents(input.pointer.envContents)];
+    const roots = new Set(envs.map(env => resolveObjectRunLogSpillDir(undefined, {
+      env, instanceRoot: canonicalInstanceRoot, cwd: input.workspacePath,
+    })));
+    unrecoveredRunLogSpills = [...new Set((await Promise.all(
+      [...roots].map(root => listUnrecoveredObjectRunLogSpills(root)),
+    )).flat())];
   } catch (error) {
     warning = `Refusing to remove instance directory "${configuredInstanceRoot}" because its run-log spill could not be read: ${error instanceof Error ? error.message : String(error)}`;
     await recordRefusal({ canonicalInstanceRoot, refusalReason: "run_log_spill_unreadable" });

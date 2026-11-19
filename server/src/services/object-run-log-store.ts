@@ -59,12 +59,19 @@ function finalizationError(error: unknown) {
  * a company id, so it never collides with a local run log.
  */
 export const RUN_LOG_SPILL_SUBDIR = ".spill";
-export function resolveObjectRunLogSpillDir(spillDir?: string) {
-  return spillDir ?? process.env.RUN_LOG_SPILL_PATH
-    ?? path.resolve(
-      process.env.RUN_LOG_BASE_PATH ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-logs"),
+/** Cleanup resolves another instance without changing the running server's environment. */
+export function resolveObjectRunLogSpillDir(spillDir?: string, context: {
+  env?: Record<string, string | undefined>;
+  instanceRoot?: string;
+  cwd?: string;
+} = {}) {
+  const env = context.env ?? process.env;
+  const cwd = context.cwd ?? process.cwd();
+  return path.resolve(cwd, spillDir ?? env.RUN_LOG_SPILL_PATH
+    ?? path.resolve(cwd,
+      env.RUN_LOG_BASE_PATH ?? path.join(context.instanceRoot ?? resolvePaperclipInstanceRoot(), "data", "run-logs"),
       RUN_LOG_SPILL_SUBDIR,
-    );
+    ));
 }
 function spillPaths(spillDir: string | undefined, logRef: string) {
   const segments = logRef.split("/");
