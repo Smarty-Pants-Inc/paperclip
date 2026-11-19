@@ -1583,6 +1583,50 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
       await expect(fs.lstat(instance.instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
     }, 30_000);
+
+    // Some runs end with DB rows/events but no data/run-logs file (a run
+    // cancelled before start, a failed setup, a conversation reset). The
+    // instance's own embedded DB is then its only trace.
+    it("R3 (never-OK): an owned worktree instance whose only trace is its embedded DB after a recorded run, with no run log, is kept byte for byte", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      // Planted (named): embedded-Postgres data files under the instance db dir.
+      await fs.writeFile(path.join(instance.instanceRoot, "db", "PG_VERSION"), "17\n", "utf8");
+      await fs.mkdir(path.join(instance.instanceRoot, "db", "base", "1"), { recursive: true });
+      await fs.writeFile(path.join(instance.instanceRoot, "db", "base", "1", "16384"), "heartbeat_run_events rows\n", "utf8");
+      // Real producer, run as the guest instance: the marker every run-event
+      // writer and run execution writes before its first DB trace.
+      await withEnv({ PAPERCLIP_HOME: instance.worktreesDir, PAPERCLIP_INSTANCE_ID: instance.instanceId }, async () => {
+        const { markInstanceHasHeartbeatRuns } = await import("../services/instance-run-marker.ts");
+        await markInstanceHasHeartbeatRuns();
+      });
+      await expect(fs.lstat(path.join(instance.instanceRoot, "data", "run-logs"))).rejects.toMatchObject({ code: "ENOENT" });
+      const before = await readTree(instance.instanceRoot);
+      expect(before.has(path.join("data", "heartbeat-runs-recorded"))).toBe(true);
+
+      const sweep = await withEnv({ PAPERCLIP_WORKTREES_DIR: instance.worktreesDir }, () =>
+        cooldownService(1).sweepTerminalWorkspaces());
+
+      expect(sweep).toMatchObject({ archived: 1, skippedCooldown: 0, cleanupFailed: 0 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+      expect(await readTree(instance.instanceRoot)).toEqual(before);
+      const [row] = await db.select({ cleanupReason: executionWorkspaces.cleanupReason }).from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      expect(row?.cleanupReason).toContain("raw traces");
+    }, 30_000);
+
+    it("R3c (control): an owned worktree instance with a non-empty embedded DB that never recorded a run is reaped as today", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      await fs.writeFile(path.join(instance.instanceRoot, "db", "PG_VERSION"), "17\n", "utf8");
+
+      const sweep = await withEnv({ PAPERCLIP_WORKTREES_DIR: instance.worktreesDir }, () =>
+        cooldownService(1).sweepTerminalWorkspaces());
+
+      expect(sweep).toMatchObject({ archived: 1, skippedCooldown: 0, cleanupFailed: 0 });
+      await expect(fs.lstat(instance.instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    }, 30_000);
   });
 
   it("does not treat an unrelated inbound issue mention as delivery evidence", async () => {
