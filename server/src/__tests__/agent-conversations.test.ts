@@ -757,7 +757,7 @@ import {
     // each once; a message deleted first is not sent. A paused or held chat
     // refuses Send with its reason and runs nothing until it is resumed. A
     // task keeps its rule: a Stop holds its queued comments for the next wake.
-    it.each(["task", "send", "delete-then-send", "agent-paused", "chat-held", "recovery-wait"] as const)("after a person's Stop nothing is sent; the owner's Send starts one turn with the waiting messages (%s)", async (variant) => {
+    it.each(["task", "send", "delete-then-send", "agent-paused", "chat-held", "recovery-wait"] as const)('DESIGN "Every waiting message is listed, always": after a person\'s Stop nothing is sent; the owner\'s Send starts one turn with the waiting messages (%s)' , async (variant) => {
       const chatMode = variant !== "task";
       const runtimeCompany = randomUUID();
       const runtimeAgent = randomUUID();
@@ -853,14 +853,16 @@ import {
         expect(await heldIds()).toEqual(queuedIds);
         expect(turns).toHaveLength(1);
         if (chatMode) {
-          // FALLBACK 2 gives each posted message its own wake. The read must
-          // show the whole waiting list even BEFORE Stop gathers those wakes.
+          // DESIGN waiting list: "Every waiting message is listed, always."
+          // Batch storage is not the contract: every visible row must retain
+          // actionable queue coordinates and survive a reload, before Stop.
           const busyQueue = (await request(routes(null)).get(queuePath).expect(200)).body;
           expect(busyQueue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(queuedIds);
           expect(busyQueue.entries.map((entry: { comment: { body: string } }) => entry.comment.body)).toEqual(["A", "B", "C"]);
-          expect(busyQueue.entries.slice(1).every((entry: { queueId?: string; queueRevision?: string }) =>
-            entry.queueId && entry.queueId !== busyQueue.queueId && entry.queueRevision)).toBe(true);
-          expect(new Set([busyQueue.queueId, ...busyQueue.entries.slice(1).map((entry: { queueId: string }) => entry.queueId)]).size).toBe(3);
+          expect(busyQueue.entries.every((entry: { queueId?: string; queueRevision?: string; canEdit: boolean; canDiscard: boolean }) =>
+            (entry.queueId ?? busyQueue.queueId) && (entry.queueRevision ?? busyQueue.revision) && entry.canEdit && entry.canDiscard)).toBe(true);
+          const reloaded = (await request(routes(null)).get(queuePath).expect(200)).body;
+          expect(reloaded.entries).toEqual(busyQueue.entries);
         }
 
         // Gate 5 runs a conversation runtime. A legacy conversation adapter
