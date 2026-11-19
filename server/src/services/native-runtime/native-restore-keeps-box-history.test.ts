@@ -177,3 +177,64 @@ it("(c) a symbolic link at the conversation path is kept, not followed or replac
   expect(await readFile(elsewhere, "utf8")).toBe(f.newer);
   expect(existsSync(f.runnerState)).toBe(false);
 });
+
+// smarty-dev#21273 round 4 (rf-3 #20787 comment 7007193445, never-OK): the
+// restore's TOCTOU race. The box's conversation is appended AFTER the real
+// hash probe and BEFORE the staging writes. The restore re-checks the
+// destination right before the final placement and never writes over it: the
+// appended bytes survive, via the runner's syncIn AND via tar-extract.
+const RACE_ROUNDS = [1, 2, 3] as const;
+for (const via of ["syncIn", "command"] as const) {
+  it.each(RACE_ROUNDS)(`(race) a conversation appended after the hash probe keeps the appended bytes (${via === "command" ? "tar" : via} staging, round %i)`, async () => {
+    const f = await fixture();
+    await mkdir(f.boxSessions, { recursive: true });
+    // The box holds exactly the backup's conversation: the probe says "stage".
+    await writeFile(f.boxSession, f.older);
+    const appended = message("a2", "a1", "assistant", "Appended while the restore ran: the fix is in src/build/paths.ts line 42.");
+    const live = f.older + appended;
+    let probes = 0;
+    const { appendFile } = await import("node:fs/promises");
+    const restore = (runner: CommandManagedRuntimeRunner) => restoreHarnessBackupKeepingRemoteHistory({
+      target: { kind: "remote" } as never, backupRoot: join(f.root, "backup"),
+      directories: [{ name: "runner", targetPath: join(f.root, "box", "runner") }, { name: "pi-agent", targetPath: join(f.root, "box", "pi-agent") }],
+      runner: {
+        ...runner,
+        execute: async input => {
+          const result = await runner.execute(input);
+          // The concurrent writer: right after the real probe answered.
+          if (input.args?.includes("paperclip-runner-restore-history-probe")) { probes += 1; await appendFile(f.boxSession, appended); }
+          return result;
+        },
+      },
+    });
+    const base: CommandManagedRuntimeRunner = { execute: input => runChildProcess(`restore-race-${randomUUID()}`,
+      input.command, input.args ?? [], { cwd: f.root, env: {}, timeoutSec: (input.timeoutMs ?? 60_000) / 1000, graceSec: 1,
+        stdin: input.stdin, onLog: async () => {} }) };
+    const syncInCalls: string[] = [];
+    const runner: CommandManagedRuntimeRunner = via === "command" ? base : { execute: base.execute, syncIn: async operations => {
+      for (const operation of operations) for (const file of operation.files) {
+        syncInCalls.push(file.targetPath);
+        await rm(file.targetPath, { recursive: true, force: true });
+        await cp(file.sourcePath, file.targetPath, { recursive: true });
+      }
+      return { operations: [] } as never;
+    } };
+
+    const outcome = await restore(runner).then(value => ({ value }), (error: Error) => ({ error }));
+
+    expect(probes).toBe(1);
+    // Never overwritten: the appended bytes are intact, byte for byte.
+    expect(await readFile(f.boxSession, "utf8")).toBe(live);
+    expect(Buffer.byteLength(appended)).toBeGreaterThan(100);
+    // Now NEWER than the backup: kept per (a); the rest of the backup staged.
+    expect(outcome).toEqual({ value: { keptNewerOnBox: [`pi-agent/sessions/${f.boxSession.split("/").pop()}`] } });
+    expect(await readFile(f.runnerState, "utf8")).toBe(f.suspended);
+    expect(await f.validate()).toBe("valid");
+    // A path that can hold a live conversation is never given to syncIn.
+    expect(syncInCalls.filter(path => path.endsWith("pi-agent"))).toEqual([]);
+    // No staging leftovers beside the target.
+    const { readdir } = await import("node:fs/promises");
+    expect((await readdir(join(f.root, "box"))).sort()).toEqual(["pi-agent", "runner"]);
+    expect((await readdir(f.boxSessions)).sort()).toEqual([f.boxSession.split("/").pop()]);
+  });
+}

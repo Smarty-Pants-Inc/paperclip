@@ -19062,7 +19062,7 @@ describe("runnerd provider runtime wiring", () => {
       }) };
       if (command.args?.[0] === "--version") return { exitCode: 0, timedOut: false, stdout: "codex-cli 0.160.0", stderr: "" };
       if (command.command === "sh") {
-        try { return { exitCode: 0, timedOut: false, stdout: execFileSync("sh", command.args, { encoding: "utf8" }), stderr: "" }; }
+        try { return { exitCode: 0, timedOut: false, stdout: execFileSync("sh", command.args, { encoding: "utf8", input: (command as { stdin?: string }).stdin }), stderr: "" }; }
         catch { return { exitCode: 1, timedOut: false, stdout: "", stderr: "" }; }
       }
       return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
@@ -19127,7 +19127,8 @@ describe("runnerd provider runtime wiring", () => {
         await run;
         expect(dispatch).toHaveBeenCalledTimes(1);
         expect(continuationCount).toBe(1);
-        expect(syncIn).toHaveBeenCalled();
+        // #21273 round 4: the backup is restored through the no-clobber box placement, never syncIn.
+        expect(remoteExecute.mock.calls.some(([command]) => command.args?.[2] === "paperclip-runner-restore-place")).toBe(true);
       } else {
         const outcome = await run.then(value => ({ value }), error => ({ error }));
         expect(continuationCount, "a reattach claim means prior work; absent backup must not authorize blank bootstrap").toBe(0);
@@ -25800,7 +25801,7 @@ describe("runnerd provider runtime wiring", () => {
       }) };
       if (command.args?.[0] === "--version") return { exitCode: 0, timedOut: false, stdout: "codex-cli 0.160.0", stderr: "" };
       if (command.args?.[1]?.includes("base64")) {
-        try { return { exitCode: 0, timedOut: false, stdout: execFileSync("sh", command.args, { encoding: "utf8" }), stderr: "" }; }
+        try { return { exitCode: 0, timedOut: false, stdout: execFileSync("sh", command.args, { encoding: "utf8", input: (command as { stdin?: string }).stdin }), stderr: "" }; }
         catch { return { exitCode: 1, timedOut: false, stdout: "", stderr: "" }; }
       }
       return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
@@ -25978,7 +25979,7 @@ describe("runnerd provider runtime wiring", () => {
       }) };
       if (command.args?.[0] === "--version") return { exitCode: 0, timedOut: false, stdout: "codex-cli 0.160.0", stderr: "" };
       if (command.args?.[1]?.includes("base64")) {
-        try { return { exitCode: 0, timedOut: false, stdout: execFileSync("sh", command.args, { encoding: "utf8" }), stderr: "" }; }
+        try { return { exitCode: 0, timedOut: false, stdout: execFileSync("sh", command.args, { encoding: "utf8", input: (command as { stdin?: string }).stdin }), stderr: "" }; }
         catch { return { exitCode: 1, timedOut: false, stdout: "", stderr: "" }; }
       }
       return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
@@ -27176,6 +27177,13 @@ describe("runnerd provider runtime wiring", () => {
       if (command.args?.[0] === "--version") return {
         exitCode: 0, timedOut: false, stdout: "codex-cli 0.160.0", stderr: "",
       };
+      // #21273 round 4: the restore places the backup through the box shell
+      // (never syncIn), on the real fixture directory.
+      if (command.args?.[2] === "paperclip-runner-restore-place") {
+        try { return { exitCode: 0, timedOut: false, stdout: execFileSync("sh", command.args, { encoding: "utf8",
+          input: (command as { stdin?: string }).stdin }), stderr: "" }; }
+        catch { return { exitCode: 1, timedOut: false, stdout: "", stderr: "" }; }
+      }
       if (command.args?.[1]?.includes("base64")) return {
         exitCode: 1, timedOut: false, stdout: "", stderr: "",
       };
@@ -27263,7 +27271,8 @@ describe("runnerd provider runtime wiring", () => {
       expect(nativeSessionFailureDisposition(1, new Date(), "native_event_replay_conflict").phase).toBe("terminal_failure");
     } else {
       await expect(prepared).rejects.toThrow("runner_harness_state_mismatch: restored_provider_identity_changed");
-      expect(syncIn).toHaveBeenCalled();
+      // The backup was restored, through the no-clobber box placement.
+      expect(remoteExecute.mock.calls.some(([command]) => command.args?.[2] === "paperclip-runner-restore-place")).toBe(true);
     }
   });
 

@@ -16048,6 +16048,7 @@ export async function restoreHarnessBackupKeepingRemoteHistory(input: {
   directories: readonly { name: string; targetPath: string }[];
 }): Promise<{ keptNewerOnBox: string[] }> {
   const keep = new Map<string, string[]>();
+  const probed = new Map<string, Map<string, string>>();
   let otherConversation = false;
   for (const directory of input.directories) {
     const sourceRoot = resolve(input.backupRoot, directory.name);
@@ -16073,37 +16074,111 @@ export async function restoreHarnessBackupKeepingRemoteHistory(input: {
       const match = /^(\d+) ([0-9a-f]{64})(?: ([0-9a-f]{64}))?$/.exec(line);
       if (!match) throw restoreTargetKeptError(RESTORE_TARGET_HISTORY_DIFFERS);
       const backupBytes = backups[index]!, boxBytes = Number(match[1]);
-      if (boxBytes <= backupBytes.length && sha256Hex(backupBytes.subarray(0, boxBytes)) === match[2]) return;
+      if (boxBytes <= backupBytes.length && sha256Hex(backupBytes.subarray(0, boxBytes)) === match[2]) {
+        // The exact state the final placement re-checks before replacing it.
+        if (!probed.has(directory.name)) probed.set(directory.name, new Map());
+        probed.get(directory.name)!.set(relative, `${boxBytes}:${match[2]}`);
+        return;
+      }
       if (boxBytes > backupBytes.length && match[3] === sha256Hex(backupBytes)) { kept.push(relative); return; }
       otherConversation = true;
     });
     if (kept.length > 0) keep.set(directory.name, kept);
   }
   if (otherConversation) throw nativeReconciliationError(RESTORE_TARGET_HOLDS_OTHER_CONVERSATION);
+  // #21273 round 4 (rf-3 TOCTOU, never-OK): the box's conversation can be
+  // appended between the probe above and the final placement. Never through a
+  // runner's syncIn (it replaces the directory wholesale), and never a write
+  // over a conversation file: each one is staged BESIDE the target, re-checked
+  // against the probe right before it is placed, and placed with a no-clobber
+  // link. A changed destination is kept and classified by the same rule.
   for (const directory of input.directories) {
-    const kept = keep.get(directory.name) ?? [];
-    let stagingRoot: string | null = null;
-    try {
-      let sourcePath = resolve(input.backupRoot, directory.name);
-      if (kept.length > 0) {
-        // Stage a copy without the box's newer conversations, so nothing is
-        // copied over them (any file name; never the verified backup itself).
-        stagingRoot = mkdtempSync(join(tmpdir(), "paperclip-runner-restore-keep-"));
-        const copy = join(stagingRoot, "source");
-        cpSync(sourcePath, copy, { recursive: true, preserveTimestamps: true });
-        for (const relative of kept) rmSync(join(copy, relative), { force: true });
-        sourcePath = copy;
-      }
-      // A runner's syncIn replaces a directory wholesale (destroy-then-replace),
-      // which would delete the kept file; the command path extracts over it.
-      await stageRemoteRunnerDirectory({ target: input.target,
-        runner: kept.length > 0 ? { execute: input.runner.execute.bind(input.runner) } : input.runner, sourcePath,
-        targetPath: directory.targetPath, mode: 0o700 });
-    } finally {
-      if (stagingRoot) rmSync(stagingRoot, { recursive: true, force: true });
+    const kept = new Set(keep.get(directory.name) ?? []);
+    const sourceRoot = resolve(input.backupRoot, directory.name);
+    const expected = probed.get(directory.name) ?? new Map<string, string>();
+    const histories = localConversationHistoryFiles(sourceRoot).map(relative => {
+      const bytes = readFileSync(join(sourceRoot, relative));
+      return [relative, kept.has(relative) ? "K" : expected.get(relative) ?? "A", String(bytes.length), sha256Hex(bytes)] as const;
+    });
+    const placed = await placeRestoreDirectoryWithoutClobber({ runner: input.runner, sourcePath: sourceRoot,
+      targetPath: directory.targetPath, histories });
+    for (const [relative, outcome] of placed) {
+      if (outcome === "K") keep.set(directory.name, [...new Set([...(keep.get(directory.name) ?? []), relative])]);
     }
+    const outcomes = [...placed.values()];
+    if (outcomes.includes("D")) throw nativeReconciliationError(RESTORE_TARGET_HOLDS_OTHER_CONVERSATION);
+    if (outcomes.some(outcome => outcome === "R" || outcome === "X")) throw restoreTargetKeptError(RESTORE_TARGET_HISTORY_DIFFERS);
   }
   return { keptNewerOnBox: [...keep].flatMap(([name, kept]) => kept.map(relative => `${name}/${relative}`)) };
+}
+
+// #21273 round 4: places a verified backup directory on the box without ever
+// writing over a conversation file that changed after the probe. Arguments:
+// <target> then, per conversation file, <relative path> <probe state> <backup
+// bytes> <backup sha256>; the probe state is `A` (absent), `<bytes>:<sha256>`
+// (an older copy to replace) or `K` (kept newer: never placed). The archive is
+// extracted into a fresh directory BESIDE the target (same filesystem, so a
+// hard link works). Per file, immediately before placement, the destination is
+// hashed again and must still equal the probe. Placement uses `ln` without
+// `-f`: link(2) fails with EEXIST and never replaces an existing name (POSIX
+// ln: "If the last operand specifies an existing file ... ln shall write a
+// diagnostic message ... and do nothing more with the current source_file").
+// An older copy is first renamed to a fresh name, re-checked, and the backup
+// linked into the now-free name; any change puts the box's bytes back. renameat2
+// RENAME_NOREPLACE is not reachable from a portable box shell, so link(2) is the
+// no-clobber primitive. Prints one `<P|K|D|R|X> <relative>` line per file: P
+// placed, K kept newer (the backup is its prefix), D kept different, R kept
+// (changed, still an older prefix), X kept unreadable. Only when every line is
+// P or K is the rest of the backup (no conversation files) extracted over the
+// target, as before.
+export const RESTORE_PLACE_WITHOUT_CLOBBER_SCRIPT =
+  'set -u; if command -v sha256sum >/dev/null 2>&1; then h() { sha256sum | cut -d " " -f1; }; ' +
+  'elif command -v shasum >/dev/null 2>&1; then h() { shasum -a 256 | cut -d " " -f1; }; else h() { return 1; }; fi; ' +
+  'case "$(tar --version 2>/dev/null)" in *"GNU tar"*) tf=--delay-directory-restore ;; *) tf= ;; esac; ' +
+  'T=$1; shift; umask 077; test ! -L "$T" && mkdir -p -- "$T" || exit 3; ' +
+  'S=$(mktemp -d "$(dirname -- "$T")/.$(basename -- "$T").paperclip-restore.XXXXXX") || exit 3; ' +
+  'trap \'rm -rf -- "$S"\' EXIT HUP INT TERM; base64 -d | tar $tf -xzf - -C "$S" || exit 3; ' +
+  'st() { if test -L "$1"; then echo X; elif test ! -e "$1"; then echo A; elif test ! -f "$1" || test ! -r "$1"; then echo X; ' +
+  'elif s=$(wc -c < "$1" | tr -d " ") && w=$(h < "$1") && test -n "$w"; then echo "$s:$w"; else echo X; fi; }; ' +
+  'ok=1; cls() { r=X; if test ! -L "$1" && test -f "$1" && test -r "$1" && s=$(wc -c < "$1" | tr -d " ") && w=$(h < "$1") ' +
+  '&& p=$(head -c "$3" < "$1" | h) && q=$(head -c "$s" < "$5" | h) && test -n "$w"; then ' +
+  'if test "$s" -gt "$3" && test "$p" = "$4"; then r=K; elif test "$s" -le "$3" && test "$q" = "$w"; then r=R; else r=D; fi; fi; ' +
+  'test "$r" = K || ok=0; echo "$r $2"; }; ' +
+  'while test $# -ge 4; do rel=$1; e=$2; bn=$3; bs=$4; shift 4; src=$S/$rel; dst=$T/$rel; ' +
+  'if test "$e" = K; then rm -f -- "$src"; echo "K $rel"; continue; fi; ' +
+  'mkdir -p -- "$(dirname -- "$dst")" || { ok=0; echo "X $rel"; continue; }; ' +
+  'if test "$(st "$dst")" != "$e"; then cls "$dst" "$rel" "$bn" "$bs" "$src"; rm -f -- "$src"; continue; fi; ' +
+  'if test "$e" = A; then if ln -- "$src" "$dst" 2>/dev/null; then echo "P $rel"; else cls "$dst" "$rel" "$bn" "$bs" "$src"; fi; rm -f -- "$src"; continue; fi; ' +
+  'a=$(mktemp "$dst.paperclip-restore-prev.XXXXXX") && mv -f -- "$dst" "$a" || { ok=0; echo "X $rel"; rm -f -- "$src"; continue; }; ' +
+  'if test "$(st "$a")" != "$e"; then if ln -- "$a" "$dst" 2>/dev/null; then rm -f -- "$a"; cls "$dst" "$rel" "$bn" "$bs" "$src"; else ok=0; echo "X $rel"; fi; ' +
+  'elif ln -- "$src" "$dst" 2>/dev/null; then if test "$(st "$a")" != "$e"; then mv -f -- "$a" "$dst"; cls "$dst" "$rel" "$bn" "$bs" "$src"; else rm -f -- "$a"; echo "P $rel"; fi; ' +
+  'else ok=0; echo "X $rel"; fi; rm -f -- "$src"; done; ' +
+  'if test "$ok" = 1; then tar -cf - -C "$S" . | tar $tf -xf - -C "$T" && chmod 700 "$T" || exit 4; fi; exit 0';
+
+async function placeRestoreDirectoryWithoutClobber(input: {
+  runner: CommandManagedRuntimeRunner;
+  sourcePath: string;
+  targetPath: string;
+  histories: readonly (readonly [string, string, string, string])[];
+}): Promise<Map<string, "P" | "K" | "D" | "R" | "X">> {
+  const archive = await execFileBuffered("tar", ["--no-xattrs", "-czf", "-", "-C", input.sourcePath, "."], {
+    maxBuffer: 64 * 1024 * 1024, env: { ...process.env, COPYFILE_DISABLE: "1" } });
+  const result = await input.runner.execute({
+    command: "sh",
+    args: ["-c", RESTORE_PLACE_WITHOUT_CLOBBER_SCRIPT, "paperclip-runner-restore-place", input.targetPath,
+      ...input.histories.flat()],
+    stdin: archive.toString("base64"),
+    bypassSession: true,
+  });
+  if (result.exitCode !== 0 || result.timedOut) throw new Error("runner_remote_directory_staging_failed");
+  const outcomes = new Map<string, "P" | "K" | "D" | "R" | "X">();
+  for (const line of result.stdout.split("\n")) {
+    const match = /^([PKDRX]) (.+)$/.exec(line);
+    if (match) outcomes.set(match[2]!, match[1] as "P" | "K" | "D" | "R" | "X");
+  }
+  // Every conversation file is answered; a missing answer is never "placed".
+  for (const [relative] of input.histories) if (!outcomes.has(relative)) outcomes.set(relative, "X");
+  return outcomes;
 }
 
 export async function stageRemoteRunnerDirectory(input: {
