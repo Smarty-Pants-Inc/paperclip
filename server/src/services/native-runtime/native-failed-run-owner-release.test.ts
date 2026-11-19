@@ -159,6 +159,9 @@ describe("failed native run owner release", () => {
     const { runId } = await nativeRun({ status: "failed", errorCode: "adapter_failed",
       error: "runner_state_identity_mismatch: session_scope_mismatch",
       coordinator: { leaseOwner, leaseExpiresAt: new Date(Date.now() - 60_000), recoveryState: "resuming_session" } });
+    await db.update(heartbeatRuns).set({ resultJson: { nativeSteeringIngestion: {
+      state: "open", sourceInstanceId: "lost-controller-stream" }, steeringIngestionReleaseHeld: true } })
+      .where(eq(heartbeatRuns.id, runId));
     expect(await agentExecutionsHaveStopped(db, [agentId])).toBe(false);
     expect(await nextAbandonedNativeOwnerReleaseAt(db)).not.toBeNull();
 
@@ -169,6 +172,10 @@ describe("failed native run owner release", () => {
       recoveryState: "blocked", failureCode: "adapter_failed",
       failureDetail: expect.objectContaining({ releasedOwner: { reason: "expired_owner", leaseOwner, attempt: 1 } }) });
     expect(await agentExecutionsHaveStopped(db, [agentId])).toBe(true);
+    const [recovered] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(recovered!.resultJson?.nativeSteeringIngestion).toMatchObject({
+      state: "recovery_closed", sourceInstanceId: "lost-controller-stream",
+    });
     // Nothing is left to schedule once the owner is settled.
     expect(await nextAbandonedNativeOwnerReleaseAt(db)).toBeNull();
   });
