@@ -6,7 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import express from "express";
 import request from "supertest";
-import { and, eq, sql } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, authUsers, companies, companyMemberships, completionContracts, createDb, environmentLeases, environments,
   executionWorkspaces, executionWorkspaceSnapshots, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations,
@@ -340,7 +340,7 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
     stall.release();
     await vi.waitFor(async () => expect(await s.attempts()).toEqual(["failed"]), { timeout: 30_000, interval: 50 });
     const [snapshotOperation] = await db.select().from(workspaceOperations).where(and(eq(workspaceOperations.heartbeatRunId, s.runId),
-      eq(workspaceOperations.phase, "remote_workspace_snapshot")));
+      eq(workspaceOperations.phase, "remote_workspace_snapshot"))).orderBy(desc(workspaceOperations.startedAt)); // cut 2a also records the initial save: read the final one
     expect(snapshotOperation).toMatchObject({ status: "failed" });
     expect(JSON.stringify(snapshotOperation.metadata)).toContain("remote_workspace_publication_fenced");
     await vi.waitFor(async () => expect(record((await s.run()).runnerProfileJson).nativeWorkspaceFinalizationOwner).toBeUndefined(),
@@ -520,7 +520,8 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
       await s.presentationWorker();
       const [reply, ...more] = await s.replies();
       expect(more).toEqual([]);
-      expect(reply).toMatchObject({ body: `${ANSWER}\n\n${FILE_LINE_KEPT_SET_ASIDE}`, createdByRunId: s.runId });
+      expect(reply).toMatchObject({ body: ANSWER, createdByRunId: s.runId });
+      expect(renderedFileLine((await s.run()).resultJson)).toBe(FILE_LINE_KEPT_SET_ASIDE);
       expect(await s.issue()).toMatchObject({ executionRunId: null, status: "blocked" });
       // The parked message starts through the real deferred-receipt release, with the notice in its input.
       await parkedMessageStarts(s, next.body.id, before, { capMs: CAP, endedAfterParkingMs, parkedAt: wake.requestedAt }, "personWaitCap");
@@ -528,7 +529,7 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
       stall.release();
       await vi.waitFor(async () => expect(await s.attempts()).toEqual(["failed"]), { timeout: 30_000, interval: 50 });
       const [snapshotOperation] = await db.select().from(workspaceOperations).where(and(eq(workspaceOperations.heartbeatRunId, s.runId),
-        eq(workspaceOperations.phase, "remote_workspace_snapshot")));
+        eq(workspaceOperations.phase, "remote_workspace_snapshot"))).orderBy(desc(workspaceOperations.startedAt)); // cut 2a also records the initial save: read the final one
       expect(JSON.stringify(snapshotOperation.metadata)).toContain("remote_workspace_publication_fenced");
       expect(await s.committedSnapshots()).toEqual(before.committed);
       expect((await s.recovery()).map(action => action.id)).toEqual([kept.action.id]);
