@@ -3017,6 +3017,21 @@ export function createPluginWorkerHandle(
       const source = context.invocationScope?.agentOrigin;
       const origin = source && context.invocationScope ? { ...source, companyId: context.invocationScope.companyId } : undefined;
       const result = await withPluginInteractionOrigin(origin, () => handler(request.params, context));
+      if (!readNonEmptyString((request as { paperclipInvocationId?: unknown }).paperclipInvocationId) &&
+          method.startsWith("state.") && context.invocationScope?.companyId) {
+        // Keep host-derived state work distinguishable from the concurrent actor.
+        // Use the existing plugin log sink; never log the state key or value.
+        const meta = { method, scopeSource: "host-derived scope", actorType: "plugin", actorId: pluginId };
+        const message = "Plugin state call with host-derived scope";
+        try {
+          if (options.hostHandlers.log) {
+            await options.hostHandlers.log({ level: "info", companyId: context.invocationScope.companyId, message, meta }, context);
+          } else log.info(meta, message);
+        } catch {
+          // Logging must not turn an already completed state write into an RPC failure.
+          log.info(meta, message);
+        }
+      }
       sendMessage({
         jsonrpc: JSONRPC_VERSION,
         id: request.id,
