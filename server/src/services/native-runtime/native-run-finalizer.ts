@@ -770,7 +770,24 @@ async function recordRetryableFailure(input: {
         tx,
       );
     } else if (exhausted) {
-      const blocked = await issueService(tx as unknown as Db).update(
+      // C12 (rf-5 06:58Z): a classic run the copy-back bound isolated, with a person's message parked behind it
+      // (the cap's own condition, read here under the task lock): that message's run is admitted next and
+      // continues the task, so the task is NOT set Blocked for the gap between this write and that run's
+      // checkout. It stays In progress, as it was; nothing is unblocked. With nobody parked, with any other
+      // failure, and with any other task state, the task is Blocked as before.
+      const [personWaiting] = filesNotKept && input.failureScope === "workspace" && issue?.status === "in_progress"
+        && issue.assigneeAgentId === input.run.agentId && !issue.assigneeUserId
+        ? await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.companyId, input.run.companyId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            isNull(agentWakeupRequests.runId), eq(agentWakeupRequests.requestedByActorType, "user"),
+            sql`${agentWakeupRequests.payload}->>'issueId' = ${input.coordinator.issueId}`)).limit(1)
+        : [];
+      // The Blocked write is also what released this run's hold on the task. Release only that, and only this run's.
+      if (personWaiting) await tx.update(issues).set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null,
+        checkoutRunId: sql`case when ${issues.checkoutRunId} = ${input.run.id} then null else ${issues.checkoutRunId} end`, updatedAt: now })
+        .where(and(eq(issues.companyId, input.run.companyId), eq(issues.id, input.coordinator.issueId),
+          eq(issues.status, "in_progress"), eq(issues.executionRunId, input.run.id)));
+      const blocked = personWaiting ? null : await issueService(tx as unknown as Db).update(
         input.coordinator.issueId,
         {
           status:
