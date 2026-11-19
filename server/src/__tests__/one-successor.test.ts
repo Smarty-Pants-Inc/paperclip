@@ -32,9 +32,10 @@ import {
   settleConversationTurn,
   undeliveredConversationComments,
 } from "../services/agent-conversations.js";
-import { answeredPersonMessageSql } from "../services/person-message-answer.js";
+import { answeredPersonMessageIds, answeredPersonMessageSql, personMessageOwedSql } from "../services/person-message-answer.js";
+import { readContinuationCommentInput } from "../services/continuation-comment-input.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
-import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessage, settleUnansweredPersonMessages, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
 import { getServerAdapter, registerServerAdapter, runningProcesses } from "../adapters/index.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat/run-preparation.js";
 import { renderFirstTurnQueuedInput } from "../services/native-runtime/first-turn-queued-input.js";
@@ -511,5 +512,217 @@ describeEmbeddedPostgres("ONE successor per Interrupt (adopt-one-successor, 390 
     expect(wakes.map(w => [w.status, w.error]), "the answer's continuation was coalesced away").toHaveLength(1);
     expect(["coalesced", "skipped", "failed"]).not.toContain(wakes[0]!.status);
     expect(run !== null || wakes[0]!.status === "deferred_issue_execution", `wake ${wakes[0]!.status} has no run`).toBe(true);
+  });
+});
+
+// RFL 19:05Z: the floor uses claimed PERSON input, not a later run's start clock.
+// Persist the stopped/failed/revived history; exercise the actual per-message
+// sweep (discovery + settle) and continuation reader, never a copied predicate.
+describeEmbeddedPostgres("person-message floor after Stop (RFL 19:05Z)", () => {
+  let db: ReturnType<typeof createDb>;
+  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  const person = "floor-person";
+  beforeAll(async () => {
+    database = await startEmbeddedPostgresTestDatabase("person-message-floor-");
+    db = createDb(database.connectionString);
+  }, 60_000);
+  afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
+
+  async function fixture() {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    const start = Date.now() - 30 * 60_000;
+    const receiptIds: string[] = [];
+    const at = (minute: number) => new Date(start + minute * 60_000);
+    await db.insert(companies).values({ id: companyId, name: "Person floor", issuePrefix: `FP${companyId.slice(0, 6)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Agent", adapterType: "process", status: "idle" });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Work saved before Stop", status: "in_progress",
+      assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: person, conversationState: "active",
+      createdAt: at(0), updatedAt: at(0) });
+    const message = async (body: string, minute: number) => {
+      const [row] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: person,
+        body, clientRequestId: randomUUID(), origin: "comment", createdAt: at(minute), updatedAt: at(minute) }).returning();
+      return row!;
+    };
+    const run = async (status: "cancelled" | "failed" | "succeeded", minute: number, ids: string[] = [],
+      context: Record<string, unknown> = {}, resultJson: Record<string, unknown> = {}) => {
+      const [row] = await db.insert(heartbeatRuns).values({ companyId, agentId, nativeIssueId: issueId,
+        runtimeMode: "native", status, createdAt: at(minute), updatedAt: at(minute + 0.5),
+        startedAt: at(minute), finishedAt: at(minute + 0.5),
+        errorCode: status === "failed" ? "adapter_failed" : status === "cancelled" ? "cancelled" : null,
+        contextSnapshot: { issueId, taskKey: issueId, ...(ids.length ? { wakeCommentId: ids.at(-1), commentId: ids.at(-1), wakeCommentIds: ids } : {}), ...context },
+        resultJson }).returning();
+      return row!;
+    };
+    const reply = async (runId: string, minute: number, body = "Continued the saved work.") => {
+      await db.insert(issueComments).values({ companyId, issueId, authorType: "agent", authorAgentId: agentId,
+        createdByRunId: runId, body, createdAt: at(minute), updatedAt: at(minute) });
+    };
+    const claimedReceipt = async (messageId: string, runId: string, minute: number) => {
+      const [receipt] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand",
+        status: "completed", reason: "issue_commented", runId, requestedAt: at(minute), claimedAt: at(minute + 0.1),
+        finishedAt: at(minute + 0.5), idempotencyKey: `conversation-comment:${messageId}`,
+        payload: { issueId, commentId: messageId, _paperclipWakeContext: { issueId, wakeCommentIds: [messageId] } } }).returning();
+      receiptIds.push(receipt!.id);
+      await db.update(heartbeatRuns).set({ wakeupRequestId: receipt!.id }).where(eq(heartbeatRuns.id, runId));
+    };
+    const sweep = () => settleUnansweredPersonMessages(db, { companyId, issueId, now: at(60) });
+    const cards = () => db.select().from(issueComments).where(and(eq(issueComments.companyId, companyId),
+      eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"),
+      sql`starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})`));
+    const wakes = () => db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    const runs = () => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    const owed = async (id: string) => {
+      const rows = await db.execute(sql`select ${personMessageOwedSql({ id: sql`m.id`, companyId: sql`m.company_id`,
+        issueId: sql`m.issue_id`, createdAt: sql`m.created_at` })} as owed from issue_comments m where m.id = ${id}::uuid`);
+      return (rows as unknown as Array<{ owed: boolean }>)[0]!.owed;
+    };
+    return { companyId, agentId, issueId, at, message, run, reply, claimedReceipt, receiptIds, sweep, cards, wakes, runs, owed };
+  }
+  type FloorFixture = Awaited<ReturnType<typeof fixture>>;
+  const evidence = (label: string, value: unknown) => console.log(`FLOOR_ROW ${label} ${JSON.stringify(value)}`);
+
+  async function stoppedThenFailed() {
+    const f = await fixture();
+    const stop = await f.run("cancelled", 1, [], {}, { cancelledByActorType: "user", cancelledByUserId: person });
+    const m = await f.message("9 + 10?", 2);
+    const first = await f.run("failed", 3, [m.id]);
+    await f.claimedReceipt(m.id, first.id, 3);
+    const second = await f.run("failed", 4, [m.id]);
+    return { ...f, stop, m, first, second };
+  }
+  async function revivedOldWork() {
+    const f = await stoppedThenFailed();
+    // The recovery continuation resumes OLD work, not either failed question
+    // carrier. No direct/receipt/continuation input edge claims M or a newer N.
+    const revived = await f.run("succeeded", 6, [], { wakeReason: "issue_continuation_needed", previousRunId: f.stop.id });
+    await f.reply(revived.id, 7);
+    return { ...f, revived };
+  }
+  async function answeredNewerPerson() {
+    const f = await stoppedThenFailed();
+    // Paul's 11-17 shape includes both a cancelled and a failed carrier.
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled" }).where(eq(heartbeatRuns.id, f.first.id));
+    const n = await f.message("Next question, please", 5);
+    const later = await f.run("succeeded", 6, [n.id]);
+    await f.reply(later.id, 7, "Answer to the next question.");
+    return { ...f, n, later };
+  }
+  async function noResend(f: FloorFixture, before: string[]) {
+    expect((await f.runs()).map(r => r.id).sort(), "the sweep never starts another run").toEqual(before.sort());
+    expect((await f.wakes()).map(w => w.id).sort(), "the sweep creates no new wake").toEqual([...f.receiptIds].sort());
+    expect(await undeliveredConversationComments(db, f.companyId, f.issueId), "the real crash-window outbox never re-sends claimed input").toEqual([]);
+  }
+
+  it("fp-888: two failed question carriers, then old work succeeds without claiming person input: ONE named note, no resend, idempotent", async () => {
+    const f = await revivedOldWork();
+    const before = (await f.runs()).map(r => r.id);
+    const floor = await f.owed(f.m.id);
+    const swept = await f.sweep(), cards = await f.cards();
+    evidence("fp-888", { m: f.m.id, body: f.m.body, failed: [f.first.id, f.second.id], revived: f.revived.id,
+      revivedInput: f.revived.contextSnapshot, floor, swept, cards });
+    expect(cards, "the revived run did not answer 9 + 10").toHaveLength(1);
+    expect(floor).toBe(true);
+    expect(cards[0]!.deletedAt).toBeNull();
+    expect(cards[0]!.metadata?.authorizationReason).toBe(`${UNANSWERED_MESSAGE_REASON_PREFIX}${f.m.id}`);
+    expect(cards[0]!.body, "the true note names the saved question using the approved naming words").toContain('Your message is saved: “9 + 10?”.');
+    await f.sweep();
+    expect((await f.cards()).map(c => c.id), "one note ever, not merely one live note").toEqual([cards[0]!.id]);
+    await noResend(f, before);
+  });
+
+  it("fp-1117: cancelled/failed M, then a succeeded replying run CLAIMS newer N: zero cards or wakes for M", async () => {
+    const f = await answeredNewerPerson();
+    const before = (await f.runs()).map(r => r.id);
+    const floor = await f.owed(f.m.id), swept = await f.sweep();
+    evidence("fp-1117", { m: f.m.id, n: f.n.id, claimed: f.later.contextSnapshot, floor, swept, cards: await f.cards() });
+    expect(floor).toBe(false);
+    expect(await f.cards()).toEqual([]);
+    await f.sweep();
+    await noResend(f, before);
+  });
+
+  it("fp-1252: G1 re-pin, older failed M and newer claimed+answered N still leave no stray card", async () => {
+    const f = await answeredNewerPerson();
+    // G1's failed (not merely cancelled) predecessor cannot be treated as an
+    // agent answer, but a genuinely claimed newer input moves the floor on.
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed" }).where(eq(heartbeatRuns.id, f.first.id));
+    const before = (await f.runs()).map(r => r.id);
+    await f.sweep(); await f.sweep();
+    evidence("fp-1252", { m: f.m.id, n: f.n.id, floor: await f.owed(f.m.id), cards: await f.cards() });
+    expect(await f.cards()).toEqual([]);
+    await noResend(f, before);
+  });
+
+  it("fp-stop: Stop-held README survives 9 + 10's answer, then a later README carrier answers once without a card", async () => {
+    const f = await fixture();
+    const readme = await f.message("Read the README", 0.5);
+    await f.run("failed", 0.7, [readme.id]);
+    const stop = await f.run("cancelled", 1, [], {}, { cancelledByActorType: "user", cancelledByUserId: person });
+    const m = await f.message("9 + 10?", 2);
+    const answer = await f.run("succeeded", 3, [m.id]);
+    await f.reply(answer.id, 4, "19");
+    const [held] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "on_demand", status: "deferred_issue_execution", reason: "issue_commented", requestedAt: f.at(0.6),
+      idempotencyKey: `conversation-comment:${readme.id}`, payload: { issueId: f.issueId, commentId: readme.id,
+        personStopHold: { runId: stop.id }, _paperclipWakeContext: { issueId: f.issueId, wakeCommentIds: [readme.id] } } }).returning();
+    expect(await f.owed(readme.id), "person Stop custody is not stale after the newer answer").toBe(true);
+    await f.sweep();
+    expect(await f.cards()).toEqual([]);
+    // Claim the surviving receipt; the later-carrier clause preserves README
+    // even after custody ends and before that run publishes its answer.
+    const carrier = await f.run("succeeded", 6, [readme.id]);
+    await db.update(heartbeatRuns).set({ wakeupRequestId: held!.id }).where(eq(heartbeatRuns.id, carrier.id));
+    await db.update(agentWakeupRequests).set({ status: "completed", runId: carrier.id, claimedAt: f.at(6), finishedAt: f.at(6.5) })
+      .where(eq(agentWakeupRequests.id, held!.id));
+    expect(await f.owed(readme.id), "the later carrier still owns README").toBe(true);
+    await f.reply(carrier.id, 7, "The README describes setup.");
+    await f.sweep(); await f.sweep();
+    const replies = await db.select().from(issueComments).where(and(eq(issueComments.createdByRunId, carrier.id), eq(issueComments.authorType, "agent")));
+    evidence("fp-stop", { readme: readme.id, carrier: carrier.id, replies: replies.map(r => r.body), cards: await f.cards(), wakes: await f.wakes() });
+    expect(replies.map(r => r.body)).toEqual(["The README describes setup."]);
+    expect(await f.owed(readme.id)).toBe(false);
+    expect(await f.cards()).toEqual([]);
+    expect((await f.wakes()).map(w => w.id)).toEqual([held!.id]);
+  });
+
+  it("fp-cr-888: the continuation reader still returns M after unrelated revived work replied", async () => {
+    const f = await revivedOldWork();
+    const pending = await readContinuationCommentInput(db, { ...f, runId: f.second.id });
+    evidence("fp-cr-888", { m: f.m.id, pending });
+    expect(pending).toMatchObject({ wakeCommentIds: [f.m.id], wakeCommentId: f.m.id, commentId: f.m.id });
+    expect((await f.wakes()).map(w => w.id), "reading pending input does not auto-send it").toEqual(f.receiptIds);
+  });
+
+  it("fp-progress: newer steered N got only a progress note, not an answer: old failed X stays owed with ONE card", async () => {
+    const f = await fixture();
+    const x = await f.message("Old held X", 1);
+    const failed = await f.run("failed", 2, [x.id]);
+    await f.claimedReceipt(x.id, failed.id, 2);
+    const n = await f.message("Newer N, steered mid-task", 4);
+    const progress = await f.run("succeeded", 3, [n.id], { steeredCommentIds: [n.id] });
+    await db.update(heartbeatRuns).set({ finishedAt: f.at(5.5), updatedAt: f.at(5.5) }).where(eq(heartbeatRuns.id, progress.id));
+    // A progress note without the streamed answer receipt is not an answer
+    // to the steer (THE answered function's requireSteeredText guard).
+    await f.reply(progress.id, 5, "Still working on the saved task.");
+    const answered = await answeredPersonMessageIds(db, { ...f, commentIds: [x.id, n.id] });
+    expect([...answered]).toEqual([]);
+    const before = (await f.runs()).map(r => r.id);
+    const floor = await f.owed(x.id), swept = await f.sweep(), cards = await f.cards();
+    const forX = cards.filter(c => c.metadata?.authorizationReason === `${UNANSWERED_MESSAGE_REASON_PREFIX}${x.id}`);
+    evidence("fp-progress", { x: x.id, n: n.id, answered: [...answered], floor, swept, forX, cards });
+    expect(floor).toBe(true);
+    expect(forX).toHaveLength(1);
+    await f.sweep();
+    expect((await f.cards()).filter(c => c.metadata?.authorizationReason === `${UNANSWERED_MESSAGE_REASON_PREFIX}${x.id}`)
+      .map(c => c.id)).toEqual([forX[0]!.id]);
+    await noResend(f, before);
+  });
+
+  it("fp-cr-1117: the continuation reader returns {} once a newer person input was claimed and answered", async () => {
+    const f = await answeredNewerPerson();
+    const pending = await readContinuationCommentInput(db, { ...f, runId: f.second.id });
+    evidence("fp-cr-1117", { m: f.m.id, n: f.n.id, pending });
+    expect(pending).toEqual({});
+    expect((await f.wakes()).map(w => w.id)).toEqual(f.receiptIds);
   });
 });
