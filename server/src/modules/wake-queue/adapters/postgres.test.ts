@@ -2050,7 +2050,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, w.id))).toEqual([]);
     const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, c.issueId), eq(issueComments.authorType, "system")));
     expect(notes).toHaveLength(1);
-    expect(notes[0].body).toContain("SMA-611 — Finish the README finished.");
+    expect(notes[0].body).toBe("Finished earlier (this report was delayed): SMA-611 — Finish the README.");
     console.log("st-e39 cancelled; D superseded; no run; ONE note:", notes[0].body);
   });
 
@@ -2172,7 +2172,30 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
       .toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, w.id))).toEqual([]);
     const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, c.issueId), eq(issueComments.authorType, "system")));
-    expect(notes).toHaveLength(1); expect(notes[0].body).toContain(held.body);
+    expect(notes).toHaveLength(1);
+    expect(notes[0].body).toBe(`Not run because the conversation moved on (this update was delayed): "${held.body}".`);
     console.log("st-system", reason, "ONE note:", notes[0].body);
+  });
+
+  it("st-system-long: a 500-character held update is quoted at 60 characters in ONE note", async () => {
+    const c = await seed();
+    const [held] = await db.insert(issueComments).values({ companyId: c.companyId, issueId: c.issueId,
+      authorType: "agent", authorAgentId: c.agentId, body: "x".repeat(500), createdAt: ago(40 * 60_000) }).returning();
+    const w = await wake(c, held.id, ago(39 * 60_000));
+    await db.update(agentWakeupRequests).set({ requestedByActorType: "system", requestedByActorId: null,
+      reason: "issue_monitor", payload: withQueuedCommentIdsInWakePayload({ issueId: c.issueId,
+        _paperclipWakeContext: { issueId: c.issueId, taskKey: c.issueId, wakeReason: "issue_monitor" } }, [held.id]) })
+      .where(eq(agentWakeupRequests.id, w.id));
+    const newer = await message(c, "Person moved on", ago(20 * 60_000));
+    const r = await run(c, [newer.id], ago(19 * 60_000)); await reply(c, r.id);
+    for (let pass = 0; pass < 2; pass++) { await drain(c, r.id); await sweep(c); }
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0])
+      .toMatchObject({ status: "cancelled", runId: null, error: "The conversation moved on" });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, w.id))).toEqual([]);
+    const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, c.issueId), eq(issueComments.authorType, "system")));
+    expect(notes.map(n => n.body)).toEqual([
+      `Not run because the conversation moved on (this update was delayed): "${"x".repeat(59)}…".`,
+    ]);
+    console.log("st-system-long ONE note:", notes[0].body);
   });
 });
