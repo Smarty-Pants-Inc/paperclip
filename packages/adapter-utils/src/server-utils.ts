@@ -2349,6 +2349,12 @@ function renderPaperclipWakePromptBody(
     normalized.comments.length > 0 ||
     normalized.includedCount > 0 ||
     normalized.requestedCount > 0;
+  const multipleWakeComments =
+    Math.max(
+      normalized.comments.length,
+      normalized.includedCount,
+      normalized.requestedCount,
+    ) > 1;
   const executionStage = normalized.executionStage;
   const recovery = normalized.recovery;
   const recoveryScoped = Boolean(
@@ -2564,7 +2570,9 @@ function renderPaperclipWakePromptBody(
                   : "Answer the pending comments directly, in order. You may combine the reply, but do not omit any request or preface the answer with an acknowledgment or a description of your next action.",
               ]
             : [
-                "Before generic repo exploration or boilerplate heartbeat updates, acknowledge the latest comment and explain how it changes your next action.",
+                multipleWakeComments
+                  ? "Before generic repo exploration or boilerplate heartbeat updates, answer the new comments in order, oldest first, and explain how each changes your next action."
+                  : "Before generic repo exploration or boilerplate heartbeat updates, acknowledge the latest comment and explain how it changes your next action.",
               ]
           : []),
         externalChatContract
