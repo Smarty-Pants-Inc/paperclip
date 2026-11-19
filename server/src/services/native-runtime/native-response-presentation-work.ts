@@ -43,19 +43,25 @@ export function nativeResponsePresentationWork(db: Db) {
   }
   async function loadWithinTrace(scope: NativeResponsePresentationScope | undefined, signal: AbortSignal | undefined,
     canRun: () => boolean): Promise<Entry[]> {
-    const entries: Entry[] = [];
+    const entries = new Map<string, Entry>();
+    const append = (entry: Entry) => {
+      // A committed acceptance entry can also be an ordinary candidate.
+      // Discover each run once without delaying its earliest due work.
+      const previous = entries.get(entry.id);
+      if (!previous || entry.dueAt < previous.dueAt) entries.set(entry.id, entry);
+    };
     let after: string | undefined;
     while (canRun() && !signal?.aborted) {
       const rows = await measureRunPhase("response.resolve", () => candidates(scope, after));
-      for (const row of rows) entries.push({ id: row.id, companyId: row.companyId, issueId: row.issueId, agentId: row.agentId, endpointId: row.endpointId, principalId: row.principalId, dueAt: dueAt(row) });
+      for (const row of rows) append({ id: row.id, companyId: row.companyId, issueId: row.issueId, agentId: row.agentId, endpointId: row.endpointId, principalId: row.principalId, dueAt: dueAt(row) });
       if (rows.length < 100) break;
       after = rows[rows.length - 1].id;
     }
     after = undefined;
     while (canRun() && !signal?.aborted) {
       const rows = await measureRunPhase("response.resolve", () => withheld(scope, after));
-      for (const row of rows) entries.push({ id: row.id, companyId: row.companyId, issueId: row.issueId, agentId: row.agentId, endpointId: row.endpointId, principalId: row.principalId, dueAt: dueAt(row) });
-      if (rows.length < 100) return entries;
+      for (const row of rows) append({ id: row.id, companyId: row.companyId, issueId: row.issueId, agentId: row.agentId, endpointId: row.endpointId, principalId: row.principalId, dueAt: dueAt(row) });
+      if (rows.length < 100) return [...entries.values()];
       after = rows[rows.length - 1].id;
     }
     throw new Error("Native response presentation discovery stopped");
