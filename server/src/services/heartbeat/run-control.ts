@@ -46,6 +46,7 @@ import {
   userStopBoundaryAt,
 } from "../run-cancellation.js";
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
+import { settleConversationTurn } from "../agent-conversations.js";
 import { readQueuedInteractionResponse } from "../queued-interaction-response.js";
 import {
   isAcknowledgedNativeStop,
@@ -1894,8 +1895,17 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
             "failed to append run event for cancellation",
           );
         });
+        // A pending, answerable card is the person's next step whatever ended its run: a run the SYSTEM cancelled
+        // parks its chat as a failed or timed-out one does (run-completion.ts completeRun), through the same
+        // one-function read (settleConversationTurn -> answeredPersonMessageSql). The person's OWN Stop keeps its
+        // own semantics (ruling 8) and is not settled here.
+        const conversationSettled = cancelled.resultJson?.cancelledByActorType !== "user"
+          && await settleConversationTurn(db, cancelled).catch((settleErr) => {
+            logger.warn({ err: settleErr, runId: run.id }, "failed to settle the conversation turn of a cancelled run");
+            return false;
+          });
         await releaseIssueExecutionAndPromote(cancelled, {
-          suppressImmediateRecovery: options.suppressImmediateRecovery,
+          suppressImmediateRecovery: options.suppressImmediateRecovery || conversationSettled,
         });
         await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
