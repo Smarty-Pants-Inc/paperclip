@@ -75,7 +75,9 @@ function world(readyAfter: number[], options: { errorAt?: number; archivedAt?: n
       if (options.refuseStops) return res({ error: "stop refused" }, 403);
       b.stopped = true; return res({ stop: { id: `stop_${id}`, status: "pending" } }, 202);
     }
-    if (b && method === "GET") return res({ sandbox: { id, labels: b.labels, state: state(id, b), ...(b.stopped ? { stop: { id: `stop_${id}`, status: "completed" } } : {}) } });
+    if (b && method === "GET") return res({ sandbox: { id, labels: b.labels, state: state(id, b),
+      archiveAfter: new Date(b.deadline ?? b.at + cfg.ttlSeconds * 1000).toISOString(),
+      ...(b.stopped ? { stop: { id: `stop_${id}`, status: "completed" } } : {}) } });
     throw new Error(`Unexpected ${method} ${path}`);
   }));
   return { creates, stops, boxes, patches, events };

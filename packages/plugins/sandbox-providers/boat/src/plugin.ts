@@ -755,6 +755,11 @@ async function resumeOwedSpareStops(config: Config, companyId: string, environme
       if (entry.acquisition) {
         try {
           const debt = entry.acquisition;
+          const owner = { companyId, environmentId, runId: debt.runId };
+          // Old workers could persist unfinished keepId-fallback debt. It is
+          // not cleanup authority; wait for a real reservation or terminal error.
+          const disposition = await loadProvisionHedge(owner, debt.attemptId);
+          if (!disposition || (!disposition.winnerId && !disposition.failed)) continue;
           const listed = await acquisitionMatches(config, debt.attemptId, { companyId, environmentId, runId: debt.runId });
           // Known IDs are owed even if an eventually consistent list omits one.
           const ids = new Set([...debt.ids, ...listed]);
@@ -766,18 +771,24 @@ async function resumeOwedSpareStops(config: Config, companyId: string, environme
             // Drain may stop further requests, but can never discharge a
             // loser whose stop was skipped. Replacement still owns this debt.
             if (shuttingDown) return;
-            if (id === debt.keepId) continue;
-            const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`);
-            const sandbox = result.sandbox ?? result;
-            assertSandboxId(sandbox, id);
-            if (sandbox.labels?.owner !== `paperclip:${companyId}` || sandbox.labels?.environment !== environmentId
-                || sandbox.labels?.["paperclip-acquire"] !== debt.attemptId
-                || (debt.runId !== undefined && sandbox.labels?.run !== debt.runId)) throw new Error("Boat hedge stop ownership changed");
-            if (!["archived", "stopped"].includes(sandbox.state)) {
-              // Also bound a late-create loser first discovered by maintenance.
-              await boundProvisionLoser(config, companyId, record, debt, id);
-              await stopSandbox(config, id);
-            }
+            await withProvisionOwnership(owner, debt.attemptId, async () => {
+              const current = await loadProvisionHedge(owner, debt.attemptId);
+              if (!current || (!current.winnerId && !current.failed)) return;
+              // Re-read under the SAME fence handoff takes, not the old debt's
+              // keepId captured before awaited discovery/provider work.
+              if (id === current.winnerId || id === debt.keepId) return;
+              const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`);
+              const sandbox = result.sandbox ?? result;
+              assertSandboxId(sandbox, id);
+              if (sandbox.labels?.owner !== `paperclip:${companyId}` || sandbox.labels?.environment !== environmentId
+                  || sandbox.labels?.["paperclip-acquire"] !== debt.attemptId
+                  || (debt.runId !== undefined && sandbox.labels?.run !== debt.runId)) throw new Error("Boat hedge stop ownership changed");
+              if (!["archived", "stopped"].includes(sandbox.state)) {
+                try { await boundProvisionLoser(config, owner, record, debt, id); }
+                catch { /* TTL is unconfirmed; still attempt the terminal loser's stop. */ }
+                await stopSandbox(config, id);
+              }
+            });
           }
           // An unanswered create can still appear. Absence before the shared
           // creation settle floor never discharges that identity's debt.
@@ -1654,7 +1665,21 @@ async function creationExpiry(companyId: string, creationId: string, ttlSeconds:
 type ProvisionHedge = {
   environmentId: string; runId?: string; hedgeId: string; body: string;
   startedAt: number; firstId: string; hedgeBoxId?: string; winnerId?: string;
+  handedOut?: boolean; failed?: boolean;
+  // Write-ahead, per-attempt/per-box send admission. A lost outcome cannot
+  // replay a relative TTL PATCH, including across worker replacement.
+  loserTtlAttempts?: Record<string, number>;
 };
+const provisionOwnership = new Map<string, Promise<unknown>>();
+async function withProvisionOwnership<T>(owner: { companyId: string; environmentId: string }, attemptId: string,
+  work: () => Promise<T>): Promise<T> {
+  const key = JSON.stringify([owner.companyId, owner.environmentId, attemptId]);
+  const previous = provisionOwnership.get(key) ?? Promise.resolve();
+  const pending = previous.catch(() => undefined).then(work);
+  provisionOwnership.set(key, pending);
+  try { return await pending; }
+  finally { if (provisionOwnership.get(key) === pending) provisionOwnership.delete(key); }
+}
 const provisionHedgeWrites = new Map<string, Promise<ProvisionHedge>>();
 function provisionHedgeScope(owner: { companyId: string; environmentId: string }, attemptId: string) {
   return { scopeKind: "company" as const, scopeId: owner.companyId, namespace: "boat-provision-hedges", stateKey: `${owner.environmentId}:${attemptId}` };
@@ -1669,6 +1694,11 @@ async function loadProvisionHedge(owner: { companyId: string; environmentId: str
       || !record.hedgeId || typeof record.body !== "string" || !Number.isFinite(record.startedAt) || typeof record.firstId !== "string"
       || (record.hedgeBoxId !== undefined && typeof record.hedgeBoxId !== "string")
       || record.hedgeId === attemptId || !record.firstId
+      || (record.handedOut !== undefined && typeof record.handedOut !== "boolean")
+      || (record.failed !== undefined && typeof record.failed !== "boolean")
+      || (record.handedOut && (!record.winnerId || record.failed))
+      || (record.loserTtlAttempts !== undefined && (!record.loserTtlAttempts || typeof record.loserTtlAttempts !== "object"
+        || Array.isArray(record.loserTtlAttempts) || Object.values(record.loserTtlAttempts).some(at => !Number.isFinite(at))))
       || (record.winnerId !== undefined && (typeof record.winnerId !== "string"
         || (record.winnerId !== record.firstId && record.winnerId !== record.hedgeBoxId)))) throw new Error("Boat provisioning hedge identity is invalid");
   let labels: Record<string, unknown>;
@@ -1683,31 +1713,56 @@ async function saveProvisionHedge(owner: { companyId: string; environmentId: str
   if (!pluginContext?.state?.set) throw new Error("Boat provisioning hedge requires durable plugin state");
   await pluginContext.state.set(provisionHedgeScope(owner, attemptId), { ...record });
 }
-/** Do not renew a successful short TTL: PATCH again would extend the loser's
- * life. A refusal is recorded without provider text (which may hold secrets),
- * and never prevents the existing owed non-force stop from being attempted.
+/** Caller holds the handoff's ownership fence across GET, write-ahead admission
+ * and PATCH. Only a handed-out winner makes its siblings terminal TTL losers.
  * https://docs.boat.dev/api/reference/sandboxes/update-sandbox */
-async function boundProvisionLoser(config: Config, companyId: string, record: OwedSpareStops,
+async function boundProvisionLoser(config: Config, owner: { companyId: string; environmentId: string; runId?: string }, record: OwedSpareStops,
   debt: AcquisitionStopDebt, id: string): Promise<void> {
-  if (id === debt.keepId || debt.loserTtls?.[id]) return;
+  const current = await loadProvisionHedge(owner, debt.attemptId);
+  if (!current?.handedOut || current.failed || current.winnerId !== debt.keepId
+      || id === current.winnerId || debt.loserTtls?.[id] || current.loserTtlAttempts?.[id] !== undefined) return;
+  const observed = await request(config, `/sandboxes/${encodeURIComponent(id)}`,
+    { method: "GET", cache: "no-store", signal: AbortSignal.timeout(5_000) }, false, { maxSends: 1, requireJson: true });
+  const sandbox = observed.sandbox ?? observed;
+  assertSandboxId(sandbox, id);
+  if (sandbox.labels?.owner !== `paperclip:${owner.companyId}` || sandbox.labels?.environment !== owner.environmentId
+      || sandbox.labels?.["paperclip-acquire"] !== debt.attemptId
+      || (owner.runId !== undefined && sandbox.labels?.run !== owner.runId)) throw new Error("Boat hedge TTL ownership changed");
+  if (["archived", "stopped", "archiving", "cancelled"].includes(sandbox.state)) return;
+  // PATCH is relative to provider application time, not GET time. Leave its
+  // entire 5-second send budget as slack, and skip an already shorter bound.
+  // An absent/invalid deadline is unknown, never permission to extend it.
+  const deadline = sandbox.archiveAfter === null ? Infinity
+    : typeof sandbox.archiveAfter === "string" ? Date.parse(sandbox.archiveAfter) : NaN;
+  if (!(deadline - Date.now() > (LOSER_TTL + 5) * 1000)) return;
   const attemptedAt = Date.now();
+  (current.loserTtlAttempts ??= {})[id] = attemptedAt;
+  // Fail closed BEFORE sending, not after the provider side effect. Outcomes
+  // in stop-owed are informational; losing one cannot grant another send.
+  await saveProvisionHedge(owner, debt.attemptId, current);
   let outcome: LoserTtl["outcome"] = "failed";
   try {
     await request(config, `/sandboxes/${encodeURIComponent(id)}`, { method: "PATCH", signal: AbortSignal.timeout(5_000),
-      body: JSON.stringify({ ttlSeconds: LOSER_TTL }) }, false, { maxSends: 1 });
+      body: JSON.stringify({ ttlSeconds: LOSER_TTL }) }, false, { maxSends: 1,
+        sendGuard: () => {
+          // Write-ahead state or the request's own rate-limit wait can consume
+          // the slack. Check at the actual send, not just before those awaits.
+          if (!(deadline - Date.now() > (LOSER_TTL + 5) * 1000)) throw new Error("Boat loser deadline is already shorter; TTL PATCH suppressed");
+        } });
     outcome = "applied";
   } catch {
-    duplexLogger?.warn("Boat hedge loser TTL not confirmed; non-force stop remains owed", { companyId, sandboxId: id });
+    duplexLogger?.warn("Boat hedge loser TTL not confirmed; non-force stop remains owed", { companyId: owner.companyId, sandboxId: id });
   }
   (debt.loserTtls ??= {})[id] = { ttlSeconds: LOSER_TTL, outcome, attemptedAt };
-  // State failure must not veto the safe stop either. In-memory outcome remains
-  // available to the same worker; existing durable debt still owns the loser.
-  try { await persistOwedSpareStops(companyId, record); } catch { /* Continue owed stop. */ }
+  try { await persistOwedSpareStops(owner.companyId, record); } catch { /* Continue owed stop. */ }
 }
 /** A decision is durable before a loser stop; an unanswered POST keeps its
  * creation identity owed until the same settle floor core uses for late boxes. */
 async function oweProvisionLosers(config: Config, owner: { companyId: string; environmentId: string; runId?: string }, attemptId: string,
   record: ProvisionHedge, keepId: string): Promise<void> {
+  // Inspection of an unfinished acquisition cannot invent a keep reservation.
+  // Neither PATCH nor stop may dispose of a contender that can still win.
+  if (!record.winnerId && !record.failed) return;
   const owed = await loadOwedSpareStops(owner.companyId);
   const spareId = `acquisition:${attemptId}`;
   // A saved winner is an ownership reservation. Inspection/error recovery
@@ -1719,11 +1774,14 @@ async function oweProvisionLosers(config: Config, owner: { companyId: string; en
   owed.owed = owed.owed.filter(entry => entry.spareId !== spareId);
   owed.owed.push({ environmentId: owner.environmentId, configHash: `hedge:${attemptId}`, spareId, acquisition });
   await persistOwedSpareStops(owner.companyId, owed);
-  // Known losers get Boat's restart-independent bound at the decision, before
-  // inventory/stop work. Never PATCH the durable committed winner, even replay.
+  // Only a completed handoff grants TTL admission. The helper checks the
+  // current reservation under the handoff fence before any provider write.
   for (const id of acquisition.ids) {
     if (id === acquisition.keepId) continue;
-    await boundProvisionLoser(config, owner.companyId, owed, acquisition, id);
+    await withProvisionOwnership(owner, attemptId, async () => {
+      try { await boundProvisionLoser(config, owner, owed, acquisition, id); }
+      catch { /* An unconfirmed TTL never vetoes the owed non-force stop. */ }
+    });
   }
   // Registers this key even with spare pools OFF, and tracks the bounded stop
   // work for shutdown; a slow/refused stop never blocks the winning lease.
@@ -1749,9 +1807,9 @@ async function waitProvisionWinner(config: Config, first: any, owner: { companyI
     return { ready: await waitReady(config, first.id, false, { deadline, observe: refuseStopped }), labels: primaryLabels, hedge: false };
   }
   if (saved && saved.firstId !== first.id) throw new Error("Boat provisioning primary identity changed");
+  if (saved?.failed) throw new Error("Boat provisioning acquisition is terminally failed");
   if (saved?.winnerId) {
     enterHedge();
-    await oweProvisionLosers(config, owner, attemptId, saved, saved.winnerId);
     const ready = await waitReady(config, saved.winnerId, false, { deadline, startDeadline: deadline, observe: refuseStopped });
     return { ready, labels: saved.winnerId === first.id ? primaryLabels : JSON.parse(saved.body).labels, hedge: saved.winnerId !== first.id };
   }
@@ -1821,9 +1879,12 @@ async function waitProvisionWinner(config: Config, first: any, owner: { companyI
     cancel.abort();
     await Promise.allSettled([primaryReady, ...(hedgeWork ? [hedgeWork] : [])]);
     if (record) {
-      record.winnerId = ready.id;
-      await saveProvisionHedge(owner, attemptId, record);
-      await oweProvisionLosers(config, owner, attemptId, record, ready.id);
+      await withProvisionOwnership(owner, attemptId, async () => {
+        const current = await loadProvisionHedge(owner, attemptId);
+        if (current?.failed || (current?.winnerId && current.winnerId !== ready.id)) throw new Error("Boat provisioning winner reservation changed");
+        record!.winnerId = ready.id;
+        await saveProvisionHedge(owner, attemptId, record!);
+      });
     }
     return { ready, labels: ready.id === first.id ? primaryLabels : JSON.parse(record!.body).labels, hedge: ready.id !== first.id };
   } catch (error) {
@@ -1831,7 +1892,15 @@ async function waitProvisionWinner(config: Config, first: any, owner: { companyI
     await Promise.allSettled([primaryReady, ...(hedgeWork ? [hedgeWork] : [])]);
     // The caller's existing cleanup owns the primary; durable debt owns
     // the hedge, so failure does not send two simultaneous primary stops.
-    if (record) await oweProvisionLosers(config, owner, attemptId, record, first.id);
+    if (record) {
+      await withProvisionOwnership(owner, attemptId, async () => {
+        const current = await loadProvisionHedge(owner, attemptId);
+        if (current?.handedOut) return;
+        record!.failed = true;
+        await saveProvisionHedge(owner, attemptId, record!);
+      });
+      await oweProvisionLosers(config, owner, attemptId, record, first.id);
+    }
     throw error;
   }
 }
@@ -3371,6 +3440,23 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         assertActive("handoff");
         const lease = await finishAcquisition(params, c, id!, { ...ready, ...ownershipObservation }, winner.labels, remoteCwd, snapshot, null, undefined, budget);
         assertActive("handoff");
+        await withProvisionOwnership(params, attemptId, async () => {
+          const current = await loadProvisionHedge(params, attemptId);
+          if (!current) return;
+          const owed = await loadOwedSpareStops(params.companyId);
+          const legacyTtl = owed.owed.some(entry => entry.environmentId === params.environmentId
+            && entry.acquisition?.attemptId === attemptId && entry.acquisition.loserTtls?.[id!]);
+          if (current.failed || current.winnerId !== id || current.loserTtlAttempts?.[id!] !== undefined || legacyTtl) throw new Error("Boat provisioning handoff ownership changed");
+          assertActive("handoff");
+          current.handedOut = true;
+          await saveProvisionHedge(params, attemptId, current);
+        });
+        // The immutable handoff reservation precedes all terminal-loser work.
+        // Track it for drain, but a slow PATCH/stop must not hold the chat lease.
+        trackOwedStopWork((async () => {
+          const current = await loadProvisionHedge(params, attemptId);
+          if (current) await oweProvisionLosers(c, params, attemptId, current, id!);
+        })());
         endedAt = Date.now(); stampOutcome = "ok";
         return lease;
       } catch (caught) {
@@ -3407,6 +3493,14 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
           await duplexChannels.suspend({ ...params, providerLeaseId: id });
           await retireForLifecycle({ ...params, providerLeaseId: id });
         }
+        const failedHedge = await withProvisionOwnership(params, attemptId, async () => {
+          const current = await loadProvisionHedge(params, attemptId);
+          if (!current || current.handedOut || committedWinnerId) return undefined;
+          current.failed = true;
+          await saveProvisionHedge(params, attemptId, current);
+          return current;
+        });
+        if (failedHedge) await oweProvisionLosers(c, params, attemptId, failedHedge, id ?? failedHedge.firstId);
         await cleanupAcquisition(c, ids, params, attemptId, error, committedWinnerId, startFailure);
         // #22194: Boat could not start the box, before any agent work. The SDK on
         // this line carries the acquisition diagnostic (providerState "error")
@@ -3511,9 +3605,9 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       const ids = await acquisitionMatches(c, params.creationOperation.id, owner);
       const hedge = await loadProvisionHedge(owner, params.creationOperation.id);
       if (hedge) {
-        // This is core reconciling an abandoned creation, not an active lease.
-        // Reconstruct loser/late-create debt even when the killed worker never
-        // reached a winner decision. Core owns the exact row returned below.
+        // Reconstruct terminal debt only. An unfinished record is resumable:
+        // inventory order is not authority to shorten/stop a future chat box.
+        // Core still owns the exact cleanup envelope returned below.
         await oweProvisionLosers(c, owner, params.creationOperation.id, hedge, ids[0] ?? "");
       }
       // Report operation-scoped absence as destroyed: core owns the settle

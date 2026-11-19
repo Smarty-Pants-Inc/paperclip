@@ -36,18 +36,38 @@ failed-creation destroy path uses the same exclusion for inventory matches and
 refuses an exact-ID cleanup of that winner before changing its lease lifecycle.
 Explicit ordinary release/stop/destroy requests are unchanged.
 
-The winner decision is persisted before handing off. Losers enter the existing
-durable `stop-owed` queue, with exact known IDs and acquisition ownership. While
-credentials are still in hand, each known loser first receives Boat's documented
-[`PATCH /sandboxes/{id}`](https://docs.boat.dev/api/reference/sandboxes/update-sandbox)
-`{ttlSeconds: 300}`, then the existing non-force stop (never force or delete).
-`LOSER_TTL` is a provider-side auto-stop fallback: PATCH sets its deadline to
-now + 300 seconds. The committed winner is excluded from both PATCH and stop.
-The debt records the TTL attempt time and applied/failed outcome per loser,
-without any key or provider error text. An attempted TTL is not sent again on
-replay/retry, because another PATCH could extend a successfully applied deadline.
-A failed PATCH does not block the owed stop, but provides **no confirmed short
-bound**; that row remains dependent on stop retries or the prior provider TTL.
+The winner decision is persisted before handing off. Only after successful lease
+preparation and the durable handoff reservation do its siblings become terminal
+TTL losers. Inspection of an unfinished acquisition cannot invent a primary-as-
+keep reservation: it neither PATCHes nor stops a contender that may still win.
+The handoff, fresh winner checks, and all awaited loser PATCH/stop continuations
+share one operation-scoped ownership fence. A saved winner is immutable; a box
+with a write-ahead loser-PATCH admission can never pass the handoff gate.
+
+Losers enter the existing durable `stop-owed` queue, with exact known IDs and
+acquisition ownership. While credentials are still in hand, the worker GETs each
+terminal loser's current `archiveAfter` before Boat's documented
+[`PATCH /sandboxes/{id}`](https://docs.boat.dev/api/reference/sandboxes/update-sandbox).
+It sends `{ttlSeconds: 300}` only if the current deadline exceeds that bound plus
+the entire five-second PATCH transport budget. It skips already-shorter and
+unknown/invalid deadlines; `archiveAfter: null` explicitly means no auto-stop.
+It never increases a shorter create/prior deadline to obtain a nominal 300-second
+bound. The existing non-force stop follows (never force or delete). This relies
+on Boat enforcing the request's five-second transport abort; the relative-TTL API
+provides no absolute-deadline conditional update.
+
+Before a PATCH can be sent, the acquisition record durably stores its per-loser
+attempt admission. Admission write failure suppresses the PATCH, not the stop.
+The debt separately records applied/failed outcome without any key or provider
+error text. Losing that outcome receipt cannot grant another send: the write-ahead
+admission remains, even after worker replacement. Old records without the optional
+handoff/admission fields remain readable; unfinished legacy debt is not cleanup
+authority. Existing recorded TTL outcomes also suppress replay.
+
+**F4 residual:** a failed/unconfirmed PATCH plus worker restart leaves the original
+create TTL as the provider-side bound (or the prior deadline if already shorter),
+not a confirmed 300-second bound. Non-force stop is still attempted. Until a
+credentialed call restores maintenance, setup + health alone cannot retry it.
 Missing list entries cannot erase known loser IDs. A refused stop remains owed
 and is retried by the existing maintenance service, including with spares OFF.
 A replacement's credentialed acquisition restores and arms maintenance for its
@@ -66,8 +86,8 @@ not a force-stop receipt or unconditional billing guarantee: provider scheduling
 and Boat's documented working-agent TTL behavior still apply.
 An unanswered hedge POST retains identity-level debt through the shared
 30-minute creation-settle floor so a late box can be found and stopped. Core's
-abandoned-creation inspection reconstructs this debt if the worker died before
-a winner decision. This protocol assumes replacement, not overlapping independent
+creation inspection reconstructs debt only from a committed winner or terminal
+failed acquisition; an unfinished operation remains resumable, not cleanup-owned. This protocol assumes replacement, not overlapping independent
 workers; the local intent-write serialization is not a distributed compare-and-set.
 
 A plugin context without durable state retains the single-create behavior rather
