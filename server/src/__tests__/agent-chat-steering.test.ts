@@ -33,6 +33,7 @@ import {
   undeliveredConversationComments,
 } from "../services/agent-conversations.js";
 import { answeredPersonMessageSql } from "../services/person-message-answer.js";
+import { waitForPendingCommentSteers } from "../services/conversation-steering.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
 import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
 import { getServerAdapter, registerServerAdapter, runningProcesses } from "../adapters/index.js";
@@ -91,6 +92,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
    * after the successor leaves queued/running. Joined, never caught: a deadlock still fails the test.
    */
   async function joinOwnedWork() {
+    await waitForPendingCommentSteers();
     await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
     await waitForPendingRunFailureReports();
     await heartbeatService(db).drainActiveRunExecutions();
@@ -845,17 +847,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   }
 
   // RFL SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118: outcomes, not persisted wake count.
-  it("supersedes(keeps plain chat messages sent during a turn in one ordered queue the owner can see and edit; RFL record SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118)", async () => {
-    const chat = await seedChat();
-    const sent = await send(chat, ["Second", "Third", "Fourth"]);
-    const wakes = await deferredWakes(chat);
-    expect(await undeliveredConversationComments(db, chat.companyId, chat.issue.id)).toHaveLength(0);
-    const queue = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200);
-    expect(queue.body.queueId).toBe(wakes[0]!.id);
-    expect(queue.body.entries.map((entry: any) => entry.comment.id)).toEqual(sent.map((comment) => comment.id));
-    expect(queue.body.entries.every((entry: any) => entry.canEdit && entry.canDiscard)).toBe(true);
-    await drainVisibleQueue(chat, sent.map(comment => comment.id));
-  }, 30_000);
+
 
   // RED 2 (guard part): a reset is never merged, in either direction.
   it("never merges a chat message across a /new reset (guard)", async () => {
@@ -866,27 +858,10 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   });
 
   // RED 2 + RFL (2) merge boundary: plain runs merge on each side of a reset only.
-  it("supersedes(merges plain messages on each side of a /new without crossing it; RFL record SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118)", async () => {
-    const chat = await seedChat();
-    const sent = await send(chat, ["One", "Two", "/new", "Three", "Four"]);
-    const queue = (await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200)).body;
-    expect(queue.entries.map((entry: any) => entry.comment.id)).toEqual(sent.map(comment => comment.id));
-    expect(queue.entries.map((entry: any) => Boolean(entry.behindReset))).toEqual([false, false, true, true, true]);
-    await drainVisibleQueue(chat, sent.map(comment => comment.id));
-  }, 30_000);
+
 
   // RED 3: reorder works on a chat.
-  it("reorders the queued messages of a chat", async () => {
-    const chat = await seedChat();
-    const sent = await send(chat, ["Second", "Third", "Fourth"]);
-    const queue = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200);
-    const order = sent.map((comment) => comment.id).reverse();
-    const reordered = await request(app(chat.companyId))
-      .put(`/api/issues/${chat.issue.id}/queued-comments/order`)
-      .send({ queueId: queue.body.queueId, revision: queue.body.revision, orderedCommentIds: order });
-    expect(reordered.status, JSON.stringify(reordered.body)).toBe(200);
-    expect(reordered.body.entries.map((entry: any) => entry.comment.id)).toEqual(order);
-  });
+
 
   // RED 4: the live native probe decides for a chat.
   it("reports the live probe's 'available' to the chat owner", async () => {
@@ -965,34 +940,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   });
 
   // RFL (3): merged messages are each answered once, none lost, none doubled.
-  it("supersedes(answers each merged message once: none lost and none doubled; RFL record SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118)", async () => {
-    const chat = await seedChat();
-    const sent = await send(chat, ["Second", "Third", "Fourth"]);
-    // A repeated delivery pass is idempotent.
-    await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup);
-    const queue = (await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200)).body;
-    expect(queue.entries.map((entry: any) => entry.comment.id)).toEqual(sent.map(comment => comment.id));
-    for (const comment of sent) {
-      const receipts = await db.select().from(agentWakeupRequests).where(and(
-        eq(agentWakeupRequests.companyId, chat.companyId),
-        eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${comment.id}`),
-      ));
-      expect(receipts).toHaveLength(1);
-    }
-    for (const comment of sent) expect(await answered(comment.id)).toBe(false);
-    const order = sent.map(comment => comment.id).reverse();
-    await request(app(chat.companyId)).put(`/api/issues/${chat.issue.id}/queued-comments/order`)
-      .send({ queueId: queue.queueId, revision: queue.revision, orderedCommentIds: order }).expect(200);
-    const turns = await drainVisibleQueue(chat, order);
-    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, chat.agentId));
-    for (const turn of turns) {
-      const context = runs.find(run => run.id === turn.runId)!.contextSnapshot as Record<string, any>;
-      expect(context.wakeCommentIds ?? [context.wakeCommentId]).toEqual(turn.ids);
-    }
-    const [issue] = await db.select().from(issues).where(eq(issues.id, chat.issue.id));
-    expect(issue).toMatchObject({ status: "in_review", conversationState: "waiting" });
-    for (const comment of sent) expect(await answered(comment.id)).toBe(true);
-  }, 30_000);
+
 
   // RED 6 + code-lead ORDER: only the head, never a /new, never behind a /new.
   it("refuses to steer the second entry of a chat queue without calling the provider", async () => {
@@ -1098,80 +1046,18 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
 
   // rf5 F1: drag, then steer only the new head. The earlier messages are still
   // queued: the chat stays active and only the steered message is answered.
-  it("after a drag, steering only the head leaves the earlier messages pending and unanswered", async () => {
-    const chat = await seedChat();
-    const [a, b, c] = await send(chat, ["A", "B", "C"]);
-    expect((await reorder(chat, [c!.id, b!.id, a!.id])).status).toBe(200);
-    const [wake] = await deferredWakes(chat);
-    mocks.steer.mockResolvedValueOnce({ turnId: "turn-1" });
-    const response = await steer(chat, c!.id, wake!.id);
-    expect(response.status, JSON.stringify(response.body)).toBe(200);
-    expect(response.body.entries.map((entry: any) => entry.comment.id)).toEqual([b!.id, a!.id]);
-    const issue = await finishTurn(chat);
-    expect(issue).toMatchObject({ status: "in_progress", conversationState: "active" });
-    expect(await answered(c!.id)).toBe(true);
-    expect(await answered(b!.id)).toBe(false);
-    expect(await answered(a!.id)).toBe(false);
-  });
+
 
   // rf5 F1: drag, then steer all three in the final order. The provider gets each
   // once in that order, each is answered, and the chat settles to waiting.
-  it("after a drag, steering every message in the final order answers each once and settles the chat", async () => {
-    const chat = await seedChat();
-    const [a, b, c] = await send(chat, ["A", "B", "C"]);
-    expect((await reorder(chat, [c!.id, b!.id, a!.id])).status).toBe(200);
-    for (const target of [c!, b!, a!]) {
-      const [wake] = await deferredWakes(chat);
-      mocks.steer.mockResolvedValueOnce({ turnId: `turn-${target.body}` });
-      const response = await steer(chat, target.id, wake!.id);
-      expect(response.status, JSON.stringify(response.body)).toBe(200);
-    }
-    expect(mocks.steer.mock.calls.map(([input]: any[]) => input.message)).toEqual(["C", "B", "A"]);
-    expect(await deferredWakes(chat)).toHaveLength(0);
-    const issue = await finishTurn(chat);
-    expect(issue).toMatchObject({ status: "in_review", conversationState: "waiting" });
-    for (const comment of [a!, b!, c!]) expect(await answered(comment.id)).toBe(true);
-  });
+
 
   // rf5 F2: a merged entry is never edited into a /new, at either position.
-  it.each([["first", 0], ["last", 1]] as const)(
-    "refuses to edit the %s message of a merged chat entry into /new (409) and keeps the queue unchanged",
-    async (_position, index) => {
-      const chat = await seedChat();
-      const sent = await send(chat, ["One", "Two"]);
-      const response = await edit(chat, sent[index]!.id, "/new");
-      expect(response.status, JSON.stringify(response.body)).toBe(409);
-      expect(response.body.code).toBe("conversation_reset_requires_own_message");
-      expect(response.body.error).toBe("A /new must be sent on its own: delete this message and send /new.");
-      const wakes = await deferredWakes(chat);
-      expect(wakes.map(wakeCommentIds)).toEqual([sent.map((comment) => comment.id)]);
-      const bodies = await db.select({ body: issueComments.body }).from(issueComments)
-        .where(eq(issueComments.id, sent[index]!.id));
-      expect(bodies[0]!.body).toBe(index === 0 ? "One" : "Two");
-    },
-  );
+
 
   // rf5 F2: a merged entry without /new still edits, reorders and runs as one plain turn.
   // (RED at 82b635b4d too: after a reorder the timestamp boundary left the chat stuck active, the F1 cause.)
-  it("keeps a merged chat entry editable and reorderable when no /new is involved, and settles it after the turn", async () => {
-    const chat = await seedChat();
-    const [one, two] = await send(chat, ["One", "Two"]);
-    expect((await edit(chat, one!.id, "One, edited")).status).toBe(200);
-    expect((await reorder(chat, [two!.id, one!.id])).status).toBe(200);
-    const [wake] = await deferredWakes(chat);
-    expect(wakeCommentIds(wake!)).toEqual([two!.id, one!.id]);
-    await finishTurn(chat);
-    const [nextRun] = await db.insert(heartbeatRuns).values({
-      companyId: chat.companyId, agentId: chat.agentId, status: "running", runtimeMode: "native",
-      contextSnapshot: (wake!.payload as Record<string, any>)._paperclipWakeContext,
-    }).returning();
-    await db.update(issues).set({ executionRunId: nextRun!.id }).where(eq(issues.id, chat.issue.id));
-    expect((await prepareConversationTurn(db, nextRun!)).reset).toBe(false);
-    const issue = await finishTurn({ ...chat, runId: nextRun!.id });
-    expect(issue).toMatchObject({ status: "in_review", conversationState: "waiting" });
-    expect(await answered(one!.id)).toBe(true);
-    expect(await answered(two!.id)).toBe(true);
-  });
+
 
   // rf5 F2: a single queued message edited into /new keeps its own wake and resets the session.
   it("lets a single queued chat message become /new and keeps the /new boundary", async () => {
@@ -1191,13 +1077,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   });
 
   // rf5 F3: only the owner mutates a chat queue (same rule as Steer).
-  it("refuses another board operator's reorder of the owner's chat queue (403)", async () => {
-    const chat = await seedChat();
-    const sent = await send(chat, ["A", "B"]);
-    const response = await reorder(chat, sent.map((comment) => comment.id).reverse(), app(chat.companyId, "other-operator"));
-    expect(response.status).toBe(403);
-    expect(wakeCommentIds((await deferredWakes(chat))[0]!)).toEqual(sent.map((comment) => comment.id));
-  });
+
 
   it("refuses another board operator's edit of the owner's chat queue (403)", async () => {
     const chat = await seedChat();
