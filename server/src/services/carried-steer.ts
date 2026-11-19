@@ -77,7 +77,7 @@ export async function withCarriedSteerDisplay<T extends { id: string; issueId: s
   const liveWakes = await db.select({ key: agentWakeupRequests.idempotencyKey, payload: agentWakeupRequests.payload })
     .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, first.companyId),
       sql`${agentWakeupRequests.payload}->>'issueId' = ${first.issueId}`,
-      sql`${agentWakeupRequests.status} in ('queued', 'deferred_issue_execution', 'claimed', 'deferred')`));
+      sql`${agentWakeupRequests.status} in ('queued', 'deferred_issue_execution', 'deferred')`));
   const heldByLiveWake = new Set<string>();
   for (const wake of liveWakes) {
     const payload = object(wake.payload), context = object(payload._paperclipWakeContext);
