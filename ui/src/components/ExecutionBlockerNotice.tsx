@@ -36,8 +36,10 @@ const blockerAction: Record<string, string> = {
 };
 
 /** One ordinary interruption surface. Technical records remain in diagnostics. */
-export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers }: {
+export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers, heldByPersonStop }: {
   presentation: TaskInterruptionPresentation | null | undefined;
+  /** The chat's stopped bar stands (queueHeldByPersonStop): it is the ONE line. */
+  heldByPersonStop?: boolean;
   companyId?: string;
   blockers?: IssueRelationIssueSummary[];
   canRetry: boolean;
@@ -126,7 +128,9 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
       </div>
     </div>
   );
-  if (optimistic || !presentation || presentation.responsibility !== "system" ||
+  // After a person's own Stop the held bar says what happened and offers Send;
+  // the stopped attempt is not a failure to retry (org 11-19 04:36Z).
+  if (optimistic || !presentation || presentation.responsibility !== "system" || heldByPersonStop ||
       !["failed", "retry_scheduled"].includes(presentation.state)) return null;
   return (
     <div className={cn(presentation.state === "failed" && "pt-4", className)}>

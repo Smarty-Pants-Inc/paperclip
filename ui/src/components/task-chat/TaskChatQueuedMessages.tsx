@@ -48,6 +48,13 @@ import {
 type QueueAction = "steer" | "interrupt" | "discard" | null;
 export const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
 export const CHAT_STOPPED_BY_PERSON_LINE = "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it.";
+/** The stopped bar's own fact: the server's person-Stop reason on the chat's
+ * queue (readPersonStopHold decided it). While it stands, the bar is the ONE
+ * line, so the task's failed-attempt banner and its Retry stay hidden. */
+export function queueHeldByPersonStop(queue: IssueQueuedCommentQueue | null | undefined): boolean {
+  return queue?.executionWait?.reason === CHAT_STOPPED_BY_PERSON_REASON && Boolean(queue.queueId) &&
+    !queue.targetRunId && (queue.entries?.length ?? 0) > 0;
+}
 /** A paused chat agent (the Send route's own 409 code): the bar says the
  * server's paused line and offers no Send. */
 export const CHAT_AGENT_PAUSED_REASON = "queued_comment_chat_paused";

@@ -294,7 +294,9 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
           const runs = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
             .where(eq(heartbeatRuns.companyId, s.f.companyId));
           const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, s.f.companyId));
-          await evidence(`heldbar R1 ${label}`, { get: bar,
+          const page = (await request(s.client).get(`/api/issues/${s.f.issueId}`).expect(200)).body;
+          await evidence(`heldbar R1 ${label}`, { get: bar, interruption: page.interruption ?? null,
+            executionBlocker: page.executionBlocker ?? null,
             providerCalls: fixture.calls.length, runs, wakes: wakes.map(w => ({ status: w.status, wait: (w.payload as any)?.executionWait })) });
           expect([label, bar.executionWait]).toEqual([label, { reason: "stopped_by_person",
             message: "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it." }]);
@@ -371,6 +373,20 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
         wakes: wakes.map(w => ({ status: w.status, wait: (w.payload as any)?.executionWait?.reason })) });
       expect(turns).toEqual([]);
       expect(wakes.some(w => w.status === "deferred_issue_execution")).toBe(true);
+      // heldbar-r2 (B) control: an attempt that ended without the person's
+      // Stop. The real GET bodies 10 s on: the queue has no person-Stop bar,
+      // so the page keeps the task's failed-attempt banner and its Retry.
+      const endedAt = Date.now();
+      vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true });
+      try {
+        vi.setSystemTime(endedAt + 10_000);
+        await s.heartbeat.resumeQueuedRuns();
+        await s.heartbeat.drainActiveRunExecutions();
+        const bar = (await request(s.client).get(`/api/issues/${s.f.issueId}/queued-comments`).expect(200)).body;
+        const page = (await request(s.client).get(`/api/issues/${s.f.issueId}`).expect(200)).body;
+        await evidence("heldbar-r2 control +10s", { get: bar, interruption: page.interruption ?? null });
+        expect(bar.executionWait?.reason).not.toBe("stopped_by_person");
+      } finally { vi.useRealTimers(); }
     } finally { s.done(); }
   }, 120_000);
 });
