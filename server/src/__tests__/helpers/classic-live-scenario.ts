@@ -212,3 +212,77 @@ export async function liveScenario({ db, root }: ClassicLiveContext) {
   return { companyId, agentId, issueId, app, boxes, runs, issue, say, agentComments, servedLine, faultedBox,
     stallReached, releaseStall: () => { release(); fault.stall = null; } };
 }
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * The cut's real chain on one liveScenario, as row "K1 live" walks it (ADDED beside the moved harness; that row keeps
+ * its own inline walk). Every step is the real route or producer:
+ *   turn 0 .. POST /api/issues/:id/comments -> the real queue and executor; its own copy-back saves SAVED
+ *   R ....... the next POST wakes it; the real executor runs it into its teardown copy-back, which hangs (CLASSIC-STALL-1)
+ *   the cut . a third POST parks behind R; the copy-back worker's own load + check ends R at the person-wait cap
+ *   P ....... heartbeat.resumeQueuedRuns starts the parked message in its own root, seeded from R's startup seed
+ * `afterCut` runs after R ended and before P is started (the task is bound to no root then).
+ * The caller owns `finish()` (its finally): it releases the stall and stops the delivery work.
+ */
+export async function driveClassicCut(context: ClassicLiveContext, s: Awaited<ReturnType<typeof liveScenario>>,
+  options: { capMs?: number; afterCut?: (state: { rRootWorkspaceId: string; rRoot: string; rRunId: string }) => Promise<void> } = {}) {
+  const { db } = context;
+  const { heartbeatService } = await import("../../services/heartbeat.js");
+  const { createDeliveryWorkCoordinator } = await import("../../services/delivery-work-coordinator.js");
+  const { nativeWorkspaceFinalizationWork } = await import("../../services/native-runtime/native-workspace-finalization-work.js");
+  const { reconcileNativeFinalizations } = await import("../../services/native-runtime/native-finalization-reconciler.js");
+  const { agentWakeupRequests, executionWorkspaces } = await import("@paperclipai/db");
+  const errors: unknown[] = [];
+  const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: () => ({}) as never });
+  const delivery = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => errors.push(error) });
+  const receipts = heartbeat.registerDeferredReceiptWork(delivery, () => true);
+  const CAP = options.capMs ?? 2_000;
+  const work = nativeWorkspaceFinalizationWork(db, { environmentRuntime: {} as never, copyOutBound: { personWaitCapMs: CAP },
+    onWorkspaceSettled: async () => undefined });
+  const sweep = async (runId: string) => { for (const entry of await work.load({ companyId: s.companyId, runId })) await work.check(entry); };
+  const finish = async () => { s.releaseStall(); receipts.stop?.(); await delivery.stop(); await heartbeat.drainActiveRunExecutions(); };
+  try {
+    await receipts.ready;
+    // REAL turn 0.
+    await s.say("Please write the report.");
+    for (let waited = 0; waited < 60_000; waited += 250) {
+      await heartbeat.resumeQueuedRuns();
+      await reconcileNativeFinalizations(db, (await s.runs()).map(run => run.id), { environmentRuntime: {} as never }).catch(() => undefined);
+      const [first] = await s.runs();
+      if (first && first.status !== "running" && first.status !== "queued") break;
+      await sleep(250);
+    }
+    await heartbeat.drainActiveRunExecutions();
+    const [r0] = await s.runs();
+    expect(r0, "turn 0 never ran").toMatchObject({ status: "succeeded" });
+    const [rRootWorkspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, (await s.issue()).executionWorkspaceId!));
+    const rRoot = rRootWorkspace.cwd!;
+    // REAL: M wakes R, which hangs in its own teardown copy-back.
+    await s.say("Please rewrite the report.");
+    const hung = Promise.race([s.stallReached.then(() => "hung" as const), sleep(60_000).then(() => "R never reached its copy-back" as const)]);
+    for (let waited = 0; waited < 60_000 && !(await Promise.race([hung, sleep(250).then(() => null)])); waited += 250) await heartbeat.resumeQueuedRuns();
+    expect(await hung).toBe("hung");
+    const [, r] = await s.runs();
+    expect(r).toMatchObject({ status: "running", runtimeMode: "native" });
+    // REAL: the person's next message parks behind the live R; the bound's own sweep ends R at the cap.
+    const next = await s.say("Also add a summary section to the report.");
+    const parked = async () => (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, s.agentId)))
+      .filter(wake => wake.status === "deferred_issue_execution" && JSON.stringify(wake.payload).includes(next));
+    await vi.waitFor(async () => expect(await parked()).toHaveLength(1), { timeout: 10_000, interval: 50 });
+    const parkedAt = (await parked())[0].requestedAt.getTime();
+    while ((await s.runs())[1].status === "running" && Date.now() - parkedAt < CAP + 15_000) { await sweep(r.id); await sleep(200); }
+    expect((await s.runs())[1]).toMatchObject({ status: "failed", errorCode: "native_workspace_sync_out_stalled" });
+    expect(await s.issue()).toMatchObject({ executionRunId: null, executionWorkspaceId: null });
+    await options.afterCut?.({ rRootWorkspaceId: rRootWorkspace.id, rRoot, rRunId: r.id });
+    // REAL: P starts once beside R's still-hung executor.
+    const startAt = Date.now();
+    while (Date.now() - startAt < 30_000 && box.inputs.length < 3) { await heartbeat.resumeQueuedRuns(); await sleep(250); }
+    const [, , p] = await s.runs();
+    expect(p, "P never started beside R's still-live executor").toBeTruthy();
+    const pRootWorkspaceId = (await s.issue()).executionWorkspaceId!;
+    const [pRootWorkspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, pRootWorkspaceId));
+    return { heartbeat, sweep, errors, finish, capMs: CAP, r0, r, p: p!, nextMessageId: next,
+      rRootWorkspaceId: rRootWorkspace.id, rRoot, pRootWorkspaceId, pRoot: pRootWorkspace.cwd! };
+  } catch (error) { await finish(); throw error; }
+}
