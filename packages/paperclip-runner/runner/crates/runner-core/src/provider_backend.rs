@@ -7023,10 +7023,14 @@ impl CommandExecutor for CodexCommandExecutor {
             self.save_before_provider_writes(false)?;
             self.restore()?;
             self.maintain_deferred_pi_terminal()?;
+            // Fork: run.prepare from the new run rebinds through
+            // attach_run_with_provider_refresh (the run.attach path, which
+            // clears the wait) or refuses, so it may pass this fence too.
             if self.awaiting_new_run_attach
                 && !matches!(
                     command.command_type.as_str(),
                     "run.attach"
+                        | "run.prepare"
                         | "session.snapshot"
                         | "session.close"
                         | "session.destroy"

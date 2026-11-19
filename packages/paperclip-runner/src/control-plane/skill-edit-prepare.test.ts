@@ -204,7 +204,11 @@ it.each([
     expect(prepared).toMatchObject({ status: "completed" });
     if (blocker) {
       expect(prepared.result?.result).toMatchObject({ status: blocker === "goal" || blocker === "contract" ? "refresh_fresh" : "refresh_wait" });
-      expect(JSON.parse(await readFile(join(next.stateDirectory, "codex-provider-state.json"), "utf8"))).toEqual(before);
+      // Upstream #22267 marks the saved state awaitingRunAttach for a fresh
+      // Runner; nothing else in the predecessor's state may change.
+      const { awaitingRunAttach, ...unchanged } = JSON.parse(await readFile(join(next.stateDirectory, "codex-provider-state.json"), "utf8"));
+      expect(awaitingRunAttach).toBe(true);
+      expect(unchanged).toEqual(before);
       return;
     }
     await next.completed("session.open");
