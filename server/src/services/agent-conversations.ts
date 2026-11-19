@@ -1,4 +1,5 @@
 import { isContextCompactionRun } from "./context-compaction.js";
+import { trySteerConversationComment } from "./conversation-steering.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
@@ -601,6 +602,11 @@ export async function undeliveredConversationComments(
         sql`${issueComments.clientRequestId} is not null`,
         sql`not exists (select 1 from ${agentWakeupRequests} where ${agentWakeupRequests.companyId} = ${companyId}
       and ${agentWakeupRequests.idempotencyKey} = 'conversation-comment:' || ${issueComments.id}::text)`,
+        // A same-turn hand-off owns this input without a wake. This also closes
+        // the POST/outbox crash window and keeps retries from creating a second run.
+        sql`not exists (select 1 from ${heartbeatRuns} steered_run where steered_run.company_id = ${companyId}
+          and (steered_run.native_issue_id = ${issueId}::uuid or steered_run.context_snapshot->>'issueId' = ${issueId})
+          and coalesce(steered_run.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? ${issueComments.id}::text)`, 
       ),
     )
     .orderBy(issueComments.createdAt, issueComments.id)
@@ -725,6 +731,7 @@ export async function deliverConversationComments(
       )) {
         if (!(await canDeliver(tx as unknown as Db)).invokable) return "deferred" as const;
         await resumeConversationForReset(db, comment);
+        if (await trySteerConversationComment(db, comment)) continue;
         try {
           await enqueue(issue.conversationAgentId!, {
             source: "on_demand",

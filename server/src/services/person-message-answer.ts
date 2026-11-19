@@ -49,7 +49,12 @@ const PERSON_MESSAGE_ANSWER_CARD_STATUSES = ["pending", "answered", "accepted", 
  *   With neither provenance nor an arrival record, nothing is history.
  */
 export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
-  return sql`(exists (select 1 from ${issueComments} a
+  return sql`(exists (select 1 from ${heartbeatRuns} streamed
+      where streamed.company_id = ${m.companyId}
+        and (streamed.native_issue_id = ${m.issueId} or streamed.context_snapshot->>'issueId' = ${m.issueId}::text)
+        and coalesce(streamed.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? ${m.id}::text
+        and coalesce(streamed.context_snapshot->'answeredSteeredCommentIds', '[]'::jsonb) ? ${m.id}::text)
+    or exists (select 1 from ${issueComments} a
     join ${heartbeatRuns} r on r.id = a.created_by_run_id and r.company_id = a.company_id
     where a.company_id = ${m.companyId} and a.issue_id = ${m.issueId} and a.author_type = 'agent' and a.deleted_at is null
       and a.created_at > ${m.createdAt}
