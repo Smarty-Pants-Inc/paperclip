@@ -3547,20 +3547,26 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       ? (await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId, now: at })).kind : "not_visited";
     return { discovered, flagged, outcome, cards: await cardsByGet(f) };
   }
-  async function loseHeldByTreePause(f: { companyId: string; issueId: string }) {
+  // RETARGETED SETUP (adopt-fold2 D; RFL ruling D2: a tree PAUSE now KEEPS a person's parked message, so it
+  // no longer loses A). A is lost by the REAL subtree CANCEL + restore instead, as the fold did for R1. As R1,
+  // R5 runs on the task page only: an Agent Chat has no path that cancels its held wake (a subtree cancel of a
+  // chat root is refused, issue-tree-control.ts "Stop the active reply instead of cancelling the persistent
+  // conversation"; a chat under a cancelled root is refused too, issues.ts "Conversation identity is fixed"),
+  // and the tree Pause keeps it (D2). The assertions below are unchanged.
+  async function loseHeldBySubtreeCancel(f: { companyId: string; issueId: string }) {
     const client = treeApp(f.companyId, "queue-owner");
-    const paused = await request(client).post(`/api/issues/${f.issueId}/tree-holds`).send({ mode: "pause", reason: "lossguard R5" });
-    expect(paused.status, JSON.stringify(paused.body)).toBeLessThan(300);
-    const released = await request(client).post(`/api/issues/${f.issueId}/tree-holds/${paused.body.hold.id}/release`).send({ reason: "lossguard R5 release" });
-    expect(released.status, JSON.stringify(released.body)).toBeLessThan(300);
+    const cancelled = await request(client).post(`/api/issues/${f.issueId}/tree-holds`).send({ mode: "cancel", reason: "lossguard R5" });
+    expect(cancelled.status, JSON.stringify(cancelled.body)).toBeLessThan(300);
+    const restored = await request(client).post(`/api/issues/${f.issueId}/tree-holds`).send({ mode: "restore", reason: "lossguard R5 restore" });
+    expect(restored.status, JSON.stringify(restored.body)).toBeLessThan(300);
   }
   const createdAt = async (id: string) => (await db.select().from(issueComments).where(eq(issueComments.id, id)))[0]!.createdAt.getTime();
 
-  it.each(["chat", "task"] as const)("lossguard R5 %s: A's card shows, the person's own DELETE of A: at the next sweep A's card is retired (seconds); B's card on the same issue is untouched", async (surface) => {
+  it.each(["task"] as const)("lossguard R5 %s: A's card shows, the person's own DELETE of A: at the next sweep A's card is retired (seconds); B's card on the same issue is untouched", async (surface) => {
     const f = await seedStoppableTurn(surface);
     const a = await postMessage(f, "Reply exactly A");
     await stopByRoute(f, "queue-owner");
-    await loseHeldByTreePause(f);
+    await loseHeldBySubtreeCancel(f);
     const tA = await createdAt(a);
     const shown: any[] = [];
     for (const s of [119, 121]) shown.push({ s, ...await sweepSeconds(f, new Date(tA + s * 1000)) });
@@ -3568,7 +3574,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     const cardA = shown[1].cards[0].id as string;
     // Control: B, a second message on the same issue, lost the same way, gets its own card.
     const b = await postMessage(f, "Reply exactly B");
-    await loseHeldByTreePause(f);
+    await loseHeldBySubtreeCancel(f);
     const tB = await createdAt(b);
     // B's wake became a run that the Pause cancelled: B's card comes by its own (ended-run) path, by +360 s.
     const bSamples: ({ s: number } & Awaited<ReturnType<typeof sweepSeconds>>)[] = [];
