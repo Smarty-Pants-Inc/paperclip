@@ -21,6 +21,12 @@ type Step = "first-flush" | "second-flush" | "close";
 type Fault = "EIO" | "ECONNRESET";
 const SECRET = "private-run-log-content";
 
+async function readBody(body: AsyncIterable<Uint8Array>) {
+  const chunks: Buffer[] = [];
+  for await (const bytes of body) chunks.push(Buffer.from(bytes));
+  return Buffer.concat(chunks);
+}
+
 function memory() {
   const objects = new Map<string, Buffer>();
   const etag = (b: Buffer) => createHash("sha256").update(b).digest("hex");
@@ -33,7 +39,7 @@ function memory() {
     id: "s3",
     async putObject() { throw Error("unconditional"); },
     async putObjectConditional(i: Put) {
-      const body = Buffer.isBuffer(i.body) ? i.body : Buffer.concat(await Array.fromAsync(i.body as AsyncIterable<Buffer>));
+      const body = Buffer.isBuffer(i.body) ? i.body : await readBody(i.body);
       const isHead = i.objectKey.endsWith("/head.json");
       if (!isHead && injection.gate && !injection.entered) { injection.entered = true; await injection.gate; }
       const closing = isHead && JSON.parse(body.toString()).closed === true;
