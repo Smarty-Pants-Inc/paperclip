@@ -10,7 +10,7 @@ import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { attachSandboxCreation, environmentService } from "../services/environments.js";
 import { createOwnedSandbox, recoverSandboxCreations } from "../services/sandbox-creation-operations.js";
-import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
+import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, environmentAcquireErrorData } from "@paperclipai/plugin-sdk";
 import { getEnvironmentAcquisitionDiagnostic } from "../services/environment-acquisition-diagnostics.js";
 import { readTransientLeaseAcquisitionFailure } from "../services/environment-provider-unavailable-error.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -362,6 +362,38 @@ describe("a run retry and its predecessor's pending sandbox creation", () => {
     expect(lease).toMatchObject({ providerLeaseId: "box-2", status: "active" });
     expect(running()).toEqual(["box-2"]);
     expect([...stopped]).toEqual(["box-1"]);
+  });
+
+  // review-fleet-4 F1 (money): a timeout errno beats a client status. A create
+  // that failed with a timeout-shaped 4xx (HTTP 422 + the closed transient
+  // ETIMEDOUT) may have made the box, so it is CARRIED: the retry re-sends the
+  // same key and runs on that one box. A plain 422 is still a firm refusal.
+  const acquireRpcError = (fields: { status: number; code?: string }) => new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+    message: `Boat create failed (HTTP ${fields.status})`, data: environmentAcquireErrorData(Object.assign(new Error("Boat create failed"), fields)) });
+  it.each([
+    ["a 422 + ETIMEDOUT across the worker RPC", () => acquireRpcError({ status: 422, code: "ETIMEDOUT" })],
+    ["an in-process 422 + ETIMEDOUT", () => boatError(422, "ETIMEDOUT")],
+    ["a 408 across the worker RPC", () => acquireRpcError({ status: 408 })],
+  ] as const)("F1-TIMEOUT-ERRNO-CARRIED: %s after the box was made is CARRIED: ONE key, ONE running box", async (_name, error) => {
+    const { retry } = await failedThenRetry({ after: error });
+    expect((await db.select().from(sandboxCreationOperations))[0]).toMatchObject({ id: keys[0], state: "pending" });
+    const { lease } = await acquire(retry);
+    expect(keys).toHaveLength(2);
+    expect(new Set(keys).size).toBe(1);
+    expect(boxes.size).toBe(1);
+    expect(running()).toEqual(["box-1"]);
+    expect(lease).toMatchObject({ providerLeaseId: "box-1", status: "active" });
+  });
+
+  it("F1-TIMEOUT-ERRNO-CARRIED: GUARD a plain 422 across the worker RPC is still SPENT; the retry uses a FRESH key", async () => {
+    const { retry } = await failedThenRetry({ before: () => acquireRpcError({ status: 422 }) });
+    expect((await db.select().from(sandboxCreationOperations))[0]).toMatchObject({ id: keys[0], state: "resolved", leaseId: null,
+      metadata: { creationReconciliationReason: "provider_refused_create" } });
+    const { lease } = await acquire(retry);
+    expect(keys).toHaveLength(2);
+    expect(new Set(keys).size).toBe(2);
+    expect(boxes.size).toBe(1);
+    expect(lease.providerLeaseId).toBe("box-1");
   });
 
   it("R4: an ordinary first create is unchanged", async () => {
