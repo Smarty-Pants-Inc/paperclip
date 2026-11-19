@@ -1,6 +1,6 @@
 {
   "name": "@paperclipai/plugin-boat",
-  "version": "0.1.17-spare.9",
+  "version": "0.1.17-spare.10",
   "description": "Boat sandbox provider plugin for Paperclip environments",
   "license": "MIT",
   "type": "module",
