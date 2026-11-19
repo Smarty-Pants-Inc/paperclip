@@ -8,6 +8,8 @@ import { warmSandboxExpiryCandidateCondition } from "../warm-sandbox-expiry.js";
 import { logger } from "../../middleware/logger.js";
 import { readEnvironmentLeaseController } from "../environment-lease-controller.js";
 import { currentControllerBootId } from "../controller-process-identity.js";
+import { REPLACE_BEFORE_REUSE_KEY, REPLACE_BEFORE_REUSE_SCHEMA, readReplaceBeforeReuseMarker,
+  type ReplaceBeforeReuseMarker } from "./predecessor-retirement.js";
 
 /** Lease policies whose box a warm Stop can hand off (native-failed-workspace-recovery). */
 const reusableNativeLeasePolicies = ["reuse_by_environment", "reuse_by_execution_workspace"];
@@ -60,6 +62,71 @@ export const HANDED_OFF_WARM_UNPROVEN_SINCE_KEY = "handedOffWarmUnprovenSince";
  * proven -> the stop-only owner's stop_and_retain intent. */
 export const handedOffWarmUnprovenBound = { ms: 30_000 };
 type Redispatch = () => Promise<unknown>;
+/** adopt-hung-stop (org criterion (b)): the SECOND bound. After the stop-and-retain
+ * intent for a handed-off warm box is written, its provider receipt normally
+ * admits the successor. If no receipt has come this long after the intent
+ * (Boat hung), the successor no longer waits for it: the old lease gets the
+ * existing replace-before-reuse marker (never resumed again) and stays
+ * pending_cleanup (stop debt, the cleanup sweep keeps retrying the stop), and
+ * the held message starts on a fresh box from the saved workspace. */
+export const handedOffWarmStopReceiptBound = { ms: 60_000 };
+/** Lease metadata: the stop receipt was overdue past handedOffWarmStopReceiptBound ({ runId, intentAt, overdueAt, boundMs }). */
+export const HANDED_OFF_WARM_STOP_OVERDUE_KEY = "handedOffWarmStopReceiptOverdue";
+const handedOffStopMarkers = [HANDED_OFF_WARM_STOP_KEY, HANDED_OFF_WARM_UNAVAILABLE_STOP_KEY, HANDED_OFF_WARM_UNPROVEN_STOP_KEY];
+/** One receipt deadline per lease (process-local, one-shot); the durable intent time (releasedAt) re-arms it after a restart. */
+const receiptDeadlines = new Map<string, NodeJS.Timeout>();
+/** The latest caller's redispatch per run, for timers armed inside requestHandedOffWarmLeaseStop. */
+const latestRedispatch = new Map<string, Redispatch>();
+
+/** A handed-off warm box whose stop-and-retain intent (one of this module's markers) is still unanswered. */
+function handedOffStopPending(run: Pick<Run, "id">, lease: typeof environmentLeases.$inferSelect): boolean {
+  const intent = lease.metadata?.sandboxStopAndRetain as Record<string, unknown> | undefined;
+  return lease.status === "pending_cleanup" && intent?.runId === run.id && handedOffStopMarkers.some(key => intent[key] === true);
+}
+
+/** adopt-hung-stop: DB-only. The handed-off box's stop receipt is overdue and the box is
+ * marked replace-before-reuse, so admission no longer waits for its receipt. */
+export function handedOffWarmStopReceiptOverdue(run: Pick<Run, "id">, lease: typeof environmentLeases.$inferSelect): boolean {
+  const overdue = lease.metadata?.[HANDED_OFF_WARM_STOP_OVERDUE_KEY] as { runId?: unknown } | undefined;
+  return handedOffStopPending(run, lease) && overdue?.runId === run.id && readReplaceBeforeReuseMarker(lease.metadata) !== null;
+}
+
+/** Past the bound with no receipt: mark the lease (guarded: still pending_cleanup with its intent). True when marked now. */
+async function markHandedOffStopOverdue(db: Db, run: Run, lease: typeof environmentLeases.$inferSelect): Promise<boolean> {
+  const now = new Date();
+  const marker: ReplaceBeforeReuseMarker = { schema: REPLACE_BEFORE_REUSE_SCHEMA, runId: run.id, predecessorRunId: run.id,
+    recordedAt: now.toISOString() };
+  const updated = await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
+    [HANDED_OFF_WARM_STOP_OVERDUE_KEY]: { runId: run.id, intentAt: lease.releasedAt?.toISOString() ?? null, overdueAt: now.toISOString(),
+      boundMs: handedOffWarmStopReceiptBound.ms }, [REPLACE_BEFORE_REUSE_KEY]: marker })}::jsonb`, updatedAt: now })
+    .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, run.companyId),
+      eq(environmentLeases.status, "pending_cleanup"), sql`${environmentLeases.metadata} ? 'sandboxStopAndRetain'`))
+    .returning({ id: environmentLeases.id });
+  if (updated.length) logger.warn({ runId: run.id, leaseId: lease.id, providerLeaseId: lease.providerLeaseId,
+    boundMs: handedOffWarmStopReceiptBound.ms }, "handed-off warm stop receipt overdue; the successor starts on a fresh box, the old box stays owed a stop");
+  return updated.length > 0;
+}
+
+/** Arm ONE deadline at intent + bound for an unanswered handed-off stop; past it, mark now. True when marked now. */
+async function armHandedOffStopReceiptDeadline(db: Db, run: Run, lease: typeof environmentLeases.$inferSelect): Promise<boolean> {
+  if (!handedOffStopPending(run, lease) || handedOffWarmStopReceiptOverdue(run, lease)) return false;
+  const intentAt = lease.releasedAt?.getTime() ?? Date.now();
+  const remaining = intentAt + handedOffWarmStopReceiptBound.ms - Date.now();
+  if (remaining <= 0) return markHandedOffStopOverdue(db, run, lease);
+  if (receiptDeadlines.has(lease.id)) return false;
+  const timer = setTimeout(() => {
+    receiptDeadlines.delete(lease.id);
+    void (async () => {
+      const [current] = await db.select().from(environmentLeases).where(and(eq(environmentLeases.id, lease.id),
+        eq(environmentLeases.companyId, run.companyId))).limit(1);
+      if (!current || !handedOffStopPending(run, current)) return; // the receipt came: today's receipt path admits
+      if (await markHandedOffStopOverdue(db, run, current)) await latestRedispatch.get(run.id)?.();
+    })().catch(err => logger.warn({ err, runId: run.id, leaseId: lease.id }, "handed-off warm stop receipt deadline failed"));
+  }, Math.max(0, remaining) + 50);
+  timer.unref?.();
+  receiptDeadlines.set(lease.id, timer);
+  return false;
+}
 /** At most one scheduled re-proof per run (process-local, one-shot). */
 const unprovenRechecks = new Map<string, { timer: NodeJS.Timeout; redispatch?: Redispatch }>();
 type ProofOutcome = "none" | "proven" | "unproven" | "timed_out" | "stop_requested";
@@ -76,13 +143,17 @@ export function handedOffWarmProofInFlight(runId: string): boolean { return proo
  * (no warm session for the run in this process, e.g. after a server restart) ->
  * the same stop_and_retain intent AT ONCE, never a wait for warm expiry. */
 export function proveHandedOffWarmLeases(db: Db, run: Run, opts?: { redispatch?: Redispatch }): Promise<ProofOutcome> {
+  if (opts?.redispatch) latestRedispatch.set(run.id, opts.redispatch);
   const scheduled = unprovenRechecks.get(run.id);
   if (scheduled && opts?.redispatch) scheduled.redispatch = opts.redispatch;
   const running = proofsInFlight.get(run.id);
   if (running) return running;
   const work = (async (): Promise<ProofOutcome> => {
-    const leases = (await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
-      eq(environmentLeases.heartbeatRunId, run.id)))).filter(lease => handedOffWarmLease(run, lease) && !handedOffWarmLeaseSettled(run, lease));
+    const all = await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
+      eq(environmentLeases.heartbeatRunId, run.id)));
+    // adopt-hung-stop: a handed-off stop already requested gets its receipt deadline (re-armed from the durable intent time).
+    for (const lease of all) await armHandedOffStopReceiptDeadline(db, run, lease);
+    const leases = all.filter(lease => handedOffWarmLease(run, lease) && !handedOffWarmLeaseSettled(run, lease));
     if (!leases.length) return "none";
     assertNoOpenTransaction("runner:handedOffWarmOwnerRunnerExited");
     const { handedOffWarmOwnerRunnerExited, handedOffWarmOwnerProofUnavailable } = await import("./native-session-executor.js");
@@ -214,6 +285,7 @@ async function requestHandedOffWarmLeaseStop(db: Db, run: Run, lease: typeof env
     warmSandboxExpiryCandidateCondition())).limit(1);
   const requested = candidate && handedOffWarmLease(run, candidate)
     ? await prepareSupersededWarmSandboxStop(db, candidate, marker) : null;
+  if (requested) await armHandedOffStopReceiptDeadline(db, run, requested as typeof environmentLeases.$inferSelect);
   // rf-4 row 21 (the kind): a refusal is never silent.
   if (!requested) logger.warn({ runId: run.id, leaseId: lease.id, providerLeaseId: lease.providerLeaseId,
     candidate: Boolean(candidate), timeoutMs: handedOffWarmProofTimeout.ms },
