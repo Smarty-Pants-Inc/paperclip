@@ -110,4 +110,53 @@ describe.skipIf(!support.supported)("the extracted claim predecessor decision", 
     console.log(`equivalence: ${cases} cases`, decisions);
     expect(Object.keys(decisions).sort()).toEqual(["predecessor_cleanup_pending", "predecessor_still_executing", "starts"]);
   }, 300_000);
+
+  // ONE release reader, two producers (d2 compose, addition 7). The REAL-ROUTE rows of the first check of the claim
+  // (heartbeat/queue.ts, the in-process settling owner) are the live K1 rows of native-classic-bound.test.ts: a real
+  // P is claimed while the real R's executor still hangs in its copy-back. The rows here are the second check
+  // (queuedRunPredecessorHold), which no real route reaches today (the cut clears the task's execution owner).
+  // PLANTED (named): every predecessor run row below, its marker, its pending-cleanup lease, and "live".
+  it("an ended predecessor the copy-back bound released holds the next run by its cleanup only, never by its live executor; a second producer drops in", async () => {
+    const companyId = randomUUID(), agentId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Release reader", issuePrefix: `R${companyId.slice(0, 7)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "reader", adapterType: "paperclip_runner" });
+    const [issue] = await db.insert(issues).values({ companyId, title: "T", status: "in_progress", assigneeAgentId: agentId }).returning();
+    const plant = async (input: { status: string; errorCode?: string; marker?: boolean; pending?: boolean }) => {
+      const id = randomUUID();
+      await db.insert(heartbeatRuns).values({ id, companyId, agentId, issueId: issue.id, status: input.status, errorCode: input.errorCode ?? null,
+        finishedAt: input.status === "running" ? null : new Date(), contextSnapshot: { issueId: issue.id },
+        // The marker as native-run-finalizer.ts writes it for a classic sync run (isolateClassicSourceWorkspace).
+        resultJson: input.marker ? { workspaceSyncOutStall: { workspace: { kind: "classic_isolated", sourceRunId: id } } } : null });
+      if (input.pending) await db.insert(environmentLeases).values({ companyId, heartbeatRunId: id, provider: "boat",
+        providerLeaseId: `sbx-${id}`, status: "pending_cleanup", cleanupStatus: "failed", releasedAt: new Date() });
+      return id;
+    };
+    const self = randomUUID();
+    const decide = (executionRunId: string, extra: Record<string, unknown> = {}) => queuedRunPredecessorHold(db, {
+      run: { id: self, companyId, agentId, retryOfRunId: null, scheduledRetryReason: null }, issueId: issue.id, ownsIssue: true,
+      executionRunId, isTerminal: isHeartbeatRunTerminalStatus, isLive: () => true, ...extra } as Parameters<typeof queuedRunPredecessorHold>[1]);
+    // Producer 1, the copy-back bound: the hung executor of the ended run does not hold the next run.
+    const bound = await plant({ status: "failed", errorCode: "native_workspace_sync_out_stalled", marker: true });
+    expect(await decide(bound)).toBeNull();
+    // ...but its unsettled cleanup still does (K6 is settled elsewhere; this reader never waives it).
+    const boundPending = await plant({ status: "failed", errorCode: "native_workspace_sync_out_stalled", marker: true, pending: true });
+    expect(await decide(boundPending)).toEqual({ reason: "predecessor_cleanup_pending", predecessorRunId: boundPending });
+    // CONTROL: the same live ended run without the marker still holds; so does a marked run that has NOT ended.
+    const plain = await plant({ status: "failed", errorCode: "native_workspace_sync_out_retry_exhausted" });
+    expect(await decide(plain)).toEqual({ reason: "predecessor_still_executing", predecessorRunId: plain });
+    const running = await plant({ status: "running", marker: true });
+    expect(await decide(running)).toEqual({ reason: "predecessor_still_executing", predecessorRunId: running });
+    // Producer 2 drops in (the shape of paperclip-lead's Pause certificate: an exact in-process fact over a run
+    // cancelled agent_paused; its teardown continues on a box the next input never reuses, so cleanup is released too).
+    const paused = await plant({ status: "cancelled", errorCode: "agent_paused", pending: true });
+    const certificate = new Set([paused]);
+    const pauseCertificate = { name: "pause_certificate", cleanup: "released" as const,
+      released: (previous: { id: string; status: string | null; errorCode: string | null }) =>
+        previous.status === "cancelled" && previous.errorCode === "agent_paused" && certificate.has(previous.id) };
+    expect(await decide(paused)).toEqual({ reason: "predecessor_still_executing", predecessorRunId: paused });
+    expect(await decide(paused, { releaseProducers: [pauseCertificate] })).toBeNull();
+    // The certificate is exact: another cancelled run, or the same run with another code, is still held.
+    const otherPaused = await plant({ status: "cancelled", errorCode: "agent_paused", pending: true });
+    expect(await decide(otherPaused, { releaseProducers: [pauseCertificate] })).toEqual({ reason: "predecessor_still_executing", predecessorRunId: otherPaused });
+  }, 120_000);
 });
