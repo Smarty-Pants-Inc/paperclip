@@ -177,11 +177,13 @@ describe("native failed-turn continuation", () => {
     } }).where(eq(heartbeatRuns.id, source.id));
     const [later] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "board-user",
       body: "A later queued message keeps its own delivery.", createdAt: new Date(Date.now() + 1) }).returning();
-    await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", triggerDetail: "manual",
-      reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user",
+    // The first projection below is the no-live-custody snapshot. Re-open
+    // this captured mixed wake only afterward, for the dispatcher/split proof.
+    const [restoreWake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", triggerDetail: "manual",
+      reason: "issue_commented", status: "cancelled", finishedAt: new Date(), requestedByActorType: "user",
       requestedByActorId: "board-user", idempotencyKey: `conversation-comment:${message.id}`,
       payload: { issueId, commentId: later.id, _paperclipWakeContext: { issueId, commentId: later.id,
-        wakeCommentId: later.id, wakeCommentIds: [message.id, later.id], source: "issue.comment" } } });
+        wakeCommentId: later.id, wakeCommentIds: [message.id, later.id], source: "issue.comment" } } }).returning();
     // Occupy only the agent's capacity, on no issue. This admission/projection
     // regression must not race unrelated provider provisioning or impersonate a
     // Pi read; the separate full-server SIGKILL row owns that qualification.
@@ -191,6 +193,8 @@ describe("native failed-turn continuation", () => {
       expect((await issueService(db).listComments(issueId)).find(comment => comment.id === message.id)).toMatchObject({
         steeringStatus: null, deliveryOutcome: "ordinary", steeringUnavailableReason: "run_ended_before_read",
       });
+      await db.update(agentWakeupRequests).set({ status: "deferred_issue_execution", finishedAt: null })
+        .where(eq(agentWakeupRequests.id, restoreWake.id));
       await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
       const successors = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
         .filter(run => run.id !== source.id && run.contextSnapshot?.issueId === issueId);
@@ -231,7 +235,7 @@ describe("native failed-turn continuation", () => {
   // messages saved by builds that kept no read seq ('accepted') or no steering fields, and that
   // the run ANSWERED, read days later through the comment GET. Synthetic rows shaped like the
   // capture (no capture data). Unanswered ones keep 'run_ended_before_read' (guard).
-  it.each(["accepted-answered", "absent-answered", "accepted-unanswered"] as const)(
+  it.each(["accepted-answered", "absent-answered", "accepted-unanswered", "absent-unanswered"] as const)(
     "an old steer from a pre-A2r3 build is not newly run_ended_before_read when its run answered it (%s)",
     async (shape) => {
       const issueId = randomUUID();
@@ -246,16 +250,19 @@ describe("native failed-turn continuation", () => {
       await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "succeeded", runtimeMode: "native",
         invocationSource: "on_demand", createdAt: at(0), finishedAt: at(156),
         contextSnapshot: { issueId, commentId: wake.id, wakeCommentId: wake.id, wakeCommentIds: [wake.id, steer.id],
-          ...(shape === "absent-answered" ? {} : { steeredCommentIds: [steer.id] }),
+          ...(shape.startsWith("absent-") ? {} : { steeredCommentIds: [steer.id] }),
           ...(shape === "accepted-answered" ? { answeredSteeredCommentIds: [steer.id] } : {}) },
         resultJson: { queuedSteeringAcknowledgements: { [steer.id]: { status: "acknowledged", queueId: null,
           turnId: "old-build-turn", acknowledgedAt: at(135).toISOString() } } } });
-      if (shape !== "accepted-unanswered") {
+      if (!shape.endsWith("unanswered")) {
         await db.insert(issueComments).values({ companyId, issueId, authorType: "agent", authorAgentId: agentId,
           createdByRunId: runId, body: "Done, and the tests pass.", createdAt: at(149) });
       }
       const shown = (await issueService(db).listComments(issueId)).find(comment => comment.id === steer.id);
-      if (shape === "accepted-unanswered") {
+      console.info("OLD_CAPTION_ROW", JSON.stringify({ shape, issueId, endedRunId: runId,
+        commentId: steer.id, steeringStatus: shown?.steeringStatus, deliveryOutcome: shown?.deliveryOutcome,
+        steeringUnavailableReason: shown?.steeringUnavailableReason, carriedIntoRunId: shown?.carriedIntoRunId }));
+      if (shape.endsWith("unanswered")) {
         expect(shown).toMatchObject({ steeringStatus: null, steeringUnavailableReason: "run_ended_before_read" });
         return;
       }
