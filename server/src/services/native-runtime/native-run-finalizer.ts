@@ -1035,6 +1035,14 @@ export const NATIVE_WITHHELD_REPLY_FAILURE_CODES = [
 /** The settled file line of a reply whose copy-back succeeded: no line. */
 export const REPLY_FILE_LINE_SAVED = { state: "saved", deadlineAt: null } as const;
 
+/** K12: the statuses a run ends with. A row that holds one of them with its
+ * end time set is over; no later write changes its status, error, failure code
+ * or end time. The ONE definition, used by every write that could. */
+export const NATIVE_RUN_ENDED_STATUSES = ["failed", "timed_out", "interrupted", "succeeded", "cancelled"] as const;
+export function nativeRunAlreadyEndedSql() {
+  return sql`(${heartbeatRuns.finishedAt} is not null and ${heartbeatRuns.status} in ('failed', 'timed_out', 'interrupted', 'succeeded', 'cancelled'))`;
+}
+
 /** An existing selected answer, including a subsequently deleted one, must
  * never be replaced or resurrected. The ONE never-twice guard shared by the
  * committed reply path and the withheld-reply path (native-withheld-reply.ts). */
@@ -2152,7 +2160,7 @@ async function finalizeNativeRunAndProject(input: {
         ...(providerFailure ? { nativeProviderFailure: providerFailure.diagnostic } : {}),
         ...(turnFailure ? { nativeTurnFailure: turnFailure } : {}),
         finalizationPhase,
-        ...(finalizationPhase === "committed" ? { failureCode: null, originalFailureCode: null, nextAttemptAt: null } : {}),
+        ...(finalizationPhase === "committed" ? { nextAttemptAt: null } : {}),
         assessmentId: assessmentRow.id,
         decisionId: committed.decision.id,
         authoritativeDecision: decision.toStatus,
@@ -2190,7 +2198,13 @@ async function finalizeNativeRunAndProject(input: {
       // run. Preserve that terminal outcome while retaining the accepted result
       // and finalization receipts. Evaluate against the locked current row,
       // including a cancellation that won after this finalizer read the run.
-      const projectedRunStatus = sql`case when ${heartbeatRuns.status} = 'cancelled'
+      // K12 (RFL 11-19): a run that already ended is never rewritten, by any
+      // path. A late save (the retained-workspace recovery, the startup
+      // reconciler, Retry export, a late copy-back) may commit this run's
+      // accepted result and save its files; the run keeps the status, error,
+      // failure code and end time it ended with. Evaluated on the locked row.
+      const runAlreadyEnded = nativeRunAlreadyEndedSql();
+      const projectedRunStatus = sql`case when ${heartbeatRuns.status} = 'cancelled' or ${runAlreadyEnded}
         then ${heartbeatRuns.status} else ${projectedStatus} end`;
       // Decision (i): a run cancelled after its result was accepted keeps
       // `cancelled`, which the committed reply path refuses. Its saved answer
@@ -2206,8 +2220,11 @@ async function finalizeNativeRunAndProject(input: {
       // The file line of an already published reply is a bounded state
       // (reply-file-line.ts). A commit is the copy-back succeeding: whatever the
       // line said (saving, kept, lost), the files are saved now and it clears.
+      // K15a/K15b: on a run that had already ended, a line that reads LOST is
+      // never taken back; KEPT (or saving) moves to saved, once.
       const savedReplyFileLine = finalizationPhase === "committed"
         ? sql`case when jsonb_typeof(${heartbeatRuns.resultJson} #> '{presentationDecision,fileLine}') = 'object'
+          and not (${runAlreadyEnded} and ${heartbeatRuns.resultJson} #>> '{presentationDecision,fileLine,state}' = 'lost')
           then jsonb_build_object('presentationDecision', (${heartbeatRuns.resultJson} -> 'presentationDecision')
             || ${JSON.stringify({ fileLine: REPLY_FILE_LINE_SAVED })}::jsonb) else '{}'::jsonb end`
         : sql`'{}'::jsonb`;
@@ -2215,7 +2232,9 @@ async function finalizeNativeRunAndProject(input: {
         || ${JSON.stringify(finalizationMetadata)}::jsonb
         || ${cancelledWithheldReply}
         || ${savedReplyFileLine}
-        || ${clearExecutionFailure ? sql`case when ${heartbeatRuns.status} = 'cancelled' then '{}'::jsonb
+        || ${finalizationPhase === "committed" ? sql`case when ${runAlreadyEnded} then '{}'::jsonb
+          else '{"failureCode":null,"originalFailureCode":null}'::jsonb end` : sql`'{}'::jsonb`}
+        || ${clearExecutionFailure ? sql`case when ${heartbeatRuns.status} = 'cancelled' or ${runAlreadyEnded} then '{}'::jsonb
           else ${recoveredExecutionFailureMetadata()} end` : sql`'{}'::jsonb`}`;
       const nextError = providerFailure ? sql`coalesce(${heartbeatRuns.error}, ${providerFailure.errorMessage})`
         : clearExecutionFailure ? sql`null` : sql`${heartbeatRuns.error}`;
@@ -2228,10 +2247,15 @@ async function finalizeNativeRunAndProject(input: {
       const explained = projectsFailedStatus
         ? explainFailedRun(explainNativeTurnFailure(turnFailure) ?? NATIVE_RUN_FAILED_UNEXPLAINED, { error: nextError, errorCode: nextErrorCode })
         : null;
-      const projectedError = explained?.error ?? sql`case when ${heartbeatRuns.status} = 'cancelled' then ${heartbeatRuns.error}
-        else ${nextError} end`;
-      const projectedErrorCode = explained?.errorCode ?? sql`case when ${heartbeatRuns.status} = 'cancelled' then ${heartbeatRuns.errorCode}
-        else ${nextErrorCode} end`;
+      const keepsRunOutcome = sql`${heartbeatRuns.status} = 'cancelled' or ${runAlreadyEnded}`;
+      // A failed run with no recorded cause is still explained (a blank is filled, nothing is replaced).
+      const keepsExplainedOutcome = sql`${runAlreadyEnded} and ${heartbeatRuns.status} <> 'failed'`;
+      const projectedError = explained
+        ? sql`case when ${keepsExplainedOutcome} then ${heartbeatRuns.error} else ${explained.error} end`
+        : sql`case when ${keepsRunOutcome} then ${heartbeatRuns.error} else ${nextError} end`;
+      const projectedErrorCode = explained
+        ? sql`case when ${keepsExplainedOutcome} then ${heartbeatRuns.errorCode} else ${explained.errorCode} end`
+        : sql`case when ${keepsRunOutcome} then ${heartbeatRuns.errorCode} else ${nextErrorCode} end`;
       const projectionChanged = or(
         sql`${heartbeatRuns.nativePhase} is distinct from ${finalizationPhase}`,
         sql`${heartbeatRuns.resultJson} is distinct from ${projectedResult}`,
@@ -2250,7 +2274,7 @@ async function finalizeNativeRunAndProject(input: {
           ...(input.projectRunStatus
             ? {
                 status: projectedRunStatus,
-                finishedAt: sql`case when ${heartbeatRuns.status} = 'cancelled' then ${heartbeatRuns.finishedAt}
+                finishedAt: sql`case when ${heartbeatRuns.status} = 'cancelled' or ${runAlreadyEnded} then ${heartbeatRuns.finishedAt}
                   when ${heartbeatRuns.status} is distinct from ${projectedStatus} then ${now.toISOString()}::timestamptz else coalesce(${heartbeatRuns.finishedAt}, ${now.toISOString()}::timestamptz) end`,
               }
             : {}),
