@@ -63,9 +63,17 @@ it.each(["active-turn", "descendants", "goal"] as const)("surfaces %s refresh ad
     expect(runnerPrepareRefusalCode(error)).toBe(prepareRefusalCode);
     const controller = JSON.parse(await readFile(join(root, "next/control-plane/control-plane-state.json"), "utf8"));
     expect(controller.commands.some((command: { type: string }) => command.type === "session.open")).toBe(false);
-    expect(await readFile(nextState, "utf8")).toBe(before);
+    // Upstream #22267: a fresh Runner over a saved Codex session marks it
+    // awaitingRunAttach before durable state exists. That mark is upstream's
+    // design; nothing else in the predecessor's state may be rewritten.
+    const unchangedApartFromAttachWait = async () => {
+      const { awaitingRunAttach, ...rest } = JSON.parse(await readFile(nextState, "utf8"));
+      expect(awaitingRunAttach).toBe(true);
+      expect(rest).toEqual(JSON.parse(before));
+    };
+    await unchangedApartFromAttachWait();
     await next.transport.close();
-    expect(await readFile(nextState, "utf8")).toBe(before);
+    await unchangedApartFromAttachWait();
   } finally {
     await next?.transport.close();
     await first.transport.close();
