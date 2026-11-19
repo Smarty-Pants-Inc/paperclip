@@ -1,5 +1,4 @@
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
-import { readPersonStopHold } from "../acknowledged-native-stop.js";
 import { turnAuthorityRevocation } from "../native-runtime/turn-authority-revocation.js";
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
