@@ -53,6 +53,7 @@ import {
   companies,
   documentAnnotationComments,
   documentAnnotationThreads,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueAttachments,
   issueComments,
@@ -2349,6 +2350,49 @@ export async function readHeartbeatWakeComments(db: Db, companyId: string, issue
     );
 }
 
+const MAX_INTERRUPTED_TURN_TOOLS = 32;
+const MAX_INTERRUPTED_TURN_TOOL_OUTPUT_CHARS = 600;
+
+/** The immediate predecessor run on this task, when the person's Interrupt cut it, and the tool
+ * calls its cut turn completed (durable receipts, in order). A STOP, a failure or any other end: none. */
+export async function readInterruptCutCompletedTools(db: Db, input: { companyId: string; issueId: string; currentRunId: string }) {
+  const [current] = await db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.currentRunId)));
+  if (!current) return [];
+  const [previous] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
+    resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId),
+    sql`(${heartbeatRuns.nativeIssueId} = ${input.issueId}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId})`,
+    sql`${heartbeatRuns.id} <> ${input.currentRunId}`,
+    sql`${heartbeatRuns.createdAt} <= ${current.createdAt.toISOString()}::timestamptz`,
+  )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+  const result = parseObject(previous?.resultJson);
+  if (!previous || previous.status !== "cancelled" || result.operatorInterrupted !== true ||
+      result.interruptionSource !== "issue_comment_interrupt") return [];
+  const events = await db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.companyId, input.companyId), eq(heartbeatRunEvents.runId, previous.id),
+    eq(heartbeatRunEvents.eventType, "tool.execution.completed"),
+  )).orderBy(asc(heartbeatRunEvents.seq)).limit(MAX_INTERRUPTED_TURN_TOOLS * 4);
+  const seen = new Set<string>();
+  const tools: Array<{ name: string; status: "completed"; output: string; outputTruncated: boolean }> = [];
+  for (const event of events) {
+    const stored = parseObject(event.payload);
+    const prp = parseObject(stored.prpEvent);
+    const tool = Object.keys(parseObject(prp.payload)).length ? parseObject(prp.payload) : stored;
+    if (tool.schema !== "paperclip.tool.execution.v1" || tool.status !== "completed") continue;
+    const id = readNonEmptyString(tool.executionId);
+    if (id && seen.has(id)) continue;
+    if (id) seen.add(id);
+    const name = readNonEmptyString(tool.name) ?? "tool";
+    const output = typeof tool.output === "string" ? tool.output : "";
+    tools.push({ name: name.slice(0, 300), status: "completed",
+      output: output.slice(0, MAX_INTERRUPTED_TURN_TOOL_OUTPUT_CHARS),
+      outputTruncated: output.length > MAX_INTERRUPTED_TURN_TOOL_OUTPUT_CHARS || tool.outputTruncated === true });
+    if (tools.length >= MAX_INTERRUPTED_TURN_TOOLS) break;
+  }
+  return tools;
+}
+
 export async function buildPaperclipWakePayload(input: {
   db: Db;
   companyId: string;
@@ -2448,6 +2492,12 @@ export async function buildPaperclipWakePayload(input: {
       .flatMap(({ result }) => { const ids = parseObject(result).interruptCarriedReadSteeredCommentIds;
         return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : []; }))
     : new Set<string>();
+  // adopt-redo-fresh: the tool calls the Interrupt-cut turn already COMPLETED, from its own durable
+  // tool.execution.completed receipts. The renderer injects them only into a fresh session (new box),
+  // which never saw them; a resumed session already holds them. Never invented: receipts only.
+  const interruptedTurnCompletedTools = issueId && input.runId
+    ? await readInterruptCutCompletedTools(input.db, { companyId: input.companyId, issueId, currentRunId: input.runId })
+    : [];
   const issueDescription = conversationMode ? null : issueSummary?.description ?? null;
   const issueDescriptionTruncated =
     issueDescription !== null &&
@@ -2931,6 +2981,7 @@ export async function buildPaperclipWakePayload(input: {
           updatedAt: safeContinuationSummary.updatedAt.toISOString(),
         }
       : null,
+    ...(interruptedTurnCompletedTools.length ? { interruptedTurnCompletedTools } : {}),
     commentIds,
     latestCommentId: commentIds[commentIds.length - 1] ?? null,
     comments,
