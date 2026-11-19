@@ -29,6 +29,7 @@ import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-
 import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
 import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
 import { isNativeContinuationRefusal, isRecoverableNativeSupervisionFailure } from "../native-continuation-refusal.js";
+import { isPersonStopOwnHold, readPersonStopHold } from "../acknowledged-native-stop.js";
 import { REMOTE_RUNNER_SUPERVISION_EXHAUSTED, REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION } from "../native-runtime/remote-runner-recovery-diagnostics.js";
 
 /**
@@ -623,11 +624,22 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // A board-owned hold means nothing moves by itself: queued wakes behind it
   // do not count as a further attempt.
   const [activeRecovery] = await q.select({ id: issueRecoveryActions.id, nextAction: issueRecoveryActions.nextAction,
-    ownerType: issueRecoveryActions.ownerType, wakePolicy: issueRecoveryActions.wakePolicy }).from(issueRecoveryActions).where(and(
+    ownerType: issueRecoveryActions.ownerType, wakePolicy: issueRecoveryActions.wakePolicy,
+    cause: issueRecoveryActions.cause, evidence: issueRecoveryActions.evidence }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
     inArray(issueRecoveryActions.status, ["active", "escalated"])))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
-  const boardHold = activeRecovery?.ownerType === "board" ? activeRecovery : null;
+  // Stop means stop, read BEFORE the board-hold gate: the ONE person-Stop reader
+  // (acknowledged-native-stop.ts readPersonStopHold, the same one the queued
+  // header reads). When this message is held by a person's Stop, the Stop's OWN
+  // board hold (native_continuation_requires_reconciliation for the very run the
+  // person stopped, written by the release when the acknowledgement landed late)
+  // does not turn the note into no_run. Any other board hold (a real failure, or
+  // a person Stop of a different run) keeps its own card: isPersonStopOwnHold is
+  // false for it, so boardHold stays set and the held branch below is skipped.
+  const personStop = !agentPaused && !settingUp
+    ? await readPersonStopHold(q, { companyId: issue.companyId, issueId: issue.id, agentId, messageId: message.id }) : null;
+  const boardHold = activeRecovery?.ownerType === "board" && !isPersonStopOwnHold(activeRecovery, personStop) ? activeRecovery : null;
   if (!boardHold && !agentPaused && !settingUp) {
     const wakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status })
       .from(agentWakeupRequests).where(and(
@@ -657,12 +669,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       const heldWithoutWait = !pendingExecutionWait && wakes.some(wake => wake.status === "deferred_issue_execution"
         && wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
       if ((pendingExecutionWait || heldWithoutWait) && !sendRequested) {
-        const [lastTurn] = await q.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
-          .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun))
-          .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-        const stop = (lastTurn?.resultJson ?? {}) as Record<string, unknown>;
-        heldByPersonStop = lastTurn?.status === "cancelled" && stop.cancelledByActorType === "user"
-          && !stop.queuedCommentInterruptQueueId;
+        heldByPersonStop = personStop !== null;
         if (!heldByPersonStop && pendingExecutionWait) waitingToStart = true;
       } else if (pendingExecutionWait) waitingToStart = true;
     }
