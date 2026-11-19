@@ -442,8 +442,9 @@ a complete receipt settles the original reservation and charge once.
 A native interrupt RPC that never acknowledges must not leave its execution
 owner waiting for a terminal event forever. When the existing cancellation
 cleanup deadline expires, the owner enters the normal idempotent session close
-and its stop/checkpoint fences. Timeout never qualifies a warm session or proves
-process exit. New user input still passes those fences; a fresh Pi successor
+and its stop/checkpoint fences. Lease release uses existing stop-and-retain
+immediately, not a second warm-handoff proof wait. Timeout never qualifies a warm
+session or proves process exit. New user input still passes those fences; a fresh Pi successor
 records an honest stop-timeout notice and leaves the old session file in custody.
 
 A recovery setup failure does not establish that the original execution never

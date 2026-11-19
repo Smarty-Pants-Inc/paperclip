@@ -275,6 +275,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       incrementalSessionOutput: false, concurrentSyncOperations: false, independentControlCommands: true,
       runnerWebSocketIngress: true, reusableLeases: true, duplexCommandStream: false };
     const stopCalls: string[] = [];
+    const stopProcessIdentities: Array<{ pid: number; birth: string }> = [];
     let box = `spike-box-${randomUUID()}`;
     let commandCount = 0;
     const staged = join(remoteWorkspace, ".paperclip-runtime", "paperclip-runner");
@@ -340,7 +341,23 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
           refresh: async () => endpoint, close: async () => {} };
         return endpoint;
       },
-      retryPendingSandboxTeardown: async ({ lease }) => { stopCalls.push(lease.id); stage("provider stop requested", { leaseId: lease.id }); return { providerLeaseId: lease.providerLeaseId!, state: "stopped" }; },
+      retryPendingSandboxTeardown: async ({ lease }) => {
+        stopCalls.push(lease.id); stage("provider stop requested", { leaseId: lease.id });
+        // The simulated provider Stop models stopping this owned allocation,
+        // not a second transport.close (which can join its own release hook).
+        // Signal only the recorded process birth, through this existing provider
+        // stop path, and attest Stop only after the real owner actually exits.
+        for (const identity of stopProcessIdentities) {
+          if (!existsSync(`/proc/${identity.pid}`)) continue;
+          if (procBirth(identity.pid) !== identity.birth) throw new Error("fixture provider stop process birth changed");
+          process.kill(identity.pid, "SIGTERM");
+          const deadline = Date.now() + 5_000;
+          while (existsSync(`/proc/${identity.pid}`) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+          if (existsSync(`/proc/${identity.pid}`)) throw new Error("fixture provider stop has not retired its real owner");
+        }
+        stage("provider Stop proved real process exit", { leaseId: lease.id, stopProcessIdentities });
+        return { providerLeaseId: lease.providerLeaseId!, state: "stopped" };
+      },
     }];
     await db.insert(environments).values({ id: environmentId, name: "Turnstop loopback allocation", driver: "sandbox",
       config: { provider: "boat", reuseLease: true, remoteCwd: workspace, runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 300000 } });
@@ -504,6 +521,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       return null;
     });
     const originalIdentity = { ...pid, runnerBirth: procBirth(pid.runnerPid), piBirth: procBirth(pid.piPid), boxBootId, nativeSessionId: admitted.nativeSessionId };
+    stopProcessIdentities.push({ pid: pid.piPid, birth: originalIdentity.piBirth },
+      { pid: pid.runnerPid, birth: originalIdentity.runnerBirth });
     stage("runnerd/Pi live identity", originalIdentity);
     for (const prior of warmupIdentities) expect({ ...pid, nativeSessionId: admitted.nativeSessionId })
       .toEqual({ runnerPid: prior.runnerPid, piPid: prior.piPid, nativeSessionId: prior.nativeSessionId });
@@ -532,11 +551,11 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const pressAt = Date.now();
       let terminalAt: number | undefined, admittedAt: number | undefined;
       const cancellationRequestId = randomUUID();
-      const cancel = () => api("POST", `/heartbeat-runs/${current.id}/cancel`, { cancellationRequestId })
+      const cancel = (requestId = cancellationRequestId) => api("POST", `/heartbeat-runs/${current.id}/cancel`, { cancellationRequestId: requestId })
         .then(result => ({ result, at: Date.now() }), error => ({ error: String(error), at: Date.now() }));
       const route = cancel();
       await waitFor("real interrupt dispatch entered", async () => stages.find(row => row.stage === "I-B turn.interrupt never resolves") ?? null, 10_000);
-      const duplicate = scenario === "R-no-ack-double" ? cancel() : Promise.resolve(null);
+      const duplicate = scenario === "R-no-ack-double" ? cancel(randomUUID()) : Promise.resolve(null);
       const restart = scenario === "R-no-ack-restart" ? (async () => {
         stage("I-B graceful restart detach entered during hanging Stop");
         const { detachNativeSessionsForRestart } = await import("../services/native-runtime/native-session-executor.js");
@@ -592,6 +611,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const live = bundles.map(bundle => bundle.transport.processInfo?.()?.pid).filter((value): value is number => !!value)
         .map(runnerPid => ({ runnerPid, piPid: piDescendant(runnerPid) })).find(value => value.piPid !== null);
       expect(live?.piPid, "uncertain resident is not reused").not.toBe(pid.piPid);
+      expect(existsSync(`/proc/${pid.piPid}`), "old Pi process really exited before fallback").toBe(false);
+      expect(stopCalls.length, "the existing stop-and-retain provider path ran").toBeGreaterThan(0);
       stage("I-B FALLBACK GREEN", { scenario, admissionMs: admittedAt! - pressAt, originalIdentity, live,
         originalFile, originalInode, successorRunId: next.id, requestAt: request!.at, notes: notes.filter(row => row.authorType === "system").map(row => row.body) });
       return;
