@@ -119,6 +119,8 @@ export async function recordSteeredMessageEvidence(db: Db, input: { companyId: s
     const steered = Array.isArray(context.steeredCommentIds) ? context.steeredCommentIds.filter((id): id is string => typeof id === "string") : [];
     if (!steered.length) return;
     const evidence = await readSteeredMessageAnswers(tx as unknown as Db, input);
+    // Replace this run's projection, never union it: a failed/cancelled terminal
+    // can invalidate text that was already materialized as answered while streaming.
     await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context,
       answeredSteeredCommentIds: evidence.answered.filter(id => steered.includes(id)),
       steeredDeliveryEventSeqs: Object.fromEntries(Object.entries(evidence.deliveredEventSeqs).filter(([id]) => steered.includes(id))),

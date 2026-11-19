@@ -599,6 +599,69 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     expect(carriers.wakes.length + carriers.runs.length).toBe(1);
   });
 
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21272
+  // RFL bound (2): failed/stopped text does not answer M. Exercise the real port,
+  // including the provisional streaming projection, duplicate receipt and PG release.
+  it.each(["turn.failed", "turn.cancelled", "turn.completed"] as const)("S-t terminal ingestion: %s refreshes an already materialized answer before release", async terminal => {
+    const expectsAnswer = terminal === "turn.completed";
+    const chat = await seedChat(); await attachSteerable(chat);
+    const response = await postDefault(chat, "Do not lose this on a failed or stopped turn").expect(201);
+    const sourceInstanceId = randomUUID();
+    const port = new PaperclipControlPlanePort(db, { companyId: chat.companyId, issueId: chat.issue.id,
+      runId: chat.runId, agentId: chat.agentId, sessionId: "terminal-evidence-session",
+      completionContractId: randomUUID(), completionContractSha256: `sha256:${"a".repeat(64)}`,
+      sourceInstanceId, controlPlaneSourceInstanceId: randomUUID() });
+    const events = [
+      { eventType: "item.started", itemId: "turn-1:input", payload: { kind: "userMessage" } },
+      { eventType: "item.completed", itemId: `turn-1:steer:${response.body.id}`, payload: { kind: "steering_acknowledgement" } },
+      { eventType: "item.started", itemId: "turn-1:read-M", payload: { kind: "userMessage" } },
+      { eventType: "item.started", itemId: "turn-1:reply", payload: { kind: "agentMessage" } },
+      { eventType: "item.completed", itemId: "turn-1:reply", payload: { kind: "agentMessage", text: "Completed text before the terminal" } },
+      { eventType: terminal, itemId: "turn-1:end", payload: { status: terminal === "turn.failed" ? "failed" : expectsAnswer ? "completed" : "cancelled" } },
+    ];
+    const receipts = events.map((event, index) => ({ schema: "paperclip.prp.event.v1",
+      sourceInstanceId, sourceKind: "runner", sourceEventId: `${sourceInstanceId}:${index + 1}`, sourceSeq: index + 1,
+      runId: chat.runId, normalizedSessionId: "terminal-evidence-session", turnId: "turn-1", schemaVersion: 1,
+      priority: 0, emittedAt: new Date().toISOString(), ...event } as PrpEvent));
+    for (const event of receipts.slice(0, -1)) await port.appendEvent(event);
+    const [streaming] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    const streamingSqlAnswered = await answered(response.body.id);
+    expect((streaming!.contextSnapshot as any).answeredSteeredCommentIds).toEqual([response.body.id]);
+    expect(streamingSqlAnswered).toBe(true);
+    await port.appendEvent(receipts.at(-1)!);
+    const [atTerminal] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    const terminalSqlAnswered = await answered(response.body.id);
+    const replay = await port.appendEvent(receipts.at(-1)!);
+    await finishTurn(chat, { status: terminal === "turn.failed" ? "failed" : expectsAnswer ? "succeeded" : "cancelled", log: false });
+    await releaseRun(chat); // Repeated release must not manufacture another carrier.
+    const { readSteeredMessageAnswers } = await import("../services/native-runtime/steered-message-answers.js");
+    const evidence = await readSteeredMessageAnswers(db, { companyId: chat.companyId, runId: chat.runId });
+    const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    const carriers = await carriersOf(chat, response.body.id);
+    const sqlAnswered = await answered(response.body.id);
+    const outcome = await settleUnansweredPersonMessage(db, { companyId: chat.companyId, issueId: chat.issue.id });
+    const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+      sql`${issueComments.metadata}->>'authorizationReason' like ${UNANSWERED_MESSAGE_REASON_PREFIX + "%"}`));
+    const persisted = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, chat.runId)).orderBy(asc(heartbeatRunEvents.seq));
+    if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `S-t-terminal-${terminal}.json`), JSON.stringify({
+      fixture: "controlled normalized runner events through production PaperclipControlPlanePort + real PG release",
+      messageId: response.body.id, events: receipts, streaming, streamingSqlAnswered,
+      atTerminal, terminalSqlAnswered, replay, evidence, run: ended, carriers, sqlAnswered, outcome, notices, persisted,
+    }, null, 2));
+    const expectedIds = expectsAnswer ? [response.body.id] : [];
+    expect(evidence.answered).toEqual(expectedIds);
+    expect((atTerminal!.contextSnapshot as any).answeredSteeredCommentIds).toEqual(expectedIds);
+    expect(terminalSqlAnswered).toBe(expectsAnswer);
+    expect((ended!.contextSnapshot as any).answeredSteeredCommentIds ?? []).toEqual(expectedIds);
+    expect(sqlAnswered).toBe(expectsAnswer);
+    expect(replay.disposition).toBe("duplicate");
+    expect(persisted.filter(event => event.eventType === terminal)).toHaveLength(1);
+    expect((ended!.resultJson as any).restoredSteeredCommentIds ?? []).toEqual(expectsAnswer ? [] : [response.body.id]);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(expectsAnswer ? 0 : 1);
+    expect(outcome.kind).not.toBe("noticed");
+    expect(notices).toHaveLength(0);
+  });
+
   it("A3: uncertain steering timeout returns 201 accepted and end-of-run carries M once", async () => {
     const chat = await seedChat(); await attachSteerable(chat);
     const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
