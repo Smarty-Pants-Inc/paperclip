@@ -36,20 +36,22 @@ export async function carryOwedMessagesIntoFreshThread(db: Db, input: {
     .from(issueComments).where(and(eq(issueComments.id, issue.boundaryId), eq(issueComments.companyId, input.companyId),
       eq(issueComments.issueId, input.issueId))).limit(1) : [];
   if (!issue || (issue.boundaryId && !boundary)) return [];
+  const notAnswered = sql`not ${answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+    issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}`;
   const owed = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, since),
     boundary ? sql`(${issueComments.createdAt}, ${issueComments.id}) > (${boundary.createdAt.toISOString()}::timestamptz, ${boundary.id}::uuid)` : undefined,
-    sql`not ${answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
-      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}`,
+    notAnswered,
   )).orderBy(asc(issueComments.createdAt), asc(issueComments.id)).limit(FRESH_THREAD_OWED_MESSAGES_MAX);
   if (owed.length === 0) return [];
   const current = deriveCommentId(input.context, null);
   const candidates = [...new Set([...extractWakeCommentIds(input.context), ...(current ? [current] : []), ...owed.map(row => row.id)])];
-  // One order for the whole batch: thread order (oldest first), each id once.
+  // One order for the whole batch: thread order (oldest first), each id once. The ONE answered
+  // rule applies to the FINAL union: an inherited wake/comment id already answered is never re-sent.
   const ordered = (await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
-    inArray(issueComments.id, candidates))).orderBy(asc(issueComments.createdAt), asc(issueComments.id))).map(row => row.id);
+    inArray(issueComments.id, candidates), notAnswered)).orderBy(asc(issueComments.createdAt), asc(issueComments.id))).map(row => row.id);
   if (ordered.length === 0) return [];
   const carried = { wakeCommentIds: ordered, wakeCommentId: ordered.at(-1)!, commentId: ordered.at(-1)! };
   Object.assign(input.context, carried);
