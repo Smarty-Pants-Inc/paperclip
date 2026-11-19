@@ -123,7 +123,7 @@ describe.skipIf(!support.supported)("pause tB2 2b round 3: an older owner's late
           },
           result: async () => null,
           interrupt: async () => { if (opts.interruptHung) return hungInterrupt; await interruptGate.promise; stop.resolve(); },
-          close: async () => { stop.resolve(); await session.close(); } };
+          close: async () => { stop.resolve(); await session.close({ reason: "test close" }); } };
       } };
     };
     const pluginKey = "paperclip.pu2b-" + pluginId.slice(0, 8);
