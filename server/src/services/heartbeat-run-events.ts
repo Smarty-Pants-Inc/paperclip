@@ -6,7 +6,7 @@ import { isNativeResponseEvidence, notifyNativeResponsePresentation } from "./na
 import { isSafeNativeChatProgressEventType } from "./safe-native-chat-progress.js";
 import { notifyChatNativeProgress } from "./chat-native-progress-notifications.js";
 import { boundRunIssueIdSql } from "./run-task-binding.js";
-import { and, asc, eq, getTableColumns, sql } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRunEvents, heartbeatRuns } from "@paperclipai/db";
 import { nativeSha256 } from "./native-runtime/canonical.js";
@@ -53,10 +53,23 @@ export interface AppendHeartbeatRunEventInput {
    * its own, which would add a SAVEPOINT round trip to every event.
    */
   assertWritable?: () => void;
+  /** Leave heartbeat_runs.updated_at as it was (Option S: the Stop's acceptance row is not run activity). */
+  keepRunUpdatedAt?: boolean;
 }
 
 type NativeSourceEventInput = AppendHeartbeatRunEventInput & Required<Pick<AppendHeartbeatRunEventInput, "nativeSource">>;
 type RunEventWakes = { recovery: boolean; reassessment: boolean; progress: boolean; response: boolean; retention: boolean };
+
+/** Option S: run-control's server-owned Stop/Interrupt acceptance row (`run.stop.accepted`, source ids NULL). */
+/** A total boolean: under SQL NOT, a NULL message must stay a non-acceptance row (B), never UNKNOWN (dropped). */
+export const stopAcceptanceEventSql = () => sql`coalesce(${and(eq(heartbeatRunEvents.eventType, "lifecycle"), eq(heartbeatRunEvents.message, "run.stop.accepted"),
+  isNull(heartbeatRunEvents.sourceEventId), isNull(heartbeatRunEvents.sourceInstanceId))}, false)`;
+/** Exact-sequence readers query with `not(stopAcceptanceEventSql())` and read the rest renumbered as B (no row) would have it. */
+export async function seqPastStopAcceptance<T extends { seq: number }>(db: Db, companyId: string, runId: string, events: T[]): Promise<T[]> {
+  const skipped = (await db.select({ seq: heartbeatRunEvents.seq }).from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, companyId),
+    eq(heartbeatRunEvents.runId, runId), stopAcceptanceEventSql()))).map(row => row.seq);
+  return skipped.length ? events.map(event => ({ ...event, seq: event.seq - skipped.filter(seq => seq < event.seq).length })) : events;
+}
 
 export type HeartbeatRunEventRunUpdate = Partial<Pick<typeof heartbeatRuns.$inferInsert,
   "legacyProcessSettlement" | "processPid" | "processGroupId" | "processHostHash" | "processStartedAt">>;
@@ -133,7 +146,7 @@ async function appendHeartbeatRunEventOnce(
       with allocated_run_event as (
         update heartbeat_runs
         set next_event_seq = next_event_seq + 1,
-            updated_at = ${sql.param(new Date(), heartbeatRuns.updatedAt)}
+            updated_at = ${input.keepRunUpdatedAt ? sql`updated_at` : sql.param(new Date(), heartbeatRuns.updatedAt)}
         where id = ${input.runId} and company_id = ${input.companyId} and agent_id = ${input.agentId}
         returning company_id, id as run_id, agent_id, next_event_seq - 1 as seq
       )
