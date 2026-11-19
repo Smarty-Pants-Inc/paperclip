@@ -44,7 +44,7 @@ describe.skipIf(!support.supported)('RF5 PU real HTTP pause truth',()=>{
    return {...backend,openSession:async(input:any)=>{const session=await backend.openSession(input);return {...session,
     startTurn:async(input:any)=>session.startTurn(input),
     async *events(){for await(const event of session.events()){if(event.eventType==='turn.started'){started=true;yield event;await stop.promise;yield {...event,sourceSeq:2,sourceEventId:event.sourceInstanceId+':'+event.runId+':2',eventType:'turn.completed' as const,payload:{status:'interrupted'}};return;}}},result:async()=>null,
-    interrupt:async()=>{stop.resolve();},close:async()=>{stop.resolve();await session.close()}}}};
+    interrupt:async()=>{stop.resolve();},close:async()=>{stop.resolve();await session.close({reason:"test close"})}}}};
   };
   const pluginKey='paperclip.pu-'+pluginId.slice(0,8);
   await db.insert(plugins).values({id:pluginId,pluginKey,packageName:'@paperclipai/plugin-fake-sandbox',version:'1.0.0',apiVersion:1,categories:['automation'],status:'ready',installOrder:1,updatedAt:new Date(),manifestJson:{id:pluginKey,apiVersion:1,version:'1.0.0',displayName:'Blocked PU box',description:'provider-only seam',author:'Paperclip',categories:['automation'],capabilities:['environment.drivers.register'],entrypoints:{worker:'dist/worker.js'},environmentDrivers:[{driverKey:'fake-boat',kind:'sandbox_provider',displayName:'Blocked PU box',configSchema:{type:'object'}}]}} as never);
