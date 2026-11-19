@@ -289,7 +289,7 @@ describe.skipIf(!support.supported)("a message held for Continue on a SHARED pro
     .map(comment => JSON.stringify([comment.body, comment.presentation ?? null, comment.metadata ?? null]));
 
   it("WAITING (a)(c)(f): while R's box is still stopping, the task, the queue and the Inbox's GET say the ONE waiting line (never a recovery's 'Your Retry is saved'); the +11 min sweep posts nothing in that wait, so no send-again note stands beside Continue once the hold forms; Continue then answers M exactly once", async () => {
-    const out = await drive("waiting-sweep", { partial: true, waitingSweep: true, holdSweep: true, actions: ["continue"] });
+    const out = await drive("waiting-sweep", { partial: true, waitingSweep: true, holdSweep: true, actions: ["retry", "continue"] });
     expect(out.faults.length).toBeGreaterThan(0);
     const waiting = out.snapshots.waiting as Snapshot;
     // The automatic wait: R's box is not stopped, nothing started, M is parked.
@@ -319,8 +319,13 @@ describe.skipIf(!support.supported)("a message held for Continue on a SHARED pro
     expect(out.holdSweep.noticed, "+11min hold sweep must not advise send-again").toBe(0);
     expect.soft(visibleNotes(out.snapshots["hold-after-11min-sweep"]).filter(note => SEND_AGAIN.test(note))).toEqual([]);
     expectHeld(out.snapshots["hold-after-11min-sweep"]);
+    // A plain Retry sent to the route during the hold (rf-5) is accepted and starts nothing: M stays held. (Its GETs
+    // are the `heldAfterPlainRetry` state of the Inbox's UI fixture.)
+    expect(out.presses[0]).toMatchObject({ action: "retry", status: 202, body: { accepted: true } });
+    expect(out.presses[0].sent).not.toHaveProperty("retryAction");
+    expectHeld(out.snapshots["after-retry"]);
     // Continue (the card's ONE action): exactly one run, M answered once.
-    expect(out.presses[0]).toMatchObject({ action: "continue", status: 202, body: { accepted: true } });
+    expect(out.presses[1]).toMatchObject({ action: "continue", status: 202, body: { accepted: true } });
     expectAnsweredOnce(out.snapshots["after-continue"]);
     expectAnsweredOnce(out.snapshots.final);
     expect.soft(visibleNotes(out.snapshots.final).filter(note => SEND_AGAIN.test(note))).toEqual([]);
