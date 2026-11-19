@@ -742,6 +742,97 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     expect(await successorPrompt(chat, withContinuation, true)).toContain("Prior tool calls are history, not commands to replay");
   });
 
+  /** Real Pi tool events (tool_execution_start/end) through the REAL Pi projector, stored as the runner stores them. */
+  async function piToolReceipts(chat: Chat, calls: Array<{ tool: string; args: Record<string, unknown>; output: string; isError?: boolean }>) {
+    const projector = createPiEventProjector({ runId: chat.runId, turnId: `turn-${randomUUID()}` });
+    const projected = calls.flatMap((call, index) => {
+      const toolCallId = `call-${randomUUID()}-${index}`;
+      return [
+        ...projector.project({ type: "tool_execution_start", toolCallId, toolName: call.tool, args: call.args }),
+        ...projector.project({ type: "tool_execution_end", toolCallId, toolName: call.tool,
+          result: { content: [{ type: "text", text: call.output }] }, isError: call.isError === true }),
+      ];
+    });
+    const [allocated] = await db.update(heartbeatRuns)
+      .set({ nextEventSeq: sql`${heartbeatRuns.nextEventSeq} + ${projected.length}` })
+      .where(eq(heartbeatRuns.id, chat.runId)).returning({ next: heartbeatRuns.nextEventSeq });
+    const first = Number(allocated!.next) - projected.length;
+    await db.insert(heartbeatRunEvents).values(projected.map((event, index) => ({
+      companyId: chat.companyId, runId: chat.runId, agentId: chat.agentId, seq: first + index,
+      eventType: event.eventType, sourceEventId: randomUUID(),
+      payload: { prpEvent: { turnId: event.turnId, itemId: event.itemId, payload: event.payload } },
+    })));
+  }
+
+  /** The next fresh request on this task: a person's new message and a new run with a fresh session. */
+  async function nextFreshRequest(chat: Chat, body: string) {
+    const next = await issueService(db).addComment(chat.issue.id, body, { userId: owner });
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: chat.companyId, agentId: chat.agentId, status: "running",
+      runtimeMode: "native", startedAt: new Date(), contextSnapshot: { issueId: chat.issue.id, taskKey: chat.issue.id,
+        wakeCommentId: next.id, commentId: next.id } }).returning();
+    return successorPrompt(chat, run!, false);
+  }
+
+  it("RF4-J2 (rf-4 F3 red): Interrupt after STEP1 ⇒ the successor FAILS without a reply ⇒ the next fresh request still lists STEP1 done (the chain walks back to the last run that ended with an agent reply)", async () => {
+    const chat = await seedChat();
+    await toolReceipts(chat, [{ name: "echo STEP1 > /tmp/step1", output: "STEP1-RESULT-wrote-step1" }]);
+    const { carry } = await steerThenInterrupt(chat, "unread");
+    const run2 = await admitSuccessor(chat, carry);
+    const chat2 = await successorRuns(chat, run2);
+    await toolReceipts(chat2, [{ name: "echo STEP2 > /tmp/step2", output: "STEP2-FAILED-boom", status: "failed" }]);
+    await successorFails(chat2, run2);
+    const prompt = await nextFreshRequest(chat2, "MSG3: please carry on");
+    expect(prompt, "STEP1 was done before the failed successor; a fresh input without it re-runs STEP1")
+      .toContain("1. `echo STEP1 > /tmp/step1`: completed\n   result: STEP1-RESULT-wrote-step1");
+    expect(prompt, "the failed successor's own call is listed too, as failed").toContain("2. `echo STEP2 > /tmp/step2`: failed\n   error: STEP2-FAILED-boom");
+    expect(count(prompt, "STEP1-RESULT-wrote-step1"), "once").toBe(1);
+  });
+
+  it("RF4-J2c (control): Interrupt after STEP1 ⇒ the successor ANSWERS (ends with a reply) ⇒ the next fresh request lists nothing from before that reply", async () => {
+    const chat = await seedChat();
+    await toolReceipts(chat, [{ name: "echo STEP1 > /tmp/step1", output: "STEP1-RESULT-wrote-step1" }]);
+    const { carry } = await steerThenInterrupt(chat, "unread");
+    const run2 = await admitSuccessor(chat, carry);
+    await successorRuns(chat, run2);
+    await successorAnswers(chat, run2);
+    const prompt = await nextFreshRequest(chat, "MSG3: next thing");
+    expect(prompt).not.toContain("STEP1-RESULT-wrote-step1");
+    expect(prompt).not.toMatch(/Already done in the interrupted turn/);
+  });
+
+  it("RF4-J3 (rf-4 F1 red): a non-bash call keeps its ARGUMENTS (write: path + short content), from the real Pi projector's receipts", async () => {
+    const chat = await seedChat();
+    await piToolReceipts(chat, [
+      { tool: "write", args: { path: "/work/notes/step1.md", content: "STEP1 CONTENT A" }, output: "Successfully wrote 15 bytes to /work/notes/step1.md" },
+      { tool: "write", args: { path: "/work/notes/step2.md", content: "STEP2 CONTENT B" }, output: "Successfully wrote 15 bytes" },
+      { tool: "bash", args: { command: "echo STEP3 > /tmp/step3" }, output: "STEP3-RESULT" },
+    ]);
+    const { carry } = await steerThenInterrupt(chat, "unread");
+    const successor = await admitSuccessor(chat, carry);
+    const prompt = await successorPrompt(chat, successor, false);
+    const section = prompt.slice(prompt.indexOf("## Already done in the interrupted turn"));
+    expect(section).toMatch(/1\. `write` \(`[^`\n]*\/work\/notes\/step1\.md[^`\n]*STEP1 CONTENT A[^`\n]*`\): completed/);
+    expect(section).toMatch(/2\. `write` \(`[^`\n]*\/work\/notes\/step2\.md[^`\n]*STEP2 CONTENT B[^`\n]*`\): completed/);
+    expect(section).toContain("3. `echo STEP3 > /tmp/step3`: completed\n   result: STEP3-RESULT");
+  });
+
+  it("RF4-J6 (rf-4 F2 red): 33 completed calls ⇒ 32 listed and the input SAYS one more was omitted; it never claims the list is everything", async () => {
+    const chat = await seedChat();
+    await toolReceipts(chat, Array.from({ length: 33 }, (_, i) => ({ name: `echo STEP${i + 1}`, output: `R${i + 1}` })));
+    const { carry } = await steerThenInterrupt(chat, "unread");
+    const successor = await admitSuccessor(chat, carry);
+    const prompt = await successorPrompt(chat, successor, false);
+    expect(prompt).toContain("32. `echo STEP32`: completed");
+    expect(prompt).not.toContain("33. `echo STEP33`");
+    expect(prompt).toMatch(/1 more tool call[^\n]* omitted/);
+    expect(prompt).not.toMatch(/everything recorded/);
+    const under = await (async () => { const c = await seedChat();
+      await toolReceipts(c, [{ name: "echo ONLY", output: "ONLY-R" }]);
+      const s = await admitSuccessor(c, (await steerThenInterrupt(c, "unread")).carry);
+      return successorPrompt(c, s, false); })();
+    expect(under, "under the cap nothing is said omitted").not.toMatch(/omitted/);
+  });
+
   it("R6: a non-terminal conversation-comment wake for an adopted steer is retired at the press (coalesced into the carry); STEER has ONE carrier, the carry", async () => {
     const chat = await seedChat();
     const { steerId, carry } = await steerThenInterrupt(chat, "read", { staleWake: "deferred_issue_execution" });

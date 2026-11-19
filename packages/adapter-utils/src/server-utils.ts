@@ -820,6 +820,10 @@ type PaperclipWakePayload = {
   simplifiedEnglishInteractions: boolean;
   dependencyBlockedInteraction: boolean;
   interruptedTurnToolCalls: Array<{ name: string; target: string | null; status: "completed" | "failed" | "interrupted"; output: string; outputTruncated: boolean }>;
+  /** adopt-receipts3: calls recorded in the Interrupt chain but not listed (over the cap). */
+  interruptedTurnToolCallsOmitted: number;
+  /** adopt-receipts3: the chain reaches further back than was read; earlier calls are not counted. */
+  interruptedTurnEarlierCallsOmitted: boolean;
   treeHoldInteraction: boolean;
   activeTreeHold: PaperclipWakeTreeHoldSummary | null;
   unresolvedBlockerIssueIds: string[];
@@ -1924,6 +1928,9 @@ export function normalizePaperclipWakePayload(
             ? [{ name: tool.name, target: typeof tool.target === "string" && tool.target.trim() ? tool.target : null,
                 status, output: asString(tool.output, ""), outputTruncated: asBoolean(tool.outputTruncated, false) }] : [];
         }).slice(0, 32) : [],
+    interruptedTurnToolCallsOmitted: Math.max(0, Math.floor(asNumber(payload.interruptedTurnToolCallsOmitted, 0)))
+      + (Array.isArray(payload.interruptedTurnToolCalls) ? Math.max(0, payload.interruptedTurnToolCalls.length - 32) : 0),
+    interruptedTurnEarlierCallsOmitted: asBoolean(payload.interruptedTurnEarlierCallsOmitted, false),
     dependencyBlockedInteraction: asBoolean(
       payload.dependencyBlockedInteraction,
       false,
@@ -2612,7 +2619,7 @@ function renderPaperclipWakePromptBody(
   const freshInterruptToolCalls = !resumedSession ? normalized.interruptedTurnToolCalls : [];
   if (freshInterruptToolCalls.length > 0) {
     lines.push("", "## Already done in the interrupted turn",
-      "The person interrupted your previous turn. This fresh session does not hold that turn; the tool calls below are everything recorded of it (from their saved receipts), in order. Do not run them again; continue from the next step. A call marked interrupted was cut mid-flight: check whether it took effect before you run it again.");
+      `The person interrupted your previous turn. This fresh session does not hold that turn; the tool calls below are the calls recorded since your last reply (from their saved receipts), in order${normalized.interruptedTurnToolCallsOmitted > 0 || normalized.interruptedTurnEarlierCallsOmitted ? ", but NOT all of them: some were omitted (see the end of this list)" : ", all of them"}. Do not run them again; continue from the next step. A call marked interrupted was cut mid-flight: check whether it took effect before you run it again.`);
     freshInterruptToolCalls.forEach((tool, index) => {
       const call = `${markdownInlineCode(tool.name)}${tool.target ? ` (${markdownInlineCode(tool.target)})` : ""}`;
       const state = tool.status === "completed" ? "completed"
@@ -2620,6 +2627,9 @@ function renderPaperclipWakePromptBody(
       lines.push(`${index + 1}. ${call}: ${state}`);
       if (tool.output) lines.push(`   ${tool.status === "failed" ? "error" : "result"}${tool.outputTruncated ? " (excerpt)" : ""}: ${tool.output.replace(/\s+/g, " ").trim()}`);
     });
+    const omitted = normalized.interruptedTurnToolCallsOmitted;
+    if (omitted > 0) lines.push(`${omitted} more tool call${omitted === 1 ? " was" : "s were"} recorded after these and omitted from this list (over the limit): they may have run. Check the workspace before you redo any step.`);
+    if (normalized.interruptedTurnEarlierCallsOmitted) lines.push("Earlier tool calls in this interrupted work were omitted from this list (over the limit): check the workspace before you redo any step.");
   }
   for (const config of normalized.githubReviewConfigurations) {
     lines.push("", "## Configured GitHub review instructions", config.instructions);

@@ -26,6 +26,7 @@ import {
   eq,
   inArray,
   isNull,
+  or,
   sql,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -2353,6 +2354,9 @@ export async function readHeartbeatWakeComments(db: Db, companyId: string, issue
 const MAX_INTERRUPTED_TURN_TOOLS = 32;
 const MAX_INTERRUPTED_TURN_TOOL_OUTPUT_CHARS = 600;
 const MAX_INTERRUPTED_TURN_CHAIN_RUNS = 16;
+const MAX_INTERRUPTED_TURN_EVENTS = 4096;
+const MAX_INTERRUPTED_TURN_ARGUMENTS_CHARS = 300;
+const MAX_INTERRUPTED_TURN_ARGUMENT_VALUE_CHARS = 120;
 
 export type InterruptedTurnToolCall = {
   name: string;
@@ -2369,16 +2373,43 @@ function interruptCut(run: { status: string; resultJson: unknown }) {
     result.interruptionSource === "issue_comment_interrupt";
 }
 
-/** adopt-receipts2: the person's Interrupt chain that ends at this run. Walking back from the immediate
- * predecessor on this task, every run the person's Interrupt cut belongs to the chain; the first run that
- * ended any other way (an agent reply, a STOP, a failure) ends it. Each chained run's tool calls are read
- * from their durable receipts, oldest run first, in order, once each: completed calls are done, failed calls
- * failed, and a call cut mid-flight (started with no completed receipt, or completed as interrupted /
- * cancelled / aborted) is interrupted. A STOP or any other end right before this run: none. */
-export async function readInterruptCutToolCalls(db: Db, input: { companyId: string; issueId: string; currentRunId: string }) {
+/** A short, single-line view of a non-bash call's arguments (e.g. write: path + the start of its content), so a
+ * fresh successor can tell WHICH call was done. Display only, never execution authority. */
+function summarizeToolArguments(args: unknown, input: unknown): string | null {
+  const shorten = (value: unknown): unknown => typeof value === "string"
+    ? value.length > MAX_INTERRUPTED_TURN_ARGUMENT_VALUE_CHARS ? `${value.slice(0, MAX_INTERRUPTED_TURN_ARGUMENT_VALUE_CHARS)}…` : value
+    : Array.isArray(value) ? value.slice(0, 8).map(shorten)
+      : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).slice(0, 12).map(([k, v]) => [k, shorten(v)]))
+        : value;
+  let text: string | null = null;
+  if (args && typeof args === "object" && !Array.isArray(args) && Object.keys(args).length > 0) text = JSON.stringify(shorten(args));
+  else if (typeof input === "string" && input.trim()) text = input;
+  if (!text) return null;
+  text = text.replace(/\s+/g, " ").replace(/`/g, "'").trim();
+  return text.length > MAX_INTERRUPTED_TURN_ARGUMENTS_CHARS ? `${text.slice(0, MAX_INTERRUPTED_TURN_ARGUMENTS_CHARS)}…` : text;
+}
+
+export type InterruptCutToolCalls = {
+  calls: InterruptedTurnToolCall[];
+  /** Calls recorded in the chain but not listed (over the cap). */
+  omitted: number;
+  /** The chain reaches further back than the runs read (over the run cap): earlier calls are not counted. */
+  earlierRunsOmitted: boolean;
+};
+
+/** adopt-receipts3: every tool call since the last run on this task that ENDED WITH AN AGENT REPLY, when the
+ * person's Interrupt cut at least one run since then. Walking back from the immediate predecessor, a run the
+ * Interrupt cut, or a run that ended without a reply (a failed successor), belongs to the chain; the first run
+ * that ended with an agent reply, or the person's STOP, ends it. Each chained run's tool calls are read from
+ * their durable receipts, oldest run first, in order, once each: completed calls are done, failed calls failed,
+ * and a call cut mid-flight (started with no completed receipt, or completed as interrupted / cancelled /
+ * aborted) is interrupted. A non-bash call carries its arguments from the same call's item receipt. Over the
+ * cap, the omitted count is returned so the input never implies everything is listed. */
+export async function readInterruptCutToolCalls(db: Db, input: { companyId: string; issueId: string; currentRunId: string }): Promise<InterruptCutToolCalls> {
+  const none: InterruptCutToolCalls = { calls: [], omitted: 0, earlierRunsOmitted: false };
   const [current] = await db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.currentRunId)));
-  if (!current) return [];
+  if (!current) return none;
   const previous = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
     resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId),
@@ -2386,26 +2417,60 @@ export async function readInterruptCutToolCalls(db: Db, input: { companyId: stri
     sql`${heartbeatRuns.id} <> ${input.currentRunId}`,
     sql`${heartbeatRuns.createdAt} <= ${current.createdAt.toISOString()}::timestamptz`,
   )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(MAX_INTERRUPTED_TURN_CHAIN_RUNS + 1);
+  if (previous.length === 0) return none;
+  const replied = new Set((await db.select({ runId: issueComments.createdByRunId, derived: issueComments.derivedCreatedByRunId })
+    .from(issueComments).where(and(
+      eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
+      eq(issueComments.authorType, "agent"), isNull(issueComments.deletedAt),
+      or(inArray(issueComments.createdByRunId, previous.map((run) => run.id)),
+        inArray(issueComments.derivedCreatedByRunId, previous.map((run) => run.id))),
+    ))).flatMap((row) => [row.runId, row.derived]).filter((id): id is string => typeof id === "string"));
   const chain: string[] = [];
+  let cut = false;
+  let earlierRunsOmitted = false;
   for (const run of previous) {
-    if (!interruptCut(run) || chain.length >= MAX_INTERRUPTED_TURN_CHAIN_RUNS) break;
+    const interrupted = interruptCut(run);
+    // The last run that ENDED WITH AN AGENT REPLY bounds the chain; so does the person's STOP (its own marker
+    // governs) and any run still live. A failed (or otherwise ended) run with no reply never ends it.
+    const ended = ["succeeded", "failed", "timed_out", "cancelled", "error"].includes(run.status);
+    if (!interrupted && (replied.has(run.id) || !ended || run.status === "cancelled")) break;
+    if (chain.length >= MAX_INTERRUPTED_TURN_CHAIN_RUNS) { earlierRunsOmitted = true; break; }
+    if (interrupted) cut = true;
     chain.unshift(run.id);
   }
-  if (chain.length === 0) return [];
+  if (chain.length === 0 || !cut) return none;
+  const toolCallKinds = sql`(${heartbeatRunEvents.eventType} in ('tool.execution.started', 'tool.execution.completed')
+    or (${heartbeatRunEvents.eventType} in ('item.started', 'item.delta', 'item.completed', 'item.failed')
+      and ${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' in ('tool', 'commandExecution')))`;
   const events = await db.select({ runId: heartbeatRunEvents.runId, eventType: heartbeatRunEvents.eventType,
     payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
-    eq(heartbeatRunEvents.companyId, input.companyId), inArray(heartbeatRunEvents.runId, chain),
-    inArray(heartbeatRunEvents.eventType, ["tool.execution.started", "tool.execution.completed"]),
-  )).orderBy(asc(heartbeatRunEvents.seq)).limit(MAX_INTERRUPTED_TURN_TOOLS * 8);
+    eq(heartbeatRunEvents.companyId, input.companyId), inArray(heartbeatRunEvents.runId, chain), toolCallKinds,
+  )).orderBy(asc(heartbeatRunEvents.seq)).limit(MAX_INTERRUPTED_TURN_EVENTS);
+  const eventsCapped = events.length >= MAX_INTERRUPTED_TURN_EVENTS;
+  // The same call's arguments, from its item receipt (Pi: item.started/delta/completed carry item.arguments).
+  const argumentsByItem = new Map<string, string>();
+  for (const event of events) {
+    if (!event.eventType.startsWith("item.")) continue;
+    const prp = parseObject(parseObject(event.payload).prpEvent);
+    const itemId = readNonEmptyString(prp.itemId);
+    const payload = parseObject(prp.payload);
+    if (!itemId) continue;
+    const item = parseObject(payload.item);
+    const summary = summarizeToolArguments(item.arguments ?? item.input, payload.input);
+    if (summary) argumentsByItem.set(`${event.runId}:${itemId}`, summary);
+  }
   const calls = new Map<string, InterruptedTurnToolCall>();
+  const seen = new Set<string>();
   for (const runId of chain) {
     for (const event of events) {
-      if (event.runId !== runId) continue;
+      if (event.runId !== runId || !event.eventType.startsWith("tool.execution.")) continue;
       const stored = parseObject(event.payload);
       const prp = parseObject(stored.prpEvent);
       const tool = Object.keys(parseObject(prp.payload)).length ? parseObject(prp.payload) : stored;
       if (tool.schema !== "paperclip.tool.execution.v1") continue;
-      const key = `${runId}:${readNonEmptyString(tool.executionId) ?? readNonEmptyString(prp.itemId) ?? calls.size}`;
+      const callId = readNonEmptyString(tool.executionId) ?? readNonEmptyString(prp.itemId) ?? `${seen.size}`;
+      const key = `${runId}:${callId}`;
+      seen.add(key);
       const known = calls.get(key);
       if (known && known.status !== "interrupted") continue;
       const completed = event.eventType === "tool.execution.completed";
@@ -2415,16 +2480,20 @@ export async function readInterruptCutToolCalls(db: Db, input: { companyId: stri
           : reported === "failed" || reported === "error" ? "failed" : "interrupted";
       if (!known && calls.size >= MAX_INTERRUPTED_TURN_TOOLS) continue;
       const output = typeof tool.output === "string" ? tool.output : known?.output ?? "";
+      const isBash = tool.transport === "process" && tool.operation === "execute";
+      const args = isBash ? null : argumentsByItem.get(`${runId}:${readNonEmptyString(prp.itemId) ?? callId}`)
+        ?? argumentsByItem.get(key) ?? null;
       calls.set(key, {
         name: (readNonEmptyString(tool.name) ?? known?.name ?? "tool").slice(0, 300),
-        target: (readNonEmptyString(tool.target) ?? known?.target ?? null)?.slice(0, 300) ?? null,
+        target: (readNonEmptyString(tool.target) ?? args ?? known?.target ?? null)?.slice(0, MAX_INTERRUPTED_TURN_ARGUMENTS_CHARS + 1) ?? null,
         status,
         output: output.slice(0, MAX_INTERRUPTED_TURN_TOOL_OUTPUT_CHARS),
         outputTruncated: output.length > MAX_INTERRUPTED_TURN_TOOL_OUTPUT_CHARS || tool.outputTruncated === true,
       });
     }
   }
-  return [...calls.values()];
+  return { calls: [...calls.values()], omitted: Math.max(0, seen.size - calls.size),
+    earlierRunsOmitted: earlierRunsOmitted || eventsCapped };
 }
 
 export async function buildPaperclipWakePayload(input: {
@@ -2530,9 +2599,10 @@ export async function buildPaperclipWakePayload(input: {
   // ended another way), from their own durable tool.execution receipts: done, failed, or cut mid-flight. The
   // renderer injects them only into a fresh session (new box), which never saw them; a resumed session
   // already holds them. Never invented: receipts only.
-  const interruptedTurnToolCalls = issueId && input.runId
+  const interruptCutTools = issueId && input.runId
     ? await readInterruptCutToolCalls(input.db, { companyId: input.companyId, issueId, currentRunId: input.runId })
-    : [];
+    : { calls: [], omitted: 0, earlierRunsOmitted: false };
+  const interruptedTurnToolCalls = interruptCutTools.calls;
   const issueDescription = conversationMode ? null : issueSummary?.description ?? null;
   const issueDescriptionTruncated =
     issueDescription !== null &&
@@ -3016,7 +3086,9 @@ export async function buildPaperclipWakePayload(input: {
           updatedAt: safeContinuationSummary.updatedAt.toISOString(),
         }
       : null,
-    ...(interruptedTurnToolCalls.length ? { interruptedTurnToolCalls } : {}),
+    ...(interruptedTurnToolCalls.length ? { interruptedTurnToolCalls,
+      ...(interruptCutTools.omitted > 0 ? { interruptedTurnToolCallsOmitted: interruptCutTools.omitted } : {}),
+      ...(interruptCutTools.earlierRunsOmitted ? { interruptedTurnEarlierCallsOmitted: true } : {}) } : {}),
     commentIds,
     latestCommentId: commentIds[commentIds.length - 1] ?? null,
     comments,
