@@ -6392,7 +6392,8 @@ const GONE_REMOTE_RUNNER_DELIVERY_COMMANDS = new Set(["run.attach", "semantic_to
   "session.goal.get"]);
 
 function readSettledRunnerdProjection(root: string, identity: Record<string, string>,
-  options: { localRunner?: boolean; controlBytes?: string; remoteRunnerGone?: boolean; remoteRunnerStopped?: boolean; parkedGovernedWait?: boolean } = {}): SettledRunnerdProjection {
+  options: { localRunner?: boolean; controlBytes?: string; remoteRunnerGone?: boolean; remoteRunnerStopped?: boolean; parkedGovernedWait?: boolean;
+    personStopped?: boolean } = {}): SettledRunnerdProjection {
   const refuse = (refused: string): SettledRunnerdProjection => ({ refused });
   try {
     if (!isSafeNativeStateDirectory(root)) return refuse("root_unsafe");
@@ -6418,10 +6419,19 @@ function readSettledRunnerdProjection(root: string, identity: Record<string, str
       : LOCAL_RUNNER_LIFECYCLE_COMMANDS;
     // A remote Runner whose own environment restarted can no longer act on its
     // lifecycle commands either. Its deliveries and tool answers still count.
-    const settledCommands = ((options.localRunner && lifecycle === "not_suspended") || options.remoteRunnerGone
+    const runnerSettled = ((options.localRunner && lifecycle === "not_suspended") || options.remoteRunnerGone
       || options.remoteRunnerStopped) && Array.isArray(control.commands)
       ? commands.filter(command => !goneCommandTypes.has(String(command.type)) || command.status === "completed")
       : commands;
+    // A person's acknowledged Stop closed this session: its close barrier
+    // queued the Runner's own suspend (drain, shutdown), which a Runner on a
+    // stopping box may never answer. That Stop, not the Runner, settles the
+    // turn; the caller still proves the Stop settled cleanly and the controller
+    // stopped. Only a still-pending lifecycle command; every other command,
+    // and a failed or indeterminate suspend, still counts.
+    const settledCommands = options.personStopped
+      ? runnerSettled.filter(command => !(LOCAL_RUNNER_LIFECYCLE_COMMANDS.has(String(command.type)) && command.status === "pending"))
+      : runnerSettled;
     const settledControl = settledCommands === commands ? control : { ...control, commands: settledCommands };
     // The controller journals a tool's answer after the tool ran. Only its
     // delivery can be outstanding, and only to a Runner that is gone.
@@ -6559,8 +6569,17 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
   });
   const parkedGovernedWait = remoteRunnerGone && await priorRunParkedOnGovernedWait(input.db, {
     companyId: binding.companyId, issueId: binding.issueId, runId: identity.runId });
-  const projectionOptions = { localRunner, controlBytes: input.projectedControlBytes, remoteRunnerGone, remoteRunnerStopped, parkedGovernedWait };
-  const projection = readSettledRunnerdProjection(input.root, identity, projectionOptions);
+  let projectionOptions: Parameters<typeof readSettledRunnerdProjection>[2] = { localRunner, controlBytes: input.projectedControlBytes,
+    remoteRunnerGone, remoteRunnerStopped, parkedGovernedWait };
+  let projection = readSettledRunnerdProjection(input.root, identity, projectionOptions);
+  // adopt-suspend-pending: a person's Stop leaves its Runner's suspend
+  // pending when that Runner never answers. Read the Stop receipt, then
+  // apply the same proof with that Stop settling only the lifecycle commands.
+  if (projection.refused?.startsWith("journal_commands_unsettled(")
+    && await ownerSettledByAcknowledgedStop(input.db, { ...binding, runId: identity.runId })) {
+    projectionOptions = { ...projectionOptions, personStopped: true };
+    projection = readSettledRunnerdProjection(input.root, identity, projectionOptions);
+  }
   if (projection.refused !== undefined) return refuse(projection.refused);
   const controlBytes = projection.bytes;
   let prior: { run: typeof heartbeatRuns.$inferSelect; owner: typeof nativeRunFinalizations.$inferSelect } | undefined;
@@ -6635,7 +6654,8 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
     for (const name of readdirSync(quarantine)) {
       if (!name.startsWith(`${basename(input.root)}.`)) continue;
       if (quarantinedBootstrapOfOwnerHeldNoProviderWork(resolve(quarantine, name), identity, localRunner)) continue;
-      const copy = readSettledRunnerdProjection(resolve(quarantine, name), identity, { localRunner, remoteRunnerGone, remoteRunnerStopped, parkedGovernedWait });
+      const copy = readSettledRunnerdProjection(resolve(quarantine, name), identity, { localRunner, remoteRunnerGone, remoteRunnerStopped,
+        parkedGovernedWait, personStopped: projectionOptions.personStopped });
       if (copy.refused !== undefined) return refuse(`quarantine_${copy.refused}`);
     }
   }
@@ -6659,6 +6679,25 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
     return null;
   };
   return { finished: true, run: prior.run, recheck };
+}
+
+/** The owner's run was settled by a person's acknowledged Stop (the same
+ * receipt and finalization shape stoppedByUser reads below). */
+async function ownerSettledByAcknowledgedStop(db: Db, binding: { companyId: string; agentId: string; issueId: string; runId: string }): Promise<boolean> {
+  try {
+    const [owner] = await db.select({ run: heartbeatRuns, owner: nativeRunFinalizations }).from(heartbeatRuns)
+      .innerJoin(nativeRunFinalizations, and(eq(nativeRunFinalizations.runId, heartbeatRuns.id),
+        eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId)))
+      .where(and(eq(heartbeatRuns.id, binding.runId), eq(heartbeatRuns.companyId, binding.companyId),
+        eq(heartbeatRuns.agentId, binding.agentId), eq(heartbeatRuns.nativeIssueId, binding.issueId),
+        eq(nativeRunFinalizations.issueId, binding.issueId)))
+      .limit(1);
+    return !!owner && owner.run.runtimeMode === "native" && owner.run.status === "cancelled"
+      && owner.owner.phase === "terminal_failure" && owner.owner.failureCode === "native_retry_cancelled"
+      && hasAcknowledgedNativeStopIntent(owner.run);
+  } catch {
+    return false;
+  }
 }
 
 export function quarantinedBootstrapOfOwnerHeldNoProviderWork(root: string, identity: Record<string, string>,
