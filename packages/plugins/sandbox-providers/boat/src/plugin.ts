@@ -962,9 +962,16 @@ async function findTimedOutCreation(config: Config, attemptId: string, owner: { 
   const fail = (providerState: "absent" | "unavailable" | "other") => Object.assign(createError as object, {
     phase: "create", providerState, elapsedMs: Math.max(0, Date.now() - createStartedAt), budgetMs: BOAT_CREATE_ATTEMPT_MS });
   for (;;) {
-    let ids: string[];
-    try { ids = await acquisitionMatches(config, attemptId, owner); }
-    catch { throw fail("unavailable"); }
+    let ids: string[] | undefined;
+    try { ids = await acquisitionMatches(config, attemptId, owner, capAt); }
+    catch { ids = undefined; }
+    // The cap is strict (rf-4 U3 C1): a lookup that returns after it admits
+    // nothing, even a box it found. Daytona decides the same way after its
+    // lookup (daytona plugin.ts:3034-3035, `if (expired ...) return creating`).
+    // The late box is not lost: the caller's cleanup lists the label again and
+    // stops it, and core's creation intent keeps owning it.
+    if (Date.now() >= capAt) throw fail(ids && ids.length > 1 ? "other" : "absent");
+    if (ids === undefined) throw fail("unavailable");
     if (ids.length === 1) return ids[0];
     // More than one box for one idempotent create: adopt none; cleanup stops all.
     if (ids.length > 1) throw fail("other");
@@ -1003,10 +1010,13 @@ async function waitReady(config: Config, id: string, allowArchived = false, boun
   }
   throw new Error(boatStartDeadlineMessage(id, lastObservedState));
 }
-async function waitSetup(config: Config, id: string): Promise<any> {
-  const until = Date.now() + config.setupTimeoutSeconds * 1000;
+async function waitSetup(config: Config, id: string, deadline?: number): Promise<any> {
+  const setupUntil = Date.now() + config.setupTimeoutSeconds * 1000;
+  // The acquisition budget bounds setup too (rf-4 U3 C1; Daytona's one budget
+  // covers creation and setup, daytona plugin.ts:2981-2987).
+  const until = Math.min(setupUntil, deadline ?? Number.POSITIVE_INFINITY);
   while (Date.now() < until) {
-    const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`);
+    const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`, {}, false, deadline === undefined ? {} : { deadline });
     const s = result.sandbox ?? result;
     assertSandboxId(s, id);
     if (s.setupStatus === "done") return s;
@@ -1017,6 +1027,7 @@ async function waitSetup(config: Config, id: string): Promise<any> {
     await delay(Math.min(2000, Math.max(0, until - Date.now())));
   }
   // A Boat-side setup deadline is transient: the host retries it by this errno.
+  if (until < setupUntil) throw Object.assign(new Error(`Boat sandbox ${id} setup did not finish within the acquisition budget`), { code: "ETIMEDOUT" });
   throw Object.assign(new Error(`Boat sandbox ${id} setup timed out after ${config.setupTimeoutSeconds} seconds`), { code: "ETIMEDOUT" });
 }
 async function stopSandbox(config: Config, id: string): Promise<{ providerLeaseId: string; state: "stopped" }> {
@@ -1071,7 +1082,7 @@ function cleanupIdentity(config: Config, id: string, owner: { companyId: string;
     accountFingerprint: createHash("sha256").update(`${API}\n${config.apiKey}`).digest("hex"),
     labels: { "paperclip-acquire": attemptId } };
 }
-async function acquisitionMatches(config: Config, attemptId: string, owner: { companyId: string; environmentId: string; runId?: string }): Promise<string[]> {
+async function acquisitionMatches(config: Config, attemptId: string, owner: { companyId: string; environmentId: string; runId?: string }, deadline?: number): Promise<string[]> {
   // Documented repeated label=key=value and pageInfo.nextCursor; do not scan all accounts.
   // https://docs.boat.dev/api/reference/sandboxes/list-sandboxes.md
   const ids = new Set<string>(), cursors = new Set<string>();
@@ -1079,7 +1090,10 @@ async function acquisitionMatches(config: Config, attemptId: string, owner: { co
   do {
     const query = new URLSearchParams({ label: `paperclip-acquire=${attemptId}`, limit: "200" });
     if (cursor) query.set("cursor", cursor);
-    const result = await request(config, `/sandboxes?${query}`, { signal: AbortSignal.timeout(10_000) });
+    // A bounded caller (the create cap) never lets one page run past its end.
+    const pageMs = deadline === undefined ? 10_000 : Math.min(10_000, deadline - Date.now());
+    if (pageMs <= 0) throw new Error("Boat acquisition lookup reached its deadline");
+    const result = await request(config, `/sandboxes?${query}`, { signal: AbortSignal.timeout(pageMs) }, false, deadline === undefined ? {} : { deadline });
     if (!Array.isArray(result?.sandboxes)) throw new Error("Boat acquisition lookup omitted sandboxes");
     for (const sandbox of result.sandboxes) {
       if (typeof sandbox?.id !== "string" || !sandbox.id || sandbox.labels?.["paperclip-acquire"] !== attemptId ||
@@ -1940,6 +1954,17 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       // directly every 30 minutes and counts every company's runs.
       if (hasSpareSetting) refreshRunCreateLedger(c, params.companyId, params.environmentId);
       const createStartedAt = Date.now();
+      // One budget bounds the whole acquisition: create, adoption, readiness,
+      // setup and handoff (rf-4 U3 C1). Daytona: one deadline (daytona
+      // plugin.ts:2981-2987) asserted between phases (assertActive, :3011-3013,
+      // :3061-3092). A lease is never handed off after it; the catch below
+      // stops the box and the host retries the ETIMEDOUT.
+      const deadline = createStartedAt + BOAT_ACQUIRE_ATTEMPT_BUDGET_MS;
+      const assertActive = (phase: string) => {
+        if (Date.now() < deadline) return;
+        throw Object.assign(new Error(`Boat lease acquisition exceeded ${BOAT_ACQUIRE_ATTEMPT_BUDGET_MS} ms during ${phase}`), {
+          code: "ETIMEDOUT", phase, elapsedMs: Math.max(0, Date.now() - createStartedAt), budgetMs: BOAT_ACQUIRE_ATTEMPT_BUDGET_MS });
+      };
       // Set only when Boat reported the box `error` before it was ready (#22194).
       let startFailure: PluginEnvironmentAcquisitionDiagnostic | undefined;
       try {
@@ -1955,16 +1980,21 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         const sb = created?.sandbox ?? created; if (typeof sb?.id !== "string" || !sb.id) throw new Error("Boat create response did not contain sandbox.id");
         id = sb.id;
         idleActivity.resource(activityKey(c, sb.id));
-        // An adopted box is still starting (or preparing): wait inside the acquire budget.
-        const ready = await waitReady(c, sb.id, false, adopted ? { deadline: createStartedAt + BOAT_ACQUIRE_ATTEMPT_BUDGET_MS } : {}).catch(error => {
+        // A created or adopted box waits for ready inside the acquire budget.
+        assertActive(adopted ? "adopt" : "create");
+        const ready = await waitReady(c, sb.id, false, { deadline }).catch(error => {
           if (error instanceof BoatSandboxStateError && error.state === "error") {
             startFailure = { phase: "create", elapsedMs: Math.min(Math.max(0, Date.now() - createStartedAt), BOAT_ACQUIRE_ATTEMPT_BUDGET_MS - 1),
               budgetMs: BOAT_ACQUIRE_ATTEMPT_BUDGET_MS, providerState: "error" };
           }
           throw error;
         });
-        const ownershipObservation = c.setupScript !== undefined ? await waitSetup(c, sb.id) : ready;
-        return await finishAcquisition(params, c, sb.id, { ...ready, ...ownershipObservation }, labels, remoteCwd, snapshot, null);
+        assertActive("ready");
+        const ownershipObservation = c.setupScript !== undefined ? await waitSetup(c, sb.id, deadline) : ready;
+        assertActive("setup");
+        const lease = await finishAcquisition(params, c, sb.id, { ...ready, ...ownershipObservation }, labels, remoteCwd, snapshot, null);
+        assertActive("handoff");
+        return lease;
       } catch (error) {
         if (shuttingDown && !id) throw error;
         const ids = id ? [id] : await acquisitionMatches(c, attemptId, params).catch(lookupError => {
