@@ -4,6 +4,7 @@ import { createAgentLifecycle } from "../agent-lifecycle.js";
 import { QUEUED_SEND_AFTER_STOP_KEY } from "../run-cancellation.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
 import { connectionIntentService } from "../connection-intents.js";
+import { readRetryCardAnswerInput } from "../continuation-comment-input.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
 import { isProcessRunAdmissionClosed, isReattachPhaseActive as isProcessReattachPhaseActive } from "./run-admission.js";
@@ -2967,6 +2968,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         enrichedContextSnapshot.previousRunId = failed.id;
         enrichedContextSnapshot.forceFreshSession = true;
       }
+      // The card answers the retried run still owed (the one carry, as a task Retry: run-control.ts
+      // resumeTaskRetry): or the chat's Retry replays the message without what the person answered.
+      if (issueId) Object.assign(enrichedContextSnapshot, await readRetryCardAnswerInput(db, {
+        companyId: agent.companyId, issueId, runId: failed.id }));
     }
 
     const caseRequest = opts.durableCaseHandoffRequest;
