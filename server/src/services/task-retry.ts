@@ -11,7 +11,8 @@ import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, chatActions, chatConversations, chatEndpoints, heartbeatRuns, issues, issueComments, runIdentityContexts, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { conflict, forbidden, notFound, HttpError } from "../errors.js";
 import { persistActivity } from "./activity-log.js";
-import { createSystemRecovery, readSystemRecovery, savedFilesUnrecoverable, CHECKOUT_CONTINUE_REQUIRED_REASON } from "./system-recovery-state.js";
+import { createSystemRecovery, readSystemRecovery, savedFilesUnrecoverable } from "./system-recovery-state.js";
+import { replyFileLineReadsLost } from "./native-runtime/native-late-save-rule.js";
 import { adoptSystemRecovery, updateSystemRecovery } from "./system-recovery.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { notifyChatActionWork } from "./chat-work-notifications.js";
@@ -332,13 +333,10 @@ function admitTaskRetry(input: TaskRetryRequest) {
         !(await undeliveredContinuation(tx, { companyId: issue.companyId, issueId: issue.id })))
       return { requestId: null, accepted: false, stale: false, alreadyMovedOn: true, observedRunId: latest.id, chatActionId: undefined };
     if (input.retryAction === "continue_with_files") {
-      // Only while the gate holds a message for exactly this choice (its wait reason, saved on the waiting message).
-      // The choice is recorded on the held run's recovery action; the gate reads it there and releases the message once.
-      const [held] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-        eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
-        sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
-        sql`${agentWakeupRequests.payload}#>>'{executionWait,reason}' = ${CHECKOUT_CONTINUE_REQUIRED_REASON}`)).limit(1);
-      const chosen = held ? await tx.update(issueRecoveryActions).set({ updatedAt: new Date(),
+      // Only for a run whose reply's files read LOST (the state the choice belongs to). The choice is recorded on
+      // that run's recovery action; the gate reads it there and releases the message once. It changes nothing while
+      // the checkout equals the last saved state: the gate asks for it only on a checkout that differs.
+      const chosen = replyFileLineReadsLost(latest.resultJson) ? await tx.update(issueRecoveryActions).set({ updatedAt: new Date(),
         evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{checkoutContinue}', ${JSON.stringify({
           sourceRunId: latest.id, actorId: input.actorId, requestedAt: new Date().toISOString() })}::jsonb)` }).where(and(
         eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
