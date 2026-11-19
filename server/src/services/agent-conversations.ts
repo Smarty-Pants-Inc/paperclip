@@ -30,7 +30,7 @@ import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { createHeartbeatTimerPolicy, parseHeartbeatPolicy } from "./heartbeat/timer-policy.js";
 import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { HttpError } from "../errors.js";
-import { commentCarriedSql } from "./interrupt-carry-custody.js";
+import { commentCarriedSql, WAKES_THAT_HOLD_A_MESSAGE } from "./interrupt-carry-custody.js";
 
 export type ConversationIdentity = {
   conversationAgentId?: string | null;
@@ -602,7 +602,8 @@ export async function undeliveredConversationComments(
         eq(issueComments.origin, "comment"),
         sql`${issueComments.clientRequestId} is not null`,
         sql`not exists (select 1 from ${agentWakeupRequests} where ${agentWakeupRequests.companyId} = ${companyId}
-      and ${agentWakeupRequests.idempotencyKey} = 'conversation-comment:' || ${issueComments.id}::text)`,
+      and ${agentWakeupRequests.idempotencyKey} = 'conversation-comment:' || ${issueComments.id}::text
+      and ${agentWakeupRequests.status} in ${WAKES_THAT_HOLD_A_MESSAGE})`,
         // A same-turn hand-off owns this input without a wake. This also closes
         // the POST/outbox crash window and keeps retries from creating a second run.
         sql`not exists (select 1 from ${heartbeatRuns} steered_run where steered_run.company_id = ${companyId}
