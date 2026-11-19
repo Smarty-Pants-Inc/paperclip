@@ -129,9 +129,17 @@ export async function answeredPersonMessageIds(
 /** SQL: a run that carried message m FAILED and posted no reply of its own. */
 function failedCarrierSql(m: PersonMessageSql): SQL {
   return sql`exists (select 1 from ${heartbeatRuns} fc
-    where fc.company_id = ${m.companyId} and fc.status = 'failed' and ${carriesCommentSql("fc", m.id, false)}
-      and not exists (select 1 from ${issueComments} fr where fr.company_id = fc.company_id
-        and fr.created_by_run_id = fc.id and fr.author_type = 'agent' and fr.deleted_at is null))`;
+    where fc.company_id = ${m.companyId} and ${failedCarrierRunSql("fc", m)})`;
+}
+
+/** SQL over the heartbeat_runs row `alias`: that run carried message m (any carried key), FAILED, and posted no
+ * agent reply of its own: the ONE failed-carrier notion (L1b). failedCarrierSql above and the unanswered-message
+ * sweep's older selection (G1: an owed message carried only by failed runs still gets its one card) both read it. */
+export function failedCarrierRunSql(alias: string, m: Pick<PersonMessageSql, "id">): SQL {
+  const run = sql.identifier(alias);
+  return sql`(${run}.status = 'failed' and ${carriesCommentSql(alias, m.id, false)}
+      and not exists (select 1 from ${issueComments} fr where fr.company_id = ${run}.company_id
+        and fr.created_by_run_id = ${run}.id and fr.author_type = 'agent' and fr.deleted_at is null))`;
 }
 
 /** SQL: message m is a PERSON comment that arrived by a company import (see answeredPersonMessageSql). */

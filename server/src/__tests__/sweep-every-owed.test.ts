@@ -209,6 +209,60 @@ describe.skipIf(!support.supported)("the sweep cards every owed person message, 
     expect(after.map(c => c.message).sort(), JSON.stringify(after)).toEqual([m, m0].sort());
   }, 120_000);
 
+  // G1 (rf-4 B' verdict, 25, never-told): m was carried (steered) into a run that FAILED with no reply; a LATER
+  // message M3 was answered. The ONE answered rule says m is owed (L1b, failed carrier), so the person gets exactly
+  // ONE card for m, and a second pass adds nothing. Controls: the same m carried by a LIVE run gets no card while it
+  // is live; carried by a SUCCEEDED run that answered it, no card.
+  async function g1(carrier: "failed" | "running" | "succeeded") {
+    const f = await seed();
+    const t = (n: number) => new Date(Date.now() - (30 - n) * 60_000);
+    const m = randomUUID(), m3 = randomUUID();
+    await db.insert(issueComments).values({ id: m, companyId: f.companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: userId, body: "m, steered mid-turn", createdAt: t(4), updatedAt: t(4) });
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "on_demand",
+      triggerDetail: "manual", status: carrier, runtimeMode: "native", startedAt: t(3.5),
+      finishedAt: carrier === "running" ? null : t(5), errorCode: carrier === "failed" ? "process_lost" : null,
+      responsibleUserId: userId, nativeIssueId: f.issueId, issueId: f.issueId,
+      contextSnapshot: { issueId: f.issueId, wakeCommentIds: [m], steeredCommentIds: [m],
+        ...(carrier === "succeeded" ? { answeredSteeredCommentIds: [m] } : {}), responsibleUserId: userId } }).returning();
+    if (carrier === "succeeded") await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorAgentId: f.agentId, authorType: "agent", createdByRunId: run!.id, origin: "comment", body: "answer to m", createdAt: t(5) });
+    await db.insert(issueComments).values({ id: m3, companyId: f.companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: userId, body: "M3", createdAt: t(6), updatedAt: t(6) });
+    const [run3] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "on_demand",
+      triggerDetail: "manual", status: "succeeded", runtimeMode: "native", startedAt: t(7), finishedAt: t(8),
+      responsibleUserId: userId, nativeIssueId: f.issueId, issueId: f.issueId,
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: m3, commentId: m3, wakeCommentIds: [m3], responsibleUserId: userId } }).returning();
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorAgentId: f.agentId,
+      authorType: "agent", createdByRunId: run3!.id, origin: "comment", body: "answer to M3 only", createdAt: t(9) });
+    const answered = await answeredPersonMessageIds(db, { companyId: f.companyId, issueId: f.issueId, commentIds: [m, m3] });
+    const first = await sweep(f), afterFirst = (await allCards(f)).filter(c => c.message === m);
+    const second = await sweep(f), afterSecond = (await allCards(f)).filter(c => c.message === m);
+    await evidence(`g1-${carrier}`, { m, m3, runId: run!.id, answered: [...answered], first, afterFirst, second, afterSecond });
+    return { m, m3, answered, first, afterFirst, second, afterSecond, all: await allCards(f) };
+  }
+
+  it("row G1: steered m whose ONLY carrier FAILED (no reply) + later M3 answered => exactly ONE card for m; a second pass adds nothing", async () => {
+    const r = await g1("failed");
+    expect(r.answered.has(r.m), "m stays owed (L1b)").toBe(false);
+    expect(r.answered.has(r.m3)).toBe(true);
+    expect(r.afterFirst, `one card for m after the first pass: ${JSON.stringify(r)}`).toHaveLength(1);
+    expect(r.afterFirst[0]!.deleted).toBe(false);
+    expect(r.afterSecond, "a second pass adds nothing").toEqual(r.afterFirst);
+    expect(r.all.filter(c => c.message === r.m3), "none for the answered M3").toEqual([]);
+  }, 120_000);
+
+  it("control G1-live: m carried by a LIVE (running) run => no card for m while it is live", async () => {
+    const r = await g1("running");
+    expect(r.afterSecond, JSON.stringify(r)).toEqual([]);
+  }, 120_000);
+
+  it("control G1-succeeded: m carried by a SUCCEEDED run that answered it => no card for m", async () => {
+    const r = await g1("succeeded");
+    expect(r.answered.has(r.m)).toBe(true);
+    expect(r.afterSecond, JSON.stringify(r)).toEqual([]);
+  }, 120_000);
+
   it("control: M1 and M2 both answered => no card", async () => {
     const f = await seed({ m1Answered: true });
     const swept = await sweep(f);

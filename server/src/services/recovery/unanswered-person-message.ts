@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql } from "../person-message-answer.js";
+import { answeredPersonMessageSql, failedCarrierRunSql } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -421,8 +421,10 @@ export const OWED_OLDER_MESSAGES_PER_SWEEP = 20;
 /** The older person messages on this task that the ONE answered predicate says
  * are owed, in discovery scope, with no final (non-waiting) card yet, and that
  * never REACHED the agent (no run's input lists them: the reached clause's
- * case). An older message a run carried already has that run's own outcome
- * in view (its failure, a Stop) and keeps today's newest-only reading.
+ * case) or whose ONLY carriers FAILED without a reply (failedCarrierRunSql,
+ * the answered rule's own L1b notion; G1: a steered message whose run failed
+ * stays owed and is told once). An older message a run carried otherwise (live,
+ * succeeded, stopped, or a failed run that replied) keeps today's newest-only reading.
  * `skipReasons`: the notice keys this pass's carried-steer step (a) just noticed; those messages are skipped. */
 async function owedOlderMessageIds(db: Db, issue: DecisionIssue, newestId: string, skipReasons: string[]): Promise<string[]> {
   const rows = await db.select({ id: issueComments.id }).from(issueComments).where(and(
@@ -433,7 +435,17 @@ async function owedOlderMessageIds(db: Db, issue: DecisionIssue, newestId: strin
       and (r.context_snapshot->>'wakeCommentId' = ${issueComments.id}::text or r.context_snapshot->>'commentId' = ${issueComments.id}::text
         or r.context_snapshot->>'conversationReplyBoundaryCommentId' = ${issueComments.id}::text
         or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${issueComments.id}::text
-        or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${issueComments.id}::text))`,
+        or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${issueComments.id}::text)
+      and not ${failedCarrierRunSql("r", { id: sql`${issueComments.id}` })})`,
+    // One card per failed carrier's batch (interrupt-lostdouble L1/L1b): a failed run that carried m AND a LATER
+    // message still owed is told by that later message's card (the newest's, or its own older pick), never twice.
+    sql`not exists (select 1 from ${heartbeatRuns} fb where fb.company_id = ${issueComments.companyId}
+      and ${failedCarrierRunSql("fb", { id: sql`${issueComments.id}` })}
+      and exists (select 1 from ${issueComments} later where later.company_id = ${issueComments.companyId}
+        and later.issue_id = ${issueComments.issueId} and later.author_type = 'user' and later.deleted_at is null
+        and later.created_at > ${issueComments.createdAt}
+        and ${failedCarrierRunSql("fb", { id: sql.raw("later.id") })}
+        and not ${answeredPersonMessageSql(rawMessage("later"))}))`,
     eq(issueComments.authorType, "user")))
     .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(OWED_OLDER_MESSAGES_PER_SWEEP);
   return rows.map(row => row.id);
