@@ -247,6 +247,12 @@ function noticeRetiredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt:
 }
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
+/** SQL: a note's cited message is gone: its person deleted it (tombstoned or removed). Its note retires. */
+const citedMessageGoneSql = (n: { companyId: SQL; issueId: SQL; metadata: SQL }) => sql`not exists (select 1 from ${issueComments} g
+  where g.company_id = ${n.companyId} and g.issue_id = ${n.issueId} and g.deleted_at is null
+    and g.id::text = substr(${n.metadata}->>'authorizationReason', strpos(${n.metadata}->>'authorizationReason', ':') + 1))`;
+const noteSql = (alias: string) => ({ companyId: sql.raw(`${alias}.company_id`), issueId: sql.raw(`${alias}.issue_id`),
+  metadata: sql.raw(`${alias}.metadata`) });
 
 /**
  * SQL: message m is still in scope. It is within the lookback, or its own
@@ -289,7 +295,12 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and ${noticeRetiredSql(rawMessage("m"), sql.raw("m.deleted_at"), sql.raw("n.created_at"))}))`;
+      and ${noticeRetiredSql(rawMessage("m"), sql.raw("m.deleted_at"), sql.raw("n.created_at"))})
+    or exists (select 1 from ${issueComments} n where n.company_id = ${companyId} and n.issue_id = ${issueId}
+      and n.author_type = 'system' and n.deleted_at is null
+      and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+        or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
+      and ${citedMessageGoneSql(noteSql("n"))}))`;
 }
 
 /**
@@ -314,7 +325,12 @@ export function unansweredPersonMessageCommentCondition(): SQL {
       and exists (select 1 from ${issueComments} m
         where m.company_id = ${issueComments.companyId} and m.issue_id = ${issueComments.issueId}
           and m.id::text = substr(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
-          and ${noticeRetiredSql(rawMessage("m"), sql.raw("m.deleted_at"), sql`${issueComments.createdAt}`)})))`;
+          and ${noticeRetiredSql(rawMessage("m"), sql.raw("m.deleted_at"), sql`${issueComments.createdAt}`)}))
+    or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
+      and (starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+        or starts_with(${issueComments.metadata}->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
+      and ${citedMessageGoneSql({ companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`,
+        metadata: sql`${issueComments.metadata}` })}))`;
 }
 
 export type UnansweredMessageOutcome =
@@ -369,6 +385,8 @@ export async function settleUnansweredPersonMessage(
 
   // An answer to a message supersedes that message's notice (and its
   // retrying line): the relation is message -> answer, not the notice's time.
+  // The person's own Delete of that message retires them too (rf-2).
+  // The ONE retire below (UPDATE ... SET deleted_at) serves both.
   // Written under the same issue fence, in the same order (issue row, then its
   // comments) as the notice writers.
   const [liveNotice] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
@@ -383,9 +401,10 @@ export async function settleUnansweredPersonMessage(
     where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
       and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
         or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
-      and exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
+      and (exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
         and m.id::text = substr(n.metadata->>'authorizationReason', strpos(n.metadata->>'authorizationReason', ':') + 1)
-        and ${noticeRetiredSql(rawMessage("m"), sql.raw("m.deleted_at"), sql.raw("n.created_at"))})`);
+        and ${noticeRetiredSql(rawMessage("m"), sql.raw("m.deleted_at"), sql.raw("n.created_at"))})
+        or ${citedMessageGoneSql(noteSql("n"))})`);
   });
 
   // The AGREED order (adopt-lead + rf-4, 10:09Z), one card per message:
