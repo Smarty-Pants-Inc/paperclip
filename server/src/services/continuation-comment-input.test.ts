@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { pendingContinuationCommentInput, readContinuationCommentInput } from "./continuation-comment-input.js";
@@ -8,6 +8,8 @@ import { claimFirstTurnQueuedInput } from "./native-runtime/first-turn-queued-in
 import { createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
 import { requestTaskRetry } from "./task-retry.js";
 import { heartbeatService } from "./heartbeat.js";
+import { personMessageOwedSql } from "./person-message-answer.js";
+import { readPersonStopHold } from "./acknowledged-native-stop.js";
 
 // DREA-31 / data safety: exercise persisted input and answer attribution, not SQL text.
 const support = await getEmbeddedPostgresTestSupport();
@@ -184,5 +186,89 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     expect(queued, JSON.stringify({ receipt, wake: wake && { status: wake.status, payload: wake.payload, error: wake.error } })).toHaveLength(1);
     expect(queued[0].contextSnapshot).toMatchObject({ taskRetryRequestId: receipt.requestId, previousRunId: f.runId });
     expectAnswerSeed(queued[0].contextSnapshot, f);
+  });
+
+  describe("rf-4 C-R / C-V: the successor seed and Stop-held floor", () => {
+    // Keep reason: rf-4's C-R/C-V findings at base 9bf515b3. Use persisted
+    // runs, replies and wakes, with explicit chronology rather than insert time.
+    async function failedCarrier() {
+      const f = await fixture();
+      const t0 = Date.now() - 3_600_000;
+      const at = (seconds: number) => new Date(t0 + seconds * 1_000);
+      await db.update(issueComments).set({ createdAt: at(1) }).where(eq(issueComments.id, f.message.id));
+      const [run] = await db.update(heartbeatRuns).set({ createdAt: at(2), startedAt: at(3), finishedAt: at(60) })
+        .where(eq(heartbeatRuns.id, f.run.id)).returning();
+      return { ...f, run, at };
+    }
+
+    async function laterReply(f: Awaited<ReturnType<typeof failedCarrier>>) {
+      const [nextMessage] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "user", authorUserId: "board", body: "Now do the next thing", createdAt: f.at(80) }).returning();
+      const [later] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+        nativeIssueId: f.issueId, runtimeMode: "native", status: "succeeded", createdAt: f.at(90),
+        startedAt: f.at(91), finishedAt: f.at(120),
+        contextSnapshot: { issueId: f.issueId, wakeCommentId: nextMessage.id } }).returning();
+      await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+        authorAgentId: f.agentId, createdByRunId: later.id, body: "The next thing is done", createdAt: f.at(110) });
+      return later;
+    }
+
+    async function successorSeed(f: Awaited<ReturnType<typeof failedCarrier>>, row: string) {
+      const read = await readContinuationCommentInput(db, { ...f, runId: f.run.id });
+      const pending = await pendingContinuationCommentInput(db, { ...f, contextSnapshot: f.run.contextSnapshot });
+      console.info("FLOOR_CR3", JSON.stringify({ row, messageId: f.message.id, parentId: f.run.id, read, pending }));
+      return { read, pending };
+    }
+
+    it("(cr-old) does not seed the failed parent's old message after a later started turn succeeded and replied", async () => {
+      const f = await failedCarrier();
+      await laterReply(f);
+      const seed = await successorSeed(f, "cr-old");
+      expect.soft(seed.read, "readContinuationCommentInput(P): the chat moved on").toEqual({});
+      expect(seed.pending, "pendingContinuationCommentInput(P.context): no old wakeCommentIds").toEqual({});
+    });
+
+    it("(cr-live) still seeds a failed parent's unanswered message when no later successful turn replied", async () => {
+      const f = await failedCarrier();
+      const seed = await successorSeed(f, "cr-live");
+      for (const input of [seed.read, seed.pending]) {
+        expect(input).toMatchObject({ wakeCommentIds: [f.message.id], wakeCommentId: f.message.id, commentId: f.message.id });
+      }
+    });
+
+    it("(cr-answered) never seeds a message answered by its own failed parent's published reply", async () => {
+      const f = await failedCarrier();
+      await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+        authorAgentId: f.agentId, createdByRunId: f.run.id, body: "COBALT", createdAt: f.at(30) });
+      const seed = await successorSeed(f, "cr-answered");
+      expect.soft(seed.read).toEqual({});
+      expect(seed.pending).toEqual({});
+    });
+
+    it("(cv-held) keeps a person's Stop-held deferred wake with a saved wait owed despite a later replying success and no later carrier", async () => {
+      const f = await failedCarrier();
+      const later = await laterReply(f);
+      // A subsequent ordinary turn is stopped by the person. It never carried
+      // M: only P did, BEFORE R started. Thus the later-carrier escape cannot
+      // hide a missing deferred-wake custody arm.
+      const [stopped] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+        nativeIssueId: f.issueId, runtimeMode: "native", status: "cancelled", createdAt: f.at(130),
+        startedAt: f.at(131), finishedAt: f.at(140), contextSnapshot: { issueId: f.issueId },
+        resultJson: { cancelledByActorType: "user" } }).returning();
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+        source: "on_demand", reason: "issue_commented", status: "deferred", requestedByActorType: "user",
+        requestedByActorId: "board", idempotencyKey: `conversation-comment:${f.message.id}`,
+        payload: { issueId: f.issueId, commentId: f.message.id,
+          executionWait: { reason: "stopped_execution", message: "Stopped by you." } } }).returning();
+      expect(f.run.startedAt!.getTime()).toBeLessThan(later.startedAt!.getTime());
+      expect(await readPersonStopHold(db, { ...f, messageId: f.message.id }))
+        .toEqual({ stoppedRunId: stopped.id, wakeIds: [wake.id] });
+      const [actual] = await db.select({ owed: personMessageOwedSql({ id: sql`${issueComments.id}`,
+        companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`,
+        createdAt: sql`${issueComments.createdAt}` }) }).from(issueComments).where(eq(issueComments.id, f.message.id));
+      console.info("FLOOR_CR3", JSON.stringify({ row: "cv-held", messageId: f.message.id, parentId: f.run.id,
+        laterId: later.id, stoppedId: stopped.id, wakeId: wake.id, wakeStatus: wake.status, owed: actual.owed }));
+      expect(actual.owed, "personMessageOwedSql(M): Stop-held input must be delivered or carded, not floor-skipped").toBe(true);
+    });
   });
 });
