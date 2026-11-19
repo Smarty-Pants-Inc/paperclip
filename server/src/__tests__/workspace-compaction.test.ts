@@ -3,7 +3,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createObjectRunLogStore, readObjectRunLogSpill } from "../services/object-run-log-store.js";
+import { event, ids, spillMemory } from "../services/object-run-log-spill.fixture.js";
 import {
   WORKSPACE_COMPACTION_TRASH_DIR,
   deleteWorkspaceCompactionTrash,
@@ -44,6 +46,7 @@ async function createRepoWithWorktree(gitignore: string[]) {
 
 afterEach(async () => {
   for (const dir of tempDirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
+  vi.unstubAllEnvs();
 });
 
 describe("findRegenerableWorkspaceDirs", () => {
@@ -72,6 +75,51 @@ describe("findRegenerableWorkspaceDirs", () => {
       "packages/ui/dist",
       "packages/ui/node_modules",
     ]);
+  });
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7016708798
+  // Keep reason: NEVER-OK trace custody. Real writer + Git discovery + reaper rename/delete, no filesystem doubles.
+  it.each(["process", "pointer", "instance", "cwd", "base"] as const)("keeps unrecovered configured spill under ignored build/ (%s)", async source => {
+    const { root, worktreePath } = await createRepoWithWorktree(["build/", "dist/"]);
+    const instanceRoot = path.join(root, "instances", "spill-reaper");
+    await fs.mkdir(instanceRoot, { recursive: true });
+    await write(path.join(worktreePath, ".paperclip/.env"),
+      `PAPERCLIP_HOME=${JSON.stringify(root)}\nPAPERCLIP_INSTANCE_ID=spill-reaper\n`);
+    const spillRoot = path.join(worktreePath, "build", "kept-run-log-spill");
+    vi.stubEnv("RUN_LOG_SPILL_PATH", undefined);
+    vi.stubEnv("RUN_LOG_BASE_PATH", undefined);
+    const key = source === "base" ? "RUN_LOG_BASE_PATH" : "RUN_LOG_SPILL_PATH";
+    const value = source === "base" ? path.join(worktreePath, "build") : spillRoot;
+    vi.stubEnv(key, value);
+    const m = spillMemory();
+    const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", flushMs: 1000,
+      assertWriterAuthority: async () => undefined });
+    const handle = await store.begin({ ...ids, runId: "configured-reaper" });
+    m.state.down = true;
+    const receipt = await store.enqueue!(handle, event(1, "the reaper must not take this only copy"));
+    const committed = receipt.committed.catch(() => undefined);
+    await store.finalize(handle);
+    await committed;
+    const spill = await readObjectRunLogSpill(undefined, handle.logRef);
+    expect(spill.unrecovered.length).toBeGreaterThan(0);
+    const bytes = await fs.readFile(spill.path), index = await fs.readFile(spill.indexPath);
+    if (source !== "process" && source !== "base") {
+      const envPath = source === "pointer" ? path.join(worktreePath, ".paperclip/.env")
+        : source === "instance" ? path.join(instanceRoot, ".env") : path.join(worktreePath, ".env");
+      await fs.appendFile(envPath, `${key}=${JSON.stringify(value)}\n`);
+      vi.stubEnv(key, undefined);
+    }
+    await write(path.join(worktreePath, "dist", "regenerable.js"));
+    const candidates = await findRegenerableWorkspaceDirs(worktreePath);
+    const move = await moveWorkspaceDirsToTrash(worktreePath, candidates);
+    await deleteWorkspaceCompactionTrash(move.trashDir);
+    const survived = await fs.stat(spill.path).then(() => true, () => false);
+    console.info("configured-spill-reaper", { source, candidates, survived, bytes: bytes.length });
+    expect(survived).toBe(true);
+    expect((await fs.readFile(spill.path)).equals(bytes)).toBe(true);
+    expect((await fs.readFile(spill.indexPath)).equals(index)).toBe(true);
+    expect(candidates).toContain("dist");
+    expect(candidates).not.toContain("build");
   });
 
   it("does not follow or return a symlinked directory", async () => {
