@@ -63,7 +63,7 @@ async function expectSavedResultApplied(f: Awaited<ReturnType<typeof diskFullHol
   await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
   expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0])
     .toMatchObject({ status: "done", executionRunId: null, checkoutRunId: null });
-  expect((await run(f.runId)).status).toBe("succeeded");
+  expect((await run(f.runId)).status).toBe("failed"); // K12 (RFL 11-19): the saved result is applied; the run that already ended stays as it ended
   expect(await f.runIds()).toEqual(runsBefore);
   expect(await db.select().from(costEvents).where(eq(costEvents.companyId, f.companyId))).toEqual([]);
 }

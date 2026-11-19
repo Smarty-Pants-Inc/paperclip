@@ -490,12 +490,41 @@ describe.skipIf(!support.supported)("NOFLIP (RFL 11-19): a run that already ende
     expect(await ended(s)).toEqual(before);
     expect(await s.replies()).toHaveLength(1);
     expect(await s.otherRuns()).toEqual([]);
+    // For the record (not asserted): what the late save's commit did to the task and its recovery action.
+    await l3Evidence("NOFLIP-K15a-task-after-late-save", { task: await s.task(), action: { status: (await b.action()).status, outcome: (await b.action()).outcome },
+      coordinator: (await s.coordinator()).phase, endedRunKept: (await s.run()).resultJson?.endedRunKept });
+    expect(await s.coordinator()).toMatchObject({ phase: "committed" });
+    expect((await s.run()).resultJson?.endedRunKept).toMatchObject({ schema: "paperclip.ended-run-kept.v1", status: "failed" });
     // ONCE: a second restart changes nothing.
     const line = (await s.run()).resultJson?.presentationDecision;
     await b.restartWithTheSaveCallPassing();
     expect(await ended(s)).toEqual(before);
     expect((await s.run()).resultJson?.presentationDecision).toEqual(line);
     expect(await s.replies()).toHaveLength(1);
+  }, 240_000);
+
+  it("NOFLIP K12 + K15a, the restart comes BEFORE the reply was published: the late save commits, R stays FAILED, the reply is published exactly once with no file line", async () => {
+    const s = await scenario({ realSync: true }), b = await realBox(s);
+    await s.streamAndAccept();
+    await s.failCopyBackThreeTimes();
+    // No presentation pass yet: the server stopped right after the terminal write.
+    expect(await s.replies()).toEqual([]);
+    const before = await ended(s);
+    expect(before.status).toBe("failed");
+    await b.plantStopReceipt();
+    await b.restartWithTheSaveCallPassing();       // its passes include the REAL reply-presentation worker
+    expect(await b.hostFile()).toBe(CONTENT_OF_R);
+    expect(await ended(s)).toEqual(before);
+    const replies = await s.replies();
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({ body: ANSWER, createdByRunId: s.runId });
+    // Saved: no file line is shown (never KEPT or LOST beside saved files).
+    expect((await s.fileLine())?.state ?? "saved").toBe("saved");
+    expect(await s.line()).toBeNull();
+    await s.expectAnsweredOnceAndNoNotice();
+    await b.restartWithTheSaveCallPassing();
+    expect(await s.replies()).toHaveLength(1);
+    expect(await ended(s)).toEqual(before);
   }, 240_000);
 
   it("NOFLIP K15b, SERVER RESTART: the line already reads LOST -> the late save writes nothing into the task's workspace, R stays FAILED, the line stays LOST, the bytes are kept aside", async () => {

@@ -278,7 +278,7 @@ describe("automatic retained workspace recovery", () => {
     await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
     expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0])
       .toMatchObject({ status: reviewPending ? "in_review" : "done", executionRunId: null, checkoutRunId: null });
-    expect((await run(f.runId)).status).toBe("succeeded");
+    expect((await run(f.runId)).status).toBe("failed"); // K12 (RFL 11-19): the saved result is applied; the run that already ended stays as it ended
     if (reviewPending) expect((await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId)))[0])
       .toMatchObject({ status: "pending", result: null, resolvedAt: null });
   }, 30_000);
