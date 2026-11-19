@@ -691,7 +691,11 @@ describe("persistent agent directories", () => {
           try {return await (store.apply as any)(...params);}finally{finished();}
         }};
       });
-      const directory=agentDirectoryWorkingCopyService(db,(c:string,r:string)=>copies.get(c,r));
+      const directory=agentDirectoryWorkingCopyService(db,(c:string,r:string)=>copies.get(c,r),async(row,values,condition)=>{
+        const [updated]=await db.update(agentInstructionWorkingCopies).set({...values,updatedAt:new Date()})
+          .where(sql`${agentInstructionWorkingCopies.companyId} = ${row.companyId} and ${agentInstructionWorkingCopies.runId} = ${row.runId} and ${condition ?? sql`true`}`).returning();
+        return updated ?? (await copies.get(row.companyId,row.runId))!;
+      });
       let error:string|null=null;await directory.collectStopped((await copies.get(companyId,row.runId))!,boat.executionTarget,controller.signal).catch((e:any)=>{error=String(e);});
       await applyDone;await new Promise(r=>setTimeout(r,10));
       const canonical=await fs.readFile(path.join(root,f),'utf8');const source=await fs.readFile(path.join(row.executionRoot,f),'utf8').catch((e:any)=>'MISSING:'+e.code);
