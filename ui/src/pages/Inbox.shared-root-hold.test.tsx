@@ -61,7 +61,8 @@ async function act(callback: () => void | Promise<void>) {
   await result;
 }
 
-type Fixture = (typeof fixtures)["held_continueRequired"] | (typeof fixtures)["afterPress"] | (typeof fixtures)["ordinaryFailedRun_noHold"];
+type Fixture = (typeof fixtures)["held_continueRequired"] | (typeof fixtures)["afterPress"] | (typeof fixtures)["ordinaryFailedRun_noHold"]
+  | (typeof fixtures)["heldAfterPlainRetry"];
 const WIDTHS = [390, 1440] as const;
 // RFL's words (11:45Z), byte-exact, and the hold's ONE action.
 const PARTLY = "The last reply's file changes couldn't be saved, and part of them may already be in the project's files. Your message will start once you choose Continue.";
@@ -184,6 +185,22 @@ describe("the Inbox failed-run row while a message is held for Continue: the rea
       expect(screenText(host, width)).not.toContain(PARTLY);
       expect(labels(screenButtons(host, width)).filter(label => label === CONTINUE || label === "Retry")).toEqual([]);
       expect(apiMocks.retryTask).toHaveBeenCalledTimes(1);
+    });
+
+    it(`${width}px: after a plain Retry was sent to the route during the hold (accepted, M still held), the row still says the ONE sentence and offers only Continue, never 'Retry is waiting ...' with another Retry`, async () => {
+      const held = fixtures.heldAfterPlainRetry;
+      expect(held.plainRetry).toMatchObject({ status: 202, accepted: true });
+      expect([held.runsThatCarryM, held.attributedRepliesToM, held.taskBlocker?.savedMessageWait]).toEqual([[], 0, "continue_required"]);
+      await mount(held, width);
+      const row = await vi.waitFor(() => { const found = failedRunRow(held); expect(found, "the Inbox shows R's failed-run row").toBeTruthy(); return found!; });
+      dump("heldAfterPlainRetry", width, row);
+      expect(count(screenText(host, width), PARTLY), "the sentence, once, on the page").toBe(1);
+      expect(screenText(host, width)).not.toMatch(/Retry is waiting|Couldn[’']t finish this attempt/);
+      expect(labels(remedies(row, width))).toEqual([CONTINUE]);
+      apiMocks.retryTask.mockResolvedValue(fixtures.held_continueRequired.pressed.body);
+      await act(async () => { (remedies(row, width)[0] as HTMLButtonElement).click(); });
+      await vi.waitFor(() => expect(apiMocks.retryTask).toHaveBeenCalledTimes(1));
+      expect(apiMocks.retryTask.mock.calls[0]).toEqual([held.issueId, { idempotencyKey: expect.stringMatching(UUID), observedRunId: held.rRunId, retryAction: "continue_with_files" }]);
     });
 
     it(`${width}px CONTROL: an ordinary failed run with no message held keeps today's text and its plain Retry`, async () => {
