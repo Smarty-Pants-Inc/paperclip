@@ -26,6 +26,8 @@ export interface TaskChatAdapterContext {
    */
   issueAssigneeAgentId?: string | null;
   verificationCaveatsByRunId?: ReadonlyMap<string, TaskChatMessageItem["verificationCaveats"]>;
+  /** Runs the issue's run lists show as terminal: a still-'accepted' steer into one is not delivered. */
+  terminalRunIds?: ReadonlySet<string> | null;
 }
 
 function effectiveAgentId(comment: IssueChatComment): string | null {
@@ -145,7 +147,7 @@ export function commentsToTaskChatItems(
       optimistic,
       queueTargetRunId: queued ? comment.queueTargetRunId ?? null : null,
       ...(kind === "human" && readSteeredIntoRunId(comment)
-        ? { steeredIntoRunId: readSteeredIntoRunId(comment), steeredDelivery: readSteeredDelivery(comment) ?? "sent" }
+        ? { steeredIntoRunId: readSteeredIntoRunId(comment), steeredDelivery: readSteeredDelivery(comment, ctx.terminalRunIds) ?? "sent" }
         : kind === "human" && readSteeredDelivery(comment) === "pending"
           ? { steeredDelivery: "pending" as const }
           : {}),
