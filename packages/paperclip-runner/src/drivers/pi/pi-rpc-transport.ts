@@ -224,6 +224,18 @@ export class PiRpcTransport {
     return this.#child.pid ?? null;
   }
 
+  /** Linux identity from the Pi child itself, never the controller's PID space. */
+  get processIdentity(): { boot_id: string | null; piPid: number | null; piProcessStartTicks: string | null } {
+    let boot_id: string | null = null;
+    let piProcessStartTicks: string | null = null;
+    try { boot_id = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(); } catch { /* non-Linux/unavailable */ }
+    if (this.pid !== null) {
+      try { piProcessStartTicks = readFileSync(`/proc/${this.pid}/stat`, "utf8").split(") ").at(-1)!.split(" ")[19] ?? null; }
+      catch { /* child exited or /proc unavailable */ }
+    }
+    return { boot_id, piPid: this.pid, piProcessStartTicks };
+  }
+
   get exited(): boolean {
     return this.#exited;
   }

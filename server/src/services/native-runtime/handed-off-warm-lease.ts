@@ -1,3 +1,4 @@
+import { recordWarmRetentionProbe } from "./warm-retention-probe.js";
 import { assertNoOpenTransaction } from "@paperclipai/db/transaction-context";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { environmentLeases, type Db, type heartbeatRuns } from "@paperclipai/db";
@@ -199,23 +200,32 @@ export function proveHandedOffWarmLeases(db: Db, run: Run, opts?: { redispatch?:
     // adopt-hung-stop: a handed-off stop already requested gets its receipt deadline (re-armed from the durable intent time).
     for (const lease of all) await armHandedOffStopReceiptDeadline(db, run, lease);
     const leases = all.filter(lease => handedOffWarmLease(run, lease) && !handedOffWarmLeaseSettled(run, lease));
-    if (!leases.length) return "none";
+    if (!leases.length) {
+      for (const lease of all) await recordWarmRetentionProbe(db, { companyId: run.companyId, runId: run.id, leaseId: lease.id },
+        { phase: "proof", outcome: "skipped", elapsedMs: 0 });
+      return "none";
+    }
     assertNoOpenTransaction("runner:handedOffWarmOwnerRunnerExited");
     const { handedOffWarmOwnerRunnerExited, handedOffWarmOwnerProofUnavailable } = await import("./native-session-executor.js");
     let outcome: ProofOutcome = "proven";
     for (const [index, lease] of leases.entries()) {
+      const proofStartedAt = Date.now();
+      const probe = (outcome: string) => recordWarmRetentionProbe(db, { companyId: run.companyId, runId: run.id, leaseId: lease.id },
+        { phase: "proof", outcome, elapsedMs: Math.max(0, Date.now() - proofStartedAt) });
       let timer: NodeJS.Timeout | undefined;
       const answer = await Promise.race([
         handedOffWarmOwnerRunnerExited({ runId: run.id, providerLeaseId: lease.providerLeaseId }).catch(() => false),
         new Promise<"timeout">(resolve => { timer = setTimeout(() => resolve("timeout"), handedOffWarmProofTimeout.ms); }),
       ]).finally(() => clearTimeout(timer));
       if (answer === true) {
+        await probe("proven");
         await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
           [HANDED_OFF_WARM_EXIT_KEY]: { runId: run.id, provenAt: new Date().toISOString() } })}::jsonb`, updatedAt: new Date() })
           .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, run.companyId)));
         continue;
       }
       if (answer === "timeout") {
+        await probe("unproven");
         await requestHandedOffWarmLeaseStop(db, run, lease, { [HANDED_OFF_WARM_STOP_KEY]: true, proofTimedOutMs: handedOffWarmProofTimeout.ms }, "proof timed out");
         return "timed_out";
       }
@@ -228,7 +238,11 @@ export function proveHandedOffWarmLeases(db: Db, run: Run, opts?: { redispatch?:
       if (handedOffByAnotherBoot(lease) && handedOffWarmOwnerProofUnavailable({ runId: run.id, providerLeaseId: lease.providerLeaseId })) {
         for (const unavailable of leases.slice(index))
           if (handedOffByAnotherBoot(unavailable) && handedOffWarmOwnerProofUnavailable({ runId: run.id, providerLeaseId: unavailable.providerLeaseId }))
-            await requestHandedOffWarmLeaseStop(db, run, unavailable, { [HANDED_OFF_WARM_UNAVAILABLE_STOP_KEY]: true }, "proof unavailable");
+            {
+              await recordWarmRetentionProbe(db, { companyId: run.companyId, runId: run.id, leaseId: unavailable.id },
+                { phase: "proof", outcome: "unavailable", elapsedMs: Math.max(0, Date.now() - proofStartedAt) });
+              await requestHandedOffWarmLeaseStop(db, run, unavailable, { [HANDED_OFF_WARM_UNAVAILABLE_STOP_KEY]: true }, "proof unavailable");
+            }
         return "stop_requested";
       }
       // adopt-unproven-bound: UNPROVEN in THIS boot (not a restart). Only the
@@ -236,6 +250,7 @@ export function proveHandedOffWarmLeases(db: Db, run: Run, opts?: { redispatch?:
       // would wait for warm expiry. Bound it: past handedOffWarmUnprovenBound the
       // stop-only owner stops and keeps the box; before it, ONE re-proof is
       // scheduled at the bound. Never for a box another live turn uses.
+      await probe("unproven");
       if (await boundUnprovenHandedOffWarmLease(db, run, lease, opts?.redispatch)) return "stop_requested";
       outcome = "unproven";
       break;

@@ -51,9 +51,10 @@ class FailureTransport {
   async close() { this.closed = this.exited = true; this.wake?.(); }
 }
 const flushFailure = () => new Promise<void>(resolve => setImmediate(resolve));
-async function failureFixture(capture = true) {
+async function failureFixture(capture = true, processIdentity?: PiRpcTransport["processIdentity"]) {
   const root = await mkdtemp(join(tmpdir(), "pi-failure-"));
   const transport = new FailureTransport();
+  if (processIdentity) Object.assign(transport, { processIdentity });
   const session = await new PiRpcDriver({ runtimeDirectory: join(root, "runtime"), model: "neutral/model", piRpcThinkingLevel: "high", environment: { PI_CODING_AGENT_DIR: join(root, "agent") }, transportFactory: () => transport as unknown as PiRpcTransport })
     .openSession({ runId: "run-old", normalizedSessionId: "normalized", workingDirectory: root });
   const events: PrpEvent[] = [];
@@ -61,8 +62,8 @@ async function failureFixture(capture = true) {
   return { session, transport, events, async close() { await session.close({ reason: "unit cleanup" }); await drained; await rm(root, { recursive: true, force: true }); } };
 }
 
-async function inputProxyFixture() {
-  const f = await failureFixture(false); const frames: PiRpcRecord[] = [];
+async function inputProxyFixture(processIdentity?: PiRpcTransport["processIdentity"]) {
+  const f = await failureFixture(false, processIdentity); const frames: PiRpcRecord[] = [];
   const proxy = createPiRpcAppServerProxy({ stdout: { write(frame) { frames.push(JSON.parse(frame)); return true; }, once() {} },
     environment: { PAPERCLIP_RUN_ID: "run-old" }, createDriver: () => ({ async descriptor() { throw new Error("unused"); }, async openSession() { return f.session; } }) });
   let nextId = 0;
@@ -162,6 +163,14 @@ describe("PiRpcDriver thinking display", () => {
 });
 
 describe("PiRpcDriver", () => {
+  it("carries the Pi child's identity in the existing proxy admission receipt", async () => {
+    const identity = { boot_id: "boot-on-box", piPid: 42, piProcessStartTicks: "123456" };
+    const f = await inputProxyFixture(identity);
+    try {
+      const response = f.frames.find(frame => frame.id === 1) as { result?: { piNativeAdmission?: { piProcessIdentity?: unknown } } };
+      expect(response.result?.piNativeAdmission?.piProcessIdentity).toEqual(identity);
+    } finally { await f.close(); }
+  });
   it("k: runner session and RPC mode win over manager-supplied Pi environment", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-manager-env-"));
     const runtime = join(root, "copied-runner", "sessions");
