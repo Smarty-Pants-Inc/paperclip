@@ -86,6 +86,7 @@ import { environmentService, KEPT_SANDBOX_LEASE_POLICIES } from "./environments.
 import { instanceSettingsService } from "./instance-settings.js";
 import { hasSandboxSnapshotQualification, qualifiedSandboxSnapshotId, usesManagedCloudSandboxImage, type SandboxTemplateIdentity } from "./sandbox-snapshot-qualification.js";
 import { verifyRecoverableNativeHarnessBackup } from "./native-runtime/native-harness-backup-storage.js";
+import { keepNativeTurnBox, nativeTurnCustody, nativeTurnCustodyForLease, NATIVE_TURN_CUSTODY_REFUSED_MESSAGE } from "./native-turn-custody.js";
 import { loadNativeHarnessBackupLeaseChain, loadNativeHarnessBackupLeaseRows, nativeHarnessBackupHasLaterProviderWork,
   nativeSessionOfLeaseRun, newestNativeHarnessBackupStampOnChain, sourceFilesHeld } from "./native-runtime/native-retired-backup-source.js";
 import { warmOwnerInThisProcessHoldsLease } from "./native-runtime/warm-owner-lease-holders.js";
@@ -2950,6 +2951,10 @@ function createSandboxEnvironmentDriver(
       if (!exportResume && await nativeWorkspaceExportPendingForLease(db, input.lease)) {
         throw new Error("Native workspace export is pending; destructive cleanup is forbidden.");
       }
+      if (!exportResume) {
+        const custody = await nativeTurnCustody(db, input.lease);
+        if (!custody.destroy) throw new Error(`${NATIVE_TURN_CUSTODY_REFUSED_MESSAGE} (${custody.reason})`);
+      }
       const resumeIntent = readStopOnlyCleanup(input.lease);
       const assertExportResumeOwnership = async () => {
         if (!resumeIntent) throw new Error("Workspace export resume ownership is invalid.");
@@ -4568,6 +4573,13 @@ export function environmentRuntimeService(
     if (await nativeWorkspaceExportPendingForLease(db, input.leaseRow)) return null;
     if (!(await allowLegacyShutdownWorkspaceCleanup(db, input.leaseRow))) return null;
     if (await agentFileSaveHeldOnLease(db, input.leaseRow)) return null;
+    // Custody gate: a box whose native turn the server does not hold is kept
+    // (stop-and-retain), never claimed for destroy.
+    const custody = await nativeTurnCustodyForLease(db, input.leaseRow);
+    if (!custody.destroy) {
+      await keepNativeTurnBox(db, input.leaseRow, custody.reason);
+      return null;
+    }
     const now = new Date();
     const attemptId = randomUUID();
     // The claimer is bound to this attempt. If this server dies mid-teardown,
@@ -4820,6 +4832,21 @@ export function environmentRuntimeService(
           if (hasNativeWorkspaceExportResume(leaseSnapshot) && providerResourceDisposition === "destroy") {
             const completed = await releaseCompletedNativeWorkspaceExportRetention(db, leaseSnapshot);
             if (completed) { leaseRow = completed; leaseSnapshot = toEnvironmentLeaseSnapshot(completed); }
+          }
+          // Custody gate: a destroy, or a release that erases a non-reusable
+          // box, runs only when the server holds the box's native turn. Else
+          // the box is stopped and kept through the stop-only branch below.
+          if (providerResourceDisposition !== "stop_and_retain" && providerResourceDisposition !== "keep_running"
+            && !hasStopOnlyCleanup(leaseSnapshot) && getLeaseDriverKey(leaseSnapshot, environment) === "sandbox"
+            && (providerResourceDisposition === "destroy" || leaseSnapshot.leasePolicy !== "reuse_by_environment")) {
+            const custody = await nativeTurnCustodyForLease(db, leaseRow);
+            if (!custody.destroy) {
+              const kept = await keepNativeTurnBox(db, leaseRow, custody.reason);
+              if (!kept || !hasStopOnlyCleanup(kept)) continue;
+              leaseRow = kept;
+              leaseSnapshot = toEnvironmentLeaseSnapshot(kept);
+              preparedStopAttemptId = kept.metadata?.pendingCleanupAttemptId;
+            }
           }
           if (providerResourceDisposition === "stop_and_retain" && !hasStopOnlyCleanup(leaseSnapshot)
             && getLeaseDriverKey(leaseSnapshot, environment) === "sandbox") {

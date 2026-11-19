@@ -5,6 +5,7 @@ import { conflict, notFound } from "../errors.js";
 import { persistActivity, publishActivity } from "./activity-log.js";
 import { notifyEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { instructionCopyRetryAt } from "./instruction-copy-retry.js";
+import { nativeTurnCustody } from "./native-turn-custody.js";
 
 export const AGENT_FILES_SAVE_PENDING_INSTRUCTION = "Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox.";
 export const AGENT_FILES_RETIREMENT_COLLECTION_TIMEOUT = "AGENT_FILES_RETIREMENT_COLLECTION_TIMEOUT";
@@ -78,11 +79,16 @@ const allocationRows = (leaseId: SQL) => sql`select alloc_lease.id, alloc_lease.
  * A hold write and a collection pin take the same row locks and are refused
  * once a claim exists, so the hold check, the collection and the destroy
  * authority can never interleave.
- * Returns the claim token, or null when claimed/pinned/held (or the lease
- * vanished): never destroy then. Release only with the token.
+ * The native-turn custody gate (nativeTurnCustody) is checked under the same
+ * locks: a box whose native turn the server does not hold is never claimed.
+ * Returns the claim token, or null when claimed/pinned/held/not in custody (or
+ * the lease vanished): never destroy then. Release only with the token.
  */
 export async function claimLeaseForDestroyUnlessHeld(db: Db, lease: HoldLease): Promise<string | null> {
-  if (typeof (db as Db).transaction !== "function") return (await agentFileSaveHeldOnLease(db, lease)) ? null : randomUUID();
+  if (typeof (db as Db).transaction !== "function") {
+    if (await agentFileSaveHeldOnLease(db, lease)) return null;
+    return (await nativeTurnCustody(db, lease)).destroy ? randomUUID() : null;
+  }
   return await db.transaction(async tx => {
     const locked = await (tx as unknown as Db).execute(sql`select alloc.id,
         ${liveDestroyClaimSql(sql`alloc.metadata`)} as claimed,
@@ -91,6 +97,7 @@ export async function claimLeaseForDestroyUnlessHeld(db: Db, lease: HoldLease): 
     if (!Array.isArray(locked) || !locked.some(row => row.id === lease.id)) return null;
     if (locked.some(row => row.claimed === true || row.pinned === true)) return null;
     if (await agentFileSaveHeldOnLease(tx as unknown as Db, lease)) return null;
+    if (!(await nativeTurnCustody(tx as unknown as Db, lease)).destroy) return null;
     const token = randomUUID();
     await (tx as unknown as Db).execute(sql`update environment_leases set metadata = coalesce(metadata, '{}'::jsonb)
       || jsonb_build_object(${AGENT_FILE_DESTROY_CLAIM_KEY}::text, ${token}::text,

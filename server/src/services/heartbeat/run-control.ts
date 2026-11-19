@@ -481,9 +481,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         );
         return { closed: 0, busy: 0, failed: 1 };
       });
-      // A failed remote checkpoint cannot veto destruction of the isolated
-      // sandbox after the run stopped. Provider destruction supplies the exit
-      // proof; it does not turn the interrupted checkpoint into a success.
+      // A failed warm-session close does not by itself defer the release of
+      // an isolated sandbox after the run stopped. But the destroy is still
+      // gated by native-turn custody (native-turn-custody.ts): a box whose
+      // native turn the server does not hold (no matching backup, or a
+      // workspace copy-out that did not succeed) is stopped and KEPT, never
+      // destroyed, for failed and cancelled runs too.
       const remoteLeases = closeResult.failed > 0 && leaseOwnerRun &&
           ["cancelled", "failed", "timed_out", "interrupted"].includes(leaseOwnerRun.status)
         ? await db.select({ provider: environmentLeases.provider }).from(environmentLeases).where(and(

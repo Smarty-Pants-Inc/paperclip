@@ -27,6 +27,7 @@ import {
 import { currentControllerProcess, readControllerProcess } from "../controller-process-identity.js";
 import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { hasNativeHarnessBackupMissing } from "../native-runtime/native-harness-backup-missing.js";
+import { escalateExpiredNativeTurnCustodyKeeps, keepNativeTurnBox, nativeTurnCustodyForLease } from "../native-turn-custody.js";
 import { startNativeSessionExecutionLeaseRenewal, type NativeExecutionLeaseRenewal } from "../native-runtime/native-execution-lease.js";
 import type { WorkspaceWorkers } from "../plugin-workspaces.js";
 import { listExpiredNativeRunnerAuthorities } from "../native-runtime/native-runner-checkpoint.js";
@@ -1877,6 +1878,11 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       logger.warn({ errorKind: "teardown_claim_settle_failed" }, "teardown claim settle failed; a later sweep retries");
     });
 
+    // Money rule: a kept native-turn box past its expiry is escalated (typed
+    // marker + operator log); it is never destroyed here.
+    if (!manualRetry) await escalateExpiredNativeTurnCustodyKeeps(db).catch(() => {
+      logger.warn({ errorKind: "native_turn_custody_escalation_failed" }, "kept-box escalation failed; a later sweep retries");
+    });
     if (!manualRetry) await expireAbandonedWorkspaceFileHoldsWhenDue(db).catch(() => {
       logger.warn({ errorKind: "abandoned_workspace_files_expiry_failed" }, "abandoned workspace file expiry failed; a later sweep retries");
     });
@@ -1915,6 +1921,15 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       if (!hasStopOnlyCleanup(row) && hasNativeHarnessBackupMissing(row)) {
         await deferPendingCleanupLease(row.id);
         continue;
+      }
+      if (!hasStopOnlyCleanup(row)) {
+        // Custody gate: a pending destroy of a box whose native turn the
+        // server does not hold becomes a stop-and-keep instead.
+        const custody = await nativeTurnCustodyForLease(db, row);
+        if (!custody.destroy) {
+          await keepNativeTurnBox(db, row, custody.reason);
+          continue;
+        }
       }
       if (!hasStopOnlyCleanup(row) && await parkAbandonedWorkspaceFilesLease(db, row, ["pending_cleanup"])) continue;
       if (!hasStopOnlyCleanup(row) && await nativeWorkspaceExportPendingForLease(db, row)) {
