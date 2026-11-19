@@ -15,36 +15,28 @@ import type { EnvironmentLease } from "@paperclipai/shared";
 import type { PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 
-// The stuck-save bound on a CLASSIC nativeWorkspaceSync run (the minimum cut, CHALLENGE-r1 sections 2 and 7).
-// Rows K1, K2r, K4-K9 (RF5-ROWS.md) and RFL's list, with the majors C5-C12, C16.
+// A person's message parked behind a run R whose answer is already shown, when R ends by ANY path; a terminal run
+// that never flips; a wake a Pause cancelled that is never silent. (RFL 04:56Z + 05:00Z, gate 5; cause.md.)
 //
 // REAL in every row (the route or producer is named at its call):
 //   the person's messages ....... POST /api/issues/:id/comments (routes/issues.ts)
-//   the task's saved directory .. materializeIsolatedTaskDirectory (the repository-free task directory)
-//   R's classic sync ............ prepareNativeWorkspaceSync: the startup seed S0, the descriptor and the
-//                                 prepared reference; the "sandbox" is a local directory and every sandbox
-//                                 command really runs
-//   acceptance .................. NativeRunCoordinatorStore.completeRun
-//   every copy-back attempt ..... nativeWorkspaceFinalizationWork(...).load + .check (the worker's own functions)
-//                                 -> attemptNativeWorkspaceFinalization -> resumeNativeWorkspaceSync (the
-//                                 finalizer entry), under withNativeWorkspaceFinalizationOwnership
-//   the bound ................... the same .check -> recordNativeWorkspaceFinalizationFailure
-//                                 -> recordNativeFinalizationFailure (the finalizer's one terminal write)
-//   R's reply and its line ...... the reply-presentation worker; GET /api/issues/:id/comments and
-//                                 GET /api/issues/:id/runs; the ONE renderer replyFileLineText
-//   the parked message's start .. heartbeat.registerDeferredReceiptWork + resumeQueuedRuns: real release,
-//                                 claimQueuedRun, fenceUnverifiedPredecessorsAtAdmission, workspace
-//                                 preparation, environment acquisition and P's own prepareNativeWorkspaceSync
+//   turn 0, R and the next run .. real runs of the real executor: the queue's claim, workspace preparation,
+//                                 environment acquisition, prepareNativeWorkspaceSync, R's own teardown copy-back
+//   every later copy-back ....... nativeWorkspaceFinalizationWork(...).load + .check (the worker's own functions)
+//   R's end ..................... the finalizer's one terminal write (recordNativeFinalizationFailure), reached by
+//                                 the worker's third failed attempt, or by its person-wait cap; Stop is
+//                                 POST /api/heartbeat-runs/:id/cancel; Pause and Resume are
+//                                 POST /api/issues/:id/tree-holds and .../tree-holds/:holdId/release
+//   the parked message's start .. heartbeat.registerDeferredReceiptWork + resumeQueuedRuns
+//   what the person reads ....... GET /api/agents/:id, GET /api/issues/:id/comments, GET /api/issues/:id/runs
+//   the one line ................ settleUnansweredPersonMessagesForTask (recovery/unanswered-person-message.ts)
+// SCRIPTED (named): the provider turn (it accepts its own result through PaperclipControlPlanePort).
 // NAMED INJECTIONS:
-//   CLASSIC-STALL-1 ............. the box's sandbox commands block for R's box until the test releases them
-//                                 (no apply started: the copy-back hangs in its first command)
-//   CLASSIC-STALL-AFTER-APPLY ... the same seam, armed on the stamp command only: the host apply has FINISHED
-//                                 and its success is not recorded (RFL "applied but uncommitted", K8)
-// PLANTED (named), rows K1, K4, K8, C5, C6 and the Git row: the native run row R, its lease, its workspace row and
-//   its claim of M's wake. Beside them, the SAME shape by the real route: the live row (last in this file) has no
-//   planted row at all. There turn 0, R and P are real runs of the real executor, R's lease and workspace row are
-//   the ones real preparation wrote, and R hangs in its own teardown copy-back. Only the provider turn is scripted.
-// C11, the Stop base: these rows ride cut 2a (62fcab5b) as it is. No row presses Stop; nothing here changes Stop.
+//   CLASSIC-STALL-1 ... R's box calls hang until the test releases them
+//   SAVE-FAILS ........ the held call comes back as a failure (the provider gave up on it)
+//   CLOCK-SKIP ........ the 30 s retry delay is moved to now; where said, the sweep's clock is 10 minutes on
+//   TURN-GATE ......... the next run's provider turn is held open (the control row)
+// PLANTED: nothing.
 const box = vi.hoisted(() => ({ targets: new Map<string, unknown>(), inputs: [] as unknown[],
   nextBox: null as null | ((leaseId: string, real: () => Promise<any>, lease: any) => Promise<unknown>),
   /** The scripted provider turn of one run (the live-executor rows): returns after it accepted its own result. */
@@ -78,7 +70,7 @@ import { agentRoutes } from "../../routes/agents.js";
 import { issueRoutes } from "../../routes/issues.js";
 import { activityRoutes } from "../../routes/activity.js";
 import { issueTreeControlRoutes } from "../../routes/issue-tree-control.js";
-import { settleUnansweredPersonMessagesForTask } from "../recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_TASK_PAUSED_TEXT } from "../recovery/unanswered-person-message.js";
 import { errorHandler } from "../../middleware/index.js";
 import { materializeIsolatedTaskDirectory } from "../isolated-task-directory.js";
 import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
@@ -202,10 +194,12 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
     const stallReached = new Promise<void>(resolve => { reached = resolve; });
     const stallRelease = new Promise<void>(resolve => { release = resolve; });
     let turns = 0;
+    const turnGate = { hold: null as null | Promise<void>, entered: null as null | (() => void) };
     const faultedBox = { index: -1 };
     box.session = async input => {
       const turn = ++turns;
-      if (turn > 2) return null; // P's turn: the default scripted answer.
+      // P's turn: the default scripted answer. TURN-GATE (named): the control row holds P's provider turn open.
+      if (turn > 2) { if (turn === 3 && turnGate.hold) { turnGate.entered?.(); await turnGate.hold; } return null; }
       const execution = input.execution, runId: string = execution.binding.runId;
       const sessionId: string = execution.session.normalizedSessionId ?? `session-${runId}`;
       const runnerId = input.runnerInstanceId, controlPlaneId = `${runnerId}:control`;
@@ -274,7 +268,7 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
       const state = readReplyFileLine(served?.resultJson?.replyFileLine);
       return { status: served?.status ?? null, state: state?.state ?? null, shown: replyFileLineText(state, { nowMs: Date.now(), recoverSavedFilesShown: false }) };
     };
-    return { companyId, agentId, issueId, app, boxes, runs, issue, say, agentComments, servedLine, faultedBox, fault,
+    return { companyId, agentId, issueId, app, boxes, runs, issue, say, agentComments, servedLine, faultedBox, fault, turnGate,
       stallReached, releaseStall: () => { release(); fault.stall = null; } };
   }
 
@@ -442,72 +436,131 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
     } finally { await h.stop(); }
   }, 300_000);
 
-  it("PROBE stop", async () => {
-    const h = await hungRWithParkedMessage(NO_CAP);
+  it("CAP (the snap's deadline): the save hangs with a message parked -> at the cap R ends, the agent does not read error, the parked message runs once within a minute, 0 'no run started'; the save then returns -> R stays as it ended", async () => {
+    const CAP = 2_000;
+    const h = await hungRWithParkedMessage(CAP);
     try {
-      const stopped = await request(h.s.app).post(`/api/heartbeat-runs/${h.r.id}/cancel`).send({ cancellationRequestId: randomUUID() });
-      const out: Record<string, unknown> = { stopStatus: stopped.status, stopBody: { status: stopped.body?.status, errorCode: stopped.body?.errorCode } };
-      await sleep(2_000);
-      out.Rhung = brief(await h.run(h.r.id));
-      out.wakesHung = (await h.wakesOf(h.next)).map(w => ({ id: w.id, status: w.status, error: w.error, runId: w.runId }));
-      const admitted = await h.admitParked(20_000);
-      out.admittedWhileHung = { afterMs: admitted.afterMs, turns: admitted.turns, runs: admitted.runs.map(brief) };
-      await h.present();
-      out.R = brief(await h.run(h.r.id)); out.coordinator = (await h.coordinator(h.r.id))?.phase; out.line = await h.s.servedLine(h.r.id);
-      out.agent = await h.agentRead(); out.issue = { status: (await h.s.issue()).status, executionRunId: (await h.s.issue()).executionRunId };
-      out.wakes = (await h.wakesOf(h.next)).map(w => ({ id: w.id, status: w.status, error: w.error, runId: w.runId }));
-      out.sweep = await h.sweepUnanswered(new Date(Date.now() + 10 * 60_000));
-      out.thread = (await h.thread()).map(c => ({ by: c.authorType, run: c.createdByRunId, body: c.body.slice(0, 200) }));
+      const startAt = Date.now();
+      while ((await h.run(h.r.id)).status === "running" && Date.now() - startAt < CAP + 15_000) { await h.sweep(h.r.id); await sleep(200); }
+      const ended = await h.run(h.r.id);
+      expect(ended).toMatchObject({ status: "failed", errorCode: STALLED });
+      const agentAtEnd = await h.agentRead();
+      expect(agentAtEnd).toMatchObject({ lifecycleState: "ready" });
+      expect(agentAtEnd.status).not.toBe("error");
+      const admitted = await h.admitParked(60_000);
+      expect(admitted.runs, "the parked message never started").toHaveLength(1);
+      expect(admitted.turns).toBe(1);
+      const frozen = brief(await h.run(h.r.id));
       h.s.releaseStall();
       await h.heartbeat.drainActiveRunExecutions();
       await h.sweep(h.r.id);
-      const late = await h.admitParked(10_000);
-      out.admittedAfterRelease = { afterMs: late.afterMs, turns: late.turns, runs: late.runs.map(brief) };
-      out.Rlate = brief(await h.run(h.r.id)); out.lineLate = await h.s.servedLine(h.r.id); out.coordinatorLate = (await h.coordinator(h.r.id))?.phase;
-      out.wakesLate = (await h.wakesOf(h.next)).map(w => ({ id: w.id, status: w.status, error: w.error, runId: w.runId }));
-      out.agentLate = await h.agentRead(); out.hostLate = await listing(h.hostDir); await h.present(); out.lineLatePresented = await h.s.servedLine(h.r.id);
-      out.ownerLate = record(record((await h.run(h.r.id)).runnerProfileJson).nativeWorkspaceFinalizationOwner);
-      out.opsLate = (await db.select().from(workspaceOperations).where(and(eq(workspaceOperations.heartbeatRunId, h.r.id), eq(workspaceOperations.phase, "workspace_finalize")))).map(o => o.status);
-      // The person's next explicit message after the Stop.
-      const again = await h.s.say("Please continue: add the summary section.");
-      const startAt = Date.now(); const before = box.inputs.length;
-      while (Date.now() - startAt < 20_000 && box.inputs.length === before) { await h.heartbeat.resumeQueuedRuns(); await sleep(250); }
-      await sleep(500);
-      out.afterNextMessage = { turns: box.inputs.length - before, runs: (await h.s.runs()).slice(2).map(run => ({ ...brief(run), carries: [h.next, again].filter(id => JSON.stringify(run.contextSnapshot).includes(id)).length })),
-        wakes: [...await h.wakesOf(h.next), ...await h.wakesOf(again)].map(w => ({ status: w.status, error: w.error, runId: w.runId })), agent: await h.agentRead() };
-      out.errors = h.errors.map(String);
-      evidence.probeStop = out;
+      await h.present();
+      expect(await h.agentRead()).toMatchObject({ status: "idle", lifecycleState: "ready" });
+      await h.sweepUnanswered(new Date(Date.now() + 10 * 60_000));
+      const thread = await h.thread();
+      expect(thread.filter(comment => /no run started|wasn't answered/i.test(comment.body))).toEqual([]);
+      expect(thread.filter(comment => comment.createdByRunId === admitted.runs[0].id && comment.authorType === "agent")).toHaveLength(1);
+      expect(brief(await h.run(h.r.id))).toEqual(frozen);
+      expect(await h.s.servedLine(h.r.id)).toMatchObject({ status: "failed", state: "lost", shown: THE_LINE });
+      evidence.CAP = { R: frozen, agentAtEnd, admittedAfterMs: admitted.afterMs };
     } finally { await h.stop(); }
   }, 300_000);
 
-  it("PROBE pause", async () => {
+  it("STOP, as the product is today (cause.md DESIGN CHOICE 1 is open): Stop during the hung save -> R is cancelled and never flips when the save returns; the agent does not read error; the parked message is held with one line and is answered once, with the person's next message", async () => {
     const h = await hungRWithParkedMessage(NO_CAP);
     try {
-      const out: Record<string, unknown> = {};
-      const w = async () => (await h.wakesOf(h.next)).map(wake => ({ status: wake.status, error: wake.error, runId: wake.runId, reason: wake.reason }));
-      const paused = await request(h.s.app).post(`/api/issues/${h.s.issueId}/tree-holds`).send({ mode: "pause", reason: "cleanup" });
-      out.pause = { status: paused.status, holdId: paused.body?.hold?.id, body: paused.status === 201 ? undefined : paused.body };
-      await sleep(1_500);
-      out.Rpaused = brief(await h.run(h.r.id));
-      out.wakesPaused = await w();
-      out.sweepPaused = await h.sweepUnanswered(new Date(Date.now() + 10 * 60_000));
-      out.sweepPaused2 = await h.sweepUnanswered(new Date(Date.now() + 20 * 60_000));
-      out.threadPaused = (await h.thread()).map(c => ({ by: c.authorType, run: c.createdByRunId, body: c.body.slice(0, 200) }));
+      const stopped = await request(h.s.app).post(`/api/heartbeat-runs/${h.r.id}/cancel`).send({ cancellationRequestId: randomUUID() });
+      expect(stopped.status, JSON.stringify(stopped.body)).toBe(200);
+      const frozen = brief(await h.run(h.r.id));
+      expect(frozen).toMatchObject({ status: "cancelled" });
+      expect((await h.agentRead()).status).not.toBe("error");
+      // Held by the Stop rule (modules/wake-queue/adapters/postgres.ts, "An operator stop never promotes old queued work").
+      const held = await h.admitParked(5_000);
+      expect(held.runs).toEqual([]);
+      expect((await h.wakesOf(h.next)).map(wake => wake.status)).toEqual(["deferred_issue_execution"]);
+      // The save returns late: R never flips.
       h.s.releaseStall();
       await h.heartbeat.drainActiveRunExecutions();
-      const released = await request(h.s.app).post(`/api/issues/${h.s.issueId}/tree-holds/${paused.body?.hold?.id}/release`).send({ reason: "cleanup done" });
-      out.release = { status: released.status, body: released.status < 300 ? undefined : released.body };
-      const startAt = Date.now(); const before = box.inputs.length;
-      while (Date.now() - startAt < 20_000 && box.inputs.length === before) { await h.heartbeat.resumeQueuedRuns(); await sleep(250); }
-      await sleep(1_000); await h.heartbeat.drainActiveRunExecutions(); await h.present();
-      out.afterResume = { turns: box.inputs.length - before, runs: (await h.s.runs()).slice(2).map(run => ({ ...brief(run), carriesNext: JSON.stringify(run.contextSnapshot).includes(h.next),
-        wakeReason: record(run.contextSnapshot).wakeReason })) };
-      out.wakesResumed = await w();
-      out.allWakes = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, h.s.agentId))).map(wake => ({ status: wake.status, reason: wake.reason, error: wake.error }));
-      out.sweepResumed = await h.sweepUnanswered(new Date(Date.now() + 10 * 60_000));
-      out.threadResumed = (await h.thread()).map(c => ({ by: c.authorType, run: c.createdByRunId, body: c.body.slice(0, 200) }));
-      out.agent = await h.agentRead(); out.issue = { status: (await h.s.issue()).status };
-      evidence.probePause = out;
+      await h.sweep(h.r.id);
+      await h.present();
+      expect(brief(await h.run(h.r.id))).toEqual(frozen);
+      // One line for the held message (the sweep's clock 10 minutes on), never silence.
+      await h.sweepUnanswered(new Date(Date.now() + 10 * 60_000));
+      await h.sweepUnanswered(new Date(Date.now() + 20 * 60_000));
+      const lines = (await h.thread()).filter(comment => comment.authorType === "system" && /your message/i.test(comment.body));
+      expect(lines.map(comment => comment.body)).toHaveLength(1);
+      // The person's next message starts ONE run that carries both.
+      const again = await h.s.say("Please continue: add the summary section.");
+      const before = box.inputs.length;
+      for (const startAt = Date.now(); Date.now() - startAt < 30_000 && box.inputs.length === before;) { await h.heartbeat.resumeQueuedRuns(); await sleep(250); }
+      await h.heartbeat.drainActiveRunExecutions();
+      const later = (await h.s.runs()).slice(2);
+      expect(later.map(run => run.status)).toEqual(["succeeded"]);
+      expect(JSON.stringify(later[0].contextSnapshot)).toContain(again);
+      expect((await h.wakesOf(h.next)).map(wake => wake.status)).not.toContain("deferred_issue_execution");
+      expect(brief(await h.run(h.r.id))).toEqual(frozen);
+      evidence.STOP = { R: frozen, line: lines[0].body, laterRuns: later.map(brief) };
     } finally { await h.stop(); }
+  }, 300_000);
+
+  it("PAUSE (F3): a cleanup Pause cancels the parked message's wake -> ONE true line at once, the same line after Resume, never silence; sent again after Resume, it is answered once", async () => {
+    const h = await hungRWithParkedMessage(NO_CAP);
+    try {
+      // REAL: the cleanup's Pause of the task.
+      const paused = await request(h.s.app).post(`/api/issues/${h.s.issueId}/tree-holds`).send({ mode: "pause", reason: "cleanup" });
+      expect(paused.status, JSON.stringify(paused.body)).toBe(201);
+      await vi.waitFor(async () => expect((await h.wakesOf(h.next)).map(wake => ({ status: wake.status, error: wake.error }))).toEqual([
+        { status: "cancelled", error: "Cancelled because an active subtree pause hold was created" }]), { timeout: 10_000, interval: 50 });
+      await vi.waitFor(async () => expect((await h.run(h.r.id)).status).toBe("cancelled"), { timeout: 10_000, interval: 50 });
+      // The sweep at the real clock: the line is due now, not after the no-run grace.
+      const lines = async () => (await h.thread()).filter(comment => comment.authorType === "system" && /your message/i.test(comment.body)).map(comment => comment.body);
+      expect(await h.sweepUnanswered()).toEqual({ noticed: 1, pending: 0 });
+      expect(await lines()).toEqual([UNANSWERED_MESSAGE_TASK_PAUSED_TEXT]);
+      expect(await h.sweepUnanswered(new Date(Date.now() + 10 * 60_000))).toEqual({ noticed: 0, pending: 0 });
+      expect(await lines()).toEqual([UNANSWERED_MESSAGE_TASK_PAUSED_TEXT]);
+      // Resume. The cancelled wake does not come back (not the product's path); the line is still the one true line.
+      h.s.releaseStall();
+      await h.heartbeat.drainActiveRunExecutions();
+      const released = await request(h.s.app).post(`/api/issues/${h.s.issueId}/tree-holds/${paused.body.hold.id}/release`).send({ reason: "cleanup done" });
+      expect(released.status, JSON.stringify(released.body)).toBe(200);
+      const resumed = await h.admitParked(5_000);
+      await h.sweepUnanswered(new Date(Date.now() + 10 * 60_000));
+      expect(await lines()).toEqual([UNANSWERED_MESSAGE_TASK_PAUSED_TEXT]);
+      evidence.PAUSE = { line: (await lines())[0], runsAfterResume: resumed.runs.map(brief), wake: (await h.wakesOf(h.next)).map(wake => ({ status: wake.status, error: wake.error })) };
+    } finally { await h.stop(); }
+  }, 300_000);
+
+  it("CONTROL: an unrelated LIVE predecessor still blocks. After R ended and the parked message's run P started, a third message stays parked behind the live P and starts only when P ends", async () => {
+    const h = await hungRWithParkedMessage(NO_CAP);
+    let openGate!: () => void;
+    try {
+      const gateEntered = new Promise<void>(resolve => { h.s.turnGate.entered = resolve; });
+      h.s.turnGate.hold = new Promise<void>(resolve => { openGate = resolve; });
+      await exhaustRetries(h);
+      // P starts and stays live in its provider turn (TURN-GATE).
+      const admitting = h.admitParked(60_000);
+      await Promise.race([gateEntered, sleep(60_000)]);
+      const [p] = (await h.s.runs()).filter(run => run.id !== h.r.id && JSON.stringify(run.contextSnapshot).includes(h.next));
+      expect(p, "P never started").toMatchObject({ status: "running" });
+      // REAL: a third message while P is live.
+      const third = await h.s.say("And number the sections.");
+      await vi.waitFor(async () => expect((await h.wakesOf(third)).map(wake => wake.status)).toEqual(["deferred_issue_execution"]), { timeout: 10_000, interval: 50 });
+      const turnsWhileLive = box.inputs.length;
+      for (const startAt = Date.now(); Date.now() - startAt < 6_000;) { await h.heartbeat.resumeQueuedRuns(); await sleep(250); }
+      // Still parked: R's ended state released nothing of P's.
+      expect((await h.wakesOf(third)).map(wake => wake.status)).toEqual(["deferred_issue_execution"]);
+      expect(box.inputs.length).toBe(turnsWhileLive);
+      expect((await h.s.runs()).filter(run => JSON.stringify(run.contextSnapshot).includes(third))).toEqual([]);
+      expect((await h.run(p.id)).status).toBe("running");
+      // P ends: the third message starts once.
+      openGate();
+      await admitting;
+      await h.heartbeat.drainActiveRunExecutions();
+      for (const startAt = Date.now(); Date.now() - startAt < 30_000 && box.inputs.length === turnsWhileLive;) { await h.heartbeat.resumeQueuedRuns(); await sleep(250); }
+      await h.heartbeat.drainActiveRunExecutions();
+      const carrying = (await h.s.runs()).filter(run => JSON.stringify(run.contextSnapshot).includes(third));
+      expect(carrying.map(run => run.status)).toEqual(["succeeded"]);
+      evidence.CONTROL = { P: brief(await h.run(p.id)), third: carrying.map(brief) };
+    } finally { openGate?.(); await h.stop(); }
   }, 300_000);
 });
