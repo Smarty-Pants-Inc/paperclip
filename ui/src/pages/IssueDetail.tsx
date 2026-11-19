@@ -2664,6 +2664,21 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     ],
   );
 
+  // Undo of a queued Delete: the server clears deletedAt and puts the message
+  // back in its place; errors (too late, not yours) reach the bar's Undo line.
+  const restoreQueuedComment = useCallback(
+    async (commentId: string) => {
+      storeQueuedCommentQueue(await issuesApi.restoreQueuedComment(issueId, commentId));
+      setDiscardedQueuedCommentIds((current) => {
+        const next = new Set(current);
+        next.delete(commentId);
+        return next;
+      });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(issueId) });
+    },
+    [issueId, queryClient, storeQueuedCommentQueue],
+  );
+
   const timelineEvents = useMemo(
     () => extractIssueTimelineEvents(resolvedActivity),
     [resolvedActivity],
@@ -2859,6 +2874,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             onReorderQueuedComments={reorderQueuedComments}
             onSteerQueuedComment={steerQueuedComment}
             onDiscardQueuedComment={discardQueuedComment}
+            onRestoreQueuedComment={restoreQueuedComment}
             onDeleteComment={onDeleteComment}
             onCancelQueued={onCancelQueued}
             interruptingQueuedRunId={interruptingQueuedRunId}

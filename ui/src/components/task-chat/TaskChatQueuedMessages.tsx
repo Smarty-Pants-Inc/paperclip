@@ -55,9 +55,10 @@ type QueueAction = "steer" | "interrupt" | "discard" | null;
  * (no automatic steer countdown, so no steer fires from the UI).
  */
 export const QUEUE_ROW_REORDER_EDIT_STEER_ENABLED = false;
-/** Delete hides the row at once and offers Undo this long; only then is the
- * discard sent. Undo sends nothing. A page that closes inside the window sends
- * nothing either, so the message simply stays queued (never lost). */
+/** Delete is sent to the server at once (the message is deleted there, its
+ * words kept); the bar then offers Undo this long. Undo asks the server to
+ * restore it in place. Closing or leaving the page changes nothing: the
+ * delete already happened on the server. No client timer decides delivery. */
 export const QUEUED_DELETE_UNDO_MS = 8_000;
 export const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
 export const CHAT_STOPPED_BY_PERSON_LINE = "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it.";
@@ -124,6 +125,8 @@ export interface TaskChatQueuedMessagesProps {
   onSteer: (commentId: string, revision: string) => Promise<void>;
   onInterrupt?: () => Promise<IssueQueuedCommentQueue | void>;
   onDiscard: (commentId: string, revision: string) => Promise<void>;
+  /** Undo of a Delete: the server restores the message in the same place. */
+  onRestore?: (commentId: string) => Promise<void>;
   /** The queued message open in the editor; its automatic send waits for the save. */
   editingCommentId?: string | null;
   /** Steer eligible queued messages automatically after this delay; null keeps every message queued. */
@@ -343,6 +346,7 @@ export function TaskChatQueuedMessages({
   onSteer,
   onInterrupt,
   onDiscard,
+  onRestore,
   editingCommentId = null,
   autoSteerDelayMs = null,
   steeringUnavailableReason = null,
@@ -362,11 +366,18 @@ export function TaskChatQueuedMessages({
   latestQueue.current = queue;
   const latestOnDiscard = useRef(onDiscard);
   latestOnDiscard.current = onDiscard;
-  // Delete with Undo: "undo" rows are hidden with an Undo line in their place
-  // and nothing sent; "sending" rows are hidden while the discard is in flight.
-  const [deleting, setDeleting] = useState<ReadonlyMap<string, "undo" | "sending">>(() => new Map());
+  const latestOnRestore = useRef(onRestore);
+  latestOnRestore.current = onRestore;
+  // Delete: "sending" while the server deletes it (row hidden, "Deleting…"),
+  // then "deleted" with Undo for QUEUED_DELETE_UNDO_MS, "restoring" while Undo
+  // is in flight. The timer only hides the Undo line; the delete is already
+  // done on the server, so unmount/close/reload cannot abandon it.
+  const [deleting, setDeleting] = useState<ReadonlyMap<string, "sending" | "deleted" | "restoring">>(() => new Map());
+  // Where each deleted row sat, so its Undo line (and an undone row) keeps its place.
+  const deletedRows = useRef(new Map<string, { entry: IssueQueuedCommentQueue["entries"][number]; index: number }>());
   const undoTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
-  // Leaving the page inside the window sends nothing: the message stays queued.
+  // Every Delete still in flight: Interrupt waits for all of them first.
+  const inflightDiscards = useRef(new Map<string, Promise<boolean>>());
   useEffect(() => () => {
     for (const timer of undoTimers.current.values()) clearTimeout(timer);
     undoTimers.current.clear();
@@ -464,7 +475,7 @@ export function TaskChatQueuedMessages({
     void runRowAction(due.comment.id, "steer");
   });
 
-  function setDeletingState(commentId: string, state: "undo" | "sending" | null) {
+  function setDeletingState(commentId: string, state: "sending" | "deleted" | "restoring" | null) {
     setDeleting((current) => {
       const next = new Map(current);
       if (state) next.set(commentId, state); else next.delete(commentId);
@@ -475,34 +486,41 @@ export function TaskChatQueuedMessages({
   function startDelete(commentId: string) {
     if (pending || reordering || deleting.has(commentId) ||
       entries.some((entry) => entry.comment.id === commentId && entry.queueId && entry.queueId !== queue.queueId)) return;
+    const index = entries.findIndex((entry) => entry.comment.id === commentId);
+    if (index < 0) return;
+    deletedRows.current.set(commentId, { entry: entries[index]!, index });
     setVisibleError(null);
-    setDeletingState(commentId, "undo");
-    setAnnouncement("Queued message deleted. Undo is available for a few seconds.");
-    undoTimers.current.set(commentId, setTimeout(() => {
-      undoTimers.current.delete(commentId);
-      void commitDiscard(commentId);
-    }, QUEUED_DELETE_UNDO_MS));
-  }
-
-  function undoDelete(commentId: string) {
-    const timer = undoTimers.current.get(commentId);
-    if (timer === undefined) return;
-    clearTimeout(timer);
-    undoTimers.current.delete(commentId);
-    setDeletingState(commentId, null);
-    setAnnouncement("Queued message restored.");
-  }
-
-  /** The Undo window ended (or Interrupt is sending the queue): send the discard now. */
-  async function commitDiscard(commentId: string): Promise<boolean> {
     setDeletingState(commentId, "sending");
+    setAnnouncement("Deleting queued message.");
+    const discard = commitDiscard(commentId).finally(() => inflightDiscards.current.delete(commentId));
+    inflightDiscards.current.set(commentId, discard);
+    void discard;
+  }
+
+  /** Delete happens on the server now; only its confirmation shows "Deleted". */
+  async function commitDiscard(commentId: string): Promise<boolean> {
     try {
+      // Optimistic (unsent) rows are cancelled locally and have no Undo.
       await latestOnDiscard.current(commentId, latestQueue.current.revision);
+      if (commentId.startsWith("optimistic-") || !latestOnRestore.current) {
+        deletedRows.current.delete(commentId);
+        setEntries((current) => current.filter((entry) => entry.comment.id !== commentId));
+        setDeletingState(commentId, null);
+        setAnnouncement("Queued message discarded.");
+        return true;
+      }
+      // The server's queue no longer holds it; its Undo line keeps the place.
       setEntries((current) => current.filter((entry) => entry.comment.id !== commentId));
-      setDeletingState(commentId, null);
-      setAnnouncement("Queued message discarded.");
+      setDeletingState(commentId, "deleted");
+      setAnnouncement("Queued message deleted. Undo is available for a few seconds.");
+      undoTimers.current.set(commentId, setTimeout(() => {
+        undoTimers.current.delete(commentId);
+        deletedRows.current.delete(commentId);
+        setDeletingState(commentId, null);
+      }, QUEUED_DELETE_UNDO_MS));
       return true;
     } catch (error) {
+      deletedRows.current.delete(commentId);
       setDeletingState(commentId, null);
       setAnnouncement("");
       const code = queueActionErrorCode(error);
@@ -517,19 +535,35 @@ export function TaskChatQueuedMessages({
     }
   }
 
-  /** A message deleted inside its Undo window must never ride along with an Interrupt. */
-  async function commitUndoableDeletes(): Promise<boolean> {
-    const ids = [...undoTimers.current.keys()];
-    for (const id of ids) {
-      clearTimeout(undoTimers.current.get(id));
-      undoTimers.current.delete(id);
+  /** Undo: the server restores the message in its place; until it answers, it stays deleted. */
+  async function undoDelete(commentId: string) {
+    const restore = latestOnRestore.current;
+    if (!restore || deleting.get(commentId) !== "deleted") return;
+    clearTimeout(undoTimers.current.get(commentId));
+    undoTimers.current.delete(commentId);
+    setDeletingState(commentId, "restoring");
+    try {
+      await restore(commentId);
+      const row = deletedRows.current.get(commentId);
+      deletedRows.current.delete(commentId);
+      if (row) {
+        setEntries((current) => current.some((entry) => entry.comment.id === commentId) ? current : [
+          ...current.slice(0, row.index), row.entry, ...current.slice(row.index)]);
+      }
+      setDeletingState(commentId, null);
+      setAnnouncement("Queued message restored.");
+    } catch (error) {
+      deletedRows.current.delete(commentId);
+      setDeletingState(commentId, null);
+      setAnnouncement("");
+      setVisibleError(queueActionErrorText(error) ?? "Couldn’t undo. The message stays deleted.");
     }
-    for (const id of ids) {
-      if (!(await commitDiscard(id))) return false;
-      // Let the parent's queue (and its new revision) render before the next one.
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    }
-    return true;
+  }
+
+  /** Interrupt never carries a message whose Delete is still in flight. */
+  async function settleInflightDiscards(): Promise<boolean> {
+    const results = await Promise.all([...inflightDiscards.current.values()]);
+    return results.every(Boolean);
   }
 
   async function handleDragEnd(event: DragEndEvent) {
@@ -586,9 +620,10 @@ export function TaskChatQueuedMessages({
     ) {
       return;
     }
-    if (action === "interrupt" && undoTimers.current.size > 0 && !(await commitUndoableDeletes())) return;
+    // A failed Delete leaves its message visible with an error: send nothing then.
+    if (action === "interrupt" && inflightDiscards.current.size > 0 && !(await settleInflightDiscards())) return;
     const deliveredIds = action === "interrupt"
-      ? entries.map((entry) => entry.comment.id)
+      ? entries.map((entry) => entry.comment.id).filter((id) => !deleting.has(id) && !deletedRows.current.has(id))
       : action === "steer" ? [commentId] : [];
     for (const id of deliveredIds) optimisticDeliveryIds.current.add(id);
     if (deliveredIds.length) {
@@ -674,10 +709,13 @@ export function TaskChatQueuedMessages({
   const stoppedPaused = queue.executionWait?.reason === CHAT_AGENT_PAUSED_REASON &&
     Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0;
 
-  const hasUndoLine = [...deleting.values()].includes("undo");
-  if (entries.length === 0 && !visibleError && !statusMessage && !steeringUnavailableReason) return null;
-  if (entries.every((entry) => deleting.get(entry.comment.id) === "sending") && !hasUndoLine &&
-    !visibleError && !statusMessage && !steeringUnavailableReason) return null;
+  // Deleted rows leave the server's queue; keep their Undo line where they sat.
+  const displayEntries = [...entries];
+  for (const [id, row] of [...deletedRows.current.entries()].sort((a, b) => a[1].index - b[1].index)) {
+    if (!deleting.has(id) || displayEntries.some((entry) => entry.comment.id === id)) continue;
+    displayEntries.splice(Math.min(row.index, displayEntries.length), 0, row.entry);
+  }
+  if (displayEntries.length === 0 && !visibleError && !statusMessage && !steeringUnavailableReason) return null;
 
   return (
     <TaskChatComposerBar
@@ -702,10 +740,19 @@ export function TaskChatQueuedMessages({
             className="max-h-(--tc-queued-list-max-h) overflow-y-auto overscroll-contain"
             data-testid="task-chat-queued-messages-list"
           >
-          {entries.map((entry) => {
+          {displayEntries.map((entry) => {
             const deleteState = deleting.get(entry.comment.id);
-            if (deleteState === "sending") return null;
-            if (deleteState === "undo") {
+            if (deleteState === "sending") {
+              return (
+                <div key={entry.comment.id} role="status"
+                  className="flex min-h-11 min-w-0 items-center gap-2 border-b border-border/55 bg-card/95 px-2.5 py-1 text-xs text-muted-foreground last:border-b-0"
+                  data-testid={`task-chat-queued-deleting-${entry.comment.id}`}>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                  <span className="min-w-0 flex-1 truncate">Deleting…</span>
+                </div>
+              );
+            }
+            if (deleteState === "deleted" || deleteState === "restoring") {
               const label = stripStandaloneImageEmbeds(queuedMessageLabel(entry));
               return (
                 <div
@@ -713,10 +760,11 @@ export function TaskChatQueuedMessages({
                   className="flex min-h-11 min-w-0 items-center gap-2 border-b border-border/55 bg-card/95 px-2.5 py-1 text-xs text-muted-foreground last:border-b-0"
                   data-testid={`task-chat-queued-undo-${entry.comment.id}`}
                 >
-                  <span className="min-w-0 flex-1 truncate">Message deleted.</span>
+                  <span className="min-w-0 flex-1 truncate">Deleted</span>
                   <button
                     type="button"
-                    onClick={() => undoDelete(entry.comment.id)}
+                    disabled={deleteState === "restoring"}
+                    onClick={() => void undoDelete(entry.comment.id)}
                     aria-label={`Undo delete: ${label || "Images"}`}
                     className="flex h-7 shrink-0 items-center rounded-md border border-border px-2.5 text-xs font-medium text-foreground transition-colors hover:bg-accent"
                     data-testid={`task-chat-queued-undo-button-${entry.comment.id}`}

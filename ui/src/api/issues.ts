@@ -607,6 +607,12 @@ export const issuesApi = {
       `/issues/${id}/queued-comments/${commentId}/steer`,
       data,
     ),
+  /** Undo of a queued Delete: the server puts it back in the same place. */
+  restoreQueuedComment: (id: string, commentId: string) =>
+    api.post<IssueQueuedCommentQueue>(
+      `/issues/${id}/queued-comments/${commentId}/restore`,
+      {},
+    ),
   discardQueuedComment: (
     id: string,
     commentId: string,

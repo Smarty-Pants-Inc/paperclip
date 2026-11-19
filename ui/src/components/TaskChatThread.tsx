@@ -578,7 +578,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     onDismissInteraction: undefined, onRetryFailedRun: undefined, onTryAgainNoLiveExecutionPath: undefined,
     onResumeAssignee: undefined, onResumeFromBacklog: undefined, onInterruptQueued: undefined,
     onCancelQueued: undefined, onEditQueuedComment: undefined, onReorderQueuedComments: undefined,
-    onSteerQueuedComment: undefined, onDiscardQueuedComment: undefined, runFinalizationActions: undefined,
+    onSteerQueuedComment: undefined, onDiscardQueuedComment: undefined, onRestoreQueuedComment: undefined, runFinalizationActions: undefined,
     onResolveRecoveryAction: undefined, onReissueIsolatedRecoveryAction: undefined,
     onReconcileForwardRecoveryAction: undefined, onBreakGlassOverrideRecoveryAction: undefined,
     onQuarantineRestoreRecoveryAction: undefined,
@@ -663,6 +663,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     onSteerQueuedComment,
     queuedMessageAutoSteerDelayMs = QUEUED_MESSAGE_AUTO_STEER_DELAY_MS,
     onDiscardQueuedComment,
+    onRestoreQueuedComment,
     blockedBy = [],
     blockerAttention,
     liveIssueIds,
@@ -3915,6 +3916,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                             if (queuedEdit?.commentId === commentId)
                               setQueuedEdit(null);
                           }}
+                          onRestore={onRestoreQueuedComment}
                         />
                       ) : null}
                       <div className="relative z-10">

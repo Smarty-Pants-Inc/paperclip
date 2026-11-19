@@ -118,57 +118,122 @@ describe("TaskChatQueuedMessages", () => {
     };
     const advance = async (ms: number) => { await act(async () => { await vi.advanceTimersByTimeAsync(ms); }); };
 
-    it("hides the row at once with Undo; Undo puts it back in place and sends no discard", async () => {
-      const props = render({ onInterrupt: vi.fn().mockResolvedValue(undefined) });
+    // delundo2: Delete is sent to the server AT ONCE; Undo asks the server to
+    // restore it. No client timer decides delivery (B3-1..B3-4).
+    it("deletes on the server at once; Deleted · Undo shows only after the server's ack; Undo restores it in place", async () => {
+      const ack = deferred<void>();
+      const props = render({
+        onInterrupt: vi.fn().mockResolvedValue(undefined),
+        onDiscard: vi.fn().mockReturnValue(ack.promise),
+        onRestore: vi.fn().mockResolvedValue(undefined),
+      });
       expect(rowIds()).toEqual(["comment-1", "comment-2"]);
       await press("task-chat-queued-discard-comment-1");
+      expect(props.onDiscard).toHaveBeenCalledTimes(1);
+      expect(props.onDiscard).toHaveBeenCalledWith("comment-1", "rev-1");
       expect(rowOf("comment-1")).toBeNull();
-      expect(container.querySelector('[data-testid="task-chat-queued-undo-comment-1"]')?.textContent).toContain("Undo");
+      // Never 'Deleted' while the message is still live on the server.
+      expect(container.querySelector('[data-testid="task-chat-queued-undo-comment-1"]')).toBeNull();
+      expect(container.querySelector('[data-testid="task-chat-queued-deleting-comment-1"]')?.textContent).toContain("Deleting");
+      await act(async () => { ack.resolve(); await ack.promise; });
+      expect(container.querySelector('[data-testid="task-chat-queued-undo-comment-1"]')?.textContent).toContain("Deleted");
       await advance(QUEUED_DELETE_UNDO_MS - 100);
-      expect(props.onDiscard).not.toHaveBeenCalled();
       await press("task-chat-queued-undo-button-comment-1");
+      expect(props.onRestore).toHaveBeenCalledTimes(1);
+      expect(props.onRestore).toHaveBeenCalledWith("comment-1");
       expect(rowIds()).toEqual(["comment-1", "comment-2"]);
       expect(rowOf("comment-1")?.textContent).toContain("First queued message");
       expect(container.querySelector('[data-testid="task-chat-queued-undo-comment-1"]')).toBeNull();
       await advance(QUEUED_DELETE_UNDO_MS * 2);
-      expect(props.onDiscard).not.toHaveBeenCalled();
+      expect(props.onDiscard).toHaveBeenCalledTimes(1);
     });
 
-    it("sends exactly one discard when the Undo window ends", async () => {
-      const props = render({ onInterrupt: vi.fn().mockResolvedValue(undefined) });
-      await press("task-chat-queued-discard-comment-2");
-      await advance(QUEUED_DELETE_UNDO_MS - 1);
-      expect(props.onDiscard).not.toHaveBeenCalled();
-      await advance(1);
+    it("Undo line keeps the row's place and goes after ~8 s; nothing more is sent", async () => {
+      const props = render({ onInterrupt: vi.fn().mockResolvedValue(undefined), onRestore: vi.fn().mockResolvedValue(undefined) });
+      await press("task-chat-queued-discard-comment-1");
       expect(props.onDiscard).toHaveBeenCalledTimes(1);
-      expect(props.onDiscard).toHaveBeenCalledWith("comment-2", "rev-1");
-      await advance(QUEUED_DELETE_UNDO_MS * 2);
+      const lines = [...container.querySelectorAll('[data-testid^="task-chat-queued-undo-comment-"], [data-testid^="task-chat-queued-message-comment-"]')]
+        .map((el) => el.getAttribute("data-testid"));
+      expect(lines).toEqual(["task-chat-queued-undo-comment-1", "task-chat-queued-message-comment-2"]);
+      await advance(QUEUED_DELETE_UNDO_MS);
+      expect(container.querySelector('[data-testid="task-chat-queued-undo-comment-1"]')).toBeNull();
+      expect(rowIds()).toEqual(["comment-2"]);
       expect(props.onDiscard).toHaveBeenCalledTimes(1);
-      expect(rowIds()).toEqual(["comment-1"]);
-      expect(container.querySelector('[data-testid="task-chat-queued-undo-comment-2"]')).toBeNull();
+      expect(props.onRestore).not.toHaveBeenCalled();
     });
 
-    it("sends nothing when the bar closes inside the window (the message stays queued)", async () => {
-      const props = render({ onInterrupt: vi.fn().mockResolvedValue(undefined) });
+    // Re-pin of delundo's "sends nothing when the bar closes inside the window"
+    // (TaskChatQueuedMessages.test.tsx:151-157 at 8673fcd2): that pinned B3-1.
+    it("delete then close: it stays deleted (one discard already sent, no restore)", async () => {
+      const props = render({ onInterrupt: vi.fn().mockResolvedValue(undefined), onRestore: vi.fn().mockResolvedValue(undefined) });
       await press("task-chat-queued-discard-comment-1");
       flushSync(() => root.unmount());
       root = createRoot(container);
       await advance(QUEUED_DELETE_UNDO_MS * 2);
-      expect(props.onDiscard).not.toHaveBeenCalled();
+      expect(props.onDiscard).toHaveBeenCalledTimes(1);
+      expect(props.onDiscard).toHaveBeenCalledWith("comment-1", "rev-1");
+      expect(props.onRestore).not.toHaveBeenCalled();
     });
 
-    it("never lets a message deleted inside the window ride along with Interrupt", async () => {
+    it("delete, then the turn ends inside the window: the deleted message is not sent or put back", async () => {
+      const props = render({ onInterrupt: vi.fn().mockResolvedValue(undefined), onRestore: vi.fn().mockResolvedValue(undefined) });
+      await press("task-chat-queued-discard-comment-1");
+      // Deleted on the server before the turn can end (B3-2): no waiting window.
+      expect(props.onDiscard).toHaveBeenCalledTimes(1);
+      // The turn ends: the server's queue no longer has comment-1 (deleted) and
+      // advanced comment-2 into the next turn.
+      flushSync(() => root.render(<MemoryRouter><ThemeProvider><TaskChatQueuedMessages {...props}
+        queue={{ ...queue, revision: "rev-2", entries: [] }} /></ThemeProvider></MemoryRouter>));
+      await advance(QUEUED_DELETE_UNDO_MS * 2);
+      expect(props.onDiscard).toHaveBeenCalledTimes(1);
+      expect(props.onRestore).not.toHaveBeenCalled();
+      expect(props.onInterrupt).not.toHaveBeenCalled();
+      expect(rowOf("comment-1")).toBeNull();
+    });
+
+    it("two deletes in flight + Interrupt: Interrupt waits for both and carries neither", async () => {
       const order: string[] = [];
+      const acks = new Map<string, ReturnType<typeof deferred<void>>>();
+      const threeQueue = { ...queue, entries: [...queue.entries, { ...queue.entries[1]!, position: 2,
+        comment: { ...queue.entries[1]!.comment, id: "comment-3", body: "Third queued message" } }] };
       const props = render({
-        onDiscard: vi.fn(async (id: string) => { order.push(`discard:${id}`); }),
+        queue: threeQueue,
+        onRestore: vi.fn().mockResolvedValue(undefined),
+        onDiscard: vi.fn((id: string) => { order.push(`discard:${id}`); const d = deferred<void>(); acks.set(id, d);
+          return d.promise.then(() => { order.push(`ack:${id}`); }); }),
         onInterrupt: vi.fn(async () => { order.push("interrupt"); }),
       });
       await press("task-chat-queued-discard-comment-1");
-      await press("task-chat-queued-interrupt-comment-2");
+      await press("task-chat-queued-discard-comment-2");
+      await press("task-chat-queued-interrupt-comment-3");
       await advance(10);
-      expect(order).toEqual(["discard:comment-1", "interrupt"]);
-      await advance(QUEUED_DELETE_UNDO_MS * 2);
-      expect(props.onDiscard).toHaveBeenCalledTimes(1);
+      expect(props.onInterrupt).not.toHaveBeenCalled();
+      await act(async () => { acks.get("comment-2")!.resolve(); await advance(1); });
+      expect(props.onInterrupt).not.toHaveBeenCalled();
+      await act(async () => { acks.get("comment-1")!.resolve(); await advance(1); });
+      expect(order).toEqual(["discard:comment-1", "discard:comment-2", "ack:comment-2", "ack:comment-1", "interrupt"]);
+      expect(rowOf("comment-1")).toBeNull();
+      expect(rowOf("comment-2")).toBeNull();
+    });
+
+    it("a failed delete in flight stops Interrupt: nothing is sent and the other delete still stands", async () => {
+      const acks = new Map<string, ReturnType<typeof deferred<void>>>();
+      const threeQueue = { ...queue, entries: [...queue.entries, { ...queue.entries[1]!, position: 2,
+        comment: { ...queue.entries[1]!.comment, id: "comment-3", body: "Third queued message" } }] };
+      const props = render({
+        queue: threeQueue,
+        onRestore: vi.fn().mockResolvedValue(undefined),
+        onDiscard: vi.fn((id: string) => { const d = deferred<void>(); acks.set(id, d); return d.promise; }),
+        onInterrupt: vi.fn().mockResolvedValue(undefined),
+      });
+      await press("task-chat-queued-discard-comment-1");
+      await press("task-chat-queued-discard-comment-2");
+      await press("task-chat-queued-interrupt-comment-3");
+      await act(async () => { acks.get("comment-1")!.reject(new Error("network")); acks.get("comment-2")!.resolve(); await advance(1); });
+      expect(props.onInterrupt).not.toHaveBeenCalled();
+      expect(rowOf("comment-1")).not.toBeNull();
+      expect(container.querySelector('[data-testid="task-chat-queued-undo-comment-2"]')).not.toBeNull();
+      expect(props.onDiscard).toHaveBeenCalledTimes(2);
     });
 
     it("keeps Delete and Interrupt apart: Delete leads the row, Interrupt ends it, the message between", () => {

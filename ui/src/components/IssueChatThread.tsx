@@ -712,6 +712,8 @@ interface IssueChatThreadProps {
     commentId: string,
     revision: string,
   ) => Promise<void>;
+  /** Undo of a queued Delete (the server restores it in place). */
+  onRestoreQueuedComment?: (commentId: string) => Promise<void>;
   onDeleteComment?: (commentId: string) => Promise<void> | void;
   interruptingQueuedRunId?: string | null;
   stoppingRunId?: string | null;
