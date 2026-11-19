@@ -4,8 +4,9 @@ vi.mock('node:timers/promises', () => ({ setTimeout: (ms=0, value?: unknown, opt
  if(opts?.signal?.aborted) return reject(opts.signal.reason);
  const t=setTimeout(()=>resolve(value),ms); opts?.signal?.addEventListener('abort',()=>{clearTimeout(t); reject(opts.signal!.reason);},{once:true});
 }) }));
-// Keep: never-OK winner-stop and paid-life guards. Judge rows below are verbatim
-// from the shipped rf-4 fixture; only its default import target is redirected.
+// Keep: never-OK winner-stop and paid-life guards. J9 is re-pinned under
+// rf-4's shipped 19:40Z ruling (RF4-SP16-VERDICT-AND-RULING.md); all other
+// original rows retain their assertions. S18 covers the BRIEF ADDED condition.
 const target = process.env.JUDGE_TARGET || './plugin.js';
 let plugin:any, store:Map<string,any>, context:any;
 const cfg={apiKey:'boat_judge_fake_not_a_credential',type:'small',ttlSeconds:1800,reuseLease:false,labels:{}};
@@ -24,8 +25,8 @@ beforeEach(async()=>{store=new Map(); const key=(s:any)=>JSON.stringify([s.scope
 afterEach(()=>{vi.clearAllTimers();vi.useRealTimers();vi.unstubAllGlobals();vi.restoreAllMocks();});
 // Independent provider model: create TTL is real; PATCH is now+TTL (null disables);
 // only Boat agent prompts defer expiry. Exec/SSH do NOT defer it.
-function boat(opts:{ttlRefused?:boolean;stopsRefused?:boolean;primaryReady?:number;hedgeReady?:number;hideHedgeUntil?:number;patchGate?:(id:string,body:any)=>Promise<void>}={}) {
- const boxes=new Map<string,any>(), requests:any[]=[];
+function boat(opts:{ttlRefused?:boolean;stopsRefused?:boolean;primaryReady?:number;hedgeReady?:number;hideHedgeUntil?:number;extension?:'500'|'late'|'short'|'retry'|'delayed';patchGate?:(id:string,body:any)=>Promise<void>}={}) {
+ const boxes=new Map<string,any>(), requests:any[]=[]; let extensions=0;
  function refresh(b:any){if(!b.explicitStop&&Date.now()>=b.deadline){if(b.promptActive){while(b.deadline<=Date.now())b.deadline+=b.ttl*1000;}else b.explicitStop=true;}}
  function snapshot(id:string,b:any){refresh(b);return {id,labels:b.labels,name:b.name,state:b.explicitStop?'archived':Date.now()>=b.ready?'running':'provisioning',hydrated:true,setupStatus:'done',ttlSeconds:b.ttl,archiveAfter:Number.isFinite(b.deadline)?new Date(b.deadline).toISOString():null,...(b.explicitStop?{stoppedAt:new Date().toISOString()}:{})};}
  vi.stubGlobal('fetch',vi.fn(async(input:any,init:any={})=>{
@@ -39,9 +40,20 @@ function boat(opts:{ttlRefused?:boolean;stopsRefused?:boolean;primaryReady?:numb
   if(path==='/sandboxes'&&method==='GET'){const filters=url.searchParams.getAll('label').map(s=>s.split('='));return response({sandboxes:[...boxes].filter(([id,b])=>filters.every(([k,v])=>b.labels[k]===v)&&!(id==='bx_judge1'&&Date.now()<(opts.hideHedgeUntil??0))).map(([id,b])=>snapshot(id,b)),pageInfo:{nextCursor:null}});}
   const id=path.split('/')[2],b=boxes.get(id); if(!b)return response({error:'missing'},404);
   if(method==='PATCH'){await opts.patchGate?.(id,body);const prior=b.deadline; if(opts.ttlRefused&&body.ttlSeconds===300)return response({error:'refused'},403);
-   if('ttlSeconds'in body){b.ttl=body.ttlSeconds;b.deadline=b.ttl===null?Infinity:Date.now()+b.ttl*1000;}
+   if(id==='bx_judge1'&&body.ttlSeconds>600){
+    extensions++;
+    if(opts.extension==='500'||(opts.extension==='retry'&&extensions===1)){trace.status=500;return response({error:'controlled extension failure'},500);}
+    if(opts.extension==='delayed')await new Promise<void>(r=>setTimeout(r,2000));
+    if(opts.extension==='late')return await new Promise<Response>((resolve,reject)=>{
+     // Boat applies the request despite the caller timing out. The provider
+     // timer is independent of the aborted client transport.
+     setTimeout(()=>{b.ttl=body.ttlSeconds;b.deadline=Date.now()+b.ttl*1000;Object.assign(trace,{appliedAt:Date.now(),priorDeadline:prior,newDeadline:b.deadline});resolve(response({sandbox:snapshot(id,b)}));},7000);
+     init.signal.addEventListener('abort',()=>{trace.abortedAt=Date.now();reject(init.signal.reason);},{once:true});
+    });
+   }
+   if('ttlSeconds'in body){b.ttl=opts.extension==='short'&&id==='bx_judge1'&&body.ttlSeconds>600?120:body.ttlSeconds;b.deadline=b.ttl===null?Infinity:Date.now()+b.ttl*1000;}
    if(body.name)b.name=body.name;if(body.labels)b.labels=body.labels;
-   Object.assign(trace,{appliedAt:Date.now(),priorDeadline:prior,newDeadline:b.deadline});return response({sandbox:snapshot(id,b)});
+   Object.assign(trace,{status:200,appliedAt:Date.now(),priorDeadline:prior,newDeadline:b.deadline});return response({sandbox:snapshot(id,b),...(opts.extension==='short'?{giftLimitNotice:'controlled cap'}:{})});
   }
   if(method==='POST'&&path.endsWith('/stop')){if(opts.stopsRefused)return response({error:'stop refused'},403);b.explicitStop=true;return response({stop:{id:'stop_'+id,status:'pending'}},202);}
   if(method==='GET')return response({sandbox:snapshot(id,b)});
@@ -51,6 +63,72 @@ function boat(opts:{ttlRefused?:boolean;stopsRefused?:boolean;primaryReady?:numb
 }
 function receipt(name:string,w:ReturnType<typeof boat>,extra:any={}){const dir=process.env.JUDGE_TRACES||'judge-traces';mkdirSync(dir,{recursive:true});writeFileSync(`${dir}/${name}.json`,JSON.stringify({name,target,at:Date.now(),...extra,requests:w.requests,boxes:[...w.boxes].map(([id,b])=>({...b,id,observation:w.snapshot(id,b)})),state:[...store]},null,2));}
 async function advance(work:Promise<any>,ms:number){const result=caught(work);await vi.advanceTimersByTimeAsync(ms);return result;}
+
+// Keep: never-OK money guards. rf-4's shipped ruling and BRIEF ADDED 20:12Z.
+const longRequest={...p,config:{...cfg,ttlSeconds:36000}};
+it.each([180,36000])('S18 never-resumed unfinished hedge auto-stops with no call within min(env TTL %i, 600)',async ttl=>{
+ const request={...p,config:{...cfg,ttlSeconds:ttl}},w=boat({stopsRefused:true});
+ void caught(plugin.definition.onEnvironmentAcquireLease(request));await vi.advanceTimersByTimeAsync(76000);await restart();await plugin.definition.onHealth();
+ const count=w.requests.length,hedge=w.boxes.get('bx_judge1'),bound=Math.min(ttl,600);
+ expect(w.requests.filter(r=>r.method==='POST'&&r.path==='/sandboxes').map(r=>r.body.ttlSeconds)).toEqual([ttl,bound]);
+ expect(w.requests.filter(r=>r.method==='PATCH')).toEqual([]);expect(w.stops()).toEqual([]);
+ await vi.advanceTimersByTimeAsync(hedge.at+bound*1000-1-Date.now());expect(w.live('bx_judge1')).toBe(true);
+ await vi.advanceTimersByTimeAsync(1);receipt('S18-never-resumed-'+ttl,w,{count,bound});
+ expect(w.live('bx_judge1')).toBe(false);expect(w.requests).toHaveLength(count);
+});
+it('S18 resumed unfinished hedge extends to 36000 before handoff; terminal primary stop and PATCH',async()=>{
+ const w=boat({stopsRefused:true});void caught(plugin.definition.onEnvironmentAcquireLease(longRequest));await vi.advanceTimersByTimeAsync(76000);await restart();
+ await plugin.definition.onEnvironmentInspectLease({...longRequest,providerLeaseId:'judgeop',creationOperation:{id:'judgeop',runId:'judgerun'}});
+ expect(w.requests.filter(r=>r.method==='PATCH')).toEqual([]);expect(w.stops()).toEqual([]);
+ const a:any=await advance(plugin.definition.onEnvironmentAcquireLease({...longRequest}),40000);
+ receipt('S18-resumed-extension',w,{a});expect(a.error).toBeUndefined();expect(a.lease.providerLeaseId).toBe('bx_judge1');
+ expect(w.boxes.get('bx_judge1').ttl).toBe(36000);expect(w.boxes.get('bx_judge1').deadline).toBeGreaterThanOrEqual(a.settledAt+36000*1000);
+ expect(w.requests.some(r=>r.method==='PATCH'&&r.path.endsWith('/bx_judge1')&&r.body.ttlSeconds===36000&&r.appliedAt<=a.settledAt)).toBe(true);
+ expect(w.patches().map(r=>r.path)).toEqual(['/sandboxes/bx_judge0']);expect(w.stops().map(r=>r.path)).toEqual(['/sandboxes/bx_judge0/stop']);
+});
+it.each(['winner','failed'])('S18 unfinished becomes terminal %s elsewhere: loser stop plus PATCH within one inspection maintenance pass',async disposition=>{
+ const w=boat({stopsRefused:true});void caught(plugin.definition.onEnvironmentAcquireLease(longRequest));await vi.advanceTimersByTimeAsync(76000);await restart();
+ const key=[...store.keys()].find(k=>k.includes('boat-provision-hedges'))!,record=store.get(key);
+ if(disposition==='winner'){record.winnerId='bx_judge0';record.handedOut=true;}else record.failed=true;
+ await plugin.definition.onEnvironmentInspectLease({...longRequest,providerLeaseId:'judgeop',creationOperation:{id:'judgeop',runId:'judgerun'}});
+ await vi.advanceTimersByTimeAsync(0);receipt('S18-one-terminal-pass-'+disposition,w);
+ expect(w.patches().map(r=>r.path)).toEqual(['/sandboxes/bx_judge1']);expect(w.stops().map(r=>r.path)).toEqual(['/sandboxes/bx_judge1/stop']);
+ expect(w.requests.filter(r=>r.method==='PATCH'&&r.path.endsWith('/bx_judge0'))).toEqual([]);
+});
+it('S18 normally extended winner is alive at env TTL minus one second without another call',async()=>{
+ const w=boat({stopsRefused:true});const a:any=await advance(plugin.definition.onEnvironmentAcquireLease(longRequest),116000);
+ expect(a.error).toBeUndefined();expect(a.lease.providerLeaseId).toBe('bx_judge1');
+ await restart();await plugin.definition.onHealth();const count=w.requests.length;
+ await vi.advanceTimersByTimeAsync(a.settledAt+36000*1000-1000-Date.now());receipt('S18-winner-normal-life',w,{a,count});
+ expect(w.live(a.lease.providerLeaseId)).toBe(true);expect(w.requests).toHaveLength(count);
+});
+it.each(['500','late','short'] as const)('S18 extension %s is never a short-TTL handoff; primary serves once',async extension=>{
+ const w=boat({extension,primaryReady:140000});let a:any;
+ const pending=caught(plugin.definition.onEnvironmentAcquireLease(longRequest)).then(value=>a=value);
+ await vi.advanceTimersByTimeAsync(116000);expect(a).toBeUndefined();
+ await vi.advanceTimersByTimeAsync(54000);await pending;receipt('S18-extension-'+extension,w,{a});
+ expect(a.error).toBeUndefined();expect(a.lease.providerLeaseId).toBe('bx_judge0');
+ const attempted=w.requests.filter(r=>r.method==='PATCH'&&r.path.endsWith('/bx_judge1')&&r.body.ttlSeconds===36000);
+ expect(attempted.length).toBeGreaterThan(0);if(extension==='late')expect(attempted.some(r=>r.appliedAt>r.abortedAt)).toBe(true);
+ const b:any=await advance(plugin.definition.onEnvironmentAcquireLease({...longRequest}),1000);expect(b.lease).toEqual(a.lease);
+ expect(w.requests.filter(r=>r.path==='/sandboxes'&&r.method==='POST')).toHaveLength(2);expect(w.stops().some(r=>r.path.endsWith('/bx_judge0/stop'))).toBe(false);
+ expect(w.stops().some(r=>r.path.endsWith('/bx_judge1/stop'))).toBe(true);
+});
+it('S18 transient extension 500 retries within acquire deadline, then serves a confirmed long-lived hedge',async()=>{
+ const w=boat({extension:'retry'});const a:any=await advance(plugin.definition.onEnvironmentAcquireLease(longRequest),170000);
+ receipt('S18-extension-retry',w,{a});expect(a.error).toBeUndefined();expect(a.lease.providerLeaseId).toBe('bx_judge1');
+ const extensions=w.requests.filter(r=>r.method==='PATCH'&&r.path.endsWith('/bx_judge1')&&r.body.ttlSeconds===36000);
+ expect(extensions[0].status).toBe(500);expect(extensions.some(r=>r.status===200&&r.appliedAt<=a.settledAt&&r.newDeadline>=a.settledAt+36000*1000-60000)).toBe(true);
+});
+it('S18 a hedge is NOT handed out while its extension confirmation is in flight',async()=>{
+ const w=boat({extension:'delayed'});let a:any;
+ const pending=caught(plugin.definition.onEnvironmentAcquireLease(longRequest)).then(value=>a=value);
+ await vi.advanceTimersByTimeAsync(116000);expect(a).toBeUndefined();
+ await vi.advanceTimersByTimeAsync(2000);await pending;receipt('S18-confirm-before-handoff',w,{a});
+ expect(a.error).toBeUndefined();expect(a.lease.providerLeaseId).toBe('bx_judge1');
+ const confirmed=w.requests.find(r=>r.method==='PATCH'&&r.path.endsWith('/bx_judge1')&&r.body.ttlSeconds===36000);
+ expect(confirmed.appliedAt).toBeLessThanOrEqual(a.settledAt);expect(confirmed.newDeadline).toBeGreaterThanOrEqual(a.settledAt+36000*1000-60000);
+});
 
 // Additional never-OK rows do not replace or weaken the original J9 trigger.
 it('S17 legacy loser TTL receipt cannot be handed out after replacement',async()=>{
@@ -126,6 +204,24 @@ it('J7 Boat prompt, unlike exec or SSH, can postpone loser auto-stop across TTL 
 
 it('J8 replacement error cleanup excludes durable returned winner',async()=>{const w=boat();const a:any=await advance(plugin.definition.onEnvironmentAcquireLease(p),170000);await restart();vi.setSystemTime(190000);const b:any=await advance(plugin.definition.onEnvironmentAcquireLease({...p}),1000);receipt('J8',w,{a,b});expect(a.error).toBeUndefined();expect(b.error).toBeDefined();expect(w.live(a.lease.providerLeaseId)).toBe(true);expect(w.stops().filter(r=>r.path.includes(a.lease.providerLeaseId))).toEqual([]);});
 
-it('J9 pending discovery PATCH never lands after contender is handed to chat',async()=>{let release!:()=>void;const gate=new Promise<void>(r=>release=r);let gated=0;const w=boat({stopsRefused:true,patchGate:async(id,body)=>{if(id==='bx_judge1'&&body.ttlSeconds===300){gated++;await gate;}}});void caught(plugin.definition.onEnvironmentAcquireLease(p));await vi.advanceTimersByTimeAsync(114000);await restart();const inspection=caught(plugin.definition.onEnvironmentInspectLease({...p,providerLeaseId:'judgeop',creationOperation:{id:'judgeop',runId:'judgerun'}}));await vi.advanceTimersByTimeAsync(0);expect(gated).toBeGreaterThan(0);const a:any=await advance(plugin.definition.onEnvironmentAcquireLease({...p}),2000);receipt('J9-before-release',w,{a,gated});expect(a.error).toBeUndefined();release();await vi.advanceTimersByTimeAsync(0);await inspection;receipt('J9-after-release',w,{a,gated});await vi.advanceTimersByTimeAsync(300000);receipt('J9-expiry',w,{a,gated});expect(w.live(a.lease.providerLeaseId)).toBe(true);});
+it('J9 terminal loser PATCH delayed 2s races settled handoff; zero provider PATCHes to returned id',async()=>{
+ let gated=0;
+ const w=boat({primaryReady:100000,stopsRefused:true,patchGate:async(id,body)=>{
+  if(id==='bx_judge1'&&body.ttlSeconds===300){gated++;await new Promise<void>(r=>setTimeout(r,2000));}
+ }});
+ let a:any;const pending=caught(plugin.definition.onEnvironmentAcquireLease(p)).then(value=>a=value);
+ await vi.advanceTimersByTimeAsync(76000);
+ // This unfinished record has no disposition: neither contender may be PATCHed.
+ await plugin.definition.onEnvironmentInspectLease({...p,providerLeaseId:'judgeop',creationOperation:{id:'judgeop',runId:'judgerun'}});
+ expect(w.requests.filter(r=>r.method==='PATCH')).toEqual([]);
+ await vi.advanceTimersByTimeAsync(25000);await pending;
+ expect(a.error).toBeUndefined();expect(a.lease.providerLeaseId).toBe('bx_judge0');expect(gated).toBe(1);
+ const b:any=await advance(plugin.definition.onEnvironmentAcquireLease({...p}),0);
+ expect(b.lease).toEqual(a.lease);receipt('J9-before-release',w,{a,b,gated});
+ await vi.advanceTimersByTimeAsync(1000);receipt('J9-after-release',w,{a,b,gated});
+ const loser=w.patches()[0];expect(loser.appliedAt-loser.at).toBe(2000);
+ expect(w.requests.filter(r=>r.method==='PATCH'&&r.path.endsWith('/'+a.lease.providerLeaseId))).toEqual([]);
+ await vi.advanceTimersByTimeAsync(300000);receipt('J9-expiry',w,{a,b,gated});expect(w.live(a.lease.providerLeaseId)).toBe(true);
+});
 
 it('J10 failed TTL receipt persistence must not allow replay to extend the prior applied deadline',async()=>{const w=boat({stopsRefused:true});const save=context.state.set;context.state.set=async(scope:any,value:any)=>{if(scope.stateKey==='stop-owed'&&value.owed?.some((x:any)=>Object.keys(x.acquisition?.loserTtls||{}).length))throw new Error('controlled state receipt outage');return save(scope,value);};const a:any=await advance(plugin.definition.onEnvironmentAcquireLease(p),170000);receipt('J10-before-restart',w,{a});context.state.set=save;await restart();vi.setSystemTime(175000);const b:any=await advance(plugin.definition.onEnvironmentAcquireLease({...p}),1000);receipt('J10-after-restart',w,{a,b});expect(a.error).toBeUndefined();expect(b.error).toBeUndefined();expect(w.patches()).toHaveLength(1);});

@@ -5,7 +5,8 @@
 An ordinary acquisition whose first box still reports `provisioning` after
 **75 seconds** starts at most **one** hedge create. Both ready observers race
 inside the original **180-second acquisition budget**; `ready`, `idle`, or
-`running` wins. An observed `error` or `archived` primary before the hedge starts
+`running` makes a contender eligible. A hedge additionally needs a confirmed
+normal-lifetime extension before it can win. An observed `error` or `archived` primary before the hedge starts
 keeps the existing failure path. Readiness does not wait for hydration, and the
 ready-spare pool's claim rules are unchanged.
 
@@ -19,6 +20,28 @@ carries `paperclip-hedge-of` and its own `creation` label/Idempotency-Key. Its c
 is counted as paid run inventory, not as a spare refill. The stored create body
 can include configured setup text/labels, as pending spare refill state already
 does; it contains no authentication header.
+
+The hedge's own create request sets **`ttlSeconds = min(environment TTL, 600)`**;
+the primary create is unchanged. A new short-TTL hedge left during readiness and
+never resumed therefore auto-stops on Boat within that short create lifetime,
+without a startup key, inspection, or maintenance request. Auto-stop must remain
+enabled. This is provider time, not a timer owned by the lost worker. Persisted
+legacy hedge bodies keep their original bytes and TTL for Boat's idempotency
+contract; the short-create rule applies to new hedge intents.
+
+A ready hedge is not handed to chat on the strength of an HTTP 200 or a sent
+request. Under the handoff/cleanup ownership fence, the plugin PATCHes it to the
+environment TTL and requires the exact-ID response's **`archiveAfter >= now +
+environment TTL - 60 seconds`**. The 60-second slack covers transport and handoff;
+a `giftLimitNotice` or an explicitly shorter `ttlSeconds` is a failed extension,
+even within that slack. Missing/invalid deadlines, 5xx and transport failures are
+not confirmation. Each send has at most five seconds and shares the original
+acquire deadline. Failed extensions retry with a one-second backoff while the
+primary is still observed; a primary that becomes ready can serve instead.
+Ownership/known-loser failures are permanent, not retried. A new hedge must still
+have its confirmed lifetime at the final handoff gate. No extension is sent for
+a primary winner, a terminal loser, or a previously handed-out winner. A failed
+acquisition disposes of its hedge through the existing terminal stop/bound path.
 
 Concurrent callers in one worker for the same company, environment, run and
 creation operation share the entire in-flight acquisition, including its winner,
@@ -38,8 +61,10 @@ Explicit ordinary release/stop/destroy requests are unchanged.
 
 The winner decision is persisted before handing off. Only after successful lease
 preparation and the durable handoff reservation do its siblings become terminal
-TTL losers. Inspection of an unfinished acquisition cannot invent a primary-as-
-keep reservation: it neither PATCHes nor stops a contender that may still win.
+TTL losers. A failed acquisition also makes its unhanded contenders terminal.
+Inspection of an unfinished acquisition cannot invent a primary-as-keep
+reservation: it neither sends a loser-TTL PATCH nor stops a contender that may
+still win. The confirmed winner extension above is separate from loser cleanup.
 The handoff, fresh winner checks, and all awaited loser PATCH/stop continuations
 share one operation-scoped ownership fence. A saved winner is immutable; a box
 with a write-ahead loser-PATCH admission can never pass the handoff gate.
@@ -64,9 +89,10 @@ admission remains, even after worker replacement. Old records without the option
 handoff/admission fields remain readable; unfinished legacy debt is not cleanup
 authority. Existing recorded TTL outcomes also suppress replay.
 
-**F4 residual:** a failed/unconfirmed PATCH plus worker restart leaves the original
-create TTL as the provider-side bound (or the prior deadline if already shorter),
-not a confirmed 300-second bound. Non-force stop is still attempted. Until a
+**F4 residual:** a failed/unconfirmed loser PATCH plus worker restart leaves the
+original create TTL as the provider-side bound (or the prior deadline if already
+shorter), not a confirmed 300-second bound. For an unextended hedge that is now
+at most 600 seconds; a primary retains its unchanged environment create TTL. Non-force stop is still attempted. Until a
 credentialed call restores maintenance, setup + health alone cannot retry it.
 Missing list entries cannot erase known loser IDs. A refused stop remains owed
 and is retried by the existing maintenance service, including with spares OFF.
@@ -83,7 +109,12 @@ loser discovered by credentialed maintenance is likewise PATCHed before stopping
 An unknown/unanswered create cannot receive a per-ID bound until discovered.
 No resolved API key or secret reference is persisted. This is an auto-stop TTL,
 not a force-stop receipt or unconditional billing guarantee: provider scheduling
-and Boat's documented working-agent TTL behavior still apply.
+and Boat's documented working-agent TTL behavior still apply. A crash during or
+after a winner-extension send but before handoff is a separate indeterminate
+provider mutation: the create-TTL bound alone cannot undo an extension that
+already landed or lands late. The relative-TTL API has no atomic extend-and-handoff
+or conditional absolute-deadline operation; these scripted rows do not prove a
+short bound for that cut point.
 An unanswered hedge POST retains identity-level debt through the shared
 30-minute creation-settle floor so a late box can be found and stopped. Core's
 creation inspection reconstructs debt only from a committed winner or terminal

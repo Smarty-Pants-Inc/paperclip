@@ -65,7 +65,8 @@ function world(readyAfter: number[], options: { errorAt?: number; archivedAt?: n
     if (b && method === "PATCH") {
       const body = JSON.parse(init.body);
       patches.push({ id, body, at: Date.now() }); events.push(`PATCH:${id}`);
-      if (options.refuseTtl) return res({ error: "TTL refused" }, 403);
+      // This option refuses LOSER shortening, not the new winner extension.
+      if (options.refuseTtl && body.ttlSeconds === 300) return res({ error: "TTL refused" }, 403);
       b.ttlSeconds = body.ttlSeconds; b.deadline = Date.now() + body.ttlSeconds * 1000;
       return res({ sandbox: { id, labels: b.labels, state: state(id, b), ttlSeconds: b.ttlSeconds, archiveAfter: new Date(b.deadline).toISOString() } });
     }
@@ -326,8 +327,11 @@ it("restart while hedge is provisioning: same durable hedge key, no third box, l
   expect(w.creates.filter(c => c.key === hedgeKey).map(c => c.body)).toEqual([w.creates[1].body, w.creates[1].body]);
   expect(w.stops.map(s => s.id)).toEqual(["bx_hedge0"]); money(w);
 });
-it("core inspection after a crash during an unanswered hedge owns its late box without any new create", async () => {
-  const w = world([240_000, 40_000], { hangHedge: true });
+// Re-pin authorized by rf-4's shipped 19:40Z ruling: unfinished contenders
+// remain resumable, not stop debt. The no-resume bound and terminal one-pass
+// stop/PATCH are independent provider-TTL rows in judge-sp16.test.ts (S18).
+it("core inspection after a crash during an unanswered hedge preserves its late box for resumed acquisition", async () => {
+  const w = world([240_000, 40_000], { hedgePostDelayMs: 40_000 });
   void settle(plugin.definition.onEnvironmentAcquireLease!(params));
   await vi.advanceTimersByTimeAsync(76_000); expect(w.boxes.size).toBe(2);
   vi.clearAllTimers(); vi.resetModules();
@@ -336,10 +340,14 @@ it("core inspection after a crash during an unanswered hedge owns its late box w
   const observed = await restarted.definition.onEnvironmentInspectLease!({ ...params, providerLeaseId: "hop", creationOperation: { id: "hop", runId: "hrun" } } as any);
   await vi.advanceTimersByTimeAsync(1_000);
   expect(observed.creationCleanup).toMatchObject({ attemptId: "hop" });
-  expect(w.stops.map(s => s.id)).toEqual(["bx_hedge1"]);
+  expect(w.stops).toEqual([]);expect(w.patches).toEqual([]);
   expect(w.creates).toHaveLength(2);
-  const debt: any = [...storage.entries()].find(([key]) => key.includes("stop-owed"))?.[1];
-  expect(debt.owed).toHaveLength(1); expect(debt.owed[0].acquisition.settleUntil).toBe(1_800_000); money(w);
+  const work = settle(restarted.definition.onEnvironmentAcquireLease!(params));
+  await vi.advanceTimersByTimeAsync(40_000);const resumed: any = await work;
+  expect(resumed.error).toBeUndefined();expect(resumed.lease.providerLeaseId).toBe("bx_hedge1");
+  expect(w.stops.map(s => s.id)).toEqual(["bx_hedge0"]);
+  expect(w.boxes.get(resumed.lease.providerLeaseId)!.stopped).toBe(false);
+  expect(new Set(w.creates.map(c => c.key)).size).toBe(2);money(w);
 });
 it("refused loser stop stays durably owed after a successful hedge", async () => {
   const w = world([240_000, 40_000], { refuseStops: true }); const r = await acquire();
@@ -407,8 +415,9 @@ it.each(["ON", "OFF", "NONE"] as const)("F2 %s: refused loser expires on Boat af
     boxes: [...w.boxes].map(([id, b]) => ({ id, stopped: b.stopped, ttlSeconds: b.ttlSeconds, deadline: b.deadline })) };
   console.info("F2 no-new-call TTL boundary", JSON.stringify(receipt));
   expect(beforeDeadline).toBe(false); expect(atDeadline).toBe(true);
-  expect(w.patches).toEqual([{ id: "bx_hedge0", body: { ttlSeconds: 300 }, at: 115_000 }]);
-  expect(w.events.slice(0, 2)).toEqual(["PATCH:bx_hedge0", "STOP:bx_hedge0"]);
+  expect(w.patches).toEqual([{ id: "bx_hedge1", body: { ttlSeconds: 1800 }, at: 115_000 },
+    { id: "bx_hedge0", body: { ttlSeconds: 300 }, at: 115_000 }]);
+  expect(w.events).toEqual(["PATCH:bx_hedge1", "PATCH:bx_hedge0", "STOP:bx_hedge0"]);
   expect(debt.owed[0].acquisition.loserTtls.bx_hedge0).toEqual({ ttlSeconds: 300, outcome: "applied", attemptedAt: 115_000 });
   expect(w.boxes.get("bx_hedge0")!.stopped).toBe(true);
   expect(w.boxes.get(r.lease.providerLeaseId)!.stopped).toBe(false);
@@ -421,8 +430,9 @@ it("TTL PATCH refusal records failed bound but still attempts the owed non-force
   expect(r.error).toBeUndefined();
   const debt: any = [...storage.entries()].find(([key]) => key.includes("stop-owed"))?.[1];
   console.info("F2 PATCH refused: no short bound", JSON.stringify({ patches: w.patches, stops: w.stops, debt }));
-  expect(w.patches).toEqual([{ id: "bx_hedge0", body: { ttlSeconds: 300 }, at: 115_000 }]);
-  expect(w.events.slice(0, 2)).toEqual(["PATCH:bx_hedge0", "STOP:bx_hedge0"]);
+  expect(w.patches).toEqual([{ id: "bx_hedge1", body: { ttlSeconds: 1800 }, at: 115_000 },
+    { id: "bx_hedge0", body: { ttlSeconds: 300 }, at: 115_000 }]);
+  expect(w.events).toEqual(["PATCH:bx_hedge1", "PATCH:bx_hedge0", "STOP:bx_hedge0"]);
   expect(w.stops).toEqual([{ id: "bx_hedge0", body: {} }]);
   expect(debt.owed[0].acquisition.loserTtls.bx_hedge0).toEqual({ ttlSeconds: 300, outcome: "failed", attemptedAt: 115_000 });
   expect(w.boxes.get("bx_hedge0")!.deadline).toBeUndefined();
@@ -437,6 +447,7 @@ it("re-entry never renews an applied loser TTL and never PATCHes a committed win
   const work = settle(restarted.definition.onEnvironmentAcquireLease!(params));
   await vi.advanceTimersByTimeAsync(2_000);
   expect((await work as any).error).toBeUndefined();
-  expect(w.patches).toEqual([{ id: "bx_hedge0", body: { ttlSeconds: 300 }, at: 115_000 }]);
-  expect(w.boxes.get(r.lease.providerLeaseId)!.deadline).toBeUndefined();
+  expect(w.patches).toEqual([{ id: "bx_hedge1", body: { ttlSeconds: 1800 }, at: 115_000 },
+    { id: "bx_hedge0", body: { ttlSeconds: 300 }, at: 115_000 }]);
+  expect(w.boxes.get(r.lease.providerLeaseId)!.deadline).toBe(1_915_000);
 });

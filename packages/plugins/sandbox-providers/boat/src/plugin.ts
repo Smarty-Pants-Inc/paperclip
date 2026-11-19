@@ -1465,6 +1465,12 @@ const BOAT_CREATE_ATTEMPT_MS = 90_000;
 const BOAT_ACQUIRE_ATTEMPT_BUDGET_MS = 180_000;
 // Most observed creates reach running in 40–90s; one tail gets one hedge at 75s.
 const BOAT_PROVISION_HEDGE_MS = 75_000;
+// Before winner extension, a new hedge expires without a replacement key.
+const BOAT_PROVISION_HEDGE_TTL_SECONDS = 600;
+// Boat's documented archiveAfter is the authority, not the requested TTL or
+// HTTP status. Allow at most 60 s of transport/handoff time, never a fair-use
+// cap that leaves the chat on the short create deadline.
+const BOAT_HEDGE_EXTENSION_SLACK_MS = 60_000;
 const BOAT_CREATE_LOOKUP_INTERVAL_MS = 5_000;
 /**
  * A step's own abort signal, never past the acquisition budget's end (rf-4 U3b
@@ -1714,13 +1720,14 @@ async function saveProvisionHedge(owner: { companyId: string; environmentId: str
   await pluginContext.state.set(provisionHedgeScope(owner, attemptId), { ...record });
 }
 /** Caller holds the handoff's ownership fence across GET, write-ahead admission
- * and PATCH. Only a handed-out winner makes its siblings terminal TTL losers.
+ * and PATCH. A handed-out winner or failed acquisition makes terminal TTL losers.
  * https://docs.boat.dev/api/reference/sandboxes/update-sandbox */
 async function boundProvisionLoser(config: Config, owner: { companyId: string; environmentId: string; runId?: string }, record: OwedSpareStops,
   debt: AcquisitionStopDebt, id: string): Promise<void> {
   const current = await loadProvisionHedge(owner, debt.attemptId);
-  if (!current?.handedOut || current.failed || current.winnerId !== debt.keepId
-      || id === current.winnerId || debt.loserTtls?.[id] || current.loserTtlAttempts?.[id] !== undefined) return;
+  if (!current || (!current.failed && (!current.handedOut || current.winnerId !== debt.keepId))
+      || id === debt.keepId || (current.handedOut && id === current.winnerId)
+      || debt.loserTtls?.[id] || current.loserTtlAttempts?.[id] !== undefined) return;
   const observed = await request(config, `/sandboxes/${encodeURIComponent(id)}`,
     { method: "GET", cache: "no-store", signal: AbortSignal.timeout(5_000) }, false, { maxSends: 1, requireJson: true });
   const sandbox = observed.sandbox ?? observed;
@@ -1790,6 +1797,36 @@ async function oweProvisionLosers(config: Config, owner: { companyId: string; en
   // arm the keeper. It still needs the existing maintenance retry service.
   if (heldStopDebt()) ensureSpareRefreshTimer();
 }
+/** A short-lived hedge is not usable until Boat confirms its normal lifetime.
+ * Caller holds the same ownership fence as terminal cleanup and handoff. No
+ * retry may extend a terminal loser, or PATCH a box already handed to chat. */
+async function extendProvisionHedgeWinner(config: Config, owner: { companyId: string; environmentId: string; runId?: string },
+  attemptId: string, id: string, deadline: number): Promise<any> {
+  const current = await loadProvisionHedge(owner, attemptId);
+  const owed = await loadOwedSpareStops(owner.companyId);
+  const legacyTtl = owed.owed.some(entry => entry.environmentId === owner.environmentId
+    && entry.acquisition?.attemptId === attemptId && entry.acquisition.loserTtls?.[id]);
+  if (!current || current.failed || current.handedOut || current.hedgeBoxId !== id
+      || (current.winnerId && current.winnerId !== id) || current.loserTtlAttempts?.[id] !== undefined || legacyTtl) {
+    throw Object.assign(new Error("Boat hedge extension ownership changed"), { code: "boat_hedge_extension_ownership_changed" });
+  }
+  if (shuttingDown || Date.now() >= deadline) throw new Error("Boat hedge extension budget expired");
+  const signal = withinBudget(deadline, 5_000);
+  const response = await request(config, `/sandboxes/${encodeURIComponent(id)}`, { method: "PATCH", signal,
+    body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(config) }) }, false, { maxSends: 1, deadline, requireJson: true,
+    sendGuard: () => { if (shuttingDown || Date.now() >= deadline) throw new Error("Boat hedge extension budget expired"); } });
+  const candidate = response?.sandbox ?? response;
+  assertSandboxId(candidate, id);
+  signal.throwIfAborted();
+  if (Date.now() >= deadline || !hedgeWinnerTtlConfirmed(config, candidate) || response.giftLimitNotice !== undefined
+      || (typeof candidate.ttlSeconds === "number" && candidate.ttlSeconds < effectiveTtlSeconds(config))
+      || dedupedBoxStop(candidate)) throw new Error("Boat hedge winner TTL extension was not confirmed");
+  return candidate;
+}
+function hedgeWinnerTtlConfirmed(config: Config, sandbox: any): boolean {
+  const deadline = typeof sandbox?.archiveAfter === "string" ? Date.parse(sandbox.archiveAfter) : NaN;
+  return deadline >= Date.now() + effectiveTtlSeconds(config) * 1000 - BOAT_HEDGE_EXTENSION_SLACK_MS;
+}
 /** Independent ready observers race inside ONE acquisition deadline. The
  * first observer starts exactly one durable hedge only on provisioning >= H.
  * A worker restart replays that stored POST/key/body, never mints another box.
@@ -1810,7 +1847,10 @@ async function waitProvisionWinner(config: Config, first: any, owner: { companyI
   if (saved?.failed) throw new Error("Boat provisioning acquisition is terminally failed");
   if (saved?.winnerId) {
     enterHedge();
-    const ready = await waitReady(config, saved.winnerId, false, { deadline, startDeadline: deadline, observe: refuseStopped });
+    let ready = await waitReady(config, saved.winnerId, false, { deadline, startDeadline: deadline, observe: refuseStopped });
+    if (saved.winnerId !== first.id && !saved.handedOut) {
+      ready = await withProvisionOwnership(owner, attemptId, () => extendProvisionHedgeWinner(config, owner, attemptId, saved.winnerId!, deadline));
+    }
     return { ready, labels: saved.winnerId === first.id ? primaryLabels : JSON.parse(saved.body).labels, hedge: saved.winnerId !== first.id };
   }
   const cancel = new AbortController();
@@ -1833,6 +1873,7 @@ async function waitProvisionWinner(config: Config, first: any, owner: { companyI
             if (existing) return existing;
             const hedgeId = creationIdentityId();
             const parsed = JSON.parse(body);
+            parsed.ttlSeconds = Math.min(config.ttlSeconds, BOAT_PROVISION_HEDGE_TTL_SECONDS);
             parsed.labels = { ...parsed.labels, creation: hedgeId, "paperclip-hedge-of": attemptId };
             const intent: ProvisionHedge = { environmentId: owner.environmentId, runId: owner.runId,
               hedgeId, body: JSON.stringify(parsed), startedAt, firstId: first.id };
@@ -1862,20 +1903,44 @@ async function waitProvisionWinner(config: Config, first: any, owner: { companyI
   refuseStopped(first);
   if (first.state === "error") throw new BoatSandboxStateError(first.id, "error");
   if (saved) startHedge();
+  let primaryAvailable: any;
   const primaryReady = (async () => {
     refuseStopped(first);
-    return waitReady(config, first.id, false, { deadline, startDeadline: deadline, signal, observe: sandbox => {
+    const ready = await waitReady(config, first.id, false, { deadline, startDeadline: deadline, signal, observe: sandbox => {
       refuseStopped(sandbox);
       if (sandbox.state === "provisioning" && Date.now() - startedAt >= BOAT_PROVISION_HEDGE_MS) startHedge();
     } });
+    primaryAvailable = ready;
+    return ready;
   })();
   try {
     // Failure of one contender is not failure of the other. Before H, however,
     // primary error/archived fails immediately and cannot launch a hedge.
-    const ready = await Promise.race([
+    let ready = await Promise.race([
       primaryReady.catch(error => { if (!hedgeWork) throw error; return hedgeReady; }),
       hedgeReady.catch(() => primaryReady),
     ]);
+    // Readiness alone is not a hedge win. Keep observing the primary while
+    // confirming the extension; a failed/capped/indeterminate PATCH retries
+    // only inside this acquisition's original deadline. A ready primary can
+    // serve instead, but never race a still-pending extension into handoff.
+    if (ready.id !== first.id) {
+      for (;;) {
+        if (primaryAvailable) { ready = primaryAvailable; break; }
+        try {
+          ready = await withProvisionOwnership(owner, attemptId,
+            () => extendProvisionHedgeWinner(config, owner, attemptId, ready.id, deadline));
+          break;
+        } catch (error) {
+          // A retry cannot repair ownership or turn a known loser receipt into
+          // a winner. Keep this integrity veto distinct from provider failure.
+          if ((error as { code?: unknown })?.code === "boat_hedge_extension_ownership_changed") throw error;
+          if (primaryAvailable) { ready = primaryAvailable; break; }
+          if (shuttingDown || Date.now() >= deadline) throw error;
+          await delay(Math.min(1_000, deadline - Date.now()), undefined, { signal });
+        }
+      }
+    }
     cancel.abort();
     await Promise.allSettled([primaryReady, ...(hedgeWork ? [hedgeWork] : [])]);
     if (record) {
@@ -3447,6 +3512,9 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
           const legacyTtl = owed.owed.some(entry => entry.environmentId === params.environmentId
             && entry.acquisition?.attemptId === attemptId && entry.acquisition.loserTtls?.[id!]);
           if (current.failed || current.winnerId !== id || current.loserTtlAttempts?.[id!] !== undefined || legacyTtl) throw new Error("Boat provisioning handoff ownership changed");
+          // A previously handed-out box is immutable here. A new hedge must
+          // still carry its confirmed normal lifetime after setup/handoff IO.
+          if (!current.handedOut && winner.hedge && !hedgeWinnerTtlConfirmed(c, ready)) throw new Error("Boat hedge extension expired before handoff");
           assertActive("handoff");
           current.handedOut = true;
           await saveProvisionHedge(params, attemptId, current);
