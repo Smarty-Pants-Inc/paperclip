@@ -184,7 +184,12 @@ describe.skipIf(!support.supported)("merged fold: after Resume a waiting message
           ...(typeof context.commentId === "string" ? [context.commentId] : [])];
         return { id: run.id, status: run.status, commentIds: [...new Set(ids)] };
       });
-    const runByGet = async (runId: string) => (await request(client).get(`/api/heartbeat-runs/${runId}`).expect(200)).body;
+    /** REAL GET of the run (its header's source). Two bulky fields the header never reads are left out of the
+     * captured body: runnerProfileJson and contextSnapshot. */
+    const runByGet = async (runId: string) => {
+      const { runnerProfileJson: _profile, contextSnapshot: _context, ...run } = (await request(client).get(`/api/heartbeat-runs/${runId}`).expect(200)).body;
+      return run;
+    };
     const until = async (what: string, done: () => Promise<boolean>, step: () => Promise<unknown>, timeoutMs = 45_000) => {
       const t0 = Date.now();
       for (;;) {
