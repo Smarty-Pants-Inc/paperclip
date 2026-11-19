@@ -2497,8 +2497,10 @@ function createSandboxEnvironmentDriver(
             const diagnostic = error instanceof JsonRpcCallError && cleanup?.companyId === input.companyId &&
               cleanup.environmentId === input.environment.id && cleanup.runId === identity.runId
               ? readEnvironmentAcquisitionDiagnostic(error) : null;
+            // identity.runId correlates the provider resource; a carried creation
+            // keeps its first run's. The evidence belongs to the acquiring run.
             captureEnvironmentAcquisitionDiagnostic(error, {
-              companyId: input.companyId, environmentId: input.environment.id, runId: identity.runId,
+              companyId: input.companyId, environmentId: input.environment.id, runId: input.heartbeatRunId ?? identity.runId,
             }, diagnostic);
             throw error;
           }

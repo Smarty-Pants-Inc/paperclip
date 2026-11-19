@@ -27,8 +27,14 @@ const TRANSIENT_ERROR_CODES = new Set([
  * the provider reported a provisional creation that did not finish, or a
  * control-plane database query failed while the lease was taken.
  */
-type TransientLeaseFailureReason = "acquisition_incomplete" | "database_error";
+type TransientLeaseFailureReason = "acquisition_incomplete" | "database_error" | "creation_reclaimed";
 type TransientProviderEvidence = { httpStatus?: number; errorCode?: string; acquisitionTimedOut?: true; reason?: TransientLeaseFailureReason };
+
+/** A retry's carried creation was reclaimed by recovery before it attached. */
+export class SandboxCreationReclaimedError extends Error {
+  readonly code = "sandbox_creation_reclaimed";
+  constructor() { super("Sandbox creation ownership has already transferred"); this.name = "SandboxCreationReclaimedError"; }
+}
 
 function own(value: unknown, key: string): unknown {
   try {
@@ -115,6 +121,7 @@ export function readTransientLeaseAcquisitionFailure(
       return acquisition.elapsedMs >= acquisition.budgetMs ? { acquisitionTimedOut: true } : { reason: "acquisition_incomplete" };
     }
     if (cause instanceof JsonRpcCallError && cause.code === PLUGIN_RPC_ERROR_CODES.TIMEOUT) return { acquisitionTimedOut: true };
+    if (cause instanceof SandboxCreationReclaimedError) return { reason: "creation_reclaimed" };
   }
   return transientDatabaseFailure(error) ? { reason: "database_error" } : null;
 }
@@ -122,6 +129,7 @@ export function readTransientLeaseAcquisitionFailure(
 const REASON_LABELS: Record<TransientLeaseFailureReason, string> = {
   acquisition_incomplete: "sandbox creation did not finish",
   database_error: "a database query failed while recording the lease",
+  creation_reclaimed: "recovery was stopping the earlier attempt's sandbox",
 };
 
 function category(evidence: TransientProviderEvidence): ProviderFailure["category"] {

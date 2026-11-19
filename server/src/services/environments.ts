@@ -1,3 +1,4 @@
+import { SandboxCreationReclaimedError } from "./environment-provider-unavailable-error.js";
 import { AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY } from "./agent-file-save-hold.js";
 import { notifyEnvironmentConfigChange, withEnvironmentConfigChange } from "./environment-config-revision.js";
 import { carryReusableLeasePreparation, createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
@@ -80,13 +81,20 @@ export async function attachSandboxCreation(db: Db, id: string, scope: { company
       const [run] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, scope.heartbeatRunId), eq(heartbeatRuns.companyId, scope.companyId), eq(heartbeatRuns.status, "running"),
       )).for("update");
-      if (!run || (operation?.runId !== scope.heartbeatRunId && operation?.metadata.creationHeartbeatRunId !== scope.heartbeatRunId)) throw new Error("Sandbox creation run authority changed");
+      // A creation carried to a retry run belongs to that run alone.
+      const authority = typeof operation?.metadata.creationHeartbeatRunId === "string" ? operation.metadata.creationHeartbeatRunId : operation?.runId;
+      if (!run || authority !== scope.heartbeatRunId) throw new Error("Sandbox creation run authority changed");
     }
     if (operation?.state === "attached" && operation.leaseId) {
       const existing = await environmentService(tx as unknown as Db).getLeaseById(operation.leaseId);
       if (existing?.status === "active") return existing;
     }
-    if (!operation || operation.state !== "pending") throw new Error("Sandbox creation ownership has already transferred");
+    if (!operation || operation.state !== "pending") {
+      // Recovery that inspected this creation before a retry carried it has
+      // queued its cleanup. That retry is retried; the next one creates fresh.
+      throw scope.heartbeatRunId && operation?.runId !== scope.heartbeatRunId && operation?.state === "cleanup_pending"
+        ? new SandboxCreationReclaimedError() : new Error("Sandbox creation ownership has already transferred");
+    }
     const lease = await attach(tx as unknown as Db);
     await notifyEnvironmentCleanup(tx, { companyId: scope.companyId, runId: operation.runId });
     await tx.update(sandboxCreationOperations).set({ state: "attached", leaseId: lease.id, updatedAt: new Date() })

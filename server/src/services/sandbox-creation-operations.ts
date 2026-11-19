@@ -132,14 +132,18 @@ export async function createOwnedSandbox(
     // A run retry re-sends its predecessor's still-pending creation: same id
     // (idempotency key) and runId, so the provider returns that one resource.
     // Moving the heartbeat owner and settle deadline keeps recovery off it.
+    // A creation already moved to this run is found again too, so every
+    // attempt of the chain re-sends that one key (never one under this runId).
     const [retry] = owner.heartbeatRunId && !stopped ? await tx.select({ of: heartbeatRuns.retryOfRunId }).from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, owner.heartbeatRunId)) : [];
+    const carriedOwner = sql`${sandboxCreationOperations.metadata}->>'creationHeartbeatRunId'`;
     if (retry?.of) [carried] = await tx.update(sandboxCreationOperations).set({ nextAttemptAt: settleAt, updatedAt: new Date(),
       metadata: sql`${sandboxCreationOperations.metadata} || ${JSON.stringify({ creationHeartbeatRunId: owner.heartbeatRunId,
         creationController, creationSettleAt: settleAt.toISOString() })}::jsonb` }).where(and(
       eq(sandboxCreationOperations.companyId, owner.companyId), eq(sandboxCreationOperations.originalEnvironmentId, owner.environmentId),
       eq(sandboxCreationOperations.requestKey, owner.requestKey ?? "run"), eq(sandboxCreationOperations.state, "pending"),
-      sql`${sandboxCreationOperations.leaseId} is null and ${sandboxCreationOperations.metadata}->>'creationHeartbeatRunId' = ${retry.of}`,
+      sql`${sandboxCreationOperations.leaseId} is null`, ne(sandboxCreationOperations.runId, runId),
+      or(sql`${carriedOwner} = ${retry.of}`, sql`${carriedOwner} = ${runId}`),
     )).returning();
     if (carried) return carried;
     const [inserted] = await tx.insert(sandboxCreationOperations).values({
