@@ -104,14 +104,34 @@ function holderSessionDirectory(holder: SandboxRunnerHolder): string {
   return posix.basename(posix.dirname(posix.dirname(holder.identityPath)));
 }
 
+/** retire-bind: the same Runner generation, by everything its marker records:
+ * the identity file's nonce, pid, runner id and process-start fingerprint
+ * (parseSandboxRunnerHolders), and the run its state names for that runner id. */
+function sameSandboxRunner(a: SandboxRunnerHolder, b: SandboxRunnerHolder): boolean {
+  return a.identityPath === b.identityPath && a.nonce === b.nonce && a.pid === b.pid
+    && a.runnerInstanceId === b.runnerInstanceId && a.processStartFingerprint === b.processStartFingerprint && a.runId === b.runId;
+}
+
+/** True only when this session directory's Runner marker is the requested
+ * run's (its state's runId, bound to the marker's runner id) AND the very
+ * generation the stop pass selected for that run (`expected`, from
+ * retireSandboxRunnerPortHolders' `only.observed`); and that Runner is proven
+ * exited. No stop-pass holder, a marker of a different run, or one that changed
+ * since the stop pass refuses: a directory alone never proves a predecessor exited. */
 export async function sandboxSessionRunnerExited(input: {
   runner: CommandManagedRuntimeRunner;
   runtimeRoot: string;
   sessionDirectory: string;
+  runId: string;
+  expected: SandboxRunnerHolder | null;
 }): Promise<boolean> {
   const { holders } = await listSandboxRunnerHolders(input.runner, input.runtimeRoot, "");
-  const holder = holders?.find(candidate => holderSessionDirectory(candidate) === input.sessionDirectory);
-  return holder !== undefined && await checkHolder(input.runner, holder, "paperclip-runner-exit-check") === 45;
+  const inDirectory = holders?.filter(candidate => holderSessionDirectory(candidate) === input.sessionDirectory) ?? [];
+  if (inDirectory.length !== 1) return false;
+  const [holder] = inDirectory;
+  if (!input.runId || holder.runId !== input.runId) return false;
+  if (!input.expected || !sameSandboxRunner(holder, input.expected)) return false;
+  return await checkHolder(input.runner, holder, "paperclip-runner-exit-check") === 45;
 }
 
 export const SANDBOX_SESSION_RUNNER_INSPECT_SCRIPT = [
@@ -185,7 +205,8 @@ export async function retireSandboxRunnerPortHolders(input: {
   ownSessionRoot: string;
   providerLeaseId: string | null;
   adoptedRunId?: string | null;
-  only?: { sessionDirectory: string; runId: string };
+  /** `observed` receives each holder the `only` filter selects, before any probe or stop. */
+  only?: { sessionDirectory: string; runId: string; observed?: (holder: SandboxRunnerHolder) => void };
   retireInProcess: (holderRunId: string) => Promise<boolean>;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   waitMs?: number;
@@ -200,6 +221,7 @@ export async function retireSandboxRunnerPortHolders(input: {
   for (const holder of holders) {
     if (input.only ? holderSessionDirectory(holder) !== input.only.sessionDirectory || holder.runId !== input.only.runId
       : holder.runId === input.runId || (holder.runId !== null && holder.runId === input.adoptedRunId)) continue;
+    input.only?.observed?.(holder);
     const initial = await probeHolder(input.runner, holder);
     if (initial === "gone") continue;
     const unproven = (reason: string) => new NativePredecessorRetirementUnprovenError(holder.runId, input.providerLeaseId,
