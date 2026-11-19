@@ -1,5 +1,5 @@
 import { and, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
-import { agentWakeupRequests, environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { parseObject } from "../adapters/utils.js";
 import { resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
@@ -207,6 +207,25 @@ export async function readPersonStopHold(db: Db, input: {
   return held.length ? { stoppedRunId: lastTurn.id, wakeIds: held.map(wake => wake.id),
     stoppedByUserId: typeof stop.cancelledByUserId === "string" && stop.cancelledByUserId ? stop.cancelledByUserId : null,
     stopBoundaryAt: userStopBoundaryAt(lastTurn) } : null;
+}
+
+/** bb-2d-stopwords: can the queue's Send (POST .../queued-comments/interrupt) START the messages a person's Stop
+ * holds, now? Only when the stopped run's cleanup is verified by the same DB facts the Send's gate requires
+ * (explicit-native-continuation.ts): a native run with an acknowledged Stop, its finalization coordinator in
+ * terminal_failure with no lease owner and no successor (otherwise the gate keeps the wake: controller_settling,
+ * "The cancelled run still needs verified cleanup."), and the provider's recorded stop
+ * (acknowledgedNativeStopExecutionHasStopped). Read-only. Anything else answers false: the panel then offers no
+ * Send beside the Stop line, because a press there is accepted and starts nothing. */
+export async function personStopSendCanStart(db: Db, input: { companyId: string; stoppedRunId: string }): Promise<boolean> {
+  const [run] = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.stoppedRunId))).limit(1);
+  if (!run || run.runtimeMode !== "native" || !isAcknowledgedNativeStop(run)) return false;
+  const [coordinator] = await db.select({ phase: nativeRunFinalizations.phase, leaseOwner: nativeRunFinalizations.leaseOwner,
+    failureDetail: nativeRunFinalizations.failureDetail }).from(nativeRunFinalizations).where(and(
+    eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.runId, run.id))).limit(1);
+  if (!coordinator || coordinator.phase !== "terminal_failure" || coordinator.leaseOwner ||
+      parseObject(coordinator.failureDetail).successorRunId) return false;
+  return acknowledgedNativeStopExecutionHasStopped(db, run);
 }
 
 /** adopt-marker-port (RFL F1): this run is the FIRST turn after a person's Stop when the latest person Stop

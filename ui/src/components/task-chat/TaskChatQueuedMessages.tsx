@@ -72,6 +72,11 @@ export const CHAT_AGENT_PAUSED_REASON = "queued_comment_chat_paused";
  * what that line names: each row's Delete. No Send, on the line or on a row: in that
  * hold the queue's Send can be accepted and start nothing; a new message carries them. */
 export const TASK_HELD_BY_OWN_STOP_REASON = "held_by_own_stop";
+/** The same hold where the stopped run's cleanup is verified (the server's read,
+ * personStopSendCanStart): the queue's Send starts the held messages, so the panel
+ * says the server's line with ONE Send on it (the stopped bar's frame) and each
+ * row keeps its Delete. */
+export const TASK_HELD_BY_OWN_STOP_SEND_REASON = "held_by_own_stop_send";
 
 export function reorderQueuedMessageEntries(
   entries: IssueQueuedCommentEntry[],
@@ -600,6 +605,11 @@ export function TaskChatQueuedMessages({
   // works, never a promise: no Send on the line or on a row.
   const heldByOwnStop = queue.executionWait?.reason === TASK_HELD_BY_OWN_STOP_REASON &&
     Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0;
+  // The same hold where the queue's Send starts them: the stopped bar's frame, with
+  // the server's line. Without a Send handler the line would name a button that is
+  // not there, so nothing is said (as the chat's bar).
+  const heldByOwnStopSend = queue.executionWait?.reason === TASK_HELD_BY_OWN_STOP_SEND_REASON &&
+    Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0 && Boolean(onInterrupt);
 
   if (entries.length === 0 && !visibleError && !statusMessage && !steeringUnavailableReason) return null;
 
@@ -655,7 +665,7 @@ export function TaskChatQueuedMessages({
                     : undefined
                 }
                 onDiscard={() => void runRowAction(entry.comment.id, "discard")}
-                sendOnLine={stoppedByPerson || stoppedPaused || heldByOwnStop}
+                sendOnLine={stoppedByPerson || stoppedPaused || heldByOwnStop || heldByOwnStopSend}
               />
             );
           })}
@@ -663,12 +673,12 @@ export function TaskChatQueuedMessages({
         </SortableContext>
       </DndContext>
       {statusMessage ? <p role="status" className="border-t border-border px-3 py-1.5 text-xs text-muted-foreground">{statusMessage}</p> : null}
-      {stoppedByPerson ? (
+      {stoppedByPerson || heldByOwnStopSend ? (
         <div
           className="flex flex-wrap items-center gap-2 border-t border-border px-3 py-1.5 text-xs text-muted-foreground"
           data-testid="task-chat-queued-stopped"
         >
-          <p role="status" className="min-w-0 flex-1">{CHAT_STOPPED_BY_PERSON_LINE}</p>
+          <p role="status" className="min-w-0 flex-1">{heldByOwnStopSend ? queue.executionWait!.message : CHAT_STOPPED_BY_PERSON_LINE}</p>
           <button
             type="button"
             className="flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-border px-2.5 text-xs font-medium text-foreground transition-colors hover:bg-accent disabled:opacity-40"

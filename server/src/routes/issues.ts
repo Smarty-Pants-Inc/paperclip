@@ -87,7 +87,7 @@ import multer from "multer";
 import { z } from "zod";
 import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { readPersonStopHold } from "../services/acknowledged-native-stop.js";
+import { personStopSendCanStart, readPersonStopHold } from "../services/acknowledged-native-stop.js";
 import { isNativeAdmissionAdapter } from "../services/explicit-native-continuation.js";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
@@ -463,12 +463,19 @@ const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
 const CHAT_STOPPED_BY_PERSON_MESSAGE = "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it.";
 // bb-2d-stopwords (RFL 22:22Z): a TASK's waiting messages held by their sender's OWN Stop. The reason is the hold's
 // own, read from the hold (readPersonStopHold: who pressed Stop, and when), never from a stored wait's text. The line
-// names only what works in that hold: the row's Delete, and a new message, which carries the held ones (the wake
-// queue: "An operator stop never promotes old queued work by itself. The next explicit wake adopts those messages").
-// It names no Send: in that hold the queue's Send (POST .../queued-comments/interrupt) can be accepted and start
-// nothing (the gate keeps the wake, controller_settling), so the panel offers none beside this line.
+// names only what works in that hold, and the panel offers exactly that:
+// - held_by_own_stop_send: the stopped run's cleanup is verified (personStopSendCanStart), so the queue's Send
+//   starts the held messages: ONE Send on the line, each row its Delete.
+// - held_by_own_stop: it is not (for example the Stop came while the run's save hung). There the queue's Send is
+//   accepted and starts nothing (the gate keeps the wake, controller_settling), so the panel offers none: each
+//   row its Delete, and a new message, which carries the held ones (the wake queue: "An operator stop never
+//   promotes old queued work by itself. The next explicit wake adopts those messages").
 const TASK_HELD_BY_OWN_STOP_REASON = "held_by_own_stop";
-function taskHeldByOwnStopMessage(count: number): string {
+const TASK_HELD_BY_OWN_STOP_SEND_REASON = "held_by_own_stop_send";
+function taskHeldByOwnStopMessage(count: number, send: boolean): string {
+  if (send) return count === 1
+    ? "Not sent, because you pressed Stop. Send it now, or delete it."
+    : "Not sent, because you pressed Stop. Send them now, or delete any.";
   return count === 1
     ? "Not sent, because you pressed Stop. Delete it, or send a new message: this one goes with it."
     : "Not sent, because you pressed Stop. Delete any, or send a new message: these go with it.";
@@ -7986,7 +7993,12 @@ export function issueRoutes(
       if (hold && boundary !== undefined && hold.stoppedByUserId === input.actor.actorId &&
           comments.every(comment => comment.authorUserId === input.actor.actorId &&
             new Date(comment.createdAt).getTime() <= boundary)) {
-        queue.executionWait = { reason: TASK_HELD_BY_OWN_STOP_REASON, message: taskHeldByOwnStopMessage(comments.length) };
+        // Send is named, and offered, only where its press starts the run: the stopped run's cleanup is verified
+        // and the agent is not paused. Otherwise the line names Delete and a new message, and the panel has no Send.
+        const send = await personStopSendCanStart(input.executor as Db, { companyId: input.issue.companyId, stoppedRunId: hold.stoppedRunId })
+          && !(await isChatAgentPaused(input.executor, input.issue.companyId, input.issue.assigneeAgentId));
+        queue.executionWait = { reason: send ? TASK_HELD_BY_OWN_STOP_SEND_REASON : TASK_HELD_BY_OWN_STOP_REASON,
+          message: taskHeldByOwnStopMessage(comments.length, send) };
       }
     }
     if (wake && queuedInteractionId(wake.payload)) {
