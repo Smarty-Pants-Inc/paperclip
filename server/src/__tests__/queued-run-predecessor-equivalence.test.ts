@@ -149,7 +149,7 @@ describe.skipIf(!support.supported)("the extracted claim predecessor decision", 
     // Producer 2 drops in (the shape of paperclip-lead's Pause certificate: an exact in-process fact over a run
     // cancelled agent_paused; its teardown continues on a box the next input never reuses, so cleanup is released too).
     const paused = await plant({ status: "cancelled", errorCode: "agent_paused", pending: true });
-    const certificate = new Set([paused]);
+    const certificate = new Set<string>([paused]);
     const pauseCertificate = { name: "pause_certificate", cleanup: "released" as const,
       released: (previous: { id: string; status: string | null; errorCode: string | null }) =>
         previous.status === "cancelled" && previous.errorCode === "agent_paused" && certificate.has(previous.id) };
