@@ -960,9 +960,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // that collector returns; only exact destruction proof settles it.
     if (held && row.location !== "local" && !transports.has(key(row)) && target?.kind !== "remote"
       && row.receipt?.warm === true) return recoverStoppedRemote(row);
-    // Upstream: save only while the box is live; a stopped box's copy stays pending_collection.
+    // Upstream: no new save against a stopped box (pending_collection, no pin); an existing hold keeps its own retry.
     if (row.receipt?.warm === true && !settled(row)) {
-      if (row.location !== "local" && !leaseLive(await ownedRemoteLease(row))) return recoverStoppedRemote(row);
+      if (!held && row.location !== "local" && !leaseLive(await ownedRemoteLease(row))) return recoverStoppedRemote(row);
       row = await checkpoint(row, target, true, signal);
       // Never release a stopped copy while retained aside copies are unsurfaced.
       if (row.errorCode === "AGENT_FILES_ASIDE_UNSURFACED") return row;
