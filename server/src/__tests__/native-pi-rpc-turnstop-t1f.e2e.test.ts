@@ -56,7 +56,7 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-fallback", "finished"] as const)(`warm turnstop T1-F: %s (real Runner/Pi, two prior turns)`, async scenario => {
+it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "finished"] as const)(`warm turnstop T1-F: %s (real Runner/Pi, two prior turns)`, async scenario => {
   const stopTurn = 3;
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("responses");
@@ -356,6 +356,18 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-fallback", "finishe
       stage("transport kind=pi_rpc", { provider: options?.provider, thinking: options?.piRpcThinkingLevel });
       expect(options?.provider).toBe("pi_rpc"); expect(options?.piRpcThinkingLevel).toBe(thinking);
       const bundle = realFactory(options);
+      if (scenario === "R-late-ack") {
+        const request = bundle.transport.request.bind(bundle.transport);
+        bundle.transport.request = async (method, params) => {
+          const result = await request(method, params);
+          if (method === "turn/interrupt") {
+            const receivedAt = Date.now();
+            await new Promise(resolve => setTimeout(resolve, 3_000));
+            stage("late interrupt RPC reply delivered", { receivedAt, deliveredAt: Date.now() });
+          }
+          return result;
+        };
+      }
       if (scenario === "R-fallback") {
         const request = bundle.transport.request.bind(bundle.transport);
         bundle.transport.request = async (method, params) => {

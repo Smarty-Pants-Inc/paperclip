@@ -56,7 +56,7 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`warm turnstop spike: %s (real Runner/Pi, two prior turns)`, async scenario => {
+it.skipIf(!enabled).each(["interrupt", "stop", "late-ack", "finished"] as const)(`warm turnstop spike: %s (real Runner/Pi, two prior turns)`, async scenario => {
   const stopTurn = 3;
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("responses");
@@ -330,7 +330,7 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
       stage("transport kind=pi_rpc", { provider: options?.provider, thinking: options?.piRpcThinkingLevel });
       expect(options?.provider).toBe("pi_rpc"); expect(options?.piRpcThinkingLevel).toBe(thinking);
       const bundle = realFactory(options);
-      if (scenario === "no-ack") {
+      if (scenario === "late-ack") {
         const request = bundle.transport.request.bind(bundle.transport);
         bundle.transport.request = async (method, params) => {
           const result = await request(method, params);
@@ -519,10 +519,8 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
     stage("retained qualification after drain (read-only)", { checkpoint: drainedRun?.runnerProfileJson?.nativeRetainedIdleCheckpoint,
       leases: drainedLeases.map(lease => ({ id: lease.id, status: lease.status, metadata: lease.metadata,
         retained: drainedRun && executor.hasRetainedNativeTurnStop?.(drainedRun, lease) })) });
-    if (scenario !== "no-ack") {
-      expect(alive(pid.piPid), "Stop must keep Pi alive after server run drain, before harness teardown").toBe(true);
-      expect(alive(pid.runnerPid), "Stop must keep the original runnerd warm").toBe(true);
-    }
+    expect(alive(pid.piPid), "qualified Stop must keep Pi alive after server run drain, before harness teardown").toBe(true);
+    expect(alive(pid.runnerPid), "qualified Stop must keep the original runnerd warm").toBe(true);
     expect(existsSync(join(root, "after-stop.txt")), "cancelled command cannot run its trailing effect").toBe(false);
     const successorPressAt = scenario === "interrupt" ? started : Date.now();
     stage("successor authorization", { successorPressAt, stopToSendMs: successorPressAt - started, drainedAt: Date.now() });
@@ -564,11 +562,10 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
       beforeLeaseId: beforeStopLease!.id, nextLeaseId: nextLease!.id, beforeBoxId: beforeStopLease!.providerLeaseId, nextBoxId: nextLease!.providerLeaseId });
     expect(commentBoundToSuccessor, "the apparent reply belongs to the newly authorized comment, not an old restored wake").toBe(true);
     expect(requestHasAuthorizedDirection, "the real model request contains the newly authorized direction").toBe(true);
-    if (scenario === "no-ack") {
-      expect(nextLease!.id).not.toBe(beforeStopLease!.id);
-      expect(replacement.piPid).not.toBe(pid.piPid);
-      stage("FALLBACK GREEN", { original: pid, replacement, stopCalls });
-    } else {
+    {
+      // The 3s delayed RPC reply is not a never-ack adversary: the real
+      // terminal event can acknowledge the idle Pi inside its 5s deadline.
+      // Every qualified row therefore has the same exact-owner oracle.
       // A new durable lease row is the ordinary cross-run handoff, not a new
       // physical box. Qualify allocation identity and the actual process birth.
       expect(nextLease!.providerLeaseId).toBe(beforeStopLease!.providerLeaseId);
