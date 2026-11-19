@@ -551,6 +551,44 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(codeOf(notices[0]!)).toBe("runner_state_identity_mismatch");
   });
 
+  it("note-port: one true note at a time: the sweep's held 'Send a new message to try again' note retires when the automatic fresh thread starts; without one it stands unchanged; another unanswered note stays", async () => {
+    const { supersedeHeldConversationNotice, writePiSessionHistoryLossNotice } = await import("../native-runtime/pi-session-recovery-notice.js");
+    const { FRESH_THREAD_STARTED_NOTE } = await import("../native-runtime/fresh-thread-stop-gate.js");
+    const current = (rows: { body: string; metadata: unknown }[]) => rows
+      .filter(row => !(row.metadata as Record<string, unknown> | null)?.supersededByCommentId).map(row => row.body);
+    for (const heldSessionId of [randomUUID(), null]) {
+      // The person's attempt fails before any turn (the real sweep writes today's held note under unanswered_message:<id>).
+      const f = await fixture();
+      const failed = await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed",
+        error: "runner_state_identity_mismatch: legacy_owner_unverified" });
+      await f.sweep();
+      const [held] = await f.visible();
+      expect(held!.body).toBe(HELD);
+      // A control: a different unanswered note (another message's) on the same task.
+      const [other] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "system",
+        body: "Your message wasn't answered.", metadata: { version: 1, authorizationReason: `unanswered_message:${randomUUID()}`, sections: [] } }).returning();
+      // No automatic continuation yet: today's note is unchanged and current.
+      expect(current(await f.visible())).toContain(HELD);
+      // The automatic fresh thread starts: the real writer pair (selectFreshContinuationThread / pi-conversation-record).
+      const authorizationReason = `fresh_provider_thread:${randomUUID()}`;
+      await db.transaction(async tx => {
+        await writePiSessionHistoryLossNotice(db, tx, { companyId: f.companyId, issueId: f.issueId, runId: failed, agentId: f.agentId,
+          authorizationReason, body: FRESH_THREAD_STARTED_NOTE, replaceExisting: true });
+        await supersedeHeldConversationNotice(tx, { companyId: f.companyId, issueId: f.issueId, heldSessionId, reason: authorizationReason });
+      });
+      // A later sweep pass does not write the retired note again.
+      await f.sweep();
+      const after = await f.visible();
+      console.log("[note-port]", JSON.stringify({ heldSessionId, notes: after.map(row => ({ body: row.body.slice(0, 60),
+        reason: (row.metadata as any)?.authorizationReason, supersededBy: (row.metadata as any)?.supersededByCommentId ?? null })) }));
+      expect(current(after), "the 'Send a new message' note retired").not.toContain(HELD);
+      expect(current(after)).toContain(FRESH_THREAD_STARTED_NOTE);
+      expect(current(after), "another unanswered note stays").toContain("Your message wasn't answered.");
+      expect(after.find(row => row.id === held!.id)!.body, "history kept").toBe(HELD);
+      expect(after.find(row => row.id === other!.id)!.metadata).not.toHaveProperty("supersededByCommentId");
+    }
+  });
+
   it("G2: the first refusal after a good turn (prior_owner_active) -> one notice", async () => {
     const f = await fixture();
     await f.reply(await f.run({ commentId: await f.message("First question"), status: "succeeded" }));
