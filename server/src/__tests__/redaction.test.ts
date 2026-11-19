@@ -1079,3 +1079,115 @@ describe("ANSI-stripped credential view", () => {
     expect(redactSensitiveText(input)).toBe(input);
   });
 });
+
+// catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21230
+// Keep reason: never disclose credentials; never promote scheme words through CSI boundaries.
+describe("union of transparent and bare-token boundary ANSI views", () => {
+  const colour = "\u001b[31m";
+  const reset = "\u001b[0m";
+  const body = "rf2SyntheticOnly0123456789ABCDEF";
+  const shapes = [
+    ["sk-proj-", "sk-proj-", body],
+    ["sk-ant-", "sk-ant-", body],
+    ["ghp_", "ghp_", body],
+    ["github_pat_", "github_pat_", body],
+    ["AKIA", "AKIA", "RF2SYNTH01234567"],
+    ["JWT", "eyJ", "hbGciOiJIUzI1NiJ9.eyJzdWIiOiJyZjJzeW50aGV0aWMifQ.c3ludGhldGljU2lnbmF0dXJl"],
+    ["Bearer", "Bearer ", body],
+  ] as const;
+  const codes = [colour, "\u001b[K", "\u001b[01;31m\u001b[K", "\u001b[1C"];
+  const before = ["x", "7", "_", "-", "="];
+  const matrix = shapes.flatMap(([shape, prefix, tail]) => before.flatMap(word => codes.map(code => ({
+    shape, word, code, input: `${word}${code}${prefix}${tail}${reset}`,
+    // Bearer is V1-only. A CSI must not create a new boundary for a scheme word.
+    expected: prefix === "Bearer " && /\w/.test(word)
+      ? `${word}${code}${prefix}${tail}${reset}`
+      : `${word}${code}${prefix === "Bearer " ? "Bearer " : ""}${REDACTED_EVENT_VALUE}${reset}`,
+  }))));
+  it.each(matrix)("(x) $shape after $word and CSI $code", ({ input, expected }) => {
+    expect(redactSensitiveText(input)).toBe(expected);
+  });
+
+  const witnesses = [
+    ["standard\u001b[31mbearer abc123def\u001b[0m", "standard\u001b[31mbearer abc123def\u001b[0m"],
+    [`prefix${colour}sk-proj-${body}${reset}`, `prefix${colour}${REDACTED_EVENT_VALUE}${reset}`],
+    [`the ${colour}bearer of${reset} good news`, `the ${colour}bearer of${reset} good news`],
+    [`Use ${colour}bearer authentication${reset} here`, `Use ${colour}bearer authentication${reset} here`],
+  ];
+  it.each(witnesses)("(w) ruled A2 witness %j", (input, expected) => {
+    expect(redactSensitiveText(input)).toBe(expected);
+  });
+
+  it.each(shapes)("(x) repeated CSI and line-start %s", (_shape, prefix, tail) => {
+    const masked = prefix === "Bearer " ? `Bearer ${REDACTED_EVENT_VALUE}` : REDACTED_EVENT_VALUE;
+    const glued = `prefix${colour}\u001b[K${prefix}${tail}${reset}`;
+    expect(redactSensitiveText(glued)).toBe(prefix === "Bearer " ? glued : `prefix${colour}\u001b[K${masked}${reset}`);
+    expect(redactSensitiveText(`${colour}${prefix}${tail}${reset}`)).toBe(`${colour}${masked}${reset}`);
+  });
+
+  it.each(shapes)("(y) %s retains transparent prefix/body matching", (_shape, prefix, tail) => {
+    const masked = prefix === "Bearer " ? `Bearer ${REDACTED_EVENT_VALUE}` : REDACTED_EVENT_VALUE;
+    const insidePrefix = `${prefix.slice(0, 2)}${colour}${prefix.slice(2)}${tail}${reset}`;
+    // CSI inside the Bearer word belongs to the preserved scheme, not its value.
+    const expectedPrefix = prefix === "Bearer " ? `Be${colour}arer ${REDACTED_EVENT_VALUE}` : REDACTED_EVENT_VALUE;
+    expect(redactSensitiveText(insidePrefix)).toBe(`${expectedPrefix}${reset}`);
+    expect(redactSensitiveText(`${colour}${prefix}${tail.slice(0, 3)}\u001b[K${tail.slice(3)}${reset}`))
+      .toBe(`${colour}${masked}${reset}`);
+  });
+
+  it("keeps the actual whole-word grep capture unchanged, the pre-existing glued-key gap #21241", () => {
+    // Exact bytes of inputs/real-grep-capture.bin, including its final newline.
+    const capture = `\u001b[01;31m\u001b[Kprefixsk-proj-${body}\u001b[m\u001b[K\n`;
+    expect(redactSensitiveText(capture)).toBe(capture);
+    expect(redactSensitiveText(`prefixsk-proj-${body}`)).toBe(`prefixsk-proj-${body}`);
+    expect(redactSensitiveText(`prefix\u001b[01;31m\u001b[Ksk-proj-${body}\u001b[m\u001b[K`))
+      .toBe(`prefix\u001b[01;31m\u001b[K${REDACTED_EVENT_VALUE}\u001b[m\u001b[K`);
+  });
+
+  it("keeps real Bearer lines masked through transparent CSI beside the scheme-boundary negative", () => {
+    expect(redactSensitiveText(`Authorization:${colour} Bearer\u001b[K abc123def${reset}`))
+      .toBe(`Authorization:${colour} ${REDACTED_EVENT_VALUE}${reset}`);
+    expect(redactSensitiveText(`Bearer${colour} abc123def${reset}`))
+      .toBe(`Bearer${colour} ${REDACTED_EVENT_VALUE}${reset}`);
+    expect(redactSensitiveText(`Bearer ${colour}abc123def${reset}`))
+      .toBe(`Bearer ${colour}${REDACTED_EVENT_VALUE}${reset}`);
+    expect(redactSensitiveText(`standard${colour}bearer abc123def${reset}`))
+      .toBe(`standard${colour}bearer abc123def${reset}`);
+  });
+
+  const shortTails = ["sk-1", "sk-proj-123", "sk-ant-1234", "ghp_123", "github_pat_123", "AKIA12", "eyJ123"];
+  it.each(shortTails)("keeps a short non-key after CSI: %s", tail => {
+    const input = `task${colour}${tail}${reset}`;
+    expect(redactSensitiveText(input)).toBe(input);
+  });
+  it.each(["gho_", "ghu_", "ghs_", "ghr_"])("uses the existing GitHub prefix %s", prefix => {
+    expect(redactSensitiveText(`x${colour}${prefix}${body}${reset}`))
+      .toBe(`x${colour}${REDACTED_EVENT_VALUE}${reset}`);
+  });
+
+  const gatedShapes = [
+    ["sk-", "a".repeat(11), false], ["sk-", "a".repeat(12), true],
+    ["ghp_", "a".repeat(19), false], ["ghp_", "a".repeat(20), true],
+    ["github_pat_", "a".repeat(19), false], ["github_pat_", "a".repeat(20), true],
+    ["AKIA", "A".repeat(15), false], ["AKIA", "A".repeat(16), true],
+    ["AKIA", "a".repeat(16), false], ["AKIA", "A".repeat(17), false],
+    ["sk-", "a".repeat(5) + "/" + "a".repeat(6), false],
+    ["ghp_", "a".repeat(10) + "-" + "a".repeat(9), false],
+    ["github_pat_", "a".repeat(10) + "/" + "a".repeat(9), false],
+    ["eyJ", "abcdefgh.abcdefgh.abcdefgh", true],
+  ] as const;
+  it.each(gatedShapes)("does not relax uncoloured shape rules: %s%s (%s)", (prefix, tail, masks) => {
+    const token = prefix + tail;
+    const expected = masks ? REDACTED_EVENT_VALUE : token;
+    expect(redactSensitiveText(token)).toBe(expected);
+    expect(redactSensitiveText(`x${colour}${token}${reset}`)).toBe(`x${colour}${expected}${reset}`);
+  });
+
+  it("unions overlapping transparent and boundary spans instead of leaving a body fragment", () => {
+    const token = "sk-" + "a".repeat(16) + colour + "b".repeat(16);
+    expect(redactSensitiveText(`${colour}${token}${reset}`)).toBe(`${colour}${REDACTED_EVENT_VALUE}${reset}`);
+    // Existing sk- charset includes the hyphen and the following AKIA-shaped tail.
+    expect(redactSensitiveText(`${colour}sk-${"a".repeat(12)}-AKIA${"A".repeat(16)}${reset}`))
+      .toBe(`${colour}${REDACTED_EVENT_VALUE}${reset}`);
+  });
+});
