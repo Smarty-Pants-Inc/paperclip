@@ -2971,5 +2971,6 @@ export { recognizeLinkPreview, type LinkPreviewTarget, type LinkPreviewState, ty
 export * from "./mcp-apps.js";
 export * from "./mcp-skills.js";
 export { REPLY_FILE_LINE_STATES, FILE_LINE_LOST, FILE_LINE_KEPT, FILE_LINE_KEPT_NO_BUTTON, FILE_LINE_SAVING, FILE_LINE_NOT_SAVED_YET,
-  REPLY_FILES_NOT_SAVED_LINE, REPLY_FILES_PARTLY_SAVED_LINE,
+  REPLY_FILES_NOT_SAVED_LINE, REPLY_FILES_PARTLY_SAVED_LINE, REPLY_FILES_LOST_WAITING_LINE, REPLY_FILES_CONTINUE_ACTION,
+  SAVED_MESSAGE_WAIT_STATES, CHECKOUT_CONTINUE_REQUIRED_REASON, type SavedMessageWaitState,
   readReplyFileLine, replyFileLineSavingExpired, replyFileLineText, type ReplyFileLine, type ReplyFileLineState } from "./reply-file-line.js";

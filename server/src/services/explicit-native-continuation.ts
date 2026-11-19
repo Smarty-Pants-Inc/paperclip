@@ -7,7 +7,8 @@ import { verifiedWorkspaceSnapshotReceipt } from "./workspace-recovery-snapshot.
 import { readTaskRetryIntent, retireTaskRetriesContinuedBy } from "./task-retry.js";
 import { isPreDispatchExecutionWaitVerified } from "./pre-dispatch-execution-wait.js";
 import { readSystemRecovery, savedFilesUnrecoverable, unrecoverableSavedFilesFailure, unrecoverableSavedFilesNotice,
-  REPLY_FILES_NOT_SAVED_LINE, REPLY_FILES_PARTLY_SAVED_LINE } from "./system-recovery-state.js";
+  REPLY_FILES_NOT_SAVED_LINE, REPLY_FILES_PARTLY_SAVED_LINE, REPLY_FILES_LOST_WAITING_LINE, CHECKOUT_CONTINUE_REQUIRED_REASON,
+  checkoutContinueChosen } from "./system-recovery-state.js";
 import { replyFileLineReadsLost } from "./native-runtime/native-late-save-rule.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
@@ -407,8 +408,9 @@ export async function admitExplicitNativeContinuation(input: {
   const sources: Run[] = [];
   let readiness: ContinuationReadiness | undefined;
   const freshSources = new Map<string, string>();
-  /** d2shared2: runs whose reply's file line reads LOST and whose saved-work recovery is spent. The person's message
-   * continues ON THE CURRENT checkout (never the new-workspace strategy, which starts empty for a local directory). */
+  /** Runs whose reply's file line reads LOST and whose saved-work recovery is spent, for a reason that is NOT one of
+   * the three "unrecoverable" codes (those keep their old path: a new workspace from recorded work). The person's
+   * message continues ON THE CURRENT checkout. */
   const lostLineSources = new Map<string, Run>();
   const freshCandidates: Array<{ run: Run; intent: string; cause: string; evidence: Record<string, unknown>;
     remote: boolean; leaseIds: string[] }> = [];
@@ -544,9 +546,11 @@ export async function admitExplicitNativeContinuation(input: {
         // of them never lands in the task's workspace (native-late-save-rule.ts, K15b: Retry export and the recovery
         // worker keep them aside). So a spent recovery of those files holds nothing in the checkout: the message
         // continues on the checkout as it is, with the not-saved notice in its input. Every stop proof below still
-        // applies. Proposed, pending RFL (option 2).
-        if (replyFileLineReadsLost(run.resultJson)) lostLineSources.set(run.id, run);
-        else if (!freshIntent || !live.every(row => savedFilesUnrecoverable(readSystemRecovery(row.evidence))))
+        // applies. SCOPE: the three "unrecoverable" codes (savedFilesUnrecoverable) keep their old path below, a Retry
+        // that continues in a new workspace from recorded work.
+        const unrecoverable = live.every(row => savedFilesUnrecoverable(readSystemRecovery(row.evidence)));
+        if (!unrecoverable && replyFileLineReadsLost(run.resultJson)) lostLineSources.set(run.id, run);
+        else if (!freshIntent || !unrecoverable)
           return live.some(row => row.retryClass === "service_required")
             ? blocked("saved_work_recovery_refused", "Paperclip refused to recover the saved files because a safety check on them cannot pass. Your Retry is saved.")
             : blocked("saved_work_recovery_failed", "Saving the agent's files failed. Retry to try again.");
@@ -646,11 +650,11 @@ export async function admitExplicitNativeContinuation(input: {
         // adopt-words-state: a bounded hand-off wait (unproven phase or stop-receipt
         // phase) says its ceiling; the line is projected from state, the same as the queue GET.
         return blocked("remote_cleanup", handedOffWarmWaitLine(run, unsettled)
-          ?? "Waiting for the previous environment to stop. Your message will start automatically.");
+          ?? REPLY_FILES_LOST_WAITING_LINE);
       }
       if (run.runtimeMode === "native" && !input.dryRun && !leases.every(lease => completeTerminatedRemoteNativeSessionCleanup({
         companyId, runId: run.id, remoteCleanupScope: remoteLeaseCleanupScope(lease)!,
-      }))) return refused("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
+      }))) return refused("remote_cleanup", REPLY_FILES_LOST_WAITING_LINE);
     } else {
       if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return blocked("local_cleanup", "Waiting for the previous environment to finish cleanup. Your message will start automatically.");
       if (!unusedAdmission && !cancelledStartup && !failedPreparation) {
@@ -761,22 +765,28 @@ export async function admitExplicitNativeContinuation(input: {
   const continuation = { previousRunId: previous.id, commentId, ...(retry ? { failedRunId: input.failedRunId! } : {}),
     ...(queuedInterrupt ? { queuedCommentInterruptId: input.queuedCommentInterruptId! } : {}),
     ...(taskRetry ? { taskRetryRequestId: input.taskRetryRequestId! } : {}), ...(readiness ? { readiness } : {}) };
-  if (input.dryRun) return continuation;
-  // d2shared2 (rf-5 (a), BYTES): before the message runs on the current checkout, compare the checkout with the last
-  // saved state (the baseline the LOST run started from). A checkout that differs is never continued silently: the
-  // one line and the run's input notice then say so.
+  // BYTES, before the message runs on the current checkout (and before a preview says it can): compare the checkout
+  // with the last saved state (the baseline the LOST run started from). A checkout that differs (a partial copy-back,
+  // or a saved state that can no longer be read) HOLDS the message: it never starts by itself on a mixed tree. The
+  // person's one action, "Continue with the files as they are" (POST /api/issues/:id/retry, retryAction
+  // continue_with_files; task-retry.ts records it on the hold's action), releases it once.
   let currentCheckout: { sourceRunId: string; reason: "reply_files_lost"; checkout: "matches_last_save" | "differs" | "unknown";
-    baselineSha256: string | null; differing: string[] } | null = null;
+    baselineSha256: string | null; differing: string[]; continuedByPerson?: true } | null = null;
   for (const lost of lostLineSources.values()) {
     const reference = readNativeWorkspaceSyncReference(lost.runnerProfileJson?.nativeWorkspaceSync);
     const compared = reference ? await compareNativeWorkspaceSyncRootWithBaseline({ companyId, runId: lost.id, reference }) : null;
     const checkout = compared?.state ?? "unknown";
+    const chosen = checkout !== "matches_last_save" && actions.some(action => action.evidence.runId === lost.id
+      && checkoutContinueChosen(action.evidence, lost.id));
+    if (checkout !== "matches_last_save" && !chosen) return blocked(CHECKOUT_CONTINUE_REQUIRED_REASON, REPLY_FILES_PARTLY_SAVED_LINE);
     if (!currentCheckout || (currentCheckout.checkout === "matches_last_save" && checkout !== "matches_last_save"))
       currentCheckout = { sourceRunId: lost.id, reason: "reply_files_lost", checkout,
-        baselineSha256: compared?.baselineSha256 ?? null, differing: compared?.differing ?? [] };
+        baselineSha256: compared?.baselineSha256 ?? null, differing: compared?.differing ?? [], ...(chosen ? { continuedByPerson: true as const } : {}) };
   }
-  const lostReplyLine = !currentCheckout ? null
-    : currentCheckout.checkout === "matches_last_save" ? REPLY_FILES_NOT_SAVED_LINE : REPLY_FILES_PARTLY_SAVED_LINE;
+  if (input.dryRun) return continuation;
+  // The thread line, once, at the moment the message starts: only the sentence that is true then. A message the
+  // person continued on a mixed checkout gets no line (sentence 3 is no longer true; its input carries the notice).
+  const lostReplyLine = currentCheckout?.checkout === "matches_last_save" ? REPLY_FILES_NOT_SAVED_LINE : null;
   for (const stopped of stoppedSessions) {
     if (!stopped.retire()) return blocked("local_cleanup", "The previous provider cleanup changed. Your message is saved.");
     await appendHeartbeatRunEvent(db, {
@@ -842,7 +852,7 @@ export async function admitExplicitNativeContinuation(input: {
     await issueService(db).addComment(issueId, unrecoverableSavedFilesNotice(unrecoverable), {},
       { authorType: "system" }, tx);
   } else if (lostReplyLine && actions.some(action => lostLineSources.has(String(action.evidence.runId)))) {
-    // The ONE line, once, at the moment the message starts (proposed, pending RFL).
+    // The ONE line, once, at the moment the message starts.
     const { issueService } = await import("./issues.js");
     await issueService(db).addComment(issueId, lostReplyLine, {}, { authorType: "system" }, tx);
   }
