@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, forwardRef, useImperativeHandle, type ForwardedRef } from "react";
+import { act, forwardRef, Profiler, useImperativeHandle, type ForwardedRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -350,6 +350,101 @@ describe("withheld accepted reply: the real published state, rendered", () => {
       await act(async () => { await vi.advanceTimersByTimeAsync(24 * 3_600_000); });
       expect(text()).not.toContain(FILE_LINE_SAVING);
       expect(count(text("thread"), FILE_LINE_NOT_SAVED_YET)).toBe(1);
+    });
+  });
+});
+
+// F2 (RFL on a4a822bd): a thread that was MOUNTED while the run was live. The
+// next poll returns the presented reply; the run must not become a settling
+// tail ('Working' kept up, and the live lane's copy of the reply standing in
+// for the canonical comment and its file line).
+describe("withheld accepted reply: a MOUNTED thread goes live -> presented (F2)", () => {
+  const REPLY_BODY = saving.comments.find(comment => comment.authorType === "agent")!.body;
+  /** Before publish: the real SAVING run row with no reply yet (no agent comment, no replyFileLine stored), still running. */
+  function beforePublish() {
+    const view = page(saving, { fileLine: null });
+    return { ...view, comments: view.comments.filter(comment => comment.authorType !== "agent") };
+  }
+  /** PLANTED: the native transcript the live lane streams (this file mocks the transcript hook). Its final
+   *  message is the reply's own text, as the runner streams it before the reply is published. */
+  function plantLiveTranscript() {
+    state.transcripts.set("answer-run", [
+      { kind: "tool_call", ts: at(2), name: "read_file", input: { path: "src/util.ts" } } as TranscriptEntry,
+      { kind: "assistant", channel: "final", ts: at(9), text: REPLY_BODY } as TranscriptEntry,
+    ]);
+  }
+  /** Every commit's rendered page (React's Profiler fires once per commit, after the DOM is written), so a
+   *  layout-effect re-render that lands before the browser paints is seen, not only the state after act settles. */
+  let commits: string[] = [];
+  async function paintRecorded(view: ReturnType<typeof page>, threadProps: Partial<React.ComponentProps<typeof TaskChatThread>> = {}) {
+    commits = [];
+    await act(() => root.render(<QueryClientProvider client={client}><ThemeProvider>
+      <Profiler id="page" onRender={() => { commits.push(host.textContent ?? ""); }}>
+        <div data-testid="top-status"><WorkspaceExportRecovery issueId="task" companyId="company" action={view.recoveryAction} /></div>
+        <CoordinatorPresentation value={state.coordinator}>
+          <div data-testid="thread"><TaskChatThread issueId="task" companyId="company" currentUserId="viewer" comments={view.comments}
+            linkedRuns={[view.run]} liveRuns={view.live ? [view.liveRun] : []} activeRun={view.live ? view.liveRun : undefined}
+            issueStatus={view.issueStatus} recoveryAction={view.recoveryAction} onAdd={async () => {}} {...threadProps} /></div>
+        </CoordinatorPresentation>
+      </Profiler>
+    </ThemeProvider></QueryClientProvider>));
+    return commits;
+  }
+  const fileLineOf = { SAVING: FILE_LINE_SAVING, KEPT: FILE_LINE_KEPT_NO_BUTTON, LOST: FILE_LINE_LOST } as const;
+  const fixtures = [["SAVING", saving], ["KEPT", kept], ["LOST", lost]] as const;
+
+  describe.each(WIDTHS)("at %i px", width => {
+    beforeEach(() => setWidth(width));
+
+    it.each(fixtures)("%s (real state fixture; transcript PLANTED, hooks mocked): 'Working' ends at publish; the reply shows once, with its file line, from the poll's first commit", async (name, fixture) => {
+      vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(T0 + 5_000);
+      plantLiveTranscript();
+      await paintRecorded(beforePublish()); await settle(); await settle();
+      // The live turn is up before publish: this is the MOUNTED thread the row is about.
+      expect(text()).toContain("Working");
+      expect(text()).not.toContain(fileLineOf[name]);
+      // The next poll: the presented reply plus its stored file-line state (the real fixture).
+      const pollCommits = await paintRecorded(page(fixture));
+      dump(`mounted-${name.toLowerCase()}`, width);
+      // Every commit of the poll's render tick (before any timer or later poll) and the page after it.
+      expect(pollCommits.length).toBeGreaterThan(0);
+      for (const rendered of [...pollCommits, text()]) {
+        expect(rendered).not.toContain("Working");
+        expect(count(rendered, ANSWER_START)).toBe(1);
+        expect(count(rendered, fileLineOf[name])).toBe(1);
+      }
+      expect(fileLineCount()).toBe(1);
+      expect(host.querySelector('[data-testid="task-chat-live-transcript"]')).toBeNull();
+      // And it stays so once everything settles.
+      await settle(); await settle();
+      expect(text()).not.toContain("Working");
+      expect(count(text(), ANSWER_START)).toBe(1);
+      expect(count(text("thread"), fileLineOf[name])).toBe(1);
+      expect(fileLineCount()).toBe(1);
+    });
+
+    it("control: a run that ends with NO presented reply still gets the settling tail (Paperclip's no-flicker handoff)", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(T0 + 5_000);
+      plantLiveTranscript();
+      await paintRecorded(beforePublish()); await settle(); await settle();
+      expect(text()).toContain("Working");
+      // The live-runs poll drops the run before the runs list and the reply comment arrive (the settle gap):
+      // no reply is presented and no file line is stored.
+      const gap = beforePublish();
+      const gapCommits = await paintRecorded({ ...gap, live: false });
+      await settle(); await settle();
+      // The lane is held, never blank: the layout effect re-renders it before the browser paints, so the gap's
+      // last commit (and the page after it) still show the turn's live lane and its answer once.
+      expect(gapCommits.length).toBeGreaterThan(1);
+      for (const rendered of [gapCommits.at(-1)!, text()]) expect(count(rendered, ANSWER_START)).toBe(1);
+      expect(host.querySelector('[data-testid="task-chat-live-transcript"]')).not.toBeNull();
+      expect(fileLineCount()).toBe(0);
+      // The run settles and its reply comment lands: the tail hands off, the reply still shows once.
+      const ended = page({ ...saving, issueStatus: "in_review", run: { ...saving.run, status: "succeeded" } } as Fixture, { fileLine: null });
+      await paintRecorded({ ...ended, live: false }); await settle(); await settle();
+      expect(host.querySelector('[data-testid="task-chat-live-transcript"]')).toBeNull();
+      expect(count(text(), ANSWER_START)).toBe(1);
+      expect(text()).not.toContain("Working");
     });
   });
 });
