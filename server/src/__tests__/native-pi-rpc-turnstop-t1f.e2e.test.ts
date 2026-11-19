@@ -411,8 +411,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     unsubscribe = subscribeCompanyLiveEvents(companyId, event => {
       const text = JSON.stringify(event.payload);
       if (text.includes("T1F_SIX_STEPS_DONE_") || text.includes("T1F_PLAIN_ANSWER") || text.includes("Perform STEP")) {
-        const request = requests.at(-1);
-        if (request && !request.deliveredAt) request.deliveredAt = Date.now();
+        const request = requests.find(value => !value.deliveredAt && value.reply && text.includes(value.reply));
+        if (request) request.deliveredAt = Date.now();
       }
       changed?.();
     });
@@ -501,7 +501,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       expect(lease).toBeDefined();
       const interrupt = scenario !== "R-stop";
       const message = `T1F_INPUT_${press}: ${scenario === "R-stop" ? "What kind of number is six? This is a plain question, not permission to resume the stopped work." : "Continue the six steps without repeating completed tools."}`;
-      if (interrupt) await api("POST", `/issues/${issueId}/comments`, { body: message, deliveryIntent: "queue" }, 201);
+      let successorCommentId: string;
+      if (interrupt) successorCommentId = (await api("POST", `/issues/${issueId}/comments`, { body: message, deliveryIntent: "queue" }, 201)).id;
       const queue = interrupt ? await api("GET", `/issues/${issueId}/queued-comments`) : null;
       const requestCountAtPress = requests.length;
       const pressAt = Date.now();
@@ -521,7 +522,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       // Stop itself must dispatch nothing. The separate Send is new authority.
       if (!interrupt) expect(requests).toHaveLength(requestCountAtPress);
       const sendAt = interrupt ? pressAt : Date.now();
-      if (!interrupt) await api("POST", `/issues/${issueId}/comments`, { body: message }, 201);
+      if (!interrupt) successorCommentId = (await api("POST", `/issues/${issueId}/comments`, { body: message }, 201)).id;
       // Do not skip a wrong/stale first request while waiting for a later
       // correctly attributed one: the very next provider input is the oracle.
       const first = await waitFor(`successor ${press} FIRST model request`, async () => requests[requestCountAtPress] ?? null);
@@ -530,14 +531,21 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const live = bundles.map(bundle => bundle.transport.processInfo?.()?.pid).filter((value): value is number => !!value)
         .map(runnerPid => ({ runnerPid, piPid: piDescendant(runnerPid) })).find(value => value.piPid !== null)!;
       const actualIdentity = live && { ...live, runnerBirth: procBirth(live.runnerPid), piBirth: procBirth(live.piPid!), boxBootId, nativeSessionId: next.nativeSessionId };
+      const [nextLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, next.id));
+      const commentBoundToSuccessor = next.contextSnapshot?.commentId === successorCommentId!
+        || next.contextSnapshot?.wakeCommentId === successorCommentId!
+        || Array.isArray(next.contextSnapshot?.wakeCommentIds) && next.contextSnapshot.wakeCommentIds.includes(successorCommentId!);
       const observation = { press, predecessorRunId: current.id, successorRunId: next.id, qualified,
         forceFreshSession: next.contextSnapshot?.forceFreshSession === true, originalIdentity, actualIdentity,
+        successorCommentId: successorCommentId!, commentBoundToSuccessor,
+        beforeBoxId: lease!.providerLeaseId, nextBoxId: nextLease?.providerLeaseId,
         expectedSteps, actualFirstTurn: first.turn, actualFirstInputSteps: first.completed, pressAt, cancelledAt, drainedAt, sendAt,
         requestAt: first.at, firstTokenWrittenAt: first.firstTokenWrittenAt,
         cancelRouteMs: cancelledAt - pressAt, drainMs: drainedAt - pressAt, sendToRequestMs: first.at - sendAt };
       observations.push(observation);
       stage("BOUNDARY OBSERVATION", observation);
       await writeFile(join(root, "observations.json"), JSON.stringify(observations, null, 2));
+      expect(commentBoundToSuccessor, "the FIRST successor is bound to the newly authorized comment").toBe(true);
       expect(first.turn, "the FIRST successor input carries the newly authorized message").toBe(press);
       if (scenario === "R-fallback") {
         expect(observation.forceFreshSession).toBe(true);
@@ -552,6 +560,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         }
         expect(observation.forceFreshSession).toBe(false);
         expect(actualIdentity).toEqual(originalIdentity);
+        expect(nextLease?.providerLeaseId, "the same physical allocation, not merely a new durable lease").toBe(lease!.providerLeaseId);
         expect(stopCalls).toEqual([]);
       }
       current = next;
@@ -565,6 +574,17 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     const actualSteps = readFileSync(stepsPath, "utf8").trim().split("\n");
     if (scenario !== "R-fallback") expect(actualSteps, "finished steps are never rerun; Stop does not resume work")
       .toEqual((scenario === "R-stop" ? [1, 2] : [1, 2, 3, 4, 5, 6]).map(step => `STEP${step}`));
+    for (const observation of observations) {
+      const request = requests.find(value => value.at === observation.requestAt)!;
+      expect(request.firstTokenWrittenAt, "actual successor first-token socket write observed").toBeDefined();
+      expect(request.deliveredAt, "actual successor first-word live-event delivery observed").toBeDefined();
+      const modelTtftMs = request.firstTokenWrittenAt! - request.at;
+      const firstDeliveredMs = request.deliveredAt! - Number(observation.sendAt);
+      Object.assign(observation, { firstTokenWrittenAt: request.firstTokenWrittenAt, deliveredAt: request.deliveredAt,
+        modelTtftMs, firstDeliveredMs, overheadMs: firstDeliveredMs - modelTtftMs });
+      stage("PERFORMANCE REPORT ONLY: sub-second bar is out of I-B scope", observation);
+    }
+    await writeFile(join(root, "observations.json"), JSON.stringify(observations, null, 2));
     stage("GREEN", { scenario, actualSteps, reply: reply.body, publicationObservedAt, observations,
       timingScope: "loopback HTTP, actual provider request/first-token write, durable comment publication; no browser/render or inference-latency claim" });
   } catch (error) {
