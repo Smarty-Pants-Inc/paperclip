@@ -8,6 +8,9 @@ import type { InProgressRecord, SettleOutcome } from "./recovery/ownership-regis
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { ORPHANED_SANDBOX_RECOVERY_KEY, prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
 import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "./reusable-sandbox-kept-marker.js";
+import { NATIVE_CUSTODY_UNVERIFIED_REASON, nativeLeaseCustodyMissing } from "./native-runtime/native-lease-custody.js";
+import { PENDING_CLEANUP_SWEEP_ATTEMPT_CAP } from "./environment-cleanup-state.js";
+import { logger } from "../middleware/logger.js";
 
 /** Failure reason on a retained orphan sandbox released for destruction. */
 export const RETAINED_ORPHAN_RELEASED_REASON = "retained_orphan_sandbox_released";
@@ -207,6 +210,19 @@ export async function settleRetainedOrphanSandbox(db: Db, record: InProgressReco
     if (!hasRemoteTerminationReceipt(lease)
       || (lease.leasePolicy === "ephemeral" ? !lease.metadata?.[ORPHANED_SANDBOX_RECOVERY_KEY] : lease.leasePolicy !== "reuse_by_environment")) {
       return { settled: false, reason: "no_longer_a_retained_orphan" };
+    }
+    // Custody retry: the stopped box is destroyed only once a verified saved
+    // harness copy exists. Each pass counts; the cleanup cap escalates once.
+    if (await nativeLeaseCustodyMissing(tx, lease.id)) {
+      const attempts = Number(lease.metadata?.nativeCustodyAttempts ?? 0) + 1;
+      const escalate = attempts >= PENDING_CLEANUP_SWEEP_ATTEMPT_CAP && lease.metadata?.nativeCustodyEscalated !== true;
+      await tx.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
+        nativeCustodyAttempts: attempts, ...(escalate ? { nativeCustodyEscalated: true } : {}) })}::jsonb` })
+        .where(eq(environmentLeases.id, lease.id));
+      if (escalate) logger.warn({ leaseId: lease.id, environmentId: lease.environmentId, runId, attempts,
+        reason: NATIVE_CUSTODY_UNVERIFIED_REASON },
+        "environment lease needs operator attention; native box kept stopped without a verified saved harness copy");
+      return { settled: false, reason: NATIVE_CUSTODY_UNVERIFIED_REASON };
     }
     const status = lease.status;
     const now = context.now;
