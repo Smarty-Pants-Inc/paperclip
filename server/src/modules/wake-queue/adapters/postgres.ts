@@ -1271,37 +1271,9 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
 
     async findExistingDeferredWake(
       scope,
-      { companyId, agentId, issueId, chatConversationId, durableActor, conversationTail },
+      { companyId, agentId, issueId, chatConversationId, durableActor },
     ) {
       const tx = requireAdmissionTx(scope, companyId);
-      if (conversationTail) {
-        // Agent Chat keeps the person's order and the /new boundary: join only
-        // the newest pending wake, and only when it holds plain person messages.
-        const [tail] = await tx.select().from(agentWakeupRequests).where(and(
-          eq(agentWakeupRequests.companyId, companyId),
-          eq(agentWakeupRequests.agentId, agentId),
-          eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
-          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
-        )).orderBy(desc(agentWakeupRequests.requestedAt), desc(agentWakeupRequests.createdAt)).limit(1);
-        if (!tail) return null;
-        const payload = parseObject(tail.payload);
-        const deferredContext = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
-        const ids = queuedCommentIdsFromWakePayload(payload);
-        if (ids.length === 0 || readNonEmptyString(payload.interactionId) ||
-            readNonEmptyString(deferredContext.interactionId) || deferredContext.forceFreshSession === true ||
-            (chatConversationId && readNonEmptyString(deferredContext[CHAT_CONVERSATION_ID_KEY]) &&
-              deferredContext[CHAT_CONVERSATION_ID_KEY] !== chatConversationId) ||
-            (durableActor && (tail.requestedByActorType !== durableActor.type ||
-              tail.requestedByActorId !== durableActor.id))) return null;
-        const held = await tx.select({ body: issueComments.body, authorType: issueComments.authorType })
-          .from(issueComments).where(and(
-            eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
-            inArray(issueComments.id, ids), isNull(issueComments.deletedAt),
-          ));
-        if (held.length !== ids.length ||
-            held.some((comment) => comment.authorType !== "user" || isConversationReset(comment.body))) return null;
-        return { id: tail.id, runId: tail.runId, payload, deferredContext, coalescedCount: tail.coalescedCount };
-      }
       const row = await tx
         .select()
         .from(agentWakeupRequests)
