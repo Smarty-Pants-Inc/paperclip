@@ -169,6 +169,14 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
     const messageId: string = sent.body.id;
 
     // (R is planted before M is sent, so M's wake is deterministically saved behind it; R then carries M.)
+    // COMPOSED ON I-A'' (bb-2d-onIA): M's wake is read as saved BEFORE R's context names M. The route enqueues the
+    // wake after it answers the POST, and I-A'''s ONE-successor re-filter (heartbeat/queue.ts,
+    // commentIdsCarriedElsewhere) completes a person's comment wake as "coalesced" once a live run already carries its
+    // message. "Saved behind R, THEN R carries M" is therefore an order this fixture keeps itself (no product change).
+    await vi.waitFor(async () => expect(await db.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
+      sql`${agentWakeupRequests.payload}->>'commentId' = ${messageId}`)))
+      .toEqual([{ status: "deferred_issue_execution" }]), { timeout: 10_000, interval: 25 });
     await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, source: "assignment", wakeReason: "issue_commented",
       wakeCommentId: messageId, commentId: messageId } }).where(eq(heartbeatRuns.id, runId));
     const [environment] = await db.insert(environments).values({ name: `Box ${runId}`, driver: "sandbox", status: "active",
