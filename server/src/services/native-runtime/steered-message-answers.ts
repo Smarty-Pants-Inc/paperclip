@@ -10,6 +10,8 @@ export interface SteerAnswerEvent {
   kind?: string | null;
   /** item.completed agentMessage only: the completed block carries non-empty text. */
   hasText?: boolean | null;
+  /** Durable pre-RPC custody, not a provider ACK. Never binds a prior read. */
+  reservation?: boolean;
 }
 
 /** A text item's evidence: where its item.started was, and whether it completed with non-empty text. */
@@ -73,7 +75,7 @@ export function steeredMessageAnswers(events: Iterable<SteerAnswerEvent>): {
       if (!id || acknowledged.includes(id)) continue;
       acknowledged.push(id);
       const reads = early.get(turnId) ?? [];
-      if (reads.length > 0) deliveredAt.set(id, reads.shift()!);
+      if (!event.reservation && reads.length > 0) deliveredAt.set(id, reads.shift()!);
       else pending.push({ id, turnId });
     } else if (event.eventType === "item.started" && event.kind === "userMessage") {
       const count = (inputs.get(turnId) ?? 0) + 1;
@@ -136,6 +138,7 @@ export async function readSteeredMessageAnswers(db: Db, input: { companyId: stri
   const rows = await db.select({
     seq: heartbeatRunEvents.seq,
     createdAt: heartbeatRunEvents.createdAt,
+    emittedAt: sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->>'emittedAt'`,
     eventType: heartbeatRunEvents.eventType,
     turnId: sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId'`,
     itemId: sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId'`,
@@ -152,7 +155,29 @@ export async function readSteeredMessageAnswers(db: Db, input: { companyId: stri
         [...TOOL_KINDS].map((value) => sql`${value}`), sql`, `)})`),
     ),
   )).orderBy(asc(heartbeatRunEvents.seq));
-  const evidence = steeredMessageAnswers(rows.map((row) => ({ ...row, seq: Number(row.seq) })));
+  // A real Pi can read and answer M before the RPC ACK returns (or after its
+  // timeout). Its saved pending receipt already names M and its accepted turn.
+  // Seed that custody at its actual admission boundary, never an earlier read;
+  // delivery and answer still require the SAME persisted Pi read/text facts.
+  const [run] = await db.select({ context: heartbeatRuns.contextSnapshot, result: heartbeatRuns.resultJson })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
+  const steered = Array.isArray(run?.context?.steeredCommentIds) ? run.context.steeredCommentIds : [];
+  const receipts = run?.result?.queuedSteeringAcknowledgements;
+  const reservations: SteerAnswerEvent[] = [];
+  for (const id of steered) {
+    if (typeof id !== "string" || !receipts || typeof receipts !== "object" || Array.isArray(receipts)) continue;
+    const receipt = (receipts as Record<string, unknown>)[id];
+    if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) continue;
+    const ack = receipt as Record<string, unknown>;
+    if (ack.status !== "pending" || typeof ack.turnId !== "string" || typeof ack.acknowledgedAt !== "string"
+      || rows.some(row => row.kind === "steering_acknowledgement" && STEER_ITEM.exec(row.itemId ?? "")?.[1] === id)) continue;
+    const admittedAt = Date.parse(ack.acknowledgedAt);
+    const next = rows.find(row => Number.isFinite(admittedAt) && Date.parse(row.emittedAt ?? "") >= admittedAt);
+    if (!next) continue;
+    reservations.push({ seq: Number(next.seq) - 0.5, eventType: "item.completed", kind: "steering_acknowledgement",
+      itemId: `${ack.turnId}:steer:${id}`, turnId: ack.turnId, reservation: true });
+  }
+  const evidence = steeredMessageAnswers([...rows.map((row) => ({ ...row, seq: Number(row.seq) })), ...reservations]);
   const times = new Map(rows.map(row => [Number(row.seq), row.createdAt.toISOString()]));
   return { ...evidence, deliveredAts: Object.fromEntries(Object.entries(evidence.deliveredEventSeqs)
     .map(([id, seq]) => [id, times.get(seq)]).filter((entry): entry is [string, string] => typeof entry[1] === "string")) };

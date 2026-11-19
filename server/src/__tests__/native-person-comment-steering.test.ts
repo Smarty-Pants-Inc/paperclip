@@ -437,9 +437,8 @@ describe("person comment default steering eligibility and asynchronous receipt",
       expect((pending.resultJson?.queuedSteeringAcknowledgements as any)[message.id].status).toBe("pending");
       f.peer.boundary();
       if (took) {
-        // The RPC already timed out. A late ACK now binds the independently
-        // persisted Pi read/text facts; timeout alone must not dispatch twice.
-        release();
+        // B5: RPC timed out; hold the ACK through terminal settlement/release.
+        // Actual Pi read/text, not the still-pending ACK, must discharge M.
         await vi.waitFor(async () => {
           const [read] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
           expect(read.contextSnapshot?.answeredSteeredCommentIds).toContain(message.id);
