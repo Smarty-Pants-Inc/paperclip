@@ -410,7 +410,7 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
   /** Called only after the ordered consumer has stopped/joined, including crash
    * without a terminal. Recovery must settle the old consumer before calling it. */
   async settleEventIngestion(): Promise<void> {
-    await settleSteeringIngestion(this.#db, { ...this.#binding, noTerminal: true });
+    await settleSteeringIngestion(this.#db, { ...this.#binding, consumerStopped: true });
   }
 
   async appendEvent(value: NativeRunEvent | PrpEvent, options?: { signal: AbortSignal; deferPostCommitObservers?: true }) {
