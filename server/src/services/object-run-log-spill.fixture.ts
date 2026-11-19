@@ -69,7 +69,8 @@ export async function readAll(store: ReturnType<typeof newStore>, logRef: string
   return Buffer.concat(parts);
 }
 /** One settled run: record 1 stored, storage then refuses record 2 and 3 for good; finalize spills them. */
-export async function spilledRun(runId: string) {
+export async function spilledRun(runId: string, binding: { companyId: string; agentId: string } = ids) {
+  const ids = binding;
   const m = spillMemory(), spillDir = mkdtempSync(path.join(os.tmpdir(), "objlog-spill-"));
   const store = newStore(m, spillDir);
   const handle = await store.begin({ ...ids, runId });
