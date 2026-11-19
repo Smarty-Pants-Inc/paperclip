@@ -216,6 +216,13 @@ export async function findWorktreeInstanceRawTraces(
     }
     for (const candidate of candidates) if (await holdsContent(candidate)) found.push(candidate);
   }
+  // Kept spills can be configured away from data/run-logs, including under
+  // an ignored build/ or outside this root. Use the writer's resolver; never
+  // classify its only copy as regenerable just because its directory moved.
+  for (const env of envs) {
+    const spillRoot = resolveObjectRunLogSpillDir(undefined, { env, instanceRoot, cwd: instanceRoot });
+    if ((await listUnrecoveredObjectRunLogSpills(spillRoot)).length) found.push(spillRoot);
+  }
   // 4. Provider homes under the instance.
   const providerHomes = WORKTREE_INSTANCE_PROVIDER_HOME_NAMES.map((name) => path.join(instanceRoot, name));
   const companiesDir = path.join(instanceRoot, "companies");

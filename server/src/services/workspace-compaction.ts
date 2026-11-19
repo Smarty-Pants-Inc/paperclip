@@ -2,6 +2,8 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { listUnrecoveredObjectRunLogSpills } from "./object-run-log-store.js";
+import { listWorktreeRunLogSpillRoots } from "./workspace-instance-cleanup.js";
 
 // Directory names that hold regenerable output: installed dependencies, build
 // output, and tool caches. Compaction removes a directory only when its name is
@@ -114,6 +116,29 @@ async function filterRemovableCandidates(worktreePath: string, candidates: strin
     !tracked.some((trackedPath) => trackedPath === candidate || trackedPath.startsWith(`${candidate}/`)));
 }
 
+// A configured spill can sit inside otherwise regenerable build output.
+// Protect both its ancestors and descendants: descending into a kept build/
+// must not then remove a company or agent directory named build/node_modules.
+async function unrecoveredSpillRoots(worktreePath: string): Promise<string[]> {
+  const kept: string[] = [];
+  for (const root of await listWorktreeRunLogSpillRoots({ workspacePath: worktreePath })) {
+    if (!(await listUnrecoveredObjectRunLogSpills(root)).length) continue;
+    kept.push(path.resolve(root), await fs.realpath(root));
+  }
+  return [...new Set(kept)];
+}
+
+function sameOrChild(candidate: string, root: string) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
+}
+
+async function intersectsSpill(candidate: string, roots: string[]) {
+  if (!roots.length) return false;
+  const paths = [path.resolve(candidate), await fs.realpath(candidate)];
+  return paths.some(value => roots.some(root => sameOrChild(value, root) || sameOrChild(root, value)));
+}
+
 // Returns true only for a linked Git worktree: its `.git` entry is a file that
 // points at the main repository. A main checkout has a `.git` directory, and
 // compaction never touches one.
@@ -130,6 +155,8 @@ export async function findRegenerableWorkspaceDirs(
   worktreePath: string,
   options: { signal?: AbortSignal } = {},
 ): Promise<string[]> {
+  options.signal?.throwIfAborted();
+  const protectedSpills = await unrecoveredSpillRoots(worktreePath);
   const removable: string[] = [];
 
   async function collect(relativeDir: string, depth: number, candidates: string[]) {
@@ -157,6 +184,9 @@ export async function findRegenerableWorkspaceDirs(
     }
     if (candidates.length === 0) break;
     const eligible = new Set(await filterRemovableCandidates(worktreePath, candidates, options.signal));
+    for (const candidate of candidates) {
+      if (await intersectsSpill(path.join(worktreePath, candidate), protectedSpills)) eligible.delete(candidate);
+    }
     removable.push(...candidates.filter((candidate) => eligible.has(candidate)));
     roots = candidates.filter((candidate) => !eligible.has(candidate));
   }
@@ -178,6 +208,9 @@ export async function moveWorkspaceDirsToTrash(
   worktreePath: string,
   relativePaths: string[],
 ): Promise<WorkspaceCompactionMove> {
+  // Recheck at the destructive boundary too: a spill may have appeared since
+  // discovery while the workspace waited for its lifecycle lock.
+  const protectedSpills = await unrecoveredSpillRoots(worktreePath);
   const trashDir = path.join(
     path.dirname(worktreePath),
     WORKSPACE_COMPACTION_TRASH_DIR,
@@ -189,6 +222,7 @@ export async function moveWorkspaceDirsToTrash(
     const sourcePath = path.join(worktreePath, relativePath);
     const stat = await fs.lstat(sourcePath).catch(() => null);
     if (!stat?.isDirectory()) continue;
+    if (await intersectsSpill(sourcePath, protectedSpills)) continue;
     const trashPath = path.join(trashDir, String(index));
     try {
       await fs.rename(sourcePath, trashPath);
