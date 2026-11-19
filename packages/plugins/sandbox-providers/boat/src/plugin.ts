@@ -1015,7 +1015,9 @@ async function waitSetup(config: Config, id: string): Promise<any> {
     if (s.setupStatus === "done") return s;
     if (s.setupStatus === "failed") {
       const detail = typeof s.setupError === "string" ? s.setupError : typeof s.setupErrorText === "string" ? s.setupErrorText : typeof s.error === "string" ? s.error : s.error?.message;
-      throw new Error(`Boat sandbox ${id} setup failed${detail ? `: ${detail}` : "."}`);
+      // Boat's setup text leaves the worker verbatim (RPC message): the one redactor, bounded (rf-4 U2b C1).
+      const words = typeof detail === "string" ? providerWords(config, detail) : null;
+      throw stopDiagnostic(config, `Boat sandbox ${id} setup failed${words ? `: ${words}` : "."}`);
     }
     await delay(Math.min(2000, Math.max(0, until - Date.now())));
   }
@@ -1072,7 +1074,8 @@ async function stopSandboxRequests(config: Config, id: string): Promise<{ provid
   const refusal = stopRefusals.get(activityKey(config, id));
   if (refusal && Date.now() < refusal.until) {
     const last = refusal.error;
-    throw new BoatStopRefusedError(id, last.stopId, last.boatStatus, last.boatError, last.lastGoodSnapshotAt, last.notResentBefore, last.refusals);
+    // The cached refusal takes the id through the same normaliser as the first refusal, never raw (rf-4 U2b C2).
+    throw new BoatStopRefusedError(redactKey(config, id), last.stopId, last.boatStatus, last.boatError, last.lastGoodSnapshotAt, last.notResentBefore, last.refusals);
   }
   const proof = idleActivity.proof(activityKey(config, id));
   const stopped = await request(config, `/sandboxes/${encodeURIComponent(id)}/stop`, { method: "POST", body: JSON.stringify({}) }, false, { ownStop: true });
@@ -1955,7 +1958,11 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   },
   async onEnvironmentProbe(params: PluginEnvironmentProbeParams): Promise<PluginEnvironmentProbeResult> {
     try { const result = await request(parse(params.config), "/limits"); return { ok: true, summary: "Boat API reachable.", metadata: { provider: "boat", limits: result } }; }
-    catch (e) { return { ok: false, summary: "Boat API probe failed.", metadata: { provider: "boat", error: e instanceof Error ? e.message : String(e) } }; }
+    catch (e) {
+      // A returned diagnostic: the one redactor even though request() errors are already closed (rf-4 U2b inventory).
+      const apiKey = typeof params.config?.apiKey === "string" ? params.config.apiKey.trim() : "";
+      return { ok: false, summary: "Boat API probe failed.", metadata: { provider: "boat", error: redactProviderText({ apiKey }, e instanceof Error ? e.message : String(e)) } };
+    }
   },
   onEnvironmentAcquireLease(params: PluginEnvironmentAcquireLeaseParams): Promise<PluginEnvironmentLease> {
     if (shuttingDown) return Promise.reject(new Error("Boat provider is shutting down"));
@@ -2222,7 +2229,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         const failure = error as ReturnType<typeof requestError>;
         ttlRefresh = { status: "failed", at, category: failure.category, httpStatus: failure.httpStatus, archiveAfter: sandbox.archiveAfter ?? null };
       }
-      const details = { providerLeaseId: c.apiKey ? id.split(c.apiKey).join("[REDACTED]") : id, status: ttlRefresh.status,
+      const details = { providerLeaseId: redactKey(c, id), status: ttlRefresh.status,
         category: ttlRefresh.status === "failed" ? ttlRefresh.category : ttlRefresh.status === "unconfirmed" ? "deadline_mismatch" : null };
       if (ttlRefresh.status === "ok") duplexLogger?.info("Boat warm lease TTL refresh", details);
       else duplexLogger?.warn("Boat warm lease TTL refresh", details);
