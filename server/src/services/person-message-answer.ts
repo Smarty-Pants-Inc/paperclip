@@ -174,19 +174,9 @@ export function personMessageOwedSql(m: PersonMessageSql): SQL {
           where newer_person.company_id = ${m.companyId} and newer_person.issue_id = ${m.issueId}
             and newer_person.author_type = 'user' and newer_person.deleted_at is null
             and newer_person.created_at > ${m.createdAt}
-            and (moved_on.context_snapshot->>'wakeCommentId' = newer_person.id::text
-              or moved_on.context_snapshot->>'commentId' = newer_person.id::text
-              or coalesce(moved_on.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? newer_person.id::text
-              or coalesce(moved_on.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? newer_person.id::text
-              or exists (select 1 from ${agentWakeupRequests} claimed_input
-                where claimed_input.company_id = moved_on.company_id
-                  and (claimed_input.id = moved_on.wakeup_request_id or claimed_input.run_id = moved_on.id)
-                  and (claimed_input.payload->>'commentId' = newer_person.id::text
-                    or claimed_input.payload->'_paperclipWakeContext'->>'commentId' = newer_person.id::text
-                    or claimed_input.payload->'_paperclipWakeContext'->>'wakeCommentId' = newer_person.id::text
-                    or coalesce(claimed_input.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? newer_person.id::text
-                    or coalesce(claimed_input.payload->'commentIds', '[]'::jsonb) ? newer_person.id::text
-                    or claimed_input.idempotency_key = 'conversation-comment:' || newer_person.id::text))))
+            -- rf-5 Q2 / RFL 19:17Z: THE one answered function decides that the newer message was answered.
+            and ${answeredPersonMessageSql({ id: sql`newer_person.id`, companyId: sql`newer_person.company_id`,
+              issueId: sql`newer_person.issue_id`, createdAt: sql`newer_person.created_at` })})
         -- neworg-floor-custody: a run that carries m and started at or after this run (a Stop-held
         -- README's carrier after the '9 + 10' turn) owns m; the chat has not moved on past it,
         -- so that carrier's failure still cards (G1).
