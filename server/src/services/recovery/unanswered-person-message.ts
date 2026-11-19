@@ -32,7 +32,7 @@ import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
 import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
 import { isNativeContinuationRefusal, isRecoverableNativeSupervisionFailure } from "../native-continuation-refusal.js";
 import { REMOTE_RUNNER_SUPERVISION_EXHAUSTED, REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION } from "../native-runtime/remote-runner-recovery-diagnostics.js";
-import { senderStoppedWhileAnswering, stoppedBySender } from "./person-stopped-message.js";
+import { cardAnswerGivenBeforeStop, senderStoppedWhileAnswering, stoppedBySender } from "./person-stopped-message.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -848,7 +848,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     const [heldRun] = typeof heldRunId === "string" ? await q.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
       resultJson: heartbeatRuns.resultJson, contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, heldRunId), eq(heartbeatRuns.agentId, agentId))) : [];
-    if (heldRun && stoppedBySender(heldRun, message.authorUserId)) {
+    // RFL-2: an answer given AFTER the Stop is not held by it (person-stopped-message.ts cardAnswerGivenBeforeStop).
+    if (heldRun && stoppedBySender(heldRun, message.authorUserId)
+      && (!cardAnswer || cardAnswerGivenBeforeStop(message.createdAt, heldRun))) {
       const waiting = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
         inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])));

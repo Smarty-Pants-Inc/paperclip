@@ -185,11 +185,11 @@ describe.skipIf(!support.supported)("the sender's own Stop wins over the board h
     return { delivery: delivery?.status, wakes: wakes.map(w => [w.status, (w.payload as Record<string, unknown>).interactionId === cardId]),
       holds: holds.map(h => [h.kind, h.status, h.ownerType, (h.evidence as Record<string, unknown>).runId === f.runId]) };
   };
-  it.each([["CHAT", "answer, then Stop", true], ["TASK", "answer, then Stop", false], ["CHAT", "Stop, then answer", true]] as const)(
+  it.each([["CHAT", "answer, then Stop", true], ["TASK", "answer, then Stop", false]] as const)(
     "%s card answer (real answer route + the answerer's real Stop; %s): no 'no run started' line for the answer at +1/+3/+11/+30 min",
-    async (_shape, order, chat) => {
+    async (_shape, _order, chat) => {
       const f = await seed("native", chat); const cardId = await f.card();
-      if (order === "answer, then Stop") { await f.answer(cardId); await f.stop(); } else { await f.stop(); await f.answer(cardId); }
+      await f.answer(cardId); await f.stop();
       expect(await cardFootprint(f, cardId), "the real routes' footprint: the answer's own wake waits behind the Stop's hold").toEqual({
         delivery: "fallback_queued", wakes: [["deferred_issue_execution", true]], holds: [["active_run_watchdog", "active", "board", true]] });
       for (const min of [1, 3, 11, 30]) {
@@ -199,6 +199,36 @@ describe.skipIf(!support.supported)("the sender's own Stop wins over the board h
       }
       await f.sweep(); await f.sweep();
       expect(await f.notes(), "the real sweep writes nothing either").toHaveLength(0);
+    }, 60000);
+
+  // supersedes(d7c310aeb / 98ea9cee sender-stop-hold.test.ts:188 '["CHAT", "Stop, then answer", true] ... no 'no run
+  // started' line for the answer at +1/+3/+11/+30 min'; RFL 01:05Z ruling RFL-2 on merged8, "NOT exempt by default":
+  // an answer given AFTER the person's own Stop is exempt only if their Stop stopped the run that was ANSWERING that
+  // card answer). OLD: 0 lines, the Stop's hold covered an answer given after it. NEW: the Stop was pressed before the
+  // answer existed, so it cannot have been a Stop of that answer; the answer's run never starts -> exactly ONE line.
+  // Real routes only: the Stop (POST /heartbeat-runs/:runId/cancel), then the answer
+  // (POST /issues/:id/interactions/:id/respond) with its real delivery and wake. Order is read from the routes' own
+  // stamps: the Stop's resultJson.executionCancellation.requestedAt and the card's resolvedAt.
+  it.each([["CHAT", true], ["TASK", false]] as const)(
+    "RFL-2 %s: Stop, then answer, the answer's run never starts -> exactly 1 'no run started' line for the answer", async (_shape, chat) => {
+      const f = await seed("native", chat); const cardId = await f.card();
+      const stopped = await f.stop(); await f.answer(cardId);
+      expect(await cardFootprint(f, cardId), "the real routes' footprint: the answer's own wake waits behind the Stop's hold").toEqual({
+        delivery: "fallback_queued", wakes: [["deferred_issue_execution", true]], holds: [["active_run_watchdog", "active", "board", true]] });
+      const [answered] = await db.select({ resolvedAt: issueThreadInteractions.resolvedAt }).from(issueThreadInteractions).where(eq(issueThreadInteractions.id, cardId));
+      const pressedAt = Date.parse(String((stopped.resultJson as { executionCancellation?: { requestedAt?: string } }).executionCancellation?.requestedAt));
+      expect(pressedAt, "the real Stop route stamped its request").toBeGreaterThan(0);
+      expect(answered!.resolvedAt!.getTime(), "the answer route's own stamp is after the Stop's own stamp").toBeGreaterThan(pressedAt);
+      const counts: number[] = [];
+      for (const min of [1, 3, 11, 30]) { await f.settle(min * 60000); counts.push(lines(await f.notes()).length); }
+      // The Stop's board hold means nothing starts by itself, so the line does not wait for the start bound: it is
+      // written once the answer's settle grace has passed (+3 min, as for another user's Stop below) and never twice.
+      expect(counts, "none at +1 min; ONE line from +3 min; never a second").toEqual([0, 1, 1, 1]);
+      await f.sweep(); await f.sweep();
+      const notes = lines(await f.notes());
+      expect(notes, "exactly one line, after two real sweeps too").toHaveLength(1);
+      expect(notes[0]!.body).toBe("Your answer is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.");
+      expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${cardId}`);
     }, 60000);
 
   it("negative: ANOTHER board user's real Stop -> the person's card answer keeps its ONE line, never silence", async () => {

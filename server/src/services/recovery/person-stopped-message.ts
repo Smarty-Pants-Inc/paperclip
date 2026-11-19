@@ -25,6 +25,29 @@ export function stoppedBySender(run: StoppedRun, senderUserId: string | null): b
     && hasRecordedUserStopRequest(run) && run.resultJson?.cancelledByUserId === senderUserId;
 }
 
+/** When the person pressed Stop, from the Stop's OWN record (run-control.ts cancelRun writes
+ * resultJson.executionCancellation { state: "requested", requestedAt } at :1478-1490, or startupCancellation.requestedAt
+ * for a run stopped before it started; an acknowledged stop keeps acknowledgedAt). Null when the run has no such record. */
+export function recordedStopRequestedAt(resultJson: Record<string, unknown> | null | undefined): Date | null {
+  const object = (value: unknown) => (value && typeof value === "object" && !Array.isArray(value) ? value : {}) as Record<string, unknown>;
+  const execution = object(resultJson?.executionCancellation), startup = object(resultJson?.startupCancellation);
+  for (const value of [execution.requestedAt, startup.requestedAt, execution.acknowledgedAt]) {
+    const at = typeof value === "string" ? Date.parse(value) : NaN;
+    if (Number.isFinite(at)) return new Date(at);
+  }
+  return null;
+}
+
+/** RFL-2 (RFL 01:05Z ruling on merged8): a card answer is covered by the answerer's own Stop of ANOTHER run (the
+ * Stop's hold, STOP_HOLD_YIELDS_TO_SENDER_STOP) only when the answer already existed when they pressed Stop. An
+ * answer given AFTER their Stop is not exempt by default: that Stop cannot have stopped a run answering it. (A Stop
+ * of the run that WAS answering it is senderStoppedWhileAnswering, whenever the answer was given.) Order is read
+ * from the two routes' own stamps: the answer's resolvedAt and the Stop's recorded request time. */
+export function cardAnswerGivenBeforeStop(answeredAt: Date, stoppedRun: { resultJson: Record<string, unknown> | null }): boolean {
+  const pressedAt = recordedStopRequestedAt(stoppedRun.resultJson);
+  return Boolean(pressedAt && answeredAt.getTime() <= pressedAt.getTime());
+}
+
 /** The run's OWN first-turn input: its wake comment(s), the comments it took
  * into its first turn and the card answers it carried (interactionId(s)). A
  * steer, a message queued behind it or one delivered after the stop is not here. */
