@@ -7,6 +7,7 @@
  * the baseline live thread renders the author-typed message history + optimistic
  * echo, which is the core legibility win.
  */
+import { readSteeredIntoRunId } from "@/api/comment-delivery";
 import type { Agent } from "@paperclipai/shared";
 import { supersededCommentIds, type IssueChatComment } from "@/lib/issue-chat-messages";
 import { resolveCommentAttribution } from "@/lib/comment-attribution";
@@ -143,6 +144,7 @@ export function commentsToTaskChatItems(
       timestamp: formatTaskChatCommentTimestamp(comment, kind),
       optimistic,
       queueTargetRunId: queued ? comment.queueTargetRunId ?? null : null,
+      ...(kind === "human" && readSteeredIntoRunId(comment) ? { steeredIntoRunId: readSteeredIntoRunId(comment) } : {}),
       verificationCaveats: sourceRunId
         ? ctx.verificationCaveatsByRunId?.get(sourceRunId)
         : undefined,

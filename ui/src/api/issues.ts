@@ -1,5 +1,6 @@
 import type { SetIssueTitle } from "@paperclipai/shared";
 import { ISSUE_CHAT_BOOTSTRAP_MAX_IDS, ISSUE_SUMMARIES_MAX_IDS, type IssueChatBootstrap } from "@paperclipai/shared";
+import { commentDeliveryRequestFields, type CommentDeliveryIntent } from "./comment-delivery";
 import type { RunForIssue } from "./activity";
 import type { ActiveRunForIssue, LiveRunForIssue } from "./heartbeats";
 import type { IssueSummary } from "@paperclipai/shared";
@@ -734,6 +735,7 @@ export const issuesApi = {
     interrupt?: boolean,
     attachmentIds?: string[],
     clientRequestId?: string,
+    deliveryIntent?: CommentDeliveryIntent,
   ) =>
     confirmedCommentResponse(
       api.post<IssueComment>(`/issues/${id}/comments`, {
@@ -742,6 +744,7 @@ export const issuesApi = {
         ...(reopen === undefined ? {} : { reopen }),
         ...(interrupt === undefined ? {} : { interrupt }),
         ...(attachmentIds?.length ? { attachmentIds } : {}),
+        ...commentDeliveryRequestFields(deliveryIntent),
       }),
       hasCommentReceipt,
     ),

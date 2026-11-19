@@ -115,6 +115,8 @@ export interface TaskChatQueuedMessagesProps {
   editingCommentId?: string | null;
   /** Steer eligible queued messages automatically after this delay; null keeps every message queued. */
   autoSteerDelayMs?: number | null;
+  /** D5: the server queued a message it was asked to steer, with its reason. */
+  steeringUnavailableReason?: string | null;
 }
 
 function SortableQueuedMessage({
@@ -330,6 +332,7 @@ export function TaskChatQueuedMessages({
   onDiscard,
   editingCommentId = null,
   autoSteerDelayMs = null,
+  steeringUnavailableReason = null,
 }: TaskChatQueuedMessagesProps) {
   const [entries, setEntries] = useState(queue.entries);
   // Automatic steering: Cancel keeps a message queued for this view; each
@@ -576,13 +579,20 @@ export function TaskChatQueuedMessages({
   const stoppedPaused = queue.executionWait?.reason === CHAT_AGENT_PAUSED_REASON &&
     Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0;
 
-  if (entries.length === 0 && !visibleError && !statusMessage) return null;
+  if (entries.length === 0 && !visibleError && !statusMessage && !steeringUnavailableReason) return null;
 
   return (
     <TaskChatComposerBar
       data-testid="task-chat-queued-messages"
       aria-label="Queued messages"
     >
+      {/* The waiting list holds QUEUED messages only; a steered message is in the thread. */}
+      <div data-testid="task-chat-queued-list">
+      {steeringUnavailableReason ? (
+        <p role="status" className="px-3 py-1.5 text-xs text-muted-foreground" data-testid="task-chat-steering-unavailable">
+          Steering paused: {steeringUnavailableReason} Will send after this turn.
+        </p>
+      ) : null}
       <DndContext
         sensors={sensors}
         collisionDetection={closestCenter}
@@ -664,6 +674,7 @@ export function TaskChatQueuedMessages({
       ) : null}
       <div className="sr-only" aria-live="polite" aria-atomic="true">
         {announcement}
+      </div>
       </div>
     </TaskChatComposerBar>
   );
