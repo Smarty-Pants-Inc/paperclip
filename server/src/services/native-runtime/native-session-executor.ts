@@ -13296,7 +13296,17 @@ async function executePaperclipNativeSessionAttempt(
           trace.setBudgetStart("warm");
         };
         try {
-          if (executionContext) await executionContext.wait(emitReuse); else await emitReuse();
+          if (input.execution.provider.kind === "pi_rpc" && !executionContext) {
+            // All owner/configuration/instruction fences above have passed.
+            // These two receipts are diagnostics (emitStartupReuse already
+            // swallows sink failures), not admission authority. Keep their
+            // order and drain them with the trace, without serially awaiting
+            // two run-log writes before a retained Pi turn can start.
+            // Startup-context providers keep their deadline/Stop wait intact.
+            trace.setBudgetStart("warm");
+            trace.defer(emitReuse);
+          } else if (executionContext) await executionContext.wait(emitReuse);
+          else await emitReuse();
         } catch (error) {
           if (lifecyclePolicy.mode === "warm") {
             await timeController("warm_reuse_release", () => releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken,

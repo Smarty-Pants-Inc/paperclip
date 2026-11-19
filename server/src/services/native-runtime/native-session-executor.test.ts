@@ -12041,6 +12041,188 @@ describe("bounded stopped instruction collection", () => {
 });
 
 describe("native warm session supervision", () => {
+  describe("warm admission window with real PostgreSQL", () => {
+    let db: Db;
+    let cleanup: (() => Promise<void>) | undefined;
+    beforeAll(async () => {
+      const { startRecoveryPostgres } = await import("../../__tests__/helpers/recovery-postgres.js");
+      const tables = await import("@paperclipai/db");
+      const database = await startRecoveryPostgres("warm-admission-window-");
+      cleanup = database.cleanup;
+      db = tables.createDb(database.connectionString);
+    }, 180_000);
+    afterAll(async () => { await db?.$client.end(); await cleanup?.(); });
+    beforeEach(async () => {
+      const wake = await vi.importActual<typeof import("./current-wake-comments.js")>("./current-wake-comments.js");
+      state.resolveCurrentWakeCommentsBinding.mockImplementation((...args: unknown[]) =>
+        wake.resolveCurrentWakeCommentsBinding(args[0] as Db, args[1] as Parameters<typeof wake.resolveCurrentWakeCommentsBinding>[1]));
+    });
+
+    // The real executor, coordinator, successor lease and wake reads run on PG.
+    // Only the provider and sandbox transport ports are this suite's existing
+    // doubles. Delays are on those ports, not on the timers being measured.
+    async function warmAdmission(provider: "pi_rpc" | "codex", mutation = "same", slowDiagnostics = false, slowSpans = false) {
+      const tables = await import("@paperclipai/db");
+      const { prepareNativeHeartbeatRun } = await import("./prepare-native-run.js");
+      const { buildNativeCompletionContract } = await import("./completion-contracts.js");
+      const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), environmentId = randomUUID();
+      const sessionId = randomUUID(), workspaceId = randomUUID();
+      await db.insert(tables.companies).values({ id: companyId, name: "Warm admission", issuePrefix: `W${companyId.slice(0, 7).toUpperCase()}` });
+      await db.insert(tables.agents).values({ id: agentId, companyId, name: "Warm agent" });
+      const [issue] = await db.insert(issues).values({ id: issueId, companyId, title: "Warm admission", status: "in_progress", assigneeAgentId: agentId }).returning();
+      await db.insert(tables.environments).values({ id: environmentId, name: `Warm sandbox ${environmentId}`, driver: "sandbox" });
+      const remoteCwd = await mkdtemp(join(tmpdir(), "warm-admission-window-"));
+      const previousHome = process.env.PAPERCLIP_HOME;
+      process.env.PAPERCLIP_HOME = join(remoteCwd, "controller");
+      const note = join(remoteCwd, "instructions.txt");
+      await writeFile(note, "unchanged");
+      let armed = false, remoteCalls = 0;
+      const delay = () => new Promise<void>(resolve => setTimeout(resolve, 150));
+      const runner = { execute: vi.fn(async () => {
+        if (armed) { remoteCalls++; await delay(); }
+        return { exitCode: 0, signal: null, timedOut: false, stdout: await readFile(note, "utf8"), stderr: "", pid: null, startedAt: new Date().toISOString() };
+      }) };
+      const acquisition = { outcome: "resumed" as const, providerLeaseId: "same-task" };
+      const runnerTask = vi.fn(async () => {
+        if (armed) { remoteCalls++; await delay(); }
+        return { kind: "description", taskId: acquisition.providerLeaseId, launchPreparationVersion: 1, projectAuthCheckVersion: 1,
+          warmTaskVersion: 1, runner: { version: "fixture", digest: `sha256:${"a".repeat(64)}` } };
+      });
+      const copy = (runId: string) => ({ runId, preparationKey: "same", hasChanges: async () => (await runner.execute()).stdout !== "unchanged",
+        collectStopped: async () => undefined });
+      const session = { close: vi.fn(async () => undefined) };
+      const events: AdapterRuntimeEvent[] = [];
+      let entered = false, diagnosticPending = 0, admittedWhileDiagnosticsPending = false, admissionAtMs = 0;
+      const result = { result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" }, turnId: "warm-turn",
+        normalizedSessionId: sessionId, providerSessionId: sessionId, driverKind: "test", driverVersion: "1", nativeEventCount: 1,
+        highestContiguousSourceSeq: 1, usage: null };
+      state.execute.mockReset().mockImplementation(async options => {
+        if (armed) {
+          entered = true; admissionAtMs = Date.now(); admittedWhileDiagnosticsPending = diagnosticPending > 0;
+          expect(Boolean(options.existingSession)).toBe(mutation === "same" || mutation === "instruction");
+        }
+        await options.onSession?.(session);
+        return result;
+      });
+      let prior: NativeExecutionInputV3 | undefined;
+      let lastLease: string | undefined;
+      let elapsedMs = 0;
+      try {
+        for (let turn = 0; turn < 2; turn++) {
+          const runId = randomUUID(), leaseId = randomUUID();
+          if (prior) {
+            await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, prior.binding.runId));
+            await db.update(environmentLeases).set({ status: "expired", releasedAt: new Date() }).where(eq(environmentLeases.id, lastLease!));
+          }
+          const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", status: "running",
+            runtimeMode: "native", nativeIssueId: issueId, nativeSessionId: sessionId, runnerInstanceId: sessionId, contextSnapshot: { issueId } }).returning();
+          await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, phase: "observed" });
+          await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+          await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, heartbeatRunId: runId,
+            provider: "fixture", providerLeaseId: acquisition.providerLeaseId, leasePolicy: "reuse_by_environment", metadata: { remoteCwd } });
+          await prepareNativeHeartbeatRun({ db, run: run!, issue: issue!, environmentLeaseId: leaseId });
+          const [contract] = await db.select().from(tables.completionContracts).where(eq(tables.completionContracts.issueId, issueId));
+          const current = { ...execution, schema: "paperclip.native-execution-input.v3", executionMode: "default", planningContext: null,
+            provider: provider === "pi_rpc" ? { kind: "pi_rpc", model: "paperclip/test", profile: QUALIFIED_PI_RPC_PROFILE } : execution.provider,
+            runtimeContext: nativeRuntimeContextFixture(),
+            completionContract: { id: contract!.id, sha256: contract!.canonicalSha256, schemaVersion: "paperclip.completion-contract.v1",
+              contract: buildNativeCompletionContract(issue!, { revision: contract!.revision }) },
+            binding: { companyId, agentId, issueId, runId, executionWorkspaceId: workspaceId },
+            workspace: { cwd: remoteCwd, repoUrl: null, repoRef: null, branchName: null },
+            session: { ...execution.session, normalizedSessionId: sessionId, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 } },
+          } as NativeExecutionInputV3;
+          const target = { kind: "remote" as const, transport: "sandbox" as const, environmentId, leaseId, remoteCwd, runner,
+            sandboxLeaseAcquisition: acquisition, ...(provider === "codex" ? { runnerTask } : {}) };
+          let release: (() => Promise<void>) | null = null;
+          if (prior) {
+            release = await claimWarmNativeInstructionCopy({ priorExecution: prior, companyId, agentId, runId, executionWorkspaceId: workspaceId,
+              workspace: current.workspace, environmentId, target, preparationKey: "same", adopt: async () => copy(runId) });
+            expect(release).toBeTypeOf("function");
+            if (mutation === "configuration") current.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 90_000 };
+            // A plugin task is the physical sandbox allocation identity too.
+            if (mutation === "task") acquisition.providerLeaseId = "changed-task-and-box";
+            if (mutation === "owner") current.session.normalizedSessionId = randomUUID();
+            if (mutation === "instruction") await writeFile(note, "changed after preparation");
+            events.length = 0;
+            armed = true;
+          }
+          const started = Date.now();
+          const pending = executePaperclipNativeSession({ db, execution: current, runnerInstanceId: sessionId, useRunnerd: true,
+            backend: { kind: "test" } as never, runnerExecutionTarget: target, instructionWorkingCopy: copy(runId), onEvent: async event => {
+              if (armed && ((slowDiagnostics && event.eventType === "run.startup.reuse" && ["runner", "provider_session"].includes(String(event.payload?.layer))) ||
+                (slowSpans && event.eventType === "run.performance.span" && ["warm_owner_forget", "warm_instruction_check", "warm_reuse_runner", "warm_reuse_provider_session"].some(name => event.payload?.span === `native.controller.${name}`)))) {
+                diagnosticPending++; try { await delay(); } finally { diagnosticPending--; }
+              }
+              events.push(event);
+            } });
+          if (mutation !== "same" && armed) {
+            await expect(pending).rejects.toThrow(mutation === "owner" ? "native_session_supervisor_busy"
+              : mutation === "instruction" ? "native_instruction_preparation_copy_changed" : "native_instruction_preparation_configuration_changed");
+            expect(entered).toBe(false);
+          } else await pending;
+          if (armed) elapsedMs = entered ? admissionAtMs - started : Date.now() - started;
+          await release?.();
+          prior = current; lastLease = leaseId;
+        }
+        const spans = events.filter(event => event.eventType === "run.performance.span").map(event => event.payload!);
+        process.stdout.write(`${JSON.stringify({ measurement: "warm-admission", provider, mutation, slowDiagnostics, slowSpans, injectedRemoteMs: 150,
+          remoteCalls, elapsedToAdmissionMs: entered ? elapsedMs : null, elapsedToRefusalMs: entered ? null : elapsedMs, admittedWhileDiagnosticsPending,
+          spans: spans.filter(span => String(span.span).startsWith("native.controller.")).map(span => ({ name: span.span, ms: span.durationMs, start: span.wallStartedAtMs })) })}\n`);
+        return { spans, events, elapsedMs, remoteCalls, admittedWhileDiagnosticsPending, closed: session.close.mock.calls.length, diagnosticPending };
+      } finally {
+        await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "warm admission fixture cleanup" });
+        if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
+        await rm(remoteCwd, { recursive: true, force: true });
+      }
+    }
+
+    it.each(["pi_rpc", "codex"] as const)("names every awaited warm admission step (%s)", async provider => {
+      const { spans } = await warmAdmission(provider);
+      expect(spans.map(span => span.span)).toEqual(expect.arrayContaining([
+        "native.controller.usage_delivery", "native.controller.warm_owner_forget", "native.controller.warm_instruction_check",
+        "native.controller.warm_reuse_runner", "native.controller.warm_reuse_provider_session", "native.controller.wake_binding",
+        ...(provider === "codex" ? ["native.controller.warm_admission_task_describe", "native.controller.startup_context_clear"] : []),
+      ]));
+      const usage = spans.find(span => span.span === "native.controller.usage_delivery")!;
+      const wake = spans.find(span => span.span === "native.controller.wake_binding")!;
+      const start = Number(usage.wallStartedAtMs) + Number(usage.durationMs), end = Number(wake.wallStartedAtMs);
+      const leaves = spans.filter(span => /native.controller.(warm_owner_forget|warm_instruction_check|warm_admission_task_describe|startup_context_clear|warm_reuse_runner|warm_reuse_provider_session)$/.test(String(span.span)))
+        .filter(span => Number(span.wallStartedAtMs) >= start && Number(span.wallStartedAtMs) + Number(span.durationMs) <= end)
+        .sort((a, b) => Number(a.wallStartedAtMs) - Number(b.wallStartedAtMs));
+      expect(end - start).toBeGreaterThanOrEqual(140);
+      expect(end - start - leaves.reduce((sum, span) => sum + Number(span.durationMs), 0)).toBeLessThan(80);
+      let previousEnd = start;
+      for (const leaf of leaves) {
+        expect(Number(leaf.wallStartedAtMs)).toBeGreaterThanOrEqual(previousEnd);
+        previousEnd = Number(leaf.wallStartedAtMs) + Number(leaf.durationMs);
+      }
+    });
+
+    it("does not await warm admission span writes, but drains them before return", async () => {
+      const result = await warmAdmission("pi_rpc", "same", false, true);
+      expect(result.admittedWhileDiagnosticsPending).toBe(true);
+      expect(result.diagnosticPending).toBe(0);
+      expect(result.elapsedMs).toBeLessThan(400);
+    });
+
+    it.each([1, 2, 3])("keeps slow reuse diagnostics off the proven warm Pi admission path and drains them before return (sample %s)", async () => {
+      const result = await warmAdmission("pi_rpc", "same", true);
+      expect(result.admittedWhileDiagnosticsPending).toBe(true);
+      expect(result.diagnosticPending).toBe(0);
+      expect(result.elapsedMs).toBeLessThan(400); // One required 150ms instruction probe, not two diagnostic writes too.
+      expect(result.events.filter(event => event.eventType === "run.startup.reuse" && event.payload?.state === "reused").map(event => event.payload?.layer))
+        .toEqual(expect.arrayContaining(["runner", "provider_session"]));
+    });
+
+    it.each(["configuration", "task", "owner", "instruction"] as const)("keeps the full warm admission fence after %s changes", async mutation => {
+      const result = await warmAdmission(mutation === "task" ? "codex" : "pi_rpc", mutation, true);
+      expect(result.closed).toBeGreaterThan(0);
+      expect(result.admittedWhileDiagnosticsPending).toBe(false);
+      expect(result.events.filter(event => event.eventType === "run.startup.reuse" && event.payload?.layer === "runner" && event.payload?.state === "reused"))
+        .toHaveLength(0);
+    });
+  });
+
   it.each(["collect", "close-failure", "stopped", "destroyed", "missing-lease", "foreign-run", "foreign-environment", "deleted-environment", "claim-edit", "claim-add", "claim-remove", "claim-remove-entry", "claim-canonical", "claim-config", "claim-uncertain"])("composes remote warm ownership with real DB successor leases and current-run collection: %s", async ending => {
     const tables = await import("@paperclipai/db");
     const { eq, sql } = await import("drizzle-orm");
