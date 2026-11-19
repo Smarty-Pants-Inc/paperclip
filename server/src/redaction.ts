@@ -1143,11 +1143,11 @@ interface AnsiCredentialView {
 }
 interface CredentialSpan { start: number; end: number; replacement: string }
 
-// Both scanners keep whole-line context. V1 removes terminal controls (including
-// codes inside credentials); V2 substitutes ASCII space U+0020 for bare-token
-// matching and strict Bearer bodies only at an immediate escape boundary. General
-// schemes, assignments and context-sensitive prose rules remain V1-only.
-// Original OSC payloads are scanned so stripping a hyperlink cannot hide a key.
+// V1 keeps whole-line context with terminal controls removed. The token span
+// pass reuses that source map: a control may admit a candidate at its edge,
+// but stays transparent inside that candidate. General schemes, assignments
+// and context-sensitive prose rules remain V1-only. Original OSC payloads are
+// scanned so stripping a hyperlink cannot hide a key.
 /**
  * `quotedLeaf`: `input` is the decoded content of a JSON string literal, so
  * its start and end stand for the literal's opening and closing quote.
@@ -1155,15 +1155,12 @@ interface CredentialSpan { start: number; end: number; replacement: string }
 export function redactSensitiveText(input: string, context?: { quotedLeaf?: boolean }): string {
   if (!input.includes("\u001b") && !input.includes("\u009b")) return redactPlainSensitiveText(input, context);
 
-  const transparent: AnsiCredentialView = { text: "", starts: [], ends: [] };
-  const boundary: AnsiCredentialView = { text: "", starts: [], ends: [], escapeBoundaries: new Set() };
+  const transparent: AnsiCredentialView = { text: "", starts: [], ends: [], escapeBoundaries: new Set() };
   const append = (start: number, end: number) => {
-    for (const view of [transparent, boundary]) {
-      view.text += input.slice(start, end);
-      for (let index = start; index < end; index += 1) {
-        view.starts.push(index);
-        view.ends.push(index + 1);
-      }
+    transparent.text += input.slice(start, end);
+    for (let index = start; index < end; index += 1) {
+      transparent.starts.push(index);
+      transparent.ends.push(index + 1);
     }
   };
   let copiedThrough = 0;
@@ -1171,10 +1168,7 @@ export function redactSensitiveText(input: string, context?: { quotedLeaf?: bool
   for (const escape of terminalEscapes(input)) {
     append(copiedThrough, escape.start);
     copiedThrough = escape.end;
-    boundary.escapeBoundaries!.add(boundary.text.length);
-    boundary.text += " ";
-    boundary.starts.push(escape.start);
-    boundary.ends.push(copiedThrough);
+    transparent.escapeBoundaries!.add(transparent.text.length);
     if (escape.payloadEnd !== undefined) {
       // A payload is a separate control string, not visible scheme context.
       // Keep its literal bytes and identity map for the existing scanner; no
@@ -1203,7 +1197,7 @@ export function redactSensitiveText(input: string, context?: { quotedLeaf?: bool
   }));
   const spans = [
     ...credentialSpansForView(transparent, (text, apply) => redactPlainSensitiveText(text, context, apply)),
-    ...credentialSpansForView(boundary, (text, apply) => redactBoundaryTokenRanges(text, apply, boundary)),
+    ...escapeEdgeCredentialSpans(transparent),
     ...originalPayloadSpans,
     ...originalTokenSpans,
   ].sort((a, b) => a.start - b.start || b.end - a.end);
@@ -1345,21 +1339,64 @@ const ESCAPE_BOUNDARY_BEARER_RE = new RegExp(
   "gi",
 );
 
-function redactBoundaryTokenRanges(input: string, apply: ApplyRedactionStage, view?: AnsiCredentialView): string {
-  // Run first, while match offsets still address the original boundary view.
-  // Only a recognized escape immediately before the scheme may introduce it.
-  // Mark substitutions explicitly: even a single-byte stray ESC recognized
-  // before a credential is a boundary, but an ordinary space is not. The
-  // original-byte token pass has no view and acquires no synthetic boundaries.
-  const text = apply(input, (value, replace) => value.replace(ESCAPE_BOUNDARY_BEARER_RE,
-    (match: string, prefix: string, _token: string, index: number) => {
-      if (!view?.escapeBoundaries?.has(index - 1)) return match;
-      return prefix + replace(index + prefix.length, index + match.length, REDACTED_EVENT_VALUE);
-    }));
-  // JWT/bare-prefix tokens retain their existing lengths, charsets and
-  // validation, including prefixed tokens shorter than the strict Bearer body.
-  // Never run general schemes, assignments or prose rules on V2.
-  return redactTokenPatterns(text, apply, [
+const ANSI_CREDENTIAL_START_RE = new RegExp(
+  STRICT_CREDENTIAL_SHAPES.tokenPrefixes.join("|") + "|[Bb][Ee][Aa][Rr][Ee][Rr](?=[ \\t])", "g",
+);
+const ANSI_BARE_TOKEN_PATTERNS = [
+  RANGE_COMMAND_OPENAI_KEY_RE, RANGE_COMMAND_GITHUB_TOKEN_RE, RANGE_COMMAND_JWT_RE,
+  GITHUB_FINE_GRAINED_TOKEN_RE, AWS_ACCESS_KEY_ID_RE,
+].map(pattern => new RegExp(pattern.source, "y"));
+const ANSI_BEARER_PATTERN = new RegExp(ESCAPE_BOUNDARY_BEARER_RE.source, "iy");
+
+function escapeEdgeCredentialSpans(view: AnsiCredentialView): CredentialSpan[] {
+  const spans: CredentialSpan[] = [];
+  // One candidate pass in original source order; no global space-substituted
+  // view. The V1 map skips controls while extending the same uncoloured shape.
+  // At an escape edge only, start the existing sticky pattern in local context
+  // so its left boundary cannot see the word before the control. Natural V1
+  // boundaries retain all original context (including JWT's hyphen exclusion).
+  ANSI_CREDENTIAL_START_RE.lastIndex = 0;
+  const edges = [...view.escapeBoundaries!];
+  let edgeIndex = 0;
+  let candidate: RegExpExecArray | null;
+  while ((candidate = ANSI_CREDENTIAL_START_RE.exec(view.text))) {
+    const start = candidate.index;
+    const atEscape = view.escapeBoundaries!.has(start);
+    if (!atEscape && /[A-Za-z0-9_]/.test(view.text[start - 1] ?? "")) continue;
+    const bearer = /^Bearer$/i.test(candidate[0]);
+    if (bearer && !atEscape) continue;
+    while (edgeIndex < edges.length && edges[edgeIndex] <= start) edgeIndex += 1;
+    const offset = atEscape ? 0 : start;
+    const text = atEscape ? view.text.slice(start) : view.text;
+    const nextEdge = edges[edgeIndex];
+    for (const pattern of bearer ? [ANSI_BEARER_PATTERN] : ANSI_BARE_TOKEN_PATTERNS) {
+      const matchAtStart = (value: string) => {
+        pattern.lastIndex = offset;
+        const match = pattern.exec(value);
+        return match && (pattern.source !== RANGE_COMMAND_JWT_RE.source || looksLikeCredentialJwt(match[0])) ? match : null;
+      };
+      // Prefer the complete transparent body. If it is invalid, a control can
+      // still END an otherwise valid token (notably a fixed-length AWS id).
+      // This candidate-local fallback preserves V2's old edge matches without
+      // making any interior control split a valid reconstructed credential.
+      const match = matchAtStart(text) ?? (nextEdge === undefined ? null :
+        matchAtStart(view.text.slice(atEscape ? start : 0, nextEdge)));
+      if (!match) continue;
+      const end = start + match[0].length;
+      const bodyStart = bearer ? start + match[1].length : start;
+      spans.push({ start: view.starts[bodyStart], end: view.ends[end - 1], replacement: REDACTED_EVENT_VALUE });
+      // The mapped endpoints include every interior control and exclude every
+      // control after the last body byte, preserving trailing resets verbatim.
+      ANSI_CREDENTIAL_START_RE.lastIndex = end;
+      break;
+    }
+  }
+  return spans;
+}
+
+function redactBoundaryTokenRanges(input: string, apply: ApplyRedactionStage): string {
+  // Original-byte coverage remains token-only, never general schemes/prose.
+  return redactTokenPatterns(input, apply, [
     RANGE_COMMAND_OPENAI_KEY_RE, RANGE_COMMAND_GITHUB_TOKEN_RE, RANGE_COMMAND_JWT_RE,
     GITHUB_FINE_GRAINED_TOKEN_RE, AWS_ACCESS_KEY_ID_RE,
   ], true);
