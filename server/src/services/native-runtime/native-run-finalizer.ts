@@ -369,6 +369,10 @@ export const NATIVE_WORKSPACE_SYNC_OUT_STALLED = "native_workspace_sync_out_stal
 const CLASSIC_STALL_RUN_ERROR = "Saving the workspace made no progress, so this run was ended. The agent's result is kept. "
   + "This turn's file changes were not saved; the task continues from the last saved files.";
 const CLASSIC_STALL_NEXT_ACTION = "This turn's file changes were not saved. Continue from the last saved files, or ask for the changes again.";
+/** Proposed, pending RFL: the run error of a classic sync run whose save failed for the last time while a person's
+ * message was parked behind it. The run ends as the stuck save ends (isolated, its files not kept), never "kept". */
+export const CLASSIC_SAVE_FAILED_PARKED_RUN_ERROR = "Saving the workspace failed, so this run was ended. The agent's result is kept. "
+  + "This turn's file changes were not saved; the task continues from the last saved files.";
 
 /** The run columns that end a run whose finalization reached a terminal verdict. */
 function terminalFinalizationRunPatch(input: {
@@ -481,6 +485,16 @@ function readFinalizationFailureCount(resultJson: unknown) {
   return typeof count === "number" && Number.isInteger(count) && count >= 0 ? count : 0;
 }
 
+/** A person's message is parked behind this task: the same reading as the person-wait cap
+ * (native-workspace-finalization-work.ts `parkedAt`). */
+async function personMessageParkedBehind(tx: Db, companyId: string, issueId: string) {
+  const [parked] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    isNull(agentWakeupRequests.runId), eq(agentWakeupRequests.requestedByActorType, "user"),
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`)).limit(1);
+  return Boolean(parked);
+}
+
 async function recordRetryableFailure(input: {
   db: Db;
   run: typeof heartbeatRuns.$inferSelect;
@@ -564,11 +578,11 @@ async function recordRetryableFailure(input: {
     // `remote_workspace_authority_changed` / `remote_workspace_publication_fenced`).
     // A run whose files cannot be fenced is never ended by the bound.
     // A classic sync run has no epoch: it is isolated instead (isolateClassicSourceWorkspace), and its files are not kept.
-    const stallFence = !stalled ? null : await fenceSourceWorkspace(tx as unknown as Db, input.run)
+    let stallFence = !stalled ? null : await fenceSourceWorkspace(tx as unknown as Db, input.run)
       ?? await isolateClassicSourceWorkspace(tx as unknown as Db, input.run, input.coordinator.issueId);
     if (stalled && !stallFence) return current;
     // C8: the texts follow the fence kind, so "kept for recovery" never sits beside the LOST line.
-    const filesNotKept = Boolean(stallFence && "kind" in stallFence);
+    let filesNotKept = Boolean(stallFence && "kind" in stallFence);
     if (filesNotKept) input = { ...input, nextAction: CLASSIC_STALL_NEXT_ACTION };
     const latestDecision = issue?.lastStatusDecisionId
       ? await tx
@@ -609,6 +623,25 @@ async function recordRetryableFailure(input: {
     const supersededByNewerRun = Boolean(
       latestDecisionRun && latestDecisionRun.createdAt > input.run.createdAt,
     );
+    // A save that fails for the LAST time (retry budget spent, or permanent) while a person's message is parked
+    // behind this task ends the run exactly as the person-wait cap ends a classic run: the same cause, isolated,
+    // its copy-back owner a tombstone. So the parked message starts at once in its own root, and nothing later
+    // commits or publishes this run's files (every later claim fails at the ownership CAS). Only this run's own
+    // holds are released: the marker written below names this run. With nobody parked, or a root the task does
+    // not own, nothing here applies and the run keeps its retained-export recovery.
+    const lastWorkspaceFailure = !stalled && input.failureScope === "workspace" && input.projectRunStatus === true
+      && (input.permanent === true || isSandboxStorageExhausted(failureCause)
+        || Number(record(input.coordinator.failureDetail).workspaceFinalizeAttempt ?? 0) + 1 >= 3);
+    let saveFailureCode: string | null = null;
+    if (lastWorkspaceFailure && !supersededByNewerRun
+      && await personMessageParkedBehind(tx as unknown as Db, input.run.companyId, input.coordinator.issueId)) {
+      stallFence = await isolateClassicSourceWorkspace(tx as unknown as Db, input.run, input.coordinator.issueId);
+      if (stallFence) {
+        filesNotKept = true;
+        saveFailureCode = input.failureCode;
+        input = { ...input, failureCode: NATIVE_WORKSPACE_SYNC_OUT_STALLED, permanent: true, nextAction: CLASSIC_STALL_NEXT_ACTION };
+      }
+    }
     const priorFailureDetail = record(input.coordinator.failureDetail);
     const workspaceFinalizeAttempt =
       input.failureScope === "workspace"
@@ -682,7 +715,7 @@ async function recordRetryableFailure(input: {
         failureCode,
         failureDetail: {
           message: input.message.slice(0, 2_000),
-          originalFailureCode: input.failureCode,
+          originalFailureCode: saveFailureCode ?? input.failureCode,
           ...(failureCause ? { failureCause } : {}),
           ...(priorFailureDetail.workspaceExportRetry ? { workspaceExportRetry: priorFailureDetail.workspaceExportRetry } : {}),
           ...(workspaceFinalizeAttempt === null
@@ -724,7 +757,8 @@ async function recordRetryableFailure(input: {
         executionStatusDeliveryId: randomUUID(),
         ...(projectsTerminalStatus
           ? terminalFinalizationRunPatch({ status: terminalRunStatus, failureCode, now,
-              error: filesNotKept ? CLASSIC_STALL_RUN_ERROR : terminalFinalizationFailureMessage(failureCode, input.failureScope, failureCause) })
+              error: filesNotKept ? saveFailureCode ? CLASSIC_SAVE_FAILED_PARKED_RUN_ERROR : CLASSIC_STALL_RUN_ERROR
+                : terminalFinalizationFailureMessage(failureCode, input.failureScope, failureCause) })
           : {}),
         nativePhase: phase,
         nativePhaseUpdatedAt: now,
@@ -733,7 +767,7 @@ async function recordRetryableFailure(input: {
         resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
           finalizationPhase: phase,
           failureCode,
-          originalFailureCode: input.failureCode,
+          originalFailureCode: saveFailureCode ?? input.failureCode,
           // The latest attempt's redacted cause; cleared when it named none.
           failureCause,
           ...(finalizationFailureCount === null ? {} : { finalizationFailureCount }),
@@ -817,7 +851,7 @@ async function recordRetryableFailure(input: {
           ...(workspaceFinalizeAttempt === null
             ? {}
             : { workspaceFinalizeAttempt }),
-          originalFailureCode: input.failureCode,
+          originalFailureCode: saveFailureCode ?? input.failureCode,
         },
         nextAction: exhausted
           ? input.permanent
