@@ -701,4 +701,95 @@ describeEmbeddedPostgres("ONE successor per Interrupt (adopt-one-successor, 390 
       .filter(w => w.idempotencyKey === `conversation-comment:${response.body.id}`);
     expect(wakes.map(w => w.status).filter(s => !["cancelled", "failed", "skipped"].includes(s))).toHaveLength(1);
   });
+
+  // catch: https://github.com/Smarty-Pants-Inc/paperclip/commit/b68b61e489a927995607617d2f983e57f32b47b8
+  // rf-4 C1: real run-end restore and per-message sweep; no outbox/boot re-send in these rows.
+  describe("C1 restored-steer notices (neworg-floor-c1)", () => {
+    async function restoredSteerWithFailedCarrier() {
+      const chat = await seedChat();
+      await attachSteerable(chat);
+      const m = (await postDefault(chat, "M: read this steer, then the turn ends without answering it").expect(201)).body;
+      expect(m.steeredIntoRunId).toBe(chat.runId);
+      await readNotAnswered(chat, m.id);
+      await finishTurn(chat, { log: false, reply: false });
+      const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+      expect((ended!.resultJson as any).restoredSteeredCommentIds).toEqual([m.id]);
+      expect((ended!.contextSnapshot as any).steeredCommentIds).not.toContain(m.id);
+      expect(await answered(m.id), "reading the steer was not an answer").toBe(false);
+      const restored = await carriersOf(chat, m.id);
+      expect(restored.wakes.length + restored.runs.length, "the restored steer has ONE carrier").toBe(1);
+      // Admit the real restored wake without launching a provider: the boundary under test is
+      // persisted recovery state, not provider execution. Its sole carrying turn R2 fails.
+      const base = Date.now() - 50 * 60_000;
+      await db.update(issueComments).set({ createdAt: at(base, -10), updatedAt: at(base, -10) })
+        .where(eq(issueComments.id, chat.first.id));
+      await db.update(issueComments).set({ createdAt: at(base, 10), updatedAt: at(base, 10) })
+        .where(eq(issueComments.id, m.id));
+      await db.update(heartbeatRuns).set({ createdAt: at(base, -1), startedAt: at(base, 0), finishedAt: at(base, 20) })
+        .where(eq(heartbeatRuns.id, chat.runId));
+      const carrier = restored.runs[0] ?? (await db.insert(heartbeatRuns).values({
+        companyId: chat.companyId, agentId: chat.agentId, status: "running", runtimeMode: "native",
+        wakeupRequestId: restored.wakes[0]!.id,
+        contextSnapshot: (restored.wakes[0]!.payload as any)._paperclipWakeContext,
+      }).returning())[0]!;
+      expect((carrier.contextSnapshot as any).wakeCommentIds).toContain(m.id);
+      await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed",
+        createdAt: at(base, 29), startedAt: at(base, 30), finishedAt: at(base, 40), updatedAt: at(base, 40) })
+        .where(eq(heartbeatRuns.id, carrier.id));
+      await db.update(agentWakeupRequests).set({ status: "completed", runId: carrier.id,
+        claimedAt: at(base, 30), finishedAt: at(base, 40), updatedAt: at(base, 40) })
+        .where(and(eq(agentWakeupRequests.companyId, chat.companyId), sql`(${agentWakeupRequests.runId} = ${carrier.id}
+          or ${agentWakeupRequests.id} = ${carrier.wakeupRequestId ?? restored.wakes[0]?.id ?? null}::uuid)`));
+      const held = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId)))
+        .filter(w => ["queued", "deferred_issue_execution", "claimed"].includes(w.status)
+          && (w.idempotencyKey === `conversation-comment:${m.id}` || wakeCommentIds(w).includes(m.id)));
+      expect(held, "a terminal carrier must leave no live wake holding M").toEqual([]);
+      return { chat, m, carrier, base };
+    }
+
+    async function cardsFor(chat: Chat, id: string) {
+      return db.select().from(issueComments).where(and(eq(issueComments.companyId, chat.companyId),
+        eq(issueComments.issueId, chat.issue.id), eq(issueComments.authorType, "system"),
+        sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + id}`));
+    }
+
+    async function perMessageSweeps(chat: Chat) {
+      for (const ahead of [0, 5 * 60_000, 10 * 60_000]) {
+        const input = { companyId: chat.companyId, issueId: chat.issue.id, now: new Date(Date.now() + ahead) };
+        await settleUnansweredPersonMessages(db, input);
+        await settleUnansweredPersonMessage(db, input);
+      }
+    }
+
+    it("(c1-old) RED: restored M's carrier R2 fails, then later R3 succeeds with a reply: NO card for M", async () => {
+      const { chat, m, carrier, base } = await restoredSteerWithFailedCarrier();
+      const [n] = await db.insert(issueComments).values({ companyId: chat.companyId, issueId: chat.issue.id,
+        authorType: "user", authorUserId: owner, clientRequestId: randomUUID(), body: "N: the chat has moved on",
+        createdAt: at(base, 50), updatedAt: at(base, 50) }).returning();
+      const [r3] = await db.insert(heartbeatRuns).values({ companyId: chat.companyId, agentId: chat.agentId,
+        status: "succeeded", runtimeMode: "native", createdAt: at(base, 59), startedAt: at(base, 60), finishedAt: at(base, 80),
+        contextSnapshot: { issueId: chat.issue.id, taskKey: chat.issue.id, wakeCommentId: n!.id, wakeCommentIds: [n!.id] },
+      }).returning();
+      await db.insert(issueComments).values({ companyId: chat.companyId, issueId: chat.issue.id, authorType: "agent",
+        authorAgentId: chat.agentId, createdByRunId: r3!.id, body: "Agent reply to N", createdAt: at(base, 80), updatedAt: at(base, 80) });
+      expect(r3!.startedAt!.getTime()).toBeGreaterThan(at(base, 30).getTime());
+      expect(await answered(m.id), "M was not directly answered; only the owed floor may skip its notice").toBe(false);
+      await perMessageSweeps(chat);
+      const cards = await cardsFor(chat, m.id);
+      console.info("C1-EVIDENCE", JSON.stringify({ row: "c1-old", messageId: m.id, restorer: chat.runId,
+        failedCarrier: carrier.id, laterReplyRun: r3!.id, cards: cards.map(c => ({ id: c.id, body: c.body })) }));
+      expect(cards, "the carried-steer sweep carded M after the chat moved on").toHaveLength(0);
+    });
+
+    it("(c1-live) restored M's carrier R2 fails, no later run: exactly ONE carried-steer card for M", async () => {
+      const { chat, m, carrier } = await restoredSteerWithFailedCarrier();
+      await perMessageSweeps(chat);
+      const cards = await cardsFor(chat, m.id);
+      console.info("C1-EVIDENCE", JSON.stringify({ row: "c1-live", messageId: m.id, restorer: chat.runId,
+        failedCarrier: carrier.id, cards: cards.map(c => ({ id: c.id, body: c.body })) }));
+      expect(cards, "repeated singular and batched sweeps must not duplicate M's note").toHaveLength(1);
+      expect(cards[0]!.deletedAt).toBeNull();
+      expect(cards[0]!.body).toBe("Your message (received mid-task) wasn't answered because the run failed. Sending it again is safe.");
+    });
+  });
 });
