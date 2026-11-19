@@ -6,7 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { logger } from "../middleware/logger.js";
 import type { StorageProvider } from "../storage/types.js";
-import type { RunLogStore, RunLogHandle, RunLogBeginInput } from "./run-log-store.js";
+import type { RunLogStore, RunLogHandle, RunLogBeginInput, RunLogPersistenceCause } from "./run-log-store.js";
 import { createObjectByteJournal, ObjectJournalConflictError, ObjectJournalSourcePrefixProofUnavailableError, type ObjectJournalIOPriority, type ObjectJournalWriter } from "./object-byte-journal.js";
 import { MAX_RUN_LOG_RECORD_BYTES } from "./run-log-record-limits.js";
 import { notFound } from "../errors.js";
@@ -423,7 +423,7 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
         "Object run log spill recovery record failed; the stored log is complete");
     }
   }
-  async function journalRangeSha(state: WriterState, start: number, length: number) {
+  async function journalRangeSha(state: Pick<WriterState, "journal" | "writer" | "signal">, start: number, length: number) {
     const hash = createHash("sha256");
     for (let at = start; at < start + length; at += MAX_READ_BYTES)
       hash.update(await state.journal.readRange(state.writer.head, at, Math.min(MAX_READ_BYTES, start + length - at), state.signal));
@@ -658,14 +658,26 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       }
     }
   }
-  async function incompleteLog(logRef: string) {
+  async function incompleteLog(logRef: string, journal: WriterState["journal"], writer: ObjectJournalWriter, signal?: AbortSignal) {
     // The writer's kept index survives process retirement/restart. Add only
     // in-memory accounting: spilled batches have already released that count.
     // Do not infer missing bytes from a null final size or an open head (a
     // close/digest failure can leave every byte stored).
-    const { open } = await readSpillIndex(spillPaths(options.spillDir, logRef).indexPath);
-    let bytes = open.reduce((sum, entry) => sum + entry.bytes, 0);
-    const causes = open.map(entry => entry.cause ?? { name: "UnknownError" });
+    const { spilled, recovered } = await readSpillIndex(spillPaths(options.spillDir, logRef).indexPath);
+    let bytes = 0, position = -1;
+    const causes: RunLogPersistenceCause[] = [];
+    for (const entry of spilled) {
+      position = Math.max(position, entry.journalEnd);
+      // The recovery record can fail AFTER its bytes reached object storage.
+      // Use the same range proof as spill adoption before reporting them missing;
+      // never trust a closed head alone or mutate the kept index on a log read.
+      if (!recovered.has(entry.spillStart) && !(position + entry.bytes <= writer.head.end &&
+        await journalRangeSha({ journal, writer, signal }, position, entry.bytes) === entry.sha256)) {
+        bytes += entry.bytes;
+        causes.push(entry.cause ?? { name: "UnknownError" });
+      }
+      position += entry.bytes;
+    }
     for (const state of writers.values()) if (state.handle.logRef === logRef && state.pendingBytes > 0) {
       bytes += state.pendingBytes;
       causes.push(state.failure ? finalizationError(state.failure) : { name: "ObjectRunLogPendingWrite" });
@@ -900,7 +912,7 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       const store = journal(handle.logRef, opts.priority ?? "interactive"),
         snapshot = await store.head(opts.signal) ?? writers.get(handle)?.writer;
       if (!snapshot || snapshot.head.deleted) throw notFound("Run log not found");
-      const incomplete = await incompleteLog(handle.logRef);
+      const incomplete = await incompleteLog(handle.logRef, store, snapshot, opts.signal);
       const offset = Math.max(0, opts.offset ?? 0),
         limit = opts.limitBytes ?? 256_000;
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_READ_BYTES)
