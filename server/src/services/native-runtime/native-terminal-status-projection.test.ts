@@ -1,3 +1,5 @@
+// Import first: installs the named sandbox/provider injections, not a mock executor.
+import { box, liveScenario, openClassicLiveContext, resetClassicLiveBox } from "../../__tests__/helpers/classic-live-scenario.js";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -8,6 +10,9 @@ import { deliverExecutionStatuses } from "../execution-status-delivery.js";
 import { buildIssueMonitorTriggeredPatch, normalizeIssueExecutionPolicy } from "../issue-execution-policy.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { finalizeNativeRun } from "./native-run-finalizer.js";
+import { heartbeatService } from "../heartbeat.js";
+import { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
+import { reconcileNativeFinalizations } from "./native-finalization-reconciler.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("native terminal status projection", () => {
@@ -96,7 +101,81 @@ describe.skipIf(!support.supported)("native terminal status projection", () => {
     expect((await f.read()).executionStatusDeliveryId).toBe(newer);
   });
 
-  it.each(["metadata", "status", "missing_completion_time"])("broadcasts a changed terminal projection after acknowledgement (%s)", async change => {
+  it("broadcasts a changed terminal projection after acknowledgement (status)", async () => {
+    // REAL producers: comments route -> queue/claim -> heartbeat executor -> its own
+    // failure write, then finalizeNativeRun commits the accepted result.
+    // SCRIPTED: provider turn accepts via PaperclipControlPlanePort, then reports
+    // EXECUTOR-FAILS (as K12 EXECUTOR-FAILED); CLASSIC-STALL-1 holds teardown until
+    // the accepted result is pending. PLANTED: harness company/user/task/environment
+    // configuration only; no terminal run, accepted result or finalization row.
+    const context = await openClassicLiveContext("terminal-status-executor-");
+    const s = await liveScenario(context);
+    const heartbeat = heartbeatService(context.db, { nativeSessionBackendFactory: () => ({}) as never });
+    const errors: unknown[] = [];
+    const delivery = createDeliveryWorkCoordinator({ owner: context.db, canRun: () => true, onError: error => errors.push(error) });
+    const receipts = heartbeat.registerDeferredReceiptWork(delivery, () => true);
+    const failure = { errorCode: "provider_transport_failed", errorMessage: "provider_transport_failed: runner did not durably suspend before checkpoint" };
+    const providerTurn = box.session!;
+    let turns = 0;
+    box.session = async input => {
+      const result = await providerTurn(input);
+      return ++turns === 2 ? { exitCode: 1, signal: null, timedOut: false, ...failure } : result;
+    };
+    try {
+      await receipts.ready;
+      await s.say("Please write the report.");
+      await vi.waitFor(async () => {
+        await heartbeat.resumeQueuedRuns();
+        await reconcileNativeFinalizations(context.db, (await s.runs()).map(run => run.id), { environmentRuntime: {} as never });
+        expect((await s.runs())[0]).toMatchObject({ status: "succeeded" });
+      }, { timeout: 60_000, interval: 250 });
+      await heartbeat.drainActiveRunExecutions();
+      await s.say("Please rewrite the report.");
+      let stalled = false;
+      void s.stallReached.then(() => { stalled = true; });
+      await vi.waitFor(async () => {
+        await heartbeat.resumeQueuedRuns();
+        expect(stalled).toBe(true);
+      }, { timeout: 60_000, interval: 250 });
+      const runId = (await s.runs())[1].id;
+      const read = async () => (await context.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]!;
+      const coordinator = async () => (await context.db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId)))[0]!;
+      expect(await coordinator()).toMatchObject({ phase: "workspace_finalizing", resultId: expect.any(String) });
+      s.releaseStall();
+      await heartbeat.drainActiveRunExecutions();
+      const ended = await read();
+      expect(ended).toMatchObject({ status: "failed", errorCode: failure.errorCode, error: failure.errorMessage, finishedAt: expect.any(Date) });
+      expect((await coordinator()).phase).not.toBe("committed");
+      // NAMED INJECTION: report an unsuccessful workspace barrier to the real
+      // finalizer, publishing the failed projection while its result is pending.
+      await finalizeNativeRun({ db: context.db, runId, workspaceFinalizeStatus: "failed", projectRunStatus: true });
+      const publish = vi.fn();
+      await deliverExecutionStatuses(context.db, { publish });
+      expect((await read()).executionStatusDeliveryId).toBeNull();
+      // The real finalizer now commits with the successful workspace barrier
+      // (R's actual teardown saved its files). It changes the terminal projection,
+      // not the failed executor's truthful status/error/end time (K12).
+      await finalizeNativeRun({ db: context.db, runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+      expect(await coordinator()).toMatchObject({ phase: "committed" });
+      expect(await read()).toMatchObject({ status: "failed", errorCode: ended.errorCode, error: ended.error, finishedAt: ended.finishedAt,
+        resultJson: { endedRunKept: { schema: "paperclip.ended-run-kept.v1", status: "failed" }, finalizationPhase: "committed" } });
+      await deliverExecutionStatuses(context.db, { publish });
+      const notifications = publish.mock.calls.filter(([event]) => event.payload.runId === runId);
+      expect(notifications).toHaveLength(2);
+      expect(notifications.map(([event]) => event.payload.status)).toEqual(["failed", "failed"]);
+      expect(notifications[1][0].payload.deliveryId).not.toBe(notifications[0][0].payload.deliveryId);
+      await reconcileNativeFinalizations(context.db, [runId], { environmentRuntime: {} as never });
+      await deliverExecutionStatuses(context.db, { publish });
+      expect(publish.mock.calls.filter(([event]) => event.payload.runId === runId)).toHaveLength(2);
+      expect(errors).toEqual([]);
+    } finally {
+      s.releaseStall(); receipts.stop?.(); await delivery.stop();
+      await heartbeat.drainActiveRunExecutions();
+      resetClassicLiveBox(); await context.close();
+    }
+  }, 180_000);
+
+  it.each(["metadata", "missing_completion_time"])("broadcasts a changed terminal projection after acknowledgement (%s)", async change => {
     const f = await fixture();
     await f.finalize();
     const publish = vi.fn();
@@ -105,7 +184,8 @@ describe.skipIf(!support.supported)("native terminal status projection", () => {
       await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "failed", projectRunStatus: true });
       expect((await f.read()).resultJson?.workspaceFinalizeStatus).toBe("failed");
     } else {
-      await db.update(heartbeatRuns).set(change === "status" ? { status: "failed" } : { finishedAt: null })
+      // PLANTED: a legacy terminal row missing its completion time (repair coverage).
+      await db.update(heartbeatRuns).set({ finishedAt: null })
         .where(eq(heartbeatRuns.id, f.runId));
       await f.finalize();
       expect(await f.read()).toMatchObject({ status: "succeeded", finishedAt: expect.any(Date) });
