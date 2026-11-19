@@ -1,5 +1,7 @@
+import { insertIssueComment } from "../../../services/issue-comment-writes.js";
 import { lockAgentForRunAdmission } from "../../../services/heartbeat-run-admission-lock.js";
 import { pendingContinuationCommentInput } from "../../../services/continuation-comment-input.js";
+import { conversationMovedOnSql, deferredWakeIsStaleSql, personMessageOwedSql } from "../../../services/person-message-answer.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
 import { notifyQueuedRunDispatch, notifyRunDispatch } from "../../../services/run-dispatch-notifications.js";
@@ -12,7 +14,7 @@ import { notifyChatRunMilestones } from "../../../services/chat-run-milestone-no
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-work-notifications.js";
 import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
 import { readRunCancellation } from "../../../services/run-cancellation.js";
-import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
+import { CHAT_COMPLETION_WAKE_REASON, isCompletedOnboardingHandoffWake, supersedeStaleChatCompletionWake } from "../../../services/chat-completion-delivery.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition, isConversationReset } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
@@ -406,7 +408,15 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       }
     },
 
-    async getQueuedCommentLiveness({ companyId, issueId, wakeAgentId, finishingRunId, finishingRunAgentId, queuedCommentIds, retainDeliveredCommentBindings }) {
+    async getQueuedCommentLiveness({ companyId, wakeId, issueId, wakeAgentId, finishingRunId, finishingRunAgentId, queuedCommentIds, retainDeliveredCommentBindings }) {
+      const [wake] = wakeId ? await tx.select({ stale: deferredWakeIsStaleSql({
+        companyId: sql`${agentWakeupRequests.companyId}`, agentId: sql`${agentWakeupRequests.agentId}`,
+        issueId: sql`${issueId}::uuid`, requestedAt: sql`${agentWakeupRequests.requestedAt}`, payload: sql`${agentWakeupRequests.payload}`,
+      }) }).from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.id, wakeId), eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS))) : [];
+      const conversationMovedOn = Boolean(wake?.stale);
+      const message = { id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+        issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` };
       // Malformed ids (for example an 8-char short form written into a wake
       // payload) can never match a comment row, but Postgres rejects the whole
       // `inArray` statement on the first invalid uuid and blocks every queued
@@ -416,13 +426,18 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .map((commentId) => commentId.trim())
         .filter((commentId) => isUuidLike(commentId));
       const rows = queryableCommentIds.length === 0 ? [] : await tx
-        .select({ id: issueComments.id, deletedAt: issueComments.deletedAt, createdByRunId: issueComments.createdByRunId })
+        .select({ id: issueComments.id, deletedAt: issueComments.deletedAt, createdByRunId: issueComments.createdByRunId,
+          owed: conversationMovedOn ? sql<boolean>`(${issueComments.authorType} is distinct from 'user' or
+            (${personMessageOwedSql(message)} and not ${conversationMovedOnSql(message)}))` : sql<boolean>`true` })
         .from(issueComments)
         .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, queryableCommentIds), currentConversationCommentCondition()));
       const targetsFinishingRunAgent = wakeAgentId === finishingRunAgentId;
       const liveAndUnauthored = queryableCommentIds.filter((commentId) => {
         const row = rows.find((candidate) => candidate.id === commentId);
-        return Boolean(row && !row.deletedAt && (!targetsFinishingRunAgent || row.createdByRunId !== finishingRunId));
+        // The floor retires already-carried input. A never-carried OLD stays
+        // owed for its ONE sweep card, not for replay by a stale receipt. Fresh
+        // messages coalesced into an old receipt may still be owed delivery.
+        return Boolean(row && row.owed && !row.deletedAt && (!targetsFinishingRunAgent || row.createdByRunId !== finishingRunId));
       });
       // Promoting a saved wake whose comments a completed run already
       // received would deliver them twice and can reopen finished work.
@@ -434,7 +449,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       const containedSelfAuthoredComment = rows.some(
         (row) => targetsFinishingRunAgent && !row.deletedAt && row.createdByRunId === finishingRunId,
       );
-      return { liveNonSelfCommentIds, containedSelfAuthoredComment, deliveredCommentIds: [...delivered] };
+      return { liveNonSelfCommentIds, containedSelfAuthoredComment, deliveredCommentIds: [...delivered], conversationMovedOn };
     },
 
     async cancelDeferredWake({ companyId, wakeId, agentId, reason, now }) {
@@ -451,7 +466,29 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
           ),
         )
-        .returning({ id: agentWakeupRequests.id });
+        .returning();
+      const cancelled = rows[0];
+      if (cancelled && reason === "The conversation moved on") {
+        const payload = parseObject(cancelled.payload);
+        const context = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
+        const issueId = readNonEmptyString(payload.issueId);
+        if (issueId && (context.wakeReason ?? cancelled.reason) === CHAT_COMPLETION_WAKE_REASON) {
+          const deliveryIds = payload.chatCompletionDeliveryIds ?? context.chatCompletionDeliveryIds;
+          await supersedeStaleChatCompletionWake(tx, { companyId, conversationId: issueId, agentId, wakeId,
+            deliveryIds: Array.isArray(deliveryIds) ? deliveryIds.filter((id): id is string => typeof id === "string" && isUuidLike(id)) : [] });
+        } else if (issueId && cancelled.requestedByActorType === "system") {
+          // A system update is not a person input to resend. Its cancelled
+          // receipt owns ONE truthful note, including monitor/restore updates.
+          const commentIds = queuedCommentIdsFromWakePayload(payload).filter(isUuidLike);
+          const held = commentIds.length ? await tx.select({ body: issueComments.body }).from(issueComments).where(and(
+            eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+            inArray(issueComments.id, commentIds), isNull(issueComments.deletedAt))).orderBy(asc(issueComments.createdAt)) : [];
+          const named = held.map(comment => `Saved update: "${comment.body}".`);
+          await insertIssueComment(tx, { companyId, issueId, authorType: "system",
+            body: [...named, `The queued "${cancelled.reason ?? "system"}" update was not delivered as a turn because the conversation moved on.`].join("\n"),
+            metadata: { version: 1, sections: [], authorizationReason: `stale_system_wake:${wakeId}` } });
+        }
+      }
       return rows.length > 0;
     },
 
@@ -1116,11 +1153,16 @@ async function gatherPersonStoppedChatMessages(tx: Db, run: ReleaseRun, issue: I
     if (!plain) break;
     messages.push(wake);
   }
-  if (messages.length < 2) return;
+  const personStop = isPersonStoppedChatRun(run, issue);
+  if (messages.length === 0 || (messages.length < 2 && !personStop)) return;
   const [queue, ...rest] = messages;
   const all = [...new Set(messages.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload)))];
   const ids = [...restoredOrder.filter(id => all.includes(id)), ...all.filter(id => !restoredOrder.includes(id))];
-  await tx.update(agentWakeupRequests).set({ payload: withQueuedCommentIdsInWakePayload(queue!.payload, ids),
+  // Persist the Stop's exact source even for ONE held message. The latest run
+  // will be the person's next typed turn when this receipt finally drains.
+  await tx.update(agentWakeupRequests).set({ payload: withQueuedCommentIdsInWakePayload({ ...queue!.payload,
+    ...(personStop ? { personStopHold: { runId: run.id } } : {}),
+  }, ids),
     requestedAt: new Date(Math.min(...messages.map(wake => wake.requestedAt.getTime()))),
     coalescedCount: (queue!.coalescedCount ?? 0) + rest.length, updatedAt: now })
     .where(and(eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, queue!.id)));
