@@ -1173,6 +1173,28 @@ describe("renderPaperclipWakePrompt", () => {
     }
   });
 
+  it("tells a chat to answer each waiting message once, never again in its final reply", () => {
+    const line = "Answer each waiting message once, at the point you take it up. Do not restate earlier answers in your final reply.";
+    const comment = (id: string, body: string) => ({ id, issueId: "chat", body, bodyTruncated: false, createdAt: null, authorType: "user", authorId: "paul" });
+    const wake = (comments: ReturnType<typeof comment>[]) => ({
+      reason: "issue_commented",
+      issue: { id: "chat", status: "in_progress" },
+      comments,
+      commentWindow: { requestedCount: comments.length, includedCount: comments.length, missingCount: 0 },
+      fallbackFetchNeeded: false,
+    });
+    const work = comment("c1", "Write the release note.");
+    const questions = [work, comment("c2", "6 x 7?"), comment("c3", "capital of France?")];
+    for (const resumedSession of [false, true]) {
+      for (const comments of [[work], questions]) {
+        const chat = renderPaperclipWakePrompt(wake(comments), { resumedSession, conversationMode: true });
+        expect(chat.split(line).length - 1).toBe(1);
+        expect(renderPaperclipWakePrompt(wake(comments), { resumedSession })).not.toContain(line);
+      }
+      expect(renderPaperclipWakePrompt(wake([]), { resumedSession, conversationMode: true })).not.toContain(line);
+    }
+  });
+
   const ordinaryExternalChatWake = {
     reason: "External chat message received",
     externalChatProvider: " GitHub ",
