@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { agentRoutes } from "../../routes/agents.js";
+import { errorHandler } from "../../middleware/index.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -2104,4 +2108,100 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(notices).toHaveLength(1);
       expect(notices[0]!.body).toBe(NO_REPLY);
     });
+  // tB2 cut 2c (rf-5 f6 rows 104 + 107; port of fam-notices d75ee690's pause arm):
+  // the REAL agent Pause route (POST /api/agents/:id/pause -> lifecycle pause,
+  // then heartbeat.cancelActiveForAgent -> errorCode agent_paused) cancels the
+  // native turn carrying M. The person paused it: the sweep never writes the
+  // resend text; it writes the paused note on M, once, in place.
+  describe("pausenote-tb2: a person's own agent Pause of M's running turn", () => {
+    const PAUSE_STOPPED = "Managed Pi was paused before it answered your message. Send it again to continue.";
+    const routes = (f: { companyId: string; userId: string }) => {
+      const app = express(); app.use(express.json());
+      app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: f.userId, companyIds: [f.companyId],
+        memberships: [{ companyId: f.companyId, membershipRole: "owner", status: "active" }], isInstanceAdmin: true } as never; next(); });
+      app.use("/api", agentRoutes(db, {} as never)); app.use(errorHandler);
+      return app;
+    };
+    const runRow = async (id: string) => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)))[0]!;
+    // The lifecycle worker's 'complete' writes (pausing -> paused, resuming ->
+    // ready) are the only simulated steps; both routes are real.
+    const workerComplete = (f: { agentId: string }, lifecycleState: "paused" | "ready") => db.update(agents)
+      .set(lifecycleState === "ready" ? { lifecycleState, status: "idle" } : { lifecycleState }).where(eq(agents.id, f.agentId));
+    const bodies = async (f: { visible: () => Promise<Array<{ body: string }>> }) => (await f.visible()).map(n => n.body);
+    // A live native turn carrying M: the run plus the finalization row native
+    // runtime selection writes when it selects the native path
+    // (heartbeat/runtime-selection.ts, phase "observed").
+    const liveTurn = async (f: Awaited<ReturnType<typeof fixture>>, M: string) => {
+      const turn = await f.run({ commentId: M, status: "running" });
+      await db.update(heartbeatRuns).set({ startedAt: new Date() }).where(eq(heartbeatRuns.id, turn));
+      await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: turn, phase: "observed" });
+      return turn;
+    };
+
+    it("Pause route on M's live native turn: the sweep at +2 m / +11 m writes the paused note ONCE on M, never the resend text; after the real Resume the SAME note says it was paused before answering; M runs and is answered -> the note retires", async () => {
+      const f = await fixture();
+      const app = routes(f);
+      const M = await f.message("Please continue.");
+      const turn = await liveTurn(f, M);
+      const paused = await request(app).post(`/api/agents/${f.agentId}/pause`).send({});
+      expect(paused.status, JSON.stringify(paused.body)).toBe(200);
+      expect(await runRow(turn)).toMatchObject({ status: "cancelled", errorCode: "agent_paused" });
+      await workerComplete(f, "paused");
+      await settleAt(f, 2 * 60_000);
+      await settleAt(f, 11 * 60_000);
+      const whilePaused = await f.visible();
+      expect(whilePaused.map(n => n.body)).toEqual([PAUSED_TEXT]);
+      expect(whilePaused[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${M}`);
+      const resumed = await request(app).post(`/api/agents/${f.agentId}/resume`).send({});
+      expect(resumed.status, JSON.stringify(resumed.body)).toBe(200);
+      await workerComplete(f, "ready");
+      await settleAt(f, 2 * 60_000);
+      await settleAt(f, 11 * 60_000);
+      const after = await f.visible();
+      expect(after.map(n => n.body)).toEqual([PAUSE_STOPPED]);
+      expect(after[0]!.id).toBe(whilePaused[0]!.id);
+      expect(after[0]!.presentation).toMatchObject({ title: "Managed Pi was paused before it answered" });
+      expect(codeOf(after[0]!)).not.toBe("unclassified_failure");
+      expect(JSON.stringify(after)).not.toContain("Sending it again is safe");
+      // M runs after the Resume and is answered: the one answered reading retires the note.
+      const answering = await f.run({ commentId: M, status: "running" });
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, answering));
+      await f.reply(answering);
+      await settleAt(f, 12 * 60_000);
+      expect(await f.visible()).toHaveLength(0);
+    }, 60_000);
+
+    it("control: a FAILED (not paused) turn carrying M keeps its resend card", async () => {
+      const f = await fixture();
+      const M = await f.message("Please continue.");
+      await f.run({ commentId: M, status: "failed", errorCode: "adapter_failed", error: "provider_process_exited: exit 1" });
+      await settleAt(f, 2 * 60_000);
+      await settleAt(f, 11 * 60_000);
+      expect(await bodies(f)).toEqual([NOT_ANSWERED]);
+    });
+
+    // Base behaviour, unchanged: the budget's system stop (run-control.ts
+    // cancelBudgetScopeWork, errorCode "cancelled") is not the person's Pause.
+    // While held: the '<agent> is paused' note; after the hold is released the
+    // SAME note becomes the resend text, as at 62fcab5b.
+    it("control: a SYSTEM/budget pause of M's live turn follows the base behaviour (paused note while held, then the resend text)", async () => {
+      const f = await fixture();
+      const M = await f.message("Please continue.");
+      const turn = await liveTurn(f, M);
+      await db.update(agents).set({ status: "paused", lifecycleState: "paused", lifecycleHolds: ["budget"], pauseReason: "budget" })
+        .where(eq(agents.id, f.agentId));
+      await heartbeatService(db).cancelBudgetScopeWork({ companyId: f.companyId, scopeType: "agent", scopeId: f.agentId });
+      expect(await runRow(turn)).toMatchObject({ status: "cancelled", errorCode: "cancelled" });
+      await settleAt(f, 2 * 60_000);
+      await settleAt(f, 11 * 60_000);
+      const held = await f.visible();
+      expect(held.map(n => n.body)).toEqual([PAUSED_TEXT]);
+      await db.update(agents).set({ status: "idle", lifecycleState: "ready", lifecycleHolds: [], pauseReason: null })
+        .where(eq(agents.id, f.agentId));
+      await settleAt(f, 12 * 60_000);
+      const released = await f.visible();
+      expect(released.map(n => n.body)).toEqual([NOT_ANSWERED]);
+      expect(released[0]!.id).toBe(held[0]!.id);
+    }, 60_000);
+  });
 });
