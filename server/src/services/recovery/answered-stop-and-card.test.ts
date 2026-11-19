@@ -14,6 +14,7 @@ import { issueRoutes } from "../../routes/issues.js";
 import { heartbeatService } from "../heartbeat.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { answeredPersonMessageSql } from "../person-message-answer.js";
+import { nativeContinuationAttributionContext } from "../native-runtime/status-decision-committer.js";
 import { settleUnansweredPersonMessagesForTask, unansweredPersonMessageCommentCondition, UNANSWERED_CARD_ANSWER_NO_REPLY_TEXT, UNANSWERED_CARD_ANSWER_NO_RUN_TEXT,
   UNANSWERED_CARD_ANSWER_TEXT, UNANSWERED_MESSAGE_NO_REPLY_TEXT, UNANSWERED_MESSAGE_TEXT,
 } from "./unanswered-person-message.js";
@@ -312,6 +313,29 @@ describe.skipIf(!support.supported)("the sender's own Stop and an answerable car
       source: "native_status_decision" } }).where(eq(heartbeatRuns.id, successor));
     expect((await f.sweep(31)).noticed).toBe(1);
     expect(await f.notices()).toMatchObject([{ deletedAt: null, body: UNANSWERED_CARD_ANSWER_TEXT, metadata: key(f.cardId) }]);
+  }, 60_000);
+
+  // merged9 item 1, the TWO-HOP carry, card half (onm1-13rows.md 'GAP (probe D)': continuation-comment-input.ts:41
+  // ignored attributionInteractionIds). Both successors' contexts are built by the REAL producer
+  // (nativeContinuationAttributionContext, the schedule_retry effect, status-decision-committer.ts:962) over the run
+  // each continues; only the run rows and their outcomes are planted.
+  it("merged9 two-hop carry, card half: a native-status continuation of a native-status continuation still names the card answer (attribution only) -> no line", async () => {
+    const f = await cardFixture();
+    const resume = await f.resumeRun(f.cardId, "failed");
+    const hop = async (origin: string, status: "succeeded" | "failed", reply: boolean) => {
+      const carried = await nativeContinuationAttributionContext(db, { companyId: f.companyId, issueId: f.issueId, originRunId: origin });
+      const runId = await f.resumeRun(f.cardId, status, reply);
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, taskId: f.issueId, ...carried,
+        wakeReason: "issue_status_changed", source: "native_status_decision" } }).where(eq(heartbeatRuns.id, runId));
+      return { runId, carried };
+    };
+    const hop1 = await hop(resume, "failed", false);
+    expect(hop1.carried, "hop 1: the real producer names the answer").toEqual({ attributionInteractionIds: [f.cardId] });
+    const hop2 = await hop(hop1.runId, "succeeded", true);
+    expect(hop2.carried, "hop 2: still named, and only for attribution (never interactionId(s): no second prompt)")
+      .toEqual({ attributionInteractionIds: [f.cardId] });
+    for (const minutes of PASSES) expect(await f.sweep(minutes)).toEqual({ noticed: 0, pending: 0 });
+    expect(await f.notices(), "no notice was ever written").toHaveLength(0);
   }, 60_000);
 
   it("ruling 4: card answered, the run that took the answer FINISHES WITHOUT A REPLY -> exactly one finished-without-a-reply line", async () => {

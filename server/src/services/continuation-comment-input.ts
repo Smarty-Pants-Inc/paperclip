@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { heartbeatRuns, issueComments, issueThreadInteractions, type Db } from "@paperclipai/db";
-import { carryContinuationCommentInput } from "../modules/wake-queue/domain/continuation-comment-input.js";
+import { carryContinuationCommentInput, carryContinuationInteractionCandidates } from "../modules/wake-queue/domain/continuation-comment-input.js";
 import { answeredPersonMessageSql } from "./person-message-answer.js";
 import { runOwnInputIds, senderStoppedWhileAnswering } from "./recovery/person-stopped-message.js";
 
@@ -37,9 +37,7 @@ export async function pendingContinuationCommentInput(db: Pick<Db, "select">, in
  * time) and whose run the sender did not stop while it was answering. The successor's runtime selection
  * revalidates them (runtime-selection.ts materializeNativeInteractionResponses reads context.interactionIds). */
 async function pendingContinuationInteractionInput(db: Pick<Db, "select">, input: CarryInput): Promise<Record<string, unknown>> {
-  const context = (input.contextSnapshot && typeof input.contextSnapshot === "object" ? input.contextSnapshot : {}) as Record<string, unknown>;
-  const candidates = [...new Set([context.interactionId, ...(Array.isArray(context.interactionIds) ? context.interactionIds : [])]
-    .filter((id): id is string => typeof id === "string" && UUID.test(id)))];
+  const candidates = carryContinuationInteractionCandidates(input.contextSnapshot).filter(id => UUID.test(id));
   if (candidates.length === 0) return {};
   const senderStopped = senderStoppedCheck(db, input);
   const rows = await db.select({ id: issueThreadInteractions.id, authorUserId: issueThreadInteractions.resolvedByUserId })

@@ -154,19 +154,20 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       // producer saves a wake-intent id, not retryOfRunId/previousRunId.
       const carried = opts.fromProducer
         ? await nativeContinuationAttributionContext(db, { companyId, issueId, originRunId: sourceRunId }) : {};
-      const [contract] = await db.insert(completionContracts).values({ companyId, issueId, revision: 1,
+      const revision = (await db.select({ id: completionContracts.id }).from(completionContracts).where(eq(completionContracts.issueId, issueId))).length + 1;
+      const [contract] = await db.insert(completionContracts).values({ companyId, issueId, revision,
         schemaVersion: "v1", policyVersion: "v1", risk: "low", completionAuthority: "agent", incompleteCriteriaPolicy: "block",
-        contractJson: {}, canonicalSha256: "47".repeat(32), createdByActorType: "system", createdByActorId: "fixture" }).returning();
+        contractJson: {}, canonicalSha256: String(46 + revision).repeat(32), createdByActorType: "system", createdByActorId: "fixture" }).returning();
       await db.update(heartbeatRuns).set({ completionContractId: contract!.id }).where(eq(heartbeatRuns.id, sourceRunId));
       const [result] = await db.insert(nativeRunResults).values({ companyId, issueId, runId: sourceRunId,
         completionContractId: contract!.id, serverFingerprint: "fixture", schemaStatus: "accepted",
         canonicalSha256: "fixture", resultJson: {} }).returning();
       const [assessment] = await db.insert(workAssessments).values({ companyId, issueId, runId: sourceRunId,
         contractId: contract!.id, resultId: result!.id, triggerKind: "run_terminal", triggerActorCompanyId: companyId,
-        priorIssueStatus: "in_review", priorStatusVersion: 1, policyVersion: "v1", assessmentJson: {}, inputDigest: "fixture" }).returning();
+        priorIssueStatus: "in_review", priorStatusVersion: 1, policyVersion: "v1", assessmentJson: {}, inputDigest: revision === 1 ? "fixture" : `fixture-${revision}` }).returning();
       const [decision] = await db.insert(statusDecisions).values({ companyId, issueId, runId: sourceRunId,
-        assessmentId: assessment!.id, decisionVersion: 1, policyVersion: "v1", fromStatus: "in_review", toStatus: "in_progress",
-        reasonCode: "native_run_failed_continuation", decisionJson: {}, decisionDigest: "fixture", applicationState: "applied" }).returning();
+        assessmentId: assessment!.id, decisionVersion: revision, policyVersion: "v1", fromStatus: "in_review", toStatus: "in_progress",
+        reasonCode: "native_run_failed_continuation", decisionJson: {}, decisionDigest: revision === 1 ? "fixture" : `fixture-${revision}`, applicationState: "applied" }).returning();
       const target = await run({ status, wakeReason: "issue_status_changed" });
       const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
         reason: "issue_status_changed", status: "coalesced", runId: target, requestedByActorType: "system",
@@ -726,6 +727,44 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
     }
     expect(await readContinuationCommentInput(db, { ...f, runId: failed })).toMatchObject({ wakeCommentIds: [commentId] });
+  });
+
+  // merged9 item 1, the TWO-HOP carry (onm1-13rows.md 'GAP (probe D)'; RULING-1119 01:23Z: a real producer that
+  // CONTINUES M's turn without writing M into its own input is a PRODUCER GAP: carry it, attribution only).
+  // Both successors' inputs are built by the REAL producer, nativeContinuationAttributionContext (the function the
+  // schedule_retry effect calls, status-decision-committer.ts:962), over the run each continues; only the run rows
+  // and their outcomes are planted (fixture nativeSuccessor, fromProducer). Hop 1's context names M in
+  // attributionCommentIds / conversationReplyBoundaryCommentId ONLY; the one carry
+  // (modules/wake-queue/domain/continuation-comment-input.ts) must read those for hop 2.
+  // A second schedule_retry over a native-status successor is real when the successor's failed turn does not own the
+  // provider-failure decision (native-run-finalizer.ts:1875 failedTurnContinuationUsed is then false ->
+  // status-arbiter.ts:470-478 schedule_retry again -> status-decision-committer.ts:962).
+  it("merged9 two-hop carry: a native-status continuation of another native-status continuation still names M (attribution only) -> its reply answers M, 0 notices", async () => {
+    const f = await fixture();
+    const commentId = await f.message("What about my follow-up?");
+    const failed = await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "native_workspace_required" });
+    const hop1 = await f.nativeSuccessor(failed, "failed", { fromProducer: true });
+    await db.update(heartbeatRuns).set({ errorCode: "adapter_failed", error: "pi_output_truncated" }).where(eq(heartbeatRuns.id, hop1));
+    const hop2 = await f.nativeSuccessor(hop1, "succeeded", { fromProducer: true });
+    const contexts = await Promise.all([hop1, hop2].map(async id => (await db.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, id)))[0]!.contextSnapshot as Record<string, unknown>));
+    for (const [index, context] of contexts.entries()) {
+      expect(context, `hop ${index + 1}: the real producer names M`).toMatchObject({
+        attributionCommentIds: [commentId], conversationReplyBoundaryCommentId: commentId });
+      // Attribution ONLY: none of the fields that put a comment into the successor's model input (the wake prompt reads
+      // wakeCommentId(s) / commentId, the first-turn re-delivery reads firstTurnQueuedInput). M's text reaches the
+      // successor once, from the conversation it continues, never as a second user turn.
+      expect(["wakeCommentId", "wakeCommentIds", "commentId", "commentIds", "firstTurnQueuedInput", "paperclipWake"]
+        .filter(key => key in context), `hop ${index + 1}: nothing re-injects M`).toEqual([]);
+    }
+    await f.reply(hop2);
+    for (let pass = 0; pass < 2; pass++) {
+      expect(await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId })).toEqual({ kind: "answered" });
+      expect(await f.visible(), "no notice beside a visible answer").toHaveLength(0);
+    }
+    expect((await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system"))))
+      .filter(c => String((c.metadata as Record<string, unknown> | null)?.authorizationReason ?? "").startsWith("unanswered_message:")),
+      "no unanswered notice was ever written").toHaveLength(0);
   });
 
   it("RFL F4: an unrelated timer run's success is not evidence; the message's own path gives exactly one notice", async () => {
