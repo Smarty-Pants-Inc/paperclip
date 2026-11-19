@@ -33,6 +33,7 @@ import { agentChatDraft } from "@/lib/agent-chat-draft";
 import { trackRecentProject } from "@/lib/recent-projects";
 import { ExecutionBlockerNotice } from "../components/ExecutionBlockerNotice";
 import type { TaskComposerPause } from "../components/task-chat/TaskChatPausedTakeover";
+import { queueHeldByPersonStop } from "../components/task-chat/TaskChatQueuedMessages";
 import { TaskDetailTasksPanel } from "@/components/task-detail/TaskDetailTasksPanel";
 import { IssueCreatedFromNote } from "@/components/task-detail/IssueCreatedFromNote";
 import { EmailThreadProvider } from "../components/EmailMessageCard";
@@ -3876,6 +3877,17 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     boardAccess,
   );
   const canConfirmOwnerStop = canBoardConfirmOwnerStop(selectedCompanyId, boardAccess);
+  // The chat's own queue read (the same cache the held bar draws from; this
+  // observer never fetches). Its person-Stop reason is the one fact that
+  // hides the failed-attempt banner while the stopped bar stands.
+  const noticeQueueIssueId = issue?.id ?? "";
+  const { data: noticeQueuedCommentQueue } = useQuery({
+    queryKey: queryKeys.issues.queuedComments(noticeQueueIssueId),
+    queryFn: async () => normalizeIssueQueuedCommentQueue(
+      await issuesApi.getQueuedComments(noticeQueueIssueId), noticeQueueIssueId),
+    enabled: false,
+  });
+  const heldByPersonStop = queueHeldByPersonStop(noticeQueuedCommentQueue);
   // Retained-file recovery reports whether it offers its own control. Keep the
   // task Retry only when the server's execution blocker allows it and this recovery
   // surface does not already own the control.
@@ -8365,6 +8377,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           {resolvedDetailTab === "chat" && (
             // TODO(D10): replace Retry with a fresh thread from history.
             <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption} blockers={issue.blockedBy}
+              heldByPersonStop={heldByPersonStop}
               issueId={issue.id} companyId={issue.companyId} agentName={agentMap.get(issue.assigneeAgentId ?? "")?.name} projectName={issue.project?.name}
               canRetry={canResolveBoardRecoveryAction &&
                 !(issue.executionBlocker?.canRetry === false &&
