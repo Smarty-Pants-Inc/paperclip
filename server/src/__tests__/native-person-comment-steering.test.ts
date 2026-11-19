@@ -359,7 +359,8 @@ async function fixture(label: string, conversation = true, earlyBodies: string[]
       companyId, issueId, runId, commands: peer.requests, outcomes: [...owner.outcomes],
       requestSettlements: peer instanceof B6RealPiPeer ? peer.requestSettlements : undefined,
       nativeEventAppends: nativeEventAppends.get(runId),
-      databaseActivity: await db.execute(sql`select pid, state, wait_event_type, wait_event,
+      databaseActivity: await db.execute(sql`select clock_timestamp() as sampled_at, pid, state,
+        query_start, xact_start, clock_timestamp() - query_start as query_age, wait_event_type, wait_event,
         pg_blocking_pids(pid) as blocking_pids, left(query, 400) as query
         from pg_stat_activity where datname = current_database() and pid <> pg_backend_pid()`),
       runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)),
