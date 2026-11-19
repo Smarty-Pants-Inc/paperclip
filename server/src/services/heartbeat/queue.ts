@@ -4007,12 +4007,58 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           if (opts.failedRunId) {
             // The issue lock makes double-clicks and network retries adopt the
             // same successor, including after it has already finished.
-            const [previousRetry] = await tx.select().from(heartbeatRuns).where(and(
+            // RETRY-DEDUP-PER-MESSAGE: ownership is (failedRunId, the selected message ids). A
+            // second card's Retry for the same failed run must not return a successor that
+            // never carries its message.
+            const previousRetries = await tx.select().from(heartbeatRuns).where(and(
               eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId),
               eq(heartbeatRuns.retryOfRunId, opts.failedRunId),
               sql`${heartbeatRuns.contextSnapshot}->>'wakeReason' = 'retry_failed_run'`,
-            )).orderBy(desc(heartbeatRuns.createdAt)).limit(1);
-            if (previousRetry) return { kind: "replayed" as const, run: previousRetry };
+            )).orderBy(desc(heartbeatRuns.createdAt));
+            const idsOf = (snapshot: unknown) => {
+              const record = parseObject(snapshot);
+              return [...new Set([...(Array.isArray(record.wakeCommentIds) ? record.wakeCommentIds : []), record.wakeCommentId]
+                .filter((id): id is string => typeof id === "string" && id.length > 0))];
+            };
+            const selectedIds = idsOf(enrichedContextSnapshot);
+            if (previousRetries.length > 0) {
+              const missing = selectedIds.filter(id => !previousRetries.some(run => idsOf(run.contextSnapshot).includes(id)));
+              if (missing.length === 0) {
+                const owner = previousRetries.find(run => selectedIds.every(id => idsOf(run.contextSnapshot).includes(id)));
+                return { kind: "replayed" as const, run: owner ?? previousRetries[0]! };
+              }
+              const threadOrder = async (ids: string[]) => {
+                const rows = await tx.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments)
+                  .where(and(eq(issueComments.companyId, issue.companyId), inArray(issueComments.id, ids)));
+                const at = new Map(rows.map(row => [row.id, +new Date(row.createdAt)]));
+                return [...ids].sort((a, b) => (at.get(a) ?? Infinity) - (at.get(b) ?? Infinity));
+              };
+              const notStarted = previousRetries.find(run => run.status === "queued" && !run.startedAt);
+              if (notStarted) {
+                const merged = await threadOrder([...new Set([...idsOf(notStarted.contextSnapshot), ...missing])]);
+                const [updated] = await tx.update(heartbeatRuns).set({
+                  contextSnapshot: { ...parseObject(notStarted.contextSnapshot), wakeCommentIds: merged, wakeCommentId: merged[merged.length - 1] },
+                  updatedAt: new Date(),
+                }).where(and(eq(heartbeatRuns.id, notStarted.id), eq(heartbeatRuns.status, "queued"), isNull(heartbeatRuns.startedAt)))
+                  .returning();
+                if (updated) return { kind: "replayed" as const, run: updated };
+              }
+              // A Retry already parked behind the started successor owns these messages: keep it single.
+              const parked = await tx.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+                eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
+                sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+                sql`${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->>'wakeReason' = 'retry_failed_run'`,
+                sql`${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->>'previousRunId' = ${opts.failedRunId}`,
+              ));
+              if (missing.every(id => parked.some(row => idsOf(parseObject(row.payload)[DEFERRED_WAKE_CONTEXT_KEY]).includes(id))))
+                return { kind: "deferred" as const };
+              // The successor already started: mint a new successor carrying only the missing messages.
+              const ordered = await threadOrder(missing);
+              enrichedContextSnapshot.wakeCommentIds = ordered;
+              enrichedContextSnapshot.wakeCommentId = ordered[ordered.length - 1];
+              if (readNonEmptyString(enrichedContextSnapshot.commentId)) enrichedContextSnapshot.commentId = ordered[ordered.length - 1];
+            }
           }
 
           let reconciledSourceRunId: string | null = null;
