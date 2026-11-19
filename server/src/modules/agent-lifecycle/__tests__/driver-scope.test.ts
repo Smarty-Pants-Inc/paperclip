@@ -15,8 +15,9 @@ describe("lifecycle host stop scope", () => {
     expect(await driver.runHost({ id: "target", companyId: "company", lifecycleState: "pausing", lifecycleHolds: ["manual"],
       lifecycleVersion: 2, lifecycleRequiredPluginIds: [], lifecycleError: null, lifecycleOperation: null } as never)).toBe("complete");
     expect(update).toHaveBeenCalledOnce();
-    // A pause keeps the messages it deferred (work-intent outbox).
-    expect(stop).toHaveBeenCalledWith(["target"], "Agent lifecycle stop requested", { preservePauseDeferred: true });
+    // A pause keeps the messages it deferred (work-intent outbox) and completes on the
+    // server's own run record (serverRecordOnly), never on the provider box.
+    expect(stop).toHaveBeenCalledWith(["target"], "Agent lifecycle stop requested", { preservePauseDeferred: true, serverRecordOnly: true });
     expect(db.select).not.toHaveBeenCalled();
   });
 });
