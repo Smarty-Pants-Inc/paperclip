@@ -39,6 +39,12 @@ import { useDraftOwner } from "@/hooks/useDraftOwner";
 import { useRequestOwnerBinding } from "@/hooks/useRequestOwnerBinding";
 import { PendingSendNotice } from "@/components/PendingSendNotice";
 import {
+  isMacPlatform,
+  sendChordIntent,
+  sendChordLabels,
+  type CommentDeliveryIntent,
+} from "@/api/comment-delivery";
+import {
   ArrowUp,
   RotateCw,
   Square,
@@ -115,6 +121,8 @@ interface TaskChatComposerProps {
     attachmentIds?: string[],
     clientRequestId?: string,
     runSettings?: ComposerRunSettings,
+    /** Omitted for the default Send; the server decides steer vs queue. */
+    deliveryIntent?: CommentDeliveryIntent,
   ) => Promise<void> | void;
   /** New tasks share the editor and controls, but retain their draft until creation succeeds. */
   creation?: {
@@ -431,6 +439,7 @@ export function TaskChatComposer({
   const streamlined = useStreamlinedTaskChatPresentation();
   const submitKey = useComposerSubmitKey();
   const stopControl = useComposerStop(onStop, stopPending, confirmedStoppedRunIds);
+  const [sendMenuOpen, setSendMenuOpen] = useState(false);
   const [localBody, setBody] = useState(() => (draftKey ? loadDraft(draftKey) : ""));
   const body = creation ? creation.value : localBody;
   const [submitting, setSubmitting] = useState(false);
@@ -900,6 +909,11 @@ export function TaskChatComposer({
     body.trim().length === 0 &&
     attachments.length === 0 &&
     Boolean(onStop || stopControl.stopping);
+  // The agent is working: Send steers by default (the server decides), and ▾
+  // offers Steer, Queue and Interrupt for this one message.
+  const agentWorking = Boolean(onStop) && !queuedEdit && !creation;
+  const macChords = isMacPlatform();
+  const chordLabels = sendChordLabels(macChords, submitKey);
   const uploadPending = attachments.some((item) => item.status === "uploading");
   const uploadFailed = attachments.some((item) => item.status === "error");
   const takeoverVisible = Boolean(takeover && !pause);
@@ -937,7 +951,8 @@ export function TaskChatComposer({
 
   const canResetPausedConversation = conversationMode && !queuedEdit && body.trim() === "/new" && attachments.length === 0;
 
-  async function submit() {
+  async function submit(deliveryIntent?: CommentDeliveryIntent) {
+    setSendMenuOpen(false);
     if (disabled || (pause && !canResetPausedConversation)) return;
     if (creation) {
       if (submittingRef.current || uploadPending || uploadFailed || creation.submitDisabled || (!bodyRef.current.trim() && !creation.canSubmitWithoutBody)) return;
@@ -1128,6 +1143,7 @@ export function TaskChatComposer({
         ...(reassignment ? { reassignment } : {}),
         ...(attachmentIds.length ? { attachmentIds } : {}),
         ...(runSettings ? { runSettings: runSettings as unknown as Record<string, unknown> } : {}),
+        ...(deliveryIntent ? { deliveryIntent } : {}),
       };
       if (draftKey) {
         saveDraft(draftKey, submittedBody);
@@ -1136,7 +1152,9 @@ export function TaskChatComposer({
         changeBody(bodyRef.current);
       }
       sentModeChoice.current = { attemptId, generation: submittedModeGeneration };
-      if (runSettings) {
+      if (deliveryIntent) {
+        await onAdd(fullBody, reopen, reassignment, attachmentIds.length ? attachmentIds : undefined, attemptId, runSettings ?? undefined, deliveryIntent);
+      } else if (runSettings) {
         await onAdd(fullBody, reopen, reassignment, attachmentIds.length ? attachmentIds : undefined, attemptId, runSettings);
       } else {
         await onAdd(fullBody, reopen, reassignment, attachmentIds.length ? attachmentIds : undefined, attemptId);
@@ -1231,7 +1249,8 @@ export function TaskChatComposer({
       submission.attemptId,
     ] as const;
     try {
-      if (request.runSettings) await onAdd(...args, request.runSettings as unknown as ComposerRunSettings);
+      if (request.deliveryIntent) await onAdd(...args, request.runSettings as unknown as ComposerRunSettings | undefined, request.deliveryIntent);
+      else if (request.runSettings) await onAdd(...args, request.runSettings as unknown as ComposerRunSettings);
       else await onAdd(...args);
     } catch (error) {
       if (!isCurrentAccount()) return "pending";
@@ -1396,6 +1415,16 @@ export function TaskChatComposer({
         // period by key and code because hardware keyboards on iOS can omit
         // `code` for Cmd+Period.
         if (disabled || queuedEdit) return;
+        if (!creation && !e.nativeEvent.isComposing) {
+          const chordIntent = sendChordIntent(e.nativeEvent, macChords);
+          if (chordIntent) {
+            e.preventDefault();
+            e.stopPropagation();
+            // Idle, a chord is an ordinary send.
+            void submit(agentWorking ? chordIntent : undefined);
+            return;
+          }
+        }
         const isPeriod = e.key === "." || e.code === "Period";
         const isModeShortcut =
           (isPeriod && (e.metaKey || e.ctrlKey)) ||
@@ -1684,6 +1713,9 @@ export function TaskChatComposer({
                 Cancel
               </button>
             ) : null}
+            {/* `task-chat-send` wraps the Send button; the button keeps its
+                existing `task-chat-composer-send` id, which e2e suites use. */}
+            <span className="inline-flex shrink-0" data-testid={showStop ? undefined : "task-chat-send"}>
             <button
               type="button"
               onClick={() => void (showStop ? stopControl.stop() : submit())}
@@ -1712,7 +1744,9 @@ export function TaskChatComposer({
                       ? "Waiting for upload to finish"
                       : uploadFailed
                         ? "Remove the failed attachment to send"
-                        : `${creation?.submitLabel ?? "Send"} (${submitKey === "mod-enter" ? "⌘/Ctrl+Enter" : "Enter"})`
+                        : agentWorking
+                          ? `Send: steers while the agent works (${chordLabels.send})`
+                          : `${creation?.submitLabel ?? "Send"} (${submitKey === "mod-enter" ? "⌘/Ctrl+Enter" : "Enter"})`
               }
               aria-label={
                 showStop
@@ -1735,6 +1769,7 @@ export function TaskChatComposer({
               data-testid={
                 showStop ? "task-chat-composer-stop" : "task-chat-composer-send"
               }
+              data-send-default={!showStop && agentWorking ? "steer" : undefined}
               data-slot="icon-button"
             >
               {submitting || (showStop && stopControl.stopping) ? (
@@ -1745,6 +1780,23 @@ export function TaskChatComposer({
                 <ArrowUp className="h-4 w-4" aria-hidden />
               )}
             </button>
+            </span>
+            {agentWorking && !showStop ? (
+              <SendModeMenu
+                open={sendMenuOpen}
+                onOpenChange={setSendMenuOpen}
+                labels={chordLabels}
+                disabled={
+                  disabled ||
+                  submitting ||
+                  !!uncertainSubmission ||
+                  uploadPending ||
+                  uploadFailed ||
+                  (body.trim().length === 0 && attachedRefs.length === 0)
+                }
+                onPick={(intent) => void submit(intent)}
+              />
+            ) : null}
             </div>
           </div>
           {stopControl.error ? (
@@ -1753,6 +1805,91 @@ export function TaskChatComposer({
             </p>
           ) : null}
       </div>
+    </div>
+  );
+}
+
+const SEND_MODE_ROWS: Array<{
+  intent: CommentDeliveryIntent;
+  label: string;
+  description: string;
+  chord: (labels: ReturnType<typeof sendChordLabels>) => string;
+}> = [
+  { intent: "steer", label: "Steer", description: "Delivered at the agent's next step, without stopping it.", chord: (labels) => labels.steer },
+  { intent: "queue", label: "Queue", description: "Sent after the agent finishes this turn.", chord: (labels) => labels.queue },
+  { intent: "interrupt", label: "Interrupt", description: "Stops the current step and sends now.", chord: (labels) => labels.interrupt },
+];
+
+/** Send ▾ while the agent works: Steer, Queue and Interrupt, each for this one message. */
+function SendModeMenu({
+  open,
+  onOpenChange,
+  labels,
+  disabled,
+  onPick,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  labels: ReturnType<typeof sendChordLabels>;
+  disabled: boolean;
+  onPick: (intent: CommentDeliveryIntent) => void;
+}) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: MouseEvent | KeyboardEvent) => {
+      if (event instanceof KeyboardEvent ? event.key === "Escape" : !rootRef.current?.contains(event.target as Node)) {
+        onOpenChange(false);
+      }
+    };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", close);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", close);
+    };
+  }, [open, onOpenChange]);
+  return (
+    <div ref={rootRef} className="relative shrink-0">
+      <button
+        type="button"
+        aria-label="Send options"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title="Choose how this message is sent"
+        disabled={disabled}
+        onClick={() => onOpenChange(!open)}
+        data-testid="task-chat-send-menu-toggle"
+        className="flex size-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50 max-sm:size-11"
+      >
+        <ChevronDown className="h-4 w-4" aria-hidden />
+      </button>
+      {open ? (
+        <div
+          role="menu"
+          aria-label="Send options"
+          className="absolute bottom-full right-0 z-50 mb-2 w-72 max-w-[calc(100vw-2rem)] rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md"
+        >
+          {SEND_MODE_ROWS.map((row) => (
+            <button
+              key={row.intent}
+              type="button"
+              role="menuitem"
+              onClick={() => onPick(row.intent)}
+              data-testid={`task-chat-send-menu-${row.intent}`}
+              className="flex min-h-11 w-full flex-col items-start gap-0.5 rounded-md px-2.5 py-2 text-left hover:bg-accent focus-visible:bg-accent focus-visible:outline-none"
+            >
+              <span className="flex w-full items-center justify-between gap-3 text-sm font-medium">
+                <span>{row.label}</span>
+                <kbd className="font-sans text-xs font-normal text-muted-foreground" data-testid={`task-chat-send-menu-${row.intent}-chord`}>
+                  {row.chord(labels)}
+                </kbd>
+              </span>
+              <span className="text-xs text-muted-foreground">{row.description}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }

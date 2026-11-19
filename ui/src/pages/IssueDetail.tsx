@@ -76,6 +76,7 @@ import {
 } from "@/hooks/useSharedPolling";
 import { ApiError } from "../api/client";
 import { issuesApi } from "../api/issues";
+import { readCommentDelivery, type CommentDeliveryIntent } from "../api/comment-delivery";
 import { classifySendFailure } from "../lib/pending-send";
 import { useUpdateIssueMutation } from "../hooks/useUpdateIssueMutation";
 import { describeInteractionResolutionFailure, interactionResolutionErrorMessage } from "../lib/interaction-resolution-error";
@@ -1286,6 +1287,7 @@ type IssueDetailChatTabProps = {
   initialHistoryError?: boolean;
   onRetryInitialHistory?: () => void;
   locallyQueuedCommentRunIds: ReadonlyMap<string, string>;
+  steeringUnavailableReason?: string | null;
   interactions: IssueThreadInteraction[];
   documents: IssueDocumentSummary[];
   createdTasks: Issue[];
@@ -1346,6 +1348,7 @@ type IssueDetailChatTabProps = {
     attachmentIds?: string[],
     clientRequestId?: string,
     runSettings?: ComposerRunSettings,
+    deliveryIntent?: CommentDeliveryIntent,
   ) => Promise<void>;
   onImageUpload: (file: File) => Promise<string>;
   onAttachImage: (file: File) => Promise<IssueAttachment | void>;
@@ -1446,6 +1449,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   initialHistoryError = false,
   onRetryInitialHistory,
   locallyQueuedCommentRunIds,
+  steeringUnavailableReason = null,
   interactions,
   documents,
   createdTasks,
@@ -2834,6 +2838,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             onAttachImage={onAttachImage}
             onInterruptQueued={interruptQueuedComments}
             queuedCommentQueue={visibleQueuedCommentQueue}
+            steeringUnavailableReason={steeringUnavailableReason}
             onEditQueuedComment={editQueuedComment}
             onReorderQueuedComments={reorderQueuedComments}
             onSteerQueuedComment={steerQueuedComment}
@@ -3386,6 +3391,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const [locallyQueuedCommentRunIds, setLocallyQueuedCommentRunIds] = useState<
     Map<string, string>
   >(() => new Map());
+  const [steeringUnavailableReason, setSteeringUnavailableReason] = useState<string | null>(null);
   const [pendingCommentComposerFocusKey, setPendingCommentComposerFocusKey] =
     useState(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -5160,8 +5166,9 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   });
 
   const addComment = useAccountBoundMutation({
-    mutationFn: async ({ body, reopen, interrupt, attachmentIds, clientRequestId, runSettings }: {
+    mutationFn: async ({ body, reopen, interrupt, attachmentIds, clientRequestId, runSettings, deliveryIntent }: {
       body: string; reopen?: boolean; interrupt?: boolean; attachmentIds?: string[]; clientRequestId?: string; runSettings?: ComposerRunSettings;
+      deliveryIntent?: CommentDeliveryIntent;
     }, { assertCurrentAccount }) => {
       if (issue?.conversationAgentId) clearLegacyChatMessageRequests(`${issue.companyId}:${currentUserId}:${issue.conversationAgentId}`);
       const writableIssueId = await resolveWritableIssueId();
@@ -5183,7 +5190,9 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         assertCurrentAccount();
         queryClient.setQueryData(queryKeys.issues.detail(writableIssueId), updated);
       }
-      return issuesApi.addComment(writableIssueId, body, reopen, interrupt, attachmentIds, clientRequestId ?? createUuid());
+      return deliveryIntent
+        ? issuesApi.addComment(writableIssueId, body, reopen, interrupt, attachmentIds, clientRequestId ?? createUuid(), deliveryIntent)
+        : issuesApi.addComment(writableIssueId, body, reopen, interrupt, attachmentIds, clientRequestId ?? createUuid());
     },
     onMutate: async ({ body, reopen, interrupt }) => {
       // Start cache cancellation immediately but do not put it in front of the
@@ -5200,11 +5209,15 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       const previousIssue = queryClient.getQueryData<Issue>(
         queryKeys.issues.detail(issueId!),
       );
-      const queuedComment = !interrupt
+      // While the agent works, the SERVER decides steer vs queue (steering
+      // is the default). Until its answer the composer shows its pending
+      // state only: no bubble in the thread and no row in the waiting list.
+      const workingRun = !interrupt
         ? readIssueRunStateFromCache(queryClient, issueId!, issue)
             .interruptibleIssueRun
         : null;
-      const optimisticComment = issue
+      const queuedComment = null as { id: string } | null;
+      const optimisticComment = issue && !workingRun
         ? createOptimisticIssueComment({
             companyId: issue.companyId,
             issueId: issue.id,
@@ -5230,6 +5243,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       return {
         optimisticCommentId: optimisticComment?.clientId ?? null,
         queuedCommentTargetRunId: queuedComment?.id ?? null,
+        workingRunId: workingRun?.id ?? null,
         previousIssue,
       };
     },
@@ -5265,6 +5279,23 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
             tone: "error",
           });
         }
+      }
+      if (context?.workingRunId) {
+        // Show exactly what the server answered for this POST.
+        const delivery = readCommentDelivery(comment);
+        setSteeringUnavailableReason(
+          delivery.kind === "queued" ? delivery.steeringUnavailableReason : null,
+        );
+        if (delivery.kind === "queued") {
+          setLocallyQueuedCommentRunIds((current) => {
+            const next = new Map(current);
+            next.set(comment.id, context.workingRunId!);
+            return next;
+          });
+        }
+        void queryClient.invalidateQueries({
+          queryKey: queryKeys.issues.queuedComments(issueId ?? comment.issueId),
+        });
       }
       if (context?.queuedCommentTargetRunId) {
         setLocallyQueuedCommentRunIds((current) => {
@@ -7046,6 +7077,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       attachmentIds?: string[],
       clientRequestId?: string,
       runSettings?: ComposerRunSettings,
+      deliveryIntent?: CommentDeliveryIntent,
     ) => {
       if (!issue?.conversationAgentId && (reassignment || runSettings)) {
         await addCommentAndReassign.mutateAsync({
@@ -7058,7 +7090,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         });
         return;
       }
-      await addComment.mutateAsync({ body, reopen, attachmentIds, clientRequestId, runSettings });
+      await addComment.mutateAsync(
+        deliveryIntent
+          ? { body, reopen, attachmentIds, clientRequestId, runSettings, deliveryIntent }
+          : { body, reopen, attachmentIds, clientRequestId, runSettings },
+      );
     },
     [addComment, addCommentAndReassign, issue?.conversationAgentId],
   );
@@ -8833,6 +8869,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     void refetchWorkProducts();
                   }}
                   locallyQueuedCommentRunIds={locallyQueuedCommentRunIds}
+                  steeringUnavailableReason={steeringUnavailableReason}
                   interactions={interactions}
                   documents={issue.documentSummaries ?? []}
                   createdTasks={threadCreatedTasks}
