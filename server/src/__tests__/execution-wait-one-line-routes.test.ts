@@ -7,7 +7,7 @@ import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, authUsers, companies, companyMemberships, createDb, environmentLeases,
-  heartbeatRuns, issueComments, issues, nativeRunFinalizations } from "@paperclipai/db";
+  heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { agentRoutes } from "../routes/agents.js";
@@ -405,5 +405,64 @@ describe.skipIf(!support.supported)("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rea
       expect(run.status).toBe("queued");
       expect.soft(comments.filter((row: any) => row.authorType === "system" && row.metadata?.recoveryResponsibility !== "system")).toEqual([]);
     }
+  });
+  // RFL 06:11Z / rf-3 06:10Z (merged10 finding): a saved wake that waits behind the sender's own STANDING Stop hold
+  // counts as waiting whatever its deferred status. The hold rule (unanswered-person-message.ts
+  // STOP_HOLD_YIELDS_TO_SENDER_STOP) read only "queued" and "deferred_issue_execution", so a wake in status
+  // "deferred" (the S10-1 record's status) was not waiting: the sweep said "no run started" at once.
+  // REAL: the sender's Stop (POST /heartbeat-runs/:runId/cancel), which leaves its board-owned hold STANDING (it is
+  // asserted, and NOT resolved here, unlike the rows above whose recoverableSource ends it), then the comment route
+  // (POST /issues/:id/comments -> heartbeat enqueueWakeup), whose admission saves the wake and its remote_cleanup
+  // wait. Outcomes are read from the real GETs. planted, as in the rows above: the prior execution and the remote
+  // environment without a stop receipt. PLANTED, and named so, beside the real-route reads of the same shape: the
+  // saved wake's status "deferred" (no admission path on this line writes that status; the real one is
+  // "deferred_issue_execution") and, last, that wake without its stored wait.
+  // The TASK surface is not this shape: under the same standing hold its real admission queues a RUN that carries
+  // the message (upstream's header is its one line; row "queued run stays in the upstream header" above).
+  it("chat: a deferred remote_cleanup wake behind the sender's own STANDING Stop hold is waiting: no 'no run started' line (real Stop + real comment admission)", async () => {
+    const f = await plantedHistory(true);
+    await stop(f);
+    await db.insert(environmentLeases).values({ companyId: f.companyId, heartbeatRunId: f.sourceId,
+      provider: "daytona", providerLeaseId: `planted-${randomUUID()}`, status: "pending_cleanup", leasePolicy: "ephemeral" });
+    const standingHold = async () => (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId)))
+      .filter(hold => ["active", "escalated"].includes(hold.status))
+      .map(hold => [hold.kind, hold.status, hold.ownerType, (hold.evidence as Record<string, unknown> | null)?.runId]);
+    expect(await standingHold(), "the real Stop route left its board-owned hold standing").toEqual([["active_run_watchdog", "active", "board", f.sourceId]]);
+    const stopped = (await request(f.client).get(`/api/heartbeat-runs/${f.sourceId}`).expect(200)).body;
+    expect(stopped, "the real Stop route recorded the sender").toMatchObject({ status: "cancelled",
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "m10-person" } });
+    const { message, wake } = await send(f);
+    expect(message.authorUserId).toBe("m10-person");
+    expect([wake.status, wake.runId, wake.payload?.executionWait], "what real admission saved").toEqual([
+      "deferred_issue_execution", null, expect.objectContaining({ reason: "remote_cleanup", message: REMOTE_WORDS })]);
+    const t0 = wake.requestedAt.getTime();
+    const read = async (shape: string) => {
+      const kinds: string[] = [];
+      for (const elapsed of [0, 10_000, 120_000, 599_999, 660_000]) {
+        kinds.push((await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId, now: new Date(t0 + elapsed) })).kind);
+        const comments = (await request(f.client).get(`/api/issues/${f.issueId}/comments`).expect(200)).body;
+        expect.soft(comments.filter((row: any) => row.authorType === "system" && row.metadata?.recoveryResponsibility !== "system")
+          .map((row: any) => row.body), `${shape}, +${elapsed} ms: no notice, and never the no-run words`).toEqual([]);
+      }
+      const queue = (await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
+      expect(await standingHold(), `${shape}: the Stop's hold still stands`).toHaveLength(1);
+      return { kinds, queue };
+    };
+    // The real saved wake: kept by the sender's own Stop at every read; its stored wait is the one line.
+    const real = await read("real deferred_issue_execution wake");
+    expect(real.kinds).toEqual(Array(5).fill("person_stopped"));
+    expect(real.queue.entries.map((entry: any) => entry.comment.id), "the message is still saved in the queue").toContain(message.id);
+    expect(real.queue.executionWait, "the stored wait is the one line (this GET is read at the real clock)").toEqual({ reason: "remote_cleanup", message: REMOTE_WORDS });
+    // PLANTED status "deferred" on that same saved wake (its stored remote_cleanup wait untouched): the same outcome.
+    await db.update(agentWakeupRequests).set({ status: "deferred" }).where(eq(agentWakeupRequests.id, wake.id));
+    const plantedDeferred = (await read("PLANTED status deferred")).kinds;
+    // PLANTED: the "deferred" wake without its stored wait. Before the fix this is the false "no run started" line at
+    // once (the hold rule did not count it, and no stored wait kept it pending).
+    await db.update(agentWakeupRequests).set({ payload: sql`${agentWakeupRequests.payload} - 'executionWait'` }).where(eq(agentWakeupRequests.id, wake.id));
+    const plantedNoWait = (await read("PLANTED status deferred, no stored wait")).kinds;
+    expect({ plantedDeferred, plantedNoWait }, "kept by the sender's own Stop, like the real wake").toEqual({
+      plantedDeferred: Array(5).fill("person_stopped"), plantedNoWait: Array(5).fill("person_stopped") });
+    expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system"),
+      eq(issueComments.body, UNANSWERED_MESSAGE_NO_RUN_TEXT))), "no 'no run started' notice was ever written").toEqual([]);
   });
 });

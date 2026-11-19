@@ -67,6 +67,9 @@ const OVERDUE_NATIVE_RETRY_MS = 5 * 60_000;
 
 /** Earlier owed messages settled per task per pass; discovery keeps flagging the task until none is left. */
 const EARLIER_OWED_PER_PASS = 20;
+/** The hold rule's waiting statuses (STOP_HOLD_YIELDS_TO_SENDER_STOP): a wake in one of these still waits in line
+ * behind the run its sender stopped. */
+const STOP_HOLD_WAITING_WAKE_STATUSES = ["queued", "deferred", "deferred_issue_execution"];
 
 export const UNANSWERED_MESSAGE_NO_REPLY_CODE = "no_reply";
 export const UNANSWERED_MESSAGE_NO_RUN_CODE = "no_run";
@@ -840,7 +843,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       && (!cardAnswer || cardAnswerGivenBeforeStop(message.createdAt, heldRun))) {
       const waiting = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
-        inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])));
+        // "deferred" is a waiting status too (rf-3 06:10Z / RFL 06:11Z, the S10-1 shape): a saved wake that waits
+        // behind the stopped run in ANY deferred status is kept by the sender's own Stop, never "no run started".
+        inArray(agentWakeupRequests.status, STOP_HOLD_WAITING_WAKE_STATUSES)));
       if (waiting.some(wake => wakeCarriesIssue(wake.payload, issue.id)
         && (cardAnswer ? wakeCarriesCardAnswer(wake.payload, message.id) : wakeCarriesMessage(wake.payload, message.id)))) return personStopped;
     }
