@@ -667,6 +667,193 @@ async function resumeOwedSpareStops(config: Config, companyId: string, environme
     }
   })());
 }
+/**
+ * RFL late-box (A) (adopt-boat-late-sweep). Core settles a creation it can no
+ * longer see once its deadline has passed (sandbox-creation-operations.ts
+ * creationSettleAt), and after that nothing looks again: its recovery scans
+ * pending operations only. A box Boat makes later for that attempt would run
+ * until its own auto-stop TTL. So when this plugin reports a creation
+ * `destroyed` (an empty lookup) or abandons a timed-out create at its cap or
+ * budget, it RECORDS the attempt (its `paperclip-acquire` label, owner and
+ * time) in its durable plugin state, the store owed spare stops use. The
+ * maintenance tick SWEEPS those records whenever a Boat key is held: it lists
+ * boxes by the attempt's label, checks each one BY ID as ours (owner, label,
+ * environment, run) and not a live lease, then STOPS it with the owed-stop
+ * path and back-off. A late box is never adopted.
+ *
+ * Daytona's late-create delete is the shape: a not-found lookup after an
+ * uncertain create is not a deletion receipt, the provider may still
+ * materialize it (daytona plugin.ts:1287-1290); destroyFailedCreation resolves
+ * the box by its immutable creation name, checks its ownership labels
+ * (:1318-1326, :1349-1352) and deletes it (:1362). Boat cannot get or delete a
+ * box by name, so the sweep lists by label and stops by id.
+ */
+const LATE_BOX_STATE_KEY = "late-box-sweep";
+/**
+ * A record's lifetime. "boat keeps keys for 24 hours" (boat-llms-full.txt:2242,
+ * idempotent sandbox creation): the attempt's Idempotency-Key, and with it the
+ * create that may still materialize, ends 24 h after it was sent. A box that
+ * appears inside that window is stopped within one tick of appearing.
+ */
+export const BOAT_LATE_BOX_RECORD_TTL_MS = 24 * 60 * 60_000;
+type LateBoxRecord = { attemptId: string; environmentId: string; runId?: string; account: string; recordedAt: number; retryAt: number; failures: number };
+const companyLateBoxes = new Map<string, LateBoxRecord[]>();
+const companyLateBoxLoads = new Map<string, Promise<LateBoxRecord[]>>();
+const companyLateBoxWrites = new Map<string, Promise<void>>();
+/** The Boat key this worker last held per company and environment (an acquire or a creation inspection brought it). */
+const lateBoxKeys = new Map<string, { config: Config; companyId: string; environmentId: string }>();
+let lateBoxSweepWork: Promise<void> | undefined;
+function boatAccount(config: Config): string { return createHash("sha256").update(`${apiBase(config)}\n${config.apiKey}`).digest("hex"); }
+/** True while a held key has a late-box record to sweep: the maintenance timer stays on. */
+function heldLateBoxDebt(): boolean {
+  for (const held of lateBoxKeys.values()) {
+    const account = boatAccount(held.config);
+    if (companyLateBoxes.get(held.companyId)?.some(record => record.environmentId === held.environmentId && record.account === account)) return true;
+  }
+  return false;
+}
+/** A read that fails is not cached: an empty cache would overwrite the stored records on the next write. */
+async function loadLateBoxes(companyId: string): Promise<LateBoxRecord[]> {
+  const cached = companyLateBoxes.get(companyId);
+  if (cached) return cached;
+  const pending = companyLateBoxLoads.get(companyId);
+  if (pending) return pending;
+  const work = (async () => {
+    const records: LateBoxRecord[] = [];
+    const stored = pluginContext?.state?.get ? await pluginContext.state.get({ scopeKind: "company", scopeId: companyId,
+      namespace: SPARE_ACTIVITY_NAMESPACE, stateKey: LATE_BOX_STATE_KEY }) : null;
+    const rows = stored && typeof stored === "object" && Array.isArray((stored as { records?: unknown }).records) ? (stored as { records: unknown[] }).records : [];
+    const text = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+    for (const row of rows) {
+      const r = row as Record<string, unknown> | null;
+      if (!r || !text(r.attemptId) || !text(r.environmentId) || !text(r.account) || !Number.isFinite(r.recordedAt)) continue;
+      records.push({ attemptId: r.attemptId, environmentId: r.environmentId, ...(text(r.runId) ? { runId: r.runId } : {}), account: r.account,
+        recordedAt: Number(r.recordedAt), retryAt: Number.isFinite(r.retryAt) ? Number(r.retryAt) : 0,
+        failures: Number.isInteger(r.failures) && Number(r.failures) > 0 ? Number(r.failures) : 0 });
+    }
+    if (!companyLateBoxes.has(companyId)) companyLateBoxes.set(companyId, records);
+    return companyLateBoxes.get(companyId)!;
+  })();
+  companyLateBoxLoads.set(companyId, work);
+  try { return await work; }
+  finally { if (companyLateBoxLoads.get(companyId) === work) companyLateBoxLoads.delete(companyId); }
+}
+/** Persist the company's records; false when the host's store refused the write (no store: memory only). */
+async function persistLateBoxes(companyId: string): Promise<boolean> {
+  const records = companyLateBoxes.get(companyId);
+  if (!records || !pluginContext?.state?.set) return true;
+  const context = pluginContext;
+  const previous = companyLateBoxWrites.get(companyId) ?? Promise.resolve();
+  const write = previous.catch(() => undefined).then(() => context.state.set({ scopeKind: "company", scopeId: companyId,
+    namespace: SPARE_ACTIVITY_NAMESPACE, stateKey: LATE_BOX_STATE_KEY }, { records: records.map(record => ({ ...record })) }));
+  companyLateBoxWrites.set(companyId, write);
+  try { await write; return true; }
+  catch { duplexLogger?.warn("Boat late-box record write failed", { companyId }); return false; }
+  finally { if (companyLateBoxWrites.get(companyId) === write) companyLateBoxWrites.delete(companyId); }
+}
+/** Drop records older than BOAT_LATE_BOX_RECORD_TTL_MS, in place; true when any was dropped. */
+function expireLateBoxes(records: LateBoxRecord[], now: number): boolean {
+  const kept = records.filter(record => now < record.recordedAt + BOAT_LATE_BOX_RECORD_TTL_MS);
+  if (kept.length === records.length) return false;
+  records.splice(0, records.length, ...kept);
+  return true;
+}
+function holdLateBoxKey(config: Config, companyId: string, environmentId: string): void {
+  if (!config.apiKey || shuttingDown) return;
+  lateBoxKeys.set(JSON.stringify([companyId, environmentId]), { config, companyId, environmentId });
+  // A previous worker's records for this environment start the sweep now that a key is held.
+  void loadLateBoxes(companyId).then(() => { if (heldLateBoxDebt()) ensureSpareRefreshTimer(); })
+    .catch(() => { duplexLogger?.warn("Boat late-box record read failed", { companyId }); });
+}
+/**
+ * Record an attempt whose box may still appear. Resolves true only once the
+ * record is durable, so `destroyed` is never reported for an unrecorded attempt.
+ */
+async function recordLateBox(config: Config, owner: { companyId: string; environmentId: string; runId?: string }, attemptId: string): Promise<boolean> {
+  const records = await loadLateBoxes(owner.companyId);
+  const now = Date.now();
+  expireLateBoxes(records, now);
+  if (!records.some(record => record.attemptId === attemptId && record.environmentId === owner.environmentId)) {
+    records.push({ attemptId, environmentId: owner.environmentId, ...(typeof owner.runId === "string" && owner.runId ? { runId: owner.runId } : {}),
+      account: boatAccount(config), recordedAt: now, retryAt: 0, failures: 0 });
+  }
+  const stored = await persistLateBoxes(owner.companyId);
+  holdLateBoxKey(config, owner.companyId, owner.environmentId);
+  ensureSpareRefreshTimer();
+  return stored;
+}
+/** A new acquire for the same attempt owns it again: its record is dropped (the box may become that acquire's live lease). */
+async function forgetLateBox(companyId: string, environmentId: string, attemptId: string): Promise<void> {
+  const records = await loadLateBoxes(companyId);
+  const kept = records.filter(record => !(record.attemptId === attemptId && record.environmentId === environmentId));
+  if (kept.length === records.length) return;
+  records.splice(0, records.length, ...kept);
+  await persistLateBoxes(companyId);
+}
+/** One record: list by label, check each box by id as ours and not a live lease, stop it. */
+async function sweepLateBox(config: Config, companyId: string, record: LateBoxRecord): Promise<"open" | "stopped" | "failed"> {
+  let listed: any[];
+  try { listed = await listBoatSandboxes(config, [["paperclip-acquire", record.attemptId]]); }
+  catch { return "open"; }
+  let stopped = false, failed = false;
+  for (const candidate of listed) {
+    if (shuttingDown) return "open";
+    if (candidate.labels?.["paperclip-acquire"] !== record.attemptId) continue;
+    const id: string = candidate.id;
+    let sandbox: any;
+    try {
+      const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`, { method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000) }, true, { requireJson: true });
+      sandbox = result === null ? null : result?.sandbox ?? result;
+    } catch { failed = true; continue; }
+    if (sandbox === null) continue;
+    // Ours by id: the exact box, our label, owner, environment and run. Anything else is never stopped.
+    if (sandbox?.id !== id || sandbox.labels?.["paperclip-acquire"] !== record.attemptId || sandbox.labels?.owner !== `paperclip:${companyId}`
+        || sandbox.labels?.environment !== record.environmentId || (record.runId !== undefined && sandbox.labels?.run !== record.runId)) continue;
+    // A live lease (a claimed spare, or a box this worker holds for a run) is never stopped.
+    if ((typeof sandbox.name === "string" && sandbox.name.startsWith("paperclip-claim:")) || claimedSpareLeases.has(id)
+        || runLeaseTtlRefreshes.has(activityKey(config, id))) continue;
+    if (sandbox.state === "archived" || sandbox.state === "cancelled") { stopped = true; continue; }
+    try {
+      await stopSandbox(config, id);
+      stopped = true;
+      duplexLogger?.info("Boat late box for a creation reported destroyed was found by label and stopped", { companyId, environmentId: record.environmentId, attemptId: record.attemptId });
+    } catch { failed = true; }
+  }
+  return failed ? "failed" : stopped ? "stopped" : "open";
+}
+/** From the maintenance tick: sweep every record under a held key; no record, no Boat call. */
+async function sweepLateBoxes(): Promise<void> {
+  if (lateBoxSweepWork) return lateBoxSweepWork;
+  const work = (async () => {
+    for (const held of [...lateBoxKeys.values()]) {
+      if (shuttingDown) return;
+      let records: LateBoxRecord[];
+      try { records = await loadLateBoxes(held.companyId); }
+      catch { continue; }
+      const now = Date.now();
+      let changed = expireLateBoxes(records, now);
+      const account = boatAccount(held.config);
+      for (const record of records.filter(entry => entry.environmentId === held.environmentId && entry.account === account && entry.retryAt <= now)) {
+        if (shuttingDown) return;
+        const outcome = await sweepLateBox(held.config, held.companyId, record);
+        if (outcome === "stopped") {
+          const index = records.indexOf(record);
+          if (index >= 0) records.splice(index, 1);
+          changed = true;
+        } else if (outcome === "failed") {
+          // The owed spare stops' back-off: no retry before it ends.
+          record.failures += 1;
+          record.retryAt = Date.now() + READY_SPARE_STOP_BACKOFF_MS;
+          changed = true;
+        }
+      }
+      if (changed) await persistLateBoxes(held.companyId);
+    }
+  })();
+  lateBoxSweepWork = work;
+  try { await work; }
+  finally { if (lateBoxSweepWork === work) lateBoxSweepWork = undefined; }
+}
 function parse(raw: Record<string, unknown>): Config {
   return {
     apiKey: typeof raw.apiKey === "string" ? raw.apiKey.trim() : "",
@@ -1998,7 +2185,7 @@ async function sweepSyncTemps(logger: PluginContext["logger"] | undefined): Prom
   } catch { /* Neither startup nor the timer fails on the sweep. */ }
 }
 function clearSpareRefreshTimerIfIdle(): void {
-  if ([...knownSparePools.values()].some(pool => pool.desired > 0) || heldStopDebt()) return;
+  if ([...knownSparePools.values()].some(pool => pool.desired > 0) || heldStopDebt() || heldLateBoxDebt()) return;
   if (spareRefreshTimer) clearInterval(spareRefreshTimer);
   spareRefreshTimer = undefined;
 }
@@ -2064,6 +2251,8 @@ async function maintainReadySpares(reconcile = false): Promise<void> {
   if (shuttingDown) return;
   // rf-4 U1c C2: owed stops first, whatever the pools' settings (the last pool OFF included).
   await serviceOwedSpareStops();
+  // RFL late-box (A): late boxes for creations reported destroyed, under every held key.
+  await sweepLateBoxes();
   if (![...knownSparePools.values()].some(pool => pool.desired > 0)) return;
   if (spareMaintenanceWork) return spareMaintenanceWork;
   const work = (async () => {
@@ -2307,6 +2496,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     readySpares.setStopRecordListener(record => { trackOwedStopWork(recordSpareStop(record)); });
     knownSparePools.clear();
     companyOwedStops.clear(); owedStopRetryAt.clear(); owedStopKeys.clear(); spareSettingReadFailures.clear();
+    companyLateBoxes.clear(); lateBoxKeys.clear();
     claimedSpareLeases.clear();
     runCreateLedgerReads.clear();
     runLeaseTtlCaps.clear();
@@ -2415,7 +2605,9 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         if (spareMaintenanceWork) await spareMaintenanceWork.catch(() => undefined);
         await readySpares.drain();
         await Promise.allSettled([...owedStopWork]);
-        await Promise.all([...companySpareActivityWrites.values(), ...companyAcquireOutcomeWrites.values(), ...companyOwedStopWrites.values()].map(write => write.catch(() => undefined)));
+        if (lateBoxSweepWork) await lateBoxSweepWork.catch(() => undefined);
+        await Promise.all([...companySpareActivityWrites.values(), ...companyAcquireOutcomeWrites.values(), ...companyOwedStopWrites.values(),
+          ...companyLateBoxWrites.values()].map(write => write.catch(() => undefined)));
       } finally {
         try { await duplexChannels.shutdown(); } finally { await sshCarrier.close(); }
       }
@@ -2423,6 +2615,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       readySpares.reset();
       knownSparePools.clear();
       companyOwedStops.clear(); owedStopRetryAt.clear(); owedStopKeys.clear();
+      companyLateBoxes.clear(); lateBoxKeys.clear();
       claimedSpareLeases.clear();
       runCreateLedgerReads.clear();
       spareClaimStore = undefined;
@@ -2501,6 +2694,13 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     const ttl = effectiveTtlSeconds(c);
     const remoteCwd = workspaceDirectory(params.requestedCwd ?? "/home/user/paperclip-workspace");
     const attemptId = params.creationOperationId ?? randomUUID();
+    // RFL late-box (A): an acquire holds a Boat key for the sweep; one that owns
+    // this attempt again (same creation id) drops the attempt's late-box record.
+    holdLateBoxKey(c, params.companyId, params.environmentId);
+    if (params.creationOperationId) {
+      try { await forgetLateBox(params.companyId, params.environmentId, attemptId); }
+      catch { duplexLogger?.warn("Boat late-box record read failed", { companyId: params.companyId }); }
+    }
     const labels = { ...c.labels, owner: `paperclip:${params.companyId}`, purpose: params.purpose ?? "run", expiry: params.requestedExpiresAt ?? new Date(Date.now() + ttl * 1000).toISOString(), environment: params.environmentId, run: params.runId, ...(params.creationOperationId ? { creation: params.creationOperationId } : {}), "paperclip-acquire": attemptId };
     // Check outside allocation cleanup: no create was attempted on a failed pin check.
     // Lead measurement 11-12: create.from accepts a NAME, not the snapshot UUID.
@@ -2600,13 +2800,15 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       const budget: AcquisitionBudget = { deadline, enter: assertActive };
       // Set only when Boat reported the box `error` before it was ready (#22194).
       let startFailure: PluginEnvironmentAcquisitionDiagnostic | undefined;
+      // Our create POST timed out unanswered: Boat may still make the box after we give up.
+      let createUncertain = false;
       try {
         if (shuttingDown) throw new Error("Boat provider is shutting down");
         let created: any, adopted = false;
         try {
           created = await request(c, "/sandboxes", { method: "POST", signal: withinBudget(deadline, 30_000), headers: { "Idempotency-Key": attemptId }, body: JSON.stringify(createSandboxBody(c, ttl, labels, from)) });
         } catch (createError) {
-          if (createTimedOut(createError)) noteUnsettledCreate(attemptId, createStartedAt);
+          if (createTimedOut(createError)) { noteUnsettledCreate(attemptId, createStartedAt); createUncertain = true; }
           // #20828: adopt the box our timed-out create made; never send a second create.
           created = { sandbox: { id: await findTimedOutCreation(c, attemptId, params, createError, createStartedAt) } };
           adopted = true; source = "adopted";
@@ -2643,6 +2845,12 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
           ? budgetError(caught instanceof Error ? caught.message : undefined) : caught;
         const typed = error && typeof error === "object" ? error as { code?: unknown; budgetMs?: unknown } : {};
         stampOutcome = typed.code === "ETIMEDOUT" && typed.budgetMs === BOAT_ACQUIRE_ATTEMPT_BUDGET_MS ? "budget" : "error";
+        // RFL late-box (A): a create abandoned at its cap or budget is recorded
+        // before cleanup, so a box Boat makes after we gave up is swept and stopped.
+        if (createUncertain) {
+          try { await recordLateBox(c, params, attemptId); }
+          catch { duplexLogger?.warn("Boat late-box record failed", { companyId: params.companyId, environmentId: params.environmentId }); }
+        }
         if (shuttingDown && !id) throw error;
         const ids = id ? [id] : await acquisitionMatches(c, attemptId, params).catch(lookupError => {
           // frozen7-VERDICT F2: Boat definitely refused this create. A failing
@@ -2745,6 +2953,10 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       // core's settle floor has passed, so core keeps inspecting at its retry
       // interval and a late box is found and stopped (adopt-boat-late-box2).
       if (!ids.length && createStillSettling(params.creationOperation.id)) throw new Error("Boat creation identity is not visible yet; retry inspection");
+      // RFL late-box (A): core settles on this answer and never looks again, so
+      // the attempt is recorded durably first; the maintenance sweep stops a box
+      // that appears later. No durable record, no `destroyed`: core retries.
+      if (!ids.length && !await recordLateBox(c, owner, params.creationOperation.id)) throw new Error("Boat late-box record was not stored; retry inspection");
       if (!ids.length) return { providerLeaseId: params.creationOperation.id, state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt: new Date().toISOString() };
       return { providerLeaseId: ids[0], state: "unknown", creationCleanup: cleanupIdentity(c, ids[0], owner, params.creationOperation.id) };
     }
