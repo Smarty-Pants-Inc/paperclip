@@ -187,8 +187,10 @@ describe("board-only denial", () => {
     expect(AGENT_CHAT_DIRECTIVE).not.toContain("Complete other permitted work");
   });
 
-  it("chat guidance sends a task whose automatic recovery stopped to the person's Retry", () => {
-    expect(AGENT_CHAT_DIRECTIVE).toContain("its supported next step is the person's Retry on that task");
+  it("chat guidance sends a task whose automatic recovery stopped to Retry (the agent's own when allowed, else the person's)", () => {
+    expect(AGENT_CHAT_DIRECTIVE).toContain("its supported next step is Retry on that task");
+    expect(AGENT_CHAT_DIRECTIVE).toContain("You may press it yourself when the task is not a chat and is assigned to you or to an agent you manage");
+    expect(AGENT_CHAT_DIRECTIVE).toContain("tell the person to use Retry there");
     expect(AGENT_CHAT_DIRECTIVE).toContain("Retry rechecks the task's current gates (budget, pause, holds) and keeps the failed attempt's evidence");
     expect(AGENT_CHAT_DIRECTIVE).toContain("Do not reassign it, change its status, comment on it to resume it, or create a replacement task to re-run the work");
     expect(AGENT_CHAT_DIRECTIVE).toContain("Take the work over only when the person explicitly asks you to take it over or reassign it.");

@@ -1,4 +1,4 @@
-import { and, desc, eq, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, environmentLeases, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { persistActivity } from "../activity-log.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
@@ -41,7 +41,7 @@ export async function retainNativeRecoverySource(db: Db, input: WorkspaceRecover
       const [request] = await tx.select().from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.agentId, run.agentId),
         eq(agentWakeupRequests.reason, "task_retry"), eq(agentWakeupRequests.status, "deferred_issue_execution"),
-        eq(agentWakeupRequests.requestedByActorType, "user"), sql`${agentWakeupRequests.runId} is null`,
+        inArray(agentWakeupRequests.requestedByActorType, ["user", "agent"]), sql`${agentWakeupRequests.runId} is null`,
         sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`,
         sql`${agentWakeupRequests.payload}#>>'{taskRetry,sourceRunId}' = ${input.runId}`,
       )).limit(1).for("update");

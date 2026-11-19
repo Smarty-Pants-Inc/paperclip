@@ -18,6 +18,7 @@ const APPROVAL_KIND_LABELS: Record<string, string> = {
   request_board_approval: "Board approval request",
   approve_ceo_strategy: "Strategy approval",
   budget_override_required: "Budget override request",
+  create_company: "New organization request",
 };
 
 const wholeDollars =(cents: number) => formatConfiguredCents(cents).replace(/\.00$/, "");

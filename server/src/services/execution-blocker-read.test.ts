@@ -78,13 +78,14 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
     expect(await getExecutionBlocker(db, randomUUID(), f.issueId)).toBeNull();
   });
 
-  it("names Retry as the person's control, so an agent reading the blocker does not re-run the work", async () => {
+  it("names who may Retry (a person, the assignee or its manager; a chat only its owner), never a re-run by other means", async () => {
     const f = await fixture();
     const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
     expect(blocker).toMatchObject({ canRetry: true });
     expect(blocker!.nextAction).toBe(`Inspect the source run. ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}`);
-    expect(EXECUTION_BLOCKER_PERSON_RETRY_ACTION).toMatch(/^A person can use Retry on this task/);
-    expect(EXECUTION_BLOCKER_PERSON_RETRY_ACTION).toContain("Agents cannot retry it for them.");
+    expect(EXECUTION_BLOCKER_PERSON_RETRY_ACTION).toMatch(/^Retry on this task, or a new message to it, continues it/);
+    expect(EXECUTION_BLOCKER_PERSON_RETRY_ACTION).toContain("A person can use Retry; so can the agent assigned to it or an agent that manages that agent");
+    expect(EXECUTION_BLOCKER_PERSON_RETRY_ACTION).not.toContain("Agents cannot retry it for them.");
   });
 
   it("shows plain wording and Retry for a finalization deadline saved by the previous release", async () => {

@@ -94,16 +94,19 @@ describe("agent refusals that are final", () => {
     expect(res.body.remediation).toContain("its host name did not resolve");
   });
 
-  it("marks budget changes and approval decisions board-only in the API catalog", () => {
+  it("marks budget incident resolution and approval decisions board-only in the API catalog", () => {
     const paths = buildOpenApiDocument().paths;
     for (const [path, method] of [
-      ["/api/companies/{companyId}/budgets/policies", "post"],
       ["/api/companies/{companyId}/budget-incidents/{incidentId}/resolve", "post"],
-      ["/api/companies/{companyId}/budgets", "patch"],
-      ["/api/agents/{agentId}/budgets", "patch"],
       ["/api/approvals/{id}/approve", "post"],
       ["/api/approvals/{id}/reject", "post"],
     ] as const) expect(paths[path][method]["x-paperclip-authorization"], `${method} ${path}`).toEqual({ actor: "board" });
+    // #21271: budget policy writes have agent branches (bounded budget authority), so the catalog admits agents.
+    for (const [path, method] of [
+      ["/api/companies/{companyId}/budgets/policies", "post"],
+      ["/api/companies/{companyId}/budgets", "patch"],
+      ["/api/agents/{agentId}/budgets", "patch"],
+    ] as const) expect(paths[path][method]["x-paperclip-authorization"], `${method} ${path}`).toEqual({ actor: "board_or_agent" });
     expect(paths["/api/companies/{companyId}/budget-incidents/{incidentId}/resolve"].post.description).toContain("[Open budgets](/<prefix>/activity/budgets)");
     expect(paths["/api/agents/{agentId}/budgets"].patch.description).toContain("[Open budget](/<prefix>/agents/<agentId>/budgets)");
   });
