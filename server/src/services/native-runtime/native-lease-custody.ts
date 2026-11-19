@@ -33,8 +33,9 @@ export async function nativeLeaseChainCustodyStamp(db: Db, lease: CustodyLease,
   return stamp;
 }
 
-/** Names a native box kept (stopped, not destroyed) because no verified saved
- * harness copy exists. Set on the orphan-recovery marker of the stop intent;
+/** Names a native box kept, never destroyed, because no verified saved harness
+ * copy exists. Addressable boxes are stopped; an unaddressable binding records
+ * retained/unstoppable custody without claiming a stop. Set on the orphan-recovery marker of the stop intent;
  * the retained-orphan settle owns it, counts its custody attempts and
  * escalates after the cleanup cap. */
 export const NATIVE_CUSTODY_UNVERIFIED_KEY = "nativeCustodyUnverified";
