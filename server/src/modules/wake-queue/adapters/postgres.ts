@@ -1,7 +1,7 @@
 import { insertIssueComment } from "../../../services/issue-comment-writes.js";
 import { lockAgentForRunAdmission } from "../../../services/heartbeat-run-admission-lock.js";
 import { pendingContinuationCommentInput } from "../../../services/continuation-comment-input.js";
-import { conversationMovedOnSql, deferredWakeIsStaleSql, personMessageOwedSql } from "../../../services/person-message-answer.js";
+import { deferredWakeIsStaleSql, newerPersonInputAnsweredSql, personMessageOwedSql } from "../../../services/person-message-answer.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
 import { notifyQueuedRunDispatch, notifyRunDispatch } from "../../../services/run-dispatch-notifications.js";
@@ -429,7 +429,8 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       const rows = queryableCommentIds.length === 0 ? [] : await tx
         .select({ id: issueComments.id, deletedAt: issueComments.deletedAt, createdByRunId: issueComments.createdByRunId,
           owed: conversationMovedOn ? sql<boolean>`(${issueComments.authorType} is distinct from 'user' or
-            (${personMessageOwedSql(message)} and not ${conversationMovedOnSql(message)}))` : sql<boolean>`true` })
+            (${personMessageOwedSql(message)} and not ${newerPersonInputAnsweredSql({ companyId: message.companyId,
+              issueId: message.issueId, requestedAt: message.createdAt })}))` : sql<boolean>`true` })
         .from(issueComments)
         .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, queryableCommentIds), currentConversationCommentCondition()));
       const targetsFinishingRunAgent = wakeAgentId === finishingRunAgentId;
