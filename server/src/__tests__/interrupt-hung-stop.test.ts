@@ -267,6 +267,31 @@ describe.skipIf(!support.supported)("adopt-hung-stop: Boat never answers the sto
     expect(oldWrites).toEqual([]);
   }, 120_000);
 
+  it("WORDS: during the receipt wait (after the stop intent, before overdue) the GET's line names a time >= the real remaining ceiling", async () => {
+    // A receipt bound longer than the unproven bound, so the unproven bound alone is visibly short.
+    const savedReceiptMs = receiptBound!.ms;
+    receiptBound!.ms = 3 * BOUND_MS;
+    try {
+      const { f, stopping } = await interruptToStopIntent();
+      const queue = await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+      const readAt = Date.now();
+      const line = queue.body.executionWait ?? null;
+      const named = /up to (\d+) (second|minute)s?\b/.exec(String(line?.message ?? ""));
+      const namedMs = named ? Number(named[1]) * (named[2] === "minute" ? 60_000 : 1_000) : 0;
+      const remainingMs = stopping.releasedAt!.getTime() + receiptBound!.ms - readAt;
+      await evidence("words_receipt_wait", { line, namedMs, remainingMs, boundMs: BOUND_MS, receiptBoundMs: receiptBound!.ms,
+        overdue: (await leaseOf(f.leaseId)).metadata?.handedOffWarmStopReceiptOverdue ?? null });
+      expect((await leaseOf(f.leaseId)).metadata?.handedOffWarmStopReceiptOverdue, "still inside the receipt wait").toBeUndefined();
+      expect(line).toMatchObject({ reason: "remote_cleanup",
+        message: (handedOff as { handedOffWarmUnprovenWaitMessage: () => string }).handedOffWarmUnprovenWaitMessage() });
+      expect(namedMs, `the line (${line?.message}) never promises less than the remaining ceiling`).toBeGreaterThanOrEqual(remainingMs);
+      // Let the overdue mark land so no timer outlives the row.
+      expect(await until(async () => (await carryingOf(f)).length > 0, receiptBound!.ms + N_MS)).toBe(true);
+    } finally {
+      receiptBound!.ms = savedReceiptMs;
+    }
+  }, 120_000);
+
   it("control: the stop DOES answer within the receipt bound -> today's receipt path, no replace-before-reuse, ONE successor", async () => {
     const { f, heartbeat, t0, stopping } = await interruptToStopIntent();
     const settled = await settleStopOnlyCleanup(db, stopping, { attemptId: String(stopping.metadata?.pendingCleanupAttemptId),
