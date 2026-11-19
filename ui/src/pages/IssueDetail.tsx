@@ -273,7 +273,7 @@ import {
   TaskTreeControlDialog,
   TaskTreeControlMenuItems,
 } from "../components/TaskTreeControls";
-import { waitForStoppedRuns } from "../lib/wait-for-stopped-runs";
+import { isRunStopConfirmed, waitForStoppedRuns } from "../lib/wait-for-stopped-runs";
 import { useIssueExternalObjects } from "../hooks/useIssueExternalObjects";
 import { IssueGalleryContext } from "../context/IssueGalleryContext";
 import { useIssuePlanDocument } from "../hooks/useIssuePlanDocument";
@@ -4912,11 +4912,26 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       // The person's Stop accepts the server's record that the turn's
       // cancellation was acknowledged; a warm box may never send a stop receipt.
       await waitForStoppedRuns([runId], { initialRuns: [stoppedRun], acceptNativeCancellationRecord: true });
+      // A confirmed Stop ends the live lane at once: the run leaves this page's
+      // live-run caches now, not on their next poll. A refused Stop keeps it.
+      const refs = [...new Set([issueId!, issue?.id, issue?.identifier].filter((ref): ref is string => !!ref))];
+      const keys = refs.flatMap((ref) => [queryKeys.issues.liveRuns(ref), queryKeys.issues.activeRun(ref), queryKeys.issues.runs(ref)]);
+      await Promise.all(keys.map((queryKey) => queryClient.cancelQueries({ queryKey })));
+      for (const ref of refs) {
+        queryClient.setQueryData<LiveRunForIssue[]>(queryKeys.issues.liveRuns(ref), (runs) => runs?.filter((run) => run.id !== runId));
+        queryClient.setQueryData<ActiveRunForIssue | null>(queryKeys.issues.activeRun(ref), (run) => run?.id === runId ? null : run);
+        if (stoppedRun?.id === runId && isRunStopConfirmed(stoppedRun, { acceptNativeCancellationRecord: true })) queryClient.setQueryData<RunForIssue[]>(queryKeys.issues.runs(ref), (runs) => runs?.map((run) =>
+          run.runId === runId ? { ...run, status: stoppedRun.status, finishedAt: stoppedRun.finishedAt ? String(stoppedRun.finishedAt) : run.finishedAt } : run));
+      }
     },
-    onSettled: () => Promise.all([
-      queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(issueId!) }),
-      queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) }),
-    ]),
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.issues.liveRuns(issueId!) });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.issues.activeRun(issueId!) });
+      return Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(issueId!) }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) }),
+      ]);
+    },
   });
   const stopAndFinalizeRun = useMutation({
     mutationFn: async ({
