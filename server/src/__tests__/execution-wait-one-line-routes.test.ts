@@ -167,6 +167,7 @@ describe.skipIf(!support.supported)("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rea
           elapsed, readAt: new Date().toISOString(), expectedLine: reason === "remote_cleanup" && elapsed >= 600_000 ? REMOTE_EXPIRED_WORDS : words[reason],
           issueBeforeSend, issueAfterSend, messageId: message.id, queue, comments });
         expect.soft(queue.executionWait).toEqual({ reason, message: reason === "remote_cleanup" && elapsed >= 600_000 ? REMOTE_EXPIRED_WORDS : words[reason] });
+        expect.soft(queue.queueId).toBe(wake.id); // Same saved receipt; never a second notice/queue.
         expect.soft(queue.entries.map((entry: any) => entry.comment.id)).toContain(message.id);
         expect.soft(comments.filter((row: any) => row.authorType === "system" && row.metadata?.recoveryResponsibility !== "system")).toEqual([]);
       }
