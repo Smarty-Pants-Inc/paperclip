@@ -742,6 +742,68 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     expect(await successorPrompt(chat, withContinuation, true)).toContain("Prior tool calls are history, not commands to replay");
   });
 
+  /** The successor's REAL native request: the server's resume selection (buildNativeExecutionWithCheckpoint, the
+   * same call runtime-selection makes) over the real wake payload, then the runner's model envelope for that
+   * selection. `samePiSession` gives the previous run a valid Pi checkpoint (tier 1: the same live session continues);
+   * without one the selection falls back to a fresh session. */
+  async function nativeSuccessorRequest(chat: Chat, run: typeof heartbeatRuns.$inferSelect, samePiSession: boolean) {
+    const { buildNativeExecutionInput } = await import("../services/native-runtime/native-execution-input.js");
+    const { buildNativeExecutionWithCheckpoint, nativeToolContractFingerprintForTarget } = await import("../services/native-runtime/native-session-resume.js");
+    const { nativeRuntimeContextFixture } = await import("../services/native-runtime/runtime-context.test-fixture.js");
+    const { buildNativeModelEnvelope } = await import("../vendor/paperclip-runner/index.js");
+    const wakePayload = await buildPaperclipWakePayload({ db, companyId: chat.companyId, agentId: chat.agentId,
+      runId: run.id, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>) } });
+    const sessionId = randomUUID();
+    const previousRunId = randomUUID();
+    const build = (runId: string, payload: unknown, resumedSession: boolean, previousTurn: Parameters<typeof buildNativeExecutionInput>[0]["previousTurn"] = null) =>
+      buildNativeExecutionInput({ companyId: chat.companyId, agentId: chat.agentId, runId,
+        issue: { id: chat.issue.id, identifier: null, title: "Six-step work", description: null, workMode: "standard" },
+        taskPrompt: "Do the six steps", wakePayload: payload, resumedSession, previousTurn,
+        workspace: { id: chat.issue.id, cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+        normalizedSessionId: sessionId, provider: "pi_rpc", model: "provider/model-a",
+        completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1",
+          contract: { revision: "1", objective: "Answer", criteria: [{ id: "answer", requirement: "Answer" }] } },
+        runtimeContext: nativeRuntimeContextFixture() });
+    const previous = build(previousRunId, null, false);
+    const previousRun = { id: previousRunId, companyId: chat.companyId, agentId: chat.agentId, nativeSessionId: sessionId,
+      runnerProfileJson: { nativeExecutionInput: previous,
+        nativeToolContractFingerprint: nativeToolContractFingerprintForTarget("local", "pi_rpc"),
+        ...(samePiSession ? { sessionCheckpoint: { backendKind: "runner", driverKind: "pi_rpc", sessionId: "pi-facade",
+          providerSessionId: "pi-header", identity: { runId: previousRunId, sessionId, companyId: chat.companyId,
+            issueId: chat.issue.id, agentId: chat.agentId }, cursor: "42", semanticResult: null, terminal: null,
+          activeTurnId: null, terminalTurns: [], pendingRuntimeRequests: [] } } : {}) } };
+    const selected = buildNativeExecutionWithCheckpoint({ previousRun, normalizedSessionId: sessionId,
+      buildExecution: ({ resumedSession }) => build(run.id, wakePayload, resumedSession,
+        resumedSession ? { runId: previousRunId, task: previous.task, nativeExecutionInput: previous } : null) });
+    expect(selected.checkpoint !== null, "the selection is the case under test").toBe(samePiSession);
+    const envelope = selected.checkpoint
+      ? buildNativeModelEnvelope(selected.execution, { resumedSession: true }) : buildNativeModelEnvelope(selected.execution);
+    return JSON.stringify(envelope);
+  }
+
+  it("C1 (adopt-c1-fresh red): Interrupt, tier 1's SAME live Pi session continues ⇒ its real request never says 'fresh session' and lists no receipts; a fallback FRESH session keeps them", async () => {
+    const chat = await seedChat();
+    await toolReceipts(chat, [{ name: "echo STEP1 > /tmp/step1", output: "STEP1-RESULT-wrote-step1" }]);
+    const { carry, cut } = await steerThenInterrupt(chat, "unread");
+    const successor = await admitSuccessor(chat, carry);
+    const { buildExecutionContinuation } = await import("../services/execution-continuation.js");
+    const executionContinuation = await buildExecutionContinuation({ db, companyId: chat.companyId, issueId: chat.issue.id,
+      agentId: chat.agentId, context: { ...(successor.contextSnapshot as Record<string, unknown>), interruptedRunId: cut.id }, runId: successor.id,
+      summary: null, exposeLowTrustRaw: false });
+    const withContinuation = { ...successor, contextSnapshot: { ...(successor.contextSnapshot as Record<string, unknown>), executionContinuation } };
+    const same = await nativeSuccessorRequest(chat, withContinuation, true);
+    expect(same, "a false statement about the agent's own context").not.toMatch(/fresh session/i);
+    expect(same, "the same session already holds the cut turn's calls").not.toContain("Commands already run in the interrupted turn");
+    expect(same).not.toContain("STEP1-RESULT-wrote-step1");
+    expect(same).toContain("Prior tool calls are history, not commands to replay");
+    expect(same).toContain(MSG);
+    const fresh = await nativeSuccessorRequest(chat, withContinuation, false);
+    expect(fresh).toContain("This fresh session does not hold that turn");
+    expect(fresh).toContain("This is a fresh session: that run's conversation and tool calls are not in this input, except the tool calls listed under");
+    expect(fresh).toContain("1. `echo STEP1 > /tmp/step1`: completed");
+    expect(fresh).toContain("STEP1-RESULT-wrote-step1");
+  });
+
   /** Real Pi tool events (tool_execution_start/end) through the REAL Pi projector, stored as the runner stores them. */
   async function piToolReceipts(chat: Chat, calls: Array<{ tool: string; args: Record<string, unknown>; output: string; isError?: boolean }>) {
     const projector = createPiEventProjector({ runId: chat.runId, turnId: `turn-${randomUUID()}` });

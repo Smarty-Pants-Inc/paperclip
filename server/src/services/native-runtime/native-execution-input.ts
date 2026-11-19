@@ -221,6 +221,10 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     conversationMode: input.conversationMode,
   }, {
     resumedSession: false,
+    // adopt-c1-fresh: the bootstrap layout is rendered for every native turn, but when the server's resume
+    // selection verified the previous run's checkpoint (buildNativeExecutionWithCheckpoint) the SAME provider
+    // session continues and already holds the interrupted turn. A fallback rebuilds this with resumedSession false.
+    sessionContinues: input.resumedSession === true,
     includeCommunicationGuidance: false,
     nativeWakeReaderAvailable: true,
   });
