@@ -1,5 +1,7 @@
 import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import { answeredPersonMessageSql } from "../person-message-answer.js";
+import { readPersonStopHold } from "../acknowledged-native-stop.js";
+import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -477,20 +479,31 @@ async function decideCarriedSteerNotices(q: Db, issue: DecisionIssue, now: Date)
     // A wake already promoted into a run is that run's: the run's own end decides.
     isNull(agentWakeupRequests.runId)));
   const notices: CarriedSteerNotice[] = [];
+  const [agent] = await q.select().from(agents).where(and(eq(agents.companyId, issue.companyId), eq(agents.id, agentId)));
+  const invokability = await evaluateAgentInvokabilityFromDb(q, agent);
+  const paused = !invokability.invokable && invokability.reason === "paused";
   let recheckAt: number | null = null;
   for (const message of messages) {
     // The turn that carried it after its restore: never the run that restored it (that run no longer carries it).
     const carriers = runs.filter((run) => runCarriesMessage(run.contextSnapshot, message.id)
       && !restoredIds(run.resultJson).includes(message.id));
-    const carrying = carriers[0];
-    if (!carrying || carriers.some((run) => LIVE.includes(run.status))) continue;
-    if (!CARRIED_STEER_FAILED_ENDS.includes(carrying.status)) continue;
-    if (wakes.some((wake) => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id))) continue;
-    const code = unansweredMessageCode(carrying);
+    if (carriers.some((run) => LIVE.includes(run.status))) continue;
+    const waiting = wakes.some((wake) => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
+    const stopped = waiting && Boolean(await readPersonStopHold(q, {
+      companyId: issue.companyId, issueId: issue.id, agentId, messageId: message.id,
+    }));
+    // A restored input refused by ordinary admission is still held, not lost.
+    // The SAME per-message fence below owns its one truthful hold line, even
+    // when a later person message exists. No second notice writer.
+    const held = waiting && (paused || stopped);
+    const carrying = carriers[0] ?? (held ? runs.find(run => restoredIds(run.resultJson).includes(message.id)) : undefined);
+    if (!carrying || (!held && !CARRIED_STEER_FAILED_ENDS.includes(carrying.status))) continue;
+    if (waiting && !held) continue;
+    const code = held ? paused ? UNANSWERED_MESSAGE_AGENT_PAUSED_CODE : "person_stopped" : unansweredMessageCode(carrying);
     // A held conversation has its own notice ("send a new message"), never "sending it again is safe".
     if (HELD_CODES.has(code) || isNativeContinuationRefusal(carrying)) continue;
     const due = (carrying.finishedAt ?? carrying.updatedAt).getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
-    if (due > now.getTime()) { recheckAt = Math.min(recheckAt ?? due, due); continue; }
+    if (!held && due > now.getTime()) { recheckAt = Math.min(recheckAt ?? due, due); continue; }
     // A same-run retry or a pending native finalization is a further attempt that still carries it: not yet.
     const [coordinator] = await q.select({ phase: nativeRunFinalizations.phase, nextAttemptAt: nativeRunFinalizations.nextAttemptAt })
       .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, issue.companyId),
@@ -508,14 +521,18 @@ async function decideCarriedSteerNotices(q: Db, issue: DecisionIssue, now: Date)
       .from(issueComments).where(and(eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
         sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
     if (noticed && !noticed.waiting) continue;
-    const stopped = carrying.status === "cancelled";
-    notices.push({ reason, code, upgradeCommentId: noticed?.id ?? null, notice: buildStrandedRecoveryEscalationNotice({
-      seed: { title: "Your message wasn't answered", tone: "warning",
-        body: stopped ? UNANSWERED_CARRIED_STEER_STOPPED_TEXT : UNANSWERED_CARRIED_STEER_FAILED_TEXT,
-        nextAction: "Send the message again; if it fails again, assign this agent a new task." },
+    const notice = buildStrandedRecoveryEscalationNotice({
+      seed: { title: held ? "Your message is saved" : "Your message wasn't answered", tone: held ? "info" : "warning",
+        body: held ? paused ? agentPausedText(agent?.name ?? "This agent")
+          : "The run was stopped. Your message (received mid-task) is saved. Press Send to continue."
+          : carrying.status === "cancelled" ? UNANSWERED_CARRIED_STEER_STOPPED_TEXT : UNANSWERED_CARRIED_STEER_FAILED_TEXT,
+        nextAction: held ? paused ? "Resume the agent to continue." : "Press Send to continue."
+          : "Send the message again; if it fails again, assign this agent a new task." },
       recoveryActionId: null, recoveryOwner: null, recoveryResponsibility: "user",
       sourceRun: { id: carrying.id, agentId: carrying.agentId, status: carrying.status, errorCode: code },
-    }) });
+    });
+    if (held) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
+    notices.push({ reason, code, upgradeCommentId: noticed?.id ?? null, notice });
   }
   return { notices, recheckAt };
 }
