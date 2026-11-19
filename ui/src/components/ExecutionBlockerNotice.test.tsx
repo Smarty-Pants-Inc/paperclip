@@ -141,6 +141,28 @@ describe("ordinary task interruption", () => {
     expect(container.textContent).toContain("Checking that the previous attempt stopped. Trying again in 30s…");
     expect(container.textContent).not.toContain("Paperclip will retry automatically.");
   });
+  // catch: RFL VERDICT-OVERLOAD.md: exhausted capacity explanation was hidden.
+  it.each([390, 1440])("shows one capacity sentence and a working Retry at %spx", async width => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    const providerFailure = { schema: "paperclip.provider-failure.v1" as const, provider: "pi_rpc", phase: "turn" as const,
+      category: "overloaded" as const, retryability: "transient" as const, message: "The model is at capacity." };
+    const text = "The model was still at capacity after 2 tries. Press Retry to try again.";
+    await render({ ...failed, providerFailure, notice: { code: "native_provider_overloaded_exhausted", text } });
+    expect(container.querySelector('[role="status"]')?.textContent).toBe(`${text}Retry`);
+    expect(container.textContent).not.toMatch(/pi_rpc|Failed during work|Provider at capacity|Paperclip will retry automatically/);
+    expect(container.querySelectorAll("button")).toHaveLength(1);
+    console.log("CAPACITY_RENDER_EVIDENCE", JSON.stringify({ width, state: "exhausted", text: container.textContent, buttons: 1 }));
+    await act(async () => container.querySelector<HTMLButtonElement>("button")!.click());
+    expect(retry).toHaveBeenCalledOnce();
+    await render({ ...failed, providerFailure, notice: { code: "native_provider_overloaded_exhausted", text } }, { canRetry: false });
+    expect(container.querySelector('[role="status"]')?.textContent).toBe(text);
+    expect(container.querySelector("button")).toBeNull();
+    await render({ ...failed, providerFailure, state: "retry_scheduled", canRetry: false });
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("The model is at capacity; retrying…");
+    expect(container.querySelector("button")).toBeNull();
+    console.log("CAPACITY_RENDER_EVIDENCE", JSON.stringify({ width, state: "scheduled", text: container.textContent, buttons: 0 }));
+  });
+
   it("leaves genuine user decisions to their specific action surface", async () => {
     await render({ ...failed, responsibility: "user", state: "waiting_for_user", userAction: "approval", canRetry: false });
     expect(container.textContent).toBe("");

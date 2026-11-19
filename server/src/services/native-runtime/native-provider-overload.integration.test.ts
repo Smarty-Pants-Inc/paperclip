@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentWakeupRequests, authUsers, companies, companyMemberships, completionContracts, createDb, environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, nativeRunResults, statusDecisionEffects, statusDecisions } from "@paperclipai/db";
+import { agents, agentWakeupRequests, authUsers, companies, companyMemberships, completionContracts, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, nativeRunResults, statusDecisionEffects, statusDecisions } from "@paperclipai/db";
 import type { ControlPlanePort, NativeExecutionInputV1, PrpEvent, PrpTerminalState } from "@paperclipai/paperclip-runner";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { CONTROL_PLANE_CONFORMANCE_RESULT } from "../../vendor/paperclip-runner/testing.js";
@@ -48,7 +48,7 @@ describe("durable native provider capacity retry", () => {
   });
   afterAll(async () => { vi.unstubAllEnvs(); await temporary?.cleanup(); });
 
-  async function acceptCapacityFailure(runId: string, issueId: string, mutateOwner = false, kind: "codex" | "pi_rpc" = "codex") {
+  async function acceptCapacityFailure(runId: string, issueId: string, mutateOwner = false, kind: "codex" | "pi_rpc" = "codex", resultless = false, errorOverride?: Record<string, unknown>) {
     const capacityMessage = kind === "pi_rpc" ? "The model is at capacity." : NATIVE_PROVIDER_OVERLOADED_MESSAGE;
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     const [run] = await db.update(heartbeatRuns).set({ status: "running", runtimeMode: "native", nativeIssueId: issueId, error: null, errorCode: null }).where(eq(heartbeatRuns.id, runId)).returning();
@@ -86,6 +86,40 @@ describe("durable native provider capacity retry", () => {
       return { result, terminal, turnId: native.turnId, normalizedSessionId: native.normalizedSessionId, providerSessionId: "fixture-session", driverKind: execution.session.driverKind, driverVersion: "fixture", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
     });
     const unexpected = async () => { throw new Error("Unexpected provider call"); };
+    if (resultless) {
+      // catch: RFL VERDICT-OVERLOAD.md, result-less failed terminal at 8bd74f0f.
+      // The actual Runner executes session.result() === null and throws its
+      // NativeProviderTerminalFailure. Only the external provider is a fixture.
+      const actual = await vi.importActual<typeof import("../../vendor/paperclip-runner/index.js")>("../../vendor/paperclip-runner/index.js");
+      provider.execute.mockImplementation(actual.executeNativeSession);
+      const identity = { companyId, runId, issueId, agentId, sessionId: native.normalizedSessionId };
+      const capabilities = { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
+      const session = {
+        identity: () => identity,
+        async capabilities() { return capabilities; },
+        async startTurn() { return { turnId: native.turnId }; },
+        async *events() { yield errorOverride ? { ...event, payload: { status: "failed", error: errorOverride } } : event; },
+        async result() {
+          if (mutateOwner) await db.update(issues).set({ assigneeAgentId: otherAgentId, executionRunId: null }).where(eq(issues.id, issueId));
+          return null;
+        },
+        async snapshot() { return { backendKind: "mock" as const, sessionId: native.normalizedSessionId, identity,
+          providerSessionId: "resultless-provider", activeTurnId: null, pendingRuntimeRequests: [], semanticResult: null, terminal }; },
+        async close() {},
+      };
+      await expect(executePaperclipNativeSession({ db, execution, runnerInstanceId: native.runnerInstanceId,
+        backend: { async descriptor() { return { kind: "mock", name: "resultless-provider", version: "1", capabilities }; },
+          async openSession() { return session; } } })).rejects.toBeInstanceOf(actual.NativeProviderTerminalFailure);
+      const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, runId))).toHaveLength(0);
+      if (errorOverride) return saved;
+      expect(saved).toMatchObject({ status: "failed", errorCode: "native_provider_overloaded", error: capacityMessage,
+        resultJson: { providerFailure: { category: "overloaded", message: capacityMessage }, nativeProviderFailure: { provider: kind, category: "server_overloaded" } } });
+      expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId)))[0])
+        .toMatchObject({ phase: "terminal_failure", failureCode: "native_provider_overloaded", nextAttemptAt: null, resultId: null });
+      console.log("RESULTLESS_CAPACITY_EVIDENCE", JSON.stringify({ runId, errorCode: saved.errorCode, message: saved.error, semanticResults: 0 }));
+      return saved;
+    }
     const adapter = await executePaperclipNativeSession({ db, execution, runnerInstanceId: native.runnerInstanceId, backend: { descriptor: unexpected, openSession: unexpected } });
     expect(adapter).toMatchObject({ errorCode: "native_provider_overloaded", errorMessage: capacityMessage });
     const [persisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
@@ -106,7 +140,7 @@ describe("durable native provider capacity retry", () => {
     return recoveredRun;
   }
 
-  it.each(["codex", "pi_rpc"] as const)("%s retries after one and two minutes across restart/replay, then stops", async kind => {
+  it.each([["codex", false], ["pi_rpc", false], ["pi_rpc", true]] as const)("%s resultless=%s retries after one and two minutes across restart/replay, then stops", async (kind, resultless) => {
     const issueId = randomUUID(), originalRunId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Capacity task", status: "in_progress", assigneeAgentId: agentId, responsibleUserId: "capacity-owner" });
     await db.insert(heartbeatRuns).values({ id: originalRunId, companyId, agentId, responsibleUserId: "capacity-owner", contextSnapshot: { issueId, wakeCommentId: "original-message" } });
@@ -119,7 +153,7 @@ describe("durable native provider capacity retry", () => {
     for (let failure = 0; failure <= 2; failure++) {
       const before = Date.now();
       sentry.captureRunFailure.mockClear();
-      await acceptCapacityFailure(runId, issueId, false, kind);
+      await acceptCapacityFailure(runId, issueId, false, kind, resultless);
       await waitForPendingRunFailureReports();
       const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.retryOfRunId, runId)));
       if (failure === 2) {
@@ -128,7 +162,12 @@ describe("durable native provider capacity retry", () => {
         expect(sentry.captureRunFailure).toHaveBeenCalledOnce();
         expect(sentry.captureRunFailure.mock.calls[0]![0]).toMatchObject({ runId, runStatus: "failed" });
         expect(JSON.stringify(sentry.captureRunFailure.mock.calls)).not.toContain(providerDisplayMessage);
-        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({ status: "blocked", unblockDescriptor: { action: expect.stringContaining("Automatic retries exhausted") } });
+        const [exhaustedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+        expect(exhaustedIssue).toMatchObject({ status: "blocked", unblockDescriptor: { action: "The model was still at capacity after 2 tries. Press Retry to try again." } });
+        const presentation = await taskInterruptionPresentation(db, exhaustedIssue);
+        expect(presentation).toMatchObject({ state: "failed", canRetry: true,
+          notice: { code: "native_provider_overloaded_exhausted", text: exhaustedIssue.unblockDescriptor!.action } });
+        console.log("CAPACITY_PRESENTATION_EVIDENCE", JSON.stringify({ kind, resultless, stage: "exhausted", runId, presentation }));
         break;
       }
       expect(successors).toHaveLength(1);
@@ -137,9 +176,10 @@ describe("durable native provider capacity retry", () => {
         contextSnapshot: { issueId, forceFreshSession: true, executionRetryAccounting: { version: 1, failureRetries: failure + 1, maxTurnContinuations: 0 } } });
       const [retryIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
       // Exercise the actual thread read, including its predecessor explanation join.
-      expect(await taskInterruptionPresentation(db, retryIssue))
-        .toMatchObject({ state: "retry_scheduled", providerFailure: { category: "overloaded",
-          message: kind === "pi_rpc" ? "The model is at capacity." : providerDisplayMessage } });
+      const presentation = await taskInterruptionPresentation(db, retryIssue);
+      expect(presentation).toMatchObject({ state: "retry_scheduled", providerFailure: { category: "overloaded",
+        message: kind === "pi_rpc" ? "The model is at capacity." : providerDisplayMessage } });
+      console.log("CAPACITY_PRESENTATION_EVIDENCE", JSON.stringify({ kind, resultless, stage: "scheduled", runId: retry.id, presentation }));
       expect(retry.contextSnapshot).not.toHaveProperty("wakeCommentId");
       // The scheduled retry owns recovery; this failure stays out of Sentry.
       expect(sentry.captureRunFailure).not.toHaveBeenCalled();
@@ -148,7 +188,7 @@ describe("durable native provider capacity retry", () => {
       const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.runId, retry.id));
       expect(wakes).toHaveLength(1);
       const [decision] = await db.select().from(statusDecisions).where(eq(statusDecisions.runId, runId));
-      expect(await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.decisionId, decision.id))).toMatchObject([{ effectKind: "schedule_retry", targetType: "heartbeat_run", targetId: retry.id }]);
+      if (!resultless) expect(await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.decisionId, decision.id))).toMatchObject([{ effectKind: "schedule_retry", targetType: "heartbeat_run", targetId: retry.id }]);
       expect((await release({ companyId, runId, now: new Date() })).outcome.kind).toBe("released");
       expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
       const schedulerAfterRestart = heartbeatService(db, { runtimeEnv: {} });
@@ -159,14 +199,16 @@ describe("durable native provider capacity retry", () => {
     expect(unexpected).not.toHaveBeenCalled();
   });
 
-  it("answers the saved person message once when the Pi capacity retry succeeds", async () => {
-    const issueId = randomUUID(), runId = randomUUID();
+  it.each([false, true])("answers the saved person message once when the Pi capacity retry succeeds (resultless=%s)", async resultless => {
+    const issueId = randomUUID(), runId = randomUUID(), conversationUserId = `capacity-person-${resultless}`;
+    await db.insert(authUsers).values({ id: conversationUserId, name: "Capacity person", email: `${conversationUserId}@example.invalid`, createdAt: new Date(), updatedAt: new Date() });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: conversationUserId, status: "active", membershipRole: "operator" });
     await db.insert(issues).values({ id: issueId, companyId, title: "Ordinary message", status: "in_progress",
-      assigneeAgentId: agentId, responsibleUserId: "capacity-owner", conversationAgentId: agentId,
-      conversationUserId: "capacity-owner", conversationState: "active" });
-    const [message] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "capacity-owner", body: "What is six times seven?" }).returning();
-    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, responsibleUserId: "capacity-owner", contextSnapshot: { issueId, wakeCommentId: message.id, conversationSessionGeneration: 0 } });
-    await acceptCapacityFailure(runId, issueId, false, "pi_rpc");
+      assigneeAgentId: agentId, responsibleUserId: conversationUserId, conversationAgentId: agentId,
+      conversationUserId, conversationState: "active" });
+    const [message] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: conversationUserId, body: "What is six times seven?" }).returning();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, responsibleUserId: conversationUserId, contextSnapshot: { issueId, wakeCommentId: message.id, conversationSessionGeneration: 0 } });
+    await acceptCapacityFailure(runId, issueId, false, "pi_rpc", resultless);
     const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
     const unexpectedRecovery = async () => { throw new Error("Unexpected recovery"); };
     const release = createReleaseIssueExecution({
@@ -180,10 +222,13 @@ describe("durable native provider capacity retry", () => {
     const native = await prepareNativeHeartbeatRun({ db, run, issue, environmentLeaseId: randomUUID() });
     const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.issueId, issueId));
     const contractInput = buildNativeCompletionContract(issue, { revision: contract.revision });
+    const continuation = await buildExecutionContinuation({ db, companyId, issueId, agentId, runId: run.id,
+      context: run.contextSnapshot!, summary: null, exposeLowTrustRaw: false });
+    expect(continuation.messages).toContainEqual(expect.objectContaining({ id: message.id, body: message.body }));
     const execution: NativeExecutionInputV1 = {
       schema: "paperclip.native-execution-input.v1", binding: { companyId, runId: run.id, issueId, agentId, executionWorkspaceId: run.id },
       provider: { kind: "pi_rpc", model: "anthropic/test-model", profile: QUALIFIED_PI_RPC_PROFILE },
-      task: { identifier: issueId, title: issue.title, description: null, prompt: message.body, workMode: "standard" },
+      task: { identifier: issueId, title: issue.title, description: null, prompt: JSON.stringify(continuation), workMode: "standard" },
       workspace: { cwd: "/tmp", repoUrl: null, repoRef: null, branchName: null },
       session: { normalizedSessionId: native.normalizedSessionId, driverKind: "pi_rpc", protocolVersion: 1, lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } },
       completionContract: { id: contract.id, sha256: contract.canonicalSha256, schemaVersion: "paperclip.completion-contract.v1", contract: contractInput },
@@ -207,7 +252,36 @@ describe("durable native provider capacity retry", () => {
       return { result, terminal, turnId: native.turnId, normalizedSessionId: native.normalizedSessionId, providerSessionId: "retry-session", driverKind: "pi_rpc", driverVersion: "fixture", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
     });
     const unexpected = async () => { throw new Error("Unexpected provider call"); };
-    const adapter = await executePaperclipNativeSession({ db, execution, runnerInstanceId: native.runnerInstanceId, backend: { descriptor: unexpected, openSession: unexpected } });
+    let backend: import("@paperclipai/paperclip-runner").NativeSessionBackend = { descriptor: unexpected, openSession: unexpected };
+    if (resultless) {
+      const actual = await vi.importActual<typeof import("../../vendor/paperclip-runner/index.js")>("../../vendor/paperclip-runner/index.js");
+      provider.execute.mockImplementation(actual.executeNativeSession);
+      const identity = { companyId, issueId, runId: run.id, agentId, sessionId: native.normalizedSessionId };
+      const capabilities = { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
+      let settled = false;
+      backend = { async descriptor() { return { kind: "mock", name: "pi_rpc", version: "1", capabilities }; },
+        async openSession() { return {
+          identity: () => identity, async capabilities() { return capabilities; },
+          async startTurn(turn: Parameters<import("@paperclipai/paperclip-runner").NativeSession["startTurn"]>[0]) {
+            expect(turn.message.text).toContain(message.body);
+            return { turnId: native.turnId };
+          },
+          async *events() {
+            const base = { schema: "paperclip.prp.event.v1" as const, runId: run.id, normalizedSessionId: native.normalizedSessionId,
+              turnId: native.turnId, sourceInstanceId: native.runnerInstanceId, sourceKind: "runner" as const,
+              schemaVersion: 1 as const, priority: 0 as const, emittedAt: new Date().toISOString() };
+            yield { ...base, sourceEventId: "answer", sourceSeq: 1, eventType: "item.completed" as const, itemId: "answer",
+              payload: { kind: "agentMessage", channel: "final", text: "42" } };
+            settled = true;
+            yield { ...base, sourceEventId: "completed", sourceSeq: 2, eventType: "turn.completed" as const, payload: { status: "completed" } };
+          },
+          async result() { return { result, terminal, turnId: native.turnId }; },
+          async snapshot() { return { backendKind: "mock" as const, sessionId: native.normalizedSessionId, identity,
+            providerSessionId: "recovered-provider", activeTurnId: null, pendingRuntimeRequests: [], semanticResult: settled ? result : null, terminal: settled ? terminal : null }; },
+          async close() {},
+        }; } };
+    }
+    const adapter = await executePaperclipNativeSession({ db, execution, runnerInstanceId: native.runnerInstanceId, backend });
     expect(adapter.exitCode).toBe(0);
     for (let replay = 0; replay < 2; replay++) await finalizeNativeRun({ db, runId: run.id, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
     expect(provider.execute).toHaveBeenCalledTimes(1);
@@ -215,6 +289,7 @@ describe("durable native provider capacity retry", () => {
     const [savedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
     const [accepted] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, run.id));
     expect(await acceptedResponseDigestMatches(db, savedRun, accepted)).toBe(true);
+    if (resultless) expect(await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, run.id), eq(heartbeatRunEvents.eventType, "item.completed")))).toHaveLength(1);
     expect(await selectAcceptedFinalAgentMessage(db, { companyId, runId: run.id, agentId, nativeSessionId: native.normalizedSessionId,
       turnId: native.turnId, conversation: true, currentConversation: true })).toMatchObject({ text: "42" });
     const replies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorAgentId, agentId)));
@@ -223,6 +298,18 @@ describe("durable native provider capacity retry", () => {
       status: savedRun.status, replies: replies.map(reply => ({ id: reply.id, body: reply.body })) }));
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id))).toHaveLength(0);
     expect(await db.select().from(statusDecisions).where(eq(statusDecisions.runId, run.id))).toHaveLength(1);
+  });
+
+  it.each([
+    [{ code: "pi_provider_error", message: '500 {"type":"error","error":{"type":"server_error","message":"overloaded"}}' }, "native_provider_terminal_failed"],
+    [{ code: "pi_provider_error", stop_reason: "refusal", message: "Declined" }, "provider_policy_refusal"],
+  ] as const)("preserves result-less non-capacity control %j", async (error, expectedCode) => {
+    const issueId = randomUUID(), runId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Result-less control", status: "in_progress", assigneeAgentId: agentId, responsibleUserId: "capacity-owner" });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, responsibleUserId: "capacity-owner", contextSnapshot: { issueId } });
+    const saved = await acceptCapacityFailure(runId, issueId, false, "pi_rpc", true, error);
+    expect(saved.errorCode).toBe(expectedCode);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
   });
 
   it("uses failed-run history without lending a resumed task's consumed continuation receipt", async () => {
@@ -251,11 +338,11 @@ describe("durable native provider capacity retry", () => {
     await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, retry.id));
   });
 
-  it("does not claim a capacity retry before predecessor cleanup settles", async () => {
+  it.each([false, true])("does not claim a capacity retry before predecessor cleanup settles (resultless=%s)", async resultless => {
     const issueId = randomUUID(), runId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Cleanup capacity task", status: "in_progress", assigneeAgentId: agentId, responsibleUserId: "capacity-owner" });
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, responsibleUserId: "capacity-owner", contextSnapshot: { issueId } });
-    await acceptCapacityFailure(runId, issueId);
+    await acceptCapacityFailure(runId, issueId, false, "pi_rpc", resultless);
     const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
     await db.update(issues).set({ executionRunId: null, checkoutRunId: null }).where(eq(issues.id, issueId));
     const scheduler = heartbeatService(db, { runtimeEnv: {} });
@@ -268,12 +355,12 @@ describe("durable native provider capacity retry", () => {
     await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, retry.id));
   });
 
-  it("does not retry or change the task after reassignment", async () => {
+  it.each([false, true])("does not retry or change the task after reassignment (resultless=%s)", async resultless => {
     const issueId = randomUUID(), runId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Reassigned capacity task", status: "in_progress", assigneeAgentId: agentId, responsibleUserId: "capacity-owner" });
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, responsibleUserId: "capacity-owner", contextSnapshot: { issueId } });
     sentry.captureRunFailure.mockClear();
-    await acceptCapacityFailure(runId, issueId, true);
+    await acceptCapacityFailure(runId, issueId, true, "pi_rpc", resultless);
     await waitForPendingRunFailureReports();
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
     // No retry owns this failure, so it remains reportable.

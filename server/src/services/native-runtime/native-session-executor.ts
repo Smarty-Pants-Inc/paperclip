@@ -124,7 +124,12 @@ import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { redactNativeFailureError } from "./native-failure-redaction.js";
 import { parseCodexCliVersion } from "./codex-runtime-compatibility.js";
 import { createNativeToolTrace, type NativeToolTrace } from "./native-tool-trace.js";
-import { createNativeProviderFailureObservation, PROVIDER_POLICY_REFUSAL_CODE } from "./native-provider-failure.js";
+import { createNativeProviderFailureObservation, NATIVE_PROVIDER_OVERLOADED_CODE, PROVIDER_POLICY_REFUSAL_CODE } from "./native-provider-failure.js";
+import { materializeNativeProviderCapacityRetry } from "./native-provider-capacity-retry.js";
+import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
+import { pendingNativeGovernance } from "./native-governance.js";
+import { issueTreeControlService } from "../issue-tree-control.js";
+import { nativeRunHasStopRequest } from "./native-run-stop-request.js";
 import { explainNativeTurnFailure } from "./native-run-failure-explanation.js";
 import { nativeStartupRetryExhaustedAction, nativeStartupRetryWait, planNativeStartupRetry } from "./native-startup-retry.js";
 import { admitUnclaimedNativeBootstrapRetry } from "./native-bootstrap-retry.js";
@@ -344,6 +349,7 @@ import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { issueService } from "../issues.js";
 import {
   NATIVE_STATUS_ARBITER_POLICY_VERSION,
+  resolveNativeProviderCapacityFailure,
   type NativeAuthoritativeIssueStatus,
   type NativeStatusDecision,
 } from "./status-arbiter.js";
@@ -9732,6 +9738,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === "runner_remote_provider_artifact_incompatible" ||
     sourceFailureCode === "runner_remote_provider_verification_unavailable" ||
     sourceFailureCode === "native_provider_terminal_failed" ||
+    sourceFailureCode === NATIVE_PROVIDER_OVERLOADED_CODE ||
     sourceFailureCode === PROVIDER_POLICY_REFUSAL_CODE ||
     sourceFailureCode === NATIVE_PROVIDER_STATE_INCOMPATIBLE ||
     sourceFailureCode === NATIVE_PROVIDER_SIDE_EFFECT_PENDING ||
@@ -9930,6 +9937,7 @@ export function nativeSessionFailureSourceCode(
   | "pi_conversation_identity_missing"
   | "native_permission_declined"
   | "native_provider_terminal_failed"
+  | typeof NATIVE_PROVIDER_OVERLOADED_CODE
   | typeof PROVIDER_POLICY_REFUSAL_CODE
   | "native_governed_wait_settlement_pending"
   | typeof NATIVE_PROVIDER_STATE_INCOMPATIBLE
@@ -14306,9 +14314,14 @@ async function executePaperclipNativeSessionAttempt(
             schema: "paperclip.prp.terminal.v1", turnTerminalState: "failed", runTerminalState: "failed", reportedWorkDisposition: "blocked",
           }) : null;
       const thrownFailureCode = nativeSessionFailureSourceCode(error);
-      const policyRefusal = thrownFailureCode === "native_provider_terminal_failed"
-        && observedTerminalFailure?.errorCode === PROVIDER_POLICY_REFUSAL_CODE ? observedTerminalFailure : null;
-      const rawFailureCode = policyRefusal ? PROVIDER_POLICY_REFUSAL_CODE : thrownFailureCode;
+      // Only an accepted, bound failed terminal can carry this classification.
+      // Integrity/startup/cleanup failures must keep their own stronger meaning.
+      const terminalFailure = thrownFailureCode === "native_provider_terminal_failed"
+        && (observedTerminalFailure?.errorCode === PROVIDER_POLICY_REFUSAL_CODE
+          || observedTerminalFailure?.errorCode === NATIVE_PROVIDER_OVERLOADED_CODE) ? observedTerminalFailure : null;
+      const rawFailureCode = terminalFailure
+        ? terminalFailure.errorCode === NATIVE_PROVIDER_OVERLOADED_CODE ? NATIVE_PROVIDER_OVERLOADED_CODE : PROVIDER_POLICY_REFUSAL_CODE
+        : thrownFailureCode;
       const addressedFailure = !ownershipUnverified && readNativeAddressedInteractionId(input.runContextSnapshot)
         ? await readNativeAddressedInteractionFailure(input.db, input.execution.binding, error) : null;
       const startupClassifiedFailureCode = addressedFailure
@@ -14337,6 +14350,7 @@ async function executePaperclipNativeSessionAttempt(
         ? NATIVE_ADOPTED_RUNNER_AUTHENTICATION_TIMEOUT
         : classifiedFailureCode === NATIVE_ADDRESSED_INTERACTION_FAILED ||
           classifiedFailureCode === PROVIDER_POLICY_REFUSAL_CODE ||
+          classifiedFailureCode === NATIVE_PROVIDER_OVERLOADED_CODE ||
           classifiedFailureCode === "native_event_replay_conflict"
           ? classifiedFailureCode
           : providerUsageLimitObserved
@@ -14380,7 +14394,11 @@ async function executePaperclipNativeSessionAttempt(
         recoveryEvidence.recoveryMode === "ambiguous_state"
           ? sourceFailureCode
           : disposition.failureCode;
-      const providerFailure = providerFailureFromError(error);
+      const providerFailure = terminalFailure && terminalEvent
+        ? providerFailureObservation.providerFailureForTerminal(terminalEvent.turnId, {
+            schema: "paperclip.prp.terminal.v1", turnTerminalState: "failed", runTerminalState: "failed", reportedWorkDisposition: "blocked",
+          }) ?? providerFailureFromError(error)
+        : providerFailureFromError(error);
       const startupFailureSignature = recoveryEvidence.recoveryMode === "bootstrap_retry"
         ? nativeStartupFailureSignature(providerFailure) : null;
       const startupRejectedAction = repeatedRemoteStartupFailure && providerFailure
@@ -14441,7 +14459,7 @@ async function executePaperclipNativeSessionAttempt(
       const { exhausted } = recoveryProjection;
       const integrityFailure =
         sourceFailureCode === "native_event_replay_conflict";
-      const message = policyRefusal?.errorMessage ?? redactIdentityText(
+      const message = terminalFailure?.errorMessage ?? redactIdentityText(
         error instanceof Error ? error.message : String(error),
       ).slice(0, 2_000);
       const sanitizedStderrTail = redactIdentityText(message).slice(-4_096);
@@ -14719,7 +14737,7 @@ async function executePaperclipNativeSessionAttempt(
             } : {}),
             error: message,
             resultJson: sql`(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) - 'remoteRunnerRecovery')
-              || ${JSON.stringify(policyRefusal ? { nativeProviderFailure: policyRefusal.diagnostic } : {})}::jsonb
+              || ${JSON.stringify(terminalFailure ? { nativeProviderFailure: terminalFailure.diagnostic } : {})}::jsonb
               || ${JSON.stringify(remoteRunnerRecovery ? { remoteRunnerRecovery } : {})}::jsonb
               || ${providerFailure ? sql`jsonb_build_object('providerFailure', coalesce(${heartbeatRuns.resultJson}->'providerFailure', ${JSON.stringify(providerFailure)}::jsonb))` : sql`'{}'::jsonb`}`,
             errorCode: ownershipUnverified
@@ -14752,6 +14770,35 @@ async function executePaperclipNativeSessionAttempt(
             failureTask.executionRunId === input.execution.binding.runId) &&
           (!failureTask.checkoutRunId ||
             failureTask.checkoutRunId === input.execution.binding.runId);
+        // There is deliberately no semantic result to finalize here. Apply
+        // the existing capacity policy and materializer under these same
+        // issue/coordinator/run locks; do not invent a result or a same-run retry.
+        if (sourceFailureCode === NATIVE_PROVIDER_OVERLOADED_CODE && terminalFailure && !ownershipUnverified) {
+          if (!stillOwnsTask || failureTask.assigneeUserId || !updatedRun || nativeRunHasStopRequest(updatedRun.resultJson)) return;
+          const reviewContext = readNativeReviewAssignmentContext(updatedRun.contextSnapshot);
+          const review = reviewContext ? await getNativeReviewAssignment(tx as unknown as Db, {
+            ...input.execution.binding, contextSnapshot: reviewContext, allowResolvedByRunId: updatedRun.id,
+          }) : null;
+          if (reviewContext && review?.interaction.status !== "pending") return;
+          const governanceGate = await pendingNativeGovernance({ db: tx as unknown as Db,
+            ...input.execution.binding, executionState: record(failureTask.executionState) });
+          const readiness = await issueService(tx as unknown as Db).getDependencyReadiness(failureTask.id, tx as unknown as Db);
+          const pause = await issueTreeControlService(tx as unknown as Db).getActivePauseHoldGate(failureTask.companyId, failureTask.id);
+          const capacity = resolveNativeProviderCapacityFailure({
+            priorIssueStatus: failureTask.status as NativeAuthoritativeIssueStatus,
+            agentId: updatedRun.agentId, failureRetryCount: executionFailureRetryCount(updatedRun),
+            ...(reviewContext ? { nativeReviewOutcome: "pending" as const } : {}),
+            governanceGate, hasUnresolvedIssueBlockers: readiness.unresolvedBlockerCount > 0, hasActivePauseHold: pause !== null,
+          });
+          if (capacity.effects.some(effect => effect.kind === "schedule_retry")) {
+            await materializeNativeProviderCapacityRetry({ tx: tx as unknown as Db, ...input.execution.binding });
+          } else if (capacity.statusAction === "blocked") {
+            await issueService(tx as unknown as Db).update(failureTask.id,
+              { status: "blocked", unblockDescriptor: capacity.unblockDescriptor }, tx);
+          }
+          await tx.update(issues).set({ executionRunId: null, checkoutRunId: null, updatedAt: now }).where(eq(issues.id, failureTask.id));
+          return;
+        }
         let failureBlockStatusVersion: number | undefined;
         if (stillOwnsTask && recoveryProjection.issueStatus) {
           const projected = await issueService(tx as unknown as Db).update(

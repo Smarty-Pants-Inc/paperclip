@@ -1,3 +1,4 @@
+import { NATIVE_PROVIDER_CAPACITY_EXHAUSTED_MESSAGE, NATIVE_PROVIDER_OVERLOADED_CODE } from "./native-runtime/native-provider-failure.js";
 import { STORAGE_UNAVAILABLE_WAIT_RETRY_REASON } from "../storage/storage-unavailable.js";
 import { AGENT_DIRECTORY_WAIT_RETRY_REASON, INTERRUPTED_PREPARATION_RETRY_REASON } from "./execution-recovery-attempt.js";
 import { boundSetupCommandFailure, readSetupCommandFailure } from "./workspace-setup-command-failure.js";
@@ -54,7 +55,8 @@ function awaitsExactRemoteResume(issue: Pick<typeof issues.$inferSelect, "status
     && (run.processPid !== null || run.processGroupId !== null) && detail?.recoveryMode === "exact_checkpoint_resume";
 }
 
-type ProjectionIssue = Pick<typeof issues.$inferSelect, "id" | "companyId" | "status" | "assigneeAgentId" | "projectId">;
+type ProjectionIssue = Pick<typeof issues.$inferSelect, "id" | "companyId" | "status" | "assigneeAgentId" | "projectId"> &
+  Partial<Pick<typeof issues.$inferSelect, "unblockDescriptor">>;
 type ProjectionRun = Pick<typeof heartbeatRuns.$inferSelect,
   "id" | "status" | "scheduledRetryAt" | "errorCode" | "livenessState" | "resultJson"> &
   Partial<Pick<typeof heartbeatRuns.$inferSelect, "agentId" | "error" | "companyId" | "nativeIssueId" | "runtimeMode" | "startedAt"
@@ -264,6 +266,12 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
   const providerFailure = run.status === "failed" || run.status === "scheduled_retry"
     ? readProviderFailure(run.resultJson?.providerFailure) : null;
   if (providerFailure) base.providerFailure = providerFailure;
+  // The arbiter's explanation is the public capacity outcome, not the raw
+  // provider envelope. Bind it to the current failed run and closed action.
+  if (run.status === "failed" && run.errorCode === NATIVE_PROVIDER_OVERLOADED_CODE && issue.status === "blocked"
+      && issue.unblockDescriptor?.action === NATIVE_PROVIDER_CAPACITY_EXHAUSTED_MESSAGE) {
+    base.notice = { code: "native_provider_overloaded_exhausted", text: issue.unblockDescriptor.action };
+  }
   if (["failed", "scheduled_retry"].includes(run.status) && run.errorCode === "workspace_validation_failed"
       && typeof run.error === "string" && run.error.trim()) base.workspaceFailure = { message: run.error };
   // A scheduled retry carries its setup_failed predecessor's cause; it has no error code of its own.
@@ -368,7 +376,9 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
   // would race it, so show the resume until it is due and briefly while its
   // dispatch runs. A resume that never ran falls through to one Retry.
   const nativeResumeAt = run.nativeResumeAt?.getTime();
-  const retryAt = system?.nextAttemptAt ?? nativeResumeAt ?? run.scheduledRetryAt?.getTime();
+  // A failed scheduled attempt retains its old due time as history. It does
+  // not schedule another attempt, especially after the capacity budget ended.
+  const retryAt = system?.nextAttemptAt ?? nativeResumeAt ?? (run.status === "scheduled_retry" ? run.scheduledRetryAt?.getTime() : undefined);
   if (run.runtimeMode === "native" && run.errorCode === "native_governed_wait_settlement_pending") {
     const settling = recoveryRunning || Boolean(retryAt && now - retryAt < NATIVE_RESUME_DISPATCH_GRACE_MS);
     return { ...base, state: settling ? "working" : "failed", canRetry: false,

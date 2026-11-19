@@ -10,6 +10,8 @@ export const NATIVE_PROVIDER_OVERLOADED_MESSAGE =
 export const NATIVE_PI_PROVIDER_OVERLOADED_MESSAGE = "The model is at capacity.";
 export const NATIVE_PROVIDER_OVERLOADED_CODE = "native_provider_overloaded";
 export const NATIVE_PROVIDER_CAPACITY_MAX_RETRIES = 2;
+export const NATIVE_PROVIDER_CAPACITY_EXHAUSTED_MESSAGE =
+  `The model was still at capacity after ${NATIVE_PROVIDER_CAPACITY_MAX_RETRIES} tries. Press Retry to try again.`;
 export const PROVIDER_POLICY_REFUSAL_CODE = "provider_policy_refusal";
 export const PROVIDER_POLICY_REFUSAL_MESSAGE =
   "The model provider refused this request under its policies; it won't be retried automatically.";

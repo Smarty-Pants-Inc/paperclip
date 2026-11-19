@@ -1,6 +1,6 @@
 import { COMPLETION_REVIEW_STAGE_REASON, COMPLETION_REVIEW_STAGE_REJECTED_REASON, type CompletionReviewStageEntry } from "../issue-execution-policy.js";
 import type { NativeEvidenceAssessment } from "./evidence-classifier.js";
-import { NATIVE_MODEL_REJECTION_MESSAGE, NATIVE_PROVIDER_CAPACITY_MAX_RETRIES, NATIVE_PROVIDER_OVERLOADED_CODE, NATIVE_PROVIDER_OVERLOADED_MESSAGE, PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "./native-provider-failure.js";
+import { NATIVE_MODEL_REJECTION_MESSAGE, NATIVE_PROVIDER_CAPACITY_MAX_RETRIES, NATIVE_PROVIDER_OVERLOADED_CODE, NATIVE_PROVIDER_CAPACITY_EXHAUSTED_MESSAGE, PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "./native-provider-failure.js";
 import { NATIVE_ENVIRONMENT_BLOCKER_CODE, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_ACTION, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE,
   NATIVE_ENVIRONMENT_BLOCKER_MAX_RETRIES } from "./native-environment-blocker.js";
 
@@ -99,6 +99,45 @@ export interface NativeStatusDecision {
   } | null;
   effects: NativeStatusEffect[];
   blockerOwnerKind?: string;
+}
+
+/** The same capacity disposition applies with or without a semantic result.
+ * This does not infer task completion from a failed provider terminal. */
+export function resolveNativeProviderCapacityFailure(input: {
+  priorIssueStatus: NativeAuthoritativeIssueStatus;
+  agentId: string;
+  failureRetryCount?: number;
+  nativeReviewOutcome?: "resolved" | "pending" | "stale";
+  governanceGate?: NativeGovernanceGate | null;
+  hasUnresolvedIssueBlockers?: boolean;
+  hasActivePauseHold?: boolean;
+}): NativeStatusDecision {
+  const held = input.governanceGate || input.hasUnresolvedIssueBlockers || input.hasActivePauseHold || input.priorIssueStatus === "blocked";
+  const exhausted = (input.failureRetryCount ?? 0) >= NATIVE_PROVIDER_CAPACITY_MAX_RETRIES;
+  if (held || (exhausted && input.nativeReviewOutcome === "pending")) return {
+    policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+    statusAction: "preserve", toStatus: input.priorIssueStatus,
+    reasonCode: held ? "native_provider_overloaded_held" : "native_provider_overloaded_exhausted",
+    unblockDescriptor: null, effects: [{ kind: "release_checkout" }],
+  };
+  if (exhausted) {
+    const action = NATIVE_PROVIDER_CAPACITY_EXHAUSTED_MESSAGE;
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "blocked", toStatus: "blocked", reasonCode: "native_provider_overloaded_exhausted",
+      unblockDescriptor: { owner: "board", action },
+      effects: [{ kind: "bind_blocker", owner: "board", action }],
+    };
+  }
+  return {
+    policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+    statusAction: "preserve", toStatus: input.priorIssueStatus,
+    reasonCode: NATIVE_PROVIDER_OVERLOADED_CODE, unblockDescriptor: null,
+    effects: [
+      { kind: "schedule_retry", cause: NATIVE_PROVIDER_OVERLOADED_CODE, summary: "Retry after model capacity becomes available.", agentId: input.agentId },
+      ...(input.nativeReviewOutcome === "pending" ? [{ kind: "release_checkout" as const }] : []),
+    ],
+  };
 }
 
 /**
@@ -378,32 +417,7 @@ export function arbitrateNativeStatus(input: {
   }
   if (input.providerOverloaded && input.terminalState === "failed" &&
       input.nativeReviewOutcome !== "stale" && input.nativeReviewOutcome !== "resolved") {
-    const held = input.governanceGate || input.hasUnresolvedIssueBlockers || input.hasActivePauseHold || input.priorIssueStatus === "blocked";
-    const exhausted = (input.failureRetryCount ?? 0) >= NATIVE_PROVIDER_CAPACITY_MAX_RETRIES;
-    if (held || (exhausted && input.nativeReviewOutcome === "pending")) return {
-      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
-      statusAction: "preserve", toStatus: input.priorIssueStatus,
-      reasonCode: held ? "native_provider_overloaded_held" : "native_provider_overloaded_exhausted",
-      unblockDescriptor: null, effects: [{ kind: "release_checkout" }],
-    };
-    if (exhausted) {
-      const action = `${NATIVE_PROVIDER_OVERLOADED_MESSAGE} Automatic retries exhausted; retry later or choose a different model.`;
-      return {
-        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
-        statusAction: "blocked", toStatus: "blocked", reasonCode: "native_provider_overloaded_exhausted",
-        unblockDescriptor: { owner: "board", action },
-        effects: [{ kind: "bind_blocker", owner: "board", action }],
-      };
-    }
-    return {
-      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
-      statusAction: "preserve", toStatus: input.priorIssueStatus,
-      reasonCode: NATIVE_PROVIDER_OVERLOADED_CODE, unblockDescriptor: null,
-      effects: [
-        { kind: "schedule_retry", cause: NATIVE_PROVIDER_OVERLOADED_CODE, summary: "Retry after model capacity becomes available.", agentId: input.agentId },
-        ...(input.nativeReviewOutcome === "pending" ? [{ kind: "release_checkout" as const }] : []),
-      ],
-    };
+    return resolveNativeProviderCapacityFailure(input);
   }
   if (input.nativeReviewOutcome) {
     return {

@@ -69,6 +69,20 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
     && ["working", "retry_scheduled"].includes(presentation.state) ? recoveryStepText[presentation.recoveryStep] : null;
   const seconds = Math.max(0, Math.ceil((Date.parse(presentation?.nextRetryAt ?? "") - Date.now()) / 1000));
   const retryIn = `Trying again in ${seconds > 60 ? `${Math.ceil(seconds / 60)}m` : `${seconds}s`}…`;
+  if (!optimistic && !presentation?.retryWait && presentation?.providerFailure?.provider === "pi_rpc"
+      && presentation.providerFailure.category === "overloaded" && ["failed", "retry_scheduled"].includes(presentation.state)) {
+    const scheduled = presentation.state === "retry_scheduled";
+    const message = scheduled ? step ? `${step}. ${retryIn}` : "The model is at capacity; retrying…"
+      : presentation.notice?.text ?? "The model is at capacity.";
+    return <div className={cn(!scheduled && "pt-4", className)}>
+      <div role="status" aria-label="Task status" className={cn("flex items-center justify-between gap-3 text-sm",
+        scheduled ? "text-muted-foreground" : "rounded-lg bg-destructive/10 p-4 text-foreground")}>
+        {!scheduled && <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />}
+        <span className="min-w-0 flex-1 whitespace-pre-wrap break-words">{message}</span>
+        {retryShown && presentation.canRetry && <Button variant="outline" size="sm" className="shrink-0" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
+      </div>
+    </div>;
+  }
   if (!optimistic && !presentation?.retryWait && presentation?.providerFailure && ["failed", "retry_scheduled", "waiting_for_user"].includes(presentation.state)) {
     // Saved-work recovery is what the task waits for, so name it over the
     // generic automatic-retry line while keeping the provider explanation.

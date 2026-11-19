@@ -1374,9 +1374,16 @@ existing provider-failure notice. The thread says it will retry automatically
 only while a durable retry is scheduled; exhaustion does not promise a retry.
 Non-overload Pi errors and other providers keep their existing behavior.
 Paperclip preserves the accepted result and task history, then atomically records
-a durable automatic retry with its status decision. The first retry waits one
-minute; the second waits two minutes. Both spend the existing failure-retry
-budget. Exhaustion requires an explicit retry or a model change.
+a durable automatic retry with its status decision. If a bound native turn fails
+without a semantic result, the terminal failure boundary commits the normalized
+failure and the same capacity disposition atomically, without fabricating an
+accepted result. Both paths use the same durable retry planner. The first retry
+waits one minute; the second waits two minutes. Both spend the existing
+failure-retry budget. While a retry is scheduled, the Pi thread says “The model
+is at capacity; retrying…”. After both automatic tries, one
+ordinary notice says “The model was still at capacity after 2 tries. Press Retry
+to try again.” and offers Retry. Non-capacity failures retain their existing
+notices.
 
 Retries use a fresh provider session and the normal task context, without an
 automatic model switch. Consumed wake input and continuation receipts stay on
