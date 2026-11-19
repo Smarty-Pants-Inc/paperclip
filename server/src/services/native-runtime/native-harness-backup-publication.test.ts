@@ -40,7 +40,12 @@ describe("native harness backup publication", () => {
       throw new Error("stamp transaction rejected");
     } })).rejects.toThrow("stamp transaction rejected");
     expect(await fs.readFile(path.join(input.current, "manifest.json"), "utf8")).toBe("saved");
-    expect(await fs.readdir(backupRoot)).toEqual(["current"]); expect(changes).toEqual([]);
+    // Retargeted (rf-3 04:04Z item B): the rolled-back replacement is kept in
+    // superseded, never removed (this row asserted its removal).
+    expect((await fs.readdir(backupRoot)).sort()).toEqual(["current", "superseded"]); expect(changes).toEqual([]);
+    const kept = await fs.readdir(path.join(backupRoot, "superseded"));
+    expect(kept).toHaveLength(1);
+    expect(await fs.readFile(path.join(backupRoot, "superseded", kept[0]!, "manifest.json"), "utf8")).toBe("replacement");
   });
   // Retargeted (rotation-keep, RFL 11-19 03:00Z): the predecessor and a leftover
   // 'previous' are kept in failover-backups/superseded, never removed.
@@ -298,5 +303,36 @@ describe("native harness backup rotation keeps the superseded copy (rotation-kee
     expect((await fs.stat(kept[0]!)).ino, "rename, not copy").toBe(leftoverInode);
     expect(await fs.readFile(path.join(kept[1]!, "codex-home", "a.jsonl"), "utf8")).toBe("first bytes");
     expect(existsSync(previous)).toBe(false);
+  });
+
+  // rf-3 04:04Z item B: a publish that fails after the new copy became 'current'
+  // (the stamp rejects) rolled back by REMOVING that copy. It is a trace like any
+  // other: it must be moved into superseded and re-hash, and the old current is
+  // restored.
+  it("ROT-4: a publish that fails after writing the new current keeps that copy in failover-backups/superseded (re-hashes) and restores the old current", async () => {
+    const { scope, backupRoot } = await scopeRoot();
+    const relative = "codex-home/sessions/rollout-1.jsonl";
+    const v0 = Buffer.from('{"turn":1,"text":"published copy"}\n');
+    const v1 = Buffer.from('{"turn":1,"text":"published copy"}\n{"turn":2,"text":"only copy of turn two"}\n');
+    await publish(backupRoot, scope, { "manifest.json": '{"providerKind":"codex_app_server"}', [relative]: v0 });
+    const pendingRoot = path.join(backupRoot, ".pending-failed");
+    await fs.mkdir(path.dirname(path.join(pendingRoot, relative)), { recursive: true });
+    await fs.writeFile(path.join(pendingRoot, relative), v1);
+    await fs.writeFile(path.join(pendingRoot, "manifest.json"), '{"providerKind":"codex_app_server","attempt":2}');
+    const pendingInode = (await fs.stat(pendingRoot)).ino;
+    let stamped: string | undefined;
+    await expect(publishNativeHarnessBackup({ db: {}, companyId: "company", scopeDigest: scope, backupRoot, pendingRoot,
+      stamp: async current => {
+        stamped = sha(await fs.readFile(path.join(current, relative)));
+        throw new Error("stamp transaction rejected");
+      } })).rejects.toThrow("stamp transaction rejected");
+    expect(stamped, "the new copy was written as current before the failure").toBe(sha(v1));
+    const kept = await superseded(backupRoot);
+    expect(kept).toHaveLength(1);
+    expect(sha(await fs.readFile(path.join(kept[0]!, relative)))).toBe(sha(v1));
+    expect(await fs.readFile(path.join(kept[0]!, "manifest.json"), "utf8")).toBe('{"providerKind":"codex_app_server","attempt":2}');
+    expect((await fs.stat(kept[0]!)).ino, "rename, not copy").toBe(pendingInode);
+    expect(await fs.readFile(path.join(backupRoot, "current", relative))).toEqual(v0);
+    expect((await fs.readdir(backupRoot)).sort()).toEqual(["current", "superseded"]);
   });
 });
