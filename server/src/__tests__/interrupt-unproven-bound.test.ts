@@ -217,7 +217,7 @@ describe.skipIf(!support.supported)("adopt-unproven-bound: a same-boot UNPROVEN 
       const during = await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
       await evidence(`${cause}_words_during`, { executionWait: during.body.executionWait ?? null });
       expect(during.body.executionWait).toMatchObject({ reason: "remote_cleanup",
-        message: `Waiting up to ${Math.ceil(BOUND_MS / 1000)} seconds for the previous environment to stop. Your message will start automatically.` });
+        message: (handedOff as { handedOffWarmUnprovenWaitMessage: () => string }).handedOffWarmUnprovenWaitMessage() });
       // No further route call: the one-shot re-proof at the bound must stop and keep the box.
       const stopping = await until(async () => { const lease = await leaseOf(f.leaseId); return lease.status === "pending_cleanup" ? lease : null; },
         BOUND_MS + 8_000);
