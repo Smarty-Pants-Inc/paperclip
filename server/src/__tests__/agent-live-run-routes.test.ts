@@ -708,7 +708,7 @@ describe("agent live run routes", () => {
   // Keep reason: NEVER-OK trace custody. Bytes object storage refused are in
   // the kept spill; once storage is back, the log GET must return ALL admitted bytes.
   it("returns ALL admitted bytes from the log GET after a persistent storage failure is restored", async () => {
-    const { spilledRun } = await vi.importActual<typeof import("../services/object-run-log-store-spill-recovery.test.js")>("../services/object-run-log-store-spill-recovery.test.js");
+    const { spilledRun } = await vi.importActual<typeof import("../services/object-run-log-spill.fixture.js")>("../services/object-run-log-spill.fixture.js");
     const { createObjectRunLogStore } = await vi.importActual<typeof import("../services/object-run-log-store.js")>("../services/object-run-log-store.js");
     const { recoverSpilledRunLog } = await vi.importActual<typeof import("../services/heartbeat/run-log-spill-recovery.js")>("../services/heartbeat/run-log-spill-recovery.js");
     const { createHash } = await import("node:crypto");

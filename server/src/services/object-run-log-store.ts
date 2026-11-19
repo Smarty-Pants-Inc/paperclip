@@ -49,10 +49,19 @@ function finalizationError(error: unknown) {
  * `<run>.index.ndjson` (append-only: which bytes were spilled, at which journal
  * offset, why, and whether a later flush stored them). Nothing in this module
  * deletes or truncates either file.
+ *
+ * Custody: the default is `.spill` INSIDE the run-log data tree
+ * (`<instance>/data/run-logs/.spill`, or `$RUN_LOG_BASE_PATH/.spill`), so the
+ * copy that takes `data/run-logs` takes the spill with it. `.spill` cannot be
+ * a company id, so it never collides with a local run log.
  */
+export const RUN_LOG_SPILL_SUBDIR = ".spill";
 export function resolveObjectRunLogSpillDir(spillDir?: string) {
   return spillDir ?? process.env.RUN_LOG_SPILL_PATH
-    ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-log-spill");
+    ?? path.resolve(
+      process.env.RUN_LOG_BASE_PATH ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-logs"),
+      RUN_LOG_SPILL_SUBDIR,
+    );
 }
 function spillPaths(spillDir: string | undefined, logRef: string) {
   const segments = logRef.split("/");
@@ -73,7 +82,42 @@ export interface ObjectRunLogSpillRecord {
   sha256: string;
   /** Object-journal end when the batch was spilled (spilled) or after it was stored (recovered). */
   journalEnd: number;
+  /** Journal cursors of the batch, so a later recovery restores them with the bytes. */
+  sequence?: number;
+  sourceCursor?: number;
   cause?: ReturnType<typeof finalizationError>;
+}
+async function readSpillIndex(indexPath: string) {
+  const index = await fs.readFile(indexPath, "utf8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
+  const records = index.split("\n").filter(Boolean).map(line => JSON.parse(line) as ObjectRunLogSpillRecord);
+  const recovered = new Set(records.filter(entry => entry.event === "recovered").map(entry => entry.spillStart));
+  return { records, open: records.filter(entry => entry.event === "spilled" && !recovered.has(entry.spillStart)) };
+}
+const SPILL_INDEX_SUFFIX = ".index.ndjson";
+/** Every run (`<company>/<agent>/<run>`) whose spill holds bytes no flush has stored yet. */
+export async function listUnrecoveredObjectRunLogSpills(spillDir?: string) {
+  const root = resolveObjectRunLogSpillDir(spillDir), found: string[] = [];
+  const list = (dir: string) => fs.readdir(dir, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT" || error.code === "ENOTDIR") return [];
+    throw error;
+  });
+  for (const company of await list(root)) {
+    if (!company.isDirectory()) continue;
+    for (const agent of await list(path.join(root, company.name))) {
+      if (!agent.isDirectory()) continue;
+      for (const file of await list(path.join(root, company.name, agent.name))) {
+        if (!file.isFile() || !file.name.endsWith(SPILL_INDEX_SUFFIX)) continue;
+        const logRef = `${company.name}/${agent.name}/${file.name.slice(0, -SPILL_INDEX_SUFFIX.length)}`;
+        try {
+          if ((await readSpillIndex(spillPaths(spillDir, logRef).indexPath)).open.length) found.push(logRef);
+        } catch { /* Not a spill this store wrote; it is left as it is. */ }
+      }
+    }
+  }
+  return found.sort();
 }
 /**
  * Read a run's kept spill. `unrecovered` is every spilled range that no later
@@ -82,13 +126,7 @@ export interface ObjectRunLogSpillRecord {
  */
 export async function readObjectRunLogSpill(spillDir: string | undefined, logRef: string) {
   const paths = spillPaths(spillDir, logRef);
-  const index = await fs.readFile(paths.indexPath, "utf8").catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return "";
-    throw error;
-  });
-  const records = index.split("\n").filter(Boolean).map(line => JSON.parse(line) as ObjectRunLogSpillRecord);
-  const recovered = new Set(records.filter(entry => entry.event === "recovered").map(entry => entry.spillStart));
-  const open = records.filter(entry => entry.event === "spilled" && !recovered.has(entry.spillStart));
+  const { records, open } = await readSpillIndex(paths.indexPath);
   const parts: Buffer[] = [];
   if (open.length) {
     const file = await fs.open(paths.path, "r");
@@ -109,6 +147,11 @@ export interface ObjectRunLogStoreOptions {
   keyPrefix: string;
   /** Root of the kept local spill; see resolveObjectRunLogSpillDir. */
   spillDir?: string;
+  /**
+   * Test seam (mutation rows only): false turns OFF the upload of a kept spill
+   * when a run's log is next begun or recovered. Production never sets it.
+   */
+  recoverSpill?: boolean;
   flushMs?: number;
   segmentBytes?: number;
 
@@ -152,6 +195,8 @@ interface WriterState {
   sourcePrefixVerified: boolean;
   coverageEligible: boolean;
   admittedSourceCursor: number;
+  /** The spill holds bytes that cannot be placed in order; the journal is never closed as complete. */
+  unplacedSpill?: boolean;
 }
 
 export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunLogStore {
@@ -292,7 +337,8 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       const entry: ObjectRunLogSpillRecord = {
         v: 1, event: "spilled", at: new Date().toISOString(), logRef: state.handle.logRef,
         attemptId: state.handle.attemptId, spillStart, bytes: kept.length, sha256: kept.sha256,
-        journalEnd: state.writer.head.end, cause: finalizationError(cause),
+        journalEnd: state.writer.head.end, sequence: kept.sequence, sourceCursor: kept.sourceCursor,
+        cause: finalizationError(cause),
       };
       await appendDurably(paths.indexPath, Buffer.from(`${JSON.stringify(entry)}\n`));
       kept.spillStart = spillStart;
@@ -350,6 +396,59 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
     }
     for (const item of items) item.reject(error);
   }
+  async function recordRecovered(state: WriterState, kept: { spillStart: number; length: number; sha256: string }) {
+    // The spill file is kept as it is; the record says these bytes are now stored.
+    const entry: ObjectRunLogSpillRecord = {
+      v: 1, event: "recovered", at: new Date().toISOString(), logRef: state.handle.logRef,
+      attemptId: state.handle.attemptId, spillStart: kept.spillStart, bytes: kept.length,
+      sha256: kept.sha256, journalEnd: state.writer.head.end,
+    };
+    try {
+      await appendDurably(spillPaths(options.spillDir, state.handle.logRef).indexPath,
+        Buffer.from(`${JSON.stringify(entry)}\n`));
+    } catch (error) {
+      logger.error({ runId: runIdOf(state), step: "spill", bytes: kept.length, err: finalizationError(error) },
+        "Object run log spill recovery record failed; the stored log is complete");
+    }
+  }
+  async function journalRangeSha(state: WriterState, start: number, length: number) {
+    const hash = createHash("sha256");
+    for (let at = start; at < start + length; at += MAX_READ_BYTES)
+      hash.update(await state.journal.readRange(state.writer.head, at, Math.min(MAX_READ_BYTES, start + length - at), state.signal));
+    return hash.digest("hex");
+  }
+  /**
+   * Take back the run's spilled ranges that no flush has stored, so they are
+   * stored first, at the journal offset they were admitted at. A range already
+   * in the journal (stored, but its record was lost) is only recorded. A range
+   * that no longer fits the journal end stays in the spill, untouched.
+   */
+  async function adoptSpill(state: WriterState) {
+    if (options.recoverSpill === false) return;
+    const open = (await readSpillIndex(spillPaths(options.spillDir, state.handle.logRef).indexPath)).open;
+    let position = -1, adopted = 0;
+    for (const entry of open) {
+      position = Math.max(position, entry.journalEnd);
+      const end = state.writer.head.end;
+      if (!adopted && end >= position + entry.bytes &&
+        await journalRangeSha(state, position, entry.bytes) === entry.sha256) {
+        await recordRecovered(state, { spillStart: entry.spillStart, length: entry.bytes, sha256: entry.sha256 });
+        position += entry.bytes;
+        continue;
+      }
+      if (end + adopted !== position) {
+        state.unplacedSpill = true;
+        logger.error({ runId: runIdOf(state), step: "spill",
+          spill: { start: entry.spillStart, bytes: entry.bytes, journalEnd: entry.journalEnd }, journalEnd: end },
+          "Object run log spill does not fit the journal end; it stays in the spill file");
+        break;
+      }
+      state.kept.push({ length: entry.bytes, sha256: entry.sha256, spillStart: entry.spillStart,
+        sequence: entry.sequence ?? 0, sourceCursor: entry.sourceCursor ?? 0 });
+      adopted += entry.bytes;
+      position += entry.bytes;
+    }
+  }
   /** Store every kept batch, oldest first, before any newer bytes. */
   async function storeKept(state: WriterState) {
     while (state.kept.length) {
@@ -364,21 +463,7 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       }
       state.kept.shift();
       if (kept.spillStart === undefined) released(state, kept.length);
-      else {
-        // The spill file is kept as it is; the record says these bytes are now stored.
-        const entry: ObjectRunLogSpillRecord = {
-          v: 1, event: "recovered", at: new Date().toISOString(), logRef: state.handle.logRef,
-          attemptId: state.handle.attemptId, spillStart: kept.spillStart, bytes: kept.length,
-          sha256: kept.sha256, journalEnd: state.writer.head.end,
-        };
-        try {
-          await appendDurably(spillPaths(options.spillDir, state.handle.logRef).indexPath,
-            Buffer.from(`${JSON.stringify(entry)}\n`));
-        } catch (error) {
-          logger.error({ runId: runIdOf(state), step: "spill", bytes: kept.length, err: finalizationError(error) },
-            "Object run log spill recovery record failed; the stored log is complete");
-        }
-      }
+      else await recordRecovered(state, { spillStart: kept.spillStart, length: kept.length, sha256: kept.sha256 });
     }
     // The journal again holds every admitted byte in order: admission may resume.
     state.failure = undefined;
@@ -526,14 +611,46 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       }
     }
   }
-  return {
+  const api: RunLogStore = {
     async begin(input) {
       const logRef = `${input.companyId}/${input.agentId}/${input.runId}`;
       const store = journal(logRef);
-      const writer = await store.claim({
+      let writer = await store.claim({
         assertAuthority: () => options.assertWriterAuthority(input),
         signal: input.signal,
       });
+      // Bytes an earlier attempt spilled go into the journal first, at the
+      // offset they were admitted at, so this attempt's bytes follow them.
+      const recovering: WriterState = {
+        handle: { store: "s3_segments", logRef }, kept: [], flushAttempt: 1, finalized: false, journal: store,
+        writer, pending: [], pendingBytes: 0, closed: false, admitting: new Set(), signal: input.signal,
+        sourcePrefixVerified: false, coverageEligible: false, admittedSourceCursor: writer.head.sourceCursor,
+      };
+      try {
+        await adoptSpill(recovering);
+      } catch (error) {
+        input.signal?.throwIfAborted();
+        recovering.kept = [];
+        recovering.unplacedSpill = true;
+        logger.error({ runId: input.runId, step: "spill", err: finalizationError(error) },
+          "Object run log spill could not be read; it stays in the spill file");
+      }
+      if (recovering.kept.length) {
+        try {
+          await storeKept(recovering);
+        } catch (error) {
+          const unreadable = (error as { message?: unknown; code?: unknown } | null);
+          if (unreadable?.message !== "object_run_log_spill_integrity_error" && unreadable?.code !== "ENOENT")
+            // Storage still refuses the bytes. They stay in the spill; the log
+            // is not begun past them (the caller retries, as for a failed claim).
+            throw error;
+          recovering.kept = [];
+          recovering.unplacedSpill = true;
+          logger.error({ runId: input.runId, step: "spill", err: finalizationError(error) },
+            "Object run log spill failed its integrity check; it stays in the spill file");
+        }
+        writer = recovering.writer;
+      }
       const sourcePrefixVerified = writer.head.generation > 1 && await store.hasVerifiedSourcePrefix(writer.head, input.signal);
       const handle: RunLogHandle = {
         store: "s3_segments",
@@ -559,6 +676,7 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
         sourcePrefixVerified,
         coverageEligible: true,
         admittedSourceCursor: writer.head.sourceCursor,
+        unplacedSpill: recovering.unplacedSpill,
       });
       return handle;
     },
@@ -626,7 +744,8 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
         step = "flush";
         await flush(state);
         // Never close a journal that lacks admitted bytes: the open head marks it incomplete.
-        if (state.kept.length || state.pending.length) throw state.failure ?? new Error("object_journal_kept_bytes");
+        if (state.kept.length || state.pending.length || state.unplacedSpill)
+          throw state.failure ?? new Error("object_journal_kept_bytes");
         step = "close";
         for (;; attempt++) {
           try {
@@ -760,5 +879,18 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       const results = await Promise.allSettled([...writers.values()].map(flush));
       for (const result of results) if (result.status === "rejected") throw result.reason;
     },
+    listSpilledLogRefs: () => options.recoverSpill === false
+      ? Promise.resolve([]) : listUnrecoveredObjectRunLogSpills(options.spillDir),
+    async recoverSpill(input) {
+      const logRef = `${input.companyId}/${input.agentId}/${input.runId}`;
+      if (options.recoverSpill === false) return null;
+      // A writer of this process still holds the run: its own flush stores the kept batch.
+      for (const state of writers.values()) if (state.handle.logRef === logRef) return null;
+      if (!(await readSpillIndex(spillPaths(options.spillDir, logRef).indexPath)).open.length) return null;
+      // begin stores the spill at its recorded journal offset; finalize closes
+      // the journal and digests it, and refuses both while any byte is missing.
+      return api.finalize(await api.begin(input));
+    },
   };
+  return api;
 }

@@ -14,6 +14,7 @@ import { agentIdentityService } from "../agent-identity.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import { addRunSecretMaterial } from "../agent-identity-redaction.js";
 import { logger } from "../../middleware/logger.js";
+import { recoverSpilledRunLog, runLogSpillSettlement } from "../heartbeat/run-log-spill-recovery.js";
 import { createNativeRunLogExporter, nativeRunLogPrefixCursor, nativeRunLogSourceWhere } from "./native-run-log-export.js";
 
 interface Recovery {
@@ -58,6 +59,17 @@ export async function readRecoverableRunLog(
   options?: RunLogReadOptions,
   known?: { runtimeMode?: string | null; status?: string; logBytes?: number | null },
 ) {
+  // A settled run whose storage refused its log: store the kept spill first,
+  // so this read returns every admitted byte. A no-op when nothing was spilled.
+  if (handle.store === "s3_segments" && known?.status !== "running" &&
+    (known?.logBytes === undefined || known.logBytes === null))
+    await Promise.resolve()
+      .then(() => recoverSpilledRunLog(store, handle.logRef, runLogSpillSettlement(db, handle.logRef), options?.signal))
+      .catch(() => {
+        options?.signal?.throwIfAborted();
+        logger.warn({ runId: handle.logRef.split("/").at(-1) },
+          "Run log spill recovery is incomplete; serving the published prefix");
+      });
   if (
     handle.store === "s3_segments" &&
     known?.runtimeMode !== "legacy" &&

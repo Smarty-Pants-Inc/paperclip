@@ -103,6 +103,14 @@ export interface RunLogStore {
   // in-flight mirror immediately (graceful-shutdown path). No-op when the
   // in-flight mirror is not enabled.
   flushInflightMirrors?(): Promise<void>;
+  /** Runs (`<company>/<agent>/<run>`) whose kept local spill holds bytes object storage has not taken. */
+  listSpilledLogRefs?(): Promise<string[]>;
+  /**
+   * Store a settled run's kept spill in its object log, at the offset it was
+   * admitted at, then close and digest the log. Null when there is nothing to
+   * recover; `bytes: null` when storage still refuses (the spill is kept).
+   */
+  recoverSpill?(input: RunLogBeginInput): Promise<RunLogFinalizeSummary | null>;
 }
 
 function safeSegments(...segments: string[]) {
@@ -635,6 +643,8 @@ export function getRunLogStore() {
       return local.read(handle, opts);
     },
     flushInflightMirrors: async () => { await Promise.all([local.flushInflightMirrors?.(), external?.flushInflightMirrors?.()]); },
+    listSpilledLogRefs: async () => await external?.listSpilledLogRefs?.() ?? [],
+    recoverSpill: async input => await external?.recoverSpill?.(input) ?? null,
   };
   return cachedStore;
 }

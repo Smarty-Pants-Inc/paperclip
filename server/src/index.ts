@@ -1834,6 +1834,11 @@ async function startServerWithDatabaseTeardown(
           );
         }
 
+        // Run-log bytes object storage refused are kept in the local spill; store
+        // them now that this process is up. In the background: it never holds startup.
+        void heartbeat.recoverSpilledRunLogs().then(result => {
+          if (result.spilled > 0) logger.warn(result, "startup run-log spill recovery reconciled kept spills");
+        }).catch(err => logger.error({ err }, "startup run-log spill recovery failed; the spill is kept"));
         const recoveredGoalActions = await timeStartupRecovery("goal_actions", () => heartbeat.recoverPendingSessionGoalActions()).catch(err => {
           logger.error({ err }, "startup session-goal action recovery failed");
           return { enqueued: 0, invalid: 0 };

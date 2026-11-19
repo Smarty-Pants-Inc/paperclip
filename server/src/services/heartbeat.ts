@@ -55,6 +55,7 @@ import { prepareHeartbeatRuntimeServiceIntents, startHeartbeatRuntimeServices, r
 import { bindHeartbeatRunnerHomeMode, buildHeartbeatWorkspaceConfiguration, prepareHeartbeatExecutionConfiguration } from "./heartbeat/execution-configuration.js";
 import { adoptsLiveRemoteRunner } from "./heartbeat/live-runner-adoption.js";
 import { createRunLogWriterAuthority } from "./heartbeat/run-log-authority.js";
+import { recoverSpilledRunLogs } from "./heartbeat/run-log-spill-recovery.js";
 import { watchShutdownHandoff } from "./heartbeat/shutdown-handoff.js";
 import { createHeartbeatRunOutput } from "./heartbeat/run-output.js";
 import { readRecoverableRunLog } from "./native-runtime/native-run-log-recovery.js";
@@ -4818,6 +4819,8 @@ export function heartbeatService(
     reportAssignedWorkInvariant: recovery.assignedWork.report,
     recoverPendingSessionGoalActions,
     recoverActiveSessionGoals,
+    /** Store every settled run's kept run-log spill in its object log (startup reconcile). */
+    recoverSpilledRunLogs: (signal?: AbortSignal) => recoverSpilledRunLogs(db, runLogStore, signal),
 
     terminalizeRunOnLeaseRelease,
 
