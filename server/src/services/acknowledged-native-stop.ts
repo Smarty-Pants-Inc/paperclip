@@ -1,5 +1,5 @@
-import { and, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
-import { agentWakeupRequests, environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { and, desc, eq, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
+import { agentWakeupRequests, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
 import { parseObject } from "../adapters/utils.js";
 import { resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
@@ -10,6 +10,8 @@ import { isConfirmedCursorCloudTerminalObservation } from "./native-runtime/curs
 import { isAgentLifecycleStopRecord } from "./governance-pause-stop.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { isWellFormedExecutionWait, wellFormedExecutionWaitSql } from "./deferred-execution-wait.js";
+import { stopAcceptanceEventSql } from "./heartbeat-run-events.js";
+import { QUEUED_SEND_AFTER_STOP_KEY, recordedUserStop } from "./run-cancellation.js";
 
 export function hasAcknowledgedNativeRunStopRequest(run: {
   id: string; companyId: string; status: string; nativeIssueId: string | null;
@@ -157,7 +159,7 @@ export async function acknowledgedNativeStopExecutionHasStopped(db: Db, run: Pic
  * cause native_continuation_requires_reconciliation, evidence.runId = the run). */
 export const PERSON_STOP_OWN_HOLD_CAUSE = "native_continuation_requires_reconciliation";
 
-export type PersonStopHold = { stoppedRunId: string; wakeIds: string[] };
+export type PersonStopHold = { stoppedRunId: string; userId: string; acceptedAt: string; wakeIds: string[] };
 
 function personStopWakeCarries(payload: unknown, issueId: string, messageId?: string): boolean {
   const value = parseObject(payload);
@@ -169,21 +171,35 @@ function personStopWakeCarries(payload: unknown, issueId: string, messageId?: st
   return messageId ? ids.includes(messageId) : ids.length > 0;
 }
 
+function personStopWakeCommentIds(payload: unknown): string[] {
+  const value = parseObject(payload);
+  const nested = parseObject(value._paperclipWakeContext);
+  return [...new Set([...queuedCommentIdsFromWakePayload(value), value.commentId, nested.wakeCommentId,
+    ...(Array.isArray(nested.wakeCommentIds) ? nested.wakeCommentIds : [])]
+    .filter((id): id is string => typeof id === "string" && /^[0-9a-f-]{36}$/i.test(id)))];
+}
+
 /**
  * Stop means stop: the ONE reader of "these messages are held by a person's
- * Stop" (H2 section 3). Both the queued-comments header (routes/issues.ts) and
- * the per-message note (recovery/unanswered-person-message.ts) read it, so they
- * cannot disagree. Held when ALL of these are true:
+ * Stop" (H2 section 3). Every promoter of a saved wake asks it, so none of
+ * them can run a held message by itself. Held when ALL of these are true:
  * - no run is running on the issue;
- * - the latest run of the assignee on the issue (nativeIssueId OR
- *   contextSnapshot.issueId) is cancelled by a user (cancelledByActorType
- *   "user") and is not a queued-comment interrupt (queuedCommentInterruptQueueId);
+ * - the latest Stop/Interrupt acceptance on this agent's turns on the issue is
+ *   the Stop route's own server-owned row (`run.stop.accepted`, kind
+ *   `person_stop`), and its run recorded that person's Stop (recordedUserStop).
+ *   An Interrupt (kind `interrupt`), an agent's or the system's cancel, or no
+ *   row at all is never a hold (NULL-safe: no row, no hold);
+ * - that person has not typed a new message on the issue since the Stop (a
+ *   typed message runs first; the held ones follow it);
  * - a deferred_issue_execution wake, or a deferred wake with a well-formed
  *   saved wait, carries the issue's messages (the given message, or wake, when
- *   named), WITH OR WITHOUT a saved wait, and has no queuedCommentInterrupt
- *   (a person's Send is delivering it).
+ *   named), WITH OR WITHOUT a saved wait, and has no queuedCommentInterrupt nor
+ *   a Send-after-Stop receipt (a person's Send is delivering it);
+ * - every live message it carries was written by THAT person at or before the
+ *   Stop. Another person's message, or anything newer, is not held.
  * A saved wait (execution_active, execution_recovery, stopped_execution) does
  * not undo the Stop: nothing clears it after the Stop, so it is stale.
+ * (ported from al/c1-heldstop-sweep-c1d 61f43a23; keyed on S's acceptance row)
  */
 export async function readPersonStopHold(db: Db, input: {
   companyId: string; issueId: string; agentId: string; messageId?: string; wakeId?: string;
@@ -193,20 +209,46 @@ export async function readPersonStopHold(db: Db, input: {
     eq(heartbeatRuns.companyId, input.companyId), or(onIssue, eq(heartbeatRuns.issueId, input.issueId)),
     eq(heartbeatRuns.status, "running"))).limit(1);
   if (running) return null;
-  const [lastTurn] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
-    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), onIssue))
-    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-  const stop = parseObject(lastTurn?.resultJson);
-  if (!lastTurn || lastTurn.status !== "cancelled" || stop.cancelledByActorType !== "user" || stop.queuedCommentInterruptQueueId) return null;
+  const [stop] = await db.select({ runId: heartbeatRuns.id, status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson,
+    payload: heartbeatRunEvents.payload })
+    .from(heartbeatRunEvents).innerJoin(heartbeatRuns, and(eq(heartbeatRuns.id, heartbeatRunEvents.runId),
+      eq(heartbeatRuns.companyId, heartbeatRunEvents.companyId)))
+    .where(and(eq(heartbeatRunEvents.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), onIssue,
+      stopAcceptanceEventSql()))
+    .orderBy(desc(heartbeatRunEvents.createdAt), desc(heartbeatRunEvents.id)).limit(1);
+  const accepted = parseObject(stop?.payload);
+  const userId = typeof accepted.userId === "string" && accepted.userId ? accepted.userId : null;
+  const acceptedAt = typeof accepted.acceptedAt === "string" ? new Date(accepted.acceptedAt) : null;
+  if (!stop || accepted.schema !== "paperclip.stop-acceptance.v1" || accepted.kind !== "person_stop" ||
+      accepted.issueId !== input.issueId || !userId || !acceptedAt || !Number.isFinite(acceptedAt.getTime())) return null;
+  const stopped = recordedUserStop(stop);
+  if (!stopped || stopped.source !== "operator" || parseObject(stop.resultJson).cancelledByUserId !== userId ||
+      parseObject(stop.resultJson).queuedCommentInterruptQueueId) return null;
+  const [typedAfterStop] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
+    eq(issueComments.authorType, "user"), eq(issueComments.authorUserId, userId), isNull(issueComments.createdByRunId),
+    gt(issueComments.createdAt, acceptedAt))).limit(1);
+  if (typedAfterStop) return null;
   const wakes = await db.select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, payload: agentWakeupRequests.payload })
     .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.agentId, input.agentId),
+      input.wakeId ? eq(agentWakeupRequests.id, input.wakeId) : undefined,
       or(eq(agentWakeupRequests.status, "deferred_issue_execution"),
         and(eq(agentWakeupRequests.status, "deferred"), wellFormedExecutionWaitSql(agentWakeupRequests.payload)))));
-  const held = wakes.filter(wake => (!input.wakeId || wake.id === input.wakeId)
+  const candidates = wakes.filter(wake => (!input.wakeId || wake.id === input.wakeId)
     && (wake.status === "deferred_issue_execution" || isWellFormedExecutionWait(parseObject(wake.payload).executionWait))
     && parseObject(wake.payload).queuedCommentInterrupt == null
+    && parseObject(wake.payload)[QUEUED_SEND_AFTER_STOP_KEY] == null
     && personStopWakeCarries(wake.payload, input.issueId, input.messageId));
-  return held.length ? { stoppedRunId: lastTurn.id, wakeIds: held.map(wake => wake.id) } : null;
+  const ids = [...new Set(candidates.flatMap(wake => personStopWakeCommentIds(wake.payload)))];
+  const comments = ids.length ? await db.select({ id: issueComments.id, authorUserId: issueComments.authorUserId,
+    createdAt: issueComments.createdAt }).from(issueComments).where(and(eq(issueComments.companyId, input.companyId),
+    eq(issueComments.issueId, input.issueId), inArray(issueComments.id, ids), isNull(issueComments.deletedAt))) : [];
+  const byId = new Map(comments.map(comment => [comment.id, comment]));
+  const held = candidates.filter(wake => {
+    const live = personStopWakeCommentIds(wake.payload).map(id => byId.get(id)).filter(comment => comment !== undefined);
+    return live.length > 0 && live.every(comment => comment.authorUserId === userId && comment.createdAt <= acceptedAt);
+  });
+  return held.length ? { stoppedRunId: stop.runId, userId, acceptedAt: acceptedAt.toISOString(), wakeIds: held.map(wake => wake.id) } : null;
 }
 
 /** adopt-marker-port (RFL F1): this run is the FIRST turn after a person's Stop when the latest person Stop
