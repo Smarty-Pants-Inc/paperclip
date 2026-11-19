@@ -1,0 +1,114 @@
+[
+  {
+    "id": "0972e142-1779-4a6b-9bd2-275cc8be019c",
+    "run_id": "bd4f8bd0-a049-4170-a586-48f672112f46",
+    "issue_id": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+    "to_status": "in_progress",
+    "applied_at": "2026-11-19T07:19:52.603+00:00",
+    "company_id": "e2cfb11f-296e-4705-823c-bf54805e11d4",
+    "created_at": "2026-11-19T07:19:52.591302+00:00",
+    "from_status": "in_progress",
+    "reason_code": "conversation_turn_finished",
+    "assessment_id": "bd1a7675-b785-4caa-90b3-e942d51fbef7",
+    "decision_json": {
+      "effects": [],
+      "toStatus": "in_progress",
+      "reasonCode": "conversation_turn_finished",
+      "statusAction": "preserve",
+      "unblockDescriptor": null,
+      "priorStatusVersion": 1,
+      "projectedStatusVersion": 1
+    },
+    "policy_version": "phase6-v14",
+    "decision_digest": "960a5422d977edc3e13c974139599a5bd2cd3764f7c460b0421825efb57c96ba",
+    "decision_version": 3,
+    "application_state": "applied",
+    "supersedes_decision_id": null
+  },
+  {
+    "id": "40111e11-6291-4ec5-8926-8bcadfd17687",
+    "run_id": "a8742cca-ba7e-4170-a1c7-bc0c9c9d727e",
+    "issue_id": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+    "to_status": "in_review",
+    "applied_at": "2026-11-19T07:19:53.659+00:00",
+    "company_id": "e2cfb11f-296e-4705-823c-bf54805e11d4",
+    "created_at": "2026-11-19T07:19:53.596024+00:00",
+    "from_status": "in_review",
+    "reason_code": "prior_status_terminal_preserved",
+    "assessment_id": "b45a0a03-d126-49f7-95f6-2acbda2c4792",
+    "decision_json": {
+      "effects": [
+        {
+          "kind": "append_superseding_assessment"
+        }
+      ],
+      "toStatus": "in_review",
+      "reasonCode": "prior_status_terminal_preserved",
+      "statusAction": "preserve",
+      "unblockDescriptor": null,
+      "priorStatusVersion": 2,
+      "projectedStatusVersion": 2
+    },
+    "policy_version": "phase6-v14",
+    "decision_digest": "6abe0eb3a59d2fb839e8b428229228f9cae3bb3f6da5657d74c6dbd3e7b72f38",
+    "decision_version": 4,
+    "application_state": "applied",
+    "supersedes_decision_id": null
+  },
+  {
+    "id": "a59a9206-e06f-40a8-9ea4-9f89e253783d",
+    "run_id": "a8742cca-ba7e-4170-a1c7-bc0c9c9d727e",
+    "issue_id": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+    "to_status": "in_progress",
+    "applied_at": "2026-11-19T07:18:58.862+00:00",
+    "company_id": "e2cfb11f-296e-4705-823c-bf54805e11d4",
+    "created_at": "2026-11-19T07:18:58.853281+00:00",
+    "from_status": "in_progress",
+    "reason_code": "conversation_turn_finished",
+    "assessment_id": "0a93c883-6ea8-4629-b962-75369cadb284",
+    "decision_json": {
+      "effects": [],
+      "toStatus": "in_progress",
+      "reasonCode": "conversation_turn_finished",
+      "statusAction": "preserve",
+      "unblockDescriptor": null,
+      "priorStatusVersion": 1,
+      "projectedStatusVersion": 1
+    },
+    "policy_version": "phase6-v14",
+    "decision_digest": "c064a766bd42fa29055ec6b5841d132c9216d86c3ed23a3b4ebb7cb1ad5fa3f5",
+    "decision_version": 2,
+    "application_state": "applied",
+    "supersedes_decision_id": null
+  },
+  {
+    "id": "a907c568-9257-42ee-838c-e6abf2c0c7f3",
+    "run_id": "bd4f8bd0-a049-4170-a586-48f672112f46",
+    "issue_id": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+    "to_status": "in_review",
+    "applied_at": "2026-11-19T07:19:53.714+00:00",
+    "company_id": "e2cfb11f-296e-4705-823c-bf54805e11d4",
+    "created_at": "2026-11-19T07:19:53.696741+00:00",
+    "from_status": "in_review",
+    "reason_code": "prior_status_terminal_preserved",
+    "assessment_id": "f6b9531e-4ccd-4127-a9a8-23ab0b6ace7f",
+    "decision_json": {
+      "effects": [
+        {
+          "kind": "append_superseding_assessment"
+        }
+      ],
+      "toStatus": "in_review",
+      "reasonCode": "prior_status_terminal_preserved",
+      "statusAction": "preserve",
+      "unblockDescriptor": null,
+      "priorStatusVersion": 2,
+      "projectedStatusVersion": 2
+    },
+    "policy_version": "phase6-v14",
+    "decision_digest": "e3e3d5a03c4483b6b93fcaff2709f1c702a74f728a602afb7b6e55f8ed4249c8",
+    "decision_version": 5,
+    "application_state": "applied",
+    "supersedes_decision_id": null
+  }
+]

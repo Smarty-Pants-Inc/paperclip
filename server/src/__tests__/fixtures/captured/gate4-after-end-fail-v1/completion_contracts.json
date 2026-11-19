@@ -1,0 +1,106 @@
+[
+  {
+    "id": "1e1d05da-fc2f-49c1-98e6-0eac18c7be51",
+    "risk": "low",
+    "issue_id": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+    "revision": 1,
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:51:08.876512+00:00",
+    "contract_json": {
+      "criteria": [
+        {
+          "id": "objective",
+          "requirement": "<redacted:850 chars>"
+        }
+      ],
+      "revision": "<redacted:1 chars>",
+      "objective": "<redacted:776 chars>"
+    },
+    "policy_version": "phase6-v4",
+    "schema_version": "paperclip.completion-contract.v1",
+    "canonical_sha256": "d6fbd8dc60ef724a23b5bd612b57831112108485ff0183a0b2b35da6425dfada",
+    "created_by_actor_id": "dac90670-28f3-4bbf-b74c-20ea1992f034",
+    "completion_authority": "<redacted:18 chars>",
+    "created_by_actor_type": "<redacted:6 chars>",
+    "supersedes_contract_id": null,
+    "incomplete_criteria_policy": "<redacted:21 chars>"
+  },
+  {
+    "id": "37fac54d-8ecd-40d7-a3e1-4f01a36c451b",
+    "risk": "low",
+    "issue_id": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+    "revision": 4,
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:58:29.064005+00:00",
+    "contract_json": {
+      "criteria": [
+        {
+          "id": "objective",
+          "requirement": "<redacted:114 chars>"
+        }
+      ],
+      "revision": "<redacted:1 chars>",
+      "objective": "<redacted:776 chars>"
+    },
+    "policy_version": "phase6-v4",
+    "schema_version": "paperclip.completion-contract.v1",
+    "canonical_sha256": "1dcac2a6f35c7ae8375906aa9ec06a59f0ead3f45810723e81fd4092070c0ad6",
+    "created_by_actor_id": "dac90670-28f3-4bbf-b74c-20ea1992f034",
+    "completion_authority": "<redacted:18 chars>",
+    "created_by_actor_type": "<redacted:6 chars>",
+    "supersedes_contract_id": "591788ef-2814-4284-af43-14c24e646472",
+    "incomplete_criteria_policy": "<redacted:21 chars>"
+  },
+  {
+    "id": "591788ef-2814-4284-af43-14c24e646472",
+    "risk": "low",
+    "issue_id": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+    "revision": 3,
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:57:24.63632+00:00",
+    "contract_json": {
+      "criteria": [
+        {
+          "id": "objective",
+          "requirement": "<redacted:116 chars>"
+        }
+      ],
+      "revision": "<redacted:1 chars>",
+      "objective": "<redacted:776 chars>"
+    },
+    "policy_version": "phase6-v4",
+    "schema_version": "paperclip.completion-contract.v1",
+    "canonical_sha256": "a1496260c582c826a321ba329a3eb24e2a7628cfb62d92cf99c9cdd33861a93b",
+    "created_by_actor_id": "dac90670-28f3-4bbf-b74c-20ea1992f034",
+    "completion_authority": "<redacted:18 chars>",
+    "created_by_actor_type": "<redacted:6 chars>",
+    "supersedes_contract_id": "652c9a4e-9952-48b1-add4-8af830ea856c",
+    "incomplete_criteria_policy": "<redacted:21 chars>"
+  },
+  {
+    "id": "652c9a4e-9952-48b1-add4-8af830ea856c",
+    "risk": "low",
+    "issue_id": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+    "revision": 2,
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:55:08.831933+00:00",
+    "contract_json": {
+      "criteria": [
+        {
+          "id": "objective",
+          "requirement": "<redacted:242 chars>"
+        }
+      ],
+      "revision": "<redacted:1 chars>",
+      "objective": "<redacted:776 chars>"
+    },
+    "policy_version": "phase6-v4",
+    "schema_version": "paperclip.completion-contract.v1",
+    "canonical_sha256": "18b6150a8f59c901602545b54a1ea72b9e135e5f676fe7cb94bc7e6da61e1985",
+    "created_by_actor_id": "dac90670-28f3-4bbf-b74c-20ea1992f034",
+    "completion_authority": "<redacted:18 chars>",
+    "created_by_actor_type": "<redacted:6 chars>",
+    "supersedes_contract_id": "1e1d05da-fc2f-49c1-98e6-0eac18c7be51",
+    "incomplete_criteria_policy": "<redacted:21 chars>"
+  }
+]

@@ -1,0 +1,414 @@
+[
+  {
+    "id": "08d634b6-0b54-4bde-a428-f1b6aefc2fdb",
+    "run_id": "99ad41ce-2576-4d50-9179-30e8ea65cfdd",
+    "turn_id": "pi-turn-3424d4ac-f97f-4f5a-b144-be89bc7fc0c3",
+    "issue_id": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+    "result_id": "8c885aef-5089-41dd-b17d-641165e3a412",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:59:11.50395+00:00",
+    "contract_id": "652c9a4e-9952-48b1-add4-8af830ea856c",
+    "trigger_ref": "8c885aef-5089-41dd-b17d-641165e3a412",
+    "input_digest": "0f97a817fb808ea9b508bc9314503fd0b7c1791a6578cbe4606f42f21339d546",
+    "trigger_kind": "native_result",
+    "policy_version": "phase6-v14",
+    "assessment_json": {
+      "blocker": null,
+      "summary": "<redacted:4 chars>",
+      "continuation": null,
+      "rejectedEvidence": [],
+      "attentionRequests": [],
+      "objectiveSatisfied": false,
+      "verificationPassed": false,
+      "missingRequirements": [],
+      "reportedDisposition": "done",
+      "verificationCaveats": [],
+      "acceptedEvidenceRefs": [],
+      "allCriteriaSatisfied": false,
+      "criterionAssessments": [
+        {
+          "outcome": "unverifiable",
+          "reasonCode": "criterion_evidence_unverifiable",
+          "claimStatus": "satisfied",
+          "criterionId": "objective",
+          "evidenceRefs": [
+            {
+              "ref": "<redacted:32 chars>",
+              "kind": "unknown",
+              "outcome": "unverifiable",
+              "reasonCode": "unsupported_evidence_reference",
+              "durableRecordId": null
+            }
+          ]
+        }
+      ],
+      "unverifiableEvidence": [
+        {
+          "ref": "<redacted:32 chars>",
+          "reasonCode": "unsupported_evidence_reference"
+        }
+      ],
+      "hasFailedVerification": false,
+      "contractRevisionMatches": true,
+      "objectiveClaimSatisfied": true,
+      "verificationAssessments": [
+        {
+          "detail": "<redacted:27 chars>",
+          "outcome": "unverifiable",
+          "reasonCode": "verification_has_no_durable_reference",
+          "claimStatus": "passed",
+          "evidenceRef": null,
+          "commandOrCheck": "<redacted:77 chars>",
+          "reportedReasonCode": null
+        }
+      ],
+      "hasBlockingRemainingWork": false,
+      "ignoredAttentionRequests": []
+    },
+    "prior_decision_id": null,
+    "prior_issue_status": "in_review",
+    "trigger_capability": "server_native_finalizer",
+    "prior_status_version": 2,
+    "supersedes_assessment_id": "2c9948de-dc54-403c-9f3d-8414da318156",
+    "trigger_actor_company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856"
+  },
+  {
+    "id": "0add0510-5bcb-441c-a8dd-ea58b74efe76",
+    "run_id": "f5a19940-7c6a-4410-b054-da0c0c5392c4",
+    "turn_id": "pi-turn-432bde47-3dfc-406d-bbd9-1ca63723276d",
+    "issue_id": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+    "result_id": "724459e5-7c54-48dd-af94-5fd4bd28968b",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:58:17.352061+00:00",
+    "contract_id": "591788ef-2814-4284-af43-14c24e646472",
+    "trigger_ref": "724459e5-7c54-48dd-af94-5fd4bd28968b",
+    "input_digest": "2e23520c7c881b42bbf63ccf1cc3b164bb1352e19b64de58146606fd20df1176",
+    "trigger_kind": "native_result",
+    "policy_version": "phase6-v14",
+    "assessment_json": {
+      "blocker": null,
+      "summary": "<redacted:38 chars>",
+      "continuation": null,
+      "rejectedEvidence": [],
+      "attentionRequests": [
+        {
+          "kind": "review",
+          "legacy": false,
+          "summary": "<redacted:44 chars>",
+          "ownerClass": "<redacted:5 chars>",
+          "sourceKind": "review",
+          "sourceIndex": 0,
+          "targetAgentId": null
+        }
+      ],
+      "objectiveSatisfied": false,
+      "verificationPassed": false,
+      "missingRequirements": [],
+      "reportedDisposition": "needs_review",
+      "verificationCaveats": [],
+      "acceptedEvidenceRefs": [],
+      "allCriteriaSatisfied": false,
+      "criterionAssessments": [
+        {
+          "outcome": "unverifiable",
+          "reasonCode": "criterion_claim_not_satisfied",
+          "claimStatus": "unknown",
+          "criterionId": "objective",
+          "evidenceRefs": []
+        }
+      ],
+      "unverifiableEvidence": [],
+      "hasFailedVerification": false,
+      "contractRevisionMatches": true,
+      "objectiveClaimSatisfied": false,
+      "verificationAssessments": [],
+      "hasBlockingRemainingWork": true,
+      "ignoredAttentionRequests": []
+    },
+    "prior_decision_id": null,
+    "prior_issue_status": "in_progress",
+    "trigger_capability": "server_native_finalizer",
+    "prior_status_version": 1,
+    "supersedes_assessment_id": null,
+    "trigger_actor_company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856"
+  },
+  {
+    "id": "2c9948de-dc54-403c-9f3d-8414da318156",
+    "run_id": "99ad41ce-2576-4d50-9179-30e8ea65cfdd",
+    "turn_id": "pi-turn-3424d4ac-f97f-4f5a-b144-be89bc7fc0c3",
+    "issue_id": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+    "result_id": "8c885aef-5089-41dd-b17d-641165e3a412",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:57:17.065614+00:00",
+    "contract_id": "652c9a4e-9952-48b1-add4-8af830ea856c",
+    "trigger_ref": "8c885aef-5089-41dd-b17d-641165e3a412",
+    "input_digest": "ee7683ca40888d3681c7f36d5c28cd489c79a5b22b2a15f60814643e88e16cea",
+    "trigger_kind": "native_result",
+    "policy_version": "phase6-v14",
+    "assessment_json": {
+      "blocker": null,
+      "summary": "<redacted:4 chars>",
+      "continuation": null,
+      "rejectedEvidence": [],
+      "attentionRequests": [],
+      "objectiveSatisfied": false,
+      "verificationPassed": false,
+      "missingRequirements": [],
+      "reportedDisposition": "done",
+      "verificationCaveats": [],
+      "acceptedEvidenceRefs": [],
+      "allCriteriaSatisfied": false,
+      "criterionAssessments": [
+        {
+          "outcome": "unverifiable",
+          "reasonCode": "criterion_evidence_unverifiable",
+          "claimStatus": "satisfied",
+          "criterionId": "objective",
+          "evidenceRefs": [
+            {
+              "ref": "<redacted:32 chars>",
+              "kind": "unknown",
+              "outcome": "unverifiable",
+              "reasonCode": "unsupported_evidence_reference",
+              "durableRecordId": null
+            }
+          ]
+        }
+      ],
+      "unverifiableEvidence": [
+        {
+          "ref": "<redacted:32 chars>",
+          "reasonCode": "unsupported_evidence_reference"
+        }
+      ],
+      "hasFailedVerification": false,
+      "contractRevisionMatches": true,
+      "objectiveClaimSatisfied": true,
+      "verificationAssessments": [
+        {
+          "detail": "<redacted:27 chars>",
+          "outcome": "unverifiable",
+          "reasonCode": "verification_has_no_durable_reference",
+          "claimStatus": "passed",
+          "evidenceRef": null,
+          "commandOrCheck": "<redacted:77 chars>",
+          "reportedReasonCode": null
+        }
+      ],
+      "hasBlockingRemainingWork": false,
+      "ignoredAttentionRequests": []
+    },
+    "prior_decision_id": null,
+    "prior_issue_status": "in_progress",
+    "trigger_capability": "server_native_finalizer",
+    "prior_status_version": 1,
+    "supersedes_assessment_id": null,
+    "trigger_actor_company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856"
+  },
+  {
+    "id": "86cf313e-ce50-4af8-b491-2769e994bdfe",
+    "run_id": "f5a19940-7c6a-4410-b054-da0c0c5392c4",
+    "turn_id": "pi-turn-432bde47-3dfc-406d-bbd9-1ca63723276d",
+    "issue_id": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+    "result_id": "724459e5-7c54-48dd-af94-5fd4bd28968b",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:59:11.544051+00:00",
+    "contract_id": "591788ef-2814-4284-af43-14c24e646472",
+    "trigger_ref": "724459e5-7c54-48dd-af94-5fd4bd28968b",
+    "input_digest": "51838ee67cb52504f3567485201a04767a4e49fc34cb31c1599a7045dea800a3",
+    "trigger_kind": "native_result",
+    "policy_version": "phase6-v14",
+    "assessment_json": {
+      "blocker": null,
+      "summary": "<redacted:38 chars>",
+      "continuation": null,
+      "rejectedEvidence": [],
+      "attentionRequests": [
+        {
+          "kind": "review",
+          "legacy": false,
+          "summary": "<redacted:44 chars>",
+          "ownerClass": "<redacted:5 chars>",
+          "sourceKind": "review",
+          "sourceIndex": 0,
+          "targetAgentId": null
+        }
+      ],
+      "objectiveSatisfied": false,
+      "verificationPassed": false,
+      "missingRequirements": [],
+      "reportedDisposition": "needs_review",
+      "verificationCaveats": [],
+      "acceptedEvidenceRefs": [],
+      "allCriteriaSatisfied": false,
+      "criterionAssessments": [
+        {
+          "outcome": "unverifiable",
+          "reasonCode": "criterion_claim_not_satisfied",
+          "claimStatus": "unknown",
+          "criterionId": "objective",
+          "evidenceRefs": []
+        }
+      ],
+      "unverifiableEvidence": [],
+      "hasFailedVerification": false,
+      "contractRevisionMatches": true,
+      "objectiveClaimSatisfied": false,
+      "verificationAssessments": [],
+      "hasBlockingRemainingWork": true,
+      "ignoredAttentionRequests": []
+    },
+    "prior_decision_id": null,
+    "prior_issue_status": "in_review",
+    "trigger_capability": "server_native_finalizer",
+    "prior_status_version": 2,
+    "supersedes_assessment_id": "0add0510-5bcb-441c-a8dd-ea58b74efe76",
+    "trigger_actor_company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856"
+  },
+  {
+    "id": "8f5b19e0-b80e-4a96-871a-317efa5ea849",
+    "run_id": "038baba6-e5ca-4690-b0b6-5ad61af23f24",
+    "turn_id": "pi-turn-8e43c0cc-2a1e-4d07-988b-846ca068d518",
+    "issue_id": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+    "result_id": "2ecb5af1-d5aa-4534-b92d-80cadd107b8d",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:59:06.886226+00:00",
+    "contract_id": "37fac54d-8ecd-40d7-a3e1-4f01a36c451b",
+    "trigger_ref": "2ecb5af1-d5aa-4534-b92d-80cadd107b8d",
+    "input_digest": "0bc8aae1bb92b17e7613e1ff584ce68a5845cde5073675cd948df063a715ccf5",
+    "trigger_kind": "native_result",
+    "policy_version": "phase6-v14",
+    "assessment_json": {
+      "blocker": null,
+      "summary": "<redacted:112 chars>",
+      "continuation": null,
+      "rejectedEvidence": [],
+      "attentionRequests": [],
+      "objectiveSatisfied": false,
+      "verificationPassed": false,
+      "missingRequirements": [],
+      "reportedDisposition": "done",
+      "verificationCaveats": [],
+      "acceptedEvidenceRefs": [],
+      "allCriteriaSatisfied": false,
+      "criterionAssessments": [
+        {
+          "outcome": "unverifiable",
+          "reasonCode": "criterion_evidence_unverifiable",
+          "claimStatus": "satisfied",
+          "criterionId": "objective",
+          "evidenceRefs": [
+            {
+              "ref": "<redacted:25 chars>",
+              "kind": "unknown",
+              "outcome": "unverifiable",
+              "reasonCode": "unsupported_evidence_reference",
+              "durableRecordId": null
+            }
+          ]
+        }
+      ],
+      "unverifiableEvidence": [
+        {
+          "ref": "<redacted:25 chars>",
+          "reasonCode": "unsupported_evidence_reference"
+        }
+      ],
+      "hasFailedVerification": false,
+      "contractRevisionMatches": true,
+      "objectiveClaimSatisfied": true,
+      "verificationAssessments": [
+        {
+          "detail": "<redacted:2 chars>",
+          "outcome": "unverifiable",
+          "reasonCode": "verification_has_no_durable_reference",
+          "claimStatus": "passed",
+          "evidenceRef": null,
+          "commandOrCheck": "<redacted:24 chars>",
+          "reportedReasonCode": null
+        }
+      ],
+      "hasBlockingRemainingWork": false,
+      "ignoredAttentionRequests": []
+    },
+    "prior_decision_id": null,
+    "prior_issue_status": "in_progress",
+    "trigger_capability": "server_native_finalizer",
+    "prior_status_version": 1,
+    "supersedes_assessment_id": null,
+    "trigger_actor_company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856"
+  },
+  {
+    "id": "a1465070-640c-421d-9743-97f41b616990",
+    "run_id": "038baba6-e5ca-4690-b0b6-5ad61af23f24",
+    "turn_id": "pi-turn-8e43c0cc-2a1e-4d07-988b-846ca068d518",
+    "issue_id": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+    "result_id": "2ecb5af1-d5aa-4534-b92d-80cadd107b8d",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:59:11.433476+00:00",
+    "contract_id": "37fac54d-8ecd-40d7-a3e1-4f01a36c451b",
+    "trigger_ref": "2ecb5af1-d5aa-4534-b92d-80cadd107b8d",
+    "input_digest": "b031ab2f8f2302ebd2d33f3074dd18eb9f03a2e341e195467ec46271582c7409",
+    "trigger_kind": "native_result",
+    "policy_version": "phase6-v14",
+    "assessment_json": {
+      "blocker": null,
+      "summary": "<redacted:112 chars>",
+      "continuation": null,
+      "rejectedEvidence": [],
+      "attentionRequests": [],
+      "objectiveSatisfied": false,
+      "verificationPassed": false,
+      "missingRequirements": [],
+      "reportedDisposition": "done",
+      "verificationCaveats": [],
+      "acceptedEvidenceRefs": [],
+      "allCriteriaSatisfied": false,
+      "criterionAssessments": [
+        {
+          "outcome": "unverifiable",
+          "reasonCode": "criterion_evidence_unverifiable",
+          "claimStatus": "satisfied",
+          "criterionId": "objective",
+          "evidenceRefs": [
+            {
+              "ref": "<redacted:25 chars>",
+              "kind": "unknown",
+              "outcome": "unverifiable",
+              "reasonCode": "unsupported_evidence_reference",
+              "durableRecordId": null
+            }
+          ]
+        }
+      ],
+      "unverifiableEvidence": [
+        {
+          "ref": "<redacted:25 chars>",
+          "reasonCode": "unsupported_evidence_reference"
+        }
+      ],
+      "hasFailedVerification": false,
+      "contractRevisionMatches": true,
+      "objectiveClaimSatisfied": true,
+      "verificationAssessments": [
+        {
+          "detail": "<redacted:2 chars>",
+          "outcome": "unverifiable",
+          "reasonCode": "verification_has_no_durable_reference",
+          "claimStatus": "passed",
+          "evidenceRef": null,
+          "commandOrCheck": "<redacted:24 chars>",
+          "reportedReasonCode": null
+        }
+      ],
+      "hasBlockingRemainingWork": false,
+      "ignoredAttentionRequests": []
+    },
+    "prior_decision_id": null,
+    "prior_issue_status": "in_review",
+    "trigger_capability": "server_native_finalizer",
+    "prior_status_version": 2,
+    "supersedes_assessment_id": "8f5b19e0-b80e-4a96-871a-317efa5ea849",
+    "trigger_actor_company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856"
+  }
+]

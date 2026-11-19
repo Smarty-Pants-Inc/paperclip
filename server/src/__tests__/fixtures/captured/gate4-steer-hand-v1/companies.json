@@ -1,0 +1,26 @@
+[
+  {
+    "id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "name": "<redacted:9 chars>",
+    "status": "active",
+    "paused_at": null,
+    "created_at": "2026-11-16T04:58:50.449096+00:00",
+    "updated_at": "2026-11-16T04:58:50.449096+00:00",
+    "description": "<redacted:99 chars>",
+    "issue_prefix": "GAT",
+    "pause_reason": null,
+    "issue_counter": 339,
+    "spend_month_utc": null,
+    "spent_monthly_cents": 0.0,
+    "budget_monthly_cents": 0,
+    "budget_owner_user_id": null,
+    "default_responsible_user_id": "pXCjqsKtAkBFq1NFT6a83fAwdEhtY53n",
+    "feedback_data_sharing_enabled": false,
+    "default_decision_owner_user_id": null,
+    "interaction_resolver_governance": {},
+    "feedback_data_sharing_consent_at": null,
+    "feedback_data_sharing_terms_version": null,
+    "require_board_approval_for_new_agents": false,
+    "feedback_data_sharing_consent_by_user_id": null
+  }
+]

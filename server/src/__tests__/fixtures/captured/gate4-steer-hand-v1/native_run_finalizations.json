@@ -1,0 +1,34 @@
+[
+  {
+    "phase": "committed",
+    "run_id": "fcdf9174-b883-404d-85fa-46f9b22d2895",
+    "attempt": 1,
+    "issue_id": "0c8b537d-5135-4a01-8510-1e777a997cee",
+    "result_id": "3ffe01b0-af52-4a18-8c66-a62200c1731e",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:34:16.388817+00:00",
+    "updated_at": "2026-11-19T08:36:35.128+00:00",
+    "decision_id": "654bb291-db8e-4b56-a8ac-4d3aaba3c8be",
+    "lease_owner": null,
+    "failure_code": null,
+    "lease_holder": {
+      "pid": 7,
+      "bootId": "2e69b304-35cd-420a-af6b-ddc324384c5d",
+      "hostHash": "e0de897e5daee8cf379a31c1b7ab3a30",
+      "processStartedAt": "2026-11-19T08:07:52.260Z"
+    },
+    "assessment_id": "ee9c026f-638b-4a3c-a5e2-4eff07279590",
+    "controller_pid": 7,
+    "failure_detail": null,
+    "recovery_state": null,
+    "next_attempt_at": null,
+    "lease_expires_at": null,
+    "recovery_history": [],
+    "controller_boot_id": "2e69b304-35cd-420a-af6b-ddc324384c5d",
+    "control_deadline_at": null,
+    "recovery_request_id": null,
+    "controller_host_hash": "e0de897e5daee8cf379a31c1b7ab3a30",
+    "controller_generation": 1,
+    "controller_process_started_at": "2026-11-19T08:07:52.26+00:00"
+  }
+]

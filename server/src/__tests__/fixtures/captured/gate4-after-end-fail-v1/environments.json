@@ -1,0 +1,29 @@
+[
+  {
+    "id": "11c0ec3b-0857-4132-98b7-047b6fd62a91",
+    "name": "<redacted:22 chars>",
+    "config": {
+      "from": "<redacted:56 chars>",
+      "type": "small",
+      "labels": {
+        "owner": "<redacted:13 chars>",
+        "purpose": "<redacted:5 chars>"
+      },
+      "provider": "boat",
+      "reuseLease": true,
+      "ttlSeconds": 1800,
+      "duplexCarrier": "off",
+      "retainOnDestroy": true,
+      "runnerIdleTimeoutMs": 300000,
+      "runnerLifecycleMode": "warm",
+      "setupTimeoutSeconds": 180,
+      "runnerReconnectGraceMs": 420000
+    },
+    "driver": "sandbox",
+    "status": "active",
+    "metadata": null,
+    "created_at": "2026-11-16T04:58:53.172+00:00",
+    "updated_at": "2026-11-18T02:42:35.926+00:00",
+    "description": "<redacted:74 chars>"
+  }
+]

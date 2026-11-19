@@ -1,0 +1,350 @@
+[
+  {
+    "id": "c358cc0f-12e2-43ab-9699-4952b92da206",
+    "status": "expired",
+    "issue_id": "0c8b537d-5135-4a01-8510-1e777a997cee",
+    "metadata": {
+      "from": "<redacted:56 chars>",
+      "type": "small",
+      "driver": "sandbox",
+      "labels": {
+        "owner": "<redacted:13 chars>",
+        "purpose": "<redacted:5 chars>"
+      },
+      "agentId": "4f7a3c27-9504-4b36-bbaf-96929c7a9127",
+      "pluginId": "83323bdb-4bb4-44b5-b7a8-f59dc32cf288",
+      "provider": "boat",
+      "boatOrgId": "team_e872bcc0-062c-4d9a-818d-fffac0913977",
+      "pluginKey": "<redacted:31 chars>",
+      "remoteCwd": "<redacted:30 chars>",
+      "sandboxId": "bx_4hrp452q",
+      "reuseLease": true,
+      "ttlSeconds": 1800,
+      "adapterType": "paperclip_runner",
+      "resumedLease": false,
+      "duplexCarrier": "off",
+      "providerLabels": {
+        "run": "<redacted:36 chars>",
+        "owner": "<redacted:46 chars>",
+        "expiry": "<redacted:24 chars>",
+        "purpose": "<redacted:3 chars>",
+        "creation": "<redacted:36 chars>",
+        "environment": "11c0ec3b-0857-4132-98b7-047b6fd62a91",
+        "paperclip-acquire": "<redacted:36 chars>"
+      },
+      "leaseController": {
+        "pid": 7,
+        "bootId": "2e69b304-35cd-420a-af6b-ddc324384c5d",
+        "hostHash": "e0de897e5daee8cf379a31c1b7ab3a30",
+        "processStartedAt": "2026-11-19T08:07:52.260Z"
+      },
+      "retainOnDestroy": true,
+      "warmFailureRunId": "fcdf9174-b883-404d-85fa-46f9b22d2895",
+      "providerClaimName": null,
+      "warmFailureStreak": 0,
+      "workspaceSentinel": {
+        "path": "<redacted:77 chars>",
+        "result": "<redacted:7 chars>",
+        "allocationFiles": {
+          "files": [
+            {
+              "sha256": "b7efeb6b6d8bb1ba563049ccf1a9dea94d798d96b47986289e972c5cb077f38b",
+              "relativePath": "<redacted:46 chars>"
+            }
+          ],
+          "remoteCwd": "<redacted:30 chars>",
+          "providerLeaseId": "bx_4hrp452q"
+        }
+      },
+      "creationOperationId": "97a2bb0d-e7b2-4c12-aece-2a096f884cd4",
+      "nativeHarnessBackup": {
+        "schema": "paperclip.native-harness-backup-stamp.v2",
+        "completedAt": "2026-11-19T08:41:51.929Z",
+        "manifestSha256": "sha256:4cd9b24c71c8c4f969f896623cb594c2d0d00daeaa6dd1948b6b2ec084866ebb",
+        "runnerInstanceId": "5d8075a4-34ac-486f-8c68-ecb0001fbe53",
+        "sessionScopeSha256": "2d1b493daa113378e815a5651b8f953bc5fbbe3cf51ba8459514ac640dbde589",
+        "normalizedSessionId": "a2378005-a28d-4b85-90b4-687dbb8a53ed",
+        "sourceProviderLeaseId": "bx_4hrp452q",
+        "authorizedProviderLeaseId": "bx_4hrp452q"
+      },
+      "nativeWorkspaceSync": {
+        "schema": "paperclip.native-workspace-stamp/v1",
+        "remoteCwd": "<redacted:30 chars>",
+        "hostSha256": "2ef1126a7c9620a5959fc70b461c79488ccfabeba7364bab27193d3e077abe24",
+        "workspaceId": "f2178a4e-2cd7-4b50-a03d-bb50f364a106",
+        "finalizedRunId": "fcdf9174-b883-404d-85fa-46f9b22d2895",
+        "providerLeaseId": "bx_4hrp452q"
+      },
+      "runnerIdleTimeoutMs": 300000,
+      "runnerLifecycleMode": "warm",
+      "setupTimeoutSeconds": 180,
+      "reusableSandboxLease": {
+        "agentId": "4f7a3c27-9504-4b36-bbaf-96929c7a9127",
+        "version": 1,
+        "provider": "boat",
+        "companyId": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+        "remoteCwd": "<redacted:30 chars>",
+        "adapterType": "paperclip_runner",
+        "environmentId": "11c0ec3b-0857-4132-98b7-047b6fd62a91",
+        "leaseFingerprint": {
+          "version": 1,
+          "category": "<redacted:5 chars>",
+          "algorithm": "<redacted:6 chars>",
+          "fingerprint": "<redacted:74 chars>"
+        },
+        "workspaceSentinel": {
+          "path": "<redacted:77 chars>",
+          "result": "<redacted:7 chars>",
+          "allocationFiles": {
+            "files": [
+              {
+                "sha256": "b7efeb6b6d8bb1ba563049ccf1a9dea94d798d96b47986289e972c5cb077f38b",
+                "relativePath": "<redacted:46 chars>"
+              }
+            ],
+            "remoteCwd": "<redacted:30 chars>",
+            "providerLeaseId": "bx_4hrp452q"
+          }
+        },
+        "runtimeFingerprint": "65a5afc49a74d5c7e753f74bf51e4cadad410d19f40633ff105e7e73e3fc3081",
+        "executionWorkspaceId": "f2178a4e-2cd7-4b50-a03d-bb50f364a106",
+        "leaseIdentityFingerprint": {
+          "version": 1,
+          "category": "<redacted:5 chars>",
+          "algorithm": "<redacted:6 chars>",
+          "fingerprint": "<redacted:74 chars>"
+        }
+      },
+      "workspaceRealization": {
+        "mode": "copy",
+        "local": {
+          "path": "<redacted:122 chars>",
+          "source": "task_session",
+          "repoRef": null,
+          "repoUrl": null,
+          "strategy": "<redacted:15 chars>",
+          "projectId": null,
+          "branchName": null,
+          "worktreePath": null,
+          "projectWorkspaceId": null
+        },
+        "remote": {
+          "path": "<redacted:30 chars>",
+          "sandboxId": "bx_4hrp452q"
+        },
+        "leaseId": "c358cc0f-12e2-43ab-9699-4952b92da206",
+        "rebuild": {
+          "mode": "shared_workspace",
+          "repoRef": null,
+          "repoUrl": null,
+          "metadata": {
+            "source": {
+              "kind": "task_session",
+              "repoRef": null,
+              "repoUrl": null,
+              "strategy": "<redacted:15 chars>",
+              "localPath": "<redacted:122 chars>",
+              "projectId": null,
+              "branchName": null,
+              "worktreePath": null,
+              "projectWorkspaceId": null
+            },
+            "provider": "boat",
+            "runtimeOverlay": {
+              "cleanupCommand": null,
+              "teardownCommand": null,
+              "provisionCommand": null,
+              "workspaceRuntime": null,
+              "runtimeProvisionCommand": null
+            },
+            "providerMetadata": {
+              "provider": "boat",
+              "remoteCwd": "<redacted:30 chars>"
+            },
+            "environmentDriver": "sandbox"
+          },
+          "localPath": "<redacted:122 chars>",
+          "remotePath": "<redacted:30 chars>",
+          "providerLeaseId": "bx_4hrp452q",
+          "executionWorkspaceId": "f2178a4e-2cd7-4b50-a03d-bb50f364a106"
+        },
+        "summary": "<redacted:76 chars>",
+        "version": 1,
+        "provider": "boat",
+        "bootstrap": {
+          "command": null
+        },
+        "additional": [],
+        "pathAliases": [],
+        "environmentId": "11c0ec3b-0857-4132-98b7-047b6fd62a91",
+        "providerLeaseId": "bx_4hrp452q",
+        "authoritativeRoot": "<redacted:122 chars>",
+        "outboundRestorePaths": []
+      },
+      "sandboxProviderPlugin": true,
+      "executionWorkspaceMode": "shared_workspace",
+      "pendingCleanupInFlight": false,
+      "reusableLeaseSuccessor": {
+        "schema": "paperclip.reusable-lease-handoff.v1",
+        "agentId": "4f7a3c27-9504-4b36-bbaf-96929c7a9127",
+        "issueId": "0c8b537d-5135-4a01-8510-1e777a997cee",
+        "provider": "boat",
+        "companyId": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+        "handoffId": "a5d95394-6398-4f5f-9eec-5755a4f076ae",
+        "recordedAt": "2026-11-19T08:55:24.078Z",
+        "workspaceId": "f2178a4e-2cd7-4b50-a03d-bb50f364a106",
+        "environmentId": "11c0ec3b-0857-4132-98b7-047b6fd62a91",
+        "previousRunId": "fcdf9174-b883-404d-85fa-46f9b22d2895",
+        "successorRunId": "a4920ce3-0497-4ac0-ad20-88dccf352f19",
+        "previousLeaseId": "c358cc0f-12e2-43ab-9699-4952b92da206",
+        "providerLeaseId": "bx_4hrp452q",
+        "successorLeaseId": "af137941-b62b-4559-b40d-aef4ed556df5"
+      },
+      "runnerReconnectGraceMs": 420000,
+      "pendingCleanupAttemptId": "d639913c-6a5d-4b22-ab33-a6564eb08535",
+      "sandboxLeaseAcquisition": {
+        "outcome": "created"
+      },
+      "anonymousGitHubLaunchers": {
+        "layout": {
+          "PATH": "<redacted:387 chars>",
+          "ZDOTDIR": "<redacted:137 chars>",
+          "BASH_ENV": "<redacted:145 chars>",
+          "GH_CONFIG_DIR": "<redacted:147 chars>",
+          "PAPERCLIP_GITHUB_LAUNCHER_DIR": "<redacted:137 chars>"
+        },
+        "leaseId": "c358cc0f-12e2-43ab-9699-4952b92da206"
+      },
+      "pendingCleanupController": {
+        "pid": 7,
+        "bootId": "2e69b304-35cd-420a-af6b-ddc324384c5d",
+        "hostHash": "e0de897e5daee8cf379a31c1b7ab3a30",
+        "attemptId": "d639913c-6a5d-4b22-ab33-a6564eb08535",
+        "countedAttempt": true,
+        "processStartedAt": "2026-11-19T08:07:52.260Z"
+      },
+      "warmSandboxIdleTimeoutMs": 300000,
+      "workspaceAllocationFiles": {
+        "files": [
+          {
+            "sha256": "b7efeb6b6d8bb1ba563049ccf1a9dea94d798d96b47986289e972c5cb077f38b",
+            "relativePath": "<redacted:46 chars>"
+          }
+        ],
+        "remoteCwd": "<redacted:30 chars>",
+        "providerLeaseId": "bx_4hrp452q"
+      },
+      "pendingCleanupRetryAfterMs": 1795078144302,
+      "remoteExecutionTermination": {
+        "runId": "fcdf9174-b883-404d-85fa-46f9b22d2895",
+        "state": "stopped",
+        "schema": "paperclip.remote-termination.v1",
+        "leaseId": "c358cc0f-12e2-43ab-9699-4952b92da206",
+        "provider": "boat",
+        "companyId": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+        "confirmedAt": "2026-11-19T08:44:04.284Z",
+        "providerLeaseId": "bx_4hrp452q"
+      },
+      "pendingCleanupRetryAttempts": 1,
+      "sandboxStopAndRetainReceipt": {
+        "runId": "fcdf9174-b883-404d-85fa-46f9b22d2895",
+        "method": "environmentStopLease",
+        "schema": "paperclip.sandbox-stop-and-retain-receipt.v1",
+        "leaseId": "c358cc0f-12e2-43ab-9699-4952b92da206",
+        "pluginId": "83323bdb-4bb4-44b5-b7a8-f59dc32cf288",
+        "provider": "boat",
+        "companyId": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+        "requestId": "a901be9e-d8a6-4fca-9aa2-0d33f44108de",
+        "confirmedAt": "2026-11-19T08:44:04.284Z",
+        "providerLeaseId": "bx_4hrp452q"
+      },
+      "pendingCleanupRetryCapWarned": false,
+      "pendingCleanupLeaseExpiresAtMs": 0,
+      "nativeWorkspaceRealizationPreparation": {
+        "cwd": "<redacted:30 chars>",
+        "leaseId": "c358cc0f-12e2-43ab-9699-4952b92da206",
+        "realization": {
+          "mode": "copy",
+          "local": {
+            "path": "<redacted:122 chars>",
+            "source": "task_session",
+            "repoRef": null,
+            "repoUrl": null,
+            "strategy": "<redacted:15 chars>",
+            "projectId": null,
+            "branchName": null,
+            "worktreePath": null,
+            "projectWorkspaceId": null
+          },
+          "remote": {
+            "path": "<redacted:30 chars>",
+            "sandboxId": "bx_4hrp452q"
+          },
+          "leaseId": "c358cc0f-12e2-43ab-9699-4952b92da206",
+          "rebuild": {
+            "mode": "shared_workspace",
+            "repoRef": null,
+            "repoUrl": null,
+            "metadata": {
+              "source": {
+                "kind": "task_session",
+                "repoRef": null,
+                "repoUrl": null,
+                "strategy": "<redacted:15 chars>",
+                "localPath": "<redacted:122 chars>",
+                "projectId": null,
+                "branchName": null,
+                "worktreePath": null,
+                "projectWorkspaceId": null
+              },
+              "provider": "boat",
+              "runtimeOverlay": {
+                "cleanupCommand": null,
+                "teardownCommand": null,
+                "provisionCommand": null,
+                "workspaceRuntime": null,
+                "runtimeProvisionCommand": null
+              },
+              "providerMetadata": {
+                "provider": "boat",
+                "remoteCwd": "<redacted:30 chars>"
+              },
+              "environmentDriver": "sandbox"
+            },
+            "localPath": "<redacted:122 chars>",
+            "remotePath": "<redacted:30 chars>",
+            "providerLeaseId": "bx_4hrp452q",
+            "executionWorkspaceId": "f2178a4e-2cd7-4b50-a03d-bb50f364a106"
+          },
+          "summary": "<redacted:76 chars>",
+          "version": 1,
+          "provider": "boat",
+          "bootstrap": {
+            "command": null
+          },
+          "additional": [],
+          "pathAliases": [],
+          "environmentId": "11c0ec3b-0857-4132-98b7-047b6fd62a91",
+          "providerLeaseId": "bx_4hrp452q",
+          "authoritativeRoot": "<redacted:122 chars>",
+          "outboundRestorePaths": []
+        }
+      }
+    },
+    "provider": "boat",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:34:06.859+00:00",
+    "expires_at": "2026-11-19T09:04:01.591+00:00",
+    "updated_at": "2026-11-19T08:55:24.078+00:00",
+    "acquired_at": "2026-11-19T08:34:06.859+00:00",
+    "released_at": "2026-11-19T08:55:24.078+00:00",
+    "last_used_at": "2026-11-19T08:55:24.078+00:00",
+    "lease_policy": "reuse_by_environment",
+    "cleanup_status": "success",
+    "environment_id": "11c0ec3b-0857-4132-98b7-047b6fd62a91",
+    "failure_reason": null,
+    "heartbeat_run_id": "fcdf9174-b883-404d-85fa-46f9b22d2895",
+    "provider_lease_id": "bx_4hrp452q",
+    "execution_workspace_id": "f2178a4e-2cd7-4b50-a03d-bb50f364a106"
+  }
+]

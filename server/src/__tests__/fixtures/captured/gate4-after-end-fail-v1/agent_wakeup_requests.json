@@ -1,0 +1,209 @@
+[
+  {
+    "id": "4465834c-a5ba-4878-991f-5d22b5bd064a",
+    "error": "<redacted:126 chars>",
+    "reason": "<redacted:15 chars>",
+    "run_id": "f5a19940-7c6a-4410-b054-da0c0c5392c4",
+    "source": "on_demand",
+    "status": "failed",
+    "payload": {
+      "issueId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+      "commentId": "ec4d53b9-0acc-4c80-b176-006e065d1cbc",
+      "interactionOrigin": {
+        "actorId": "pXCjqsKtAkBFq1NFT6a83fAwdEhtY53n",
+        "actorType": "user"
+      },
+      "_paperclipWakeContext": {
+        "source": "issue.comment",
+        "taskId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+        "issueId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+        "taskKey": "<redacted:36 chars>",
+        "commentId": "ec4d53b9-0acc-4c80-b176-006e065d1cbc",
+        "wakeReason": "issue_commented",
+        "wakeSource": "on_demand",
+        "wakeCommentId": "ec4d53b9-0acc-4c80-b176-006e065d1cbc",
+        "wakeCommentIds": [
+          "ec4d53b9-0acc-4c80-b176-006e065d1cbc"
+        ],
+        "wakeTriggerDetail": "manual"
+      }
+    },
+    "agent_id": "dac90670-28f3-4bbf-b74c-20ea1992f034",
+    "claimed_at": "2026-11-19T08:57:21.125+00:00",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:57:20.847913+00:00",
+    "updated_at": "2026-11-19T08:58:17.498+00:00",
+    "finished_at": "2026-11-19T08:58:17.394+00:00",
+    "requested_at": "2026-11-19T08:57:20.847913+00:00",
+    "trigger_detail": "manual",
+    "coalesced_count": 0,
+    "idempotency_key": "conversation-comment:ec4d53b9-0acc-4c80-b176-006e065d1cbc",
+    "requested_by_actor_id": "pXCjqsKtAkBFq1NFT6a83fAwdEhtY53n",
+    "requested_by_actor_type": "user"
+  },
+  {
+    "id": "52a4dd45-2395-490e-803a-1628d04419df",
+    "error": null,
+    "reason": "<redacted:15 chars>",
+    "run_id": "99ad41ce-2576-4d50-9179-30e8ea65cfdd",
+    "source": "on_demand",
+    "status": "completed",
+    "payload": {
+      "issueId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+      "commentId": "5ab367be-ab2f-414d-bff6-155a3e8aa2b3",
+      "interactionOrigin": {
+        "actorId": "pXCjqsKtAkBFq1NFT6a83fAwdEhtY53n",
+        "actorType": "user"
+      },
+      "_paperclipWakeContext": {
+        "source": "issue.comment",
+        "taskId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+        "issueId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+        "taskKey": "<redacted:36 chars>",
+        "commentId": "5ab367be-ab2f-414d-bff6-155a3e8aa2b3",
+        "wakeReason": "issue_commented",
+        "wakeSource": "on_demand",
+        "wakeCommentId": "5ab367be-ab2f-414d-bff6-155a3e8aa2b3",
+        "wakeCommentIds": [
+          "5ab367be-ab2f-414d-bff6-155a3e8aa2b3"
+        ],
+        "wakeTriggerDetail": "manual"
+      }
+    },
+    "agent_id": "dac90670-28f3-4bbf-b74c-20ea1992f034",
+    "claimed_at": "2026-11-19T08:55:02.939+00:00",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:55:02.671253+00:00",
+    "updated_at": "2026-11-19T08:57:20.755+00:00",
+    "finished_at": "2026-11-19T08:57:20.754+00:00",
+    "requested_at": "2026-11-19T08:55:02.671253+00:00",
+    "trigger_detail": "manual",
+    "coalesced_count": 0,
+    "idempotency_key": "conversation-comment:5ab367be-ab2f-414d-bff6-155a3e8aa2b3",
+    "requested_by_actor_id": "pXCjqsKtAkBFq1NFT6a83fAwdEhtY53n",
+    "requested_by_actor_type": "user"
+  },
+  {
+    "id": "742466f1-15e6-45bd-afd3-12970f9bc22f",
+    "error": "<redacted:28 chars>",
+    "reason": "<redacted:15 chars>",
+    "run_id": "c56b9ac7-7f46-46fc-a218-2b96cf80631e",
+    "source": "on_demand",
+    "status": "cancelled",
+    "payload": {
+      "issueId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+      "commentId": "b3bb33c1-b8d6-4fe1-97cc-a12e412c2ee4",
+      "interactionOrigin": {
+        "actorId": "pXCjqsKtAkBFq1NFT6a83fAwdEhtY53n",
+        "actorType": "user"
+      },
+      "_paperclipWakeContext": {
+        "source": "issue.comment",
+        "taskId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+        "issueId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+        "taskKey": "<redacted:36 chars>",
+        "commentId": "b3bb33c1-b8d6-4fe1-97cc-a12e412c2ee4",
+        "wakeReason": "issue_commented",
+        "wakeSource": "on_demand",
+        "wakeCommentId": "b3bb33c1-b8d6-4fe1-97cc-a12e412c2ee4",
+        "wakeCommentIds": [
+          "b3bb33c1-b8d6-4fe1-97cc-a12e412c2ee4"
+        ],
+        "wakeTriggerDetail": "manual"
+      }
+    },
+    "agent_id": "dac90670-28f3-4bbf-b74c-20ea1992f034",
+    "claimed_at": "2026-11-19T08:50:49.981+00:00",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:50:49.741896+00:00",
+    "updated_at": "2026-11-19T08:51:32.96+00:00",
+    "finished_at": "2026-11-19T08:51:32.881+00:00",
+    "requested_at": "2026-11-19T08:50:49.741896+00:00",
+    "trigger_detail": "manual",
+    "coalesced_count": 0,
+    "idempotency_key": "conversation-comment:b3bb33c1-b8d6-4fe1-97cc-a12e412c2ee4",
+    "requested_by_actor_id": "pXCjqsKtAkBFq1NFT6a83fAwdEhtY53n",
+    "requested_by_actor_type": "user"
+  },
+  {
+    "id": "89a5e821-1081-4e9c-b96b-57882afd89a2",
+    "error": null,
+    "reason": "<redacted:20 chars>",
+    "run_id": "038baba6-e5ca-4690-b0b6-5ad61af23f24",
+    "source": "automation",
+    "status": "coalesced",
+    "payload": {
+      "taskId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+      "issueId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+      "retryCause": "<redacted:17 chars>",
+      "retrySummary": "<redacted:74 chars>",
+      "nativeDecisionId": "1022847f-1318-4e65-8e32-8ad65dc8d47e",
+      "interactionOrigin": {
+        "actorId": "dac90670-28f3-4bbf-b74c-20ea1992f034",
+        "actorType": "agent",
+        "operation": "assign"
+      },
+      "_paperclipWakeContext": {
+        "source": "native_status_decision",
+        "taskId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+        "issueId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+        "wakeReason": "issue_status_changed",
+        "statusDecisionSource": "<redacted:22 chars>"
+      }
+    },
+    "agent_id": "dac90670-28f3-4bbf-b74c-20ea1992f034",
+    "claimed_at": "2026-11-19T08:58:17.452+00:00",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:58:17.358414+00:00",
+    "updated_at": "2026-11-19T08:58:17.81+00:00",
+    "finished_at": "2026-11-19T08:58:17.81+00:00",
+    "requested_at": "2026-11-19T08:58:17.358414+00:00",
+    "trigger_detail": "system",
+    "coalesced_count": 0,
+    "idempotency_key": "native-status:1022847f-1318-4e65-8e32-8ad65dc8d47e:retry",
+    "requested_by_actor_id": "native-status-committer",
+    "requested_by_actor_type": "system"
+  },
+  {
+    "id": "e77551fa-767f-4259-b686-9b836a2d29f6",
+    "error": null,
+    "reason": "<redacted:20 chars>",
+    "run_id": "038baba6-e5ca-4690-b0b6-5ad61af23f24",
+    "source": "automation",
+    "status": "completed",
+    "payload": {
+      "taskId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+      "issueId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+      "retryCause": "<redacted:17 chars>",
+      "retrySummary": "<redacted:74 chars>",
+      "nativeDecisionId": "1022847f-1318-4e65-8e32-8ad65dc8d47e",
+      "interactionOrigin": {
+        "actorId": "dac90670-28f3-4bbf-b74c-20ea1992f034",
+        "actorType": "agent"
+      },
+      "_paperclipWakeContext": {
+        "source": "native_status_decision",
+        "taskId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+        "issueId": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+        "taskKey": "<redacted:36 chars>",
+        "wakeReason": "issue_status_changed",
+        "wakeSource": "automation",
+        "wakeTriggerDetail": "system",
+        "statusDecisionSource": "<redacted:22 chars>",
+        "nativeStatusWakeIntentId": "89a5e821-1081-4e9c-b96b-57882afd89a2"
+      }
+    },
+    "agent_id": "dac90670-28f3-4bbf-b74c-20ea1992f034",
+    "claimed_at": "2026-11-19T08:58:23.866+00:00",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:58:17.563257+00:00",
+    "updated_at": "2026-11-19T08:59:10.457+00:00",
+    "finished_at": "2026-11-19T08:59:10.456+00:00",
+    "requested_at": "2026-11-19T08:58:17.563257+00:00",
+    "trigger_detail": "system",
+    "coalesced_count": 0,
+    "idempotency_key": "native-status:1022847f-1318-4e65-8e32-8ad65dc8d47e:retry",
+    "requested_by_actor_id": "native-status-wake-dispatch:89a5e821-1081-4e9c-b96b-57882afd89a2",
+    "requested_by_actor_type": "system"
+  }
+]

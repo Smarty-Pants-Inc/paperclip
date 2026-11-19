@@ -1,0 +1,112 @@
+[
+  {
+    "id": "d5510000-a418-4f35-aefd-17087e0f802d",
+    "kind": "active_run_watchdog",
+    "cause": "native_continuation_requires_reconciliation",
+    "status": "resolved",
+    "outcome": "cancelled",
+    "evidence": {
+      "runId": "5fdb1188-a050-410c-b576-784dcfa6aee4",
+      "systemRecovery": {
+        "phase": "reconcile_effects",
+        "state": "complete",
+        "schema": "paperclip.system-recovery.v1",
+        "failure": {
+          "code": "agent_stop_unconfirmed",
+          "retryClass": "recheck_evidence",
+          "evidenceFingerprint": "eda84c6ec79bea6e765b152d96628e37c2bb8a343cbdb9c86f39522dd7a04a55"
+        },
+        "attempts": 2,
+        "intentId": null,
+        "revision": 7,
+        "attemptId": "48b8b884-f121-41b2-84eb-b95768747df2",
+        "deadlineAt": 1795075947793,
+        "retriesUsed": 1,
+        "sourceRunId": "5fdb1188-a050-410c-b576-784dcfa6aee4",
+        "generationId": "5cedd16c-ce26-42ad-a1dc-e7b17a6a7391",
+        "nextAttemptAt": null,
+        "policyVersion": 1,
+        "firstFailureAt": 1795074147793,
+        "freshAttemptRunId": null,
+        "providerCooldownAt": null,
+        "capturePolicyVersion": 2,
+        "preservationOperationIds": [
+          "4d89f117-3b24-49d1-943a-f22cb0e14c4f"
+        ]
+      },
+      "automaticRecovery": {
+        "runId": "5fdb1188-a050-410c-b576-784dcfa6aee4",
+        "policy": "<redacted:26 chars>",
+        "replay": "<redacted:26 chars>",
+        "recordedAt": "2026-11-19T07:42:27.552Z",
+        "actionOutcome": "unknown"
+      },
+      "workspaceRecovery": {
+        "runId": "5fdb1188-a050-410c-b576-784dcfa6aee4",
+        "stage": "saving_receipts",
+        "schema": "paperclip.workspace-recovery.v1",
+        "status": "recovered",
+        "attempt": 2,
+        "retryable": true,
+        "requestIds": [],
+        "attemptLimit": 6
+      },
+      "originalFailureCode": "operator_interrupted",
+      "continuationDelivery": "invalidated",
+      "workspaceStopEvidence": {
+        "schema": "paperclip.workspace-stop-evidence.v1",
+        "consumed": true,
+        "fingerprint": "353a34c19a3524c72e4fd96e5e33fa82d93614ce8f561550e6f39c58259bfb73",
+        "sourceRunId": "5fdb1188-a050-410c-b576-784dcfa6aee4",
+        "generationId": "5cedd16c-ce26-42ad-a1dc-e7b17a6a7391"
+      },
+      "systemRecoveryActiveAt": 1795074162767,
+      "workspaceRestoreFailure": "<redacted:14 chars>",
+      "workspaceRestorePending": true,
+      "explicitUserContinuation": {
+        "runId": "65b3c9d5-b063-43bb-9e46-659b0d5500f0",
+        "actorId": "pj0cO3JstKNq80QhSqVBg45xHoJUseMX",
+        "commentId": "e64c12dd-46f2-4283-a4a7-253aa09b9608",
+        "recordedAt": "2026-11-19T07:42:54.285Z",
+        "previousRunId": "5fdb1188-a050-410c-b576-784dcfa6aee4",
+        "commentBodyHash": "f77c2a48fe9f035f952845a7391024cfa294c7d401a1f2131d93bba733dc9d9a",
+        "commentUpdatedAt": "2026-11-19T07:41:56.420Z",
+        "queuedCommentInterruptId": "2eb895fc-b453-4d9b-87cf-1e8815b9b1b0"
+      },
+      "workspaceRestoreRecovery": {
+        "schema": "paperclip.workspace-restore-recovery.v1",
+        "leaseIds": [
+          "4095e53c-a87f-417b-adcd-1d183adc4aeb"
+        ]
+      },
+      "historicalWorkspaceSource": {
+        "runId": "5fdb1188-a050-410c-b576-784dcfa6aee4",
+        "schema": "paperclip.historical-workspace-source.v1",
+        "leaseIds": [
+          "4095e53c-a87f-417b-adcd-1d183adc4aeb"
+        ]
+      },
+      "previousWorkspaceRecovery": null
+    },
+    "company_id": "e2cfb11f-296e-4705-823c-bf54805e11d4",
+    "created_at": "2026-11-19T07:42:27.497156+00:00",
+    "owner_type": "system",
+    "timeout_at": null,
+    "updated_at": "2026-11-19T07:42:54.289+00:00",
+    "fingerprint": "<redacted:53 chars>",
+    "next_action": "<redacted:82 chars>",
+    "resolved_at": "2026-11-19T07:42:54.289+00:00",
+    "wake_policy": null,
+    "max_attempts": null,
+    "attempt_count": 1,
+    "owner_user_id": null,
+    "monitor_policy": null,
+    "owner_agent_id": null,
+    "last_attempt_at": null,
+    "resolution_note": "<redacted:87 chars>",
+    "source_issue_id": "82decabe-17a4-4d40-b4d0-8248be214186",
+    "recovery_issue_id": null,
+    "return_owner_agent_id": null,
+    "previous_owner_agent_id": null
+  }
+]

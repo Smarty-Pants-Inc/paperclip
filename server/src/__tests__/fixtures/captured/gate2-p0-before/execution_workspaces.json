@@ -1,0 +1,165 @@
+[
+  {
+    "id": "5908e014-286e-4cbc-b937-919f45d80073",
+    "cwd": "<redacted:122 chars>",
+    "mode": "<redacted:16 chars>",
+    "name": "<redacted:7 chars>",
+    "status": "active",
+    "base_ref": null,
+    "metadata": {
+      "config": {
+        "desiredState": null,
+        "environmentId": "ffb7a9e5-8db6-4fcc-93bf-dd2017add5e5",
+        "serviceStates": null,
+        "cleanupCommand": null,
+        "teardownCommand": null,
+        "provisionCommand": null,
+        "workspaceRuntime": null,
+        "runtimeProvisionCommand": null
+      },
+      "source": "task_session",
+      "createdByRuntime": false,
+      "configFingerprint": {
+        "version": 1,
+        "categories": [
+          "<redacted:4 chars>",
+          "<redacted:16 chars>",
+          "<redacted:8 chars>",
+          "<redacted:4 chars>",
+          "<redacted:17 chars>",
+          "<redacted:15 chars>",
+          "<redacted:11 chars>",
+          "<redacted:11 chars>"
+        ],
+        "workspaceHash": "<redacted:74 chars>",
+        "lastEvaluatedAt": "2026-11-19T07:19:22.923Z",
+        "categoryFingerprints": {
+          "mode": "v1:sha256:d911dda054ac8b983eaf3b88021282281ede336936cd5bd841db05c7e0454a62",
+          "repo": "<redacted:74 chars>",
+          "strategy": "<redacted:74 chars>",
+          "environment": "v1:sha256:4a8d1c0fe1c019d2254f529ff45f81509f0a470e5726b3418aa9d1bd98827b10",
+          "realization": "<redacted:74 chars>",
+          "runtimeServices": "<redacted:74 chars>",
+          "projectWorkspace": "<redacted:74 chars>",
+          "lifecycleCommands": "<redacted:74 chars>"
+        }
+      },
+      "_issuePrivacySources": {
+        "6edb47fd-1b88-47b2-b9ad-80a43772a1ed": true
+      },
+      "workspaceRealization": {
+        "mode": "copy",
+        "local": {
+          "path": "<redacted:122 chars>",
+          "source": "task_session",
+          "repoRef": null,
+          "repoUrl": null,
+          "strategy": "<redacted:15 chars>",
+          "projectId": null,
+          "branchName": null,
+          "worktreePath": null,
+          "projectWorkspaceId": null
+        },
+        "remote": {
+          "path": "<redacted:30 chars>",
+          "sandboxId": "bx_mmdg4p97"
+        },
+        "leaseId": "99b3237c-8833-4730-b549-4b301b99ac7a",
+        "rebuild": {
+          "mode": "shared_workspace",
+          "repoRef": null,
+          "repoUrl": null,
+          "metadata": {
+            "source": {
+              "kind": "task_session",
+              "repoRef": null,
+              "repoUrl": null,
+              "strategy": "<redacted:15 chars>",
+              "localPath": "<redacted:122 chars>",
+              "projectId": null,
+              "branchName": null,
+              "worktreePath": null,
+              "projectWorkspaceId": null
+            },
+            "provider": "boat",
+            "runtimeOverlay": {
+              "cleanupCommand": null,
+              "teardownCommand": null,
+              "provisionCommand": null,
+              "workspaceRuntime": null,
+              "runtimeProvisionCommand": null
+            },
+            "providerMetadata": {
+              "provider": "boat",
+              "remoteCwd": "<redacted:30 chars>"
+            },
+            "environmentDriver": "sandbox"
+          },
+          "localPath": "<redacted:122 chars>",
+          "remotePath": "<redacted:30 chars>",
+          "providerLeaseId": "bx_mmdg4p97",
+          "executionWorkspaceId": "5908e014-286e-4cbc-b937-919f45d80073"
+        },
+        "summary": "<redacted:76 chars>",
+        "version": 1,
+        "provider": "boat",
+        "bootstrap": {
+          "command": null
+        },
+        "additional": [],
+        "pathAliases": [],
+        "environmentId": "ffb7a9e5-8db6-4fcc-93bf-dd2017add5e5",
+        "providerLeaseId": "bx_mmdg4p97",
+        "authoritativeRoot": "<redacted:122 chars>",
+        "outboundRestorePaths": []
+      },
+      "workspaceRealizationRequest": {
+        "source": {
+          "kind": "task_session",
+          "repoRef": null,
+          "repoUrl": null,
+          "strategy": "<redacted:15 chars>",
+          "localPath": "<redacted:122 chars>",
+          "projectId": null,
+          "branchName": null,
+          "worktreePath": null,
+          "projectWorkspaceId": null
+        },
+        "issueId": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+        "version": 1,
+        "companyId": "e2cfb11f-296e-4705-823c-bf54805e11d4",
+        "adapterType": "paperclip_runner",
+        "environmentId": "ffb7a9e5-8db6-4fcc-93bf-dd2017add5e5",
+        "requestedMode": "shared_workspace",
+        "heartbeatRunId": "bd4f8bd0-a049-4170-a586-48f672112f46",
+        "runtimeOverlay": {
+          "cleanupCommand": null,
+          "teardownCommand": null,
+          "provisionCommand": null,
+          "workspaceRuntime": null,
+          "runtimeProvisionCommand": null
+        },
+        "additionalSources": [],
+        "executionWorkspaceId": "5908e014-286e-4cbc-b937-919f45d80073"
+      },
+      "_controllerProvisionCopyOnly": true
+    },
+    "repo_url": null,
+    "closed_at": null,
+    "opened_at": "2026-11-19T07:13:48.133+00:00",
+    "company_id": "e2cfb11f-296e-4705-823c-bf54805e11d4",
+    "created_at": "2026-11-19T07:13:48.13361+00:00",
+    "project_id": null,
+    "updated_at": "2026-11-19T07:19:24.346+00:00",
+    "branch_name": null,
+    "last_used_at": "2026-11-19T07:19:22.924+00:00",
+    "provider_ref": null,
+    "provider_type": "<redacted:8 chars>",
+    "strategy_type": "project_primary",
+    "cleanup_reason": null,
+    "source_issue_id": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+    "cleanup_eligible_at": null,
+    "project_workspace_id": null,
+    "derived_from_execution_workspace_id": null
+  }
+]

@@ -1,0 +1,177 @@
+[
+  {
+    "id": "1022847f-1318-4e65-8e32-8ad65dc8d47e",
+    "run_id": "f5a19940-7c6a-4410-b054-da0c0c5392c4",
+    "issue_id": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+    "to_status": "in_progress",
+    "applied_at": "2026-11-19T08:58:17.384+00:00",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:58:17.358414+00:00",
+    "from_status": "in_progress",
+    "reason_code": "run_failed_partial_evidence_preserved",
+    "assessment_id": "0add0510-5bcb-441c-a8dd-ea58b74efe76",
+    "decision_json": {
+      "effects": [
+        {
+          "kind": "schedule_retry",
+          "cause": "native_run_failed",
+          "agentId": "dac90670-28f3-4bbf-b74c-20ea1992f034",
+          "summary": "<redacted:74 chars>"
+        }
+      ],
+      "toStatus": "in_progress",
+      "reasonCode": "run_failed_partial_evidence_preserved",
+      "statusAction": "preserve",
+      "unblockDescriptor": null,
+      "priorStatusVersion": 1,
+      "projectedStatusVersion": 1
+    },
+    "policy_version": "phase6-v14",
+    "decision_digest": "cc04bc84744d25d8f67fbbd2d2bdc3c7e61d017c174172a4d4e5571981eea186",
+    "decision_version": 3,
+    "application_state": "applied",
+    "supersedes_decision_id": null
+  },
+  {
+    "id": "caf0b269-b693-4ffa-b3b6-4c904e6bd867",
+    "run_id": "99ad41ce-2576-4d50-9179-30e8ea65cfdd",
+    "issue_id": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+    "to_status": "in_review",
+    "applied_at": "2026-11-19T08:59:11.52+00:00",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:59:11.506281+00:00",
+    "from_status": "in_review",
+    "reason_code": "prior_status_terminal_preserved",
+    "assessment_id": "08d634b6-0b54-4bde-a428-f1b6aefc2fdb",
+    "decision_json": {
+      "effects": [
+        {
+          "kind": "append_superseding_assessment"
+        }
+      ],
+      "toStatus": "in_review",
+      "reasonCode": "prior_status_terminal_preserved",
+      "statusAction": "preserve",
+      "unblockDescriptor": null,
+      "priorStatusVersion": 2,
+      "projectedStatusVersion": 2
+    },
+    "policy_version": "phase6-v14",
+    "decision_digest": "d61b1f0ac05569630b620cd5848ddd5d149e357e0a8df5338f24e82ca1628f07",
+    "decision_version": 6,
+    "application_state": "applied",
+    "supersedes_decision_id": null
+  },
+  {
+    "id": "cb0379bd-91e6-454e-8d25-8501ce846d43",
+    "run_id": "99ad41ce-2576-4d50-9179-30e8ea65cfdd",
+    "issue_id": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+    "to_status": "in_progress",
+    "applied_at": "2026-11-19T08:57:17.087+00:00",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:57:17.073186+00:00",
+    "from_status": "in_progress",
+    "reason_code": "conversation_turn_finished",
+    "assessment_id": "2c9948de-dc54-403c-9f3d-8414da318156",
+    "decision_json": {
+      "effects": [],
+      "toStatus": "in_progress",
+      "reasonCode": "conversation_turn_finished",
+      "statusAction": "preserve",
+      "unblockDescriptor": null,
+      "priorStatusVersion": 1,
+      "projectedStatusVersion": 1
+    },
+    "policy_version": "phase6-v14",
+    "decision_digest": "5574b747b48deeedee932c6f96d98b56aa2f149412f8aefada8b1d08f215c1c8",
+    "decision_version": 2,
+    "application_state": "applied",
+    "supersedes_decision_id": null
+  },
+  {
+    "id": "e662ef3c-640e-48c2-9eb2-37d7735b2740",
+    "run_id": "f5a19940-7c6a-4410-b054-da0c0c5392c4",
+    "issue_id": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+    "to_status": "in_review",
+    "applied_at": "2026-11-19T08:59:11.56+00:00",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:59:11.546771+00:00",
+    "from_status": "in_review",
+    "reason_code": "prior_status_terminal_preserved",
+    "assessment_id": "86cf313e-ce50-4af8-b491-2769e994bdfe",
+    "decision_json": {
+      "effects": [
+        {
+          "kind": "append_superseding_assessment"
+        }
+      ],
+      "toStatus": "in_review",
+      "reasonCode": "prior_status_terminal_preserved",
+      "statusAction": "preserve",
+      "unblockDescriptor": null,
+      "priorStatusVersion": 2,
+      "projectedStatusVersion": 2
+    },
+    "policy_version": "phase6-v14",
+    "decision_digest": "2c70622f967d2e8ff479d009322dce412e60f0ba51e42f61008d09d1da408678",
+    "decision_version": 7,
+    "application_state": "applied",
+    "supersedes_decision_id": null
+  },
+  {
+    "id": "f0fefc5b-b9ec-4023-8282-80ba8b70e89d",
+    "run_id": "038baba6-e5ca-4690-b0b6-5ad61af23f24",
+    "issue_id": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+    "to_status": "in_progress",
+    "applied_at": "2026-11-19T08:59:06.901+00:00",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:59:06.890988+00:00",
+    "from_status": "in_progress",
+    "reason_code": "conversation_turn_finished",
+    "assessment_id": "8f5b19e0-b80e-4a96-871a-317efa5ea849",
+    "decision_json": {
+      "effects": [],
+      "toStatus": "in_progress",
+      "reasonCode": "conversation_turn_finished",
+      "statusAction": "preserve",
+      "unblockDescriptor": null,
+      "priorStatusVersion": 1,
+      "projectedStatusVersion": 1
+    },
+    "policy_version": "phase6-v14",
+    "decision_digest": "2b89b2488dc0550c6f15e1198db66df42e41c844ab70bec05b15111e7c615777",
+    "decision_version": 4,
+    "application_state": "applied",
+    "supersedes_decision_id": null
+  },
+  {
+    "id": "f77acba4-7e43-4e6a-8124-f73438d6ff51",
+    "run_id": "038baba6-e5ca-4690-b0b6-5ad61af23f24",
+    "issue_id": "3e21230b-8b39-433c-86e4-b819b73cc70f",
+    "to_status": "in_review",
+    "applied_at": "2026-11-19T08:59:11.462+00:00",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:59:11.43661+00:00",
+    "from_status": "in_review",
+    "reason_code": "prior_status_terminal_preserved",
+    "assessment_id": "a1465070-640c-421d-9743-97f41b616990",
+    "decision_json": {
+      "effects": [
+        {
+          "kind": "append_superseding_assessment"
+        }
+      ],
+      "toStatus": "in_review",
+      "reasonCode": "prior_status_terminal_preserved",
+      "statusAction": "preserve",
+      "unblockDescriptor": null,
+      "priorStatusVersion": 2,
+      "projectedStatusVersion": 2
+    },
+    "policy_version": "phase6-v14",
+    "decision_digest": "13865aa7734f009f3f25b07aac3ba3d02bd382247d3469fbbc96822ae90284bc",
+    "decision_version": 5,
+    "application_state": "applied",
+    "supersedes_decision_id": null
+  }
+]

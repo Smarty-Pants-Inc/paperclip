@@ -1,0 +1,28 @@
+[
+  {
+    "id": "b4159fe5-04d2-45fa-9e06-adb77909d0a1",
+    "risk": "low",
+    "issue_id": "0c8b537d-5135-4a01-8510-1e777a997cee",
+    "revision": 1,
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:34:16.299396+00:00",
+    "contract_json": {
+      "criteria": [
+        {
+          "id": "objective",
+          "requirement": "<redacted:242 chars>"
+        }
+      ],
+      "revision": "<redacted:1 chars>",
+      "objective": "<redacted:776 chars>"
+    },
+    "policy_version": "phase6-v4",
+    "schema_version": "paperclip.completion-contract.v1",
+    "canonical_sha256": "733bb7b7292c553cb47f10c8159c7b8cdd6786a70882457e1581c55402f5b193",
+    "created_by_actor_id": "4f7a3c27-9504-4b36-bbaf-96929c7a9127",
+    "completion_authority": "<redacted:18 chars>",
+    "created_by_actor_type": "<redacted:6 chars>",
+    "supersedes_contract_id": null,
+    "incomplete_criteria_policy": "<redacted:21 chars>"
+  }
+]

@@ -1,0 +1,86 @@
+[
+  {
+    "id": "0f47f964-1362-43fd-8f2d-009e2355b11a",
+    "error": null,
+    "reason": "<redacted:15 chars>",
+    "run_id": "a4920ce3-0497-4ac0-ad20-88dccf352f19",
+    "source": "on_demand",
+    "status": "claimed",
+    "payload": {
+      "issueId": "0c8b537d-5135-4a01-8510-1e777a997cee",
+      "commentId": "66efcde0-ae70-4675-9a11-6d1f3a905be0",
+      "interactionOrigin": {
+        "actorId": "pXCjqsKtAkBFq1NFT6a83fAwdEhtY53n",
+        "actorType": "user"
+      },
+      "_paperclipWakeContext": {
+        "source": "issue.comment",
+        "taskId": "0c8b537d-5135-4a01-8510-1e777a997cee",
+        "issueId": "0c8b537d-5135-4a01-8510-1e777a997cee",
+        "taskKey": "<redacted:36 chars>",
+        "commentId": "66efcde0-ae70-4675-9a11-6d1f3a905be0",
+        "wakeReason": "issue_commented",
+        "wakeSource": "on_demand",
+        "wakeCommentId": "66efcde0-ae70-4675-9a11-6d1f3a905be0",
+        "wakeCommentIds": [
+          "66efcde0-ae70-4675-9a11-6d1f3a905be0"
+        ],
+        "wakeTriggerDetail": "manual"
+      }
+    },
+    "agent_id": "4f7a3c27-9504-4b36-bbaf-96929c7a9127",
+    "claimed_at": "2026-11-19T08:55:09.252+00:00",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:55:09.045127+00:00",
+    "updated_at": "2026-11-19T08:55:09.282+00:00",
+    "finished_at": null,
+    "requested_at": "2026-11-19T08:55:09.045127+00:00",
+    "trigger_detail": "manual",
+    "coalesced_count": 0,
+    "idempotency_key": "conversation-comment:66efcde0-ae70-4675-9a11-6d1f3a905be0",
+    "requested_by_actor_id": "pXCjqsKtAkBFq1NFT6a83fAwdEhtY53n",
+    "requested_by_actor_type": "user"
+  },
+  {
+    "id": "42c5fbb8-4bd4-4718-9fc4-46383676e1a9",
+    "error": null,
+    "reason": "<redacted:15 chars>",
+    "run_id": "fcdf9174-b883-404d-85fa-46f9b22d2895",
+    "source": "on_demand",
+    "status": "completed",
+    "payload": {
+      "issueId": "0c8b537d-5135-4a01-8510-1e777a997cee",
+      "commentId": "930fb800-d875-48ca-9daa-8e2c113cd3d4",
+      "interactionOrigin": {
+        "actorId": "pXCjqsKtAkBFq1NFT6a83fAwdEhtY53n",
+        "actorType": "user"
+      },
+      "_paperclipWakeContext": {
+        "source": "issue.comment",
+        "taskId": "0c8b537d-5135-4a01-8510-1e777a997cee",
+        "issueId": "0c8b537d-5135-4a01-8510-1e777a997cee",
+        "taskKey": "<redacted:36 chars>",
+        "commentId": "930fb800-d875-48ca-9daa-8e2c113cd3d4",
+        "wakeReason": "issue_commented",
+        "wakeSource": "on_demand",
+        "wakeCommentId": "930fb800-d875-48ca-9daa-8e2c113cd3d4",
+        "wakeCommentIds": [
+          "930fb800-d875-48ca-9daa-8e2c113cd3d4"
+        ],
+        "wakeTriggerDetail": "manual"
+      }
+    },
+    "agent_id": "4f7a3c27-9504-4b36-bbaf-96929c7a9127",
+    "claimed_at": "2026-11-19T08:33:59.817+00:00",
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:33:59.535507+00:00",
+    "updated_at": "2026-11-19T08:36:35.183+00:00",
+    "finished_at": "2026-11-19T08:36:35.135+00:00",
+    "requested_at": "2026-11-19T08:33:59.535507+00:00",
+    "trigger_detail": "manual",
+    "coalesced_count": 0,
+    "idempotency_key": "conversation-comment:930fb800-d875-48ca-9daa-8e2c113cd3d4",
+    "requested_by_actor_id": "pXCjqsKtAkBFq1NFT6a83fAwdEhtY53n",
+    "requested_by_actor_type": "user"
+  }
+]

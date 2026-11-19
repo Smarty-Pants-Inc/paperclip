@@ -1,0 +1,120 @@
+[
+  {
+    "id": "3dcdf1a3-fb2d-4ba2-9c39-5309a0107ac1",
+    "run_id": "a8742cca-ba7e-4170-a1c7-bc0c9c9d727e",
+    "turn_id": "pi-turn-792d0c67-a962-40bc-8ac1-20e82dd6f8bf",
+    "issue_id": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+    "company_id": "e2cfb11f-296e-4705-823c-bf54805e11d4",
+    "created_at": "2026-11-19T07:18:51.252096+00:00",
+    "result_json": {
+      "result": {
+        "schema": "paperclip.run_result.v1",
+        "summary": "<redacted:45 chars>",
+        "evidence": [
+          {
+            "ref": "<redacted:32 chars>"
+          }
+        ],
+        "artifacts": [],
+        "verification": [
+          {
+            "detail": "<redacted:165 chars>",
+            "status": "passed",
+            "commandOrCheck": "<redacted:58 chars>"
+          }
+        ],
+        "completionClaim": {
+          "criteria": [
+            {
+              "status": "satisfied",
+              "criterionId": "objective",
+              "evidenceRefs": [
+                "<redacted:32 chars>"
+              ]
+            }
+          ],
+          "remainingWork": [],
+          "contractRevision": "2",
+          "objectiveSatisfied": true
+        },
+        "attentionRequests": [],
+        "reportedWorkDisposition": "done"
+      },
+      "terminal": {
+        "schema": "paperclip.prp.terminal.v1",
+        "runTerminalState": "succeeded",
+        "turnTerminalState": "completed",
+        "reportedWorkDisposition": "done"
+      },
+      "normalizationDiagnostics": {
+        "ignoredAttentionRequests": []
+      }
+    },
+    "schema_status": "accepted",
+    "rejection_code": null,
+    "caller_result_id": "174fe60d-54f8-4610-ad75-20a7a3f65c75:a8742cca-ba7e-4170-a1c7-bc0c9c9d727e:result",
+    "canonical_sha256": "f84d8557bd563ecf938365fd3a68791b6b7df62a7620f202bb249debfbd6bed9",
+    "caller_dedupe_key": "a8742cca-ba7e-4170-a1c7-bc0c9c9d727e:28dc95c4be1813beab355c81b99b60bc3964c8b536dbbc45a3432810c060ac0b",
+    "server_fingerprint": "8a675d5c602959233087746df4910376770dabba9921564e3aec374c18bed65a",
+    "completion_contract_id": "1e942bb5-4087-4fd6-8c8b-7c68ea9a9d37"
+  },
+  {
+    "id": "ca4a1938-9362-4384-8cfb-b0856700c6e4",
+    "run_id": "bd4f8bd0-a049-4170-a586-48f672112f46",
+    "turn_id": "pi-turn-dcff750a-aeff-4928-8f65-fd77d6cbbc50",
+    "issue_id": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+    "company_id": "e2cfb11f-296e-4705-823c-bf54805e11d4",
+    "created_at": "2026-11-19T07:19:45.627982+00:00",
+    "result_json": {
+      "result": {
+        "schema": "paperclip.run_result.v1",
+        "summary": "<redacted:21 chars>",
+        "evidence": [
+          {
+            "ref": "<redacted:54 chars>"
+          }
+        ],
+        "artifacts": [],
+        "verification": [
+          {
+            "detail": "<redacted:140 chars>",
+            "status": "passed",
+            "commandOrCheck": "<redacted:52 chars>"
+          }
+        ],
+        "completionClaim": {
+          "criteria": [
+            {
+              "status": "satisfied",
+              "criterionId": "objective",
+              "evidenceRefs": [
+                "<redacted:54 chars>"
+              ]
+            }
+          ],
+          "remainingWork": [],
+          "contractRevision": "3",
+          "objectiveSatisfied": true
+        },
+        "attentionRequests": [],
+        "reportedWorkDisposition": "done"
+      },
+      "terminal": {
+        "schema": "paperclip.prp.terminal.v1",
+        "runTerminalState": "succeeded",
+        "turnTerminalState": "completed",
+        "reportedWorkDisposition": "done"
+      },
+      "normalizationDiagnostics": {
+        "ignoredAttentionRequests": []
+      }
+    },
+    "schema_status": "accepted",
+    "rejection_code": null,
+    "caller_result_id": "174fe60d-54f8-4610-ad75-20a7a3f65c75:bd4f8bd0-a049-4170-a586-48f672112f46:result",
+    "canonical_sha256": "e2ed8cc5e75687b5c63c473bf2df708ce1d98502a85c450ad683493ccc287a14",
+    "caller_dedupe_key": "bd4f8bd0-a049-4170-a586-48f672112f46:2bf3e75f28c777778a0ef9ce4f81a560490a49056cda9750cdc05b35f3276c75",
+    "server_fingerprint": "a1d0b8e77bc41a4f66cf2aad75b6d6fc93a17a51dd735679f95173a93d37184d",
+    "completion_contract_id": "0f4bfee3-9b49-49b3-aacb-0d76b547fa44"
+  }
+]

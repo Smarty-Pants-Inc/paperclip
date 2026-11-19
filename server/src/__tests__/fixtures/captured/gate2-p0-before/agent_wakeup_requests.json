@@ -1,0 +1,201 @@
+[
+  {
+    "id": "691696f4-ca21-4201-8153-dc9dfad99585",
+    "error": null,
+    "reason": "<redacted:24 chars>",
+    "run_id": "a8742cca-ba7e-4170-a1c7-bc0c9c9d727e",
+    "source": "on_demand",
+    "status": "coalesced",
+    "payload": {
+      "issueId": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+      "commentId": "f405d228-1d98-4482-8f67-36900955b71c",
+      "executionWait": {
+        "reason": "workspace_repair_required",
+        "message": "<redacted:76 chars>",
+        "recoveryActionId": "afc2b41e-88fd-4424-a968-f44ecfb09eb0"
+      },
+      "interactionOrigin": {
+        "actorId": "pj0cO3JstKNq80QhSqVBg45xHoJUseMX",
+        "actorType": "user"
+      },
+      "_paperclipWakeContext": {
+        "source": "issue.comment",
+        "taskId": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+        "issueId": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+        "taskKey": "<redacted:36 chars>",
+        "commentId": "f405d228-1d98-4482-8f67-36900955b71c",
+        "wakeReason": "issue_commented",
+        "wakeSource": "on_demand",
+        "wakeCommentId": "f405d228-1d98-4482-8f67-36900955b71c",
+        "wakeCommentIds": [
+          "f405d228-1d98-4482-8f67-36900955b71c"
+        ],
+        "wakeTriggerDetail": "manual"
+      },
+      "queuedCommentInterrupt": {
+        "actorId": "pj0cO3JstKNq80QhSqVBg45xHoJUseMX",
+        "requestedAt": "2026-11-19T07:15:15.104Z",
+        "targetRunId": "5d14f227-b72c-415d-adf9-1752ef924e9d",
+        "continuation": {
+          "runId": "a8742cca-ba7e-4170-a1c7-bc0c9c9d727e",
+          "actorId": "pj0cO3JstKNq80QhSqVBg45xHoJUseMX",
+          "commentId": "f405d228-1d98-4482-8f67-36900955b71c",
+          "recordedAt": "2026-11-19T07:16:05.548Z",
+          "previousRunId": "5d14f227-b72c-415d-adf9-1752ef924e9d",
+          "commentBodyHash": "a90dc112a0da7306158e13ed01b81a454c279d3ea26c405f205772c7f3b0b533",
+          "commentUpdatedAt": "2026-11-19T07:14:49.222Z",
+          "queuedCommentInterruptId": "691696f4-ca21-4201-8153-dc9dfad99585"
+        }
+      }
+    },
+    "agent_id": "d2e4759f-2418-4d98-99e0-1abc2d794525",
+    "claimed_at": null,
+    "company_id": "e2cfb11f-296e-4705-823c-bf54805e11d4",
+    "created_at": "2026-11-19T07:14:49.509873+00:00",
+    "updated_at": "2026-11-19T07:16:05.581+00:00",
+    "finished_at": "2026-11-19T07:16:05.581+00:00",
+    "requested_at": "2026-11-19T07:14:49.509873+00:00",
+    "trigger_detail": "manual",
+    "coalesced_count": 0,
+    "idempotency_key": "conversation-comment:f405d228-1d98-4482-8f67-36900955b71c",
+    "requested_by_actor_id": "pj0cO3JstKNq80QhSqVBg45xHoJUseMX",
+    "requested_by_actor_type": "user"
+  },
+  {
+    "id": "76281799-26a5-4cb8-b682-9b4e72e900f7",
+    "error": null,
+    "reason": "<redacted:15 chars>",
+    "run_id": "a8742cca-ba7e-4170-a1c7-bc0c9c9d727e",
+    "source": "on_demand",
+    "status": "completed",
+    "payload": {
+      "issueId": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+      "commentId": "f405d228-1d98-4482-8f67-36900955b71c",
+      "executionWait": {
+        "reason": "workspace_repair_required",
+        "message": "<redacted:76 chars>",
+        "recoveryActionId": "afc2b41e-88fd-4424-a968-f44ecfb09eb0"
+      },
+      "interactionOrigin": {
+        "actorId": "pj0cO3JstKNq80QhSqVBg45xHoJUseMX",
+        "actorType": "user"
+      },
+      "_paperclipWakeContext": {
+        "taskId": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+        "actorId": "pj0cO3JstKNq80QhSqVBg45xHoJUseMX",
+        "issueId": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+        "taskKey": "<redacted:36 chars>",
+        "commentId": "f405d228-1d98-4482-8f67-36900955b71c",
+        "wakeReason": "issue_commented",
+        "wakeSource": "on_demand",
+        "triggeredBy": "<redacted:5 chars>",
+        "wakeCommentId": "f405d228-1d98-4482-8f67-36900955b71c",
+        "wakeCommentIds": [
+          "f405d228-1d98-4482-8f67-36900955b71c"
+        ],
+        "responsibleUserId": "pj0cO3JstKNq80QhSqVBg45xHoJUseMX",
+        "wakeTriggerDetail": "manual"
+      }
+    },
+    "agent_id": "d2e4759f-2418-4d98-99e0-1abc2d794525",
+    "claimed_at": "2026-11-19T07:16:05.683+00:00",
+    "company_id": "e2cfb11f-296e-4705-823c-bf54805e11d4",
+    "created_at": "2026-11-19T07:16:05.398075+00:00",
+    "updated_at": "2026-11-19T07:18:58.919+00:00",
+    "finished_at": "2026-11-19T07:18:58.873+00:00",
+    "requested_at": "2026-11-19T07:16:05.398075+00:00",
+    "trigger_detail": "manual",
+    "coalesced_count": 0,
+    "idempotency_key": "queued-comment-interrupt:691696f4-ca21-4201-8153-dc9dfad99585",
+    "requested_by_actor_id": "pj0cO3JstKNq80QhSqVBg45xHoJUseMX",
+    "requested_by_actor_type": "user"
+  },
+  {
+    "id": "d0cff185-235e-4a8e-ab6f-e8febf2f1a0b",
+    "error": null,
+    "reason": "<redacted:24 chars>",
+    "run_id": "bd4f8bd0-a049-4170-a586-48f672112f46",
+    "source": "on_demand",
+    "status": "completed",
+    "payload": {
+      "issueId": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+      "commentId": "28e628d2-3024-44c2-ad13-43f519c2fcc6",
+      "executionWait": {
+        "reason": "execution_recovery",
+        "message": "<redacted:54 chars>"
+      },
+      "interactionOrigin": {
+        "actorId": "pj0cO3JstKNq80QhSqVBg45xHoJUseMX",
+        "actorType": "user"
+      },
+      "_paperclipWakeContext": {
+        "source": "issue.comment",
+        "taskId": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+        "issueId": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+        "taskKey": "<redacted:36 chars>",
+        "commentId": "28e628d2-3024-44c2-ad13-43f519c2fcc6",
+        "wakeReason": "issue_commented",
+        "wakeSource": "on_demand",
+        "wakeCommentId": "28e628d2-3024-44c2-ad13-43f519c2fcc6",
+        "wakeCommentIds": [
+          "28e628d2-3024-44c2-ad13-43f519c2fcc6"
+        ],
+        "wakeTriggerDetail": "manual"
+      }
+    },
+    "agent_id": "d2e4759f-2418-4d98-99e0-1abc2d794525",
+    "claimed_at": "2026-11-19T07:19:22.674+00:00",
+    "company_id": "e2cfb11f-296e-4705-823c-bf54805e11d4",
+    "created_at": "2026-11-19T07:14:51.052842+00:00",
+    "updated_at": "2026-11-19T07:19:52.661+00:00",
+    "finished_at": "2026-11-19T07:19:52.61+00:00",
+    "requested_at": "2026-11-19T07:14:51.052842+00:00",
+    "trigger_detail": "manual",
+    "coalesced_count": 0,
+    "idempotency_key": "conversation-comment:28e628d2-3024-44c2-ad13-43f519c2fcc6",
+    "requested_by_actor_id": "pj0cO3JstKNq80QhSqVBg45xHoJUseMX",
+    "requested_by_actor_type": "user"
+  },
+  {
+    "id": "da76ecb8-3d45-4c47-aed4-0640a1b4d50f",
+    "error": "<redacted:35 chars>",
+    "reason": "<redacted:15 chars>",
+    "run_id": "5d14f227-b72c-415d-adf9-1752ef924e9d",
+    "source": "on_demand",
+    "status": "cancelled",
+    "payload": {
+      "issueId": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+      "commentId": "272d6e3a-a513-42ea-85c7-ad770793230b",
+      "interactionOrigin": {
+        "actorId": "pj0cO3JstKNq80QhSqVBg45xHoJUseMX",
+        "actorType": "user"
+      },
+      "_paperclipWakeContext": {
+        "source": "issue.comment",
+        "taskId": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+        "issueId": "6edb47fd-1b88-47b2-b9ad-80a43772a1ed",
+        "taskKey": "<redacted:36 chars>",
+        "commentId": "272d6e3a-a513-42ea-85c7-ad770793230b",
+        "wakeReason": "issue_commented",
+        "wakeSource": "on_demand",
+        "wakeCommentId": "272d6e3a-a513-42ea-85c7-ad770793230b",
+        "wakeCommentIds": [
+          "272d6e3a-a513-42ea-85c7-ad770793230b"
+        ],
+        "wakeTriggerDetail": "manual"
+      }
+    },
+    "agent_id": "d2e4759f-2418-4d98-99e0-1abc2d794525",
+    "claimed_at": "2026-11-19T07:13:47.738+00:00",
+    "company_id": "e2cfb11f-296e-4705-823c-bf54805e11d4",
+    "created_at": "2026-11-19T07:13:47.450453+00:00",
+    "updated_at": "2026-11-19T07:15:15.446+00:00",
+    "finished_at": "2026-11-19T07:15:15.365+00:00",
+    "requested_at": "2026-11-19T07:13:47.450453+00:00",
+    "trigger_detail": "manual",
+    "coalesced_count": 0,
+    "idempotency_key": "conversation-comment:272d6e3a-a513-42ea-85c7-ad770793230b",
+    "requested_by_actor_id": "pj0cO3JstKNq80QhSqVBg45xHoJUseMX",
+    "requested_by_actor_type": "user"
+  }
+]

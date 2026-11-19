@@ -1,0 +1,76 @@
+[
+  {
+    "id": "dac90670-28f3-4bbf-b74c-20ea1992f034",
+    "icon": null,
+    "name": "<redacted:53 chars>",
+    "role": "general",
+    "title": null,
+    "status": "idle",
+    "metadata": null,
+    "paused_at": null,
+    "appearance": {
+      "paletteId": "coral-current",
+      "schemaVersion": 1,
+      "characterVersion": "cap-v1"
+    },
+    "company_id": "5b41a72d-4ecd-4597-8221-c24a5797d856",
+    "created_at": "2026-11-19T08:49:19.57792+00:00",
+    "reports_to": null,
+    "updated_at": "2026-11-19T08:59:10.584+00:00",
+    "permissions": {
+      "canCreateAgents": true,
+      "canCreateSkills": true
+    },
+    "adapter_type": "paperclip_runner",
+    "capabilities": null,
+    "error_reason": null,
+    "pause_reason": null,
+    "adapter_config": {
+      "model": "paperclip/claude-fable-5-2",
+      "provider": "pi_rpc",
+      "timeoutSec": 1200,
+      "idleTimeoutMs": 28800000,
+      "lifecycleMode": "warm",
+      "piRpcThinkingLevel": "medium",
+      "instructionsFilePath": "<redacted:142 chars>",
+      "instructionsRootPath": "<redacted:132 chars>",
+      "instructionsEntryFile": "<redacted:9 chars>",
+      "instructionsBundleMode": "<redacted:7 chars>"
+    },
+    "runtime_config": {
+      "heartbeat": {
+        "enabled": false,
+        "wakeOnDemand": true,
+        "maxConcurrentRuns": 1
+      },
+      "aiConnection": {
+        "mode": "shared",
+        "method": "api_key",
+        "grantId": "f9931b6e-075e-4218-bf15-4768b3b4b809",
+        "provider": "anthropic",
+        "connectionId": "b6b9d018-3421-42fc-9ab0-bfc68a5e7808"
+      }
+    },
+    "lifecycle_error": null,
+    "lifecycle_holds": [],
+    "lifecycle_state": "ready",
+    "spend_month_utc": null,
+    "last_heartbeat_at": "2026-11-19T08:59:10.584+00:00",
+    "lifecycle_version": 8,
+    "created_by_user_id": "pXCjqsKtAkBFq1NFT6a83fAwdEhtY53n",
+    "harness_verified_at": null,
+    "lifecycle_operation": {
+      "id": "aa881a8c-2b46-402b-91a4-be5e3a4904ad",
+      "attempts": 0,
+      "resumeState": "ready",
+      "hostComplete": false,
+      "responsibleUserId": "pXCjqsKtAkBFq1NFT6a83fAwdEhtY53n",
+      "completedPluginIds": []
+    },
+    "spent_monthly_cents": 0.0,
+    "budget_monthly_cents": 0,
+    "default_environment_id": "11c0ec3b-0857-4132-98b7-047b6fd62a91",
+    "harness_verified_digest": null,
+    "lifecycle_required_plugin_ids": []
+  }
+]
