@@ -1,12 +1,17 @@
 import { createHash } from "node:crypto";
+import { mkdtempSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import type { StorageProvider } from "../storage/types.js";
 import { ObjectJournalBusyError } from "./object-byte-journal.js";
-import { createObjectRunLogStore } from "./object-run-log-store.js";
+import { createObjectRunLogStore, readObjectRunLogSpill } from "./object-run-log-store.js";
 import { logger } from "../middleware/logger.js";
 
-vi.mock("../middleware/logger.js", () => ({ logger: { warn: vi.fn() } }));
+vi.mock("../middleware/logger.js", () => ({ logger: { warn: vi.fn(), error: vi.fn() } }));
+// Failure rows keep their admitted bytes in a local spill; never write it under the real instance root.
+process.env.RUN_LOG_SPILL_PATH = mkdtempSync(path.join(os.tmpdir(), "objlog-spill-default-"));
 
 async function readBody(body: AsyncIterable<Uint8Array>) {
   const chunks: Buffer[] = [];
@@ -150,35 +155,53 @@ describe("S3 run log store", () => {
     } finally { warning.mockRestore(); put.mockRestore(); m.provider.getObject = get; }
   });
 
-  it.each(["flush", "close"] as const)("logs a content-free cause at the failing %s step without deleting bytes", async step => {
-    const m = memory(), store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", flushMs: 1000,
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7002475364 (rf-3)
+  // Keep reason: trace custody. This row used to expect only the earlier committed
+  // record after a failed flush (it encoded the discard). A failed flush now KEEPS
+  // its batch, retries it, and spills it to a kept local file when storage stays down.
+  it.each(["flush", "close"] as const)("keeps and retries the admitted batch at a persistently failing %s step, with a content-free cause", async step => {
+    const spillDir = mkdtempSync(path.join(os.tmpdir(), "objlog-spill-"));
+    const m = memory(), store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", flushMs: 1000, spillDir,
       assertWriterAuthority: async () => undefined });
     const runId = `finalize-${step}`, handle = await store.begin({ ...input, runId });
     await store.append(handle, event(1));
     const retained = new Map([...m.objects].filter(([key]) => key.includes("/objects/"))
       .map(([key, bytes]) => [key, Buffer.from(bytes)]));
     const put = m.provider.putObjectConditional!.bind(m.provider);
+    let attempts = 0;
     m.provider.putObjectConditional = async value => {
       const closing = value.objectKey.endsWith("/head.json") && Buffer.isBuffer(value.body) &&
         JSON.parse(value.body.toString()).closed === true;
-      if (step === "close" ? closing : value.objectKey.includes("/objects/"))
+      if (step === "close" ? closing : value.objectKey.includes("/objects/")) {
+        attempts++;
         throw Object.assign(new Error("private-content-from-response"), { name: "AccessDenied", code: "EACCES" });
+      }
       return put(value);
     };
     const pending = step === "flush" ? (await store.enqueue!(handle, event(2))).committed.catch(error => error) : undefined;
+    const line = (seq: number) => `${JSON.stringify({ ts: event(seq).ts, attemptId: handle.attemptId,
+      stream: "stdout", chunk: event(seq).chunk, seq })}\n`;
     const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
     vi.mocked(logger.warn).mockClear();
     try {
       expect(await store.finalize(handle)).toEqual({ bytes: null, sha256: null, compressed: false });
       if (pending) expect(await pending).toBeInstanceOf(Error);
-      expect(vi.mocked(logger.warn).mock.calls).toEqual([
-        [expect.objectContaining({ runId, step, attempt: 1, maxAttempts: 1,
-          err: { name: "AccessDenied", code: "EACCES", reason: undefined, statusCode: undefined } }), expect.any(String)],
-      ]);
-      expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain("private-content-from-response");
+      const calls = vi.mocked(logger.warn).mock.calls;
+      const err = { name: "AccessDenied", code: "EACCES", reason: undefined, statusCode: undefined };
+      // Bounded retry, visible per attempt, then the final cause.
+      expect(attempts).toBeGreaterThanOrEqual(3);
+      expect(calls[0]).toEqual([expect.objectContaining({ runId, step, attempt: 1, maxAttempts: 3, err }), expect.any(String)]);
+      expect(calls[1]).toEqual([expect.objectContaining({ runId, step, attempt: 2, maxAttempts: 3, err }), expect.any(String)]);
+      expect(calls.at(-1)).toEqual([expect.objectContaining({ runId, step, attempt: 3, maxAttempts: 3, err }),
+        "Object run log finalization failed"]);
+      expect(JSON.stringify(calls)).not.toContain("private-content-from-response");
       expect(warning).toHaveBeenCalledWith(expect.stringContaining("persistence is incomplete"));
       expect(new Map([...m.objects].filter(([key]) => key.includes("/objects/")))).toEqual(retained);
-      expect((await store.read(handle)).content.trim().split("\n")).toHaveLength(1);
+      m.provider.putObjectConditional = put;
+      const stored = (await store.read(handle)).content, spill = await readObjectRunLogSpill(spillDir, handle.logRef);
+      // The admitted batch is KEPT: what the object store lacks is in the kept spill, byte for byte.
+      expect(stored + spill.unrecovered.toString()).toBe(step === "flush" ? line(1) + line(2) : line(1));
+      expect(spill.unrecovered.toString()).toBe(step === "flush" ? line(2) : "");
     } finally { warning.mockRestore(); m.provider.putObjectConditional = put; }
   });
 
@@ -497,8 +520,9 @@ describe("S3 run log store", () => {
         entered = true;
         await gate;
         value.signal?.throwIfAborted();
-        if (mode === "storage failure") throw new Error("controlled upload failure");
       }
+      // Persistent: a one-shot upload failure is now retried and recovers (rf-3).
+      if (value.objectKey.includes("/run/objects/") && mode === "storage failure") throw new Error("controlled upload failure");
       return original(value);
     };
     const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", assertWriterAuthority: async () => undefined });
