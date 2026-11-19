@@ -214,3 +214,39 @@ describe("ordinary task interruption", () => {
     expect(container.textContent).toBe("");
   });
 });
+
+// adopt-g1-naming (SUPERSEDE-G1-CARRIED-FAILED-FLOOR-B-1119): AT THE FAILURE the failed carrier's own card names
+// the person messages that run carried, quoted short, oldest first (the server's carriedMessages). Once the chat
+// moved on the late sweep posts no card, so this card is where the person is told.
+describe("the failure card names the messages the failed run carried", () => {
+  let root: Root;
+  let container: HTMLDivElement;
+  beforeEach(() => { container = document.createElement("div"); document.body.append(container); root = createRoot(container); });
+  afterEach(async () => { await act(async () => root.unmount()); container.remove(); });
+  const render = async (presentation: TaskInterruptionPresentation) =>
+    act(async () => root.render(<ExecutionBlockerNotice presentation={presentation} canRetry onRetry={() => {}} />));
+  const carriedMessages = [{ id: "m1", quote: "Please rename the export" }, { id: "m2", quote: "Also add a total row…" }];
+  const quotes = () => [...container.querySelectorAll('[data-testid="task-execution-carried-message"]')].map(node => node.textContent);
+
+  it("a run carrying M1+M2 failed => the card quotes M1, M2 in order, with its Retry", async () => {
+    await render({ ...failed, carriedMessages });
+    expect(container.textContent).toContain("Couldn’t finish this attempt. Your message is saved.");
+    expect(quotes()).toEqual(["“Please rename the export”", "“Also add a total row…”"]);
+    expect(container.querySelector('[data-testid="task-execution-carried"]')?.textContent).toContain("Not answered yet:");
+    expect(container.querySelector('[data-testid="task-execution-retry"]')?.textContent).toBe("Retry");
+  });
+  it("the provider-failure card that replaces it names them too", async () => {
+    const providerFailure = { schema: "paperclip.provider-failure.v1" as const, provider: "openai", phase: "startup" as const,
+      category: "overloaded" as const, retryability: "transient" as const, message: "Provider overloaded" };
+    await render({ ...failed, providerFailure, carriedMessages });
+    expect(container.textContent).toContain("Provider overloaded");
+    expect(quotes()).toEqual(["“Please rename the export”", "“Also add a total row…”"]);
+  });
+  it("a failed run carrying nothing person-authored => card unchanged", async () => {
+    await render(failed);
+    expect(container.querySelector('[data-testid="task-execution-carried"]')).toBeNull();
+    await render({ ...failed, carriedMessages: [] });
+    expect(container.querySelector('[data-testid="task-execution-carried"]')).toBeNull();
+    expect(container.textContent).toBe("Couldn’t finish this attempt. Your message is saved.Retry");
+  });
+});
