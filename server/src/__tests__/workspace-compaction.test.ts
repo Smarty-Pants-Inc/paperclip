@@ -141,15 +141,18 @@ describe("findRegenerableWorkspaceDirs", () => {
     const { worktreePath } = await createRepoWithWorktree(["build/", "dist/", ".env"]);
     const spill = await contentSpill(worktreePath, path.join(worktreePath, "build"), mode);
     await write(path.join(worktreePath, "dist", "control.js"));
+    await write(path.join(worktreePath, "packages", "control", "build", "control.js"));
     const kept = mode !== "recovered";
     const candidates = await findRegenerableWorkspaceDirs(worktreePath);
     // Also pass a stale candidate list to exercise the destructive recheck.
-    const move = await moveWorkspaceDirsToTrash(worktreePath, ["build", "dist"]);
+    const move = await moveWorkspaceDirsToTrash(worktreePath, ["build", "dist", "packages/control/build"]);
     await deleteWorkspaceCompactionTrash(move.trashDir);
     const survived = await fs.stat(spill.path).then(() => true, () => false);
     console.info("content-custody-direct", { mode, candidates, moved: move.moved, survived });
     expect(survived).toBe(kept);
     expect(candidates.includes("build")).toBe(!kept);
+    expect(candidates).toContain("packages/control/build");
+    expect(await fs.stat(path.join(worktreePath, "packages", "control", "build")).then(() => true, () => false)).toBe(false);
     expect(await fs.stat(path.join(worktreePath, "dist")).then(() => true, () => false)).toBe(false);
     if (kept) {
       await fs.chmod(spill.indexPath, 0o600);
