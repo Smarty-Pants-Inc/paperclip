@@ -1010,13 +1010,28 @@ async function restoreUnansweredSteersAtRunEnd(tx: Db, run: ReleaseRun, issue: I
       sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`)) : [];
   const carried = new Set([...successors.flatMap(({ contextSnapshot }) => {
     const value = parseObject(contextSnapshot);
-    return [...strings(value.wakeCommentIds), ...strings(parseObject(value.firstTurnQueuedInput).commentIds)];
+    return [...strings(value.wakeCommentIds), ...strings([value.wakeCommentId, value.commentId]), ...strings(parseObject(value.firstTurnQueuedInput).commentIds)];
   }), ...waitingWakes.flatMap(({ payload }) => queuedCommentIdsFromWakePayload(payload))]);
   const restored: string[] = [];
   const byWake = new Map<string, string[]>();
   for (const { id, queueId } of unanswered) {
     if (carried.has(id)) { restored.push(id); continue; }
     if (queueId) byWake.set(queueId, [...(byWake.get(queueId) ?? []), id]);
+    else {
+      // Default steers never created a wake. On an unanswered end only, create
+      // the ordinary deferred input that the ONE Stop-hold reader already reads.
+      const [comment] = await tx.select().from(issueComments).where(and(eq(issueComments.companyId, run.companyId),
+        eq(issueComments.issueId, issue.id), eq(issueComments.id, id), isNull(issueComments.deletedAt)));
+      if (!comment?.authorUserId) continue;
+      await tx.insert(agentWakeupRequests).values({ companyId: run.companyId, agentId: run.agentId,
+        source: "on_demand", triggerDetail: "manual", reason: "issue_commented", status: DEFERRED_WAKE_STATUS,
+        requestedByActorType: "user", requestedByActorId: comment.authorUserId, requestedAt: comment.createdAt,
+        idempotencyKey: `conversation-comment:${id}`, payload: { issueId: issue.id, commentId: id,
+          [DEFERRED_WAKE_CONTEXT_KEY]: { issueId: issue.id, taskKey: issue.id, commentId: id, wakeCommentId: id,
+            wakeCommentIds: [id], source: "issue.comment", conversationSessionGeneration: issue.conversationSessionGeneration } },
+      });
+      restored.push(id);
+    }
   }
   for (const [wakeId, ids] of byWake) {
     const [wake] = await tx.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, run.companyId),

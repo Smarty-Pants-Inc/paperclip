@@ -61,6 +61,7 @@ import { reconstructNativeWorkspace, unreconciledNativeExportPredicate } from ".
 import { reconstructWorkspaceSchema } from "@paperclipai/shared";
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse, type QueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, heldConversationComments, isConversation, isConversationReset } from "../services/agent-conversations.js";
+import { withSteeredCommentDisplay } from "../services/conversation-steering.js";
 import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboarding-first-task-admission.js";
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
@@ -20253,16 +20254,23 @@ export function issueRoutes(
           if (!existing) await logActivity(tx as unknown as Db, {
             companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
             action: "issue.comment_added", entityType: "issue", entityId: issue.id,
-            details: { commentId: saved.id, identifier: issue.identifier },
+            details: { commentId: saved.id, identifier: issue.identifier,
+              deliveryIntent: req.body.deliveryIntent ?? (req.body.interrupt ? "interrupt" : "steer") },
           }, publications);
-          if (!existing) await enqueueFastResponse(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id, agentId: issue.conversationAgentId,
-            responsibleUserId: userId, sourceCommentId: saved.id, sourceKey: `comment:${saved.id}`, acceptedAt: new Date(saved.createdAt), sessionGeneration: issue.conversationSessionGeneration });
           return saved;
         });
         for (const publication of publications) publishActivity(publication);
         await issueReferencesSvc.syncComment(comment.id);
         await deliverConversationComments(db, issue, heartbeat.wakeup);
-        res.status(201).json(comment);
+        const [displayComment] = await withSteeredCommentDisplay(db, [comment]);
+        // A same-turn steer already has its agent: no independent fast-response
+        // attempt may race it or manufacture another answer/run.
+        if (!displayComment?.steeredIntoRunId) await db.transaction(tx => enqueueFastResponse(tx as unknown as Db, {
+          companyId: issue.companyId, issueId: issue.id, agentId: issue.conversationAgentId,
+          responsibleUserId: userId, sourceCommentId: comment.id, sourceKey: `comment:${comment.id}`,
+          acceptedAt: new Date(comment.createdAt), sessionGeneration: issue.conversationSessionGeneration,
+        }));
+        res.status(201).json(displayComment ?? comment);
         return;
       }
       if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {

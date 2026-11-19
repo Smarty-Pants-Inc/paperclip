@@ -1,4 +1,5 @@
 import { recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "./public-mcp/upload-cleanup.js";
+import { withSteeredCommentDisplay } from "./conversation-steering.js";
 import { assertAgentInteraction } from "./agent-interaction-policy.js";
 import { currentPluginInteractionOrigin } from "./plugin-interaction-context.js";
 import type { IssueDisplayStatus } from "@paperclipai/shared";
@@ -13558,9 +13559,9 @@ export function issueService(db: Db) {
       const projectedComments = await projectHistoricalRunComments(comments);
       const enrichedComments =
         await enrichCommentsWithDerivedAgentAttribution(projectedComments);
-      return enrichedComments.map((comment) =>
+      return withSteeredCommentDisplay(db, enrichedComments.map((comment) =>
         redactIssueComment(comment, censorUsernameInLogs),
-      );
+      ));
     },
 
     getCommentCursor: async (issueId: string) => {

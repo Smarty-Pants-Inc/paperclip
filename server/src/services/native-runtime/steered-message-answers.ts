@@ -1,5 +1,5 @@
 import { and, asc, eq, isNotNull, or, sql } from "drizzle-orm";
-import { heartbeatRunEvents, type Db } from "@paperclipai/db";
+import { heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 
 /** One durable run-log event, in persisted sequence order (heartbeat_run_events). */
 export interface SteerAnswerEvent {
@@ -53,6 +53,7 @@ const TURN_END = new Set(["turn.completed", "turn.cancelled", "turn.failed"]);
  */
 export function steeredMessageAnswers(events: Iterable<SteerAnswerEvent>): {
   acknowledged: string[]; delivered: string[]; answered: string[];
+  deliveredEventSeqs: Record<string, number>;
 } {
   const list = [...events].sort((a, b) => a.seq - b.seq);
   const acknowledged: string[] = [];
@@ -104,10 +105,30 @@ export function steeredMessageAnswers(events: Iterable<SteerAnswerEvent>): {
     const end = boundaries.find((seq) => seq > at) ?? Number.POSITIVE_INFINITY;
     return [...textItems.values()].some((item) => item.completed && item.start! > at && item.start! < end);
   });
-  return { acknowledged, delivered: acknowledged.filter((id) => deliveredAt.has(id)), answered };
+  return { acknowledged, delivered: acknowledged.filter((id) => deliveredAt.has(id)), answered,
+    deliveredEventSeqs: Object.fromEntries(deliveredAt) };
 }
 
 const kind = sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind'`;
+
+/** Materialize the SAME evidence at the event boundary, not just at run end.
+ * The one answeredPersonMessageSql reader then works during streaming too.
+ * A native ack only names an input; Pi's userMessage is the delivery proof.
+ */
+export async function recordSteeredMessageEvidence(db: Db, input: { companyId: string; runId: string }) {
+  await db.transaction(async tx => {
+    const [run] = await tx.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId))).for("update");
+    const context = run?.context ?? {};
+    const steered = Array.isArray(context.steeredCommentIds) ? context.steeredCommentIds.filter((id): id is string => typeof id === "string") : [];
+    if (!steered.length) return;
+    const evidence = await readSteeredMessageAnswers(tx as unknown as Db, input);
+    await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context,
+      answeredSteeredCommentIds: evidence.answered.filter(id => steered.includes(id)),
+      steeredDeliveryEventSeqs: Object.fromEntries(Object.entries(evidence.deliveredEventSeqs).filter(([id]) => steered.includes(id))),
+    } }).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
+  });
+}
 
 /** The run's stored events the answered rule reads. Only events the native transport validated count. */
 export async function readSteeredMessageAnswers(db: Db, input: { companyId: string; runId: string }) {

@@ -1115,6 +1115,12 @@ export type IssueCommentDerivedAuthorSource =
   | "run_log_comment_post";
 
 export interface IssueComment {
+  /** Same-turn custody, never proof of delivery or an answer. */
+  steeredIntoRunId?: string | null;
+  steeredAt?: string | null;
+  steeringStatus?: "accepted" | "delivered" | null;
+  /** Pi's own persisted userMessage event, not our acknowledgement. */
+  steeringDeliveryEventSeq?: number | null;
   clientRequestId?: string | null;
   conversationSessionGeneration?: number | null;
   id: string;
