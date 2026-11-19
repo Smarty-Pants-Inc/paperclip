@@ -5383,10 +5383,17 @@ export function issueRoutes(
     resource: T | null | undefined | Promise<T | null | undefined>,
     notFoundMessage: string,
     notFoundBody: Record<string, unknown> = { error: notFoundMessage },
+    action: "issue:read" | "issue:comment" | "issue:mutate" = "issue:read",
   ): Promise<T | null> {
     const issue = await getAccessibleResource(req, res, resource, notFoundMessage, notFoundBody);
     if (!issue) return null;
-    if ((await decideIssueAccess(req, issue, "issue:read")).allowed) return issue;
+    // A write route asks for its own action: the private-task overlay rides on
+    // that decision. A non-privacy write denial keeps the route's own checks
+    // (the gate only decides visibility), so it falls back to the read decision.
+    const decision = await decideIssueAccess(req, issue, action);
+    if (decision.allowed) return issue;
+    if (decision.reason !== "deny_issue_private" && action !== "issue:read"
+      && (await decideIssueAccess(req, issue, "issue:read")).allowed) return issue;
     res.status(404).json(notFoundBody);
     return null;
   }
@@ -12156,12 +12163,7 @@ export function issueRoutes(
 
   router.post("/issues/:id/documents/:key/lock", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await getReadableIssue(
-      req,
-      res,
-      svc.getById(id),
-      "Issue not found",
-    );
+    const issue = await getReadableIssue(req, res, svc.getById(id), "Issue not found", undefined, "issue:mutate");
     if (!issue) return;
     if (req.actor.type !== "board") {
       res.status(403).json({ error: "Board authentication required" });
@@ -12213,12 +12215,7 @@ export function issueRoutes(
 
   router.post("/issues/:id/documents/:key/unlock", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await getReadableIssue(
-      req,
-      res,
-      svc.getById(id),
-      "Issue not found",
-    );
+    const issue = await getReadableIssue(req, res, svc.getById(id), "Issue not found", undefined, "issue:mutate");
     if (!issue) return;
     if (req.actor.type !== "board") {
       res.status(403).json({ error: "Board authentication required" });
@@ -12461,12 +12458,7 @@ export function issueRoutes(
 
   router.delete("/issues/:id/documents/:key", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await getReadableIssue(
-      req,
-      res,
-      svc.getById(id),
-      "Issue not found",
-    );
+    const issue = await getReadableIssue(req, res, svc.getById(id), "Issue not found", undefined, "issue:mutate");
     if (!issue) return;
     if (req.actor.type !== "board") {
       res.status(403).json({ error: "Board authentication required" });
@@ -14950,7 +14942,7 @@ export function issueRoutes(
   );
 
   router.put("/issues/:id/title", validateIssueMutationBody(setIssueTitleSchema), async (req, res) => {
-    const existing = await getReadableIssue(req, res, svc.getById(req.params.id as string), "Issue not found");
+    const existing = await getReadableIssue(req, res, svc.getById(req.params.id as string), "Issue not found", undefined, "issue:mutate");
     if (!existing) return;
     if (req.actor.type === "agent") {
       const decision = await decideIssueAccess(req, existing, "issue:mutate");
@@ -18668,12 +18660,7 @@ export function issueRoutes(
     validate(createIssueThreadInteractionSchema),
     async (req, res) => {
       const id = req.params.id as string;
-      const issue = await getReadableIssue(
-        req,
-        res,
-        svc.getById(id),
-        "Issue not found",
-      );
+      const issue = await getReadableIssue(req, res, svc.getById(id), "Issue not found", undefined, "issue:comment");
       if (!issue) return;
       if (req.actor.type === "agent") {
         if (
@@ -18833,7 +18820,7 @@ export function issueRoutes(
     "/issues/:id/interactions/:interactionId/resolve-from-comment",
     validate(resolveConfirmationFromCommentSchema),
     async (req, res) => {
-      const issue = await getReadableIssue(req, res, svc.getById(req.params.id as string), "Issue not found");
+      const issue = await getReadableIssue(req, res, svc.getById(req.params.id as string), "Issue not found", undefined, "issue:comment");
       if (!issue) return;
       if (req.actor.type !== "agent") throw forbidden("Conversational resolution requires the responding agent run");
       const [replyComment] = await db.select({ authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
@@ -18864,12 +18851,7 @@ export function issueRoutes(
     async (req, res) => {
       const id = req.params.id as string;
       const interactionId = req.params.interactionId as string;
-      const issue = await getReadableIssue(
-        req,
-        res,
-        svc.getById(id),
-        "Issue not found",
-      );
+      const issue = await getReadableIssue(req, res, svc.getById(id), "Issue not found", undefined, "issue:comment");
       if (!issue) return;
       const authorizedResolution =
         await getIssueThreadInteractionResolutionAuthorization(
@@ -19194,12 +19176,7 @@ export function issueRoutes(
     async (req, res) => {
       const id = req.params.id as string;
       const interactionId = req.params.interactionId as string;
-      const issue = await getReadableIssue(
-        req,
-        res,
-        svc.getById(id),
-        "Issue not found",
-      );
+      const issue = await getReadableIssue(req, res, svc.getById(id), "Issue not found", undefined, "issue:comment");
       if (!issue) return;
       const authorizedResolution =
         await getIssueThreadInteractionResolutionAuthorization(
@@ -19313,12 +19290,7 @@ export function issueRoutes(
     async (req, res) => {
       const id = req.params.id as string;
       const interactionId = req.params.interactionId as string;
-      const issue = await getReadableIssue(
-        req,
-        res,
-        svc.getById(id),
-        "Issue not found",
-      );
+      const issue = await getReadableIssue(req, res, svc.getById(id), "Issue not found", undefined, "issue:comment");
       if (!issue) return;
       const authorizedResolution =
         await getIssueThreadInteractionResolutionAuthorization(
@@ -19406,12 +19378,7 @@ export function issueRoutes(
     async (req, res) => {
       const id = req.params.id as string;
       const interactionId = req.params.interactionId as string;
-      const issue = await getReadableIssue(
-        req,
-        res,
-        svc.getById(id),
-        "Issue not found",
-      );
+      const issue = await getReadableIssue(req, res, svc.getById(id), "Issue not found", undefined, "issue:comment");
       if (!issue) return;
       const authorizedResolution =
         await getIssueThreadInteractionResolutionAuthorization(
@@ -19509,12 +19476,7 @@ export function issueRoutes(
     async (req, res) => {
       const id = req.params.id as string;
       const interactionId = req.params.interactionId as string;
-      const issue = await getReadableIssue(
-        req,
-        res,
-        svc.getById(id),
-        "Issue not found",
-      );
+      const issue = await getReadableIssue(req, res, svc.getById(id), "Issue not found", undefined, "issue:comment");
       if (!issue) return;
 
       const interactionSvc = issueThreadInteractionService(db);
@@ -19546,7 +19508,7 @@ export function issueRoutes(
     "/issues/:id/interactions/:interactionId/dismiss",
     async (req, res) => {
       assertBoard(req);
-      const issue = await getReadableIssue(req, res, svc.getById(req.params.id as string), "Issue not found");
+      const issue = await getReadableIssue(req, res, svc.getById(req.params.id as string), "Issue not found", undefined, "issue:comment");
       if (!issue) return;
       if (!(await assertIssueReadAllowed(req, res, issue))) return;
       const actor = getActorInfo(req);
@@ -19574,12 +19536,7 @@ export function issueRoutes(
     async (req, res) => {
       const id = req.params.id as string;
       const interactionId = req.params.interactionId as string;
-      const issue = await getReadableIssue(
-        req,
-        res,
-        svc.getById(id),
-        "Issue not found",
-      );
+      const issue = await getReadableIssue(req, res, svc.getById(id), "Issue not found", undefined, "issue:comment");
       if (!issue) return;
       if (req.actor.type === "agent") {
         res.status(403).json({
@@ -19642,12 +19599,7 @@ export function issueRoutes(
     async (req, res) => {
       const id = req.params.id as string;
       const interactionId = req.params.interactionId as string;
-      const issue = await getReadableIssue(
-        req,
-        res,
-        svc.getById(id),
-        "Issue not found",
-      );
+      const issue = await getReadableIssue(req, res, svc.getById(id), "Issue not found", undefined, "issue:comment");
       if (!issue) return;
       if (req.actor.type === "agent") {
         res.status(403).json({
