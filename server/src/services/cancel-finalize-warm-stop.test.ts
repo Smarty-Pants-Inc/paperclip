@@ -135,7 +135,7 @@ const support = await getEmbeddedPostgresTestSupport();
     await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
   });
 
-  type Variant = { edit: boolean; settled: boolean; exportFails: boolean };
+  type Variant = { edit: boolean; settled: boolean; exportFails: boolean; cutWrite?: boolean };
   async function stopMidTurn(variant: Variant) {
     const root = await mkdtemp(join(tmpdir(), "paperclip-cancel-finalize-"));
     roots.push(root);
@@ -192,6 +192,14 @@ const support = await getEmbeddedPostgresTestSupport();
     vi.spyOn(nativeExecutor, "executePaperclipNativeSession").mockImplementationOnce(async () => {
       // The agent's own tool edits the task workspace on the box, mid-turn.
       if (variant.edit) await writeFile(join(box, "task.txt"), EDIT);
+      if (variant.cutWrite) {
+        // adopt-cf-fence F1: the agent's write tool is cut by the Stop after 1 of 8 MiB; its receipt says started,
+        // and no completed receipt follows.
+        await writeFile(join(box, "B.bin"), Buffer.alloc(1024 * 1024, 0x42));
+        await db.insert(heartbeatRunEvents).values({ companyId, runId, agentId, seq: 2, eventType: "tool.execution.started",
+          stream: "system", payload: { schema: "paperclip.tool.execution.v1", executionId: "exec-b", transport: "file",
+            operation: "write", name: "write", target: "B.bin", readOnly: false, status: "running" } });
+      }
       // The person's Stop, acknowledged; NSE settles it (retained idle receipt) only after a clean cancellation.
       const stoppedAt = new Date();
       const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
@@ -358,6 +366,101 @@ const support = await getEmbeddedPostgresTestSupport();
       .toMatchObject({ state: "prepared", finalHostSha256: null });
     expect(run.runnerProfileJson?.nativeCancelledWarmExport).toMatchObject({ state: "unproven", reason: "timed_out" });
     expect(run.status).toBe("cancelled");
+  }, 60_000);
+
+  // ---- adopt-cf-fence: rf4-cf F2 / F3 / F1 ----
+  async function hostSha(dir: string) {
+    return directorySnapshotSha256(await captureDirectorySnapshot(dir, { exclude: [] }));
+  }
+
+  it("F2: a copy-back held past the deadline and released after a NEW owner took the lock and edited the host writes NOTHING", async () => {
+    const f = await stopMidTurn({ edit: true, settled: false, exportFails: false });
+    await settleLater(f);
+    let release!: () => void;
+    f.runnerState.gate = { match: script => script.includes("find . -mindepth 1 -maxdepth 1 -print0"),
+      until: new Promise<void>(resolve => { release = resolve; }) };
+    const outcome = await finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
+      nativeWorkspaceSync: f.sync, timeoutMs: 1_500 });
+    expect(outcome).toEqual({ outcome: "unproven", reason: "timed_out" });
+    expect(f.runnerState.held).toBe(1);
+    const SUCCESSOR = "the successor's own edit\n";
+    const taken = await withNativeWorkspaceFinalizationOwnership({ db, companyId: f.companyId, runId: f.runId }, async () => {
+      // The new owner edits the host workspace, then the old, blocked export is released while it holds the lock.
+      await writeFile(join(f.host, "task.txt"), SUCCESSOR);
+      const before = await hostSha(f.host);
+      release();
+      await f.sync.restoreWorkspace().catch(() => undefined);
+      await waitFor(() => f.runnerState.inflight === 0);
+      return { before, after: await hostSha(f.host) };
+    });
+    expect(taken).toMatchObject({ acquired: true });
+    const { before, after } = (taken as { value: { before: string; after: string } }).value;
+    expect(after, "host files byte-unchanged after the late join").toBe(before);
+    expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(SUCCESSOR);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(readNativeWorkspaceSyncReference(run.runnerProfileJson?.nativeWorkspaceSync)).toMatchObject({ state: "prepared" });
+  }, 60_000);
+
+  it("F3: a final mv held past the deadline never publishes 'finalized': persisted state and the remote stamp agree", async () => {
+    const f = await stopMidTurn({ edit: true, settled: false, exportFails: false });
+    await settleLater(f);
+    let release!: () => void;
+    f.runnerState.gate = { match: script => script.includes("-c mv ") && script.includes("workspace-sync-v1.json"),
+      until: new Promise<void>(resolve => { release = resolve; }) };
+    let outcome: unknown;
+    try {
+      outcome = await finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
+        nativeWorkspaceSync: f.sync, timeoutMs: 3_000 });
+    } finally { release(); }
+    await f.sync.restoreWorkspace().catch(() => undefined);
+    await waitFor(() => f.runnerState.inflight === 0);
+    expect(outcome).toEqual({ outcome: "unproven", reason: "timed_out" });
+    expect(f.runnerState.held).toBe(1);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(readNativeWorkspaceSyncReference(run.runnerProfileJson?.nativeWorkspaceSync)).toMatchObject({ state: "prepared" });
+    await expect(stat(join(f.box, ...STAMP))).rejects.toMatchObject({ code: "ENOENT" });
+    // No staged payload is left behind either.
+    const runtimeDir = join(f.box, ".paperclip-runtime", "paperclip-runner");
+    const { readdir } = await import("node:fs/promises");
+    expect((await readdir(runtimeDir).catch(() => [] as string[])).filter(name => name.startsWith("workspace-sync-v1.json"))).toEqual([]);
+  }, 60_000);
+
+  it("F1: a write the Stop cut is exported as-is, and the next turn's input says it may be incomplete", async () => {
+    const f = await stopMidTurn({ edit: true, settled: true, exportFails: false, cutWrite: true });
+    expect(f.reference?.state).toBe("finalized");
+    // Exported as-is: the host holds exactly the box's 1 MiB prefix (faithful to the Stop).
+    expect((await stat(join(f.host, "B.bin"))).size).toBe(1024 * 1024);
+    expect(sha((await readFile(join(f.host, "B.bin"))).toString("latin1")))
+      .toBe(sha((await readFile(join(f.box, "B.bin"))).toString("latin1")));
+    await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId: f.runId,
+      seq: 1000, eventType: "lifecycle", stream: "system", message: "run.stop.accepted",
+      payload: { schema: "paperclip.stop-acceptance.v1", kind: "person_stop", issueId: f.issueId, userId: "board" } });
+    const { readPersonStoppedPreviousTurnRun, readStoppedTurnCutWrites } = await import("./acknowledged-native-stop.js");
+    const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.successorRunId));
+    const stoppedRunId = await readPersonStoppedPreviousTurnRun(db, { companyId: f.companyId, issueId: f.issueId,
+      agentId: f.agentId, runId: f.successorRunId, runCreatedAt: next.createdAt });
+    expect(stoppedRunId).toBe(f.runId);
+    const personStoppedCutWrites = await readStoppedTurnCutWrites(db, { companyId: f.companyId, runId: stoppedRunId! });
+    expect(personStoppedCutWrites).toEqual(["B.bin"]);
+    const wakePayload = { reason: "issue_commented", personStoppedPreviousTurn: true, personStoppedCutWrites,
+      comments: [{ id: randomUUID(), body: "What finished?", authorType: "user", authorId: "board" }] };
+    const { renderPaperclipWakePrompt } = await import("@paperclipai/adapter-utils/server-utils");
+    expect(renderPaperclipWakePrompt(wakePayload)).toContain("B.bin may be incomplete (its write was stopped).");
+    const nextIssue = { id: f.issueId, companyId: f.companyId, identifier: "CF-1", title: "Edit the file", description: null,
+      workMode: "standard", assigneeAgentId: f.agentId, status: "in_progress", executionRunId: f.successorRunId, checkoutRunId: null };
+    const request = buildNativeExecutionInput({ companyId: f.companyId, agentId: f.agentId, runId: f.successorRunId,
+      issue: nextIssue,
+      taskPrompt: "What finished?", workspace: { id: f.workspaceId, cwd: f.host, repoUrl: null, repoRef: null, branchName: null },
+      normalizedSessionId: f.sessionId, provider: "codex", lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
+      completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1",
+        contract: { revision: "1", objective: "Edit the file", criteria: [{ id: "edit", requirement: "Edit the file" }] } },
+      runtimeContext: nativeRuntimeContextFixture(), wakePayload });
+    expect(JSON.stringify(request)).toContain("B.bin may be incomplete (its write was stopped).");
+    // A finished write is never flagged: once the call completes, nothing is listed.
+    await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: f.runId, agentId: f.agentId, seq: 1001,
+      eventType: "tool.execution.completed", stream: "system", payload: { schema: "paperclip.tool.execution.v1",
+        executionId: "exec-b", transport: "file", operation: "write", name: "write", target: "B.bin", readOnly: false, status: "completed" } });
+    expect(await readStoppedTurnCutWrites(db, { companyId: f.companyId, runId: f.runId })).toEqual([]);
   }, 60_000);
 
   it("the honest line: the rows the helper writes are exactly the fixture the real transcript consumer renders as ONE entry", async () => {

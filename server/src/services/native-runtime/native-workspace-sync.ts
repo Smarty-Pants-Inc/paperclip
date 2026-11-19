@@ -3,6 +3,7 @@ import { hasMigratedLegacyWorkspaceSource } from "../legacy-workspace-recovery-m
 import { notifyCancelledWorkspacePreservation } from "../cancelled-workspace-preservation-notifications.js";
 import { notifyEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { measureRunPhase } from "../execution-preparation-timing.js";
+import { logger } from "../../middleware/logger.js";
 import { emitStartupReuse, type StartupReuseReason } from "@paperclipai/adapter-utils/startup-reuse";
 import type { AdapterRuntimeEvent } from "@paperclipai/adapter-utils";
 import type { WorkspaceCheckpointMetrics } from "@paperclipai/adapter-utils/workspace-checkpoint";
@@ -696,6 +697,12 @@ async function writeRemoteStamp(input: {
    * this re-check runs AFTER the payload write returns and BEFORE the stamp is
    * published (mv): a payload write held past the deadline publishes nothing. */
   beforePublish?: () => Promise<void>;
+  /** adopt-cf-fence: handed the retraction of THIS stamp once its payload is
+   * staged on the box (before the mv is issued). A mv the transport holds past
+   * the deadline may still land; the caller retracts it then (see
+   * retractRemoteStamp), so the box never keeps a 'finalized' stamp the
+   * persisted descriptor does not have. */
+  onStaged?: (retract: () => Promise<void>) => void;
 }): Promise<void> {
   if (!input.target.runner) {
     throw new Error("native_workspace_sync_runner_missing");
@@ -706,7 +713,9 @@ async function writeRemoteStamp(input: {
     "paperclip-runner",
   );
   const stampPath = path.posix.join(runtimeDir, REMOTE_STAMP_NAME);
-  const tempPath = `${stampPath}.tmp`;
+  // A fenced (deadline-bounded) publish stages under its own name, so its
+  // retraction can never remove a successor's staged payload.
+  const tempPath = input.beforePublish ? `${stampPath}.tmp.${randomUUID()}` : `${stampPath}.tmp`;
   const encoded = Buffer.from(
     `${canonicalJson(input.stamp)}\n`,
     "utf8",
@@ -730,8 +739,31 @@ async function writeRemoteStamp(input: {
     return;
   }
   await run(write);
+  input.onStaged?.(() => retractRemoteStamp({ target: input.target, tempPath, stampPath, encoded }));
   await input.beforePublish();
   await run(publish);
+}
+
+/** adopt-cf-fence: remove this attempt's staged payload, and the published
+ * stamp ONLY if its bytes are exactly this attempt's (it names this run as the
+ * finalizer), so a successor's stamp is never touched. Ordered before a late
+ * mv, the mv finds no source and publishes nothing; ordered after it, the late
+ * stamp is withdrawn. */
+async function retractRemoteStamp(input: {
+  target: Extract<AdapterExecutionTarget, { transport: "sandbox" }>;
+  tempPath: string;
+  stampPath: string;
+  encoded: string;
+}): Promise<void> {
+  const stamp = shellQuote(input.stampPath);
+  const result = await input.target.runner!.execute({
+    command: input.target.shellCommand ?? "sh",
+    args: ["-c", `rm -f ${shellQuote(input.tempPath)}; if [ -f ${stamp} ] && [ "$(base64 < ${stamp} | tr -d '\\n')" = ${shellQuote(input.encoded)} ]; then rm -f ${stamp}; fi`],
+    cwd: "/",
+    timeoutMs: 15_000,
+    bypassSession: true,
+  });
+  if (result.timedOut || result.exitCode !== 0) throw new Error("native_workspace_sync_remote_stamp_retract_failed");
 }
 
 async function remoteStampMatches(input: {
@@ -822,9 +854,48 @@ function finalizedWorkspaceStamp(input: {
   };
 }
 
+/** adopt-cf-fence: the copy-back's ownership token. While a deadline-bounded
+ * export (restoreWorkspace with a signal) runs, `current` is that attempt's
+ * check (deadline not passed, still the finalization owner). */
+type CopybackFence = { current: (() => Promise<void>) | null };
+
+/** adopt-cf-fence: every remote command / transfer of the copy-back passes the
+ * attempt's token check before it is issued AND again when it returns, before
+ * its result is handed to the restore (whose next step is the host write). A
+ * command held past the deadline, or past a new owner taking the lock, joins
+ * with an error instead of data: the restore stops and writes nothing more
+ * into the host workspace. The check is the one bound when the command was
+ * issued, so a later attempt's token cannot admit an earlier attempt's join. */
+function fenceCopybackRunner(
+  target: Extract<AdapterExecutionTarget, { transport: "sandbox" }>,
+  fence: CopybackFence | undefined,
+): Extract<AdapterExecutionTarget, { transport: "sandbox" }> {
+  const runner = target.runner;
+  if (!fence || !runner) return target;
+  const guarded = <A extends unknown[], R>(call: (...args: A) => Promise<R>) => async (...args: A): Promise<R> => {
+    const check = fence.current;
+    await check?.();
+    const result = await call(...args);
+    await check?.();
+    return result;
+  };
+  const wrapped = new Proxy(runner, {
+    get(object, property) {
+      const value = Reflect.get(object, property, object);
+      if (typeof value !== "function") return value;
+      const bound = (value as (...args: unknown[]) => unknown).bind(object);
+      return property === "execute" || property === "syncIn" || property === "syncOut"
+        ? guarded(bound as (...args: unknown[]) => Promise<unknown>)
+        : bound;
+    },
+  });
+  return { ...target, runner: wrapped };
+}
+
 async function prepareRuntime(input: {
   runId: string;
   target: Extract<AdapterExecutionTarget, { transport: "sandbox" }>;
+  copybackFence?: CopybackFence;
   workspaceLocalDir: string;
   mode: WorkspaceInboundMode;
   baseline?: DirectorySnapshot;
@@ -844,7 +915,7 @@ async function prepareRuntime(input: {
   } as const;
   return measureRunPhase(phase[input.mode], () => prepareAdapterExecutionTargetRuntime({
     runId: input.runId,
-    target: input.target,
+    target: fenceCopybackRunner(input.target, input.copybackFence),
     adapterKey: "paperclip-runner",
     workspaceLocalDir: input.workspaceLocalDir,
     workspaceRemoteDir: input.target.remoteCwd,
@@ -872,6 +943,7 @@ async function finalizePreparedRuntime(input: {
   descriptor: NativeWorkspaceSyncDescriptor;
   assertOwnership?: () => Promise<void>;
   signal?: AbortSignal;
+  copybackFence?: CopybackFence;
   onPhase?: RuntimeSpanRunner;
   onCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
 }): Promise<NativeWorkspaceSyncReference> {
@@ -884,9 +956,28 @@ async function finalizePreparedRuntime(input: {
     input.signal?.throwIfAborted();
   };
   input.signal?.throwIfAborted();
+  // adopt-cf-fence: a deadline-bounded export fences every copy-back command
+  // on the SAME token as its deadline (fenceCopybackRunner).
+  const fenceCheck = input.signal && input.copybackFence ? stillOwned : null;
+  if (fenceCheck) input.copybackFence!.current = fenceCheck;
+  // adopt-cf-fence: from the moment the stamp payload is staged until the
+  // finalized descriptor is committed, losing the token (the deadline's abort,
+  // a failed re-check) retracts this attempt's stamp: no 'finalized' on the box
+  // that the persisted record does not also say.
+  let retractStamp: (() => Promise<void>) | null = null;
+  let committed = false;
+  const retract = () => {
+    if (committed || !retractStamp) return;
+    const pending = retractStamp;
+    retractStamp = null;
+    void pending().catch((error) => logger.warn({ err: error, runId: input.runId },
+      "native workspace sync could not retract an uncommitted remote stamp"));
+  };
+  input.signal?.addEventListener("abort", retract, { once: true });
+  try {
   if (input.onPhase) await input.onPhase("workspace.restore", () => input.runtime.restoreWorkspace());
   else await input.runtime.restoreWorkspace();
-  return measureRunPhase("execution.workspace_commit", async () => {
+  return await measureRunPhase("execution.workspace_commit", async () => {
     await stillOwned();
     const finalSnapshot =
       await import("@paperclipai/adapter-utils/workspace-restore-merge").then(
@@ -905,7 +996,11 @@ async function finalizePreparedRuntime(input: {
     });
     // After the copyback and the host snapshot, before the remote stamp.
     await stillOwned();
-    await writeRemoteStamp({ target: input.target, stamp, beforePublish: input.signal ? stillOwned : undefined });
+    await writeRemoteStamp({ target: input.target, stamp, beforePublish: input.signal ? stillOwned : undefined,
+      onStaged: input.signal ? (retractThis) => {
+        retractStamp = retractThis;
+        if (input.signal!.aborted) retract();
+      } : undefined });
     const finalizedDescriptor: NativeWorkspaceSyncDescriptor = {
       ...input.descriptor,
       state: "finalized",
@@ -913,6 +1008,8 @@ async function finalizePreparedRuntime(input: {
       finalHostSha256,
     };
     await stillOwned();
+    // The commit point: still the owner, inside the deadline.
+    committed = true;
     const reference = await writeDescriptor(finalizedDescriptor);
     await persistRunReference(input.db, input.runId, reference);
     await persistLeaseStamp({
@@ -922,6 +1019,13 @@ async function finalizePreparedRuntime(input: {
     });
     return reference;
   });
+  } catch (error) {
+    retract();
+    throw error;
+  } finally {
+    input.signal?.removeEventListener("abort", retract);
+    if (fenceCheck && input.copybackFence!.current === fenceCheck) input.copybackFence!.current = null;
+  }
 }
 
 export async function prepareNativeWorkspaceSync(input: {
@@ -966,6 +1070,7 @@ export async function prepareNativeWorkspaceSync(input: {
   );
 
   let runtime: PreparedAdapterExecutionTargetRuntime | undefined;
+  const copybackFence: CopybackFence = { current: null };
   let descriptor: NativeWorkspaceSyncDescriptor;
   let mode: WorkspaceInboundMode = "host_current";
   let reuseReason: StartupReuseReason = "created";
@@ -1012,6 +1117,7 @@ export async function prepareNativeWorkspaceSync(input: {
     runtime = await prepareRuntime({
       runId: input.runId,
       target,
+      copybackFence,
       onPhase: input.onPhase,
       onCheckpoint: input.onCheckpoint,
       workspaceLocalDir: input.workspaceLocalDir,
@@ -1048,6 +1154,7 @@ export async function prepareNativeWorkspaceSync(input: {
     runtime = await prepareRuntime({
       runId: input.runId,
       target,
+      copybackFence,
       onPhase: input.onPhase,
       onCheckpoint: input.onCheckpoint,
       workspaceLocalDir: input.workspaceLocalDir,
@@ -1094,6 +1201,7 @@ export async function prepareNativeWorkspaceSync(input: {
         runtime = await prepareRuntime({
           runId: input.runId,
           target,
+          copybackFence,
           workspaceLocalDir: input.workspaceLocalDir,
           mode: preparedSeed ? "durable_seed" : mode,
           seedCacheCompanyDirectory,
@@ -1163,6 +1271,7 @@ export async function prepareNativeWorkspaceSync(input: {
           descriptor,
           assertOwnership,
           signal: options?.signal,
+          copybackFence,
           onPhase: input.onPhase,
           onCheckpoint: input.onCheckpoint,
         })

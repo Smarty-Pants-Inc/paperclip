@@ -35,7 +35,7 @@ import type { createHeartbeatRetries } from "./retries.js";
 import type { createHeartbeatLifecycle } from "./run-lifecycle.js";
 import { createHeartbeatPreparationTiming } from "./preparation-timing.js";
 import { mcpAppViewsService, renderMcpAppRunContext } from "../mcp-app-views.js";
-import { readPersonStoppedPreviousTurn } from "../acknowledged-native-stop.js";
+import { readPersonStoppedPreviousTurnRun, readStoppedTurnCutWrites } from "../acknowledged-native-stop.js";
 import {
   ConfigurationIncompleteFailure, applyRunScopedMentionedSkillKeys, resolveExecutionRunAdapterConfig,
   resolveRunScopedMentionedSkillKeys, type createHeartbeatRunPreparation, type resolveAcceptedPlanWakeRoutingDecision,
@@ -464,13 +464,19 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   const connectorDelivery = await time("configuration_connector_delivery", () => prepareConnectorSkillDelivery(connectorSkillConfig, agent.adapterType));
   // Always replace this runtime-only field; caller wake data cannot supply skills.
   // App context is server-owned too: a caller's wake data cannot supply it.
+  // Server-owned (adopt-marker-port): the first turn after a person's Stop says so, once.
+  const personStoppedRunId = issueId ? await readPersonStoppedPreviousTurnRun(db, { companyId: agent.companyId, issueId,
+    agentId: agent.id, runId: run.id, runCreatedAt: run.createdAt }) : null;
+  const personStoppedCutWrites = personStoppedRunId
+    ? await readStoppedTurnCutWrites(db, { companyId: agent.companyId, runId: personStoppedRunId }) : [];
   context.paperclipWake = {
     ...parseObject(context.paperclipWake),
     connectorSkillInstructions: connectorDelivery.instructions,
     mcpAppContext: await mcpAppContextPreparation,
     // Server-owned (adopt-marker-port): the first turn after a person's Stop says so, once.
-    personStoppedPreviousTurn: issueId && await readPersonStoppedPreviousTurn(db, { companyId: agent.companyId, issueId,
-      agentId: agent.id, runId: run.id, runCreatedAt: run.createdAt }) ? true : undefined,
+    personStoppedPreviousTurn: personStoppedRunId ? true : undefined,
+    // adopt-cf-fence (F1): a write the Stop cut is exported as-is; the next turn is told it may be incomplete.
+    personStoppedCutWrites: personStoppedCutWrites.length ? personStoppedCutWrites : undefined,
   };
   let runtimeConfig = await prepareConnectionInstructionDelivery({
     resolve: async () => preparedInstructions.value,

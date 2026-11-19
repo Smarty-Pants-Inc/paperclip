@@ -212,6 +212,14 @@ export async function readPersonStopHold(db: Db, input: {
 export async function readPersonStoppedPreviousTurn(db: Db, input: {
   companyId: string; issueId: string; agentId: string; runId: string; runCreatedAt: Date;
 }): Promise<boolean> {
+  return (await readPersonStoppedPreviousTurnRun(db, input)) !== null;
+}
+
+/** adopt-cf-fence (F1): the run the person stopped, when this run is the first turn after that Stop
+ * (readPersonStoppedPreviousTurn's rule), else null. */
+export async function readPersonStoppedPreviousTurnRun(db: Db, input: {
+  companyId: string; issueId: string; agentId: string; runId: string; runCreatedAt: Date;
+}): Promise<string | null> {
   const { stopAcceptanceEventSql } = await import("./heartbeat-run-events.js");
   const onIssue = or(eq(heartbeatRuns.nativeIssueId, input.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`);
   const [stop] = await db.select({ runId: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt, resultJson: heartbeatRuns.resultJson,
@@ -221,12 +229,12 @@ export async function readPersonStoppedPreviousTurn(db: Db, input: {
     .where(and(eq(heartbeatRunEvents.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), onIssue,
       stopAcceptanceEventSql(), sql`${heartbeatRunEvents.payload}->>'kind' = 'person_stop'`))
     .orderBy(desc(heartbeatRunEvents.createdAt), desc(heartbeatRunEvents.id)).limit(1);
-  if (!stop || stop.runId === input.runId) return false;
+  if (!stop || stop.runId === input.runId) return null;
   const accepted = parseObject(stop.payload);
   if (accepted.schema !== "paperclip.stop-acceptance.v1" || accepted.issueId !== input.issueId
     || typeof accepted.userId !== "string" || !accepted.userId
-    || parseObject(stop.resultJson).queuedCommentInterruptQueueId) return false;
-  if (stop.createdAt.getTime() > input.runCreatedAt.getTime()) return false;
+    || parseObject(stop.resultJson).queuedCommentInterruptQueueId) return null;
+  if (stop.createdAt.getTime() > input.runCreatedAt.getTime()) return null;
   const between = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), onIssue,
     sql`${heartbeatRuns.id} <> ${input.runId}`, sql`${heartbeatRuns.id} <> ${stop.runId}`,
@@ -235,10 +243,42 @@ export async function readPersonStoppedPreviousTurn(db: Db, input: {
   for (const run of between) {
     // Only an ENDED-unsuccessful run that never started a provider TURN leaves the marker for the next one; a run
     // that succeeded, is still live, or started (or may have started) a turn consumed (or may yet consume) it.
-    if (!MARKER_PASSING_RUN_STATUSES.includes(run.status)) return false;
-    if (await startedProviderTurnForStopMarker(db, { companyId: input.companyId, runId: run.id })) return false;
+    if (!MARKER_PASSING_RUN_STATUSES.includes(run.status)) return null;
+    if (await startedProviderTurnForStopMarker(db, { companyId: input.companyId, runId: run.id })) return null;
   }
-  return true;
+  return stop.runId;
+}
+
+/** adopt-cf-fence (F1): what the stopped turn was still writing when the person stopped it, from its own
+ * durable tool receipts (never invented): a non-read-only tool call that started and has no completed receipt,
+ * or completed as interrupted / cancelled / aborted. The workspace export copies such a file as it is on the box
+ * (faithful to the Stop: the same box would hold the same partial file); the next turn is told it may be
+ * incomplete. A call with a target names its file; a command names itself. At most 8, in call order. */
+export async function readStoppedTurnCutWrites(db: Db, input: { companyId: string; runId: string }): Promise<string[]> {
+  const events = await db.select({ eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload })
+    .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, input.companyId),
+      eq(heartbeatRunEvents.runId, input.runId),
+      inArray(heartbeatRunEvents.eventType, ["tool.execution.started", "tool.execution.completed"])))
+    .orderBy(heartbeatRunEvents.seq).limit(2_000);
+  const calls = new Map<string, { label: string; cut: boolean }>();
+  for (const event of events) {
+    const stored = parseObject(event.payload);
+    const prp = parseObject(stored.prpEvent);
+    const tool = Object.keys(parseObject(prp.payload)).length ? parseObject(prp.payload) : stored;
+    if (tool.schema !== "paperclip.tool.execution.v1" || tool.readOnly === true) continue;
+    const id = typeof tool.executionId === "string" && tool.executionId ? tool.executionId : null;
+    if (!id) continue;
+    const target = typeof tool.target === "string" && tool.target.trim() ? tool.target.trim().slice(0, 300) : null;
+    const name = typeof tool.name === "string" && tool.name.trim() ? tool.name.trim().slice(0, 300) : null;
+    const label = target ?? (name ? `A file written by \`${name}\`` : null);
+    if (!label) continue;
+    const status = typeof tool.status === "string" ? tool.status.toLowerCase() : "";
+    const cut = event.eventType === "tool.execution.started"
+      || ["interrupted", "cancelled", "canceled", "aborted"].includes(status);
+    const known = calls.get(id);
+    calls.set(id, { label: known?.label ?? label, cut: event.eventType === "tool.execution.started" ? (known?.cut ?? true) : cut });
+  }
+  return [...new Set([...calls.values()].filter((call) => call.cut).map((call) => call.label))].slice(0, 8);
 }
 
 /** A run between the stopped run and this one that ended in these states, without starting a provider turn,

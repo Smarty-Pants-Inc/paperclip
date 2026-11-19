@@ -556,6 +556,17 @@ type PaperclipWakeExecutionStage = {
  * `personStoppedPreviousTurn`). Claude Code's '[Request interrupted by user]' shape; Pi drops
  * its own aborted assistant message from the model's input (pi-ai transform-messages). */
 export const PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE = "The person stopped your previous turn. Do not resume or redo that work unless they ask; answer their new message.";
+/** adopt-cf-fence (F1): a write the person's Stop cut mid-flight (server-owned, from the stopped turn's own tool
+ * receipts). The export copies the file as it was on the box at the Stop; the next turn is told it may be incomplete. */
+export function paperclipPersonStoppedCutWriteNote(label: string): string {
+  return `${label} may be incomplete (its write was stopped).`;
+}
+/** The Stop note, then one line per write the Stop cut. */
+export function paperclipPersonStoppedNoteLines(wake: { personStoppedPreviousTurn: boolean; personStoppedCutWrites: string[] }): string[] {
+  return wake.personStoppedPreviousTurn
+    ? [PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE, ...wake.personStoppedCutWrites.map(paperclipPersonStoppedCutWriteNote)]
+    : [];
+}
 export const PAPERCLIP_EARLIER_READ_COMMENT_NOTE = "An earlier turn already read this comment and may have applied it. Check the current task state first, and do not repeat work that is already done.";
 /** The one prefix line of a carried steer: a person's message steered into a turn that ended without answering it,
  * delivered again in the next turn. Only carried steers get it, never ordinary queued messages. */
@@ -821,6 +832,8 @@ type PaperclipWakePayload = {
   skillTest: boolean;
   /** Server-owned: this is the first turn after a person's Stop of the previous one. */
   personStoppedPreviousTurn: boolean;
+  /** Server-owned (adopt-cf-fence F1): what the stopped turn was still writing at the Stop (tool receipts). */
+  personStoppedCutWrites: string[];
   // Experimental: write user-interaction content in ASD-STE100 Simplified
   // Technical English with brief decision context.
   simplifiedEnglishInteractions: boolean;
@@ -1922,6 +1935,9 @@ export function normalizePaperclipWakePayload(
     ),
     skillTest,
     personStoppedPreviousTurn: payload.personStoppedPreviousTurn === true,
+    personStoppedCutWrites: payload.personStoppedPreviousTurn === true && Array.isArray(payload.personStoppedCutWrites)
+      ? payload.personStoppedCutWrites.flatMap((value) => typeof value === "string" && value.trim()
+        ? [value.trim().slice(0, 300)] : []).slice(0, 8) : [],
     simplifiedEnglishInteractions: asBoolean(
       payload.simplifiedEnglishInteractions,
       false,
@@ -2621,7 +2637,7 @@ function renderPaperclipWakePromptBody(
       ];
 
   // Said once, right under the heading, before any 'continue the task' wording.
-  if (normalized.personStoppedPreviousTurn) lines.splice(2, 0, PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE);
+  if (normalized.personStoppedPreviousTurn) lines.splice(2, 0, ...paperclipPersonStoppedNoteLines(normalized));
   // adopt-receipts2: a fresh session (new box) after the person's Interrupt never saw the cut turn(s).
   // Every tool call of the Interrupt chain is listed from its durable receipt, with what is known of it:
   // done, failed, or cut mid-flight. Nothing completed is run twice; nothing is silently dropped.
