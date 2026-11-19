@@ -1547,6 +1547,13 @@ const STEER_A2_THREAD_GET_DELIVERED = [{"id": "9583981a-c88f-4b2c-baf8-7267730eb
 const QUEUE_SF_POST_RESPONSE = {"id": "aa2e7da8-2ed1-4854-a6e8-a255289791c6", "companyId": "4dd77ee4-6ac3-4727-ae38-39b73985af2e", "issueId": "dd731e54-4d0f-4462-bb3f-8da5e3e31352", "authorAgentId": null, "authorUserId": "chat-owner", "onBehalfOfUserId": null, "authorType": "user", "createdByRunId": null, "derivedAuthorAgentId": null, "derivedCreatedByRunId": null, "derivedAuthorSource": null, "clientRequestId": "ab689719-04b5-4271-b65b-cb7abecf83f4", "conversationSessionGeneration": null, "origin": "comment", "fastResponseRequestId": null, "body": "Queue deliberately", "presentation": null, "metadata": null, "deletedAt": null, "deletedByType": null, "deletedByAgentId": null, "deletedByUserId": null, "deletedByRunId": null, "sourceTrust": null, "createdAt": "2026-11-19T07:44:01.735Z", "updatedAt": "2026-11-19T07:44:01.735Z", "steeredIntoRunId": null, "steeredAt": null, "steeringStatus": null, "steeringDeliveryEventSeq": null} as const;
 const QUEUE_SF_THREAD_GET = [{"id": "aa2e7da8-2ed1-4854-a6e8-a255289791c6", "companyId": "4dd77ee4-6ac3-4727-ae38-39b73985af2e", "issueId": "dd731e54-4d0f-4462-bb3f-8da5e3e31352", "authorAgentId": null, "authorUserId": "chat-owner", "onBehalfOfUserId": null, "authorType": "user", "createdByRunId": null, "derivedAuthorAgentId": null, "derivedCreatedByRunId": null, "derivedAuthorSource": null, "clientRequestId": "ab689719-04b5-4271-b65b-cb7abecf83f4", "conversationSessionGeneration": null, "origin": "comment", "fastResponseRequestId": null, "body": "Queue deliberately", "presentation": null, "metadata": null, "deletedAt": null, "deletedByType": null, "deletedByAgentId": null, "deletedByUserId": null, "deletedByRunId": null, "sourceTrust": null, "createdAt": "2026-11-19T07:44:01.735Z", "updatedAt": "2026-11-19T07:44:01.735Z", "steeredIntoRunId": null, "steeredAt": null, "steeringStatus": null, "steeringDeliveryEventSeq": null}, {"id": "a34b1ede-69b0-4c65-a68a-ec54fce4dbb5", "companyId": "4dd77ee4-6ac3-4727-ae38-39b73985af2e", "issueId": "dd731e54-4d0f-4462-bb3f-8da5e3e31352", "authorAgentId": null, "authorUserId": "chat-owner", "onBehalfOfUserId": null, "authorType": "user", "createdByRunId": null, "derivedAuthorAgentId": null, "derivedCreatedByRunId": null, "derivedAuthorSource": null, "clientRequestId": null, "conversationSessionGeneration": null, "origin": "comment", "fastResponseRequestId": null, "body": "First message", "presentation": null, "metadata": null, "deletedAt": null, "deletedByType": null, "deletedByAgentId": null, "deletedByUserId": null, "deletedByRunId": null, "sourceTrust": null, "createdAt": "2026-11-19T07:44:01.695Z", "updatedAt": "2026-11-19T07:44:01.695Z", "steeredIntoRunId": null, "steeredAt": null, "steeringStatus": null, "steeringDeliveryEventSeq": null}] as const;
 const QUEUE_SF_QUEUED_COMMENTS_GET = {"issueId": "dd731e54-4d0f-4462-bb3f-8da5e3e31352", "queueId": "40779553-6ebe-4b70-98fe-0b3d25c5da98", "state": "deferred", "targetRunId": "52289e09-b836-4484-abd1-e420b9886128", "revision": "a0320dbbe9024a480a94dd567a02c8a9", "protocol": "paperclip_runner_v1", "steeringDisposition": "available", "entries": [{"comment": {"id": "aa2e7da8-2ed1-4854-a6e8-a255289791c6", "companyId": "4dd77ee4-6ac3-4727-ae38-39b73985af2e", "issueId": "dd731e54-4d0f-4462-bb3f-8da5e3e31352", "authorAgentId": null, "authorUserId": "chat-owner", "onBehalfOfUserId": null, "authorType": "user", "createdByRunId": null, "derivedAuthorAgentId": null, "derivedCreatedByRunId": null, "derivedAuthorSource": null, "clientRequestId": "ab689719-04b5-4271-b65b-cb7abecf83f4", "conversationSessionGeneration": null, "origin": "comment", "fastResponseRequestId": null, "body": "Queue deliberately", "presentation": null, "metadata": null, "deletedAt": null, "deletedByType": null, "deletedByAgentId": null, "deletedByUserId": null, "deletedByRunId": null, "sourceTrust": null, "createdAt": "2026-11-19T07:44:01.735Z", "updatedAt": "2026-11-19T07:44:01.735Z"}, "position": 0, "canEdit": true, "canDiscard": true, "behindReset": false}]} as const;
+// steer-ui4 (SUPERSEDE-STEER-UI-NO-CLIENT-GUESS-1119): the S-f POST body as the steer
+// server head answers it. neworg/steer-B3-c3 3d4ef657 server/src/services/conversation-steering.ts:232-233
+// adds `deliveryOutcome` ('queued': the comment waits in a deferred wake) and
+// `steeringUnavailableReason` (null: an explicit Queue, not a refused steer) to the same
+// body. DERIVED from QUEUE_SF_POST_RESPONSE (captured at 69c95176) plus those two server
+// fields; not re-captured.
+const QUEUE_SF_POST_RESPONSE_SAYS_QUEUED = { ...QUEUE_SF_POST_RESPONSE, deliveryOutcome: "queued", steeringUnavailableReason: null } as const;
 
 describe("IssueDetail", () => {
   let container: HTMLDivElement;
@@ -5804,8 +5811,20 @@ describe("IssueDetail", () => {
     expect(optimisticComment?.queueState).toBeUndefined();
     expect(queuedProps.queuedCommentQueue?.entries ?? []).toHaveLength(0);
 
+    // supersedes(steer-ui3 11-19: a BARE POST answer was placed in the waiting list by
+    // IssueDetail's timestamp rule; SUPERSEDE-STEER-UI-NO-CLIENT-GUESS-1119: only an answer
+    // that SAYS queued places it). The server answers queued (deliveryOutcome 'queued',
+    // as QUEUE_SF_POST_RESPONSE_SAYS_QUEUED) and its queued-comments read lists it.
+    mockIssuesApi.getQueuedComments.mockResolvedValue(createQueuedCommentQueue({
+      targetRunId: "run-queued", protocol: "legacy", steeringDisposition: "unsupported",
+      entries: [{ comment: createIssueComment({ body: "Queued run message" }), position: 0, canEdit: true, canDiscard: true }],
+    }));
     await act(async () => {
-      postedComment.resolve(createIssueComment({ body: "Queued run message" }));
+      postedComment.resolve({
+        ...createIssueComment({ body: "Queued run message" }),
+        deliveryOutcome: "queued",
+        steeringUnavailableReason: null,
+      } as IssueComment);
     });
     await flushReact();
 
@@ -5911,13 +5930,26 @@ describe("IssueDetail", () => {
     // supersedes(the optimistic queued projection before the POST answers; RFL CONDITION steer-ui 11-19: the client never decides steer vs queue, and between the click and the POST's answer only the composer's pending state shows)
     expect(pendingProps.queuedCommentQueue?.entries ?? []).toHaveLength(0);
 
+    // supersedes(steer-ui3 11-19: a BARE POST answer was placed in the waiting list by
+    // IssueDetail's timestamp rule; SUPERSEDE-STEER-UI-NO-CLIENT-GUESS-1119: only an answer
+    // that SAYS queued places it). The server answers queued (deliveryOutcome 'queued',
+    // as QUEUE_SF_POST_RESPONSE_SAYS_QUEUED) and its queued-comments read lists it.
+    mockIssuesApi.getQueuedComments.mockResolvedValue(createQueuedCommentQueue({
+      targetRunId: "run-native",
+      entries: [{
+        comment: createIssueComment({ id: "native-follow-up", body: "Use the newer direction" }),
+        position: 0, canEdit: true, canDiscard: true,
+      }],
+    }));
     await act(async () => {
-      postedComment.resolve(
-        createIssueComment({
+      postedComment.resolve({
+        ...createIssueComment({
           id: "native-follow-up",
           body: "Use the newer direction",
         }),
-      );
+        deliveryOutcome: "queued",
+        steeringUnavailableReason: null,
+      } as IssueComment);
     });
     await flushReact();
 
@@ -6210,12 +6242,48 @@ describe("IssueDetail", () => {
     expect(mockIssuesApi.interruptQueuedComments).not.toHaveBeenCalled();
     expect(mockHeartbeatsApi.cancel).not.toHaveBeenCalled();
 
+    // supersedes(steer-ui3 11-19: this row resolved a BARE answer and no longer exercised
+    // the Interrupt binding; SUPERSEDE-STEER-UI-NO-CLIENT-GUESS-1119: the binding comes
+    // from the SERVER). The answer SAYS queued (deliveryOutcome 'queued', as
+    // QUEUE_SF_POST_RESPONSE_SAYS_QUEUED) and the server's queued-comments read lists the
+    // message against the run it was submitted to (run-original), while run-replacement
+    // is live.
+    mockIssuesApi.getQueuedComments.mockResolvedValue(createQueuedCommentQueue({
+      targetRunId: "run-original", protocol: "legacy", steeringDisposition: "unsupported",
+      entries: [{
+        comment: createIssueComment({ body: "Keep this bound to the original run" }),
+        position: 0, canEdit: true, canDiscard: true,
+      }],
+    }));
     await act(async () => {
-      postedComment.resolve(
-        createIssueComment({ body: "Keep this bound to the original run" }),
-      );
+      postedComment.resolve({
+        ...createIssueComment({ body: "Keep this bound to the original run" }),
+        deliveryOutcome: "queued",
+        steeringUnavailableReason: null,
+      } as IssueComment);
     });
     await flushReact();
+    await waitForAssertion(() => {
+      const answered = (mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as typeof replacementProps)
+        .comments?.find((comment) => comment.body === "Keep this bound to the original run");
+      expect(answered).toMatchObject({ queueState: "queued", queueTargetRunId: "run-original" });
+    });
+    const answeredProps = mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as typeof replacementProps;
+    const answeredComment = answeredProps.comments?.find(
+      (comment) => comment.body === "Keep this bound to the original run",
+    );
+    // Its Interrupt control stays bound to the server's run, never rebound to the
+    // replacement: when the server's queue has moved on, the server refuses it.
+    mockIssuesApi.getQueuedComments.mockResolvedValue(createQueuedCommentQueue({
+      targetRunId: "run-replacement", protocol: "legacy", steeringDisposition: "unsupported",
+    }));
+    await act(async () => {
+      await expect(answeredProps.onInterruptQueued(
+        answeredComment!.queueTargetRunId!,
+      )).rejects.toThrow("The queued messages changed");
+    });
+    expect(mockIssuesApi.interruptQueuedComments).not.toHaveBeenCalled();
+    expect(mockHeartbeatsApi.cancel).not.toHaveBeenCalled();
     mockHeartbeatsApi.cancel.mockClear();
   });
 
@@ -7124,7 +7192,7 @@ describe("IssueDetail", () => {
     width: number,
     flow: "steer" | "queue",
     // steer-ui3: the POST answer DELAYED (gate 4's hand take: POST 2.67 s), or refused.
-    answer: { delayMs?: number; failStatus?: 500 | 409 } = {},
+    answer: { delayMs?: number; failStatus?: 500 | 409; says?: "bare" | "queued" } = {},
   ) {
     const { TaskChatThread } = await vi.importActual<
       typeof import("../components/TaskChatThread")
@@ -7133,7 +7201,11 @@ describe("IssueDetail", () => {
     markdownEditorFixture.stub = true;
     mockSidebarState.isMobile = width < 768;
     Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
-    const post = flow === "steer" ? STEER_A2_POST_RESPONSE : QUEUE_SF_POST_RESPONSE;
+    // steer-ui4: says 'queued' = the S-f body with the server's deliveryOutcome 'queued';
+    // says 'bare' = the S-f body as captured (no steer, no queued marker) and the server's
+    // queued-comments read stays empty.
+    const post = flow === "steer" ? STEER_A2_POST_RESPONSE
+      : answer.says === "queued" ? QUEUE_SF_POST_RESPONSE_SAYS_QUEUED : QUEUE_SF_POST_RESPONSE;
     const finalThread: readonly { id: string }[] = flow === "steer" ? STEER_A2_THREAD_GET_DELIVERED : QUEUE_SF_THREAD_GET;
     const runId = flow === "steer" ? STEER_A2_POST_RESPONSE.steeredIntoRunId : QUEUE_SF_QUEUED_COMMENTS_GET.targetRunId;
     const emptyQueue = createQueuedCommentQueue({ queueId: null, state: null, targetRunId: null, entries: [] });
@@ -7157,7 +7229,7 @@ describe("IssueDetail", () => {
         state.thread = flow === "steer"
           ? finalThread.map((comment) => comment.id === post.id ? post : comment)
           : [...QUEUE_SF_THREAD_GET];
-        state.queue = flow === "steer" ? emptyQueue : QUEUE_SF_QUEUED_COMMENTS_GET;
+        state.queue = flow === "steer" || answer.says === "bare" ? emptyQueue : QUEUE_SF_QUEUED_COMMENTS_GET;
         return new Response(JSON.stringify(post), { status: 201, headers: { "content-type": "application/json" } });
       }
       fetched.push(`${method} ${url}`);
@@ -7335,6 +7407,55 @@ describe("IssueDetail", () => {
       expect(waitingText()).not.toContain(post.body);
       if (process.env.STEER_UI_EVIDENCE) {
         writeFileSync(`${process.env.STEER_UI_EVIDENCE}/pending-then-sent-${width}.txt`, `answered at ${answeredAt.toFixed(1)} ms\n${node.outerHTML}\n`);
+      }
+    },
+    20_000,
+  );
+
+  // steer-ui4 (RFL rfl-steerui2 FAIL (1); SUPERSEDE-STEER-UI-NO-CLIENT-GUESS-1119): only the
+  // SERVER's queue state places a message in the waiting list. A bare answer is never
+  // put there by a client rule (the old IssueDetail timestamp rule: createdAt >= the
+  // live run's startedAt).
+  it.each([390, 1440])(
+    "steer-ui4: a BARE POST answer (no steer, no queued marker) while the agent works stays in the thread, never in the waiting list at %i",
+    async (width) => {
+      const { post, posts, bubbles, waitingText } = await renderSteeringPlacement(width, "queue", { delayMs: DELAYED_POST_MS, says: "bare" });
+      await pressEnterAndReadPending(bubbles, post.body, width, "bare");
+      // The answer has landed when the pending bubble is gone.
+      expect(await waitUntil(() => !bubbles().some((node) => node.dataset.delivery === "pending"), DELAYED_POST_MS + 3000)).toBe(true);
+      // Let the follow-up reads (thread, queued comments) settle.
+      for (let i = 0; i < 10; i++) await flushReact();
+      expect(posts).toHaveLength(1);
+      expect(posts[0]).not.toHaveProperty("deliveryIntent");
+      // No client rule puts a bare answer in the waiting list.
+      expect(waitingText()).not.toContain(post.body);
+      expect(container.querySelector('[data-testid="task-chat-queued-list"]')?.textContent ?? "").not.toContain(post.body);
+      // It is in the thread, as the person's message.
+      expect(await waitUntil(() => bubbles().length === 1)).toBe(true);
+      const shown = bubbles();
+      expect(shown).toHaveLength(1);
+      expect(shown[0]!.textContent).not.toMatch(/Queued|Sending…/);
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/bare-answer-${width}.txt`,
+          `${shown[0]!.outerHTML}\nwaiting list: ${JSON.stringify(waitingText())}\n`);
+      }
+    },
+    20_000,
+  );
+
+  it.each([390, 1440])(
+    "steer-ui4 control: an answer that SAYS queued (deliveryOutcome 'queued' + the server's queued-comments read) moves it to the waiting list at %i",
+    async (width) => {
+      const { post, posts, bubbles, waitingText } = await renderSteeringPlacement(width, "queue", { delayMs: DELAYED_POST_MS, says: "queued" });
+      expect(post).toMatchObject({ deliveryOutcome: "queued" });
+      await pressEnterAndReadPending(bubbles, post.body, width, "says-queued");
+      expect(await waitUntil(() => waitingText().includes(post.body), DELAYED_POST_MS + 3000)).toBe(true);
+      expect(posts).toHaveLength(1);
+      expect(container.querySelector('[data-testid="task-chat-queued-list"]')?.textContent).toContain(post.body);
+      expect(container.querySelectorAll('[data-testid="task-chat-steered-message"]')).toHaveLength(0);
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/says-queued-${width}.txt`,
+          `${container.querySelector('[data-testid="task-chat-queued-messages"]')!.outerHTML}\n`);
       }
     },
     20_000,
