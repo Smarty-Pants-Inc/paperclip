@@ -1,5 +1,5 @@
 import { and, asc, desc, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
-import { heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { withSteeredCommentDisplay, type SteeredCommentDisplay } from "./conversation-steering.js";
 
 export { PAPERCLIP_RECEIVED_MID_TASK_LABEL } from "@paperclipai/adapter-utils/server-utils";
@@ -71,6 +71,20 @@ export async function withCarriedSteerDisplay<T extends { id: string; issueId: s
       eq(heartbeatRunEvents.eventType, "item.started"),
       sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' = 'userMessage'`,
     )).orderBy(asc(heartbeatRunEvents.seq)) : [];
+  // A comment a LIVE wake still holds (the run-end restore's conversation-comment wake, a deferred
+  // batch, a person-Stop hold) is waiting to be answered, not lost: never caption it 'run_ended_before_read'
+  // (gate 7, RFL frames: a person who believed that caption re-sent and got two answers).
+  const liveWakes = await db.select({ key: agentWakeupRequests.idempotencyKey, payload: agentWakeupRequests.payload })
+    .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, first.companyId),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${first.issueId}`,
+      sql`${agentWakeupRequests.status} in ('queued', 'deferred_issue_execution', 'claimed', 'deferred')`));
+  const heldByLiveWake = new Set<string>();
+  for (const wake of liveWakes) {
+    const payload = object(wake.payload), context = object(payload._paperclipWakeContext);
+    if (wake.key?.startsWith("conversation-comment:")) heldByLiveWake.add(wake.key.slice("conversation-comment:".length));
+    for (const id of [payload.commentId, context.commentId, context.wakeCommentId, ...ids(context.wakeCommentIds)])
+      if (typeof id === "string") heldByLiveWake.add(id);
+  }
   return displayed.map<T & CarriedSteerDisplay>(comment => {
     const carrier = carriers.find(run => ids(run.context?.carriedSteeredCommentIds).includes(comment.id) &&
       ![...ids(run.result?.restoredSteeredCommentIds), ...ids(run.result?.stopRestoredSteeredCommentIds)].includes(comment.id));
@@ -85,6 +99,10 @@ export async function withCarriedSteerDisplay<T extends { id: string; issueId: s
       ["pending", "acknowledged"].includes(String(object(object(run.result?.queuedSteeringAcknowledgements)[comment.id]).status)));
     const restored = ended && [...ids(ended.result?.restoredSteeredCommentIds), ...ids(ended.result?.stopRestoredSteeredCommentIds)].includes(comment.id);
     if (ended && (restored || (!["queued", "running", "scheduled_retry"].includes(ended.status) && comment.steeringStatus !== "delivered"))) {
+      if (heldByLiveWake.has(comment.id)) {
+        return { ...comment, steeringStatus: null, carriedIntoRunId: null, steeringDeliveryEventSeq: null,
+          deliveryOutcome: "queued", steeringUnavailableReason: null };
+      }
       return { ...comment, steeringStatus: null, carriedIntoRunId: null, steeringDeliveryEventSeq: null,
         deliveryOutcome: "ordinary", steeringUnavailableReason: "run_ended_before_read" };
     }
