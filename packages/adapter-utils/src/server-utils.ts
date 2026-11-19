@@ -824,6 +824,8 @@ type PaperclipWakePayload = {
   interruptedTurnToolCallsOmitted: number;
   /** adopt-receipts3: the chain reaches further back than was read; earlier calls are not counted. */
   interruptedTurnEarlierCallsOmitted: boolean;
+  /** adopt-receipts4: the cut turn's record lost events from before the press; a further call may have run. */
+  interruptedTurnRecordIncomplete: boolean;
   treeHoldInteraction: boolean;
   activeTreeHold: PaperclipWakeTreeHoldSummary | null;
   unresolvedBlockerIssueIds: string[];
@@ -1931,6 +1933,7 @@ export function normalizePaperclipWakePayload(
     interruptedTurnToolCallsOmitted: Math.max(0, Math.floor(asNumber(payload.interruptedTurnToolCallsOmitted, 0)))
       + (Array.isArray(payload.interruptedTurnToolCalls) ? Math.max(0, payload.interruptedTurnToolCalls.length - 32) : 0),
     interruptedTurnEarlierCallsOmitted: asBoolean(payload.interruptedTurnEarlierCallsOmitted, false),
+    interruptedTurnRecordIncomplete: asBoolean(payload.interruptedTurnRecordIncomplete, false),
     dependencyBlockedInteraction: asBoolean(
       payload.dependencyBlockedInteraction,
       false,
@@ -2617,10 +2620,11 @@ function renderPaperclipWakePromptBody(
   // Every tool call of the Interrupt chain is listed from its durable receipt, with what is known of it:
   // done, failed, or cut mid-flight. Nothing completed is run twice; nothing is silently dropped.
   const freshInterruptToolCalls = !resumedSession ? normalized.interruptedTurnToolCalls : [];
-  if (freshInterruptToolCalls.length > 0) {
+  const freshInterruptRecordIncomplete = !resumedSession && normalized.interruptedTurnRecordIncomplete;
+  if (freshInterruptToolCalls.length > 0 || freshInterruptRecordIncomplete) {
     lines.push("", "## Commands already run in the interrupted turn (do not run these again)",
       "This list may not include file edits made in that turn; check the files before redoing any edit.",
-      `The person interrupted your previous turn. This fresh session does not hold that turn; the tool calls below are the calls recorded since your last reply (from their saved receipts), in order${normalized.interruptedTurnToolCallsOmitted > 0 || normalized.interruptedTurnEarlierCallsOmitted ? ", but NOT all of them: some were omitted (see the end of this list)" : ", all of them"}. Do not run them again; continue from the next step. A call marked interrupted was cut mid-flight: check whether it took effect before you run it again.`);
+      `The person interrupted your previous turn. This fresh session does not hold that turn; the tool calls below are the calls recorded since your last reply (from their saved receipts), in order${normalized.interruptedTurnToolCallsOmitted > 0 || normalized.interruptedTurnEarlierCallsOmitted || freshInterruptRecordIncomplete ? ", but NOT all of them: some were omitted (see the end of this list)" : ", all of them"}. Do not run them again; continue from the next step. A call marked interrupted was cut mid-flight: check whether it took effect before you run it again.`);
     freshInterruptToolCalls.forEach((tool, index) => {
       const call = `${markdownInlineCode(tool.name)}${tool.target ? ` (${markdownInlineCode(tool.target)})` : ""}`;
       const state = tool.status === "completed" ? "completed"
@@ -2628,6 +2632,8 @@ function renderPaperclipWakePromptBody(
       lines.push(`${index + 1}. ${call}: ${state}`);
       if (tool.output) lines.push(`   ${tool.status === "failed" ? "error" : "result"}${tool.outputTruncated ? " (excerpt)" : ""}: ${tool.output.replace(/\s+/g, " ").trim()}`);
     });
+    // adopt-receipts4: a step that finished AT the press can lose its receipt in the cut; never drop it silently.
+    if (freshInterruptRecordIncomplete) lines.push(`${freshInterruptToolCalls.length + 1}. A further call may have run right before the interrupt (its receipt was lost in the cut): interrupted: it may or may not have taken effect. Check the workspace for the next step's effect before you run it.`);
     const omitted = normalized.interruptedTurnToolCallsOmitted;
     if (omitted > 0) lines.push(`${omitted} more tool call${omitted === 1 ? " was" : "s were"} recorded after these and omitted from this list (over the limit): they may have run. Check the workspace before you redo any step.`);
     if (normalized.interruptedTurnEarlierCallsOmitted) lines.push("Earlier tool calls in this interrupted work were omitted from this list (over the limit): check the workspace before you redo any step.");

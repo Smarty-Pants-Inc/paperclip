@@ -833,6 +833,107 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     expect(under, "under the cap nothing is said omitted").not.toMatch(/omitted/);
   });
 
+  /** adopt-receipts4: rows exactly as the server persisted a REAL Pi 1.5.2 run through runnerd (rf3-redo2
+   * f1-write-source-receipts.json, seqs 92/101/105/108): item.* is kind "tool_use" with NO arguments, and the
+   * dynamic tool.execution.* has target null; only its result names the path. Each row carries its runner
+   * source sequence (`seq: null` = lost in the cut, as runnerd's cancel discarded STEP2 in rf3-redo head-fresh-1). */
+  async function realPiRows(chat: Chat, rows: Array<{ seq: number | null; eventType: string; payload: Record<string, unknown>; itemId?: string }>) {
+    const kept = rows.filter((row) => row.seq !== null);
+    const [allocated] = await db.update(heartbeatRuns)
+      .set({ nextEventSeq: sql`${heartbeatRuns.nextEventSeq} + ${kept.length}` })
+      .where(eq(heartbeatRuns.id, chat.runId)).returning({ next: heartbeatRuns.nextEventSeq });
+    const first = Number(allocated!.next) - kept.length;
+    const instance = `runnerd-${chat.runId}`;
+    await db.insert(heartbeatRunEvents).values(kept.map((row, index) => ({
+      companyId: chat.companyId, runId: chat.runId, agentId: chat.agentId, seq: first + index, eventType: row.eventType,
+      sourceInstanceId: instance, sourceEventId: `${instance}:${row.seq}`, sourceSeq: row.seq!,
+      payload: { prpEvent: { schema: "paperclip.prp.event.v1", sourceKind: "runner", sourceInstanceId: instance, sourceSeq: row.seq,
+        turnId: "pi-turn-1", itemId: row.itemId ?? chat.runId, eventType: row.eventType, payload: row.payload } },
+    })));
+  }
+  const piItem = (id: string, eventType: "item.started" | "item.completed", seq: number | null) => ({ seq, eventType, itemId: id,
+    payload: { item: { id, text: null, type: "tool_use", status: eventType === "item.started" ? "running" : "completed", channel: "detail" },
+      kind: "tool_use", text: "", channel: "unknown" } });
+  const piExec = (id: string, name: string, transport: "dynamic" | "process", status: "running" | "completed", output: string, seq: number | null) => ({
+    seq, eventType: status === "running" ? "tool.execution.started" : "tool.execution.completed",
+    payload: { schema: "paperclip.tool.execution.v1", executionId: id, transport, operation: transport === "process" ? "execute" : "unknown",
+      name, target: null, status, output, readOnly: null, namespace: null, exitCode: null, progress: null } });
+
+  it("RF5-F1 (rf-3 F1 red): a REAL-Pi-persisted write (kind tool_use, no arguments, target null) ⇒ listed WITH its path, marked 'arguments not recorded'", async () => {
+    const chat = await seedChat();
+    const w = "pi-turn-1:pi-tool:write-1";
+    await realPiRows(chat, [
+      piItem(w, "item.started", 1), piExec(w, "write", "dynamic", "running", "", 2), piItem(w, "item.completed", 3),
+      piExec(w, "write", "dynamic", "completed", "Successfully wrote to /work/notes/nonbash.txt", 4),
+      piExec("pi-turn-1:pi-tool:bash-1", "printf 'STEP1' >> /work/counter.txt", "process", "running", "", 5),
+      piExec("pi-turn-1:pi-tool:bash-1", "printf 'STEP1' >> /work/counter.txt", "process", "completed", "RF_STEP1_RESULT", 6),
+    ]);
+    const { carry } = await steerThenInterrupt(chat, "unread");
+    const prompt = await successorPrompt(chat, await admitSuccessor(chat, carry), false);
+    expect(prompt, "the fresh successor must know WHICH file it already wrote")
+      .toContain("1. `write` (`/work/notes/nonbash.txt; arguments not recorded`): completed\n   result: Successfully wrote to /work/notes/nonbash.txt");
+    expect(prompt).toContain("2. `printf 'STEP1' >> /work/counter.txt`: completed\n   result: RF_STEP1_RESULT");
+    expect(prompt).not.toMatch(/A further call may have run/);
+  });
+
+  it("RF5-AT (rf-3 #2 red): STEP2 finished AT the press and its receipts were lost in the cut (source gap before the interrupt ack) ⇒ never missing: an 'interrupted, may or may not have taken effect' entry follows STEP1", async () => {
+    const chat = await seedChat();
+    const b1 = "pi-turn-1:pi-tool:bash-1", b2 = "pi-turn-1:pi-tool:bash-2";
+    await realPiRows(chat, [
+      piItem(b1, "item.started", 1), piExec(b1, "echo STEP1 >> /work/c", "process", "running", "", 2), piItem(b1, "item.completed", 3),
+      piExec(b1, "echo STEP1 >> /work/c", "process", "completed", "RF_STEP1_RESULT", 4),
+      // STEP2 ran (its effect and the post-tool model request existed) but the cut discarded its receipts.
+      piItem(b2, "item.started", null), piExec(b2, "echo STEP2 >> /work/c", "process", "running", "", null),
+      piExec(b2, "echo STEP2 >> /work/c", "process", "completed", "RF_STEP2_RESULT", null),
+      { seq: 8, eventType: "item.completed", payload: { kind: "interrupt_acknowledgement", text: "Interrupt accepted for the active turn." } },
+    ]);
+    const { carry } = await steerThenInterrupt(chat, "unread");
+    const prompt = await successorPrompt(chat, await admitSuccessor(chat, carry), false);
+    expect(prompt).toContain("1. `echo STEP1 >> /work/c`: completed");
+    expect(prompt, "a step completed at the press must not vanish from the fresh input")
+      .toMatch(/\n2\. A further call may have run right before the interrupt[^\n]*interrupted: it may or may not have taken effect/);
+    expect(prompt).toMatch(/in order, but NOT all of them/);
+  });
+
+  it("RF5-AT control: the same run with every receipt durable (no gap before the ack) ⇒ STEP1/STEP2 completed, no 'further call' line", async () => {
+    const chat = await seedChat();
+    const b1 = "pi-turn-1:pi-tool:bash-1", b2 = "pi-turn-1:pi-tool:bash-2";
+    await realPiRows(chat, [
+      piExec(b1, "echo STEP1 >> /work/c", "process", "running", "", 1), piExec(b1, "echo STEP1 >> /work/c", "process", "completed", "R1", 2),
+      piExec(b2, "echo STEP2 >> /work/c", "process", "running", "", 3), piExec(b2, "echo STEP2 >> /work/c", "process", "completed", "R2", 4),
+      { seq: 5, eventType: "item.completed", payload: { kind: "interrupt_acknowledgement", text: "Interrupt accepted for the active turn." } },
+      // after the press: cancellation bookkeeping the cut may drop; it is not work
+      { seq: 9, eventType: "turn.cancelled", payload: { status: "cancelled" } },
+    ]);
+    const { carry } = await steerThenInterrupt(chat, "unread");
+    const prompt = await successorPrompt(chat, await admitSuccessor(chat, carry), false);
+    expect(prompt).toContain("2. `echo STEP2 >> /work/c`: completed");
+    expect(prompt).not.toMatch(/A further call may have run/);
+    expect(prompt).toMatch(/in order, all of them/);
+  });
+
+  it("RF5-WAIT (rf-3 #2 red): STEP2's completion is still in ordered ingestion when the successor builds its input ⇒ the build waits (bounded) for the cut run's ingestion fence and lists STEP2 completed", async () => {
+    const chat = await seedChat();
+    const b2 = "pi-turn-1:pi-tool:bash-2";
+    await realPiRows(chat, [piExec(b2, "echo STEP2 >> /work/c", "process", "running", "", 1)]);
+    const { carry, cut } = await steerThenInterrupt(chat, "unread");
+    const open = { nativeSteeringIngestion: { state: "open", sourceInstanceId: `runnerd-${chat.runId}` } };
+    await db.update(heartbeatRuns).set({ resultJson: { ...(cut.resultJson as Record<string, unknown> ?? {}), ...open } }).where(eq(heartbeatRuns.id, chat.runId));
+    const successor = await admitSuccessor(chat, carry);
+    // The ordered consumer persists STEP2's completion 300 ms later, then settles the fence (terminal ingested).
+    const landed = (async () => {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await realPiRows(chat, [piExec(b2, "echo STEP2 >> /work/c", "process", "completed", "RF_STEP2_RESULT", 2)]);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+      await db.update(heartbeatRuns).set({ resultJson: { ...(run!.resultJson as Record<string, unknown>),
+        nativeSteeringIngestion: { ...open.nativeSteeringIngestion, state: "terminal_ingested" } } }).where(eq(heartbeatRuns.id, chat.runId));
+    })();
+    const prompt = await successorPrompt(chat, successor, false);
+    await landed;
+    expect(prompt, "a completion landing in the press window is listed done, not re-run")
+      .toContain("1. `echo STEP2 >> /work/c`: completed\n   result: RF_STEP2_RESULT");
+  });
+
   it("R6: a non-terminal conversation-comment wake for an adopted steer is retired at the press (coalesced into the carry); STEER has ONE carrier, the carry", async () => {
     const chat = await seedChat();
     const { steerId, carry } = await steerThenInterrupt(chat, "read", { staleWake: "deferred_issue_execution" });
