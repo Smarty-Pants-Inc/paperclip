@@ -7,10 +7,12 @@ import { logger } from "../middleware/logger.js";
  * Marker, under an instance root, that this instance's database has recorded a
  * heartbeat run. Some runs end with run rows and heartbeat_run_events but no
  * data/run-logs file (for example a run cancelled before start, a run that fails
- * setup, or a conversation reset). The worktree-instance reaper keeps an instance
- * whose embedded DB directory holds data AND that has this marker, so those DB
- * traces are never deleted with the instance root, and it never queries the DB
- * to decide (R-keep-all-traces, never-OK).
+ * setup, or a conversation reset). The worktree-instance reaper keeps any
+ * instance that has this marker, and removes an instance only when it is proven
+ * never to have recorded a run (no marker AND an empty or absent db/ AND no
+ * trace content); it never queries the DB to decide (R-keep-all-traces,
+ * never-OK). A failed marker write therefore fails closed: the instance's
+ * non-empty db/ alone keeps it.
  */
 export const INSTANCE_HEARTBEAT_RUN_MARKER = path.join("data", "heartbeat-runs-recorded");
 
