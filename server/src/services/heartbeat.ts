@@ -418,6 +418,7 @@ import {
 } from "../vendor/paperclip-runner/index.js";
 
 import { getRunLogStore, isRunLogStoreType } from "./run-log-store.js";
+import { markInstanceHasHeartbeatRuns } from "./instance-run-marker.js";
 import {
   providerTraceStore,
 } from "./provider-trace-store.js";
@@ -1993,6 +1994,8 @@ export function heartbeatService(
     let persistUsageCaptureFailure: (() => Promise<void>) | undefined;
     let run = await getRun(runId);
     if (!run) return;
+    // Paths below can finish this run with run rows but no run log (reaper keep).
+    await markInstanceHasHeartbeatRuns();
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {

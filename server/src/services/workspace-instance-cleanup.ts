@@ -8,6 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
 import { expandHomePrefix } from "../home-paths.js";
+import { INSTANCE_HEARTBEAT_RUN_MARKER } from "./instance-run-marker.js";
 import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
 
 const execFileAsync = promisify(execFile);
@@ -118,6 +119,16 @@ async function holdsRawTrace(directory: string): Promise<boolean> {
   return (await fs.readdir(directory)).length > 0;
 }
 
+async function traceEntryExists(candidate: string): Promise<boolean> {
+  try {
+    await fs.lstat(candidate);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 /** The raw-trace directories with content inside this instance root. */
 export async function findWorktreeInstanceRawTraces(
   instanceRoot: string,
@@ -133,6 +144,14 @@ export async function findWorktreeInstanceRawTraces(
         && (resolved === instanceRoot || isStrictChildPath(resolved, instanceRoot))) candidates.add(resolved);
     }
     for (const candidate of candidates) if (await holdsRawTrace(candidate)) found.push(candidate);
+  }
+  // The instance's own embedded DB holds run rows and run events, which are
+  // trace even when no run log was written (a run cancelled before start, a
+  // failed setup, a conversation reset). Keep a non-empty DB directory once the
+  // instance has recorded a run (instance-run-marker.ts); never query the DB.
+  const embeddedDb = path.join(instanceRoot, "db");
+  if (await traceEntryExists(path.join(instanceRoot, INSTANCE_HEARTBEAT_RUN_MARKER)) && await holdsRawTrace(embeddedDb)) {
+    found.push(embeddedDb);
   }
   return found;
 }

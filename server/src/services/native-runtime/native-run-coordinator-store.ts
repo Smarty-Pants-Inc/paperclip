@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import { and, desc, eq, inArray, lt } from "drizzle-orm";
 
 import type { Db } from "@paperclipai/db";
+import { markInstanceHasHeartbeatRuns } from "../instance-run-marker.js";
 import {
   heartbeatRunEvents,
   heartbeatRuns,
@@ -304,6 +305,7 @@ export class NativeRunCoordinatorStore {
       if (isNativeResponseEvidence(event.eventType, canonicalPayload)) {
         await notifyNativeResponsePresentation(tx, this.#binding);
       }
+      await markInstanceHasHeartbeatRuns();
       const cursor = run.nextEventSeq;
       const [inserted] = await tx
         .insert(heartbeatRunEvents)

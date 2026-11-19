@@ -11,6 +11,7 @@ import type { Db } from "@paperclipai/db";
 import { heartbeatRunEvents, heartbeatRuns } from "@paperclipai/db";
 import { nativeSha256 } from "./native-runtime/canonical.js";
 import { retryUnlessTransactionBound } from "./transaction-retry.js";
+import { markInstanceHasHeartbeatRuns } from "./instance-run-marker.js";
 
 export const RETRY_EXHAUSTION_MESSAGE_PREFIX = "Bounded retry exhausted";
 
@@ -349,6 +350,8 @@ async function appendLockedEvent(
     await notifyNativeResponsePresentation(tx, { companyId: run.companyId, runId: input.runId });
   }
   if (wakes.retention) await notifyAttentionRetentionWork(tx, { companyId: input.companyId, sourceKind: "failed_run" });
+  // A run event can outlive any run log; mark the instance first (reaper keep).
+  await markInstanceHasHeartbeatRuns();
   const seq = await allocateHeartbeatRunEventSeq(tx, input.runId, input.runUpdate);
   const [row] = await tx.insert(heartbeatRunEvents).values({
     companyId: input.companyId,

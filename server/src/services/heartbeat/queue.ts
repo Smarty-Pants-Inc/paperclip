@@ -222,6 +222,7 @@ import type { createRunDispatch } from "../../modules/run-dispatch/index.js";
 import { hasRetainedExternalChatRetry, type PostCommitEffect as WakeQueuePostCommitEffect, type createWakeQueue } from "../../modules/wake-queue/index.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 import { retryUnlessTransactionBound } from "../transaction-retry.js";
+import { markInstanceHasHeartbeatRuns } from "../instance-run-marker.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 type QueuedRunCandidate = Pick<HeartbeatRun, "id" | "companyId" | "agentId" | "status" | "invocationSource" | "createdAt"
@@ -4346,6 +4347,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               cancelled.id,
             );
 
+            await markInstanceHasHeartbeatRuns();
             await tx.insert(heartbeatRunEvents).values({
               companyId: cancelled.companyId,
               runId: cancelled.id,
