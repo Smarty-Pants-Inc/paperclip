@@ -88,7 +88,8 @@ export async function readContinuationCommentInput(db: Pick<Db, "select">, input
   return source ? pendingContinuationCommentInput(db, { ...input, contextSnapshot: source.contextSnapshot }) : {};
 }
 
-/** A person's Retry (run-control.ts resumeTaskRetry) starts a fresh session on the task, not a comment continuation:
+/** A person's Retry (the task Retry: run-control.ts resumeTaskRetry; the chat thread's Retry of an exact failed run:
+ * heartbeat/queue.ts failedRunId) starts a fresh session on the task, not a comment continuation:
  * it takes from the ONE carry only the card answers the run it retries still owes (same rule: a person's answer,
  * not ANSWERED, not sender-stopped), named in interactionIds alone. The runtime selection materializes them into
  * the successor's first turn (runtime-selection.ts) and the one answered function reads the same field, so the
