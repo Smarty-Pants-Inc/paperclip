@@ -299,9 +299,9 @@ describe("S124 fix: a parked Send whose held messages were carried by a run that
     await answer(f,[f.message.id],'failed');
     await register(queue); await pastDeadline(queue,at);
     const v=await view(f,wake.id);
-    expect(v.wake.status).toBe('deferred_issue_execution');
-    expect(v.notes).toHaveLength(1);
-    expect((v.notes[0]!.metadata as any)?.authorizationReason).toBe(`unanswered_message:${f.message.id}`);
-    expect(heldIds(v.queue)).toEqual([f.message.id]);
+    expect(v.wake.status).toBe('cancelled');
+    expect(v.notes).toHaveLength(0);
+    expect(v.wake.error).toBe('parked_send_answered_elsewhere');
+    expect(heldIds(v.queue)).toEqual([]);
   });
 });
