@@ -42,6 +42,7 @@ import { rearmExhaustedCapturePolicy } from "./workspace-recovery-capture-policy
 import { rearmExhaustedStopProof } from "./workspace-recovery-stop-proof.js";
 import { settleRecoveredWorkspaceRestoreHolds } from "./workspace-restore-hold-settlement.js";
 import { reusableSandboxNotKeptAfterReplacementSql } from "./reusable-sandbox-kept-marker.js";
+import { readLateSaveRule } from "./native-runtime/native-late-save-rule.js";
 
 const exportCauses = ["native_workspace_sync_out_unrecoverable", "native_workspace_sync_out_retry_exhausted"];
 const terminal = ["failed", "interrupted", "timed_out", "cancelled", "succeeded"];
@@ -263,6 +264,7 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
     };
     let observing = Promise.resolve();
     let cacheReclaimUnconfirmed = false;
+    const keptAside: { operationId: string; leaseId: string; reason: string }[] = [];
     const observer = setInterval(() => { observing = observing.then(observeActive).catch(() => undefined); }, 15_000);
     try {
       await observeActive();
@@ -368,6 +370,18 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
           await inspectWorkspaceRecoverySource(db, input);
           await progress({ phase: "preserve_files" });
           let operationId: string;
+          // K15b/K15c (RFL 11-19): the late save of an ended run's accepted
+          // result is written into the task's workspace only while the reply's
+          // file line does not read LOST and no newer run exists on the task.
+          // Otherwise the bytes are kept aside as a separate stored snapshot of
+          // the exact bound box (the branch below): never written over the
+          // task's files, never published as this run's, never discarded.
+          let lateSave: { aside: boolean; reason?: string } = { aside: false };
+          const lateSaveKeptAside = async () => {
+            if (!exportCauses.includes(inspected.action.cause)) return { aside: false };
+            const rule = await readLateSaveRule(db, input);
+            return rule.target === "aside" ? { aside: true, reason: rule.reason } : { aside: false };
+          };
           if (source.remoteReference && source.remoteWorkspace) {
             const [workspace] = await db.select().from(executionWorkspaces).where(and(
               eq(executionWorkspaces.companyId, input.companyId), eq(executionWorkspaces.id, source.remoteWorkspace.id),
@@ -409,7 +423,7 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
                 storage: "remote_workspace", epoch: source.remoteReference.epoch,
               } }).returning({ id: workspaceOperations.id }))[0]!;
             operationId = operation.id;
-          } else if (reference) {
+          } else if (reference && !(lateSave = await lateSaveKeptAside()).aside) {
             const copied = await resumeNativeWorkspaceSync({ db, runId: input.runId, target, assertOwnership: ownership.assertHeld });
             if (!copied) throw new SystemRecoveryFailure("snapshot_verification_failed", "service_required");
             const after = await inspectWorkspaceRecoverySource(db, input);
@@ -430,6 +444,11 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
           } else {
             operationId = await preserveWorkspaceSnapshot({ ...input, leaseId: lease.id,
               providerLeaseId: lease.providerLeaseId!, target, assertHeld: ownership.assertHeld });
+            if (lateSave.aside) {
+              keptAside.push({ operationId, leaseId: lease.id, reason: lateSave.reason! });
+              logger.info({ runId: input.runId, operationId, reason: lateSave.reason },
+                "Late save kept aside: nothing was written into the task's workspace");
+            }
           }
           await progress({ preservationOperationIds: [...new Set([...current!.preservationOperationIds, operationId])] });
           clearInterval(keepalive); await renewal;
@@ -465,7 +484,8 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
         await notifyNativeStatusReassessment(tx, input);
         await tx.insert(workspaceOperations).values({ companyId: input.companyId, issueId: input.issueId,
           heartbeatRunId: input.runId, phase: "workspace_finalize", status: "succeeded", finishedAt: new Date(),
-          metadata: { owningService: "workspace_recovery", preservationOperationIds: next.preservationOperationIds } });
+          metadata: { owningService: "workspace_recovery", preservationOperationIds: next.preservationOperationIds,
+            ...(keptAside.length ? { lateSaveKeptAside: keptAside } : {}) } });
         if (!await updateSystemRecovery(tx as unknown as Db, input, current!, next))
           throw new Error("workspace_recovery_generation_changed");
         if (inspected.action.evidence.nativeSourceRetention && !await settleRecoveredNativeSourceRetention(tx as unknown as Db, input, next.preservationOperationIds))
@@ -475,7 +495,9 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
         await settleRecoveredWorkspaceRestoreHolds(tx as unknown as Db, input);
         return persistActivity(tx as unknown as Db, { companyId: input.companyId, actorType: "system", actorId: "workspace-recovery",
           action: "issue.workspace_recovered", entityType: "issue", entityId: input.issueId, runId: input.runId,
-          details: { recoveryActionId: input.actionId, summary: "Saved work recovered." } });
+          details: { recoveryActionId: input.actionId, summary: keptAside.length
+            ? "Late files kept aside; the task's workspace was not changed." : "Saved work recovered.",
+            ...(keptAside.length ? { lateSaveKeptAside: keptAside } : {}) } });
       });
       current = next;
       try { publishActivity(activity.publication); } catch { logger.warn({ runId: input.runId }, "Recovery activity delivery deferred"); }

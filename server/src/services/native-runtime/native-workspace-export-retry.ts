@@ -16,6 +16,7 @@ import type { EnvironmentRuntimeService } from "../environment-runtime.js";
 import { resolveEnvironmentExecutionTarget } from "../environment-execution-target.js";
 import { readSystemRecovery } from "../system-recovery-state.js";
 import { readWorkspaceRecovery } from "../workspace-recovery-receipt.js";
+import { replyFileLineReadsLost } from "./native-late-save-rule.js";
 
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const changed = () => conflict("The recorded export repair is no longer current. Refresh the task and inspect its run.", { code: "workspace_export_retry_stale" });
@@ -62,6 +63,11 @@ export async function retryNativeWorkspaceExport(input: {
       or(gt(heartbeatRuns.createdAt, run.createdAt), inArray(heartbeatRuns.status, ["queued", "running"])),
     )).limit(1);
     if (newer) throw changed();
+    // K15b: once the reply's file line reads LOST, a late save never lands in
+    // the task's workspace. The retained box keeps the bytes; nothing is discarded.
+    if (replyFileLineReadsLost(run.resultJson)) throw conflict(
+      "This reply's files were already reported as not saved, so they are not written into the task's workspace. They are kept in the retained sandbox.",
+      { code: "workspace_export_retry_line_lost" });
     const pending = record(action.evidence?.workspaceExportRetry);
     const alreadyQueued = coordinator.phase !== "terminal_failure" && pending.runId === run.id
       && pending.resultId === result.id && pending.leaseId === lease.id;
@@ -148,9 +154,12 @@ export async function retryNativeWorkspaceExport(input: {
         await notifyNativeFinalizationWork(tx, { companyId: current.run.companyId, runId: current.run.id });
         await tx.update(nativeRunFinalizations).set({ phase: "result_accepted", failureCode: null, nextAttemptAt: null,
           failureDetail: { ...current.coordinator.failureDetail, workspaceFinalizeAttempt: 0, workspaceExportRetry: retry }, updatedAt: now }).where(eq(nativeRunFinalizations.runId, current.run.id));
-        await tx.update(heartbeatRuns).set({ status: "running", finishedAt: null, error: null, errorCode: null,
+        // K12 (RFL 11-19): Retry export saves an ended run's files. It never
+        // makes that run `running` again: its status, error, failure code and
+        // end time stay as the run ended. Only the finalization suffix reopens.
+        await tx.update(heartbeatRuns).set({
           nativePhase: "result_accepted", nativePhaseUpdatedAt: now,
-          resultJson: { ...current.run.resultJson, workspaceExportRetry: retry, finalizationPhase: "result_accepted", failureCode: null, originalFailureCode: null, nextAttemptAt: null }, updatedAt: now }).where(eq(heartbeatRuns.id, current.run.id));
+          resultJson: { ...current.run.resultJson, workspaceExportRetry: retry, finalizationPhase: "result_accepted", nextAttemptAt: null }, updatedAt: now }).where(eq(heartbeatRuns.id, current.run.id));
         await notifyStatusCardIssueChange(tx, current.run.companyId);
         await tx.update(issues).set({ executionRunId: current.run.id, updatedAt: now }).where(eq(issues.id, current.issue.id));
         // Reclaim the same lease only for control-plane copyback. The normal

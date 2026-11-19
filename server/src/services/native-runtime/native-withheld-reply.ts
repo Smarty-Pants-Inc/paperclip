@@ -48,7 +48,10 @@ const record = (value: unknown): Record<string, unknown> =>
 const withheldMarkerState = sql`${heartbeatRuns.resultJson} #>> '{nativeWithheldReply,state}'`;
 const terminalWithheld = and(eq(nativeRunFinalizations.phase, "terminal_failure"),
   inArray(nativeRunFinalizations.failureCode, [...NATIVE_WITHHELD_REPLY_FAILURE_CODES]));
-const cancelledCommitted = and(eq(nativeRunFinalizations.phase, "committed"), eq(heartbeatRuns.status, "cancelled"));
+// K12: a run that ended `failed` and whose late save then committed stays
+// `failed`, exactly as a cancelled one stays `cancelled`. The committed reply
+// path refuses both, so a reply not yet shown is published here, once.
+const cancelledCommitted = and(eq(nativeRunFinalizations.phase, "committed"), inArray(heartbeatRuns.status, ["cancelled", "failed"]));
 const withheldMarkerTrigger = sql<string | null>`${heartbeatRuns.resultJson} #>> '{nativeWithheldReply,trigger}'`;
 /** An entry written at acceptance is due in every phase, and while the
  * finalizer holds its lease: it needs only the accepted result, which never changes. */
@@ -139,7 +142,7 @@ export async function publishWithheldAcceptedReply(
     if (!run || isNativeRunnerOwnershipHeld(run)) return false;
     // A committed run is this path's only when it stayed cancelled; every
     // other committed run belongs to the committed reply path.
-    if (trigger === "terminal" && !terminal && run.status !== "cancelled") return false;
+    if (trigger === "terminal" && !terminal && !["cancelled", "failed"].includes(run.status)) return false;
     const marker = record(record(run.resultJson).nativeWithheldReply);
     if (marker.state !== "pending" || (marker.trigger ?? "terminal") !== trigger) return false;
     if (marker.resultId !== coordinator.resultId) return false;
