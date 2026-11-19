@@ -114,6 +114,41 @@ describe("worktree instance cleanup", () => {
     await expect(fs.stat(instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7002475364 (rf-3 condition 4)
+  // Keep reason: NEVER-OK trace custody. This cleanup is the one path that
+  // removes a whole instance root; run-log bytes that exist ONLY in the kept
+  // spill under it must never go with it.
+  it.each([
+    ["holds run-log bytes object storage has not taken", "refused", false],
+    ["holds only spilled bytes that are already in the object log", "removed", true],
+  ] as const)("an instance whose run-log spill %s is %s", async (_case, status, recovered) => {
+    const worktreesDir = await makeTempRoot("paperclip-managed-worktrees-");
+    const workspacePath = await makeTempRoot("paperclip-cleanup-workspace-");
+    const instanceId = "pap-spill";
+    const instanceRoot = path.join(worktreesDir, "instances", instanceId);
+    const spillDir = path.join(instanceRoot, "data", "run-logs", ".spill", "company", "agent");
+    await fs.mkdir(spillDir, { recursive: true });
+    const bytes = "{\"chunk\":\"admitted\"}\n";
+    const entry = { v: 1, event: "spilled", at: "2026-11-19T00:00:00Z", logRef: "company/agent/run", spillStart: 0,
+      bytes: bytes.length, sha256: "0".repeat(64), journalEnd: 0 };
+    await fs.writeFile(path.join(spillDir, "run.ndjson"), bytes);
+    await fs.writeFile(path.join(spillDir, "run.index.ndjson"),
+      [entry, ...(recovered ? [{ ...entry, event: "recovered", journalEnd: bytes.length }] : [])]
+        .map(line => `${JSON.stringify(line)}\n`).join(""));
+    await writeWorkspaceEnv(workspacePath, worktreesDir, instanceId);
+    const { recorder, operations } = createRecorderDouble();
+    const result = await cleanupWorktreeInstanceArtifacts({
+      pointer: (await readWorktreeInstancePointer(workspacePath))!, workspaceId: "workspace-1", workspacePath,
+      expectedInstanceId: instanceId, expectedInstanceRoot: instanceRoot, worktreesDir, recorder,
+    });
+    expect(result.status).toBe(status);
+    if (status === "refused") {
+      expect(await fs.readFile(path.join(spillDir, "run.ndjson"), "utf8")).toBe(bytes);
+      expect(operations.at(-1)?.metadata).toMatchObject({ refusalReason: "run_log_spill_unrecovered",
+        unrecoveredRunLogSpills: ["company/agent/run"] });
+    } else await expect(fs.stat(instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("preserves a collision-resistant active instance when persisted ownership is absent", async () => {
     const worktreesDir = await makeTempRoot("paperclip-managed-worktrees-");
     const workspacePath = await makeTempRoot("paperclip-cleanup-workspace-");
