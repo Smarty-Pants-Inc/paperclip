@@ -6651,6 +6651,45 @@ describe("TaskChatThread composer execution controls", () => {
     });
   });
 
+  // stail-2c (server source of the stale 'Working / Thinking'): the thread
+  // mounted from the REAL issue-detail and issue-runs GET bodies of
+  // server c3-optS-send-after-stop "stail-2c R1" (a person's acknowledged
+  // Stop of a live native turn with 3 held; real comment POSTs, the real
+  // cancel route), planted verbatim: e27ee901's body at +0 s and the fix's
+  // bodies at +0 s and +5 s.
+  describe.each([{ width: 390, mobile: true }, { width: 1440, mobile: false }])("after a person's Stop with held messages at $width", ({ mobile }) => {
+    const bodies = {
+      base0: { interruption: {"intentId": "b8adad6d-fbc7-4045-9823-1343c3c4497b", "responsibility": "system", "state": "working", "nextRetryAt": null, "canRetry": false, "userAction": null, "sourceRunIds": ["23bfbabf-e6b8-460e-ac78-ad4befeefb80"], "observedRunId": "23bfbabf-e6b8-460e-ac78-ad4befeefb80"},
+        run: {"runId": "23bfbabf-e6b8-460e-ac78-ad4befeefb80", "runtimeMode": "native", "status": "cancelled", "agentId": "92a441a6-3ad1-4702-a62e-37d3227297a7", "adapterType": "paperclip_runner", "startedAt": "2026-11-19T04:47:34.940Z", "finishedAt": "2026-11-19T04:47:35.290Z", "createdAt": "2026-11-19T04:47:34.872Z", "invocationSource": "on_demand", "errorCode": "cancelled", "resultJson": {"stopReason": "cancelled", "timeoutFired": false, "timeoutSource": "default", "timeoutConfigured": false, "nativeCancellation": {"runId": "23bfbabf-e6b8-460e-ac78-ad4befeefb80", "schema": "paperclip.native-cancellation.v1", "companyId": "e825edac-3a1b-4f9b-9d8c-e498438b2511", "dispatchState": "acknowledged"}, "effectiveTimeoutSec": 0, "executionCancellation": {"state": "requested"}}} },
+      head0: { interruption: {"intentId": "c4094cc8-460e-4e29-89b7-101b2b3683b5", "responsibility": "system", "state": "resolved", "nextRetryAt": null, "canRetry": false, "userAction": null, "sourceRunIds": ["4768f271-507b-4f6f-a93b-1af12113e680"], "observedRunId": "4768f271-507b-4f6f-a93b-1af12113e680"},
+        run: {"runId": "4768f271-507b-4f6f-a93b-1af12113e680", "runtimeMode": "native", "status": "cancelled", "agentId": "c53dfe2f-d335-4fbc-8499-63cf53693cde", "adapterType": "paperclip_runner", "startedAt": "2026-11-19T04:47:04.998Z", "finishedAt": "2026-11-19T04:47:05.381Z", "createdAt": "2026-11-19T04:47:04.918Z", "invocationSource": "on_demand", "errorCode": "cancelled", "resultJson": {"stopReason": "cancelled", "timeoutFired": false, "timeoutSource": "default", "timeoutConfigured": false, "nativeCancellation": {"runId": "4768f271-507b-4f6f-a93b-1af12113e680", "schema": "paperclip.native-cancellation.v1", "companyId": "704925a0-5a7d-4623-b07a-5b76fdf3a225", "dispatchState": "acknowledged"}, "effectiveTimeoutSec": 0, "executionCancellation": {"state": "requested"}}} },
+      head5: { interruption: {"intentId": "c4094cc8-460e-4e29-89b7-101b2b3683b5", "responsibility": "system", "state": "resolved", "nextRetryAt": null, "canRetry": false, "userAction": null, "sourceRunIds": ["4768f271-507b-4f6f-a93b-1af12113e680"], "observedRunId": "4768f271-507b-4f6f-a93b-1af12113e680"},
+        run: {"runId": "4768f271-507b-4f6f-a93b-1af12113e680", "runtimeMode": "native", "status": "cancelled", "agentId": "c53dfe2f-d335-4fbc-8499-63cf53693cde", "adapterType": "paperclip_runner", "startedAt": "2026-11-19T04:47:04.998Z", "finishedAt": "2026-11-19T04:47:05.381Z", "createdAt": "2026-11-19T04:47:04.918Z", "invocationSource": "on_demand", "errorCode": "cancelled", "resultJson": {"stopReason": "cancelled", "timeoutFired": false, "timeoutSource": "default", "timeoutConfigured": false, "nativeCancellation": {"runId": "4768f271-507b-4f6f-a93b-1af12113e680", "schema": "paperclip.native-cancellation.v1", "companyId": "704925a0-5a7d-4623-b07a-5b76fdf3a225", "dispatchState": "acknowledged"}, "effectiveTimeoutSec": 0, "executionCancellation": {"state": "requested"}}} },
+    };
+    const mount = (body: typeof bodies[keyof typeof bodies]) => {
+      sidebarState.isMobile = mobile;
+      const agent = { id: body.run.agentId, name: "Pi worker", adapterType: "paperclip_runner" } as Agent;
+      render(<TaskChatThread comments={[]} onAdd={async () => {}} issueId="issue" issueStatus="in_progress" companyId="company"
+        issueAssigneeAgentId={agent.id} agentMap={new Map([[agent.id, agent]])}
+        linkedRuns={[body.run as unknown as NonNullable<ComponentProps<typeof TaskChatThread>["linkedRuns"]>[number]]}
+        interruption={body.interruption as ComponentProps<typeof TaskChatThread>["interruption"]} />);
+    };
+    const liveLane = () => container.querySelector('[data-testid="task-chat-live-transcript"]');
+
+    it.each(["head0", "head5"] as const)("the fixed server's %s body shows no bare 'Working / Thinking'", key => {
+      mount(bodies[key]);
+      expect(liveLane()).toBeNull();
+      expect(container.textContent).not.toContain("Working");
+      expect(container.textContent).not.toContain("Thinking");
+    });
+
+    it("e27ee901's +0 s body draws the bare 'Working / Thinking' lane (the live bug)", () => {
+      mount(bodies.base0);
+      expect(liveLane()?.textContent).toContain("Working");
+      expect(liveLane()?.textContent).toContain("Thinking");
+    });
+  });
+
   it("reconciles a timed-out Stop from exact company-bound historical proof after its live action disappears", async () => {
     vi.useFakeTimers();
     try {
