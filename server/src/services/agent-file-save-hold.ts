@@ -5,6 +5,7 @@ import { conflict, notFound } from "../errors.js";
 import { persistActivity, publishActivity } from "./activity-log.js";
 import { notifyEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { instructionCopyRetryAt } from "./instruction-copy-retry.js";
+import { nativeLeaseCustodyMissing } from "./native-runtime/native-lease-custody.js";
 
 export const AGENT_FILES_SAVE_PENDING_INSTRUCTION = "Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox.";
 export const AGENT_FILES_RETIREMENT_COLLECTION_TIMEOUT = "AGENT_FILES_RETIREMENT_COLLECTION_TIMEOUT";
@@ -82,6 +83,9 @@ const allocationRows = (leaseId: SQL) => sql`select alloc_lease.id, alloc_lease.
  * vanished): never destroy then. Release only with the token.
  */
 export async function claimLeaseForDestroyUnlessHeld(db: Db, lease: HoldLease): Promise<string | null> {
+  // Every provider destroy claims here: no verified saved harness copy of a
+  // native lease, no destroy (the box is stopped and kept instead).
+  if (await nativeLeaseCustodyMissing(db, lease.id)) return null;
   if (typeof (db as Db).transaction !== "function") return (await agentFileSaveHeldOnLease(db, lease)) ? null : randomUUID();
   return await db.transaction(async tx => {
     const locked = await (tx as unknown as Db).execute(sql`select alloc.id,
