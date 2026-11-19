@@ -227,6 +227,47 @@ describe("native failed-turn continuation", () => {
     }
   }, 120_000);
 
+  // Old chat (RFL 14:57Z; testing-lead's gate-4 capture, build s-steer2, pre-A2r3): steered
+  // messages saved by builds that kept no read seq ('accepted') or no steering fields, and that
+  // the run ANSWERED, read days later through the comment GET. Synthetic rows shaped like the
+  // capture (no capture data). Unanswered ones keep 'run_ended_before_read' (guard).
+  it.each(["accepted-answered", "absent-answered", "accepted-unanswered"] as const)(
+    "an old steer from a pre-A2r3 build is not newly run_ended_before_read when its run answered it (%s)",
+    async (shape) => {
+      const issueId = randomUUID();
+      await db.insert(issues).values({ id: issueId, companyId, title: "Old chat", status: "done", workMode: "standard",
+        assigneeAgentId: agentId, createdByUserId: "board-user", responsibleUserId: "board-user" });
+      const at = (seconds: number) => new Date(Date.parse("2026-11-16T08:33:59.000Z") + seconds * 1000);
+      const [wake, steer] = await db.insert(issueComments).values([
+        { companyId, issueId, authorType: "user", authorUserId: "board-user", body: "Start the work.", createdAt: at(0) },
+        { companyId, issueId, authorType: "user", authorUserId: "board-user", body: "Also check the tests.", createdAt: at(134) },
+      ]).returning();
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "succeeded", runtimeMode: "native",
+        invocationSource: "on_demand", createdAt: at(0), finishedAt: at(156),
+        contextSnapshot: { issueId, commentId: wake.id, wakeCommentId: wake.id, wakeCommentIds: [wake.id, steer.id],
+          ...(shape === "absent-answered" ? {} : { steeredCommentIds: [steer.id] }),
+          ...(shape === "accepted-answered" ? { answeredSteeredCommentIds: [steer.id] } : {}) },
+        resultJson: { queuedSteeringAcknowledgements: { [steer.id]: { status: "acknowledged", queueId: null,
+          turnId: "old-build-turn", acknowledgedAt: at(135).toISOString() } } } });
+      if (shape !== "accepted-unanswered") {
+        await db.insert(issueComments).values({ companyId, issueId, authorType: "agent", authorAgentId: agentId,
+          createdByRunId: runId, body: "Done, and the tests pass.", createdAt: at(149) });
+      }
+      const shown = (await issueService(db).listComments(issueId)).find(comment => comment.id === steer.id);
+      if (shape === "accepted-unanswered") {
+        expect(shown).toMatchObject({ steeringStatus: null, steeringUnavailableReason: "run_ended_before_read" });
+        return;
+      }
+      expect(shown?.steeringUnavailableReason).toBeNull();
+      expect(shown?.carriedIntoRunId).toBeNull();
+      expect(shown).toMatchObject(shape === "accepted-answered"
+        ? { steeredIntoRunId: runId, steeringStatus: "delivered", steeringDeliveryEventSeq: null }
+        : { steeredIntoRunId: null, steeringStatus: null, deliveryOutcome: "ordinary" });
+    },
+    60_000,
+  );
+
   it("does not treat a copied retry intent id as a used continuation", async () => {
     const issueId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Review another PR", status: "in_progress", workMode: "standard", assigneeAgentId: agentId, createdByUserId: "board-user", responsibleUserId: "board-user" });
