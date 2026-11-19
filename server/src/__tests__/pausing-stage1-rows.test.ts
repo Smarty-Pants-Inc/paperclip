@@ -215,7 +215,8 @@ describe("pausing stage 1 rows", () => {
       authorUserId: "person-1", createdAt: new Date(Date.now() - 30 * 60_000) });
     await settleUnansweredPersonMessage(db, { companyId, issueId: issue!.id, now: new Date() });
     const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issue!.id), eq(issueComments.authorType, "system")));
-    expect(notes.map(note => note.body)).toEqual(["Boat Lead is paused for new work. We could not confirm that its previous run stopped. Your message is saved."]);
+    // SUPERSEDE-PAUSED-LINE-STOPUNCONFIRMED-1118
+    expect(notes.map(note => note.body)).toEqual(["Boat Lead is paused. We could not confirm that its previous run stopped. Your message is saved, and it will run when Boat Lead is resumed. A board user or Boat Lead's manager can resume Boat Lead."]);
   });
 
   it("row E: a message to a pausing agent whose old run is unproved gets the true line, never silence", async () => {
@@ -230,7 +231,8 @@ describe("pausing stage 1 rows", () => {
     await settleUnansweredPersonMessage(db, { companyId, issueId: issue!.id, now: new Date() });
     const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issue!.id), eq(issueComments.authorType, "system")));
     expect(notes).toHaveLength(1);
-    expect(notes[0]!.body).toBe("Stack Lead is paused for new work. We could not confirm that its previous run stopped. Your message is saved.");
+    // SUPERSEDE-PAUSED-LINE-STOPUNCONFIRMED-1118
+    expect(notes[0]!.body).toBe("Stack Lead is paused. We could not confirm that its previous run stopped. Your message is saved, and it will run when Stack Lead is resumed. A board user or Stack Lead's manager can resume Stack Lead.");
   });
 
   it("row G: the pausing inventory is report-only and names the blocker", async () => {

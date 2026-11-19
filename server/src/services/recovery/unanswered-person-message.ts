@@ -86,8 +86,7 @@ const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused", UNANSWER
  * assertCanManageAgentLifecycle :2613-2623 -> agent-subtree-management.ts:34-39
  * assertAgentLifecycleAuthority / assertCanManageSubordinateAgent). */
 export function agentPausedText(name: string, stopUnconfirmed = false) {
-  if (stopUnconfirmed) return `${name} is paused for new work. We could not confirm that its previous run stopped. Your message is saved.`;
-  return `${name} is paused. Your message is saved, and it will run when ${name} is resumed. `
+  return `${name} is paused. ${stopUnconfirmed ? "We could not confirm that its previous run stopped. " : ""}Your message is saved, and it will run when ${name} is resumed. `
     + `A board user or ${name}'s manager can resume ${name}.`;
 }
 
@@ -537,7 +536,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // paused and who can resume it; it stays a waiting-kind note, so after the
   // resume the saved message's own run decides (its answer supersedes it).
   const [agentRow] = await q.select({ name: agents.name, status: agents.status, lifecycleState: agents.lifecycleState,
-    lifecycleHolds: agents.lifecycleHolds, pauseReason: agents.pauseReason, lifecycleError: agents.lifecycleError })
+    lifecycleHolds: agents.lifecycleHolds, pauseReason: agents.pauseReason, lifecycleError: agents.lifecycleError,
+    lifecycleOperation: agents.lifecycleOperation })
     .from(agents).where(and(eq(agents.companyId, issue.companyId), eq(agents.id, agentId)));
   // Setup uses the compatibility status "paused", but completes by itself.
   // Its saved message remains an obligation: use the existing sweep deadline
@@ -773,6 +773,12 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const supervisionUnconfirmed = code === REMOTE_RUNNER_SUPERVISION_EXHAUSTED && !held;
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
+  // A 'pausing' agent's pause completes only after its host step, the
+  // execution Stop, returned "complete" (agent-lifecycle-driver.ts runHost:
+  // agentInvocationStopBlocker null), which sets lifecycleOperation.hostComplete
+  // (postgres.ts completeHost; worker.ts). Entering 'pausing' resets it to
+  // false. Until then its previous run's stop is not confirmed.
+  const stopUnconfirmed = agentRow?.lifecycleState === "pausing" && agentRow.lifecycleOperation?.hostComplete !== true;
   const waiting = WAITING_KIND_CODES.has(code);
   // The ONE bound: the message's automatic lineage used its K=2 fresh
   // continuations and the last one failed. Nothing further starts by itself.
@@ -782,7 +788,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // Server-local HH:MM: the instance's time zone, not an assumed UTC zone.
   const since = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
   const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
-    : paused ? agentPausedText(pausedName, agentRow?.lifecycleState === "pausing") : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+    : paused ? agentPausedText(pausedName, stopUnconfirmed) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
