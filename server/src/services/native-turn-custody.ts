@@ -6,6 +6,8 @@ import { nativeRunNeverLaunchedRunner } from "./environment-lease-release-deferr
 import { hasNativeHarnessBackupMissing } from "./native-runtime/native-harness-backup-missing.js";
 import { readNativeHarnessBackupStamp, verifyNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
 import { durableNativeHarnessStorage } from "./native-runtime/native-harness-backup-storage.js";
+import { loadNativeHarnessBackupLeaseChain, loadNativeHarnessBackupLeaseRows, nativeHarnessBackupHasLaterProviderWork,
+  nativeSessionOfLeaseRun, newestNativeHarnessBackupStampOnChain } from "./native-runtime/native-retired-backup-source.js";
 import { hasStopOnlyCleanup, prepareSandboxStopAndRetain, prepareUnconfirmedSourceSandboxStop } from "./sandbox-stop-and-retain.js";
 
 /**
@@ -95,7 +97,7 @@ export async function nativeTurnCustodyForLease(db: Db, lease: LeaseRow): Promis
   const provider = input?.provider as Record<string, unknown> | undefined;
   if (provider?.kind === "codex" && input?.homeMode === "preconfigured") return { destroy: false, reason: "preconfigured_codex_home_not_backed_up" };
   if (missingMarker) return { destroy: false, reason: "native_backup_missing_marker" };
-  const stamp = readNativeHarnessBackupStamp(metadata.nativeHarnessBackup, lease.providerLeaseId);
+  const stamp = readNativeHarnessBackupStamp(metadata.nativeHarnessBackup, lease.providerLeaseId) ?? await chainCustodyStamp(db, lease);
   if (!stamp) return { destroy: false, reason: "native_backup_stamp_missing" };
   let durable: boolean;
   try { durable = durableNativeHarnessStorage() !== null; } catch { return { destroy: false, reason: "native_backup_storage_unavailable" }; }
@@ -116,6 +118,27 @@ export async function nativeTurnCustodyForLease(db: Db, lease: LeaseRow): Promis
     if (!finalized) return { destroy: false, reason: "workspace_copy_out_not_succeeded" };
   }
   return { destroy: true, basis: "backup_and_copy_out_held" };
+}
+
+/**
+ * A warm box's stamp can sit on a retired predecessor row of the same
+ * allocation (recordNativeHarnessBackupStampOnLeaseChain). Same selection as
+ * obsolete-box custody (environment-runtime obsoleteLeaseCustodyStamp): the
+ * newest stamp of the tip run's own session, refused when provider work
+ * followed it.
+ */
+async function chainCustodyStamp(db: Db, lease: LeaseRow) {
+  const allocation = { companyId: lease.companyId, providerLeaseId: lease.providerLeaseId! };
+  let chain = await loadNativeHarnessBackupLeaseChain(db, allocation);
+  if (!chain || chain.tip.id !== lease.id) {
+    const rows = await loadNativeHarnessBackupLeaseRows(db, allocation);
+    if (rows.length !== 1 || rows[0]!.id !== lease.id) return null;
+    chain = { tip: rows[0]!, predecessors: [] };
+  }
+  const stamp = newestNativeHarnessBackupStampOnChain(chain, await nativeSessionOfLeaseRun(db, chain.tip), "cleanup");
+  if (!stamp || await nativeHarnessBackupHasLaterProviderWork(db, { companyId: lease.companyId,
+    normalizedSessionId: stamp.normalizedSessionId, completedAt: stamp.completedAt })) return null;
+  return stamp;
 }
 
 function keptMarker(lease: LeaseRow, reason: NativeTurnCustodyKeepReason, now: Date) {
