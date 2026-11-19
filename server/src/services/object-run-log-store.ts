@@ -24,6 +24,9 @@ const DIGEST_ATTEMPTS = 3;
 const FLUSH_ATTEMPTS = 3;
 const CLOSE_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = 100;
+// Peers can retain all capacity when BOTH object storage and the spill fail.
+// Finalization must release the run even when no capacity wake remains.
+export const OBJECT_RUN_LOG_FINALIZE_ADMISSION_TIMEOUT_MS = 60_000;
 // One journal append takes at most 8 MiB; kept batches stay under that.
 const MAX_KEPT_BATCH_BYTES = MAX_RUN_LOG_RECORD_BYTES;
 
@@ -192,7 +195,10 @@ interface WriterState {
   flushing?: Promise<void>;
   closed: boolean;
   admitting: Set<Promise<unknown>>;
+  /** Cancels only this writer's capacity wait, never its kept-byte retries. */
+  admissionAbort: AbortController;
   failure?: unknown;
+  spillFailure?: unknown;
   signal?: AbortSignal;
   sourcePrefixVerified: boolean;
   coverageEligible: boolean;
@@ -344,6 +350,7 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       };
       await appendDurably(paths.indexPath, Buffer.from(`${JSON.stringify(entry)}\n`));
       kept.spillStart = spillStart;
+      state.spillFailure = undefined;
       kept.bytes = undefined;
       released(state, kept.length);
       logger.warn({ runId: runIdOf(state), step: "flush", err: finalizationError(cause),
@@ -351,6 +358,7 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
         "Object run log batch kept in the local spill file");
       return true;
     } catch (error) {
+      state.spillFailure = error;
       logger.error({ runId: runIdOf(state), step: "spill", bytes: kept.length, err: finalizationError(error) },
         "Object run log spill failed; the batch stays in memory");
       return false;
@@ -547,7 +555,9 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
     finally { state.admitting.delete(admission); }
   }
   async function admit(state: WriterState, handle: RunLogHandle, event: Parameters<RunLogStore["append"]>[1]) {
-    state.signal?.throwIfAborted();
+    const admissionSignal = state.signal
+      ? AbortSignal.any([state.signal, state.admissionAbort.signal]) : state.admissionAbort.signal;
+    admissionSignal.throwIfAborted();
     if (state.failure) throw state.failure;
     const bytes = Buffer.from(
       `${JSON.stringify({
@@ -566,6 +576,7 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
         state.pendingBytes + bytes.length > MAX_PENDING_BYTES ||
         totalPendingBytes + bytes.length > 64 * MAX_SEGMENT_BYTES
       ) {
+        admissionSignal.throwIfAborted();
         if (state.failure) throw state.failure;
         if (!waiting) {
           if (admissions >= 32 || admissionBytes + bytes.length > MAX_PENDING_BYTES)
@@ -578,18 +589,18 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
           if (writer.pending.length) void flush(writer).catch(() => undefined);
         await new Promise<void>((resolve, reject) => {
           const wake = () => {
-            state.signal?.removeEventListener("abort", abort);
+            admissionSignal.removeEventListener("abort", abort);
             resolve();
           };
           const abort = () => {
             capacityWaiters.delete(wake);
-            reject(state.signal!.reason);
+            reject(admissionSignal.reason);
           };
-          state.signal?.addEventListener("abort", abort, { once: true });
+          admissionSignal.addEventListener("abort", abort, { once: true });
           capacityWaiters.add(wake);
         });
       }
-      state.signal?.throwIfAborted();
+      admissionSignal.throwIfAborted();
       if (state.failure) throw state.failure;
       if (event.preservesSourceCoverage !== true || event.sourceCursor !== undefined &&
         (!Number.isSafeInteger(event.sourceCursor) || event.sourceCursor <= state.admittedSourceCursor)) {
@@ -631,7 +642,8 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       // offset they were admitted at, so this attempt's bytes follow them.
       const recovering: WriterState = {
         handle: { store: "s3_segments", logRef }, kept: [], flushAttempt: 1, finalized: false, journal: store,
-        writer, pending: [], pendingBytes: 0, closed: false, admitting: new Set(), signal: input.signal,
+        writer, pending: [], pendingBytes: 0, closed: false, admitting: new Set(),
+        admissionAbort: new AbortController(), signal: input.signal,
         sourcePrefixVerified: false, coverageEligible: false, admittedSourceCursor: writer.head.sourceCursor,
       };
       try {
@@ -680,6 +692,7 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
         pendingBytes: 0,
         closed: false,
         admitting: new Set(),
+        admissionAbort: new AbortController(),
         signal: input.signal,
         sourcePrefixVerified,
         coverageEligible: true,
@@ -748,7 +761,18 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
         // stop: the second flush below retries the kept batch first.
         await flush(state).catch(() => undefined);
         step = "admissions";
-        await Promise.allSettled([...state.admitting]);
+        if (state.admitting.size) {
+          const deadline = setTimeout(() => state.admissionAbort.abort(Object.assign(
+            new Error("Object run log finalization admission timed out"),
+            { name: "ObjectRunLogAdmissionTimeoutError", code: "object_run_log_finalize_admission_timeout" },
+          )), OBJECT_RUN_LOG_FINALIZE_ADMISSION_TIMEOUT_MS);
+          try {
+            // Abort settles and removes this writer's waiters, including their
+            // admission accounting. Already admitted bytes are NOT cancelled.
+            await Promise.allSettled([...state.admitting]);
+            state.admissionAbort.signal.throwIfAborted();
+          } finally { clearTimeout(deadline); }
+        }
         step = "flush";
         await flush(state);
         // Never close a journal that lacks admitted bytes: the open head marks it incomplete.
@@ -795,6 +819,18 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
         const unspilledBytes = state.kept.reduce((sum, kept) => sum + (kept.bytes ? kept.length : 0), 0);
         logger.warn({
           ...diagnostic(error),
+          // The target may hold no bytes itself: its admission is blocked by
+          // peers whose admitted bytes still occupy memory. Name their custody
+          // and BOTH sanitized storage causes, not just a generic timeout.
+          ...(step === "admissions" ? { capacity: {
+            location: "memory", stored: false, spilled: false,
+            bytes: totalPendingBytes,
+            writers: [...writers.values()].filter(writer => writer.pendingBytes > 0).map(writer => ({
+              runId: runIdOf(writer), bytes: writer.pendingBytes,
+              storageError: writer.failure ? finalizationError(writer.failure) : undefined,
+              spillError: writer.spillFailure ? finalizationError(writer.spillFailure) : undefined,
+            })),
+          } } : {}),
           ...(spilled.length ? { spill: {
             path: spillPaths(options.spillDir, handle.logRef).path,
             start: spilled[0]!.spillStart, bytes: spilled.reduce((sum, kept) => sum + kept.length, 0),
