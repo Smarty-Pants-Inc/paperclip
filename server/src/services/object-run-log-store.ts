@@ -197,6 +197,8 @@ interface WriterState {
   admitting: Set<Promise<unknown>>;
   /** Cancels only this writer's capacity wait, never its kept-byte retries. */
   admissionAbort: AbortController;
+  /** Serialize custody of refused source-less records behind earlier flushes. */
+  refusedCustody?: Promise<void>;
   failure?: unknown;
   spillFailure?: unknown;
   signal?: AbortSignal;
@@ -623,6 +625,32 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       if (state.pendingBytes >= segmentBytes) void flush(state).catch(() => undefined);
       else schedule(state);
       return { committed };
+    } catch (error) {
+      if (event.sourceCursor === undefined && state.admissionAbort.signal.aborted &&
+        error === state.admissionAbort.signal.reason) {
+        // The bound refuses admission, not custody. Native source-backed records
+        // can be re-exported; stdout/stderr without a cursor have NO other copy.
+        // Keep their exact encoded record behind earlier bytes, using the same
+        // durable spill/index path. If the disk also refuses, retain memory and
+        // its accounting, just like any other kept batch. Never advance a native
+        // source cursor for these records or spill a source-backed refusal too.
+        const previous = state.refusedCustody;
+        const custody = (async () => {
+          await previous;
+          await state.flushing?.catch(() => undefined);
+          if (event.preservesSourceCoverage !== true) {
+            state.sourcePrefixVerified = false;
+            state.coverageEligible = false;
+          }
+          state.pendingBytes += bytes.length;
+          totalPendingBytes += bytes.length;
+          await keep(state, [{ bytes, sequence: event.seq ?? state.writer.head.sequence,
+            sourceCursor: state.writer.head.sourceCursor, resolve: () => undefined, reject: () => undefined }], error);
+        })();
+        state.refusedCustody = custody;
+        await custody;
+      }
+      throw error;
     } finally {
       if (waiting) {
         admissions--;
