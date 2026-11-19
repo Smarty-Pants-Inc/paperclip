@@ -11,6 +11,8 @@ import {
 } from "../services/workspace-instance-cleanup.js";
 import type { WorkspaceOperation } from "@paperclipai/shared";
 import type { WorkspaceOperationRecorder } from "../services/workspace-operations.js";
+import { createObjectRunLogStore, readObjectRunLogSpill } from "../services/object-run-log-store.js";
+import { event, ids, spillMemory } from "../services/object-run-log-spill.fixture.js";
 
 const tempRoots = new Set<string>();
 
@@ -80,6 +82,7 @@ afterEach(async () => {
   await Promise.all(Array.from(tempRoots, (root) => fs.rm(root, { recursive: true, force: true })));
   tempRoots.clear();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 describe("worktree instance cleanup", () => {
@@ -152,6 +155,70 @@ describe("worktree instance cleanup", () => {
       expect(operations.at(-1)?.metadata).toMatchObject(recovered === true
         ? { refusalReason: "raw_traces_kept", rawTraceDirectories: [path.join(instanceRoot, "data", "run-logs")] }
         : { refusalReason: "run_log_spill_unrecovered", unrecoveredRunLogSpills: ["company/agent/run"] });
+    }
+  });
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7016708798
+  // Keep reason: NEVER-OK trace custody. Real writer, spill bytes, index, and recursive instance removal.
+  it.each([
+    ["inside", "process", false], ["outside", "process", false],
+    ["base", "process", false], ["default", "process", false],
+    ["inside", "pointer", false], ["outside", "instance", false],
+    ["inside", "process", true],
+  ] as const)("keeps a configured %s spill from %s until recovered=%s", async (location, source, recovered) => {
+    const worktreesDir = await makeTempRoot("paperclip-configured-spill-");
+    const workspacePath = await makeTempRoot("paperclip-configured-workspace-");
+    const instanceId = "configured-spill";
+    const instanceRoot = path.join(worktreesDir, "instances", instanceId);
+    await fs.mkdir(instanceRoot, { recursive: true });
+    await writeWorkspaceEnv(workspacePath, worktreesDir, instanceId);
+    const spillRoot = location === "outside" ? path.join(worktreesDir, "outside-spill")
+      : location === "default" ? path.join(instanceRoot, "data/run-logs/.spill")
+      : location === "base" ? path.join(instanceRoot, "kept-run-logs/.spill")
+      : path.join(instanceRoot, "kept-run-log-spill");
+    vi.stubEnv("PAPERCLIP_HOME", worktreesDir);
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", instanceId);
+    vi.stubEnv("RUN_LOG_SPILL_PATH", undefined);
+    vi.stubEnv("RUN_LOG_BASE_PATH", undefined);
+    // Product keys: resolveObjectRunLogSpillDir reads RUN_LOG_SPILL_PATH before RUN_LOG_BASE_PATH.
+    const key = location === "base" ? "RUN_LOG_BASE_PATH" : "RUN_LOG_SPILL_PATH";
+    const value = location === "base" ? path.dirname(spillRoot) : spillRoot;
+    if (location !== "default") vi.stubEnv(key, value);
+    const m = spillMemory();
+    const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", flushMs: 1000,
+      assertWriterAuthority: async () => undefined });
+    const handle = await store.begin({ ...ids, runId: "configured-cleanup" });
+    m.state.down = true;
+    const receipt = await store.enqueue!(handle, event(1, "the only copy of these source-less bytes"));
+    const committed = receipt.committed.catch(() => undefined);
+    await store.finalize(handle);
+    await committed;
+    const spill = await readObjectRunLogSpill(undefined, handle.logRef);
+    expect(spill.path).toBe(path.join(spillRoot, `${handle.logRef}.ndjson`));
+    expect(spill.unrecovered.length).toBeGreaterThan(0);
+    if (recovered) {
+      m.state.down = false;
+      await store.recoverSpill!({ ...ids, runId: "configured-cleanup" });
+      expect((await readObjectRunLogSpill(undefined, handle.logRef)).unrecovered.length).toBe(0);
+    }
+    const bytes = await fs.readFile(spill.path), marker = await fs.readFile(spill.indexPath);
+    if (source !== "process") {
+      const envPath = source === "pointer" ? path.join(workspacePath, ".paperclip/.env") : path.join(instanceRoot, ".env");
+      await fs.appendFile(envPath, `${key}=${JSON.stringify(value)}\n`);
+      vi.stubEnv(key, undefined);
+    }
+    const { recorder, operations } = createRecorderDouble();
+    const result = await cleanupWorktreeInstanceArtifacts({
+      pointer: (await readWorktreeInstancePointer(workspacePath))!, workspaceId: "workspace-1", workspacePath,
+      expectedInstanceId: instanceId, expectedInstanceRoot: instanceRoot, worktreesDir, recorder,
+    });
+    console.info("configured-spill-cleanup", { location, source, recovered, status: result.status,
+      bytes: bytes.length, survived: await fs.stat(spill.path).then(() => true, () => false) });
+    expect(result.status).toBe(recovered ? "removed" : "refused");
+    if (!recovered) {
+      expect(operations.at(-1)?.metadata).toMatchObject({ refusalReason: "run_log_spill_unrecovered" });
+      expect((await fs.readFile(spill.path)).equals(bytes)).toBe(true);
+      expect((await fs.readFile(spill.indexPath)).equals(marker)).toBe(true);
     }
   });
 
