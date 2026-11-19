@@ -9,6 +9,8 @@ import { activityEntityIdCondition, caseAwareActivitySource } from "./case-activ
 
 export interface AgentActionAuditFilters {
   companyId: string;
+  /** The caller's task read predicate (private-task overlay); joined task content outside it is withheld. */
+  issueReadCondition?: SQL<boolean>;
   actorScope?: "agents" | "all";
   agentId?: string;
   responsibleUserId?: string;
@@ -127,6 +129,7 @@ export function agentActionAuditService(db: Db) {
         eq(issues.id, issueComments.issueId),
         eq(issues.companyId, filters.companyId),
         visibleIssueCondition(),
+        filters.issueReadCondition ?? sql<boolean>`true`,
       )).where(and(
         eq(issueComments.companyId, filters.companyId),
         inArray(issueComments.id, commentEntityIds),
@@ -136,6 +139,7 @@ export function agentActionAuditService(db: Db) {
       }).from(issues).where(and(
         eq(issues.companyId, filters.companyId),
         visibleIssueCondition(),
+        filters.issueReadCondition ?? sql<boolean>`true`,
         inArray(issues.id, issueEntityIds),
       ));
       const documentRows = documentEntityIds.length === 0 ? [] : await db.select({
@@ -145,6 +149,7 @@ export function agentActionAuditService(db: Db) {
         eq(issues.id, issueDocuments.issueId),
         eq(issues.companyId, filters.companyId),
         visibleIssueCondition(),
+        filters.issueReadCondition ?? sql<boolean>`true`,
       )).where(and(
         eq(issueDocuments.companyId, filters.companyId),
         or(
