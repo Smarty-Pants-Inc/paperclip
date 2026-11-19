@@ -1539,3 +1539,98 @@ describe("strict V2 Bearer after any immediate recognized terminal escape", () =
     }
   });
 });
+
+// catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21257
+// Keep reason: never disclose a key when a terminal control is both an edge
+// before the key and transparent inside its body. Unit test agreed: exported
+// pure-function secret-redaction guard; the independent RFL rows supplied REDs.
+describe("escape edges and transparent interiors in the same credential span", () => {
+  const controls = [
+    ["CSI7", "\u001b[31m", "\u001b[0m"],
+    ["CSI8", "\u009b31m", "\u009b0m"],
+    ["tput sgr0", "\u001b(B\u001b[m", "\u001b(B\u001b[m"],
+    ["nF", "\u001b(B", "\u001b(B"],
+    ["nF multi-intermediate", "\u001b( B", "\u001b(B"],
+    ["Fp save", "\u001b7", "\u001b8"],
+    ["Fp restore", "\u001b8", "\u001b7"],
+    ["Fe", "\u001bM", "\u001bM"],
+    ["Fs", "\u001bc", "\u001bc"],
+    ["OSC BEL", "\u001b]8;;https://docs.example/guide\u0007", "\u001b]8;;\u0007"],
+    ["OSC ST", "\u001b]8;;https://docs.example/guide\u001b\\", "\u001b]8;;\u001b\\"],
+  ] as const;
+  const body = "AbCdEf0123456789AbCdEf0123456789";
+  const shapes = [
+    ["sk-proj-", "sk-proj-", body],
+    ["sk-ant-", "sk-ant-", body],
+    ["ghp_", "ghp_", body],
+    ["github_pat_", "github_pat_", body],
+    ["AKIA", "AKIA", "RF2SYNTH01234567"],
+    ["JWT", "eyJ", "hbGciOiJIUzI1NiJ9.eyJzdWIiOiJyZjJzeW50aGV0aWMifQ.c3ludGhldGljU2lnbmF0dXJl"],
+    ["Bearer", "Bearer ", body],
+  ] as const;
+  const residuals = [
+    ["R1 CSI/nF", `prefix\u001b[31msk-proj-AbCdEf0123\u001b(B456789AbCdEf0123456789\u001b[0m`, `prefix\u001b[31m${REDACTED_EVENT_VALUE}\u001b[0m`],
+    ["R1 nF/nF", `prefix\u001b(Bsk-proj-AbCdEf0123\u001b(B456789AbCdEf0123456789\u001b(B`, `prefix\u001b(B${REDACTED_EVENT_VALUE}\u001b(B`],
+    ["R1 CSI/CSI", `prefix\u001b[31msk-proj-AbCdEf0123\u001b[0m456789AbCdEf0123456789\u001b[0m`, `prefix\u001b[31m${REDACTED_EVENT_VALUE}\u001b[0m`],
+    ["R1 early split", `prefix\u001b(Bsk-proj-A\u001b(BbCdEf0123456789AbCdEf0123456789\u001b(B`, `prefix\u001b(B${REDACTED_EVENT_VALUE}\u001b(B`],
+    ["R2 OSC BEL", `prefix\u001b(Bsk-proj-AbCdEf0123\u001b]8;;https://docs.example/guide\u0007456789AbCdEf0123456789\u001b]8;;\u0007`, `prefix\u001b(B${REDACTED_EVENT_VALUE}\u001b]8;;\u0007`],
+    ["R2 OSC ST", `prefix\u001b(Bsk-proj-AbCdEf0123\u001b]8;;https://docs.example/guide\u001b\\456789AbCdEf0123456789\u001b]8;;\u001b\\`, `prefix\u001b(B${REDACTED_EVENT_VALUE}\u001b]8;;\u001b\\`],
+    ["R3 CSI8", `prefix\u009b31msk-proj-AbCdEf0123\u009b0m456789AbCdEf0123456789\u009b0m`, `prefix\u009b31m${REDACTED_EVENT_VALUE}\u009b0m`],
+    ["grep partial match", `prefix\u001b[01;31m\u001b[Ksk-proj-AbCdEf0123\u001b[m\u001b[K456789AbCdEf0123456789`, `prefix\u001b[01;31m\u001b[K${REDACTED_EVENT_VALUE}`],
+  ] as const;
+  it.each(residuals)("%s removes the entire key and only interior controls", (_name, input, expected) => {
+    expect(redactSensitiveText(input)).toBe(expected);
+  });
+
+  const rows = controls.flatMap(([kind, open, close]) => shapes.flatMap(([shape, prefix, tail]) =>
+    [1, Math.min(10, tail.length - 1), tail.length - 1].map(split => ({
+      kind, shape, split,
+      input: `prefix${open}${prefix}${tail.slice(0, split)}${open}${tail.slice(split)}${close}`,
+      expected: `prefix${open}${prefix === "Bearer " ? prefix : ""}${REDACTED_EVENT_VALUE}${close}`,
+    }))));
+  it.each(rows)("$kind / $shape / interior split $split with a glued word", ({ input, expected }) => {
+    expect(redactSensitiveText(input)).toBe(expected);
+  });
+
+  it.each(controls)("%s keeps the same body thresholds and trailing word rules", (_kind, open, close) => {
+    for (const key of ["sk-1", "sk-" + "a".repeat(11), "ghp_" + "a".repeat(19),
+      "github_pat_" + "a".repeat(19), "AKIA" + "A".repeat(15), "AKIA" + "A".repeat(17),
+      "AKIA" + "a".repeat(16), "eyJnot.a.jwt", "Bearer " + "a".repeat(19)]) {
+      const split = Math.min(10, key.length - 1);
+      const input = `task${open}${key.slice(0, split)}${open}${key.slice(split)}${close}`;
+      expect(redactSensitiveText(input)).toBe(input);
+    }
+    const witness = `standard${open}bearer abc123def${close}`;
+    expect(redactSensitiveText(witness)).toBe(witness);
+  });
+
+  it.each(controls)("%s keeps padding and inline separators for a split Bearer body", (_kind, open, close) => {
+    for (const separator of [" ", "  ", "\t"]) {
+      const input = `prefix${open}Bearer${separator}AbCdEf${open}0123456789AbCdEf0123456789==${close}`;
+      expect(redactSensitiveText(input)).toBe(`prefix${open}Bearer${separator}${REDACTED_EVENT_VALUE}${close}`);
+    }
+  });
+
+  it.each(["gho_", "ghu_", "ghs_", "ghr_"])("%s shares the span construction", prefix => {
+    expect(redactSensitiveText(`word\u001b(B${prefix}Ab\u001b[0m${body}\u001b[0m`))
+      .toBe(`word\u001b(B${REDACTED_EVENT_VALUE}\u001b[0m`);
+  });
+
+  it("retains the old boundary-view match when a control ends a fixed-length token", () => {
+    // The following A makes the transparent AWS shape overlong, but the
+    // control is still a valid edge after exactly 16 uppercase body bytes.
+    expect(redactSensitiveText(`prefix\u001b(BAKIA${"A".repeat(16)}\u001b(BA\u001b(B`))
+      .toBe(`prefix\u001b(B${REDACTED_EVENT_VALUE}\u001b(BA\u001b(B`);
+    expect(redactSensitiveText(`prefix\u001b(BBearer ${"a".repeat(20)}=\u001b(BA\u001b(B`))
+      .toBe(`prefix\u001b(BBearer ${REDACTED_EVENT_VALUE}\u001b(BA\u001b(B`);
+  });
+
+  it("uses only an immediate escape as the additional start, not one earlier on the line", () => {
+    for (const input of [`prefixsk-proj-${body}`, `\u001b(Bprefixsk-proj-${body}\u001b(B`,
+      `prefix\u001b(Bxxsk-proj-${body}\u001b(B`, `prefix\u001b(BxxBearer ${body}\u001b(B`]) {
+      expect(redactSensitiveText(input)).toBe(input);
+    }
+    expect(redactSensitiveText(`word\u001bsk-proj-Ab\u001b(B${body}\u001b(B`))
+      .toBe(`word\u001b${REDACTED_EVENT_VALUE}\u001b(B`);
+  });
+});
