@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { withSteeredCommentDisplay, type SteeredCommentDisplay } from "./conversation-steering.js";
+import { answeredPersonMessageIds } from "./person-message-answer.js";
 
 export { PAPERCLIP_RECEIVED_MID_TASK_LABEL } from "@paperclipai/adapter-utils/server-utils";
 
@@ -85,6 +86,23 @@ export async function withCarriedSteerDisplay<T extends { id: string; issueId: s
     for (const id of [payload.commentId, context.commentId, context.wakeCommentId, ...ids(context.wakeCommentIds)])
       if (typeof id === "string") heldByLiveWake.add(id);
   }
+  // Once a later run carried it (the held wake ran) or it was answered, the turn that ended unread is
+  // history, not a delivery failure: never caption such a message 'run_ended_before_read' (RFL heldcap (1)).
+  const answered = await answeredPersonMessageIds(db, { companyId: first.companyId, issueId: first.issueId,
+    commentIds: comments.map(comment => comment.id) });
+  const carriedLater = new Set<string>();
+  const laterRuns = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, first.companyId),
+    or(eq(heartbeatRuns.nativeIssueId, first.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${first.issueId}`),
+    inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry", "succeeded"])));
+  for (const run of laterRuns) {
+    const context = object(run.context);
+    // The steering run itself lists a steer in wakeCommentIds too (conversation-steering adds it to both);
+    // only a run that carries the comment as ordinary input (not as its own steer) counts.
+    const steered = new Set(ids(context.steeredCommentIds));
+    for (const id of [context.commentId, context.wakeCommentId, ...ids(context.wakeCommentIds)])
+      if (typeof id === "string" && !steered.has(id)) carriedLater.add(id);
+  }
   return displayed.map<T & CarriedSteerDisplay>(comment => {
     const carrier = carriers.find(run => ids(run.context?.carriedSteeredCommentIds).includes(comment.id) &&
       ![...ids(run.result?.restoredSteeredCommentIds), ...ids(run.result?.stopRestoredSteeredCommentIds)].includes(comment.id));
@@ -99,6 +117,10 @@ export async function withCarriedSteerDisplay<T extends { id: string; issueId: s
       ["pending", "acknowledged"].includes(String(object(object(run.result?.queuedSteeringAcknowledgements)[comment.id]).status)));
     const restored = ended && [...ids(ended.result?.restoredSteeredCommentIds), ...ids(ended.result?.stopRestoredSteeredCommentIds)].includes(comment.id);
     if (ended && (restored || (!["queued", "running", "scheduled_retry"].includes(ended.status) && comment.steeringStatus !== "delivered"))) {
+      if (answered.has(comment.id) || carriedLater.has(comment.id)) {
+        return { ...comment, steeringStatus: null, carriedIntoRunId: null, steeringDeliveryEventSeq: null,
+          deliveryOutcome: "ordinary", steeringUnavailableReason: null };
+      }
       if (heldByLiveWake.has(comment.id)) {
         return { ...comment, steeringStatus: null, carriedIntoRunId: null, steeringDeliveryEventSeq: null,
           deliveryOutcome: "queued", steeringUnavailableReason: null };
