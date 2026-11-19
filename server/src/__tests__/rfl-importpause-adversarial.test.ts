@@ -97,7 +97,7 @@ describe.skipIf(!support.supported)("RFL importpause adversarial acceptance", ()
     const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
     console.log(JSON.stringify({ check: order, holds: agent!.lifecycleHolds, pauseReason: agent!.pauseReason, notes: (await noteRows(f.tasks[0]!.id)).map(n => n.body) }));
     expect((await noteRows(f.tasks[0]!.id)).map(n => n.body)).toEqual([
-      "RFL worker is paused. Your message is saved, and it will run when RFL worker is resumed. A board user or RFL worker's manager can resume RFL worker.",
+      "RFL worker is paused. Your message is saved. Send it again after RFL worker is resumed. A board user or RFL worker's manager can resume RFL worker.",
     ]);
   });
 
