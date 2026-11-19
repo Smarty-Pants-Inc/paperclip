@@ -85,7 +85,7 @@ import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { nativeResponsePresentationWork } from "./native-response-presentation-work.js";
 import { nativeWorkspaceFinalizationWork } from "./native-workspace-finalization-work.js";
-import { recordNativeWorkspaceFinalizationFailure } from "./native-workspace-finalizer.js";
+import { attemptNativeWorkspaceFinalization, recordNativeWorkspaceFinalizationFailure } from "./native-workspace-finalizer.js";
 import { cleanupNativeWorkspaceSync, prepareNativeWorkspaceSync, readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
 import { reconcileNativeFinalizations } from "./native-finalization-reconciler.js";
 import { readPreviousTurnWorkspaceNotice } from "../heartbeat/predecessor-admission.js";
@@ -493,6 +493,11 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
       await reconcileNativeFinalizations(db, [s.runId], { environmentRuntime: {} as never });
       expect(await s.attempts()).toEqual(["failed"]);
       expect(record(record((await s.run()).runnerProfileJson).nativeWorkspaceFinalizationOwner)).toMatchObject({ fenced: true });
+      // T4: a check that was already past discovery when R ended (attemptNativeWorkspaceFinalization, the worker's
+      // own attempt) claims nothing and raises no "owner unverified" action on a task that has moved on.
+      expect(await attemptNativeWorkspaceFinalization({ db, runId: s.runId, environmentRuntime: {} as never }))
+        .toEqual({ kind: "waiting", reason: "binding_changed" });
+      expect((await s.recovery()).map(action => action.cause).filter(cause => /owner_unverified/.test(String(cause)))).toEqual([]);
       // ONE true line for R's turn, never two; ONE reply.
       await s.presentationWorker();
       const after = await s.replies();
