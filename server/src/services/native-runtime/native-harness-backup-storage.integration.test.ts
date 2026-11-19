@@ -996,6 +996,32 @@ describeEmbeddedPostgres("durable native provider backups", () => {
     expect(await readFile(join(root, "runner", "runner-state.json"), "utf8")).toBe(orphan);
     expect(await f.db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.scopeDigest, f.scopeDigest))).toHaveLength(0);
   });
+  it("RK2 (never-OK, S3 mode): a destroyed box's durable backup, issue closed, clock +8 days: expireDurableBackups keeps the row current and the object, which re-hashes", async () => {
+    // S3 mode through the S3 test double this file uses (the storage service over a local-disk provider).
+    const f = await fixture(); await persistNativeHarnessBackup(f);
+    const [before] = await f.db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.scopeDigest, f.scopeDigest));
+    expect(before.status).toBe("current");
+    // PLANTED (named): the box's lease as the turn-end destroy leaves it: "expired", carrying the backup stamp.
+    await f.db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueId, heartbeatRunId: f.runId,
+      status: "expired", metadata: { nativeHarnessBackup: { sessionScopeSha256: f.scopeDigest, manifestSha256: f.manifestSha256 } } });
+    await settle(f); // run settled, issue done now
+    const deleted = vi.spyOn(f.storage, "deleteObject");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date(Date.now() + 8 * 86_400_000));
+      const retention = nativeHarnessBackupExpirationService(f.db, { storage: f.storage });
+      const pass = await retention.tickCheckpoints();
+      expect(pass).toMatchObject({ expired: 0, candidates: 0, failed: 0 });
+      expect((await retention.tickCheckpoints()).expired).toBe(0);
+    } finally { vi.useRealTimers(); }
+    expect(deleted).not.toHaveBeenCalled();
+    const rows = await f.db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.scopeDigest, f.scopeDigest));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe(before.id);
+    expect(rows[0].status).toBe("current");
+    // The object is still present and re-hashes to the row's manifest digest.
+    expect(await verifyDurableNativeHarnessBackup({ ...f, backupId: before.id })).toBe(true);
+  });
   it("retains live work and retries an uncertain object deletion through the existing startup retention pass", async () => {
     const f = await fixture(); await persistNativeHarnessBackup(f);
     const old = new Date(Date.now() - 10 * 86_400_000);
