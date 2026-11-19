@@ -137,12 +137,24 @@ describe.skipIf(!support.supported)("the save fails for good on a SHARED project
       const active = out.before.recoveryActions.body.active;
       out.inspect = active ? await get(`/recovery-actions?inspectSourceRunId=${r.id}&inspectSourceActionId=${active.id}`) : null;
       const turnsBefore = box.inputs.length;
-      const presses = press.split("+");
+      const phases = press.split(">");
+      const presses = phases[0].split("+");
       out.pressed = {};
-      for (const one of presses) {
+      const apply = async (tokens: string[]) => { for (const one of tokens) {
         if (one === "recover") out.pressed[one] = await post("/recovery-actions/recover-workspace", { actionId: active?.id, runId: r.id, idempotencyKey: randomUUID() });
         if (one === "retry-export") out.pressed[one] = await post("/recovery-actions/retry-workspace-export", { actionId: active?.id, runId: r.id, repairNote: "The sandbox was checked and is reachable again now." });
         if (one === "retry") out.pressed[one] = await post("/retry", { idempotencyKey: randomUUID(), observedRunId: r.id });
+        // REAL: the ONE action of the mixed-tree hold, "Continue with the files as they are" (POST /api/issues/:id/retry, retryAction).
+        if (one === "continue" || one === "continue-again") out.pressed[one] = await post("/retry", { idempotencyKey: randomUUID(), observedRunId: r.id, retryAction: "continue_with_files" });
+        // PLANTED (named UNRECOVERABLE-CODE): the spent recovery's failure, rewritten to one of the three codes that mean the
+        // saved files cannot be recovered at all (system-recovery-state.ts UNRECOVERABLE_SOURCE_CODES). The harness's own
+        // recovery always ends source_binding_invalid, which is not one of them.
+        if (one === "oldcode") for (const action of await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, s.issueId))) {
+          const system = (action.evidence as any).systemRecovery;
+          if (system?.state === "exhausted") await db.update(issueRecoveryActions).set({ evidence: { ...action.evidence,
+            systemRecovery: { ...system, failure: { ...system.failure, code: "source_unavailable", retryClass: "use_alternative_strategy" } } } })
+            .where(eq(issueRecoveryActions.id, action.id));
+        }
         if (one === "move-forward") out.pressed[one] = await post("/retry", { idempotencyKey: randomUUID(), observedRunId: r.id, retryAction: "move_forward" });
         if (one === "send-again") out.pressed[one] = await post("/comments", { body: "Also add a summary section to the report.", clientRequestId: randomUUID() });
         if (one === "save-works") s.fault.fail = false;
@@ -165,7 +177,8 @@ describe.skipIf(!support.supported)("the save fails for good on a SHARED project
         // working directory; a real provider records it. Planted so the saved-work recovery passes that binding check.
         if (one === "cwd") for (const lease of await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, r.id)))
           await db.update(environmentLeases).set({ metadata: { ...(lease.metadata ?? {}), remoteCwd: s.boxes[s.faultedBox.index].cwd } }).where(eq(environmentLeases.id, lease.id));
-      }
+      } };
+      await apply(presses);
       // REAL workers from here, for a bounded time: the saved-work recovery worker (real environment runtime), the
       // execution-disposition pass and the execution-continuation delivery, the copy-back worker, and the queue.
       recoveryWorker = registerWorkspaceRecoveryWork(db, delivery, environmentRuntimeService(db), heartbeat.resumeRemoteStopComments);
@@ -174,13 +187,23 @@ describe.skipIf(!support.supported)("the save fails for good on a SHARED project
       registerEnvironmentCleanupWork(db, delivery, { canRun: () => true,
         sweepPending: backoffMs => heartbeat.sweepPendingCleanupLeases({ backoffMs }), minimumSpacingMs: 1 });
       out.timeline = [];
+      out.phases = [];
+      for (const [index, phase] of phases.entries()) {
+      // A later phase: what the person and the GETs saw BEFORE its presses, then the presses, then the same real workers.
+      if (index > 0) {
+        await present();
+        out.phases.push({ before: phases[index], providerTurns: box.inputs.length - turnsBefore, snapshot: await snapshot(),
+          systemNotes: ((await get("/comments")).body as Array<{ authorType: string; body: string }>).filter(c => c.authorType === "system").map(c => c.body) });
+        await apply(phase.split("+"));
+      }
+      const turnsAtPhase = box.inputs.length;
       const minutesList = presses.includes("wait") ? [0, 2, 11, 16, 31, 61] : [0];
       for (const minutes of minutesList) {
         const now = new Date(Date.now() + minutes * 60_000);
         const pass = await settleUnrecoverableExecutions(db, now).then(() => "ok").catch(error => String(error));
         const delivered = await deliverReconciledExecutions(db, heartbeat.wakeup).then(() => "ok").catch(error => String(error));
         const until = Date.now() + (minutes === minutesList.at(-1) ? 20_000 : 4_000);
-        while (Date.now() < until && box.inputs.length === turnsBefore) {
+        while (Date.now() < until && box.inputs.length === turnsAtPhase) {
           await heartbeat.resumeQueuedRuns();
           await sweep(r.id).catch(error => errors.push(String(error)));
           await sleep(500);
@@ -190,7 +213,10 @@ describe.skipIf(!support.supported)("the save fails for good on a SHARED project
             .map(a => ({ status: a.status, cause: a.cause, ownerType: a.ownerType, outcome: a.outcome, check: (a.evidence as any).freshContinuationCheck ?? null,
               fresh: (a.evidence as any).freshContinuation ?? null, delivery: (a.evidence as any).continuationDelivery ?? null,
               system: (a.evidence as any).systemRecovery ?? null, workspaceRecovery: (a.evidence as any).workspaceRecovery ?? null })) });
-        if (box.inputs.length > turnsBefore) break;
+        if (box.inputs.length > turnsAtPhase) break;
+      }
+      await sleep(1500);
+      await heartbeat.drainActiveRunExecutions();
       }
       await sleep(1500);
       await heartbeat.drainActiveRunExecutions();
@@ -235,8 +261,18 @@ describe.skipIf(!support.supported)("the save fails for good on a SHARED project
     await drive(press);
   }, 300_000);
 
-  const LINE = "Your message is saved. The last reply's file changes couldn't be saved; it starts now on the project's files.";
-  const PARTLY = "Your message is saved. The last reply's file changes couldn't all be saved, and some of them may be in the project's files; it starts now on the files as they are.";
+  // RFL's words (11:45Z), byte-exact.
+  const LINE = "Your message is saved. The last reply's file changes couldn't be saved; your message starts now on the project's files as they are.";
+  const PARTLY = "The last reply's file changes couldn't be saved, and part of them may already be in the project's files. Your message will start once you choose Continue.";
+  // The existing queue wait words: the ONE line while R's box is not stopped yet (never "starts now" before it is true).
+  const WAIT = "Waiting for the previous environment to stop. Your message will start automatically.";
+  type Snapshot = { issue: { body: any }; queuedComments: { body: any }; comments: { body: any }; recoveryActions: { body: any }; actionsDb: any[]; allRuns: any[] };
+  /** Every place a person (or an agent) reads the state says the SAME one sentence. */
+  function expectOneSentence(snapshot: Snapshot, sentence: string, wait: "waiting" | "starting" | "continue_required") {
+    expect(snapshot.issue.body.executionBlocker).toMatchObject({ nextAction: sentence, savedMessageWait: wait });
+    if (snapshot.queuedComments.body.executionWait) expect(snapshot.queuedComments.body.executionWait.message).toBe(sentence);
+    if (sentence !== LINE) expect(JSON.stringify([snapshot.issue.body.executionBlocker, snapshot.queuedComments.body.executionWait ?? null])).not.toMatch(/starts now/);
+  }
   type Out = Awaited<ReturnType<typeof drive>>;
   const carriers = (out: Out) => (out.after.allRuns as Array<{ id: string; status: string; ctx: unknown }>)
     .filter(run => run.id !== out.ids.r && JSON.stringify(run.ctx).includes(out.ids.m));
@@ -276,8 +312,9 @@ describe.skipIf(!support.supported)("the save fails for good on a SHARED project
     expectRUntouched(out);
     // (a) BYTES: before the next turn runs, the shared checkout equals the last saved state.
     expect(out.hash.whenREnded).toBe(out.hash.saved);
-    // (c) the board card says the ONE line at the moment R ended (never "Create a new task ...").
-    expect(out.before.issue.body.executionBlocker.nextAction).toBe(LINE);
+    // (4) at the moment R ended its box is not stopped: the task's next action is the wait line, never "starts now"
+    // (and never "Create a new task ...").
+    expectOneSentence(out.before, WAIT, "waiting");
     expectAnsweredOnceOnTheCheckout(out);
     expect(systemNotes(out).filter(body => body === LINE)).toHaveLength(1);
     expect(JSON.stringify([out.after.issue.body, out.after.queuedComments.body, out.after.comments.body])).not.toMatch(/Your Retry is saved|Create a new task to continue/);
@@ -312,17 +349,56 @@ describe.skipIf(!support.supported)("the save fails for good on a SHARED project
   }, 300_000);
 
   // PLANTED (named PARTIAL-PREFIX, at its line in drive()), beside the real-route rows above.
-  it("SHARED-PARTIAL (a): a PARTIAL prefix of R's copy-back is on the shared checkout -> the message never runs silently on the mixed tree: the thread says the second line, and the run's input says the files may be mixed", async () => {
-    const out = await drive("partial+stopped");
+  it("SHARED-HOLD (2): a PARTIAL prefix of R's copy-back is on the shared checkout -> the message does NOT run: 0 runs, the second line everywhere, and ONE action; a plain Retry stays held; 'Continue with the files as they are' (POST /api/issues/:id/retry, retryAction continue_with_files) runs it ONCE, a second press starts nothing", async () => {
+    const out = await drive("partial+stopped>retry>continue>continue-again");
     expectRUntouched(out);
     expect(out.hash.beforeNextTurn).toBe(out.hash.saved); // hashed at the moment R ended, before the plant
+    const [held, heldAfterRetry, answered] = out.phases as Array<{ providerTurns: number; snapshot: Snapshot; systemNotes: string[] }>;
+    // Before Continue: 0 runs, the line, the one action.
+    for (const phase of [held, heldAfterRetry]) {
+      expect(phase.providerTurns, "the message ran on a mixed tree without the person's Continue").toBe(0);
+      expect(phase.snapshot.allRuns.filter(run => run.id !== out.ids.r && JSON.stringify(run.ctx).includes(out.ids.m))).toEqual([]);
+      expectOneSentence(phase.snapshot, PARTLY, "continue_required");
+      expect(phase.snapshot.queuedComments.body).toMatchObject({ state: "deferred", executionWait: { reason: "checkout_continue_required", message: PARTLY } });
+      expect(phase.systemNotes).toEqual([]);
+      expect(phase.snapshot.issue.body.status).toBe("blocked");
+    }
+    // A plain Retry (no Continue) is accepted and stays held.
+    expect(out.pressed.retry.status).toBe(202);
+    // Continue: accepted, and M answered ONCE on the checkout as it is.
+    expect(out.pressed.continue).toMatchObject({ status: 202, body: { accepted: true } });
+    expect(answered.providerTurns).toBe(1);
     expect(out.M.projectCheckoutFiles).toMatchObject({ ...SAVED, "notes.md": "R's new notes (unsaved)\n" });
     expect(out.providerTurns).toBe(1);
     expect(out.providerInputs).toMatchObject([{ carriesM: true, carriesPartlySavedNotice: true, carriesNotSavedNotice: false }]);
-    expect(systemNotes(out).filter(body => body === PARTLY)).toHaveLength(1);
-    expect(systemNotes(out).filter(body => body === LINE)).toEqual([]);
+    expect(carriers(out).map(run => run.status)).toEqual(["succeeded"]);
     expect(out.carrierRoots.every((root: { isProjectCheckout: boolean }) => root.isProjectCheckout)).toBe(true);
+    expect(out.after.issue.body.status).not.toBe("blocked");
+    expect(out.after.queuedComments.body.entries ?? []).toEqual([]);
+    // No line that is no longer true stays in the thread: neither sentence is posted for a message the person continued.
+    expect(systemNotes(out).filter(body => body === PARTLY || body === LINE)).toEqual([]);
+    expect(out.sweep).toMatchObject({ noticed: 0 });
     expect(REPLY_FILES_PARTLY_SAVED_LINE).toBe(PARTLY);
+  }, 300_000);
+
+  // PLANTED (named UNRECOVERABLE-CODE and BOX-STOPPED, at their lines in drive()).
+  it("SHARED-OLDCODE (5): the spent recovery reads one of the three 'unrecoverable' codes (source_unavailable) -> the OLD path: no same-checkout continuation and neither new sentence; the task's next action is the old 'Retry continues the task in a new workspace' text, and Retry answers with the old notice", async () => {
+    const out = await drive("none>oldcode+stopped>retry");
+    expectRUntouched(out);
+    const [waiting, old] = out.phases as Array<{ providerTurns: number; snapshot: Snapshot; systemNotes: string[] }>;
+    expectOneSentence(waiting.snapshot, WAIT, "waiting");
+    // The old path, before Retry: the message is not started on the checkout, and nothing says either new sentence.
+    expect(old.providerTurns).toBe(0);
+    expect(old.snapshot.issue.body.executionBlocker.savedMessageWait).toBeUndefined();
+    expect(old.snapshot.issue.body.executionBlocker.nextAction).toMatch(/Retry continues the task in a new workspace from its recorded work/);
+    expect(JSON.stringify([old.snapshot.issue.body, old.snapshot.queuedComments.body, old.snapshot.comments.body])).not.toContain(LINE);
+    expect(JSON.stringify([old.snapshot.issue.body, old.snapshot.queuedComments.body, old.snapshot.comments.body])).not.toContain(PARTLY);
+    // After Retry: the old continuation (a new workspace from recorded work), never the same-checkout receipt.
+    expect(out.pressed.retry).toMatchObject({ status: 202, body: { accepted: true } });
+    expect(JSON.stringify(out.after.actionsDb)).not.toContain("currentCheckout");
+    expect(systemNotes(out).filter(body => body === PARTLY || body === LINE)).toEqual([]);
+    expect(systemNotes(out).filter(body => /Retry continued this task in a new workspace from its recorded work/.test(body))).toHaveLength(1);
+    expect(out.carrierRoots.some((root: { isProjectCheckout: boolean }) => root.isProjectCheckout)).toBe(false);
   }, 300_000);
 
   it("SHARED-CONTROL (never-OK): while R's box is NOT stopped, nothing starts beside it: the message stays parked with a wait line that names the wait, never 'Your Retry is saved'", async () => {
@@ -334,7 +410,9 @@ describe.skipIf(!support.supported)("the save fails for good on a SHARED project
     expect(out.after.queuedComments.body).toMatchObject({ state: "deferred",
       executionWait: { reason: "remote_cleanup", message: "Waiting for the previous environment to stop. Your message will start automatically." } });
     expect(out.after.queuedComments.body.executionWait.message).not.toMatch(/Your Retry is saved/);
-    expect(out.after.issue.body.executionBlocker.nextAction).toBe(LINE);
+    // (4) ONE line, the wait line, at the moment R ended and after the workers ran: never "starts now" while it waits.
+    expectOneSentence(out.before, WAIT, "waiting");
+    expectOneSentence(out.after, WAIT, "waiting");
     expect(out.M.projectCheckoutFiles).toEqual(SAVED);
   }, 300_000);
 });
