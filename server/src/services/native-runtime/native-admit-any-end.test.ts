@@ -493,11 +493,20 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
       await h.sweep(h.r.id);
       await h.present();
       expect(brief(await h.run(h.r.id))).toEqual(frozen);
-      // One line for the held message (the sweep's clock 10 minutes on), never silence.
+      // Never silence for the held message (the sweep's clock 10 and 20 minutes on). COMPOSED ON I-A'' (bb-2d-onIA):
+      // on 2d's own base this row read ONE sweep line here ("the product as it is today", DESIGN CHOICE 1 open).
+      // I-A'' ruled that choice (Known #4 / ruling (b), recovery/unanswered-person-message.ts "Stop means stop"): a
+      // message held by its own sender's Stop is the sender's to send again, so the sweep posts NO card on it, and it
+      // is not silent because the queue panel lists it (the real GET below). Same reading as I-A'''s own row
+      // "Known #4 task: held by the person's Stop with no typed message gets no card and the queue panel lists them".
       await h.sweepUnanswered(new Date(Date.now() + 10 * 60_000));
       await h.sweepUnanswered(new Date(Date.now() + 20 * 60_000));
       const lines = (await h.thread()).filter(comment => comment.authorType === "system" && /your message/i.test(comment.body));
-      expect(lines.map(comment => comment.body)).toHaveLength(1);
+      expect(lines.map(comment => comment.body)).toEqual([]);
+      const panel = await request(h.s.app).get(`/api/issues/${h.s.issueId}/queued-comments`);
+      expect(panel.status, JSON.stringify(panel.body)).toBe(200);
+      expect((panel.body.entries as Array<{ comment: { id: string } }>).map(entry => entry.comment.id), JSON.stringify(panel.body)).toEqual([h.next]);
+      process.stdout.write(`ADMIT-STOP-PANEL ${JSON.stringify({ sweepLines: lines.length, executionWait: panel.body.executionWait ?? null, entries: panel.body.entries.length })}\n`);
       // The person's next message starts ONE run that carries both.
       const again = await h.s.say("Please continue: add the summary section.");
       const before = box.inputs.length;
@@ -508,7 +517,9 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
       expect(JSON.stringify(later[0].contextSnapshot)).toContain(again);
       expect((await h.wakesOf(h.next)).map(wake => wake.status)).not.toContain("deferred_issue_execution");
       expect(brief(await h.run(h.r.id))).toEqual(frozen);
-      evidence.STOP = { R: frozen, line: lines[0].body, laterRuns: later.map(brief) };
+      evidence.STOP = { R: frozen, sweepLines: lines.map(comment => comment.body),
+        panel: { executionWait: panel.body.executionWait ?? null, entries: (panel.body.entries as Array<{ comment: { id: string } }>).map(entry => entry.comment.id) },
+        laterRuns: later.map(brief) };
     } finally { await h.stop(); }
   }, 300_000);
 
