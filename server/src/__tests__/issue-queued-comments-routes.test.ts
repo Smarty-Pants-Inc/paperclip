@@ -26,6 +26,7 @@ import {
   nativeRunResults,
   issueTreeHolds,
   issues,
+  principalPermissionGrants,
   runIdentityContexts,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
@@ -3692,5 +3693,74 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(deleted.status, JSON.stringify(deleted.body)).toBeLessThan(300);
     await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId, now: new Date(Date.now() + 2 * 60_000) });
     expect(await liveNotes(f)).toEqual([]);
+  });
+
+  // rf-3 (on a663f2fc): the agent is PAUSED, the sender posts M (its ONE note:
+  // '<agent> is paused … it will run when … resumed'), then the task is
+  // subtree-cancelled. REAL: the agent Pause route (POST /api/agents/:id/pause),
+  // the comment POST, the subtree cancel route, the sweep and the recovery
+  // worker's discovery. PLANTED (named): as seedStoppableTurn, plus the
+  // pauser's agents:create grant (the sender stays an ordinary operator).
+  const noteRows = async (f: { issueId: string }) => (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)))
+    .filter(c => c.authorType === "system" && !c.deletedAt
+      && String((c.metadata as Record<string, unknown> | null)?.authorizationReason ?? "").startsWith("unanswered_message:"))
+    .map(c => ({ id: c.id, body: c.body }));
+  async function pausedThenCancel(by: string) {
+    const f = await seedStoppableTurn("task");
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: "other-board-user",
+      status: "active", membershipRole: "operator" }).onConflictDoNothing();
+    await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user",
+      principalId: "other-board-user", permissionKey: "agents:create" });
+    const paused = await request(boardApp(f.companyId, "other-board-user")).post(`/api/agents/${f.agentId}/pause`).send({});
+    expect(paused.status, JSON.stringify(paused.body)).toBe(200);
+    const a = await postMessage(f, "Reply exactly A");
+    const t = new Date();
+    const [before] = await sweepAt(f, t, [2]);
+    const pausedNotes = await noteRows(f);
+    expect(pausedNotes.length, JSON.stringify(before)).toBe(1);
+    expect(pausedNotes[0].body).toContain("is paused");
+    const cancelled = await request(treeApp(f.companyId, by)).post(`/api/issues/${f.issueId}/tree-holds`).send({ mode: "cancel", reason: "cancel card rf-3" });
+    expect(cancelled.status, JSON.stringify(cancelled.body)).toBeLessThan(300);
+    const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(task.status).toBe("cancelled");
+    return { f, a, t, pausedNoteId: pausedNotes[0].id };
+  }
+
+  it("cancel card (rf-3): the agent paused, M's paused note, the SENDER cancels: the paused note retired, no card at +2/+11", async () => {
+    const { f, t, pausedNoteId } = await pausedThenCancel("queue-owner");
+    const seen = await sweepAt(f, new Date(t.getTime() + 2 * 60_000), [2, 11]);
+    process.stdout.write(`CANCELCARD-PAUSED queue-owner ${JSON.stringify({ pausedNoteId, seen })}\n`);
+    expect(seen.map(s => s.notes), JSON.stringify(seen)).toEqual([[], []]);
+    const [retired] = await db.select().from(issueComments).where(eq(issueComments.id, pausedNoteId));
+    expect(retired.deletedAt, JSON.stringify(retired)).not.toBeNull();
+  });
+
+  it("cancel card (rf-3): the agent paused, M's paused note, ANOTHER user cancels: ONE card, the cancel words, the paused note's id, at +2/+11 and through the worker", async () => {
+    const { f, a, t, pausedNoteId } = await pausedThenCancel("other-board-user");
+    // The REAL recovery worker's discovery visits the cancelled task; its visit runs the real sweep (+2).
+    const visited: { issueId?: string; unanswered?: boolean; outcome?: string }[] = [];
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
+    const worker = registerIssueRecoveryWork(db, coordinator, {
+      stranded: async scope => {
+        if (scope.issueId !== f.issueId || visited.length) return;
+        const outcome = await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId,
+          now: new Date(t.getTime() + 4 * 60_000) });
+        visited.push({ issueId: scope.issueId, unanswered: (scope as any).unanswered, outcome: outcome.kind });
+      },
+      orphanBlockers: async () => {}, recoveryActions: async () => {}, dependencies: async () => ({ enqueueFailed: 0 }),
+      locks: async () => {}, watchdogs: async () => ({ incomplete: 0 }), schedulingSuppressed: async () => false,
+    }, () => true);
+    try {
+      await worker.ready;
+      for (let i = 0; i < 50 && visited.length === 0; i++) await new Promise(resolve => setTimeout(resolve, 100));
+    } finally { await worker.stop(); }
+    const afterWorker = await noteRows(f);
+    const seen = await sweepAt(f, new Date(t.getTime() + 2 * 60_000), [2, 11]);
+    const after = await noteRows(f);
+    process.stdout.write(`CANCELCARD-PAUSED other-board-user ${JSON.stringify({ pausedNoteId, visited, afterWorker, seen, after })}\n`);
+    expect(visited, JSON.stringify(visited)).toEqual([{ issueId: f.issueId, unanswered: true, outcome: "noticed" }]);
+    expect(afterWorker, JSON.stringify(afterWorker)).toEqual([{ id: pausedNoteId, body: CANCELLED_CARD }]);
+    expect(seen.map(s => s.notes), JSON.stringify(seen)).toEqual([[{ message: a, body: CANCELLED_CARD }], [{ message: a, body: CANCELLED_CARD }]]);
+    expect(after, JSON.stringify(after)).toEqual([{ id: pausedNoteId, body: CANCELLED_CARD }]);
   });
 });
