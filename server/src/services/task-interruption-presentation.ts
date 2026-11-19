@@ -14,7 +14,7 @@ import { readSystemRecovery } from "./system-recovery-state.js";
 import { PROJECT_ACCESS_DENIED } from "./project-access-denial.js";
 import { authorizationService } from "./authorization.js";
 import { taskWorkspaceProjectRequirements } from "./task-workspace-access.js";
-import { isAcknowledgedNativeStop } from "./acknowledged-native-stop.js";
+import { isAcknowledgedNativeStop, readPersonStopHold } from "./acknowledged-native-stop.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
@@ -117,6 +117,8 @@ type ProjectionState = {
    * predecessor's cleanup is unsettled: a sandbox lease the provider has not
    * released, or other cleanup of the previous run. */
   queuedStartHold?: QueuedStartHold;
+  /** Every wait of this task is the person's messages held by their Stop of this run (readPersonStopHold). */
+  personStopHeld?: boolean;
 };
 
 type QueuedStartHold = "sandbox_provider" | "previous_run";
@@ -286,7 +288,8 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
   if (!wait && !action && isAcknowledgedLegacyUserStop(run)) return base;
   // Intentional Stop is not an unsuccessful attempt. This is presentation only;
   // physical containment and pending cleanup keep their execution-side gates.
-  if (!wait && run.runtimeMode === "native" && run.companyId === issue.companyId && run.nativeIssueId === issue.id
+  // So is a Stop whose only wait is the person's own messages it holds.
+  if ((!wait || input.personStopHeld) && run.runtimeMode === "native" && run.companyId === issue.companyId && run.nativeIssueId === issue.id
       && isAcknowledgedNativeStop({ ...run, companyId: run.companyId, nativeIssueId: run.nativeIssueId })) return base;
   // A queued-message Interrupt stops this run to deliver that exact message.
   // The stop is the user's intent and the message starts next, so show the
@@ -865,6 +868,14 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     [...runMap].flatMap(([issueId, run]) => run.errorCode === NATIVE_SESSION_CLEANUP_QUARANTINED ? [{ issueId, run }] : []));
   const confirmableLaunches = new Set(launchWaits.filter(entry => launchRefusals.get(entry.run.id) === null).map(entry => entry.issueId));
   const queuedStartHolds = await queuedRunStartHolds(db, companyId, [...runMap]);
+  const personStopHeld = new Set<string>();
+  for (const issue of selected) {
+    const run = runMap.get(issue.id), wait = waitMap.get(issue.id), retryWait = retryWaitMap.get(issue.id);
+    if (!run?.agentId || run.status !== "cancelled" || !wait) continue;
+    const hold = await readPersonStopHold(db, { companyId, issueId: issue.id, agentId: run.agentId });
+    if (hold?.stoppedRunId === run.id && [wait, retryWait].every(held => !held || hold.wakeIds.includes(held.id)))
+      personStopHeld.add(issue.id);
+  }
   const now = Date.now();
   for (const issue of selected) {
     const required = requirements.get(issue.id);
@@ -890,6 +901,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       waitingOnOpenSubtasks: waitingOnOpenSubtasks.has(issue.id),
       cleanupSettling: cleanupSettling.has(issue.id),
       queuedStartHold: queuedStartHolds.get(issue.id),
+      personStopHeld: personStopHeld.has(issue.id),
     }, now);
     result.set(issue.id, presentation);
     const run = facts.run;

@@ -13,6 +13,7 @@ import request from "supertest";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { agentRoutes } from "../routes/agents.js";
+import { activityRoutes } from "../routes/activity.js";
 import { issueService } from "../services/issues.js";
 import { deliverConversationComments } from "../services/agent-conversations.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -27,6 +28,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 // and the admitted warm sandbox lifecycle (runtime-selection's keep_running).
 const fixture = vi.hoisted(() => ({
   warm: true,
+  // false: the Stop's run-only abort never reached the live session (no Stop receipt).
+  dispatch: true,
   calls: [] as string[],
   onFirst: undefined as undefined | ((input: { runId: string }) => Promise<void>),
 }));
@@ -53,7 +56,7 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
     // (dispatched). The durable intent and acknowledgement stay product code.
     cancelNativeSession: (async (runId: string, reason: string, options?: Parameters<typeof actual.cancelNativeSession>[2]) => {
       const result = await actual.cancelNativeSession(runId, reason, options!);
-      if (!options || !fixture.calls.includes(runId) || typeof result !== "object") return result;
+      if (!options || !fixture.dispatch || !fixture.calls.includes(runId) || typeof result !== "object") return result;
       const { db } = options;
       const { heartbeatRuns } = await import("@paperclipai/db");
       const { eq, sql } = await import("drizzle-orm");
@@ -136,6 +139,7 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
     });
     testApp.use("/api", issueRoutes(db, {} as any, {}));
     testApp.use("/api", agentRoutes(db));
+    testApp.use("/api", activityRoutes(db));
     testApp.use(errorHandler);
     return testApp;
   }
@@ -173,8 +177,9 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
     }
   }
 
-  async function heldThenStop(stopBy: "person" | "system" = "person") {
+  async function heldThenStop(stopBy: "person" | "system" = "person", options: { dispatch?: boolean } = {}) {
     fixture.warm = true;
+    fixture.dispatch = options.dispatch ?? true;
     fixture.calls = [];
     turns.length = 0;
     const f = await seed();
@@ -215,11 +220,22 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
       },
     });
     const held: string[] = [];
+    let refused: undefined | { status: number; body: unknown; runStatus?: string; nativeCancellation: unknown;
+      interruption: { state: string } | null };
     let stopping: Promise<unknown> | undefined;
     fixture.onFirst = async ({ runId }) => {
       // Three person messages while the turn is busy: the chat route holds them.
       for (const body of ["M1 held", "M2 held", "M3 held"])
         held.push((await post(body).expect(201)).body.id);
+      if (!fixture.dispatch) {
+        // stail-2c control: the Stop's abort never reached the live session
+        // (no Stop receipt). Read the issue right after the real Stop route answers.
+        const res = await request(client).post(`/api/heartbeat-runs/${runId}/cancel`).send({});
+        const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        refused = { status: res.status, body: res.body, runStatus: row?.status, nativeCancellation: row?.resultJson?.nativeCancellation,
+          interruption: (await request(client).get(`/api/issues/${f.issueId}`).expect(200)).body.interruption };
+        return;
+      }
       // optS-dd: the person's Stop goes through the real Stop route (POST /api/heartbeat-runs/:runId/cancel).
       stopping = stopBy === "person" ? request(client).post(`/api/heartbeat-runs/${runId}/cancel`).send({}).expect(200)
         : heartbeat.cancelRun(runId, "Cancelled by a board operator", { resultJson: { cancelledByActorType: "system" } });
@@ -242,7 +258,8 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
       await heartbeat.resumeQueuedRuns();
       await heartbeat.drainActiveRunExecutions();
       await stopping;
-    } finally { fixture.onFirst = undefined; fixture.warm = false; }
+    } catch (error) { if (fixture.dispatch) { factory.mockRestore(); throw error; } }
+    finally { fixture.onFirst = undefined; fixture.warm = false; fixture.dispatch = true; }
     const settle = async () => {
       for (let i = 0; i < 3; i++) { await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions(); }
       await readTurns();
@@ -258,7 +275,7 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
         .send({ queueId: queue.body.queueId ?? queue.body.id, targetRunId: f.runId, revision: queue.body.revision });
     };
     const lease = async () => (await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId!)))[0];
-    return { f, client, heartbeat, held, settle, answered, send, lease, post, done: () => factory.mockRestore() };
+    return { f, client, heartbeat, held, refused, settle, answered, send, lease, post, done: () => factory.mockRestore() };
   }
 
   it("S10: three held, Stop, Send => one run answers all three, once each, at once", async () => {
@@ -387,6 +404,65 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
         await evidence("heldbar-r2 control +10s", { get: bar, interruption: page.interruption ?? null });
         expect(bar.executionWait?.reason).not.toBe("stopped_by_person");
       } finally { vi.useRealTimers(); }
+    } finally { s.done(); }
+  }, 120_000);
+
+  // stail-2c (source of the stale 'Working / Thinking'): the issue detail GET's
+  // interruption after a person's acknowledged Stop whose only wait is their
+  // three held messages. The thread's startup lane shows 'Working' while it is
+  // 'working' (TaskChatThread optimisticRunnerStartup).
+  const interruptionAt = async (s: Awaited<ReturnType<typeof heldThenStop>>, label: string) => {
+    const body = (await request(s.client).get(`/api/issues/${s.f.issueId}`).expect(200)).body;
+    const runs = (await request(s.client).get(`/api/issues/${s.f.issueId}/runs`).expect(200)).body;
+    await evidence(`stail-2c ${label}`, { interruption: body.interruption, runs, issue: body });
+    return body.interruption as { state: string; observedRunId: string | null } | null;
+  };
+
+  it("stail-2c R1: a person's acknowledged Stop with only their 3 held messages reads resolved, not working (+0 s, +5 s)", async () => {
+    const s = await heldThenStop();
+    try {
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, s.f.runId));
+      expect((run?.resultJson as any)?.nativeCancellation).toMatchObject({ dispatchState: "acknowledged", dispatched: true });
+      const stopAt = Date.now();
+      vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true });
+      try {
+        for (const [label, offset] of [["+0s", 0], ["+5s", 5_000]] as const) {
+          vi.setSystemTime(stopAt + offset);
+          const interruption = await interruptionAt(s, `R1 ${label}`);
+          expect([label, interruption?.state, interruption?.observedRunId]).toEqual([label, "resolved", s.f.runId]);
+        }
+      } finally { vi.useRealTimers(); }
+      // The held bar is unchanged: still the person's stopped line with all three.
+      const bar = (await request(s.client).get(`/api/issues/${s.f.issueId}/queued-comments`).expect(200)).body;
+      expect(bar.executionWait?.reason).toBe("stopped_by_person");
+      expect(bar.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(s.held);
+    } finally { s.done(); }
+  }, 120_000);
+
+  it("stail-2c control: a message typed after the Stop reads working at once", async () => {
+    const s = await heldThenStop();
+    try {
+      expect((await interruptionAt(s, "typed before"))?.state).toBe("resolved");
+      await s.post("M4 typed").expect(201);
+      expect((await interruptionAt(s, "typed +0s"))?.state).toBe("working");
+    } finally { s.done(); }
+  }, 120_000);
+
+  it("stail-2c control: a Stop with no Stop receipt keeps working", async () => {
+    const s = await heldThenStop("person", { dispatch: false });
+    try {
+      await evidence("stail-2c no-receipt", s.refused);
+      // The real route either refuses (404) or records the Stop without its
+      // receipt (dispatched false); neither is an acknowledged person Stop.
+      expect((s.refused?.nativeCancellation as { dispatched?: unknown } | undefined)?.dispatched).not.toBe(true);
+      expect(s.refused?.interruption?.state).toBe("working");
+    } finally { s.done(); }
+  }, 120_000);
+
+  it("stail-2c control: a non-person cancel with the held messages keeps working", async () => {
+    const s = await heldThenStop("system");
+    try {
+      expect((await interruptionAt(s, "system +0s"))?.state).toBe("working");
     } finally { s.done(); }
   }, 120_000);
 });
