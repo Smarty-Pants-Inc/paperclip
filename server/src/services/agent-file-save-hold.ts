@@ -10,6 +10,8 @@ import { notifyInstructionCollection } from "./instruction-collection-notificati
 import { persistActivity, publishActivity } from "./activity-log.js";
 import { notifyEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { instructionCopyRetryAt } from "./instruction-copy-retry.js";
+import { durableAgentFilesEnabled, verifyFilesInDurableStore } from "./agent-file-durability.js";
+import { ephemeralServerEnabled } from "./ephemeral-server-mode.js";
 
 export const AGENT_FILES_SAVE_PENDING_INSTRUCTION = "Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox.";
 export const AGENT_FILES_RETIREMENT_COLLECTION_TIMEOUT = "AGENT_FILES_RETIREMENT_COLLECTION_TIMEOUT";
@@ -44,7 +46,7 @@ export function agentFileHoldParked(savePending: unknown): boolean {
 }
 export type AgentFileHeldFile = { path: string; sha256: string };
 export type AgentFileDurableCheck = { durable: boolean; checkedAt: string; files: number; changed: string[]; missing: string[]; detail?: string;
-  mirrorHash?: string | null; observedHash?: string | null; empty?: boolean };
+  mirrorHash?: string | null; observedHash?: string | null; empty?: boolean; store?: "object" | "local" };
 /**
  * B2 (rf-3 items 2-3): the held bytes are durable only as the DURABLE copy the
  * hold pinned, i.e. the controller mirror whose whole-tree snapshot hash is
@@ -79,19 +81,41 @@ export function agentFileHoldNoticePending(savePending: unknown): boolean {
   const pending = savePending as { permanent?: unknown; noticeDelivered?: unknown } | null | undefined;
   return pending?.permanent === true && pending.noticeDelivered === false;
 }
-type HeldCopyRow = { company_id: string; run_id: string; local_root: string; receipt: Record<string, unknown> | null };
+type HeldCopyRow = { company_id: string; agent_id: string; run_id: string; local_root: string; receipt: Record<string, unknown> | null };
+/**
+ * rf-3 item 3 (durable custody): on an ephemeral server, or with durable agent
+ * files on, the controller's disk (local_root) is a disposable projection, so a
+ * mirror there is not custody. The held bytes count as durable only when every
+ * held file is in the durable object store, read back by object key + sha256.
+ * Only a persistent server without durable agent files keeps the local mirror
+ * check: that disk is then the agent files' own store.
+ */
+export async function verifyHeldBytesDurable(db: Pick<Db, "select">, row: Pick<HeldCopyRow, "company_id" | "agent_id" | "local_root">,
+  pending: { mirrorHash?: unknown; heldFiles?: unknown }): Promise<AgentFileDurableCheck> {
+  if (!ephemeralServerEnabled() && !durableAgentFilesEnabled()) return { ...await verifyHeldMirrorDurable(row.local_root, pending), store: "local" };
+  const checkedAt = new Date().toISOString();
+  const heldFiles = Array.isArray(pending.heldFiles) ? pending.heldFiles as AgentFileHeldFile[] : null;
+  if (heldFiles && heldFiles.length === 0) return { durable: true, checkedAt, files: 0, changed: [], missing: [], empty: true, store: "object",
+    detail: "Empty hold: the held candidate contains no file, so nothing is left to keep" };
+  if (!heldFiles) return { durable: false, checkedAt, files: 0, changed: [], missing: [], store: "object",
+    detail: "The hold has no held-file manifest" };
+  const stored = await verifyFilesInDurableStore(db, { companyId: row.company_id, id: row.agent_id }, heldFiles);
+  return { durable: stored.durable, checkedAt, files: heldFiles.length, changed: [], missing: stored.missing, store: "object",
+    ...(stored.detail ? { detail: stored.detail } : {}) };
+}
 /**
  * B2: a permanent hold past AGENT_FILE_PERMANENT_HOLD_DESTROY_BOUND_MS no
- * longer blocks its box's destroy, but only while every held file is byte-equal
- * in the controller mirror the hold points at (savePending.heldFiles, path +
- * sha256). The check is written to the hold (savePending.durableCheck).
+ * longer blocks its box's destroy, but only while every held file is durable
+ * (verifyHeldBytesDurable: the object store when the controller's disk is
+ * disposable, else the controller mirror; savePending.heldFiles, path + sha256).
+ * The check is written to the hold (savePending.durableCheck).
  */
 async function permanentHoldReleasedForDestroy(db: Pick<Db, "execute">, row: HeldCopyRow): Promise<boolean> {
   const pending = row.receipt?.savePending as { permanent?: unknown; permanentAt?: unknown; since?: unknown; heldFiles?: unknown; mirrorHash?: unknown } | undefined;
   if (pending?.permanent !== true) return false;
   const permanentAt = Date.parse(String(pending.permanentAt ?? pending.since ?? ""));
   if (!Number.isFinite(permanentAt) || Date.now() - permanentAt < AGENT_FILE_PERMANENT_HOLD_DESTROY_BOUND_MS) return false;
-  const check = await verifyHeldMirrorDurable(row.local_root, pending);
+  const check = await verifyHeldBytesDurable(db as Db, row, pending);
   await (db as Db).execute(sql`update agent_instruction_working_copies
     set receipt = jsonb_set(receipt, '{savePending,durableCheck}', ${JSON.stringify(check)}::jsonb)
     where company_id = ${row.company_id} and run_id::text = ${row.run_id}::text and receipt ? 'savePending'`);
@@ -128,7 +152,7 @@ export async function rearmAgentFileHoldsOnLeaseActive(db: Db, lease: HoldLease 
  */
 export async function agentFileSaveHeldOnLease(db: Pick<Db, "execute">, lease: HoldLease): Promise<boolean> {
   if (typeof (db as Db).execute !== "function") return false;
-  const rows = await (db as Db).execute(sql`select held_copy.company_id::text as company_id, held_copy.run_id::text as run_id,
+  const rows = await (db as Db).execute(sql`select held_copy.company_id::text as company_id, held_copy.agent_id::text as agent_id, held_copy.run_id::text as run_id,
       held_copy.local_root, held_copy.receipt from agent_instruction_working_copies held_copy
     join environment_leases held_lease on held_lease.company_id = held_copy.company_id
       and held_lease.id::text = held_copy.receipt->'cleanup'->>'leaseId'
@@ -323,7 +347,7 @@ export function agentFileCopyRetirementSettled(row: { state: string; receipt?: R
  */
 export async function agentFileCopiesToCollectOnLease(db: Pick<Db, "execute">, lease: HoldLease & { heartbeatRunId?: string | null }): Promise<string[]> {
   if (typeof (db as Db).execute !== "function") return [];
-  const rows = await (db as Db).execute(sql`select company_id::text as company_id, run_id::text as run_id, local_root, receipt from agent_instruction_working_copies
+  const rows = await (db as Db).execute(sql`select company_id::text as company_id, agent_id::text as agent_id, run_id::text as run_id, local_root, receipt from agent_instruction_working_copies
     where company_id = ${lease.companyId}
       and receipt->>'schema' = 'paperclip.agent-files.v1'
       and (run_id::text = ${lease.heartbeatRunId ?? null}::text or receipt->'cleanup'->>'leaseId' = ${lease.id}::text)
@@ -332,7 +356,7 @@ export async function agentFileCopiesToCollectOnLease(db: Pick<Db, "execute">, l
           or (state = 'unavailable' and process_stopped_at is not null))))`);
   if (!Array.isArray(rows)) return [];
   const collect: string[] = [];
-  // A permanent hold released for destroy (B2) needs no collection: its bytes are verified in the mirror.
+  // A permanent hold released for destroy (B2) needs no collection: its bytes are verified durable.
   for (const row of rows as unknown as HeldCopyRow[]) if (!await permanentHoldReleasedForDestroy(db, row)) collect.push(String(row.run_id));
   return collect;
 }

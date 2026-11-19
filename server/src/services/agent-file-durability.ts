@@ -214,6 +214,42 @@ export async function withAgentFilesRestoredBeforeLock<T>(work: () => Promise<T>
   }
 }
 
+/**
+ * rf-3 item 3: whether held bytes survive the loss of this controller's disk.
+ * Each file must be in the agent's durable head (path + sha256, with its object
+ * key), and that object is read back through the store and re-hashed (the
+ * store's own durable read; the head keeps the collector from removing it). A
+ * local projection or mirror is never consulted. Missing = no committed object
+ * with these bytes, or a read that failed or did not match.
+ */
+export async function verifyFilesInDurableStore(db: Pick<Db, "select">, owner: { companyId: string; id: string },
+  files: ReadonlyArray<{ path: string; sha256: string }>): Promise<{ durable: boolean; missing: string[]; detail?: string }> {
+  const [head] = await (db as Db).select({ entries: agentFileRoots.entries }).from(agentFileRoots).where(where(owner));
+  if (!head) return { durable: false, missing: files.map(file => file.path), detail: "The agent has no durable file head" };
+  let service: ReturnType<typeof storage>;
+  try { service = storage(); } catch {
+    return { durable: false, missing: files.map(file => file.path), detail: "Durable agent files require shared object storage" };
+  }
+  const committed = new Map(head.entries.map(entry => [entry.path, entry]));
+  const signal = AbortSignal.timeout(30_000);
+  const missing: string[] = [];
+  for (const file of files) {
+    const entry = committed.get(file.path);
+    if (entry?.kind !== "file" || entry.sha256 !== file.sha256) { missing.push(file.path); continue; }
+    try {
+      const hash = createHash("sha256");
+      let size = 0;
+      if (entry.objectKey !== null) {
+        const object = await service.getObject(owner.companyId, entry.objectKey, { signal });
+        for await (const chunk of object.stream) { size += chunk.length; if (size > entry.size) break; hash.update(chunk); }
+      }
+      if (size !== entry.size || hash.digest("hex") !== file.sha256) missing.push(file.path);
+    } catch { missing.push(file.path); }
+  }
+  return { durable: missing.length === 0, missing,
+    ...(missing.length ? { detail: "Held files are not in durable object storage" } : {}) };
+}
+
 /** Objects uploaded before the agent row lock, by content (`sha256:size`). */
 export type PreparedAgentFileObjects = ReadonlyMap<string, string>;
 const contentKey = (sha256: string, size: number) => `${sha256}:${size}`;
