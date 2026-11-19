@@ -152,7 +152,7 @@ import { transactionRetryStats } from "../services/transaction-retry.js";
 import { isTransientLockContention, postgresErrorCode, retryTransientLockContention } from "../services/transient-lock-contention.js";
 import { AGENT_HIRE_ATTEMPTS, AgentHireContentionError, COMPANY_DEFAULT_GRANTS_DEFERRED } from "../services/agent-lifecycle.js";
 import { ensureNewAgentMembership } from "../services/agent-hiring.js";
-import { agentBudgetPage, assertAuthenticated, assertBoard, assertCompanyAccess, COMPANY_BUDGETS_PAGE, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { agentBudgetPage, assertAuthenticated, assertBoard, assertCompanyAccess, COMPANY_BUDGETS_PAGE, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource as getCompanyAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
 import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
 import {
@@ -1541,15 +1541,24 @@ export function agentRoutes(
     agent: { id: string; companyId: string },
     payload: unknown,
   ): Promise<boolean> {
-    const record = asRecord(payload) ?? {};
-    const taskIds = [...new Set([record.issueId, record.taskId].filter((value): value is string =>
-      typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.trim()))
-      .map((value) => value.trim()))];
-    for (const taskId of taskIds) {
-      const issue = await issueService(db).getById(taskId);
+    const record = asRecord(payload);
+    if (!record) return true;
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    for (const key of ["issueId", "taskId"] as const) {
+      const raw = record[key];
+      if (typeof raw !== "string") continue;
+      const value = raw.trim();
+      // A task UUID or a task identifier (PREFIX-123) resolves ONCE here to the
+      // server-owned task id; the wake carries that id, never the alias.
+      const identifier = uuidPattern.test(value) ? null : normalizeIssueIdentifier(value);
+      if (!uuidPattern.test(value) && !identifier) continue;
+      const issue = identifier
+        ? await issueService(db).getByIdentifier(identifier)
+        : await issueService(db).getById(value);
       if (!issue || issue.companyId !== agent.companyId) {
-        // taskId is also a free-form task key; only a named issueId must exist.
-        if (taskId !== record.issueId) continue;
+        // A UUID taskId is also a free-form task key; a named issueId, and any
+        // identifier alias, must name a task.
+        if (key === "taskId" && !identifier) continue;
         res.status(404).json({ error: "Issue not found" });
         return false;
       }
@@ -1570,8 +1579,55 @@ export function agentRoutes(
         res.status(404).json({ error: "Issue not found" });
         return false;
       }
+      record[key] = issue.id;
     }
     return true;
+  }
+
+  /**
+   * The private-task read gate at the source of this router's lookups. A task
+   * row, or a heartbeat run bound to a task (its durable issueId, else the
+   * issueId its context names), that the caller may not read under the
+   * private-task overlay answers with the route's own missing status and body,
+   * before any run, trace, runtime-request or eligibility detail. Only the
+   * privacy denial folds into "missing"; other denials stay with the route.
+   */
+  async function privateTaskHidden(req: Request, value: object): Promise<boolean> {
+    const row = value as Record<string, unknown>;
+    let issueId: string | null = null;
+    if (typeof row.id === "string" && "identifier" in row && "assigneeAgentId" in row && "status" in row) {
+      issueId = row.id;
+    } else if ("invocationSource" in row && typeof row.agentId === "string") {
+      const context = asRecord(row.contextSnapshot) ?? {};
+      issueId = typeof row.issueId === "string" ? row.issueId
+        : typeof context.issueId === "string" && isUuidLike(context.issueId.trim()) ? context.issueId.trim() : null;
+    }
+    if (!issueId || typeof row.companyId !== "string") return false;
+    const issue = await issueService(db).getById(issueId);
+    if (!issue || issue.companyId !== row.companyId) return false;
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "issue:read",
+      resource: {
+        type: "issue", companyId: issue.companyId, issueId: issue.id, projectId: issue.projectId,
+        parentIssueId: issue.parentId, assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId, status: issue.status,
+      },
+    });
+    return !decision.allowed && decision.reason === "deny_issue_private";
+  }
+
+  async function getAccessibleResource<T extends { companyId: string }>(
+    req: Request,
+    res: Response,
+    resource: T | null | undefined | Promise<T | null | undefined>,
+    notFoundMessage: string,
+    notFoundBody: Record<string, unknown> = { error: notFoundMessage },
+  ): Promise<T | null> {
+    const resolved = await getCompanyAccessibleResource(req, res, resource, notFoundMessage, notFoundBody);
+    if (!resolved || !(await privateTaskHidden(req, resolved))) return resolved;
+    res.status(404).json(notFoundBody);
+    return null;
   }
 
   /** getAccessibleResource for an issue plus the private-task read gate (same 404 as missing). */
@@ -1579,7 +1635,7 @@ export function agentRoutes(
     id: string; companyId: string; projectId: string | null; parentId: string | null;
     assigneeAgentId: string | null; assigneeUserId: string | null; status: string;
   }>(req: Request, res: Response, resource: T | null | undefined | Promise<T | null | undefined>): Promise<T | null> {
-    const issue = await getAccessibleResource(req, res, resource, "Issue not found");
+    const issue = await getCompanyAccessibleResource(req, res, resource, "Issue not found");
     if (!issue) return null;
     const decision = await access.decide({
       actor: req.actor,
@@ -6545,6 +6601,9 @@ export function agentRoutes(
       ) {
         throw notFound("Failed run not found");
       }
+      // The run's task read gate comes before any eligibility detail: a run on a
+      // private task the caller may not read is a missing run.
+      if (await privateTaskHidden(req, failedRun)) throw notFound("Failed run not found");
       if (failedRun.runtimeMode === "native" && failedRun.errorCode === "native_session_cleanup_quarantined") {
         throw conflict(NATIVE_CLEANUP_SETTLING_MESSAGE, {
           code: "native_session_cleanup_quarantined",

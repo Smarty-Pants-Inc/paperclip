@@ -63,6 +63,29 @@ export function agentActionAuditService(db: Db) {
       // Preserve the historical agent-audit query unless the caller opts into
       // the unified all-actors feed explicitly.
       if (filters.actorScope !== "all") conditions.push(isNotNull(activityLog.agentId));
+      // The task read predicate filters the page rows themselves, not only the
+      // joined enrichment: a task-derived row (the task, its comment or its
+      // document) of a task the caller may not read is not listed at all, so
+      // its id, action and timestamp do not reveal the hidden task.
+      if (filters.issueReadCondition) {
+        const readable = filters.issueReadCondition;
+        conditions.push(sql<boolean>`(
+          (${activityLog.entityType} <> 'issue' or not exists (
+            select 1 from ${issues} where ${issues.companyId} = ${filters.companyId}
+              and ${issues.id}::text = ${activityLog.entityId} and not (${readable})))
+          and (${activityLog.entityType} <> 'issue_comment' or not exists (
+            select 1 from ${issueComments} join ${issues} on ${issues.id} = ${issueComments.issueId}
+              and ${issues.companyId} = ${issueComments.companyId}
+            where ${issueComments.companyId} = ${filters.companyId}
+              and ${issueComments.id}::text = ${activityLog.entityId} and not (${readable})))
+          and (${activityLog.entityType} <> 'issue_document' or not exists (
+            select 1 from ${issueDocuments} join ${issues} on ${issues.id} = ${issueDocuments.issueId}
+              and ${issues.companyId} = ${issueDocuments.companyId}
+            where ${issueDocuments.companyId} = ${filters.companyId}
+              and (${issueDocuments.id}::text = ${activityLog.entityId} or ${issueDocuments.documentId}::text = ${activityLog.entityId})
+              and not (${readable})))
+        )`);
+      }
       if (filters.agentId) conditions.push(eq(activityLog.agentId, filters.agentId));
       if (filters.responsibleUserId) conditions.push(or(
         eq(activityLog.responsibleUserId, filters.responsibleUserId),

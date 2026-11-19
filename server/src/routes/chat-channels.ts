@@ -1,7 +1,7 @@
 import { connectionManagementService } from "../services/connection-management.js";
 import { chatCredentialRotationId, connectionIntentService, savedChatSetupPath } from "../services/connection-intents.js";
-import { companies } from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { chatActions, chatConversations, chatDeliveries, chatPublications, companies, issues } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
 import { requiredConnectionUserAction, filterConnectionManagementRows, connectionManagementGuard, connectionRequestContext, connectionRequestUserId } from "./connection-management-authz.js";
 import { slackTestMessageSchema, slackRegistrationSchema, slackSetupActionSchema, slackManagedProvisionSchema } from "@paperclipai/shared";
 import { isCrossSiteOAuthCallbackNavigation, oauthCallbackInterstitialHtml } from "../lib/oauth-browser-return.js";
@@ -180,6 +180,54 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
     )
       return;
     throw forbidden("Missing permission: tools:manage_connections");
+  }
+
+  /**
+   * The task read gate for connector routes. The task is the one the record is
+   * bound to on the server (publication, conversation, delivery or action),
+   * never a body value. A private task the caller may not read makes the
+   * connector record look missing: the route's own 404, before any publish,
+   * replay, resolution or binding projection. Only the privacy denial counts.
+   */
+  async function chatTaskHidden(req: ExpressRequest, binding: { issueId?: string | null; conversationId?: string | null }) {
+    let issueId = binding.issueId ?? null;
+    if (!issueId && binding.conversationId) {
+      issueId = await db.select({ issueId: chatConversations.issueId }).from(chatConversations)
+        .where(eq(chatConversations.id, binding.conversationId)).then((rows) => rows[0]?.issueId ?? null);
+    }
+    if (!issueId) return false;
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    if (!issue) return false;
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "issue:read",
+      resource: {
+        type: "issue", companyId: issue.companyId, issueId: issue.id, projectId: issue.projectId,
+        parentIssueId: issue.parentId, assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId, status: issue.status,
+      },
+    });
+    return !decision.allowed && decision.reason === "deny_issue_private";
+  }
+
+  async function assertChatRecordTaskReadable(req: ExpressRequest, kind: "delivery" | "publication" | "action" | "conversation", id: string) {
+    if (!isUuidLike(id) || !isUuidLike(endpointId(req))) return;
+    const where = <T extends { endpointId: any; id: any }>(table: T) => and(eq(table.endpointId, endpointId(req)), eq(table.id, id));
+    if (kind === "delivery") {
+      const row = await db.select({ conversationId: chatDeliveries.conversationId }).from(chatDeliveries).where(where(chatDeliveries)).then((rows) => rows[0]);
+      if (row && await chatTaskHidden(req, row)) throw notFound("Delivery not found");
+    } else if (kind === "publication") {
+      const row = await db.select({ issueId: chatPublications.issueId, conversationId: chatPublications.conversationId }).from(chatPublications).where(where(chatPublications)).then((rows) => rows[0]);
+      if (row && await chatTaskHidden(req, row)) throw notFound("Publication not found");
+    } else if (kind === "action") {
+      const row = await db.select({ conversationId: chatActions.conversationId, deliveryId: chatActions.deliveryId }).from(chatActions).where(where(chatActions)).then((rows) => rows[0]);
+      const conversationId = row?.conversationId ?? (row?.deliveryId ? await db.select({ conversationId: chatDeliveries.conversationId })
+        .from(chatDeliveries).where(eq(chatDeliveries.id, row.deliveryId)).then((rows) => rows[0]?.conversationId ?? null) : null);
+      if (row && await chatTaskHidden(req, { conversationId })) throw notFound("Provider action not found");
+    } else {
+      const row = await db.select({ issueId: chatConversations.issueId }).from(chatConversations).where(where(chatConversations)).then((rows) => rows[0]);
+      if (row && await chatTaskHidden(req, row)) throw notFound("Conversation not found");
+    }
   }
 
   async function assertEndpointManagementAccess(
@@ -592,7 +640,10 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
 
   router.get("/chat-endpoints/:endpointId/conversations", managementGuard("connections:read", "GET /chat-endpoints/:endpointId/conversations"), async (req, res) => {
     if (!(await assertEndpointAccess(req, res, service))) return;
-    res.json(await filterConnectionManagementRows(db, req, "connections:read", await service.listConversations(endpointId(req)), row => ({ issueId: row.issueId })));
+    const conversations = await filterConnectionManagementRows(db, req, "connections:read", await service.listConversations(endpointId(req)), row => ({ issueId: row.issueId }));
+    const readable = [];
+    for (const row of conversations) if (!(await chatTaskHidden(req, { issueId: row.issueId }))) readable.push(row);
+    res.json(readable);
   });
 
   router.get("/chat-endpoints/:endpointId/activity", managementGuard("connections:audit", "GET /chat-endpoints/:endpointId/activity"), async (req, res) => {
@@ -610,6 +661,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
     "/chat-endpoints/:endpointId/deliveries/:deliveryId/replay", (req, _res, next) => { assertBoard(req); next(); },
     async (req, res) => {
       if (!(await assertEndpointManagementAccess(req, res))) return;
+      await assertChatRecordTaskReadable(req, "delivery", req.params.deliveryId as string);
       await service.replayDelivery(
         endpointId(req),
         req.params.deliveryId as string,
@@ -622,6 +674,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
     "/chat-endpoints/:endpointId/publications/:publicationId/replay", (req, _res, next) => { assertBoard(req); next(); },
     async (req, res) => {
       if (!(await assertEndpointManagementAccess(req, res))) return;
+      await assertChatRecordTaskReadable(req, "publication", req.params.publicationId as string);
       await service.replayPublication(
         endpointId(req),
         req.params.publicationId as string,
@@ -635,6 +688,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
     validate(resolveChatPublicationSchema),
     async (req, res) => {
       if (!(await assertEndpointManagementAccess(req, res))) return;
+      await assertChatRecordTaskReadable(req, "publication", req.params.publicationId as string);
       const userId = actorUserId(req);
       if (!userId) throw badRequest("A board user is required");
       await service.resolvePublication(
@@ -653,6 +707,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
     validate(resolveChatActionSchema),
     async (req, res) => {
       if (!(await assertEndpointManagementAccess(req, res))) return;
+      await assertChatRecordTaskReadable(req, "action", req.params.actionId as string);
       const userId = actorUserId(req);
       if (!userId) throw badRequest("A board user is required");
       await service.resolveAction(
@@ -670,6 +725,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
     validate(publishChatPublicationSchema),
     async (req, res) => {
       if (!(await assertEndpointAccess(req, res, service))) return;
+      await assertChatRecordTaskReadable(req, "conversation", req.params.conversationId as string);
       if ("commentId" in req.body) {
         res
           .status(201)
@@ -714,6 +770,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
         );
       }
       if (!(await assertEndpointAccess(req, res, service))) return;
+      await assertChatRecordTaskReadable(req, "conversation", req.params.conversationId as string);
       res.json(
         await service.getPublicationBatchStatus(
           endpointId(req),
@@ -730,6 +787,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
     if (issueId !== issueId.trim() || !isUuidLike(issueId)) {
       throw badRequest("Task ID must be a UUID");
     }
+    // The management guard already folded a private task the caller may not read into "missing".
     const binding = await service.getIssueBinding(issueId);
     if (binding) {
       const endpoint = await getAccessibleResource(

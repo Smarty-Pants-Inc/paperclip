@@ -298,7 +298,7 @@ import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
 import {
   assertBoard,
   assertCompanyAccess,
-  getAccessibleResource,
+  getAccessibleResource as getCompanyAccessibleResource,
   getActorInfo,
   issueNotFoundBody,
 } from "./authz.js";
@@ -3633,6 +3633,20 @@ async function recordAgentChildTaskRead(db: Db, req: Request, issue: { id: strin
     .catch(error => logger.warn({ err: error, runId: req.actor.runId }, "could not record the child task a run read"));
 }
 
+/**
+ * An issue row whose privacy the overlay may restrict: private itself, or under
+ * a private parent/root. A partial projection without the markers is checked too.
+ */
+function isPrivacyMarkedIssueRow(value: object): value is {
+  id: string; companyId: string; projectId: string | null; parentId: string | null;
+  assigneeAgentId: string | null; assigneeUserId: string | null; status: string;
+} {
+  const row = value as Record<string, unknown>;
+  if (typeof row.id !== "string" || !("identifier" in row) || !("assigneeAgentId" in row) || !("status" in row)) return false;
+  if (!("visibility" in row) && !("privacyRootIssueId" in row) && !("privacyParentIssueId" in row)) return true;
+  return row.visibility === "private" || !!row.privacyRootIssueId || !!row.privacyParentIssueId;
+}
+
 export function issueRoutes(
   db: Db,
   storage: StorageService,
@@ -5379,7 +5393,7 @@ export function issueRoutes(
     notFoundBody: Record<string, unknown> = { error: notFoundMessage },
     action: "issue:read" | "issue:comment" | "issue:mutate" = "issue:read",
   ): Promise<T | null> {
-    const issue = await getAccessibleResource(req, res, resource, notFoundMessage, notFoundBody);
+    const issue = await getCompanyAccessibleResource(req, res, resource, notFoundMessage, notFoundBody);
     if (!issue) return null;
     // A write route asks for its own action: the private-task overlay rides on
     // that decision. A non-privacy write denial keeps the route's own checks
@@ -5388,6 +5402,32 @@ export function issueRoutes(
     if (decision.allowed) return issue;
     if (decision.reason !== "deny_issue_private" && action !== "issue:read"
       && (await decideIssueAccess(req, issue, "issue:read")).allowed) return issue;
+    res.status(404).json(notFoundBody);
+    return null;
+  }
+
+  /**
+   * The read gate at the source of every issue-scoped route here. Every route
+   * in this router that loads its task through getAccessibleResource gets the
+   * private-task overlay (decideIssueAccess issue:read) right after the company
+   * check: a private task the caller may not read answers with the route's own
+   * missing-task status and body, before any route-specific check, lookup or
+   * write (checkout, compact, monitor, runner-goal, feedback votes, ...).
+   * Non-issue resources, and tasks with no privacy marker, pass straight through.
+   * Only the privacy denial is folded into "missing"; every other denial stays
+   * with the route's own checks.
+   */
+  async function getAccessibleResource<T extends { companyId: string }>(
+    req: Request,
+    res: Response,
+    resource: T | null | undefined | Promise<T | null | undefined>,
+    notFoundMessage: string,
+    notFoundBody: Record<string, unknown> = { error: notFoundMessage },
+  ): Promise<T | null> {
+    const resolved = await getCompanyAccessibleResource(req, res, resource, notFoundMessage, notFoundBody);
+    if (!resolved || !isPrivacyMarkedIssueRow(resolved)) return resolved;
+    const decision = await decideIssueAccess(req, resolved, "issue:read");
+    if (decision.allowed || decision.reason !== "deny_issue_private") return resolved;
     res.status(404).json(notFoundBody);
     return null;
   }
@@ -10198,7 +10238,8 @@ export function issueRoutes(
   router.get("/issues/:id", async (req, res) => {
     const timing = createIssueReadTiming();
     const id = req.params.id as string;
-    const issue = await getAccessibleResource(
+    // Its own read check below carries the break-glass exception.
+    const issue = await getCompanyAccessibleResource(
       req,
       res,
       timing.time("lookup", () => getIssueById(req, id)),

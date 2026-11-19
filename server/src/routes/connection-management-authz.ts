@@ -7,6 +7,7 @@ import { type Db, toolConnections, toolApplications, toolProfiles, toolProfileEn
 import { badRequest, forbidden, notFound, HttpError } from "../errors.js";
 import { assertAuthenticated, assertCompanyAccess, hasCompanyAccess, getActorInfo } from "./authz.js";
 import { connectionManagementService, responsibleConnectionUser, type ConnectionManagementContext } from "../services/connection-management.js";
+import { authorizationService } from "../services/authorization.js";
 import { isToolAssignmentOperation, type ConnectionManagementAction, type ConnectionManagementResource } from "../services/connection-management-policy.js";
 
 const contexts = new WeakMap<Request, ConnectionManagementContext>();
@@ -207,6 +208,21 @@ export function connectionManagementGuard(db: Db, purpose: "tool" | "chat" | "ai
         bindCompany(conversation);
         if (req.params.endpointId && conversation.endpointId !== req.params.endpointId) throw notFound("Conversation not found");
         resource.issueId = conversation.issueId;
+      }
+      // The task a route names (its :issueId, or the task its :runId or
+      // :conversationId is bound to) passes the private-task read gate for every
+      // caller, board or agent: a private task the caller may not read is the
+      // same missing resource as an absent one, before any connector projection.
+      if (resource.issueId && (req.params.issueId || req.params.runId || req.params.conversationId)) {
+        const [task] = await db.select().from(issues).where(eq(issues.id, resource.issueId));
+        if (task) {
+          const decision = await authorizationService(db).decide({
+            actor: req.actor, action: "issue:read",
+            resource: { type: "issue", companyId: task.companyId, issueId: task.id, projectId: task.projectId,
+              parentIssueId: task.parentId, assigneeAgentId: task.assigneeAgentId, assigneeUserId: task.assigneeUserId, status: task.status },
+          });
+          if (!decision.allowed && decision.reason === "deny_issue_private") throw notFound(inaccessibleMessage);
+        }
       }
       if (body.reassignToProfileId) extraResources.push({ ...resource, profileId: uuid(body.reassignToProfileId) });
       if (req.params.entryId) {
