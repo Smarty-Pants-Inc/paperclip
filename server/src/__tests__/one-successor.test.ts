@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { once } from "node:events";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
@@ -34,7 +34,8 @@ import {
 } from "../services/agent-conversations.js";
 import { answeredPersonMessageSql } from "../services/person-message-answer.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
-import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessage, settleUnansweredPersonMessages, UNANSWERED_MESSAGE_REASON_PREFIX,
+  UNANSWERED_MESSAGE_TEXT, UNANSWERED_MESSAGE_NO_RUN_TEXT } from "../services/recovery/unanswered-person-message.js";
 import { getServerAdapter, registerServerAdapter, runningProcesses } from "../adapters/index.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat/run-preparation.js";
 import { renderFirstTurnQueuedInput } from "../services/native-runtime/first-turn-queued-input.js";
@@ -511,5 +512,178 @@ describeEmbeddedPostgres("ONE successor per Interrupt (adopt-one-successor, 390 
     expect(wakes.map(w => [w.status, w.error]), "the answer's continuation was coalesced away").toHaveLength(1);
     expect(["coalesced", "skipped", "failed"]).not.toContain(wakes[0]!.status);
     expect(run !== null || wakes[0]!.status === "deferred_issue_execution", `wake ${wakes[0]!.status} has no run`).toBe(true);
+  });
+});
+
+// I-A''' / RFL 19:05Z + 19:17Z: real recovery discovery + per-message sweep,
+// not a duplicate SQL selector. Persisted inputs model the reported daily-work
+// shapes; no provider is launched and these rows do not claim installed-screen proof.
+describeEmbeddedPostgres("I-A''' answered-person floor (a3)", () => {
+  let db: ReturnType<typeof createDb>;
+  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  const userId = "a3-person";
+
+  beforeAll(async () => {
+    database = await startEmbeddedPostgresTestDatabase("paperclip-a3-floor-");
+    db = createDb(database.connectionString);
+  }, 60_000);
+  afterAll(async () => {
+    await db?.$client.end();
+    await database?.cleanup();
+  });
+
+  async function fixture() {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "A3 daily-work shape", issuePrefix: `A${companyId.slice(0, 7)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Chat agent", role: "engineer", status: "idle",
+      adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Conversation", status: "in_progress",
+      assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" });
+    // All arrivals and terminal attempts precede the real sweep clock/grace.
+    const base = Date.now() - 30 * 60_000;
+    const at = (minute: number) => new Date(base + minute * 60_000);
+    async function message(body: string, minute: number) {
+      const [row] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
+        body, createdAt: at(minute), updatedAt: at(minute) }).returning();
+      return row!;
+    }
+    async function run(status: "failed" | "cancelled" | "succeeded" | "running", ids: string[], minute: number,
+      extra: Record<string, unknown> = {}) {
+      const [row] = await db.insert(heartbeatRuns).values({ companyId, agentId, nativeIssueId: issueId, issueId,
+        status, runtimeMode: "native", invocationSource: "automation", triggerDetail: "system",
+        createdAt: at(minute), startedAt: at(minute), finishedAt: status === "running" ? null : at(minute + 0.5),
+        errorCode: status === "failed" ? "process_lost" : status === "cancelled" ? "cancelled" : null,
+        contextSnapshot: { issueId, wakeReason: ids.length ? "issue_commented" : "chat_task_completed",
+          ...(ids.length ? { wakeCommentId: ids.at(-1), commentId: ids.at(-1), wakeCommentIds: ids } : {}), ...extra } }).returning();
+      return row!;
+    }
+    async function reply(runId: string, minute: number, body = "The sub-task finished; here is its report.") {
+      await db.insert(issueComments).values({ companyId, issueId, authorType: "agent", authorAgentId: agentId,
+        createdByRunId: runId, body, createdAt: at(minute), updatedAt: at(minute) });
+    }
+    async function sweep() {
+      return settleUnansweredPersonMessages(db, { companyId, issueId, now: new Date() });
+    }
+    async function cards() {
+      return (await db.select().from(issueComments).where(and(eq(issueComments.companyId, companyId),
+        eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"))))
+        .filter(c => String(c.metadata?.authorizationReason ?? "").startsWith(UNANSWERED_MESSAGE_REASON_PREFIX));
+    }
+    async function wakes() {
+      return db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    }
+    async function runs() {
+      return db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    }
+    async function answered(id: string) {
+      const rows = await db.execute(sql`select ${answeredPersonMessageSql({ id: sql`m.id`, companyId: sql`m.company_id`,
+        issueId: sql`m.issue_id`, createdAt: sql`m.created_at` })} as answered from issue_comments m where m.id = ${id}::uuid`);
+      return Boolean((rows as unknown as Array<{ answered: boolean }>)[0]?.answered);
+    }
+    return { companyId, agentId, issueId, at, message, run, reply, sweep, cards, wakes, runs, answered };
+  }
+  type A3 = Awaited<ReturnType<typeof fixture>>;
+  const reason = (id: string) => `${UNANSWERED_MESSAGE_REASON_PREFIX}${id}`;
+  async function record(label: string, f: A3, extra: Record<string, unknown>) {
+    if (process.env.A3_EVIDENCE) await appendFile(process.env.A3_EVIDENCE, JSON.stringify({ label,
+      ...extra, companyId: f.companyId, issueId: f.issueId, cards: await f.cards(), wakes: await f.wakes(), runs: await f.runs() }) + "\n");
+  }
+  async function expectOneTrueNote(label: string, f: A3, m: typeof issueComments.$inferSelect, carrierId: string | null,
+    expectedBody = UNANSWERED_MESSAGE_TEXT) {
+    const beforeRuns = (await f.runs()).map(r => r.id).sort(), beforeWakes = await f.wakes();
+    const first = await f.sweep(), firstCards = await f.cards();
+    const second = await f.sweep(), all = await f.cards();
+    await record(label, f, { messageId: m.id, carrierId, first, firstCards, second });
+    const forM = all.filter(c => c.metadata?.authorizationReason === reason(m.id));
+    expect.soft(forM, "one note ever for this message, including a second discovery/sweep").toHaveLength(1);
+    if (forM[0]) {
+      expect.soft(forM[0].deletedAt).toBeNull();
+      expect.soft(forM[0].body).toBe(expectedBody);
+      expect.soft(forM[0].metadata).toMatchObject({ recoveryResponsibility: "user", sourceRunId: carrierId,
+        authorizationReason: reason(m.id) });
+      expect.soft(firstCards.map(c => c.id)).toEqual(all.map(c => c.id));
+    }
+    expect.soft(await f.wakes(), "the notice does not wake or resend").toEqual(beforeWakes);
+    expect.soft((await f.runs()).map(r => r.id).sort(), "no second carrier").toEqual(beforeRuns);
+  }
+
+  it("(a3-sys) M's carrier failed; a later chat_task_completed run replied but claimed no person => ONE note, no wake", async () => {
+    const f = await fixture(), m = await f.message("Please check the README setup instructions", 1);
+    const failed = await f.run("failed", [m.id], 2);
+    const system = await f.run("succeeded", [], 4);
+    await f.reply(system.id, 5);
+    expect(await f.answered(m.id)).toBe(false);
+    await expectOneTrueNote("a3-sys", f, m, failed.id);
+    expect((await f.cards()).map(c => c.metadata?.authorizationReason)).toEqual([reason(m.id)]);
+  });
+
+  it.each(["cancelled", "failed"] as const)("(a3-1117) M carried by %s then N claimed and answered => no card or wake for M", async status => {
+    const f = await fixture(), m = await f.message("Please check the README", 1);
+    await f.run(status, [m.id], 2);
+    const n = await f.message("Now tell me 9 + 10", 4);
+    const later = await f.run("succeeded", [n.id], 5);
+    await f.reply(later.id, 6, "19");
+    expect(await f.answered(n.id)).toBe(true);
+    const first = await f.sweep(), second = await f.sweep();
+    await record(`a3-1117-${status}`, f, { m: m.id, n: n.id, first, second });
+    expect(await f.cards()).toEqual([]);
+    expect(await f.wakes()).toEqual([]);
+  });
+
+  it("(a3-c2) N has a wake, but the succeeded replying system run never claimed N => M still gets ONE note", async () => {
+    const f = await fixture(), m = await f.message("Please check the README setup instructions", 1);
+    const failed = await f.run("failed", [m.id], 2);
+    const n = await f.message("And check the logs", 3);
+    // A terminal, unclaimed wake: existence alone is not a claim by the system run.
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "on_demand", status: "failed", reason: "issue_commented", requestedByActorType: "user", requestedByActorId: userId,
+      idempotencyKey: `conversation-comment:${n.id}`, payload: { issueId: f.issueId, commentId: n.id,
+        _paperclipWakeContext: { issueId: f.issueId, wakeCommentId: n.id, wakeCommentIds: [n.id] } },
+      requestedAt: f.at(3), updatedAt: f.at(3), finishedAt: f.at(3.5) });
+    const system = await f.run("succeeded", [], 4);
+    await f.reply(system.id, 5);
+    expect(await f.answered(n.id)).toBe(false);
+    await expectOneTrueNote("a3-c2", f, m, failed.id);
+  });
+
+  it("(a3-progress) old held X; newer N only got a progress note, not an answer => X still gets ONE note", async () => {
+    const f = await fixture(), x = await f.message("Please check the README setup instructions", 1);
+    const failed = await f.run("failed", [x.id], 2);
+    const n = await f.message("Also inspect the build logs", 3);
+    // An unread/unanswered steer: a progress comment is not a response to its text.
+    const progress = await f.run("succeeded", [n.id], 4, { steeredCommentIds: [n.id] });
+    await f.reply(progress.id, 5, "Still working on the earlier task.");
+    expect(await f.answered(n.id), "the ONE answer function must reject this progress-only shape").toBe(false);
+    await expectOneTrueNote("a3-progress", f, x, failed.id);
+  });
+
+  it("(a3-progress-held) X only ever had a held wake; N got progress but no answer => ONE no-run note for X", async () => {
+    const f = await fixture(), x = await f.message("Please check the README setup instructions", 1);
+    // X was held, not put in any run. Its terminal wake proves an earlier handoff
+    // without manufacturing live custody, which would bypass the floor entirely.
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "on_demand", status: "cancelled", reason: "issue_commented", requestedByActorType: "user", requestedByActorId: userId,
+      idempotencyKey: `conversation-comment:${x.id}`, payload: { issueId: f.issueId, commentId: x.id,
+        executionWait: { reason: "stopped_by_person", message: "These messages are waiting." } },
+      createdAt: f.at(1), requestedAt: f.at(1), updatedAt: f.at(2), finishedAt: f.at(2) });
+    const n = await f.message("Also inspect the build logs", 3);
+    const progress = await f.run("succeeded", [n.id], 4, { steeredCommentIds: [n.id] });
+    await f.reply(progress.id, 5, "Still working on the earlier task.");
+    expect(await f.answered(n.id)).toBe(false);
+    await expectOneTrueNote("a3-progress-held", f, x, null, UNANSWERED_MESSAGE_NO_RUN_TEXT);
+  });
+
+  it("(a3-stop) README kept in Stop custody; its carrier starts after 9 + 10 and fails => ONE note, never floor-skipped", async () => {
+    const f = await fixture(), m = await f.message("Please check the README setup instructions", 1);
+    const n = await f.message("Now tell me 9 + 10", 3);
+    const later = await f.run("succeeded", [n.id], 4);
+    await f.reply(later.id, 5, "19");
+    const holding = await f.run("running", [m.id], 6);
+    const live = await f.sweep();
+    expect((await f.cards()).filter(c => c.metadata?.authorizationReason === reason(m.id))).toEqual([]);
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: f.at(7), errorCode: "process_lost" })
+      .where(eq(heartbeatRuns.id, holding.id));
+    await expectOneTrueNote("a3-stop", f, m, holding.id);
+    await record("a3-stop-live", f, { live });
   });
 });
