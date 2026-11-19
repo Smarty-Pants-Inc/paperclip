@@ -4,7 +4,7 @@ import request from "supertest";
 import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
+import { agents, agentWakeupRequests, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { companyPortabilityService } from "../services/company-portability.js";
@@ -132,6 +132,54 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
     ]);
     expect((await notes(f.issue.id)).filter(n => (n.metadata as Record<string, unknown> | null)?.authorizationReason
       === `unanswered_message:${importedMessage!.id}`), "the imported bundle message gets no paused note (imported history)").toHaveLength(0);
+  });
+
+  it.each(["import", "manual"] as const)("a LIVE person message to an agent paused only by %s gets ONE true paused note across repeat sweeps (importpause)", async pause => {
+    const f = await imported(false);
+    await db.execute(sql`update activity_log set created_at = now() - interval '8 minutes'
+      where action = 'issue.imported' and entity_type = 'issue' and entity_id = ${f.issue.id}`);
+    if (pause === "manual") {
+      // Control: the same task, its import pause resumed, then the person's own Pause.
+      const worker = configureAgentLifecycle(db, { requiredPluginIds: async () => [],
+        runPlugin: async () => "complete", runHost: async () => "complete" });
+      try {
+        await worker.process(f.agentId);
+        await createAgentLifecycle(db).resumeAgent(f.agentId);
+        await worker.process(f.agentId);
+      } finally { await worker.stop(); }
+      await createAgentLifecycle(db).pauseAgent(f.agentId, "manual");
+    }
+    const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(agent).toMatchObject({ status: "paused", pauseReason: pause, lifecycleHolds: [pause] });
+    // The person's message through the real comment route (board actor), after the import.
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = { type: "board", source: "local_implicit", userId: "m12-board", isInstanceAdmin: true };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as Parameters<typeof issueRoutes>[1]));
+    app.use(errorHandler);
+    const posted = await request(app).post(`/api/issues/${f.issue.id}/comments`).send({ body: "Are you there? Please continue." });
+    expect(posted.status, JSON.stringify(posted.body)).toBe(201);
+    const heartbeat = heartbeatService(db, { runStartHandover: { isYielding: () => true, refreshIfStale: async () => {} } });
+    try {
+      for (let i = 0; i < 3; i++) {
+        await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issue.id });
+        await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issue.id,
+          now: new Date(Date.now() + (30 + i * 10) * 60_000) });
+      }
+      const swept = await notes(f.issue.id);
+      console.log(JSON.stringify({ check: "importpause-live", pause, notes: swept.map(n => n.body) }));
+      // Not 'will run': the import's task never ran, so the paused message's wake is not saved.
+      expect(swept.map(n => n.body)).toEqual([
+        "Import Coder is paused. Your message is saved. Send it again after Import Coder is resumed. "
+        + "A board user or Import Coder's manager can resume Import Coder.",
+      ]);
+      expect((swept[0]!.metadata as Record<string, unknown> | null)?.authorizationReason).toBe(`unanswered_message:${posted.body.id}`);
+      expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, f.agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution")))).toHaveLength(0);
+    } finally { await heartbeat.drainActiveRunExecutions(); }
   });
 
   it("an armed monitor survives import-pause recovery and its timer admits a run after resume", async () => {
