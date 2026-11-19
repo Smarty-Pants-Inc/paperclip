@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readdir, readlink, rename, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
-import { heartbeatRuns, nativeHarnessBackups, nativeRunFinalizations } from "@paperclipai/db";
+import { environmentLeases, heartbeatRuns, nativeHarnessBackups, nativeRunFinalizations } from "@paperclipai/db";
 import { afterEach, expect, it, vi } from "vitest";
 import { describeEmbeddedPostgres, nativeRestartFixture } from "../../__tests__/helpers/native-restart.js";
 import { createLocalDiskStorageProvider } from "../../storage/local-disk-provider.js";
@@ -13,6 +13,9 @@ import { createStorageService } from "../../storage/service.js";
 import { nativeHarnessBackupOwner, persistNativeHarnessBackup, restoreDurableNativeHarnessBackup } from "./native-harness-backup-storage.js";
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { canonicalProviderPackJson } from "./remote-provider-pack-verification.js";
+import { buildNativeHarnessBackupManifestStreamed } from "./native-session-executor.js";
+import { createNativeHarnessBackupStamp, readNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
+import { recordNativeHarnessBackupStampOnLeaseChain } from "./native-retired-backup-source.js";
 
 // Durable harness backups against an S3 endpoint that throttles requests.
 describeEmbeddedPostgres("durable native provider backups under an object-storage request-rate limit", () => {
@@ -70,6 +73,123 @@ describeEmbeddedPostgres("durable native provider backups under an object-storag
     }).where(eq(heartbeatRuns.id, f.runId));
     return { ...f, original, manifest, launchRoot, providerArtifacts: { sourceRoot, manifest, launchRoot, accountUid: 1000 } };
   }
+  it("opens a turn-end native harness backup through server decryption and re-reads its file inventory and manifest sha", async () => {
+    const f = await fixture("codex-home"), { runtimeRoot, agentId } = environment.current;
+    // Use the same streamed manifest producer and encrypted publisher as turn-end
+    // checkpointing, with a real lease stamp rather than an invented digest.
+    vi.stubEnv("PAPERCLIP_RUNNER_STATE_DIR", runtimeRoot);
+    const home = join(runtimeRoot, f.scopeDigest);
+    await rename(f.home, home); ownedHomes.push(home);
+    const root = join(home, "failover-backups", "current");
+    const runnerInstanceId = randomUUID(), providerLeaseId = randomUUID();
+    const execution: Parameters<typeof buildNativeHarnessBackupManifestStreamed>[0]["execution"] = {
+      provider: { kind: "codex" },
+      binding: { companyId: f.companyId, issueId: f.issueId, runId: f.runId, agentId, executionWorkspaceId: randomUUID() },
+      workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      session: { normalizedSessionId: f.identity.normalizedSessionId, driverKind: "codex_app_server",
+        protocolVersion: 1, lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } },
+    } as Parameters<typeof buildNativeHarnessBackupManifestStreamed>[0]["execution"];
+    const manifest = await buildNativeHarnessBackupManifestStreamed({ backupRoot: root, execution, runnerInstanceId,
+      providerSessionIdentity: { providerSessionId: f.identity.providerSessionId }, sourceProviderLeaseId: providerLeaseId });
+    await writeFile(join(root, "manifest.json"), JSON.stringify(manifest), { mode: 0o600 });
+    const stamp = createNativeHarnessBackupStamp({ manifestPath: join(root, "manifest.json"), sessionScopeId: f.sessionScopeId,
+      authorizedProviderLeaseId: providerLeaseId, normalizedSessionId: f.identity.normalizedSessionId,
+      runnerInstanceId, completedAt: manifest.completedAt });
+    const [lease] = await f.db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueId,
+      heartbeatRunId: f.runId, providerLeaseId, status: "active" }).returning();
+    expect(await recordNativeHarnessBackupStampOnLeaseChain(f.db, { leaseId: lease.id, companyId: f.companyId,
+      providerLeaseId, runId: f.runId, stamp })).toBe(true);
+    const files = async (directory: string): Promise<string[]> => {
+      const names: string[] = [];
+      for (const entry of await readdir(directory, { withFileTypes: true })) {
+        if (entry.isDirectory()) names.push(...(await files(join(directory, entry.name))).map(name => `${entry.name}/${name}`));
+        else if (entry.isFile()) names.push(entry.name);
+      }
+      return names.sort();
+    };
+    const originalFiles = await files(root);
+    expect(originalFiles).toHaveLength(3);
+    const objects = new Map<string, Buffer>();
+    // Same HTTP S3 test double as the throttle rows below: the real S3 provider
+    // uploads/downloads bytes; only the remote object store is replaced.
+    const server = createServer((request, response) => {
+      const key = new URL(request.url!, "http://localhost").pathname, chunks: Buffer[] = [];
+      request.on("data", chunk => chunks.push(chunk));
+      request.on("end", () => {
+        if (request.method === "PUT") {
+          objects.set(key, Buffer.concat(chunks)); response.writeHead(200, { ETag: '"backup"' }).end();
+        } else if (request.method === "GET" || request.method === "HEAD") {
+          const body = objects.get(key);
+          if (!body) { response.writeHead(404).end(); return; }
+          response.writeHead(200, { "Content-Length": body.length, "Content-Type": "application/octet-stream" })
+            .end(request.method === "GET" ? body : undefined);
+        } else if (request.method === "DELETE") { objects.delete(key); response.writeHead(204).end(); }
+        else response.writeHead(500).end();
+      });
+    });
+    await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+    vi.stubEnv("AWS_ACCESS_KEY_ID", "fixture"); vi.stubEnv("AWS_SECRET_ACCESS_KEY", "fixture");
+    const storage = createStorageService(createS3StorageProvider({ bucket: "bucket", region: "us-east-1", forcePathStyle: true,
+      endpoint: `http://127.0.0.1:${(server.address() as AddressInfo).port}` }));
+    try {
+      await persistNativeHarnessBackup({ ...f, root, storage });
+      const [row] = await f.db.select().from(nativeHarnessBackups).where(and(eq(nativeHarnessBackups.scopeDigest, f.scopeDigest),
+        eq(nativeHarnessBackups.status, "current")));
+      const [stampedLease] = await f.db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+      const leaseStamp = readNativeHarnessBackupStamp(stampedLease.metadata?.nativeHarnessBackup, providerLeaseId);
+      expect(leaseStamp).not.toBeNull();
+      const objectKey = `/bucket/${row.reference.objectKey as string}`;
+      expect(objects.size).toBe(1); expect(objects.has(objectKey)).toBe(true);
+      // Remove every local source/cache so restore cannot take its manifest-only
+      // fast path: this open must download, authenticate, decrypt and extract .pchn.
+      await removeNativeHarnessBackup(home);
+      const backupRoot = join(home, "failover-backups"), restoredRoot = join(backupRoot, "current");
+      expect(await restoreDurableNativeHarnessBackup({ ...f, storage, backupRoot })).toBe(true);
+      const restoredFiles = await files(restoredRoot);
+      expect(restoredFiles).toHaveLength(originalFiles.length);
+      expect(restoredFiles).toEqual(originalFiles);
+      const manifestBytes = await readFile(join(restoredRoot, "manifest.json"));
+      const restoredManifest = JSON.parse(manifestBytes.toString("utf8")) as typeof manifest;
+      // Independently re-read every restored directory using the manifest's
+      // sorted path/type/mode/length/NUL + content hashing rule, not the producer.
+      for (const declared of restoredManifest.directories) {
+        const hash = createHash("sha256"); let bytes = 0;
+        const visit = async (directory: string, relative = ""): Promise<void> => {
+          const entries = (await readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+          if (!entries.length) hash.update(`directory:${relative}\0`);
+          for (const entry of entries) {
+            const path = join(directory, entry.name), name = relative ? `${relative}/${entry.name}` : entry.name;
+            const stats = await lstat(path);
+            if (entry.isDirectory()) { hash.update(`directory:${name}:${stats.mode & 0o777}\0`); await visit(path, name); }
+            else if (entry.isSymbolicLink()) hash.update(`symlink:${name}:${await readlink(path)}\0`);
+            else {
+              expect(entry.isFile()).toBe(true);
+              const contents = await readFile(path); bytes += contents.length;
+              hash.update(`file:${name}:${stats.mode & 0o777}:${contents.length}\0`); hash.update(contents);
+            }
+          }
+        };
+        await visit(join(restoredRoot, declared.name));
+        expect({ sha256: `sha256:${hash.digest("hex")}`, bytes }).toEqual({ sha256: declared.sha256, bytes: declared.bytes });
+      }
+      const recomputed = `sha256:${createHash("sha256").update(manifestBytes).digest("hex")}`;
+      expect(row.manifestSha256).toBe(recomputed);
+      expect(recomputed).toBe(leaseStamp!.manifestSha256);
+      console.info(`[native-backup-open] files=${restoredFiles.length} manifest_sha256=${recomputed} lease_manifest_sha256=${leaseStamp!.manifestSha256}`);
+      // A single changed stored byte must never open, even after a prior good
+      // restore. Delete that cache too so the corrupt object is actually read.
+      const corrupt = Buffer.from(objects.get(objectKey)!);
+      corrupt[Math.floor(corrupt.length / 2)]! ^= 1;
+      objects.set(objectKey, corrupt);
+      await removeNativeHarnessBackup(home);
+      await expect(restoreDurableNativeHarnessBackup({ ...f, storage, backupRoot })).rejects.toThrow("native_harness_storage_hash_mismatch");
+      await expect(readFile(join(restoredRoot, "manifest.json"))).rejects.toMatchObject({ code: "ENOENT" });
+      console.info("[native-backup-open] one-byte stored-object corruption rejected: native_harness_storage_hash_mismatch");
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
   // Staging: two OpenCode per-turn runs had an accepted result, but object
   // storage answered the backup upload with one 503 SlowDown ("Please reduce
   // your request rate."). The upload was a single stream PUT that nothing
