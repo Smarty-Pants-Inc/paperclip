@@ -130,6 +130,50 @@ it('S18 a hedge is NOT handed out while its extension confirmation is in flight'
  expect(confirmed.appliedAt).toBeLessThanOrEqual(a.settledAt);expect(confirmed.newDeadline).toBeGreaterThanOrEqual(a.settledAt+36000*1000-60000);
 });
 
+it('S18 confirmed extended hedge crash before handoff reconciles once after credentialed restart',async()=>{
+ const w=boat();const save=context.state.set;let crash:any,original:any;
+ // Crash after Boat's confirmed extension AND the durable winner reservation,
+ // before any handoff. The old worker is abandoned at this write boundary;
+ // restart() reloads the real plugin with the same durable state/provider.
+ context.state.set=async(scope:any,value:any)=>{
+  await save(scope,value);
+  if(scope.namespace==='boat-provision-hedges'&&value.winnerId==='bx_judge1'&&!value.handedOut){
+   crash={at:Date.now(),record:structuredClone(value)};
+   await new Promise<void>(()=>{});
+  }
+ };
+ void caught(plugin.definition.onEnvironmentAcquireLease(longRequest)).then(value=>original=value);
+ await vi.advanceTimersByTimeAsync(116000);context.state.set=save;
+ expect(crash?.record.winnerId).toBe('bx_judge1');expect(crash.record.handedOut).not.toBe(true);expect(original).toBeUndefined();
+ const extension=w.requests.find(r=>r.method==='PATCH'&&r.path.endsWith('/bx_judge1')&&r.body.ttlSeconds===36000);
+ expect(extension.status).toBe(200);expect(extension.appliedAt).toBeLessThanOrEqual(crash.at);
+ expect(extension.newDeadline).toBeGreaterThanOrEqual(crash.at+36000*1000-60000);
+ receipt('S18-confirmed-crash-before-restart',w,{crash,extension});
+ await restart();
+ let a:any;const resumed=caught(plugin.definition.onEnvironmentAcquireLease({...longRequest})).then(value=>a=value);
+ for(let waited=0;a===undefined&&waited<170000;waited+=1000)await vi.advanceTimersByTimeAsync(1000);
+ await resumed;
+ const chat=new Set<string>();if(a.lease)chat.add(a.lease.providerLeaseId);
+ const matching=()=>[...w.boxes].filter(([,b])=>b.labels.owner==='paperclip:judgeco'&&b.labels.environment==='judgeenv'&&b.labels.run==='judgerun'&&b.labels['paperclip-acquire']==='judgeop');
+ const liveIds=()=>matching().filter(([id])=>w.live(id)).map(([id])=>id);
+ receipt('S18-confirmed-crash-reconciled',w,{crash,a,chat:[...chat],liveIds:liveIds()});
+ expect(liveIds()).toEqual(['bx_judge1']);expect(chat.size).toBeLessThanOrEqual(1);
+ expect(a.error).toBeUndefined();expect(a.lease.providerLeaseId).toBe('bx_judge1');
+ // The primary has exactly one disposition: never handed, one terminal stop.
+ expect(chat.has('bx_judge0')).toBe(false);expect(w.live('bx_judge0')).toBe(false);
+ expect(w.stops().filter(r=>r.path==='/sandboxes/bx_judge0/stop')).toHaveLength(1);
+ expect(w.stops().filter(r=>r.path==='/sandboxes/bx_judge1/stop')).toEqual([]);
+ const settled=structuredClone(w.requests);await restart();
+ const b:any=await advance(plugin.definition.onEnvironmentAcquireLease({...longRequest}),1000);
+ if(b.lease)chat.add(b.lease.providerLeaseId);
+ receipt('S18-confirmed-crash-replayed',w,{crash,a,b,chat:[...chat],liveIds:liveIds()});
+ expect(b.error).toBeUndefined();expect(b.lease).toEqual(a.lease);expect(chat.size).toBe(1);expect(liveIds()).toEqual(['bx_judge1']);
+ expect(matching()).toHaveLength(2);
+ expect(w.requests.filter(r=>r.method==='POST'&&r.path==='/sandboxes')).toHaveLength(2);
+ // A second restart must not reconcile the winner or stop the primary twice.
+ expect(w.requests.filter(r=>r.method==='PATCH'||r.path.endsWith('/stop'))).toEqual(settled.filter(r=>r.method==='PATCH'||r.path.endsWith('/stop')));
+});
+
 // Additional never-OK rows do not replace or weaken the original J9 trigger.
 it('S17 legacy loser TTL receipt cannot be handed out after replacement',async()=>{
  const w=boat({stopsRefused:true});void caught(plugin.definition.onEnvironmentAcquireLease(p));await vi.advanceTimersByTimeAsync(76000);
