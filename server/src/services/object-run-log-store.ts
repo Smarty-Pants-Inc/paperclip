@@ -97,9 +97,9 @@ export interface ObjectRunLogSpillRecord {
   sourceCursor?: number;
   cause?: ReturnType<typeof finalizationError>;
 }
-async function readSpillIndex(indexPath: string) {
+async function readSpillIndex(indexPath: string, missingIsEmpty = true) {
   const index = await fs.readFile(indexPath, "utf8").catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return "";
+    if (missingIsEmpty && error.code === "ENOENT") return "";
     throw error;
   });
   const records = index.split("\n").filter(Boolean).map(line => JSON.parse(line) as ObjectRunLogSpillRecord);
@@ -108,6 +108,56 @@ async function readSpillIndex(indexPath: string) {
   return { records, spilled, recovered, open: spilled.filter(entry => !recovered.has(entry.spillStart)) };
 }
 const SPILL_INDEX_SUFFIX = ".index.ndjson";
+// Measured on this repo's installed node_modules: 141,583 entries / 431 ms.
+// Seven times that tree fits; exceeding the budget keeps the candidate visibly.
+const SPILL_CUSTODY_WALK_MAX_ENTRIES = 1_000_000;
+let spillCustodyWalkBoundHits = 0;
+
+/**
+ * Destructive cleanup's content guard. Roots/configuration can drift after a
+ * writer spills: search the WHOLE candidate, at any depth, pruning no names.
+ * spillPaths fixes only <company>/<agent>/<run>.index.ndjson below a root, not
+ * where that root lives. Use the writer's reader, not another index dialect.
+ * Symlink targets are not walked: rename/rm removes links, never their targets.
+ * With no matching index this does only directory reads, not file-content IO.
+ */
+export async function candidateHoldsUnrecoveredRunLogSpill(candidatePath: string): Promise<boolean> {
+  const pending = [candidatePath];
+  let visitedEntries = 0;
+  try {
+    while (pending.length) {
+      const directory = pending.pop()!;
+      let entries;
+      try {
+        entries = await fs.opendir(directory);
+      } catch (error) {
+        // An already-absent candidate has nothing to lose. All other inspection
+        // failures (including disappearing children) refuse destructive work.
+        if (directory === candidatePath && (error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+      for await (const entry of entries) {
+        if (++visitedEntries > SPILL_CUSTODY_WALK_MAX_ENTRIES) {
+          logger.warn({ candidatePath, visitedEntries, maxEntries: SPILL_CUSTODY_WALK_MAX_ENTRIES,
+            walkBoundHits: ++spillCustodyWalkBoundHits }, "kept: walk bound hit");
+          return true;
+        }
+        const entryPath = path.join(directory, entry.name);
+        if (entry.name.endsWith(SPILL_INDEX_SUFFIX)) {
+          // A discovered but now missing/unreadable/torn index fails closed.
+          if ((await readSpillIndex(entryPath, false)).open.length) return true;
+        }
+        if (entry.isDirectory()) pending.push(entryPath);
+      }
+    }
+    return false;
+  } catch (error) {
+    logger.warn({ candidatePath, visitedEntries, error: finalizationError(error) },
+      "kept: run-log spill content could not be read");
+    return true;
+  }
+}
+
 /** Every run (`<company>/<agent>/<run>`) whose spill holds bytes no flush has stored yet. */
 export async function listUnrecoveredObjectRunLogSpills(spillDir?: string) {
   const root = resolveObjectRunLogSpillDir(spillDir), found: string[] = [];
