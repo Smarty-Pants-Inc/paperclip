@@ -105,7 +105,8 @@ const CARRIED_CLIENT_STATUSES = new Set([408, 409, 425, 429, 499]);
  * - key_reused: Boat's 409 idempotency_key_reused. Spent like a refusal and
  *   reported as its own named error; the next retry mints a fresh key.
  * Typed idempotency codes are authoritative; then any carried evidence on the
- * chain wins over a refusal. Message text is never parsed.
+ * chain wins over a refusal, and a closed transient errno is read before the
+ * status, so a 4xx with ETIMEDOUT is carried. Message text is never parsed.
  */
 export function readCreationRetryOutcome(error: unknown): "carried" | "refused" | "box_stopped" | "key_reused" {
   const idempotency = creationIdempotencyCode(error);
@@ -116,6 +117,10 @@ export function readCreationRetryOutcome(error: unknown): "carried" | "refused" 
   for (let cause = error, depth = 0; cause && depth < 5; cause = own(cause, "cause"), depth++) {
     if (cause instanceof JsonRpcCallError && cause.code === PLUGIN_RPC_ERROR_CODES.TIMEOUT) return "carried";
     if (readEnvironmentAcquisitionDiagnostic(cause)) return "carried";
+    // A closed transient errno (ETIMEDOUT, ECONNRESET, ...) is checked BEFORE
+    // the status: a timeout-shaped 4xx (e.g. 422 + ETIMEDOUT) may have made the box.
+    const errno = readEnvironmentAcquireErrorDiagnostic(cause)?.errorCode ?? own(cause, "code");
+    if (typeof errno === "string" && TRANSIENT_ERROR_CODES.has(errno)) return "carried";
     const status = readEnvironmentAcquireErrorDiagnostic(cause)?.httpStatus
       ?? [own(cause, "status"), own(cause, "statusCode")].find(value => Number.isInteger(value));
     if (typeof status !== "number") continue;
