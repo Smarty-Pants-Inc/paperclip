@@ -6158,6 +6158,38 @@ valid live path. A stale agent handback to a human cannot cancel the run and orp
 a queued response. This does not make an old resolved card a review path for a
 later run, or prevent an explicit board reassignment.
 
+### Deferred task-completion reports
+
+A handed-off task finishing while its source chat is replying records a durable
+completion delivery. Its deferred wake can contain completion delivery IDs without
+comment IDs or an execution-wait receipt. Ownership-registry settlement uses the
+**same wired stale-lock sweep and locked release drain** as normal heartbeat
+recovery, rather than a separate recovery service missing the release callback.
+Thus a native busy-finalization return cannot lose its completion handoff when
+settlement clears the terminal owner's lock. The drain waits for live issue runs,
+committed native finalization, cleanup ownership, and any successor already
+admitted. A persisted result awaiting finalization/reconciliation cannot release
+its queue early, even between finalizer leases: its issue-lock handoff is retained
+until coordinator commit. Historical completion receipts whose locks an older
+server already cleared are reconstructed by the existing deferred-receipt worker,
+which invokes that same locked release drain. No separate promoter or direct
+worker enqueue is introduced.
+
+The release drain checks staleness before promotion. A post-boot report superseded
+by newer answered person input becomes one bounded, task-naming "Finished earlier"
+system note, not a late agent turn. A report requested before this server process's
+reported start time is historical news and takes that same note-only path even
+without newer input. Delivery-status and wake-status compare-and-set writes make
+that note idempotent. Retiring a head makes younger pending reports due immediately
+so a blocked report does not retain an unrelated retry lease.
+
+Other pre-boot wakes cannot start a turn without still-owed person input. When no
+independent durable owner of a system obligation has been established, the drain
+**preserves** that receipt rather than cancelling restore, automation, monitor, or
+agent-authored work. It can still consider owed person input behind the preserved
+receipt. This is a no-run hold, not evidence that the underlying obligation has
+completed or that saved workspace/session bytes can be discarded.
+
 ### Persistent sandbox cleanup
 
 A lost bridge cannot indefinitely prevent Daytona termination. Ordinary lease release
