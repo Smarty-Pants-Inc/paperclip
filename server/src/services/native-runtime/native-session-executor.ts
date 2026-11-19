@@ -1657,6 +1657,7 @@ const DEFERRED_PREPARATION_CONTROLLER_STEPS = new Set([
   "warm_task_describe", "portable_source", "warm_task_resume", "warm_owner_detach", "warm_checkpoint_recovery",
   "failed_attachment_read", "warm_owner_wait", "warm_backup_verify", "warm_terminal_log", "warm_runner_probe",
   "warm_recovery_inspect", "runner_identity_write", "controller_identity", "controller_process",
+  "github_access", "github_activate",
 ]);
 
 /** Persist controller waits in the same run trace as provider-pack admission.
@@ -1668,7 +1669,9 @@ function createNativeControllerTiming(runId: string, currentTrace: () => NativeR
     measureNativeControllerStep(phase, async () => {
       const trace = currentTrace();
       if (trace && DEFERRED_PREPARATION_CONTROLLER_STEPS.has(phase)) {
-        const scope = trace.start(`native.controller.${phase}`, { parentName: "task.prepare" });
+        const scope = trace.start(`native.controller.${phase}`, {
+          parentName: phase === "github_access" || phase === "github_activate" ? "task.provider_session" : "task.prepare",
+        });
         let outcome: "ok" | "failed" = "failed";
         try { const value = await trace.run(scope, () => time(phase, work)); outcome = "ok"; return value; }
         finally { await trace.end(scope, { outcome, deferRunLog: true }); }
@@ -13383,10 +13386,11 @@ async function executePaperclipNativeSessionAttempt(
           cwd: input.execution.workspace.cwd!,
           env: resolveNativeProviderEnvironment(input.execution.provider, input.runnerEnvironment),
           resolveCredentials: (binding) => resolveGitHubOperationCredentials(input.db, binding),
+          trace: controllerTrace,
           onLog: input.onLog,
         }));
         executionContext?.assertOpen();
-        releaseGitHubRun = await timeController("github_activate", () => githubAccess!.activate(input.execution.binding));
+        releaseGitHubRun = await timeController("github_activate", () => githubAccess!.activate(input.execution.binding, controllerTrace));
         input = { ...input, runnerEnvironment: { ...input.runnerEnvironment, ...githubAccess.env } };
       }
       return input.runnerEnvironment;

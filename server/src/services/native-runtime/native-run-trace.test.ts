@@ -71,6 +71,22 @@ function createRecordingTraceContext(): {
 }
 
 describe("native runner performance trace", () => {
+  it("keeps GitHub preparation kinds closed in run-log rows and OTel attributes", async () => {
+    const events: AdapterRuntimeEvent[] = [];
+    const recording = createRecordingTraceContext();
+    const trace = createNativeRunTrace({ runId: "github-kind-privacy", traceContext: recording.traceContext,
+      onEvent: async event => { events.push(event); } });
+    for (const kind of ["quarantine_list", "secret-token/private/path", "provider-supplied-text"]) {
+      await trace.record({ name: "native.controller.github_activate.probe", startedAtMs: Date.now(), endedAtMs: Date.now(),
+        attributes: { kind, path: "/private", token: "secret" } });
+    }
+    await trace.finish("ok");
+    const rows = events.filter(event => event.payload?.span === "native.controller.github_activate.probe");
+    expect(rows.map(event => event.payload?.kind)).toEqual(["quarantine_list", undefined, undefined]);
+    expect(recording.spans.filter(span => span.name === "native.controller.github_activate.probe")
+      .map(span => span.attributes["paperclip.native.span.kind"])).toEqual(["quarantine_list", undefined, undefined]);
+    expect(JSON.stringify(events)).not.toMatch(/secret-token|private|provider-supplied-text/);
+  });
   it("persists Pi RPC spans and retained transport attach for the current run without OTLP", async () => {
     const events = new Map<string, AdapterRuntimeEvent[]>();
     const traces = ["old-run", "warm-run"].map(runId => createNativeRunTrace({ runId,

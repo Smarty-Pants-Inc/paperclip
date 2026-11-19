@@ -10,6 +10,21 @@ import {
 } from "@paperclipai/adapter-utils/execution-target";
 import { githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
 
+import type { NativeRunTrace } from "./native-run-trace.js";
+import { createNativeControllerStepTiming } from "./native-controller-step-timing.js";
+
+function preparationSpans(trace: NativeRunTrace | undefined, phase: "github_access" | "github_activate") {
+  const timing = trace ? createNativeControllerStepTiming(trace) : undefined;
+  const startedAtMs = Date.now();
+  return {
+    span: timing?.observe,
+    finish: () => {
+      timing?.flush(phase, startedAtMs, Date.now());
+      timing?.finish();
+    },
+  };
+}
+
 type Binding = { companyId: string; agentId: string; issueId: string; runId: string };
 type LauncherInput = Parameters<typeof prepareGitHubOperationLaunchers>[0];
 export type NativeGitHubAccess = Awaited<ReturnType<typeof createNativeGitHubAccess>>;
@@ -25,7 +40,10 @@ export async function createNativeGitHubAccess(input: {
   env: NodeJS.ProcessEnv;
   resolveCredentials: (binding: Binding) => Promise<unknown>;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  trace?: NativeRunTrace;
 }, startBridge = startAdapterExecutionTargetPaperclipBridge) {
+  const preparation = preparationSpans(input.trace, "github_access");
+  const preparationSpan = preparation.span;
   const duplexRequested = adapterExecutionTargetEnablesSandboxDuplexBridge(input.target);
   const token = randomBytes(32).toString("hex");
   const location = { runId: `native-session-${randomUUID()}`, target: input.target };
@@ -129,6 +147,7 @@ export async function createNativeGitHubAccess(input: {
           hostApiUrl: url,
           enableSandboxDuplexBridge: duplexRequested,
           startPaused: true,
+          preparationSpan,
           getRunGeneration: () => activeGeneration ?? undefined,
           duplexObservabilityRecorder: adapterExecutionTargetDuplexObservabilityRecorder(input.target),
           onLog: input.onLog,
@@ -150,7 +169,7 @@ export async function createNativeGitHubAccess(input: {
     // not escape after launcher staging failed.
     const [preparedBridge, preparedLaunchers] = await Promise.allSettled([
       prepareBridge(),
-      prepareGitHubOperationLaunchers({ ...location, cwd: input.cwd,
+      prepareGitHubOperationLaunchers({ ...location, cwd: input.cwd, preparationSpan,
         env: typeof input.env.PATH === "string" ? { PATH: input.env.PATH } : {},
       }),
     ]);
@@ -168,14 +187,17 @@ export async function createNativeGitHubAccess(input: {
       env,
       get ready() { return ready && !stopped && bridge?.readRunDisposition?.().failed !== true; },
       duplexRequested,
-      async activate(binding: Binding) {
+      async activate(binding: Binding, trace?: NativeRunTrace) {
         if (stopped || active) throw new Error("GitHub session is closed or busy");
         if (binding.companyId !== input.scope.companyId || binding.agentId !== input.scope.agentId ||
             binding.issueId !== input.scope.issueId) throw new Error("GitHub session scope mismatch");
         // Quarantine requests left by the previous run and resume polling before
         // publishing this run's authority. The broker stays inactive throughout.
         const generation = randomUUID();
-        await bridge?.resume?.(generation);
+        // A retained bridge must use THIS run's trace, never its creation trace.
+        const activation = preparationSpans(trace, "github_activate");
+        try { await bridge?.resume?.(generation, activation.span); }
+        finally { activation.finish(); }
         const owner = { ...binding };
         active = owner;
         activeGeneration = generation;
@@ -192,5 +214,5 @@ export async function createNativeGitHubAccess(input: {
   } catch (error) {
     await stop().catch(() => undefined);
     throw error;
-  }
+  } finally { preparation.finish(); }
 }

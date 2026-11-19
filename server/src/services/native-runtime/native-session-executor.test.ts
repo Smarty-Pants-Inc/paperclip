@@ -21355,6 +21355,46 @@ describe("runnerd provider runtime wiring", () => {
     }
   });
 
+  it.each(["github_access", "github_activate"] as const)("does not await a held %s parent row before GitHub backend admission", async phase => {
+    let unblock!: () => void;
+    const blocked = new Promise<void>(resolve => { unblock = resolve; });
+    let sinkEntered = false;
+    let backendReached = false;
+    const deactivate = vi.fn();
+    const activate = vi.fn(() => deactivate);
+    const stop = vi.fn(async () => undefined);
+    const issueService = vi.spyOn(issueServiceModule, "issueService").mockReturnValue({
+      update: vi.fn(async () => ({ status: "blocked", statusVersion: 1 })),
+    } as unknown as ReturnType<typeof issueServiceModule.issueService>);
+    githubAccess.create.mockImplementationOnce(async () => ({ env: {}, ready: true, duplexRequested: false, activate, stop }));
+    state.createAssignedMcpTools.mockImplementationOnce(async () => ({ definitions: () => [], has: () => false, execute: vi.fn() }));
+    state.createBackend.mockImplementationOnce(() => { backendReached = true; throw new Error("backend-boundary"); });
+    const running = executePaperclipNativeSession({
+      db: leaseDb(execution), execution, runnerInstanceId: "runner-held-github-diagnostics", useRunnerd: true, managedGitHub: true,
+      onEvent: async event => {
+        if (event.payload?.span === `native.controller.${phase}`) { sinkEntered = true; await blocked; }
+      },
+      runnerExecutionTarget: {
+        kind: "remote", transport: "sandbox", providerKey: "daytona", leaseId: "held-github-diagnostics",
+        remoteCwd: "/home/daytona/paperclip-workspace", runner: { execute: vi.fn() },
+      } as never,
+    }).then(value => ({ value }), error => ({ error }));
+    try {
+      await vi.waitFor(() => expect(backendReached).toBe(true), { timeout: 1500 });
+      expect(sinkEntered).toBe(true);
+      const creation = githubAccess.create.mock.calls.at(-1)![0];
+      expect(creation.trace).toEqual(expect.objectContaining({ start: expect.any(Function) }));
+      expect(activate).toHaveBeenCalledWith(execution.binding, creation.trace);
+    } finally {
+      unblock();
+      await running;
+      issueService.mockRestore();
+    }
+    expect(await running).toMatchObject({ error: { message: "backend-boundary" } });
+    expect(deactivate).toHaveBeenCalledOnce();
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
   it.each((["codex", "opencode", "pi_rpc"] as const).flatMap(provider =>
     (["github", "assigned"] as const).map(failure => ({ provider, failure })),
   ))("cleans run-owned access after overlapping $provider executor failure: $failure", async ({ provider, failure }) => {
@@ -21417,7 +21457,7 @@ describe("runnerd provider runtime wiring", () => {
       expect(state.execute).not.toHaveBeenCalled();
       expect(state.createBackend).not.toHaveBeenCalled();
       if (failure === "assigned") {
-        expect(activate).toHaveBeenCalledWith(current.binding);
+        expect(activate).toHaveBeenCalledWith(current.binding, expect.objectContaining({ start: expect.any(Function) }));
         expect(controllerEvents.some(event => event.eventType === "run.performance.span"
           && event.payload?.span === "native.controller.github_activate")).toBe(true);
         expect(deactivate).toHaveBeenCalledOnce();

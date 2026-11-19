@@ -7,6 +7,40 @@ import { measureRunnerOperation } from "./runner-operation-timing.js";
 afterEach(() => vi.restoreAllMocks());
 
 describe("controller warm-start wait attribution", () => {
+  it("partitions GitHub calls without merging distinct same-kind or zero-duration waits", async () => {
+    let now = 100;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const events: AdapterRuntimeEvent[] = [];
+    const trace = createNativeRunTrace({ runId: "github-observations", onEvent: async event => { events.push(event); } });
+    const preparation = trace.start("native.controller.github_access");
+    const timing = createNativeControllerStepTiming(trace);
+    const launcher = timing.observe("launcher_staging");
+    now = 110;
+    const queue = timing.observe("queue_setup");
+    now = 120;
+    queue("ok");
+    now = 130;
+    launcher("ok");
+    timing.flush("github_access", 100, 130);
+    timing.finish();
+    await trace.end(preparation, { deferRunLog: true });
+    const activationScope = trace.start("native.controller.github_activate");
+    const activation = createNativeControllerStepTiming(trace);
+    const zero = activation.observe("stale_entry_settle");
+    zero("failed");
+    const next = activation.observe("stale_entry_settle");
+    now = 140;
+    next("ok");
+    activation.flush("github_activate", 130, 140);
+    activation.finish();
+    await trace.end(activationScope, { deferRunLog: true });
+    await trace.finish("ok");
+    const rows = events.filter(event => event.eventType === "run.performance.span").map(event => event.payload!);
+    expect(rows.filter(row => row.parentSpan === "native.controller.github_access").map(row => [row.kind, row.durationMs]))
+      .toEqual([["launcher_staging", 10], ["queue_setup", 10], ["launcher_staging", 10]]);
+    expect(rows.filter(row => row.parentSpan === "native.controller.github_activate").map(row => [row.kind, row.durationMs, row.outcome]))
+      .toEqual([["stale_entry_settle", 10, "ok"], ["stale_entry_settle", 0, "failed"]]);
+  });
   it("partitions nested waits across warm resume and submitted-to-started without double counting", async () => {
     let now = 100;
     vi.spyOn(Date, "now").mockImplementation(() => now);

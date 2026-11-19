@@ -1,5 +1,6 @@
 import { buildRemotePidLockAcquireScript, buildRemotePidLockCleanupScript } from "./remote-pid-lock.js";
 import { syncRemoteTextFile, syncRemoteTextFiles, type RemoteTextFileSyncInput, type RemoteTextFileBatchInput } from "./remote-text-file-sync.js";
+import { measureBridgePreparation, type BridgePreparationSpan } from "./bridge-preparation-timing.js";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { promises as fs } from "node:fs";
 import http2 from "node:http2";
@@ -323,7 +324,7 @@ export interface SandboxCallbackBridgeQueueClient {
 
 export interface SandboxCallbackBridgeWorkerHandle {
   pause(): Promise<void>;
-  resume(generation?: string): Promise<void>;
+  resume(generation?: string, preparationSpan?: BridgePreparationSpan): Promise<void>;
   stop(options?: { drainTimeoutMs?: number }): Promise<void>;
 }
 
@@ -899,6 +900,7 @@ async function writeBridgeResponse(
 export async function startSandboxCallbackBridgeWorker(input: {
   client: SandboxCallbackBridgeQueueClient;
   queueDir: string;
+  preparationSpan?: BridgePreparationSpan;
   pollIntervalMs?: number | null;
   /** Idle-listing backoff cap for clients without list-wait support or all-guarded listings; defaults to pollIntervalMs. */
   idleBackoffMaxMs?: number | null;
@@ -978,18 +980,23 @@ export async function startSandboxCallbackBridgeWorker(input: {
     directories.logsDir,
   ];
   if (input.startPaused && input.client.writeTextFiles) {
-    await input.client.writeTextFiles([{ remotePath: runStatePath, body: "paused" }], queueDirectories);
+    await measureBridgePreparation(input.preparationSpan, "queue_setup", () =>
+      input.client.writeTextFiles!([{ remotePath: runStatePath, body: "paused" }], queueDirectories));
   } else {
     if (input.client.makeDirs) {
-      await input.client.makeDirs(queueDirectories);
+      await measureBridgePreparation(input.preparationSpan, "queue_setup", () => input.client.makeDirs!(queueDirectories));
     } else {
-      for (const directory of queueDirectories) await input.client.makeDir(directory);
+      for (const directory of queueDirectories) {
+        await measureBridgePreparation(input.preparationSpan, "queue_setup", () => input.client.makeDir(directory));
+      }
     }
-    if (input.startPaused) await input.client.writeTextFile(runStatePath, "paused");
+    if (input.startPaused) await measureBridgePreparation(input.preparationSpan, "queue_setup", () => input.client.writeTextFile(runStatePath, "paused"));
   }
   let runStateManaged = Boolean(input.startPaused);
   let runStateWriteFailureLogged = false;
-  const writeRunStateBestEffort = async (write: () => Promise<void>): Promise<void> => {
+  const writeRunStateBestEffort = async (write: () => Promise<void>, preparationSpan?: BridgePreparationSpan): Promise<void> => {
+    const end = preparationSpan?.("generation_markers");
+    let outcome: "ok" | "failed" = "failed";
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
@@ -998,6 +1005,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
           timer = setTimeout(() => reject(new Error("run-state write timed out")), 5_000);
         }),
       ]);
+      outcome = "ok";
     } catch (error) {
       if (!runStateWriteFailureLogged) {
         runStateWriteFailureLogged = true;
@@ -1005,6 +1013,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       }
     } finally {
       if (timer) clearTimeout(timer);
+      end?.(outcome);
     }
   };
   let stopping = false;
@@ -1444,7 +1453,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
   // wins over the drain 503, exactly like the earlier stop behavior.
   const failPendingRequests = async (
     message: string,
-    options: { abandonInFlight?: boolean } = {},
+    options: { abandonInFlight?: boolean; preparationSpan?: BridgePreparationSpan } = {},
   ) => {
     if (options.abandonInFlight) {
       // Abort every in-flight handler first, then arm its 504 backstop. The loop
@@ -1468,11 +1477,11 @@ export async function startSandboxCallbackBridgeWorker(input: {
     // channel is unresponsive, a client call hangs with no reject. The timeout
     // keeps this recovery path fail-fast, so it never re-hangs on the same dead
     // channel that triggered the recovery.
-    const fileNames = await withTimeout(
+    const fileNames = await measureBridgePreparation(options.preparationSpan, "quarantine_list", () => withTimeout(
       input.client.listJsonFiles(directories.requestsDir),
       iterationTimeoutMs,
       "Sandbox callback bridge list pending requests",
-    ).catch(() => [] as string[]);
+    )).catch(() => [] as string[]);
     for (const fileName of fileNames) {
       const guard = inFlightRequestGuards.get(fileName);
       if (guard && guard.claim === "handler" && (options.abandonInFlight || guard.controller.signal.aborted)) {
@@ -1495,77 +1504,81 @@ export async function startSandboxCallbackBridgeWorker(input: {
         // mutation. A retry after the 503 then applies the mutation once.
         guard.claim = "abandon";
       }
-      const requestPath = path.posix.join(directories.requestsDir, fileName);
-      const responsePath = path.posix.join(directories.responsesDir, fileName);
-      const requestId = fileName.replace(/\.json$/i, "") || randomUUID();
-      let responseId = requestId;
+      const endSettle = options.preparationSpan?.("stale_entry_settle");
+      let settleOutcome: "ok" | "failed" = "failed";
       try {
-        const raw = await withTimeout(
-          input.client.readTextFile(requestPath),
-          iterationTimeoutMs,
-          `Sandbox callback bridge read pending request ${requestId}`,
-        );
-        const parsed = JSON.parse(raw) as Partial<SandboxCallbackBridgeRequest>;
-        if (typeof parsed.id === "string" && parsed.id.length > 0) {
-          responseId = parsed.id;
-        }
-      } catch (error) {
-        // The read or the parse failed, most likely on the same dead channel that
-        // triggered this recovery. Keep the request file, so a later recovery pass
-        // can still read it and deliver a terminal 503. A remove here drops the
-        // request and strands the caller until its own deadline.
-        console.warn(
-          `[paperclip] sandbox callback bridge could not read pending request ${requestId}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-        continue;
-      }
-      // Write the 503 first, then remove the request file only after the write
-      // lands. Retry a transient failure, bounded by the per-iteration timeout,
-      // exactly like the finalize and 504 backstop writes. When every attempt
-      // fails, keep the request file. A later recovery pass, or the caller retry,
-      // then still finds the queued request and delivers a terminal 503, instead
-      // of a silent drop that strands the caller until its own deadline. The
-      // request is unclaimed or abandoned, so its host mutation never ran; a later
-      // 503 stays exactly-once.
-      let wrote503 = false;
-      let lastWriteError = "Sandbox callback bridge could not write the recovery 503.";
-      for (let attempt = 1; attempt <= MAX_BACKSTOP_WRITE_ATTEMPTS; attempt += 1) {
+        const requestPath = path.posix.join(directories.requestsDir, fileName);
+        const responsePath = path.posix.join(directories.responsesDir, fileName);
+        const requestId = fileName.replace(/\.json$/i, "") || randomUUID();
+        let responseId = requestId;
         try {
-          await withTimeout(
-            writeBridgeResponse(input.client, requestPath, responsePath, {
-              id: responseId,
-              status: 503,
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ error: message }),
-              completedAt: new Date().toISOString(),
-            }, {
-              requireRequestPath: false,
-            }),
+          const raw = await withTimeout(
+            input.client.readTextFile(requestPath),
             iterationTimeoutMs,
-            `Sandbox callback bridge write 503 for ${requestId}`,
+            `Sandbox callback bridge read pending request ${requestId}`,
           );
-          wrote503 = true;
-          break;
+          const parsed = JSON.parse(raw) as Partial<SandboxCallbackBridgeRequest>;
+          if (typeof parsed.id === "string" && parsed.id.length > 0) {
+            responseId = parsed.id;
+          }
         } catch (error) {
-          lastWriteError = error instanceof Error ? error.message : String(error);
+          // The read or the parse failed, most likely on the same dead channel that
+          // triggered this recovery. Keep the request file, so a later recovery pass
+          // can still read it and deliver a terminal 503. A remove here drops the
+          // request and strands the caller until its own deadline.
           console.warn(
-            `[paperclip] sandbox callback bridge failed to write recovery 503 for ${requestId} (attempt ${attempt}/${MAX_BACKSTOP_WRITE_ATTEMPTS}): ${lastWriteError}`,
+            `[paperclip] sandbox callback bridge could not read pending request ${requestId}: ${error instanceof Error ? error.message : String(error)}`,
           );
-          if (attempt < MAX_BACKSTOP_WRITE_ATTEMPTS) {
-            await new Promise((resolve) => setTimeout(resolve, BACKSTOP_WRITE_RETRY_MS));
+          continue;
+        }
+        // Write the 503 first, then remove the request file only after the write
+        // lands. Retry a transient failure, bounded by the per-iteration timeout,
+        // exactly like the finalize and 504 backstop writes. When every attempt
+        // fails, keep the request file. A later recovery pass, or the caller retry,
+        // then still finds the queued request and delivers a terminal 503, instead
+        // of a silent drop that strands the caller until its own deadline. The
+        // request is unclaimed or abandoned, so its host mutation never ran; a later
+        // 503 stays exactly-once.
+        let wrote503 = false;
+        let lastWriteError = "Sandbox callback bridge could not write the recovery 503.";
+        for (let attempt = 1; attempt <= MAX_BACKSTOP_WRITE_ATTEMPTS; attempt += 1) {
+          try {
+            await withTimeout(
+              writeBridgeResponse(input.client, requestPath, responsePath, {
+                id: responseId,
+                status: 503,
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ error: message }),
+                completedAt: new Date().toISOString(),
+              }, {
+                requireRequestPath: false,
+              }),
+              iterationTimeoutMs,
+              `Sandbox callback bridge write 503 for ${requestId}`,
+            );
+            wrote503 = true;
+            break;
+          } catch (error) {
+            lastWriteError = error instanceof Error ? error.message : String(error);
+            console.warn(
+              `[paperclip] sandbox callback bridge failed to write recovery 503 for ${requestId} (attempt ${attempt}/${MAX_BACKSTOP_WRITE_ATTEMPTS}): ${lastWriteError}`,
+            );
+            if (attempt < MAX_BACKSTOP_WRITE_ATTEMPTS) {
+              await new Promise((resolve) => setTimeout(resolve, BACKSTOP_WRITE_RETRY_MS));
+            }
           }
         }
-      }
-      if (wrote503) {
-        // The 503 landed. Remove the request file, so the poll loop does not
-        // re-process it.
-        await input.client.remove(requestPath).catch(() => undefined);
-      } else {
-        // Every 503 write failed. Keep the request file for a later recovery pass.
-        console.warn(
-          `[paperclip] sandbox callback bridge kept queued request ${requestId} after every recovery 503 write failed: ${lastWriteError}`,
-        );
-      }
+        if (wrote503) {
+          // The 503 landed. Remove the request file, so the poll loop does not
+          // re-process it.
+          await input.client.remove(requestPath).then(() => { settleOutcome = "ok"; }, () => undefined);
+        } else {
+          // Every 503 write failed. Keep the request file for a later recovery pass.
+          console.warn(
+            `[paperclip] sandbox callback bridge kept queued request ${requestId} after every recovery 503 write failed: ${lastWriteError}`,
+          );
+        }
+      } finally { endSettle?.(settleOutcome); }
     }
   };
 
@@ -1837,18 +1850,18 @@ export async function startSandboxCallbackBridgeWorker(input: {
         });
       }
     },
-    resume: async (generation?: string) => {
+    resume: async (generation?: string, preparationSpan?: BridgePreparationSpan) => {
       if (stopping || !paused) return;
-      await failPendingRequests("Bridge request belongs to a detached run.", { abandonInFlight: true });
+      await failPendingRequests("Bridge request belongs to a detached run.", { abandonInFlight: true, preparationSpan });
       const state = generation ? `attached:${generation}` : "attached";
       if (input.client.writeTextFiles) {
         await writeRunStateBestEffort(() => input.client.writeTextFiles!([
           { remotePath: everAttachedPath, body: "attached" },
           { remotePath: runStatePath, body: state },
-        ]));
+        ]), preparationSpan);
       } else {
-        await writeRunStateBestEffort(() => input.client.writeTextFile(everAttachedPath, "attached"));
-        await writeRunStateBestEffort(() => input.client.writeTextFile(runStatePath, state));
+        await writeRunStateBestEffort(() => input.client.writeTextFile(everAttachedPath, "attached"), preparationSpan);
+        await writeRunStateBestEffort(() => input.client.writeTextFile(runStatePath, state), preparationSpan);
       }
       idlePollIntervalMs = pollIntervalMs;
       resetIdleOnNextEmpty = true;
@@ -1857,7 +1870,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       resumePolling?.();
       resumePolling = null;
       pausedPromise = null;
-      await pollStarted;
+      await measureBridgePreparation(preparationSpan, "poll_start_wait", () => pollStarted);
     },
     stop: async (options = {}) => {
       stopping = true;
@@ -1899,12 +1912,13 @@ export async function syncSandboxCallbackBridgeEntrypoint(input: {
   remoteCwd: string;
   assetRemoteDir: string;
   bridgeAsset: SandboxCallbackBridgeAsset;
+  preparationSpan?: BridgePreparationSpan;
   timeoutMs?: number | null;
   shellCommand?: "bash" | "sh" | null;
 }): Promise<{ remoteEntrypoint: string; sha256: string; uploaded: boolean }> {
   const remoteEntrypoint = path.posix.join(input.assetRemoteDir, SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT);
   const entrypointSource = await fs.readFile(input.bridgeAsset.entrypoint, "utf8");
-  const { uploaded, sha256 } = await syncRemoteTextFileWithHashSkip({
+  const { uploaded, sha256 } = await measureBridgePreparation(input.preparationSpan, "entrypoint_install", () => syncRemoteTextFileWithHashSkip({
     runner: input.runner,
     remoteCwd: input.remoteCwd,
     remoteDir: input.assetRemoteDir,
@@ -1915,7 +1929,7 @@ export async function syncSandboxCallbackBridgeEntrypoint(input: {
     lockDir: path.posix.join(input.assetRemoteDir, ".paperclip-bridge-upload.lock"),
     timeoutMs: input.timeoutMs,
     shellCommand: input.shellCommand,
-  });
+  }));
 
   return {
     remoteEntrypoint,
@@ -1931,6 +1945,7 @@ export async function startSandboxCallbackBridgeServer(input: {
   queueDir: string;
   bridgeToken: string;
   bridgeAsset?: SandboxCallbackBridgeAsset | null;
+  preparationSpan?: BridgePreparationSpan;
   host?: string;
   port?: number | null;
   pollIntervalMs?: number | null;
@@ -1953,6 +1968,7 @@ export async function startSandboxCallbackBridgeServer(input: {
       bridgeAsset: input.bridgeAsset,
       timeoutMs,
       shellCommand,
+      preparationSpan: input.preparationSpan,
     });
     remoteEntrypoint = assetSync.remoteEntrypoint;
   }
@@ -1969,7 +1985,7 @@ export async function startSandboxCallbackBridgeServer(input: {
   const nodeCommand = input.nodeCommand?.trim() || "node";
   // Launch and admit the listener in one control RPC. The readiness check is
   // immediate, with bounded short backoff, not the worker's idle long-list.
-  const readyResult = await runSandboxBridgeControlCommand(input.runner, {
+  const readyResult = await measureBridgePreparation(input.preparationSpan, "gateway_ready", () => runSandboxBridgeControlCommand(input.runner, {
     command: shellCommand,
     args: shellCommandArgs(
       [
@@ -2007,8 +2023,7 @@ export async function startSandboxCallbackBridgeServer(input: {
       ...env,
     },
     timeoutMs,
-  });
-  requireSuccessfulResult("wait for sandbox callback bridge readiness", readyResult);
+  }).then(result => requireSuccessfulResult("wait for sandbox callback bridge readiness", result)));
 
   let readyData: { host?: string; port?: number; baseUrl?: string; pid?: number };
   try {

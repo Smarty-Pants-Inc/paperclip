@@ -1,8 +1,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { NativeRunHistoricalSpan, NativeRunTrace } from "./native-run-trace.js";
+import type { BridgePreparationKind, BridgePreparationSpan } from "@paperclipai/adapter-utils/bridge-preparation-timing";
 
 const active = new AsyncLocalStorage<NativeControllerStepTiming>();
-type Wait = { step: string; startedAtMs: number; endedAtMs?: number; outcome: "ok" | "failed" };
+type Wait = { step: string; kind?: BridgePreparationKind; startedAtMs: number; endedAtMs?: number; outcome: "ok" | "failed" };
 
 /** Observe existing waits only. No run-log write is awaited on the startup path. */
 export function createNativeControllerStepTiming(trace: NativeRunTrace) {
@@ -13,6 +14,14 @@ export function createNativeControllerStepTiming(trace: NativeRunTrace) {
     finished = true;
     waits.length = 0;
     for (const span of pending.splice(0)) void trace.record(span, { deferRunLog: true }).catch(() => {});
+  };
+  // GitHub's adapter-owned boundaries report synchronous start/end observations.
+  // Use the same exclusive partition and deferred sink as controller startup.
+  const observe: BridgePreparationSpan = kind => {
+    if (finished || waits.length >= 2048) return () => {};
+    const wait: Wait = { step: kind, kind, startedAtMs: Date.now(), outcome: "ok" };
+    waits.push(wait);
+    return outcome => { wait.endedAtMs ??= Date.now(); wait.outcome = outcome; };
   };
   const measure = <T>(step: string, work: () => T | PromiseLike<T>): Promise<T> => {
     if (finished || waits.length >= 2048) return Promise.resolve(work());
@@ -33,8 +42,11 @@ export function createNativeControllerStepTiming(trace: NativeRunTrace) {
       throw error;
     }
   };
-  const flush = (phase: "resume" | "submit", startedAtMs: number, endedAtMs: number) => {
+  const flush = (phase: "resume" | "submit" | "github_access" | "github_activate", startedAtMs: number, endedAtMs: number) => {
     if (finished) return;
+    const github = phase === "github_access" || phase === "github_activate";
+    const parentName = github ? `native.controller.${phase}`
+      : phase === "resume" ? "runner.session.resume" : "runner.turn.submitted_to_started";
     endedAtMs = Math.max(startedAtMs, endedAtMs);
     // Runner milestones are emitted before controller observation. Clip to the
     // same bounds as the wrapper, including a wait still active at that milestone.
@@ -45,6 +57,8 @@ export function createNativeControllerStepTiming(trace: NativeRunTrace) {
       Math.max(startedAtMs, Math.min(endedAtMs, wait.endedAtMs ?? endedAtMs)),
     ])])].sort((a, b) => a - b);
     const spans: NativeRunHistoricalSpan[] = [];
+    const attributed = new Set<Wait>();
+    let previousWait: Wait | undefined;
     for (let i = 1; i < points.length; i++) {
       const start = points[i - 1]!, end = points[i]!;
       if (end <= start) continue;
@@ -52,16 +66,19 @@ export function createNativeControllerStepTiming(trace: NativeRunTrace) {
       if (!wait) continue; // Unobserved time is not evidence of an ingress/DB wait.
       const name = `native.controller.${phase}.${wait.step}`;
       const previous = spans.at(-1);
-      if (previous?.name === name && previous.endedAtMs === start && previous.outcome === wait.outcome) previous.endedAtMs = end;
-      else spans.push({ name, parentName: phase === "resume" ? "runner.session.resume" : "runner.turn.submitted_to_started",
-        startedAtMs: start, endedAtMs: end, outcome: wait.outcome });
+      if (previous?.name === name && previous.endedAtMs === start && previous.outcome === wait.outcome && (!github || previousWait === wait)) previous.endedAtMs = end;
+      else spans.push({ name, parentName, startedAtMs: start, endedAtMs: end, outcome: wait.outcome,
+        ...(wait.kind ? { attributes: { kind: wait.kind } } : {}) });
+      attributed.add(wait);
+      previousWait = wait;
     }
     // Sub-millisecond waits still need a named receipt at Date.now precision.
     for (const wait of waits) {
       const name = `native.controller.${phase}.${wait.step}`;
-      if (wait.startedAtMs >= startedAtMs && wait.startedAtMs <= endedAtMs && !spans.some(span => span.name === name)) {
-        spans.push({ name, parentName: phase === "resume" ? "runner.session.resume" : "runner.turn.submitted_to_started",
-          startedAtMs: wait.startedAtMs, endedAtMs: wait.startedAtMs, outcome: wait.outcome });
+      if (wait.startedAtMs >= startedAtMs && wait.startedAtMs <= endedAtMs &&
+          (github ? !attributed.has(wait) : !spans.some(span => span.name === name))) {
+        spans.push({ name, parentName, startedAtMs: wait.startedAtMs, endedAtMs: wait.startedAtMs, outcome: wait.outcome,
+          ...(wait.kind ? { attributes: { kind: wait.kind } } : {}) });
       }
     }
     // Do not even enqueue new writes until turn.started (or trace finish).
@@ -69,7 +86,7 @@ export function createNativeControllerStepTiming(trace: NativeRunTrace) {
     pending.push(...spans);
     if (phase === "submit") finish();
   };
-  return { measure, flush, finish };
+  return { measure, observe, flush, finish };
 }
 
 export type NativeControllerStepTiming = ReturnType<typeof createNativeControllerStepTiming>;

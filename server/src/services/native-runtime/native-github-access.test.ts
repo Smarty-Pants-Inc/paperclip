@@ -9,13 +9,15 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { createNativeGitHubAccess, type NativeGitHubAccess } from "./native-github-access.js";
+import { createNativeRunTrace, type NativeRunTrace } from "./native-run-trace.js";
 import { OpenCodeServerDriver } from "@paperclipai/paperclip-runner";
 import { createCapabilityRunnerdProviderEnvironment } from "@paperclipai/paperclip-runner/live";
 const scope = { companyId: "company-a", agentId: "agent-a", issueId: "task-a" };
 const run = (runId: string) => ({ ...scope, runId });
 const cleanups: (() => Promise<unknown>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
-function localDuplexChannel(command: readonly string[], cwd: string): CommandManagedDuplexChannel {
+function localDuplexChannel(command: readonly string[], cwd: string,
+  drop?: "readiness" | "preface"): CommandManagedDuplexChannel {
   const child = spawn(command[0]!, command.slice(1), { cwd, stdio: ["pipe", "pipe", "pipe"] });
   const buffered: Buffer[] = [];
   let dataListener: ((chunk: Uint8Array) => void) | undefined;
@@ -23,7 +25,22 @@ function localDuplexChannel(command: readonly string[], cwd: string): CommandMan
   let exit: { exitCode: number | null } | undefined;
   child.stdin.on("error", () => undefined);
   child.stderr.resume();
-  child.stdout.on("data", (chunk: Buffer) => dataListener ? dataListener(chunk) : buffered.push(chunk));
+  let readyLine = Buffer.alloc(0);
+  let sentReadyLine = false;
+  child.stdout.on("data", (raw: Buffer) => {
+    if (drop === "readiness") return;
+    let chunk = raw;
+    if (drop === "preface") {
+      if (sentReadyLine) return;
+      readyLine = Buffer.concat([readyLine, raw]);
+      const newline = readyLine.indexOf(10);
+      if (newline < 0) return;
+      sentReadyLine = true;
+      chunk = readyLine.subarray(0, newline + 1);
+    }
+    if (dataListener) dataListener(chunk);
+    else buffered.push(chunk);
+  });
   const closed = new Promise<void>(resolve => child.once("close", code => {
     exit = { exitCode: code };
     exitListener?.(exit);
@@ -40,9 +57,11 @@ function localDuplexChannel(command: readonly string[], cwd: string): CommandMan
 async function broker(resolveCredentials = vi.fn(async (binding: ReturnType<typeof run>) => ({
   status: "available", env: { GH_TOKEN: `fixture-${binding.runId}` },
 })), remote = false, bridgeUnavailable = false, onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>,
-duplex?: { enabled?: boolean; capability: boolean; unavailable?: boolean; recorder?: DuplexObservabilityRecorder }, rpcLatencyMs = 0,
+duplex?: { enabled?: boolean; capability: boolean; unavailable?: boolean; recorder?: DuplexObservabilityRecorder;
+  drop?: "readiness" | "preface" }, rpcLatencyMs = 0,
 onCommand?: (input: Parameters<CommandManagedRuntimeRunner["execute"]>[0]) => Promise<void>,
-onBridgeStarted?: (bridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>>) => Promise<void>) {
+onBridgeStarted?: (bridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>>) => Promise<void>,
+diagnostics?: { getTrace: () => NativeRunTrace | undefined; resolvePath?: boolean }) {
   const root = await mkdtemp(path.join(tmpdir(), "native-github-reuse-"));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const bin = path.join(root, "real-bin");
@@ -62,7 +81,7 @@ onBridgeStarted?: (bridge: Awaited<ReturnType<typeof startAdapterExecutionTarget
   });
   const openDuplexChannel = vi.fn<NonNullable<CommandManagedRuntimeRunner["openDuplexChannel"]>>(async input => {
     if (duplex?.unavailable) throw new Error("fixture channel unavailable");
-    return localDuplexChannel(input.command, root);
+    return localDuplexChannel(input.command, root, duplex?.drop);
   });
   const target = remote ? { kind: "remote" as const, transport: "sandbox" as const, providerKey: "test",
     remoteCwd: root, runner: { execute, ...(duplex ? { openDuplexChannel } : {}) }, streamRunLogs: false,
@@ -73,9 +92,12 @@ onBridgeStarted?: (bridge: Awaited<ReturnType<typeof startAdapterExecutionTarget
     } } : {}) } : null;
   const bridgeModes: (string | undefined)[] = [];
   const result = await createNativeGitHubAccess({ scope, target, cwd: root,
-    env: { PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`, PAPERCLIP_API_KEY: "old-run-api-key" }, resolveCredentials, onLog },
+    env: { ...(diagnostics?.resolvePath ? {} : { PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin` }),
+      PAPERCLIP_API_KEY: "old-run-api-key" }, resolveCredentials, onLog, trace: diagnostics?.getTrace() },
     bridgeUnavailable ? async () => { throw new Error("fixture bridge unavailable"); } : async input => {
-      const bridge = await startAdapterExecutionTargetPaperclipBridge(input);
+      const bridge = await startAdapterExecutionTargetPaperclipBridge({ ...input,
+        ...(duplex?.drop ? { duplexReadinessTimeoutMs: 500 } : {}),
+      });
       bridgeModes.push(bridge?.env.PAPERCLIP_API_BRIDGE_MODE);
       await onBridgeStarted?.(bridge);
       return bridge;
@@ -358,4 +380,155 @@ it.each([false, true])("keeps anonymous launchers usable when the remote broker 
   });
   expect(result.stdout).toBe("anonymous");
   expect(b.resolveCredentials).not.toHaveBeenCalled();
+});
+
+// Keep reason: distinguish every duplex decision in the native run stream, not only OTLP.
+it.each([
+  { label: "gate_off", duplex: { enabled: false, capability: true }, expected: ["gate_off"], failed: undefined },
+  { label: "capability_absent", duplex: { enabled: true, capability: false }, expected: ["capability_absent"], failed: undefined },
+  { label: "open_failure", duplex: { enabled: true, capability: true, unavailable: true }, expected: ["channel_open", "fallback"], failed: "channel_open" },
+  { label: "http2_ready", duplex: { enabled: true, capability: true }, expected: ["channel_open", "ready_wait", "preface_wait"], failed: undefined },
+  { label: "ready_timeout", duplex: { enabled: true, capability: true, drop: "readiness" as const }, expected: ["channel_open", "ready_wait", "fallback"], failed: "ready_wait" },
+  { label: "preface_timeout", duplex: { enabled: true, capability: true, drop: "preface" as const }, expected: ["channel_open", "ready_wait", "preface_wait", "fallback"], failed: "preface_wait" },
+])("names real-shell GitHub duplex branch $label", async ({ label, duplex, expected, failed }) => {
+  const events: Record<string, unknown>[] = [];
+  const trace = createNativeRunTrace({ runId: label, onEvent: async event => {
+    if (event.eventType === "run.performance.span") events.push(event.payload!);
+  } });
+  try {
+    const b = await trace.measure("native.controller.github_access", () =>
+      broker(undefined, true, false, undefined, duplex, 0, undefined, undefined, { getTrace: () => trace }));
+    const release = await trace.measure("native.controller.github_activate", () => b.activate(run(label), trace));
+    await release();
+    await trace.finish("ok");
+    const children = events.filter(event => event.parentSpan === "native.controller.github_access");
+    expect(children.map(event => event.kind)).toEqual(expect.arrayContaining(["queue_setup", "entrypoint_install", "launcher_staging", ...expected]));
+    expect(children.filter(event => event.outcome === "failed").map(event => event.kind)).toEqual(failed ? [failed] : []);
+    expect(children.some(event => event.kind === "fallback")).toBe(Boolean(failed));
+    expect(b.bridgeModes).toEqual([label === "http2_ready" ? "http2_v1" : "queue_v1"]);
+    expect(events.filter(event => event.parentSpan === "native.controller.github_activate").map(event => event.kind))
+      .toEqual(label === "http2_ready" ? ["generation_markers"] : ["quarantine_list", "generation_markers", "poll_start_wait"]);
+    console.log(JSON.stringify({ row: "github-duplex-children", label, events }));
+  } finally { await trace.finish("ok"); }
+});
+
+// Keep reason: the run's own span stream must attribute real restore bridge waits.
+it.each([
+  { resolvePath: false, rpcLatencyMs: 0 },
+  { resolvePath: true, rpcLatencyMs: 0 },
+  { resolvePath: false, rpcLatencyMs: 150 },
+])("names real-shell GitHub restore children (resolve PATH: $resolvePath, RPC latency: $rpcLatencyMs)", async ({ resolvePath, rpcLatencyMs }) => {
+  type Row = Record<string, unknown>;
+  const rows: Row[] = [];
+  let trace = createNativeRunTrace({ runId: "restore-a", onEvent: async event => {
+    if (event.eventType === "run.performance.span") rows.push(event.payload!);
+  } });
+  const firstTrace = trace;
+  const b = await trace.measure("native.controller.github_access", () =>
+    broker(undefined, true, false, undefined, undefined, rpcLatencyMs, undefined, undefined, { getTrace: () => trace, resolvePath }));
+  const queue = path.join(b.env.PAPERCLIP_GITHUB_LAUNCHER_DIR!, "paperclip-bridge", "queue");
+  for (const id of ["stale", "private-token-path"]) {
+    await writeFile(path.join(queue, "requests", `${id}.json`), JSON.stringify({ id }));
+  }
+  const release = await trace.measure("native.controller.github_activate", () => b.activate(run("restore-a"), trace));
+  for (const id of ["stale", "private-token-path"]) {
+    expect(JSON.parse(await readFile(path.join(queue, "responses", `${id}.json`), "utf8"))).toMatchObject({ status: 503 });
+  }
+  expect(b.resolveCredentials).not.toHaveBeenCalled();
+  await release();
+  await firstTrace.finish("ok");
+  const assertChildren = (stream: Row[], phase: string, kinds: string[]) => {
+    const parent = stream.find(row => row.span === `native.controller.${phase}`)!;
+    const children = stream.filter(row => row.parentSpan === parent?.span);
+    expect(children.map(row => row.kind)).toEqual(expect.arrayContaining(kinds));
+    for (const child of children) {
+      expect(child.span).toBe(`${parent.span}.${child.kind}`);
+      expect(child.outcome).toBe("ok");
+      expect(child.durationMs).toEqual(expect.any(Number));
+      expect(Number(child.durationMs)).toBeGreaterThanOrEqual(0);
+      expect(Number(child.startOffsetMs)).toBeGreaterThanOrEqual(Number(parent.startOffsetMs));
+      expect(Number(child.startOffsetMs) + Number(child.durationMs))
+        .toBeLessThanOrEqual(Number(parent.startOffsetMs) + Number(parent.durationMs));
+      expect(Object.keys(child).sort()).toEqual([
+        "schema", "traceSchemaVersion", "span", "parentSpan", "startOffsetMs", "durationMs", "outcome", "kind",
+        "duration_ms", "wallStartedAtMs",
+      ].sort());
+    }
+    const sumMs = children.reduce((sum, row) => sum + Number(row.durationMs), 0);
+    let unionMs = 0;
+    let coveredUntil = Number.NEGATIVE_INFINITY;
+    for (const child of [...children].sort((a, b) => Number(a.startOffsetMs) - Number(b.startOffsetMs))) {
+      const start = Number(child.startOffsetMs);
+      const end = start + Number(child.durationMs);
+      unionMs += Math.max(0, end - Math.max(start, coveredUntil));
+      coveredUntil = Math.max(coveredUntil, end);
+    }
+    expect(unionMs).toBeLessThanOrEqual(Number(parent.durationMs));
+    expect(JSON.stringify(children)).not.toContain("private-token-path");
+    console.log(JSON.stringify({ row: "github-child-accounting", resolvePath, rpcLatencyMs, phase, parentMs: parent.durationMs, sumMs, unionMs, children }));
+    // Like the executor's other controller steps, these are exclusive wall-time
+    // slices: parallel launchers must not double-count the bridge's wait time.
+    expect(sumMs).toBeLessThanOrEqual(Number(parent.durationMs));
+  };
+  assertChildren(rows, "github_access", ["queue_setup", "entrypoint_install", "gateway_ready", "launcher_staging", "gate_off",
+    ...(resolvePath ? ["path_resolution"] : [])]);
+  expect(rows.some(row => row.kind === "path_resolution")).toBe(resolvePath);
+  assertChildren(rows, "github_activate", ["quarantine_list", "stale_entry_settle", "generation_markers", "poll_start_wait"]);
+  expect(rows.filter(row => row.kind === "stale_entry_settle")).toHaveLength(2);
+
+  // A retained broker must use B's trace, not hold the completed A trace.
+  const nextRows: Row[] = [];
+  trace = createNativeRunTrace({ runId: "restore-b", onEvent: async event => {
+    if (event.eventType === "run.performance.span") nextRows.push(event.payload!);
+  } });
+  const firstCount = rows.length;
+  const nextRelease = await trace.measure("native.controller.github_activate", () => b.activate(run("restore-b"), trace));
+  await nextRelease();
+  await trace.finish("ok");
+  expect(rows).toHaveLength(firstCount);
+  assertChildren(nextRows, "github_activate", ["quarantine_list", "generation_markers", "poll_start_wait"]);
+  expect(nextRows.some(row => row.kind === "queue_setup" || row.kind === "stale_entry_settle")).toBe(false);
+});
+
+it.each(["github_access", "github_activate"] as const)("does not await a held %s child diagnostic sink in the real shell harness", async phase => {
+  let unblock!: () => void;
+  const blocked = new Promise<void>(resolve => { unblock = resolve; });
+  let sinkEntered = false;
+  const trace = createNativeRunTrace({ runId: "held-github", onEvent: async event => {
+    if (String(event.payload?.span).startsWith(`native.controller.${phase}.`)) {
+      sinkEntered = true;
+      await blocked;
+    }
+  } });
+  let release: (() => Promise<void>) | undefined;
+  const scopes: ReturnType<typeof trace.start>[] = [];
+  // Use the executor's deferred parent policy. Race the WHOLE step so even a
+  // regression inside activation releases the sink and joins its real processes.
+  const working = (async () => {
+    const scope = trace.start("native.controller.github_access");
+    scopes.push(scope);
+    const b = await trace.run(scope, () => broker(undefined, true, false, undefined, undefined, 0,
+      undefined, undefined, { getTrace: () => trace }));
+    await trace.end(scope, { deferRunLog: true });
+    const activation = trace.start("native.controller.github_activate");
+    scopes.push(activation);
+    release = await trace.run(activation, () => b.activate(run("held-github"), trace));
+    await trace.end(activation, { deferRunLog: true });
+    return b;
+  })();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const b = await Promise.race([working, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("GitHub preparation awaited diagnostics")), 2000);
+    })]);
+    expect(await (await request(b)).json()).toMatchObject({ env: { GH_TOKEN: "fixture-held-github" } });
+    expect(sinkEntered).toBe(true);
+  } finally {
+    if (timer) clearTimeout(timer);
+    unblock();
+    await working;
+    await release?.();
+    for (const scope of scopes) await trace.end(scope, { deferRunLog: true });
+    await trace.finish("ok");
+  }
 });

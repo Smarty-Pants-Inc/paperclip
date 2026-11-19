@@ -1,4 +1,5 @@
 import { getRunExecutionTraceContext } from "../execution-preparation-timing.js";
+import { BRIDGE_PREPARATION_KINDS } from "@paperclipai/adapter-utils/bridge-preparation-timing";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { runWithRunnerOperationRecorder } from "./runner-operation-timing.js";
 import { createHash } from "node:crypto";
@@ -219,6 +220,7 @@ const SAFE_NATIVE_RUN_SPAN_ATTRIBUTE_KEYS = new Set([
   "eventKind",
   "harness",
   "identityPresent",
+  "kind",
   "lifecycleMode",
   "mode",
   "outcome",
@@ -244,6 +246,8 @@ function hashedId(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 12);
 }
 
+const SAFE_BRIDGE_PREPARATION_KINDS: ReadonlySet<unknown> = new Set(BRIDGE_PREPARATION_KINDS);
+
 function safeAttributes(
   attributes: Record<string, string | number | boolean> | undefined,
 ): Record<string, string | number | boolean> {
@@ -253,6 +257,7 @@ function safeAttributes(
       .filter(
         ([key, value]) =>
           SAFE_NATIVE_RUN_SPAN_ATTRIBUTE_KEYS.has(key) &&
+          (key !== "kind" || SAFE_BRIDGE_PREPARATION_KINDS.has(value)) &&
           (typeof value === "boolean" ||
             (typeof value === "number" && Number.isFinite(value)) ||
             (typeof value === "string" && value.length <= 120)),

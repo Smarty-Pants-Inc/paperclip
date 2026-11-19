@@ -1,4 +1,6 @@
 import type { WorkspaceCheckpointMetrics } from "./workspace-checkpoint.js";
+import { measureBridgePreparation, type BridgePreparationSpan } from "./bridge-preparation-timing.js";
+export type { BridgePreparationSpan } from "./bridge-preparation-timing.js";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -454,7 +456,7 @@ export interface AdapterExecutionTargetPaperclipBridgeHandle {
   /** Pause file-queue polling at a native-run detach boundary. */
   pause?(): Promise<void>;
   /** Quarantine paused queue entries before polling under a new run. */
-  resume?(generation?: string): Promise<void>;
+  resume?(generation?: string, preparationSpan?: BridgePreparationSpan): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -1776,6 +1778,7 @@ export async function cleanupGitHubOperationLaunchers(input: GitHubLauncherLocat
 async function githubOperationLauncherBasePath(
   target: AdapterCommandCapableExecutionTarget | null,
   env: Record<string, string>,
+  preparationSpan?: BridgePreparationSpan,
 ): Promise<string> {
   if (!target) return env.PATH || process.env.PATH || "/usr/bin:/bin";
   const configuredPath = sanitizeRemoteExecutionEnv(env).PATH;
@@ -1784,18 +1787,20 @@ async function githubOperationLauncherBasePath(
   // The provider owns login/profile setup. Query its effective PATH before
   // staging BASH_ENV, rather than substituting the controller's toolchain or
   // a minimal PATH that hides legacy NVM/user-local agent installations.
-  const result = await adapterExecutionTargetCommandRunner(target).execute({
-    command: "sh",
-    args: ["-c", "printf '\\000%s\\000' \"$PATH\""],
-    cwd: target.remoteCwd,
-    timeoutMs: 15_000,
+  return measureBridgePreparation(preparationSpan, "path_resolution", async () => {
+    const result = await adapterExecutionTargetCommandRunner(target).execute({
+      command: "sh",
+      args: ["-c", "printf '\\000%s\\000' \"$PATH\""],
+      cwd: target.remoteCwd,
+      timeoutMs: 15_000,
+    });
+    // Frame the value so login banners cannot become executable search paths.
+    const remotePath = result.stdout.match(/\0([^\0]+)\0/)?.[1];
+    if (result.timedOut || result.exitCode !== 0 || !remotePath) {
+      throw new Error("Could not resolve remote PATH for managed GitHub launchers");
+    }
+    return remotePath;
   });
-  // Frame the value so login banners cannot become executable search paths.
-  const remotePath = result.stdout.match(/\0([^\0]+)\0/)?.[1];
-  if (result.timedOut || result.exitCode !== 0 || !remotePath) {
-    throw new Error("Could not resolve remote PATH for managed GitHub launchers");
-  }
-  return remotePath;
 }
 
 export const EXECUTION_TARGET_GIT_CONTEXT_UNAVAILABLE_CODE = "execution_target_git_context_unavailable";
@@ -1963,11 +1968,12 @@ printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
 /** Stage token-free launchers next to the execution, not in shared global Git config. */
 export async function prepareGitHubOperationLaunchers(input: {
   runId: string; target: AdapterExecutionTarget | null | undefined; cwd: string; env: Record<string, string>;
+  preparationSpan?: BridgePreparationSpan;
 }): Promise<Record<string, string>> {
   const remote = input.target?.kind === "remote" ? input.target : null;
   const directory = githubOperationLauncherDirectory(input);
   const configDirectory = path.posix.join(directory, "gh-config");
-  const basePath = await githubOperationLauncherBasePath(remote, input.env);
+  const basePath = await githubOperationLauncherBasePath(remote, input.env, input.preparationSpan);
   const managedPath = basePath ? `${directory}:${basePath}` : directory;
   // Login shells may reorder PATH through /etc/profile or path_helper. Restore
   // the managed launchers after startup without loading a host user's profile.
@@ -1987,7 +1993,7 @@ export async function prepareGitHubOperationLaunchers(input: {
   ]);
   if (remote) {
     const runner = adapterExecutionTargetCommandRunner(remote);
-    await syncRemoteTextFilesWithHashSkip({
+    await measureBridgePreparation(input.preparationSpan, "launcher_staging", () => syncRemoteTextFilesWithHashSkip({
       runner, remoteCwd: remote.remoteCwd,
       files: Object.entries(files).map(([program, body]) => ({
         remoteDir: directory, remotePath: path.posix.join(directory, program), body,
@@ -1997,7 +2003,7 @@ export async function prepareGitHubOperationLaunchers(input: {
       })),
       ensureDirectories: [configDirectory], action: "stage GitHub operation launchers",
       timeoutMs: 15_000, shellCommand: adapterExecutionTargetShellCommand(remote),
-    });
+    }));
   } else {
     await fs.mkdir(directory, { recursive: true, mode: 0o700 });
     await fs.mkdir(configDirectory, { recursive: true, mode: 0o700 });
@@ -4567,6 +4573,8 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // request's execs group under one wrapper span. When it is absent, the request
   // work runs under the run parent with no wrapper span.
   runtimeSpan?: RuntimeSpanRunner;
+  /** Deferred native run diagnostics; not provider telemetry. */
+  preparationSpan?: BridgePreparationSpan;
   /** Start file polling paused until a native run binding is attached. */
   startPaused?: boolean;
   /** Read the broker's current generation when HTTP/2 HEADERS are accepted. */
@@ -4604,7 +4612,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   const queueDir = path.posix.join(bridgeRuntimeDir, "queue");
   const runStatePath = path.posix.join(queueDir, "run-state.json");
   let runStateWriteFailureLogged = false;
-  const writeHttp2RunState = async (state: string): Promise<void> => {
+  const writeHttp2RunState = async (state: string, preparationSpan?: BridgePreparationSpan,
+    kind: "queue_setup" | "generation_markers" = "generation_markers"): Promise<void> => {
+    const end = preparationSpan?.(kind);
+    let outcome: "ok" | "failed" = "failed";
     try {
       const command = [
         `mkdir -p ${shellQuote(queueDir)}`,
@@ -4618,12 +4629,13 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         timeoutMs: 5_000,
       });
       if (result.timedOut || result.exitCode !== 0) throw new Error("run-state write failed");
+      outcome = "ok";
     } catch (error) {
       if (!runStateWriteFailureLogged) {
         runStateWriteFailureLogged = true;
         void Promise.resolve().then(() => onLog("stderr", `[paperclip] Sandbox HTTP/2 bridge could not update run state: ${error instanceof Error ? error.message : String(error)}\n`)).catch(() => undefined);
       }
-    }
+    } finally { end?.(outcome); }
   };
   const clearHttp2RunState = async (): Promise<void> => {
     try {
@@ -4862,8 +4874,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // capability or the runner method absent. A later channel-open failure records
   // its own fallback through the channel-open attempt below.
   if (!duplexRequested) {
+    input.preparationSpan?.("gate_off")("ok");
     duplexObservability.recordFallback("gate_off");
   } else if (!capabilityGranted || typeof openDuplexChannel !== "function") {
+    input.preparationSpan?.("capability_absent")("ok");
     duplexObservability.recordFallback("capability_absent");
   }
   if (duplexRequested && capabilityGranted && typeof openDuplexChannel === "function") {
@@ -4910,6 +4924,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         bridgeAsset,
         timeoutMs: bridgeTimeoutMs,
         shellCommand,
+        preparationSpan: input.preparationSpan,
       });
       const gatewayEnv: Record<string, string> = {
         PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_HTTP2_MODE,
@@ -4925,10 +4940,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         remoteEntrypoint: assetSync.remoteEntrypoint,
         env: gatewayEnv,
       });
-      if (input.startPaused) await writeHttp2RunState("paused");
-      else await clearHttp2RunState();
+      if (input.startPaused) await writeHttp2RunState("paused", input.preparationSpan, "queue_setup");
+      else await measureBridgePreparation(input.preparationSpan, "queue_setup", clearHttp2RunState);
       openStage = "channel_open";
-      channel = await openDuplexChannel({ command });
+      channel = await measureBridgePreparation(input.preparationSpan, "channel_open", () => openDuplexChannel({ command }));
     } catch (error) {
       // The channel never opened, so no request could carry the bridge token.
       // The open call is the last statement of the try, so `channel` is still
@@ -4943,6 +4958,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         : openStage === "entrypoint_sync"
           ? "entrypoint_sync_failed"
           : "channel_open_failed";
+      input.preparationSpan?.("fallback")("ok");
       duplexChannelOpen.fallback(reason);
       await onLog(
         "stderr",
@@ -4956,7 +4972,8 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         nonce,
         timeoutMs: readinessTimeoutMs,
       });
-      const readiness = await gate.ready;
+      const readiness = await measureBridgePreparation(input.preparationSpan, "ready_wait", () => gate.ready,
+        result => result.ok ? "ok" : "failed");
       if (!readiness.ok) {
         // Fail closed. Close the partial channel inside a bounded budget, then
         // select the file bridge. The broker never started, so no request that
@@ -4964,7 +4981,8 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         // is a fixed enum, so it rides the log line and the fallback telemetry
         // with no raw value.
         gate.disposePendingReplay();
-        await closeDuplexChannelWithinBudget(channel, DEFAULT_DUPLEX_CLEANUP_BUDGET_MS);
+        await measureBridgePreparation(input.preparationSpan, "fallback", () =>
+          closeDuplexChannelWithinBudget(channel, DEFAULT_DUPLEX_CLEANUP_BUDGET_MS));
         duplexChannelOpen.fallback(duplexReadinessFallbackReason(readiness.reason));
         await onLog(
           "stderr",
@@ -4983,14 +5001,16 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
           capBytes: DUPLEX_READINESS_BUFFER_CAP_BYTES,
           timeoutMs: readinessTimeoutMs,
         });
-        const prefaceResult = await prefaceScan.settled;
+        const prefaceResult = await measureBridgePreparation(input.preparationSpan, "preface_wait", () => prefaceScan.settled,
+          result => result === "missing" ? "failed" : "ok");
         if (prefaceResult === "missing") {
           // Fail closed, the same shape as a readiness failure: close the
           // partial channel inside the cleanup budget, then select the file
           // bridge. No HTTP/2 server ever bound to this channel, so no
           // request reached it or any endpoint.
           gate.disposePendingReplay();
-          await closeDuplexChannelWithinBudget(openedChannel, DEFAULT_DUPLEX_CLEANUP_BUDGET_MS);
+          await measureBridgePreparation(input.preparationSpan, "fallback", () =>
+            closeDuplexChannelWithinBudget(openedChannel, DEFAULT_DUPLEX_CLEANUP_BUDGET_MS));
           duplexChannelOpen.fallback("preface_missing");
           await onLog(
             "stderr",
@@ -5136,8 +5156,8 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
             runLogTail: duplexRunLogTail,
             readRunDisposition: (): DuplexBrokerRunDisposition => dispositionLatch.disposition,
             pause: async () => { await writeHttp2RunState("paused"); },
-            resume: async (generation?: string) => {
-              await writeHttp2RunState(generation ? `attached:${generation}` : "attached");
+            resume: async (generation?: string, preparationSpan?: BridgePreparationSpan) => {
+              await writeHttp2RunState(generation ? `attached:${generation}` : "attached", preparationSpan);
             },
             // Atomically read the latch and mark the orderly completion for the
             // ACP success-eligible terminal, so no await separates the read from
@@ -5186,6 +5206,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       getRuntimeParentContext: input.getRuntimeParentContext,
       runtimeSpan: input.runtimeSpan,
       startPaused: input.startPaused,
+      preparationSpan: input.preparationSpan,
       // The worker encodes binary bodies only at the queue boundary.
       handleRequest: (request, options) => forwardBridgeRequest({ ...request, bridgeTransport: "queue_v1" }, options?.signal, {
         reservation: options?.reservation,
@@ -5201,6 +5222,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       timeoutMs: bridgeTimeoutMs,
       maxBodyBytes,
       shellCommand,
+      preparationSpan: input.preparationSpan,
     });
   } catch (error) {
     await Promise.allSettled([
@@ -5231,7 +5253,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     },
     runLogTail,
     pause: async () => { await worker?.pause(); },
-    resume: async (generation?: string) => { await worker?.resume(generation); },
+    resume: async (generation?: string, preparationSpan?: BridgePreparationSpan) => { await worker?.resume(generation, preparationSpan); },
     stop: async () => {
       await Promise.allSettled([
         server?.stop(),

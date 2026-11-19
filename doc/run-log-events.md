@@ -258,6 +258,37 @@ failures do not change operation results or errors. Only bounded step names,
 numeric timestamps/durations and outcomes are recorded: no secrets, environment
 values, prompts, provider identifiers or exception messages.
 
+## Native GitHub preparation and activation
+
+The existing run-log trace records children of `native.controller.github_access`
+and `native.controller.github_activate`, including on a restored/retained session.
+The fixed child suffix is also the closed `kind` attribute:
+
+- Preparation: `queue_setup`, `entrypoint_install` (hash check/upload in one
+  remote call), `gateway_ready` (launch and listener readiness),
+  `launcher_staging`, and `path_resolution` only when PATH must be queried.
+- Duplex selection: `gate_off`, `capability_absent`, `channel_open`, `ready_wait`,
+  `preface_wait`, and `fallback`. A failed readiness/preface wait remains `failed`
+  even when file fallback succeeds. Gate decisions can have zero duration.
+- Activation: `quarantine_list`, `stale_entry_settle` for each stale entry,
+  `generation_markers`, and `poll_start_wait`. HTTP/2 activation only writes
+  generation markers; it has no file quarantine or poll-start wait.
+
+Each remote call/wait is observed once, then uses the same **exclusive wall-time
+partitioning** as the controller warm-start steps above. Concurrent launcher and
+bridge preparation therefore do not double-count the parent. A logical wait may
+have multiple disjoint slices when another wait interrupts its attribution;
+these are not duplicate remote calls. Distinct same-kind calls retain distinct
+receipts, including zero-duration calls. Summed child `durationMs` is bounded by
+the parent duration, not a sum of inclusive concurrent RPC latencies.
+
+Rows retain `durationMs`, `outcome` and `parentSpan`. No paths, tokens, generation
+values, request names or provider text are added. Both parents and their children
+use the existing ordered deferred sink, drained at trace finish, rather than
+awaiting diagnostic writes during GitHub setup. A retained bridge receives the
+activation trace from the **current run**, not the run that created it. Remote
+commands, authority checks, quarantine order and transport selection are unchanged.
+
 ## Local runner startup sub-steps
 
 `run.performance.span` splits a local Runner startup (`runner.session.bootstrap` or
