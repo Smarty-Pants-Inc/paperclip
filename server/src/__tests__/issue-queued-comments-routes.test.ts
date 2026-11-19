@@ -3239,7 +3239,12 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     for (const actor of ["user", "system"] as const) {
       const f = await seedStoppableTurn(surface);
       const held = [await postMessage(f, "Reply exactly H1"), await postMessage(f, "Reply exactly H2"), await postMessage(f, "Reply exactly H3")];
-      const stopped = await stopTurn(f, actor);
+      // adopt-stophold-2cp: the person's Stop goes through the REAL Stop route (stopByRoute: POST
+      // /api/heartbeat-runs/:runId/cancel => run.stop.accepted person_stop). Ruling (c): a cancel
+      // with the person's attribution but no accepted person_stop row is no hold, and since the
+      // no-card gate (ab4d297d) asks the ONE reader for a held message, a direct cancelRun now
+      // gets the card. Setup only; the assertions are unchanged. The system control is unchanged.
+      const stopped = actor === "user" ? await stopByRoute(f, "queue-owner") : await stopTurn(f, actor);
       const seen = await sweepAt(f, stopped.finishedAt!, [2, 3, 11]);
       const queue = await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
       if (actor === "user") {
