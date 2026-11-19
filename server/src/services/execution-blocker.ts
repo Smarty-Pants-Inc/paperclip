@@ -1,7 +1,7 @@
 import { isPreDispatchReviewWait, neverStartedDispatchCancellationPredicate } from "./pre-dispatch-review-wait.js";
 import { replyFileLineReadsLost } from "./native-runtime/native-late-save-rule.js";
 import { CHECKOUT_CONTINUE_REQUIRED_REASON, REPLY_FILES_LOST_WAITING_LINE, REPLY_FILES_NOT_SAVED_LINE, REPLY_FILES_PARTLY_SAVED_LINE,
-  readSystemRecovery, savedFilesUnrecoverable } from "./system-recovery-state.js";
+  isSpentFileRecoveryWaitReason, readSystemRecovery, savedFilesUnrecoverable } from "./system-recovery-state.js";
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { preDispatchExecutionWaitRecoveryActionPredicate } from "./pre-dispatch-execution-wait.js";
 import { legacyShutdownBeforeDispatchCondition } from "./legacy-shutdown-before-dispatch.js";
@@ -517,6 +517,10 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   // the three "unrecoverable" codes, which keep their old text): the task says ONE sentence, the SAME one the queue's
   // wait line says (the gate's own words, saved on the waiting message by explicit-native-continuation.ts).
   //  - the gate named a wait .............. its words (the mixed-checkout hold names its one action)
+  //  - the gate's stored wait is for the reply's SPENT file recovery ("... refused to recover the saved files ...
+  //    Your Retry is saved."): the gate named it BEFORE this reply's line read LOST and has not run again yet. With
+  //    the line LOST that recovery holds nothing and the message is no Retry, so it is not this message's wait: read
+  //    as "no wait named yet" (below), the gate's own answer on its next run
   //  - no wait named yet, box not stopped . the wait words (never "starts now" before it is true)
   //  - no wait named yet, box stopped ..... the gate's own comparison of the checkout with the last saved state,
   //                                         read here for the short time until the gate runs again: "starts now"
@@ -525,7 +529,8 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   if (saved.length && restoreHold && run && replyFileLineReadsLost(run.resultJson)
       && !savedFilesUnrecoverable(readSystemRecovery(action.evidence))) {
     const gateWait = queue.map(entry => entry.payload?.executionWait as { reason?: unknown; message?: unknown } | null | undefined)
-      .filter(wait => typeof wait?.reason === "string" && typeof wait.message === "string" && wait.message.trim());
+      .filter(wait => typeof wait?.reason === "string" && typeof wait.message === "string" && wait.message.trim())
+      .filter(wait => !isSpentFileRecoveryWaitReason(wait!.reason));
     const held = gateWait.find(wait => wait!.reason === CHECKOUT_CONTINUE_REQUIRED_REASON);
     if (held) savedMessageWait = { state: "continue_required", line: REPLY_FILES_PARTLY_SAVED_LINE };
     else if (gateWait.length) savedMessageWait = { state: "waiting", line: String(gateWait[0]!.message) };
@@ -569,4 +574,22 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     ...(canReconstructWorkspace ? { canReconstructWorkspace, workspaceRecoveryStatusVersion: conversation!.statusVersion } : {}),
     ...(reconstructionPending ? { workspaceReconstructionPending: true } : {}),
   };
+}
+
+/** The queue's wait line for a waiting message whose stored wait is the gate's spent-file-recovery wait
+ * (system-recovery-state.ts SPENT_FILE_RECOVERY_WAIT_REASONS). It is the SAME reading the task says (`savedMessageWait`
+ * above), in the gate's own reason for that sentence, so the queue line and the task cannot differ:
+ *  - waiting ............. the stop wait (explicit-native-continuation.ts `remote_cleanup`)
+ *  - continue_required ... the checkout hold
+ *  - starting ............ no wait: the message starts
+ * `undefined`: the task says none of the three sentences (a reply whose line does not read LOST, or one of the three
+ * unrecoverable codes); the stored wait stands as it is. Reads only. */
+export async function savedMessageQueueWait(db: Db, companyId: string, issueId: string,
+  stored: { reason: string; message: string }): Promise<{ reason: string; message: string } | null | undefined> {
+  if (!isSpentFileRecoveryWaitReason(stored.reason)) return undefined;
+  const blocker = await getExecutionBlocker(db, companyId, issueId);
+  if (!blocker?.savedMessageWait) return undefined;
+  if (blocker.savedMessageWait === "starting") return null;
+  return { reason: blocker.savedMessageWait === "continue_required" ? CHECKOUT_CONTINUE_REQUIRED_REASON : "remote_cleanup",
+    message: blocker.nextAction };
 }

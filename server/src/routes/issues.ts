@@ -68,7 +68,7 @@ import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboar
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
-import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { getExecutionBlocker, savedMessageQueueWait } from "../services/execution-blocker.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -7927,6 +7927,14 @@ export function issueRoutes(
       actorType: input.actor.actorType,
       actorId: input.actor.actorId,
     });
+    // The gate's stored wait for a reply's SPENT file recovery ("... refused to recover the saved files ... Your Retry
+    // is saved."), read beside that reply's LOST line: the gate named it before the line settled and has not run again
+    // yet. The queue then says what the task says (execution-blocker.ts savedMessageWait, the ONE reading), never a
+    // Retry the person did not press. Every other stored wait stands as it is.
+    if (queue.executionWait && !interruptHandoff) {
+      const read = await savedMessageQueueWait(input.executor as unknown as Db, input.issue.companyId, input.issue.id, queue.executionWait);
+      if (read !== undefined) queue.executionWait = read;
+    }
     // The stopped bar offers Send, so it wins over a stored wait only where that
     // Send can admit: S's native admission path (isNativeAdmissionAdapter). A
     // legacy/process chat keeps the base gate: a stored wait (for example its
