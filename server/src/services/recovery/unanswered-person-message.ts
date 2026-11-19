@@ -81,7 +81,10 @@ const WAITING_ROW_JSON = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL }] 
 export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";
 /** Setup completes by itself; a stalled setup gets one factual waiting note. */
 export const UNANSWERED_MESSAGE_AGENT_SETUP_CODE = "agent_setup";
-export const SETUP_WAIT_BOUND_MS = 10 * 60_000;
+// Preserve the sweep's existing start bound as the one shared ten-minute value.
+export { PENDING_WAIT_START_BOUND_MS } from "../deferred-execution-wait.js";
+import { PENDING_WAIT_START_BOUND_MS } from "../deferred-execution-wait.js";
+export const SETUP_WAIT_BOUND_MS = PENDING_WAIT_START_BOUND_MS;
 const WAITING_KIND_CODES = new Set(["agent_paused", UNANSWERED_MESSAGE_AGENT_SETUP_CODE]);
 /** Paperclip's pause model: POST /agents/:id/resume is allowed for a board user
  * or an agent that manages the paused agent (routes/agents.ts:6017-6023 ->

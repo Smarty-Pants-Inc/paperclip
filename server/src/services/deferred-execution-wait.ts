@@ -4,6 +4,24 @@ import { agentWakeupRequests, issues, type Db } from "@paperclipai/db";
 import { notifyDeferredExecutionWork } from "./deferred-execution-notifications.js";
 import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 
+/** The sweep's existing start bound, shared with the remote-cleanup panel. */
+export const PENDING_WAIT_START_BOUND_MS = 10 * 60_000;
+export const REMOTE_CLEANUP_PERSON_WAIT_MS = PENDING_WAIT_START_BOUND_MS;
+export const REMOTE_CLEANUP_EXECUTION_WAIT_MESSAGE = "Your message is saved. The run you stopped is still shutting down, so your message hasn't started yet.";
+export const REMOTE_CLEANUP_PERSON_WAIT_EXPIRED_MESSAGE = "Your message is saved, but the run you stopped still hasn't shut down, so it can't start yet. You can delete it if you no longer need it.";
+
+/** Person-facing projection of the saved receipt, not a second notice or timer.
+ * The receipt's immutable request time owns the clock: recovery retries and
+ * repeated GETs cannot restart it. Admission still owns releasing the hold
+ * (U3/U5); at the bound we only stop promising an unbounded automatic start. */
+export function executionWaitForPerson(wait: Record<string, unknown>, requestedAt: Date | null | undefined,
+  now = Date.now()): { reason: string; message: string } | null {
+  if (!isWellFormedExecutionWait(wait)) return null;
+  return { reason: wait.reason, message: wait.reason === "remote_cleanup" && requestedAt
+    && now >= requestedAt.getTime() + REMOTE_CLEANUP_PERSON_WAIT_MS
+    ? REMOTE_CLEANUP_PERSON_WAIT_EXPIRED_MESSAGE : wait.message };
+}
+
 /** Admission has saved this refusal on the caller's durable deferred receipt.
  * HTTP callers still receive the existing 409; receipt recovery waits for its
  * owning gate producer instead of treating the refusal as infrastructure debt. */
