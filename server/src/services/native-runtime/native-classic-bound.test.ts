@@ -1002,8 +1002,12 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
     }
   }, 240_000);
 
-  it("C12 control: a NON-fenced terminal save failure (the box is gone: unrecoverable) still sets the task Blocked, even with a person's message parked", async () => {
-    const s = await scenario();
+  // d2 compose (C12 x admit F1). bb/2dfix wrote this control on a task-own root; on d2 that case no longer exists as
+  // "non-fenced": admit's F1 (RFL 04:56Z, R ends by ANY path) isolates a save that fails for the LAST time while a
+  // person's message is parked. So the control moves to the failure admit does NOT isolate, a root the task does not
+  // own, and the task-own-root case is the next row, with admit's outcome.
+  it("C12 control: a NON-fenced terminal save failure (the box is gone: unrecoverable; a root the task does not own) still sets the task Blocked, even with a person's message parked", async () => {
+    const s = await scenario({ sharedProjectRoot: true });
     await s.streamAndAccept();
     await s.personSaysWhileSaving("Also add a summary section to the report.");
     // PLANTED (named): R's box lease is expired, so the copy-back is unrecoverable. Beside it, the fenced path by the
@@ -1018,7 +1022,38 @@ describe.skipIf(!support.supported)("classic copy-back bound: the run ends, the 
     expect(record(record(ended.runnerProfileJson).nativeWorkspaceFinalizationOwner).fenced).toBeUndefined();
     const task = (await request(s.app).get(`/api/issues/${s.issueId}`)).body;
     expect(task).toMatchObject({ status: "blocked", executionWorkspaceId: s.workspaceId });
-    evidence.C12control = { route: "GET /api/issues/:id", task: { status: task.status }, run: { status: ended.status, errorCode: ended.errorCode } };
+    evidence.C12control = { route: "GET /api/issues/:id", root: "a root the task does not own", task: { status: task.status }, run: { status: ended.status, errorCode: ended.errorCode } };
+    await cleanupNativeWorkspaceSync(s.runId);
+  }, 120_000);
+
+  it("C12 x admit F1: the SAME terminal save failure on the task's OWN root with a person's message parked is isolated as the cap isolates it -> the task is NOT Blocked, and the parked message starts once in its own root on the saved files", async () => {
+    const s = await scenario();
+    await s.streamAndAccept();
+    const next = await s.personSaysWhileSaving("Also add a summary section to the report.");
+    // PLANTED (named): R's box lease is expired (as the control above). REAL from here: the worker's own check ->
+    // attemptNativeWorkspaceFinalization -> recordNativeWorkspaceFinalizationFailure -> the finalizer's one terminal write.
+    await db.update(environmentLeases).set({ status: "expired" }).where(eq(environmentLeases.id, s.leaseId));
+    expect(await s.worker().check()).toMatchObject({ entries: 1 });
+    const ended = await s.run();
+    // admit F1: ended as the cap ends a classic run (the same code, isolated, its owner a tombstone).
+    expect(ended).toMatchObject({ status: "failed", errorCode: STALLED });
+    expect(record(record(ended.resultJson).workspaceSyncOutStall).workspace).toMatchObject({ kind: "classic_isolated", sourceRunId: s.runId });
+    expect(record(record(ended.runnerProfileJson).nativeWorkspaceFinalizationOwner)).toMatchObject({ fenced: true });
+    expect(await s.coordinator()).toMatchObject({ phase: "terminal_failure", failureCode: STALLED,
+      failureDetail: { originalFailureCode: "native_workspace_sync_out_unrecoverable" } });
+    // C12: a person is waiting, so the task is not set Blocked (real GET); it is detached from R's root.
+    const task = (await request(s.app).get(`/api/issues/${s.issueId}`)).body;
+    expect(task).toMatchObject({ status: "in_progress", executionRunId: null, executionWorkspaceId: null });
+    // REAL: the parked message is admitted and starts ONCE, in its own root, on the saved files.
+    const started = await parkedMessageStarts(s, next.id);
+    expect(started.successors).toHaveLength(1);
+    expect(started.providerInputs).toHaveLength(1);
+    const [pWorkspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, (await s.issue()).executionWorkspaceId!));
+    expect(pWorkspace.cwd).not.toBe(s.hostDir);
+    expect(await listing(pWorkspace.cwd!)).toEqual(SAVED);
+    expect((await request(s.app).get(`/api/issues/${s.issueId}`)).body.status).not.toBe("blocked");
+    evidence.C12xAdmitF1 = { route: "GET /api/issues/:id", root: "the task's own root", taskAtEnd: { status: task.status },
+      run: { status: ended.status, errorCode: ended.errorCode }, P: { id: started.successor.id, status: started.successor.status, root: pWorkspace.cwd } };
     await cleanupNativeWorkspaceSync(s.runId);
   }, 120_000);
 
