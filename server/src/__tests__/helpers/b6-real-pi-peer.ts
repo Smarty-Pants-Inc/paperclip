@@ -7,6 +7,7 @@ import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "..
  * Pi itself drains one steering input at each tool boundary. */
 export class B6RealPiPeer {
   requests: Array<{ type: string; input?: PiRpcRecord; at: number }> = [];
+  requestSettlements: Array<{ type: string; at: number; error?: string }> = [];
   facadeCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
   consumed: string[] = []; replies: string[] = []; pending: string[] = [];
   sessionFile?: string; transport?: PiRpcTransport; active = false;
@@ -15,9 +16,11 @@ export class B6RealPiPeer {
   beforeBoundary?: () => Promise<void>;
   releasing?: Promise<void>;
   closeGate?: Promise<void>;
+  closing?: () => void;
   holdClose() {
     let release!: () => void; this.closeGate = new Promise<void>(resolve => { release = resolve; });
-    return release;
+    const entered = new Promise<void>(resolve => { this.closing = resolve; });
+    return Object.assign(release, { entered });
   }
   seen = new Set<string>(); answered = new Set<string>(); modelRequests: unknown[] = [];
   get pid() { return this.transport?.pid ?? null; }
@@ -67,7 +70,14 @@ export class B6RealPiPeer {
       // seen/consumed still require the real Pi user-message/model boundary.
       if (!this.bodies.includes(body)) this.bodies.push(body);
     }
-    return this.transport!.request(type, input, options);
+    try {
+      const response = await this.transport!.request(type, input, options);
+      this.requestSettlements.push({ type, at: Date.now() });
+      return response;
+    } catch (error) {
+      this.requestSettlements.push({ type, at: Date.now(), error: String(error) });
+      throw error;
+    }
   }
   async *events() {
     for await (const event of this.transport!.events()) {
@@ -90,11 +100,12 @@ export class B6RealPiPeer {
       this.released = true; const held = this.held; this.held = undefined; held?.();
     })();
     void this.releasing.catch(() => undefined); // close joins and reports it
+    return this.releasing;
   }
   finish() { this.finishing = true; this.boundary(); }
   send(event: PiRpcRecord) { if (event.type === "process_exit") void this.transport?.close(); }
   async close() {
-    try { await this.releasing; await this.closeGate; }
+    try { await this.releasing; this.closing?.(); await this.closeGate; }
     finally {
       await this.transport?.close();
       this.server.closeAllConnections();
