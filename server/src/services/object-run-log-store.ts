@@ -1,5 +1,7 @@
 import { beginIdleTrackedWork } from "./task-admission.js";
 import { createHash, randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
+import { logger } from "../middleware/logger.js";
 import type { StorageProvider } from "../storage/types.js";
 import type { RunLogStore, RunLogHandle, RunLogBeginInput } from "./run-log-store.js";
 import { createObjectByteJournal, ObjectJournalSourcePrefixProofUnavailableError, type ObjectJournalIOPriority, type ObjectJournalWriter } from "./object-byte-journal.js";
@@ -13,6 +15,23 @@ const ALIGN_WINDOW_BYTES = 32_000;
 // Most records are short, so the first alignment window rides along with the
 // body read. Longer records continue with ALIGN_WINDOW_BYTES windows.
 const ALIGN_FIRST_LOOKBACK_BYTES = 4096;
+const DIGEST_ATTEMPTS = 3;
+
+function finalizationError(error: unknown) {
+  const cause = error as { name?: unknown; code?: unknown; message?: unknown;
+    $metadata?: { httpStatusCode?: unknown } } | null;
+  const identifier = (value: unknown) => typeof value === "string" && /^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(value)
+    ? value : undefined;
+  // Storage/parse errors can carry response bodies or log bytes in their message,
+  // stack, or custom properties. Log only error identifiers and known journal codes.
+  return {
+    name: identifier(cause?.name) ?? "UnknownError",
+    code: identifier(cause?.code),
+    reason: typeof cause?.message === "string" && /^object_journal_[a-z0-9_]+$/.test(cause.message)
+      ? cause.message : undefined,
+    statusCode: typeof cause?.$metadata?.httpStatusCode === "number" ? cause.$metadata.httpStatusCode : undefined,
+  };
+}
 export interface ObjectRunLogStoreOptions {
   provider: StorageProvider;
   keyPrefix: string;
@@ -331,21 +350,42 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       if (!state) throw new Error("Object run log writer not found");
       state.closed = true;
       capacityChanged();
+      let step = "flush", attempt = 1;
+      const diagnostic = (error: unknown) => ({
+        runId: handle.logRef.split("/")[2], step, attempt,
+        maxAttempts: step === "digest" ? DIGEST_ATTEMPTS : 1,
+        err: finalizationError(error),
+      });
       try {
         await flush(state);
+        step = "admissions";
         await Promise.allSettled([...state.admitting]);
+        step = "flush";
         await flush(state);
+        step = "close";
         state.writer = await state.journal.close(state.writer, state.signal);
         if (finalizeOptions?.computeDigest === false)
           return { bytes: state.writer.head.end, sha256: null, compressed: false };
-        const hash = createHash("sha256");
-        for (let start = 0; start < state.writer.head.end; start += MAX_READ_BYTES) {
-          hash.update(
-            await state.journal.readRange(state.writer.head, start, MAX_READ_BYTES, state.signal),
-          );
+        step = "digest";
+        for (;; attempt++) {
+          try {
+            // Retry only this read-only pass against the already closed snapshot.
+            // Restart the hash too: an earlier range may have succeeded last time.
+            const hash = createHash("sha256");
+            for (let start = 0; start < state.writer.head.end; start += MAX_READ_BYTES) {
+              hash.update(
+                await state.journal.readRange(state.writer.head, start, MAX_READ_BYTES, state.signal),
+              );
+            }
+            return { bytes: state.writer.head.end, sha256: hash.digest("hex"), compressed: false };
+          } catch (error) {
+            if (attempt >= DIGEST_ATTEMPTS || state.signal?.aborted) throw error;
+            logger.warn(diagnostic(error), "Object run log digest failed; retrying read-only finalization");
+            await delay(100 * attempt, undefined, { signal: state.signal });
+          }
         }
-        return { bytes: state.writer.head.end, sha256: hash.digest("hex"), compressed: false };
-      } catch {
+      } catch (error) {
+        logger.warn(diagnostic(error), "Object run log finalization failed");
         process.emitWarning(
           "Run log persistence is incomplete; final size and digest are unknown.",
         );
