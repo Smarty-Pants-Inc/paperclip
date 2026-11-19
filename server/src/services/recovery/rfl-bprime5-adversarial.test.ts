@@ -118,7 +118,9 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     await f.reply(run, f.base + 40_000);
     await settleConversationTurnForRun(db, f.companyId, run);
     const [native] = await db.select().from(issues).where(eq(issues.id, f.issueId));
-    expect(native).toMatchObject({ status: "in_review", conversationState: "waiting" });
+    // F-B (RFL 23:59Z; rf-5 23:57Z): the chat's saved state follows the one function too. The earlier message is
+    // owed (below: its ONE notice), so the Status row stays In Progress; it was "In Review" beside that notice.
+    expect(native).toMatchObject({ status: "in_progress", conversationState: "active" });
     // The carried (latest) message is answered once; the earlier one, which the run's own input does not name, is owed.
     expect(await f.agentReplies()).toBe(1);
     expect(await f.answerCounts(first, second)).toEqual([0, 1]);
