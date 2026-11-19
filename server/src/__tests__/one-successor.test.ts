@@ -34,7 +34,7 @@ import {
 } from "../services/agent-conversations.js";
 import { answeredPersonMessageSql } from "../services/person-message-answer.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
-import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessage, settleUnansweredPersonMessages, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
 import { getServerAdapter, registerServerAdapter, runningProcesses } from "../adapters/index.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat/run-preparation.js";
 import { renderFirstTurnQueuedInput } from "../services/native-runtime/first-turn-queued-input.js";
@@ -485,5 +485,104 @@ describeEmbeddedPostgres("ONE successor per Interrupt (adopt-one-successor, 390 
       payload: { issueId: chat.issue.id, commentId: first }, contextSnapshot: { ...wake.contextSnapshot, commentId: first,
         wakeCommentId: first, wakeCommentIds: [first] } })).toBeNull();
     expect((await commentWakes(chat, first)).filter(w => w.status !== "coalesced")).toEqual([]);
+  });
+
+  describe("F2: every carry field suppresses a moved-on message's false unanswered card", () => {
+    // Keep reason: rf-4 F2, one real-Postgres sweep row per carry field. No outbox,
+    // failed carrier (G1), or old-message discovery (F1) participates in these rows.
+    const fields = [
+      { row: 1, field: "wake payload._paperclipWakeContext.commentId", location: "wake", key: "_paperclipWakeContext" },
+      { row: 2, field: "wake payload.commentIds", location: "wake", key: "commentIds" },
+      { row: 3, field: "run context_snapshot.steeredCommentIds", location: "context", key: "steeredCommentIds" },
+      { row: 4, field: "run context_snapshot.carriedSteeredCommentIds", location: "context", key: "carriedSteeredCommentIds" },
+      { row: 5, field: "run result_json.restoredSteeredCommentIds", location: "result", key: "restoredSteeredCommentIds" },
+      { row: 6, field: "run result_json.stopRestoredSteeredCommentIds", location: "result", key: "stopRestoredSteeredCommentIds" },
+      { row: 7, field: "run result_json.interruptCarriedSteeredCommentIds", location: "result", key: "interruptCarriedSteeredCommentIds" },
+      { row: 8, field: "run result_json.queuedSteeringAcknowledgements", location: "result", key: "queuedSteeringAcknowledgements" },
+    ] as const;
+    type CarryField = typeof fields[number];
+
+    async function movedOnRow(field: CarryField | null) {
+      const chat = await seedChat();
+      const m = chat.first.id;
+      const now = new Date();
+      const ago = (minutes: number) => new Date(now.getTime() - minutes * 60_000);
+      await db.update(issueComments).set({ createdAt: ago(20), updatedAt: ago(20) })
+        .where(eq(issueComments.id, m));
+      const context: Record<string, unknown> = { issueId: chat.issue.id, taskKey: chat.issue.id };
+      const result: Record<string, unknown> = {};
+      const payload: Record<string, unknown> = { issueId: chat.issue.id };
+      if (field?.location === "context") context[field.key] = [m];
+      if (field?.location === "result") result[field.key] = field.row === 8
+        ? { [m]: { status: "acknowledged" } } : [m];
+      if (field?.location === "wake") {
+        payload[field.key] = field.row === 1 ? { commentId: m } : [m];
+        await db.insert(agentWakeupRequests).values({ companyId: chat.companyId, agentId: chat.agentId,
+          source: "on_demand", status: "completed", idempotencyKey: `f2-field-${field.row}:${randomUUID()}`,
+          payload, requestedAt: ago(20), finishedAt: ago(19) });
+      }
+      // Replace the seed's ordinary input keys completely: m occurs ONLY in F.
+      // A succeeded earlier turn avoids making this a failed-carrier/G1 row.
+      await db.update(heartbeatRuns).set({ status: "succeeded", startedAt: ago(21), finishedAt: ago(19),
+        createdAt: ago(21), updatedAt: ago(19), contextSnapshot: context, resultJson: result })
+        .where(eq(heartbeatRuns.id, chat.runId));
+      runningProcesses.delete(chat.runId);
+      await db.update(issues).set({ executionRunId: null, executionLockedAt: null, conversationState: "waiting" })
+        .where(eq(issues.id, chat.issue.id));
+      const laterContext = { issueId: chat.issue.id, taskKey: chat.issue.id };
+      const [later] = await db.insert(heartbeatRuns).values({ companyId: chat.companyId, agentId: chat.agentId,
+        status: "succeeded", runtimeMode: "native", startedAt: ago(10), finishedAt: ago(9),
+        createdAt: ago(10), updatedAt: ago(9), contextSnapshot: laterContext }).returning();
+      await db.insert(issueComments).values({ companyId: chat.companyId, issueId: chat.issue.id,
+        authorType: "agent", authorAgentId: chat.agentId, createdByRunId: later!.id,
+        body: "The chat has since moved on; here is the later turn's reply.", createdAt: ago(9), updatedAt: ago(9) });
+
+      // Check the persisted shape, not just fixture construction: no ordinary
+      // comment/wake input keys or conversation-comment receipt can mask F.
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId))
+        .orderBy(asc(heartbeatRuns.startedAt));
+      expect(runs.map(r => r.contextSnapshot)).toEqual([context, laterContext]);
+      expect(runs.map(r => r.resultJson)).toEqual([result, null]);
+      expect(runs.every(r => r.status === "succeeded")).toBe(true);
+      expect(later!.startedAt!.getTime()).toBeGreaterThan(ago(20).getTime());
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId));
+      expect(wakes.map(w => ({ key: w.idempotencyKey?.startsWith("conversation-comment:"), payload: w.payload })))
+        .toEqual(field?.location === "wake" ? [{ key: false, payload }] : []);
+      expect(await answered(m), "exercise the moved-on floor, not the direct-answer predicate").toBe(false);
+      const sweeps = [];
+      for (let pass = 0; pass < 2; pass++) {
+        // Boot/sweep entry includes discovery and the real fenced notice writer.
+        sweeps.push(await settleUnansweredPersonMessages(db, { companyId: chat.companyId, issueId: chat.issue.id, now }));
+      }
+      // Also exercise the worker's per-task decision even if discovery skipped it.
+      const direct = await settleUnansweredPersonMessage(db, { companyId: chat.companyId, issueId: chat.issue.id, now });
+      const cards = await db.select({ id: issueComments.id, body: issueComments.body, deletedAt: issueComments.deletedAt })
+        .from(issueComments).where(and(eq(issueComments.companyId, chat.companyId), eq(issueComments.issueId, chat.issue.id),
+          eq(issueComments.authorType, "system"),
+          sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + m}`));
+      console.log("F2_ROW " + JSON.stringify({ row: field?.row ?? "control", field: field?.field ?? "never carried",
+        messageId: m, messageCreatedAt: ago(20).toISOString(), carryRunId: chat.runId, laterRunId: later!.id,
+        laterStartedAt: later!.startedAt, runs: runs.map(r => ({ id: r.id, context: r.contextSnapshot, result: r.resultJson })),
+        wakes: wakes.map(w => ({ id: w.id, key: w.idempotencyKey, payload: w.payload })), sweeps, direct,
+        cards: cards.map(c => ({ ...c, deletedAt: c.deletedAt?.toISOString() ?? null })), cardCount: cards.length }));
+      expect(cards, field ? `${field.field}: no false card after the chat moved on` : "never carried: exactly one true card")
+        .toHaveLength(field ? 0 : 1);
+      if (!field) {
+        expect(cards[0]!.deletedAt).toBeNull();
+        expect(sweeps.map(s => s.noticed)).toEqual([1, 0]);
+        expect(direct.kind).toBe("noticed_before");
+      } else {
+        expect(sweeps).toEqual([{ noticed: 0, pending: 0 }, { noticed: 0, pending: 0 }]);
+        expect(direct.kind).toBe("answered");
+      }
+    }
+
+    it.each(fields)("F2-$row: carried ONLY by $field => no unanswered card", async (field) => {
+      await movedOnRow(field);
+    });
+
+    it("F2-control: recent NEVER-carried message + later succeeded replying run => exactly ONE true card", async () => {
+      await movedOnRow(null);
+    });
   });
 });
