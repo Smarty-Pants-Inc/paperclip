@@ -176,6 +176,7 @@ export async function fileDigest(path: string, signal?: AbortSignal) {
     constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
   );
   try {
+    signal?.throwIfAborted();
     for await (const bytes of handle.createReadStream({
       signal,
       autoClose: false,
