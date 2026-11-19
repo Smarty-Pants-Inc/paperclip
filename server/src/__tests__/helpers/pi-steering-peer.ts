@@ -116,6 +116,12 @@ export async function openPiSteeringPeer(root: string, runId: string, options: {
       user(next); answer(text, commentary);
     },
     answerOwnInput(text: string, commentary = false) { answer(text, commentary); },
+    beginPartialReply(text: string) {
+      send({ type: "message_start", message: { role: "assistant", content: [], timestamp: Date.now(), model: "model", provider: "neutral" } });
+      send({ type: "message_update", assistantMessageEvent: { type: "text_start", contentIndex: 0 } });
+      send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: text } });
+      // No message_end: this text never became a completed final item.
+    },
     endTurn() {
       send({ type: "turn_end" }); send({ type: "agent_end", messages: [] });
       // Pinned Pi's agent_end is a continuation boundary, NOT the run terminal.

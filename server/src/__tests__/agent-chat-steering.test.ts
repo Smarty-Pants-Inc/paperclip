@@ -50,6 +50,8 @@ import { openPiSteeringPeer } from "./helpers/pi-steering-peer.js";
 import { NativeRunCoordinatorStore } from "../services/native-runtime/native-run-coordinator-store.js";
 import { finalizeNativeRun, recoverCommittedNativeChatResponse } from "../services/native-runtime/native-run-finalizer.js";
 import { nativeResponsePresentationWork } from "../services/native-runtime/native-response-presentation-work.js";
+import { publishStoppedNativeFinals } from "../services/native-runtime/native-stopped-final-replies.js";
+import { readUnreadSteeredForInterrupt } from "../services/native-runtime/unread-steered-messages.js";
 import { readSteeredMessageAnswers } from "../services/native-runtime/steered-message-answers.js";
 import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
 import type { PrpEvent } from "../vendor/paperclip-runner/index.js";
@@ -1425,7 +1427,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   }
 
   /** The person's square Stop: the native session acknowledges a run-only stop, then the run is released. */
-  async function personStop(chat: Chat) {
+  async function personStop(chat: Chat, interrupt = false) {
     mocks.cancel.mockImplementationOnce(async (runId: string) => {
       const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       await db.update(heartbeatRuns).set({ resultJson: { ...(run!.resultJson ?? {}), nativeCancellation: {
@@ -1436,7 +1438,8 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       return { decision: { stopped: true }, auditId: randomUUID() };
     });
     await heartbeatService(db).cancelRun(chat.runId, "Cancelled by a board operator",
-      { resultJson: { cancelledByActorType: "user", cancelledByUserId: owner } });
+      { stopAcceptance: interrupt ? "interrupt" : "person_stop", ...(interrupt ? { errorCode: "operator_interrupted" } : {}),
+        resultJson: { cancelledByActorType: "user", cancelledByUserId: owner, ...(interrupt ? { operatorInterrupted: true } : {}) } });
     const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
     expect(stopped!.status).toBe("cancelled");
   }
@@ -1913,7 +1916,8 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
 
   // catch: five finals were stored but only the last was posted (run 130c114e).
   describe("native per-item final reply publication", () => {
-    async function multiFinal(count: number, options: { ownFinal?: boolean; restart?: boolean; sameText?: boolean; progress?: boolean; commentaryOnly?: boolean } = {}) {
+    async function multiFinal(count: number, options: { ownFinal?: boolean; restart?: boolean; sameText?: boolean; progress?: boolean; commentaryOnly?: boolean;
+      stopAfter?: number; interrupt?: boolean } = {}) {
       const chat = await seedChat(); await attachSteerable(chat);
       const sessionId = randomUUID(), runnerId = randomUUID();
       const [contract] = await db.insert(completionContracts).values({ companyId: chat.companyId, issueId: chat.issue.id,
@@ -1936,6 +1940,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
         port ??= makePort(event); await port.appendEvent(event); events.push(event);
       } })().catch(error => { pumpError = error; });
       const sent: string[] = [], expected: string[] = [];
+      let carried: string[] = [];
       try {
         const { turnId } = await peer.session.startTurn({ message: { role: "user", text: chat.first.body } });
         await vi.waitFor(() => { if (pumpError) throw pumpError;
@@ -1946,9 +1951,15 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
           return { turnId };
         });
         if (options.ownFinal) { peer.answerOwnInput("Own task finished."); expected.push("Own task finished."); }
-        for (let i = 0; i < count; i++) {
+        if (options.stopAfter !== undefined) for (let i = 0; i < count; i++) {
           const response = await postDefault(chat, `Question ${i + 1}`).expect(201);
           sent.push(response.body.id); await waitForPendingCommentSteers();
+        }
+        for (let i = 0; i < (options.stopAfter ?? count); i++) {
+          if (options.stopAfter === undefined) {
+            const response = await postDefault(chat, `Question ${i + 1}`).expect(201);
+            sent.push(response.body.id); await waitForPendingCommentSteers();
+          }
           const text = options.sameText ? "Same answer." : `${100 + i} + 1 = ${101 + i}.`;
           const commentary = options.commentaryOnly;
           peer.answerNextSteer(text, commentary); if (!commentary) expected.push(text);
@@ -1961,6 +1972,19 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
             port = makePort(events.at(-1)!); await port.appendEvent(events.at(-1)!);
           }
         }
+        if (options.stopAfter !== undefined) {
+          peer.answerOwnInput("Still working (commentary), never a final reply.", true);
+          peer.beginPartialReply("Unfinished stream, never post this.");
+          await vi.waitFor(() => { if (pumpError) throw pumpError;
+            expect(events.some(e => e.eventType === "item.delta" && e.payload.text === "Unfinished stream, never post this."), JSON.stringify(events.slice(-8))).toBe(true);
+          }, { timeout: 5000 });
+          if (options.interrupt) {
+            // Tier 1's real carry transaction runs BEFORE Stop finalization.
+            carried = await db.transaction(tx => readUnreadSteeredForInterrupt(tx, { issueId: chat.issue.id, runId: chat.runId }));
+            expect(carried).toEqual(sent.slice(options.stopAfter));
+          }
+          await personStop(chat, options.interrupt);
+        } else {
         if (options.progress) peer.answerOwnInput("Progress after the finals, not a reply.", true);
         peer.endTurn();
         await vi.waitFor(() => { if (pumpError) throw pumpError;
@@ -1977,22 +2001,143 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
         await finalizeNativeRun({ db, runId: chat.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: false });
         runningProcesses.delete(chat.runId);
         await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, chat.runId));
+        }
         const scope = { companyId: chat.companyId, issueId: chat.issue.id, runId: chat.runId };
         await recoverCommittedNativeChatResponse(db, scope);
         const thread = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/comments`).expect(200);
         const replies = thread.body.filter((c: any) => c.authorType === "agent")
           .sort((a: any, b: any) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || a.id.localeCompare(b.id));
         const evidence = await readSteeredMessageAnswers(db, scope);
-        if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `m-${count}${options.ownFinal ? "-late" : ""}${options.restart ? "-restart" : ""}${options.sameText ? "-same" : ""}${options.commentaryOnly ? "-commentary-only" : ""}.json`),
+        if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `${options.stopAfter !== undefined ? `s-${options.interrupt ? "int" : "stop"}${options.stopAfter}-` : "m-"}${count}${options.ownFinal ? "-late" : ""}${options.restart ? "-restart" : ""}${options.sameText ? "-same" : ""}${options.commentaryOnly ? "-commentary-only" : ""}.json`),
           JSON.stringify({ scope, sent, expected, replies, evidence, events, thread: thread.body }, null, 2));
         expect(replies.map((c: any) => c.body)).toEqual(expected);
-        expect(thread.body.filter((c: any) => c.authorType === "system")).toEqual([]);
-        const expectedAnswered = options.commentaryOnly ? [] : sent;
+        if (options.stopAfter === undefined) expect(thread.body.filter((c: any) => c.authorType === "system")).toEqual([]);
+        const expectedAnswered = options.commentaryOnly ? [] : sent.slice(0, options.stopAfter ?? count);
         expect(evidence.answered).toEqual(expectedAnswered); expect(new Set(evidence.answered).size).toBe(expectedAnswered.length);
         for (const id of sent) expect(await answered(id)).toBe(expectedAnswered.includes(id));
-        return { chat, scope, replies, sent };
+        return { chat, scope, replies, sent, carried, sessionId };
       } finally { await peer.close(); await pump; await rm(root, { recursive: true, force: true }); }
     }
+    it("s-stop3: five steers, person Stop after the third completed Pi final posts exactly three in order", async () => {
+      await multiFinal(5, { stopAfter: 3 });
+    }, 30_000);
+    it("s-int3: five steers, Interrupt after three finals; same-session successor answers only the two carried questions", async () => {
+      const { chat, replies, sent, carried, sessionId } = await multiFinal(5, { stopAfter: 3, interrupt: true });
+      expect(carried).toEqual(sent.slice(3));
+      const [previous] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+      const runnerId = randomUUID();
+      const [successor] = await db.insert(heartbeatRuns).values({ companyId: chat.companyId, agentId: chat.agentId,
+        status: "running", runtimeMode: "native", startedAt: new Date(), nativeIssueId: chat.issue.id,
+        nativeSessionId: sessionId, runnerInstanceId: runnerId, responsibleUserId: owner,
+        completionContractId: previous.completionContractId, completionContractSha256: previous.completionContractSha256,
+        contextSnapshot: { issueId: chat.issue.id, taskKey: chat.issue.id, wakeCommentIds: carried,
+          conversationSessionGeneration: previous.contextSnapshot!.conversationSessionGeneration } }).returning();
+      await prepareConversationTurn(db, successor);
+      await db.update(issues).set({ executionRunId: successor.id, executionLockedAt: new Date() }).where(eq(issues.id, chat.issue.id));
+      const root = await mkdtemp(join(tmpdir(), "chat-interrupt-successor-"));
+      const peer = await openPiSteeringPeer(root, successor.id, { normalizedSessionId: sessionId });
+      const events: PrpEvent[] = []; let pumpError: unknown;
+      let port: PaperclipControlPlanePort | undefined;
+      const pump = (async () => { for await (const event of peer.session.events()) {
+        port ??= new PaperclipControlPlanePort(db, { companyId: chat.companyId, issueId: chat.issue.id,
+          runId: successor.id, agentId: chat.agentId, sessionId,
+          completionContractId: previous.completionContractId!, completionContractSha256: previous.completionContractSha256!,
+          sourceInstanceId: event.sourceInstanceId, controlPlaneSourceInstanceId: event.sourceInstanceId });
+        await port.appendEvent(event); events.push(event);
+      } })().catch(error => { pumpError = error; });
+      try {
+        const { turnId } = await peer.session.startTurn({ message: { role: "user", text: "Continue Question 4 and Question 5" } });
+        await vi.waitFor(() => { if (pumpError) throw pumpError;
+          expect(events.some(e => e.eventType === "tool.execution.started")).toBe(true); });
+        for (const text of ["103 + 1 = 104.", "104 + 1 = 105."]) {
+          peer.answerOwnInput(text);
+          await vi.waitFor(() => { if (pumpError) throw pumpError;
+            expect(events.some(e => e.eventType === "item.completed" && e.payload.text === text)).toBe(true);
+          }, { timeout: 5000 });
+        }
+        peer.endTurn();
+        await vi.waitFor(() => { if (pumpError) throw pumpError;
+          expect(events.some(e => e.eventType === "turn.completed")).toBe(true);
+        }, { timeout: 5000 });
+        const store = new NativeRunCoordinatorStore(db, { companyId: chat.companyId, issueId: chat.issue.id,
+          runId: successor.id, agentId: chat.agentId, normalizedSessionId: sessionId, runnerSourceInstanceId: runnerId,
+          completionContractId: previous.completionContractId!, completionContractSha256: previous.completionContractSha256!,
+          completionContractRevision: "test", completionContractCriterionIds: [] });
+        await store.completeRun({ turnId, result: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done",
+          summary: "Remaining two answered", completionClaim: { contractRevision: "test", objectiveSatisfied: true,
+            criteria: [], remainingWork: [] }, evidence: [], verification: [], attentionRequests: [], artifacts: [] },
+          terminal: { schema: "paperclip.prp.terminal.v1", runTerminalState: "succeeded", turnTerminalState: "completed", reportedWorkDisposition: "done" } });
+        await finalizeNativeRun({ db, runId: successor.id, workspaceFinalizeStatus: "succeeded", projectRunStatus: false });
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, successor.id));
+        const scope = { companyId: chat.companyId, issueId: chat.issue.id, runId: successor.id };
+        await recoverCommittedNativeChatResponse(db, scope);
+        for (let i = 0; i < 2; i++) {
+          await publishStoppedNativeFinals(db, { companyId: chat.companyId, runId: chat.runId });
+          await recoverCommittedNativeChatResponse(db, scope);
+        }
+        const after = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id), eq(issueComments.authorType, "agent")))
+          .orderBy(asc(issueComments.createdAt), asc(issueComments.id));
+        expect(after.map(c => c.body)).toEqual([...replies.map((c: any) => c.body), "103 + 1 = 104.", "104 + 1 = 105."]);
+        expect(after.filter(c => c.createdByRunId === chat.runId)).toHaveLength(3);
+        if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, "s-int3-successor.json"),
+          JSON.stringify({ sessionId, predecessorRunId: chat.runId, successorRunId: successor.id, carried, sent,
+            replies: after, events, commands: peer.commands }, null, 2));
+      } finally { await peer.close(); await pump; await rm(root, { recursive: true, force: true }); }
+    }, 45_000);
+    it("s-none: person Stop before any completed final posts nothing", async () => {
+      await multiFinal(5, { stopAfter: 0 });
+    }, 30_000);
+    it("s-replay: retrying Stop finalization twice never republishes its completed items", async () => {
+      const { chat, replies } = await multiFinal(5, { stopAfter: 3 });
+      for (let i = 0; i < 2; i++) {
+        await publishStoppedNativeFinals(db, { companyId: chat.companyId, runId: chat.runId });
+        await heartbeatService(db).cancelRun(chat.runId, "Retry settled Stop",
+          { stopAcceptance: "person_stop", resultJson: { cancelledByActorType: "user", cancelledByUserId: owner } });
+      }
+      const after = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id), eq(issueComments.authorType, "agent")));
+      expect(after.map(c => c.id).sort()).toEqual(replies.map((c: any) => c.id).sort());
+    }, 30_000);
+    it("s-after: even a completed final recorded after Stop is excluded on finalization retry", async () => {
+      const { chat, replies } = await multiFinal(5, { stopAfter: 3 });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+      const [allocated] = await db.update(heartbeatRuns).set({ nextEventSeq: sql`${heartbeatRuns.nextEventSeq} + 1` })
+        .where(eq(heartbeatRuns.id, chat.runId)).returning({ next: heartbeatRuns.nextEventSeq });
+      await db.insert(heartbeatRunEvents).values({ companyId: chat.companyId, runId: chat.runId, agentId: chat.agentId,
+        seq: Number(allocated.next) - 1, eventType: "item.completed", sourceEventId: randomUUID(),
+        payload: { prpEvent: { runId: chat.runId, normalizedSessionId: run.nativeSessionId, turnId: "late-turn", itemId: "late-final",
+          payload: { kind: "agentMessage", channel: "final", providerPhase: "final_answer", text: "Too late, never publish" } } } });
+      await publishStoppedNativeFinals(db, { companyId: chat.companyId, runId: chat.runId });
+      const after = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id), eq(issueComments.authorType, "agent")));
+      expect(after.map(c => c.id).sort()).toEqual(replies.map((c: any) => c.id).sort());
+    }, 30_000);
+    it("s-days-old: boot, reconciliation and two sweeps never publish old cancelled finals", async () => {
+      const { chat, scope } = await multiFinal(5, { stopAfter: 3 });
+      // Previous-release state: completed Pi finals in the DB, but no published
+      // answers. No event replay or model invocation constructs this old state.
+      await db.delete(issueComments).where(and(eq(issueComments.createdByRunId, chat.runId), eq(issueComments.authorType, "agent")));
+      const old = new Date(Date.now() - 3 * 24 * 60 * 60_000);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+      const cancellation = run.resultJson!.cancellation as Record<string, unknown>;
+      await db.update(heartbeatRuns).set({ startedAt: new Date(old.getTime() - 60_000), finishedAt: old,
+        resultJson: { ...run.resultJson, cancellation: { ...cancellation, recordedAt: old.toISOString() } } })
+        .where(eq(heartbeatRuns.id, chat.runId));
+      await db.update(heartbeatRunEvents).set({ createdAt: old }).where(eq(heartbeatRunEvents.runId, chat.runId));
+      await db.update(issueComments).set({ createdAt: old, updatedAt: old }).where(eq(issueComments.issueId, chat.issue.id));
+      const before = await db.select().from(issueComments).where(eq(issueComments.issueId, chat.issue.id));
+      expect(await nativeResponsePresentationWork(db).load(scope)).toEqual([]); // boot's discovery
+      expect(await recoverCommittedNativeChatResponse(db, scope)).toBe(false); // reconciliation
+      // Stale finalization itself must also fail closed. Removing just the
+      // process/age guard makes this witness red, not merely an uncalled branch.
+      expect(await publishStoppedNativeFinals(db, scope)).toEqual([]);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, chat.issue.id));
+      await deliverConversationComments(db, issue!, heartbeatService(db).wakeup);
+      for (const offset of [180_000, 240_000]) await settleUnansweredPersonMessage(db,
+        { ...scope, now: new Date(Date.now() + offset) });
+      const after = await db.select().from(issueComments).where(eq(issueComments.issueId, chat.issue.id));
+      expect(after.map(c => c.id).sort()).toEqual(before.map(c => c.id).sort());
+      if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, "s-days-old.json"),
+        JSON.stringify({ scope, old, before: before.map(c => ({ id: c.id, body: c.body })), after: after.map(c => ({ id: c.id, body: c.body })) }, null, 2));
+    }, 30_000);
     it("m-5: five steered questions keep five final answers in item order, no notes", async () => { await multiFinal(5); }, 30_000);
     it("m-1: one final answer stays one comment", async () => {
       const { replies } = await multiFinal(1); expect(replies[0].clientRequestId).toBeNull();
