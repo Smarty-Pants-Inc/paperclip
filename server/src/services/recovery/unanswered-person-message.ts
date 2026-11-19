@@ -112,13 +112,33 @@ const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused", UNANSWER
  * The promise is true (rf-5 T4, pl/pause-defer-wake-tb2): a message sent while
  * the agent is paused is saved as a deferred wake (heartbeat/queue.ts,
  * agent.not_invokable -> pause_lifted) and Resume's release drain runs it once
- * (pause-defer-wake-t4.test.ts). */
+ * (pause-defer-wake-t4.test.ts). Used ONLY when that save is a fact for THIS
+ * message (pausedMessageWakeSaved, rf-2 on 50b1e878); otherwise
+ * agentPausedResendText. */
 export function agentPausedText(name: string) {
   return `${name} is paused. Your message is saved, and it will run when ${name} is resumed. `
     + `A board user or ${name}'s manager can resume ${name}.`;
 }
-/** The next action of M's while-paused pause-stopped note (its run was
- * cancelled, so it asks for a resend): resume first, then send again. */
+/** 9bc65f30's paused words: no wake of THIS message is saved for a pause
+ * Resume drains (a 'pausing' agent on a never-run task, a budget or company
+ * pause), so nothing runs it after Resume and the note promises no run. */
+export function agentPausedResendText(name: string) {
+  return `${name} is paused. Your message is saved. Send it again after ${name} is resumed. `
+    + `A board user or ${name}'s manager can resume ${name}.`;
+}
+/** Holds a person's Resume leaves in place (agent-lifecycle adapters/postgres.ts
+ * :198): while one holds, Resume does not lift the pause, so the release
+ * drain (heartbeat/queue.ts resumeDeferredExecutionReceipts, pause_lifted
+ * pass) does not run the saved message. */
+const HOLDS_RESUME_KEEPS = ["budget", "company_paused", "company_archived"];
+/** The saved-wake reasons and triggers the release drain delivers
+ * (heartbeat/queue.ts resumeDeferredExecutionReceipts, pause_lifted pass);
+ * budget.blocked is not one. */
+const RESUME_DRAINED_WAIT_REASONS = ["company.inactive", "agent.not_invokable", "wake_lost"];
+const RESUME_DRAINED_WAIT_TRIGGERS = ["pause_lifted", "reconciler_backstop"];
+/** The next action of every while-paused note that asks for a resend (M's
+ * pause-stopped note, and the paused note when no wake of the message is
+ * saved for Resume): resume first, then send again. */
 const agentPausedNextAction = (name: string) =>
   `Ask a board user or ${name}'s manager to resume ${name}, then send it again.`;
 
@@ -795,12 +815,32 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     }
   }
 
+  // rf-2 on 50b1e878: the paused note promises 'will run when <name> is
+  // resumed' ONLY when THIS message's own wake is saved and waiting
+  // (deferred / deferred_issue_execution, carrying this message) for a
+  // pause Resume drains. A 'pausing' agent on a never-run task saves no wake
+  // (heartbeat/queue.ts canSaveDeferredMessage), and a budget or company
+  // pause is not lifted by Resume: those get 9bc65f30's resend words.
+  let pausedMessageWakeSaved = false;
+  if (agentPaused && !pauseCancelledOwnRun && !settingUp
+    && !HOLDS_RESUME_KEEPS.includes(agentRow?.pauseReason ?? "") && !holds.some(hold => HOLDS_RESUME_KEEPS.includes(hold))) {
+    const savedWakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+      inArray(agentWakeupRequests.status, ["deferred", "deferred_issue_execution"]), isNull(agentWakeupRequests.runId)));
+    pausedMessageWakeSaved = savedWakes.some(wake => {
+      const wait = (wake.payload?.executionWait ?? {}) as Record<string, unknown>;
+      return RESUME_DRAINED_WAIT_REASONS.includes(String(wait.reason)) && RESUME_DRAINED_WAIT_TRIGGERS.includes(String(wait.trigger))
+        && wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id);
+    });
+  }
+
   let code: string;
   if (settingUp) {
     code = UNANSWERED_MESSAGE_AGENT_SETUP_CODE;
   } else if (agentPaused) {
     // A message whose own run the Pause did not cancel (such as P, sent while
-    // paused) is deferred and gets the paused note ('will run when resumed');
+    // paused) gets the paused note ('will run when resumed' only when its wake
+    // is saved for Resume: pausedMessageWakeSaved; else the resend words);
     // M, whose own run the Pause cancelled, is pause-stopped even while paused.
     code = pauseCancelledOwnRun ? PAUSE_STOPPED_WHILE_PAUSED_CODE : UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   } else if (waitingToStart) {
@@ -961,7 +1001,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
     : pauseStoppedWhilePaused ? `${pausedName} was paused before it answered your message. Send it again after ${pausedName} is resumed.`
     : pauseStopped ? `${pausedName} was paused before it answered your message. Send it again to continue.`
-    : paused ? agentPausedText(pausedName)
+    : paused ? (pausedMessageWakeSaved ? agentPausedText(pausedName) : agentPausedResendText(pausedName))
     : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
@@ -978,7 +1018,8 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
         : settingUp ? "No action is needed; your message is saved."
         : pauseStoppedWhilePaused ? agentPausedNextAction(pausedName)
         : pauseStopped ? "Send it again to continue."
-        : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
+        : paused ? (pausedMessageWakeSaved ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
+          : agentPausedNextAction(pausedName))
         : waiting ? "No action is needed; it will start by itself."
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : held || boundReached ? "Send a new message to try again."
