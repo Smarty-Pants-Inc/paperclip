@@ -141,7 +141,14 @@ export async function acknowledgedNativeStopExecutionHasStopped(db: Db, run: Pic
  * cause native_continuation_requires_reconciliation, evidence.runId = the run). */
 export const PERSON_STOP_OWN_HOLD_CAUSE = "native_continuation_requires_reconciliation";
 
-export type PersonStopHold = { stoppedRunId: string; userId: string; acceptedAt: string; wakeIds: string[] };
+export type PersonStopHold = {
+  stoppedRunId: string; userId: string; acceptedAt: string; wakeIds: string[];
+  /** Only with `reportEndedByTypedMessage`: the Stop's held wakes whose hold that
+   * person's own typed message ended (state (b)); the message runs first and
+   * these go right after it. Never a hold: callers that keep messages waiting
+   * must not read it as one. */
+  endedByTypedCommentId?: string;
+};
 
 function personStopWakeCarries(payload: unknown, issueId: string, messageId?: string): boolean {
   const value = parseObject(payload);
@@ -185,17 +192,21 @@ function personStopWakeCommentIds(payload: unknown): string[] {
  * not count as "typed since the Stop", so admission can ask, wake by wake,
  * whether a saved wake was held by the Stop up to this very message (it runs
  * first, alone; the held ones follow it).
+ * `reportEndedByTypedMessage`: when that person's typed message has ended the
+ * hold (state (b)), return the wakes it held anyway, with
+ * `endedByTypedCommentId` set, even while a run (the typed message's) runs.
+ * Only the queue line asks this: its held messages go right after that message.
  * (ported from al/c1-heldstop-sweep-c1d 61f43a23; keyed on S's acceptance row)
  */
 export async function readPersonStopHold(db: Db, input: {
   companyId: string; issueId: string; agentId: string; messageId?: string; wakeId?: string;
-  admittingTypedCommentIds?: string[];
+  admittingTypedCommentIds?: string[]; reportEndedByTypedMessage?: boolean;
 }): Promise<PersonStopHold | null> {
   const onIssue = or(eq(heartbeatRuns.nativeIssueId, input.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`);
-  const [running] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+  const isRunning = async () => (await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), or(onIssue, eq(heartbeatRuns.issueId, input.issueId)),
-    eq(heartbeatRuns.status, "running"))).limit(1);
-  if (running) return null;
+    eq(heartbeatRuns.status, "running"))).limit(1)).length > 0;
+  if (!input.reportEndedByTypedMessage && await isRunning()) return null;
   const [stop] = await db.select({ runId: heartbeatRuns.id, status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson,
     payload: heartbeatRunEvents.payload })
     .from(heartbeatRunEvents).innerJoin(heartbeatRuns, and(eq(heartbeatRuns.id, heartbeatRunEvents.runId),
@@ -216,7 +227,8 @@ export async function readPersonStopHold(db: Db, input: {
     eq(issueComments.authorType, "user"), eq(issueComments.authorUserId, userId), isNull(issueComments.createdByRunId),
     gt(issueComments.createdAt, acceptedAt),
     input.admittingTypedCommentIds?.length ? notInArray(issueComments.id, input.admittingTypedCommentIds) : undefined)).limit(1);
-  if (typedAfterStop) return null;
+  if (typedAfterStop && !input.reportEndedByTypedMessage) return null;
+  if (!typedAfterStop && input.reportEndedByTypedMessage && await isRunning()) return null;
   const wakes = await db.select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, payload: agentWakeupRequests.payload })
     .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.agentId, input.agentId),
       input.wakeId ? eq(agentWakeupRequests.id, input.wakeId) : undefined,
@@ -236,7 +248,8 @@ export async function readPersonStopHold(db: Db, input: {
     const live = personStopWakeCommentIds(wake.payload).map(id => byId.get(id)).filter(comment => comment !== undefined);
     return live.length > 0 && live.every(comment => comment.authorUserId === userId && comment.createdAt <= acceptedAt);
   });
-  return held.length ? { stoppedRunId: stop.runId, userId, acceptedAt: acceptedAt.toISOString(), wakeIds: held.map(wake => wake.id) } : null;
+  return held.length ? { stoppedRunId: stop.runId, userId, acceptedAt: acceptedAt.toISOString(), wakeIds: held.map(wake => wake.id),
+    ...(typedAfterStop ? { endedByTypedCommentId: typedAfterStop.id } : {}) } : null;
 }
 
 /** The Stop's OWN board hold: the release wrote it for the very run the person

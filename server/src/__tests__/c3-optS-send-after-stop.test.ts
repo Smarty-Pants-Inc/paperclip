@@ -391,6 +391,24 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
     } finally { s.done(); }
   }, 120_000);
 
+  it("2c' control: a stored recovery wait with NO person Stop keeps its words, also after the person types a message", async () => {
+    const s = await heldThenStop("system");
+    try {
+      const recovery = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
+      const before = (await request(s.client).get(`/api/issues/${s.f.issueId}/queued-comments`).expect(200)).body;
+      const typed = await s.post("M4 typed");
+      await s.settle();
+      const after = (await request(s.client).get(`/api/issues/${s.f.issueId}/queued-comments`).expect(200)).body;
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, s.f.companyId));
+      await evidence("2c-control-no-stop", { held: s.held, typed: { status: typed.status, id: typed.body?.id }, before, after, turns,
+        wakes: wakes.map(w => ({ status: w.status, wait: (w.payload as any)?.executionWait })) });
+      expect(before.executionWait, JSON.stringify(before)).toEqual(recovery);
+      expect(typed.status, JSON.stringify(typed.body)).toBe(201);
+      expect(after.executionWait, JSON.stringify(after)).toEqual(recovery);
+      expect(after.entries.map((entry: { comment: { id: string } }) => entry.comment.id), JSON.stringify(after)).toEqual(expect.arrayContaining(s.held));
+    } finally { s.done(); }
+  }, 120_000);
+
   // stail-2c (source of the stale 'Working / Thinking'): the issue detail GET's
   // interruption after a person's acknowledged Stop whose only wait is their
   // three held messages. The thread's startup lane shows 'Working' while it is

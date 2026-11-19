@@ -653,6 +653,36 @@ describe("TaskChatQueuedMessages", () => {
       Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: width });
     }
   });
+  // 2c' (rf-2 keyed re-run): after the person's typed message T ends their Stop's hold, the real GET read
+  // during T's run (person-stop-hold.test.ts "2c' R") says the held ones go right after it.
+  it("after a typed message ends the Stop hold, the held messages say they go right after it, not 'execution recovery' (390 and 1440)", () => {
+    const duringT = JSON.parse(`{"issueId":"25d08ff7-6d08-4e8e-bc0f-5cfacbf9b26a","queueId":"7ff25eab-576f-4e6d-8275-8f966219f28b","state":"deferred","targetRunId":"3dfddf5e-cb28-4ac6-bd7f-2662b3166165","revision":"1e9fab1033a243d2b69c471b78863fb1","protocol":"paperclip_runner_v1","steeringDisposition":"unsupported","executionWait":{"reason":"after_typed_message","message":"These go right after your new message."},"entries":[{"comment":{"id":"78b17291-b499-4610-aec6-e1c71f184265","companyId":"c0dc9976-ec2a-4e65-9389-7769c9034802","issueId":"25d08ff7-6d08-4e8e-bc0f-5cfacbf9b26a","authorAgentId":null,"authorUserId":"hold-person","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"8bcf41cf-025c-4406-a6bf-787e77c9521e","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"H1 held","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T06:33:36.646Z","updatedAt":"2026-11-19T06:43:36.646Z"},"position":0,"canEdit":true,"canDiscard":true,"behindReset":false},{"comment":{"id":"30c5f3c3-090d-4d31-9f23-501b98b7ff9e","companyId":"c0dc9976-ec2a-4e65-9389-7769c9034802","issueId":"25d08ff7-6d08-4e8e-bc0f-5cfacbf9b26a","authorAgentId":null,"authorUserId":"hold-person","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"e9446170-ae07-480f-976b-b725e67f7890","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"H2 held","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T06:33:36.730Z","updatedAt":"2026-11-19T06:43:36.730Z"},"position":1,"canEdit":true,"canDiscard":true,"behindReset":false},{"comment":{"id":"bffbeb0b-8ffb-4e75-8b55-ceae0c20de74","companyId":"c0dc9976-ec2a-4e65-9389-7769c9034802","issueId":"25d08ff7-6d08-4e8e-bc0f-5cfacbf9b26a","authorAgentId":null,"authorUserId":"hold-person","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"ad793b64-d13d-48bb-9eaa-1d19d20aab85","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"H3 held","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T06:33:36.807Z","updatedAt":"2026-11-19T06:43:36.807Z"},"position":2,"canEdit":true,"canDiscard":true,"behindReset":false}]}`) as IssueQueuedCommentQueue;
+    // The base's body during T's run: the stored recovery wait.
+    const baseGet = { ...duringT, executionWait: { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." } };
+    const line = "These go right after your new message.";
+    const width = window.innerWidth;
+    try {
+      for (const innerWidth of [390, 1440]) {
+        Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: innerWidth });
+        window.dispatchEvent(new Event("resize"));
+        render({ queue: duringT, onInterrupt: vi.fn().mockResolvedValue(undefined) });
+        expect(container.textContent!.split(line)).toHaveLength(2);
+        expect(container.querySelector('[data-testid="task-chat-queued-after-typed"]')?.textContent).toBe(line);
+        expect(container.textContent).not.toContain("execution recovery");
+        expect(container.querySelector('[data-testid="task-chat-queued-stopped"]')).toBeNull();
+        expect(container.querySelector('[data-testid="task-chat-queued-stopped-send"]')).toBeNull();
+        for (const entry of duringT.entries) {
+          expect(container.querySelector(`[data-testid="task-chat-queued-message-${entry.comment.id}"]`)?.textContent).toContain(entry.comment.body);
+        }
+        // The stored recovery wait (any other shape) does not get the line.
+        render({ queue: baseGet, onInterrupt: vi.fn().mockResolvedValue(undefined) });
+        expect(container.querySelector('[data-testid="task-chat-queued-after-typed"]')).toBeNull();
+        expect(container.textContent).not.toContain(line);
+      }
+    } finally {
+      Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: width });
+    }
+  });
   // rf-5 F1: Stop, then Pause. The real GET's wait is the Send route's own
   // paused code and line (agent-conversations.test.ts "(agent-paused)" row),
   // so the bar says it is paused and offers no Send that would be refused.
