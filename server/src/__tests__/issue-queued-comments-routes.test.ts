@@ -3463,7 +3463,16 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     .filter(wake => JSON.stringify(wake.payload ?? {}).includes(messageId))
     .map(wake => ({ id: wake.id, status: wake.status, error: wake.error ?? null }));
 
-  it.each(["chat", "task"] as const)("lossguard R1 %s: Stop, held A, the REAL tree Pause cancels A's wake, release: A's TRUE card shows once at +2/+11 (never silent)", async (surface) => {
+  // adopt-stophold-2cp (D2, RFL 05:33Z ruling 3 / org 3B): a tree PAUSE now keeps a person's held wake
+  // (cancelUnclaimedWakeupsForTree mode "pause"); only a subtree CANCEL still cancels it. R1 is RETARGETED to
+  // the subtree cancel (POST tree-holds {mode:"cancel"}), then the REAL restore (POST tree-holds
+  // {mode:"restore"}) so the task is open again: a cancelled task is out of the sweep's scope
+  // (unanswered-person-message.ts decideMessage: status not in todo/in_progress/in_review/blocked).
+  // Its assertions are unchanged. Chat cannot be retargeted: a subtree cancel of an Agent Chat is refused
+  // (issue-tree-control.ts:796 "Stop the active reply instead of cancelling the persistent conversation"),
+  // and the tree Pause no longer cancels the held wake (by D2), so chat has no path that cancels a held
+  // wake; R1 runs on the task page only (chat stays covered by R2 and person-stop-hold D2 K16).
+  it.each(["task"] as const)("lossguard R1 %s: Stop, held A, the REAL subtree CANCEL cancels A's wake, restore: A's TRUE card shows once at +2/+11 (never silent)", async (surface) => {
     const f = await seedStoppableTurn(surface);
     const a = await postMessage(f, "Reply exactly A");
     const stopped = await stopByRoute(f, "queue-owner");
@@ -3472,10 +3481,9 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     const whileHeld = await sweepAt(f, stopped.finishedAt!, [2]);
     expect(whileHeld[0].notes, JSON.stringify(whileHeld)).toEqual([]);
     const client = treeApp(f.companyId, "queue-owner");
-    const paused = await request(client).post(`/api/issues/${f.issueId}/tree-holds`).send({ mode: "pause", reason: "lossguard R1" });
+    const paused = await request(client).post(`/api/issues/${f.issueId}/tree-holds`).send({ mode: "cancel", reason: "lossguard R1" });
     expect(paused.status, JSON.stringify(paused.body)).toBeLessThan(300);
-    const holdId = paused.body.hold.id as string;
-    const released = await request(client).post(`/api/issues/${f.issueId}/tree-holds/${holdId}/release`).send({ reason: "lossguard R1 release" });
+    const released = await request(client).post(`/api/issues/${f.issueId}/tree-holds`).send({ mode: "restore", reason: "lossguard R1 restore" });
     expect(released.status, JSON.stringify(released.body)).toBeLessThan(300);
     const lostWakes = await wakesCarrying(f, a);
     const releasedAt = new Date();

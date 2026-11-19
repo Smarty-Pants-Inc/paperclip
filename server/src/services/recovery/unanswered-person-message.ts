@@ -19,6 +19,7 @@ import { logActivity } from "../activity-log.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { isWellFormedExecutionWait, wellFormedExecutionWaitSql } from "../deferred-execution-wait.js";
 import { readPersonStopHold } from "../acknowledged-native-stop.js";
+import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
 import { PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "../native-runtime/native-provider-failure.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
@@ -526,6 +527,16 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     && (runCarriesMessage(latest.contextSnapshot, message.id)
       || await readPersonStopHold(q, { companyId: issue.companyId, issueId: issue.id, agentId, messageId: message.id })))
     return { kind: "explained" };
+  // A tree Pause keeps a person's parked message saved (its wake stays
+  // deferred: cancelUnclaimedWakeupsForTree, mode "pause"); the release
+  // drains it once. While paused, "no run started... send again" is false.
+  if (await isAutomaticRecoverySuppressedByPauseHold(q, issue.companyId, issue.id)) {
+    const parked = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution")));
+    if (parked.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id)))
+      return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+  }
   const run = messageRun && latest && latest.id !== messageRun.id
     && ["failed", "timed_out", "interrupted", "cancelled"].includes(latest.status)
     && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,

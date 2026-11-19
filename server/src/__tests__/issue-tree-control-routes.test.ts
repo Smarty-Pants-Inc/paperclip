@@ -447,6 +447,7 @@ describe("issue tree control routes", () => {
       "company-2",
       "11111111-1111-4111-8111-111111111111",
       "Cancelled because an active subtree pause hold was created",
+      "pause",
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),

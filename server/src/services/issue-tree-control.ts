@@ -1,4 +1,4 @@
-import { readPersonStopHold } from "./acknowledged-native-stop.js";
+import { personStopWakeCommentIds } from "./acknowledged-native-stop.js";
 import { notifyStrandedAgentStatus } from "./live-run-recovery-notifications.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
@@ -1326,7 +1326,14 @@ export function issueTreeControlService(db: Db) {
     return { issueId, agentId: run.agentId, interruptedRunId: run.id, holdId: hold.id };
   }
 
-  async function cancelUnclaimedWakeupsForTree(companyId: string, rootIssueId: string, reason: string) {
+  /**
+   * mode "pause" (RFL 05:33Z ruling 3, org 3B): a deferred wake that carries a
+   * PERSON's live message stays deferred under a tree Pause (held by a person's
+   * Stop or not); the release drains it once. A system-only wake is cancelled.
+   * mode "cancel": a cancelled task cancels every unclaimed wake, held or not.
+   */
+  async function cancelUnclaimedWakeupsForTree(companyId: string, rootIssueId: string, reason: string,
+    mode: "pause" | "cancel" = "cancel") {
     const treeIssues = await listTreeIssues(companyId, rootIssueId);
     const issueIds = treeIssues.map((issue) => issue.id);
     if (issueIds.length === 0) return [];
@@ -1337,13 +1344,20 @@ export function issueTreeControlService(db: Db) {
         eq(agentWakeupRequests.companyId, companyId), inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
         isNull(agentWakeupRequests.runId), inArray(sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'`, issueIds),
       )).for("update");
-      // Stop means stop: messages a person's Stop holds stay saved for that
-      // person's Send or next message. The pause has nothing to cancel there.
+      // A tree PAUSE only: a deferred wake carrying a person's live message
+      // (a person's Stop holds it, or it is simply parked) stays saved; the
+      // release drains it once. A subtree CANCEL skips nothing.
       const heldWakeIds = new Set<string>();
-      for (const key of new Set(unclaimed.filter(wake => wake.status === "deferred_issue_execution" && wake.issueId)
-        .map(wake => `${wake.issueId}:${wake.agentId}`))) {
-        const [issueId, agentId] = key.split(":") as [string, string];
-        for (const id of (await readPersonStopHold(tx as unknown as Db, { companyId, issueId, agentId }))?.wakeIds ?? []) heldWakeIds.add(id);
+      if (mode === "pause") {
+        const parked = unclaimed.filter(wake => wake.status === "deferred_issue_execution" && wake.issueId);
+        const payloads = parked.length ? await tx.select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload })
+          .from(agentWakeupRequests).where(inArray(agentWakeupRequests.id, parked.map(wake => wake.id))) : [];
+        const idsByWake = new Map(payloads.map(row => [row.id, personStopWakeCommentIds(row.payload)]));
+        const commentIds = [...new Set([...idsByWake.values()].flat())];
+        const personComments = new Set(commentIds.length ? (await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+          eq(issueComments.companyId, companyId), inArray(issueComments.id, commentIds), eq(issueComments.authorType, "user"),
+          isNull(issueComments.deletedAt)))).map(row => row.id) : []);
+        for (const wake of parked) if ((idsByWake.get(wake.id) ?? []).some(id => personComments.has(id))) heldWakeIds.add(wake.id);
       }
       const affected = unclaimed.filter(wake => !heldWakeIds.has(wake.id));
       for (const agentId of new Set(affected.map(wake => wake.agentId))) await notifyStrandedAgentStatus(tx, { companyId, agentId });

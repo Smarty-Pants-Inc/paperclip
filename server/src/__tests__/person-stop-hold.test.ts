@@ -5,7 +5,7 @@ import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  agentWakeupRequests, agents, authUsers, issueTreeHolds, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations,
 } from "@paperclipai/db";
 import express from "express";
@@ -18,6 +18,9 @@ import { issueService } from "../services/issues.js";
 import { deliverConversationComments } from "../services/agent-conversations.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { readPersonStopHold } from "../services/acknowledged-native-stop.js";
+import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_NO_RUN_TEXT } from "../services/recovery/unanswered-person-message.js";
+import { writeDeferredExecutionWait } from "../services/deferred-execution-wait.js";
+import { configureAgentLifecycle } from "../services/agent-lifecycle.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -35,7 +38,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 // settle-then-throw after an acknowledged Stop; every later turn records the
 // comment ids it was given and answers once) and the provider ACK of the Stop.
 const fixture = vi.hoisted(() => ({
-  calls: [] as { runId: string; ids: string[]; reason: string | null }[],
+  calls: [] as { runId: string; ids: string[]; reason: string | null; ordered?: string[] }[],
   onFirst: undefined as undefined | ((input: { runId: string }) => Promise<void>),
   db: undefined as unknown, companyId: "", agentId: "", issueId: "",
 }));
@@ -73,12 +76,15 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
       const [row] = await (fixture.db as any).select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       const ctx = (row?.contextSnapshot ?? {}) as Record<string, any>;
       const ids = [...new Set([ctx.commentId, ctx.wakeCommentId, ...(ctx.wakeCommentIds ?? [])].filter(Boolean))] as string[];
+      // The run's input in its own order (agent-conversations' Stop row reads it this way).
+      const ordered = (Array.isArray(ctx.wakeCommentIds) ? ctx.wakeCommentIds.map(String)
+        : typeof ctx.wakeCommentId === "string" ? [ctx.wakeCommentId] : []) as string[];
       if (fixture.calls.length === 0 && fixture.onFirst) {
-        fixture.calls.push({ runId, ids, reason: ctx.wakeReason ?? null });
+        fixture.calls.push({ runId, ids, reason: ctx.wakeReason ?? null, ordered });
         await fixture.onFirst({ runId });
         throw new actual.NativeCancellationPendingRecoveryError();
       }
-      fixture.calls.push({ runId, ids, reason: ctx.wakeReason ?? null });
+      fixture.calls.push({ runId, ids, reason: ctx.wakeReason ?? null, ordered });
       await (fixture.db as any).insert(issueComments).values({ companyId: fixture.companyId, issueId: fixture.issueId,
         authorAgentId: fixture.agentId, authorType: "agent", createdByRunId: runId, origin: "comment", body: `answer from ${runId}` });
       return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "answered" };
@@ -142,7 +148,11 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
      * "unaccepted": the person's cancel that the Stop route did NOT accept: the
      * run ends cancelled with that person's attribution (heartbeat.cancelRun,
      * S's R10 control), but there is no run.stop.accepted person_stop row (rf-2 c). */
-    stopKind?: "person" | "interrupt" | "unaccepted";
+    stopKind?: "person" | "interrupt" | "unaccepted" | "treePause";
+    /** How many messages wait behind the running turn (default 3: H1-H3). */
+    heldCount?: number;
+    /** Runs while the turn is still running, after the messages are saved and before the Stop/Pause. */
+    beforeStop?: (ctx: Ctx, held: string[], runId: string) => Promise<void>;
     /** Boat's stop stays hung: its stop receipt never comes during the wait. */
     hung?: boolean;
     /** A TASK page (no Agent Chat): the same Stop over a task's assignee turn. */
@@ -268,7 +278,8 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
     let stopping: Promise<{ status: number; body: unknown }> | undefined;
     fixture.onFirst = async ({ runId }) => {
       firstRunId = runId;
-      for (const body of ["H1 held", "H2 held", "H3 held"]) held.push((await ctx.post(body).expect(201)).body.id);
+      for (const body of ["H1 held", "H2 held", "H3 held", "H4 held"].slice(0, options.heldCount ?? 3)) held.push((await ctx.post(body).expect(201)).body.id);
+      await options.beforeStop?.(ctx, held, runId);
       if (options.stopKind === "interrupt") {
         const q = await ctx.queue();
         stopping = request(ctx.client).post(`/api/issues/${ctx.issueId}/queued-comments/interrupt`)
@@ -277,6 +288,11 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
         stopping = ctx.heartbeat.cancelRun(runId, "Cancelled by a board operator", {
           resultJson: { cancelledByActorType: "user", cancelledByUserId: userId } } as any)
           .then(body => ({ status: 200, body }));
+      } else if (options.stopKind === "treePause") {
+        // The person's REAL tree Pause (POST /api/issues/:id/tree-holds {mode:"pause"}): it interrupts the
+        // running turn (heartbeat.cancelRun) and runs cancelUnclaimedWakeupsForTree. No Stop route.
+        stopping = request(ctx.client).post(`/api/issues/${ctx.issueId}/tree-holds`).send({ mode: "pause", reason: "tree pause" })
+          .then(r => ({ status: r.status < 300 ? 200 : r.status, body: r.body }));
       } else {
         const as = options.stopper === otherUserId ? ctx.otherClient : ctx.client;
         stopping = request(as).post(`/api/heartbeat-runs/${runId}/cancel`).send({}).then(r => r);
@@ -307,8 +323,9 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
     const accepted = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, firstRunId),
       eq(heartbeatRunEvents.message, "run.stop.accepted")));
     expect(accepted.map(row => (row.payload as any)?.kind), "the Stop route wrote its acceptance row")
-      .toEqual(options.stopKind === "unaccepted" ? [] : [options.stopKind === "interrupt" ? "interrupt" : "person_stop"]);
-    return { ...ctx, held, firstRunId };
+      .toEqual(options.stopKind === "unaccepted" || options.stopKind === "treePause" ? []
+        : [options.stopKind === "interrupt" ? "interrupt" : "person_stop"]);
+    return { ...ctx, held, firstRunId, stopBody: stopped?.body as any };
   }
 
   const successorCalls = () => fixture.calls.slice(1);
@@ -548,6 +565,236 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
     for (const id of r.held) expect(await readPersonStopHold(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId,
       messageId: id }), `message ${id}`).toBeNull();
     expect(q.executionWait?.reason ?? null, JSON.stringify(q.executionWait)).not.toBe("stopped_by_person");
+  }, 120_000);
+
+  // ---- adopt-stophold-2cp: adopt-lead's decisions D1-D3 (cut 2c') ----
+  const STOPPED_LINE = "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it.";
+  /** The sweep (settleUnansweredPersonMessage) at +2 and +11 minutes; returns every 'no run started' note it wrote. */
+  const noRunNotes = async (r: { companyId: string; issueId: string }) => {
+    for (const minute of [2, 11]) await settleUnansweredPersonMessage(db, { companyId: r.companyId, issueId: r.issueId,
+      now: new Date(Date.now() + minute * 60_000) });
+    return (await db.select({ body: issueComments.body }).from(issueComments).where(eq(issueComments.issueId, r.issueId)))
+      .filter(c => c.body.includes("no run started")).map(c => c.body);
+  };
+  const wakesOf = async (r: { wakes: Ctx["wakes"] }, ids: string[]) => (await r.wakes()).filter(w => (w.ids ?? []).some(id => ids.includes(id)));
+  const heldIdsNow = async (r: { wakes: Ctx["wakes"] }) => (await r.wakes()).filter(w => w.status === "deferred_issue_execution")
+    .flatMap(w => w.ids ?? []);
+
+  // D1 (ruling (c)): agent-conversations' Stop row variants send / delete-then-send / agent-paused / chat-held,
+  // RETARGETED from the legacy `process` adapter (a direct heartbeat.cancelRun) to a NATIVE run stopped through
+  // the REAL Stop route (POST /api/heartbeat-runs/:runId/cancel, board user => run.stop.accepted person_stop).
+  // Setup only changed; the assertions are agent-conversations.test.ts's, one for one.
+  for (const variant of ["send", "delete-then-send", "agent-paused", "chat-held"] as const) {
+    it(`D1 Stop row (${variant}), native + real Stop route: after a person's Stop nothing is sent; the owner's Send starts one turn with the waiting messages`, async () => {
+      const r = await stopWithHeld();
+      const queuedIds = r.held;
+      const queuePath = `/api/issues/${r.issueId}/queued-comments`;
+      // Stop means stop: nothing is sent and nothing is lost.
+      await r.drive(1_500);
+      expect(fixture.calls).toHaveLength(1);
+      expect(await heldIdsNow(r)).toEqual(queuedIds);
+      const readQueue = async () => {
+        const response = await request(r.client).get(queuePath);
+        expect(response.status).toBe(200);
+        return response.body;
+      };
+      let queue = await readQueue();
+      expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(queuedIds);
+      expect(queue.entries.every((entry: { queueId?: string }) => !entry.queueId || entry.queueId === queue.queueId)).toBe(true);
+      expect(queue.executionWait).toEqual({ reason: "stopped_by_person", message: STOPPED_LINE });
+      const reloaded = await readQueue();
+      expect(reloaded.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(queuedIds);
+      expect(reloaded.executionWait?.reason).toBe("stopped_by_person");
+      const sendBody = () => ({ queueId: queue.queueId, revision: queue.revision, targetRunId: null });
+      // Only the chat's owner can Send.
+      expect((await request(r.otherClient).post(`${queuePath}/interrupt`).send(sendBody())).status).toBe(403);
+      let expected = queuedIds;
+      if (variant === "delete-then-send") {
+        const deleted = await request(r.client).delete(`${queuePath}/${queuedIds[1]}`).send({ queueId: queue.queueId, revision: queue.revision });
+        expect(deleted.status).toBe(200);
+        expected = [queuedIds[0]!, queuedIds[2]!];
+        queue = await readQueue();
+        expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(expected);
+        expect(queue.executionWait?.reason).toBe("stopped_by_person");
+      }
+      if (variant === "agent-paused" || variant === "chat-held") {
+        const [hold] = variant === "chat-held"
+          ? await db.insert(issueTreeHolds).values({ companyId: r.companyId, rootIssueId: r.issueId, mode: "pause",
+            status: "active", createdByActorType: "user", createdByUserId: userId,
+            releasePolicy: { strategy: "manual", note: "leaf_pause" } }).returning()
+          : [null];
+        if (variant === "agent-paused") {
+          expect((await request(r.adminClient).post(`/api/agents/${r.agentId}/pause`).send({})).status).toBe(200);
+          expect((await readQueue()).executionWait).toEqual({ reason: "queued_comment_chat_paused",
+            message: "This agent is paused. Resume it to send these messages." });
+        }
+        const refused = await request(r.client).post(`${queuePath}/interrupt`).send(sendBody());
+        expect(refused.status).toBe(409);
+        expect(refused.body.details?.code).toBe("queued_comment_chat_paused");
+        expect(refused.body.error).toBe(variant === "agent-paused"
+          ? "This agent is paused. Resume it to send these messages."
+          : "This chat is paused. Resume it to send these messages.");
+        await r.drive(1_500);
+        expect(fixture.calls).toHaveLength(1);
+        expect(await heldIdsNow(r)).toEqual(queuedIds);
+        expect((await readQueue()).entries).toHaveLength(3);
+        if (hold) await db.update(issueTreeHolds).set({ status: "released", releasedAt: new Date() }).where(eq(issueTreeHolds.id, hold.id));
+        else {
+          const lifecycle = configureAgentLifecycle(db, { requiredPluginIds: async () => [],
+            runHost: async () => "complete" as const, runPlugin: async () => "complete" as const });
+          try {
+            expect((await request(r.adminClient).post(`/api/agents/${r.agentId}/resume`).send({})).status).toBe(200);
+            await lifecycle.process(r.agentId);
+          } finally { await lifecycle.stop(); }
+        }
+        queue = await readQueue();
+        expect(queue.executionWait).toEqual({ reason: "stopped_by_person", message: STOPPED_LINE });
+      }
+      const sent = await request(r.client).post(`${queuePath}/interrupt`).send(sendBody());
+      expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+      await waitFor(async () => {
+        await r.drive(300);
+        const answered = successorCalls().flatMap(call => call.ids);
+        return expected.every(id => answered.includes(id));
+      }, 30_000);
+      // A repeated Send of the same queue neither doubles nor reopens it.
+      expect((await request(r.client).post(`${queuePath}/interrupt`).send(sendBody())).status).toBe(409);
+      await r.drive(500);
+      await evidence(`D1-${variant}`, { calls: fixture.calls, wakes: await r.wakes() });
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, r.firstRunId)))[0]!.status).toBe("cancelled");
+      expect(fixture.calls).toHaveLength(2);
+      expect(fixture.calls[1]!.runId).not.toBe(r.firstRunId);
+      expect(fixture.calls[1]!.ordered).toEqual(expected);
+      const answers = await db.select().from(issueComments).where(and(eq(issueComments.issueId, r.issueId),
+        eq(issueComments.authorAgentId, r.agentId)));
+      expect(answers.map(answer => answer.createdByRunId)).toEqual([fixture.calls[1]!.runId]);
+      expect(await heldIdsNow(r)).toEqual([]);
+      expect((await readQueue()).entries).toHaveLength(0);
+    }, 120_000);
+  }
+
+  // D2 (RFL 05:33Z ruling 3, org 3B). K16: a person's message parked behind a running turn, then the person's REAL
+  // tree Pause: its wake stays deferred (never cancelled), no 'no run started ... send again' note while paused;
+  // the REAL release answers it once. The control rides along: a system-only deferred wake (PLANTED row: no
+  // person message) on the same task IS cancelled by the same Pause.
+  it("D2 K16: a parked person wake + the real tree Pause: still deferred, no 'no run started' note while paused; the real release answers it once; a system-only deferred wake is cancelled (control)", async () => {
+    let systemWakeId = "";
+    const r = await stopWithHeld({ stopKind: "treePause", heldCount: 1, beforeStop: async (ctx, _held, runId) => {
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: ctx.companyId, agentId: ctx.agentId,
+        source: "automation", triggerDetail: "system", reason: "issue_execution_deferred", status: "deferred_issue_execution",
+        requestedByActorType: "system", payload: { issueId: ctx.issueId, _paperclipWakeContext: { issueId: ctx.issueId, wakeReason: "heartbeat_timer" } },
+      }).returning();
+      systemWakeId = wake!.id;
+      void runId;
+    } });
+    await r.drive(1_000);
+    const holdId = r.stopBody?.hold?.id ?? r.stopBody?.id;
+    expect(holdId, JSON.stringify(r.stopBody)).toBeTruthy();
+    const duringPause = await wakesOf(r, r.held);
+    const system = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, systemWakeId)))[0];
+    // The pause lasts: the real workers run, and the sweep runs at +2 and +11 minutes (its own clock).
+    // (tenMinutesPass is not used here: it shifts runs and wakes but not the tree hold's own times.)
+    await r.drive(2_000);
+    const notesWhilePaused = await noRunNotes(r);
+    const callsWhilePaused = successorCalls().length;
+    const released = await request(r.client).post(`/api/issues/${r.issueId}/tree-holds/${holdId}/release`).send({ reason: "release" });
+    expect(released.status, JSON.stringify(released.body)).toBeLessThan(300);
+    await r.drive(4_000);
+    await r.tenMinutesPass();
+    const notesAfter = await noRunNotes(r);
+    await evidence("D2-K16", { duringPause, system: system?.status, notesWhilePaused, calls: fixture.calls, wakes: await r.wakes(),
+      released: released.body, actions: (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, r.companyId)))
+        .map(a => ({ cause: a.cause, status: a.status, owner: a.ownerType, next: a.nextAction })),
+      payloads: (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, r.companyId))).map(w => ({ s: w.status, p: w.payload })),
+      runs: (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, r.companyId))).map(x => ({ id: x.id, s: x.status, e: x.errorCode, rj: x.resultJson })),
+      activity: (await db.execute(sql`select action, details from activity_log where company_id = ${r.companyId} order by created_at`)) });
+    expect(duringPause.length, JSON.stringify(await r.wakes())).toBeGreaterThan(0);
+    expect(duringPause.every(w => w.status === "deferred_issue_execution"), JSON.stringify(duringPause)).toBe(true);
+    expect(system?.status, "the system-only deferred wake is cancelled by the Pause").toBe("cancelled");
+    expect(callsWhilePaused, JSON.stringify(fixture.calls)).toBe(0);
+    expect(notesWhilePaused, "no 'no run started... send again' while paused").toEqual([]);
+    expect(answeredIds().filter(id => id === r.held[0]).length, JSON.stringify(fixture.calls)).toBe(1);
+    expect(successorCalls().filter(call => call.ids.includes(r.held[0]!)).length).toBe(1);
+    expect(notesAfter).toEqual([]);
+  }, 120_000);
+
+  it("D2: two person messages parked when the real tree Pause lands: both stay deferred; the real release starts ONE run with both, each once", async () => {
+    const r = await stopWithHeld({ stopKind: "treePause", heldCount: 2 });
+    await r.drive(1_000);
+    const holdId = r.stopBody?.hold?.id ?? r.stopBody?.id;
+    const duringPause = await wakesOf(r, r.held);
+    // A person cannot add a third message while the task is paused (the comment route refuses it).
+    const third = await r.post("third while paused");
+    const released = await request(r.client).post(`/api/issues/${r.issueId}/tree-holds/${holdId}/release`).send({ reason: "release" });
+    expect(released.status, JSON.stringify(released.body)).toBeLessThan(300);
+    await r.drive(4_000);
+    await r.tenMinutesPass();
+    await evidence("D2-two", { duringPause, third: third.status, calls: fixture.calls, wakes: await r.wakes() });
+    // Nothing carrying them is cancelled; a deferred wake carries both (the chat gathers the second into it).
+    expect(duringPause.length).toBeGreaterThan(0);
+    expect(duringPause.some(w => w.status === "cancelled"), JSON.stringify(duringPause)).toBe(false);
+    expect(duringPause.filter(w => w.status === "deferred_issue_execution").flatMap(w => w.ids ?? []).sort(), JSON.stringify(duringPause))
+      .toEqual(r.held.slice().sort());
+    expect(third.status).toBe(409);
+    const carrying = successorCalls().filter(call => call.ids.some(id => r.held.includes(id)));
+    expect(carrying.length, JSON.stringify(fixture.calls)).toBe(1);
+    expect(carrying[0]!.ids.slice().sort()).toEqual(r.held.slice().sort());
+    for (const id of r.held) expect(answeredIds().filter(a => a === id).length, JSON.stringify(fixture.calls)).toBe(1);
+    expect(await noRunNotes(r)).toEqual([]);
+  }, 120_000);
+
+  // A subtree cancel is refused on an Agent Chat (issue-tree-control.ts:796 'Stop the active reply instead of
+  // cancelling the persistent conversation'), so this row is on a TASK page.
+  it("D2: a subtree CANCEL (task page) cancels the held wakes (held by the person's Stop or not)", async () => {
+    const r = await stopWithHeld({ task: true });
+    await r.drive(1_000);
+    const before = (await heldWakes(r, r.held)).map(w => w.id);
+    expect(before.length).toBeGreaterThan(0);
+    const cancelled = await request(r.client).post(`/api/issues/${r.issueId}/tree-holds`).send({ mode: "cancel", reason: "cancel" });
+    expect(cancelled.status, JSON.stringify(cancelled.body)).toBeLessThan(300);
+    await r.drive(1_000);
+    const after = await r.wakes();
+    await evidence("D2-cancel", { before, after });
+    for (const id of before) expect(after.find(w => w.id === id)?.status, JSON.stringify(after)).toBe("cancelled");
+    expect(successorCalls()).toEqual([]);
+  }, 120_000);
+
+  // D3, R17 (RFL ruling 1 / org 1A): a person's message parked behind a SAVING run (its saved wait is the
+  // remote_cleanup wait admission stores, written by the real writer writeDeferredExecutionWait), then that
+  // person's real Stop: HELD (the reader and the bar say so); Send starts one run, answered once; never the
+  // sweep's 'no run started... send again'.
+  it("D3 R17: a message parked behind a saving run (remote_cleanup wait), then the person's real Stop: held (reader + bar); Send: one run, answered once; never 'no run started'", async () => {
+    const r = await stopWithHeld({ heldCount: 1, beforeStop: async (ctx, held) => {
+      const [wake] = (await ctx.wakes()).filter(w => (w.ids ?? []).includes(held[0]!));
+      expect(wake, JSON.stringify(await ctx.wakes())).toBeTruthy();
+      await writeDeferredExecutionWait(db, { companyId: ctx.companyId, requestId: wake!.id },
+        { reason: "remote_cleanup", message: "Waiting for the previous environment to stop. Your message will start automatically." });
+    } });
+    await r.drive(1_000);
+    const hold = await readPersonStopHold(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId });
+    const bar = await r.queue();
+    // The sweep at +2 and +11 minutes (its own clock) before the Send.
+    await r.drive(1_000);
+    const notesBeforeSend = await noRunNotes(r);
+    const q = await r.queue();
+    const sent = await request(r.client).post(`/api/issues/${r.issueId}/queued-comments/interrupt`)
+      .send({ queueId: q.queueId, revision: q.revision, targetRunId: null });
+    await waitFor(async () => { await r.drive(300); return successorCalls().length > 0; }, 30_000).catch(() => undefined);
+    await r.drive(1_000);
+    await r.tenMinutesPass();
+    const notesAfter = await noRunNotes(r);
+    await evidence("D3-R17", { hold, bar: bar.executionWait, sent: sent.status, sentBody: sent.body, calls: fixture.calls, wakes: await r.wakes(),
+      payloads: (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, r.companyId))).map(w => ({ s: w.status, p: w.payload, e: w.error })),
+      leases: (await db.select().from(environmentLeases).where(eq(environmentLeases.companyId, r.companyId))).map(l => ({ s: l.status, c: l.cleanupStatus })),
+      activity: (await db.execute(sql`select action, details from activity_log where company_id = ${r.companyId} order by created_at`)) });
+    expect(hold, "the ONE reader holds the message").toMatchObject({ stoppedRunId: r.firstRunId, userId });
+    expect(bar.executionWait?.reason, JSON.stringify(bar.executionWait)).toBe("stopped_by_person");
+    expect((bar.entries ?? []).map((e: any) => e.comment?.id)).toEqual(r.held);
+    expect(notesBeforeSend).toEqual([]);
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    expect(successorCalls().length, JSON.stringify(fixture.calls)).toBe(1);
+    expect(successorCalls()[0]!.ids).toEqual(r.held);
+    expect(notesAfter).toEqual([]);
   }, 120_000);
 
 });
