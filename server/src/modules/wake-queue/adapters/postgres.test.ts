@@ -1,6 +1,6 @@
 import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../../../services/recovery/unanswered-person-message.js";
 import { readPersonStopHold } from "../../../services/acknowledged-native-stop.js";
-import { personMessageOwedSql } from "../../../services/person-message-answer.js";
+import { answeredPersonMessageSql, deferredWakeIsStaleSql, personMessageOwedSql } from "../../../services/person-message-answer.js";
 import { resolveExternalTestDatabaseUrl } from "../../../__tests__/helpers/external-test-database.js";
 import { DELIVERY_QUEUES } from "../../../services/delivery-work-notifications.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
@@ -1976,6 +1976,17 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     console.log("sw-6 sweep cards", (await cards(c, old.id)).length);
   });
 
+  async function answerEvidence(c: Chat, newerId: string, w: typeof agentWakeupRequests.$inferSelect) {
+    const [answer] = await db.select({ answered: answeredPersonMessageSql({ id: sql`${issueComments.id}`,
+      companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`,
+      createdAt: sql`${issueComments.createdAt}` }) }).from(issueComments).where(eq(issueComments.id, newerId));
+    const [receipt] = await db.select({ stale: deferredWakeIsStaleSql({ companyId: sql`${agentWakeupRequests.companyId}`,
+      agentId: sql`${agentWakeupRequests.agentId}`, issueId: sql`${c.issueId}::uuid`,
+      requestedAt: sql`${agentWakeupRequests.requestedAt}`, payload: sql`${agentWakeupRequests.payload}` }) })
+      .from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id));
+    return { answered: answer.answered, stale: receipt.stale };
+  }
+
   async function finishQueued(c: Chat, w: typeof agentWakeupRequests.$inferSelect, text: string) {
     const rows = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, w.id));
     expect(rows).toHaveLength(1);
@@ -2065,6 +2076,11 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     // finalizer drains here; the only newer PERSON carrier is still FAILED.
     const finalizer = await run(c, [], ago(10 * 60_000));
     await reply(c, finalizer.id);
+    const evidence = await answerEvidence(c, later.id, w);
+    console.log("st-failed-newer answer evidence", evidence);
+    expect(evidence).toEqual({ answered: false, stale: false });
+    await sweep(c);
+    expect(await cards(c, old.id)).toEqual([]);
     expect((await drain(c, finalizer.id)).outcome.kind).toBe("promoted");
     await finishQueued(c, w, "Old live request answered"); await sweep(c);
     expect(await noRunFor(old.id)).toHaveLength(1); expect(await cards(c, old.id)).toEqual([]);
@@ -2112,7 +2128,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
   });
 
   it.each(["wakeCommentIds", "commentId", "wakeCommentId", "firstTurnQueuedInput", "claimed-wake"])(
-    "st-claim: a succeeded reply with newer PERSON input in %s makes the old receipt stale", async field => {
+    "st-claim: THE answer function decides whether newer PERSON input in %s stales the old receipt", async field => {
       const c = await seed();
       const old = await message(c, "Old request never claimed", ago(40 * 60_000));
       const w = await wake(c, old.id, ago(39 * 60_000));
@@ -2125,6 +2141,22 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
       await db.update(heartbeatRuns).set({ contextSnapshot: context, ...(inputWake ? { nativeIssueId: null } : {}) })
         .where(eq(heartbeatRuns.id, r.id));
       await reply(c, r.id);
+      const evidence = await answerEvidence(c, newer.id, w);
+      console.log("st-claim", field, "answer evidence", evidence);
+      if (field === "claimed-wake") {
+        // RFL 19:17Z: a wake claim alone is not attribution under THE answer
+        // function. No run-side carry key connects this reply to newer.
+        expect(evidence).toEqual({ answered: false, stale: false });
+        await sweep(c); expect(await cards(c, old.id)).toEqual([]);
+        expect((await drain(c, r.id)).outcome.kind).toBe("promoted");
+        await finishQueued(c, w, "Old live request answered");
+        await sweep(c);
+        expect(await cards(c, old.id)).toEqual([]);
+        expect(await noRunFor(old.id)).toHaveLength(1);
+        console.log("st-claim claimed-wake: newer unanswered; old promoted and answered once, cards 0");
+        return;
+      }
+      expect(evidence).toEqual({ answered: true, stale: true });
       // Also exercise custody before promotion: a stale deferred receipt must
       // not hide its never-claimed input from the real sweep.
       await sweep(c); expect(await cards(c, old.id)).toHaveLength(1);
@@ -2136,7 +2168,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     });
 
   it.each(["no-input", "reply-boundary-only", "unclaimed-wake", "no-reply", "deleted-reply"])(
-    "st-not-claim: %s does not move the live queue on", async shape => {
+    "st-not-claim: THE answer function decides whether %s moves the live queue on", async shape => {
       const c = await seed();
       const old = await message(c, "Still waiting", ago(40 * 60_000));
       const w = await wake(c, old.id, ago(39 * 60_000));
@@ -2148,6 +2180,25 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
       if (shape !== "no-reply") await reply(c, r.id);
       if (shape === "deleted-reply") await db.update(issueComments).set({ deletedAt: new Date() })
         .where(eq(issueComments.createdByRunId, r.id));
+      const evidence = await answerEvidence(c, newer.id, w);
+      console.log("st-not-claim", shape, "answer evidence", evidence);
+      if (shape === "reply-boundary-only") {
+        // Unlike the replaced direct-input predicate, THE answer function
+        // explicitly counts conversationReplyBoundaryCommentId as a carry.
+        expect(evidence).toEqual({ answered: true, stale: true });
+        await sweep(c); expect(await cards(c, old.id)).toHaveLength(1);
+        expect((await drain(c, r.id)).outcome.kind).toBe("released");
+        await sweep(c);
+        expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0])
+          .toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
+        const notices = await cards(c, old.id);
+        expect(notices).toHaveLength(1);
+        expect(notices[0].body).toContain(`Your message is saved: "${old.body}".`);
+        expect(await noRunFor(old.id)).toEqual([]);
+        console.log("st-not-claim reply-boundary-only: newer answered; old never carried, ONE naming card, no run");
+        return;
+      }
+      expect(evidence).toEqual({ answered: false, stale: false });
       await sweep(c); expect(await cards(c, old.id)).toEqual([]);
       expect((await drain(c, r.id)).outcome.kind).toBe("promoted");
       await finishQueued(c, w, "Waiting message answered");
