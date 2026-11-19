@@ -826,8 +826,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const context = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, hop2)))[0]!.contextSnapshot as Record<string, unknown>;
     if (producer === "fresh-session lane") {
       expect(context.attributionCommentIds, "hop 2 (the real lane) still names M, for attribution only").toEqual([commentId]);
-      expect(["wakeCommentId", "wakeCommentIds", "commentId", "commentIds", "firstTurnQueuedInput", "conversationReplyBoundaryCommentId",
+      expect(["wakeCommentId", "wakeCommentIds", "commentId", "commentIds", "firstTurnQueuedInput",
         "paperclipWake"].filter(key => key in context), "nothing in the lane's context sends M to the model again").toEqual([]);
+      expect(context.conversationReplyBoundaryCommentId, "hop 1's chat turn boundary is kept as it was (attribution only)").toBe(commentId);
     } else {
       expect(context, "hop 2 (the retry seed) takes M as its one wake comment").toMatchObject({ wakeCommentIds: [commentId], wakeCommentId: commentId });
       expect("attributionCommentIds" in context || Boolean(context.firstTurnQueuedInput), "named once: not also for attribution, no first-turn receipt").toBe(false);

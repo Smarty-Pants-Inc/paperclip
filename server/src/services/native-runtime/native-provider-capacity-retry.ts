@@ -112,8 +112,9 @@ async function materializeNativeFreshSessionRetry(input: NativeRetryTarget, lane
     "commentIds", "latestCommentId", "resumeIntent", "followUpRequested",
     "commentContinuation", "firstTurnQueuedInput", "queuedCommentSourceWakeIds",
     "interactionId", "interactionIds", "interactionStatus",
-    // The origin's own attribution fields are rebuilt from the carry below, never copied stale.
-    "attributionCommentIds", "attributionInteractionIds", "conversationReplyBoundaryCommentId",
+    // The origin's own attribution lists are rebuilt from the carry below, never copied stale (the origin's
+    // conversationReplyBoundaryCommentId, a chat turn boundary, stays as bb/tamin6 leaves it).
+    "attributionCommentIds", "attributionInteractionIds",
     "paperclipWake", "paperclipWakeComment", "paperclipTaskMarkdown", "paperclipTaskMarkdownCompact",
     "paperclipTaskMarkdownAssignment", "paperclipTaskMarkdownAssignmentCompact", "paperclipTurnContext",
   ]) delete predecessorContext[key];
