@@ -2,10 +2,10 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { companies, createDb, plugins, pluginState } from "@paperclipai/db";
+import { companies, createDb, plugins, pluginState, pluginLogs } from "@paperclipai/db";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { createHostClientHandlers, PLUGIN_RPC_ERROR_CODES, type WorkerHostCallContext } from "@paperclipai/plugin-sdk";
-import { buildHostServices } from "../services/plugin-host-services.js";
+import { buildHostServices, flushPluginLogBuffer } from "../services/plugin-host-services.js";
 import { currentPluginInteractionOrigin } from "../services/plugin-interaction-context.js";
 import { createPluginEventBus } from "../services/plugin-event-bus.js";
 import { pluginRegistryService } from "../services/plugin-registry.js";
@@ -19,7 +19,15 @@ describe("plugin worker proactive state while an agent invocation is active", ()
   let db: ReturnType<typeof createDb>;
   const pluginId = randomUUID(), otherPluginId = randomUUID();
   const agentCompanyId = randomUUID(), companyId = randomUUID(), unconfiguredCompanyId = randomUUID();
-  const agentId = randomUUID(), runId = randomUUID();
+  const agentId = randomUUID(), runId = randomUUID(), userId = randomUUID();
+  // One row per protocol family, including independently governed subfamilies.
+  // Each row exercises EVERY registered method in that family, not a sample.
+  const families = ["config", "localFolders", "db", "entities", "events", "http", "secrets", "activity",
+    "metrics", "telemetry", "log", "span", "companies", "projects", "executionWorkspaces", "projects.managed",
+    "routines.managed", "skills.managed", "issues", "issues.relations", "issues.summaries", "issues.documents",
+    "approvals", "agents", "agents.managed", "agents.sessions", "goals", "access.members", "access.invites",
+    "authorization.grants", "authorization.policies", "authorization.audit"];
+  const familyOf = (method: string) => method.includes(".") ? method.slice(0, method.lastIndexOf(".")) : method;
   const manifest: PaperclipPluginManifestV1 = {
     id: "test.proactive-state", apiVersion: 1, version: "1.0.0", displayName: "Proactive state",
     description: "Proactive state authorization regression", author: "Paperclip", categories: ["automation"],
@@ -45,6 +53,7 @@ describe("plugin worker proactive state while an agent invocation is active", ()
   }, 180_000);
 
   afterAll(async () => {
+    await flushPluginLogBuffer();
     await db?.$client.end({ timeout: 1 });
     await database?.cleanup();
   }, 30_000);
@@ -56,14 +65,22 @@ describe("plugin worker proactive state while an agent invocation is active", ()
     const observed: { context: WorkerHostCallContext | undefined; origin: ReturnType<typeof currentPluginInteractionOrigin> }[] = [];
     const services = buildHostServices(db, pluginId, manifest.id, createPluginEventBus());
     const handlers = createHostClientHandlers({ pluginId, capabilities: manifest.capabilities, services });
+    const dispatched: string[] = [];
+    const streams: { method: string; params: Record<string, unknown> }[] = [];
+    const tracedHandlers = Object.fromEntries(Object.entries(handlers).map(([method, handler]) => [method,
+      async (params: never, context?: WorkerHostCallContext) => {
+        dispatched.push(method);
+        return handler(params, context);
+      }])) as typeof handlers;
     const handle = createPluginWorkerHandle(pluginId, {
       entrypointPath: fileURLToPath(new URL("./fixtures/plugin-worker-proactive-state.cjs", import.meta.url)),
       manifest, config: {}, instanceInfo: { instanceId: "proactive-state-test", hostVersion: "1.0.0" }, apiVersion: 1,
       autoRestart: false,
+      onStreamNotification: (method, params) => { streams.push({ method, params }); },
       // Read the same real configuration rows as the production loader does.
       loadProactiveCompanyScopes: async () => (await pluginRegistryService(db).listConfigs(pluginId)).map(row => row.companyId),
       hostHandlers: {
-        ...handlers,
+        ...tracedHandlers,
         "companies.get": async (params, context) => {
           if (context?.invocationScope?.agentOrigin) {
             entered();
@@ -85,7 +102,12 @@ describe("plugin worker proactive state while an agent invocation is active", ()
     const agentResult = agent?.then(value => ({ value }), error => ({ error }));
     if (busy) await agentEntered;
     return {
-      observed,
+      observed, dispatched, streams, methods: Object.keys(handlers),
+      notify: (method: string, params: Record<string, unknown>) => handle.call("getData", { key: "notification", params: { method, params } }),
+      agentRead: (params: Record<string, unknown>) => handle.call("executeTool", { toolName: "read-state", parameters: params,
+        runContext: { companyId, agentId, runId, projectId: randomUUID() } }),
+      personRead: (params: Record<string, unknown>) => handle.call("performAction", { key: "read-state", params,
+        actorContext: { companyId, type: "user", userId, agentId: null, runId: null } }),
       timer: (method: string, params: Record<string, unknown>, invocationId?: string) =>
         handle.call("getData", { key: "timer", params: { method, params, invocationId } }),
       async stop() {
@@ -144,15 +166,101 @@ describe("plugin worker proactive state while an agent invocation is active", ()
     } finally { await worker.stop(); }
   });
 
+  it("refuses reading another plugin's state even when its pluginId and namespace are supplied", async () => {
+    const worker = await start();
+    try {
+      await expect(worker.timer("state.get", { ...stateKey("owner"), pluginId: otherPluginId })).resolves.toBeNull();
+      await expect(worker.timer("state.get", { ...stateKey("owner"), pluginId: otherPluginId,
+        namespace: otherPluginId })).resolves.toBeNull();
+      expect(await db.select().from(pluginState).where(eq(pluginState.pluginId, otherPluginId)))
+        .toMatchObject([{ valueJson: "other plugin's state" }]);
+    } finally { await worker.stop(); }
+  });
+
   it("keeps writes and deletes confined to the calling plugin's own state", async () => {
     const worker = await start();
     try {
       await worker.timer("state.set", { ...stateKey("owner"), pluginId: otherPluginId, value: "own state only" });
+      const afterWrite = await db.select().from(pluginState).where(eq(pluginState.pluginId, otherPluginId));
+      expect(afterWrite).toMatchObject([{ valueJson: "other plugin's state" }]);
       await expect(worker.timer("state.get", stateKey("owner"))).resolves.toBe("own state only");
       await worker.timer("state.delete", stateKey("owner"));
       await expect(worker.timer("state.get", stateKey("owner"))).resolves.toBeNull();
       const other = await db.select().from(pluginState).where(eq(pluginState.pluginId, otherPluginId));
       expect(other).toMatchObject([{ valueJson: "other plugin's state" }]);
+    } finally { await worker.stop(); }
+  });
+
+  it.each(families)("refuses every untagged method in the %s family before dispatch", async family => {
+    const worker = await start();
+    try {
+      const actualFamilies = [...new Set(worker.methods.filter(method => !method.startsWith("state.")).map(familyOf))].sort();
+      expect(actualFamilies).toEqual([...families].sort());
+      const methods = worker.methods.filter(method => familyOf(method) === family);
+      expect(methods.length).toBeGreaterThan(0);
+      for (const method of methods) {
+        const before = worker.dispatched.length;
+        await denied(worker.timer(method, { companyId, scopeKind: "company", scopeId: companyId,
+          stateKey: "untagged", filter: { companyId } }));
+        expect(worker.dispatched.slice(before), method).toEqual([]);
+      }
+      console.info("untagged family proof", { family, methods, result: "INVOCATION_SCOPE_DENIED before dispatch" });
+    } finally { await worker.stop(); }
+  });
+
+  it("refuses every untagged method in the streams notification family before delivery", async () => {
+    const worker = await start();
+    try {
+      for (const method of ["streams.open", "streams.emit", "streams.close"]) {
+        await worker.notify(method, { companyId, channel: "untagged", event: { private: true } });
+        expect(worker.streams, method).toEqual([]);
+      }
+      console.info("untagged family proof", { family: "streams notifications", result: "dropped before delivery" });
+    } finally { await worker.stop(); }
+  });
+
+  it("keeps a host-derived write plugin-owned on later agent and person reads, with a host-derived scope audit", async () => {
+    const worker = await start();
+    try {
+      const key = stateKey("provenance");
+      const audit = () => db.select().from(pluginLogs).where(and(eq(pluginLogs.pluginId, pluginId), eq(pluginLogs.companyId, companyId)));
+      await flushPluginLogBuffer();
+      const previousLogIds = new Set((await audit()).map(row => row.id));
+      const newWrites = async () => (await audit()).filter(row => !previousLogIds.has(row.id) && row.meta?.method === "state.set");
+      await worker.timer("state.set", { ...key, value: { keeper: true }, actorType: "user", actorId: userId, agentId });
+      expect(worker.observed).toEqual([{ context: { invocationScope: { companyId } }, origin: undefined }]);
+      await flushPluginLogBuffer();
+      const writes = await newWrites();
+      expect(writes).toHaveLength(1);
+      expect(writes).toContainEqual(expect.objectContaining({ message: "Plugin state call with host-derived scope",
+        meta: { method: "state.set", scopeSource: "host-derived scope", actorType: "plugin", actorId: pluginId } }));
+      const saved = await rows(companyId, "provenance");
+      expect(saved).toMatchObject([{ pluginId, scopeKind: "company", scopeId: companyId, valueJson: { keeper: true } }]);
+      expect(Object.keys(saved[0]).sort()).toEqual(["id", "pluginId", "scopeKind", "scopeId", "namespace", "stateKey", "valueJson", "updatedAt"].sort());
+      // These are real host-issued agent and user invocations, not forged RPC ids.
+      // A scoped consumer can read plugin company data, but does not become its author.
+      await expect(worker.agentRead(key)).resolves.toEqual({ keeper: true });
+      await expect(worker.personRead(key)).resolves.toEqual({ keeper: true });
+      await expect(worker.agentRead({ ...key, scopeKind: "agent", scopeId: agentId })).resolves.toBeNull();
+      await flushPluginLogBuffer();
+      expect(await rows(companyId, "provenance")).toEqual(saved);
+      expect(await newWrites()).toEqual(writes);
+      expect(worker.observed).toEqual([{ context: { invocationScope: { companyId } }, origin: undefined }]);
+      console.info("later scoped read provenance proof", { saved, writes, agentRead: "same plugin value; no author promotion",
+        personRead: "same plugin value; no author promotion", agentNamespaceRead: null });
+    } finally { await worker.stop(); }
+  });
+
+  it("refuses a named other company even when the state scope implies the configured company", async () => {
+    const worker = await start();
+    try {
+      for (const method of ["state.get", "state.set", "state.delete"]) {
+        await denied(worker.timer(method, { ...stateKey("direct-other", unconfiguredCompanyId), value: true }));
+        await denied(worker.timer(method, { ...stateKey("named-other"), companyId: unconfiguredCompanyId, value: true }));
+        await denied(worker.timer(method, { ...stateKey("implied-other", unconfiguredCompanyId), companyId, value: true }));
+      }
+      expect(await rows(companyId, "named-other")).toEqual([]);
+      expect(await rows(unconfiguredCompanyId, "implied-other")).toEqual([]);
     } finally { await worker.stop(); }
   });
 

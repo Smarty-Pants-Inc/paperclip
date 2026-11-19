@@ -21,11 +21,22 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line
     return;
   }
   if (message.method === "initialize") {
-    send({ jsonrpc: "2.0", id: message.id, result: { ok: true, supportedMethods: ["executeTool", "getData"] } });
+    send({ jsonrpc: "2.0", id: message.id, result: { ok: true, supportedMethods: ["executeTool", "getData", "performAction"] } });
+  } else if (message.method === "executeTool" && message.params.toolName === "read-state") {
+    hostCall(message, "state.get", message.params.parameters, message.paperclipInvocation.id);
+  } else if (message.method === "performAction") {
+    hostCall(message, "state.get", message.params.params, message.paperclipInvocation.id);
   } else if (message.method === "executeTool") {
     // The host holds this nested call until the test releases it. Its echoed id
     // proves that an actual agent-origin invocation remains active at the host.
     hostCall(message, "companies.get", { companyId: message.params.runContext.companyId }, message.paperclipInvocation.id);
+  } else if (message.method === "getData" && message.params.key === "notification") {
+    const { method, params } = message.params.params;
+    setTimeout(() => {
+      send({ jsonrpc: "2.0", method, params });
+      // Stdout ordering makes this a barrier after the notification dispatch.
+      send({ jsonrpc: "2.0", id: message.id, result: null });
+    }, 0);
   } else if (message.method === "getData") {
     // A separate timer deliberately has no invocation id, as a plugin keeper
     // would. Never copy getData's id (or the concurrently running agent's id).
