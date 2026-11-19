@@ -2217,6 +2217,7 @@ const validateApp = (app) => {
       connectionMethod.auth === "api_key" &&
       !connectionMethod.keyPlacement &&
       !(app.slug === "github" && connectionMethod.credentialExchange === "github_app_installation" && ["rest_api", "mcp_remote"].includes(connectionMethod.transport)) &&
+      !connectionMethod.credentialMinter &&
       (connectionMethod.purpose ?? "tool") !== "channel"
     )
       throw new Error(

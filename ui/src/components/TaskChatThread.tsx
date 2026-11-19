@@ -2013,6 +2013,8 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
             ? "Approval required"
             : code === "native_provider_usage_limit" && source.status === "failed"
             ? "Usage limit reached"
+            : code === "sandbox_disk_full" && source.status === "failed"
+            ? "Disk full"
             : source.status === "cancelled"
               ? "Run cancelled"
               : source.status === "interrupted"
@@ -2039,6 +2041,8 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                 : code === "native_provider_usage_limit" &&
                     source.status === "failed"
                   ? "The model provider has reached its current usage limit. Try again after the limit resets."
+                  : code === "sandbox_disk_full" && source.status === "failed"
+                  ? "The agent filled the disk of its computer, so the run stopped. Ask the agent to use less disk space, then retry."
                   : code === "provider_frame_too_large"
                     ? "Provider output exceeded the safe limit."
                     : source.status === "timed_out"
@@ -2050,7 +2054,8 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
           : undefined;
         const finishedAt =
           meta?.finishedAt ?? meta?.startedAt ?? meta?.createdAt;
-        if (!historical && (!props.interruption || credentialAccess ||
+        const diskFullBesideInterruption = Boolean(props.interruption) && code === "sandbox_disk_full" && source.status === "failed";
+        if (!historical && (!props.interruption || credentialAccess || diskFullBesideInterruption ||
             (props.interruption.responsibility === "user" &&
               ["native_provider_model_rejected", "native_provider_approval_required"].includes(code)))) entriesWithFailures.push({
           ms: toMs(finishedAt),
@@ -2063,7 +2068,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
             tone: source.status === "cancelled" ? "neutral" : "error",
             label,
             detail,
-            retryable: code !== "native_session_cleanup_quarantined",
+            retryable: code !== "native_session_cleanup_quarantined" && !diskFullBesideInterruption,
             ...(credentialAccess ? { credentialAccess, retryable: false } : {}),
             collapsible: true,
             runId: source.id,

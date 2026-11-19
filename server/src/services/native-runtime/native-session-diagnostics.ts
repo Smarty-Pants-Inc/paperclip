@@ -1,4 +1,5 @@
 import type { NativeRunTrace } from "./native-run-trace.js";
+import { isNativeSandboxDiskFullReport } from "./native-sandbox-disk-full.js";
 
 export interface NativeDiagnosticOwner {
   companyId: string;
@@ -8,6 +9,7 @@ export interface NativeDiagnosticOwner {
 
 export interface NativeDiagnosticLease {
   retire(): void;
+  sandboxDiskFullObserved(): boolean;
 }
 
 export type NativeIdleDiagnosticKind = "transport_close_requested" | "session_diagnostic";
@@ -30,7 +32,7 @@ export function nativeIdleDiagnosticReason(chunk: string): string {
   }
   return "other";
 }
-type Epoch = { owner: NativeDiagnosticOwner; sink?: Sink; trace?: NativeRunTrace };
+type Epoch = { owner: NativeDiagnosticOwner; sink?: Sink; trace?: NativeRunTrace; sandboxDiskFull?: boolean };
 const sessions = new WeakMap<object, NativeSessionDiagnostics>();
 
 export class NativeSessionDiagnostics {
@@ -60,6 +62,7 @@ export class NativeSessionDiagnostics {
     this.lastOwner = epoch.owner;
     return {
       retire: () => { if (this.active === epoch) this.active = undefined; },
+      sandboxDiskFullObserved: () => epoch.sandboxDiskFull === true,
     };
   }
 
@@ -79,6 +82,7 @@ export class NativeSessionDiagnostics {
 
   record(chunk: string, stream: "stdout" | "stderr" = "stderr"): void {
     const epoch = this.active;
+    if (epoch && isNativeSandboxDiskFullReport(chunk)) epoch.sandboxDiskFull = true;
     if (!epoch?.sink) {
       const kind = chunk.startsWith("[paperclip-runner] runnerd diagnostic: runner transport close requested:")
         ? "transport_close_requested" : "session_diagnostic";

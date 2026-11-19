@@ -41,6 +41,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { agentUrl } from "@/lib/utils";
 import { cn } from "@/lib/utils";
+import { ProviderLimitMessage } from "./ProviderLimitMessage";
 import { Badge } from "@/components/ui/badge";
 import {
   deriveRecoveryDisplayState,
@@ -1346,7 +1347,7 @@ export function IssueRecoveryActionCard({
             take that step here; the saved-files recovery control owns the real one. */}
         {isRetainedWorkspaceExportCause(action.cause) && !taskRetryRefusal ? null : (
         <MetadataRow label="Next action">
-          {taskRetryRefusal ? <span>{taskRetryRefusal.nextAction}</span> : action.nextAction ? <span>{action.nextAction}</span> : <MissingValue />}
+          {taskRetryRefusal ? <span>{taskRetryRefusal.nextAction}</span> : action.nextAction ? <span><ProviderLimitMessage>{action.nextAction}</ProviderLimitMessage></span> : <MissingValue />}
         </MetadataRow>
         )}
         <MetadataRow label="Follow-up">

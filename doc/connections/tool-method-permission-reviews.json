@@ -3016,6 +3016,39 @@
       "liveProof": "not-run",
       "keyPermissions": "The App installation must grant the selected repositories and permissions. Templates request contents, pull requests and issues; Custom requests exactly the permissions you enter. Approve updated App permissions in GitHub installation settings.",
       "evidenceLimit": "Provider and MCP protocol tests are fixtures. Account-bound MCP discovery, read/write calls, bot attribution, renewal, rotation and revocation need live acceptance."
+    },
+    {
+      "app": "aws",
+      "method": "aws-role",
+      "auth": "api_key",
+      "policy": "provider-key",
+      "requestedScopes": [],
+      "capability": "provider-controlled",
+      "supportedActions": "Any AWS API the connection's IAM role allows, through run_script. The read-only access level adds AWS ReadOnlyAccess as a session policy.",
+      "evidence": [
+        "https://docs.aws.amazon.com/agent-toolkit/latest/userguide/getting-started-aws-mcp-server.html",
+        "https://docs.aws.amazon.com/agent-toolkit/latest/userguide/oauth-authentication.html",
+        "https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc.html"
+      ],
+      "reviewedAt": "2026-11-18",
+      "liveProof": "2026-11-18 spike in the Paperclip dev AWS account (doc/plans/2026-11-17-aws-connector-and-minted-credentials.md, Spike findings): a Paperclip-signed connection token assumed its role, another connection's token was denied, the bearer exchange and tools/list passed, and run_script read and wrote. A read-only session read and AWS refused its write. Both access-key paths obtained a bearer. The production connector path itself is not yet live-tested."
+    },
+    {
+      "app": "aws",
+      "method": "aws-access-key",
+      "auth": "api_key",
+      "policy": "provider-key",
+      "requestedScopes": [],
+      "capability": "provider-controlled",
+      "supportedActions": "Any AWS API the IAM user (or its optional role) allows, through run_script. The read-only access level adds AWS ReadOnlyAccess as a session policy.",
+      "evidence": [
+        "https://docs.aws.amazon.com/agent-toolkit/latest/userguide/getting-started-aws-mcp-server.html",
+        "https://docs.aws.amazon.com/agent-toolkit/latest/userguide/oauth-authentication.html",
+        "https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc.html"
+      ],
+      "reviewedAt": "2026-11-18",
+      "liveProof": "2026-11-18 spike in the Paperclip dev AWS account (doc/plans/2026-11-17-aws-connector-and-minted-credentials.md, Spike findings): a Paperclip-signed connection token assumed its role, another connection's token was denied, the bearer exchange and tools/list passed, and run_script read and wrote. A read-only session read and AWS refused its write. Both access-key paths obtained a bearer. The production connector path itself is not yet live-tested.",
+      "keyPermissions": "Use a dedicated IAM user for this connection. It needs AWSMCPSignInOAuthAccessPolicy, sts:GetFederationToken, and the permissions agents should have; Paperclip cannot raise them."
     }
   ]
 }
