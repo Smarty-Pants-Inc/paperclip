@@ -901,6 +901,11 @@ async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, 
       // A successor's own claim supersedes a cancelled owner's checkpoint for
       // good (a person's Stop or Interrupt, then the next message): no retry
       // of this close can save it, so only containment decides, as above.
+      // adopt-retire-unproven: a Runner the hand-off proof already stopped can
+      // no longer suspend, so its close raises NativeSessionCloseUnrecoverableError
+      // (after ownership release), not the fence's refusal. The same exit proof decides.
+      const unsuspendedForSuccessor = options?.discardSupersededCheckpoint === true
+        && error instanceof NativeSessionCloseUnrecoverableError && error.settlement?.runnerSuspended !== true;
       const discardable = options?.discardUnsettledSession === true
         || (options?.discardSupersededCheckpoint === true && isSupersededCheckpointRefusal(error));
       const owner = discardable ? pluginTaskSessionOwners.get(entry.session) : undefined;
@@ -920,7 +925,10 @@ async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, 
           // when this exact session's Runner is proven exited: a finished, idle
           // holder is stopped first; a busy one stays refused.
           || (options?.discardSupersededCheckpoint === true && isSupersededCheckpointRefusal(error)
-            && await supersededOwnerRunnerExited(entry)));
+            && await supersededOwnerRunnerExited(entry)))
+        // No task owner only: a plugin-task owner keeps its own Launcher proof.
+        || (unsuspendedForSuccessor && !pluginTaskSessionOwners.get(entry.session)
+          && await supersededOwnerRunnerExited(entry));
       if (retiredWithoutCheckpoint) {
         logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
           providerLeaseId: entry.providerLeaseId ?? null, reason, closeFailure: describeWarmCloseFailure(error) },
