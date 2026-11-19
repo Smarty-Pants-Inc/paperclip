@@ -69,6 +69,16 @@ The handoff, fresh winner checks, and all awaited loser PATCH/stop continuations
 share one operation-scoped ownership fence. A saved winner is immutable; a box
 with a write-ahead loser-PATCH admission can never pass the handoff gate.
 
+An extension timeout retains that fence for a five-second late-landing window
+before retry, primary fallback, or failure cleanup. A client abort is not provider
+cancellation: terminal cleanup must follow the late extension, not precede it.
+This orders the existing one-shot short PATCH after the window instead of replaying
+a relative loser TTL (which could renew it). The acquire deadline is not reset;
+settlement past it permits only cleanup, not a late handoff. The scripted provider
+row exercises a PATCH applied seven seconds after send, two seconds after client
+abort. Arbitrarily later provider applications and a worker crash during this
+window are not established by that row or a provider-side ordering guarantee.
+
 Losers enter the existing durable `stop-owed` queue, with exact known IDs and
 acquisition ownership. While credentials are still in hand, the worker GETs each
 terminal loser's current `archiveAfter` before Boat's documented

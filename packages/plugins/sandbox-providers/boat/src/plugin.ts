@@ -1471,6 +1471,9 @@ const BOAT_PROVISION_HEDGE_TTL_SECONDS = 600;
 // HTTP status. Allow at most 60 s of transport/handoff time, never a fair-use
 // cap that leaves the chat on the short create deadline.
 const BOAT_HEDGE_EXTENSION_SLACK_MS = 60_000;
+// A client abort does not cancel an admitted provider PATCH. Keep the ownership
+// fence for this bounded late-landing window before fallback/terminal cleanup.
+const BOAT_HEDGE_EXTENSION_SETTLE_MS = 5_000;
 const BOAT_CREATE_LOOKUP_INTERVAL_MS = 5_000;
 /**
  * A step's own abort signal, never past the acquisition budget's end (rf-4 U3b
@@ -1812,9 +1815,19 @@ async function extendProvisionHedgeWinner(config: Config, owner: { companyId: st
   }
   if (shuttingDown || Date.now() >= deadline) throw new Error("Boat hedge extension budget expired");
   const signal = withinBudget(deadline, 5_000);
-  const response = await request(config, `/sandboxes/${encodeURIComponent(id)}`, { method: "PATCH", signal,
-    body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(config) }) }, false, { maxSends: 1, deadline, requireJson: true,
-    sendGuard: () => { if (shuttingDown || Date.now() >= deadline) throw new Error("Boat hedge extension budget expired"); } });
+  let response: any;
+  try {
+    response = await request(config, `/sandboxes/${encodeURIComponent(id)}`, { method: "PATCH", signal,
+      body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(config) }) }, false, { maxSends: 1, deadline, requireJson: true,
+      sendGuard: () => { if (shuttingDown || Date.now() >= deadline) throw new Error("Boat hedge extension budget expired"); } });
+  } catch (error) {
+    // Do not release the handoff/loser fence at the client's timeout: a late
+    // extension could otherwise overwrite the one-shot terminal short PATCH.
+    // No new provider send is admitted here, and the original acquire deadline
+    // is unchanged. If it expires while settling, only failure cleanup follows.
+    if (createTimedOut(error)) await delay(BOAT_HEDGE_EXTENSION_SETTLE_MS);
+    throw error;
+  }
   const candidate = response?.sandbox ?? response;
   assertSandboxId(candidate, id);
   signal.throwIfAborted();
