@@ -1455,6 +1455,24 @@ export function handedOffWarmOwnerProofUnavailable(input: { runId: string; provi
   return true;
 }
 
+/** adopt-unproven-bound: whether ANOTHER live turn uses this run's handed-off
+ * warm box in this process, so a same-boot UNPROVEN proof must never stop it:
+ * a warm session on the same box (or of this run) that another run is
+ * preparing (preparingRunId / instructionPreparationRunId of another run), or
+ * a session of another run on the same box that is busy, preparing or
+ * executing. The stopped run's OWN session busy/preparing for itself is not a
+ * live turn (its run is cancelled): that wait is bounded. Process-local, no network. */
+export function handedOffWarmOwnerClaimedByAnotherRun(input: { runId: string; providerLeaseId: string | null }): boolean {
+  for (const [scope, entry] of warmNativeSessions) {
+    const sameBox = Boolean(input.providerLeaseId) && entry.providerLeaseId === input.providerLeaseId;
+    if (entry.runId !== input.runId && !sameBox) continue;
+    if (entry.preparingRunId && entry.preparingRunId !== input.runId) return true;
+    if (entry.instructionPreparationRunId && entry.instructionPreparationRunId !== input.runId) return true;
+    if (entry.runId !== input.runId && (entry.busy || entry.preparingRunId || executingRunnerdSessionScopes.has(scope))) return true;
+  }
+  return false;
+}
+
 async function stopRetainedRunnerOfFinishedOwner(entry: WarmNativeSession, error: unknown, db: Db): Promise<boolean> {
   if (!entry.sandboxRunner || !(error instanceof NativeSessionCloseUnrecoverableError)
     || error.settlement?.runnerRetained !== true || error.settlement.runnerSuspended === true) return false;

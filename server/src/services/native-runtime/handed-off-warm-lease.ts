@@ -47,6 +47,21 @@ export const HANDED_OFF_WARM_STOP_KEY = "handedOffWarmProofTimedOut";
 export const HANDED_OFF_WARM_UNAVAILABLE_STOP_KEY = "handedOffWarmProofUnavailable";
 /** rf-4 row 22f: bound on the remote proof (stop the idle Runner, wait for its exit). */
 export const handedOffWarmProofTimeout = { ms: 20_000 };
+/** adopt-unproven-bound (V4ROWS point 5): marker of the stop_and_retain intent
+ * written because the proof came back UNPROVEN in THIS boot (the stopped turn's
+ * session still busy/preparing, its Runner stop failed or was refused, or no
+ * exit record) for longer than handedOffWarmUnprovenBound. */
+export const HANDED_OFF_WARM_UNPROVEN_STOP_KEY = "handedOffWarmProofUnproven";
+/** Lease metadata: when this boot first saw the proof UNPROVEN for the run ({ runId, at }). */
+export const HANDED_OFF_WARM_UNPROVEN_SINCE_KEY = "handedOffWarmUnprovenSince";
+/** adopt-unproven-bound: how long a same-boot UNPROVEN proof may hold a
+ * handed-off warm box before it is stopped and kept (never warm expiry, up to 8 h).
+ * At the bound ONE event-driven re-proof runs (no poll interval); still not
+ * proven -> the stop-only owner's stop_and_retain intent. */
+export const handedOffWarmUnprovenBound = { ms: 30_000 };
+type Redispatch = () => Promise<unknown>;
+/** At most one scheduled re-proof per run (process-local, one-shot). */
+const unprovenRechecks = new Map<string, { timer: NodeJS.Timeout; redispatch?: Redispatch }>();
 type ProofOutcome = "none" | "proven" | "unproven" | "timed_out" | "stop_requested";
 const proofsInFlight = new Map<string, Promise<ProofOutcome>>();
 /** A proof for this run is running outside the transaction right now (process-local). */
@@ -60,7 +75,9 @@ export function handedOffWarmProofInFlight(runId: string): boolean { return proo
  * admits the successor through the receipt path). row 12: proof UNAVAILABLE here
  * (no warm session for the run in this process, e.g. after a server restart) ->
  * the same stop_and_retain intent AT ONCE, never a wait for warm expiry. */
-export function proveHandedOffWarmLeases(db: Db, run: Run): Promise<ProofOutcome> {
+export function proveHandedOffWarmLeases(db: Db, run: Run, opts?: { redispatch?: Redispatch }): Promise<ProofOutcome> {
+  const scheduled = unprovenRechecks.get(run.id);
+  if (scheduled && opts?.redispatch) scheduled.redispatch = opts.redispatch;
   const running = proofsInFlight.get(run.id);
   if (running) return running;
   const work = (async (): Promise<ProofOutcome> => {
@@ -98,6 +115,12 @@ export function proveHandedOffWarmLeases(db: Db, run: Run): Promise<ProofOutcome
             await requestHandedOffWarmLeaseStop(db, run, unavailable, { [HANDED_OFF_WARM_UNAVAILABLE_STOP_KEY]: true }, "proof unavailable");
         return "stop_requested";
       }
+      // adopt-unproven-bound: UNPROVEN in THIS boot (not a restart). Only the
+      // person's next Send would re-run the proof, so the box (and the successor)
+      // would wait for warm expiry. Bound it: past handedOffWarmUnprovenBound the
+      // stop-only owner stops and keeps the box; before it, ONE re-proof is
+      // scheduled at the bound. Never for a box another live turn uses.
+      if (await boundUnprovenHandedOffWarmLease(db, run, lease, opts?.redispatch)) return "stop_requested";
       outcome = "unproven";
       break;
     }
@@ -105,6 +128,65 @@ export function proveHandedOffWarmLeases(db: Db, run: Run): Promise<ProofOutcome
   })().finally(() => proofsInFlight.delete(run.id));
   proofsInFlight.set(run.id, work);
   return work;
+}
+
+/** adopt-unproven-bound: true when the stop-and-retain intent was written.
+ * HOW A LIVE TURN IS TOLD APART from the stopped turn's own busy/preparing
+ * session: (1) process-local, handedOffWarmOwnerClaimedByAnotherRun: a warm
+ * session on this box that is busy/preparing for, or held by, a run OTHER than
+ * the stopped one -> never stopped, nothing scheduled (that turn's own finish
+ * re-runs the proof); (2) in the database, the stop intent is only written on
+ * a warmSandboxExpiryCandidateCondition row: the lease's own run is terminal,
+ * no other active/retained/pending_cleanup lease names the same box, and no
+ * other run on the task is running. A session busy or preparing with neither
+ * is the stopped (cancelled) turn's own wind-down: bounded. */
+async function boundUnprovenHandedOffWarmLease(db: Db, run: Run, lease: typeof environmentLeases.$inferSelect,
+  redispatch?: Redispatch): Promise<boolean> {
+  const { handedOffWarmOwnerClaimedByAnotherRun } = await import("./native-session-executor.js");
+  if (handedOffWarmOwnerClaimedByAnotherRun({ runId: run.id, providerLeaseId: lease.providerLeaseId })) {
+    logger.info({ runId: run.id, leaseId: lease.id, providerLeaseId: lease.providerLeaseId },
+      "handed-off warm proof unproven; another live turn holds the box, so it is not stopped");
+    return false;
+  }
+  const recorded = lease.metadata?.[HANDED_OFF_WARM_UNPROVEN_SINCE_KEY] as { runId?: unknown; at?: unknown } | undefined;
+  let since = recorded?.runId === run.id && typeof recorded.at === "string" ? Date.parse(recorded.at) : NaN;
+  if (!Number.isFinite(since)) {
+    since = Date.now();
+    await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
+      [HANDED_OFF_WARM_UNPROVEN_SINCE_KEY]: { runId: run.id, at: new Date(since).toISOString() } })}::jsonb` })
+      .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, run.companyId)));
+  }
+  const remaining = since + handedOffWarmUnprovenBound.ms - Date.now();
+  if (remaining <= 0) {
+    const requested = await requestHandedOffWarmLeaseStop(db, run, lease, { [HANDED_OFF_WARM_UNPROVEN_STOP_KEY]: true,
+      unprovenSince: new Date(since).toISOString(), unprovenBoundMs: handedOffWarmUnprovenBound.ms }, "proof unproven past its bound");
+    if (requested) unprovenRechecks.delete(run.id);
+    return requested;
+  }
+  scheduleUnprovenRecheck(db, run, remaining, redispatch);
+  return false;
+}
+
+/** ONE re-proof at the bound (setTimeout, unref'd, deduplicated per run): it
+ * runs outside any transaction from the timer, re-reads the run and re-runs the
+ * proof; proven -> the caller's redispatch admits the successor on the same box;
+ * still unproven -> the bound has passed, so the stop intent is written and the
+ * provider's receipt admits the successor. */
+function scheduleUnprovenRecheck(db: Db, run: Run, delayMs: number, redispatch?: Redispatch) {
+  const existing = unprovenRechecks.get(run.id);
+  if (existing) { if (redispatch) existing.redispatch = redispatch; return; }
+  const entry: { timer: NodeJS.Timeout; redispatch?: Redispatch } = { redispatch, timer: setTimeout(() => {
+    unprovenRechecks.delete(run.id);
+    void (async () => {
+      const { heartbeatRuns: runs } = await import("@paperclipai/db");
+      const [current] = await db.select().from(runs).where(and(eq(runs.companyId, run.companyId), eq(runs.id, run.id))).limit(1);
+      if (!current) return;
+      const outcome = await proveHandedOffWarmLeases(db, current, { redispatch: entry.redispatch });
+      if (outcome === "proven" && entry.redispatch) await entry.redispatch();
+    })().catch(err => logger.warn({ err, runId: run.id }, "handed-off warm unproven re-proof failed"));
+  }, Math.max(0, delayMs) + 50) };
+  entry.timer.unref?.();
+  unprovenRechecks.set(run.id, entry);
 }
 
 /** row 12: the lease's holder stamp (environment-lease-controller, written
