@@ -4,10 +4,10 @@ import { anchorParkedWakePayloadSql, parkedWakeAnchor, parkedWakeNeedsAnchorSql,
 import { agentWakeupRequests, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { issueService } from "../issues.js";
 import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
-import { chainCarriesCommentSql } from "../person-message-answer.js";
+import { answeredPersonMessageSql } from "../person-message-answer.js";
 import { buildStrandedRecoveryEscalationNotice } from "../recovery/stranded-notice.js";
-import { PENDING_WAIT_BOUND_MS, UNANSWERED_MESSAGE_NO_RUN_CODE, UNANSWERED_MESSAGE_REASON_PREFIX,
-  UNANSWERED_WAITING_ROW_JSON } from "../recovery/unanswered-person-message.js";
+import { owedPersonMessageSql, runCarriesMessage, PENDING_WAIT_BOUND_MS, UNANSWERED_MESSAGE_NO_RUN_CODE,
+  UNANSWERED_MESSAGE_REASON_PREFIX, UNANSWERED_WAITING_ROW_JSON } from "../recovery/unanswered-person-message.js";
 
 /**
  * S124: a parked wake (a person's saved Send, deferred_issue_execution with
@@ -150,6 +150,42 @@ export async function noticeParkedWakeDeadline(db: Db, scope: { companyId: strin
     const anchor = parkedWakeAnchor(current?.payload);
     if (!current || anchor === null || anchor + parkedWakeDeadlineMs() > now.getTime()) return false;
     const stopping = parkedWakeStopping(current.payload);
+    // EACH held X is answered only by the merged line's ONE function (D1: the run's OWN input;
+    // D3: a succeeded reply or its accepted result published once, never progress). Ancestry and
+    // the latest carrier's status cannot override that verdict, even after this park was noticed.
+    const held = queuedCommentIdsFromWakePayload(current.payload);
+    const message = { id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` };
+    const carried = held.length === 0 ? [] : await tx.select({ id: issueComments.id,
+      answered: answeredPersonMessageSql(message), owed: owedPersonMessageSql(message, now),
+    }).from(issueComments).where(and(eq(issueComments.companyId, scope.companyId),
+      eq(issueComments.issueId, issueId), eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
+      inArray(issueComments.id, held)));
+    const answered = new Set(carried.filter(row => row.answered).map(row => row.id));
+    const open = held.filter(id => !answered.has(id));
+    if (held.length > 0 && open.length === 0) {
+      await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: now, updatedAt: now,
+        error: "parked_send_answered_elsewhere" }).where(eq(agentWakeupRequests.id, scope.requestId));
+      return false;
+    }
+    // Live OWN input can still be answered: do not claim it never started. Reuse the sweep's
+    // carry reader; this is a wait, not a second answer predicate or an ancestry walk.
+    const active = await tx.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, scope.companyId),
+        sql`(${heartbeatRuns.issueId} = ${issueId} or ${heartbeatRuns.nativeIssueId} = ${issueId}
+          or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId})`,
+        inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"])));
+    if (active.some(run => open.some(id => runCarriesMessage(run.contextSnapshot, id)))) return PARKED_WAKE_CARRIER_ACTIVE;
+    const payload = answered.size > 0 ? withQueuedCommentIdsInWakePayload(current.payload, open) : current.payload;
+    if (answered.size > 0 && parkedWakeNoticed(current.payload)) {
+      await tx.update(agentWakeupRequests).set({ payload }).where(eq(agentWakeupRequests.id, scope.requestId));
+    }
+    // The SAME owed/floor decision as unanswered-message discovery, not a second age or answer
+    // rule. Out-of-scope X stays held; it is not an answered X and must not be silently retired.
+    // Gate BOTH the first note and the 30-minute rewrite before touching either notice marker.
+    const owed = new Set(carried.filter(row => row.owed).map(row => row.id));
+    const messageId = open.filter(id => owed.has(id)).at(-1);
+    if (!messageId) return false;
     if (parkedWakeNoticed(current.payload)) {
       if (!stopping) return false;
       // RFL C2: still unconfirmed 30 min after the first park: rewrite the
@@ -158,7 +194,6 @@ export async function noticeParkedWakeDeadline(db: Db, scope: { companyId: strin
         await tx.update(agentWakeupRequests).set({
           payload: sql`${agentWakeupRequests.payload} || ${JSON.stringify({ parkedUnconfirmedAt: now.toISOString() })}::jsonb`,
         }).where(eq(agentWakeupRequests.id, scope.requestId));
-        const messageId = queuedCommentIdsFromWakePayload(current.payload).at(-1) ?? scope.requestId;
         const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${messageId}`;
         const notice = buildStrandedRecoveryEscalationNotice({
           seed: { title: "Your message is saved", body: PARKED_WAKE_UNCONFIRMED_TEXT, tone: "info",
@@ -175,49 +210,12 @@ export async function noticeParkedWakeDeadline(db: Db, scope: { companyId: strin
       }
       return PARKED_WAKE_STOPPING;
     }
-    // Per held message X, the runs that CARRIED X (directly or through their
-    // continuation chain, chainCarriesCommentSql) decide (rf-4 rulings):
-    // - a carrying run still queued/running/scheduled_retry: X may yet be
-    //   answered, so "it did not start" would be false. No note now; the
-    //   worker checks again on its next pass.
-    // - X leaves this wake only when its LATEST carrying run published an agent
-    //   reply after X. A latest carrier that failed/was cancelled/timed out
-    //   without a reply keeps X's true note, even if an earlier carrier replied;
-    //   a reply to a later message whose run never carried X does not count.
-    // All held carried-and-replied: the wake is settled (cancelled, kept), no note.
-    const held = queuedCommentIdsFromWakePayload(current.payload);
-    const message = { id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
-      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` };
-    const carrier = (alias: string) => sql`${sql.identifier(alias)}.company_id = ${message.companyId}
-      and (${sql.identifier(alias)}.issue_id = ${message.issueId}
-        or ${sql.identifier(alias)}.context_snapshot->>'issueId' = ${message.issueId}::text)
-      and ${chainCarriesCommentSql(alias, message.id, message)}`;
-    const carried = held.length === 0 ? [] : await tx.select({ id: issueComments.id,
-      active: sql<boolean>`exists (select 1 from ${heartbeatRuns} r where ${carrier("r")}
-        and r.status in ('queued', 'running', 'scheduled_retry'))`,
-      answered: sql<boolean>`exists (select 1 from ${issueComments} a
-        where a.company_id = ${message.companyId} and a.issue_id = ${message.issueId} and a.author_type = 'agent'
-          and a.deleted_at is null and a.created_at > ${message.createdAt}
-          and a.created_by_run_id = (select r.id from ${heartbeatRuns} r where ${carrier("r")}
-            order by r.created_at desc, r.started_at desc nulls last, r.id desc limit 1))`,
-    }).from(issueComments)
-      .where(and(eq(issueComments.companyId, scope.companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, held)));
-    if (carried.some(row => row.active)) return PARKED_WAKE_CARRIER_ACTIVE;
-    const answered = new Set(carried.filter(row => row.answered).map(row => row.id));
-    const open = held.filter(id => !answered.has(id));
-    if (held.length > 0 && open.length === 0) {
-      await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: now, updatedAt: now,
-        error: "parked_send_answered_elsewhere" }).where(eq(agentWakeupRequests.id, scope.requestId));
-      return false;
-    }
-    const payload = answered.size > 0 ? withQueuedCommentIdsInWakePayload(current.payload, open) : current.payload;
     // First note already past the 30-min line (a late pass): write that line.
     const unconfirmed = stopping && anchor + PARKED_WAKE_UNCONFIRMED_MS <= now.getTime();
     await tx.update(agentWakeupRequests).set({
       payload: sql`${JSON.stringify(payload)}::jsonb || ${JSON.stringify({ parkedNoticeAt: now.toISOString(),
         ...(unconfirmed ? { parkedUnconfirmedAt: now.toISOString() } : {}) })}::jsonb`,
     }).where(eq(agentWakeupRequests.id, scope.requestId));
-    const messageId = open.at(-1) ?? scope.requestId;
     const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${messageId}`;
     const notice = buildStrandedRecoveryEscalationNotice({
       seed: stopping

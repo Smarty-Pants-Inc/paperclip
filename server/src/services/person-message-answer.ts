@@ -2,7 +2,6 @@ import { sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issueThreadInteractions, issues,
   nativeRunFinalizations, nativeRunResults } from "@paperclipai/db";
-import { freshContinuationSourceChainSql } from "./fresh-continuation-chain.js";
 
 /** The import's per-task arrival record: one activity row per issue a company import creates (issues.importIssues). */
 export const ISSUE_IMPORTED_ACTION = "issue.imported";
@@ -33,28 +32,6 @@ const inputSenderSql = (id: SQL) => sql`coalesce((select sender_m.author_user_id
 const answerableCardSql = (id: SQL) => sql`(q.status = 'pending' or (q.resolved_by_user_id is not null and (q.status in ('answered', 'accepted', 'rejected')
   or (q.status = 'cancelled' and q.resolved_by_user_id = ${inputSenderSql(id)}
     and (q.result->>'outcome' in ('skipped', 'withdrawn') or q.result->>'cancelled' = 'true')))))`;
-
-type PersonMessageSql = { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL };
-
-function carriesCommentSql(alias: string, commentId: SQL): SQL {
-  const context = sql`${sql.identifier(alias)}.context_snapshot`;
-  return sql`(${context}->>'wakeCommentId' = ${commentId}::text or ${context}->>'commentId' = ${commentId}::text
-    or ${context}->>'conversationReplyBoundaryCommentId' = ${commentId}::text
-    or coalesce(${context}->'wakeCommentIds', '[]'::jsonb) ? ${commentId}::text
-    or coalesce(${context}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${commentId}::text)`;
-}
-
-/** A reply/card can belong to a later run without copying the original input
- * ids. Follow durable continuation and answered-interaction edges, never mere
- * session identity or a later run's timestamp. UNION makes cycles terminate. */
-export function chainCarriesCommentSql(alias: string, commentId: SQL, m: PersonMessageSql): SQL {
-  return sql`(${carriesCommentSql(alias, commentId)} or exists (
-    ${freshContinuationSourceChainSql({ companyId: m.companyId, issueId: m.issueId,
-      runId: sql`${sql.identifier(alias)}.id` }, true)}
-    select 1 from source_chain input
-      join ${heartbeatRuns} carrying on carrying.id = input.id and carrying.company_id = ${m.companyId}
-      where ${carriesCommentSql("carrying", commentId)}))`;
-}
 
 /** SQL over reply comment a and its run r: the run's ACCEPTED result, PUBLISHED ONCE (RFL 23:13Z, record
  * SUPERSEDE-ANSWERED-ACCEPTED-PUBLISHED-1118). Comment a is THE comment the run's presentation decision recorded

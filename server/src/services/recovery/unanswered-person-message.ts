@@ -270,6 +270,14 @@ function inScopeSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }
         or coalesce(w.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text)))`;
 }
 
+/** The typed-message sweep's owed/floor decision, shared with parked-Send note writers. The floor is
+ * inScopeSql's lookback OR recent durable activity for THIS input, never a later message's answer. Keep it
+ * separate from notice coverage: a standing waiting note may need to be rewritten in place. */
+export function owedPersonMessageSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }, now = new Date()): SQL {
+  const since = new Date(now.getTime() - UNANSWERED_MESSAGE_LOOKBACK_MS).toISOString();
+  return sql`(${inScopeSql(m, since)} and not ${answeredSql(m)})`;
+}
+
 /** SQL over an issue_thread_interactions alias: a person's card answer the task OWES (unansweredCardAnswerSql, the
  * one function with the card answer as the input), given after every typed message: a newer typed message is the
  * owed input instead (as on bb/tamin6 unanswered-person-message.ts:310-321). */
@@ -349,11 +357,9 @@ export function owedCardAnswerInteractionCondition(now: Date = new Date()): SQL 
  * open status, including blocked.
  */
 export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId: AnyPgColumn): SQL {
-  const since = new Date(Date.now() - UNANSWERED_MESSAGE_LOOKBACK_MS).toISOString();
   return sql`(exists (select 1 from ${issueComments} m
       where m.company_id = ${companyId} and m.issue_id = ${issueId} and m.author_type = 'user'
-        and m.deleted_at is null and ${inScopeSql(rawMessage("m"), since)}
-        and not ${answeredSql(rawMessage("m"))}
+        and m.deleted_at is null and ${owedPersonMessageSql(rawMessage("m"))}
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
           and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX}) and ${noticeCoversSql("n", sql.raw("m.id"))}
           and ${noticeStandsSql("n", rawMessage("m"))}
@@ -396,11 +402,8 @@ export function answeredNoticeToRetireCondition(issueId: AnyPgColumn, companyId:
  * recovery worker runs ONE batched query with it per page of visited tasks.
  */
 export function unansweredPersonMessageCommentCondition(): SQL {
-  const since = new Date(Date.now() - UNANSWERED_MESSAGE_LOOKBACK_MS).toISOString();
   return sql`((${issueComments.authorType} = 'user' and ${issueComments.deletedAt} is null
-      and ${inScopeSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
-        issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }, since)}
-      and not ${answeredSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      and ${owedPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
         issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}
       and not exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
         and n.issue_id = ${issueComments.issueId}
@@ -426,7 +429,7 @@ export type UnansweredMessageOutcome =
   | { kind: "pending"; recheckAt: number }
   | { kind: "noticed"; code: string; commentId: string };
 
-function runCarriesMessage(contextSnapshot: unknown, messageId: string): boolean {
+export function runCarriesMessage(contextSnapshot: unknown, messageId: string): boolean {
   const context = (contextSnapshot ?? {}) as Record<string, unknown>;
   // A comment that arrived while the run prepared is delivered as its first-turn
   // input (first-turn-queued-input.ts; queued-comment-delivery.ts:21-60): that
