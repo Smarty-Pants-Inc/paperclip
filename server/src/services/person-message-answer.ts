@@ -1,5 +1,5 @@
-import { sql, type SQL } from "drizzle-orm";
-import { activityLog, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
+import { and, eq, inArray, sql, type SQL } from "drizzle-orm";
+import { activityLog, heartbeatRuns, issueComments, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
 import { freshContinuationSourceChainSql } from "./fresh-continuation-chain.js";
 
 /** The import's per-task arrival record: one activity row per issue a company import creates (issues.importIssues). */
@@ -70,6 +70,31 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
         -- A card answers only inputs carried on its chain, never queued inputs by time.
         and ${chainCarriesCommentSql("r", m.id, m)})
     or ${importedPersonHistorySql(m)})`;
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The ids among `commentIds` that answeredPersonMessageSql says are answered.
+ * The ONE reader for callers holding ids (the Interrupt route's carry of the
+ * interrupted turn's input, a saved Interrupt's resume): an AGENT reply (never
+ * a system notice) by a run carrying the message (any carried key, including
+ * context.commentId) or a later person input, a card on its chain, or imported
+ * history; a failed carrier never counts (L1b). Never a second partial predicate.
+ */
+export async function answeredPersonMessageIds(
+  db: Pick<Db, "select">,
+  input: { companyId: string; issueId: string; commentIds: string[] },
+): Promise<Set<string>> {
+  const ids = [...new Set(input.commentIds.filter(id => UUID.test(id)))];
+  if (!ids.length) return new Set();
+  const rows = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
+    inArray(issueComments.id, ids),
+    answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }),
+  ));
+  return new Set(rows.map(row => row.id));
 }
 
 /** SQL: a run that carried message m FAILED and posted no reply of its own. */
