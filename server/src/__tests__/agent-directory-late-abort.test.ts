@@ -364,6 +364,11 @@ describe("agent directory collection aborted after the canonical commit boundary
     const CLEANUP_ADMISSION_RETRY_MS = 30_000; // scoped-deadline-work retryMs, NOT a sweep period
     const WORKER_COMPLETION_SLACK_MS = 5_000;
     const { service, copy, executionTarget, runId, note } = await stoppedRunWithUnsavedNote({ agentFileLateAbortSettleMs: 200 });
+    const [[collectorPool], [observerPool]] = await Promise.all([
+      db.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`),
+      observer.execute<{ pid: number; version: string }>(sql`select pg_backend_pid() as pid, version() as version`),
+    ]);
+    expect(observerPool!.pid, "fixture: the observer uses a different PostgreSQL pool/session").not.toBe(collectorPool!.pid);
     const { controller, persisted, release } = plantAbortAfterPersist(note, true);
     const collection = outcomeOf(service.collectStopped({ companyId, runId, target: executionTarget, signal: controller.signal }));
     await Promise.race([persisted, collection]);
@@ -409,7 +414,8 @@ describe("agent directory collection aborted after the canonical commit boundary
       const afterWorker = await copyRow(runId);
       const sourceAfterWorker = await fs.readFile(path.join(copy.executionRoot, noteName), "utf8").catch(() => null);
       await evidence(`r9-cleanup-${delayed ? "delayed" : "normal"}.json`, {
-        realTimers: true, workerHasFixedPeriod: false, cleanupAdmissionRetryMs: CLEANUP_ADMISSION_RETRY_MS,
+        realTimers: true, postgres: { version: observerPool!.version, collectorPoolPid: collectorPool!.pid, observerPoolPid: observerPool!.pid },
+        workerHasFixedPeriod: false, cleanupAdmissionRetryMs: CLEANUP_ADMISSION_RETRY_MS,
         unlockTimeoutMs: UNLOCK_TIMEOUT_MS, lockObservationSlackMs: LOCK_OBSERVATION_SLACK_MS,
         lockFreeWhileLanding, lockFreeBeforeWorker, lockAcquiredAfterSettleMs,
         reported: atBound?.row?.errorCode, error: atBound?.error ? String(atBound.error) : null,

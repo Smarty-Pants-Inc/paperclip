@@ -32,4 +32,12 @@ unlock timeout, not an invented worker period.
 
 The object store is an in-memory stand-in; sandbox commands are real local
 child processes. These rows are local source-checkout evidence, not a deployed
-provider or production-agent verification.
+provider or production-agent verification. The evidence includes PostgreSQL's
+reported version and distinct collector-pool/observer-pool backend PIDs.
+
+The release mutations distinguish the two lifecycles: skipping the real cleanup
+worker's release only for too-late-abort copies fails source removal/receipt
+assertions, but the independent lock probe still succeeds. Skipping the
+collector's own unlock fails the independent lock probe/timing assertions.
+A red source-cleanup mutation is not evidence that this worker owns the
+collector's PostgreSQL session lock.
