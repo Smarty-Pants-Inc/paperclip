@@ -637,13 +637,18 @@ export async function admitExplicitNativeContinuation(input: {
     const remote = leases.some(lease => lease.provider !== "local");
     if (remote) {
       // Never interpret remote PIDs using the control-plane host's process table.
+      // A remote stop receipt binds only a remote lease (remoteTerminationReceipt refuses provider 'local'). The
+      // same run's LOCAL lease (the real producer's own) gets the local lease rule, never a remote receipt it can
+      // never carry (adopt-cutc3: R17's Send stayed parked on remote_cleanup after Boat's receipt landed).
+      // compose-C: B's handed-off warm-box settlement below reads the REMOTE leases only (C 1b58d777).
+      const remoteLeases = leases.filter(lease => lease.provider !== "local");
       // pl/send-after-stop: a person's Stop of a warm (keep_running) turn hands
       // the still-running box off for the next message (nativeStopWorkspaceOutcome);
       // no stop receipt ever comes for it. It is settled for this Send once the
       // s3 fence's own proof says the stopped run's Runner exited, exactly as the
       // successor's retirement on that box requires; no stop in flight on it.
       const handedOff = new Set<string>();
-      for (const lease of leases) {
+      for (const lease of remoteLeases) {
         if (hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease)) continue;
         // adopt-hung-stop: the handed-off box's stop receipt is overdue; it is stop debt, replaced before any reuse.
         if (handedOffWarmStopReceiptOverdue(run, lease)) continue;
@@ -652,7 +657,7 @@ export async function admitExplicitNativeContinuation(input: {
         if (!handedOffWarmLeaseSettled(run, lease)) break;
         handedOff.add(lease.id);
       }
-      const unsettled = leases.filter(lease => !handedOff.has(lease.id) && !hasRemoteTerminationReceipt(lease) && !hasRecoveredCleanupStopReceipt(lease)
+      const unsettled = remoteLeases.filter(lease => !handedOff.has(lease.id) && !hasRemoteTerminationReceipt(lease) && !hasRecoveredCleanupStopReceipt(lease)
         && !handedOffWarmStopReceiptOverdue(run, lease));
       if (unsettled.length) {
         if (handedOffWarmProofInFlight(run.id) && unsettled.some(lease => handedOffWarmLease(run, lease)))
@@ -664,7 +669,8 @@ export async function admitExplicitNativeContinuation(input: {
         }
         return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
       }
-      if (run.runtimeMode === "native" && !input.dryRun && !leases.every(lease => completeTerminatedRemoteNativeSessionCleanup({
+      if (leases.some(lease => lease.provider === "local" && (!lease.releasedAt || lease.cleanupStatus === "failed"))) return blocked("local_cleanup", "Waiting for the previous environment to finish cleanup. Your message will start automatically.");
+      if (run.runtimeMode === "native" && !input.dryRun && !remoteLeases.every(lease => completeTerminatedRemoteNativeSessionCleanup({
         companyId, runId: run.id, remoteCleanupScope: remoteLeaseCleanupScope(lease)!,
       }))) return refused("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
     } else {
