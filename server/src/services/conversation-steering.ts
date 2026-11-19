@@ -2,6 +2,26 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { activityLog, agents, agentWakeupRequests, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { acceptSteeredIdentity, reconcileSteeredIdentity, rejectSteeredIdentity, reserveSteeredIdentity, storedSteeringAcknowledgement } from "./run-identity.js";
 import { nativeRunHasStopRequest } from "./native-runtime/native-run-stop-request.js";
+import { logger } from "../middleware/logger.js";
+
+/** Existing outbox lock; shared with task-comment admission and run-end adoption. */
+export const personCommentDeliveryLockKey = (issueId: string): string => `conversation-delivery:${issueId}`;
+
+export type PersonCommentSteeringOptions = {
+  /** Only the existing conversation outbox, while holding the lock above. */
+  lockHeld?: boolean;
+  deliveryIntent?: "steer" | "queue" | "interrupt";
+  /** Definite provider refusal uses the caller's ordinary, idempotent admission. */
+  onRejected?: () => Promise<unknown>;
+};
+
+// The native attachment is process-owned. This promise chain only preserves RPC
+// order at that owner; durable custody remains the saved comment + carrying run.
+// It never holds the admission lock or makes a later POST await a provider ACK.
+const dispatches = new Map<string, Promise<void>>();
+export async function waitForPendingCommentSteers(): Promise<void> {
+  while (dispatches.size) await Promise.all([...dispatches.values()]);
+}
 
 const object = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const ids = (value: unknown): string[] => Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
@@ -22,38 +42,54 @@ async function deliveryIntent(db: Db, comment: typeof issueComments.$inferSelect
  * between acceptance and our receipt restores it through the existing release.
  * Pi's one-at-a-time mode is deliberately left unchanged.
  */
-export async function trySteerConversationComment(db: Db, comment: typeof issueComments.$inferSelect): Promise<boolean> {
-  if (comment.body.trim() === "/new") return false;
-  const intent = await deliveryIntent(db, comment);
+export async function trySteerPersonComment(db: Db, comment: typeof issueComments.$inferSelect, options: PersonCommentSteeringOptions = {}): Promise<boolean> {
+  if (!comment.authorUserId || comment.authorAgentId || comment.deletedAt || comment.body.trim() === "/new") return false;
+  if (!options.lockHeld) return db.transaction(async tx => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${personCommentDeliveryLockKey(comment.issueId)}, 0))`);
+    return trySteerPersonComment(db, comment, { ...options, lockHeld: true });
+  });
+  // POST retries retain their original custody even if its run has now ended.
+  const [carrying] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, comment.companyId),
+    sql`(${heartbeatRuns.nativeIssueId} = ${comment.issueId}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${comment.issueId})`,
+    sql`coalesce(${heartbeatRuns.contextSnapshot}->'steeredCommentIds', '[]'::jsonb) ? ${comment.id}`,
+  )).limit(1);
+  if (carrying) return true;
+  const intent = options.deliveryIntent ?? await deliveryIntent(db, comment);
   if (intent === "queue" || intent === "interrupt") return false;
   const [issue] = await db.select().from(issues).where(and(eq(issues.id, comment.issueId), eq(issues.companyId, comment.companyId)));
-  if (!issue?.conversationAgentId || issue.conversationUserId !== comment.authorUserId) return false;
+  if (!issue || ["done", "cancelled"].includes(issue.status)) return false;
+  // Chat stays owner-only. Task comments have already passed the ordinary
+  // comment route's access/pause checks; they target the current task assignee.
+  if (issue.conversationAgentId && issue.conversationUserId !== comment.authorUserId) return false;
+  const agentId = issue.conversationAgentId ?? issue.assigneeAgentId;
+  if (!agentId) return false;
   const [agent] = await db.select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig }).from(agents)
-    .where(and(eq(agents.id, issue.conversationAgentId), eq(agents.companyId, issue.companyId)));
+    .where(and(eq(agents.id, agentId), eq(agents.companyId, issue.companyId)));
   if (agent?.adapterType !== "paperclip_runner" || object(agent.adapterConfig).provider !== "pi_rpc") return false;
   // An explicit queued message (especially /new or a fresh-session response)
   // is an ordering boundary. Default Send never jumps across it.
   const waiting = await db.execute(sql`select 1 from agent_wakeup_requests w
-    where w.company_id = ${issue.companyId}::uuid and w.agent_id = ${issue.conversationAgentId}::uuid
+    where w.company_id = ${issue.companyId}::uuid and w.agent_id = ${agentId}::uuid
       and w.status in ('queued', 'deferred_issue_execution') and w.payload->>'issueId' = ${issue.id}
       and w.run_id is null limit 1`);
   if (waiting.length) return false;
   const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId),
-    eq(heartbeatRuns.agentId, issue.conversationAgentId), eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "running"),
+    eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "running"),
     sql`(${heartbeatRuns.nativeIssueId} = ${issue.id}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id})`,
     issue.executionRunId ? eq(heartbeatRuns.id, issue.executionRunId) : undefined,
   )).orderBy(desc(heartbeatRuns.createdAt)).limit(1);
-  if (!run || nativeRunHasStopRequest(run.resultJson) || run.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return false;
+  if (!run || nativeRunHasStopRequest(run.resultJson) || (issue.conversationAgentId && run.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration)) return false;
   // Lazy import keeps the existing conversation/runtime dependency cycle inert.
   const { getNativeSessionSteeringState, steerNativeSession, NativeSessionSteeringError } = await import("./native-runtime/native-session-executor.js");
   const state = await getNativeSessionSteeringState(run.id);
   if (state.disposition !== "available" || !state.activeTurnId) return false; // includes provider-ended / saving-files
-  const identity = await reserveSteeredIdentity(db, { companyId: issue.companyId, issueId: issue.id, runId: run.id, messageId: comment.id, source: "comment" });
   const prepared = await db.transaction(async tx => {
-    const [currentIssue] = await tx.select().from(issues).where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("update");
-    const [current] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, issue.companyId))).for("update");
+    const [currentIssue] = await tx.select().from(issues).where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
+    const [current] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, issue.companyId))).for("no key update");
     if (!current || current.status !== "running" || nativeRunHasStopRequest(current.resultJson) ||
-      currentIssue?.executionRunId !== run.id || currentIssue.conversationSessionGeneration !== issue.conversationSessionGeneration) return false;
+      currentIssue?.executionRunId !== run.id || currentIssue.assigneeAgentId !== agentId ||
+      (issue.conversationAgentId && currentIssue.conversationSessionGeneration !== issue.conversationSessionGeneration)) return false;
     const context = object(current.contextSnapshot), result = object(current.resultJson);
     const now = new Date();
     await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context,
@@ -64,39 +100,74 @@ export async function trySteerConversationComment(db: Db, comment: typeof issueC
     } }, updatedAt: now }).where(eq(heartbeatRuns.id, run.id));
     return true;
   });
-  if (!prepared) { if (identity) await rejectSteeredIdentity(db, identity); return false; }
-  try {
-    const acknowledgement = await storedSteeringAcknowledgement(db, { companyId: issue.companyId, runId: run.id, messageId: comment.id }) ?? await steerNativeSession({
-      runId: run.id, message: comment.body, correlationId: comment.id, timeoutMs: 750,
-      onAcknowledged: identity ? () => reconcileSteeredIdentity(db, identity) : undefined,
-    });
-    await db.transaction(async tx => {
-      const [current] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).for("update");
-      if (!current) return;
-      if (identity) await acceptSteeredIdentity(tx, identity);
-      const result = object(current.resultJson), acks = object(result.queuedSteeringAcknowledgements);
-      await tx.update(heartbeatRuns).set({ resultJson: { ...result, queuedSteeringAcknowledgements: {
-        ...acks, [comment.id]: { ...object(acks[comment.id]), status: "acknowledged", turnId: acknowledgement.turnId },
-      } } }).where(eq(heartbeatRuns.id, run.id));
-    });
-    return true;
-  } catch (error) {
-    // Timeout is uncertain, not refusal. The run keeps custody and its end
-    // restores the message once; enqueueing here could answer it twice.
-    if (!(error instanceof NativeSessionSteeringError) || error.code === "steering_timeout") throw error;
-    if (identity) await rejectSteeredIdentity(db, identity);
-    await db.transaction(async tx => {
-      const [current] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).for("update");
-      if (!current) return;
-      const context = object(current.contextSnapshot), result = object(current.resultJson), acks = object(result.queuedSteeringAcknowledgements);
-      await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context,
-        wakeCommentIds: ids(context.wakeCommentIds).filter(id => id !== comment.id), steeredCommentIds: ids(context.steeredCommentIds).filter(id => id !== comment.id),
-      }, resultJson: { ...result, queuedSteeringAcknowledgements: { ...acks, [comment.id]: { ...object(acks[comment.id]), status: "rejected" } } } })
-        .where(eq(heartbeatRuns.id, run.id));
-    });
-    return false;
-  }
+  if (!prepared) return false;
+  // Return the durable steer-or-queue decision now. Identity reservation and
+  // RPC ACK belong to ordered dispatch, not the HTTP latency path. Reserving a
+  // second identity before the first ACK would otherwise reject rapid Sends.
+  const previous = dispatches.get(run.id) ?? Promise.resolve();
+  const dispatch = previous.then(async () => {
+    let identity: Awaited<ReturnType<typeof reserveSteeredIdentity>> = null;
+    try {
+      const currentState = await getNativeSessionSteeringState(run.id);
+      if (currentState.disposition !== "available" || currentState.activeTurnId !== state.activeTurnId)
+        throw new NativeSessionSteeringError("steering_stale_turn", "The accepted native turn is no longer attached.");
+      identity = await reserveSteeredIdentity(db, { companyId: issue.companyId, issueId: issue.id, runId: run.id, messageId: comment.id, source: "comment" });
+      const reserved = identity;
+      const acknowledgement = await storedSteeringAcknowledgement(db, { companyId: issue.companyId, runId: run.id, messageId: comment.id }) ?? await steerNativeSession({
+        runId: run.id, message: comment.body, correlationId: comment.id,
+        onAcknowledged: reserved ? () => reconcileSteeredIdentity(db, reserved) : undefined,
+      });
+      await db.transaction(async tx => {
+        // Match identity reconciliation's task-before-run lock order.
+        await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issue.id)).for("no key update");
+        const [current] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).for("no key update");
+        if (!current) return;
+        if (identity) await acceptSteeredIdentity(tx, identity);
+        const result = object(current.resultJson), acks = object(result.queuedSteeringAcknowledgements);
+        await tx.update(heartbeatRuns).set({ resultJson: { ...result, queuedSteeringAcknowledgements: {
+          ...acks, [comment.id]: { ...object(acks[comment.id]), status: "acknowledged", turnId: acknowledgement.turnId },
+        } } }).where(eq(heartbeatRuns.id, run.id));
+      });
+    } catch (error) {
+      // Timeout/unknown failure is uncertain, not refusal. Keep durable custody;
+      // the existing run-end release owns restoration, never a second delivery.
+      if (!(error instanceof NativeSessionSteeringError) || error.code === "steering_timeout") {
+        logger.warn({ err: error, runId: run.id, commentId: comment.id }, "comment steer is uncertain; carrying run retains custody");
+        return;
+      }
+      if (!options.onRejected) return; // fail closed: still owed at run end
+      if (identity) await rejectSteeredIdentity(db, identity);
+      await db.transaction(async lock => {
+        await lock.execute(sql`select pg_advisory_xact_lock(hashtextextended(${personCommentDeliveryLockKey(issue.id)}, 0))`);
+        // Admit before dropping custody. A pause can refuse admission without
+        // throwing; only a real durable wake receipt permits releasing custody.
+        await options.onRejected!();
+        const admitted = await lock.execute(sql`select 1 from agent_wakeup_requests
+          where company_id = ${issue.companyId}::uuid and agent_id = ${agentId}::uuid
+            and idempotency_key = ${`conversation-comment:${comment.id}`}
+            and status in ('queued', 'deferred_issue_execution', 'claimed', 'coalesced', 'completed') limit 1`);
+        if (!admitted.length) return;
+        await db.transaction(async tx => {
+          const [current] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).for("no key update");
+          if (!current) return;
+          const context = object(current.contextSnapshot), result = object(current.resultJson), acks = object(result.queuedSteeringAcknowledgements);
+          await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context,
+            wakeCommentIds: ids(context.wakeCommentIds).filter(id => id !== comment.id), steeredCommentIds: ids(context.steeredCommentIds).filter(id => id !== comment.id),
+          }, resultJson: { ...result, queuedSteeringAcknowledgements: { ...acks, [comment.id]: { ...object(acks[comment.id]), status: "rejected" } } } })
+            .where(eq(heartbeatRuns.id, run.id));
+        });
+      });
+    }
+  }).catch(error => {
+    logger.error({ err: error, runId: run.id, commentId: comment.id }, "comment steer reconciliation failed; durable custody retained");
+  });
+  dispatches.set(run.id, dispatch);
+  void dispatch.then(() => { if (dispatches.get(run.id) === dispatch) dispatches.delete(run.id); });
+  return true;
 }
+
+/** Compatibility for existing conversation callers; both surfaces share one owner. */
+export const trySteerConversationComment = trySteerPersonComment;
 
 export type SteeredCommentDisplay = {
   steeredIntoRunId: string | null;

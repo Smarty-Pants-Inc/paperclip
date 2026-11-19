@@ -1,5 +1,5 @@
 import { isContextCompactionRun } from "./context-compaction.js";
-import { trySteerConversationComment } from "./conversation-steering.js";
+import { personCommentDeliveryLockKey, trySteerConversationComment } from "./conversation-steering.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
@@ -721,7 +721,7 @@ export async function deliverConversationComments(
       // Contenders release their connection while waiting so concurrent sends
       // cannot exhaust the pool needed by normal wake admission.
       const locks = await tx.execute(
-        sql`select pg_try_advisory_xact_lock(hashtextextended(${"conversation-delivery:" + issue.id}, 0)) as acquired`,
+        sql`select pg_try_advisory_xact_lock(hashtextextended(${personCommentDeliveryLockKey(issue.id)}, 0)) as acquired`,
       );
       if (!locks[0]?.acquired) return "retry" as const;
       for (const comment of await undeliveredConversationComments(
@@ -731,9 +731,7 @@ export async function deliverConversationComments(
       )) {
         if (!(await canDeliver(tx as unknown as Db)).invokable) return "deferred" as const;
         await resumeConversationForReset(db, comment);
-        if (await trySteerConversationComment(db, comment)) continue;
-        try {
-          await enqueue(issue.conversationAgentId!, {
+        const queueComment = () => enqueue(issue.conversationAgentId!, {
             source: "on_demand",
             triggerDetail: "manual",
             reason: "issue_commented",
@@ -750,6 +748,9 @@ export async function deliverConversationComments(
               source: "issue.comment",
             },
           });
+        if (await trySteerConversationComment(db, comment, { lockHeld: true, onRejected: queueComment })) continue;
+        try {
+          await queueComment();
         } catch (error) {
           // Admission remains authoritative if eligibility changes after our
           // read. Only defer the matching invokability conflict; other failures
