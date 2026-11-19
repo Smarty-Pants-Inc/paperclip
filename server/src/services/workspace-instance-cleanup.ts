@@ -104,19 +104,41 @@ export const WORKTREE_INSTANCE_RAW_TRACE_DIRECTORIES: ReadonlyArray<{ relativePa
   { relativePath: path.join("data", "run-logs"), envOverride: "RUN_LOG_BASE_PATH" },
 ];
 
-// A directory with any entry holds trace. A non-directory at the trace path is
-// kept too (fail closed). A symlink is not followed: removal only unlinks it.
-async function holdsRawTrace(directory: string): Promise<boolean> {
-  let metadata: Awaited<ReturnType<typeof fs.lstat>>;
+/**
+ * Provider homes a Paperclip instance writes under its own root (sessions,
+ * rollouts, provider state), by line:
+ * - <root>/codex-home, <root>/companies/<id>/codex-home:
+ *   packages/adapters/codex-local/src/server/codex-home.ts resolveManagedCodexHomeDir() (:179, :180),
+ *   packages/adapter-utils/src/acpx-engine/execute.ts resolveManagedCodexHomeDir() (:840),
+ *   server/src/services/feedback.ts (:402-407, companies/<id>/codex-home/sessions)
+ * - <root>/grok-home, <root>/companies/<id>/grok-home:
+ *   packages/adapters/grok-local/src/server/grok-home.ts resolveManagedGrokHomeDir() (:127, :128),
+ *   packages/adapter-utils/src/acpx-engine/execute.ts resolveManagedGrokHomeDir() (:854)
+ * - <root>/companies/<id>/acp-engine (per-agent state and codex-home):
+ *   packages/adapter-utils/src/acpx-engine/execute.ts defaultStateDir() (:836), resolveManagedCodexApiKeyHomeDir() (:844)
+ * - <root>/companies/<id>/agents/<agentId>/codex-home: server/src/routes/agents.ts codexLocalAgentHome() (:2329)
+ */
+export const WORKTREE_INSTANCE_PROVIDER_HOME_NAMES = ["codex-home", "grok-home"] as const;
+export const WORKTREE_INSTANCE_COMPANY_PROVIDER_STATE_NAMES = ["codex-home", "grok-home", "acp-engine"] as const;
+
+/**
+ * Whether a path holds content, resolved by REALPATH: a symlinked directory
+ * counts by its target's entries (in or out of the root), a non-directory
+ * counts as content (fail closed), an absent path or a dangling symlink holds
+ * none. Any other error is thrown, so the caller keeps the instance.
+ */
+async function holdsContent(candidate: string): Promise<boolean> {
+  let real: string;
   try {
-    metadata = await fs.lstat(directory);
+    real = await fs.realpath(candidate);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return false;
     throw error;
   }
-  if (metadata.isSymbolicLink()) return false;
+  const metadata = await fs.stat(real);
   if (!metadata.isDirectory()) return true;
-  return (await fs.readdir(directory)).length > 0;
+  return (await fs.readdir(real)).length > 0;
 }
 
 async function traceEntryExists(candidate: string): Promise<boolean> {
@@ -124,36 +146,98 @@ async function traceEntryExists(candidate: string): Promise<boolean> {
     await fs.lstat(candidate);
     return true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return false;
     throw error;
   }
 }
 
-/** The raw-trace directories with content inside this instance root. */
+async function realpathOrNull(candidate: string): Promise<string | null> {
+  try {
+    return await fs.realpath(candidate);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    throw error;
+  }
+}
+
+function isSameOrChildPath(candidatePath: string, rootPath: string): boolean {
+  return candidatePath === rootPath || isStrictChildPath(candidatePath, rootPath);
+}
+
+async function listDirectoryNames(directory: string): Promise<string[]> {
+  const real = await realpathOrNull(directory);
+  if (!real) return [];
+  if (!(await fs.stat(real)).isDirectory()) return [];
+  return fs.readdir(real);
+}
+
+/**
+ * Why this instance may have recorded a run. The reaper removes an instance
+ * ONLY when this is empty, i.e. when it is PROVEN never to have recorded a run
+ * (rf-3's flipped rule): no run marker, AND db/ absent or empty, AND no content
+ * in any named trace dir or provider home, each resolved by realpath. A trace
+ * dir's env override is honoured when it is absolute or RELATIVE (resolved
+ * against the instance root) and lands in the root. Otherwise the whole
+ * instance is kept (R-keep-all-traces, never-OK).
+ */
 export async function findWorktreeInstanceRawTraces(
   instanceRoot: string,
-  instanceEnv: Record<string, string | undefined> = {},
+  instanceEnv: Record<string, string | undefined> | ReadonlyArray<Record<string, string | undefined>> = {},
+  rootAliases: ReadonlyArray<string> = [],
 ): Promise<string[]> {
   const found: string[] = [];
+  const envs = Array.isArray(instanceEnv) ? instanceEnv : [instanceEnv as Record<string, string | undefined>];
+  const canonicalRoot = (await realpathOrNull(instanceRoot)) ?? path.resolve(instanceRoot);
+  const roots = [...new Set([path.resolve(instanceRoot), canonicalRoot, ...rootAliases.map((alias) => path.resolve(alias))])];
+  const inRoot = async (candidate: string) => {
+    if (roots.some((root) => isSameOrChildPath(candidate, root))) return true;
+    const real = await realpathOrNull(candidate);
+    return real !== null && isSameOrChildPath(real, canonicalRoot);
+  };
+
+  // 1. The run marker (instance-run-marker.ts).
+  const marker = path.join(instanceRoot, INSTANCE_HEARTBEAT_RUN_MARKER);
+  if (await traceEntryExists(marker)) found.push(marker);
+  // 2. The embedded DB: run rows and run events. Non-empty without the marker is
+  //    kept too: a failed marker write must fail closed.
+  const embeddedDb = path.join(instanceRoot, "db");
+  if (await holdsContent(embeddedDb)) found.push(embeddedDb);
+  // 3. The named trace dirs, at their defaults and their in-root overrides.
   for (const { relativePath, envOverride } of WORKTREE_INSTANCE_RAW_TRACE_DIRECTORIES) {
     const candidates = new Set([path.join(instanceRoot, relativePath)]);
-    const override = instanceEnv[envOverride]?.trim();
-    if (override) {
-      const resolved = path.resolve(expandHomePrefix(override));
-      if (path.isAbsolute(expandHomePrefix(override))
-        && (resolved === instanceRoot || isStrictChildPath(resolved, instanceRoot))) candidates.add(resolved);
+    for (const env of envs) {
+      const override = env[envOverride]?.trim();
+      if (!override) continue;
+      const resolved = path.resolve(instanceRoot, expandHomePrefix(override));
+      if (await inRoot(resolved)) candidates.add(resolved);
     }
-    for (const candidate of candidates) if (await holdsRawTrace(candidate)) found.push(candidate);
+    for (const candidate of candidates) if (await holdsContent(candidate)) found.push(candidate);
   }
-  // The instance's own embedded DB holds run rows and run events, which are
-  // trace even when no run log was written (a run cancelled before start, a
-  // failed setup, a conversation reset). Keep a non-empty DB directory once the
-  // instance has recorded a run (instance-run-marker.ts); never query the DB.
-  const embeddedDb = path.join(instanceRoot, "db");
-  if (await traceEntryExists(path.join(instanceRoot, INSTANCE_HEARTBEAT_RUN_MARKER)) && await holdsRawTrace(embeddedDb)) {
-    found.push(embeddedDb);
+  // 4. Provider homes under the instance.
+  const providerHomes = WORKTREE_INSTANCE_PROVIDER_HOME_NAMES.map((name) => path.join(instanceRoot, name));
+  const companiesDir = path.join(instanceRoot, "companies");
+  for (const companyId of await listDirectoryNames(companiesDir)) {
+    const companyDir = path.join(companiesDir, companyId);
+    for (const name of WORKTREE_INSTANCE_COMPANY_PROVIDER_STATE_NAMES) providerHomes.push(path.join(companyDir, name));
+    for (const agentId of await listDirectoryNames(path.join(companyDir, "agents"))) {
+      providerHomes.push(path.join(companyDir, "agents", agentId, "codex-home"));
+    }
   }
+  for (const home of providerHomes) if (await holdsContent(home)) found.push(home);
   return found;
+}
+
+/** The instance root's own .env (resolvePaperclipEnvPath() beside its config.json), if any. */
+async function readInstanceRootEnv(instanceRoot: string): Promise<Record<string, string>> {
+  try {
+    return parseEnvContents(await fs.readFile(path.join(instanceRoot, ".env"), "utf8"));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return {};
+    throw error;
+  }
 }
 
 function isStrictChildPath(candidatePath: string, rootPath: string): boolean {
@@ -439,7 +523,7 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
   let postgresStopped = false;
   let keptRawTraces: string[] = [];
   const keptWarning = () => `Kept worktree instance directory "${canonicalInstanceRoot}" because it holds raw traces `
-    + `(${keptRawTraces.join(", ")}); the reaper never deletes raw traces.`;
+    + `or may have recorded a run (${keptRawTraces.join(", ")}); the reaper removes only an instance proven never to have recorded a run.`;
   const cleanup = async () => {
     postgresStopped = await dependencies.stopEmbeddedPostgres(path.join(canonicalInstanceRoot, "db"));
     const [currentManagedInstancesDir, currentInstanceRoot] = await Promise.all([
@@ -453,9 +537,14 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
     ) {
       throw new Error(`Refusing to remove instance directory "${configuredInstanceRoot}" because its canonical path changed during cleanup.`);
     }
-    // R-keep-all-traces (never-OK): an instance root that holds raw traces is
-    // kept whole, checked last, immediately before the removal.
-    keptRawTraces = await findWorktreeInstanceRawTraces(currentInstanceRoot, parseEnvContents(input.pointer.envContents));
+    // R-keep-all-traces (never-OK): remove ONLY an instance proven never to
+    // have recorded a run; otherwise keep it whole. Checked last, immediately
+    // before the removal. fs.rm never follows a symlink out of the root.
+    keptRawTraces = await findWorktreeInstanceRawTraces(
+      currentInstanceRoot,
+      [parseEnvContents(input.pointer.envContents), await readInstanceRootEnv(currentInstanceRoot)],
+      [configuredInstanceRoot],
+    );
     if (keptRawTraces.length > 0) return;
     await dependencies.removeInstanceRoot(currentInstanceRoot);
   };
