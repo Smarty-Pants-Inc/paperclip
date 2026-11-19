@@ -106,6 +106,8 @@ export interface ComposerSendRequest {
   attachmentIds?: string[];
   /** Composer run settings, passed back unchanged. */
   runSettings?: Record<string, unknown>;
+  /** The person's pick from Send ▾; omitted for the default Send. */
+  deliveryIntent?: "steer" | "queue" | "interrupt";
 }
 
 export interface ComposerDraftSubmission {
@@ -138,8 +140,9 @@ function isNullableString(value: unknown): value is string | null {
 export function isComposerSendRequest(value: unknown): value is ComposerSendRequest {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const row = value as Record<string, unknown>;
-  if (!Object.keys(row).every((key) => ["body", "reopen", "reassignment", "attachmentIds", "runSettings"].includes(key))) return false;
+  if (!Object.keys(row).every((key) => ["body", "reopen", "reassignment", "attachmentIds", "runSettings", "deliveryIntent"].includes(key))) return false;
   if (typeof row.body !== "string") return false;
+  if (row.deliveryIntent !== undefined && row.deliveryIntent !== "steer" && row.deliveryIntent !== "queue" && row.deliveryIntent !== "interrupt") return false;
   if (row.reopen !== undefined && typeof row.reopen !== "boolean") return false;
   if (row.reassignment !== undefined) {
     const reassignment = row.reassignment as Record<string, unknown> | null;
