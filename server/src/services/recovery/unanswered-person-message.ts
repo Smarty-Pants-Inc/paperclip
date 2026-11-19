@@ -593,7 +593,12 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   // the waiting note (a further attempt carries it) or, once its run ended
   // and settled, RFL's started-run text. Never left over an ended run.
   const standingWorking = !agentPaused && !working && upgrading && standingWaitingCode === UNANSWERED_MESSAGE_WORKING_CODE;
-  if (standingWorking || (!agentPaused && upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE)) {
+  // A standing waiting-to-start note stops being true the moment that same
+  // own run is RUNNING: the SAME note becomes the working note (whichever
+  // path wrote it: a Resume, or a queued start that took a while).
+  const standingWaitingStarted = !agentPaused && working && upgrading && standingWaitingCode === UNANSWERED_MESSAGE_WAITING_CODE;
+  if (standingWorking || standingWaitingStarted
+    || (!agentPaused && upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE)) {
     standing.replacePaused = pending => {
       const ended = run && TERMINAL.includes(run.status) ? run : null;
       if (standingWorking && ended && !liveRuns.some(candidate => runCarriesMessage(candidate.contextSnapshot, message.id))) {

@@ -810,7 +810,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   }
 
   it.each(["deferred", "deferred_issue_execution"])(
-    "waitnote S10-1: %s remote_cleanup after Stop stays pending, then its completed wake's run answers without a resend notice", async status => {
+    "supersedes(pausefix4 F1: the standing waiting note says working while its OWN run runs; RFL record SUPERSEDE-PAUSEFIX-RUNNING-1118): waitnote S10-1: %s remote_cleanup after Stop stays pending, then its completed wake's run answers without a resend notice", async status => {
       const f = await stoppedMessageWithWait(status, { reason: "remote_cleanup",
         message: "Waiting for the previous environment to stop. Your message will start automatically.", recoveryActionId: null });
       // The production sweep entry, not just its decision helper, must be quiet
@@ -829,13 +829,13 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await db.update(agentWakeupRequests).set({ status: "completed", runId, finishedAt: new Date() })
         .where(eq(agentWakeupRequests.id, f.wakeId));
       await settleAt(f, 6 * 60_000);
-      expect((await f.visible()).map(note => note.body)).toEqual([WAITING]);
+      expect((await f.visible()).map(note => note.body)).toEqual([WORKING]);
       await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
       await f.reply(runId);
       await f.sweep();
       expect(await f.visible()).toHaveLength(0);
       const history = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")));
-      expect(history.map(note => note.body)).toEqual([WAITING]);
+      expect(history.map(note => note.body)).toEqual([WORKING]);
       expect(history[0]!.deletedAt).not.toBeNull();
     });
 
@@ -1092,7 +1092,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(1);
   });
 
-  it("E3.04 (2nd bound) control: the carrying run starts at 5 min -> the note stays 'waiting', then the answer supersedes it", async () => {
+  it("supersedes(pausefix4 F1: the standing waiting note says working while its OWN run runs; RFL record SUPERSEDE-PAUSEFIX-RUNNING-1118): E3.04 (2nd bound) control: the carrying run starts at 5 min -> the SAME note says working, then the answer supersedes it", async () => {
     const f = await fixture();
     const commentId = await f.message();
     const queued = await f.run({ commentId, status: "queued" });
@@ -1104,7 +1104,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await settleAt(f, 11 * 60_000);
     let notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(WAITING);
+    expect(notices[0]!.body).toBe(WORKING);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, queued));
     await f.reply(queued);
     await settleAt(f, 12 * 60_000);
@@ -1345,9 +1345,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const replaced = turn === "runs" ? WORKING : WAITING;
       expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: pausedNote!.id, body: replaced }]);
       const carrying = run ?? await f.run({ commentId, status: "running" });
+      // Its OWN run is RUNNING now in both variants: the SAME note says working (F1).
       for (const ms of [2 * 60_000, 10 * 60_000]) {
         await settleAt(f, ms);
-        expect((await f.visible()).map(n => ({ id: n.id, body: n.body })), `+${ms}`).toEqual([{ id: pausedNote!.id, body: replaced }]);
+        expect((await f.visible()).map(n => ({ id: n.id, body: n.body })), `+${ms}`).toEqual([{ id: pausedNote!.id, body: WORKING }]);
       }
       await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, carrying));
       await f.reply(carrying);
@@ -1470,6 +1471,61 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await one(f)).toEqual([{ id: pausedNote.id, body: text }]);
     expect(JSON.stringify(await f.visible())).not.toMatch(/working on|safe/i);
   });
+
+  // pausefix 4 (rf-5 F1): Resume's sweep ran BEFORE the carrying run started,
+  // so the SAME note is the waiting note. Its OWN run then RUNNING makes the
+  // next sweep say working (the shared standing-note transition, not a
+  // Resume-only case); every other live run keeps the waiting text.
+  const waitingThenResumed = async (chat: boolean) => {
+    const { f, commentId, pausedNote } = await pausedThenResumed(chat);
+    await f.sweep();
+    expect(await one(f)).toEqual([{ id: pausedNote.id, body: WAITING }]);
+    return { f, commentId, pausedNote };
+  };
+
+  it.each([[true, "answers"], [false, "answers"], [true, "fails"], [false, "fails"], [true, "succeeds with no reply"], [false, "succeeds with no reply"]] as const)(
+    "pausefix4 F1: chat=%s, a standing WAITING note becomes the SAME working note when its OWN run is running; then the run %s",
+    async (chat, end) => {
+      const { f, commentId, pausedNote } = await waitingThenResumed(chat);
+      const run = await f.run({ commentId, status: "running" });
+      await f.sweep();
+      const notes = await f.visible();
+      expect(notes.map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: pausedNote.id, body: WORKING }]);
+      expect(notes[0]!.presentation).toMatchObject({ title: UNANSWERED_MESSAGE_WORKING_TITLE("Managed Pi") });
+      expect(JSON.stringify(notes[0]!.metadata)).not.toMatch(/Next action/);
+      if (end === "answers") {
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run));
+        await f.reply(run);
+        await f.sweep();
+        expect(await f.visible()).toHaveLength(0);
+        expect(await answers(f)).toHaveLength(1);
+        return;
+      }
+      await db.update(heartbeatRuns).set({ status: end === "fails" ? "failed" : "succeeded",
+        errorCode: end === "fails" ? "adapter_failed" : null, finishedAt: new Date(Date.now() - 60_000) }).where(eq(heartbeatRuns.id, run));
+      await settleAt(f, 2 * 60_000);
+      expect(await one(f)).toEqual([{ id: pausedNote.id, body: end === "fails" ? STARTED_FAILED : STARTED_NO_REPLY }]);
+    });
+
+  it.each(["another message's run running", "its own run queued", "its own run scheduled_retry", "another task's run running"] as const)(
+    "pausefix4 F1 CONTROL: a standing WAITING note stays WAITING (never working) when %s",
+    async other => {
+      const { f, commentId, pausedNote } = await waitingThenResumed(true);
+      if (other === "another message's run running") {
+        await f.run({ commentId: null, status: "running", wakeReason: "heartbeat_timer" });
+      } else if (other === "another task's run running") {
+        const [otherIssue] = await db.insert(issues).values({ companyId: f.companyId, title: "Other work", assigneeAgentId: f.agentId,
+          status: "in_progress" }).returning();
+        await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", runtimeMode: "native",
+          nativeIssueId: otherIssue!.id, contextSnapshot: { issueId: otherIssue!.id, wakeReason: "issue_commented", wakeCommentId: commentId } });
+      } else {
+        await f.run({ commentId, status: other === "its own run queued" ? "queued" : "scheduled_retry" });
+      }
+      await f.sweep();
+      expect(await one(f)).toEqual([{ id: pausedNote.id, body: WAITING }]);
+      await settleAt(f, 60_000);
+      expect(await one(f)).toEqual([{ id: pausedNote.id, body: WAITING }]);
+    });
 
   // pausefix 3 (rf-5 L1, Paul's event-driven rule): the standing paused note's
   // own recheck is 5 min again; the RESUME EVENT drives the upgrade. The resume
