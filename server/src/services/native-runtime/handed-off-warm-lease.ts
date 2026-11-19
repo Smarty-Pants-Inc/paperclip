@@ -61,6 +61,12 @@ export const HANDED_OFF_WARM_UNPROVEN_SINCE_KEY = "handedOffWarmUnprovenSince";
  * At the bound ONE event-driven re-proof runs (no poll interval); still not
  * proven -> the stop-only owner's stop_and_retain intent. */
 export const handedOffWarmUnprovenBound = { ms: 30_000 };
+/** adopt-unproven-words: the person's line while a hand-off waits inside the
+ * unproven bound; it names the bound, rounded up to whole seconds. */
+export function handedOffWarmUnprovenWaitMessage(): string {
+  const seconds = Math.max(1, Math.ceil(handedOffWarmUnprovenBound.ms / 1000));
+  return `Waiting up to ${seconds} second${seconds === 1 ? "" : "s"} for the previous environment to stop. Your message will start automatically.`;
+}
 type Redispatch = () => Promise<unknown>;
 /** adopt-hung-stop (org criterion (b)): the SECOND bound. After the stop-and-retain
  * intent for a handed-off warm box is written, its provider receipt normally

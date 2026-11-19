@@ -213,6 +213,11 @@ describe.skipIf(!support.supported)("adopt-unproven-bound: a same-boot UNPROVEN 
         wait: (await wakeOf(f.wakeId)).payload?.executionWait ?? null, proofCalls: proc.calls.length });
       expect(proc.calls.length).toBeGreaterThan(0);
       expect(atOnce.status).toBe("retained");
+      // adopt-unproven-words: the screen's queue GET during the bound names the bound.
+      const during = await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+      await evidence(`${cause}_words_during`, { executionWait: during.body.executionWait ?? null });
+      expect(during.body.executionWait).toMatchObject({ reason: "remote_cleanup",
+        message: `Waiting up to ${Math.ceil(BOUND_MS / 1000)} seconds for the previous environment to stop. Your message will start automatically.` });
       // No further route call: the one-shot re-proof at the bound must stop and keep the box.
       const stopping = await until(async () => { const lease = await leaseOf(f.leaseId); return lease.status === "pending_cleanup" ? lease : null; },
         BOUND_MS + 8_000);
@@ -242,6 +247,9 @@ describe.skipIf(!support.supported)("adopt-unproven-bound: a same-boot UNPROVEN 
       expect(carrying).toHaveLength(1);
       expect(wake).toMatchObject({ status: "coalesced", runId: carrying[0]!.id });
       expect(admittedMs).toBeLessThan(60_000);
+      const after = await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+      await evidence(`${cause}_words_after`, { executionWait: after.body.executionWait ?? null });
+      expect(after.body.executionWait ?? null).toBeNull();
       expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).map(c => c.cause)).toEqual([]);
       await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, carrying[0]!.id));
       await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorAgentId: f.agentId,
@@ -257,6 +265,15 @@ describe.skipIf(!support.supported)("adopt-unproven-bound: a same-boot UNPROVEN 
     await evidence("control_live_claim", { waitedMs: Date.now() - t0, lease: lease.status, intent: lease.metadata?.sandboxStopAndRetain ?? null });
     expect(lease.status).toBe("retained");
     expect(lease.metadata?.sandboxStopAndRetain).toBeUndefined();
+    // Control for the words: no unproven-bound marker -> today's unbounded words.
+    expect(lease.metadata?.handedOffWarmUnprovenSince).toBeUndefined();
+    const queue = await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+    const gate = (await wakeOf(f.wakeId)).payload?.executionWait ?? null;
+    await evidence("control_live_claim_words", { executionWait: queue.body.executionWait ?? null, gate });
+    // The gate keeps today's remote_cleanup words, and the screen keeps today's hand-off line.
+    expect(gate).toMatchObject({ reason: "remote_cleanup",
+      message: "Waiting for the previous environment to stop. Your message will start automatically." });
+    expect(queue.body.executionWait).toEqual({ reason: "interrupt_handoff", message: "Sending your messages." });
   }, 60_000);
 
   it("control (database): another RUNNING turn on the task holds the box -> NOT stopped past the bound", async () => {

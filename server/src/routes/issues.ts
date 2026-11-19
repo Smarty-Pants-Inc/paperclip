@@ -26,6 +26,7 @@ import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-
 import { assertHandedOffRunTaskOwnership } from "../run-task-ownership.js";
 import { recordNativeHumanSelfHandoff } from "../services/native-runtime/native-human-self-handoff.js";
 import { recordChildTaskRead } from "../services/native-runtime/native-child-completion-delivery.js";
+import { handedOffWarmUnprovenWaitMessage } from "../services/native-runtime/handed-off-warm-lease.js";
 import { recordCompletedHandoffRead } from "../services/chat-completion-delivery.js";
 import { runRetainsIssueIdentity } from "../services/task-repository-acquisition.js";
 import { withConversationReadState } from "../services/agent-chat-read-state.js";
@@ -7895,7 +7896,10 @@ export function issueRoutes(
     const interruptHandoff = queueState?.state === "deferred" && readObject(wake?.payload).queuedCommentInterrupt != null;
     const queue = buildQueuedCommentQueueSnapshot({
       issueId: input.issue.id,
-      executionWait: interruptHandoff ? QUEUED_INTERRUPT_HANDOFF_WAIT
+      // adopt-unproven-words: a hand-off waiting inside the unproven bound is a
+      // bounded wait the person must read, so its line (naming the bound) is shown.
+      executionWait: interruptHandoff && !(wait.reason === "remote_cleanup" && wait.message === handedOffWarmUnprovenWaitMessage())
+        ? QUEUED_INTERRUPT_HANDOFF_WAIT
         : typeof wait.reason === "string" && typeof wait.message === "string"
           ? { reason: wait.reason, message: wait.message } : null,
       queueId: wake?.id ?? null,
