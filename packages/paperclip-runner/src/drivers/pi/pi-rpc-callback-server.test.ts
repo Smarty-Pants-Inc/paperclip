@@ -128,6 +128,20 @@ describe("Pi host semantic callback server (real Unix socket)", () => {
     expect(effects).toBe(1);
   });
 
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21269 (WATCH row 5)
+  it.each(["host", "client"] as const)("preserves unknown-outcome guidance over a real socket at the %s deadline", async owner => {
+    const release = deferred<PiToolResult>();
+    let effects = 0;
+    const f = await fixture({ timeoutMs: owner === "host" ? 100 : 1000,
+      handleTool: async () => { ++effects; return release.promise; } });
+    f.authority.announce("call", origin);
+    try {
+      await expect(sendPiToolRequest(f.socketPath, call(), { timeoutMs: owner === "client" ? 100 : 1000 }))
+        .rejects.toThrow("outcome unknown, may have succeeded: check before retrying");
+      expect(effects).toBe(1);
+    } finally { release.resolve(result); await f.server.close(); }
+  });
+
   it("bounds unannounced wait even if the hook ignores cancellation", async () => {
     const entered = deferred<AbortSignal>(); let effects = 0;
     const f = await fixture({ timeoutMs: 50, waitForAnnouncement: async (_request, signal) => { entered.resolve(signal); return new Promise(() => {}); }, handleTool: async () => { ++effects; return result; } });

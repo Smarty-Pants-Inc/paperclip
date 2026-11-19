@@ -164,6 +164,29 @@ describe("owned Pi bind extension", () => {
     await f.emit("agent_settled");
     await expect(tool.execute("semantic-call", {}, undefined, undefined, f.ctx)).rejects.toThrow("refused");
   });
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21269 (WATCH row 5)
+  it("reports two dispatched 60-second timeouts as unknown outcomes, never refusals", async () => {
+    let release!: (value: any) => void;
+    const blocked = new Promise<any>(resolve => { release = resolve; });
+    let effects = 0;
+    const f = await fixture({ initial: { ...initial, tools: [{ name: "managed", description: "Managed", inputSchema: { type: "object" } }] },
+      hooks: { dispatchTool: async () => { ++effects; return blocked; } } });
+    await f.emit("input", { source: "rpc" }); await f.emit("before_agent_start", { systemPrompt: "native" });
+    for (const id of ["fleet", "comment"]) await f.emit("tool_execution_start", { toolCallId: id, toolName: "managed" });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const results = ["fleet", "comment"].map(id => f.tools.get("managed")!.execute(id, {}, undefined, undefined, f.ctx)
+      .then(() => "unexpected success", error => String(error.message)));
+    try {
+      await Promise.resolve(); await Promise.resolve();
+      expect(effects).toBe(2);
+      await vi.advanceTimersByTimeAsync(60_000);
+      for (const result of await Promise.all(results)) {
+        expect(result).toContain("outcome unknown, may have succeeded: check before retrying");
+        expect(result).not.toContain("refused");
+      }
+    } finally { release({ content: [], details: {} }); vi.useRealTimers(); await Promise.all(results); }
+  });
+
   it("sends native semantic tools over a real socket and waits for a correlated result", async () => {
     const f = await fixture();
     const toolSocket = join(f.root, "tools.sock");
