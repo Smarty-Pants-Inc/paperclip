@@ -14,7 +14,7 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import type { NativeStatusDecision } from "./native-runtime/status-arbiter.js";
-import { and, desc, eq, isNull, notInArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import {
   agents,
   agentTaskSessions,
@@ -34,7 +34,7 @@ import { createHeartbeatTimerPolicy, parseHeartbeatPolicy } from "./heartbeat/ti
 import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { HttpError } from "../errors.js";
 import { commentCarriedSql } from "./interrupt-carry-custody.js";
-import { personMessageOwedSql } from "./person-message-answer.js";
+import { importedPersonHistorySql, personMessageOwedSql } from "./person-message-answer.js";
 
 export type ConversationIdentity = {
   conversationAgentId?: string | null;
@@ -593,8 +593,15 @@ export async function undeliveredConversationComments(
   companyId: string,
   issueId: string,
 ) {
-  return db
-    .select()
+  // A boot-time cut is insufficient: a post-boot input can be carried without
+  // its own receipt, then moved past before this outbox reads it. Instead use
+  // conservative evidence of ANY carrier, or import provenance. Without either,
+  // none of the unchanged floor's answer/move-on arms can reject this message.
+  // Reset history is excluded below, independently of whether it was carried.
+  // This is only a cheap over-approximation, NOT another owed/answered policy:
+  // even unclaimed wakes and rejected steering reservations trigger the floor.
+  const cheap = db
+    .select({ id: issueComments.id })
     .from(issueComments)
     .where(
       and(
@@ -609,20 +616,101 @@ export async function undeliveredConversationComments(
       and ${agentWakeupRequests.idempotencyKey} = 'conversation-comment:' || ${issueComments.id}::text)`,
         // A same-turn hand-off owns this input without a wake. This also closes
         // the POST/outbox crash window and keeps retries from creating a second run.
-        sql`not exists (select 1 from ${heartbeatRuns} steered_run where steered_run.company_id = ${companyId}
-          and (steered_run.native_issue_id = ${issueId}::uuid or steered_run.context_snapshot->>'issueId' = ${issueId})
-          and coalesce(steered_run.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? ${issueComments.id}::text)`, 
-        // ONE successor (adopt-one-successor): a steer the Interrupt or the run-end restore handed
-        // on (carry wake, interruptCarried/restoredSteeredCommentIds) is sent; never a second wake.
-        sql`not ${commentCarriedSql(companyId, issueId, sql`${issueComments.id}`)}`,
-        // rf-4 R2: the ONE owed floor (person-message-answer.ts), as the sweep and the successor seed read it:
-        // a carried message the chat moved past is never re-sent at boot.
-        personMessageOwedSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
-          issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }),
+        sql`not exists (select 1 from ${heartbeatRuns} steered_run
+          cross join lateral jsonb_array_elements_text(
+            case jsonb_typeof(steered_run.context_snapshot->'steeredCommentIds')
+              when 'array' then steered_run.context_snapshot->'steeredCommentIds'
+              when 'object' then coalesce((select jsonb_agg(key) from jsonb_object_keys(
+                steered_run.context_snapshot->'steeredCommentIds') as key), '[]'::jsonb)
+              when 'string' then jsonb_build_array(steered_run.context_snapshot->'steeredCommentIds')
+              else '[]'::jsonb end) as steered_ids(steered_id)
+          where steered_run.company_id = ${companyId}
+            and (steered_run.native_issue_id = ${issueId}::uuid or steered_run.context_snapshot->>'issueId' = ${issueId})
+            and steered_ids.steered_id = ${issueComments.id}::text)`,
+        // Match the floor's reset boundary even on legacy rows whose issue
+        // no longer has conversation identity.
+        sql`not exists (select 1 from ${issues} reset_issue
+          join ${issueComments} reset_boundary on reset_boundary.id = reset_issue.conversation_boundary_comment_id
+            and reset_boundary.company_id = reset_issue.company_id and reset_boundary.issue_id = reset_issue.id
+          where reset_issue.id = ${issueComments.issueId} and reset_issue.company_id = ${issueComments.companyId}
+            and (${issueComments.createdAt}, ${issueComments.id}) < (reset_boundary.created_at, reset_boundary.id))`,
       ),
-    )
-    .orderBy(issueComments.createdAt, issueComments.id)
-    .limit(100);
+    );
+  // Fence cheap receipt/steer exclusion before the carry JSON probes too.
+  // Otherwise the planner can probe every historical row before excluding it.
+  const candidates = await db.select().from(issueComments).where(sql`${issueComments.id} in (
+    with outbox_candidates as materialized (${cheap})
+    select outbox_candidates.id from outbox_candidates
+    where not ${commentCarriedSql(companyId, issueId, sql`outbox_candidates.id`)}
+  )`).orderBy(issueComments.createdAt, issueComments.id);
+  // Do not even PLAN the large floor on an ordinary fresh Send. It must be a
+  // separate statement, fenced to concrete ids, not an OR/CASE in the hot query.
+  // No candidate LIMIT: rejected history must not starve a later owed message.
+  if (!candidates.length) return [];
+  const ids = candidates.map(row => row.id);
+  const idArray = sql`${sql.param(ids)}::text[]`;
+  // Probe all candidate ids together: one company scan, not one scan per id.
+  // This is deliberately broader than everCarriedSql: an unclaimed wake also
+  // triggers the authoritative floor. No status/issue inference can miss a
+  // carrier on a continuation chain or a post-boot failed turn.
+  const possible = await db.execute(sql`
+    select carrier.context_snapshot as context, carrier.result_json as result,
+      null::jsonb as payload, null::uuid as imported_id
+    from ${heartbeatRuns} carrier where carrier.company_id = ${companyId}::uuid and (
+      carrier.context_snapshot->>'wakeCommentId' = any(${idArray})
+      or carrier.context_snapshot->>'commentId' = any(${idArray})
+      or carrier.context_snapshot->>'conversationReplyBoundaryCommentId' = any(${idArray})
+      or carrier.context_snapshot->'wakeCommentIds' ?| ${idArray}
+      or carrier.context_snapshot->'firstTurnQueuedInput'->'commentIds' ?| ${idArray}
+      or carrier.context_snapshot->'steeredCommentIds' ?| ${idArray}
+      or carrier.context_snapshot->'carriedSteeredCommentIds' ?| ${idArray}
+      or carrier.result_json->'restoredSteeredCommentIds' ?| ${idArray}
+      or carrier.result_json->'stopRestoredSteeredCommentIds' ?| ${idArray}
+      or carrier.result_json->'interruptCarriedSteeredCommentIds' ?| ${idArray}
+      or carrier.result_json->'queuedSteeringAcknowledgements' ?| ${idArray})
+    union all
+    select null::jsonb, null::jsonb, possible_wake.payload, null::uuid
+    from ${agentWakeupRequests} possible_wake where possible_wake.company_id = ${companyId}::uuid and (
+      possible_wake.payload->>'commentId' = any(${idArray})
+      or possible_wake.payload->'_paperclipWakeContext'->>'wakeCommentId' = any(${idArray})
+      or possible_wake.payload->'_paperclipWakeContext'->>'commentId' = any(${idArray})
+      or possible_wake.payload->'_paperclipWakeContext'->'wakeCommentIds' ?| ${idArray}
+      or possible_wake.payload->'commentIds' ?| ${idArray})
+    union all
+    select null::jsonb, null::jsonb, null::jsonb, ${issueComments.id}
+    from ${issueComments} where ${issueComments.companyId} = ${companyId}::uuid
+      and ${issueComments.issueId} = ${issueId}::uuid and ${issueComments.id} = any(${idArray}::uuid[])
+      and ${importedPersonHistorySql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+        issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}
+  `);
+  const floorIds = new Set<string>();
+  // PostgreSQL jsonb ?/ ?| recognize top-level strings, array strings and
+  // object keys. Keep that conservative membership for legacy JSON too.
+  const includes = (value: unknown, id: string) => typeof value === "string" ? value === id
+    : Array.isArray(value) ? value.includes(id)
+    : value !== null && typeof value === "object" && Object.hasOwn(value, id);
+  for (const row of possible) {
+    if (typeof row.imported_id === "string") floorIds.add(row.imported_id);
+    const context = (row.context ?? {}) as Record<string, any>;
+    const result = (row.result ?? {}) as Record<string, any>;
+    const payload = (row.payload ?? {}) as Record<string, any>;
+    const wake = payload._paperclipWakeContext ?? {};
+    const scalar = [context.wakeCommentId, context.commentId, context.conversationReplyBoundaryCommentId,
+      payload.commentId, wake.wakeCommentId, wake.commentId];
+    const collections = [context.wakeCommentIds, context.firstTurnQueuedInput?.commentIds,
+      context.steeredCommentIds, context.carriedSteeredCommentIds, result.restoredSteeredCommentIds,
+      result.stopRestoredSteeredCommentIds, result.interruptCarriedSteeredCommentIds,
+      result.queuedSteeringAcknowledgements, wake.wakeCommentIds, payload.commentIds];
+    for (const id of ids) if (scalar.includes(id) || collections.some(value => includes(value, id))) floorIds.add(id);
+  }
+  const owed = floorIds.size ? await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+    inArray(issueComments.id, [...floorIds]),
+    personMessageOwedSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }),
+  )) : [];
+  const owedIds = new Set(owed.map(row => row.id));
+  return candidates.filter(row => !floorIds.has(row.id) || owedIds.has(row.id)).slice(0, 100);
 }
 
 /** A user's /new resumes this chat without replaying the stopped turn. */
