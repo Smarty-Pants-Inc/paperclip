@@ -6,12 +6,14 @@ import { activityLog, agents, authUsers, companyMemberships, createDb, environme
   issueRecoveryActions, issueRelations, issues, nativeHarnessBackups, plugins } from "@paperclipai/db";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { hasPendingRunCleanup } from "../services/execution-blocker.js";
+import { queuedRunPredecessorHold } from "../services/heartbeat/queued-run-predecessor.js";
+import { executionProjectionForRun } from "../services/execution-projection.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { NativePredecessorRetirementUnprovenError } from "../services/native-runtime/predecessor-retirement.js";
 import { NativeProviderArtifactTransferTimeoutError } from "../services/native-runtime/native-provider-artifacts.js";
 import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
 import type { NativeRunIdentity, NativeSession, NativeSessionBackend, PrpEvent } from "@paperclipai/paperclip-runner";
-import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
+import type { Environment, ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { describe, expect, it, vi } from "vitest";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
@@ -289,7 +291,7 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
         return { ...sessionBackend, descriptor: async () => {
           try {
             const descriptor = await sessionBackend.descriptor();
-            successorLease = await runtime.acquireRunLease({ companyId, environment: environment!, agentId,
+            successorLease = await runtime.acquireRunLease({ companyId, environment: environment! as unknown as Environment, agentId,
               heartbeatRunId: execution.binding.runId, issueId: execution.binding.issueId,
               persistedExecutionWorkspace: null, adapterType: "paperclip_runner" });
             return descriptor;
@@ -311,7 +313,11 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
       expect(oldLease).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed",
         metadata: expect.objectContaining({ orphanedRunLeaseRecovery: expect.objectContaining({ nativeCustodyUnverified: true }) }) });
       expect(await db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.runId, runId))).toEqual([]);
-      expect(await hasPendingRunCleanup(db, companyId, runId)).toBe(false);
+      expect(await hasPendingRunCleanup(db, companyId, runId)).toBe(true);
+      const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+      const admission = () => queuedRunPredecessorHold(db, { run: successor!, issueId: oldLease!.issueId,
+        ownsIssue: true, executionRunId: runId });
+      expect(await admission()).toBeNull();
       const [failed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       // Neither a generic cleanup failure, a foreign replacement marker, nor a
       // certificate for another box can release the predecessor's execution gate.
@@ -319,6 +325,7 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
         { ...oldLease!.metadata, replaceBeforeReuse: { ...oldLease!.metadata?.replaceBeforeReuse as object, runId: randomUUID() } }]) {
         await db.update(environmentLeases).set({ metadata }).where(eq(environmentLeases.id, oldLease!.id));
         expect(await hasPendingRunCleanup(db, companyId, runId)).toBe(true);
+        expect(await admission()).toEqual({ reason: "predecessor_cleanup_pending", predecessorRunId: runId });
       }
       await db.update(environmentLeases).set({ metadata: oldLease!.metadata }).where(eq(environmentLeases.id, oldLease!.id));
       const fallback = failed!.resultJson!.predecessorRetirementFallback as Record<string, unknown>;
@@ -326,10 +333,14 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
         await db.update(heartbeatRuns).set({ resultJson: { ...failed!.resultJson, predecessorRetirementFallback: invalid } })
           .where(eq(heartbeatRuns.id, runId));
         expect(await hasPendingRunCleanup(db, companyId, runId)).toBe(true);
+        expect(await admission()).toEqual({ reason: "predecessor_cleanup_pending", predecessorRunId: runId });
       }
       await db.update(heartbeatRuns).set({ resultJson: failed!.resultJson }).where(eq(heartbeatRuns.id, runId));
-      const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
       expect(await heartbeat.promoteDueScheduledRetries()).toMatchObject({ promoted: 1 });
+      // Projection still reports the old allocation's pending obligation while
+      // admission permits the certified successor to execute on a fresh box.
+      expect(await executionProjectionForRun(db, companyId, successor!.id)).toMatchObject({ cause: "previous_run_settling" });
+      expect(await admission()).toBeNull();
       await heartbeat.resumeQueuedRuns();
       await waitForCondition("the fresh-box custody successor to succeed", async () =>
         (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor!.id)))[0]?.status === "succeeded");

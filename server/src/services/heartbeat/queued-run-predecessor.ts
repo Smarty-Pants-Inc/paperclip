@@ -1,6 +1,57 @@
 import { and, eq, sql } from "drizzle-orm";
-import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { hasPendingRunCleanup } from "../execution-blocker.js";
+import { nativeManualAdmissionHoldsExecution } from "../native-runtime/native-runner-ownership.js";
+import { hasRecoveredCleanupStopReceipt } from "../remote-execution-termination.js";
+
+/** Admission alone may leave a certified old allocation's custody work pending.
+ * Keep the shared pending reader truthful for projection and cleanup owners.
+ * This is the shared cleanup test with only that allocation-specific exclusion;
+ * manual holds, workspace ownership, other leases and finalizations still gate. */
+async function hasPendingPredecessorCleanup(db: Db, companyId: string, runId: string): Promise<boolean> {
+  if (!await hasPendingRunCleanup(db, companyId, runId)) return false;
+  if (await nativeManualAdmissionHoldsExecution(db, { companyId, runId })) return true;
+  const recoveredStopped = (await db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, runId),
+    sql`${environmentLeases.metadata}->'workspaceRecoveryCleanup' is not null`,
+  ))).filter(hasRecoveredCleanupStopReceipt).map(lease => lease.id);
+  const [state] = await db.execute<{ pending: boolean }>(sql`SELECT EXISTS (SELECT 1 FROM ${heartbeatRuns}
+    WHERE ${heartbeatRuns.companyId} = ${companyId} AND ${heartbeatRuns.id} = ${runId} AND (
+    ${heartbeatRuns.runnerProfileJson}->>'nativeWorkspaceFinalizationOwner' IS NOT NULL
+    OR EXISTS (SELECT 1 FROM ${environmentLeases}
+      WHERE ${environmentLeases.companyId} = ${companyId} AND ${environmentLeases.heartbeatRunId} = ${runId}
+        ${recoveredStopped.length ? sql`AND ${environmentLeases.id}::text NOT IN (${sql.join(recoveredStopped.map(id => sql`${id}`), sql`, `)})` : sql``}
+        -- Custody of the fenced OLD allocation is not execution on the fresh box.
+        AND NOT COALESCE(
+          ${heartbeatRuns.status} = 'failed'
+          AND ${heartbeatRuns.resultJson}#>>'{predecessorRetirementFallback,version}' = '1'
+          AND ${heartbeatRuns.resultJson}#>'{predecessorRetirementFallback,providerWorkStarted}' = 'false'::jsonb
+          AND jsonb_typeof(${heartbeatRuns.resultJson}#>'{predecessorRetirementFallback,replacedProviderLeaseIds}') = 'array'
+          AND (${heartbeatRuns.resultJson}#>'{predecessorRetirementFallback,replacedProviderLeaseIds}') ? ${environmentLeases.providerLeaseId}
+          AND ${environmentLeases.metadata}#>>'{replaceBeforeReuse,schema}' = 'paperclip.replace-before-reuse.v1'
+          AND ${environmentLeases.metadata}#>>'{replaceBeforeReuse,runId}' = ${runId}
+          AND ${environmentLeases.metadata}#>'{orphanedRunLeaseRecovery,nativeCustodyUnverified}' = 'true'::jsonb
+          AND ${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,runId}' = ${runId}, false)
+        AND (( ${environmentLeases.releasedAt} IS NULL AND NOT COALESCE(
+            ${environmentLeases.status} = 'retained' AND ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+              AND ${environmentLeases.cleanupStatus} = 'success', false))
+          OR ${environmentLeases.status} IN ('active', 'pending_cleanup') OR ${environmentLeases.cleanupStatus} = 'failed'
+          OR COALESCE(${environmentLeases.metadata}->>'pendingCleanupInFlight', 'false') <> 'false'
+          OR (${heartbeatRuns.runtimeMode} = 'native' AND NOT COALESCE(
+            (${environmentLeases.status} IN ('released', 'expired', 'failed')
+              AND ${environmentLeases.releasedAt} IS NOT NULL AND (${environmentLeases.cleanupStatus} = 'success'
+                OR (${environmentLeases.cleanupStatus} IS NULL AND (
+                  (${environmentLeases.provider} = 'local' AND ${environmentLeases.providerLeaseId} IS NULL)
+                  OR (${environmentLeases.provider} = 'ssh' AND ${environmentLeases.metadata}->>'driver' = 'ssh'
+                    AND ${environmentLeases.providerLeaseId} LIKE 'ssh://%')))))
+            OR (${environmentLeases.status} = 'retained' AND ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+              AND ${environmentLeases.cleanupStatus} = 'success'), false))))))
+    OR EXISTS (SELECT 1 FROM ${nativeRunFinalizations}
+      WHERE ${nativeRunFinalizations.companyId} = ${companyId} AND ${nativeRunFinalizations.runId} = ${runId}
+        AND (${nativeRunFinalizations.leaseOwner} IS NOT NULL
+          OR ${nativeRunFinalizations.phase} NOT IN ('committed', 'applied', 'terminal_failure'))) AS pending`);
+  return state?.pending === true;
+}
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 
 export type QueuedRunPredecessorHold = {
@@ -53,7 +104,7 @@ export async function queuedRunPredecessorHold(db: Db, input: {
     // A fresh continuation replaced the predecessor: its writes are revoked
     // and it shares no workspace with this run (a fenced remote epoch or a
     // new isolated workspace), so its cleanup continues without holding it.
-    if (!previous?.supersededByFreshContinuation && await hasPendingRunCleanup(db, run.companyId, previousRunId)) {
+    if (!previous?.supersededByFreshContinuation && await hasPendingPredecessorCleanup(db, run.companyId, previousRunId)) {
       return { reason: "predecessor_cleanup_pending", predecessorRunId: previousRunId };
     }
   }
