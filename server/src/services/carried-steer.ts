@@ -1,5 +1,6 @@
-import { and, eq, ne, or, sql } from "drizzle-orm";
-import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { and, asc, desc, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
+import { heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { withSteeredCommentDisplay, type SteeredCommentDisplay } from "./conversation-steering.js";
 
 export { PAPERCLIP_RECEIVED_MID_TASK_LABEL } from "@paperclipai/adapter-utils/server-utils";
 
@@ -32,6 +33,63 @@ export async function carriedSteerRestorers(db: Pick<Db, "select">, input: {
     }
   }
   return restorers;
+}
+
+type CarriedSteerDisplay = Omit<SteeredCommentDisplay, "steeringStatus"> & {
+  steeringStatus: "accepted" | "carried" | "delivered" | null;
+  carriedIntoRunId: string | null;
+};
+const ids = (value: unknown): string[] => Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
+const object = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value)
+  ? value as Record<string, unknown> : {};
+
+/** The release/admission handoff has its own custody, not an everlasting RPC
+ * acceptance. A carried comment is ordinary PERSON input in the successor;
+ * only that Pi's initial userMessage proves delivery, never admission itself.
+ * Keep the live steering writer/reader unchanged: this projects its run-end
+ * handoff on the same two public comment reads (POST receipt and thread GET).
+ */
+export async function withCarriedSteerDisplay<T extends { id: string; issueId: string; companyId: string }>(
+  db: Db, comments: T[],
+): Promise<Array<T & CarriedSteerDisplay>> {
+  const displayed = await withSteeredCommentDisplay(db, comments);
+  if (!comments.length) return [];
+  const first = comments[0]!;
+  const runs = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
+    context: heartbeatRuns.contextSnapshot, result: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, first.companyId),
+    or(eq(heartbeatRuns.nativeIssueId, first.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${first.issueId}`),
+    sql`(${heartbeatRuns.contextSnapshot} ? 'carriedSteeredCommentIds'
+      or ${heartbeatRuns.resultJson} ? 'queuedSteeringAcknowledgements'
+      or ${heartbeatRuns.resultJson} ? 'restoredSteeredCommentIds'
+      or ${heartbeatRuns.resultJson} ? 'stopRestoredSteeredCommentIds')`,
+  )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
+  const carriers = runs.filter(run => ids(run.context?.carriedSteeredCommentIds).length);
+  const reads = carriers.length ? await db.select({ runId: heartbeatRunEvents.runId, seq: heartbeatRunEvents.seq })
+    .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, first.companyId),
+      inArray(heartbeatRunEvents.runId, carriers.map(run => run.id)), isNotNull(heartbeatRunEvents.sourceEventId),
+      eq(heartbeatRunEvents.eventType, "item.started"),
+      sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' = 'userMessage'`,
+    )).orderBy(asc(heartbeatRunEvents.seq)) : [];
+  return displayed.map<T & CarriedSteerDisplay>(comment => {
+    const carrier = carriers.find(run => ids(run.context?.carriedSteeredCommentIds).includes(comment.id) &&
+      ![...ids(run.result?.restoredSteeredCommentIds), ...ids(run.result?.stopRestoredSteeredCommentIds)].includes(comment.id));
+    const read = carrier && reads.find(event => event.runId === carrier.id);
+    if (carrier && (read || ["queued", "running", "scheduled_retry"].includes(carrier.status))) {
+      return { ...comment, steeringStatus: read ? "delivered" : "carried", carriedIntoRunId: carrier.id,
+        steeringDeliveryEventSeq: read ? Number(read.seq) : null,
+        deliveryOutcome: "ordinary", steeringUnavailableReason: null };
+    }
+    const ended = runs.find(run => ids(run.context?.steeredCommentIds).includes(comment.id) ||
+      ids(run.result?.restoredSteeredCommentIds).includes(comment.id) || ids(run.result?.stopRestoredSteeredCommentIds).includes(comment.id) ||
+      ["pending", "acknowledged"].includes(String(object(object(run.result?.queuedSteeringAcknowledgements)[comment.id]).status)));
+    const restored = ended && [...ids(ended.result?.restoredSteeredCommentIds), ...ids(ended.result?.stopRestoredSteeredCommentIds)].includes(comment.id);
+    if (ended && (restored || (!["queued", "running", "scheduled_retry"].includes(ended.status) && comment.steeringStatus !== "delivered"))) {
+      return { ...comment, steeringStatus: null, carriedIntoRunId: null, steeringDeliveryEventSeq: null,
+        deliveryOutcome: "ordinary", steeringUnavailableReason: "run_ended_before_read" };
+    }
+    return { ...comment, carriedIntoRunId: null };
+  });
 }
 
 export async function carriedSteerCommentIds(db: Pick<Db, "select">, input: {

@@ -41,7 +41,7 @@ import { canResumePreservedResultFinalization } from "./preserved-result-finaliz
 import { isServerReplacementInterruption } from "./server-replacement-interruption.js";
 import { normalizeAgentNameKey } from "./agent-name-key.js";
 import { liftInterruptionBlock } from "./interruption-block-release.js";
-import { isAcknowledgedNativeStop } from "./acknowledged-native-stop.js";
+import { isAcknowledgedNativeStop, readPersonStopHold } from "./acknowledged-native-stop.js";
 
 type Run = Pick<typeof heartbeatRuns.$inferSelect,
   "id" | "companyId" | "agentId" | "status" | "startedAt" | "finishedAt" | "createdAt" |
@@ -418,7 +418,14 @@ export async function admitExplicitNativeContinuation(input: {
     if (!run || run.agentId !== agentId || !terminal.includes(run.status) ||
         (run.nativeIssueId ?? run.issueId ?? run.contextSnapshot?.issueId) !== issueId ||
         !run.finishedAt) return blocked("source_unavailable", "The previous execution has not finished or its owner changed. Your message is saved.");
-    if (!queuedInterrupt && !queuedRequest && authorizedAt <= userStopBoundaryAt(run)!) return blocked("message_predates_stop", "This message arrived before the previous run stopped. Send a new message to continue.");
+    if (!queuedInterrupt && !queuedRequest && authorizedAt <= userStopBoundaryAt(run)!) {
+      if (await readPersonStopHold(db, { companyId, issueId, agentId, ...(commentId ? { messageId: commentId } : {}) }))
+        return blocked("message_predates_stop", "This message arrived before the previous run stopped. Send a new message to continue.");
+      // Keep the existing fresh-message admission floor without calling a
+      // failure timestamp a person's Stop. A mid-turn steer is not stale.
+      if (authorizedAt <= (run.startedAt ?? run.createdAt))
+        return blocked("message_predates_run", "This message predates the previous run. Send a new message to continue.");
+    }
     if (adapterExecutionControls.has(run.id)) return blocked("execution_settling", "Waiting for the previous run to stop. Your message will start automatically.");
     const [coordinator] = await db.select().from(nativeRunFinalizations).where(and(
       eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, run.id),

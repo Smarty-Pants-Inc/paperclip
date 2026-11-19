@@ -95,6 +95,27 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       onBlocked: reason => blocked.push(reason) });
     return { result, blocked, reads };
   }
+  it("never calls a pre-failure message pre-Stop without the one person-Stop hold reader", async () => {
+    const f = await seed();
+    await db.update(heartbeatRuns).set({ startedAt: new Date("2026-09-11T09:58:00Z") })
+      .where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(issueComments).set({ createdAt: new Date("2026-09-11T09:59:00Z") })
+      .where(eq(issueComments.id, f.commentId));
+    const admission = await readAdmission(f, false);
+    expect(admission.blocked, "a failed run's finish time is not a person's Stop").not.toContain("message_predates_stop");
+    expect(admission.result, "a mid-turn message is not a stale pre-run comment").not.toBeNull();
+
+    const stale = await seed();
+    await db.update(heartbeatRuns).set({ startedAt: new Date("2026-09-11T09:58:00Z") })
+      .where(eq(heartbeatRuns.id, stale.sourceRunId));
+    await db.update(issueComments).set({ createdAt: new Date("2026-09-11T09:00:00Z") })
+      .where(eq(issueComments.id, stale.commentId));
+    const refused = await readAdmission(stale, false);
+    expect(refused.result).toBeNull();
+    expect(refused.blocked).toContain("message_predates_run");
+    expect(refused.blocked).not.toContain("message_predates_stop");
+  });
+
   const PRIOR_OWNER_REFUSAL = "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; "
     + "retirement_refused=journal_commands_unsettled(turn.start.failed)";
   it.each([

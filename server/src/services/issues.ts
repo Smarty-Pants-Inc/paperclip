@@ -1,5 +1,5 @@
 import { recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "./public-mcp/upload-cleanup.js";
-import { withSteeredCommentDisplay } from "./conversation-steering.js";
+import { withCarriedSteerDisplay as withSteeredCommentDisplay } from "./carried-steer.js";
 import { assertAgentInteraction } from "./agent-interaction-policy.js";
 import { currentPluginInteractionOrigin } from "./plugin-interaction-context.js";
 import type { IssueDisplayStatus } from "@paperclipai/shared";
