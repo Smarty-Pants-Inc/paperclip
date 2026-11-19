@@ -14932,6 +14932,7 @@ describe("native warm session supervision", () => {
 
       it.each([
         { holder: "exits-on-stop", delaySeconds: 0, answered: true, control: "stop" },
+        { holder: "exits-on-stop", delaySeconds: 0, answered: true, control: "proof-probe" },
         { holder: "exits-on-stop", delaySeconds: 30, answered: true, control: "stop" },
         { holder: "already-exited", delaySeconds: 0, answered: true, control: "stop" },
         { holder: "already-exited", delaySeconds: 30, answered: true, control: "stop" },
@@ -15110,6 +15111,18 @@ describe("native warm session supervision", () => {
             Object.assign(runDb, { select: proofDb.select.bind(proofDb), insert: proofDb.insert.bind(proofDb),
               update: proofDb.update.bind(proofDb), execute: proofDb.execute.bind(proofDb), transaction: proofDb.transaction.bind(proofDb) });
             collectStopped.mockClear(); sandboxRunner.syncIn.mockClear(); signals.length = 0;
+            if (control === "proof-probe") {
+              await runEventWriter.appendHeartbeatRunEvent(proofDb, { companyId, agentId, runId: base.binding.runId,
+                eventType: "native.warm_retention.probe", payload: { phase: "retention", retained: true }, keepRunUpdatedAt: true });
+              expect(await handedOffWarmOwnerRunnerExited({ runId: base.binding.runId, providerLeaseId: "s3f-box" })).toBe(true);
+              expect(signals).toEqual(["TERM"]);
+              await expect.poll(async () => {
+                const events = await proofDb.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, base.binding.runId));
+                return events.some(event => event.eventType === "native.warm_retention.probe" &&
+                  event.payload?.phase === "proof_runner_stop" && event.payload?.outcome === "stopped_runner" &&
+                  event.payload?.stoppedRetainedRunner === true && typeof event.payload?.elapsedMs === "number");
+              }).toBe(true);
+            }
             // adopt-retire-unproven: the Interrupt's hand-off proof runs first and says "exited" (or not).
             if (closeError === "unsuspended") {
               expect(await handedOffWarmOwnerRunnerExited({ runId: base.binding.runId, providerLeaseId: "s3f-box" })).toBe(answered);
@@ -17657,20 +17670,41 @@ describe("native session bounded recovery", () => {
 
   // Trust/data-safety boundary: cheap injection of escalated cleanup and
   // unresolved requests that the real same-PID board-Stop flow cannot force.
-  it.each(["clean", "warm-checkpoint", "escalated", "uncertain", "failed", "codex", "instruction-edits", "diagnostic"])("board Stop retains only the clean Pi warm owner: %s", async mode => {
+  it.each(["clean", "warm-checkpoint", "escalated", "uncertain", "failed", "codex", "instruction-edits", "diagnostic",
+    "cleanup-timeout", "not-warm", "terminal-run", "terminal-session", "snapshot-run", "snapshot-session",
+    "snapshot-busy", "pending-unknown", "active-session", "not-user-stop", "probe-write-failed", "probe-held", "probe-twice"] as const)("board Stop retains only the clean Pi warm owner: %s", async mode => {
+    const probe = vi.spyOn(runEventWriter, "appendHeartbeatRunEvent").mockResolvedValue({} as never);
+    if (mode === "probe-write-failed") probe.mockRejectedValue(new Error("private error text"));
+    let releaseProbe!: () => void;
+    const heldProbe = new Promise<void>(resolve => { releaseProbe = resolve; });
+    if (mode === "probe-held") probe.mockImplementation(async (_db, event) => {
+      if (event.eventType === "native.warm_retention.probe") await heldProbe;
+      return {} as never;
+    });
+    // A diagnostic hold must not consume the cancellation cleanup budget.
+    const withoutProbeWait = async <T,>(promise: Promise<T>): Promise<T> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try { return await Promise.race([promise, new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("decision waited for probe sink")), 500);
+      })]); } finally { clearTimeout(timer); }
+    };
     const name = `pi-board-stop-${mode}`;
     const current = { ...execution, provider: mode === "codex" ? execution.provider : { kind: "pi_rpc", model: "provider/model" },
       binding: { ...execution.binding, runId: name, executionWorkspaceId: name },
       session: { ...execution.session, driverKind: mode === "codex" ? execution.session.driverKind : "pi_rpc",
-        normalizedSessionId: randomUUID(), lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+        normalizedSessionId: randomUUID(), lifecyclePolicy: mode === "not-warm" ? { mode: "ephemeral" as const }
+          : { mode: "warm" as const, idleTimeoutMs: 60_000 } },
     } as NativeExecutionInputV1;
     const runResultJson: Record<string, unknown> = {};
     const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
     const close = vi.fn(async () => {});
-    const cancel = vi.fn(() => ({ cleanup: mode === "escalated" ? Promise.reject(new Error("pi_abort_escalated")) : Promise.resolve() }));
+    const cancel = vi.fn(() => ({ cleanup: mode === "cleanup-timeout" ? new Promise<void>(() => {})
+      : mode === "escalated" ? Promise.reject(new Error("pi_abort_escalated")) : Promise.resolve() }));
     const session = { close, cancel, snapshot: vi.fn(async () => ({ identity: {
-      ...current.binding, sessionId: current.session.normalizedSessionId,
-    }, activeTurnId: null, pendingRuntimeRequests: mode === "uncertain" ? [{ requestId: "unknown-effect" }] : [] })) };
+      ...current.binding, runId: mode === "snapshot-run" ? "wrong-run" : current.binding.runId,
+      sessionId: mode === "snapshot-session" ? "wrong-session" : current.session.normalizedSessionId,
+    }, activeTurnId: mode === "snapshot-busy" ? "busy" : null,
+      pendingRuntimeRequests: mode === "pending-unknown" ? null : mode === "uncertain" ? [{ requestId: "unknown-effect" }] : [] })) };
     let opened!: () => void, end!: () => void;
     const ready = new Promise<void>(resolve => { opened = resolve; });
     const ended = new Promise<void>(resolve => { end = resolve; });
@@ -17681,10 +17715,23 @@ describe("native session bounded recovery", () => {
       eventType, schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(), payload: {} });
     state.execute.mockReset().mockImplementationOnce(async options => {
       await options.onSession(session);
+      if (["clean", "probe-held"].includes(mode)) await accountingEvents.committed?.({ ...event("session.started"), payload: {
+        providerDescriptor: { piNativeAdmission: { piProcessIdentity: { boot_id: "box-boot", piPid: 314, piProcessStartTicks: "1234" } } },
+      } });
       opened(); await ended;
       if (mode === "diagnostic") await accountingEvents.committed?.({ ...event("harness.diagnostic"), payload: { code: "pi_abort_escalated" } });
-      retained = await options.retainCancelledSession({ session, signal: new AbortController().signal,
-        terminalEvent: event(mode === "failed" ? "turn.failed" : "turn.cancelled") });
+      const terminal = event(mode === "failed" ? "turn.failed" : "turn.cancelled");
+      if (mode === "terminal-run") terminal.runId = "wrong-run";
+      if (mode === "terminal-session") terminal.normalizedSessionId = "wrong-session";
+      const savedCancellation = runResultJson.nativeCancellation;
+      if (mode === "not-user-stop") delete runResultJson.nativeCancellation;
+      const retentionStarted = performance.now();
+      retained = await options.retainCancelledSession({ session: mode === "active-session" ? {} : session,
+        signal: new AbortController().signal, terminalEvent: terminal });
+      if (mode === "probe-twice") expect(await options.retainCancelledSession({ session,
+        signal: new AbortController().signal, terminalEvent: terminal })).toBe(retained);
+      if (mode === "probe-held") process.stdout.write(`retention-held-sink ${JSON.stringify({ retained, elapsedMs: performance.now() - retentionStarted })}\n`);
+      if (mode === "not-user-stop") runResultJson.nativeCancellation = savedCancellation;
       throw new Error("native_finalization_missing: session returned no semantic result");
     });
     const running = executePaperclipNativeSession({ db: leaseDb(current, {}, runResultJson, updates), execution: current,
@@ -17694,17 +17741,49 @@ describe("native session bounded recovery", () => {
     const persistence = cancellationDb({ runId: current.binding.runId,
       resultJson: { cancelledByActorType: "user", cancelledByUserId: "board" } });
     try {
-      await Promise.race([ready, running.then(error => { throw error; })]);
+      const prepared = Promise.race([ready, running.then(error => { throw error; })]);
+      await (mode === "probe-held" ? withoutProbeWait(prepared) : prepared);
       await expect(cancelNativeSession(current.binding.runId, "Board Stop", { db: persistence.db, scope: "run" }))
         .resolves.toMatchObject({ dispatched: true });
       Object.assign(runResultJson, persistence.getResultJson());
       end();
-      const outcome = await running;
-      if (!(outcome instanceof NativeCancellationPendingRecoveryError)) throw outcome;
-      expect(retained).toBe(["clean", "warm-checkpoint"].includes(mode));
-      expect(close).toHaveBeenCalledTimes(["clean", "warm-checkpoint"].includes(mode) ? 0 : 1);
-      expect(updates.some(update => update.table === heartbeatRuns && update.values.status === "failed")).toBe(false);
-    } finally { end(); await running; await closeIdleWarmNativeSessionsForRestart(); }
+      const outcome = await (mode === "probe-held" ? withoutProbeWait(running) : running);
+      if (!["no-cancel", "not-user-stop"].includes(mode) && !(outcome instanceof NativeCancellationPendingRecoveryError)) throw outcome;
+      expect(retained).toBe(["clean", "warm-checkpoint", "probe-write-failed", "probe-held", "probe-twice"].includes(mode));
+      // Assertions observe eventual diagnostics, never make the decision wait.
+      releaseProbe();
+      for (let phase = 0; phase < 5; phase++) await new Promise<void>(resolve => setImmediate(resolve));
+      const reason = ({ clean: "retained", "warm-checkpoint": "retained", escalated: "cleanup_failed",
+        uncertain: "pending_requests", failed: "no_turn_cancelled", codex: "not_pi_rpc",
+        "instruction-edits": "instruction_checkpoint_failed", diagnostic: "pi_cancellation_unsafe",
+        "cleanup-timeout": "cleanup_race_lost_2s", "not-warm": "not_warm", "terminal-run": "terminal_run_mismatch",
+        "terminal-session": "terminal_session_mismatch", "snapshot-run": "snapshot_run_mismatch", "snapshot-session": "snapshot_session_mismatch",
+        "snapshot-busy": "snapshot_not_idle", "pending-unknown": "pending_requests_unknown",
+        "active-session": "active_session_mismatch", "not-user-stop": "not_user_stop", "probe-write-failed": "retained",
+        "probe-held": "retained", "probe-twice": "retained" } as const)[mode];
+      if (mode === "clean") expect(probe).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        eventType: "native.warm_retention.probe", payload: expect.objectContaining({ phase: "admission",
+          runId: name, leaseId: null, boot_id: "box-boot", piPid: 314, piProcessStartTicks: "1234" }),
+      }));
+      expect(probe).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        eventType: "native.warm_retention.probe", keepRunUpdatedAt: true,
+        payload: expect.objectContaining({ phase: "retention", runId: name, predecessorRunId: null,
+          leaseId: null, retained, reason, elapsedMs: expect.any(Number) }),
+      }));
+      if (!["not-warm", "not-user-stop"].includes(mode)) {
+        expect(close).toHaveBeenCalledTimes(["clean", "warm-checkpoint", "probe-write-failed", "probe-held", "probe-twice"].includes(mode) ? 0 : 1);
+        expect(updates.some(update => update.table === heartbeatRuns && update.values.status === "failed")).toBe(false);
+      }
+      expect(probe.mock.calls.filter(([, event]) => event.eventType === "native.warm_retention.probe"
+        && event.payload?.phase === "retention")).toHaveLength(1);
+    } finally {
+      releaseProbe();
+      if (mode === "probe-held" && retained === undefined) {
+        await cancelNativeSession(current.binding.runId, "Board Stop", { db: persistence.db, scope: "run" });
+        Object.assign(runResultJson, persistence.getResultJson());
+      }
+      end(); await running; await closeIdleWarmNativeSessionsForRestart(); probe.mockRestore();
+    }
   });
 
   // H1 (restart chaos): a budget pause's lifecycle Stop interrupted a Codex

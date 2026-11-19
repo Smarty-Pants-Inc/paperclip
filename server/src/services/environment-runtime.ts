@@ -7,6 +7,7 @@ import { RetainedSandboxAbsentError, SandboxLeaseStartDeniedError, resumeReplyCo
 import { readNativeWorkspaceMigration } from "./native-runtime/native-workspace-migration.js";
 import { ReusableSandboxResumeError } from "./reusable-sandbox-resume-error.js";
 import { sandboxProviderFailureLabel } from "./remote-workspace-transport.js";
+import { recordWarmRetentionProbe } from "./native-runtime/warm-retention-probe.js";
 import { NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE, readReplaceBeforeReuseMarker } from "./native-runtime/predecessor-retirement.js";
 import {
   REUSABLE_SANDBOX_IDLE_RESUME_BUDGET_MS,
@@ -1154,36 +1155,37 @@ function reusableSandboxLeaseScopeMatches(input: {
   leaseFingerprint?: EffectiveRunConfigFingerprint | null;
   allowLegacyRuntimeFingerprint?: boolean;
   fingerprintKey?: "leaseFingerprint" | "leaseIdentityFingerprint";
+  onProbeRejection?: (reason: string) => void;
 }): boolean {
-  if ((!input.executionWorkspaceId && !input.issueId) || !input.agentId) return false;
-  if (!sandboxLeaseSourceMatches(input.config, input.lease.metadata ?? {})) return false;
+  const reject = (reason: string) => { input.onProbeRejection?.(reason); return false; };
+  if (!input.executionWorkspaceId && !input.issueId) return reject("no_workspace_or_issue");
+  if (!input.agentId) return reject("no_agent_id");
+  if (!sandboxLeaseSourceMatches(input.config, input.lease.metadata ?? {})) return reject("lease_source_mismatch");
   const scope = input.lease.metadata?.reusableSandboxLease;
-  if (!isRecord(scope)) return false;
+  if (!isRecord(scope)) return reject("lease_scope_missing");
   const adapterType = input.adapterType ?? null;
-  const baseScopeMatches =
-    scope.companyId === input.companyId &&
-    scope.environmentId === input.environmentId &&
-    scope.executionWorkspaceId === input.executionWorkspaceId &&
-    (input.executionWorkspaceId !== null || scope.projectlessIssueId === input.issueId) &&
-    scope.agentId === input.agentId &&
-    scope.adapterType === adapterType &&
-    scope.provider === input.provider;
-  if (!baseScopeMatches) return false;
+  if (scope.companyId !== input.companyId) return reject("scope_company_mismatch");
+  if (scope.environmentId !== input.environmentId) return reject("scope_environment_mismatch");
+  if (scope.executionWorkspaceId !== input.executionWorkspaceId) return reject("scope_workspace_mismatch");
+  if (input.executionWorkspaceId === null && scope.projectlessIssueId !== input.issueId) return reject("scope_issue_mismatch");
+  if (scope.agentId !== input.agentId) return reject("scope_agent_mismatch");
+  if (scope.adapterType !== adapterType) return reject("scope_adapter_mismatch");
+  if (scope.provider !== input.provider) return reject("scope_provider_mismatch");
 
   const expectedLeaseFingerprint = input.leaseFingerprint?.fingerprint ?? null;
   if (expectedLeaseFingerprint) {
     const storedLeaseFingerprint = readLeaseFingerprint(scope[input.fingerprintKey ?? "leaseFingerprint"]);
     if (storedLeaseFingerprint) {
-      return storedLeaseFingerprint === expectedLeaseFingerprint;
+      return storedLeaseFingerprint === expectedLeaseFingerprint || reject("lease_fingerprint_mismatch");
     }
-    if (!input.allowLegacyRuntimeFingerprint) return false;
+    if (!input.allowLegacyRuntimeFingerprint) return reject("lease_fingerprint_missing");
   }
 
   return scope.runtimeFingerprint === reusableRuntimeFingerprint({
     provider: input.provider,
     adapterType,
     config: input.config,
-  });
+  }) || reject("runtime_fingerprint_mismatch");
 }
 
 const SETTLING_REUSABLE_LEASE_WAIT_MS = 20_000;
@@ -2202,30 +2204,40 @@ function createSandboxEnvironmentDriver(
             executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId, agentId: input.agentId,
             heartbeatRunId: input.heartbeatRunId });
         }
+        const reuseProbeReasons = new Map<string, string>();
+        let reuseProbeLeases: EnvironmentLease[] | null = null;
+        const acquisitionStartedAt = Date.now();
         const reusableCandidateLeases =
           declaredReusableLeases &&
           parsed.config.reuseLease &&
           input.heartbeatRunId !== null &&
           (input.executionWorkspaceId !== null || input.issueId !== null) &&
           input.agentId !== null
-          ? (await environmentsSvc.listLeases(input.environment.id))
-              .filter((lease) =>
-                lease.leasePolicy === "reuse_by_environment" &&
-                !reusableSandboxKeptAfterReplacement(lease) &&
-                reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId }) &&
-                lease.executionWorkspaceId === input.executionWorkspaceId &&
-                (input.executionWorkspaceId !== null || lease.issueId === input.issueId) &&
-                lease.metadata?.agentId === input.agentId,
-              )
+          ? (reuseProbeLeases = await environmentsSvc.listLeases(input.environment.id))
+              .filter((lease) => {
+                const reason = lease.leasePolicy !== "reuse_by_environment" ? "lease_policy"
+                  : reusableSandboxKeptAfterReplacement(lease) ? "kept_after_replacement"
+                  : !reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId }) ? "lease_not_resumable"
+                  : lease.executionWorkspaceId !== input.executionWorkspaceId ? "workspace_mismatch"
+                  : input.executionWorkspaceId === null && lease.issueId !== input.issueId ? "issue_mismatch"
+                  : lease.metadata?.agentId !== input.agentId ? "agent_mismatch" : null;
+                if (reason) reuseProbeReasons.set(lease.id, reason);
+                return reason === null;
+              })
           : [];
         for (let index = reusableCandidateLeases.length - 1; index >= 0; index--) {
           // Protected allocations must stay out of both selection and obsolete cleanup.
-          if (await nativeWorkspaceExportPendingForResource(db, reusableCandidateLeases[index]!, input.heartbeatRunId)
-            || await legacyShutdownWorkspaceResourceProtected(db, reusableCandidateLeases[index]!))
+          if (await nativeWorkspaceExportPendingForResource(db, reusableCandidateLeases[index]!, input.heartbeatRunId)) {
+            reuseProbeReasons.set(reusableCandidateLeases[index]!.id, "workspace_export_pending");
             reusableCandidateLeases.splice(index, 1);
+          } else if (await legacyShutdownWorkspaceResourceProtected(db, reusableCandidateLeases[index]!)) {
+            reuseProbeReasons.set(reusableCandidateLeases[index]!.id, "legacy_shutdown_protected");
+            reusableCandidateLeases.splice(index, 1);
+          }
         }
         const reusableExistingLeases = reusableCandidateLeases.filter((lease) =>
           reusableSandboxLeaseScopeMatches({
+            onProbeRejection: reason => reuseProbeReasons.set(lease.id, reason),
             lease,
             companyId: input.companyId,
             environmentId: input.environment.id,
@@ -2281,6 +2293,9 @@ function createSandboxEnvironmentDriver(
           ? reusableExistingLeases.find((lease) => lease.providerLeaseId === reusableProviderLeaseId)
           : null;
 
+        for (const lease of reusableCandidateLeases) {
+          if (reusableExistingLeases.includes(lease) && !reusableProviderLeaseId) reuseProbeReasons.set(lease.id, "provider_identity_mismatch");
+        }
         const pinnedConfig = reusableLease ? compatible.pinnedConfigs.get(reusableLease.id) : undefined;
         const rolloverLease = reusableLease ? null : compatible.rolloverLease;
         const resumeConfig = pinnedConfig ? admittedSandboxLeaseConfig(workerConfig, pinnedConfig) : workerConfig;
@@ -2584,6 +2599,27 @@ function createSandboxEnvironmentDriver(
               ? reusableLease?.id
               : null,
         });
+        // Read-only diagnosis at this instant, before retirement mutates the source.
+        if (input.heartbeatRunId && input.agentId) {
+          try {
+            const predecessor = rolloverLease ?? reusableLease ?? reuseProbeLeases?.filter(lease => lease.heartbeatRunId !== input.heartbeatRunId &&
+                (input.executionWorkspaceId !== null ? lease.executionWorkspaceId === input.executionWorkspaceId : lease.issueId === input.issueId))
+              .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
+            const reason = !declaredReusableLeases ? "reuse_not_declared" : !supportsReusableLeases ? "reuse_methods_unverified"
+              : !parsed.config.reuseLease ? "reuse_disabled"
+              : input.executionWorkspaceId === null && input.issueId === null ? "no_workspace_or_issue"
+              : replacementReason ?? (rolloverLease ? "compatible_environment_change"
+              : predecessor ? reuseProbeReasons.get(predecessor.id) ?? "no_provider_lease_id"
+              : reuseProbeLeases === null ? null : "no_predecessor_lease");
+            recordWarmRetentionProbe(db, { companyId: input.companyId, runId: input.heartbeatRunId, agentId: input.agentId,
+              predecessorRunId: predecessor?.heartbeatRunId ?? null, leaseId: recordedLease.id },
+            { phase: "acquisition", acquisition: rolloverLease || (!providerLease && reusableLease) ? "replaced" : providerLease ? "resumed" : "created",
+              reason: providerLease ? "reused" : reason, predecessorLeaseId: predecessor?.id ?? null,
+              predecessorLeaseStatus: predecessor?.status ?? null, elapsedMs: Math.max(0, Date.now() - acquisitionStartedAt) });
+          } catch {
+            logger.warn({ runId: input.heartbeatRunId, code: "warm_retention_probe_read_failed" }, "Warm retention selection probe unavailable");
+          }
+        }
         // Retire the unresumable sandbox only once its replacement, which
         // carries the harness backup, is recorded. A failed creation or a
         // restart before this point leaves it eligible for the next attempt.

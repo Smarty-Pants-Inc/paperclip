@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushSecretResolutionWrites } from "../services/secret-resolution-writes.js";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   buildSshEnvLabFixtureConfig,
   getSshEnvLabSupport,
@@ -55,6 +55,7 @@ import {
 } from "../services/environment-runtime.ts";
 import * as sandboxProviderRuntime from "../services/sandbox-provider-runtime.ts";
 import * as environmentsModule from "../services/environments.ts";
+import * as runEventWriter from "../services/heartbeat-run-events.js";
 import { logger } from "../middleware/logger.ts";
 import { agentEnvironmentTestService } from "../services/agent-environment-test.js";
 import { resolveRunnerEnvironmentForRun } from "../services/runner-environment-lifecycle.js";
@@ -261,8 +262,14 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     await db.delete(environmentLeases);
     await db.delete(issues);
     await db.delete(costEvents);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
+    // Detached diagnostics allocate on the run row before inserting an event.
+    // Fence those appends while removing both tables so teardown cannot race
+    // an event into the gap between the child and parent DELETEs.
+    await db.transaction(async tx => {
+      await tx.execute(sql`select id from heartbeat_runs for no key update`);
+      await tx.delete(heartbeatRunEvents);
+      await tx.delete(heartbeatRuns);
+    });
     await db.delete(agents);
     await db.delete(environments);
     await db.delete(executionWorkspaces);
@@ -1178,7 +1185,55 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect((await environmentService(db).getLeaseById(first.lease.id))?.status).toBe("failed");
   });
 
+  it.each([true, false].flatMap(reuse => ["normal", "held", "throwing"].map(sink => ({ reuse, sink }))))(
+    "acquisition diagnostics add no selection reads and cannot block ($reuse / $sink)", async ({ reuse, sink }) => {
+      const seeded = await seedReusablePluginSandboxLease("paperclip_runner");
+      // Empty selection is important: it is not a reason to repeat listLeases.
+      await db.delete(environmentLeases).where(eq(environmentLeases.id, seeded.reusableLease.id));
+      const environment = { ...seeded.environment, config: { ...seeded.environment.config, reuseLease: reuse } };
+      const realService = environmentsModule.environmentService;
+      const list = vi.fn<(environmentId: string) => Promise<Awaited<ReturnType<ReturnType<typeof environmentService>["listLeases"]>>>>();
+      const factory = vi.spyOn(environmentsModule, "environmentService").mockImplementation(database => {
+        const real = realService(database);
+        list.mockImplementation(id => real.listLeases(id));
+        return { ...real, listLeases: list };
+      });
+      let release!: () => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      const probe = vi.spyOn(runEventWriter, "appendHeartbeatRunEvent").mockImplementation(async () => {
+        if (sink === "held") await held;
+        if (sink === "throwing") throw new Error("private event store error");
+        return {} as never;
+      });
+      const worker = createFreshPluginLeaseWorker(seeded.pluginId);
+      const runtime = environmentRuntimeService(db, { pluginWorkerManager: worker });
+      const started = performance.now();
+      const acquisition = runtime.acquireRunLease({ companyId: seeded.companyId, environment,
+        agentId: seeded.agentId, issueId: null, adapterType: "paperclip_runner", heartbeatRunId: seeded.runId,
+        persistedExecutionWorkspace: { id: seeded.executionWorkspaceId, mode: "shared_workspace" } });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const decision = await Promise.race([acquisition, new Promise<"probe blocked acquisition">(resolve => {
+          timer = setTimeout(() => resolve("probe blocked acquisition"), 1_000);
+        })]);
+        expect(decision).not.toBe("probe blocked acquisition");
+        if (typeof decision === "string") throw new Error(decision);
+        expect(decision.lease.providerLeaseId).toBe("fresh-plugin-lease");
+        expect(worker.call).toHaveBeenCalledExactlyOnceWith(seeded.pluginId, "environmentAcquireLease", expect.any(Object), expect.any(Number));
+        // Existing reads: settling cleanup + candidate selection. No fallback
+        // read is allowed just because candidate selection returned [].
+        expect(list).toHaveBeenCalledTimes(reuse ? 2 : 0);
+        process.stdout.write(`acquisition-probe ${JSON.stringify({ reuse, sink, elapsedMs: performance.now() - started, selectionReads: list.mock.calls.length })}\n`);
+      } finally {
+        clearTimeout(timer); release(); await acquisition;
+        await new Promise<void>(resolve => setImmediate(resolve));
+        factory.mockRestore(); probe.mockRestore();
+      }
+    },
+  );
+
   it("acquires and resumes a reusable lease after a task changes from per-turn to warm", async () => {
+    const { heartbeatRunEvents } = await import("@paperclipai/db");
     const seeded = await seedReusablePluginSandboxLease("paperclip_runner");
     await environmentService(db).releaseLease(seeded.reusableLease.id, "expired");
     const environment = { ...seeded.environment, config: { ...seeded.environment.config, reuseLease: false } };
@@ -1209,6 +1264,12 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     };
     const cold = await runtime.acquireRunLease({ ...input, environment, heartbeatRunId: seeded.runId });
     expect(cold.lease.leasePolicy).toBe("ephemeral");
+    await expect.poll(async () => {
+      const [event] = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, seeded.runId),
+        eq(heartbeatRunEvents.eventType, "native.warm_retention.probe")));
+      return event?.payload;
+    }).toMatchObject({ phase: "acquisition", acquisition: "created", reason: "reuse_disabled",
+      runId: seeded.runId, predecessorRunId: null, leaseId: cold.lease.id, elapsedMs: expect.any(Number) });
     await runtime.releaseRunLeases(seeded.runId, "released");
     const warmEnvironment = resolveRunnerEnvironmentForRun(environment, "paperclip_runner", { lifecycleMode: "warm" }, undefined, "selected-account:generation");
     const warmRunId = randomUUID();
@@ -1216,6 +1277,12 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const warm = await runtime.acquireRunLease({ ...input, environment: warmEnvironment, heartbeatRunId: warmRunId });
     warmProviderLeaseId = warm.lease.providerLeaseId!;
     expect(warm.lease.leasePolicy).toBe("reuse_by_environment");
+    await expect.poll(async () => {
+      const [event] = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, warmRunId),
+        eq(heartbeatRunEvents.eventType, "native.warm_retention.probe")));
+      return event?.payload;
+    }).toMatchObject({ phase: "acquisition", acquisition: "created", reason: "lease_policy",
+      predecessorRunId: seeded.runId, predecessorLeaseId: cold.lease.id, predecessorLeaseStatus: "released" });
     expect(warm.lease.executionWorkspaceId).toBe(seeded.executionWorkspaceId);
     expect((await runtime.resolveCapabilities({ environment: warmEnvironment, lease: warm.lease }))?.reusableLeases).toBe(true);
     await runtime.releaseRunLeases(warmRunId, "released", undefined, "stop_and_retain");
@@ -1225,6 +1292,12 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(next.lease.providerLeaseId).toBe(warmProviderLeaseId);
     expect(next.lease.heartbeatRunId).toBe(nextRunId);
     expect(next.lease.id).not.toBe(warm.lease.id);
+    await expect.poll(async () => {
+      const [event] = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, nextRunId),
+        eq(heartbeatRunEvents.eventType, "native.warm_retention.probe")));
+      return event?.payload;
+    }).toMatchObject({ phase: "acquisition", acquisition: "resumed", reason: "reused",
+      predecessorRunId: warmRunId, predecessorLeaseId: warm.lease.id, predecessorLeaseStatus: "released", leaseId: next.lease.id });
     expect(acquisitions).toBe(2);
     expect((await environmentService(db).getById(environment.id))?.config.reuseLease).toBe(false);
   });
@@ -5619,7 +5692,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         await environmentService(db).updateLeaseMetadata(admitted.lease.id, { ...(await environmentService(db).getLeaseById(admitted.lease.id))!.metadata,
           nativeHarnessBackup: stamp });
       }
-      await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: refreshRunId, seq: 1, eventType: "provider.event",
+      await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: refreshRunId,
+        seq: await runEventWriter.allocateHeartbeatRunEventSeq(db, refreshRunId), eventType: "provider.event",
         createdAt: new Date(Date.parse(stamp.completedAt) + (scenario === "later provider work" ? 1000 : -1000)) });
       if (scenario !== "single row") await runtimeWithPlugin.releaseRunLeases(refreshRunId);
       await settle(refreshRunId, tipSessionId);
@@ -5840,7 +5914,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         await environmentService(db).updateLeaseMetadata(admitted.lease.id, {
           ...(await environmentService(db).getLeaseById(admitted.lease.id))!.metadata, nativeHarnessBackup: stamp });
       }
-      await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: tipRunId, seq: 1, eventType: "provider.event",
+      await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: tipRunId,
+        seq: await runEventWriter.allocateHeartbeatRunEventSeq(db, tipRunId), eventType: "provider.event",
         createdAt: new Date(runEndedAt.getTime() - 5 * 60_000) });
       // The stop: that boot is gone. Its holder stamp names a previous boot.
       const tipRow = (await environmentService(db).getLeaseById(resumed.lease.id))!;
@@ -6001,7 +6076,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           ...(await environmentService(db).getLeaseById(resumed.lease.id))!.metadata,
           nativeHarnessBackup: { ...otherStamp, completedAt: new Date(runEndedAt.getTime() + 60_000).toISOString() } });
       }
-      await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: tipRunId, seq: 1, eventType: "provider.event",
+      await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: tipRunId,
+        seq: await runEventWriter.allocateHeartbeatRunEventSeq(db, tipRunId), eventType: "provider.event",
         createdAt: new Date(runEndedAt.getTime() - 5 * 60_000) });
       // The stop: that boot is gone. Its holder stamp names a previous boot.
       const tipRow = (await environmentService(db).getLeaseById(resumed.lease.id))!;
@@ -6125,7 +6201,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         normalizedSessionId, runnerInstanceId, authorizedProviderLeaseId: providerLeaseId, completedAt: manifest.completedAt });
       await environmentService(db).updateLeaseMetadata(admitted.lease.id, {
         ...(await environmentService(db).getLeaseById(admitted.lease.id))!.metadata, nativeHarnessBackup: stamp });
-      await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: tipRunId, seq: 1, eventType: "provider.event",
+      await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: tipRunId,
+        seq: await runEventWriter.allocateHeartbeatRunEventSeq(db, tipRunId), eventType: "provider.event",
         createdAt: new Date(runEndedAt.getTime() - 5 * 60_000) });
       // The stop: that boot is gone. Its holder stamp names a previous boot.
       const tipRow = (await environmentService(db).getLeaseById(resumed.lease.id))!;
@@ -6284,7 +6361,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       await insertRunningManualRun(finalRunId, companyId, agentId);
       if (state === "stale checkpoint") {
         const laterAt = new Date(Date.parse(stamp.completedAt) + 1000);
-        await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: nextRunId, seq: 1, eventType: "provider.event", createdAt: laterAt });
+        await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: nextRunId,
+          seq: await runEventWriter.allocateHeartbeatRunEventSeq(db, nextRunId), eventType: "provider.event", createdAt: laterAt });
         const stale = await acquire(changed, finalRunId);
         expect(stale.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
         expect(calls).not.toContain("environmentDestroyLease");

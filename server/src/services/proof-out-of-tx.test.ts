@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentWakeupRequests, agents, companies, createDb, environmentLeases, heartbeatRuns, issueComments,
-  issues, nativeRunFinalizations,
+  issues, nativeRunFinalizations, heartbeatRunEvents,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase, getEmbeddedPostgresTestSupport } from "../__tests__/helpers/embedded-postgres.js";
 
@@ -105,6 +105,9 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(runs.filter(run => run.id !== f.sourceRunId)).toHaveLength(1);
     const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
     expect(lease.metadata?.[handedOff.HANDED_OFF_WARM_EXIT_KEY]).toMatchObject({ runId: f.sourceRunId });
+    const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.sourceRunId));
+    expect(events.some(event => event.eventType === "native.warm_retention.probe" && event.payload?.phase === "proof"
+      && event.payload?.outcome === "proven" && event.payload?.leaseId === f.leaseId && typeof event.payload?.elapsedMs === "number")).toBe(true);
     expect(lease).toMatchObject({ status: "retained", releasedAt: null });
   }, 90_000);
 
@@ -124,6 +127,9 @@ const support = await getEmbeddedPostgresTestSupport();
       // sas3's stop-only intent (upstream's stop_and_retain shape); its provider receipt then admits through the receipt path.
       expect(lease).toBeTruthy();
       expect(JSON.stringify(lease!.metadata)).toContain(handedOff.HANDED_OFF_WARM_STOP_KEY);
+      const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.sourceRunId));
+      expect(events.some(event => event.eventType === "native.warm_retention.probe" && event.payload?.phase === "proof"
+        && event.payload?.outcome === "unproven" && event.payload?.leaseId === f.leaseId)).toBe(true);
       const receipt = await receiptOf(f.queueId);
       expect(receipt.status).toBe("deferred_issue_execution");
       expect(["interrupt_handoff", "remote_cleanup"]).toContain((receipt.payload?.executionWait as { reason?: string })?.reason);
