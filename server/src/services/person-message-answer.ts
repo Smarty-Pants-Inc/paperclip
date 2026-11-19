@@ -56,6 +56,11 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
   // whose OWN carrying run FAILED without a reply was never seen through by the
   // agent, so a reply to a LATER message does not answer it. It stays owed
   // until a run that carries it (its re-delivery) answers, or its card stands.
+  // Reached clause (RFL 08:41Z): a reply to a LATER message answers m ONLY if m
+  // REACHED the agent: m was in some run's input (any carried key, including
+  // wakeCommentIds and context.commentId). A message held and never carried
+  // stays owed (carried next, or a true card). Imported history is answered by
+  // its own arm below, never by this one.
   return sql`(exists (select 1 from ${heartbeatRuns} streamed
       where streamed.company_id = ${m.companyId}
         and (streamed.native_issue_id = ${m.issueId} or streamed.context_snapshot->>'issueId' = ${m.issueId}::text)
@@ -70,7 +75,13 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
           and (b.id = ${m.id} or (b.created_at > ${m.createdAt}
             -- A steer can overtake an earlier queued message: it answers only itself.
             and not coalesce(r.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? b.id::text
-            and not ${failedCarrierSql(m)}))
+            and not ${failedCarrierSql(m)}
+            and (exists (select 1 from ${heartbeatRuns} rc
+              where rc.company_id = ${m.companyId} and (${carriesCommentSql("rc", m.id, true)}
+              -- STEERING ARM (reached by steering): a Pi read event for m exists, i.e. steering's
+              -- materialized delivery evidence (steeredDeliveryEventSeqs, Pi's userMessage read of m);
+              -- a steered message the Pi read counts as reached, an unread steer does not.
+                or coalesce(rc.context_snapshot->'steeredDeliveryEventSeqs', '{}'::jsonb) ? ${m.id}::text)))))
           and ${chainCarriesCommentSql("r", sql`b.id`, m)}))
     or exists (select 1 from ${issueThreadInteractions} q
       join ${heartbeatRuns} r on r.id = q.source_run_id and r.company_id = q.company_id
