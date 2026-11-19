@@ -56,7 +56,7 @@ export async function withCarriedSteerDisplay<T extends { id: string; issueId: s
   const displayed = await withSteeredCommentDisplay(db, comments);
   if (!comments.length) return [];
   const first = comments[0]!;
-  const runs = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
+  const runs = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, createdAt: heartbeatRuns.createdAt,
     context: heartbeatRuns.contextSnapshot, result: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, first.companyId),
     or(eq(heartbeatRuns.nativeIssueId, first.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${first.issueId}`),
@@ -100,19 +100,26 @@ export async function withCarriedSteerDisplay<T extends { id: string; issueId: s
   // A later run that carried it as ORDINARY input (not as its own steer; the steering run lists a steer in
   // both fields) ends the 'turn ended unread' story even if that run failed: its own failure card names
   // the message (RFL cap-6), so no 'Not delivered' caption here.
-  const carriedLater = new Set<string>();
+  // Only a run created AFTER the run the steer ended in counts, never that run itself (a pre-A2r3 run
+  // has no steeredCommentIds, so its own wakeCommentIds would otherwise look like a later carrier).
+  const laterCarriers: Array<{ id: string; createdAt: Date; carried: Set<string> }> = [];
   if (endedIds.length) {
-    const laterRuns = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+    const laterRuns = await db.select({ id: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt, context: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, first.companyId),
       or(eq(heartbeatRuns.nativeIssueId, first.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${first.issueId}`),
       inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry", "succeeded", "failed", "timed_out"])));
     for (const run of laterRuns) {
       const context = object(run.context);
       const steered = new Set(ids(context.steeredCommentIds));
+      const carried = new Set<string>();
       for (const id of [context.commentId, context.wakeCommentId, ...ids(context.wakeCommentIds)])
-        if (typeof id === "string" && !steered.has(id)) carriedLater.add(id);
+        if (typeof id === "string" && !steered.has(id)) carried.add(id);
+      if (carried.size) laterCarriers.push({ id: run.id, createdAt: run.createdAt, carried });
     }
   }
+  const carriedAfter = (commentId: string, ended: { id: string; createdAt: Date }) => laterCarriers.some(run =>
+    run.id !== ended.id && run.createdAt > ended.createdAt && run.carried.has(commentId));
   return displayed.map<T & CarriedSteerDisplay>(comment => {
     const carrier = carriers.find(run => ids(run.context?.carriedSteeredCommentIds).includes(comment.id) &&
       ![...ids(run.result?.restoredSteeredCommentIds), ...ids(run.result?.stopRestoredSteeredCommentIds)].includes(comment.id));
@@ -130,7 +137,7 @@ export async function withCarriedSteerDisplay<T extends { id: string; issueId: s
     }
     const restored = ended && [...ids(ended.result?.restoredSteeredCommentIds), ...ids(ended.result?.stopRestoredSteeredCommentIds)].includes(comment.id);
     if (ended && (restored || (!["queued", "running", "scheduled_retry"].includes(ended.status) && comment.steeringStatus !== "delivered"))) {
-      if (carriedLater.has(comment.id)) {
+      if (carriedAfter(comment.id, ended)) {
         return { ...comment, steeringStatus: null, carriedIntoRunId: null, steeringDeliveryEventSeq: null,
           deliveryOutcome: "ordinary", steeringUnavailableReason: null };
       }
