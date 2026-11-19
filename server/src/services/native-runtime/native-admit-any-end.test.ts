@@ -85,7 +85,7 @@ import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { nativeResponsePresentationWork } from "./native-response-presentation-work.js";
 import { nativeWorkspaceFinalizationWork } from "./native-workspace-finalization-work.js";
-import { recordNativeWorkspaceFinalizationFailure } from "./native-workspace-finalizer.js";
+import { attemptNativeWorkspaceFinalization } from "./native-workspace-finalizer.js";
 import { cleanupNativeWorkspaceSync, prepareNativeWorkspaceSync, readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
 import { reconcileNativeFinalizations } from "./native-finalization-reconciler.js";
 
@@ -372,42 +372,73 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
   const brief = (run: typeof heartbeatRuns.$inferSelect) => ({ id: run.id, status: run.status, errorCode: run.errorCode, error: run.error,
     finishedAt: run.finishedAt?.toISOString() ?? null });
 
-  it("PROBE retry exhausted", async () => {
+  it("RE (retry exhausted) + F2: the save fails for the last time with a message parked -> R ends FAILED once, the parked message runs once within a minute in its own root on the saved files, the agent does not read error, 0 'no run started'; then the save call is let through -> R stays FAILED, its line stays as shown, its late bytes are published nowhere", async () => {
     const h = await hungRWithParkedMessage(NO_CAP);
     try {
       const ended = await exhaustRetries(h);
+      const endedAt = Date.now();
+      expect(ended).toMatchObject({ status: "failed", errorCode: STALLED, finishedAt: expect.any(Date) });
+      expect(ended.error).toMatch(/^Saving the workspace failed, so this run was ended\./);
+      expect(await h.coordinator(h.r.id)).toMatchObject({ phase: "terminal_failure", failureCode: STALLED,
+        failureDetail: { originalFailureCode: "native_workspace_sync_out_failed", workspaceFinalizeAttempt: 3 } });
+      // R's own holds only: its owner is a tombstone and the marker names R.
+      expect(record(record(ended.runnerProfileJson).nativeWorkspaceFinalizationOwner)).toMatchObject({ fenced: true });
+      expect(record(record(ended.resultJson).workspaceSyncOutStall).workspace).toMatchObject({ kind: "classic_isolated", sourceRunId: h.r.id });
+      expect(ended.error).not.toMatch(/kept for recovery|set aside|recover|repair/i);
       await h.present();
-      const out: Record<string, unknown> = { R: brief(ended), coordinator: await h.coordinator(h.r.id), line: await h.s.servedLine(h.r.id), hostAtEnd: await listing(h.hostDir),
-        wakesAtEnd: (await h.wakesOf(h.next)).map(w => ({ id: w.id, status: w.status, error: w.error, runId: w.runId })),
-        agentAtEnd: await h.agentRead(), issueAtEnd: await h.s.issue(),
-        recovery: (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, h.s.issueId))).map(a => ({ cause: a.cause, status: a.status, ownerType: a.ownerType, kind: a.kind })),
-        leases: (await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, h.r.id))).map(l => ({ status: l.status, releasedAt: l.releasedAt, cleanupStatus: l.cleanupStatus, policy: l.leasePolicy })),
-        owner: record(record((await h.run(h.r.id)).runnerProfileJson).nativeWorkspaceFinalizationOwner) };
-      const admitted = await h.admitParked(20_000);
-      out.admitted = { afterMs: admitted.afterMs, turns: admitted.turns, runs: admitted.runs.map(brief) };
-      out.wakesAfter = (await h.wakesOf(h.next)).map(w => ({ id: w.id, status: w.status, error: w.error, runId: w.runId }));
-      out.agentAfter = await h.agentRead();
-      out.sweep = await h.sweepUnanswered(new Date(Date.now() + 10 * 60_000));
-      out.thread = (await h.thread()).map(c => ({ by: c.authorType, run: c.createdByRunId, body: c.body.slice(0, 200) }));
-      // F2: the stand-in lets the call through.
+      const shown = await h.s.servedLine(h.r.id);
+      expect(shown).toMatchObject({ status: "failed", state: "lost", shown: THE_LINE });
+      // The agent is not left in error by the save failure of a run whose answer the person already has (real GET).
+      const agentAtEnd = await h.agentRead();
+      expect(agentAtEnd).toMatchObject({ lifecycleState: "ready" });
+      expect(agentAtEnd.status).not.toBe("error");
+      // The parked message is admitted at once and runs ONCE.
+      const admitted = await h.admitParked(60_000);
+      expect(admitted.runs.map(run => run.status), "the parked message never started").toHaveLength(1);
+      expect(admitted.turns).toBe(1);
+      expect(Date.now() - endedAt).toBeLessThan(60_000);
+      await h.heartbeat.drainActiveRunExecutions();
+      const [p] = (await h.s.runs()).filter(run => run.id === admitted.runs[0].id);
+      expect(p).toMatchObject({ status: "succeeded" });
+      expect((await h.wakesOf(h.next)).map(wake => wake.status)).not.toContain("deferred_issue_execution");
+      const pRoot = (await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, (await h.s.issue()).executionWorkspaceId!)))[0].cwd!;
+      expect(pRoot).not.toBe(h.hostDir);
+      const pFiles = await listing(pRoot);
+      expect(pFiles).toMatchObject(SAVED);
+      expect(JSON.stringify(pFiles)).not.toContain("REWRITTEN BY R");
+      const agentAfter = await h.agentRead();
+      expect(agentAfter).toMatchObject({ status: "idle", lifecycleState: "ready" });
+      // 0 'no run started': the sweep, with its clock 10 minutes on, has nothing to say about the message.
+      await h.present();
+      await h.sweepUnanswered(new Date(Date.now() + 10 * 60_000));
+      const thread = await h.thread();
+      expect(thread.filter(comment => /no run started|wasn't answered/i.test(comment.body))).toEqual([]);
+      expect(thread.filter(comment => comment.createdByRunId === p.id && comment.authorType === "agent")).toHaveLength(1);
+      expect(thread.filter(comment => comment.createdByRunId === h.r.id && comment.authorType === "agent").map(comment => comment.body)).toEqual([ANSWER]);
+
+      // F2: the stand-in lets the save call through. Every producer that could still copy R's files back runs.
+      const frozen = brief(await h.run(h.r.id));
+      const hostBefore = await listing(h.hostDir), pRootBefore = await treeSha256(pRoot);
       h.s.fault.fail = false;
       await h.sweep(h.r.id);
-      await reconcileNativeFinalizations(db, [h.r.id], { environmentRuntime: {} as never }).catch(error => { out.reconcileError = String(error); });
+      await reconcileNativeFinalizations(db, [h.r.id], { environmentRuntime: {} as never }).catch(() => undefined);
+      const direct = await attemptNativeWorkspaceFinalization({ db, runId: h.r.id, environmentRuntime: {} as never });
+      // The claim CAS refuses: R's owner is the tombstone (native-workspace-finalization-ownership.ts).
+      expect(direct).toEqual({ kind: "waiting", reason: "binding_changed" });
       await h.heartbeat.drainActiveRunExecutions();
-      out.Rlate = brief(await h.run(h.r.id)); out.lineLate = await h.s.servedLine(h.r.id); out.coordinatorLate = (await h.coordinator(h.r.id)).phase;
-      // The system's retained-workspace recovery (workspace-recovery.ts reconcileRetainedWorkspaces), with a runtime that records what it is asked.
-      const asked: string[] = [];
-      const runtime = new Proxy({}, { get: (_t, name) => (...args: unknown[]) => { asked.push(String(name)); throw new Error(`runtime.${String(name)} not available in this probe`); } });
-      const { reconcileRetainedWorkspaces } = await import("../workspace-recovery.js");
-      for (let pass = 0; pass < 3; pass += 1) {
-        const work = await reconcileRetainedWorkspaces(db, runtime as never, async () => { asked.push("onRecovered"); }).catch(error => { asked.push(`error:${String(error)}`); return []; });
-        await Promise.all(work ?? []);
-      }
-      out.retained = { asked, actions: (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, h.s.issueId))).map(a => ({ cause: a.cause, status: a.status, ownerType: a.ownerType,
-        systemRecovery: record(a.evidence).systemRecovery, workspaceRecovery: record(a.evidence).workspaceRecovery })) };
-      out.Rretained = brief(await h.run(h.r.id)); out.hostLate = await listing(h.hostDir);
-      out.errors = h.errors.map(String);
-      evidence.probeRetryExhausted = out;
+      await h.present();
+      expect(brief(await h.run(h.r.id))).toEqual(frozen);
+      expect(await h.coordinator(h.r.id)).toMatchObject({ phase: "terminal_failure", failureCode: STALLED });
+      expect(await h.s.servedLine(h.r.id)).toEqual(shown);
+      expect(await listing(h.hostDir)).toEqual(hostBefore);
+      expect(await treeSha256(pRoot)).toBe(pRootBefore);
+      // The late bytes are kept aside: still in R's own box, published nowhere.
+      expect(await listing(h.s.boxes[h.s.faultedBox.index].cwd)).toMatchObject({ "report.md": "report, REWRITTEN BY R (unsaved)\n" });
+      expect((await db.select().from(workspaceOperations).where(and(eq(workspaceOperations.heartbeatRunId, h.r.id),
+        eq(workspaceOperations.phase, "workspace_finalize")))).map(operation => operation.status)).not.toContain("succeeded");
+      expect(h.errors).toEqual([]);
+      evidence.RE = { R: frozen, line: shown, agentAtEnd, agentAfter, P: brief(p), admittedAfterMs: admitted.afterMs, pRoot, pFiles,
+        thread: thread.map(comment => ({ by: comment.authorType, body: comment.body.slice(0, 120) })) };
     } finally { await h.stop(); }
   }, 300_000);
 
@@ -452,22 +483,30 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
   it("PROBE pause", async () => {
     const h = await hungRWithParkedMessage(NO_CAP);
     try {
-      const ended = await exhaustRetries(h);
-      const out: Record<string, unknown> = { R: brief(ended) };
-      out.wakesBefore = (await h.wakesOf(h.next)).map(w => ({ id: w.id, status: w.status, error: w.error, runId: w.runId }));
+      const out: Record<string, unknown> = {};
+      const w = async () => (await h.wakesOf(h.next)).map(wake => ({ status: wake.status, error: wake.error, runId: wake.runId, reason: wake.reason }));
       const paused = await request(h.s.app).post(`/api/issues/${h.s.issueId}/tree-holds`).send({ mode: "pause", reason: "cleanup" });
       out.pause = { status: paused.status, holdId: paused.body?.hold?.id, body: paused.status === 201 ? undefined : paused.body };
-      out.wakesPaused = (await h.wakesOf(h.next)).map(w => ({ id: w.id, status: w.status, error: w.error, runId: w.runId }));
+      await sleep(1_500);
+      out.Rpaused = brief(await h.run(h.r.id));
+      out.wakesPaused = await w();
       out.sweepPaused = await h.sweepUnanswered(new Date(Date.now() + 10 * 60_000));
+      out.sweepPaused2 = await h.sweepUnanswered(new Date(Date.now() + 20 * 60_000));
       out.threadPaused = (await h.thread()).map(c => ({ by: c.authorType, run: c.createdByRunId, body: c.body.slice(0, 200) }));
-      const released = await request(h.s.app).post(`/api/issues/${h.s.issueId}/tree-holds/${paused.body?.hold?.id}/release`).send({});
+      h.s.releaseStall();
+      await h.heartbeat.drainActiveRunExecutions();
+      const released = await request(h.s.app).post(`/api/issues/${h.s.issueId}/tree-holds/${paused.body?.hold?.id}/release`).send({ reason: "cleanup done" });
       out.release = { status: released.status, body: released.status < 300 ? undefined : released.body };
-      const admitted = await h.admitParked(15_000);
-      out.admittedAfterResume = { afterMs: admitted.afterMs, turns: admitted.turns, runs: admitted.runs.map(brief) };
-      out.wakesResumed = (await h.wakesOf(h.next)).map(w => ({ id: w.id, status: w.status, error: w.error, runId: w.runId }));
+      const startAt = Date.now(); const before = box.inputs.length;
+      while (Date.now() - startAt < 20_000 && box.inputs.length === before) { await h.heartbeat.resumeQueuedRuns(); await sleep(250); }
+      await sleep(1_000); await h.heartbeat.drainActiveRunExecutions(); await h.present();
+      out.afterResume = { turns: box.inputs.length - before, runs: (await h.s.runs()).slice(2).map(run => ({ ...brief(run), carriesNext: JSON.stringify(run.contextSnapshot).includes(h.next),
+        wakeReason: record(run.contextSnapshot).wakeReason })) };
+      out.wakesResumed = await w();
+      out.allWakes = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, h.s.agentId))).map(wake => ({ status: wake.status, reason: wake.reason, error: wake.error }));
       out.sweepResumed = await h.sweepUnanswered(new Date(Date.now() + 10 * 60_000));
       out.threadResumed = (await h.thread()).map(c => ({ by: c.authorType, run: c.createdByRunId, body: c.body.slice(0, 200) }));
-      out.agent = await h.agentRead();
+      out.agent = await h.agentRead(); out.issue = { status: (await h.s.issue()).status };
       evidence.probePause = out;
     } finally { await h.stop(); }
   }, 300_000);
