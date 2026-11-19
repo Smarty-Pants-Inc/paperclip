@@ -39,7 +39,7 @@ const ids = (value: unknown): string[] => Array.isArray(value) ? value.filter((i
 
 /** A saved comment is the outbox. Its existing activity receipt keeps an explicit
  * Queue/Interrupt durable across a server crash, without manufacturing a wake. */
-async function deliveryIntent(db: Db, comment: SteerablePersonComment) {
+export async function deliveryIntent(db: Pick<Db, "select">, comment: Pick<SteerablePersonComment, "id" | "companyId" | "issueId">) {
   const [receipt] = await db.select({ details: activityLog.details }).from(activityLog).where(and(
     eq(activityLog.companyId, comment.companyId), eq(activityLog.entityId, comment.issueId),
     eq(activityLog.action, "issue.comment_added"), sql`${activityLog.details}->>'commentId' = ${comment.id}`,
