@@ -11,6 +11,7 @@ import { queryKeys } from "@/lib/queryKeys";
 import { useNavigate } from "@/lib/router";
 import { agentRouteRef } from "@/lib/utils";
 import { useAgentChatEnabled } from "./useAgentChatEnabled";
+import { useOpenAgentChatIds } from "./useAgentChatRead";
 
 export function useAgentChatNavigation() {
   const { selectedCompanyId: companyId } = useCompany();
@@ -21,9 +22,15 @@ export function useAgentChatNavigation() {
     queryKey: queryKeys.agents.list(companyId!), queryFn: () => agentsApi.list(companyId!),
     enabled: enabled && !!companyId,
   });
+  const openChatIds = useOpenAgentChatIds();
+  // The open chat reads as read at once (its read mark is optimistic); the server's
+  // count stands for every other chat.
+  const select = useCallback((list: Issue[]) => openChatIds.length === 0 ? list : list.map(chat =>
+    openChatIds.includes(chat.id) && (chat.unreadMessageCount || chat.isUnreadForMe)
+      ? { ...chat, unreadMessageCount: 0, isUnreadForMe: false } : chat), [openChatIds]);
   const chats = useQuery({
     queryKey: queryKeys.agentChats.list(companyId, userId), queryFn: context => agentChatsApi.list(companyId!, undefined, queryReadOptions(context)),
-    enabled: enabled && !!companyId && session.isSuccess,
+    enabled: enabled && !!companyId && session.isSuccess, select,
   });
   return { companyId, userId, enabled, loaded, agents, chats, session };
 }

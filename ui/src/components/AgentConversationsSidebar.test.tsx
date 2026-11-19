@@ -7,6 +7,9 @@ import type { Agent } from "@paperclipai/shared";
 import { AgentConversationsSidebar } from "./AgentConversationsSidebar";
 import type { AgentConversationSidebarProps } from "./AgentConversationSidebar";
 import { queryKeys } from "@/lib/queryKeys";
+import { AgentChatReadProvider, useAgentChatRead } from "@/hooks/useAgentChatRead";
+const reads = vi.hoisted(() => ({ markRead: vi.fn() }));
+vi.mock("@/api/issues", () => ({ issuesApi: { markRead: reads.markRead } }));
 const state = vi.hoisted(() => ({ companyId: "company-a", navigate: vi.fn(), closeSidebar: vi.fn(), ensure: vi.fn(), getAgent: vi.fn(), newAgent: vi.fn() }));
 const sidebarInputs = vi.hoisted(() => [] as Pick<AgentConversationSidebarProps, "existingChatAgentIds" | "unreadAgentIds" | "unreadMessageCounts">[]);
 vi.mock("./AgentConversationSidebar", async importOriginal => {
@@ -289,4 +292,56 @@ it("lists every eligible agent: open chat, then conversations by recency, then t
     expect([...container.querySelectorAll('nav[aria-label="Agent conversations"] a')].map(link => link.getAttribute("href")))
       .toEqual(["/chats/alice", "/chats/bob", "/chats/carol", "/chats/zed"]); // the open chat (alice) is pinned first
   });
+});
+
+// #21268: Paul has alice's chat open; her reply lands and the list refetch carries
+// unread 1 BEFORE the read-mark response. Sampled every 100 ms, the open row never
+// shows a badge, at the mobile (390) and desktop (1440) widths.
+const aliceBadge = () => container.querySelector('[aria-label^="1 unread message from alice"]');
+function Reply() {
+  return <div ref={useAgentChatRead("11111111-1111-4111-8111-111111111111", "2026-11-19T11:13:11.000Z", true)}>BADGE R1</div>;
+}
+async function renderOpen(open: boolean) {
+  vi.spyOn(document, "hasFocus").mockReturnValue(true);
+  await act(async () => { root.render(<QueryClientProvider client={client}>
+    {open ? <AgentChatReadProvider issueId="chat-alice" companyId="company-a" userId="user-a"><AgentConversationsSidebar />
+      <div className="task-chat-scroll-viewport"><Reply /></div></AgentChatReadProvider> : <AgentConversationsSidebar />}
+  </QueryClientProvider>); });
+  await act(async () => { window.dispatchEvent(new Event("focus")); });
+}
+it.each([390, 1440])("the open chat never flashes an unread badge when its reply lands at %ipx", async width => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "setInterval", "Date"] });
+  try {
+    window.innerWidth = width;
+    let release!: () => void;
+    reads.markRead.mockReset().mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+    await renderOpen(true);
+    const samples: boolean[] = [];
+    const sample = setInterval(() => { samples.push(!!aliceBadge()); }, 100);
+    // The reply event refetches the list with unread 1 while the read mark is in flight.
+    await act(async () => { client.setQueryData(queryKeys.agentChats.list("company-a", "user-a"), [{ ...chat("alice"), unreadMessageCount: 1, isUnreadForMe: true }]); });
+    for (let at = 0; at < 10; at += 1) await act(async () => { vi.advanceTimersByTime(100); });
+    await act(async () => { release?.(); client.setQueryData(queryKeys.agentChats.list("company-a", "user-a"), [chat("alice")]); });
+    for (let at = 0; at < 5; at += 1) await act(async () => { vi.advanceTimersByTime(100); });
+    clearInterval(sample);
+    expect(samples.length).toBeGreaterThanOrEqual(15);
+    expect(samples.filter(Boolean)).toEqual([]);
+  } finally { vi.useRealTimers(); }
+});
+it("an unread chat clears its badge when opened, shows (1) after leaving, and keeps the count across a reload", async () => {
+  reads.markRead.mockReset().mockImplementation(() => new Promise<void>(() => {}));
+  client.setQueryData(queryKeys.agentChats.list("company-a", "user-a"), [{ ...chat("alice"), unreadMessageCount: 1, isUnreadForMe: true }]);
+  await renderOpen(false);
+  expect(aliceBadge()).not.toBeNull();
+  await renderOpen(true);
+  expect(aliceBadge()).toBeNull();
+  // Leave; a new reply there is counted again.
+  await renderOpen(false);
+  await act(async () => { client.setQueryData(queryKeys.agentChats.list("company-a", "user-a"), [{ ...chat("alice"), unreadMessageCount: 1, isUnreadForMe: true }]); });
+  expect(aliceBadge()?.textContent).toBe("1");
+  // Reload (remount) shows the same count.
+  await act(async () => root.unmount());
+  root = createRoot(container);
+  await renderOpen(false);
+  expect(aliceBadge()?.textContent).toBe("1");
 });

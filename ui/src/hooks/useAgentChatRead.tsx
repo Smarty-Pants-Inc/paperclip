@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { isUuidLike } from "@paperclipai/shared";
 import { ApiError } from "@/api/client";
@@ -9,12 +9,40 @@ import { isScrolledToEnd, PIN_THRESHOLD_PX } from "@/components/task-chat/scroll
 type Seen = { id: string; at: number };
 const READ_RETRY_DELAYS = [500, 1_500];
 const ChatReadContext = createContext<((message: Seen) => void) | null>(null);
+const ChatFollowContext = createContext<((following: boolean) => void) | null>(null);
+
+// The chat the person has open and is following (focused, at its end) is read optimistically in every chat list: a list
+// refetch for its own reply can land before the read mark, and must not flash a
+// badge. Every other chat keeps the server's count.
+let openChatIds: readonly string[] = [];
+const openChatListeners = new Set<() => void>();
+function setChatOpen(id: string, open: boolean) {
+  const index = openChatIds.indexOf(id);
+  openChatIds = open ? [...openChatIds, id] : index < 0 ? openChatIds : openChatIds.filter((_, at) => at !== index);
+  openChatListeners.forEach(listener => listener());
+}
+function subscribeOpenChats(listener: () => void) {
+  openChatListeners.add(listener);
+  return () => { openChatListeners.delete(listener); };
+}
+export function useOpenAgentChatIds(): readonly string[] {
+  return useSyncExternalStore(subscribeOpenChats, () => openChatIds, () => openChatIds);
+}
 
 export function AgentChatReadProvider({ issueId, companyId, userId, children }: {
   issueId?: string; companyId: string; userId: string | null; children: ReactNode;
 }) {
   const client = useQueryClient();
   const [error, setError] = useState(false);
+  const following = useRef(false);
+  const follow = useCallback((on: boolean) => {
+    if (!issueId || on === following.current) return;
+    following.current = on;
+    setChatOpen(issueId, on);
+  }, [issueId]);
+  useLayoutEffect(() => () => {
+    if (issueId && following.current) { following.current = false; setChatOpen(issueId, false); }
+  }, [issueId]);
   // `pending` holds every distinct seen id in the newest seen millisecond. Comment
   // times carry microseconds the client cannot see, so ids sharing a millisecond
   // are all sent and the server keeps the greatest exact cutoff.
@@ -94,14 +122,15 @@ export function AgentChatReadProvider({ issueId, companyId, userId, children }: 
     if (scope.exhausted) { scope.exhausted = false; scope.failures = 0; setError(false); }
     if (!scope.busy && scope.retryTimer === null) queueMicrotask(() => { void flush(); });
   }, [issueId, scope, flush]);
-  return <ChatReadContext.Provider value={issueId ? seen : null}>
+  return <ChatFollowContext.Provider value={issueId ? follow : null}><ChatReadContext.Provider value={issueId ? seen : null}>
     {error && <p role="alert" className="text-sm text-destructive">Couldn’t mark this chat read.</p>}
     {children}
-  </ChatReadContext.Provider>;
+  </ChatReadContext.Provider></ChatFollowContext.Provider>;
 }
 
 export function useAgentChatRead(id: string, createdAt: string | undefined, enabled: boolean) {
   const seen = useContext(ChatReadContext);
+  const follow = useContext(ChatFollowContext);
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const element = ref.current;
@@ -110,9 +139,10 @@ export function useAgentChatRead(id: string, createdAt: string | undefined, enab
     if (!Number.isFinite(at)) return;
     const viewport = element.closest<HTMLElement>(".task-chat-scroll-viewport");
     const check = () => {
-      if (document.visibilityState !== "visible" || !document.hasFocus() || !viewport) return;
       // The scroller's own "at the end" policy: what it follows is what the person has read.
-      if (!isScrolledToEnd(viewport)) return;
+      const reading = document.visibilityState === "visible" && document.hasFocus() && !!viewport && isScrolledToEnd(viewport);
+      follow?.(reading);
+      if (!reading) return;
       const message = element.getBoundingClientRect(), bounds = viewport.getBoundingClientRect();
       if (message.height > 0 && message.bottom <= bounds.bottom + PIN_THRESHOLD_PX && message.bottom > bounds.top) seen({ id, at });
     };
@@ -132,6 +162,6 @@ export function useAgentChatRead(id: string, createdAt: string | undefined, enab
       viewport?.removeEventListener("scroll", check);
       document.removeEventListener("visibilitychange", check); window.removeEventListener("focus", check);
     };
-  }, [seen, id, createdAt, enabled]);
+  }, [seen, follow, id, createdAt, enabled]);
   return ref;
 }
