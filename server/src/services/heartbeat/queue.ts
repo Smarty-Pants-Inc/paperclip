@@ -2670,11 +2670,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   function trackWakeup(
     agentId: string,
     opts: WakeupOptions = {},
+    executionWaitRequestId?: string,
   ): ReturnType<typeof enqueueWakeup> {
     // Until its wake and run commit, this admission exists only in this process.
     const unsaved = {};
     unsavedWakeAdmissions.add(unsaved);
-    const promise = enqueueWakeup(agentId, opts, undefined, undefined, { saved: () => { unsavedWakeAdmissions.delete(unsaved); } });
+    const promise = enqueueWakeup(agentId, opts, executionWaitRequestId, undefined, { saved: () => { unsavedWakeAdmissions.delete(unsaved); } });
     activeWakeupPromises.add(promise);
     void promise
       .catch(() => {})
@@ -5149,10 +5150,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           };
           // A deferred durable chat wake already owns this ID and source.
           // Promote that receipt in the same transaction as its successor.
-          const wakeupRequest = durableRequest && executionWaitRequestId === durableRequest.id
+          const restoredConversationReceipt = executionWaitRequestId &&
+            opts.idempotencyKey?.startsWith(CONVERSATION_COMMENT_KEY_PREFIX);
+          const wakeupRequest = (durableRequest && executionWaitRequestId === durableRequest.id) || restoredConversationReceipt
             ? await tx.update(agentWakeupRequests).set({
                 payload, status: "queued", error: null, finishedAt: null, updatedAt: new Date(),
-              }).where(and(eq(agentWakeupRequests.id, durableRequest.id),
+              }).where(and(eq(agentWakeupRequests.id, executionWaitRequestId!),
                 eq(agentWakeupRequests.companyId, agent.companyId),
                 eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)))
                 .returning().then(rows => rows[0])
@@ -5180,7 +5183,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // Consume it with its successor even when chat keeps other messages
           // in separate turns, or finalization will deliver it a second time.
           const pendingComments =
-            (executionWaitRequestId || canCoalesceComments) &&
+            !restoredConversationReceipt && (executionWaitRequestId || canCoalesceComments) &&
             (ownsReconstructionContinuation || !(await getExecutionBlocker(tx as unknown as Db, issue.companyId, issue.id)))
               ? await tx
                   .select()
