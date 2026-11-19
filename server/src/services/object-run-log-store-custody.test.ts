@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -124,9 +124,11 @@ async function run(step: Step, fault: Fault, persistent: boolean) {
     const all = Buffer.concat(admitted), stored = await coldRead(m, handle.logRef);
     const spill = await readObjectRunLogSpill(spillDir, handle.logRef);
     const diagnostics = vi.mocked(logger.warn).mock.calls;
-    console.info("custody-row", JSON.stringify({ step, fault, persistent, admitted: all.length, stored: stored.length,
-      spilled: spill.unrecovered.length, summary, fired: m.injection.fired, head: storedHead(m, handle.logRef).closed,
-      incomplete: warning.mock.calls.length, diagnostics: diagnostics.map(([value, message]) => [value, message]) }));
+    // Evidence for a reviewer: one JSON line per row, written only when asked for.
+    if (process.env.OBJLOG_CUSTODY_EVIDENCE) appendFileSync(process.env.OBJLOG_CUSTODY_EVIDENCE, `${JSON.stringify({
+      step, fault, persistent, admitted: all.length, stored: stored.length, spilled: spill.unrecovered.length,
+      equal: Buffer.concat([stored, spill.unrecovered]).equals(all), summary, fired: m.injection.fired,
+      closed: storedHead(m, handle.logRef).closed, incomplete: warning.mock.calls.length, diagnostics })}\n`);
     return { m, store, handle, spillDir, all, stored, spill, summary, diagnostics, receipts: await Promise.all(receipts),
       incomplete: warning.mock.calls.length, runId };
   } finally { warning.mockRestore(); }
