@@ -7322,6 +7322,55 @@ describe("IssueDetail", () => {
     15_000,
   );
 
+  // cluster-lead 09:37Z (frame steerkill-g4b-092242/screen-1440/0046-after-reload.jpg):
+  // the bubble read '5m ago · Sent' after its run FAILED with steeringStatus still
+  // 'accepted'. Server facts only: 'accepted' + the run steeredIntoRunId names is
+  // terminal in the issue's runs -> 'Not delivered'; a later 'delivered' wins.
+  it.each([390, 1440])(
+    "a steered message whose turn ended unread says 'Not delivered', not 'Sent'; a later server 'delivered' wins at %i",
+    async (width) => {
+      const { post, runId, state, bubbles, finalThread } = await renderSteeringPlacement(width, "steer");
+      const editor = container.querySelector<HTMLTextAreaElement>('[data-testid="stand-in-editor"]')!;
+      await act(async () => {
+        editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+      });
+      const delivery = () => bubbles()[0]?.querySelector('[data-testid="task-chat-steered-delivery"]')?.textContent ?? "";
+      // accepted + R running: Sent.
+      expect(await waitUntil(() => bubbles()[0]?.dataset.delivery === "sent")).toBe(true);
+      expect(state.thread).toContainEqual(expect.objectContaining({ id: post.id, steeringStatus: "accepted", steeredIntoRunId: runId }));
+      expect(delivery()).toContain("Sent");
+      expect(delivery()).not.toContain("Not delivered");
+      // R FAILED before Pi read it; the server still says 'accepted'.
+      const failedRun = {
+        runId, runtimeMode: "native", status: "failed", agentId: "agent-1", adapterType: "paperclip_runner",
+        createdAt: "2026-11-19T07:43:59.400Z", startedAt: "2026-11-19T07:43:59.400Z", finishedAt: "2026-11-19T07:44:30.000Z",
+      };
+      mockHeartbeatsApi.activeRunForIssue.mockResolvedValue(null);
+      mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([]);
+      mockActivityApi.recentRunsForIssue.mockResolvedValue([failedRun]);
+      mockActivityApi.runsForIssue.mockResolvedValue([failedRun]);
+      await act(async () => { await queryClient.invalidateQueries(); });
+      expect(await waitUntil(() => bubbles()[0]?.dataset.delivery === "not_delivered")).toBe(true);
+      expect(bubbles()).toHaveLength(1);
+      expect(bubbles()[0]!.dataset.steeredIntoRunId).toBe(runId);
+      expect(delivery()).toContain("Not delivered: the turn ended before the agent read it.");
+      expect(delivery()).not.toMatch(/\bSent\b/);
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/not-delivered-${width}.txt`, `${bubbles()[0]!.outerHTML}\n`);
+      }
+      // The server later says 'delivered' (R still ended): the bubble follows the server.
+      state.thread = [...finalThread];
+      await act(async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments("PAP-1") }); });
+      expect(await waitUntil(() => bubbles()[0]?.dataset.delivery === "delivered")).toBe(true);
+      expect(delivery()).toContain("Delivered");
+      expect(delivery()).not.toContain("Not delivered");
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/after-not-delivered-server-delivered-${width}.txt`, `${bubbles()[0]!.outerHTML}\n`);
+      }
+    },
+    15_000,
+  );
+
   it.each([390, 1440])(
     "steering placement: Send ▾ Queue while the agent works puts the message in the waiting list (real server bodies), never as a steered thread item at %i",
     async (width) => {
