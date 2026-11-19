@@ -4107,13 +4107,16 @@ describe("sandbox git-bundle export transport", () => {
     });
     await commitInSandbox(remoteWorkspaceDir);
     const failure = Object.assign(new Error("private-restore-command /private-restore-path"), { code: 7, stderr: "private-restore-stderr" });
+    // A timed-out restore can finish after the next test installs its faults.
+    // Its finally must not clear an unrelated fault installed by the next test.
+    const spies: Array<{ mockRestore(): void }> = [];
     // Failures before the first host write are retried, so they must persist.
     if (step === "git_export") client.run = async () => { throw failure; };
-    if (step === "git_import") vi.spyOn(gitSync, "fetchGitBundleIntoLocalRef").mockRejectedValue(failure);
-    if (step === "directory_merge") vi.spyOn(restoreMerge, "mergeDirectoryWithBaseline").mockRejectedValue(failure);
-    if (step === "git_integration") vi.spyOn(gitSync, "integrateImportedGitHead").mockRejectedValueOnce(failure);
-    if (step === "index_reset") vi.spyOn(gitSync, "resetLocalGitIndexToHead").mockRejectedValueOnce(failure);
-    if (step === "git_ref_cleanup") vi.spyOn(gitSync, "deleteLocalGitRef").mockRejectedValueOnce(failure);
+    if (step === "git_import") spies.push(vi.spyOn(gitSync, "fetchGitBundleIntoLocalRef").mockRejectedValue(failure));
+    if (step === "directory_merge") spies.push(vi.spyOn(restoreMerge, "mergeDirectoryWithBaseline").mockRejectedValue(failure));
+    if (step === "git_integration") spies.push(vi.spyOn(gitSync, "integrateImportedGitHead").mockRejectedValueOnce(failure));
+    if (step === "index_reset") spies.push(vi.spyOn(gitSync, "resetLocalGitIndexToHead").mockRejectedValueOnce(failure));
+    if (step === "git_ref_cleanup") spies.push(vi.spyOn(gitSync, "deleteLocalGitRef").mockRejectedValueOnce(failure));
     if (step === "workspace_transfer") {
       const syncOut = client.syncOut!;
       client.syncOut = async (operations) => {
@@ -4136,7 +4139,7 @@ describe("sandbox git-bundle export transport", () => {
       const diagnostics = lines.filter((line) => line.includes("Workspace restore diagnostic:"));
       expect(diagnostics).toHaveLength(1);
       expect(diagnostics[0]).not.toContain("private-restore-");
-    } finally { vi.restoreAllMocks(); }
+    } finally { for (const spy of spies.reverse()) spy.mockRestore(); }
   });
 
   it.each([
@@ -4157,13 +4160,15 @@ describe("sandbox git-bundle export transport", () => {
       if (directory && ++directoryTransfers === 1 && failure.code === "ECONNRESET") throw failure;
       return syncOut(operations);
     };
-    if (failure.code !== "ECONNRESET") vi.spyOn(restoreMerge, "mergeDirectoryWithBaseline").mockRejectedValueOnce(failure);
+    const merge = failure.code !== "ECONNRESET"
+      ? vi.spyOn(restoreMerge, "mergeDirectoryWithBaseline").mockRejectedValueOnce(failure)
+      : undefined;
     try {
       await prepared.restoreWorkspace();
       expect(directoryTransfers).toBe(2);
       expect(await git(localWorkspaceDir, ["log", "-1", "--pretty=%s"])).toBe("sandbox update");
       await expect(readFile(path.join(localWorkspaceDir, "remote-only.txt"), "utf8")).resolves.toBe("from sandbox\n");
-    } finally { vi.restoreAllMocks(); }
+    } finally { merge?.mockRestore(); }
   });
 
   it("gives up after three copy-back attempts", async () => {
@@ -4204,7 +4209,7 @@ describe("sandbox git-bundle export transport", () => {
     try {
       await expect(prepared.restoreWorkspace()).rejects.toBe(failure);
       expect(spy).toHaveBeenCalledTimes(1);
-    } finally { vi.restoreAllMocks(); }
+    } finally { spy.mockRestore(); }
   });
 
   it("does not retry a non-Git copy-back that failed after writing a host file", async () => {
@@ -4231,7 +4236,7 @@ describe("sandbox git-bundle export transport", () => {
     // later copy fails with an otherwise retryable I/O error.
     const failure = Object.assign(new Error("i/o error"), { code: "EIO" });
     const copyFile = fsPromises.copyFile.bind(fsPromises);
-    vi.spyOn(fsPromises, "copyFile").mockImplementation(async (source, target, mode) => {
+    const copy = vi.spyOn(fsPromises, "copyFile").mockImplementation(async (source, target, mode) => {
       if (path.basename(String(source)) === "z-later.txt") throw failure;
       return copyFile(source, target, mode);
     });
@@ -4241,7 +4246,7 @@ describe("sandbox git-bundle export transport", () => {
       await expect(readFile(path.join(localWorkspaceDir, "a-first.txt"), "utf8")).resolves.toBe("first\n");
       expect(directoryTransfers).toBe(1);
       expect(merge).toHaveBeenCalledTimes(1);
-    } finally { vi.restoreAllMocks(); }
+    } finally { merge.mockRestore(); copy.mockRestore(); }
   });
 
   it("moves the bundle through one native syncOut file mapping, never through readFile", async () => {
