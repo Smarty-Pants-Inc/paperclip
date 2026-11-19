@@ -7,7 +7,7 @@ import { notifyChatPublicationWork } from "../../chat-work-notifications.js";
 
 import { type CredentialMutationLeaseGuard } from "../../chat-credential-mutation-lease.js";
 
-import { authorizeSlackBoardPublication } from "../../slack-board-authority.js";
+import { slackBoardPublicationCheck, verifySlackBoardChannel } from "../../slack-board-authority.js";
 
 import { slackPublicationAllowed } from "../../connectors/slack-access.js";
 
@@ -66,6 +66,30 @@ export function createChatPublicationAuthorization(db: Db, options: PublicationA
     endpoint: EndpointRow;
     preparedText: string | null;
   } | null> {
+    // Slack's remote channel check runs before the transaction, never inside it:
+    // a slow Slack call must not leave a session idle in transaction holding
+    // chat row locks. The transaction re-reads the inputs and requires the same
+    // verified Slack target.
+    // Credentials resolve here too: a secrets provider can be remote. The caller
+    // holds the credential mutation lease, and the transaction re-asserts it and
+    // the runtime credential fingerprint, so changed refs are denied there.
+    let verifiedSlackTarget: string | null = null;
+    let preCredentials: Record<string, string> | null = null;
+    let preCredentialsError: unknown = null;
+    if (input.endpoint.provider === "slack") {
+      try { preCredentials = await resolveCredentials(input.endpoint); } catch (error) { preCredentialsError = error; }
+    }
+    if (input.endpoint.provider === "slack" && input.publication.commentId && preCredentials) {
+      const [preConversation] = await db.select().from(chatConversations)
+        .where(eq(chatConversations.id, input.publication.conversationId));
+      if (preConversation) {
+        const target = await slackBoardPublicationCheck(db, input.endpoint, preConversation, input.publication, preCredentials.botToken ?? "");
+        if (typeof target === "object") {
+          if (!await verifySlackBoardChannel(input.endpoint, target, preCredentials.botToken ?? "", fetchImpl)) return null;
+          verifiedSlackTarget = JSON.stringify(target);
+        }
+      }
+    }
     return db.transaction(async (tx) => {
       await input.credentialLease.assertOwned(tx);
       const currentPublication = await tx
@@ -214,8 +238,10 @@ export function createChatPublicationAuthorization(db: Db, options: PublicationA
       }
       let authorizationActionId: string | null = null;
       if (endpoint.provider === "slack") {
-        const credentials = await resolveCredentials(endpoint, tx);
-        if (!await authorizeSlackBoardPublication(tx, endpoint, conversation, input.publication, credentials.botToken ?? "", fetchImpl)) return null;
+        if (preCredentialsError) throw preCredentialsError;
+        if (!preCredentials || endpoint.connectionId !== input.endpoint.connectionId) return null;
+        const target = await slackBoardPublicationCheck(tx, endpoint, conversation, input.publication, preCredentials.botToken ?? "");
+        if (target === false || (typeof target === "object" && JSON.stringify(target) !== verifiedSlackTarget)) return null;
       }
       if (
         input.publication.idempotencyKey.startsWith("wake:") &&

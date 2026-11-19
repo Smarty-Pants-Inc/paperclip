@@ -12,7 +12,9 @@ import { preserveCancelledNativeWorkspaces, preserveNativeFailedWorkspace,
   registerCancelledWorkspacePreservationWork } from "./native-failed-workspace-recovery.js";
 import { prepareSandboxStopAndRetain, settleStopOnlyCleanup } from "../sandbox-stop-and-retain.js";
 import { readRemoteWorkspaceWriterHold } from "../remote-workspace-writer-hold.js";
-import { readRemoteWorkspaceAuthority } from "@paperclipai/shared";
+import { readRemoteWorkspaceAuthority, type Environment, type EnvironmentLease } from "@paperclipai/shared";
+import { environmentRuntimeService } from "../environment-runtime.js";
+import * as providers from "../sandbox-provider-runtime.js";
 
 (recoveryPostgresSupport.supported ? describe : describe.skip)("lifecycle-cancelled workspace preservation", () => {
   let database: Awaited<ReturnType<typeof startRecoveryPostgres>>;
@@ -177,17 +179,45 @@ import { readRemoteWorkspaceAuthority } from "@paperclipai/shared";
   // A warm (reusable) run that ends without success stops its sandbox and keeps
   // the lease `released` under its reusable policy. Reassignment Stop reaches
   // that state with the workspace still dirty and bound to the stopped writer.
-  async function stopReusableSource(f: Awaited<ReturnType<typeof seed>>) {
-    const [reusable] = await db.update(environmentLeases).set({ leasePolicy: "reuse_by_environment" })
+  async function stopReusableSource(f: Awaited<ReturnType<typeof seed>>, policy = "reuse_by_environment") {
+    const [reusable] = await db.update(environmentLeases).set({ leasePolicy: policy })
       .where(eq(environmentLeases.id, f.leaseId)).returning();
     const stopping = (await prepareSandboxStopAndRetain(db, reusable))!;
     const stopped = (await settleStopOnlyCleanup(db, stopping, {
       attemptId: String(stopping.metadata!.pendingCleanupAttemptId),
       receipt: { providerLeaseId: f.reference.providerLeaseId, state: "stopped" },
     }))!;
-    expect(stopped).toMatchObject({ status: "released", leasePolicy: "reuse_by_environment", cleanupStatus: "success" });
+    expect(stopped).toMatchObject({ status: "released", leasePolicy: policy, cleanupStatus: "success" });
     return stopped;
   }
+
+  it.each(["reuse_by_environment", "reuse_by_execution_workspace"].flatMap(policy =>
+    ["expiry", "destroy"].map(path => ({ policy, path }))))("U22 marks a stopped $policy source owing files and refuses $path", async ({ policy, path }) => {
+    const f = await seed();
+    const [builtin] = await db.update(environmentLeases).set({ provider: "fake", metadata: {
+      driver: "sandbox", remoteCwd: "/work",
+    } }).where(eq(environmentLeases.id, f.leaseId)).returning();
+    await db.update(environments).set({ config: { provider: "fake", image: "fake:test", reuseLease: true } })
+      .where(eq(environments.id, builtin.environmentId!));
+    const stopped = await stopReusableSource(f, policy);
+    expect(stopped.metadata).not.toHaveProperty("workspaceRestoreRecovery");
+    await preserveCancelledNativeWorkspaces(db);
+    const [held] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+    expect.soft(held).toEqual({ ...stopped, metadata: { ...stopped.metadata, workspaceRestoreRecovery: {
+      schema: "paperclip.workspace-restore-recovery.v1", runId: f.runId, originalLeasePolicy: policy,
+    } } });
+    const [environment] = await db.select().from(environments).where(eq(environments.id, builtin.environmentId!));
+    const destroy = vi.spyOn(providers, "destroySandboxProviderLease").mockResolvedValue(undefined);
+    const driver = environmentRuntimeService(db).getDriver("sandbox")!;
+    // Exercise the real expiry and explicit-destroy implementations. The stale
+    // pre-preservation snapshot also proves the guard re-reads durable custody.
+    const input = { environment: environment as unknown as Environment, lease: stopped as unknown as EnvironmentLease };
+    const result = path === "expiry" ? await driver.releaseRunLease({ ...input, status: "expired" })
+      : await driver.destroyRunLease!({ ...input, failureReason: "U22 explicit destroy" });
+    expect.soft(result).toBeNull();
+    expect.soft(destroy).not.toHaveBeenCalled();
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0]).toEqual(held);
+  });
 
   it.each(["worker", "startup-scan"] as const)("preserves a reassignment-stopped writer's files from its stopped reusable sandbox (%s)", async kind => {
     const f = await seed();
@@ -202,8 +232,12 @@ import { readRemoteWorkspaceAuthority } from "@paperclipai/shared";
       expect(retained.resultJson).toMatchObject({ ...resultJson, workspaceRestoreFailure: "restore_failed",
         workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [f.leaseId] } });
       expect(retained).toMatchObject({ status: "cancelled", errorCode: "issue_reassigned", finishedAt: f.run.finishedAt });
-      // The stop receipt and reusable policy stay exactly as the release left them.
-      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0]).toEqual(stopped);
+      // Every stop receipt and reusable-policy field stays as released; the
+      // additional durable restore marker fences expiry while files are owed.
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0])
+        .toEqual({ ...stopped, metadata: { ...stopped.metadata, workspaceRestoreRecovery: {
+          schema: "paperclip.workspace-restore-recovery.v1", runId: f.runId, originalLeasePolicy: stopped.leasePolicy,
+        } } });
       const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId));
       expect(action).toMatchObject({ ownerType: "board", evidence: { runId: f.runId,
         automaticRecovery: { replay: "blocked" }, workspaceRestoreRecovery: { leaseIds: [f.leaseId] } } });
@@ -325,7 +359,10 @@ import { readRemoteWorkspaceAuthority } from "@paperclipai/shared";
       expect(retained).toMatchObject({ status: "cancelled", errorCode: "issue_reassigned", finishedAt: f.run.finishedAt });
       // The stopped allocation keeps its receipts. Preservation dispatches no
       // second stop and grants no execute right on the reusable sandbox.
-      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0]).toEqual(stopped);
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0])
+        .toEqual({ ...stopped, metadata: { ...stopped.metadata, workspaceRestoreRecovery: {
+          schema: "paperclip.workspace-restore-recovery.v1", runId: f.runId, originalLeasePolicy: stopped.leasePolicy,
+        } } });
       const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId));
       expect(actions).toHaveLength(1);
       expect(actions[0].evidence).toMatchObject({ runId: f.runId, workspaceRestoreRecovery: { leaseIds: [f.leaseId] } });
@@ -366,7 +403,10 @@ import { readRemoteWorkspaceAuthority } from "@paperclipai/shared";
       expect(retained.runnerProfileJson).toMatchObject({ nativeResourceDisposition: "keep_running" });
       expect(retained.resultJson).toMatchObject({ workspaceRestoreFailure: "restore_failed",
         workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [f.leaseId] } });
-      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0]).toEqual(stopped);
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0])
+        .toEqual({ ...stopped, metadata: { ...stopped.metadata, workspaceRestoreRecovery: {
+          schema: "paperclip.workspace-restore-recovery.v1", runId: f.runId, originalLeasePolicy: stopped.leasePolicy,
+        } } });
       expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId))).toHaveLength(1);
     } finally { await worker.stop(); }
   }, 120_000);
