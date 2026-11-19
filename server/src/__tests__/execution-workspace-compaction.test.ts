@@ -29,6 +29,8 @@ import {
 } from "../services/execution-workspaces.ts";
 import { realizeExecutionWorkspace } from "../services/workspace-runtime.ts";
 import { WORKSPACE_COMPACTION_TRASH_DIR } from "../services/workspace-compaction.ts";
+import { contentSpill } from "../services/object-run-log-spill.fixture.js";
+import { cleanupExecutionWorkspaceArtifacts } from "../services/workspace-runtime.js";
 
 const execFileAsync = promisify(execFile);
 const HOUR_MS = 60 * 60 * 1000;
@@ -278,6 +280,40 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
       ));
     expect((activity?.details as { removedPaths?: string[] } | undefined)?.removedPaths?.sort())
       .toEqual([...REGENERABLE_PATHS].sort());
+  }, 30_000);
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7018965885
+  // Keep reason: NEVER-OK trace custody. Actual DB-backed sweep, writer and filesystem.
+  it.each(["guest", "drift", "unreadable", "recovered"] as const)("scheduled sweep keeps undiscoverable content (%s)", async mode => {
+    const seeded = await seedWorkspace({ commitOnBranch: true, populate: false });
+    await fs.appendFile(path.join(seeded.repoRoot, ".gitignore"), "build/\n");
+    await git(seeded.repoRoot, ["add", ".gitignore"]);
+    await git(seeded.repoRoot, ["commit", "-m", "Ignore build output"]);
+    await git(seeded.worktreePath, ["cherry-pick", "main"]);
+    const spill = await contentSpill(seeded.worktreePath, path.join(seeded.worktreePath, "build"), mode);
+    await writeFile(path.join(seeded.worktreePath, "dist", "control.js"), "regenerable\n");
+    const sweep = await service().sweepTerminalWorkspaces();
+    const survived = await exists(spill.path);
+    console.info("content-custody-scheduled", { mode, sweep, survived });
+    expect(sweep).toMatchObject({ compacted: 1, compactionFailed: 0, archived: 0 });
+    expect(survived).toBe(mode !== "recovered");
+    expect(await exists(path.join(seeded.worktreePath, "dist"))).toBe(false);
+    if (survived) {
+      await fs.chmod(spill.indexPath, 0o600);
+      expect(await fs.readFile(spill.path)).toEqual(spill.bytes);
+      expect(await fs.readFile(spill.indexPath)).toEqual(spill.index);
+    }
+  }, 30_000);
+
+  it.each(["guest", "drift", "unreadable", "recovered"] as const)("whole-worktree removal keeps undiscoverable content (%s)", async mode => {
+    const seeded = await seedWorkspace({ populate: false });
+    const spill = await contentSpill(seeded.worktreePath, path.join(seeded.worktreePath, "build"), mode);
+    const [workspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    const result = await cleanupExecutionWorkspaceArtifacts({ workspace: workspace!, projectWorkspace: { cwd: seeded.repoRoot, cleanupCommand: null } });
+    const survived = await exists(spill.path);
+    console.info("content-custody-whole-worktree", { mode, result, survived });
+    expect(result.cleaned).toBe(mode === "recovered");
+    expect(survived).toBe(mode !== "recovered");
   }, 30_000);
 
   it("compacts a delivered workspace that is still inside the archive cooldown", async () => {

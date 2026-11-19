@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createObjectRunLogStore, readObjectRunLogSpill } from "../services/object-run-log-store.js";
 import { listWorktreeRunLogSpillRoots } from "../services/workspace-instance-cleanup.js";
-import { event, ids, spillMemory } from "../services/object-run-log-spill.fixture.js";
+import { contentSpill, event, ids, spillMemory } from "../services/object-run-log-spill.fixture.js";
 import {
   WORKSPACE_COMPACTION_TRASH_DIR,
   deleteWorkspaceCompactionTrash,
@@ -139,6 +139,29 @@ describe("findRegenerableWorkspaceDirs", () => {
     expect(await fs.stat(path.join(worktreePath, "dist")).then(() => true, () => false)).toBe(false);
   });
 
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7018965885
+  // Keep reason: NEVER-OK trace custody, real writer and real rename/delete.
+  it.each(["guest", "drift", "unreadable", "recovered"] as const)("content custody survives root discovery drift (%s)", async mode => {
+    const { worktreePath } = await createRepoWithWorktree(["build/", "dist/", ".env"]);
+    const spill = await contentSpill(worktreePath, path.join(worktreePath, "build"), mode);
+    await write(path.join(worktreePath, "dist", "control.js"));
+    const kept = mode !== "recovered";
+    const candidates = await findRegenerableWorkspaceDirs(worktreePath);
+    // Also pass a stale candidate list to exercise the destructive recheck.
+    const move = await moveWorkspaceDirsToTrash(worktreePath, ["build", "dist"]);
+    await deleteWorkspaceCompactionTrash(move.trashDir);
+    const survived = await fs.stat(spill.path).then(() => true, () => false);
+    console.info("content-custody-direct", { mode, candidates, moved: move.moved, survived });
+    expect(survived).toBe(kept);
+    expect(candidates.includes("build")).toBe(!kept);
+    expect(await fs.stat(path.join(worktreePath, "dist")).then(() => true, () => false)).toBe(false);
+    if (kept) {
+      await fs.chmod(spill.indexPath, 0o600);
+      expect(await fs.readFile(spill.path)).toEqual(spill.bytes);
+      expect(await fs.readFile(spill.indexPath)).toEqual(spill.index);
+    }
+  });
+
   it("does not follow or return a symlinked directory", async () => {
     const { root, worktreePath } = await createRepoWithWorktree(["node_modules"]);
     const outside = path.join(root, "shared-store");
@@ -260,6 +283,20 @@ describe("compaction trash", () => {
 
     await restoreWorkspaceDirsFromTrash(worktreePath, move);
     expect(await fs.readFile(path.join(worktreePath, "node_modules/a/index.js"), "utf8")).toBe("reinstalled\n");
+  });
+
+  // Keep reason: NEVER-OK trace custody, including crash-left compaction trash.
+  it("keeps content spills at both trash deletion boundaries", async () => {
+    const { worktreePath } = await createRepoWithWorktree([]);
+    const parent = path.dirname(worktreePath);
+    const stale = path.join(parent, WORKSPACE_COMPACTION_TRASH_DIR, "kept");
+    const spill = await contentSpill(worktreePath, stale, "drift");
+    await deleteWorkspaceCompactionTrash(stale);
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    // On the unfixed code the deletion above has already lost the only copy.
+    if (await fs.stat(stale).then(() => true, () => false)) await fs.utimes(stale, old, old);
+    await purgeStaleWorkspaceCompactionTrash(parent, 60 * 60 * 1000);
+    expect(await fs.readFile(spill.path)).toEqual(spill.bytes);
   });
 
   it("purges only trash older than the threshold", async () => {
