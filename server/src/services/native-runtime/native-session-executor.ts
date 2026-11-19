@@ -12786,8 +12786,10 @@ async function executePaperclipNativeSessionAttempt(
       },
       onEventPersistence: async (event, startedAtMs, endedAtMs) => {
         if (["turn.submitted", "turn.started", "turn.accepted", "run.result.accepted"].includes(event.eventType)) {
+          // The authoritative event has already committed. Only its diagnostic
+          // receipt is deferred, using the ordered queue drained by trace.finish.
           await trace.record({name: "runner.event.persist", parentName: "native.session.execute", startedAtMs, endedAtMs,
-            attributes:{eventKind:event.eventType}});
+            attributes:{eventKind:event.eventType}}, { deferRunLog: true });
         }
       },
       onCommittedEvent: async (event, cursor) => {
@@ -12862,7 +12864,7 @@ async function executePaperclipNativeSessionAttempt(
             parentName: "runner.session.startup",
             startedAtMs: nativeSessionExecuteStartedAtMs,
             endedAtMs: milestoneAtMs,
-          });
+          }, { deferRunLog: true });
         }
         if (event.eventType === "session.resumed") {
           const restarted = piSessionRecovery(event) !== null;
@@ -12891,7 +12893,7 @@ async function executePaperclipNativeSessionAttempt(
                 provider: input.execution.provider.kind,
                 strategy: "exact_provider_session",
               },
-            });
+            }, { deferRunLog: true });
             controllerSteps.flush("resume", nativeSessionExecuteStartedAtMs, milestoneAtMs);
             sessionStartedAtMs = milestoneAtMs;
             sessionStartupMode = "resume";
@@ -12901,13 +12903,14 @@ async function executePaperclipNativeSessionAttempt(
             parentName: "runner.session.startup",
             startedAtMs: sessionStartedAtMs,
             endedAtMs: milestoneAtMs,
-          });
+          }, { deferRunLog: true });
           if (runnerSessionStartupScope) {
             trace.annotate(runnerSessionStartupScope, {
               mode: sessionStartupMode ?? "bootstrap",
             });
             await trace.end(runnerSessionStartupScope, {
               endedAtMs: milestoneAtMs,
+              deferRunLog: true,
             });
           }
           agentTurnScope = trace.start("agent.turn", {
@@ -12924,7 +12927,7 @@ async function executePaperclipNativeSessionAttempt(
             parentName: "agent.turn",
             startedAtMs: turnSubmittedAtMs ?? milestoneAtMs,
             endedAtMs: milestoneAtMs,
-          });
+          }, { deferRunLog: true });
           controllerSteps.flush("submit", turnSubmittedAtMs ?? milestoneAtMs, milestoneAtMs);
         }
         if (!firstAgentEventRecorded && turnStartedAtMs !== null) {
