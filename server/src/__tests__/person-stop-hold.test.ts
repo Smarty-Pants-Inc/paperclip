@@ -138,14 +138,19 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
   type Options = {
     /** Who presses Stop (R9: a different person). */
     stopper?: string;
-    /** "interrupt": the queued-message Interrupt, not a person's Stop (R5). */
-    stopKind?: "person" | "interrupt";
+    /** "interrupt": the queued-message Interrupt, not a person's Stop (R5).
+     * "unaccepted": the person's cancel that the Stop route did NOT accept: the
+     * run ends cancelled with that person's attribution (heartbeat.cancelRun,
+     * S's R10 control), but there is no run.stop.accepted person_stop row (rf-2 c). */
+    stopKind?: "person" | "interrupt" | "unaccepted";
     /** Boat's stop stays hung: its stop receipt never comes during the wait. */
     hung?: boolean;
+    /** A TASK page (no Agent Chat): the same Stop over a task's assignee turn. */
+    task?: boolean;
   };
   type Ctx = Awaited<ReturnType<typeof setup>>;
 
-  async function setup() {
+  async function setup(setupOptions: { task?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
     const issuePrefix = `H${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     await db.insert(companies).values({ id: companyId, name: "Hold", issuePrefix, defaultResponsibleUserId: userId,
@@ -158,7 +163,7 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
       adapterType: "paperclip_runner", adapterConfig: { provider: "codex", model: "gpt-5.6-luna" },
       runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {} });
     await db.insert(issues).values({ id: issueId, companyId, title: "Chat", status: "in_progress", priority: "medium",
-      assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: userId, conversationState: "active",
+      assigneeAgentId: agentId, ...(setupOptions.task ? {} : { conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" }),
       responsibleUserId: userId, issueNumber: 1, identifier: `${issuePrefix}-1`, startedAt: new Date() });
     fixture.db = db; fixture.companyId = companyId; fixture.agentId = agentId; fixture.issueId = issueId;
     fixture.calls = [];
@@ -257,7 +262,7 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
       ...originalFactory(...args), releaseForRun: release,
     }));
     restoreRelease = () => spy.mockRestore();
-    const ctx = await setup();
+    const ctx = await setup({ task: options.task });
     const held: string[] = [];
     let firstRunId = "";
     let stopping: Promise<{ status: number; body: unknown }> | undefined;
@@ -268,6 +273,10 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
         const q = await ctx.queue();
         stopping = request(ctx.client).post(`/api/issues/${ctx.issueId}/queued-comments/interrupt`)
           .send({ queueId: q.queueId ?? q.id, targetRunId: runId, revision: q.revision }).then(r => r);
+      } else if (options.stopKind === "unaccepted") {
+        stopping = ctx.heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+          resultJson: { cancelledByActorType: "user", cancelledByUserId: userId } } as any)
+          .then(body => ({ status: 200, body }));
       } else {
         const as = options.stopper === otherUserId ? ctx.otherClient : ctx.client;
         stopping = request(as).post(`/api/heartbeat-runs/${runId}/cancel`).send({}).then(r => r);
@@ -281,9 +290,12 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
       await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: "native_retry_cancelled",
         leaseOwner: null }).where(eq(nativeRunFinalizations.runId, runId));
     };
-    await issueService(db).addComment(ctx.issueId, "M0 start", { userId }, { clientRequestId: randomUUID() });
-    await deliverConversationComments(db, { id: ctx.issueId, companyId: ctx.companyId, conversationAgentId: ctx.agentId },
-      ctx.heartbeat.wakeup);
+    if (options.task) await ctx.post("M0 start").expect(201);
+    else {
+      await issueService(db).addComment(ctx.issueId, "M0 start", { userId }, { clientRequestId: randomUUID() });
+      await deliverConversationComments(db, { id: ctx.issueId, companyId: ctx.companyId, conversationAgentId: ctx.agentId },
+        ctx.heartbeat.wakeup);
+    }
     await ctx.heartbeat.resumeQueuedRuns();
     const draining = ctx.heartbeat.drainActiveRunExecutions();
     await draining;
@@ -295,7 +307,7 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
     const accepted = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, firstRunId),
       eq(heartbeatRunEvents.message, "run.stop.accepted")));
     expect(accepted.map(row => (row.payload as any)?.kind), "the Stop route wrote its acceptance row")
-      .toEqual([options.stopKind === "interrupt" ? "interrupt" : "person_stop"]);
+      .toEqual(options.stopKind === "unaccepted" ? [] : [options.stopKind === "interrupt" ? "interrupt" : "person_stop"]);
     return { ...ctx, held, firstRunId };
   }
 
@@ -364,6 +376,26 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
     }, 120_000);
   }
 
+  for (const proven of [false, true]) {
+    it(`G746: the saved-message worker resumeRemoteStopComments (Stop ${proven ? "proven" : "not yet proven"}) does not send the held messages`, async () => {
+      const r = await stopWithHeld();
+      await r.drive(1_000);
+      const before = (await heldWakes(r, r.held)).map(w => w.id);
+      expect(before.length).toBeGreaterThan(0);
+      if (!proven) await db.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(jsonb_set(${heartbeatRuns.resultJson},
+        '{nativeCancellation,dispatchState}', '"pending"'::jsonb), '{executionCancellation,state}', '"requested"'::jsonb)` })
+        .where(eq(heartbeatRuns.id, r.firstRunId));
+      const [run1] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, r.firstRunId));
+      for (const id of before) await r.heartbeat.resumeRemoteStopComments(run1 as any, id);
+      await r.heartbeat.resumeRemoteStopComments(run1 as any);
+      await r.drive(2_000);
+      await evidence(`G746-${proven ? "proven" : "unproven"}`, { calls: fixture.calls, wakes: await r.wakes() });
+      expect(successorCalls(), JSON.stringify(await r.wakes())).toEqual([]);
+      const after = await r.wakes();
+      for (const id of before) expect(after.find(w => w.id === id)?.status, JSON.stringify(after)).toBe("deferred_issue_execution");
+    }, 120_000);
+  }
+
   it("R1 (Boat's stop hung): its stop receipt never comes; 10 minutes untouched, nothing runs", async () => {
     const r = await stopWithHeld({ hung: true });
     await r.drive(2_000);
@@ -385,6 +417,26 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
     // The held ones follow the typed one in ONE turn (the drain at the typed turn's release).
     expect(successorCalls().length, JSON.stringify(fixture.calls)).toBe(2);
   }, 120_000);
+
+  for (const task of [false, true]) {
+    it(`R4b (${task ? "task page" : "chat"}): a message T typed after the person's Stop is answered FIRST with ONLY T as its input; the held ones then run ONCE in their own turn; nothing is carried twice`, async () => {
+      const r = await stopWithHeld({ task });
+      await r.tenMinutesPass();
+      expect(successorCalls(), "nothing ran by itself before T").toEqual([]);
+      const typed = (await r.post("T typed").expect(201)).body.id as string;
+      await r.drive(4_000);
+      await r.tenMinutesPass();
+      await evidence(`R4b-${task ? "task" : "chat"}`, { typed, held: r.held, calls: fixture.calls, wakes: await r.wakes() });
+      // T's run input carries ONLY T (never the held ones): it is answered first.
+      expect(successorCalls()[0]?.ids, JSON.stringify(fixture.calls)).toEqual([typed]);
+      // The held ones run in their own turn, carrying only the held ones.
+      expect(successorCalls()[1]?.ids?.slice().sort(), JSON.stringify(fixture.calls)).toEqual(r.held.slice().sort());
+      // Each message is carried exactly once across every run (no 'already answered' turn).
+      const answered = answeredIds();
+      for (const id of [typed, ...r.held]) expect(answered.filter(a => a === id).length, JSON.stringify(fixture.calls)).toBe(1);
+      expect(successorCalls().length, JSON.stringify(fixture.calls)).toBe(2);
+    }, 120_000);
+  }
 
   it("R5: an Interrupt (not a person's Stop) is no hold: the hold reader does not hold them", async () => {
     const r = await stopWithHeld({ stopKind: "interrupt" });
@@ -470,6 +522,32 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
     const hold = await readPersonStopHold(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId });
     await evidence("R9", { hold, calls: fixture.calls, wakes: await r.wakes() });
     expect(hold, "the sender's messages are not held by another person's Stop").toBeNull();
+    // The bar (the real GET, the same ONE reader) does not show them as held by a person's Stop.
+    expect((await r.queue()).executionWait?.reason ?? null).not.toBe("stopped_by_person");
+  }, 120_000);
+
+  it("rf-2 (c): a Stop the Stop route did not accept (no run.stop.accepted person_stop row; the run is only cancelled with the person's attribution) holds nothing", async () => {
+    const r = await stopWithHeld({ stopKind: "unaccepted" });
+    await r.drive(1_000);
+    const [run1] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, r.firstRunId));
+    expect(run1?.status, "the run ended cancelled").toBe("cancelled");
+    expect((run1?.resultJson as any)?.cancelledByActorType, "cancelled with a user's attribution").toBe("user");
+    const hold = await readPersonStopHold(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId });
+    const q = await r.queue();
+    await evidence("rf2-c-unaccepted", { hold, bar: q.executionWait, calls: fixture.calls, wakes: await r.wakes() });
+    expect(hold, "'the latest run was cancelled by a user' alone is no hold").toBeNull();
+    expect(q.executionWait?.reason ?? null, JSON.stringify(q.executionWait)).not.toBe("stopped_by_person");
+  }, 120_000);
+
+  it("rf-2 (a): another person's Stop over MY held messages does not hold them: the bar does not say stopped, and my next message is not kept waiting behind them", async () => {
+    const r = await stopWithHeld({ stopper: otherUserId });
+    await r.drive(1_000);
+    const q = await r.queue();
+    await evidence("rf2-a-other", { bar: q.executionWait, calls: fixture.calls, wakes: await r.wakes() });
+    expect(await readPersonStopHold(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId }), "no hold").toBeNull();
+    for (const id of r.held) expect(await readPersonStopHold(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId,
+      messageId: id }), `message ${id}`).toBeNull();
+    expect(q.executionWait?.reason ?? null, JSON.stringify(q.executionWait)).not.toBe("stopped_by_person");
   }, 120_000);
 
 });
