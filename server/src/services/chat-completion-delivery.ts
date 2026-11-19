@@ -1,3 +1,4 @@
+import { insertIssueComment } from "./issue-comment-writes.js";
 import { notifyDeliveryWork, DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { notifyNativeResponsePresentation } from "./native-response-presentation-notifications.js";
 import { nativeResponsePresentationCandidates } from "./native-runtime/native-response-presentation-query.js";
@@ -96,6 +97,33 @@ function current(row: NonNullable<Awaited<ReturnType<typeof loadAudience>>>) {
   return ["done", "blocked"].includes(row.task.status) && !["superseded", "exhausted"].includes(row.delivery.status) &&
     row.source?.conversationAgentId === row.handoff.agentId &&
     row.source.conversationSessionGeneration === row.handoff.sessionGeneration;
+}
+
+/** Retire ONLY the pending deliveries named by this stale wake, in the
+ * cancellation transaction. The status CAS is also the note's idempotency gate:
+ * a retry (or a second wake naming D) cannot write the same finished-task news.
+ * Completion display text stays here, not in the wake-queue orchestrator. */
+export async function supersedeStaleChatCompletionWake(tx: Connection, input: {
+  companyId: string; conversationId: string; agentId: string; wakeId: string; deliveryIds: string[];
+}): Promise<void> {
+  if (!input.deliveryIds.length) return;
+  const rows = await tx.select({ delivery: deliveries, task: issues }).from(deliveries)
+    .innerJoin(handoffs, and(eq(handoffs.taskId, deliveries.taskId), eq(handoffs.companyId, deliveries.companyId)))
+    .innerJoin(issues, and(eq(issues.id, deliveries.taskId), eq(issues.companyId, deliveries.companyId)))
+    .where(and(eq(deliveries.companyId, input.companyId), inArray(deliveries.id, input.deliveryIds),
+      eq(handoffs.conversationId, input.conversationId), eq(handoffs.agentId, input.agentId),
+      inArray(deliveries.status, [...pending]))).orderBy(asc(deliveries.createdAt), asc(deliveries.id));
+  const named: string[] = [];
+  for (const { delivery, task } of rows) {
+    const advanced = await tx.update(deliveries).set({ status: "superseded" })
+      .where(and(eq(deliveries.companyId, input.companyId), eq(deliveries.id, delivery.id),
+        inArray(deliveries.status, [...pending]))).returning({ id: deliveries.id });
+    if (advanced.length) named.push(`${task.identifier ?? task.id} — ${task.title} ${task.status === "done" ? "finished" : "is no longer a pending completion report"}.`);
+  }
+  if (!named.length) return;
+  await insertIssueComment(tx, { companyId: input.companyId, issueId: input.conversationId,
+    authorType: "system", body: named.join("\n"),
+    metadata: { version: 1, sections: [], authorizationReason: `stale_chat_completion:${input.wakeId}` } });
 }
 
 async function taskResult(tx: Connection, task: Issue) {

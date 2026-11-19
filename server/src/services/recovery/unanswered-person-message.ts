@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql, failedCarrierRunSql, personMessageOwedSql } from "../person-message-answer.js";
+import { answeredPersonMessageSql, deferredWakeIsStaleSql, failedCarrierRunSql, personMessageOwedSql } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -347,6 +347,15 @@ function wakeCarriesIssue(payload: unknown, issueId: string): boolean {
   return value.issueId === issueId || nested.issueId === issueId || value.taskId === issueId;
 }
 
+/** A stale deferred receipt cannot postpone its never-carried message's true
+ * card. Queued receipts keep their existing waiting semantics. */
+function nonStaleWakeCondition(issueId: string): SQL {
+  return sql`(${agentWakeupRequests.status} not in ('deferred', 'deferred_issue_execution') or not ${deferredWakeIsStaleSql({
+    companyId: sql`${agentWakeupRequests.companyId}`, agentId: sql`${agentWakeupRequests.agentId}`,
+    issueId: sql`${issueId}::uuid`, requestedAt: sql`${agentWakeupRequests.requestedAt}`, payload: sql`${agentWakeupRequests.payload}`,
+  })})`;
+}
+
 /** One task: answer, supersede or notice its person's last message. Idempotent. */
 /** The recovery service's own native blocked-request repair check (it publishes
  * the run's unblock request itself when it applies). */
@@ -551,6 +560,7 @@ async function decideCarriedSteerNotices(q: Db, issue: DecisionIssue, now: Date)
   const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
     inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+    nonStaleWakeCondition(issue.id),
     // A wake already promoted into a run is that run's: the run's own end decides.
     isNull(agentWakeupRequests.runId)));
   const notices: CarriedSteerNotice[] = [];
@@ -681,7 +691,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   const agentId = issue.assigneeAgentId;
 
   const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt,
-    authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
+    body: issueComments.body, authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
     // The message this decision is for: a named owed message, else the newest.
@@ -947,6 +957,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     const wakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status })
       .from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+        nonStaleWakeCondition(issue.id),
         or(inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
           and(eq(agentWakeupRequests.status, "deferred"), wellFormedExecutionWaitSql(agentWakeupRequests.payload)))));
     // Admission has saved a real further attempt for THIS message, not a
@@ -1118,12 +1129,22 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
       >= FRESH_CONTINUATION_BOUND);
   // Server-local HH:MM: the instance's time zone, not an assumed UTC zone.
   const since = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
+  // A never-claimed stale receipt gets its existing ONE no-run card, but
+  // names the saved message. Ordinary no-run notices keep their wording.
+  const staleReceipts = code === UNANSWERED_MESSAGE_NO_RUN_CODE ? await q.select({ payload: agentWakeupRequests.payload })
+    .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, issue.companyId),
+      inArray(agentWakeupRequests.status, ["deferred", "deferred_issue_execution", "cancelled"]),
+      deferredWakeIsStaleSql({ companyId: sql`${agentWakeupRequests.companyId}`, agentId: sql`${agentWakeupRequests.agentId}`,
+        issueId: sql`${issue.id}::uuid`, requestedAt: sql`${agentWakeupRequests.requestedAt}`, payload: sql`${agentWakeupRequests.payload}` }))) : [];
+  const namedNoRun = staleReceipts.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id))
+    ? `Your message is saved: "${message.body}". It was not answered because no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.`
+    : UNANSWERED_MESSAGE_NO_RUN_TEXT;
   const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
     : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? (workingEnded ? UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT : UNANSWERED_MESSAGE_NO_REPLY_TEXT)
-    : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
+    : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? namedNoRun
       : held ? HELD_PREDECESSOR_NOTICE : workingEnded ? UNANSWERED_MESSAGE_STARTED_FAILED_TEXT : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
