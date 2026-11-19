@@ -2069,14 +2069,18 @@ async function forgetSpareRefill(key: ReadySpareKey, id: string): Promise<void> 
     if (index >= 0) pending.splice(index, 1);
   });
 }
-async function createReadySpare(config: Config, key: ReadySpareKey, ttlSeconds: number, from?: string): Promise<ReadySpare> {
+async function createReadySpare(config: Config, key: ReadySpareKey, ttlSeconds: number, from?: string, resumeRefillId?: string): Promise<ReadySpare> {
   let identity: SpareRefill | undefined;
   try {
     await updateSpareRefills(key, async pending => {
       // A refused key stays for reconciliation; it must not starve unrelated
       // capacity. Expired identities are resolved/forgotten by inventory first.
       identity = pending.find(entry => !busySpareRefills.has(entry.id) && !entry.refused
+        && (resumeRefillId === undefined || entry.id === resumeRefillId && !!entry.sandboxId)
         && (Date.now() - entry.at < BOAT_IDEMPOTENCY_KEY_LIFE_MS || entry.sandboxId));
+      // Timer recovery may only continue an inventory-confirmed paid box. It
+      // never mints a key, re-sends a create, or replaces a missing identity.
+      if (!identity && resumeRefillId !== undefined) throw new Error("Boat pending refill is not available for paid-box recovery");
       if (!identity) {
         const id = creationIdentityId();
         const expiry = await creationExpiry(key.companyId, id, ttlSeconds);
@@ -2165,10 +2169,19 @@ function abandonSickClaim(spare: ReadySpare, observed: Record<string, unknown>, 
 }
 function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSeconds: number, from?: string): ReadySpareOperations {
   const scoped = [["owner", `paperclip:${key.companyId}`], ["environment", key.environmentId], ["purpose", "spare"]] as Array<[string, string]>;
+  const resumableRefills = new Set<string>();
   return {
     async list() {
       const sandboxes = await listBoatSandboxes(config, scoped, AbortSignal.timeout(2500));
       const owned = sandboxes.filter(sandbox => sandbox.labels.owner === `paperclip:${key.companyId}` && sandbox.labels.environment === key.environmentId && sandbox.labels.purpose === "spare");
+      const pool = knownSparePools.get(readySparePoolKey(key));
+      resumableRefills.clear();
+      // OFF retirement needs Boat ownership, never a pending-refill receipt.
+      // Stop first via the keeper's memory-backed owed-debt path; inventory
+      // will settle the retained durable refill identity when ON can read it.
+      if (pool && (pool.retired || pool.baseDesired <= 0 || pool.desired <= 0)) {
+        return owned.map(sandbox => readySpareFromSandbox(sandbox, ttlSeconds));
+      }
       // A restart can land after the ready PATCH but before its state receipt.
       // Durable inventory then settles that refill, even if a run claimed it.
       const settled = new Set<string>(owned.filter(sandbox => sandbox.labels.configHash === key.configHash
@@ -2180,9 +2193,8 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       // Retain an unfinished paid box for warm continuation only while it can
       // still be admitted at the current target. OFF and nonzero target cuts
       // must expose surplus boxes to the keeper's durable owed-stop path.
-      const pool = knownSparePools.get(readySparePoolKey(key));
       const retainPending = !pool || (!pool.retired && pool.baseDesired > 0);
-      await updateSpareRefills(key, pending => {
+      try { await updateSpareRefills(key, pending => {
         for (let i = pending.length - 1; i >= 0; i--) {
           const entry = pending[i];
           if (settled.has(entry.id) && !busySpareRefills.has(entry.id)) { pending.splice(i, 1); continue; }
@@ -2192,11 +2204,21 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
           }
           if (made && !settled.has(entry.id) && !dedupedBoxStop(made)) {
             entry.sandboxId = made.id;
-            if (retainPending && !entry.refused && (!pool || spareRefillHasCapacity(key, entry.id, pool.desired))) resolving.add(made.id);
-            else surplusRefills.add(made.id);
+            if (retainPending && !entry.refused && (!pool || spareRefillHasCapacity(key, entry.id, pool.desired))) {
+              resolving.add(made.id);
+              if (!busySpareRefills.has(entry.id)) resumableRefills.add(entry.id);
+            } else surplusRefills.add(made.id);
           }
         }
-      });
+      }); } catch {
+        // Inventory is still authoritative enough to retire an owned unclaimed
+        // box. A failed state receipt must not hide it from the keeper's stop
+        // path, which retains owed debt in memory even during a total outage.
+        // Leave the durable refill identity intact; re-observe it next tick.
+        // No recovery/create is admitted without a successful durable write.
+        resumableRefills.clear();
+        duplexLogger?.warn("Boat refill inventory receipt deferred; safe spare retirement continues", { companyId: key.companyId, environmentId: key.environmentId });
+      }
       // Pending creates are not stale inventory to stop. The durable refill
       // resolves/adopts and warms that exact id instead of allocating another.
       return owned.filter(sandbox => !resolving.has(sandbox.id)).map(sandbox => ({
@@ -2220,6 +2242,13 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       return current;
     },
     create: () => createReadySpare(config, key, ttlSeconds, from),
+    async recoverPending() {
+      for (const id of [...resumableRefills]) {
+        if (shuttingDown) return;
+        try { await createReadySpare(config, key, ttlSeconds, from, id); }
+        catch { duplexLogger?.warn("Boat paid refill recovery deferred", { companyId: key.companyId, environmentId: key.environmentId, refillId: id }); }
+      }
+    },
     // No pre-claim guest commands: starting Pi can write another run's home.
     // Run preparation (including the sentinel) belongs to finishAcquisition.
     async claim(spare, name, claimTtlSeconds) {
@@ -2444,9 +2473,11 @@ async function maintainReadySpares(reconcile = false): Promise<void> {
       pool.desired = readySpares.demandTarget(pool.key, pool.baseDesired, pool.spareMax, pool.demandWindowMinutes);
       const active = activeByPool.get(poolId) === true;
       if (!reconcile) {
-        // The unscoped timer can use Boat's inventory/name token, but must not
-        // query the claim store or refill. Retire only listed ready spares.
+        // The unscoped timer never queries claims or allocates replacements.
+        // After retirement, continue only already-paid, label-resolved refills
+        // that inventory found admissible at this pool's current ON target.
         await readySpares.reconcileTimer(pool.key, active ? pool.desired : 0, pool.operations);
+        if (active && pool.desired > 0) await pool.operations.recoverPending?.();
         pool.idleStopped = !active;
         continue;
       }
@@ -3093,8 +3124,9 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     } else if (spareClaimStore && spareOperations) {
       const desiredSpares = readySpares.demandTarget(spareKey, baseSpares, spareMax, demandWindowMinutes);
       let id: string | undefined;
-      if (desiredSpares > 0 && readySpares.ready(spareKey).length === 0) {
-        // Consult the bounded durable inventory BEFORE allocating a run box.
+      if (desiredSpares > 0) {
+        // Refresh hydration from inventory even with cached candidates. If no
+        // box is hydrated, take cold with zero per-ID validation/hydration wait.
         // Claim discovery only reads; retirement belongs to reconciliation.
         await readySpares.adopt(spareKey, spareOperations, true).catch(() => undefined);
       }

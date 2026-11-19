@@ -77,6 +77,8 @@ export type ReadySpareOperations = {
   /** Boat's fresh record of the box. `signal` aborts the read (the warm claim's aggregate deadline). */
   get(spare: ReadySpare, signal?: AbortSignal): Promise<ReadySpare | undefined>;
   create(key: ReadySpareKey): Promise<ReadySpare>;
+  /** Timer-only continuation of inventory-confirmed paid refills; never creates a box. */
+  recoverPending?(): Promise<void>;
   /** Best-effort one-time work after a newly created spare is ready. */
   warmUp?(spare: ReadySpare): Promise<"completed" | "missing_pack" | "failed" | "timeout">;
   claim(spare: ReadySpare, claimName: string, ttlSeconds: number): Promise<boolean>;
@@ -715,7 +717,7 @@ export class ReadySpareKeeper {
   async adopt(key: ReadySpareKey, operations: ReadySpareOperations, readOnly = false): Promise<void> {
     if (this.stopping) return;
     const poolId = readySparePoolKey(key);
-    if ((this.pools.get(poolId) ?? []).some(item => readyAndHealthy(item, key, this.now()))) return;
+    if (!readOnly && (this.pools.get(poolId) ?? []).some(item => readyAndHealthy(item, key, this.now()))) return;
     const active = this.adopting.get(poolId);
     if (active) return active;
     const work = this.adoptOnce(key, operations, readOnly);
@@ -755,8 +757,12 @@ export class ReadySpareKeeper {
     const poolId = readySparePoolKey(key);
     const pool = this.pools.get(poolId) ?? [];
     const now = this.now();
-    const healthy = pool.filter(spare => readyAndHealthy(spare, key, now));
-    const index = pool.findIndex(spare => !this.claiming.has(spare.id) && !this.stoppingSpares.has(spare.id) && readyAndHealthy(spare, key, now));
+    // Inventory hydration is a precondition for spending any per-ID validation
+    // latency. Still require a fresh hydrated GET and both claim responses;
+    // cached/inventory hydration alone can never authorize a handoff.
+    const hydratedCandidate = (spare: ReadySpare) => readyAndHealthy(spare, key, now) && spare.providerObservation?.hydrated === true;
+    const healthy = pool.filter(hydratedCandidate);
+    const index = pool.findIndex(spare => !this.claiming.has(spare.id) && !this.stoppingSpares.has(spare.id) && hydratedCandidate(spare));
     if (index < 0) {
       if (healthy.length || (this.inFlightClaims.get(poolId) ?? 0) > 0) return { outcome: "cold", reason: "claim_conflict" };
       if (this.hasConfigMismatch(key)) return { outcome: "cold", reason: "config_mismatch" };
@@ -789,7 +795,7 @@ export class ReadySpareKeeper {
         if (!known) unknown.push(spare);
         this.claiming.delete(spare.id);
         if (candidates >= MAX_WARM_CLAIM_CANDIDATES || this.now() >= deadline || scanBudget.signal.aborted) return { outcome: "cold", reason: "no_ready_spare" };
-        const next = pool.findIndex(item => !this.claiming.has(item.id) && !this.stoppingSpares.has(item.id) && readyAndHealthy(item, key, this.now()));
+        const next = pool.findIndex(item => !this.claiming.has(item.id) && !this.stoppingSpares.has(item.id) && hydratedCandidate(item));
         if (next < 0) return { outcome: "cold", reason: "no_ready_spare" };
         [spare] = pool.splice(next, 1);
         this.claiming.add(spare.id);

@@ -1,7 +1,13 @@
 import { writeFileSync } from "node:fs";
-// Never-OK money guard: rf-4's J8-OFF-PENDING row and its needed harness
-// helpers copied byte-for-byte from the shipped judge-spare8.test.ts.txt.
-// The spare.9 hydration-response adapter is a separate hook below.
+// #21251 (review-fleet-4, condition for the spares-ON decision): a pool must not
+// keep creating spares while its OWN owed spare stop keeps failing. After two or
+// more failed owed-stop retries for a pool (the maintenance tick's included),
+// that pool makes no new spare create until a stop succeeds. Another pool with
+// no debt still refills; a person's run create is never blocked.
+// The harness is spare-f4-rows.test.ts's (the plugin's REAL hooks, keeper,
+// maintenance tick and request code against a stateful fake Boat on one fake
+// clock), copied so that file stays unchanged.
+// unchanged so the judge file stays byte-for-byte as supplied.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("node:timers/promises", () => ({
@@ -13,6 +19,7 @@ vi.mock("node:timers/promises", () => ({
 }));
 
 import plugin from "./plugin.js";
+import { READY_SPARE_STOP_BACKOFF_MS } from "./ready-spares.js";
 
 const apiKey = "boat_spare_off_test";
 const baseConfig = { apiKey, type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
@@ -69,6 +76,7 @@ class FakeBoat {
     if (method === "POST" && route === "/sandboxes") {
       const purpose = body.labels.purpose === "spare" ? "spare" : "run";
       const box: Box = { id: `bx_${purpose}${String(++this.counter).padStart(4, "0")}`, labels: { ...body.labels }, name: "",
+        hydrated: true, hydratedAt: new Date().toISOString(),
         state: "creating", readyAt: Date.now() + CREATE_LATENCY_MS,
         archiveAfter: new Date(Date.now() + body.ttlSeconds * 1000).toISOString(), createdAt: new Date().toISOString(), team: { id: "team-spare-off" } };
       this.boxes.set(box.id, box);
@@ -203,6 +211,47 @@ async function seed(h: Harness): Promise<{ s1: string; run: string }> {
   return { s1: spares[0], run: lease.providerLeaseId! };
 }
 
+type OffPath = "config" | "acquire-planted" | "removal-config" | "removal-acquire-planted";
+/**
+ * Turn spares off. "config": the real path, the host delivers onConfigChanged
+ * with spares 0. "acquire-planted": planted, the company setting reads 0 with
+ * no onConfigChanged delivered; a run acquire is the real reader. "removal-*":
+ * the spares key is deleted (not set to 0), delivered the same two ways.
+ */
+async function turnOff(h: Harness, path: OffPath): Promise<number> {
+  if (path.startsWith("removal")) delete h.config.spares;
+  else h.config.spares = 0;
+  const offAt = h.boat.mark(`spares off by ${path}`);
+  if (path === "config" || path === "removal-config") await settle(h.configChanged());
+  else {
+    const lease = await settle(h.acquire(`run-off-${path}`));
+    expect(h.boat.boxes.get(lease.providerLeaseId!)!.labels.purpose, "spares off: the run is a cold create").toBe("run");
+  }
+  await advance(5_000);
+  return offAt;
+}
+
+type Wake = "acquire" | "resume" | "release" | "health" | "timer" | "issue.comment.created" | "agent.run.started" | "issue.created";
+const WAKES: Wake[] = ["acquire", "resume", "release", "health", "timer", "issue.comment.created", "agent.run.started", "issue.created"];
+const leaseParams = (h: Harness, providerLeaseId: string | null) => ({ driverKey: "boat", companyId: h.company, environmentId: h.env, config: baseConfig, providerLeaseId });
+
+/** Drive one real wake path (acquire ~:1838, resume ~:2025, release ~:2115, maintainReadySpares via onHealth and the 15 s timer, the activity events). */
+async function wake(h: Harness, path: Wake, runBox: string): Promise<void> {
+  h.boat.mark(`wake ${path}`);
+  if (path === "acquire") await settle(h.acquire(`run-wake-${Date.now()}`));
+  else if (path === "resume") {
+    await settle(Promise.resolve(plugin.definition.onEnvironmentResumeLease!({ ...leaseParams(h, runBox), runId: "run-resume", leaseMetadata: {} } as any)).catch(() => undefined));
+  } else if (path === "release") {
+    await settle(Promise.resolve(plugin.definition.onEnvironmentReleaseLease!(leaseParams(h, null) as any)).catch(() => undefined));
+  } else if (path === "health") await settle(Promise.resolve(plugin.definition.onHealth!()));
+  else if (path === "timer") { /* the refresh timer only */ }
+  else if (eventHandlers.has(path)) await settle(h.emit(path));
+  // else: this worker has no subscription for the event (no onConfigChanged
+  // since its start), so that wake path does not exist in it.
+  else h.boat.mark(`wake ${path}: no subscription in this worker`);
+  await advance(4 * TICK_MS);
+}
+
 beforeEach(() => {
   vi.useFakeTimers({ now: START, toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
 });
@@ -219,19 +268,7 @@ afterEach(async () => {
 let current: Harness | undefined;
 async function start(name: string): Promise<Harness> { current = await harness(name); return current; }
 
-// spare.9 added a strict provider hydration gate. Adapt only the fake provider's
-// observation to Boat's documented hydrated response; the copied harness and
-// judge row above/below remain byte-for-byte unchanged. Without this response
-// field the row fails before reaching its accepted-refill money boundary.
-beforeEach(() => {
-  const observe = FakeBoat.prototype.observe;
-  vi.spyOn(FakeBoat.prototype, "observe").mockImplementation(function (this: FakeBoat, box: Box) {
-    return Object.assign(observe.call(this, box), { hydrated: true, hydratedAt: null });
-  });
-});
-afterEach(() => vi.restoreAllMocks());
-
-// Money guard copied verbatim from rf-4; unrelated judge rows omitted.
+// Independent money guard: pending refill inventory remains an OFF obligation.
 describe("SPARE8 independent pending inventory", () => {
   it("J8-OFF-PENDING OFF stops a visible unclaimed refill after its create answer was lost", async () => {
     const h = await start("j8-off-pending");
@@ -261,5 +298,44 @@ describe("SPARE8 independent pending inventory", () => {
       pending: h.state.get(`${h.company}:pending-refills`), live: h.boat.liveSpares()}));
     expect(stops, "OFF must not hide a billed box merely because its create answer was lost").toHaveLength(1);
     expect(h.boat.liveSpares()).toEqual([]);
+  });
+  it("J8-DEBT persisted before POST and retained until Boat confirms completion", async () => {
+    const h = await start("j8-debt");
+    const {s1} = await seed(h);
+    h.boat.boxes.get(s1)!.state = "running";
+    let posted = false, complete = false;
+    const hasDebt = () => (h.state.get(`${h.company}:stop-owed`) as any)?.owed.some((e: any) => e.spareId === s1);
+    vi.stubGlobal("fetch", async (input: unknown, init: RequestInit = {}) => {
+      const route = new URL(String(input)).pathname;
+      if (init.method === "POST" && route.endsWith(`/sandboxes/${s1}/stop`)) {
+        expect(hasDebt(), "debt is durable BEFORE the stop side effect").toBe(true);
+        expect(JSON.parse(String(init.body)).force).not.toBe(true);
+        posted = true;
+        return response({stop: {id: "stop_j8", status: "pending"}}, 202);
+      }
+      if (posted && route.endsWith(`/sandboxes/${s1}/stops/stop_j8`)) return response({stop: {id: "stop_j8", status: complete ? "completed" : "pending"}});
+      if (posted && route.endsWith(`/sandboxes/${s1}`)) return response({sandbox: {...h.boat.boxes.get(s1)!,
+        state: complete ? "archived" : "running", stop: {id: "stop_j8", status: complete ? "completed" : "pending"}}});
+      return h.boat.fetch(input, init);
+    });
+    h.config.spares = 0;
+    await until(() => posted, "OFF stop request", 1000);
+    await advance(5_000);
+    expect(hasDebt(), "202 accepted is not completion").toBe(true);
+    complete = true;
+    await advance(5_000);
+    expect(hasDebt(), "Boat confirmation clears the debt").toBe(false);
+  });
+  it("J8-TRIM excess ready idle inventory retires next tick after target 3 to 1", async () => {
+    const h = await start("j8-trim");
+    h.config.spares = 3; await settle(h.configChanged());
+    await settle(h.acquire("j8-teach")); await advance(5_000);
+    expect(h.boat.liveSpares()).toHaveLength(3);
+    h.config.spares = 1;
+    const at = h.boat.mark("target 3 to 1 with filled idle inventory");
+    await advance(TICK_MS);
+    expect(h.boat.liveSpares()).toHaveLength(1);
+    expect(h.boat.log.filter(e => e.seq > at && e.method === "POST" && e.path?.endsWith("/stop"))).toHaveLength(2);
+    expect(h.boat.spareCreates(at)).toHaveLength(0);
   });
 });
