@@ -126,7 +126,10 @@ describe('RFL independent real consumer boundaries', () => {
   vi.spyOn(fs,'copyFile').mockImplementation(async(...args:Parameters<typeof fs.copyFile>)=>{if(stopped)late.push('copy:'+String(args[1]));const value=await copy(...args);if(String(args[1]).includes(ref.versionId) && String(args[1]).endsWith('/SKILL.md')){entered.release();await gate.promise;}return value;});
   vi.spyOn(fs,'chmod').mockImplementation(async(...args:Parameters<typeof fs.chmod>)=>{if(stopped && String(args[0]).includes(ref.versionId))late.push('chmod:'+String(args[0]));return chmod(...args);});
   const directory=skillVersionCachePaths(ref.companyId,ref.skillId,ref.versionId).directory;
-  const op=withSkillVersionCacheLock(db,ref.companyId,async()=>{try{return await skillPackageRuntime(db).materialize(version,directory);}finally{ended.release();}}).then(value=>({value}),error=>({error:String(error)}));
+  // Failed admission must release teardown too; an admitted action must still finish
+  // before the oracle checks for late writes, even if its outer operation rejects first.
+  let admitted=false;
+  const op=withSkillVersionCacheLock(db,ref.companyId,async()=>{admitted=true;try{return await skillPackageRuntime(db).materialize(version,directory);}finally{ended.release();}}).finally(()=>{if(!admitted)ended.release();}).then(value=>({value}),error=>({error:String(error)}));
   try{await Promise.race([entered.promise,op.then(x=>{throw Error('early '+JSON.stringify(x))})]);await lose(`skill_version_cache:${ref.companyId}`);stopped=true;gate.release();await ended.promise;const result=await op;
    const proof={late,published:existsSync(directory),versionRows:(await db.select().from(companySkillVersions).where(eq(companySkillVersions.id,ref.versionId))).length,result};console.log('DELTA_PACKAGE',JSON.stringify(proof));await fs.writeFile(path.join(process.env.TASK_OUT!,'delta-package.json'),JSON.stringify(proof,null,2));expect(proof.versionRows).toBe(1);expect(proof.published).toBe(false);expect(proof.late).toEqual([]);
   }finally{gate.release();await ended.promise;await op;}
