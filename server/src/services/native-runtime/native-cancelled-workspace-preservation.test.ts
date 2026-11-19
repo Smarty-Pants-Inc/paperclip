@@ -179,31 +179,32 @@ import * as providers from "../sandbox-provider-runtime.js";
   // A warm (reusable) run that ends without success stops its sandbox and keeps
   // the lease `released` under its reusable policy. Reassignment Stop reaches
   // that state with the workspace still dirty and bound to the stopped writer.
-  async function stopReusableSource(f: Awaited<ReturnType<typeof seed>>) {
-    const [reusable] = await db.update(environmentLeases).set({ leasePolicy: "reuse_by_environment" })
+  async function stopReusableSource(f: Awaited<ReturnType<typeof seed>>, policy = "reuse_by_environment") {
+    const [reusable] = await db.update(environmentLeases).set({ leasePolicy: policy })
       .where(eq(environmentLeases.id, f.leaseId)).returning();
     const stopping = (await prepareSandboxStopAndRetain(db, reusable))!;
     const stopped = (await settleStopOnlyCleanup(db, stopping, {
       attemptId: String(stopping.metadata!.pendingCleanupAttemptId),
       receipt: { providerLeaseId: f.reference.providerLeaseId, state: "stopped" },
     }))!;
-    expect(stopped).toMatchObject({ status: "released", leasePolicy: "reuse_by_environment", cleanupStatus: "success" });
+    expect(stopped).toMatchObject({ status: "released", leasePolicy: policy, cleanupStatus: "success" });
     return stopped;
   }
 
-  it.each(["expiry", "destroy"] as const)("U22 marks a stopped reusable source owing files and refuses %s", async path => {
+  it.each(["reuse_by_environment", "reuse_by_execution_workspace"].flatMap(policy =>
+    ["expiry", "destroy"].map(path => ({ policy, path }))))("U22 marks a stopped $policy source owing files and refuses $path", async ({ policy, path }) => {
     const f = await seed();
     const [builtin] = await db.update(environmentLeases).set({ provider: "fake", metadata: {
       driver: "sandbox", remoteCwd: "/work",
     } }).where(eq(environmentLeases.id, f.leaseId)).returning();
     await db.update(environments).set({ config: { provider: "fake", image: "fake:test", reuseLease: true } })
       .where(eq(environments.id, builtin.environmentId!));
-    const stopped = await stopReusableSource(f);
+    const stopped = await stopReusableSource(f, policy);
     expect(stopped.metadata).not.toHaveProperty("workspaceRestoreRecovery");
     await preserveCancelledNativeWorkspaces(db);
     const [held] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
     expect.soft(held).toEqual({ ...stopped, metadata: { ...stopped.metadata, workspaceRestoreRecovery: {
-      schema: "paperclip.workspace-restore-recovery.v1", runId: f.runId, originalLeasePolicy: "reuse_by_environment",
+      schema: "paperclip.workspace-restore-recovery.v1", runId: f.runId, originalLeasePolicy: policy,
     } } });
     const [environment] = await db.select().from(environments).where(eq(environments.id, builtin.environmentId!));
     const destroy = vi.spyOn(providers, "destroySandboxProviderLease").mockResolvedValue(undefined);
