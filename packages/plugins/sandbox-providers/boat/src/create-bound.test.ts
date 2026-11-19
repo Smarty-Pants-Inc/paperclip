@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import plugin from "./plugin.js";
 
-// rf-4 U3 C1 (cap half): the 90 s create cap is strict. Strict HTTP fixtures
-// on the plugin's public acquire hook, not live Boat. The whole-acquisition
-// 180 s budget rows ship with the budget, not here.
+// rf-4 U3 C1: the 90 s create cap is strict and one 180 s budget bounds the
+// whole acquisition (create, adoption, readiness, setup, handoff), as in
+// Daytona's acquire (one deadline, asserted between phases). Strict HTTP
+// fixtures on the plugin's public acquire hook, not live Boat.
 vi.mock("node:timers/promises", () => ({
   setTimeout: (ms = 0, value?: unknown, options?: { signal?: AbortSignal }) => new Promise((resolve, reject) => {
     if (options?.signal?.aborted) { reject(options.signal.reason); return; }
@@ -70,7 +71,18 @@ it("C1: a label lookup in flight at the 90 s cap is ended at the cap, admitting 
   expect(w.calls.filter(c => c.method === "POST" && c.path === "/sandboxes")).toHaveLength(1);
 });
 
-it("C1: setup that finishes in time still hands off the lease (normal create unchanged)", async () => {
+it("C1: an ordinary (answered) create whose setup runs past the 180 s budget is stopped, never handed off", async () => {
+  const w = world({ create: "ok", setupUntil: 220_000 });
+  const work = settle(plugin.definition.onEnvironmentAcquireLease!({ ...p, config: { ...cfg, setupScript: "true", setupTimeoutSeconds: 300 } }));
+  await vi.advanceTimersByTimeAsync(230_000);
+  const result: any = await work;
+  expect(result).toHaveProperty("error.code", "ETIMEDOUT");
+  expect(result.at).toBeLessThan(200_000);
+  expect(w.stopped()).toBe(true);
+  expect(w.calls.find(c => c.method === "POST" && c.path.endsWith("/stop"))!.at).toBeGreaterThanOrEqual(180_000);
+});
+
+it("C1: setup that fits the budget still hands off the lease (normal create unchanged)", async () => {
   const w = world({ create: "ok", setupUntil: 20_000 });
   const work = settle(plugin.definition.onEnvironmentAcquireLease!({ ...p, config: { ...cfg, setupScript: "true", setupTimeoutSeconds: 300 } }));
   await vi.advanceTimersByTimeAsync(60_000);

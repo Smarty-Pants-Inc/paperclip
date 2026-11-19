@@ -1224,6 +1224,18 @@ class BoatSandboxStateError extends Error {
 const BOAT_CREATE_ATTEMPT_MS = 90_000;
 const BOAT_ACQUIRE_ATTEMPT_BUDGET_MS = 180_000;
 const BOAT_CREATE_LOOKUP_INTERVAL_MS = 5_000;
+/**
+ * A step's own abort signal, never past the acquisition budget's end (rf-4 U3b
+ * C1): an in-flight call is aborted at the budget, not at its own later
+ * timeout. Daytona bounds the same way: each phase gets only the remaining
+ * time (`deadline - Date.now()`, daytona plugin.ts:3075, :3089) inside one
+ * enclosing deadline race (:3145-3163).
+ */
+function withinBudget(deadline: number, ms: number): AbortSignal {
+  return AbortSignal.timeout(Math.max(0, Math.min(ms, deadline - Date.now())));
+}
+/** The acquisition budget's step state: each step enters by name, and no step starts after the budget. */
+type AcquisitionBudget = { deadline: number; enter: (phase: string) => void };
 /** Our create POST reached its own 30 s deadline (or a transport ETIMEDOUT)
  * with no HTTP answer: Boat may still be creating the box, as Daytona's create
  * is still pending at its cap. Any other failure is a create that failed, which
@@ -1279,11 +1291,15 @@ async function waitReady(config: Config, id: string, allowArchived = false, boun
   let lastObservedState: unknown;
   while (Date.now() < until) {
     let result: any;
-    try { result = await request(config, `/sandboxes/${encodeURIComponent(id)}`, bound.signal ? { signal: bound.signal } : {}, false, options); }
+    // A deadline-only caller (the acquisition budget) bounds each poll's own
+    // 30 s call timeout by the deadline, so a poll in flight ends there.
+    const pollSignal = bound.signal ?? (bound.deadline !== undefined ? withinBudget(bound.deadline, BOAT_CALL_BUDGET_MS) : undefined);
+    try { result = await request(config, `/sandboxes/${encodeURIComponent(id)}`, pollSignal ? { signal: pollSignal } : {}, false, options); }
     catch (error) {
       // A caller's timeout signal can fire during the poll, not only between polls.
       // A definite HTTP refusal must not become transient just because it was late.
-      if (bound.signal?.aborted && isOwnDeadline(error, bound.signal) && closedTransportCode(error) === "ETIMEDOUT") break;
+      if (pollSignal?.aborted && isOwnDeadline(error, pollSignal) && closedTransportCode(error) === "ETIMEDOUT"
+          && (bound.signal !== undefined || Date.now() >= until)) break;
       throw error;
     }
     const s = result.sandbox ?? result;
@@ -1301,10 +1317,21 @@ async function waitReady(config: Config, id: string, allowArchived = false, boun
   }
   throw new Error(boatStartDeadlineMessage(id, lastObservedState));
 }
-async function waitSetup(config: Config, id: string): Promise<any> {
-  const until = Date.now() + config.setupTimeoutSeconds * 1000;
+async function waitSetup(config: Config, id: string, deadline?: number): Promise<any> {
+  const setupUntil = Date.now() + config.setupTimeoutSeconds * 1000;
+  // The acquisition budget bounds setup too (rf-4 U3 C1; Daytona's one budget
+  // covers creation and setup, daytona plugin.ts:2981-2987).
+  const until = Math.min(setupUntil, deadline ?? Number.POSITIVE_INFINITY);
   while (Date.now() < until) {
-    const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`);
+    // rf-4 U3b C1: a setup GET in flight at the budget is aborted there, not at
+    // its own 30 s call timeout.
+    const pollSignal = deadline === undefined ? undefined : withinBudget(deadline, BOAT_CALL_BUDGET_MS);
+    let result: any;
+    try { result = await request(config, `/sandboxes/${encodeURIComponent(id)}`, pollSignal ? { signal: pollSignal } : {}, false, deadline === undefined ? {} : { deadline }); }
+    catch (error) {
+      if (pollSignal?.aborted && isOwnDeadline(error, pollSignal) && closedTransportCode(error) === "ETIMEDOUT" && Date.now() >= until) break;
+      throw error;
+    }
     const s = result.sandbox ?? result;
     assertSandboxId(s, id);
     if (s.setupStatus === "done") return s;
@@ -1317,6 +1344,7 @@ async function waitSetup(config: Config, id: string): Promise<any> {
     await delay(Math.min(2000, Math.max(0, until - Date.now())));
   }
   // A Boat-side setup deadline is transient: the host retries it by this errno.
+  if (until < setupUntil) throw Object.assign(new Error(`Boat sandbox ${id} setup did not finish within the acquisition budget`), { code: "ETIMEDOUT" });
   throw Object.assign(new Error(`Boat sandbox ${id} setup timed out after ${config.setupTimeoutSeconds} seconds`), { code: "ETIMEDOUT" });
 }
 async function stopSandbox(config: Config, id: string): Promise<{ providerLeaseId: string; state: "stopped" }> {
@@ -1980,6 +2008,7 @@ async function finishAcquisition(
   snapshot: ResolvedSnapshot | undefined,
   claimName: string | null,
   claimedSpare?: ReadySpare,
+  budget?: AcquisitionBudget,
 ): Promise<PluginEnvironmentLease> {
   // Every acquisition handoff (including a claimed spare) may carry stale guest state.
   preparedEnvDirectories.delete(id);
@@ -2001,14 +2030,35 @@ async function finishAcquisition(
     snapshotIdentity = { provider: config.provider, requestedRef: config.snapshot!, ...snapshot, organizationId };
   }
   const expiry = ready.archiveAfter ?? ready.expiresAt ?? ready.autoStopAt ?? null;
+  // rf-4 U3b C1: under an acquisition budget every handoff call (a sentinel or
+  // guardian command, a PUT /files) gets only the time that remains, so a call
+  // in flight at the budget is aborted there, and no call is sent after it
+  // (the request deadline and the step's own check before every send).
+  // Daytona: each phase gets `deadline - Date.now()` (daytona plugin.ts:3075,
+  // :3089) and is asserted between phases (:3061-3092).
+  const io = (phase: string) => budget ? {
+    request: (path: string, init: RequestInit = {}) => request(config, path, { ...init,
+      signal: init.signal ? AbortSignal.any([init.signal, withinBudget(budget.deadline, BOAT_CALL_BUDGET_MS)]) : withinBudget(budget.deadline, BOAT_CALL_BUDGET_MS) }, false,
+      { deadline: budget.deadline, sendGuard: () => budget.enter(phase) }),
+    run: (command: string, timeout: number, options?: Pick<RequestOptions, "intent">) => runCommand(config, id, command, timeout, undefined,
+      withinBudget(budget.deadline, timeout > 600_000 ? BOAT_CALL_BUDGET_MS : Math.max(1, Math.min(600, Math.ceil(timeout / 1000))) * 1000 + 5_000), options),
+  } : {
+    request: (path: string, init?: RequestInit) => request(config, path, init),
+    run: (command: string, timeout: number, options?: Pick<RequestOptions, "intent">) => runCommand(config, id, command, timeout, undefined, undefined, options),
+  };
+  budget?.enter("sentinel");
+  const sentinelIo = io("sentinel");
   const workspaceSentinel = await writeWorkspaceSentinel(params, config, id, remoteCwd, {
-    request: (path, init) => request(config, path, init),
+    request: (path, init) => sentinelIo.request(path, init),
     // R1: this helper's only command creates the fixed sentinel directory.
-    run: (command, timeout) => runCommand(config, id, command, timeout, undefined, undefined, { intent: "idempotent_probe" }),
+    run: (command, timeout) => sentinelIo.run(command, timeout, { intent: "idempotent_probe" }),
   });
+  budget?.enter("guardian");
+  const guardianIo = io("guardian");
   const guardianPreflight = await stageGuardian(params.config, id, {
-    request: (path, init) => request(config, path, init), run: (command, timeout, options) => runCommand(config, id, command, timeout, undefined, undefined, options),
+    request: (path, init) => guardianIo.request(path, init), run: (command, timeout, options) => guardianIo.run(command, timeout, options),
   });
+  budget?.enter("duplex");
   await bindDuplexLease(params, id, guardianPreflight);
   return { providerLeaseId: id, expiresAt: expiry, metadata: { provider: config.provider, sandboxId: id, remoteCwd,
     ...ownership,
@@ -2408,13 +2458,32 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       // directly every 30 minutes and counts every company's runs.
       if (hasSpareSetting) refreshRunCreateLedger(c, params.companyId, params.environmentId);
       const createStartedAt = Date.now();
+      // One budget bounds the whole acquisition: create, adoption, readiness,
+      // setup and handoff (rf-4 U3 C1). Daytona: one deadline (daytona
+      // plugin.ts:2981-2987) asserted between phases (assertActive, :3011-3013,
+      // :3061-3092). A lease is never handed off after it; the catch below
+      // stops the box and the host retries the ETIMEDOUT.
+      const deadline = createStartedAt + BOAT_ACQUIRE_ATTEMPT_BUDGET_MS;
+      // rf-4 U3b C1: the budget also bounds a step IN FLIGHT. Each step gets an
+      // abort signal for the time that remains (withinBudget), as each Daytona
+      // phase gets `deadline - Date.now()` inside its enclosing deadline race
+      // (daytona plugin.ts:3075, :3089, :3145-3163); no step starts after it.
+      let phase = "create";
+      const budgetError = (detail?: string) => Object.assign(new Error(`Boat lease acquisition exceeded ${BOAT_ACQUIRE_ATTEMPT_BUDGET_MS} ms during ${phase}${detail ? `: ${detail}` : ""}`), {
+        code: "ETIMEDOUT", phase, elapsedMs: Math.max(0, Date.now() - createStartedAt), budgetMs: BOAT_ACQUIRE_ATTEMPT_BUDGET_MS });
+      const assertActive = (next: string) => {
+        phase = next;
+        if (Date.now() < deadline) return;
+        throw budgetError();
+      };
+      const budget: AcquisitionBudget = { deadline, enter: assertActive };
       // Set only when Boat reported the box `error` before it was ready (#22194).
       let startFailure: PluginEnvironmentAcquisitionDiagnostic | undefined;
       try {
         if (shuttingDown) throw new Error("Boat provider is shutting down");
         let created: any, adopted = false;
         try {
-          created = await request(c, "/sandboxes", { method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": attemptId }, body: JSON.stringify(createSandboxBody(c, ttl, labels, from)) });
+          created = await request(c, "/sandboxes", { method: "POST", signal: withinBudget(deadline, 30_000), headers: { "Idempotency-Key": attemptId }, body: JSON.stringify(createSandboxBody(c, ttl, labels, from)) });
         } catch (createError) {
           // #20828: adopt the box our timed-out create made; never send a second create.
           created = { sandbox: { id: await findTimedOutCreation(c, attemptId, params, createError, createStartedAt) } };
@@ -2423,17 +2492,30 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         const sb = created?.sandbox ?? created; if (typeof sb?.id !== "string" || !sb.id) throw new Error("Boat create response did not contain sandbox.id");
         id = sb.id;
         idleActivity.resource(activityKey(c, sb.id));
-        // An adopted box is still starting (or preparing): wait inside the acquire budget.
-        const ready = await waitReady(c, sb.id, false, adopted ? { deadline: createStartedAt + BOAT_ACQUIRE_ATTEMPT_BUDGET_MS } : {}).catch(error => {
+        // A created or adopted box waits for ready inside the acquire budget.
+        assertActive(adopted ? "adopt" : "create");
+        assertActive("ready");
+        const ready = await waitReady(c, sb.id, false, { deadline }).catch(error => {
           if (error instanceof BoatSandboxStateError && error.state === "error") {
             startFailure = { phase: "create", elapsedMs: Math.min(Math.max(0, Date.now() - createStartedAt), BOAT_ACQUIRE_ATTEMPT_BUDGET_MS - 1),
               budgetMs: BOAT_ACQUIRE_ATTEMPT_BUDGET_MS, providerState: "error" };
           }
           throw error;
         });
-        const ownershipObservation = c.setupScript !== undefined ? await waitSetup(c, sb.id) : ready;
-        return await finishAcquisition(params, c, sb.id, { ...ready, ...ownershipObservation }, labels, remoteCwd, snapshot, null);
-      } catch (error) {
+        assertActive("setup");
+        const ownershipObservation = c.setupScript !== undefined ? await waitSetup(c, sb.id, deadline) : ready;
+        assertActive("handoff");
+        const lease = await finishAcquisition(params, c, sb.id, { ...ready, ...ownershipObservation }, labels, remoteCwd, snapshot, null, undefined, budget);
+        assertActive("handoff");
+        return lease;
+      } catch (caught) {
+        // A step that ended at (or after) the budget fails as the budget, typed
+        // ETIMEDOUT, so the host retries it (rf-4 U3b F2: readiness exhaustion
+        // was a plain Error the host reader could not see). A box Boat could
+        // not start keeps its own typed provider-start failure.
+        const timedOutCode = caught && typeof caught === "object" && (caught as { code?: unknown }).code === "ETIMEDOUT";
+        const error = id && !startFailure && Date.now() >= deadline && !(timedOutCode && (caught as { phase?: unknown }).phase !== undefined)
+          ? budgetError(caught instanceof Error ? caught.message : undefined) : caught;
         if (shuttingDown && !id) throw error;
         const ids = id ? [id] : await acquisitionMatches(c, attemptId, params).catch(lookupError => {
           // frozen7-VERDICT F2: Boat definitely refused this create. A failing
