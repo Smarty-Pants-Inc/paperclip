@@ -219,6 +219,23 @@ function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL 
   // disagree on a message (RFL 20:22Z: run-less agent comments never answer; org 20:29Z: imported history).
   return answeredPersonMessageSql(m);
 }
+/**
+ * SQL: message m's card is retired (each card retires on its OWN message):
+ * m was answered (the ONE answered predicate), m was deleted, or the person
+ * sent it again: a later message by the same person, saved after the card,
+ * with the SAME text, that the ONE answered predicate says is answered. No
+ * second 'answered' definition: the resend's answer is read through
+ * answeredSql. A different later message never retires it (L1b).
+ */
+function noticeRetiredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }, deletedAt: SQL, noticeCreatedAt: SQL): SQL {
+  return sql`(${deletedAt} is not null or ${answeredSql(m)}
+    or exists (select 1 from ${issueComments} again where again.company_id = ${m.companyId} and again.issue_id = ${m.issueId}
+      and again.author_type = 'user' and again.deleted_at is null and again.id <> ${m.id}
+      and exists (select 1 from ${issueComments} src where src.id = ${m.id}
+        and src.author_user_id is not distinct from again.author_user_id and btrim(src.body) = btrim(again.body))
+      and again.created_at > ${noticeCreatedAt}
+      and ${answeredSql(rawMessage("again"))}))`;
+}
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
 
@@ -263,7 +280,7 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and ${answeredSql(rawMessage("m"))}))`;
+      and ${noticeRetiredSql(rawMessage("m"), sql.raw("m.deleted_at"), sql.raw("n.created_at"))}))`;
 }
 
 /**
@@ -288,7 +305,7 @@ export function unansweredPersonMessageCommentCondition(): SQL {
       and exists (select 1 from ${issueComments} m
         where m.company_id = ${issueComments.companyId} and m.issue_id = ${issueComments.issueId}
           and m.id::text = substr(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
-          and ${answeredSql(rawMessage("m"))})))`;
+          and ${noticeRetiredSql(rawMessage("m"), sql.raw("m.deleted_at"), sql`${issueComments.createdAt}`)})))`;
 }
 
 export type UnansweredMessageOutcome =
@@ -331,7 +348,7 @@ export type NativeBlockedRepairApplies = (input: { companyId: string; issueId: s
 export async function settleUnansweredPersonMessage(
   db: Db,
   input: { companyId: string; issueId: string; now?: Date; issueCreatedAtGte?: Date | null;
-    nativeBlockedRepairApplies?: NativeBlockedRepairApplies },
+    nativeBlockedRepairApplies?: NativeBlockedRepairApplies; olderOutcomes?: UnansweredMessageOutcome[] },
 ): Promise<UnansweredMessageOutcome> {
   const now = input.now ?? new Date();
   const [issue] = await db.select({
@@ -359,10 +376,57 @@ export async function settleUnansweredPersonMessage(
         or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
       and exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
         and m.id::text = substr(n.metadata->>'authorizationReason', strpos(n.metadata->>'authorizationReason', ':') + 1)
-        and ${answeredSql(rawMessage("m"))})`);
+        and ${noticeRetiredSql(rawMessage("m"), sql.raw("m.deleted_at"), sql.raw("n.created_at"))})`);
   });
 
-  const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies);
+  // EVERY owed person message gets its own decision and card (RFL 09:03Z),
+  // not only the newest: the newest first (its outcome kinds unchanged), then
+  // each OLDER message the ONE answered predicate says is owed and that has no
+  // final card yet, within the discovery scope, newest first, at most
+  // OWED_OLDER_MESSAGES_PER_SWEEP per task per pass (the bound; the next
+  // pass takes the rest).
+  const newest = await settleOneMessage(db, issue, now, input.nativeBlockedRepairApplies, null);
+  const older: UnansweredMessageOutcome[] = [];
+  if (newest.outcome.kind !== "out_of_scope" && newest.outcome.kind !== "none" && newest.messageId) {
+    for (const id of await owedOlderMessageIds(db, issue, newest.messageId)) {
+      older.push((await settleOneMessage(db, issue, now, input.nativeBlockedRepairApplies, id)).outcome);
+    }
+  }
+  input.olderOutcomes?.push(...older);
+  // The returned outcome is the NEWEST message's (unchanged contract); the
+  // older messages' outcomes go to input.olderOutcomes (the sweep counts them).
+  return newest.outcome;
+}
+
+/** The per-sweep bound on OLDER owed messages settled for one task in one pass. */
+export const OWED_OLDER_MESSAGES_PER_SWEEP = 20;
+
+/** The older person messages on this task that the ONE answered predicate says
+ * are owed, in discovery scope, with no final (non-waiting) card yet, and that
+ * never REACHED the agent (no run's input lists them: the reached clause's
+ * case). An older message a run carried already has that run's own outcome
+ * in view (its failure, a Stop) and keeps today's newest-only reading. */
+async function owedOlderMessageIds(db: Db, issue: DecisionIssue, newestId: string): Promise<string[]> {
+  const rows = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+    sql`${issueComments.id} <> ${newestId}`, unansweredPersonMessageCommentCondition(),
+    sql`not exists (select 1 from ${heartbeatRuns} r where r.company_id = ${issueComments.companyId}
+      and (r.context_snapshot->>'wakeCommentId' = ${issueComments.id}::text or r.context_snapshot->>'commentId' = ${issueComments.id}::text
+        or r.context_snapshot->>'conversationReplyBoundaryCommentId' = ${issueComments.id}::text
+        or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${issueComments.id}::text
+        or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${issueComments.id}::text))`,
+    eq(issueComments.authorType, "user")))
+    .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(OWED_OLDER_MESSAGES_PER_SWEEP);
+  return rows.map(row => row.id);
+}
+
+async function settleOneMessage(db: Db, issue: DecisionIssue, now: Date,
+  nativeBlockedRepairApplies: NativeBlockedRepairApplies | undefined, messageId: string | null,
+): Promise<{ outcome: UnansweredMessageOutcome; messageId: string | null }> {
+  const input = { nativeBlockedRepairApplies };
+  const decided = { messageId: messageId as string | null };
+  const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies, messageId, decided);
+  const done = (outcome: UnansweredMessageOutcome) => ({ outcome, messageId: decided.messageId });
   if ((decision.kind === "pending" || decision.kind === "notice") && decision.recordWait) {
     await logActivity(db, { companyId: issue.companyId, actorType: "system", actorId: "recovery",
       action: PENDING_WAIT_ACTION, entityType: "issue", entityId: issue.id, issueId: issue.id,
@@ -375,9 +439,9 @@ export async function settleUnansweredPersonMessage(
         message: "The unanswered-message notice waits for the native blocked-request repair to publish.",
         payload: { messageId: decision.recordDeferral.messageId, boundMs: NATIVE_REPAIR_PUBLISH_BOUND_MS } });
     }
-    return { kind: "pending", recheckAt: decision.recheckAt };
+    return done({ kind: "pending", recheckAt: decision.recheckAt });
   }
-  if (decision.kind !== "notice") return decision;
+  if (decision.kind !== "notice") return done(decision);
   const commentId = await db.transaction(async tx => {
     // The issue fence that comment writers, the executor's held-notice writer
     // and execution admission take. The SAME predicate is evaluated again
@@ -386,7 +450,9 @@ export async function settleUnansweredPersonMessage(
     // means no notice.
     await tx.select({ id: issues.id }).from(issues)
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
-    const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, input.nativeBlockedRepairApplies);
+    // The newest message is re-read as the newest (a newer message that
+    // committed meanwhile means no card here); an older owed one by its id.
+    const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, input.nativeBlockedRepairApplies, messageId);
     if (fenced.kind !== "notice" || fenced.reason !== decision.reason
       || fenced.upgradeCommentId !== decision.upgradeCommentId) return null;
     if (fenced.upgradeCommentId) {
@@ -404,7 +470,7 @@ export async function settleUnansweredPersonMessage(
     }, tx);
     return comment?.id ?? null;
   });
-  return commentId ? { kind: "noticed", code: decision.code, commentId } : { kind: "noticed_before" };
+  return done(commentId ? { kind: "noticed", code: decision.code, commentId } : { kind: "noticed_before" });
 }
 
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
@@ -440,15 +506,17 @@ export const PENDING_WAIT_BOUND_MS = 2 * 60_000;
  * decision that writes (an answer, a failure text, a setup note) supersedes
  * it in place as before. */
 async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
-  nativeBlockedRepairApplies?: NativeBlockedRepairApplies): Promise<Decision> {
+  nativeBlockedRepairApplies?: NativeBlockedRepairApplies, messageId: string | null = null,
+  decided?: { messageId: string | null }): Promise<Decision> {
   const standing: { replacePaused?: (pending: Extract<Decision, { kind: "pending" }>) => Decision } = {};
-  const decision = await decideMessage(q, issue, now, nativeBlockedRepairApplies, standing);
+  const decision = await decideMessage(q, issue, now, nativeBlockedRepairApplies, standing, messageId, decided);
   return decision.kind === "pending" && standing.replacePaused ? standing.replacePaused(decision) : decision;
 }
 
 async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   nativeBlockedRepairApplies: NativeBlockedRepairApplies | undefined,
-  standing: { replacePaused?: (pending: Extract<Decision, { kind: "pending" }>) => Decision }): Promise<Decision> {
+  standing: { replacePaused?: (pending: Extract<Decision, { kind: "pending" }>) => Decision },
+  messageId: string | null = null, decided?: { messageId: string | null }): Promise<Decision> {
   if (issue.hiddenAt || !issue.assigneeAgentId || issue.assigneeUserId
     || !["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return { kind: "out_of_scope" };
   const agentId = issue.assigneeAgentId;
@@ -456,8 +524,11 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt,
     authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-    eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)))
+    eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
+    // The message this decision is for: a named owed message, else the newest.
+    messageId ? eq(issueComments.id, messageId) : undefined))
     .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
+  if (decided && message) decided.messageId = message.id;
   // No age cut here: discovery (inScopeSql) decides which messages are in
   // scope, so an open obligation is never dropped silently by age.
   if (!message) return { kind: "none" };
@@ -946,9 +1017,17 @@ export async function settleUnansweredPersonMessagesForTask(
   input: { companyId: string; issueId: string; issueCreatedAtGte?: Date | null; onDeferredDeadline?: (at: number) => void; now?: Date;
     nativeBlockedRepairApplies?: NativeBlockedRepairApplies },
 ): Promise<{ noticed: number; pending: number }> {
-  const outcome = await settleUnansweredPersonMessage(db, input);
-  if (outcome.kind === "pending") input.onDeferredDeadline?.(outcome.recheckAt);
-  return { noticed: outcome.kind === "noticed" ? 1 : 0, pending: outcome.kind === "pending" ? 1 : 0 };
+  const olderOutcomes: UnansweredMessageOutcome[] = [];
+  const outcomes = [await settleUnansweredPersonMessage(db, { ...input, olderOutcomes }), ...olderOutcomes];
+  const result = { noticed: 0, pending: 0 };
+  for (const outcome of outcomes) {
+    if (outcome.kind === "noticed") result.noticed += 1;
+    if (outcome.kind === "pending") {
+      result.pending += 1;
+      input.onDeferredDeadline?.(outcome.recheckAt);
+    }
+  }
+  return result;
 }
 
 /** The sweep's pass outside the worker (startup, a direct call): every task in
@@ -966,12 +1045,15 @@ export async function settleUnansweredPersonMessages(
   )).limit(200);
   const result = { noticed: 0, pending: 0 };
   for (const candidate of candidates) {
+    const olderOutcomes: UnansweredMessageOutcome[] = [];
     const outcome = await settleUnansweredPersonMessage(db, { companyId: candidate.companyId, issueId: candidate.id, now: input.now,
-      nativeBlockedRepairApplies: input.nativeBlockedRepairApplies });
-    if (outcome.kind === "noticed") result.noticed += 1;
-    if (outcome.kind === "pending") {
-      result.pending += 1;
-      input.onDeferredDeadline?.(outcome.recheckAt);
+      nativeBlockedRepairApplies: input.nativeBlockedRepairApplies, olderOutcomes });
+    for (const each of [outcome, ...olderOutcomes]) {
+      if (each.kind === "noticed") result.noticed += 1;
+      if (each.kind === "pending") {
+        result.pending += 1;
+        input.onDeferredDeadline?.(each.recheckAt);
+      }
     }
   }
   return result;
