@@ -15,7 +15,7 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
 import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "../services/execution-recovery-resolution.js";
-import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX, unansweredPersonMessageCondition } from "../services/recovery/unanswered-person-message.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { recordRequiredWorkspaceRestoreFailure } from "../services/legacy-execution-recovery.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -382,5 +382,76 @@ describe.skipIf(!support.supported)("Interrupt: after a failed successor's saved
     expect(retry.status, JSON.stringify(retry.body)).toBeLessThan(500);
     expect(after, `ONE run: ${JSON.stringify({ at60s, all, retry: retry.body })}`)
       .toEqual([expect.objectContaining({ ids: [f.m0, ...owed] })]);
+  }, 180_000);
+
+  /** adopt-requeue-boot: the real stranded sweep's visit, as recovery/work.ts makes it. Its page load visits a
+   * 'blocked' task only while unansweredPersonMessageCondition holds; the check is owner.stranded
+   * (heartbeat.ts: reconcileStrandedAssignedIssues with these options). */
+  async function strandedSweepVisit(f: F) {
+    const visited = await db.select({ id: issues.id }).from(issues).where(and(eq(issues.id, f.issueId),
+      eq(issues.status, "blocked"), unansweredPersonMessageCondition(issues.id, issues.companyId)));
+    await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId,
+      unanswered: true, skipExternalConversationSettlement: true, skipRelatedRecovery: true } as never);
+    return visited.length === 1;
+  }
+
+  /** gate 7's 888e5d1d as the new build finds it: recovery completed (workspace_recovered) under the OLD build,
+   * whose onRecovered queued nothing; the workers have passed; the chat sits 'blocked', untouched. */
+  async function bootShape() {
+    const { f, owed, successor, hold } = await chain(true);
+    const failed = await workspaceRecovered(f, successor.id, hold.id);
+    await workersPass(f, 1);
+    const atBoot = await state(f, successor.id, hold.id);
+    expect(atBoot.live, JSON.stringify(atBoot)).toEqual([]);
+    expect(atBoot.hold?.requeue, "the old build never dispatched").toBeUndefined();
+    return { f, owed, successor, hold, failed, atBoot };
+  }
+
+  it("B1 boot: a chat already left 'blocked' after workspace_recovered (nothing queued) ⇒ the stranded sweep's visit makes ONE run carrying all owed, in order; a second pass adds none", async () => {
+    const { f, owed, successor, hold, atBoot } = await bootShape();
+    const t0 = Date.now();
+    const visitedBlocked = await strandedSweepVisit(f);
+    const afterSweep = await state(f, successor.id, hold.id);
+    const elapsedMs = Date.now() - t0;
+    await strandedSweepVisit(f);
+    await workersPass(f, 30);
+    await strandedSweepVisit(f);
+    const later = await state(f, successor.id, hold.id);
+    // Every run created after the failure, in any status: the sweep's own dispatch may already have started it
+    // (this test server has no local runtime listener, so a started run fails there; that is not a second run).
+    const [failedRow] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor.id));
+    const runsAfter = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter(r => r.contextSnapshot?.issueId === f.issueId && r.createdAt > failedRow!.finishedAt!)
+      .map(r => ({ id: r.id, status: r.status, ids: r.contextSnapshot?.wakeCommentIds }));
+    await evidence("B1", { owed, successor: successor.id, atBoot, visitedBlocked, afterSweep, elapsedMs, later, runsAfter });
+    expect(atBoot.issueStatus, "the boot shape is 'blocked'").toBe("blocked");
+    expect(visitedBlocked, "the sweep's page load visits this blocked task").toBe(true);
+    expect(afterSweep.live, `ONE run carrying every owed message, in order: ${JSON.stringify(afterSweep)}`)
+      .toEqual([expect.objectContaining({ ids: [f.m0, ...owed] })]);
+    expect(runsAfter, `still ONE run after three sweep passes: ${JSON.stringify({ later, runsAfter })}`)
+      .toEqual([expect.objectContaining({ id: afterSweep.live[0]!.id, ids: [f.m0, ...owed] })]);
+    const keyed = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.idempotencyKey, `recovered-workspace-requeue:${hold.id}`)));
+    expect(keyed, "ONE keyed wake").toHaveLength(1);
+    expect(later.issueStatus, "the hold's own block is lifted").not.toBe("blocked");
+    expect(later.hold?.requeue).toMatchObject({ outcome: "enqueued", runId: afterSweep.live[0]!.id, commentIds: [f.m0, ...owed] });
+  }, 180_000);
+
+  it("B2 boot control: the owed messages were answered meanwhile ⇒ the sweep's visit makes nothing", async () => {
+    const { f, owed, successor, hold } = await chain(true);
+    const [answerer] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+      runtimeMode: "native", nativeIssueId: f.issueId, issueId: f.issueId, createdAt: new Date(Date.now() - 120_000),
+      startedAt: new Date(Date.now() - 120_000), finishedAt: new Date(Date.now() - 60_000),
+      contextSnapshot: { issueId: f.issueId, wakeCommentIds: [f.m0, ...owed], wakeCommentId: owed.at(-1) } }).returning();
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
+      createdByRunId: answerer!.id, body: "answers to all three" });
+    await workspaceRecovered(f, successor.id, hold.id);
+    await workersPass(f, 1);
+    await strandedSweepVisit(f);
+    await strandedSweepVisit(f);
+    const after = await state(f, successor.id, hold.id);
+    await evidence("B2", { owed, after });
+    expect(after.live, JSON.stringify(after)).toEqual([]);
+    expect(after.hold?.requeue).toBeUndefined();
   }, 180_000);
 });

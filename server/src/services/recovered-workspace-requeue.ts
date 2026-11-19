@@ -96,3 +96,26 @@ export async function recordRecoveredWorkspaceRequeue(db: Db, holdId: string, re
       outcome: result.runId ? "enqueued" : "refused", runId: result.runId } })}::jsonb` })
     .where(eq(issueRecoveryActions.id, holdId));
 }
+
+/** adopt-requeue-boot: the failed runs on this task whose resolved no-replay
+ * hold has not yet had its post-recovery dispatch enqueued. A chat left
+ * 'blocked' by a recovery that completed with nothing queued (before the
+ * onRecovered requeue existed, or when that dispatch was missed) is found by
+ * the stranded sweep's visit and gets the SAME dispatch
+ * (requeueRecoveredWorkspaceMessages); recoveredWorkspaceOwedMessages still
+ * decides every gate. */
+export async function recoveredWorkspaceRequeueRuns(db: Db, companyId: string, issueId: string) {
+  const holds = await db.select({ runId: sql<string | null>`${issueRecoveryActions.evidence}->>'runId'` }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+    eq(issueRecoveryActions.status, "resolved"),
+    sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+    sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'invalidated'`,
+    sql`coalesce(${issueRecoveryActions.evidence}->'recoveredWorkspaceRequeue'->>'outcome', '') <> 'enqueued'`,
+  )).orderBy(asc(issueRecoveryActions.createdAt)).limit(5);
+  const runIds = [...new Set(holds.map(row => row.runId).filter((id): id is string => !!id && /^[0-9a-f-]{36}$/i.test(id)))];
+  if (!runIds.length) return [];
+  return db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+    status: heartbeatRuns.status, contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, runIds)))
+    .orderBy(asc(heartbeatRuns.createdAt));
+}
