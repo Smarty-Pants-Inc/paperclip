@@ -234,8 +234,8 @@ describe.skipIf(!support.supported)("own Stop during startup writes no reconcili
       await s.settle();
       const counts = await s.answered();
       console.log("OWNSTOP TURNS", JSON.stringify(fixture.calls), JSON.stringify([...counts]));
-      // Never twice. (Open, logged above: in this harness the Send is accepted
-      // but deferred behind the startup run's missing stop proof; see result.)
+      // Never twice. (ownstop-startup-send.test.ts R16 proves the Send starts
+      // exactly one successor carrying all three.)
       for (const id of s.held) expect(counts.get(id) ?? 0).toBeLessThanOrEqual(1);
     }, 180_000);
   }
