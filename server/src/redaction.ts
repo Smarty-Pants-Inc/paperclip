@@ -1100,8 +1100,9 @@ interface AnsiCredentialView {
 interface CredentialSpan { start: number; end: number; replacement: string }
 
 // Both scanners keep whole-line context. V1 removes CSI (including codes inside
-// credentials); V2 substitutes ASCII space U+0020, a boundary for every bare
-// token pattern. Only V1 may recognize schemes, assignments or prose rules.
+// credentials); V2 substitutes ASCII space U+0020 for bare-token matching and
+// strict Bearer bodies only when CSI is immediately before the scheme. General
+// schemes, assignments and context-sensitive prose rules remain V1-only.
 /**
  * `quotedLeaf`: `input` is the decoded content of a JSON string literal, so
  * its start and end stand for the literal's opening and closing quote.
@@ -1133,7 +1134,7 @@ export function redactSensitiveText(input: string, context?: { quotedLeaf?: bool
 
   const spans = [
     ...credentialSpansForView(transparent, (text, apply) => redactPlainSensitiveText(text, context, apply)),
-    ...credentialSpansForView(boundary, redactBoundaryTokenRanges),
+    ...credentialSpansForView(boundary, (text, apply) => redactBoundaryTokenRanges(text, apply, boundary)),
   ].sort((a, b) => a.start - b.start || b.end - a.end);
   if (spans.length === 0) return input;
 
@@ -1264,10 +1265,24 @@ function redactTokenPatterns(input: string, apply: ApplyRedactionStage, patterns
   return text;
 }
 
-function redactBoundaryTokenRanges(input: string, apply: ApplyRedactionStage): string {
-  // Reuse exactly the uncoloured body lengths, charsets and JWT validation.
-  // Never run Bearer/Basic/Authorization or context-sensitive rules on V2.
-  return redactTokenPatterns(input, apply, [
+// Match Bearer's case-insensitive scheme, but not its broad uncoloured body
+// parser: that would promote `standard<CSI>bearer abc123def` into a credential.
+// Require one ASCII space and at least 20 token characters, with optional `=`.
+const CSI_BOUNDARY_BEARER_RE = /\b(Bearer )([A-Za-z0-9._~+/-]{20,}=?)(?![A-Za-z0-9._~+/=-])/gi;
+
+function redactBoundaryTokenRanges(input: string, apply: ApplyRedactionStage, view: AnsiCredentialView): string {
+  // Run first, while match offsets still address the original boundary view.
+  // A substituted CSI has a multi-byte source interval; an ordinary space
+  // does not. Only that CSI-created boundary may introduce a Bearer scheme.
+  const text = apply(input, (value, replace) => value.replace(CSI_BOUNDARY_BEARER_RE,
+    (match: string, prefix: string, _token: string, index: number) => {
+      if (index === 0 || view.ends[index - 1] - view.starts[index - 1] <= 1) return match;
+      return prefix + replace(index + prefix.length, index + match.length, REDACTED_EVENT_VALUE);
+    }));
+  // JWT/bare-prefix tokens retain their existing lengths, charsets and
+  // validation, including prefixed tokens shorter than the strict Bearer body.
+  // Never run general schemes, assignments or prose rules on V2.
+  return redactTokenPatterns(text, apply, [
     RANGE_COMMAND_OPENAI_KEY_RE, RANGE_COMMAND_GITHUB_TOKEN_RE, RANGE_COMMAND_JWT_RE,
     GITHUB_FINE_GRAINED_TOKEN_RE, AWS_ACCESS_KEY_ID_RE,
   ], true);
