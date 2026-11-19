@@ -80,6 +80,7 @@ import {
 } from "../services/run-identity.js";
 import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
+import { executionWaitForPerson } from "../services/deferred-execution-wait.js";
 import multer from "multer";
 import { z } from "zod";
 import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
@@ -7678,7 +7679,7 @@ export function issueRoutes(
   type IssueQueueRun = typeof heartbeatRuns.$inferSelect;
   type IssueQueueState = {
     wake: Pick<IssueQueueWake, "id" | "companyId" | "payload" | "status" | "runId" | "agentId" | "reason"
-      | "requestedByActorType" | "requestedByActorId">;
+      | "requestedByActorType" | "requestedByActorId" | "requestedAt">;
     state: "deferred" | "queued";
     queueRun: Pick<IssueQueueRun, "runtimeMode"> | null;
     /** The receipt already read for an interaction wake, reused by the queue builder. */
@@ -7696,6 +7697,7 @@ export function issueRoutes(
       .select({
         id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId,
         status: agentWakeupRequests.status, runId: agentWakeupRequests.runId,
+        requestedAt: agentWakeupRequests.requestedAt,
         ...firstTurnWakeColumns,
         payload: sql<Record<string, unknown>>`jsonb_build_object(
           ${firstTurnWakePayloadFields(agentWakeupRequests.payload)},
@@ -7876,8 +7878,7 @@ export function issueRoutes(
     const queue = buildQueuedCommentQueueSnapshot({
       issueId: input.issue.id,
       executionWait: interruptHandoff ? QUEUED_INTERRUPT_HANDOFF_WAIT
-        : typeof wait.reason === "string" && typeof wait.message === "string"
-          ? { reason: wait.reason, message: wait.message } : null,
+        : executionWaitForPerson(wait, wake?.requestedAt),
       queueId: wake?.id ?? null,
       state: queueState?.state ?? null,
       activeRunId: input.activeRun?.id ?? null,
