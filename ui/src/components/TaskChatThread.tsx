@@ -621,6 +621,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     onRetryFailedRun,
     retryFailedRunId = null,
     queuedCommentQueue,
+    steeringUnavailableReason = null,
     onEditQueuedComment,
     onReorderQueuedComments,
     onSteerQueuedComment,
@@ -3837,6 +3838,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                         <TaskChatQueuedMessages
                           key={issueId}
                           queue={queuedMessageQueue ?? emptyQueuedCommentQueue}
+                          steeringUnavailableReason={steeringUnavailableReason}
                           onEdit={beginQueuedEdit}
                           editingCommentId={queuedEdit?.commentId ?? null}
                           autoSteerDelayMs={queuedMessageAutoSteerDelayMs}
