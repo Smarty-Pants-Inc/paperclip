@@ -6,7 +6,7 @@ import { DELIVERY_QUEUES, type DeliveryQueue } from "../delivery-work-notificati
 import type { IssueRecoveryScope } from "../issue-recovery-notifications.js";
 import { registerScopedDeadlineWork } from "../scoped-deadline-work.js";
 import { recoveryActionSweepCondition } from "./blocker-stall-wakeups.js";
-import { unansweredPersonMessageCommentCondition, unansweredPersonMessageCondition } from "./unanswered-person-message.js";
+import { answeredUnansweredNoticeCondition, unansweredPersonMessageCommentCondition, unansweredPersonMessageCondition } from "./unanswered-person-message.js";
 
 type Entry = { id: string; companyId: string; dueAt: number; unanswered?: boolean };
 /** `unanswered`: whether this task has a person's message to settle (stranded worker only). */
@@ -53,7 +53,9 @@ export function registerIssueRecoveryWork(
           cursor ? gt(issues.id, cursor) : undefined,
           statuses
             ? alsoBlockedWhen
-              ? or(inArray(issues.status, statuses), and(eq(issues.status, "blocked"), alsoBlockedWhen()))
+              // P9-60 (B): a live notice whose message is answered retires in ANY status.
+              ? or(inArray(issues.status, statuses), and(eq(issues.status, "blocked"), alsoBlockedWhen()),
+                answeredUnansweredNoticeCondition(issues.id, issues.companyId))
               : inArray(issues.status, statuses)
             : or(isNotNull(issues.checkoutRunId), isNotNull(issues.executionRunId),
                 // A diagnostic outlives its old binding. Keep re-checking its
