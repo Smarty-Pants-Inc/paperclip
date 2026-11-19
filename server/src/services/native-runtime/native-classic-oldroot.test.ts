@@ -6,7 +6,7 @@ import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { box, driveClassicCut, liveScenario, openClassicLiveContext, resetClassicLiveBox, PERSON, SAVED } from "../../__tests__/helpers/classic-live-scenario.js";
-import { executionWorkspaces, issueRecoveryActions, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+import { issueRecoveryActions, issues, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport } from "../../__tests__/helpers/embedded-postgres.js";
 import { fileResourceRoutes } from "../../routes/file-resources.js";
 import { issueRoutes } from "../../routes/issues.js";
@@ -37,7 +37,7 @@ describe.skipIf(!support.supported)("classic copy-back bound, the old root (rf-5
     | "downloadReport" | "availability" | "issue", Probe>;
   const seen = {} as { rRootWorkspaceId: string; rRoot: string; pRootWorkspaceId: string; pRoot: string; rRunId: string;
     unbound: Files; lateApplied: Files; rRootOnDisk: Record<string, string>; recover: Probe; afterRecover: Files;
-    p2: { run: any; providerCwd: unknown; inputs: number } | null; keptRow: Probe; pRootOnDisk: Record<string, string>; failure?: unknown };
+    p2: { run: any; providerCwd: unknown; inputs: number } | null; keptRow: Probe; plantedBoundSubTask: Files; pRootOnDisk: Record<string, string>; failure?: unknown };
 
   beforeAll(async () => {
     context = await openClassicLiveContext("native-classic-oldroot-");
@@ -58,7 +58,7 @@ describe.skipIf(!support.supported)("classic copy-back bound, the old root (rf-5
       return { status: got.status, body, text };
     };
     /** REAL: what the person's Files navigation reads at workspace=auto. */
-    const files = async (): Promise<Files> => {
+    const files = async (base = `/api/issues/${s.issueId}`): Promise<Files> => {
       const availability = await request(app).post(`${base}/file-resources/availability`)
         .send({ queries: [{ path: "notes.md", workspace: "auto" }, { path: "report.md", workspace: "auto" }] });
       return {
@@ -122,6 +122,14 @@ describe.skipIf(!support.supported)("classic copy-back bound, the old root (rf-5
       seen.pRootOnDisk = await onDisk(cut.pRoot);
       seen.keptRow = await get(`/api/execution-workspaces/${cut.rRootWorkspaceId}`);
       seen.rRootOnDisk = { ...seen.rRootOnDisk, ...(await onDisk(cut.rRoot)) };
+      // PLANTED (named): a sub-task of the task that is still BOUND to R's abandoned row (a binding the cut does not
+      // own: it detaches only the task itself). Beside it, the same shape by the real route: the task above, whose
+      // row the real cut abandoned. Its reads are the same real GETs. A bound row is a candidate whatever its state;
+      // a CLOSED one is never read from its local directory (workspace-file-resources.ts candidateFromExecutionWorkspace).
+      const childId = randomUUID();
+      await db.insert(issues).values({ id: childId, companyId: s.companyId, parentId: s.issueId, title: "Check the report", status: "todo",
+        priority: "medium", responsibleUserId: PERSON, issueNumber: 2, identifier: `L${s.companyId.slice(0, 6)}-2`, executionWorkspaceId: cut.rRootWorkspaceId });
+      seen.plantedBoundSubTask = await files(`/api/issues/${childId}`);
     } catch (error) { seen.failure = error; } finally {
       await cut?.finish();
       if (process.env.CLASSIC_OLDROOT_EVIDENCE) await fs.writeFile(process.env.CLASSIC_OLDROOT_EVIDENCE, JSON.stringify(seen, (_key, value) =>
@@ -191,6 +199,19 @@ describe.skipIf(!support.supported)("classic copy-back bound, the old root (rf-5
     expect(String(seen.p2?.providerCwd)).not.toContain(seen.rRootWorkspaceId);
     expect(seen.pRootOnDisk).not.toHaveProperty("notes.md");
     expect(JSON.stringify(seen.pRootOnDisk)).not.toMatch(UNSAVED);
+  });
+
+  it("PLANTED beside the real row: a sub-task still bound to the abandoned row is not served R's root either", () => {
+    for (const [name, probe] of Object.entries(seen.plantedBoundSubTask)) {
+      if (name === "issue") continue;
+      expect(probe.text, `${name} names R's root`).not.toContain(seen.rRootWorkspaceId);
+      expect(probe.text, `${name} carries R's unsaved bytes`).not.toMatch(UNSAVED);
+    }
+    expect(seen.plantedBoundSubTask.issue.body).toMatchObject({ executionWorkspaceId: seen.rRootWorkspaceId });
+    for (const name of ["resolveNotes", "contentNotes", "downloadNotes"] as const) expect(seen.plantedBoundSubTask[name].status, name).toBe(404);
+    // What it is served instead is its parent's CURRENT root (P's), by the existing parent fallback: the saved files.
+    expect(seen.plantedBoundSubTask.list.body).toMatchObject({ workspace: { workspaceId: seen.pRootWorkspaceId } });
+    expect(seen.plantedBoundSubTask.downloadReport).toMatchObject({ status: 200, text: SAVED["report.md"] });
   });
 
   it("R's old root is KEPT for explicit recovery: its bytes are on disk and its row names it as abandoned, closed and never archived", () => {
