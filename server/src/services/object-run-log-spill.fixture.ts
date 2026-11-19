@@ -14,7 +14,11 @@ type Put = Parameters<NonNullable<StorageProvider["putObjectConditional"]>>[0];
 export function spillMemory() {
   const objects = new Map<string, Buffer>();
   const etag = (b: Buffer) => createHash("sha256").update(b).digest("hex");
-  const state = { down: false, payloadPuts: 0 };
+  const state = { down: false, payloadPuts: 0,
+    /** Payload PUTs larger than this fail with EIO (a store that takes only part of a recovery). */
+    maxPayloadBytes: Infinity,
+    /** While set, the next payload PUT waits here first; `held` says it has arrived. */
+    hold: undefined as Promise<void> | undefined, held: false };
   const provider: StorageProvider = {
     id: "s3",
     async putObject() { throw Error("unconditional"); },
@@ -23,7 +27,8 @@ export function spillMemory() {
       if (Buffer.isBuffer(i.body)) chunks.push(i.body);
       else for await (const bytes of i.body) chunks.push(Buffer.from(bytes));
       const body = Buffer.concat(chunks), isHead = i.objectKey.endsWith("/head.json");
-      if (!isHead && state.down) throw Object.assign(new Error("EIO"), { code: "EIO" });
+      if (!isHead && state.hold) { state.held = true; await state.hold; }
+      if (!isHead && (state.down || body.length > state.maxPayloadBytes)) throw Object.assign(new Error("EIO"), { code: "EIO" });
       const old = objects.get(i.objectKey);
       if (i.ifNoneMatch ? old : !old || etag(old) !== i.ifMatch)
         throw Object.assign(Error("conflict"), { name: "PreconditionFailed" });
