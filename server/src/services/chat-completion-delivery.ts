@@ -120,12 +120,28 @@ export async function supersedeStaleChatCompletionWake(tx: Connection, input: {
       eq(handoffs.conversationId, input.conversationId), eq(handoffs.agentId, input.agentId),
       inArray(deliveries.status, [...pending]))).orderBy(asc(deliveries.createdAt), asc(deliveries.id));
   const named: string[] = [];
+  let superseded = false;
   for (const { delivery, task } of rows) {
     const advanced = await tx.update(deliveries).set({ status: "superseded" })
       .where(and(eq(deliveries.companyId, input.companyId), eq(deliveries.id, delivery.id),
         inArray(deliveries.status, [...pending]))).returning({ id: deliveries.id });
+    superseded ||= advanced.length > 0;
     // Only finished tasks are news; a task no longer done owes no report (superseded silently).
     if (advanced.length && task.status === "done") named.push(`${task.identifier ?? task.id} — ${clipForNote(task.title)}`);
+  }
+  if (superseded) {
+    // A blocked younger report may already have taken its retry lease before
+    // seeing this head. Retiring the head makes that obligation due NOW, not
+    // after the unrelated 60-second lease. The ordinary one-head admission
+    // and delivery CAS still arbitrate concurrent workers.
+    await tx.update(deliveries).set({ nextAttemptAt: new Date() }).where(and(
+      eq(deliveries.companyId, input.companyId), eq(deliveries.status, "pending"),
+      isNull(deliveries.targetRunId),
+      sql`exists (select 1 from ${handoffs} h where h.company_id = ${input.companyId}
+        and h.task_id = ${deliveries.taskId} and h.conversation_id = ${input.conversationId}
+        and h.agent_id = ${input.agentId})`,
+    ));
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.chatCompletion);
   }
   if (!named.length) return;
   // RFL words 18:26Z: say it is LATE and that nothing new happened; at most 3 named, then 'and N more'.

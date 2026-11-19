@@ -1,3 +1,4 @@
+import { getServerProcessStartedAt } from "../../../server-info.js";
 import { insertIssueComment } from "../../../services/issue-comment-writes.js";
 import { lockAgentForRunAdmission } from "../../../services/heartbeat-run-admission-lock.js";
 import { pendingContinuationCommentInput } from "../../../services/continuation-comment-input.js";
@@ -413,9 +414,18 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       const [wake] = wakeId ? await tx.select({ stale: deferredWakeIsStaleSql({
         companyId: sql`${agentWakeupRequests.companyId}`, agentId: sql`${agentWakeupRequests.agentId}`,
         issueId: sql`${issueId}::uuid`, requestedAt: sql`${agentWakeupRequests.requestedAt}`, payload: sql`${agentWakeupRequests.payload}`,
-      }) }).from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+      }), requestedAt: agentWakeupRequests.requestedAt,
+        payload: agentWakeupRequests.payload, reason: agentWakeupRequests.reason,
+        requestedByActorType: agentWakeupRequests.requestedByActorType,
+      }).from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
         eq(agentWakeupRequests.id, wakeId), eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS))) : [];
-      const conversationMovedOn = Boolean(wake?.stale);
+      const beforeBoot = Boolean(wake && wake.requestedAt < new Date(getServerProcessStartedAt()));
+      const payload = parseObject(wake?.payload);
+      const context = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
+      const completion = (context.wakeReason ?? wake?.reason) === CHAT_COMPLETION_WAKE_REASON;
+      // A pre-boot completion is historical news, never a late agent turn.
+      // Both restart reconstruction and stale-lock release use this same gate.
+      let conversationMovedOn = Boolean(wake?.stale || (beforeBoot && completion));
       const message = { id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
         issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` };
       // Malformed ids (for example an 8-char short form written into a wake
@@ -428,18 +438,24 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .filter((commentId) => isUuidLike(commentId));
       const rows = queryableCommentIds.length === 0 ? [] : await tx
         .select({ id: issueComments.id, deletedAt: issueComments.deletedAt, createdByRunId: issueComments.createdByRunId,
+          authorType: issueComments.authorType, owedAtBoot: personMessageOwedSql(message),
           owed: conversationMovedOn ? sql<boolean>`(${issueComments.authorType} is distinct from 'user' or
             (${personMessageOwedSql(message)} and not ${newerPersonInputAnsweredSql({ companyId: message.companyId,
               issueId: message.issueId, requestedAt: message.createdAt })}))` : sql<boolean>`true` })
         .from(issueComments)
         .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, queryableCommentIds), currentConversationCommentCondition()));
+      const personRows = rows.filter(row => row.authorType === "user" && !row.deletedAt);
+      const owedPersonAtBoot = personRows.some(row => row.owedAtBoot);
+      if (beforeBoot && personRows.length > 0 && !owedPersonAtBoot) conversationMovedOn = true;
       const targetsFinishingRunAgent = wakeAgentId === finishingRunAgentId;
       const liveAndUnauthored = queryableCommentIds.filter((commentId) => {
         const row = rows.find((candidate) => candidate.id === commentId);
         // The floor retires already-carried input. A never-carried OLD stays
         // owed for its ONE sweep card, not for replay by a stale receipt. Fresh
         // messages coalesced into an old receipt may still be owed delivery.
-        return Boolean(row && row.owed && !row.deletedAt && (!targetsFinishingRunAgent || row.createdByRunId !== finishingRunId));
+        return Boolean(row && row.owed && !row.deletedAt &&
+          (!beforeBoot || row.authorType !== "user" || row.owedAtBoot) &&
+          (!targetsFinishingRunAgent || row.createdByRunId !== finishingRunId));
       });
       // Promoting a saved wake whose comments a completed run already
       // received would deliver them twice and can reopen finished work.
@@ -451,7 +467,13 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       const containedSelfAuthoredComment = rows.some(
         (row) => targetsFinishingRunAgent && !row.deletedAt && row.createdByRunId === finishingRunId,
       );
-      return { liveNonSelfCommentIds, containedSelfAuthoredComment, deliveredCommentIds: [...delivered], conversationMovedOn };
+      // Do not cancel system work without proof that another durable owner
+      // retains its obligation (restore/export/monitor, for example). Preserve
+      // its receipt, skip it for this drain, and allow owed person input behind it.
+      const heldBeforeBoot = beforeBoot && !completion && !owedPersonAtBoot &&
+        (wake?.requestedByActorType !== "user" || personRows.length === 0);
+      return { liveNonSelfCommentIds, containedSelfAuthoredComment, deliveredCommentIds: [...delivered],
+        conversationMovedOn, heldBeforeBoot };
     },
 
     async cancelDeferredWake({ companyId, wakeId, agentId, reason, now }) {
@@ -1637,14 +1659,20 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // A run the fresh-continuation fallback replaced is settled for good: its
         // finalization may stay terminal_failure (restart recovery ended it), and
         // the saved input queued behind it is now the task's next turn.
-        if (input.resumeStrandedQueue && run.runtimeMode === "native" && !agentRunSupersededByFreshContinuation(run)) {
-          const [finalized] = contextIssueId && run.nativeIssueId === contextIssueId
-            ? await tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
+        if (run.runtimeMode === "native" && !agentRunSupersededByFreshContinuation(run)) {
+          const [finalization] = contextIssueId && run.nativeIssueId === contextIssueId
+            ? await tx.select({ phase: nativeRunFinalizations.phase }).from(nativeRunFinalizations).where(and(
                 eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.runId, run.id),
-                eq(nativeRunFinalizations.issueId, run.nativeIssueId), eq(nativeRunFinalizations.phase, "committed"),
+                eq(nativeRunFinalizations.issueId, run.nativeIssueId),
               )).limit(1)
             : [];
-          if (!finalized) return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          // A persisted native result can return before the finalizer's lease is
+          // available. Normal completeRun must not race reconciliation either;
+          // ownership settlement uses this same drain after it commits.
+          const awaitingFinalization = run.status === "succeeded" && finalization && ["observed", "applied"].includes(finalization.phase);
+          if (awaitingFinalization || (input.resumeStrandedQueue && finalization?.phase !== "committed")) {
+            return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          }
         }
         // These two holds protect the old executor's workspace and resources. A
         // continuation in a new isolated workspace (or an abandoned remote epoch)

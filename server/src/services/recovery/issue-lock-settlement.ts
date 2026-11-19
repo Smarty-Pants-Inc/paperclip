@@ -17,11 +17,11 @@ import type { InProgressRecord, SettleOutcome } from "./ownership-registry.js";
 export async function settleIssueLock(db: Db, record: InProgressRecord,
   _context: { now: Date; proof: OwnerProof }): Promise<SettleOutcome> {
   if (record.owner.kind !== "run" || !record.companyId || !record.issueId) return { settled: false, reason: "owner_not_a_run" };
-  const { recoveryService } = await import("./service.js");
-  const result = await recoveryService(db, {
-    // Clearing a stale lock never starts work itself; the release drain does.
-    enqueueWakeup: async () => null,
-  }).sweepStaleIssueLocks({ companyId: record.companyId, issueId: record.issueId });
+  // Use the same wired sweep as live heartbeat recovery. A bare recovery
+  // service can win the guarded lock clear without releasing the deferred
+  // queue, permanently losing the only terminal-owner handoff.
+  const { heartbeatService } = await import("../heartbeat.js");
+  const result = await heartbeatService(db).sweepStaleIssueLocks({ companyId: record.companyId, issueId: record.issueId });
   return result.issueIds.includes(record.issueId)
     ? { settled: true, reason: "stale_lock_cleared" }
     : { settled: false, reason: "lock_still_needed" };
