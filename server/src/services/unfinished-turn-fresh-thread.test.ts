@@ -26,8 +26,12 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents, agentTaskSessions, companies, completionContracts, createDb, environmentLeases, environments, heartbeatRuns, issueComments,
-  issueRecoveryActions, issues, nativeRunFinalizations, nativeRunResults,
+  issueRecoveryActions, issues, nativeRunFinalizations, nativeRunResults, plugins,
 } from "@paperclipai/db";
+import type { Environment } from "@paperclipai/shared";
+import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+import { environmentRuntimeService } from "./environment-runtime.js";
+import { heartbeatService } from "./heartbeat.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { PI_CONVERSATION_KEY, selectPiConversation } from "./native-runtime/pi-conversation-record.js";
@@ -388,5 +392,131 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(envelope.schema).not.toBe("paperclip.native-continuation.v1");
     expect(await actions(f)).toHaveLength(1);
     expect(await notes(f)).toHaveLength(1);
+  });
+
+  // R-REAL (closest real-producer row in-process; RULING-FIXTURES-FROM-REAL-PRODUCER-1118). REAL: LEASE via
+  // environmentRuntimeService.acquireRunLease (plugin sandbox driver), P's Pi pointer via selectPiConversation
+  // (first_message), STOP via heartbeatService.releaseEnvironmentLeasesForRun -> run-control ->
+  // environment-runtime releaseRunLeases -> the provider's stop -> the real remoteTerminationReceipt writer,
+  // admission at selectPiConversation, the submitted startTurn envelope via executeNativeSession.
+  // STUBBED / PLANTED (named): the provider allocation/RPC boundary (a fake plugin worker), SEND (comment rows are
+  // inserted; POST /comments + wakeup are not driven), FAIL (P/S0 terminal_failure rows are written as the
+  // controller watchdog would, as native-pi-rpc-retry-fresh-thread.e2e seeds them), P's controller journal with
+  // pending turn.interrupt/turn.stop/runner.suspend (no runner process), and the answer/GET/screen (no model).
+  it("R-REAL: SEND -> LEASE -> FAIL (controls pending) -> real STOP receipt -> SEND(S0) -> STOP -> SEND(S): one fresh thread, fact in startTurn", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), pluginId = randomUUID(), provider = `boat-${pluginId}`;
+    const boxes: string[] = [], calls: Array<{ method: string; providerLeaseId?: unknown }> = [];
+    await db.insert(companies).values({ id: companyId, name: "7e625560 real", defaultResponsibleUserId: "board", issuePrefix: `R${companyId.replaceAll("-", "").slice(0, 12)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Native", role: "engineer", adapterType: "paperclip_runner", status: "idle",
+      adapterConfig: { provider: "pi_rpc" }, runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Paul's chat", status: "in_progress", assigneeAgentId: agentId });
+    const supportedMethods = ["environmentAcquireLease", "environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease",
+      "environmentStopLease", "environmentInspectLease", "environmentExecute", "environmentRunnerIngressEndpoint", "environmentRealizeWorkspace"];
+    await db.insert(plugins).values({ id: pluginId, pluginKey: provider, packageName: "boat-fixture", version: "1.0.0", apiVersion: 1,
+      categories: ["automation"], status: "ready", manifestJson: { id: provider, apiVersion: 1, version: "1.0.0", displayName: "Boat",
+        description: "fake allocation; real driver", author: "Paperclip", categories: ["automation"], capabilities: ["environment.drivers.register"],
+        entrypoints: { worker: "dist/worker.js" }, environmentDrivers: [{ driverKey: provider, kind: "sandbox_provider", displayName: "Boat",
+          sandboxCapabilities: { reusableLeases: true, runnerWebSocketIngress: true, persistentProcessSessions: false, incrementalSessionOutput: false },
+          configSchema: { type: "object", properties: { image: { type: "string" }, reuseLease: { type: "boolean" } } } }] } } as never);
+    const [environment] = await db.insert(environments).values({ companyId, name: `boat-${issueId}`, driver: "sandbox", status: "active",
+      config: { provider, image: "fixture:boat", reuseLease: false } } as never).returning();
+    const worker = { isRunning: (id: string) => id === pluginId, getWorker: (id: string) => id === pluginId ? { supportedMethods } : undefined,
+      stopAll: async () => {}, stopWorker: async () => {}, onConfigApplied: () => () => {},
+      call: async (_id: string, method: string, input: Record<string, unknown>) => {
+        calls.push({ method, providerLeaseId: input.providerLeaseId });
+        if (method === "environmentAcquireLease") { const box = `bx_${boxes.length}_${randomUUID().slice(0, 8)}`; boxes.push(box);
+          return { providerLeaseId: box, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), metadata: { remoteCwd: "/workspace" } }; }
+        if (method === "environmentStopLease" || method === "environmentReleaseLease" || method === "environmentDestroyLease")
+          return { providerLeaseId: String(input.providerLeaseId), state: "stopped" };
+        if (method === "environmentInspectLease") return { providerLeaseId: String(input.providerLeaseId), state: "stopped", observedAt: new Date().toISOString() };
+        throw new Error(`unexpected provider RPC ${method}`);
+      } } as unknown as PluginWorkerManager;
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: worker });
+    const heartbeat = heartbeatService(db, { environmentRuntime: runtime, pluginWorkerManager: worker });
+    const boundary = { provider: "pi_rpc", cwd: "/workspace", remoteCwd: "/workspace", workspaceId: null, trust: "t" };
+    const send = async (body: string) => (await db.insert(issueComments).values({ companyId, issueId, body, authorType: "user", authorUserId: "board" }).returning())[0]!;
+    const lease = async (runId: string) => runtime.acquireRunLease({ companyId, environment: environment as Environment, heartbeatRunId: runId,
+      issueId, agentId, adapterType: "paperclip_runner", persistedExecutionWorkspace: null } as never);
+    const fail = async (runId: string, attempt: number) => {
+      await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_continuation_requires_reconciliation", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+      await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, phase: "terminal_failure", attempt, controllerGeneration: attempt,
+        recoveryState: "blocked", failureCode: "native_continuation_requires_reconciliation" });
+    };
+    const stop = async (runId: string) => {
+      await heartbeat.releaseEnvironmentLeasesForRun({ runId, companyId, agentId, status: "failed" } as never);
+      const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, runId));
+      return row!;
+    };
+    // SEND -> P on box 0: the pointer is written by the real selector (first_message).
+    const first = await send("Please start the report.");
+    const P = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: P, companyId, agentId, nativeIssueId: issueId, runtimeMode: "native", status: "running",
+      invocationSource: "on_demand", contextSnapshot: { issueId, wakeCommentId: first.id } });
+    await lease(P);
+    const pointer = await selectPiConversation(db, { companyId, agentId, issueId, runId: P, boundary });
+    const pRunner = randomUUID();
+    const pExecution = buildNativeExecutionInput({ companyId, agentId, runId: P, provider: "pi_rpc", model: "paperclip/faux", piRpcThinkingLevel: "xhigh",
+      issue: { id: issueId, identifier: "R-1", title: "Paul's chat", description: null, workMode: "standard" }, taskPrompt: first.body,
+      workspace: { id: randomUUID(), cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, normalizedSessionId: pointer.id,
+      lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 }, runtimeContext: nativeRuntimeContextFixture(),
+      completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1",
+        contract: { revision: "1", objective: "Answer", criteria: [{ id: "work", requirement: "Answer" }] } } } as never);
+    await db.update(heartbeatRuns).set({ nativeSessionId: pointer.id, runnerInstanceId: pRunner, runnerProfileJson: { nativeExecutionInput: pExecution } }).where(eq(heartbeatRuns.id, P));
+    // FAIL: P's runner cannot ack: turn.interrupt / turn.stop / runner.suspend stay pending (PLANTED journal, Q1-shaped copy).
+    const copy = join(stateBase, "quarantine", `${scopedRunnerdStateRoot(pExecution as never).split("/").pop()}.identity_indeterminate.1.1`);
+    await mkdir(join(copy, "control-plane"), { recursive: true, mode: 0o700 });
+    await writeFile(join(copy, "control-plane", "control-plane-state.json"), JSON.stringify({ schema: "paperclip.runner.durable.control-plane-state.v2",
+      identity: { runId: P, normalizedSessionId: pointer.id, runnerInstanceId: pRunner, environmentLeaseId: randomUUID() },
+      commands: [{ seq: 1, type: "turn.start", status: "completed" }, { seq: 2, type: "turn.interrupt", status: "pending" },
+        { seq: 3, type: "turn.stop", status: "pending" }, { seq: 4, type: "runner.suspend", status: "pending" }], committedEvents: [] }));
+    await fail(P, 2);
+    const pLease = await stop(P);
+    // The real receipt writer's typed receipt.
+    expect(pLease.metadata?.remoteExecutionTermination).toMatchObject({ runId: P, providerLeaseId: boxes[0], state: "stopped" });
+    // SEND -> S0 on box 1, refused (FAIL) and stopped through the same real path.
+    const second = await send("Are you there?");
+    const S0 = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: S0, companyId, agentId, nativeIssueId: issueId, runtimeMode: "native", status: "running",
+      nativeSessionId: pointer.id, invocationSource: "on_demand", contextSnapshot: { issueId, wakeCommentId: second.id } });
+    await lease(S0);
+    await fail(S0, 0);
+    expect((await stop(S0)).metadata?.remoteExecutionTermination).toMatchObject({ runId: S0, providerLeaseId: boxes[1], state: "stopped" });
+    // SEND -> S on box 2: the person's next authorized message.
+    const third = await send("What happened to the previous turn, and what work is still outstanding?");
+    const S = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: S, companyId, agentId, nativeIssueId: issueId, runtimeMode: "native", status: "running",
+      invocationSource: "on_demand", contextSnapshot: { issueId, wakeCommentId: third.id, explicitUserContinuation: { commentId: third.id, actorId: "board" } } });
+    await lease(S);
+    expect(new Set(boxes).size).toBe(3);
+    const before = await inventory(stateBase);
+    const selected = await selectPiConversation(db, { companyId, agentId, issueId, runId: S, boundary });
+    expect(await inventory(stateBase), "Q5: P's copy byte-identical").toEqual(before);
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect({ previousId: selected.previousId, reason: selected.reason, runId: selected.runId })
+      .toEqual({ previousId: pointer.id, reason: `fresh_continuation:${action?.id}`, runId: S });
+    expect(selected.id).not.toBe(pointer.id);
+    const systemNotes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")));
+    expect(systemNotes.map(note => note.body)).toEqual([NOTE]);
+    // Once: the same S again gives the same thread and nothing new.
+    expect((await selectPiConversation(db, { companyId, agentId, issueId, runId: S, boundary })).id).toBe(selected.id);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(1);
+    // The submitted input: S's prompt carries the fact into the Pi session's startTurn.
+    const { readUnfinishedTurnEntry } = await import("./fresh-continuation-fallback.js");
+    const entry = await readUnfinishedTurnEntry(db, { companyId, runId: S, actionId: action!.id });
+    const s = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, S)))[0]!;
+    const packet = await createNativeSessionHandoffLoader({ db, companyId, issueId, agentId, before: s.createdAt, throughCommentId: third.id })(entry as never);
+    const execution = buildNativeExecutionInput({ companyId, agentId, runId: S, provider: "pi_rpc", model: "paperclip/faux", piRpcThinkingLevel: "xhigh",
+      issue: { id: issueId, identifier: "R-1", title: "Paul's chat", description: null, workMode: "standard" },
+      taskPrompt: ["# R-1: Paul's chat", packet].filter(Boolean).join("\n\n"),
+      workspace: { id: randomUUID(), cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, normalizedSessionId: selected.id,
+      lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 }, runtimeContext: nativeRuntimeContextFixture(),
+      completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1",
+        contract: { revision: "1", objective: "Answer", criteria: [{ id: "work", requirement: "Answer" }] } } } as never);
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: execution } }).where(eq(heartbeatRuns.id, S));
+    const starts = await startTurnInput(database.connectionString, S);
+    expect(starts, starts.outcome).toHaveLength(1);
+    expect(JSON.parse(starts[0]!.message.text).task.prompt).toContain(FACT);
+    console.log(`R-REAL-EVIDENCE ${JSON.stringify({ P, S0, S, boxes, pointer: pointer.id, selected: selected.id, actionId: action!.id,
+      receiptP: pLease.metadata?.remoteExecutionTermination, providerCalls: calls.map(call => call.method) })}`);
   });
 });
