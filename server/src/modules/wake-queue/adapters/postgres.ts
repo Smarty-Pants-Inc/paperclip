@@ -18,6 +18,7 @@ import { currentConversationCommentCondition, isConversationReset } from "../../
 import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
 import { nativeManualAdmissionHoldsExecution } from "../../../services/native-runtime/native-runner-ownership.js";
 import { readSteeredMessageAnswers } from "../../../services/native-runtime/steered-message-answers.js";
+import { answeredPersonMessageSql } from "../../../services/person-message-answer.js";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
 import { steeringIngestionPending, waitForSteeringIngestion } from "../../../services/native-runtime/steering-ingestion.js";
@@ -972,7 +973,16 @@ async function restoreUnansweredSteersAtRunEnd(tx: Db, run: ReleaseRun, issue: I
   const result = parseObject(current.resultJson);
   const strings = (value: unknown) => Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
   const accounted = new Set([...strings(result.stopRestoredSteeredCommentIds), ...strings(result.restoredSteeredCommentIds),
-    ...strings(result.interruptCarriedSteeredCommentIds), ...strings(context.answeredSteeredCommentIds)]);
+    ...strings(result.interruptCarriedSteeredCommentIds), ...strings(context.answeredSteeredCommentIds),
+    // The ONE answered predicate can already discharge M while its RPC ACK is
+    // still in flight. Never restore that answered input on receipt state alone.
+    ...(await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, issue.id),
+      inArray(issueComments.id, [...strings(context.steeredCommentIds),
+        ...Object.keys(parseObject(result.queuedSteeringAcknowledgements))].filter(isUuidLike)),
+      answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+        issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }),
+    ))).map(({ id }) => id)]);
   // In the order they were steered (rf5 F3), never JSONB key order: steeredCommentIds is appended by the
   // steer route in the same transaction that records each acknowledgement, under the run-row lock, and only
   // the queue head can be steered, so it is the person's queue order. Then the ack time, then the id.
