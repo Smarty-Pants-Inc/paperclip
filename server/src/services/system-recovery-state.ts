@@ -245,6 +245,18 @@ function unrecoverableSavedFilesReason(failure: RecoveryFailure) {
 export { REPLY_FILES_NOT_SAVED_LINE, REPLY_FILES_PARTLY_SAVED_LINE, REPLY_FILES_LOST_WAITING_LINE,
   CHECKOUT_CONTINUE_REQUIRED_REASON } from "@paperclipai/shared";
 
+/** The gate's two waits for a reply's SPENT file recovery, refused or failed (explicit-native-continuation.ts, the
+ * `blocked("saved_work_recovery_refused" | "saved_work_recovery_failed", ...)` branch). The gate names them only while
+ * that reply's file line does NOT read LOST. Once the line reads LOST (and the recovery is not one of the three
+ * unrecoverable codes) the same gate holds nothing on the spent recovery: the person's message continues on the
+ * checkout, and the gate names the stop wait or the checkout hold instead. A stored one of these beside a LOST line is
+ * therefore the gate's answer from BEFORE the line settled, kept on the waiting message until the gate runs again. It
+ * is not that message's wait any more (and its words speak of a Retry the person never pressed). */
+export const SPENT_FILE_RECOVERY_WAIT_REASONS = ["saved_work_recovery_refused", "saved_work_recovery_failed"] as const;
+export function isSpentFileRecoveryWaitReason(reason: unknown): boolean {
+  return (SPENT_FILE_RECOVERY_WAIT_REASONS as readonly unknown[]).includes(reason);
+}
+
 /** The person's ONE action on a mixed checkout, "Continue with the files as they are", recorded on the hold's
  * recovery action by POST /api/issues/:id/retry (task-retry.ts) and read by the gate (explicit-native-continuation.ts). */
 export function checkoutContinueChosen(evidence: Record<string, unknown> | null | undefined, sourceRunId: string) {
