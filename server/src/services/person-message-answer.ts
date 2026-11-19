@@ -106,15 +106,24 @@ export const UNANSWERED_MESSAGE_REASON_PREFIX = "unanswered_message:";
 export const UNANSWERED_MESSAGE_GROUP_KEY = "unansweredMessageIds";
 
 /** A FAILED run, for the membership below: it ended without completing (failed, timed out or interrupted), or it
- * was CANCELLED by anything but a person (rf-3 01:03Z: cancelledByActorType is not "user": the budget fan-out, a
- * system or recovery cancel, a managing agent's stop). No path answers the messages of such a run (the sweep owes
- * them a notice like a failed run's), so they are owed the same way. A run a PERSON stopped (the Stop and Interrupt
- * routes record cancelledByActorType "user", routes/agents.ts:7581-7584) is a Stop, a succeeded run is not a
- * failure, a live run has not ended. */
+ * was CANCELLED by anything but the message's SENDER (ruling 8; rf-3 06:10Z (b), RFL 06:11Z): the budget fan-out, a
+ * system or recovery cancel, a managing agent's stop (rf-3 01:03Z: cancelledByActorType is not "user"), ANOTHER
+ * person's Stop, and a Stop whose actor is unknown (a NULL or absent cancelledByUserId is NOT the sender). No path
+ * answers the messages of such a run (the sweep owes them a notice like a failed run's: person-stopped-message.ts
+ * stoppedBySender exempts only the sender's own Stop), so they are owed the same way. Only the SENDER's own Stop
+ * (the Stop and Interrupt routes record cancelledByActorType "user" + cancelledByUserId, routes/agents.ts:7581-7584)
+ * is a Stop of that message; a succeeded run is not a failure, a live run has not ended. */
 export const FAILED_RUN_STATUSES = ["failed", "timed_out", "interrupted"] as const;
-/** SQL over run alias r: the run is a FAILED run (above). The ONE copy for the membership. */
+/** SQL over run alias r: the run ENDED without completing: a FAILED status, or cancelled by anyone. Which of the
+ * cancelled ones count for a member is decided per member by notSendersOwnStopSql (the sender differs by member). */
 const failedRunSql = () => sql`(r.status in (${sql.join(FAILED_RUN_STATUSES.map(status => sql`${status}`), sql`, `)})
-  or (r.status = 'cancelled' and coalesce(r.result_json->>'cancelledByActorType', '') <> 'user'))`;
+  or r.status = 'cancelled')`;
+/** SQL over run alias r and a member's sender id: the run is a FAILED run FOR THIS SENDER (above): not cancelled, or
+ * cancelled by anything but this sender's own Stop. NULL-SAFE: the comparison is true only when a person's Stop
+ * records an actor id AND the member has a sender AND the two are equal; a NULL on either side is "not the
+ * sender" (coalesce(..., false)), so the message stays a member. The ONE copy for the membership. */
+const notSendersOwnStopSql = (senderUserId: SQL) => sql`(r.status <> 'cancelled'
+  or not coalesce(r.result_json->>'cancelledByActorType' = 'user' and r.result_json->>'cancelledByUserId' = ${senderUserId}, false))`;
 /** The membership's fixed order: oldest message first, the message id as the tie-break. */
 export const FAILED_OWN_PERSON_MESSAGE_ORDER = "message created_at asc, message id asc" as const;
 const MEMBERSHIP_PAGE_SIZE = 200;
@@ -194,7 +203,7 @@ function failedOwnPersonMessagePageSql(input: { companyId: string; issueId: stri
         join ${issueComments} m on m.id = c.message_id
         join ${heartbeatRuns} r on r.id = c.run_id and r.company_id = m.company_id
         where m.company_id = ${input.companyId}::uuid and m.issue_id = ${input.issueId}::uuid and m.author_type = 'user' and m.deleted_at is null
-          and ${ownInputNamesSql(sql.raw("m.id"))}
+          and ${ownInputNamesSql(sql.raw("m.id"))} and ${notSendersOwnStopSql(sql.raw("m.author_user_id"))}
         group by m.id, m.company_id, m.issue_id, m.created_at, m.author_user_id
         union all
         select q.id, q.company_id, q.issue_id, q.resolved_at as created_at, q.resolved_by_user_id as author_user_id, 'card_answer'::text as kind,
@@ -204,7 +213,7 @@ function failedOwnPersonMessagePageSql(input: { companyId: string; issueId: stri
         join ${heartbeatRuns} r on r.id = c.run_id and r.company_id = q.company_id
         where q.company_id = ${input.companyId}::uuid and q.issue_id = ${input.issueId}::uuid and q.created_by_agent_id is not null
           and q.resolved_by_user_id is not null and q.resolved_at is not null and q.status in ('answered', 'accepted', 'rejected')
-          and ${ownInputNamesSql(sql.raw("q.id"))}
+          and ${ownInputNamesSql(sql.raw("q.id"))} and ${notSendersOwnStopSql(sql.raw("q.resolved_by_user_id"))}
         group by q.id, q.company_id, q.issue_id, q.resolved_at, q.resolved_by_user_id
       ) u
       ${input.after ? sql`where (u.created_at, u.id) > (${input.after.createdAt}::timestamptz, ${input.after.messageId}::uuid)` : sql``}
@@ -228,7 +237,7 @@ function failedOwnPersonMessagePageSql(input: { companyId: string; issueId: stri
 
 /** The MEMBERSHIP of a task's failed-run person messages (rf-3 r3d item 1): every live person message of this
  * task and company, and every person's ANSWER to an agent's card (rf-3 01:03Z (2); `kind`), that a FAILED run of
- * the task (FAILED_RUN_STATUSES, or cancelled by anything but a person) names in its OWN input (ownInputNamesSql,
+ * the task (FAILED_RUN_STATUSES, or cancelled by anything but the member's SENDER's own Stop, NULL-safe) names in its OWN input (ownInputNamesSql,
  * the one copy; never history, ancestry or a later input), each with its newest such run, whether it is ANSWERED (only through
  * answeredPersonMessageSql) and the group it is noticed in (read from the notice's metadata.unansweredMessageIds
  * where a group notice exists; never re-derived).

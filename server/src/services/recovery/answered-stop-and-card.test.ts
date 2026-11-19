@@ -382,6 +382,45 @@ describe.skipIf(!support.supported)("the sender's own Stop and an answerable car
       "M1 (system-cancelled run) is a member; M2 (the sender's own Stop) is not").toEqual([[m1, "message", run1, false]]);
   }, 60_000);
 
+  // rf-3 06:10Z (b) + RFL 06:11Z (ruling 8): the membership keys on "NOT the SENDER's own Stop", NULL-safe. A
+  // cancelled run leaves its message a member unless the person who stopped it IS the message's sender; an unknown
+  // (NULL) stopper is not the sender. The three Stops are the REAL route (POST /heartbeat-runs/:runId/cancel ->
+  // heartbeatService.cancelRun, routes/agents.ts), read back from the run row; the outcome is the real membership read.
+  it("rf-3 membership (b): ANOTHER user's real Stop -> member; the SENDER's own real Stop -> not; a NULL stopper -> member", async () => {
+    const f = await fixture();
+    const read = async () => (await readTaskFailedOwnPersonMessageMembership(db, { companyId: f.companyId, issueId: f.issueId })).members
+      .map(member => [member.messageId, member.kind, member.authorUserId, member.failedRunId, member.failedRunCount, member.answered]);
+    // (i) another board user presses Stop on the run that carries the sender's message.
+    const m1 = await f.send("M1: write the document.");
+    const run1 = await f.startRun(m1);
+    expect((await f.stop(run1, f.other)).resultJson, "the real route records the OTHER user").toMatchObject({
+      cancelledByActorType: "user", cancelledByUserId: f.other });
+    expect(await read(), "another user's Stop: M1 is a member").toEqual([[m1, "message", f.sender, run1, 1, false]]);
+    // (ii) the sender presses Stop on their own message's run.
+    const m2 = await f.send("M2: and the summary.");
+    const run2 = await f.startRun(m2);
+    expect((await f.stop(run2, f.sender)).resultJson, "the real route records the SENDER").toMatchObject({
+      cancelledByActorType: "user", cancelledByUserId: f.sender });
+    expect(await read(), "the sender's own Stop: M2 is NOT a member; M1 still is").toEqual([[m1, "message", f.sender, run1, 1, false]]);
+    // (iii) a person's Stop whose actor id is unknown. PLANTED, and named so, beside the two real-route rows of the
+    // same shape above: the real route always records the board user's id (routes/agents.ts cancel handler), so the
+    // run is stopped through the REAL route (by the sender) and ONLY cancelledByUserId is then set to JSON null.
+    const m3 = await f.send("M3: and the appendix.");
+    const run3 = await f.startRun(m3);
+    await f.stop(run3, f.sender);
+    expect(await read(), "before the plant it is the sender's own Stop: not a member").toEqual([[m1, "message", f.sender, run1, 1, false]]);
+    await db.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(${heartbeatRuns.resultJson}, '{cancelledByUserId}', 'null'::jsonb)` })
+      .where(eq(heartbeatRuns.id, run3));
+    expect((await f.readRun(run3)).resultJson, "planted: a person's Stop with no actor id").toMatchObject({
+      cancelledByActorType: "user", cancelledByUserId: null });
+    expect(await read(), "a NULL stopper is NOT the sender: M3 is a member").toEqual([
+      [m1, "message", f.sender, run1, 1, false], [m3, "message", f.sender, run3, 1, false]]);
+    // ...and with the key absent altogether (planted, the same shape).
+    await db.update(heartbeatRuns).set({ resultJson: sql`${heartbeatRuns.resultJson} - 'cancelledByUserId'` }).where(eq(heartbeatRuns.id, run3));
+    expect(await read(), "an absent stopper id is NOT the sender: M3 is a member").toEqual([
+      [m1, "message", f.sender, run1, 1, false], [m3, "message", f.sender, run3, 1, false]]);
+  }, 60_000);
+
   // (2) a card answer the failed run never consumed IS a member: the same input owed to a failed run, keyed by the
   //     card id, dated by the answer (resolved_at), sent by the person who answered. Real answer (the interaction
   //     service); the run that took the answer and its outcome are planted (fixture resumeRun).
