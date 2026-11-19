@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
-import { heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { heartbeatRunEvents, heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
 import { withSteeredCommentDisplay, type SteeredCommentDisplay } from "./conversation-steering.js";
+import { answeredPersonMessageSql } from "./person-message-answer.js";
 
 export { PAPERCLIP_RECEIVED_MID_TASK_LABEL } from "@paperclipai/adapter-utils/server-utils";
 
@@ -71,18 +72,36 @@ export async function withCarriedSteerDisplay<T extends { id: string; issueId: s
       eq(heartbeatRunEvents.eventType, "item.started"),
       sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' = 'userMessage'`,
     )).orderBy(asc(heartbeatRunEvents.seq)) : [];
+  const carrierOf = (comment: { id: string }) => carriers.find(run => ids(run.context?.carriedSteeredCommentIds).includes(comment.id) &&
+    ![...ids(run.result?.restoredSteeredCommentIds), ...ids(run.result?.stopRestoredSteeredCommentIds)].includes(comment.id));
+  const endedOf = (comment: { id: string }) => runs.find(run => ids(run.context?.steeredCommentIds).includes(comment.id) ||
+    ids(run.result?.restoredSteeredCommentIds).includes(comment.id) || ids(run.result?.stopRestoredSteeredCommentIds).includes(comment.id) ||
+    ["pending", "acknowledged"].includes(String(object(object(run.result?.queuedSteeringAcknowledgements)[comment.id]).status)));
+  // An ended run's never-'delivered' steer may still have been ANSWERED: builds
+  // before A2r3 recorded no read seq (old 'accepted') or no steering fields at
+  // all. The ONE answered predicate (person-message-answer.ts) decides; an
+  // answered message is never 'Not delivered' and never 'Sent' forever.
+  const endedIds = displayed.filter(comment => endedOf(comment)).map(comment => comment.id);
+  const answered = new Set(endedIds.length ? (await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, first.companyId), eq(issueComments.issueId, first.issueId), inArray(issueComments.id, endedIds),
+    answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }),
+  ))).map(row => row.id) : []);
   return displayed.map<T & CarriedSteerDisplay>(comment => {
-    const carrier = carriers.find(run => ids(run.context?.carriedSteeredCommentIds).includes(comment.id) &&
-      ![...ids(run.result?.restoredSteeredCommentIds), ...ids(run.result?.stopRestoredSteeredCommentIds)].includes(comment.id));
+    const carrier = carrierOf(comment);
     const read = carrier && reads.find(event => event.runId === carrier.id);
     if (carrier && (read || ["queued", "running", "scheduled_retry"].includes(carrier.status))) {
       return { ...comment, steeringStatus: read ? "delivered" : "carried", carriedIntoRunId: carrier.id,
         steeringDeliveryEventSeq: read ? Number(read.seq) : null,
         deliveryOutcome: "ordinary", steeringUnavailableReason: null };
     }
-    const ended = runs.find(run => ids(run.context?.steeredCommentIds).includes(comment.id) ||
-      ids(run.result?.restoredSteeredCommentIds).includes(comment.id) || ids(run.result?.stopRestoredSteeredCommentIds).includes(comment.id) ||
-      ["pending", "acknowledged"].includes(String(object(object(run.result?.queuedSteeringAcknowledgements)[comment.id]).status)));
+    const ended = endedOf(comment);
+    if (ended && answered.has(comment.id)) {
+      // Answered: the agent read it. A steered bubble reads as read; one with
+      // no steering fields stays an ordinary message with no label.
+      return { ...comment, carriedIntoRunId: null, steeringUnavailableReason: null,
+        steeringStatus: comment.steeringStatus === "accepted" ? "delivered" : comment.steeringStatus };
+    }
     const restored = ended && [...ids(ended.result?.restoredSteeredCommentIds), ...ids(ended.result?.stopRestoredSteeredCommentIds)].includes(comment.id);
     if (ended && (restored || (!["queued", "running", "scheduled_retry"].includes(ended.status) && comment.steeringStatus !== "delivered"))) {
       return { ...comment, steeringStatus: null, carriedIntoRunId: null, steeringDeliveryEventSeq: null,
