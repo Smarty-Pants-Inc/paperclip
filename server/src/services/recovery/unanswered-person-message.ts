@@ -80,8 +80,9 @@ const WAITING_ROW_JSON = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL }] 
 /** The agent that answers the conversation is paused (or held) and will not
  * run until it is resumed. Not a failure: a waiting-kind note. */
 export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";
-/** A resumed agent's own pause cancelled this message's unbound wake, not a failure.
- * Started runs retain final5c3's existing started-run notice policy. */
+/** A resumed agent's own pause cancelled this message's unbound wake (pausewake,
+ * no-run path) or stopped this message's run (errorCode agent_paused, 42fd1d9e):
+ * not a failure, and Resume replays neither. One code, one note. */
 const PAUSE_STOPPED_CODE = "agent_pause_stopped";
 /** Setup completes by itself; a stalled setup gets one factual waiting note. */
 export const UNANSWERED_MESSAGE_AGENT_SETUP_CODE = "agent_setup";
@@ -1154,7 +1155,11 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
           ...(t0 === null ? { recordDeferral: { runId: run.id, agentId: run.agentId, messageId: message.id } } : {}) };
       }
     }
-    code = run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
+    // An intentional pause cancellation (the pause route's cancelActiveForAgent,
+    // heartbeat.ts) is not an unanswered failed attempt. Resume does not replay
+    // it: give the true manual remedy, never the resend-is-safe text.
+    code = run.status === "cancelled" && run.errorCode === "agent_paused" ? PAUSE_STOPPED_CODE
+      : run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
   }
 
   // A recovery notice attached to this message's failed run already gives
@@ -1209,7 +1214,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     && run && TERMINAL.includes(run.status));
   // The ONE bound: the message's automatic lineage used its K=2 fresh
   // continuations and the last one failed. Nothing further starts by itself.
-  const boundReached = Boolean(!paused && !waiting && run && TERMINAL.includes(run.status) && run.status !== "succeeded"
+  const boundReached = Boolean(!paused && !pauseStopped && !waiting && run && TERMINAL.includes(run.status) && run.status !== "succeeded"
     && (await freshContinuationChain(q as Db, { companyId: issue.companyId, issueId: issue.id, runId: run.id })).attempts
       >= FRESH_CONTINUATION_BOUND);
   // Server-local HH:MM: the instance's time zone, not an assumed UTC zone.
@@ -1225,8 +1230,9 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     ? `Your message is saved: "${message.body}". It was not answered because no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.`
     : UNANSWERED_MESSAGE_NO_RUN_TEXT;
   const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
-    : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+    : paused ? agentPausedText(pausedName)
     : pauseStopped ? `${pausedName} was paused before it answered your message. Send it again to continue.`
+    : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? (workingEnded ? UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT : UNANSWERED_MESSAGE_NO_REPLY_TEXT)
@@ -1234,15 +1240,15 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
       : held ? HELD_PREDECESSOR_NOTICE : workingEnded ? UNANSWERED_MESSAGE_STARTED_FAILED_TEXT : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
-      title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start"
-        : pauseStopped ? `${pausedName} was paused before it answered` : "Your message wasn't answered",
+      title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused`
+        : pauseStopped ? `${pausedName} was paused before it answered` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",
       body,
       tone: paused ? "warning" : waiting ? "info" : "warning",
       nextAction: policyRefused ? "Automatic retry is disabled for this request."
         : settingUp ? "No action is needed; your message is saved."
         : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
-        : waiting ? "No action is needed; it will start by itself."
         : pauseStopped ? "Send it again to continue."
+        : waiting ? "No action is needed; it will start by itself."
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : held || boundReached ? "Send a new message to try again."
         : workingEnded ? UNANSWERED_MESSAGE_STARTED_NEXT_ACTION : "Send the message again; if it fails again, assign this agent a new task.",
@@ -1250,7 +1256,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,
     recoveryResponsibility: "user",
-    sourceRun: run && !waiting ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: code } : null,
+    sourceRun: run && !waiting ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: pauseStopped ? null : code } : null,
     // A waiting note is not a failure: no "Failure code" row, a marker row instead.
     failureCode: waiting || pauseStopped ? undefined : run ? undefined : code,
   });
