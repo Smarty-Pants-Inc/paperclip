@@ -388,21 +388,42 @@ export function isSystemEndedRun(run: { status: string; resultJson: Record<strin
 }
 
 /** adopt-stop-marker (RFL F1): this run is the FIRST turn after a person's Stop when the ONE person-Stop fact
- * (readAcceptedPersonStop) names this agent's run on the issue that came right before it. Its input then says
- * so once (PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE), as Claude Code's '[Request interrupted by user]' does;
- * a later turn, an Interrupt, an agent's or the system's cancel never match. */
+ * (readAcceptedPersonStop) names this agent's STOPPED run on the issue, and no run of this agent on the issue
+ * between that stopped run and this one actually started a provider turn. Its input then says so once
+ * (PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE), as Claude Code's '[Request interrupted by user]' does.
+ * adopt-marker-restore (rf-4): a run in between that ENDED without provider work (e.g. the Send's run that
+ * failed native_continuation_requires_reconciliation before any turn) never consumed the marker, so the first
+ * run that does reach the provider (the automatic fresh-thread restore, a retry, a new message) carries it.
+ * A later turn (one that reached the provider since), an Interrupt, an agent's or the system's cancel never match. */
 export async function readPersonStoppedPreviousTurn(db: Db, input: {
   companyId: string; issueId: string; agentId: string; runId: string; runCreatedAt: Date;
 }): Promise<boolean> {
   const stop = await readAcceptedPersonStop(db, input);
   if (!stop) return false;
   const onIssue = or(eq(heartbeatRuns.nativeIssueId, input.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`);
-  const [previous] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+  if (stop.runId === input.runId) return false;
+  const [stopped] = await db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, stop.runId)));
+  if (!stopped || stopped.createdAt.getTime() > input.runCreatedAt.getTime()) return false;
+  const between = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), onIssue,
-    sql`${heartbeatRuns.id} <> ${input.runId}`, sql`${heartbeatRuns.createdAt} <= ${input.runCreatedAt.toISOString()}::timestamptz`))
-    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-  return previous?.id === stop.runId;
+    sql`${heartbeatRuns.id} <> ${input.runId}`, sql`${heartbeatRuns.id} <> ${stop.runId}`,
+    sql`${heartbeatRuns.createdAt} >= ${stopped.createdAt.toISOString()}::timestamptz`,
+    sql`${heartbeatRuns.createdAt} <= ${input.runCreatedAt.toISOString()}::timestamptz`));
+  if (between.length === 0) return true;
+  const { provesNoNativeRunProviderWork } = await import("./native-runtime/native-provider-work-proof.js");
+  for (const run of between) {
+    // Only an ENDED-unsuccessful run with no recorded provider work leaves the marker for the next one; a run
+    // that succeeded, is still live, or whose provider work is unknown consumed (or may yet consume) it.
+    if (!MARKER_PASSING_RUN_STATUSES.includes(run.status)) return false;
+    if (!(await provesNoNativeRunProviderWork(db, { companyId: input.companyId, runId: run.id }))) return false;
+  }
+  return true;
 }
+
+/** A run between the stopped run and this one that ended in these states, with no provider work recorded,
+ * never showed the provider the Stop marker (adopt-marker-restore). */
+const MARKER_PASSING_RUN_STATUSES: readonly string[] = ["failed", "cancelled", "timed_out"];
 
 /**
  * R17 (adopt-cutc2 3d; adopt-lead's pick, conditions rf-3 + rf-4 09:26Z): a board person's Stop of a run that

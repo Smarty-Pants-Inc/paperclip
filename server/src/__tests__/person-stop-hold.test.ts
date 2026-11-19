@@ -44,6 +44,10 @@ const fixture = vi.hoisted(() => ({
   /** Every later turn, while its run is running (before it answers). */
   onTurn: undefined as undefined | ((input: { runId: string; ids: string[] }) => Promise<void>),
   db: undefined as unknown, companyId: "", agentId: "", issueId: "",
+  /** adopt-marker-restore: the next turn fails BEFORE any provider work (no call recorded, no provider event). */
+  failNextBeforeProvider: undefined as undefined | (() => Error),
+  /** Run ids whose turn failed before provider work. */
+  failedBeforeProvider: [] as string[],
 }));
 
 vi.mock("../services/heartbeat/runtime-selection.js", async importOriginal => {
@@ -88,6 +92,12 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
         fixture.calls.push({ runId, ids, reason: ctx.wakeReason ?? null, ordered, prompt });
         await fixture.onFirst({ runId });
         throw new actual.NativeCancellationPendingRecoveryError();
+      }
+      if (fixture.failNextBeforeProvider) {
+        const failure = fixture.failNextBeforeProvider();
+        fixture.failNextBeforeProvider = undefined;
+        fixture.failedBeforeProvider.push(runId);
+        throw failure;
       }
       fixture.calls.push({ runId, ids, reason: ctx.wakeReason ?? null, ordered, prompt });
       await fixture.onTurn?.({ runId, ids });
@@ -184,7 +194,7 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
       assigneeAgentId: agentId, ...(setupOptions.task ? {} : { conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" }),
       responsibleUserId: userId, issueNumber: 1, identifier: `${issuePrefix}-1`, startedAt: new Date() });
     fixture.db = db; fixture.companyId = companyId; fixture.agentId = agentId; fixture.issueId = issueId;
-    fixture.calls = [];
+    fixture.calls = []; fixture.failedBeforeProvider = []; fixture.failNextBeforeProvider = undefined;
     const clientFor = (actorUserId: string, isInstanceAdmin = false) => {
       const client = express();
       client.use(express.json());
@@ -1093,6 +1103,74 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
     // (d) 'continue' control: the wording permits resuming when the person asks.
     expect(STOP_MARKER).toContain("unless they ask");
   }, 120_000);
+
+  it("stop-marker-restore (a): Stop, real Send; the Send's run fails BEFORE provider work; the next run that starts a provider turn (the automatic fresh-thread restore) is the first turn after the Stop; the turn after it is not", async () => {
+    const r = await stopWithHeld();
+    const queuePath = `/api/issues/${r.issueId}/queued-comments`;
+    const queue = (await request(r.client).get(queuePath).expect(200)).body;
+    expect(queue.executionWait?.reason).toBe("stopped_by_person");
+    fixture.failNextBeforeProvider = () => new Error("native_continuation_requires_reconciliation: test pre-claim refusal");
+    const sent = await request(r.client).post(`${queuePath}/interrupt`).send({ queueId: queue.queueId, revision: queue.revision, targetRunId: null });
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    await waitFor(async () => { await r.drive(300); return fixture.failedBeforeProvider.length > 0; }, 30_000);
+    const failedRunId = fixture.failedBeforeProvider[0]!;
+    await waitFor(async () => { const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failedRunId));
+      return row && !["queued", "running"].includes(row.status); }, 30_000);
+    // The faked edge's pre-claim refusal as the real executor records it (incident run 092726ac).
+    await db.update(heartbeatRuns).set({ errorCode: "native_continuation_requires_reconciliation" }).where(eq(heartbeatRuns.id, failedRunId));
+    const [failed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failedRunId));
+    expect(failed!.status).toBe("failed");
+    expect(successorCalls(), "the Send's run never reached the provider").toEqual([]);
+    // The automatic fresh-thread restore (incident run 39c78365): the next run of this agent on the task. This harness
+    // parks every later turn behind the failed run's recovery, so the ONE reader is asked for that run (as the
+    // system-cancel row below does); execution-configuration.ts asks it the same way for every run it builds.
+    const marker = (run: { id: string; createdAt: Date }) => readPersonStoppedPreviousTurn(db, { companyId: r.companyId,
+      issueId: r.issueId, agentId: r.agentId, runId: run.id, runCreatedAt: run.createdAt });
+    const [restore] = await db.insert(heartbeatRuns).values({ companyId: r.companyId, agentId: r.agentId, status: "queued",
+      contextSnapshot: { issueId: r.issueId, wakeReason: "issue_continuation_needed", previousRunId: failedRunId } }).returning();
+    const restoreMarked = await marker(restore!);
+    // The restore turn then reaches the provider and answers; the turn after it is not the first after the Stop.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, restore!.id));
+    const [after] = await db.insert(heartbeatRuns).values({ companyId: r.companyId, agentId: r.agentId, status: "queued",
+      contextSnapshot: { issueId: r.issueId } }).returning();
+    const afterMarked = await marker(after!);
+    await evidence("stop-marker-restore-a", { stoppedRunId: r.firstRunId, failedRunId, failedErrorCode: failed!.errorCode,
+      restoreRunId: restore!.id, restoreMarked, afterRunId: after!.id, afterMarked });
+    expect(restoreMarked, "the first run after the Stop that starts a provider turn carries the marker").toBe(true);
+    expect(afterMarked, "the turn after it carries none").toBe(false);
+  }, 180_000);
+
+  it("stop-marker-restore (d): one true note at a time: the failed Send's 'Send a new message to try again' note retires when the automatic fresh thread starts (its started note supersedes it); another unanswered note stays", async () => {
+    const r = await stopWithHeld({ count: 0 });
+    const { HELD_PREDECESSOR_NOTICE } = await import("../services/native-runtime/held-predecessor-notice-text.js");
+    const { supersedeHeldConversationNotice, writePiSessionHistoryLossNotice } = await import("../services/native-runtime/pi-session-recovery-notice.js");
+    const { FRESH_THREAD_STARTED_NOTE } = await import("../services/native-runtime/fresh-thread-stop-gate.js");
+    const note = (body: string, reason: string) => issueService(db).addComment(r.issueId, body, {}, { authorType: "system",
+      presentation: { kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: true },
+      metadata: { version: 1, authorizationReason: reason, sections: [{ rows: [{ type: "run_link", runId: r.firstRunId, agentId: r.agentId, title: "Run" }] }] } } as any);
+    // The unanswered sweep's note for the failed Send (incident: 'Your message and saved work are kept ... Send a new
+    // message to try again.') and, as the control, a different unanswered note on another message.
+    const held = await note(HELD_PREDECESSOR_NOTICE, `unanswered_message:${randomUUID()}`);
+    const other = await note("Your message wasn't answered.", `unanswered_message:${randomUUID()}`);
+    const notes = async () => db.select().from(issueComments).where(and(eq(issueComments.issueId, r.issueId), eq(issueComments.authorType, "system")));
+    const current = (rows: Awaited<ReturnType<typeof notes>>) => rows.filter(row => !(row.metadata as any)?.supersededByCommentId).map(row => row.body);
+    expect(current(await notes())).toContain(HELD_PREDECESSOR_NOTICE);
+    // The fresh thread starts: the real writer pair selectFreshContinuationThread / pi-conversation-record run.
+    const authorizationReason = `fresh_provider_thread:${randomUUID()}`;
+    await db.transaction(async tx => {
+      await writePiSessionHistoryLossNotice(db, tx, { companyId: r.companyId, issueId: r.issueId, runId: r.firstRunId, agentId: r.agentId,
+        authorizationReason, body: FRESH_THREAD_STARTED_NOTE, replaceExisting: true });
+      await supersedeHeldConversationNotice(tx, { companyId: r.companyId, issueId: r.issueId, heldSessionId: null, reason: authorizationReason });
+    });
+    const after = await notes();
+    await evidence("stop-marker-restore-d", after.map(row => ({ id: row.id, body: row.body.slice(0, 80),
+      reason: (row.metadata as any)?.authorizationReason, supersededBy: (row.metadata as any)?.supersededByCommentId ?? null })));
+    expect(current(after)).not.toContain(HELD_PREDECESSOR_NOTICE);
+    expect(current(after)).toContain(FRESH_THREAD_STARTED_NOTE);
+    expect(current(after)).toContain("Your message wasn't answered.");
+    expect(after.find(row => row.id === held.id)!.body, "history kept").toBe(HELD_PREDECESSOR_NOTICE);
+    expect(after.find(row => row.id === other.id)!.metadata).not.toHaveProperty("supersededByCommentId");
+  }, 180_000);
 
   it("stop-marker (c): a queued-message Interrupt (not a person's Stop), then a message: no marker in the next turn's input", async () => {
     const r = await stopWithHeld({ stopKind: "interrupt", count: 1 });
