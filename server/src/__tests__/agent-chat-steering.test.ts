@@ -241,6 +241,130 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     return issue!;
   }
 
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21272
+  // S-a..S-g are route/accounting RED tools, not installed-screen acceptance.
+  async function postDefault(chat: Chat, body: string, extra: Record<string, unknown> = {}) {
+    return request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/comments`)
+      .send({ body, clientRequestId: randomUUID(), ...extra });
+  }
+
+  async function attachSteerable(chat: Chat) {
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } })
+      .where(eq(agents.id, chat.agentId));
+    mocks.probe.mockResolvedValue({ disposition: "available", activeTurnId: "turn-1" });
+    mocks.steer.mockResolvedValue({ turnId: "turn-1" });
+  }
+
+  it("S-a/S-e/S-g: default POST goes straight into the same running chat, with zero wakes and an immediate thread receipt", async () => {
+    const chat = await seedChat();
+    await attachSteerable(chat);
+    const started = performance.now();
+    const response = await postDefault(chat, "M, sent while working");
+    expect(response.status, JSON.stringify(response.body)).toBe(201);
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(mocks.steer).toHaveBeenCalledWith(expect.objectContaining({ runId: chat.runId,
+      correlationId: response.body.id, message: "M, sent while working" }));
+    expect(mocks.cancel).not.toHaveBeenCalled();
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId))).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId))).toHaveLength(1);
+    expect(await undeliveredConversationComments(db, chat.companyId, chat.issue.id)).toHaveLength(0);
+    const thread = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/comments`).expect(200);
+    expect(thread.body.find((entry: any) => entry.id === response.body.id)).toMatchObject({
+      steeredIntoRunId: chat.runId, steeringStatus: "accepted", steeredAt: expect.any(String), steeringDeliveryEventSeq: null,
+    });
+    const queue = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200);
+    expect(queue.body.entries).toHaveLength(0);
+    expect(queue.body.executionWait).toBeNull();
+    expect(await answered(response.body.id)).toBe(false); // acceptance is NOT delivery or an answer
+  });
+
+  it("S-a RED: a reply which started before M was read never answers M, even if published afterwards", async () => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const response = await postDefault(chat, "Tuesday's lost message").expect(201);
+    await runLog(chat, [
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
+      { eventType: "item.started", kind: "agentMessage", itemId: "turn-1:old-text", text: "" },
+      { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${response.body.id}` },
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:read-M" },
+      { eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:old-text", text: "Old answer" },
+      { eventType: "turn.completed", itemId: "turn-1:end" },
+    ]);
+    await finishTurn(chat, { log: false });
+    expect(await answered(response.body.id)).toBe(false);
+    const carriers = await carriersOf(chat, response.body.id);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+  });
+
+  it("S-b: two default messages retain sent order, one durable input each and no deferred wakes", async () => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const a = await postDefault(chat, "First steer").expect(201);
+    const b = await postDefault(chat, "Second steer").expect(201);
+    expect(mocks.steer.mock.calls.map(([input]: any[]) => input.correlationId)).toEqual([a.body.id, b.body.id]);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    expect(run!.contextSnapshot!.steeredCommentIds).toEqual([a.body.id, b.body.id]);
+    expect(await deferredWakes(chat)).toHaveLength(0);
+    await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup);
+    expect(mocks.steer).toHaveBeenCalledTimes(2);
+    await finishTurn(chat);
+    expect(await answered(a.body.id)).toBe(true); expect(await answered(b.body.id)).toBe(true);
+    for (const id of [a.body.id, b.body.id]) {
+      const carried = await carriersOf(chat, id); expect(carried.wakes.length + carried.runs.length).toBe(0);
+    }
+  });
+
+  it.each(["starting", "saving-files", "non-Pi", "stale-turn"] as const)("S-c/S-c2: %s uses the ordinary next-message path once", async variant => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    if (variant === "starting" || variant === "saving-files") mocks.probe.mockResolvedValue({ disposition: "temporarily_unavailable", activeTurnId: null });
+    if (variant === "non-Pi") await db.update(agents).set({ adapterType: "process" }).where(eq(agents.id, chat.agentId));
+    if (variant === "stale-turn") {
+      const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
+      mocks.steer.mockRejectedValue(new NativeSessionSteeringError("steering_stale_turn", "Turn ended"));
+    }
+    const response = await postDefault(chat, `Fallback ${variant}`).expect(201);
+    await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup);
+    const carriers = await carriersOf(chat, response.body.id);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+    expect(await answered(response.body.id)).toBe(false);
+  });
+
+  it("S-c accepted-then-ended: an unread default steer is restored exactly once at run end", async () => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const response = await postDefault(chat, "Unread default").expect(201);
+    await finishTurn(chat, { log: false });
+    await releaseRun(chat);
+    const carriers = await carriersOf(chat, response.body.id);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+    expect(await answered(response.body.id)).toBe(false);
+  });
+
+  it("S-d: delivery without following assistant text joins the ONE person-Stop hold", async () => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const response = await postDefault(chat, "Stop before answering this").expect(201);
+    await runLog(chat, [
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
+      { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${response.body.id}` },
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:read-M" },
+      { eventType: "turn.cancelled", itemId: "turn-1:end" },
+    ]);
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(), resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || '{"cancelledByActorType":"user"}'::jsonb` })
+      .where(eq(heartbeatRuns.id, chat.runId));
+    await releaseRun(chat);
+    const { readPersonStopHold } = await import("../services/acknowledged-native-stop.js");
+    expect(await readPersonStopHold(db, { companyId: chat.companyId, issueId: chat.issue.id, agentId: chat.agentId, messageId: response.body.id }))
+      .toMatchObject({ stoppedRunId: chat.runId });
+    expect(await answered(response.body.id)).toBe(false);
+    const queue = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200);
+    expect(queue.body.entries.map((entry: any) => entry.comment.id)).toContain(response.body.id);
+  });
+
+  it("S-f: explicit Queue never calls steer even on an attached Pi turn", async () => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const response = await postDefault(chat, "Queue deliberately", { deliveryIntent: "queue" }).expect(201);
+    expect(mocks.steer).not.toHaveBeenCalled();
+    const carriers = await carriersOf(chat, response.body.id);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+  });
+
   // RED 1: one deferred wake for plain chat messages.
   it("keeps plain chat messages sent during a turn in one ordered queue the owner can see and edit", async () => {
     const chat = await seedChat();
