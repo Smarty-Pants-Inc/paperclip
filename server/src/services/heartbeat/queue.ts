@@ -2752,7 +2752,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     // ONE successor (adopt-one-successor) dispatch re-filter: a person's comment wake never carries
     // a message the ONE answered function says is answered, or that an Interrupt carry, another
     // pending wake or a live run already holds. Nothing left: the wake completes as coalesced.
-    if (issueId && reason === "issue_commented" && opts.requestedByActorType === "user" && !durableRequest &&
+    // A structured interaction response (a shared-question answer) is new input: its source comment
+    // is answered by the very reply that asked the question, so it is never re-filtered here.
+    const interactionResponse = Boolean(readNonEmptyString(enrichedContextSnapshot.interactionId) &&
+      readNonEmptyString(enrichedContextSnapshot.interactionStatus));
+    if (issueId && reason === "issue_commented" && opts.requestedByActorType === "user" && !durableRequest && !interactionResponse &&
         !opts.queuedCommentInterruptId && !opts.queuedCommentRequestId && !opts.taskRetryRequestId && !executionWaitRequestId) {
       const ids = [...new Set([...(Array.isArray(enrichedContextSnapshot.wakeCommentIds) ? enrichedContextSnapshot.wakeCommentIds : []),
         wakeCommentId].filter((id): id is string => typeof id === "string" && id.length > 0))];
