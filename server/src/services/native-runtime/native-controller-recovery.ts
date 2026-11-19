@@ -1,14 +1,14 @@
 import { createHash } from "node:crypto";
 import { posix } from "node:path";
-import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
-import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, nativeRunnerCheckpoints, type Db } from "@paperclipai/db";
+import { and, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, nativeRunnerCheckpoints, nativeRunResults, toolInvocations, type Db } from "@paperclipai/db";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { captureLegacyDurablePrpCheckpoint, parseNativeExecutionInput, type DurablePrpCheckpoint, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 import { notifyNativeFinalizationWork } from "../native-finalization-notifications.js";
 import { readRunCancellation } from "../run-cancellation.js";
 import { OWN_PROCESS_START_EVENT_TYPES } from "../native-process-start-events.js";
 import { nativeSha256 } from "./canonical.js";
-import { findNativeSessionResumeRun, isNativeSessionId, isUnusedNativeSessionBootstrap, nativeSessionProviderEvidence } from "./native-session-resume.js";
+import { findNativeSessionResumeRun, isNativeSessionId, isUnusedNativeSessionBootstrap, NATIVE_RESUME_CANDIDATE_WINDOW, nativeSessionProviderEvidence } from "./native-session-resume.js";
 import { insertMigratedNativeRunnerCheckpoint, loadNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
 import { offlineMigrationExecutionWhere } from "../offline-migration-execution.js";
 import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
@@ -388,6 +388,75 @@ export async function assertNativeRetainedSandboxBinding(db: Db, input: Retained
   return { remoteCwd: recordedCwd };
 }
 
+const RECOVERY_SOURCE_TERMINAL_STATUSES = ["succeeded", "failed", "cancelled", "interrupted", "timed_out"];
+type NativeRecoveryBarrier = NonNullable<Awaited<ReturnType<typeof findNativeSessionResumeRun>>>;
+type NativeRecoverySource = Pick<NativeRecoveryBarrier, "id" | "runtimeMode" | "status" | "createdAt" | "runnerInstanceId"> & { runnerProfileJson: unknown };
+/** A cut turn's own work after the checkpoint it would be restored past: a
+ * workspace or artifact change, a delegated or terminal action, a tool call
+ * that is not a receipted read, or a Pi session item other than the turn's own
+ * input (an assistant, reasoning or tool line). */
+const CUT_RUN_PROGRESS_EVENT_TYPES = ["workspace.changed", "workspace.change.updated", "delegation.started", "terminal.input.sent",
+  "artifact.generated", "tool.execution.started", "item.started", "item.updated", "item.delta", "item.completed", "item.failed"];
+
+/** Interrupts can cut runs before their first checkpoint: such a run has no
+ * `sessionCheckpoint` at all and so no restore point of its own (1440, 390).
+ * Within the selector's same bounded window, the newest earlier run of this
+ * exact company/agent/issue/session whose checkpoint names itself is then the
+ * source, but only when every run skipped to reach it is native, terminal and
+ * made no progress of its own (its own events, tool receipts, checkpoint parts
+ * and results). Any such progress refuses: the restore never goes over it. The
+ * skipped runs' records and session lines are only read, never changed. */
+async function sourcePastUncheckpointedCuts(db: Db, input: {
+  companyId: string; agentId: string; issueId: string; normalizedSessionId: string; currentRunId: string;
+}, barrier: NativeRecoveryBarrier): Promise<{ source: NativeRecoverySource; skipped: string[] } | { refusal: "progress_after_checkpoint" }> {
+  const unchanged = { source: barrier as NativeRecoverySource, skipped: [] as string[] };
+  if (record(barrier.runnerProfileJson).sessionCheckpoint != null) return unchanged;
+  const window = await db.select({ id: heartbeatRuns.id, runtimeMode: heartbeatRuns.runtimeMode, status: heartbeatRuns.status,
+    createdAt: heartbeatRuns.createdAt, runnerInstanceId: heartbeatRuns.runnerInstanceId, runnerProfileJson: heartbeatRuns.runnerProfileJson })
+    .from(heartbeatRuns).where(and(ne(heartbeatRuns.id, input.currentRunId), eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId),
+      eq(heartbeatRuns.nativeSessionId, input.normalizedSessionId)))
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(NATIVE_RESUME_CANDIDATE_WINDOW);
+  const start = window.findIndex(run => run.id === barrier.id);
+  if (start < 0) return unchanged;
+  const skipped: string[] = [];
+  let source: (typeof window)[number] | undefined;
+  for (const run of window.slice(start)) {
+    if (run.runtimeMode !== "native" || !RECOVERY_SOURCE_TERMINAL_STATUSES.includes(run.status)) return unchanged;
+    if (record(run.runnerProfileJson).sessionCheckpoint == null) { skipped.push(run.id); continue; }
+    const identity = record(record(record(run.runnerProfileJson).sessionCheckpoint).identity);
+    // The first checkpoint met decides: it names itself in this exact scope,
+    // or the barrier and its existing refusal stand.
+    if (identity.runId !== run.id || identity.companyId !== input.companyId || identity.agentId !== input.agentId
+      || identity.issueId !== input.issueId || identity.sessionId !== input.normalizedSessionId) return unchanged;
+    source = run;
+    break;
+  }
+  if (!source) return unchanged;
+  const events = await db.select({ eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload })
+    .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, input.companyId), inArray(heartbeatRunEvents.runId, skipped),
+      inArray(heartbeatRunEvents.eventType, CUT_RUN_PROGRESS_EVENT_TYPES)));
+  const receipts = await db.select({ id: toolInvocations.id, correlationId: toolInvocations.correlationId, riskLevel: toolInvocations.riskLevel,
+    status: toolInvocations.status }).from(toolInvocations).where(and(eq(toolInvocations.companyId, input.companyId),
+    inArray(toolInvocations.runId, skipped)));
+  const ownWork = receipts.some(row => row.riskLevel !== "read") || events.some(event => {
+    const envelope = record(event.payload), p = envelope.prpEvent ? record(record(envelope.prpEvent).payload) : envelope;
+    // A turn's own input line is the owed person message, carried again by
+    // the successor; it is not work of the cut turn.
+    if (event.eventType.startsWith("item.")) return p.kind !== "userMessage";
+    if (event.eventType !== "tool.execution.started") return true;
+    // Only a receipted, succeeded read is not a write.
+    return p.transport === "process" || !receipts.some(row => (row.id === p.executionId || row.correlationId === p.executionId)
+      && row.riskLevel === "read" && row.status === "succeeded");
+  });
+  const [ownCheckpoint] = await db.select({ runId: nativeRunnerCheckpoints.runId }).from(nativeRunnerCheckpoints).where(and(
+    eq(nativeRunnerCheckpoints.companyId, input.companyId), inArray(nativeRunnerCheckpoints.runId, skipped))).limit(1);
+  const [ownResult] = await db.select({ runId: nativeRunResults.runId }).from(nativeRunResults).where(and(
+    eq(nativeRunResults.companyId, input.companyId), inArray(nativeRunResults.runId, skipped))).limit(1);
+  if (ownWork || ownCheckpoint || ownResult) return { refusal: "progress_after_checkpoint" };
+  return { source, skipped };
+}
+
 /** Only the existing bounded selector chooses history. Never search backwards
  * again when its selected record is incomplete or incompatible. This operation
  * reads evidence; it grants neither command nor acknowledgement authority. */
@@ -403,7 +472,10 @@ export async function resolveNativeControllerRecovery(db: Db, input: {
     eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId),
     eq(heartbeatRuns.nativeSessionId, input.normalizedSessionId)));
   if (!current) return { kind: "missing_evidence", reason: "current_binding" };
-  const source = await findNativeSessionResumeRun(db, { ...input, beforeCreatedAt: current.createdAt, includeProgressBarrier: true });
+  const barrier = await findNativeSessionResumeRun(db, { ...input, beforeCreatedAt: current.createdAt, includeProgressBarrier: true });
+  const past = barrier && await sourcePastUncheckpointedCuts(db, input, barrier);
+  if (past && "refusal" in past) return { kind: "missing_evidence", reason: past.refusal };
+  const source = past ? past.source : null;
   if (!source) {
     // An exhausted candidate window is unknown history, not fresh-bootstrap
     // proof. Read only IDs, and retain the selector's existing 32-row boundary.
@@ -419,13 +491,15 @@ export async function resolveNativeControllerRecovery(db: Db, input: {
     // The normal admission and remote untouched-session claim still execute.
     return { kind: "no_prior_execution" };
   }
-  const [owner] = await db.select({ leaseOwner: nativeRunFinalizations.leaseOwner, leaseExpiresAt: nativeRunFinalizations.leaseExpiresAt }).from(nativeRunFinalizations)
-    .where(and(eq(nativeRunFinalizations.runId, source.id), eq(nativeRunFinalizations.companyId, input.companyId),
+  // A skipped cut run's own live owner is waited for like the source's.
+  const owners = await db.select({ leaseOwner: nativeRunFinalizations.leaseOwner, leaseExpiresAt: nativeRunFinalizations.leaseExpiresAt }).from(nativeRunFinalizations)
+    .where(and(inArray(nativeRunFinalizations.runId, [source.id, ...past!.skipped]), eq(nativeRunFinalizations.companyId, input.companyId),
       eq(nativeRunFinalizations.issueId, input.issueId)));
+  const owner = owners.find(row => row.leaseOwner && row.leaseExpiresAt && row.leaseExpiresAt.getTime() > Date.now());
   if (owner?.leaseOwner && owner.leaseExpiresAt && owner.leaseExpiresAt.getTime() > Date.now()) {
     return { kind: "waiting_for_owner", deadline: owner.leaseExpiresAt };
   }
-  if (source.runtimeMode !== "native" || !["succeeded", "failed", "cancelled", "interrupted", "timed_out"].includes(source.status)
+  if (source.runtimeMode !== "native" || !RECOVERY_SOURCE_TERMINAL_STATUSES.includes(source.status)
     || source.createdAt > current.createdAt) return { kind: "missing_evidence", reason: "newer_progress_barrier" };
   const profile = record(source.runnerProfileJson), snapshot = record(profile.sessionCheckpoint);
   const identity = record(snapshot.identity);
