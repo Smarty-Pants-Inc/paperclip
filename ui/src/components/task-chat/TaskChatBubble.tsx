@@ -247,7 +247,7 @@ function TaskChatBubbleContent({
       data-conversation-message={isHuman ? "human" : "agent"}
       data-testid={item.steeredIntoRunId ? "task-chat-steered-message" : undefined}
       data-steered-into-run-id={item.steeredIntoRunId ?? undefined}
-      data-delivery={item.steeredIntoRunId ? "sent" : undefined}
+      data-delivery={item.steeredIntoRunId ? item.steeredDelivery ?? "sent" : undefined}
       ref={readRef}
       className={cn(
         "flex w-full flex-col gap-1",
@@ -444,6 +444,14 @@ function TaskChatBubbleContent({
             {sentFromIMessage ? "Sent from iMessage" : null}
             {sentFromIMessage && timestamp ? " · " : null}
             {timestamp}
+            {item.steeredIntoRunId ? (
+              // Steered into the running turn: 'Sent' once the server has it,
+              // 'Delivered' once the agent has read it. Subtle, same bubble.
+              <span data-testid="task-chat-steered-delivery" data-delivery={item.steeredDelivery ?? "sent"}>
+                {timestamp ? " · " : null}
+                {item.steeredDelivery === "delivered" ? "Delivered" : "Sent"}
+              </span>
+            ) : null}
           </span>
         </div>
       ) : actions ? (
