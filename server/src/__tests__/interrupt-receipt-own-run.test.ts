@@ -67,7 +67,7 @@ const { instanceSettingsService } = await import("../services/instance-settings.
 const { preserveCancelledNativeWorkspaces } = await import("../services/native-runtime/native-failed-workspace-recovery.js");
 const { unansweredPersonMessageCommentCondition } = await import("../services/recovery/unanswered-person-message.js");
 const { currentControllerProcessStamp } = await import("../services/controller-process-identity.js");
-const { settleStopOnlyCleanup } = await import("../services/sandbox-stop-and-retain.js");
+const { prepareCleanupGateOwnerStop, prepareUnconfirmedSourceSandboxStop, settleStopOnlyCleanup } = await import("../services/sandbox-stop-and-retain.js");
 const { nativeStopWorkspaceOutcome } = await import("../services/native-runtime/native-failed-workspace-recovery.js");
 const { handedOffWarmLease } = await import("../services/native-runtime/handed-off-warm-lease.js");
 // The product bound (30 s) is shortened for the row; absent on the base (there: warm expiry).
@@ -327,5 +327,29 @@ describe.skipIf(!support.supported)("adopt-receipt-own-run: a second Interrupt o
     await heartbeat.resumeRemoteStopComments((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.liveRunId)))[0]!);
     const admitted = await until(async () => { const c = await carryingOf(f); return c.length ? c : null; }, N_MS);
     expect(admitted).toHaveLength(1);
+  }, 120_000);
+
+  it("(d) adopt-foreign-receipt F2: another run's 'destroyed' record never vetoes the cleanup gate owner's stop; the lease's OWN destroy still does", async () => {
+    const destroyedOn = async (ownReceipt: boolean, prepare: typeof prepareCleanupGateOwnerStop = prepareCleanupGateOwnerStop,
+      status = "retained") => {
+      const f = await seedLiveNativeTurn({ ownReceipt });
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.liveRunId));
+      const lease = await leaseOf(f.leaseId);
+      const record = lease.metadata!.remoteExecutionTermination as Record<string, unknown>;
+      expect(record.runId === f.liveRunId).toBe(ownReceipt);
+      await db.update(environmentLeases).set({ status, metadata: { ...lease.metadata,
+        remoteExecutionTermination: { ...record, state: "destroyed" } } }).where(eq(environmentLeases.id, f.leaseId));
+      return prepare(db, await leaseOf(f.leaseId));
+    };
+    // The ended run's unconfirmed-source stop (active lease) reads the same record.
+    expect(await destroyedOn(false, prepareUnconfirmedSourceSandboxStop, "active"), "foreign destroy: unconfirmed source stop still owed").not.toBeNull();
+    expect(await destroyedOn(true, prepareUnconfirmedSourceSandboxStop, "active"), "own destroy: no unconfirmed source stop").toBeNull();
+    const foreign = await destroyedOn(false);
+    await evidence("d_foreign_destroyed", { intent: foreign?.metadata?.sandboxStopAndRetain ?? null });
+    expect(foreign, "another run's destroyed state is NOT this lease's stop: the stop is still owed").not.toBeNull();
+    expect(foreign!.status).toBe("pending_cleanup");
+    const own = await destroyedOn(true);
+    await evidence("d_own_destroyed", { intent: own });
+    expect(own, "the lease's OWN bound destroy: no stop owed").toBeNull();
   }, 120_000);
 });

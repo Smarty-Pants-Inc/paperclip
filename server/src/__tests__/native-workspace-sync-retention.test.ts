@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   agents,
   companies,
@@ -26,6 +26,7 @@ import {
   registerNativeWorkspaceSyncRetentionWork,
 } from "../services/native-runtime/native-workspace-sync-retention.ts";
 import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.ts";
+import { remoteTerminationReceipt } from "../services/remote-execution-termination.ts";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.ts";
 import {
   nativeWorkspaceSyncInternals,
@@ -409,13 +410,40 @@ describeEmbeddedPostgres("native workspace sync retention", () => {
     );
   });
 
-  it("deletes when the retained lease was destroyed", async () => {
-    const { folder } = await seed({
-      leaseMetadata: { remoteExecutionTermination: { state: "destroyed" } },
-      recoveryAction: { status: "resolved", evidence: { systemRecovery: { state: "scheduled" } } },
-    });
+  // adopt-foreign-receipt F1: only the lease's OWN bound destroy (its run, lease and
+  // provider) retires retained recovery; another run's copied record never does.
+  async function seedRetainedDestroyed(foreign: boolean) {
+    const seeded = await seed({ leaseProvider: "daytona", leaseMetadata: { systemRecoveryAdoption: {} },
+      recoveryAction: { status: "resolved", evidence: { systemRecovery: { state: "scheduled" } } } });
+    const [lease] = await db.update(environmentLeases).set({ providerLeaseId: "same-physical-box" })
+      .where(eq(environmentLeases.heartbeatRunId, seeded.runId)).returning();
+    const termination = remoteTerminationReceipt(
+      foreign ? { ...lease!, id: randomUUID(), heartbeatRunId: randomUUID() } : lease!,
+      { providerLeaseId: "same-physical-box", state: "destroyed" });
+    await db.update(environmentLeases).set({ metadata: { systemRecoveryAdoption: {}, remoteExecutionTermination: termination } })
+      .where(eq(environmentLeases.id, lease!.id));
+    return seeded;
+  }
+
+  it("deletes when the retained lease was destroyed (its own bound destroy)", async () => {
+    const { folder } = await seedRetainedDestroyed(false);
     expect((await service().tick()).expired).toBe(1);
     expect(await exists(folder)).toBe(false);
+  });
+
+  it("keeps retained recovery when the destroyed record belongs to another run", async () => {
+    const { folder } = await seedRetainedDestroyed(true);
+    const result = await service().tick();
+    expect(result.expired).toBe(0);
+    expect(result.skipped.retained_recovery).toBe(1);
+    expect(await exists(folder)).toBe(true);
+  });
+
+  it("keeps retained recovery when the destroyed record is unbound", async () => {
+    await expectKept({
+      leaseMetadata: { remoteExecutionTermination: { state: "destroyed" } },
+      recoveryAction: { status: "resolved", evidence: { systemRecovery: { state: "scheduled" } } },
+    }, "retained_recovery");
   });
 
   it("keeps runs that historical recovery adoption has not reached", async () => {
