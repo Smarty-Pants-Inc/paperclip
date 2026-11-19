@@ -87,3 +87,17 @@ export async function readContinuationCommentInput(db: Pick<Db, "select">, input
   )).limit(1);
   return source ? pendingContinuationCommentInput(db, { ...input, contextSnapshot: source.contextSnapshot }) : {};
 }
+
+/** A person's Retry (run-control.ts resumeTaskRetry) starts a fresh session on the task, not a comment continuation:
+ * it takes from the ONE carry only the card answers the run it retries still owes (same rule: a person's answer,
+ * not ANSWERED, not sender-stopped), named in interactionIds alone. The runtime selection materializes them into
+ * the successor's first turn (runtime-selection.ts) and the one answered function reads the same field, so the
+ * answer is presented once and the successor's reply answers it. Never interactionId: that singular key marks an
+ * interaction-continuation wake (wake-queue/domain/context.ts), which a Retry is not. */
+export async function readRetryCardAnswerInput(db: Pick<Db, "select">, input: {
+  companyId: string; issueId: string; runId: string | null | undefined;
+}): Promise<{ interactionIds?: string[] }> {
+  const carried = (await readContinuationCommentInput(db, input)).interactionIds;
+  const ids = Array.isArray(carried) ? carried.filter((id): id is string => typeof id === "string") : [];
+  return ids.length ? { interactionIds: ids } : {};
+}
