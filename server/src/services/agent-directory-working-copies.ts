@@ -150,21 +150,26 @@ export async function endLockSessionOnAbort<T>(db: Db, session: { pid: number; b
  * what remains of the collection is cleanup. */
 export type AgentFileCanonicalWrite = { boundary: boolean; recorded: boolean; done: boolean };
 type LateAbort<T> = { write: AgentFileCanonicalWrite; settleMs: number;
-  /** The report at the bound: the durable "still saving" hold, or the saved
-   * record when the write was already recorded; undefined when the outcome is
-   * being recorded right now (the collection's own return is then awaited). */
+  /** The report at the bound while the write is still landing: the durable
+   * "still saving" hold; undefined when the outcome is being recorded right
+   * now (the bound then re-checks until that record is on the row). */
   stillSaving: () => Promise<T | undefined>;
-  /** The recorded outcome (write.done), marked `abortCameTooLate`. */
+  /** The recorded outcome (write.done: saved, or the failed-save hold), marked `abortCameTooLate`. */
   outcome: () => Promise<T> };
+/** How often the bound re-checks a late outcome that is being recorded right now. */
+const LATE_ABORT_RECORD_POLL_MS = 25;
 /**
  * LATE-ABORT (RFL + rf-3 agreed contract): an abort that arrives after the
  * canonical commit boundary never rejects the collection as cancelled.
  * `operation` (which owns the lock until it settles) is awaited for at most
  * `settleMs` from the abort: within that bound the collection returns its real
  * outcome (SAVED, marked `abortCameTooLate`). At the bound the collection
- * returns the durable "still saving" report instead (or the saved record, if
- * the write was already recorded), while `operation` keeps the lock, records
- * SAVED (or the failure) when the write settles, and only then releases.
+ * returns the durable "still saving" report instead, or the outcome already
+ * on the row (the saved record, or the failed-save hold): that record is the
+ * answer, and what remains of the collection (its lease unpin, its cleanup)
+ * continues after it without delaying it. Meanwhile `operation` keeps the
+ * lock, records SAVED (or the failure) when the write settles, and only then
+ * releases.
  * Once that outcome is on the row (`write.done`) the lock is no longer kept:
  * an abort during the remaining cleanup ends the lock session at once, as for
  * any aborted collection (no lock across a provider call), and the collection
@@ -186,15 +191,24 @@ export function settleLateAbort<T>(operation: Promise<T>, signal: AbortSignal, l
         void late.outcome().then(resolve, reject);
         return;
       }
-      timer = setTimeout(() => {
-        void late.stillSaving().then(report => {
-          if (settled || report === undefined) return;
+      const atBound = () => {
+        // PERSIST-FAILURE (rf-3 R7): an outcome already on the row, saved or
+        // the failed-save hold, is the answer at the bound. The collection's
+        // own bookkeeping after it never keeps the caller waiting.
+        void (late.write.done ? late.outcome() : late.stillSaving()).then(report => {
+          if (settled || reported) return;
+          if (report === undefined) {
+            // The outcome is being recorded right now: answer once it is on the row.
+            timer = setTimeout(atBound, LATE_ABORT_RECORD_POLL_MS);
+            return;
+          }
           reported = true;
           // The write still owns the lock: keep it joined for a graceful drain.
           trackAgentFileCheckpoint(operation).catch(() => undefined);
           resolve(report);
         }, error => logger.warn({ err: error }, "Agent-file save is still running after a late abort; its report could not be written, waiting for the save itself"));
-      }, late.settleMs);
+      };
+      timer = setTimeout(atBound, late.settleMs);
     };
     if (signal.aborted) onAbort();
     else signal.addEventListener("abort", onAbort, { once: true });

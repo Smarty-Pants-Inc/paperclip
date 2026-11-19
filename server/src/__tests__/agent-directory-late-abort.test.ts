@@ -1006,7 +1006,7 @@ describe("agent directory collection aborted after the canonical commit boundary
   }, 60_000);
 
   it("R14 the failed-save hold is still being WRITTEN when the bound passes (PostgreSQL delays that write), then the unpin lingers: the collection answers as soon as the hold is durable, not when its bookkeeping ends", async () => {
-    const BOUND_MS = 200, RECORD_MS = 700, OBSERVE_MS = 1_500;
+    const BOUND_MS = 200, RECORD_MS = 1_500, OBSERVE_MS = 1_500;
     const { service, executionTarget, runId, note } = await stoppedRunWithUnsavedNote({ agentFileLateAbortSettleMs: BOUND_MS });
     await plantDurableHeadRejection();
     // PLANTED DELAY, named at its line: PostgreSQL holds the UPDATE that writes
