@@ -1837,7 +1837,11 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           executionCancellationAcknowledged:
             isAcknowledgedNativeReassignmentStop(run) ||
             (run.status === "cancelled" &&
-            (queuedOperatorStop || parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
+            (queuedOperatorStop || parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)
+              // A person's own Stop before native selection: released as the
+              // native startup Stop is, its held messages gathered for Send.
+              || (run.runtimeMode !== "native" && issueRow !== null
+                && await isPersonAcceptedStartupStop(tx, { ...run, issueId: issueRow.id }))) &&
             !interruptedQueue),
         };
         const preDrain = decidePreDrain(preDrainFacts);

@@ -298,6 +298,9 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
       && run.companyId === issue.companyId && run.nativeIssueId === issue.id
       && (input.personAcceptedStartupStop
         || isAcknowledgedNativeStop({ ...run, companyId: run.companyId, nativeIssueId: run.nativeIssueId }))) return base;
+  // The one non-native shape of that fact: a person's own Stop before native
+  // selection (runtimeMode still 'legacy') of a paperclip_runner agent's run.
+  if (input.personAcceptedStartupStop && run.runtimeMode !== "native" && run.companyId === issue.companyId) return base;
   // A queued-message Interrupt stops this run to deliver that exact message.
   // The stop is the user's intent and the message starts next, so show the
   // hand-off as working, not as a failed attempt.
