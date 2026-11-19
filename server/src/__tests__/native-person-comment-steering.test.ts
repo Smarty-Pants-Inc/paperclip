@@ -527,6 +527,32 @@ describe("person comment default steering eligibility and asynchronous receipt",
     } finally { await f.close(); }
   }, 45_000);
 
+  it("B6c admission rechecks attachment after a no-work turn-start drain", async () => {
+    const f = await fixture("B6c-negative-drain");
+    try {
+      // Finish the initial observer before forcing the stale-probe crossing.
+      await vi.waitFor(async () => expect((await db.select().from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, f.runId))).some(event => event.eventType === "tool.execution.started")).toBe(true), { timeout: 15_000 });
+      await commentSteering.drainFallbackPersonComments(db, f.runId);
+      const [message] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "user", authorUserId: f.userId, body: "B6c-STALE-PROBE" }).returning();
+      // The sender observed no attachment; it becomes available while its
+      // ordinary admission commits, after turn-start's no-work observation.
+      const probe = vi.spyOn(nativeExecutor, "getNativeSessionSteeringState")
+        .mockResolvedValueOnce({ disposition: "temporarily_unavailable", activeTurnId: null });
+      try {
+        expect(await commentSteering.trySteerPersonComment(db, message, { deliveryIntent: "steer", onRejected: () =>
+          heartbeatService(db).wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
+            idempotencyKey: `conversation-comment:${message.id}`, requestedByActorType: "user", requestedByActorId: f.userId,
+            payload: { issueId: f.issueId, commentId: message.id }, contextSnapshot: { issueId: f.issueId,
+              wakeCommentId: message.id, wakeCommentIds: [message.id], source: "issue.comment" } }) })).toBe(true);
+        await waitForPendingCommentSteers();
+        expect(f.commands("steer").map(command => command.input?.message)).toEqual([message.body]);
+        f.peer.boundary(); await f.assertSteeredOnce([message]); await f.complete();
+      } finally { probe.mockRestore(); }
+    } finally { await f.close(); }
+  }, 45_000);
+
   it("S-task: a person comment on a TASK enters its attached Pi turn, without a wake or a restart", async () => {
     const f = await fixture("B-task", false);
     try {
