@@ -2,8 +2,9 @@ import { assertNoOpenTransaction } from "@paperclipai/db/transaction-context";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { environmentLeases, type Db, type heartbeatRuns } from "@paperclipai/db";
 import { admittedNativeResourceDisposition, nativeStopWorkspaceOutcome } from "./native-failed-workspace-recovery.js";
-import { hasAcknowledgedNativeRunStopRequest } from "../acknowledged-native-stop.js";
+import { hasAcknowledgedNativeRunStopRequest, hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
 import { hasStopOnlyCleanup, prepareSupersededWarmSandboxStop } from "../sandbox-stop-and-retain.js";
+import { ownLeaseStopRecord } from "../environment-lease-handoff.js";
 import { warmSandboxExpiryCandidateCondition } from "../warm-sandbox-expiry.js";
 import { hasRecoveredCleanupStopReceipt, hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { logger } from "../../middleware/logger.js";
@@ -117,7 +118,30 @@ type Redispatch = () => Promise<unknown>;
 export const handedOffWarmStopReceiptBound = { ms: 60_000 };
 /** Lease metadata: the stop receipt was overdue past handedOffWarmStopReceiptBound ({ runId, intentAt, overdueAt, boundMs }). */
 export const HANDED_OFF_WARM_STOP_OVERDUE_KEY = "handedOffWarmStopReceiptOverdue";
-const handedOffStopMarkers = [HANDED_OFF_WARM_STOP_KEY, HANDED_OFF_WARM_UNAVAILABLE_STOP_KEY, HANDED_OFF_WARM_UNPROVEN_STOP_KEY];
+/** adopt-stop-at-press: marker of the stop_and_retain intent written AT THE PRESS
+ * for a person-cut run's retained remote box that is NOT a hand-off (the admitted
+ * disposition is not keep_running, or the cancellation is not acknowledged). Before
+ * it, nothing asked for that stop: the successor waited for warm expiry (release +
+ * runner idle + margin, ~7 min; up to 8 h with no saved window). */
+export const PERSON_CUT_STOP_AT_PRESS_KEY = "personCutStopAtPress";
+const handedOffStopMarkers = [HANDED_OFF_WARM_STOP_KEY, HANDED_OFF_WARM_UNAVAILABLE_STOP_KEY, HANDED_OFF_WARM_UNPROVEN_STOP_KEY,
+  PERSON_CUT_STOP_AT_PRESS_KEY];
+
+/** adopt-stop-at-press: a person cut this run (Interrupt, or a person's acknowledged
+ * Stop) and the lease is a retained remote box with no stop receipt that is NOT a
+ * hand-off. DB-free. A live holder is excluded by the stop request's own
+ * warmSandboxExpiryCandidateCondition (and the process-local live-claim check). */
+export function personCutRetainedNonHandoffLease(run: Run & { errorCode?: string | null },
+  lease: typeof environmentLeases.$inferSelect): boolean {
+  const personCut = run.runtimeMode === "native" && run.status === "cancelled"
+    && (run.errorCode === "operator_interrupted" || hasAcknowledgedNativeStopIntent(run));
+  return personCut && lease.provider !== "local" && lease.status === "retained" && !lease.releasedAt
+    && !hasRemoteTerminationReceipt(lease) && !hasRecoveredCleanupStopReceipt(lease)
+    // The lease's OWN run's stop record means the box already stopped (adopt-receipt-own-run b').
+    && ownLeaseStopRecord(lease, "sandboxStopAndRetainReceipt") == null
+    && ownLeaseStopRecord(lease, "remoteExecutionTermination")?.state !== "stopped"
+    && lease.metadata?.pendingCleanupInFlight !== true && !hasStopOnlyCleanup(lease) && !handedOffWarmLease(run, lease);
+}
 /** One receipt deadline per lease (process-local, one-shot); the durable intent time (releasedAt) re-arms it after a restart. */
 const receiptDeadlines = new Map<string, NodeJS.Timeout>();
 /** The latest caller's redispatch per run, for timers armed inside requestHandedOffWarmLeaseStop. */
@@ -198,6 +222,16 @@ export function proveHandedOffWarmLeases(db: Db, run: Run, opts?: { redispatch?:
       eq(environmentLeases.heartbeatRunId, run.id)));
     // adopt-hung-stop: a handed-off stop already requested gets its receipt deadline (re-armed from the durable intent time).
     for (const lease of all) await armHandedOffStopReceiptDeadline(db, run, lease);
+    // adopt-stop-at-press: a person-cut box that is NOT a hand-off gets no proof and
+    // no hand-off; ask the stop-only owner to stop and keep it NOW (this runs
+    // outside any transaction), with the same 60 s receipt bound, never warm expiry.
+    const cut = all.filter(lease => personCutRetainedNonHandoffLease(run, lease));
+    if (cut.length) {
+      const { handedOffWarmOwnerClaimedByAnotherRun } = await import("./native-session-executor.js");
+      for (const lease of cut) if (!handedOffWarmOwnerClaimedByAnotherRun({ runId: run.id, providerLeaseId: lease.providerLeaseId }))
+        await requestHandedOffWarmLeaseStop(db, run, lease, { [PERSON_CUT_STOP_AT_PRESS_KEY]: true }, "person cut a non-handoff box",
+          personCutRetainedNonHandoffLease);
+    }
     const leases = all.filter(lease => handedOffWarmLease(run, lease) && !handedOffWarmLeaseSettled(run, lease));
     if (!leases.length) return "none";
     assertNoOpenTransaction("runner:handedOffWarmOwnerRunnerExited");
@@ -324,11 +358,11 @@ function handedOffByAnotherBoot(lease: typeof environmentLeases.$inferSelect): b
  * another holder uses (warmSandboxExpiryCandidateCondition), and at most once:
  * the intent makes the lease no longer a retained handoff. True when requested. */
 async function requestHandedOffWarmLeaseStop(db: Db, run: Run, lease: typeof environmentLeases.$inferSelect,
-  marker: Record<string, unknown>, why: string): Promise<boolean> {
+  marker: Record<string, unknown>, why: string, eligible: (run: Run, lease: typeof environmentLeases.$inferSelect) => boolean = handedOffWarmLease): Promise<boolean> {
   const [candidate] = await db.select().from(environmentLeases).where(and(eq(environmentLeases.id, lease.id),
     eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
     warmSandboxExpiryCandidateCondition())).limit(1);
-  const requested = candidate && handedOffWarmLease(run, candidate)
+  const requested = candidate && eligible(run, candidate)
     ? await prepareSupersededWarmSandboxStop(db, candidate, marker) : null;
   if (requested) await armHandedOffStopReceiptDeadline(db, run, requested as typeof environmentLeases.$inferSelect);
   // rf-4 row 21 (the kind): a refusal is never silent.
