@@ -5,7 +5,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import type { StorageProvider } from "../storage/types.js";
-import { createObjectRunLogStore, readObjectRunLogSpill } from "./object-run-log-store.js";
+import { createObjectRunLogStore, readObjectRunLogSpill, OBJECT_RUN_LOG_FINALIZE_ADMISSION_TIMEOUT_MS } from "./object-run-log-store.js";
 import { logger } from "../middleware/logger.js";
 
 vi.mock("../middleware/logger.js", () => ({ logger: { warn: vi.fn(), error: vi.fn() } }));
@@ -144,7 +144,7 @@ describe("object run log custody across flush / close / finalize failures", () =
   // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7003907357
   // NEVER-OK: the deadline releases the run, NOT its admitted log bytes.
   it("bounds finalize admission with 8 peers holding memory after object AND spill writes fail", async () => {
-    const boundMs = 60_000;
+    const boundMs = OBJECT_RUN_LOG_FINALIZE_ADMISSION_TIMEOUT_MS;
     const m = memory(), spillDir = mkdtempSync(path.join(os.tmpdir(), "objlog-finalize-bound-"));
     const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", spillDir,
       assertWriterAuthority: async () => undefined });
@@ -190,17 +190,20 @@ describe("object run log custody across flush / close / finalize failures", () =
       expect(observed.settled).toBe(false);
       await vi.advanceTimersByTimeAsync(boundMs - 1);
       expect(observed.settled).toBe(false);
-      await vi.advanceTimersByTimeAsync(boundMs + 1);
+      await vi.advanceTimersByTimeAsync(1);
+      const settledAtBound = observed.settled;
+      await vi.advanceTimersByTimeAsync(boundMs);
       diagnostics = [...vi.mocked(logger.warn).mock.calls];
       errors = [...vi.mocked(logger.error).mock.calls];
       const snapshot = { ...observed };
       if (admissionSettled) waitingResult = await waiting;
       if (process.env.OBJLOG_CUSTODY_EVIDENCE) appendFileSync(process.env.OBJLOG_CUSTODY_EVIDENCE,
         `${JSON.stringify({ row: "finalize-admission-bound", peers: peers.length, boundMs, elapsedMs: 2 * boundMs,
-          heldBytes: expected.reduce((sum, bytes) => sum + bytes.length, 0), ...snapshot, admissionSettled,
+          heldBytes: expected.reduce((sum, bytes) => sum + bytes.length, 0), settledAtBound, ...snapshot, admissionSettled,
           admitted, diagnostics, errors })}\n`);
       // Assertion-red at base / no-bound mutation: finalize is still waiting at 2x the bound.
       expect(snapshot.settled).toBe(true);
+      expect(settledAtBound).toBe(true);
       expect(snapshot.summary).toEqual({ bytes: null, sha256: null, compressed: false });
       expect(admissionSettled).toBe(true);
       expect(waitingResult).toMatchObject({ code: "object_run_log_finalize_admission_timeout" });
@@ -208,7 +211,8 @@ describe("object run log custody across flush / close / finalize failures", () =
       expect(diagnostics).toEqual(expect.arrayContaining([
         [expect.objectContaining({ runId: "capacity-target", step: "admissions",
           err: expect.objectContaining({ code: "object_run_log_finalize_admission_timeout" }),
-          capacity: { location: "memory", bytes: expected.reduce((sum, bytes) => sum + bytes.length, 0),
+          capacity: { location: "memory", stored: false, spilled: false,
+            bytes: expected.reduce((sum, bytes) => sum + bytes.length, 0),
             writers: peers.map(peer => ({ runId: peer.logRef.split("/")[2], bytes: expected[0]!.length,
               storageError: expect.objectContaining({ code: "EIO" }), spillError: expect.objectContaining({ code: "ENOSPC" }) })) },
         }), "Object run log finalization failed"],
