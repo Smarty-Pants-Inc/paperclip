@@ -1406,7 +1406,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   // RFL 04:58Z: a PAUSED agent's chat. "Sending it again is safe" is false
   // advice there; the note says the agent is paused and who can resume it.
   const WORKING = UNANSWERED_MESSAGE_WORKING_TEXT("Managed Pi");
-  const PAUSED_TEXT = "Managed Pi is paused. Your message is saved. Send it again after Managed Pi is resumed. "
+  const PAUSED_TEXT = "Managed Pi is paused. Your message is saved, and it will run when Managed Pi is resumed. "
     + "A board user or Managed Pi's manager can resume Managed Pi.";
   const pause = (f: { agentId: string }) => db.update(agents).set({ status: "paused", lifecycleState: "paused",
     lifecycleHolds: ["manual"], pauseReason: "manual" }).where(eq(agents.id, f.agentId));
@@ -2658,10 +2658,13 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         const pNotes = notes.filter(n => (n.metadata as Record<string, unknown> | null)?.authorizationReason === `unanswered_message:${P}`);
         expect(pNotes.map(n => n.body), `+${ms}`).toEqual([PAUSED_TEXT]);
         console.log("pausenote-r3 row 2 P note", ms, JSON.stringify(pNotes[0]!.metadata));
-        expect(pNotes[0]!.body).toBe("Managed Pi is paused. Your message is saved. Send it again after Managed Pi is resumed. "
+        // rf-5 T4 fix: P is deferred, so its note says it will run (pause-defer-wake-t4.test.ts proves the run).
+        expect(pNotes[0]!.body).toBe("Managed Pi is paused. Your message is saved, and it will run when Managed Pi is resumed. "
           + "A board user or Managed Pi's manager can resume Managed Pi.");
-        expect(JSON.stringify(pNotes[0])).toContain("Ask a board user or Managed Pi's manager to resume Managed Pi, then send it again.");
-        expect(JSON.stringify(notes)).not.toContain("will run");
+        expect(JSON.stringify(pNotes[0])).toContain("Ask a board user or Managed Pi's manager to resume Managed Pi.");
+        expect(JSON.stringify(pNotes[0])).not.toContain("then send it again");
+        // M's words are untouched: its note never says 'will run'.
+        expect(JSON.stringify(notes.filter(n => n !== pNotes[0]))).not.toContain("will run");
       }
     }, 120_000);
 

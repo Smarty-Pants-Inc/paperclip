@@ -3175,9 +3175,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     // once that run is terminal; a run still stopping after a pause commits is
     // that run. A task that never ran has none: its message stays in the task,
     // and stranded-work recovery starts the task once the hold lifts.
-    const canSaveDeferredMessage = async () => {
+    // An agent whose Pause has completed (lifecycle 'paused') is the exception
+    // (rf-5 T4): nothing would start that task on Resume, so the message is
+    // saved for the pause_lifted pass of resumeDeferredExecutionReceipts,
+    // which needs no prior run.
+    const canSaveDeferredMessage = async (save: { withoutPriorRun?: boolean } = {}) => {
       if (executionWaitRequestId || caseRequest || durableRequest || !issueId || !isUuidLike(issueId) ||
           opts.requestedByActorType !== "user" || !wakeCommentId) return false;
+      if (save.withoutPriorRun) return true;
       const [latest] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.companyId, agent.companyId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`))
         .limit(1);
@@ -3444,7 +3449,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (caseRequest) return null;
       // Only a pause defers through the release drain (wake-queue policy); a
       // pending approval still fails a promoted wake, so it is not saved here.
-      if (invokability.reason === "paused" && (await canSaveDeferredMessage()))
+      if (invokability.reason === "paused" &&
+          (await canSaveDeferredMessage({ withoutPriorRun: agent.lifecycleState === "paused" })))
         throw await saveDeferredMessage("agent.not_invokable", invokability.message,
           { status: agent.status, reason: invokability.reason });
       let waitSaved = false;
