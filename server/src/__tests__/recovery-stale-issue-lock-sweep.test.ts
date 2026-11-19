@@ -9,6 +9,8 @@ import {
   costEvents,
   activityLog,
   agents,
+  authUsers,
+  companyMemberships,
   agentWakeupRequests,
   companies,
   completionContracts,
@@ -29,7 +31,9 @@ import {
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
 
-import { heartbeatService } from "../services/heartbeat.ts";
+import { heartbeatService, startTaskDrain, stopTaskDrain } from "../services/heartbeat.ts";
+import { deliverConversationComments, settleConversationTurn } from "../services/agent-conversations.js";
+import { issueService } from "../services/issues.js";
 import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { recoveryService } from "../services/recovery/service.ts";
 
@@ -68,6 +72,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     await db.delete(issues);
     await db.delete(agentWakeupRequests);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   });
 
@@ -1262,5 +1267,139 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .from(heartbeatRunEvents)
       .where(eq(heartbeatRunEvents.runId, runningRunId));
     expect(events).toEqual([]);
+  });
+
+  // The incident leaves durable state after executeRun's
+  // NativeWorkspaceFinalizationBusyError early return (heartbeat.ts): R is
+  // terminal, its issue still holds R, and no release drain has run. These are
+  // real queue/sweep rows; dispatch is deliberately held at the task-drain
+  // boundary so the promoted run can be inspected without a model/provider.
+  describe("terminal native owner whose finalization skipped the release drain", () => {
+    const userId = `sweep-drain-${randomUUID()}`;
+
+    beforeAll(async () => {
+      await db.insert(authUsers).values({ id: userId, name: "Chat owner", email: `${userId}@example.test`,
+        createdAt: new Date(), updatedAt: new Date() });
+    });
+    afterEach(() => stopTaskDrain());
+    afterAll(async () => { await db.delete(authUsers).where(eq(authUsers.id, userId)); });
+
+    async function seedDeferredMessage(options: { paused?: boolean; done?: boolean } = {}) {
+      const { companyId, agentId, runningRunId: runId } = await seed();
+      const issueId = randomUUID();
+      await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId,
+        status: "active", membershipRole: "operator" });
+      await db.insert(issues).values({ id: issueId, companyId, title: options.done ? "Completed task" : "Conversation",
+        status: options.done ? "in_progress" : "in_review", assigneeAgentId: agentId, responsibleUserId: userId,
+        ...(!options.done ? { conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" } : {}),
+        checkoutRunId: runId, executionRunId: runId, executionLockedAt: new Date() });
+      await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issueId,
+        startedAt: new Date(Date.now() - 1_000), contextSnapshot: { issueId, taskKey: issueId } })
+        .where(eq(heartbeatRuns.id, runId));
+      const heartbeat = heartbeatService(db);
+      let commentId: string | null = null;
+      if (options.done) {
+        // A plain, non-message automation wake, as in the stalled-blocker case.
+        await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", triggerDetail: "system",
+          status: "deferred_issue_execution", reason: "issue_blocker_stalled", requestedByActorType: "system",
+          payload: { issueId, _paperclipWakeContext: { issueId, wakeReason: "issue_blocker_stalled" } } });
+      } else {
+        const comment = await issueService(db).addComment(issueId, "Please answer this new message", { userId },
+          { clientRequestId: randomUUID() });
+        commentId = comment.id;
+        const [conversation] = await db.select().from(issues).where(eq(issues.id, issueId));
+        await deliverConversationComments(db, conversation!, heartbeat.wakeup);
+      }
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+      expect(wake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect(wake.payload).not.toHaveProperty("executionWait");
+      if (commentId) expect(wake.idempotencyKey).toBe(`conversation-comment:${commentId}`);
+      // Persist exactly the early-return aftermath: terminal R, with no call to
+      // releaseIssueExecutionAndPromote. Do not simulate the fix in the fixture.
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+      const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      if (!options.done) await settleConversationTurn(db, finished!);
+      if (options.done) await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      if (options.paused) await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+      startTaskDrain({});
+      return { companyId, agentId, issueId, runId, wakeId: wake.id, commentId, heartbeat };
+    }
+
+    async function snapshot(f: Awaited<ReturnType<typeof seedDeferredMessage>>) {
+      const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, f.wakeId));
+      return { issue: issue!, wake: wake!, runs };
+    }
+
+    it("dr-1 promotes the person's plain conversation wake once after the stale-lock sweep", async () => {
+      const f = await seedDeferredMessage();
+      const before = await snapshot(f);
+      expect(before.issue.executionRunId).toBe(f.runId);
+      expect(before.runs).toEqual([]);
+      const started = Date.now();
+      await f.heartbeat.sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+      const after = await snapshot(f);
+      console.info("dr-1 persisted result", JSON.stringify({ runId: f.runId, wakeId: f.wakeId, commentId: f.commentId,
+        elapsedMs: Date.now() - started, oldLockReleased: after.issue.executionRunId !== f.runId,
+        checkoutRunId: after.issue.checkoutRunId, executionRunId: after.issue.executionRunId,
+        wakeStatus: after.wake.status, promotedRuns: after.runs.map(run => ({ id: run.id, status: run.status, context: run.contextSnapshot })) }));
+      expect(after.issue.checkoutRunId).toBeNull();
+      expect(after.issue.executionRunId).not.toBe(f.runId);
+      expect(after.wake.status).toBe("queued");
+      expect(after.runs).toHaveLength(1);
+      expect(after.runs[0]).toMatchObject({ status: "queued", wakeupRequestId: f.wakeId,
+        contextSnapshot: { issueId: f.issueId, wakeCommentId: f.commentId, wakeCommentIds: [f.commentId] } });
+      expect(after.wake.runId).toBe(after.runs[0]!.id);
+      expect(after.issue.executionRunId).toBe(after.runs[0]!.id);
+      // Repeated sweeps must not duplicate the queued turn or steal its lock.
+      await f.heartbeat.sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+      const repeated = await snapshot(f);
+      expect(repeated.runs.map(run => run.id)).toEqual(after.runs.map(run => run.id));
+      expect(repeated.issue.executionRunId).toBe(after.runs[0]!.id);
+    });
+
+    it("dr-2 preserves the drain's paused-agent gate while releasing the old lock", async () => {
+      const f = await seedDeferredMessage({ paused: true });
+      await f.heartbeat.sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+      const after = await snapshot(f);
+      console.info("dr-2 persisted result", JSON.stringify({ wakeStatus: after.wake.status, runs: after.runs.length,
+        checkoutRunId: after.issue.checkoutRunId, executionRunId: after.issue.executionRunId }));
+      expect(after.runs).toEqual([]);
+      expect(after.wake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect(after.issue).toMatchObject({ checkoutRunId: null, executionRunId: null });
+    });
+
+    it("dr-3 never runs or reopens a DONE task for a plain stalled-blocker wake", async () => {
+      const f = await seedDeferredMessage({ done: true });
+      await f.heartbeat.sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+      const after = await snapshot(f);
+      console.info("dr-3 persisted result", JSON.stringify({ status: after.issue.status, wakeStatus: after.wake.status,
+        runs: after.runs.length, checkoutRunId: after.issue.checkoutRunId, executionRunId: after.issue.executionRunId }));
+      expect(after.runs).toEqual([]);
+      expect(after.wake.runId).toBeNull();
+      expect(after.issue).toMatchObject({ status: "done", checkoutRunId: null, executionRunId: null });
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId),
+        eq(activityLog.action, "issue.updated")))).toEqual([]);
+    });
+
+    it("dr-4 logs a throwing drain and still performs the original guarded lock clear", async () => {
+      const f = await seedDeferredMessage();
+      // The only fault injection is at the release-drain boundary. Its failure
+      // must not prevent the existing sweep's real SQL clear or audit write.
+      const deps = { enqueueWakeup: vi.fn(), releaseTerminalExecutionOwner: async () => {
+        throw new Error("dr-4 injected release-drain failure");
+      } };
+      const result = await recoveryService(db, deps).sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+      const after = await snapshot(f);
+      console.info("dr-4 persisted result", JSON.stringify({ cleared: result.cleared, wakeStatus: after.wake.status,
+        runs: after.runs.length, checkoutRunId: after.issue.checkoutRunId, executionRunId: after.issue.executionRunId }));
+      expect(result.issueIds).toEqual([f.issueId]);
+      expect(after.issue).toMatchObject({ checkoutRunId: null, executionRunId: null });
+      expect(after.runs).toEqual([]);
+      expect(after.wake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId),
+        eq(activityLog.action, "issue.stale_lock_cleared")))).toHaveLength(1);
+    });
   });
 });
