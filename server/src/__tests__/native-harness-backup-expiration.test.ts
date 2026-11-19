@@ -866,6 +866,147 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     await quiet(8 * DAY_MS); await expectKept(session);
   });
 
+  // RFL record SUPERSEDE-HARNESS-BACKUP-RETENTION-KEEP-1118 (amended, rf-3): the 7 rows
+  // cd35dacd retired, RETARGETED. Each keeps its preservation, accounting, isolation or
+  // lock assertion against the keep behaviour (R-keep-all-traces).
+  it("R-1: a committed earlier close timestamp schedules no deadline and causes no early or later cleanup; the backup is kept", async () => {
+    const session = await seedSession({ closedDaysAgo: 2 });
+    await startBackups(); await settled();
+    const earlier = new Date(now.getTime() - 6 * DAY_MS);
+    await issueService(db).update(session.issueId, { completedAt: earlier });
+    await settled(); await quiet(60_000);
+    await expectKept(session); // no early cleanup
+    await quiet(8 * DAY_MS); // past the earlier close's former deadline (earlier + 7d + 1)
+    await expectKept(session); expect(await taskSessionCount(session.agentId)).toBe(1);
+    expect(backupErrors).toEqual([]);
+  });
+
+  it("R-2: allows an ordinary task reopen while the pass's backup byte counting is held outside the retirement lock, and keeps the backup", async () => {
+    const own = await seedSession(); const lstat = fs.lstat;
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const held = vi.spyOn(fs, "lstat").mockImplementation(async (...args) => {
+      if (String(args[0]) === path.join(own.current, "codex-home", "history.jsonl")) {
+        entered.resolve(); await release.promise;
+      }
+      return lstat(...args);
+    });
+    // The filesystem sweep still reaches expireSession's byte counting (allocatedBytes).
+    const pass = service().tick(); await entered.promise;
+    try {
+      await db.transaction(async tx => {
+        await tx.execute(sql`set local lock_timeout = '500ms'`);
+        await issueService(db).update(own.issueId, { status: "todo" }, tx);
+      });
+    } finally { release.resolve(); }
+    const result = await pass; held.mockRestore();
+    expect(result).toMatchObject({ checked: 1, candidates: 0, expired: 0, failed: 0 });
+    await expectKept(own); expect(await taskSessionCount(own.agentId)).toBe(1);
+    // Closed again long ago (no blocker left): the next sweep reaches the keep, not a delete.
+    await db.update(issues).set({ status: "done", completedAt: new Date(now.getTime() - 10 * DAY_MS) }).where(eq(issues.id, own.issueId));
+    expect(await service().tick()).toMatchObject({ expired: 0, skipped: { native_backup_local_copy_kept: 1 } });
+    await expectKept(own); expect(await taskSessionCount(own.agentId)).toBe(1);
+  });
+
+  it("R-14: holds nested ordinary close activation until the outer transaction commits; the backup and resume pointer are kept before and after", async () => {
+    const session = await seedSession({ issueStatus: "todo" });
+    await startBackups(); await settled();
+    let release!: () => void, written!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const staged = new Promise<void>(resolve => { written = resolve; });
+    const transaction = db.transaction(async outer => {
+      await outer.transaction(nested => issueService(db).update(session.issueId, { status: "done" }, nested));
+      written(); await gate;
+    });
+    await staged;
+    await vi.advanceTimersByTimeAsync(60_000);
+    await expectKept(session);
+    expect(await taskSessionCount(session.agentId)).toBe(1);
+    release(); await transaction;
+    const [closed] = await db.select().from(issues).where(eq(issues.id, session.issueId));
+    expect(closed!.status).toBe("done");
+    await settled(); await quiet(8 * DAY_MS);
+    await expectKept(session); expect(await taskSessionCount(session.agentId)).toBe(1);
+    expect(backupErrors).toEqual([]);
+  });
+
+  it("R-22: pages multiple company backups, preserves a busy one and keeps all three, also after process release", async () => {
+    const sessions = [await seedSession(), await seedSession(), await seedSession()]; let busy = true;
+    const expiration = nativeHarnessBackupExpirationService(db, { stateBase, now, closedForDays: 7, maxEntries: 1, maxRemovals: 1,
+      isSessionBusy: digest => busy && digest === sessions[1]!.scope });
+    const pages = [];
+    for (let page = 0; page < 6; page++) { const result = await expiration.tick(); pages.push(result); if (!result.truncated) break; }
+    expect(pages.map(page => page.checked).reduce((a, b) => a + b, 0)).toBe(3);
+    expect(pages.slice(0, -1).every(page => page.truncated)).toBe(true);
+    expect(pages.every(page => page.expired === 0 && page.failed === 0)).toBe(true);
+    expect(pages.map(page => page.skipped.native_backup_local_copy_kept ?? 0).reduce((a, b) => a + b, 0)).toBe(2);
+    expect(pages.map(page => page.skipped.session_active ?? 0).reduce((a, b) => a + b, 0)).toBe(1);
+    for (const session of sessions) await expectKept(session);
+    busy = false;
+    await startBackups({ maxEntries: 1, maxRemovals: 1 }); await settled();
+    noteNativeHarnessBackupChange(db, { companyId: sessions[1]!.companyId });
+    await settled(); await quiet();
+    for (const session of sessions) await expectKept(session);
+    expect(backupErrors).toEqual([]);
+  });
+
+  it("R-23: keeps a pre-rule expiry tombstone across drain and on resume; no deletion or retry is attempted", async () => {
+    const session = await seedSession();
+    const tombstone = path.join(session.root, "failover-backups", `.expired-${randomUUID()}`);
+    await fs.mkdir(path.join(tombstone, "codex-home"), { recursive: true });
+    await fs.writeFile(path.join(tombstone, "codex-home", "history.jsonl"), "pre-rule tombstone bytes");
+    const digest = await treeDigest(tombstone);
+    const remove = vi.spyOn(fs, "rm");
+    try {
+      await startBackups(); await settled(); admitted = false;
+      await quiet(60_000);
+      expect(await treeDigest(tombstone)).toBe(digest);
+      admitted = true; await settled(); await quiet();
+      expect(await treeDigest(tombstone)).toBe(digest); await expectKept(session);
+      await service().tick(); // the filesystem sweep keeps it beside the current one
+      expect(await treeDigest(tombstone)).toBe(digest); await expectKept(session);
+      expect(remove.mock.calls.filter(([target]) => String(target).includes(".expired-"))).toEqual([]);
+    } finally { remove.mockRestore(); }
+    expect(backupErrors).toEqual([]);
+  });
+
+  it("R-26: reopen and a later ordinary close schedule no deadline; the backup and resume pointer are kept throughout", async () => {
+    const session = await seedSession({ closedDaysAgo: 2 });
+    await startBackups(); await settled();
+    await issueService(db).update(session.issueId, { status: "todo" });
+    await settled(); await quiet(8 * DAY_MS); await expectKept(session);
+    await issueService(db).update(session.issueId, { status: "done" });
+    await settled(); await quiet(8 * DAY_MS);
+    await expectKept(session); expect(await taskSessionCount(session.agentId)).toBe(1);
+    expect(backupErrors).toEqual([]);
+  });
+
+  it("R-36: a partial physical deletion's tombstone is kept with no retry, and the resume pointer is neither cleared nor recreated", async () => {
+    const session = await seedSession();
+    const tombstone = path.join(session.root, "failover-backups", `.expired-${randomUUID()}`);
+    await fs.mkdir(path.join(tombstone, "codex-home"), { recursive: true });
+    await fs.writeFile(path.join(tombstone, "codex-home", "history.jsonl"), "partially deleted bytes");
+    const digest = await treeDigest(tombstone);
+    const pointers = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, session.agentId));
+    expect(pointers).toHaveLength(1);
+    const remove = fs.rm;
+    const fault = vi.spyOn(fs, "rm").mockImplementation(async (...args) => {
+      if (String(args[0]).includes(".expired-")) throw new Error("controlled filesystem delete failure");
+      return remove(...args);
+    });
+    let tombstoneDeletes = -1;
+    try {
+      for (let pass = 0; pass < 2; pass++) {
+        const result = await service().tick();
+        expect(result).toMatchObject({ expired: 0, failed: 0, clearedTaskSessions: 0 });
+        expect(result.skipped.native_backup_local_copy_kept).toBe(1);
+      }
+      tombstoneDeletes = fault.mock.calls.filter(([target]) => String(target).includes(".expired-")).length;
+    } finally { fault.mockRestore(); }
+    expect(tombstoneDeletes).toBe(0);
+    expect(await treeDigest(tombstone)).toBe(digest); await expectKept(session);
+    expect(await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, session.agentId))).toEqual(pointers);
+  });
+
   it("dry run reports no kept backup and rechecks quietly after source invalidation", async () => {
     const session = await seedSession(); const report = vi.spyOn(logger, "info");
     await startBackups({ dryRun: true }); await settled();
