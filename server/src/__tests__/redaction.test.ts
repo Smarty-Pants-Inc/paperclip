@@ -1076,7 +1076,7 @@ describe("ANSI-stripped credential view", () => {
 });
 
 // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21230
-// Keep reason: never disclose credentials; never promote scheme words through CSI boundaries.
+// Keep reason: never disclose credentials; preserve short/prose tails at CSI boundaries.
 describe("union of transparent and bare-token boundary ANSI views", () => {
   const colour = "\u001b[31m";
   const reset = "\u001b[0m";
@@ -1094,10 +1094,8 @@ describe("union of transparent and bare-token boundary ANSI views", () => {
   const before = ["x", "7", "_", "-", "="];
   const matrix = shapes.flatMap(([shape, prefix, tail]) => before.flatMap(word => codes.map(code => ({
     shape, word, code, input: `${word}${code}${prefix}${tail}${reset}`,
-    // Bearer is V1-only. A CSI must not create a new boundary for a scheme word.
-    expected: prefix === "Bearer " && /\w/.test(word)
-      ? `${word}${code}${prefix}${tail}${reset}`
-      : `${word}${code}${prefix === "Bearer " ? "Bearer " : ""}${REDACTED_EVENT_VALUE}${reset}`,
+    // A CSI immediately before Bearer admits only a strict token body on V2.
+    expected: `${word}${code}${prefix === "Bearer " ? "Bearer " : ""}${REDACTED_EVENT_VALUE}${reset}`,
   }))));
   it.each(matrix)("(x) $shape after $word and CSI $code", ({ input, expected }) => {
     expect(redactSensitiveText(input)).toBe(expected);
@@ -1116,7 +1114,7 @@ describe("union of transparent and bare-token boundary ANSI views", () => {
   it.each(shapes)("(x) repeated CSI and line-start %s", (_shape, prefix, tail) => {
     const masked = prefix === "Bearer " ? `Bearer ${REDACTED_EVENT_VALUE}` : REDACTED_EVENT_VALUE;
     const glued = `prefix${colour}\u001b[K${prefix}${tail}${reset}`;
-    expect(redactSensitiveText(glued)).toBe(prefix === "Bearer " ? glued : `prefix${colour}\u001b[K${masked}${reset}`);
+    expect(redactSensitiveText(glued)).toBe(`prefix${colour}\u001b[K${masked}${reset}`);
     expect(redactSensitiveText(`${colour}${prefix}${tail}${reset}`)).toBe(`${colour}${masked}${reset}`);
   });
 
@@ -1184,5 +1182,84 @@ describe("union of transparent and bare-token boundary ANSI views", () => {
     // Existing sk- charset includes the hyphen and the following AKIA-shaped tail.
     expect(redactSensitiveText(`${colour}sk-${"a".repeat(12)}-AKIA${"A".repeat(16)}${reset}`))
       .toBe(`${colour}${REDACTED_EVENT_VALUE}${reset}`);
+  });
+});
+
+// catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21230
+// Keep reason: credential non-disclosure without reopening the F1 prose regression.
+describe("narrow Bearer recognition at an immediate CSI boundary", () => {
+  const reset = "\u001b[0m";
+  const token = "A1b2C3d4E5f6G7h8I9j0K1l2"; // 24 characters; no bare-prefix match.
+  const codes = ["\u001b[31m", "\u001b[K", "\u001b[01;31m\u001b[K", "\u001b[1C"];
+  const matrix = ["x", "7", "_", "-"].flatMap(before => codes.map(code => ({ before, code })));
+
+  it.each(matrix)("masks only the token after $before and $code", ({ before, code }) => {
+    const prefix = `prefix${before}${code}Bearer `;
+    expect(redactSensitiveText(`${prefix}${token}${reset} done`))
+      .toBe(`${prefix}${REDACTED_EVENT_VALUE}${reset} done`);
+  });
+
+  it("masks the real grep Bearer-only highlight after a word, preserving every CSI", () => {
+    // LC_ALL=C GREP_COLORS='ms=01;31' grep --color=always 'Bearer .*'
+    const prefix = "prefix\u001b[01;31m\u001b[KBearer ";
+    const suffix = "\u001b[m\u001b[K\n";
+    expect(redactSensitiveText(`${prefix}${token}${suffix}`))
+      .toBe(`${prefix}${REDACTED_EVENT_VALUE}${suffix}`);
+  });
+
+  it.each(["Bearer", "bearer", "bEaReR", "BEARER"])("matches the uncoloured scheme's case handling: %s", scheme => {
+    const prefix = `prefix\u001b[31m${scheme} `;
+    expect(redactSensitiveText(`${prefix}${token}${reset}`))
+      .toBe(`${prefix}${REDACTED_EVENT_VALUE}${reset}`);
+  });
+
+  it.each([
+    "a".repeat(20), "a".repeat(19) + "1", "a".repeat(20) + "=",
+    "Ab9._~+/-".repeat(3),
+    "sk-" + "a".repeat(12), // Below 20 total: still covered by the existing bare-prefix rule.
+    "ghp_" + "a".repeat(20), "github_pat_" + "a".repeat(20),
+    "AKIA" + "A".repeat(16),
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJyZjJzeW50aGV0aWMifQ.c3ludGhldGljU2lnbmF0dXJl",
+  ])("masks a strict body or existing JWT/bare-prefix token: %s", body => {
+    expect(redactSensitiveText(`prefix\u001b[KBearer ${body}${reset}`))
+      .toBe(`prefix\u001b[KBearer ${REDACTED_EVENT_VALUE}${reset}`);
+  });
+
+  it.each(codes)("keeps short and prose tails byte-for-byte after %j", code => {
+    for (const tail of ["abc123def", "a".repeat(19), "of good news", "authentication", "bond matured", "A", "word.", "Well-known", "", "short-123"]) {
+      const input = `standard${code}Bearer ${tail}${reset}`;
+      expect(redactSensitiveText(input)).toBe(input);
+    }
+    const witness = `standard${code}bearer abc123def${reset}`;
+    expect(redactSensitiveText(witness)).toBe(witness);
+    const prose = `the ${code}bearer of${reset} good news`;
+    expect(redactSensitiveText(prose)).toBe(prose);
+  });
+
+  it.each([
+    ["Bearer  ", token], ["Bearer\t", token], ["Bearer\n", token],
+    ["minibearer ", token], ["Bearerish ", token],
+    ["Bearer ", "a".repeat(20) + "=="],
+  ])("does not broaden V2's scheme, spacing or padding: %j %j", (scheme, body) => {
+    const input = `prefix\u001b[31m${scheme}${body}${reset}`;
+    expect(redactSensitiveText(input)).toBe(input);
+  });
+
+  it("requires CSI immediately before the scheme, not merely earlier on the line", () => {
+    for (const input of [
+      `\u001b[31mprefixBearer ${token}${reset}`,
+      `prefix\u001b[31mxBearer ${token}${reset}`,
+      `prefixBearer ${token}\u001b[31m${reset}`,
+    ]) expect(redactSensitiveText(input)).toBe(input);
+  });
+
+  it("retains transparent Authorization and Bearer-prefix/body recognition", () => {
+    expect(redactSensitiveText(`Authorization:\u001b[31m Bearer\u001b[K ${token}${reset}`))
+      .toBe(`Authorization:\u001b[31m ${REDACTED_EVENT_VALUE}${reset}`);
+    const bareToken = "sk-" + "a".repeat(12);
+    expect(redactSensitiveText(`Bearer\u001b[31m${bareToken}${reset}`))
+      .toBe(`Bearer\u001b[31m${REDACTED_EVENT_VALUE}${reset}`);
+    expect(redactSensitiveText(`Bearer \u001b[31m${token}${reset}`))
+      .toBe(`Bearer \u001b[31m${REDACTED_EVENT_VALUE}${reset}`);
   });
 });
