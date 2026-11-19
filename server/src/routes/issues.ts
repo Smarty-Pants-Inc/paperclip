@@ -63,6 +63,7 @@ import { reconstructWorkspaceSchema } from "@paperclipai/shared";
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse, type QueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, heldConversationComments, isConversation, isConversationReset } from "../services/agent-conversations.js";
 import { withCarriedSteerDisplay as withSteeredCommentDisplay } from "../services/carried-steer.js";
+import { trySteerPersonComment } from "../services/conversation-steering.js";
 import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboarding-first-task-admission.js";
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
@@ -20460,7 +20461,7 @@ export function issueRoutes(
             }),
           });
           await externalObjectsSvc.syncCommentSafely(receipt.id);
-          res.status(201).json(receipt);
+          res.status(201).json((await withSteeredCommentDisplay(db, [receipt]))[0] ?? receipt);
           return;
         }
       }
@@ -20937,7 +20938,7 @@ export function issueRoutes(
             commentOptions,
             dbOrTx,
           );
-        const needsFastResponse = actor.actorType === "user" && currentIssue.assigneeAgentId && !["done", "cancelled", "backlog"].includes(currentIssue.status);
+        const needsFastResponse = actor.actorType === "user" && currentIssue.assigneeAgentId && !currentIssue.executionRunId && !["done", "cancelled", "backlog"].includes(currentIssue.status);
         comment = needsFastResponse ? await db.transaction(async tx => {
           const saved = await add(tx as unknown as Db);
           if (actor.actorType === "user" && currentIssue.assigneeAgentId && !["done", "cancelled", "backlog"].includes(currentIssue.status)) {
@@ -20949,7 +20950,28 @@ export function issueRoutes(
         }) : await add();
       }
 
-      if (!fastResponseEnqueued && actor.actorType === "user" && currentIssue.assigneeAgentId && !["done", "cancelled", "backlog"].includes(currentIssue.status)) {
+      // Task person comments use the SAME attached-native default as chat.
+      // Route authorization/pause/status handling above stays authoritative.
+      // An active native run already owns this input: no goal RPC, independent
+      // fast response or ordinary assignee wake may race its pending hand-off.
+      if (actor.actorType === "user" && !interruptRequested) {
+        goalCommentSteered = await trySteerPersonComment(db, comment, {
+          deliveryIntent: req.body.deliveryIntent ?? "steer",
+          onRejected: async () => {
+            if (!currentIssue.assigneeAgentId) return;
+            return heartbeat.wakeup(currentIssue.assigneeAgentId, {
+              source: "automation", triggerDetail: "system", reason: "issue_commented",
+              idempotencyKey: `conversation-comment:${comment.id}`,
+              requestedByActorType: "user", requestedByActorId: actor.actorId,
+              payload: { issueId: currentIssue.id, commentId: comment.id, mutation: "comment" },
+              contextSnapshot: { issueId: currentIssue.id, taskId: currentIssue.id, commentId: comment.id,
+                wakeCommentId: comment.id, wakeCommentIds: [comment.id], source: "issue.comment" },
+            });
+          },
+        });
+      }
+
+      if (!goalCommentSteered && !fastResponseEnqueued && actor.actorType === "user" && currentIssue.assigneeAgentId && !["done", "cancelled", "backlog"].includes(currentIssue.status)) {
         await db.transaction(tx => enqueueFastResponse(tx as unknown as Db, { companyId: currentIssue.companyId, issueId: currentIssue.id, agentId: currentIssue.assigneeAgentId,
           responsibleUserId: actor.actorId, sourceCommentId: comment.id, sourceKey: `comment:${comment.id}`, acceptedAt: new Date(comment.createdAt) }))
           .catch(() => logger.warn({ issueId: currentIssue.id }, "fast response admission unavailable"));
@@ -20973,6 +20995,7 @@ export function issueRoutes(
           identifier: currentIssue.identifier,
           issueTitle: currentIssue.title,
           authorizationReason: commentAuthorizationReason,
+          deliveryIntent: req.body.deliveryIntent ?? (interruptRequested ? "interrupt" : "steer"),
           ...(isDirectParentReportDecision(commentAccessDecision)
             ? { directParentReportGrant: true }
             : {}),
@@ -21020,6 +21043,7 @@ export function issueRoutes(
       else await issueReferencesSvc.syncComment(comment.id);
       await externalObjectsSvc.syncCommentSafely(comment.id);
       if (
+        !goalCommentSteered && req.body.deliveryIntent !== "queue" && req.body.deliveryIntent !== "interrupt" &&
         currentIssue.assigneeAgentId &&
         // Slack-linked messages need the normal attributed wake boundary so
         // the accepted requester and return-thread receipt travel with the run.
@@ -21445,7 +21469,7 @@ export function issueRoutes(
 
 
       await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
-      res.status(201).json(comment);
+      res.status(201).json((await withSteeredCommentDisplay(db, [comment]))[0] ?? comment);
     },
   );
 
