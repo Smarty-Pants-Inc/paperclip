@@ -146,6 +146,8 @@ describe.skipIf(!support.supported)("the save fails for good on a SHARED project
         if (one === "retry") out.pressed[one] = await post("/retry", { idempotencyKey: randomUUID(), observedRunId: r.id });
         // REAL: the ONE action of the mixed-tree hold, "Continue with the files as they are" (POST /api/issues/:id/retry, retryAction).
         if (one === "continue" || one === "continue-again") out.pressed[one] = await post("/retry", { idempotencyKey: randomUUID(), observedRunId: r.id, retryAction: "continue_with_files" });
+        // What the GETs say at this exact moment, before any worker or gate runs again.
+        if (one === "look") (out.looks ??= []).push(await snapshot());
         // PLANTED (named UNRECOVERABLE-CODE): the spent recovery's failure, rewritten to one of the three codes that mean the
         // saved files cannot be recovered at all (system-recovery-state.ts UNRECOVERABLE_SOURCE_CODES). The harness's own
         // recovery always ends source_binding_invalid, which is not one of them.
@@ -379,6 +381,22 @@ describe.skipIf(!support.supported)("the save fails for good on a SHARED project
     expect(systemNotes(out).filter(body => body === PARTLY || body === LINE)).toEqual([]);
     expect(out.sweep).toMatchObject({ noticed: 0 });
     expect(REPLY_FILES_PARTLY_SAVED_LINE).toBe(PARTLY);
+  }, 300_000);
+
+  // PLANTED (named PARTIAL-PREFIX and BOX-STOPPED). The window between the box's stop receipt and the gate's next run.
+  it("SHARED-HOLD-EARLY (4): the box is stopped and the checkout is mixed, and the gate has not run again yet -> the task already says the second line (never 'starts now'); Continue pressed right then is accepted and runs the message ONCE", async () => {
+    const out = await drive("partial+stopped+look+continue");
+    expectRUntouched(out);
+    const [look] = out.looks as Snapshot[];
+    expect(look.queuedComments.body.executionWait ?? null).toBeNull(); // the gate has named no wait yet
+    expectOneSentence(look, PARTLY, "continue_required");
+    expect(out.pressed.continue).toMatchObject({ status: 202, body: { accepted: true } });
+    expect(out.providerTurns).toBe(1);
+    expect(out.providerInputs).toMatchObject([{ carriesM: true, carriesPartlySavedNotice: true, carriesNotSavedNotice: false }]);
+    expect(carriers(out).map(run => run.status)).toEqual(["succeeded"]);
+    expect(out.carrierRoots.every((root: { isProjectCheckout: boolean }) => root.isProjectCheckout)).toBe(true);
+    expect(systemNotes(out).filter(body => body === PARTLY || body === LINE)).toEqual([]);
+    expect(out.sweep).toMatchObject({ noticed: 0 });
   }, 300_000);
 
   // PLANTED (named UNRECOVERABLE-CODE and BOX-STOPPED, at their lines in drive()).
