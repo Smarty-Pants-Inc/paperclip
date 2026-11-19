@@ -2527,10 +2527,17 @@ describe("persistent agent directories", () => {
     });
     afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
-    // Mutation gap: plant cancellation at the real post-persist/pre-commit
-    // line, not at apply entry. Reuse this durable-storage fixture; DB and
-    // canonical disk reads are real and precede any restoring store read.
-    it("RF3 POST-PERSIST ABORT: DB rows and canonical tree stay unchanged and the session lock is released", async () => {
+    // LATE-ABORT (RFL + rf-3 agreed contract; this row first exposed the gap at
+    // fb6a6e80, where it failed): cancellation is planted at the real
+    // post-persist/pre-commit line, not at apply entry. Past the canonical
+    // commit boundary the write cannot be cancelled, so the collection must not
+    // report "cancelled": it waits for the apply and reports SAVED, marked
+    // "abort came too late", with DB rows and canonical tree changed together.
+    // This is the LOCAL path (directory merge lock). The session advisory lock
+    // held through the late window is proven on the remote path in
+    // agent-directory-late-abort.test.ts (R1, R2, R4). DB and canonical disk
+    // reads are real and precede any restoring store read.
+    it("RF3 POST-PERSIST ABORT: the collection is SAVED and marked 'abort came too late'; DB rows and canonical tree change together and agree", async () => {
       // Complete the one-time legacy adoption before arming the fault. An
       // abort during adoption is pre-merge and cannot expose this mutation.
       await agentFileStore(db).read(companyId, agentId, entryFile, board());
@@ -2543,8 +2550,19 @@ describe("persistent agent directories", () => {
         roots: await db.select().from(agentFileRoots).where(eq(agentFileRoots.agentId, agentId)),
         audit: await db.select().from(activityLog).where(eq(activityLog.entityId, agentId)),
       });
-      const before = { rows: await canonicalRows(), treeHash: directorySnapshotSha256(await snapshotAgentFiles(root, false)) };
+      // Durable manifest and on-disk tree, hashed the same way (path, kind, content hash).
+      const digest = (entries: Array<[string, string, string | null]>) => createHash("sha256")
+        .update(JSON.stringify(entries.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))).digest("hex");
+      const observe = async () => {
+        const rows = await canonicalRows();
+        const tree = await snapshotAgentFiles(root, false);
+        return { rows, treeHash: directorySnapshotSha256(tree),
+          manifestDigest: digest((rows.roots[0]?.entries ?? []).map(entry => [entry.path, entry.kind, entry.kind === "file" ? entry.sha256 : null])),
+          treeDigest: digest([...tree.entries].map(([name, entry]) => [name, entry.kind, entry.kind === "file" ? entry.hash : null])) };
+      };
+      const before = await observe();
       expect(before.rows.roots).toHaveLength(1);
+      expect(before.manifestDigest, "fixture: the durable manifest equals the canonical tree before the collection").toBe(before.treeDigest);
       const realPersist = fileDurability.persistDurableAgentFiles;
       const actualStore = fileStoreModule.agentFileStore;
       let applies = 0, persisted = 0, applyDone: Promise<void> | undefined;
@@ -2573,13 +2591,13 @@ describe("persistent agent directories", () => {
       });
       const service = agentInstructionWorkingCopyService(db);
       factory.mockRestore();
-      let error: unknown, after: typeof before | undefined, lockReleased = false;
+      let error: unknown, collected: Awaited<ReturnType<typeof service.collectStopped>> | undefined, after: typeof before | undefined, lockReleased = false;
       try {
-        await service.collectStopped({ companyId, runId: copy.runId, signal: controller.signal }).catch(caught => { error = caught; });
-        // collectStopped may reject as soon as its lock session is terminated;
+        collected = await service.collectStopped({ companyId, runId: copy.runId, signal: controller.signal }).catch(caught => { error = caught; return undefined; });
+        // Without the fix collectStopped rejects before or as the apply ends;
         // wait for the actual apply transaction before observing its outcome.
         await applyDone;
-        after = { rows: await canonicalRows(), treeHash: directorySnapshotSha256(await snapshotAgentFiles(root, false)) };
+        after = await observe();
         const independent = createDb(external ?? database.connectionString);
         try {
           const key = `agent-directory:${companyId}:${agentId}`;
@@ -2588,7 +2606,9 @@ describe("persistent agent directories", () => {
           if (lockReleased) await independent.execute(sql`select pg_advisory_unlock(hashtextextended(${key}, 0))`);
         } finally { await independent.$client.end({ timeout: 1 }); }
         await writeJudgeEvidence("rf3-post-persist-abort.json", {
-          applies, persisted, aborted: controller.signal.aborted, error: String(error), before, stagedRoot, after, lockReleased,
+          applies, persisted, aborted: controller.signal.aborted, error: error === undefined ? null : String(error),
+          collected: collected ? { state: collected.state, errorCode: collected.errorCode, abortCameTooLate: collected.receipt?.abortCameTooLate ?? null } : null,
+          before, stagedRoot, after, lockReleased,
           source: await fs.readFile(path.join(copy.localRoot, "post-persist-note.txt"), "utf8"),
           canonical: await fs.readFile(path.join(root, "post-persist-note.txt"), "utf8").catch(() => null),
         });
@@ -2596,11 +2616,17 @@ describe("persistent agent directories", () => {
       expect(applies).toBe(1);
       expect(persisted).toBe(1);
       expect(controller.signal.aborted).toBe(true);
-      expect(error).toBe(reason);
-      expect(lockReleased, "the save's session advisory lock must be released").toBe(true);
-      expect.soft(after?.rows, "no canonical DB rows may change after cancellation").toEqual(before.rows);
-      expect.soft(after?.treeHash, "canonical tree SHA256 must be identical before and after cancellation").toBe(before.treeHash);
-      expect(await fs.readFile(path.join(copy.localRoot, "post-persist-note.txt"), "utf8")).toBe(note);
+      expect.soft(error, "an abort after the commit boundary must not reject the collection as cancelled").toBeUndefined();
+      expect.soft(collected, "the collection reports the true outcome").toMatchObject({ state: "saved", errorCode: null, receipt: { abortCameTooLate: true } });
+      expect.soft((await copies.get(companyId, copy.runId)), "and so does its durable record").toMatchObject({ state: "saved", errorCode: null, receipt: { abortCameTooLate: true } });
+      expect.soft(lockReleased, "the save's session advisory lock must be released").toBe(true);
+      expect.soft(after?.manifestDigest, "DB and tree agree: durable manifest == on-disk tree hash").toBe(after?.treeDigest);
+      expect.soft(after?.rows.roots[0]?.generation, "the durable rows changed").not.toBe(before.rows.roots[0]?.generation);
+      expect.soft(after?.rows.roots[0]?.entries.find(entry => entry.path === "post-persist-note.txt")).toMatchObject({ kind: "file", sha256: fileHash(Buffer.from(note)) });
+      expect.soft(after?.treeHash, "together with the canonical tree").not.toBe(before.treeHash);
+      expect.soft(await fs.readFile(path.join(root, "post-persist-note.txt"), "utf8")).toBe(note);
+      // The aborted run released nothing itself: its source copy is left to the cleanup owner.
+      expect.soft(await fs.readFile(path.join(copy.localRoot, "post-persist-note.txt"), "utf8")).toBe(note);
     }, 30_000);
     it.each([false, true])("JUDGE failed conflict upload must retain source through production retirement (warm=%s)", async warm => {
       const store = agentFileStore(db);
