@@ -155,7 +155,8 @@ function everCarriedSql(m: PersonMessageSql): SQL {
         or coalesce(any_run.result_json->'stopRestoredSteeredCommentIds', '[]'::jsonb) ? ${m.id}::text
         or coalesce(any_run.result_json->'interruptCarriedSteeredCommentIds', '[]'::jsonb) ? ${m.id}::text
         or (jsonb_typeof(any_run.result_json->'queuedSteeringAcknowledgements') = 'object'
-          and any_run.result_json->'queuedSteeringAcknowledgements' ? ${m.id}::text))))`;
+          and any_run.result_json->'queuedSteeringAcknowledgements' ? ${m.id}::text
+          and coalesce(any_run.result_json->'queuedSteeringAcknowledgements'->(${m.id}::text)->>'status', '') <> 'rejected'))))`;
 }
 
 export function personMessageOwedSql(m: PersonMessageSql): SQL {

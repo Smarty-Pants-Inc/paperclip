@@ -166,13 +166,28 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
       const steeringUnavailableReason = error instanceof NativeSessionSteeringError ? error.code : "steering_error";
       const queued = await db.transaction(async lock => {
         await lock.execute(sql`select pg_advisory_xact_lock(hashtextextended(${personCommentDeliveryLockKey(issue.id)}, 0))`);
-        // Admit before dropping custody. A pause can refuse admission without
-        // throwing; only a real durable wake receipt permits releasing custody.
-        await options.onRejected!();
-        const admitted = await lock.execute(sql`select 1 from agent_wakeup_requests
+        // A definitive refusal is not live input custody. Publish it before
+        // ordinary admission re-filters the run's pre-RPC input reservation.
+        // Keep the ids until admission succeeds so a pause/crash still leaves
+        // the saved input available to the existing run-end recovery.
+        await db.transaction(async tx => {
+          const [current] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).for("no key update");
+          if (!current) return;
+          const result = object(current.resultJson), acks = object(result.queuedSteeringAcknowledgements);
+          await tx.update(heartbeatRuns).set({ resultJson: { ...result, queuedSteeringAcknowledgements: {
+            ...acks, [comment.id]: { ...object(acks[comment.id]), status: "rejected", steeringUnavailableReason },
+          } } }).where(eq(heartbeatRuns.id, run.id));
+        });
+        // Admit before dropping the reservation. A pause can refuse admission
+        // without throwing; only a real durable receipt permits releasing it.
+        const admission = () => lock.execute(sql`select 1 from agent_wakeup_requests
           where company_id = ${issue.companyId}::uuid and agent_id = ${agentId}::uuid
             and idempotency_key = ${`conversation-comment:${comment.id}`}
             and status in ('queued', 'deferred_issue_execution', 'claimed', 'coalesced', 'completed') limit 1`);
+        // Run-end restoration may have won while the RPC was in flight.
+        // Its ordinary receipt already owns M; do not enqueue it again.
+        if (!(await admission()).length) await options.onRejected!();
+        const admitted = await admission();
         if (!admitted.length) return false;
         return db.transaction(async tx => {
           const [current] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).for("no key update");
