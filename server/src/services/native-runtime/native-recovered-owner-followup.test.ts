@@ -27,6 +27,7 @@ import { nativeUserStopRecoveryHeld } from "./native-user-stop-settlement.js";
 import { FRESH_THREAD_STARTED_NOTE } from "./fresh-thread-stop-gate.js";
 import { settleWarmRetention } from "../environment-warm-retention.js";
 import { freshThreadRefusalCode } from "./runner-reconciliation-refusal.js";
+import { HANDED_OFF_WARM_EXIT_KEY } from "./handed-off-warm-lease.js";
 import {
   buildNativeExecutionWithCheckpoint, findNativeSessionResumeRun, nativeToolContractFingerprintForTarget,
 } from "./native-session-resume.js";
@@ -1272,32 +1273,43 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await followUp.start()).toBe(outcome);
   }, 60_000);
 
-  // adopt-suspend-pending (live 11-19, B+A3): Paul Stops a warm Pi turn
-  // running `sleep 60`; the Stop's close barrier queued runner.suspend and the
-  // Runner never answered before its box was stopped (Boat's stop still
-  // pending, so the prior lease is not ended). 30 s later "what is 9 + 10?"
-  // got a NEW box and failed after 13 s at the retirement fence with
-  // journal_commands_unsettled(runner.suspend.pending), then a recovery card
-  // and an automatic re-run of the stopped sleeps. A settled person Stop
-  // settles its own Runner's lifecycle commands: the message runs once.
-  async function stoppedWithPendingSuspend(stop: Parameters<typeof stopSettledOwner>[1] = {},
-    control: "pending-suspend" | "pending-command" = "pending-suspend") {
-    const prior = await seedRecoveredPriorRun(control, { provider: "pi_rpc", lifecycle: "warm" });
+  // adopt-suspend-pending (live 11-19, B+A3) and adopt-fence-narrow (R1 replay
+  // adopt-replay-stop): Paul Stops a warm Pi turn running `sleep 60`; the
+  // Stop's close barrier queued runner.suspend and the Runner never answered.
+  // His stopped run's lease is still RETAINED (no release time), but the
+  // server persisted the hand-off proof handedOffWarmOwnerRunnerExited for
+  // THAT run on it seconds after the Stop. 30 s later "what is 9 + 10?" got a
+  // NEW box. The pending suspend is settled only because that Runner is known
+  // gone (the same fact admission reads); a person's Stop alone never settles it.
+  async function stoppedWithPendingSuspend(stop: Parameters<typeof stopSettledOwner>[1] | false = {}, options: {
+    control?: "pending-suspend" | "pending-command";
+    lease?: "proof-own" | "proof-other-run" | "retained-no-proof" | "active-no-proof" } = {}) {
+    const prior = await seedRecoveredPriorRun(options.control ?? "pending-suspend", { provider: "pi_rpc", lifecycle: "warm" });
     const followUp = await admitFollowUp(prior);
-    // The stopped run's own box: Boat's stop not yet confirmed, lease still active.
+    const lease = options.lease ?? "proof-own";
+    // The turn was admitted on a warm (keep_running) box.
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...run.runnerProfileJson, nativeResourceDisposition: "keep_running" } })
+      .where(eq(heartbeatRuns.id, prior.runId));
+    // The stopped run's own box: Boat's stop not yet confirmed, lease not ended.
     const priorEnvironmentId = randomUUID();
     await db.insert(environments).values({ id: priorEnvironmentId, name: `stopping-${prior.runId}`, driver: "sandbox" });
     await db.insert(environmentLeases).values({ companyId, environmentId: priorEnvironmentId, issueId: prior.issueId,
       heartbeatRunId: prior.runId, provider: "boat", providerLeaseId: `bx_stopping_${prior.runId.slice(0, 8)}`,
-      status: "active", metadata: { remoteCwd: "/workspace" } });
-    await stopSettledOwner(prior, { events: [
-      { eventType: "harness.diagnostic", payload: { code: "provider_interrupt_requested", pendingCallIds: [] } },
-    ], ...stop });
+      leasePolicy: "reuse_by_environment", status: lease === "active-no-proof" ? "active" : "retained", releasedAt: null,
+      metadata: { remoteCwd: "/workspace", ...(lease === "proof-own" || lease === "proof-other-run"
+        ? { [HANDED_OFF_WARM_EXIT_KEY]: { runId: lease === "proof-own" ? prior.runId : randomUUID(), provedAt: new Date().toISOString() } }
+        : {}) } });
+    if (stop !== false) {
+      await stopSettledOwner(prior, { events: [
+        { eventType: "harness.diagnostic", payload: { code: "provider_interrupt_requested", pendingCallIds: [] } },
+      ], ...stop });
+    }
     return { prior, followUp };
   }
 
   it.each(["created", "replacement"] as const)(
-    "adopt-suspend-pending (a): a person's Stop that left runner.suspend pending; the next message runs on a %s box, once, with no recovery card", async outcome => {
+    "adopt-suspend-pending (a): his shape, a RETAINED lease with this run's hand-off proof and runner.suspend pending; the next message runs on a %s box, once, with no recovery card", async outcome => {
       const { prior, followUp } = await stoppedWithPendingSuspend();
       expect(await followUp.start(outcome)).toBe(ADMITTED);
       expect(followUp.logs.join("")).not.toContain("retirement_refused");
@@ -1326,8 +1338,21 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
       return;
     }
-    const { followUp } = await stoppedWithPendingSuspend(options.stop, options.control);
+    const { followUp } = await stoppedWithPendingSuspend(options.stop, { control: options.control });
     expect(await followUp.start("created")).toBe(refusal);
+    expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
+  }, 60_000);
+
+  // adopt-fence-narrow: without the 'runner gone' fact for THIS run, a
+  // person's acknowledged Stop still leaves runner.suspend pending: refuse.
+  it.each<[string, false | Parameters<typeof stopSettledOwner>[1], "proof-other-run" | "retained-no-proof" | "active-no-proof" | "proof-own"]>([
+    ["an ACTIVE lease with no proof (dea0e48e's former (a) shape)", {}, "active-no-proof"],
+    ["a RETAINED lease with no hand-off proof", {}, "retained-no-proof"],
+    ["a hand-off proof for ANOTHER run", {}, "proof-other-run"],
+    ["no person Stop (this run's proof alone never settles an un-Stopped owner)", false, "proof-own"],
+  ])("adopt-fence-narrow control: %s still refuses", async (_label, stop, lease) => {
+    const { followUp } = await stoppedWithPendingSuspend(stop, { lease });
+    expect(await followUp.start("created")).toBe(stranded("journal_commands_unsettled(runner.suspend.pending)"));
     expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
   }, 60_000);
 

@@ -156,6 +156,7 @@ import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "../reusable-sandbox
 import { connectorToolDefinitionsForSkills } from "../connector-runtime.js";
 import { NATIVE_PREPARATION_FENCING_VERSION, setNativeExecutionActive } from "./native-active-runs.js";
 import { preserveNativeFailedWorkspace } from "./native-failed-workspace-recovery.js";
+import { handedOffWarmLeaseSettled } from "./handed-off-warm-lease.js";
 import {
   boundedExecutionCleanup,
   EXECUTION_CONTROL_DEADLINE_MS,
@@ -6606,7 +6607,10 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
   // adopt-suspend-pending: a person's Stop leaves its Runner's suspend
   // pending when that Runner never answers. Read the Stop receipt, then
   // apply the same proof with that Stop settling only the lifecycle commands.
-  if (projection.refused?.startsWith("journal_commands_unsettled(")
+  // adopt-fence-narrow: ONLY when the stopped run's Runner is known gone
+  // (remoteRunnerGone: its lease released/expired, or this run's persisted
+  // hand-off proof). A person's Stop alone never settles them.
+  if (remoteRunnerGone && projection.refused?.startsWith("journal_commands_unsettled(")
     && await ownerSettledByAcknowledgedStop(input.db, { ...binding, runId: identity.runId })) {
     projectionOptions = { ...projectionOptions, personStopped: true };
     projection = readSettledRunnerdProjection(input.root, identity, projectionOptions);
@@ -6762,11 +6766,17 @@ async function priorRemoteSandboxLeasesEnded(db: Db, input: {
   companyId: string; runId: string; currentProviderLeaseId?: string;
 }): Promise<boolean> {
   try {
-    const leases = await db.select({ status: environmentLeases.status, releasedAt: environmentLeases.releasedAt,
-      providerLeaseId: environmentLeases.providerLeaseId }).from(environmentLeases)
+    const leases = await db.select().from(environmentLeases)
       .where(and(eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.heartbeatRunId, input.runId)));
-    return leases.length > 0 && leases.every(lease => (lease.status === "released" || lease.status === "expired")
-      && lease.releasedAt !== null && lease.providerLeaseId !== input.currentProviderLeaseId);
+    // adopt-fence-proof: a warm box a person's Stop handed off stays retained,
+    // but the server's persisted proof that THIS run's Runner exited on it is
+    // the same evidence admission trusts (handedOffWarmLeaseSettled).
+    const [run] = leases.some(lease => lease.status === "retained")
+      ? await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId))).limit(1)
+      : [];
+    return leases.length > 0 && leases.every(lease => lease.providerLeaseId !== input.currentProviderLeaseId
+      && (((lease.status === "released" || lease.status === "expired") && lease.releasedAt !== null)
+        || (!!run && handedOffWarmLeaseSettled(run, lease))));
   } catch {
     return false;
   }
