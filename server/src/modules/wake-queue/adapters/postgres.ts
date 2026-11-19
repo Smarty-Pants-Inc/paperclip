@@ -10,7 +10,7 @@ import { notifyUnsafeWorkspaceExportRecovery } from "../../../services/unsafe-wo
 import { notifyChatInboundWakeNotices } from "../../../services/chat-inbound-wake-notice-notifications.js";
 import { notifyChatRunMilestones } from "../../../services/chat-run-milestone-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-work-notifications.js";
-import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop, isPersonAcceptedStartupStop, readPersonStopHold } from "../../../services/acknowledged-native-stop.js";
+import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop, isPersonAcceptedStartupStop, isStoppingPersonsOwn, readPersonStopHold } from "../../../services/acknowledged-native-stop.js";
 import { readRunCancellation } from "../../../services/run-cancellation.js";
 import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
@@ -954,17 +954,24 @@ async function gatherPersonStoppedChatMessages(tx: Db, run: ReleaseRun, issue: I
   // Chat's own deferred merge keeps it), so A, /new, B never share a turn.
   const allIds = waiting.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload));
   const comments = allIds.length ? await tx.select({ id: issueComments.id, body: issueComments.body,
-    authorType: issueComments.authorType, authorAgentId: issueComments.authorAgentId, deletedAt: issueComments.deletedAt })
+    authorType: issueComments.authorType, authorAgentId: issueComments.authorAgentId, authorUserId: issueComments.authorUserId,
+    deletedAt: issueComments.deletedAt })
     .from(issueComments).where(and(
     eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, issue.id), inArray(issueComments.id, allIds))) : [];
   const byId = new Map(comments.map((comment) => [comment.id, comment]));
+  // Only the stopping person's own messages join (the ONE same-person fact):
+  // another person's held input stays where it is and never rides this Send.
+  const stoppedBy = parseObject(run.resultJson).cancelledByUserId;
+  const stopUserId = typeof stoppedBy === "string" ? stoppedBy : null;
   const messages: typeof waiting = [];
   for (const wake of waiting) {
     const ids = queuedCommentIdsFromWakePayload(wake.payload);
+    if (ids.length > 0 && ids.every((id) => { const comment = byId.get(id);
+      return comment && !comment.deletedAt && !isStoppingPersonsOwn(comment.authorUserId, stopUserId); })) continue;
     const plain = ids.length > 0 && parseObject(parseObject(wake.payload)[DEFERRED_WAKE_CONTEXT_KEY]).forceFreshSession !== true &&
       ids.every((id) => { const comment = byId.get(id);
         return comment && !comment.deletedAt && (comment.authorType ?? (comment.authorAgentId ? "agent" : "user")) === "user" &&
-          !isConversationReset(comment.body); });
+          isStoppingPersonsOwn(comment.authorUserId, stopUserId) && !isConversationReset(comment.body); });
     if (!plain) break;
     messages.push(wake);
   }
