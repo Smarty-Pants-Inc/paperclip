@@ -21097,6 +21097,10 @@ async function createRunnerdBackendWithinSessionClaim(
     ),
     codexTransportFactory: (recoveryContext) => {
       const bundle = createRunnerdCodexTransport({
+        // Remote Pi Stop already has its five-second acknowledgement budget.
+        // Do not add the generic ten-second close grace to a frozen process.
+        // A shorter wait is NOT exit proof: stop-and-retain must still attest it.
+        ...(input.execution.provider.kind === "pi_rpc" && remoteTarget?.transport === "sandbox" ? { closeGraceMs: 1_000 } : {}),
         ...(input.recoveryPurpose === "stop_cleanup" ? { recoveryPurpose: "stop_cleanup" as const } : {}),
         measureOperation: measureRunnerOperation,
         recordTimingReceipt: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? recordRunnerTimingReceipt : undefined,

@@ -56,7 +56,7 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "R-no-ack", "R-no-ack-double", "R-no-ack-restart", "finished"] as const)(`warm turnstop T1-F: %s (real Runner/Pi)`, async scenario => {
+it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "R-no-ack", "R-no-ack-sigstop", "R-no-ack-double", "R-no-ack-restart", "finished"] as const)(`warm turnstop T1-F: %s (real Runner/Pi)`, async scenario => {
   // No-ack cleanup must not depend on qualifying earlier same-session turns;
   // that path is a separate acceptance area. Existing warm controls keep two.
   const stopTurn = scenario.startsWith("R-no-ack") ? 1 : 3;
@@ -89,7 +89,11 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
   const procBirth = (pid: number) => readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1]!.split(" ")[19];
   const boxBootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
   const packVerificationCommands: Array<Record<string, unknown>> = [];
+  const stopProcessIdentities: Array<{ pid: number; birth: string }> = [];
   let stopRetainedPostgres: (() => Promise<void>) | undefined;
+  let stopRecoveryWorkers: (() => Promise<void>) | undefined;
+  let stopLiveEvents: (() => void) | undefined;
+  let screen: Awaited<ReturnType<typeof import("./helpers/native-pi-screen.js").nativePiScreen>> = null;
   let helloProbeRequests = 0;
   let warmupCount = 0;
   const warmupRunIds = new Set<string>();
@@ -207,7 +211,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         const step = [1, 2, 3, 4, 5, 6].find(value => !completed.includes(value));
         const plainQuestion = (scenario === "R-stop" || scenario.startsWith("R-no-ack")) && turn === 1;
         const useTool = !warmup && scenario !== "finished" && !plainQuestion && step !== undefined;
-        const reply = warmup ? `WARMUP_${warmupCount}` : plainQuestion ? "T1F_PLAIN_ANSWER: six is an even number."
+        const reply = warmup ? `WARMUP_${warmupCount}` : plainQuestion ? (scenario.startsWith("R-no-ack") ? "19" : "T1F_PLAIN_ANSWER: six is an even number.")
           : useTool ? `Perform STEP${step}` : `T1F_SIX_STEPS_DONE_${turn}`;
         request.reply = reply;
         const message = { id: `msg-${randomUUID()}`, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: reply, annotations: [] }] };
@@ -277,8 +281,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       incrementalSessionOutput: false, concurrentSyncOperations: false, independentControlCommands: true,
       runnerWebSocketIngress: true, reusableLeases: true, duplexCommandStream: false };
     const stopCalls: string[] = [];
-    const stopProcessIdentities: Array<{ pid: number; birth: string }> = [];
     let box = `spike-box-${randomUUID()}`;
+    const allocationRoots = new Map<string, string>();
     let commandCount = 0;
     const staged = join(remoteWorkspace, ".paperclip-runtime", "paperclip-runner");
     await mkdir(staged, { recursive: true });
@@ -313,26 +317,41 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       acquireRunLease: async input => {
         const candidates = await db!.select().from(environmentLeases).where(eq(environmentLeases.environmentId, environmentId));
         const prior = candidates.find(row => row.issueId === input.issueId && row.metadata?.agentId === input.agentId && row.status === "retained");
-        if (!prior) box = `spike-box-${randomUUID()}`;
+        box = prior?.providerLeaseId ?? `spike-box-${randomUUID()}`;
+        let allocationCwd = allocationRoots.get(box);
+        if (!allocationCwd) {
+          // Distinct provider allocations cannot share the old box's runtime
+          // markers. Keep that box intact; give the new allocation its own root.
+          allocationCwd = allocationRoots.size ? join(root, `box-workspace-${allocationRoots.size + 1}`) : remoteWorkspace;
+          allocationRoots.set(box, allocationCwd);
+          const runtime = join(allocationCwd, ".paperclip-runtime", "paperclip-runner");
+          await mkdir(runtime, { recursive: true });
+          if (!existsSync(join(runtime, "provider-pack")))
+            await symlink(process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH!, join(runtime, "provider-pack"));
+        }
         const lease = await envService.acquireLease({ companyId: input.companyId, environmentId,
           heartbeatRunId: input.heartbeatRunId, executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId,
           // The production built-in fake allocation has a valid stop-only
           // identity. An unregistered provider without pluginId cannot settle
           // a stop receipt; it would test fixture corruption, not I-B.
           provider: "fake", providerLeaseId: prior?.providerLeaseId ?? box, leasePolicy: "reuse_by_environment",
-          ...(prior ? { replacesReusableLeaseId: prior.id } : {}), metadata: { remoteCwd: remoteWorkspace, agentId: input.agentId,
+          ...(prior ? { replacesReusableLeaseId: prior.id } : {}), metadata: { remoteCwd: allocationCwd, agentId: input.agentId,
             sandboxLeaseAcquisition: { outcome: prior ? "resumed" : "created", providerLeaseId: box } } });
-        stage("allocation", { leaseId: lease.id, box: lease.providerLeaseId, runId: input.heartbeatRunId, warm: !!prior });
+        stage("allocation", { leaseId: lease.id, box: lease.providerLeaseId, cwd: allocationCwd, runId: input.heartbeatRunId, warm: !!prior });
         return lease;
       },
       releaseRunLease: async input => envService.releaseLease(input.lease.id, input.status),
-      realizeWorkspace: async () => ({ cwd: remoteWorkspace }),
+      realizeWorkspace: async input => {
+        const cwd = allocationRoots.get(input.lease.providerLeaseId!);
+        if (!cwd) throw new Error("Fixture allocation has no owned workspace root");
+        return { cwd };
+      },
       resolveCapabilities: async () => caps,
       providerSupportsReusableLeases: async () => true,
       execute: async input => {
         const startedAt = Date.now();
         const number = ++commandCount;
-        const result = await runChildProcess(`box-command-${randomUUID()}`, input.command, input.args ?? [], { cwd: input.cwd ?? remoteWorkspace,
+        const result = await runChildProcess(`box-command-${randomUUID()}`, input.command, input.args ?? [], { cwd: input.cwd ?? allocationRoots.get(input.lease.providerLeaseId!) ?? remoteWorkspace,
           env: input.env ?? {}, stdin: input.stdin, timeoutSec: (input.commandTimeoutMs ?? input.timeoutMs ?? 30000) / 1000,
           graceSec: 1, onLog: async (stream, chunk) => { await input.onLog?.(stream, chunk); } });
         await writeFile(join(root, `command-${number}.json`), JSON.stringify({ input, durationMs: Date.now() - startedAt, result }, null, 2));
@@ -355,7 +374,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         for (const identity of stopProcessIdentities) {
           if (!existsSync(`/proc/${identity.pid}`)) continue;
           if (procBirth(identity.pid) !== identity.birth) throw new Error("fixture provider stop process birth changed");
-          process.kill(identity.pid, "SIGTERM");
+          process.kill(identity.pid, scenario === "R-no-ack-sigstop" ? "SIGKILL" : "SIGTERM");
           const deadline = Date.now() + 5_000;
           while (existsSync(`/proc/${identity.pid}`) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
           if (existsSync(`/proc/${identity.pid}`)) throw new Error("fixture provider stop has not retired its real owner");
@@ -367,9 +386,9 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     await db.insert(environments).values({ id: environmentId, name: "Turnstop loopback allocation", driver: "sandbox",
       config: { provider: "fake", reuseLease: true, runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 300000 } });
 
-    const [{ createApp }, { createStorageService }, { createLocalDiskStorageProvider }, runner, { setupRunnerPrpWebSocketServer }, { subscribeCompanyLiveEvents }] = await Promise.all([
+    const [{ createApp }, { createStorageService }, { createLocalDiskStorageProvider }, runner, { setupRunnerPrpWebSocketServer }, { subscribeCompanyLiveEvents }, { setupLiveEventsWebSocketServer }] = await Promise.all([
       import("../app.js"), import("../storage/service.js"), import("../storage/local-disk-provider.js"),
-      import("../vendor/paperclip-runner/index.js"), import("../realtime/runner-prp-ws.js"), import("../services/live-events.js"),
+      import("../vendor/paperclip-runner/index.js"), import("../realtime/runner-prp-ws.js"), import("../services/live-events.js"), import("../realtime/live-events-ws.js"),
     ]);
     const realFactory = runner.createRunnerdCodexTransport;
     // Observation only: every invocation enters the unmodified production
@@ -402,7 +421,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
           return request(method, params);
         };
       }
-      if (scenario.startsWith("R-no-ack")) {
+      if (scenario.startsWith("R-no-ack") && scenario !== "R-no-ack-sigstop") {
         const request = bundle.transport.request.bind(bundle.transport);
         bundle.transport.request = (method, params) => {
           if (method === "turn/interrupt") {
@@ -438,18 +457,27 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       } };
     });
     app = await createApp(db, {
-      uiMode: "none", serverPort: 0, storageService: createStorageService(createLocalDiskStorageProvider(join(root, "storage"))),
+      uiMode: process.env.PAPERCLIP_A2_CHROMIUM_MODULE ? "static" : "none", serverPort: 0, storageService: createStorageService(createLocalDiskStorageProvider(join(root, "storage"))),
       deploymentMode: "local_trusted", deploymentExposure: "private", allowedHostnames: ["127.0.0.1"], bindHost: "127.0.0.1",
       authReady: true, companyDeletionEnabled: false, instanceId: `local-pi-${randomUUID()}`,
       localPluginDir: join(root, "plugins"), managedPluginAutoInstall: [], decisionServiceOptions: { wakeOriginAgent: async () => undefined },
     });
     await app.locals.bundledPluginsStartup;
+    if (scenario.startsWith("R-no-ack")) {
+      const { nativePiRecoveryWorkers } = await import("./helpers/native-pi-recovery-workers.js");
+      stopRecoveryWorkers = await nativePiRecoveryWorkers(db, app.locals.deliveryWork);
+      stage("production recovery workers registered");
+    }
     http = createServer(app);
     await new Promise<void>(resolve => http!.listen(0, "127.0.0.1", resolve));
     const address = http.address(); if (!address || typeof address === "string") throw new Error("No full server listener");
     const apiUrl = `http://127.0.0.1:${address.port}`;
     vi.stubEnv("PAPERCLIP_API_URL", apiUrl);
     setupRunnerPrpWebSocketServer(http, { apiUrl });
+    // Match server/index.ts: browser status must receive the real live-event
+    // invalidations, not rely on a stale polling-only fixture.
+    const liveEvents = setupLiveEventsWebSocketServer(http, db, { deploymentMode: "local_trusted" });
+    stopLiveEvents = () => { for (const client of liveEvents.clients) client.terminate(); liveEvents.close(); };
     stage("full Paperclip server up", { apiUrl });
     const api = async (method: string, path: string, body?: unknown, expected = 200, timeoutMs = 30_000) => {
       const requestBody = method === "POST" && path.endsWith("/comments") && body && typeof body === "object"
@@ -529,6 +557,10 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     stopProcessIdentities.push({ pid: pid.piPid, birth: originalIdentity.piBirth },
       { pid: pid.runnerPid, birth: originalIdentity.runnerBirth });
     stage("runnerd/Pi live identity", originalIdentity);
+    if (process.env.PAPERCLIP_A2_CHROMIUM_MODULE && scenario.startsWith("R-no-ack")) {
+      const { nativePiScreen } = await import("./helpers/native-pi-screen.js");
+      screen = await nativePiScreen(root, `${apiUrl}/${company.issuePrefix}/issues/${issueId}`);
+    }
     for (const prior of warmupIdentities) expect({ ...pid, nativeSessionId: admitted.nativeSessionId })
       .toEqual({ runnerPid: prior.runnerPid, piPid: prior.piPid, nativeSessionId: prior.nativeSessionId });
     const readPiEnvironment = () => Object.fromEntries(readFileSync(`/proc/${pid.piPid}/environ`, "utf8").split("\0").filter(Boolean).map(entry => { const at = entry.indexOf("="); return [entry.slice(0, at), entry.slice(at + 1)]; }));
@@ -553,13 +585,23 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       expect(originalFile, "the original Pi session file is in the old allocation").toBeDefined();
       const originalInode = statSync(originalFile!).ino;
       const originalBytes = readFileSync(originalFile!, "utf8");
+      if (scenario === "R-no-ack-sigstop") {
+        process.kill(pid.piPid, "SIGSTOP");
+        const state = await waitFor("actual SIGSTOP state", async () => {
+          const observed = readFileSync(`/proc/${pid.piPid}/stat`, "utf8").split(") ")[1]!.split(" ")[0];
+          return observed === "T" ? observed : null;
+        }, 5_000);
+        expect(state).toBe("T");
+        stage("A2 Pi SIGSTOP proved", { ...originalIdentity, state });
+      }
+      await screen?.frame("before-stop");
       const pressAt = Date.now();
       let terminalAt: number | undefined, admittedAt: number | undefined;
       const cancellationRequestId = randomUUID();
       const cancel = (requestId = cancellationRequestId) => api("POST", `/heartbeat-runs/${current.id}/cancel`, { cancellationRequestId: requestId })
         .then(result => ({ result, at: Date.now() }), error => ({ error: String(error), at: Date.now() }));
       const route = cancel();
-      await waitFor("real interrupt dispatch entered", async () => stages.find(row => row.stage === "I-B turn.interrupt never resolves") ?? null, 10_000);
+      if (scenario !== "R-no-ack-sigstop") await waitFor("real interrupt dispatch entered", async () => stages.find(row => row.stage === "I-B turn.interrupt never resolves") ?? null, 10_000);
       const duplicate = scenario === "R-no-ack-double" ? cancel(randomUUID()) : Promise.resolve(null);
       const restart = scenario === "R-no-ack-restart" ? (async () => {
         stage("I-B graceful restart detach entered during hanging Stop");
@@ -568,13 +610,28 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         stage("I-B graceful restart detach settled", result);
         return result;
       })() : Promise.resolve(null);
-      const message = await api("POST", `/issues/${issueId}/comments`, { body: "T1F_INPUT_1: Answer this new message in the safe successor." }, 201);
+      const sentAt = Date.now();
+      const message = await api("POST", `/issues/${issueId}/comments`, { body: "T1F_INPUT_1: 9 + 10", deliveryIntent: "queue" }, 201);
+      stage("A2 person sent 9 + 10", { sentAt, messageId: message.id });
       const terminal = waitFor("no-ack predecessor terminal", async () => {
         const [run] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, current.id));
         if (run?.status !== "cancelled") return null;
         terminalAt = Date.now(); return run;
       }, 60_000);
+      const waitSnapshots: Array<Record<string, unknown>> = [];
+      let lastFrameAt = 0;
       const successor = waitFor("no-ack successor admitted within 60s", async () => {
+        if (Date.now() - lastFrameAt > 1_000) {
+          lastFrameAt = Date.now();
+          const queue = await api("GET", `/issues/${issueId}/queued-comments`);
+          const frame = await screen?.frame(`wait-${waitSnapshots.length}`);
+          const activeRuns = (await db!.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
+            .where(eq(heartbeatRuns.agentId, agentId))).filter(run => ["running", "queued", "scheduled_retry"].includes(run.status));
+          waitSnapshots.push({ at: lastFrameAt, queue, activeRuns, frame });
+          await writeFile(join(root, "wait-snapshots.json"), JSON.stringify(waitSnapshots, null, 2));
+          if (frame && terminalAt && Date.now() - terminalAt > 1_000 && !activeRuns.length)
+            expect(frame.headers.some(header => /\bWorking\b/.test(header)), "no Working header without an admitted run").toBe(false);
+        }
         const run = (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
           .find(row => !warmupRunIds.has(row.id) && row.id !== current.id && row.startedAt);
         if (!run) return null;
@@ -597,20 +654,40 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const notes = await waitFor("true fresh-session note is durable", async () => {
         const comments = await db!.select().from(issueComments).where(eq(issueComments.issueId, issueId));
         return comments.some(row => /didn.t confirm the stop|stop.*fresh session|fresh session.*stop/i.test(row.body)) ? comments : null;
-      }, Math.max(1, 30_000 - (Date.now() - pressAt)));
+      }, Math.max(1, 60_000 - (Date.now() - pressAt)));
       if (scenario === "R-no-ack-double") expect(results[3]!.status).toBe("fulfilled");
       if (scenario === "R-no-ack-restart") {
         expect(results[4]!.status).toBe("fulfilled");
         expect((results[4] as PromiseFulfilledResult<{ inactiveRunIds: string[] }>).value.inactiveRunIds).toContain(current.id);
       }
+      const answer = await waitFor("A2 durable answer 19", async () => (await db!.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+        .find(row => row.authorAgentId === agentId && row.body.trim() === "19") ?? null, Math.max(1, 60_000 - (Date.now() - sentAt)));
+      const answeredAt = Date.now();
+      await screen?.frame("answer");
+      await screen?.phone("answer");
+      await writeFile(join(root, "a2-answer.json"), JSON.stringify({ scenario, sentAt, answeredAt, sendToAnswerMs: answeredAt - sentAt, answer, successorRunId: next.id }, null, 2));
+      expect(answeredAt - sentAt, "send to durable answer under 30 seconds").toBeLessThan(30_000);
       await heartbeatService(db).waitForRunExecutionDrain(next.id, { timeoutMs: 30_000 });
       const request = requests.find(row => row.turn === 1);
       expect(request, "the actual fresh Pi received the authorized input").toBeDefined();
+      expect(JSON.stringify(request!.input), "the actual successor receives 9 + 10 unchanged").toContain("9 + 10");
       expect(request!.completed, "fresh fallback never claims warm tool context").toEqual([]);
-      const [settledNext] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.id));
-      expect(settledNext?.status).toBe("succeeded");
+      const sourceEvents = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, current.id));
+      for (const step of [1, 2]) expect(JSON.stringify(sourceEvents), `completed STEP${step} receipt remains in durable source history`).toContain(`${fact}_STEP${step}`);
+      // Executor drain can precede the heartbeat's terminal publication. Join
+      // that real durable boundary too, rather than race its final DB update.
+      const settledNext = await waitFor("A2 successor completed", async () => {
+        const [run] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.id));
+        return run?.status === "succeeded" ? run : null;
+      }, 30_000);
+      expect(settledNext.status).toBe("succeeded");
+      expect(settledNext?.contextSnapshot?.explicitUserContinuation, "the fresh continuation carries its durable source history binding").toMatchObject({
+        previousRunId: current.id, readiness: { mode: "fresh_isolated_workspace", sourceRunId: current.id },
+      });
+      expect(settledNext?.runnerProfileJson?.piConversation).toMatchObject({ previousId: current.nativeSessionId });
       expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
         .filter(run => !warmupRunIds.has(run.id) && run.id !== current.id)).toHaveLength(1);
+      expect(readFileSync(stepsPath, "utf8").trim().split("\n"), "the stopped tools are not replayed").toEqual(["STEP1", "STEP2"]);
       expect(statSync(originalFile!).ino, "old session file stays in place for custody").toBe(originalInode);
       expect(readFileSync(originalFile!, "utf8").startsWith(originalBytes), "old session bytes are preserved").toBe(true);
       const live = bundles.map(bundle => bundle.transport.processInfo?.()?.pid).filter((value): value is number => !!value)
@@ -619,7 +696,9 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       expect(existsSync(`/proc/${pid.piPid}`), "old Pi process really exited before fallback").toBe(false);
       expect(stopCalls.length, "the existing stop-and-retain provider path ran").toBeGreaterThan(0);
       stage("I-B FALLBACK GREEN", { scenario, admissionMs: admittedAt! - pressAt, originalIdentity, live,
-        originalFile, originalInode, successorRunId: next.id, requestAt: request!.at, notes: notes.filter(row => row.authorType === "system").map(row => row.body) });
+        originalFile, originalInode, successorRunId: next.id, requestAt: request!.at,
+        sourceReceiptEventIds: sourceEvents.filter(event => [1, 2].some(step => JSON.stringify(event).includes(`${fact}_STEP${step}`))).map(event => event.id),
+        notes: notes.filter(row => row.authorType === "system").map(row => row.body) });
       return;
     }
     const interrupts = scenario === "R-double" ? 2 : 1;
@@ -696,6 +775,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         expect(actualIdentity).toEqual(originalIdentity);
         expect(nextLease?.providerLeaseId, "the same physical allocation, not merely a new durable lease").toBe(lease!.providerLeaseId);
         expect(stopCalls).toEqual([]);
+        const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+        expect(notes.some(note => /didn.t confirm the stop in time/.test(note.body)), "a warm successor never announces a fresh stop-timeout session").toBe(false);
       }
       current = next;
     }
@@ -738,6 +819,12 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       for (const run of runs) await writeFile(join(root, `events-${run.id}.json`), JSON.stringify(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, run.id)), null, 2));
     }
     unsubscribe?.();
+    await screen?.close();
+    stopLiveEvents?.();
+    await stopRecoveryWorkers?.();
+    if (scenario === "R-no-ack-sigstop") {
+      for (const identity of stopProcessIdentities) if (existsSync(`/proc/${identity.pid}`) && procBirth(identity.pid) === identity.birth) process.kill(identity.pid, "SIGCONT");
+    }
     if (db && agentId) {
       const { heartbeatService } = await import("../services/heartbeat.js");
       const heartbeat = heartbeatService(db);

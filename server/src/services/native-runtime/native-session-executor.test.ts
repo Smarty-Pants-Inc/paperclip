@@ -3548,7 +3548,7 @@ describe("remote provider pack manifest", () => {
         runnerArtifact?: { version: string; digest: string };
       };
       if (nativePi) {
-        expect(transport).toMatchObject({ provider: "pi_rpc", piRpcThinkingLevel,
+        expect(transport).toMatchObject({ provider: "pi_rpc", piRpcThinkingLevel, closeGraceMs: 1_000,
           piCommand: "/opt/paperclip-runner/provider-pack/provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
           piCommandSha256: digest, piProxyPath: "/opt/paperclip-runner/provider-pack/dist/cli/pi-rpc-app-server-proxy.cjs",
           piProxySha256: digest,

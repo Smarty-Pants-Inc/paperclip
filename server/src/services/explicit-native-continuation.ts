@@ -2,12 +2,14 @@ import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-n
 import { agentDirectoryPreparationWaitPredicate, isAgentDirectoryPreparationWait } from "./pre-dispatch-execution-evidence.js";
 import { assertDurableChatWakeupRequest, assertDurableChatWakeupReceipt, type DurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 import { notifyExecutionRunWork } from "./execution-control-notifications.js";
-import { canSelectFreshWorkspace, freshReadinessSchema, retainedIssueWorkspaceForRetry, type ContinuationReadiness } from "./fresh-workspace-continuation.js";
+import { canSelectFreshWorkspace, freshReadinessSchema, retainedIssueWorkspaceForRetry, workspaceHasOtherWriter, type ContinuationReadiness } from "./fresh-workspace-continuation.js";
 import { verifiedWorkspaceSnapshotReceipt } from "./workspace-recovery-snapshot.js";
 import { readTaskRetryIntent, retireTaskRetriesContinuedBy } from "./task-retry.js";
 import { isPreDispatchExecutionWaitVerified } from "./pre-dispatch-execution-wait.js";
 import { readSystemRecovery, savedFilesUnrecoverable, unrecoverableSavedFilesFailure, unrecoverableSavedFilesNotice } from "./system-recovery-state.js";
-import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
+import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "./workspace-restore-recovery-state.js";
+import { hasConfirmedSandboxStopAndRetain, SANDBOX_ALLOCATION_HOLDER_STATUSES } from "./sandbox-stop-and-retain.js";
+import { preparedRemoteWorkspaceSource } from "./remote-workspace-lifecycle.js";
 import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
 import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-migration.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
@@ -23,7 +25,7 @@ import { hasNativeLocalProcessStop, hasHistoricalSuspendedNativeSession, nativeG
 import { completeTerminatedLocalNativeSessionCleanup, completeTerminatedRemoteNativeSessionCleanup, nativeSessionCleanupBlock } from "../vendor/paperclip-runner/index.js";
 import { hasRecoveredCleanupStopReceipt, hasRemoteTerminationReceipt, remoteLeaseCleanupScope } from "./remote-execution-termination.js";
 import { z } from "zod";
-import { and, desc, eq, gt, inArray, isNull, ne, not, or, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, gt, gte, inArray, isNull, ne, not, or, sql, type SQL } from "drizzle-orm";
 import {
   agents, agentWakeupRequests, approvals, issueApprovals, issueThreadInteractions,
   environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions,
@@ -85,6 +87,69 @@ const PREVIOUS_EXECUTION_UNVERIFIED = "Paperclip can't confirm that the previous
 
 export function isUserCommentContinuationReason(reason: string | null | undefined): boolean {
   return reason === "issue_commented" || reason === "issue_reopened_via_comment" || reason === "issue_assigned";
+}
+
+/** The person's Stop ends execution, not custody. A new authorized message may
+ * leave an unfinished file repair behind only with all four independent facts:
+ * their own Stop, a bound stop-and-retain exit receipt, no other owner, and
+ * retained source files. This grants a fresh isolated turn, never old-box reuse,
+ * copyback completion, destruction, or replay of the interrupted actions. */
+async function personStoppedPredecessor(input: {
+  db: Db; run: Run; issueId: string; actorId: string; successorRunId: string;
+  requestId?: string; evidence: Record<string, unknown>; authorizedAt: Date;
+  interruptedByThisClick: boolean;
+}): Promise<string | null> {
+  const { db, run, issueId, actorId, requestId } = input;
+  const ownStop = isAcknowledgedNativeStop(run) && run.resultJson?.cancelledByUserId === actorId;
+  const stoppedAt = userStopBoundaryAt(run) ?? run.finishedAt;
+  if (run.runtimeMode !== "native" || run.status !== "cancelled" || !requestId ||
+      !(ownStop || input.interruptedByThisClick) || !stoppedAt ||
+      (!input.interruptedByThisClick && input.authorizedAt <= stoppedAt)) return null;
+  const system = readSystemRecovery(input.evidence);
+  if (!system || system.sourceRunId !== run.id || system.freshAttemptRunId ||
+      (system.providerCooldownAt !== null && system.providerCooldownAt > Date.now())) return null;
+  // Keep the existing fresh-intent scope and the source's explicit policy.
+  const [wake] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+    eq(agentWakeupRequests.id, requestId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+  ));
+  const [source] = await db.select({ policy: sql<Record<string, unknown> | null>`${heartbeatRuns.contextSnapshot}->'automaticRecovery'` })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id)));
+  if (!wake || source?.policy?.allowFreshWorkspace === false || adapterExecutionControls.has(run.id) ||
+      (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date()) ||
+      await hasPendingRunCleanup(db, run.companyId, run.id)) return null;
+  const leases = await db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
+  ));
+  const recovery = run.resultJson?.workspaceRestoreRecovery as Record<string, unknown> | undefined;
+  const heldIds = recovery?.leaseIds;
+  if (!Array.isArray(heldIds) || !heldIds.length || !leases.length ||
+      heldIds.some(id => typeof id !== "string" || !leases.some(lease => lease.id === id))) return null;
+  for (const lease of leases) {
+    // A destroyed/gone allocation is exit proof but is NOT retained-file proof.
+    if (!hasConfirmedSandboxStopAndRetain(lease)) return null;
+    const hold = lease.metadata?.workspaceRestoreRecovery as Record<string, unknown> | undefined;
+    const retainedHold = lease.leasePolicy === "retain_on_failure" &&
+      hold?.schema === LEGACY_WORKSPACE_RECOVERY_SCHEMA && hold.runId === run.id;
+    const prepared = retainedHold ? null : await preparedRemoteWorkspaceSource(db, lease);
+    if (!retainedHold && !prepared) return null;
+    // A provider allocation is global: a different company's owner also fences
+    // it. Even a completed owner after this receipt invalidates the old proof.
+    const proof = lease.metadata!.sandboxStopAndRetainReceipt as { confirmedAt: string };
+    const confirmedAt = new Date(proof.confirmedAt);
+    const [other] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+      ne(environmentLeases.id, lease.id), eq(environmentLeases.provider, lease.provider!),
+      eq(environmentLeases.providerLeaseId, lease.providerLeaseId!),
+      or(inArray(environmentLeases.status, [...SANDBOX_ALLOCATION_HOLDER_STATUSES]), eq(environmentLeases.cleanupStatus, "failed"),
+        gte(environmentLeases.acquiredAt, confirmedAt), gte(environmentLeases.releasedAt, confirmedAt)),
+    )).limit(1);
+    if (other) return null;
+    const workspaceId = lease.executionWorkspaceId ?? prepared?.workspace.id;
+    if (workspaceId && await workspaceHasOtherWriter(db, { companyId: run.companyId, workspaceId,
+      successorRunId: input.successorRunId })) return null;
+  }
+  return requestId;
 }
 
 function processStopped(pid: number): boolean {
@@ -447,7 +512,7 @@ export async function admitExplicitNativeContinuation(input: {
       !run.processPid && !run.processGroupId && !run.nativeSessionId &&
       (!taskRetry || await isPreDispatchExecutionWaitVerified(db, run));
     const sourceRunId = run.id;
-    const strategyRequestId = input.taskRetryRequestId ?? input.queuedCommentRequestId ?? savedChatRequestId;
+    const strategyRequestId = input.taskRetryRequestId ?? input.queuedCommentInterruptId ?? input.queuedCommentRequestId ?? savedChatRequestId;
     const strategyEvidence = strategyRequestId && !Object.hasOwn(action.evidence, "systemRecovery")
       ? actions.find(candidate => {
           const recovery = readSystemRecovery(candidate.evidence);
@@ -455,7 +520,7 @@ export async function admitExplicitNativeContinuation(input: {
             (input.taskRetryRequestId ? recovery.intentId === input.taskRetryRequestId : true);
         })?.evidence ?? action.evidence
       : action.evidence;
-    const freshIntent = await canSelectFreshWorkspace({ db, companyId, issueId, agentId, actorId,
+    let freshIntent = await canSelectFreshWorkspace({ db, companyId, issueId, agentId, actorId,
       sourceRunId: run.id, evidence: strategyEvidence, taskRetryRequestId: input.taskRetryRequestId,
       queuedRequestId: input.queuedCommentRequestId ?? savedChatRequestId });
     const legacyUserTurn = failedPreparation || run.runtimeMode === "legacy" &&
@@ -488,6 +553,10 @@ export async function admitExplicitNativeContinuation(input: {
       run.resultJson?.interruptionSource === "issue_comment_interrupt" && run.resultJson?.interruptedIssueId === issueId &&
       run.resultJson?.interruptedByActorType === "user" && run.resultJson?.interruptedByActorId === actorId &&
       run.resultJson?.queuedCommentInterruptQueueId === input.queuedCommentInterruptId;
+    if (!freshIntent && hasRequiredWorkspaceRecovery(run.resultJson)) freshIntent = await personStoppedPredecessor({
+      db, run, issueId, actorId, successorRunId: input.successorRunId, requestId: strategyRequestId,
+      evidence: strategyEvidence, authorizedAt, interruptedByThisClick,
+    });
     if (nativeQueuedSend && authorizedAt <= run.finishedAt! && !interruptedByThisClick)
       return blocked("send_predates_stop", "Send the saved message again now that the previous run has stopped.");
     if (coordinator && coordinator.phase !== "committed" && coordinator.resultId &&
@@ -546,10 +615,10 @@ export async function admitExplicitNativeContinuation(input: {
     // binds the saved user turn; finalized file state alone is insufficient.
     if (["native_workspace_sync_out_unrecoverable", "native_workspace_sync_out_retry_exhausted"].includes(action.cause)
       && !freshIntent && !await hasVerifiedWorkspaceRepair(db, run)) return blocked("workspace_repair_required",
-      "Paperclip is recovering saved work before continuing. Your message is saved.");
+      "Waiting for saved-work recovery. Your message is saved.");
     if ((run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson))
       && !freshIntent && !await hasVerifiedWorkspaceRepair(db, run)) {
-      return blocked("workspace_repair_required", "Paperclip is recovering saved work before continuing. Your message is saved.");
+      return blocked("workspace_repair_required", "Waiting for saved-work recovery. Your message is saved.");
     }
     const cancelledStartup = await isCancelledNativeStartup(db, run, coordinator);
     if (partiallyDeliveredQueue && run.runtimeMode !== "native" && !unusedAdmission && !cancelledStartup && !failedPreparation) return null;
@@ -605,7 +674,7 @@ export async function admitExplicitNativeContinuation(input: {
     const preserved = hasRequiredWorkspaceRecovery(run.resultJson) ? null
       : await preserveNativeFailedWorkspace(db, run);
     if (preserved && hasRequiredWorkspaceRecovery(preserved.resultJson)) return blocked("workspace_repair_required",
-      "Paperclip is recovering saved work before continuing. Your message is saved.");
+      "Waiting for saved-work recovery. Your message is saved.");
     const leases = await db.select()
       .from(environmentLeases).where(and(
         eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, run.id),
@@ -840,12 +909,14 @@ export async function admitExplicitNativeContinuation(input: {
   if (readiness) await persistActivity(db, { companyId, actorType: "system", actorId: "task-recovery",
     action: readiness.mode === "reuse_issue_workspace" ? "issue.retry_workspace_reused" : "issue.fresh_workspace_selected",
     entityType: "issue", entityId: issueId, details: { ...readiness, runId: input.successorRunId } });
-  // The new box cannot restore the old box's provider thread: the Retry's first
-  // run opens a fresh thread with the saved history, never a doomed restore.
-  if (taskRetry && readiness?.mode === "fresh_isolated_workspace") {
-    const { recordRetryFreshProviderThread, retryFreshThreadTrigger } = await import("./fresh-continuation-fallback.js");
+  // A person's new message can select the same fresh-workspace retry as Retry.
+  // Both need the existing provider-thread receipt: forceFreshSession alone is
+  // not authority to leave the old thread, whose checkpoint belongs to its box.
+  if (readiness?.mode === "fresh_isolated_workspace") {
+    const { recordRetryFreshProviderThread, retryFreshThreadTrigger, RETRY_FRESH_THREAD_TRIGGER } = await import("./fresh-continuation-fallback.js");
     await recordRetryFreshProviderThread(db, { companyId, issueId, agentId, sourceRunId: readiness.sourceRunId,
-      successorRunId: input.successorRunId, trigger: retryFreshThreadTrigger(taskRetry) });
+      successorRunId: input.successorRunId,
+      trigger: taskRetry ? retryFreshThreadTrigger(taskRetry) : RETRY_FRESH_THREAD_TRIGGER });
   }
   if (input.taskRetryRequestId) {
     const payload = sql`jsonb_set(${agentWakeupRequests.payload} #- '{taskRetry,continuation}', '{taskRetry,strategy}',
