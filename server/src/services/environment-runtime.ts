@@ -37,7 +37,7 @@ import { executeEnvironmentTask, pluginEnvironmentSupportsTasks, settleDispatche
 import { allowLegacyShutdownWorkspaceCleanup, legacyShutdownWorkspaceResourceProtected } from "./legacy-shutdown-workspace-settlement.js";
 import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-runtime/native-workspace-finalization-state.js";
 import { hasNativeHarnessBackupMissing } from "./native-runtime/native-harness-backup-missing.js";
-import { nativeCustodyKeptRecovery, nativeLeaseChainCustodyStamp, nativeLeaseCustodyMissing } from "./native-runtime/native-lease-custody.js";
+import { hasRetainedUnaddressableNativeCustody, nativeCustodyKeptRecovery, nativeLeaseChainCustodyStamp, nativeLeaseCustodyMissing } from "./native-runtime/native-lease-custody.js";
 import { abandonedWorkspaceFilesHeldOnLease, abandonedWorkspaceFilesParked, parkAbandonedWorkspaceFilesLease } from "./remote-workspace-abandoned-files-hold.js";
 import { beginIdleTrackedWork } from "./task-admission.js";
 import { historicalProviderCredentials } from "./historical-provider-credentials.js";
@@ -4777,6 +4777,9 @@ export function environmentRuntimeService(
       const released: EnvironmentRuntimeLeaseRecord[] = [];
       for (let leaseRow of leaseRows) {
         try {
+          // This possibly live allocation belongs to retained-orphan tracking,
+          // not ordinary release, even after its sealed transcript is copied.
+          if (hasRetainedUnaddressableNativeCustody(leaseRow)) continue;
           let providerResourceDisposition = desiredProviderResourceDisposition;
           if (providerResourceDisposition !== "stop_and_retain" && providerResourceDisposition !== "keep_running"
             && !hasStopOnlyCleanup(leaseRow) && await nativeWorkspaceExportPendingForLease(db, leaseRow)) continue;
@@ -4813,6 +4816,9 @@ export function environmentRuntimeService(
               custodyKept ? nativeCustodyKeptRecovery() : undefined);
             if (!prepared) continue;
             leaseSnapshot = toEnvironmentLeaseSnapshot(prepared);
+            // Retention without a stop is NOT a successful release receipt.
+            // Its separate retained-orphan owner keeps tracking the live box.
+            if (hasRetainedUnaddressableNativeCustody(prepared)) continue;
             preparedStopAttemptId = prepared.metadata?.pendingCleanupAttemptId;
           }
           if (hasStopOnlyCleanup(leaseSnapshot)) {

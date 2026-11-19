@@ -40,6 +40,21 @@ export async function nativeLeaseChainCustodyStamp(db: Db, lease: CustodyLease,
 export const NATIVE_CUSTODY_UNVERIFIED_KEY = "nativeCustodyUnverified";
 export const NATIVE_CUSTODY_UNVERIFIED_REASON = "native_custody_unverified";
 
+/** A kept, possibly RUNNING allocation, not a termination receipt. Only the
+ * fresh-replacement admission caller may disregard this resource obligation.
+ * Ordinary cleanup, stop-proof and recovery readers must still see it. */
+export function hasRetainedUnaddressableNativeCustody(lease: Pick<typeof environmentLeases.$inferSelect,
+  "status" | "cleanupStatus" | "failureReason" | "heartbeatRunId" | "metadata">): boolean {
+  const recovery = lease.metadata?.orphanedRunLeaseRecovery as Record<string, unknown> | undefined;
+  const replacement = lease.metadata?.replaceBeforeReuse as Record<string, unknown> | undefined;
+  return !!lease.heartbeatRunId && lease.status === "retained" && lease.cleanupStatus === "failed"
+    && lease.failureReason === "native_custody_stop_unavailable"
+    && recovery?.nativeCustodyUnverified === true && recovery.recoveredOrphanedRunLease === true
+    && recovery.ownerProof === NATIVE_CUSTODY_UNVERIFIED_REASON && recovery.runId === lease.heartbeatRunId
+    && recovery.disposition === "retained_unstoppable"
+    && replacement?.schema === "paperclip.replace-before-reuse.v1" && replacement.runId === lease.heartbeatRunId;
+}
+
 /**
  * THE custody check before any destructive cleanup of a native lease,
  * ephemeral included (RFL 05:59Z): true when the lease's box may hold a native
