@@ -7393,6 +7393,78 @@ describe("IssueDetail", () => {
     15_000,
   );
 
+  // heldcap (RFL gate 7, B''c GRADES/bc-g7 t2-aged, f001750 1:10): the steer's run ended unread but a LIVE
+  // wake still holds it to deliver next. neworg/caption-held 8fb2d8bf (server/src/services/carried-steer.ts:102-105)
+  // projects it deliveryOutcome 'queued', steeringStatus null, steeringUnavailableReason null (steeredIntoRunId
+  // untouched). It reads 'Waiting: …' in the thread, or sits in the waiting bar when the queue GET lists it, and
+  // NEVER 'Not delivered' (a person who believed that re-sent and got two answers). Then it is answered.
+  const HELD_BY_LIVE_WAKE = { steeringStatus: null, carriedIntoRunId: null, steeringDeliveryEventSeq: null,
+    deliveryOutcome: "queued", steeringUnavailableReason: null };
+  const HELD_ANSWERED = { steeringStatus: null, carriedIntoRunId: null, steeringDeliveryEventSeq: null,
+    deliveryOutcome: "ordinary", steeringUnavailableReason: null };
+  const HELD_WAKE_RUN_ID = "7d1e0c4b-3a2f-4e9d-8b6c-5f4a3e2d1c0b";
+  const HELD_ANSWER_TEXT = "Answered: read your held message after the held tool.";
+  it.each([
+    [390, "kept", "thread"], [1440, "kept", "thread"], [390, "null", "thread"], [1440, "null", "thread"],
+    [390, "kept", "queue"], [1440, "kept", "queue"],
+  ] as const)(
+    "held: a steer a live wake still holds reads 'Waiting: …' (never 'Not delivered'), then reads as answered at %i (steeredIntoRunId %s, %s)",
+    async (width, steered, listed) => {
+      const { post, runId, state, bubbles, waitingText } = await renderSteeringPlacement(width, "steer");
+      const editor = container.querySelector<HTMLTextAreaElement>('[data-testid="stand-in-editor"]')!;
+      await act(async () => {
+        editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+      });
+      const delivery = () => bubbles()[0]?.querySelector('[data-testid="task-chat-steered-delivery"]')?.textContent ?? "";
+      const page = () => container.textContent ?? "";
+      expect(await waitUntil(() => bubbles()[0]?.dataset.delivery === "sent")).toBe(true);
+      expect(state.thread).toContainEqual(expect.objectContaining({ id: post.id, steeringStatus: "accepted", steeredIntoRunId: runId }));
+      // The run ends unread; the server's live wake holds the message to deliver next.
+      await endTheSteeredRun(runId);
+      state.thread = a2r3({ ...HELD_BY_LIVE_WAKE, steeredIntoRunId: steered === "kept" ? runId : null });
+      if (listed === "queue") {
+        const entryComment = Object.fromEntries(Object.entries(STEER_A2_THREAD_GET_DELIVERED[0])
+          .filter(([key]) => !/^steer/.test(key)));
+        state.queue = createQueuedCommentQueue({
+          queueId: "5c2b1a09-8f7e-4d6c-b5a4-39281706f5e4", state: "deferred", targetRunId: HELD_WAKE_RUN_ID,
+          entries: [{ comment: entryComment as never, position: 0, canEdit: true, canDiscard: true, behindReset: false }],
+        } as never);
+      }
+      await act(async () => { await queryClient.invalidateQueries(); });
+      if (listed === "thread") {
+        expect(await waitUntil(() => bubbles()[0]?.dataset.delivery === "waiting")).toBe(true);
+        expect(bubbles()).toHaveLength(1);
+        expect(delivery().replace(/^ · /, "")).toBe("Waiting: it will be answered when the agent is free.");
+        expect(delivery()).not.toMatch(/\bSent\b/);
+      } else {
+        expect(await waitUntil(() => waitingText().includes(post.body))).toBe(true);
+        expect(bubbles().filter((node) => !node.closest('[data-testid="task-chat-queued-messages"]'))).toHaveLength(0);
+      }
+      expect(page()).not.toContain("Not delivered");
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/held-${listed}-${steered}-${width}.txt`,
+          `${listed === "thread" ? bubbles()[0]!.outerHTML : container.querySelector('[data-testid="task-chat-queued-messages"]')!.outerHTML}\n`);
+      }
+      // The wake's run answers it: the server no longer holds it, the agent's reply follows it.
+      state.queue = createQueuedCommentQueue({ queueId: null, state: null, targetRunId: null, entries: [] });
+      state.thread = [
+        ...a2r3({ ...HELD_ANSWERED, steeredIntoRunId: steered === "kept" ? runId : null }),
+        { ...STEER_A2_THREAD_GET_DELIVERED[1], id: "e0f1a2b3-c4d5-4e6f-8a7b-9c0d1e2f3a4b", authorType: "agent",
+          authorAgentId: "agent-1", authorUserId: null, clientRequestId: null, createdByRunId: HELD_WAKE_RUN_ID,
+          body: HELD_ANSWER_TEXT, createdAt: "2026-11-19T07:45:10.000Z", updatedAt: "2026-11-19T07:45:10.000Z" },
+      ];
+      await act(async () => { await queryClient.invalidateQueries(); });
+      expect(await waitUntil(() => page().includes(HELD_ANSWER_TEXT) && bubbles().length === 1)).toBe(true);
+      expect(waitingText()).not.toContain(post.body);
+      expect(page()).not.toContain("Waiting: it will be answered when the agent is free.");
+      expect(page()).not.toContain("Not delivered");
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/held-answered-${listed}-${steered}-${width}.txt`, `${bubbles()[0]!.outerHTML}\n`);
+      }
+    },
+    15_000,
+  );
+
   // carried: A2r3 's-steer5a i-b' (steerkill-g4s5a-i-b-105057): the turn ended unread, the server took
   // the message into the next turn (steeringStatus 'carried' + carriedIntoRunId), then Pi read it there
   // ('delivered'). Also with no steeredIntoRunId in the body: the server's word alone places the bubble.
