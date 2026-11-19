@@ -94,7 +94,8 @@ async function readSpillIndex(indexPath: string) {
   });
   const records = index.split("\n").filter(Boolean).map(line => JSON.parse(line) as ObjectRunLogSpillRecord);
   const recovered = new Set(records.filter(entry => entry.event === "recovered").map(entry => entry.spillStart));
-  return { records, open: records.filter(entry => entry.event === "spilled" && !recovered.has(entry.spillStart)) };
+  const spilled = records.filter(entry => entry.event === "spilled");
+  return { records, spilled, recovered, open: spilled.filter(entry => !recovered.has(entry.spillStart)) };
 }
 const SPILL_INDEX_SUFFIX = ".index.ndjson";
 /** Every run (`<company>/<agent>/<run>`) whose spill holds bytes no flush has stored yet. */
@@ -425,10 +426,16 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
    */
   async function adoptSpill(state: WriterState) {
     if (options.recoverSpill === false) return;
-    const open = (await readSpillIndex(spillPaths(options.spillDir, state.handle.logRef).indexPath)).open;
+    const index = await readSpillIndex(spillPaths(options.spillDir, state.handle.logRef).indexPath);
+    // `position` is where a range belongs in the journal: the journal end it
+    // was spilled at, moved past every earlier range spilled at that same end.
     let position = -1, adopted = 0;
-    for (const entry of open) {
+    for (const entry of index.spilled) {
       position = Math.max(position, entry.journalEnd);
+      if (index.recovered.has(entry.spillStart)) {
+        position += entry.bytes;
+        continue;
+      }
       const end = state.writer.head.end;
       if (!adopted && end >= position + entry.bytes &&
         await journalRangeSha(state, position, entry.bytes) === entry.sha256) {
