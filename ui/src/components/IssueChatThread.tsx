@@ -643,6 +643,7 @@ interface IssueChatThreadProps {
     attachmentIds?: string[],
     clientRequestId?: string,
     runSettings?: ComposerRunSettings,
+    deliveryIntent?: import("../api/comment-delivery").CommentDeliveryIntent,
   ) => Promise<void>;
   onCancelRun?: () => Promise<void>;
   stopPending?: boolean;
@@ -693,6 +694,8 @@ interface IssueChatThreadProps {
   onCancelQueued?: (commentId: string) => void;
   /** Authoritative PRP queue. The classic thread intentionally ignores it. */
   queuedCommentQueue?: IssueQueuedCommentQueue | null;
+  /** D5: the server queued the last message instead of steering it, and said why. */
+  steeringUnavailableReason?: string | null;
   onEditQueuedComment?: (
     commentId: string,
     body: string,
