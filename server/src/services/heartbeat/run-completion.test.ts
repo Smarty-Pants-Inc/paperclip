@@ -35,6 +35,7 @@ import { PluginWorkerUnavailableError } from "../plugin-worker-unavailable-error
 import { ReviewedChatBindingDeniedError, ReviewedChatBindingNotReadyError } from "../reviewed-chat-binding-diagnostics.js";
 import { environmentTaskErrorCodeData, JsonRpcCallError, PluginEnvironmentTaskError, PluginWorkspaceOperationError, workspaceOperationErrorData } from "@paperclipai/plugin-sdk";
 import { RUNNER_REVISION_MISMATCH_RETRY } from "../runner-revision-mismatch.js";
+import { prepareHeartbeatGitHubEnvironment } from "../heartbeat-github-launchers.js";
 import { STORAGE_CREDENTIALS_REJECTED_HELD_MESSAGE, STORAGE_UNAVAILABLE_CODE, STORAGE_UNAVAILABLE_EXHAUSTED_MESSAGE, STORAGE_UNAVAILABLE_HELD_MESSAGE, STORAGE_UNAVAILABLE_MESSAGE, STORAGE_UNAVAILABLE_RETRY } from "../../storage/storage-unavailable.js";
 import { withS3FailureDiagnostics } from "../../storage/s3-failure.js";
 import { workspaceProviderCallFailure } from "../workspace-provider-failure.js";
@@ -1807,6 +1808,79 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
         providerFailure: { provider: "sandbox", phase: "startup", category: "timeout", retryability: "transient" } });
       expect(f.deps.scheduleBoundedRetryForRun).toHaveBeenCalledWith(expect.objectContaining({ id: f.run.id }), f.agent);
     } else expect(f.deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
+  });
+
+  // Boat storage incident (smarty-dev#21249): the execution-target Git probe
+  // failed on both of its attempts after a fresh box was handed off. The real
+  // adapter-utils producer builds the error; the server classifies it the way
+  // the heartbeat setup step does before it reaches the setup failure path.
+  const boatEnvironment = { id: "boat-environment", name: "Boat", driver: "sandbox" };
+  const probeFailure = async (outcome: { exitCode: number | null; timedOut: boolean; stdout: string }) => {
+    const execute = vi.fn(async () => ({ signal: null, stderr: "fatal: exec channel closed", pid: null,
+      startedAt: new Date().toISOString(), ...outcome }));
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const settled = prepareHeartbeatGitHubEnvironment({ defer: false,
+        target: { kind: "remote", transport: "sandbox", providerKey: "boat", remoteCwd: "/workspace", runner: { execute } } as never,
+        cwd: "/controller/workspace", env: {}, hostCredentials: false, networkAccess: true,
+      }).then(() => { throw new Error("expected the probe to fail"); }, (error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(2_000);
+      const error = await settled;
+      expect(execute).toHaveBeenCalledTimes(2);
+      return error;
+    } finally { vi.useRealTimers(); }
+  };
+  const classifyAsHeartbeatSetup = async (error: unknown) => {
+    const classifier = (await import("../environment-provider-unavailable-error.js") as Record<string, unknown>)
+      .classifyExecutionTargetGitContextFailure as ((error: unknown, environment: unknown) => unknown) | undefined;
+    return classifier ? classifier(error, boatEnvironment) : error;
+  };
+
+  it.each(["exit", "timeout"] as const)("GP-R1: a final execution-target Git probe failure (%s) is transient and queues one bounded retry", async kind => {
+    const f = await fixture();
+    const error = await classifyAsHeartbeatSetup(await probeFailure(kind === "exit"
+      ? { exitCode: 1, timedOut: false, stdout: "" } : { exitCode: null, timedOut: true, stdout: "" }));
+    f.deps.scheduleBoundedRetryForRun.mockResolvedValueOnce({ outcome: "scheduled", runId: randomUUID(), issueId: null } as never);
+    await f.completion.failRunSetup(f.setup(error));
+    const failed = await read(f.run.id);
+    expect(failed).toMatchObject({ status: "failed", errorCode: "environment_provider_unavailable" });
+    expect(failed.errorCode).not.toBe("setup_failed");
+    // U14's diagnosis stays on the run.
+    expect(failed.error).toContain("Could not read execution-target Git context");
+    expect(failed.error).toContain("attempts=2");
+    expect(failed.resultJson).toMatchObject({ executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      providerFailure: { provider: "sandbox", phase: "startup", providerCode: "git_context_unavailable", retryability: "transient" } });
+    expect(f.deps.scheduleBoundedRetryForRun).toHaveBeenCalledTimes(1);
+    expect(f.deps.scheduleBoundedRetryForRun).toHaveBeenCalledWith(expect.objectContaining({ id: f.run.id }), f.agent);
+  });
+
+  it("GP-R3: the person's line for a final Git probe failure names the sandbox, says no work started and that it retries", async () => {
+    const f = await fixture();
+    const error = await classifyAsHeartbeatSetup(await probeFailure({ exitCode: 1, timedOut: false, stdout: "" }));
+    f.deps.scheduleBoundedRetryForRun.mockResolvedValueOnce({ outcome: "not_scheduled", reason: "Fixture scheduler boundary", issueId: null });
+    await f.completion.failRunSetup(f.setup(error));
+    const failed = await read(f.run.id);
+    const line = (failed.resultJson as { providerFailure?: { message?: string } } | null)?.providerFailure?.message;
+    console.log(`GP-R3 person line: ${JSON.stringify(line)}`);
+    expect(line).toBe("The provider for \"Boat\" was temporarily unavailable while Paperclip was starting it "
+      + "(the sandbox did not answer its Git context check). No agent work had started. "
+      + "If the task stays blocked, use Retry once the provider is available.");
+  });
+
+  it.each(["local_probe", "other_setup", "started"] as const)("GP-R4: a %s setup failure stays setup_failed without a bounded retry", async scenario => {
+    const f = await fixture();
+    // The controller-local probe shares the code but is not a box failure (no attempts).
+    const raw = scenario === "local_probe"
+      ? Object.assign(new Error("Could not read execution-target Git context: the probe output was not valid"),
+        { code: "execution_target_git_context_unavailable" })
+      : scenario === "other_setup" ? new Error("Boat workspace sentinel directory creation failed.")
+        : await probeFailure({ exitCode: 1, timedOut: false, stdout: "" });
+    const error = await classifyAsHeartbeatSetup(raw);
+    f.deps.scheduleBoundedRetryForRun.mockResolvedValueOnce({ outcome: "not_scheduled", reason: "Fixture scheduler boundary", issueId: null });
+    await f.completion.failRunSetup(f.setup(error, scenario === "started"));
+    const failed = await read(f.run.id);
+    expect(failed).toMatchObject({ status: "failed", errorCode: "setup_failed" });
+    expect(f.deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
   });
 
   it.each(["fresh", "started", "untrusted", "denied", "retained", "session", "runner"] as const)("bounds only an owned pre-dispatch chat binding wait: %s", async scenario => {
