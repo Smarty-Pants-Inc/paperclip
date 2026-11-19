@@ -459,6 +459,8 @@ function queuedCommentDiscardDenial(issue: { identifier?: string | null }, comme
 
 const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
 const CHAT_STOPPED_BY_PERSON_MESSAGE = "Stopped. These messages are waiting. Send them now, or delete any. If you type a new message first, they go right after it.";
+const CHAT_AFTER_TYPED_MESSAGE_REASON = "after_typed_message";
+const CHAT_AFTER_TYPED_MESSAGE_MESSAGE = "These go right after your new message.";
 /** A paused chat agent: the Send route's own code and words (its 409), so the
  * held bar says it is paused and offers no Send that would be refused. */
 const CHAT_AGENT_PAUSED_REASON = "queued_comment_chat_paused";
@@ -7915,7 +7917,7 @@ export function issueRoutes(
     // Send can admit: S's native admission path (isNativeAdmissionAdapter). A
     // legacy/process chat keeps the base gate: a stored wait (for example its
     // live reconciliation hold after the Stop) keeps the wait line, no bar.
-    if (wake && queueState?.state === "deferred" && !input.activeRun && !interruptHandoff && comments.length > 0 &&
+    if (wake && queueState?.state === "deferred" && !interruptHandoff && comments.length > 0 &&
         (!queue.executionWait || isNativeAdmissionAdapter(assignedAgent?.adapterType)) &&
         input.issue.conversationAgentId && input.issue.conversationAgentId === input.issue.assigneeAgentId &&
         !queuedInteractionId(wake.payload)) {
@@ -7925,11 +7927,17 @@ export function issueRoutes(
       // held wake: the person's Stop wins over a stale stored wait the Stop's
       // own recovery path writes after it (execution_recovery, remote_cleanup,
       // execution_settling). Paused still beats stopped.
-      if (await readPersonStopHold(input.executor as Db, { companyId: input.issue.companyId, issueId: input.issue.id,
-        agentId: input.issue.conversationAgentId, wakeId: wake.id })) {
+      // When that person's typed message ended the hold (the reader's state (b)),
+      // it runs first and these go right after it: nothing failed, so the stale
+      // stored wait is not the line, during the typed message's run or before it.
+      const hold = await readPersonStopHold(input.executor as Db, { companyId: input.issue.companyId, issueId: input.issue.id,
+        agentId: input.issue.conversationAgentId, wakeId: wake.id, reportEndedByTypedMessage: true });
+      if (hold && (hold.endedByTypedCommentId || !input.activeRun)) {
         queue.executionWait = await isChatAgentPaused(input.executor, input.issue.companyId, input.issue.conversationAgentId)
           ? { reason: CHAT_AGENT_PAUSED_REASON, message: CHAT_AGENT_PAUSED_MESSAGE }
-          : { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
+          : hold.endedByTypedCommentId
+            ? { reason: CHAT_AFTER_TYPED_MESSAGE_REASON, message: CHAT_AFTER_TYPED_MESSAGE_MESSAGE }
+            : { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
       }
     }
     if (wake && queuedInteractionId(wake.payload)) {
