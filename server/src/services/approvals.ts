@@ -11,6 +11,7 @@ import { redactCurrentUserText } from "../log-redaction.js";
 import { createAgentLifecycle } from "./agent-lifecycle.js";
 
 import { instanceSettingsService } from "./instance-settings.js";
+import { reviseCompanyCreationPayload } from "./company-creation-approval.js";
 
 export function approvalRecords(db: Db) {
   const instanceSettings = instanceSettingsService(db);
@@ -93,18 +94,16 @@ export function approvalRecords(db: Db) {
       }
 
       const now = new Date();
-      return writeApprovalChange(db, existing.companyId, tx => tx
-        .update(approvals)
-        .set({
-          status: "revision_requested",
-          decidedByUserId,
-          decisionNote: decisionNote ?? null,
-          decidedAt: now,
-          updatedAt: now,
-        })
-        .where(eq(approvals.id, id))
-        .returning()
-        .then((rows) => rows[0]), { approvalId: id });
+      return writeApprovalChange(db, existing.companyId, async tx => {
+        if (existing.type === "create_company") {
+          const [current] = await tx.select().from(approvals).where(eq(approvals.id, id)).for("update");
+          if (!current || current.status !== "pending") throw unprocessable("Only pending approvals can request revision");
+        }
+        return tx.update(approvals)
+          .set({ status: "revision_requested", decidedByUserId, decisionNote: decisionNote ?? null,
+            decidedAt: now, updatedAt: now })
+          .where(eq(approvals.id, id)).returning().then(rows => rows[0]);
+      }, { approvalId: id });
     },
 
     resubmit: async (id: string, payload?: Record<string, unknown>) => {
@@ -114,19 +113,22 @@ export function approvalRecords(db: Db) {
       }
 
       const now = new Date();
-      return writeApprovalChange(db, existing.companyId, tx => tx
-        .update(approvals)
-        .set({
-          status: "pending",
-          payload: payload ?? existing.payload,
-          decisionNote: null,
-          decidedByUserId: null,
-          decidedAt: null,
-          updatedAt: now,
-        })
-        .where(eq(approvals.id, id))
-        .returning()
-        .then((rows) => rows[0]), { approvalId: id });
+      return writeApprovalChange(db, existing.companyId, async tx => {
+        // A create-company revision cannot race the effect and overwrite its
+        // approved result. Validate here, not just at the HTTP caller.
+        const [current] = existing.type === "create_company"
+          ? await tx.select().from(approvals).where(eq(approvals.id, id)).for("update")
+          : [existing];
+        if (!current || current.status !== "revision_requested")
+          throw unprocessable("Only revision requested approvals can be resubmitted");
+        const nextPayload = current.type === "create_company"
+          ? reviseCompanyCreationPayload(current.payload, payload ?? {})
+          : payload ?? current.payload;
+        return tx.update(approvals)
+          .set({ status: "pending", payload: nextPayload, decisionNote: null,
+            decidedByUserId: null, decidedAt: null, updatedAt: now })
+          .where(eq(approvals.id, id)).returning().then(rows => rows[0]);
+      }, { approvalId: id });
     },
 
     listComments: async (approvalId: string) => {

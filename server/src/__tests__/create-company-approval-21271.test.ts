@@ -8,6 +8,7 @@ import { agentApiKeys, agents, approvals, authUsers, companies, companyMembershi
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { approvalRoutes } from "../routes/approvals.js";
+import { heartbeatService } from "../services/heartbeat.js";
 import { CREATE_COMPANY_IRREVERSIBLE_NOTICE } from "../services/company-creation-approval.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -20,7 +21,13 @@ describe("create_company approval card (#21271)", () => {
     database = await startEmbeddedPostgresTestDatabase("create-company-approval-21271-");
     db = createDb(database.connectionString);
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
-  afterAll(async () => { await database?.cleanup(); });
+  afterAll(async () => {
+    if (db) {
+      await heartbeatService(db).drainActiveRunExecutions();
+      await db.$client.end();
+    }
+    await database?.cleanup();
+  });
 
   async function seed() {
     const companyId = randomUUID(), ownerId = randomUUID(), otherUserId = randomUUID(), adminId = randomUUID();
@@ -62,7 +69,8 @@ describe("create_company approval card (#21271)", () => {
       app.use(errorHandler);
       return app;
     };
-    const admin = boardApp({ type: "board", source: "session", userId: adminId, companyIds: [companyId], isInstanceAdmin: true });
+    const admin = boardApp({ type: "board", source: "session", userId: ownerId, companyIds: [companyId], isInstanceAdmin: true });
+    const foreignAdmin = boardApp({ type: "board", source: "session", userId: adminId, companyIds: [companyId], isInstanceAdmin: true });
     const operator = boardApp({ type: "board", source: "session", userId: otherUserId, companyIds: [companyId],
       memberships: [{ companyId, membershipRole: "owner", status: "active" }], isInstanceAdmin: false });
     const name = `Launch Labs ${companyId.slice(0, 6)}`;
@@ -72,7 +80,9 @@ describe("create_company approval card (#21271)", () => {
         budgetMonthlyCents: 5000, ...payload } });
     const cards = () => db.select().from(approvals).where(and(eq(approvals.companyId, companyId), eq(approvals.type, "create_company")));
     const created = (orgName = name) => db.select().from(companies).where(eq(companies.name, orgName));
-    return { companyId, ownerId, otherUserId, ids, admin, operator, ask, cards, created, name };
+    const resubmit = (id: string, payload: Record<string, unknown>) => request(api)
+      .post(`/api/approvals/${id}/resubmit`).set("Authorization", `Bearer ${tokens.primary}`).send({ payload });
+    return { companyId, ownerId, otherUserId, ids, admin, foreignAdmin, operator, ask, cards, created, name, resubmit };
   }
 
   it("C1: the primary's request makes ONE pending card; the same request again returns that card", async () => {
@@ -114,7 +124,8 @@ describe("create_company approval card (#21271)", () => {
     const orgs = await f.created();
     expect(orgs).toHaveLength(1);
     const org = orgs[0]!;
-    expect(org).toMatchObject({ name: f.name, description: "Research and marketing", budgetMonthlyCents: 5000 });
+    expect(org).toMatchObject({ name: f.name, description: "Research and marketing", budgetMonthlyCents: 5000,
+      defaultResponsibleUserId: f.ownerId });
     expect(first!.body).toMatchObject({ status: "approved", payload: { createdCompanyId: org.id } });
     expect(racing!.body.payload.createdCompanyId).toBe(org.id);
     const [membership] = await db.select().from(companyMemberships).where(and(eq(companyMemberships.companyId, org.id),
@@ -127,6 +138,65 @@ describe("create_company approval card (#21271)", () => {
     // The request after approval is a new logical request, not a replay of this one.
     expect((await f.cards()).filter(row => row.status === "approved")).toHaveLength(1);
   }, 90_000);
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21271 (RFL J12)
+  it("J12: another instance admin cannot approve creating the intended owner's org: 409, no company", async () => {
+    const f = await seed();
+    const card = (await f.ask("primary")).body;
+    const response = await request(f.foreignAdmin).post(`/api/approvals/${card.id}/approve`).send({});
+    expect(response.status, response.text).toBe(409);
+    expect(response.body.error).toBe(`Only ${f.ownerId} can approve creating their organization`);
+    expect(await f.created()).toEqual([]);
+    expect((await f.cards())[0]!.status).toBe("pending");
+  }, 60_000);
+
+  // Never-OK access guard; catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21271 (RFL J13)
+  it("J13: resubmitting a foreign reservedCompanyId is refused; approval creates NEW org, foreign memberships unchanged", async () => {
+    const f = await seed();
+    const foreignId = randomUUID();
+    await db.insert(companies).values({ id: foreignId, name: "Foreign", issuePrefix: `F${foreignId.slice(0, 7)}` });
+    const memberships = () => db.select().from(companyMemberships).where(eq(companyMemberships.companyId, foreignId));
+    const before = await memberships();
+    const card = (await f.ask("primary")).body;
+    expect((await request(f.admin).post(`/api/approvals/${card.id}/request-revision`).send({ decisionNote: "Revise name" })).status).toBe(200);
+    const response = await f.resubmit(card.id, { name: f.name, ownerUserId: f.ownerId, reservedCompanyId: foreignId });
+    expect(response.status, response.text).toBe(422);
+    const [unchanged] = await f.cards();
+    expect(unchanged!.payload.reservedCompanyId).toBeUndefined();
+    const revised = await f.resubmit(card.id, { name: f.name, description: "Revised", budgetMonthlyCents: 100 });
+    expect(revised.status, revised.text).toBe(200);
+    expect(revised.body.payload.ownerUserId).toBe(f.ownerId);
+    const approved = await request(f.admin).post(`/api/approvals/${card.id}/approve`).send({});
+    expect(approved.status, approved.text).toBe(200);
+    expect(approved.body.payload.createdCompanyId).not.toBe(foreignId);
+    expect(await f.created()).toHaveLength(1);
+    expect(await memberships()).toEqual(before);
+  }, 60_000);
+
+  it("J13 defense in depth: an existing foreign reserved id in a saved card gives 409 and no membership", async () => {
+    const f = await seed();
+    const foreignId = randomUUID();
+    await db.insert(companies).values({ id: foreignId, name: "Foreign saved", issuePrefix: `F${foreignId.slice(0, 7)}` });
+    const card = (await f.ask("primary")).body;
+    await db.update(approvals).set({ payload: { ...card.payload, reservedCompanyId: foreignId } }).where(eq(approvals.id, card.id));
+    const response = await request(f.admin).post(`/api/approvals/${card.id}/approve`).send({});
+    expect(response.status, response.text).toBe(409);
+    expect(await db.select().from(companyMemberships).where(eq(companyMemberships.companyId, foreignId))).toEqual([]);
+    expect(await f.created()).toEqual([]);
+  }, 60_000);
+
+  it("J13 strict fields: create rejects all server keys; revision permits only name, description and budget", async () => {
+    const f = await seed();
+    for (const key of ["reservedCompanyId", "createdCompanyId", "normalizedName", "irreversibleNotice", "unexpected"]) {
+      expect((await f.ask("primary", { [key]: randomUUID() })).status, key).toBe(422);
+    }
+    const card = (await f.ask("primary")).body;
+    await request(f.admin).post(`/api/approvals/${card.id}/request-revision`).send({});
+    for (const key of ["ownerUserId", "reservedCompanyId", "createdCompanyId", "normalizedName", "irreversibleNotice", "unexpected"]) {
+      expect((await f.resubmit(card.id, { [key]: randomUUID() })).status, key).toBe(422);
+    }
+    expect((await f.cards())[0]!.status).toBe("revision_requested");
+  }, 60_000);
 
   it("C4: reject creates nothing", async () => {
     const f = await seed();

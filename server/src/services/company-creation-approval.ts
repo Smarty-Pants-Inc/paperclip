@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { approvals, companies, companyMemberships, userCompanyPreferences, type Db } from "@paperclipai/db";
 import { z } from "zod";
-import { forbidden, unprocessable } from "../errors.js";
+import { conflict, forbidden, unprocessable } from "../errors.js";
 import { resolvableApprovalStatuses } from "../lib/approval-records.js";
 import { writeApprovalChange } from "./approval-work-notifications.js";
 import { notifyToolReviewChange } from "./tool-review-work-notifications.js";
@@ -24,6 +24,33 @@ export const createCompanyApprovalPayloadSchema = z.object({
   ownerUserId: z.string().min(1),
   budgetMonthlyCents: z.number().int().nonnegative().optional(),
 }).strict();
+
+const reviseCompanyApprovalPayloadSchema = createCompanyApprovalPayloadSchema
+  .pick({ name: true, description: true, budgetMonthlyCents: true }).partial().strict();
+
+/** A revision changes the proposed organization, never the owner or effect ids. */
+export function reviseCompanyCreationPayload(current: Record<string, unknown>, payload: unknown) {
+  const parsed = reviseCompanyApprovalPayloadSchema.safeParse(payload);
+  if (!parsed.success) throw unprocessable("An organization revision may change only name, description and budget.",
+    { issues: parsed.error.issues });
+  const fields = createCompanyApprovalPayloadSchema.parse({
+    name: current.name, description: current.description ?? null, ownerUserId: current.ownerUserId,
+    budgetMonthlyCents: current.budgetMonthlyCents ?? 0, ...parsed.data,
+  });
+  return { ...current, ...companyCreationCardPayload(fields) };
+}
+
+function companyCreationCardPayload(fields: z.infer<typeof createCompanyApprovalPayloadSchema>) {
+  return {
+    ...fields,
+    description: fields.description ?? null,
+    budgetMonthlyCents: fields.budgetMonthlyCents ?? 0,
+    title: fields.name,
+    summary: `Create the new organization "${fields.name}" owned by this person. ${CREATE_COMPANY_IRREVERSIBLE_NOTICE}`,
+    irreversibleNotice: CREATE_COMPANY_IRREVERSIBLE_NOTICE,
+    normalizedName: normalizeCompanyName(fields.name),
+  };
+}
 
 export function normalizeCompanyName(name: string) {
   return name.normalize("NFKC").trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
@@ -55,15 +82,7 @@ export async function requestCompanyCreation(db: Db, input: {
   if (primary?.agentId !== agentId)
     throw forbidden("Only the owner's selected primary agent can ask to create an organization for them.");
   const normalizedName = normalizeCompanyName(fields.name);
-  const payload = {
-    ...fields,
-    description: fields.description ?? null,
-    budgetMonthlyCents: fields.budgetMonthlyCents ?? 0,
-    title: fields.name,
-    summary: `Create the new organization "${fields.name}" owned by this person. ${CREATE_COMPANY_IRREVERSIBLE_NOTICE}`,
-    irreversibleNotice: CREATE_COMPANY_IRREVERSIBLE_NOTICE,
-    normalizedName,
-  };
+  const payload = companyCreationCardPayload(fields);
   return writeApprovalChange(db, companyId, async tx => {
     // Same requester and name: serialize, then join the open card.
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`create_company:${companyId}:${agentId}:${normalizedName}`}))`);
@@ -88,19 +107,19 @@ export function assertCanApproveCompanyCreation(actor: ApproverActor) {
 }
 
 /**
- * Approve a create_company card and run its effect once. A reserved company id
- * is saved on the card before creation, so a replay or a second approve
- * finishes or returns that same company and never creates another.
+ * Approve a create_company card and run its effect once. The server-minted id,
+ * company, membership and decision commit together. A replay returns the saved
+ * result; a crash cannot leave an unproven company for a later card to adopt.
  */
 export async function approveCompanyCreation(db: Db, input: {
   approvalId: string; actor: ApproverActor; decisionNote?: string | null;
 }) {
   assertCanApproveCompanyCreation(input.actor);
-  // One effect at a time per card: a concurrent approve waits, then returns the
-  // recorded company. The reservation below covers a crash between steps.
+  // One effect at a time per card. Use this transaction for every effect write,
+  // not just the lock: existence alone is never proof that this card created it.
   return db.transaction(async lock => {
     await lock.execute(sql`select pg_advisory_xact_lock(hashtext(${`create_company_effect:${input.approvalId}`}))`);
-    return runCompanyCreationEffect(db, input);
+    return runCompanyCreationEffect(lock as unknown as Db, input);
   });
 }
 
@@ -114,6 +133,10 @@ async function runCompanyCreationEffect(db: Db, input: {
   const reserved = await writeApprovalChange(db, current.companyId, async tx => {
     const [card] = await tx.select().from(approvals).where(eq(approvals.id, input.approvalId)).for("update");
     if (!card) throw unprocessable("Not a create organization request");
+    // The owner on the card is the requester's stated intent, not authority to
+    // give another person an organization. Only that person may approve it.
+    if (!input.actor.userId || card.payload.ownerUserId !== input.actor.userId)
+      throw conflict(`Only ${String(card.payload.ownerUserId)} can approve creating their organization`);
     const saved = typeof card.payload.createdCompanyId === "string" ? card.payload.createdCompanyId : null;
     if (card.status === "approved" && saved) return { card, companyId: saved, done: true };
     if (!resolvableApprovalStatuses.includes(card.status))
@@ -132,16 +155,15 @@ async function runCompanyCreationEffect(db: Db, input: {
   });
   const svc = companyService(db);
   const [existing] = await db.select().from(companies).where(eq(companies.id, reserved.companyId));
-  const company = existing ?? await svc.create({ id: reserved.companyId, name: fields.name,
+  // An old or corrupt pending card must not adopt an existing organization.
+  // Only the atomically saved approved result above proves a prior effect.
+  if (existing) throw conflict("This organization reservation already exists and was not created by this approval.");
+  const ownerUserId = input.actor.userId!;
+  const company = await svc.create({ id: reserved.companyId, name: fields.name,
     description: fields.description ?? null, budgetMonthlyCents: fields.budgetMonthlyCents ?? 0,
-    defaultResponsibleUserId: fields.ownerUserId }).catch(async error => {
-    // A concurrent approve created the reserved company first.
-    const [raced] = await db.select().from(companies).where(eq(companies.id, reserved.companyId));
-    if (raced) return raced;
-    throw error;
-  });
+    defaultResponsibleUserId: ownerUserId });
   await finishCompanyProvisioning(db, { access: accessService(db), budgets: budgetService(db), logActivity }, {
-    company, ownerPrincipalId: fields.ownerUserId, actorUserId: input.actor.userId ?? null,
+    company, ownerPrincipalId: ownerUserId, actorUserId: ownerUserId,
     activityDetails: { approvalId: reserved.card.id, requestedByAgentId: reserved.card.requestedByAgentId },
   });
   // Record the result and the decision together, once.
