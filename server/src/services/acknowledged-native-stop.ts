@@ -159,6 +159,19 @@ export async function acknowledgedNativeStopExecutionHasStopped(db: Db, run: Pic
  * cause native_continuation_requires_reconciliation, evidence.runId = the run). */
 export const PERSON_STOP_OWN_HOLD_CAUSE = "native_continuation_requires_reconciliation";
 
+/**
+ * The ONE same-person fact of a person's Stop (RFL 06:56Z): a held message
+ * belongs to the Stop only when its author is the Stop's person, and only that
+ * same person's Send may move it. `personUserId` is a held message's author or
+ * the Send-er; `stopUserId` is the person who stopped (cancelledByUserId /
+ * the acceptance row's userId). Read by readPersonStopHold (a), the Stop merge
+ * (wake-queue gatherPersonStoppedChatMessages) and isPersonAcceptedStartupStop.
+ * Never re-derive this check elsewhere.
+ */
+export function isStoppingPersonsOwn(personUserId: string | null | undefined, stopUserId: string | null | undefined): boolean {
+  return typeof stopUserId === "string" && stopUserId.length > 0 && personUserId === stopUserId;
+}
+
 export type PersonStopHold = { stoppedRunId: string; userId: string; acceptedAt: string; wakeIds: string[] };
 
 function personStopWakeCarries(payload: unknown, issueId: string, messageId?: string): boolean {
@@ -249,7 +262,7 @@ export async function readPersonStopHold(db: Db, input: {
   const byId = new Map(comments.map(comment => [comment.id, comment]));
   const held = candidates.filter(wake => {
     const live = personStopWakeCommentIds(wake.payload).map(id => byId.get(id)).filter(comment => comment !== undefined);
-    return live.length > 0 && live.every(comment => comment.authorUserId === userId && comment.createdAt <= acceptedAt);
+    return live.length > 0 && live.every(comment => isStoppingPersonsOwn(comment.authorUserId, userId) && comment.createdAt <= acceptedAt);
   });
   return held.length ? { stoppedRunId: stop.runId, userId, acceptedAt: acceptedAt.toISOString(), wakeIds: held.map(wake => wake.id) } : null;
 }
@@ -347,13 +360,17 @@ export const SUBTREE_PAUSE_CANCEL_REASON = "Cancelled by a board operator's subt
  */
 export async function isPersonAcceptedStartupStop(db: Db, input: {
   id: string; companyId: string; status: string; errorCode: string | null; issueId: string;
-}, options: { sendingWakeId?: string } = {}): Promise<boolean> {
+}, options: { sendingWakeId?: string; sendingUserId?: string } = {}): Promise<boolean> {
   if (input.status !== "cancelled" || input.errorCode !== "cancelled" || !input.issueId) return false;
   // Callers hold partial or redacted run shapes; read the stored row once.
   const [stored] = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
-    status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, error: heartbeatRuns.error, resultJson: heartbeatRuns.resultJson })
+    status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, error: heartbeatRuns.error, resultJson: heartbeatRuns.resultJson,
+    runtimeMode: heartbeatRuns.runtimeMode })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.id)));
-  if (!stored || stored.status !== "cancelled" || stored.errorCode !== "cancelled"
+  // Native shape only (rf-2 F3): a Stop before native selection (runtimeMode
+  // still 'legacy') is released by the legacy path and Send admission never
+  // takes it, so no caller (the banner included) may read it as this fact.
+  if (!stored || stored.status !== "cancelled" || stored.errorCode !== "cancelled" || stored.runtimeMode !== "native"
     || Object.keys(parseObject(stored.resultJson?.startupCancellation)).length === 0) return false;
   const run = { ...stored, issueId: input.issueId };
   const { adapterExecutionControls } = await import("./adapter-execution-control.js");
@@ -361,16 +378,23 @@ export async function isPersonAcceptedStartupStop(db: Db, input: {
   const [coordinator] = await db.select({ leaseOwner: nativeRunFinalizations.leaseOwner }).from(nativeRunFinalizations)
     .where(and(eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, run.id)));
   if (coordinator?.leaseOwner) return false;
-  const personStop = (await readPersonStopHold(db, { companyId: run.companyId, issueId: run.issueId,
-    agentId: run.agentId, sendingWakeId: options.sendingWakeId }))?.stoppedRunId === run.id;
-  if (!personStop && !(await isPersonTreePauseCancel(db, run))) return false;
+  // rf-2 F1: the Stop is the person's OWN. The reader's (a) already binds the
+  // held messages' author to the Stop's person; a Send binds the Send-er too.
+  // Another person's Stop (or Pause) of my run never gives my Send the bypass.
+  const hold = await readPersonStopHold(db, { companyId: run.companyId, issueId: run.issueId,
+    agentId: run.agentId, sendingWakeId: options.sendingWakeId });
+  const personStop = hold?.stoppedRunId === run.id
+    && (options.sendingUserId === undefined || isStoppingPersonsOwn(options.sendingUserId, hold.userId));
+  if (!personStop && !(await isPersonTreePauseCancel(db, run, options.sendingUserId))) return false;
   const { provesNoNativeRunProviderWork } = await import("./native-runtime/native-provider-work-proof.js");
   return provesNoNativeRunProviderWork(db, { companyId: run.companyId, runId: run.id });
 }
 
 async function isPersonTreePauseCancel(db: Db, run: { companyId: string; issueId: string; error: string | null;
-  resultJson: Record<string, unknown> | null }) {
+  resultJson: Record<string, unknown> | null }, sendingUserId?: string) {
   if (run.error !== SUBTREE_PAUSE_CANCEL_REASON || run.resultJson?.cancelledByActorType !== "user") return false;
+  const pausedBy = typeof run.resultJson?.cancelledByUserId === "string" ? run.resultJson.cancelledByUserId : null;
+  if (sendingUserId !== undefined && !isStoppingPersonsOwn(sendingUserId, pausedBy)) return false;
   const { issueTreeControlService } = await import("./issue-tree-control.js");
   const gate = await issueTreeControlService(db).getActivePauseHoldGate(run.companyId, run.issueId);
   if (!gate) return false;
