@@ -12,6 +12,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { answeredPersonMessageIds } from "../services/person-message-answer.js";
+import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
 import {
   settleUnansweredPersonMessages, UNANSWERED_CARRIED_STEER_FAILED_TEXT, UNANSWERED_MESSAGE_NO_RUN_TEXT,
   UNANSWERED_MESSAGE_REASON_PREFIX,
@@ -238,18 +239,72 @@ describe.skipIf(!support.supported)("the sweep cards every owed person message, 
     const answered = await answeredPersonMessageIds(db, { companyId: f.companyId, issueId: f.issueId, commentIds: [m, m3] });
     const first = await sweep(f), afterFirst = (await allCards(f)).filter(c => c.message === m);
     const second = await sweep(f), afterSecond = (await allCards(f)).filter(c => c.message === m);
-    await evidence(`g1-${carrier}`, { m, m3, runId: run!.id, answered: [...answered], first, afterFirst, second, afterSecond });
-    return { m, m3, answered, first, afterFirst, second, afterSecond, all: await allCards(f) };
+    // Every run that ever carried m (a re-send would add one).
+    const carriersOfM = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter(r => JSON.stringify(r.contextSnapshot ?? {}).includes(m)).map(r => r.id);
+    await evidence(`g1-${carrier}`, { m, m3, runId: run!.id, answered: [...answered], first, afterFirst, second, afterSecond, carriersOfM });
+    return { m, m3, runId: run!.id, answered, first, afterFirst, second, afterSecond, carriersOfM, all: await allCards(f) };
   }
 
-  it("row G1: steered m whose ONLY carrier FAILED (no reply) + later M3 answered => exactly ONE card for m; a second pass adds nothing", async () => {
+  // SUPERSEDE-G1-CARRIED-FAILED-FLOOR-B-1119 (adopt-lead, 11-19): G1 is re-pinned. m was carried, its carrier
+  // failed, then a LATER succeeded replying run started after it: the chat moved on (the floor, option B), so the
+  // late sweep posts NO card for m and nothing re-sends m. The person was told AT THE FAILURE instead: the failed
+  // carrier's own failure card names m (row G1-naming below). Supersedes the earlier "exactly ONE card for m" pin.
+  it("row G1 (SUPERSEDE-G1-CARRIED-FAILED-FLOOR-B-1119): carried, failed, then a later succeeded replying run started after it => no card, no re-send", async () => {
     const r = await g1("failed");
-    expect(r.answered.has(r.m), "m stays owed (L1b)").toBe(false);
+    expect(r.answered.has(r.m), "m stays unanswered by the one predicate (L1b)").toBe(false);
     expect(r.answered.has(r.m3)).toBe(true);
-    expect(r.afterFirst, `one card for m after the first pass: ${JSON.stringify(r)}`).toHaveLength(1);
-    expect(r.afterFirst[0]!.deleted).toBe(false);
-    expect(r.afterSecond, "a second pass adds nothing").toEqual(r.afterFirst);
+    expect(r.afterFirst, `no late sweep card for m: ${JSON.stringify(r)}`).toEqual([]);
+    expect(r.afterSecond, "a second pass adds nothing").toEqual([]);
+    expect(r.carriersOfM, "no re-send: only the failed carrier ever carried m").toEqual([r.runId]);
     expect(r.all.filter(c => c.message === r.m3), "none for the answered M3").toEqual([]);
+  }, 120_000);
+
+  // G1-naming (adopt-g1-naming, SUPERSEDE-G1-CARRIED-FAILED-FLOOR-B-1119): AT THE FAILURE, the failed carrier's own
+  // failure card ("Couldn't finish this attempt. Your message is saved." + Retry) names the person messages that
+  // run carried, quoted short, oldest first. Real Postgres, the real projection the card renders.
+  async function failedCarrier(carried: "m1m2" | "nothing") {
+    const f = await seed();
+    const t = (n: number) => new Date(Date.now() - (30 - n) * 60_000);
+    const a = randomUUID(), b = randomUUID();
+    // Saved in this order: a (older) then b; the run lists them newest first, the card still quotes oldest first.
+    await db.insert(issueComments).values({ id: a, companyId: f.companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: userId, body: "Please rename the billing export to invoices.csv", createdAt: t(4), updatedAt: t(4) });
+    await db.insert(issueComments).values({ id: b, companyId: f.companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: userId, body: "Also add a total row at the bottom of the sheet, with the currency in every cell, "
+        + "and keep the old file for a week so the finance team can compare", createdAt: t(5), updatedAt: t(5) });
+    const agentNote = randomUUID();
+    await db.insert(issueComments).values({ id: agentNote, companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+      authorAgentId: f.agentId, body: "an agent note", createdAt: t(5.2), updatedAt: t(5.2) });
+    const ids = carried === "m1m2" ? [b, a] : [agentNote];
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "on_demand",
+      triggerDetail: "manual", status: "failed", runtimeMode: "native", startedAt: t(6), finishedAt: t(6.5),
+      error: "adapter_failed: the provider exited", errorCode: "adapter_failed",
+      responsibleUserId: userId, nativeIssueId: f.issueId, issueId: f.issueId,
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: ids[0], commentId: ids[0], wakeCommentIds: ids, responsibleUserId: userId } })
+      .returning();
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const presentation = await taskInterruptionPresentation(db, issue!);
+    await evidence(`g1-naming-${carried}`, { a, b, runId: run!.id, presentation });
+    return { a, b, presentation };
+  }
+
+  it("row G1-naming: a run carrying M1+M2 FAILS => its failure card quotes M1, M2 (oldest first)", async () => {
+    const { a, b, presentation } = await failedCarrier("m1m2");
+    expect(presentation?.state, JSON.stringify(presentation)).toBe("failed");
+    expect(presentation?.responsibility).toBe("system");
+    expect(presentation?.canRetry).toBe(true);
+    expect(presentation?.carriedMessages, JSON.stringify(presentation)).toEqual([
+      { id: a, quote: "Please rename the billing export to invoices.csv" },
+      { id: b, quote: "Also add a total row at the bottom of the sheet, with the currency in every cell, and keep the…" },
+    ]);
+  }, 120_000);
+
+  it("row G1-naming control: a failed run carrying nothing person-authored => card unchanged (names nothing)", async () => {
+    const { presentation } = await failedCarrier("nothing");
+    expect(presentation?.state, JSON.stringify(presentation)).toBe("failed");
+    expect(presentation?.canRetry).toBe(true);
+    expect(presentation && "carriedMessages" in presentation, JSON.stringify(presentation)).toBe(false);
   }, 120_000);
 
   it("control G1-live: m carried by a LIVE (running) run => no card for m while it is live", async () => {
