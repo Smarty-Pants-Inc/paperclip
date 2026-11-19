@@ -5210,7 +5210,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         ? issuesApi.addComment(writableIssueId, body, reopen, interrupt, attachmentIds, clientRequestId ?? createUuid(), deliveryIntent)
         : issuesApi.addComment(writableIssueId, body, reopen, interrupt, attachmentIds, clientRequestId ?? createUuid());
     },
-    onMutate: async ({ body, reopen, interrupt }) => {
+    onMutate: async ({ body, reopen, interrupt, clientRequestId }) => {
       // Start cache cancellation immediately but do not put it in front of the
       // optimistic echo. The new-runner startup placeholder must paint in the
       // same frame as send, even when an in-flight comments query is slow to
@@ -5244,6 +5244,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               authorUserId: currentUserId,
               clientStatus: queuedComment ? "queued" : "pending",
               queueTargetRunId: queuedComment?.id ?? null,
+              // The server's copy carries it back: one bubble, whichever arrives first.
+              clientRequestId,
             }),
             ...(workingRun ? pendingDeliveryFields() : {}),
           }
@@ -5674,7 +5676,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         ...(interrupt ? { interrupt } : {}),
       });
     },
-    onMutate: async ({ body, reopen, reassignment, interrupt }) => {
+    onMutate: async ({ body, reopen, reassignment, interrupt, clientRequestId }) => {
       // Cache cancellation can wait on an active request for several seconds.
       // Start it now, but paint the optimistic echo before awaiting it so a
       // reassignment never clears the composer into an empty thread.
@@ -5700,6 +5702,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
             authorUserId: currentUserId,
             clientStatus: queuedComment ? "queued" : "pending",
             queueTargetRunId: queuedComment?.id ?? null,
+            clientRequestId,
           })
         : null;
 

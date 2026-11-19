@@ -58,6 +58,8 @@ export function createOptimisticIssueComment(params: {
   authorUserId: string | null;
   clientStatus?: OptimisticIssueComment["clientStatus"];
   queueTargetRunId?: string | null;
+  /** The id the POST carries; the server stores it on the comment (issue_comments.client_request_id). */
+  clientRequestId?: string | null;
 }): OptimisticIssueComment {
   const now = new Date();
   const clientId = createOptimisticCommentId();
@@ -74,6 +76,7 @@ export function createOptimisticIssueComment(params: {
     metadata: null,
     clientStatus: params.clientStatus ?? "pending",
     queueTargetRunId: params.queueTargetRunId ?? null,
+    clientRequestId: params.clientRequestId ?? null,
     createdAt: now,
     updatedAt: now,
   };
@@ -143,7 +146,17 @@ export function mergeIssueComments(
     // comment in different React Query notifications. Keep the optimistic row
     // mounted through that handoff without briefly rendering both versions.
     // Consume matches one-for-one so repeated identical messages remain valid.
-    const matchingPersistedComment = persistedComments.find((persisted) =>
+    // The server's copy names the POST's own clientRequestId (the comments GET,
+    // the POST answer and a live refetch all carry it): that is the match, in
+    // whichever order they arrive. It is a fresh UUID per send, so it alone
+    // is the match: the pending copy's issueId can be the page's task while
+    // the POST went to the conversation's resolved task (ensureIssue). Body +
+    // time is the fallback for a copy without one.
+    const matchingPersistedComment = (comment.clientRequestId
+      ? persistedComments.find((persisted) =>
+        !reconciledPersistedIds.has(persisted.id) &&
+        persisted.clientRequestId === comment.clientRequestId)
+      : undefined) ?? persistedComments.find((persisted) =>
       !reconciledPersistedIds.has(persisted.id) &&
       persisted.issueId === comment.issueId &&
       persisted.authorType === comment.authorType &&
@@ -153,7 +166,17 @@ export function mergeIssueComments(
     );
     if (matchingPersistedComment) {
       reconciledPersistedIds.add(matchingPersistedComment.id);
-      const acknowledged = { ...matchingPersistedComment, clientId: comment.clientId };
+      // The server's copy replaces the pending one in place (same clientId,
+      // so the same node). Until the server's copy says how it was delivered
+      // it keeps the neutral pending mark ('Sending…'), never a guess.
+      const keepsPendingMark =
+        (comment as { clientDelivery?: unknown }).clientDelivery === "pending" &&
+        !(matchingPersistedComment as { steeredIntoRunId?: string | null }).steeredIntoRunId;
+      const acknowledged = {
+        ...matchingPersistedComment,
+        clientId: comment.clientId,
+        ...(keepsPendingMark ? { clientStatus: comment.clientStatus, clientDelivery: "pending" as const } : {}),
+      };
       merged[merged.findIndex((entry) => entry.id === matchingPersistedComment.id)] = acknowledged;
       continue;
     }

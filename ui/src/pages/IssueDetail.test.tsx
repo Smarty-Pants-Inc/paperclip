@@ -7192,7 +7192,7 @@ describe("IssueDetail", () => {
     width: number,
     flow: "steer" | "queue",
     // steer-ui3: the POST answer DELAYED (gate 4's hand take: POST 2.67 s), or refused.
-    answer: { delayMs?: number; failStatus?: 500 | 409; says?: "bare" | "queued" } = {},
+    answer: { delayMs?: number; failStatus?: 500 | 409; says?: "bare" | "queued"; echoClientRequestId?: boolean } = {},
   ) {
     const { TaskChatThread } = await vi.importActual<
       typeof import("../components/TaskChatThread")
@@ -7230,7 +7230,9 @@ describe("IssueDetail", () => {
           ? finalThread.map((comment) => comment.id === post.id ? post : comment)
           : [...QUEUE_SF_THREAD_GET];
         state.queue = flow === "steer" || answer.says === "bare" ? emptyQueue : QUEUE_SF_QUEUED_COMMENTS_GET;
-        return new Response(JSON.stringify(post), { status: 201, headers: { "content-type": "application/json" } });
+        // dupbubble: the server stores and answers the POST's own clientRequestId.
+        const answered = answer.echoClientRequestId ? { ...post, clientRequestId: posts.at(-1)!.clientRequestId } : post;
+        return new Response(JSON.stringify(answered), { status: 201, headers: { "content-type": "application/json" } });
       }
       fetched.push(`${method} ${url}`);
       const body = /pending-questions|\/browsers(\?|$)|\/mcp-app-views/.test(url) ? [] : { items: [], nextCursor: null };
@@ -7598,6 +7600,122 @@ describe("IssueDetail", () => {
         writeFileSync(`${process.env.STEER_UI_EVIDENCE}/says-queued-${width}.txt`,
           `${container.querySelector('[data-testid="task-chat-queued-messages"]')!.outerHTML}\n`);
       }
+    },
+    20_000,
+  );
+
+  // dupbubble (RFL, Paul's server B' a1fb126d, fresh T3 390: at clip 2.240 s the prompt
+  // showed TWICE, the server copy 'Just now' above the pending copy 'Sending…'). The
+  // server's copy (comments GET / live refetch, server/src/services/issues.ts listComments
+  // selects every issue_comments column, so it carries clientRequestId) must replace the
+  // pending bubble IN PLACE, whichever arrives first. One bubble at every 100 ms sample.
+  async function sampleBubbleCounts(bubbles: () => HTMLElement[], untilMs: number, started: number) {
+    const samples: Array<{ at: number; count: number }> = [];
+    while (performance.now() - started < untilMs) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await flushReact();
+      samples.push({ at: Math.round(performance.now() - started), count: bubbles().length });
+    }
+    return samples;
+  }
+  async function refetchThread(state: { thread: unknown[] }, thread: unknown[]) {
+    state.thread = thread;
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments("PAP-1") });
+    });
+  }
+  const withRequestId = (comment: object, clientRequestId: unknown) => ({ ...comment, clientRequestId });
+
+  it.each([390, 1440])(
+    "dupbubble: the thread GET returns the new comment at +300 ms while the POST answers at +1 s: exactly one bubble at every 100 ms sample, then it ends 'Delivered' at %i",
+    async (width) => {
+      const { post, runId, posts, state, bubbles, finalThread } = await renderSteeringPlacement(width, "steer", { delayMs: 1000, echoClientRequestId: true });
+      const editor = container.querySelector<HTMLTextAreaElement>('[data-testid="stand-in-editor"]')!;
+      const started = performance.now();
+      await act(async () => {
+        editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+      });
+      expect(await waitUntil(() => bubbles().length === 1, 300)).toBe(true);
+      const node = bubbles()[0]!;
+      expect(node.dataset.delivery).toBe("pending");
+      const early = await sampleBubbleCounts(bubbles, 300, started);
+      // The server's copy (the POST's own clientRequestId) arrives BEFORE the POST answers.
+      const requestId = posts[0]!.clientRequestId;
+      expect(typeof requestId).toBe("string");
+      const serverCopy = withRequestId(post, requestId);
+      await refetchThread(state, finalThread.filter((comment) => comment.id !== post.id).concat([serverCopy as never]));
+      const during = await sampleBubbleCounts(bubbles, 1800, started);
+      const samples = [...early, ...during];
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/dupbubble-get-first-${width}.json`, JSON.stringify(samples));
+      }
+      expect(samples.filter((sample) => sample.count !== 1), JSON.stringify(samples)).toEqual([]);
+      expect(samples.at(-1)!.at).toBeGreaterThanOrEqual(1500);
+      // Replaced in place: the same node, now carrying the server's state.
+      expect(bubbles()[0]).toBe(node);
+      expect(node.dataset.steeredIntoRunId).toBe(runId);
+      expect(node.dataset.delivery).toBe("sent");
+      expect(node.textContent).not.toMatch(/Sending…/);
+      // Pi reads it: the next GET says delivered, still one bubble.
+      await refetchThread(state, finalThread.map((comment) => comment.id === post.id ? withRequestId(comment, requestId) : comment));
+      expect(await waitUntil(() => bubbles()[0]?.dataset.delivery === "delivered")).toBe(true);
+      expect(bubbles()).toHaveLength(1);
+      expect(bubbles()[0]!.querySelector('[data-testid="task-chat-steered-delivery"]')?.textContent).toContain("Delivered");
+      expect(container.querySelectorAll('[data-testid="task-chat-steered-message"]')).toHaveLength(1);
+    },
+    20_000,
+  );
+
+  it.each([390, 1440])(
+    "dupbubble: the reverse order (POST answers at +300 ms, the thread GET carries it at +600 ms): exactly one bubble at every 100 ms sample at %i",
+    async (width) => {
+      const { post, runId, posts, state, bubbles, finalThread } = await renderSteeringPlacement(width, "steer", { delayMs: 300, echoClientRequestId: true });
+      const editor = container.querySelector<HTMLTextAreaElement>('[data-testid="stand-in-editor"]')!;
+      const started = performance.now();
+      await act(async () => {
+        editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+      });
+      expect(await waitUntil(() => bubbles().length === 1, 300)).toBe(true);
+      const node = bubbles()[0]!;
+      const early = await sampleBubbleCounts(bubbles, 600, started);
+      const requestId = posts[0]!.clientRequestId;
+      await refetchThread(state, finalThread.filter((comment) => comment.id !== post.id).concat([withRequestId(post, requestId) as never]));
+      const late = await sampleBubbleCounts(bubbles, 1200, started);
+      const samples = [...early, ...late];
+      if (process.env.STEER_UI_EVIDENCE) {
+        writeFileSync(`${process.env.STEER_UI_EVIDENCE}/dupbubble-post-first-${width}.json`, JSON.stringify(samples));
+      }
+      expect(samples.filter((sample) => sample.count !== 1), JSON.stringify(samples)).toEqual([]);
+      expect(bubbles()[0]).toBe(node);
+      expect(node.dataset.steeredIntoRunId).toBe(runId);
+      expect(node.dataset.delivery).toBe("sent");
+    },
+    20_000,
+  );
+
+  it.each([390, 1440])(
+    "dupbubble: a thread GET copy with no delivery yet keeps the one bubble 'Sending…' until the delayed QUEUED answer moves it to the waiting list at %i",
+    async (width) => {
+      const { post, posts, state, bubbles, waitingText } = await renderSteeringPlacement(width, "queue", { delayMs: 1000, echoClientRequestId: true, says: "queued" });
+      const editor = container.querySelector<HTMLTextAreaElement>('[data-testid="stand-in-editor"]')!;
+      const started = performance.now();
+      await act(async () => {
+        editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+      });
+      expect(await waitUntil(() => bubbles().length === 1, 300)).toBe(true);
+      const node = bubbles()[0]!;
+      await sampleBubbleCounts(bubbles, 300, started);
+      await refetchThread(state, QUEUE_SF_THREAD_GET.map((comment) => comment.id === post.id ? withRequestId(comment, posts[0]!.clientRequestId) : comment));
+      const beforeAnswer = await sampleBubbleCounts(bubbles, 900, started);
+      expect(beforeAnswer.filter((sample) => sample.count !== 1), JSON.stringify(beforeAnswer)).toEqual([]);
+      // The server's copy took the pending one's place and still claims nothing.
+      expect(bubbles()[0]).toBe(node);
+      expect(node.dataset.delivery).toBe("pending");
+      expect(node.textContent).toContain("Sending…");
+      expect(node.textContent).not.toMatch(/\bSent\b|Delivered|Queued/);
+      expect(await waitUntil(() => waitingText().includes(post.body), 3000)).toBe(true);
+      expect(container.querySelectorAll('[data-testid="task-chat-steered-message"]')).toHaveLength(0);
+      expect(bubbles().filter((bubble) => bubble.dataset.delivery)).toHaveLength(0);
     },
     20_000,
   );
