@@ -152,9 +152,15 @@ describe("shared project root, the save failed for good, a message parked: the r
       expect(text("thread")).toContain(M);
       expect(text()).not.toContain("Your Retry is saved.");
       expect(text()).not.toContain("Create a new task to continue the work.");
+      // (c) the board card in the thread says the ONE line, whole, and asks no decision of the person.
+      expect(count(text("thread"), LINE)).toBe(1);
+      expect(text()).not.toContain("This recovery needs a human decision.");
       await paint(fixtures.parked_head_boxNotStopped); dump("parked_head_boxNotStopped", width);
       expect(text("thread")).toContain(M);
       expect(count(text("thread"), "next turn answered")).toBe(0);
+      expect(count(text("thread"), LINE)).toBe(1);
+      expect(text()).not.toContain("This recovery needs a human decision.");
+      expect(buttons("top-status")).toEqual(["Check file recovery status", "Retry"]);
       expect(text()).not.toContain("Your Retry is saved.");
       expect(text()).not.toContain("Create a new task to continue the work.");
       await paint(fixtures.answered_head_boxStopped); dump("answered_head_boxStopped", width);

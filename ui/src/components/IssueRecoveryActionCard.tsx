@@ -84,6 +84,9 @@ export interface IssueRecoveryActionCardProps {
    * is running from one whose due time quietly passed.
    */
   scheduledRetry?: IssueScheduledRetry | null;
+  /** The task's own true line for this state. It replaces the generic headline (never "needs a human decision"
+   * where no decision is asked of the person). */
+  headline?: string | null;
   /** Preferred state hint (e.g. observe_only when watchdog tone is requested). Falls back to derived state. */
   forcedState?: RecoveryCardCardState;
   /** Optional click handler for resolve menu actions. If omitted, the buttons are not rendered. */
@@ -1008,6 +1011,7 @@ export function IssueRecoveryActionCard({
   action,
   agentMap,
   scheduledRetry = null,
+  headline: headlineOverride = null,
   forcedState,
   onResolve,
   onReissueIsolated,
@@ -1031,6 +1035,7 @@ export function IssueRecoveryActionCard({
   const lineage = useMemo(() => readRecoveryRetryLineage(action, liveness), [action, liveness]);
 
   const headline = useMemo(() => {
+    if (headlineOverride && cardState !== "resolved") return headlineOverride;
     if (cardState === "resolved" && action.outcome) {
       return `Recovery resolved as ${OUTCOME_LABEL[action.outcome] ?? action.outcome}.`;
     }
@@ -1043,7 +1048,7 @@ export function IssueRecoveryActionCard({
     }
     if (lineage) return lineageHeadline(lineage);
     return KIND_HEADLINE[action.kind] ?? KIND_HEADLINE.missing_disposition;
-  }, [action.kind, action.outcome, action.ownerType, cardState, lineage]);
+  }, [action.kind, action.outcome, action.ownerType, cardState, lineage, headlineOverride]);
 
   // A lane with no path left must not keep advertising a retry that will never run — whether
   // the budget ran out or the scheduled attempt simply never fired.
