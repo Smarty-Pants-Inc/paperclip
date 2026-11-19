@@ -391,7 +391,7 @@ describeEmbeddedPostgres("durable native provider backups", () => {
       expect(await readFile(join(replacement, "current/provider-artifacts/opencodeProxy"), "utf8")).toBe(f.original.opencodeProxy);
     }
   });
-  it("keeps a resumable run pin when an interrupted backup is retired", async () => {
+  it("keeps a resumable run pin and the interrupted backup's row, which is no longer retired", async () => {
     const f = await artifactFixture(), put = f.storage.putFile.bind(f.storage);
     const interrupted = vi.spyOn(f.storage, "putFile").mockImplementation(async input => {
       const result = await put(input);
@@ -422,9 +422,11 @@ describeEmbeddedPostgres("durable native provider backups", () => {
       sessionParamsJson: { sessionId: f.identity.normalizedSessionId } }).returning();
     const retention = nativeHarnessBackupExpirationService(f.db, { storage: f.storage });
     const first = await retention.tickCheckpoints();
-    expect(first.expired).toBe(1); expect(first.expiredCheckpoints).toBe(0);
+    expect(first.expired).toBe(0); expect(first.expiredCheckpoints).toBe(0); expect(first.skipped.native_backup_durable_copy_kept).toBe(1);
+    expect((await f.db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.id, pending.id)))[0]?.status).toBe("pending");
     expect(await f.db.select().from(nativeProviderArtifactReferences).where(eq(nativeProviderArtifactReferences.runId, f.runId)))
-      .toMatchObject([{ backupId: null, artifactId: receipt.artifactId }]);
+      .toEqual(expect.arrayContaining([expect.objectContaining({ backupId: null, artifactId: receipt.artifactId }),
+        expect.objectContaining({ backupId: pending.id, artifactId: receipt.artifactId })]));
     expect((await loadNativeRunnerCheckpoint(f.db, { companyId: f.companyId, issueId: f.issueId, runId: f.runId }))?.recoveryEvidence.normalizedSessionId)
       .toBe(f.identity.normalizedSessionId);
     await removeNativeHarnessBackup(f.providerArtifacts.sourceRoot);
@@ -433,7 +435,8 @@ describeEmbeddedPostgres("durable native provider backups", () => {
     expect(await readFile(join(restored, "opencodeProxy"), "utf8")).toBe(f.original.opencodeProxy);
     await f.db.delete(agentTaskSessions).where(eq(agentTaskSessions.id, selected.id));
     expect((await retention.tickCheckpoints()).expiredCheckpoints).toBe(1);
-    expect(await f.db.select().from(nativeProviderArtifacts).where(eq(nativeProviderArtifacts.id, receipt.artifactId))).toEqual([]);
+    // The kept backup still references its launch artifact, so the artifact is kept with it.
+    expect(await f.db.select().from(nativeProviderArtifacts).where(eq(nativeProviderArtifacts.id, receipt.artifactId))).toHaveLength(1);
   });
   it("keeps the exact encrypted upload receipt when its artifact owner changes after upload", async () => {
     const f = await artifactFixture(), put = f.storage.putFile.bind(f.storage);
@@ -1022,21 +1025,22 @@ describeEmbeddedPostgres("durable native provider backups", () => {
     // The object is still present and re-hashes to the row's manifest digest.
     expect(await verifyDurableNativeHarnessBackup({ ...f, backupId: before.id })).toBe(true);
   });
-  it("retains live work and retries an uncertain object deletion through the existing startup retention pass", async () => {
+  it("retains live work and keeps the settled object through the existing startup retention pass", async () => {
     const f = await fixture(); await persistNativeHarnessBackup(f);
     const old = new Date(Date.now() - 10 * 86_400_000);
     await f.db.update(nativeHarnessBackups).set({ createdAt: old }).where(eq(nativeHarnessBackups.scopeDigest, f.scopeDigest));
     const retention = nativeHarnessBackupExpirationService(f.db, { storage: f.storage });
     expect((await retention.tickCheckpoints()).expired).toBe(0);
     await settle(f, old);
-    const drop = vi.spyOn(f.storage, "deleteObject").mockRejectedValueOnce(new Error("delete reply lost"));
-    expect((await retention.tickCheckpoints()).failed).toBe(1);
-    expect((await f.db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.scopeDigest, f.scopeDigest)))[0].status).toBe("retired");
-    expect((await retention.tickCheckpoints()).expired).toBe(1);
-    expect(await f.db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.scopeDigest, f.scopeDigest))).toHaveLength(0);
-    expect(drop).toHaveBeenCalledTimes(2);
+    const drop = vi.spyOn(f.storage, "deleteObject");
+    expect((await retention.tickCheckpoints())).toMatchObject({ failed: 0, expired: 0 });
+    expect((await f.db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.scopeDigest, f.scopeDigest)))[0].status).toBe("current");
+    expect((await retention.tickCheckpoints()).expired).toBe(0);
+    expect(await f.db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.scopeDigest, f.scopeDigest))).toHaveLength(1);
+    expect(drop).not.toHaveBeenCalled();
+    expect(await verifyDurableNativeHarnessBackup(f)).toBe(true);
   });
-  it("expires obsolete objects without clearing an open conversation or its exact lease backup", async () => {
+  it("keeps obsolete objects without clearing an open conversation or its exact lease backup", async () => {
     const f = await fixture(); await persistNativeHarnessBackup(f);
     const [obsolete] = await f.db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.scopeDigest, f.scopeDigest));
     await writeFile(join(f.root, "manifest.json"), JSON.stringify({ revision: 2 }));
@@ -1053,13 +1057,14 @@ describeEmbeddedPostgres("durable native provider backups", () => {
     await f.db.update(environmentLeases).set({ status: "expired" }).where(eq(environmentLeases.id, lease.id));
     expect((await retention.tickCheckpoints({ dryRun: true })).expired).toBe(0);
     expect(await f.db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.id, obsolete.id))).toHaveLength(1);
-    expect((await retention.tickCheckpoints()).expired).toBe(1);
+    expect((await retention.tickCheckpoints()).expired).toBe(0);
     const rows = await f.db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.scopeDigest, f.scopeDigest));
-    expect(rows).toHaveLength(1); expect(rows[0].status).toBe("current");
+    expect(rows).toHaveLength(2); expect(rows.map(row => row.status).sort()).toEqual(["current", "superseded"]);
+    expect(await verifyDurableNativeHarnessBackup({ ...f, backupId: obsolete.id, manifestSha256: obsolete.manifestSha256 })).toBe(true);
     expect((await f.db.select().from(agentTaskSessions).where(eq(agentTaskSessions.id, selected.id)))[0]).toEqual(selected);
     expect((await f.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].status).toBe("running");
   });
-  it("retains an in-flight pending upload and removes it once its owner settles", async () => {
+  it("retains an in-flight pending upload and keeps it once its owner settles", async () => {
     const f = await fixture(); await persistNativeHarnessBackup(f);
     const put = vi.spyOn(f.storage, "putFile").mockRejectedValueOnce(new Error("upload unavailable"));
     await expect(persistNativeHarnessBackup(f)).rejects.toThrow("upload unavailable"); put.mockRestore();
@@ -1070,11 +1075,11 @@ describeEmbeddedPostgres("durable native provider backups", () => {
     const retention = nativeHarnessBackupExpirationService(f.db, { storage: f.storage });
     expect((await retention.tickCheckpoints()).expired).toBe(0);
     await settle(f);
-    expect((await retention.tickCheckpoints()).expired).toBe(1);
+    expect((await retention.tickCheckpoints()).expired).toBe(0);
     const remaining = await f.db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.scopeDigest, f.scopeDigest));
-    expect(remaining).toHaveLength(1); expect(remaining[0].status).toBe("current");
+    expect(remaining).toHaveLength(2); expect(remaining.map(row => row.status).sort()).toEqual(["current", "pending"]);
   });
-  it("keeps deleted-source objects unchanged during a retention dry run", async () => {
+  it("keeps deleted-source objects unchanged during a retention dry run and after it", async () => {
     const f = await fixture(); await persistNativeHarnessBackup(f);
     const old = new Date(Date.now() - 10 * 86_400_000);
     await f.db.update(nativeHarnessBackups).set({ createdAt: old, runId: randomUUID() })
@@ -1084,7 +1089,8 @@ describeEmbeddedPostgres("durable native provider backups", () => {
     expect((await retention.tickCheckpoints({ dryRun: true })).expired).toBe(0);
     expect((await f.db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.id, before.id)))[0]).toEqual(before);
     expect(await verifyDurableNativeHarnessBackup(f)).toBe(true);
-    expect((await retention.tickCheckpoints()).expired).toBe(1);
-    expect(await f.db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.id, before.id))).toHaveLength(0);
+    expect((await retention.tickCheckpoints()).expired).toBe(0);
+    expect((await f.db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.id, before.id)))[0]).toEqual(before);
+    expect(await verifyDurableNativeHarnessBackup(f)).toBe(true);
   });
 });
