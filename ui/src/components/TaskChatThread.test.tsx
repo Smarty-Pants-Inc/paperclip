@@ -6617,6 +6617,46 @@ describe("TaskChatThread composer execution controls", () => {
       } finally { vi.useRealTimers(); }
     });
 
+    // B' a1fb126d gate 3 T3 at 390 (afterdone2/GRADE-head.md, 390-0031-row.png): the runs list still read the
+    // run that had just replied as 'running' for ~7 s after the live run dropped, so a status check missed it.
+    it("shows no 'Working' below DONE for 20 s while the runs list still says the replying run is running", async () => {
+      sidebarState.isMobile = mobile;
+      // No transcript held for R: the thread has no settling tail to keep (no tailRunId); DONE is the comment.
+      const listedRunning = { ...settled, status: "running", finishedAt: null };
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+      try {
+        vi.setSystemTime(new Date("2026-11-19T08:36:34.900Z"));
+        render(<TaskChatThread {...base} activeRun={live} linkedRuns={[listedRunning]} interruption={working} />);
+        expect(liveLane()).not.toBeNull();
+        // The live run drops; the issue body still says 'working' and the runs list still says 'running'.
+        vi.setSystemTime(new Date("2026-11-19T08:36:35.200Z"));
+        render(<TaskChatThread {...base} linkedRuns={[listedRunning]} interruption={working} />);
+        await act(async () => {});
+        for (let sample = 0; sample <= 100; sample += 1) {
+          if (sample === 35) {
+            // ~7 s later the runs list refetches: 'succeeded'.
+            render(<TaskChatThread {...base} linkedRuns={[settled]} interruption={working} />);
+            await act(async () => {});
+          }
+          expect(container.textContent?.split("DONE").length, `sample ${sample}`).toBeGreaterThan(1);
+          expect(liveLane(), `sample ${sample * 200} ms`).toBeNull();
+          expect(container.textContent, `sample ${sample * 200} ms`).not.toContain("Working");
+          expect(container.textContent, `sample ${sample * 200} ms`).not.toContain("Thinking");
+          await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+        }
+      } finally { vi.useRealTimers(); }
+    });
+
+    it("control: an agent comment from the run mid-run, with the run still live, keeps the live lane", async () => {
+      sidebarState.isMobile = mobile;
+      nativeTranscriptState.transcriptByRun.set(runId, [assistantEntry("2026-11-19T08:35:10.000Z", "Step 3 of 6 done.", "final")]);
+      const midRun = [comments[0], comment("7a1c0e55-3f0b-4c8e-9d2a-5b6f8e9a0c11", "agent", "Step 3 of 6 done.", "2026-11-19T08:35:10.500Z")];
+      const listedRunning = { ...settled, status: "running", finishedAt: null };
+      render(<TaskChatThread {...base} comments={midRun} activeRun={live} linkedRuns={[listedRunning]} interruption={working} />);
+      await act(async () => {});
+      expect(liveLane()).not.toBeNull();
+    });
+
     it("control: a person's new message right after DONE shows its 'Working' at once", async () => {
       sidebarState.isMobile = mobile;
       plantTranscript();
