@@ -701,11 +701,11 @@ async function appendConversationQueueComment(db: Db, comment: typeof issueComme
     if (!issue?.conversationAgentId || issue.conversationUserId !== comment.authorUserId || !issue.executionRunId) return false;
     // A fresh Send after Stop has its own admission semantics (typed input
     // first, then the held queue). Never absorb it into that stopped backlog.
-    const [active] = await tx.select({ resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+    const [active] = await tx.select({ resultJson: heartbeatRuns.resultJson, startedAt: heartbeatRuns.startedAt }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, issue.conversationAgentId),
       eq(heartbeatRuns.id, issue.executionRunId), eq(heartbeatRuns.status, "running"),
     )).limit(1);
-    if (!active || nativeRunHasStopRequest(active.resultJson)) return false;
+    if (!active?.startedAt || nativeRunHasStopRequest(active.resultJson)) return false;
     const key = `conversation-comment:${comment.id}`;
     const [receipt] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, comment.companyId), eq(agentWakeupRequests.idempotencyKey, key),
@@ -719,7 +719,10 @@ async function appendConversationQueueComment(db: Db, comment: typeof issueComme
       .for("update").limit(1);
     if (!tail || tail.status !== "deferred_issue_execution" || tail.runId || tail.payload?.interactionId ||
         (tail.payload?._paperclipWakeContext as Record<string, unknown> | undefined)?.interactionId ||
-        tail.requestedByActorType !== "user" || tail.requestedByActorId !== comment.authorUserId) return false;
+        tail.requestedByActorType !== "user" || tail.requestedByActorId !== comment.authorUserId ||
+        // Only the batch queued during THIS running turn: a stale deferred wake left from an older
+        // turn (days old on a gate) is never extended; the new message gets its own wake (rf-3).
+        tail.requestedAt < active.startedAt) return false;
     const ids = queuedCommentIdsFromWakePayload(tail.payload);
     if (!ids.length) return false;
     const rows = await tx.select({ id: issueComments.id, body: issueComments.body }).from(issueComments).where(and(
