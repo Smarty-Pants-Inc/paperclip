@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { activityLog, agentTaskSessions, agents, authUsers, companyMemberships, companySkillRepositorySnapshots, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, costEvents, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRuns, issues, issueComments, issueThreadInteractions, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
 import { accountRunCost } from "../run-cost-accounting.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
@@ -743,6 +743,100 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       expect.soft(sent.indexOf(`comment ${message.id}`, at + 1), `owed message ${message.body} listed once`).toBe(-1);
       cursor = at;
     }
+  }, 60_000);
+
+  // RF-4 (adopt-ri-cuti, Gate 5): Paul presses Stop, sends three messages whose runs fail before any provider work,
+  // and the automatic fresh-thread restore takes over. Its request (as the provider gets it) lists ALL three owed
+  // messages, oldest first, once each ('9 + 10' included), and its one reply answers all three under the ONE rule.
+  it("after Stop and three failed-before-provider runs, the automatic fresh-thread restore lists all three owed messages once, in order, and answers them all", async () => {
+    const f = await piFixture();
+    f.input.workspace.executionWorkspace.cwd = instructionRoot;
+    const first = await selectHeartbeatRuntime(db, f.input);
+    if (!first.selected || !first.nativeExecution) throw new Error("Expected selection");
+    // Stop: the running native turn had started provider work; Paul's Stop ended it and its recovery was refused.
+    await db.insert(heartbeatRunEvents).values({ companyId: f.agent.companyId, agentId: f.agent.id, runId: f.run.id,
+      seq: 1, stream: "system", eventType: "native.process_start_requested" });
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(Date.now() - 20 * 60_000),
+      errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_missing_evidence:snapshot_binding" })
+      .where(eq(heartbeatRuns.id, f.run.id));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", attempt: 1, leaseOwner: null, leaseExpiresAt: null,
+      recoveryState: "blocked", failureCode: "native_continuation_requires_reconciliation" }).where(eq(nativeRunFinalizations.runId, f.run.id));
+    const [oldLease] = await db.insert(environmentLeases).values({ companyId: f.agent.companyId, heartbeatRunId: f.run.id,
+      issueId: f.issue.id, provider: "boat", providerLeaseId: `bx_legacy_${f.run.id}`, status: "released",
+      cleanupStatus: "success", acquiredAt: new Date(Date.now() - 1000), releasedAt: new Date(),
+      metadata: { pluginId: "fixture-boat" } }).returning();
+    await db.update(environmentLeases).set({ metadata: { pluginId: "fixture-boat", remoteExecutionTermination: {
+      schema: "paperclip.remote-termination.v1", companyId: oldLease.companyId, runId: f.run.id, leaseId: oldLease.id,
+      provider: oldLease.provider, providerLeaseId: oldLease.providerLeaseId, state: "stopped", confirmedAt: new Date().toISOString() } } })
+      .where(eq(environmentLeases.id, oldLease.id));
+    // Three person messages after Stop; each one's run fails BEFORE provider work (no process event, no reply).
+    const base = Date.now() - 15 * 60_000;
+    const bodies = ["Are you still there?", "Please pick up where you stopped.", "9 + 10"];
+    const owed = [] as Array<typeof issueComments.$inferSelect>;
+    const failedRuns = [] as Array<typeof heartbeatRuns.$inferSelect>;
+    for (const [index, body] of bodies.entries()) {
+      const [row] = await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id,
+        authorType: "user", authorUserId: "local-board", body, createdAt: new Date(base + index * 60_000) }).returning();
+      owed.push(row!);
+      const [failedRun] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id, issueId: f.issue.id,
+        scopeKind: "issue", status: "failed", createdAt: new Date(base + index * 60_000 + 5_000),
+        finishedAt: new Date(base + index * 60_000 + 10_000), errorCode: "native_continuation_requires_reconciliation",
+        error: "native_controller_recovery_missing_evidence:snapshot_binding",
+        contextSnapshot: { issueId: f.issue.id, wakeCommentIds: [row!.id], wakeCommentId: row!.id, commentId: row!.id } }).returning();
+      failedRuns.push(failedRun!);
+    }
+    expect((await db.select().from(heartbeatRunEvents).where(inArray(heartbeatRunEvents.runId, failedRuns.map(run => run.id)))).length,
+      "precondition: the three message runs failed before any provider work").toBe(0);
+    expect((await answeredPersonMessageIds(db, { companyId: f.agent.companyId, issueId: f.issue.id,
+      commentIds: owed.map(row => row.id) })).size, "precondition: all three are owed").toBe(0);
+    // The automatic fresh-thread restore takes over; its run inherits only the LAST message's wake (Gate 5's shape).
+    const continued = await ensureFreshContinuation(db, { companyId: f.agent.companyId, runId: f.run.id,
+      trigger: "recovery_refused", delivery: "caller_owns" });
+    if (continued.kind !== "continued") throw new Error(JSON.stringify(continued));
+    const last = owed.at(-1)!;
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id, issueId: f.issue.id,
+      status: "running", scopeKind: "issue", createdAt: new Date(Date.now() + 1000),
+      contextSnapshot: { issueId: f.issue.id, recoveryActionId: continued.recoveryActionId, previousRunId: f.run.id, forceFreshSession: true,
+        wakeCommentIds: [last.id], wakeCommentId: last.id, commentId: last.id,
+        ...(continued.isolation === "fresh_isolated_workspace" ? { freshContinuationIsolation: continued.recoveryActionId } : {}) } }).returning();
+    f.input.run = run!;
+    f.input.session.persistedNativeExecutionInput = null;
+    f.input.session.persistedRunnerProfile = {};
+    f.input.task.context = run!.contextSnapshot!;
+    f.input.session.getFreshSessionHandoff = createNativeSessionHandoffLoader({ db, companyId: f.agent.companyId,
+      agentId: f.agent.id, issueId: f.issue.id, before: run!.createdAt });
+    const selected = await selectHeartbeatRuntime(db, f.input);
+    if (!selected.selected || !selected.nativeExecution) throw new Error("Expected fresh selection");
+    expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
+      .some(comment => comment.body === FRESH_THREAD_STARTED_NOTE), "the real fresh-thread restore path ran").toBe(true);
+    await db.update(issues).set({ executionRunId: run!.id }).where(eq(issues.id, f.issue.id));
+    const answered = await answerWithNativePeer({ db, execution: selected.nativeExecution,
+      runnerInstanceId: selected.nativeRunnerInstanceId!, text: "Yes, picking up. 9 + 10 = 19.",
+      getFreshSessionHandoff: selected.getNativeFreshSessionHandoff! });
+    expect(answered.settled).toMatchObject({ status: "succeeded" });
+    // The request text exactly as the provider got it (the controlled peer's startTurn input).
+    const sent = answered.prompts.map(prompt => JSON.stringify((prompt as { turn: unknown }).turn)).join("\n")
+      .replace(/\\n/g, "\n").replace(/\\"/g, "\"");
+    appendFileSync(process.env.RESTORE_INPUT_CAPTURE ?? join(tmpdir(), "restore-input-capture.txt"), `--- rf-4 stop+3 ---\n${sent}\n`);
+    const header = sent.indexOf("New comments in order:");
+    expect(header, "the owed messages are explicit queued input").toBeGreaterThanOrEqual(0);
+    let cursor = header;
+    for (const message of owed) {
+      const at = sent.indexOf(`comment ${message.id}`, cursor);
+      expect.soft(at, `owed message '${message.body}' listed, oldest first`).toBeGreaterThan(cursor);
+      expect.soft(sent.indexOf(`comment ${message.id}`, at + 1), `owed message '${message.body}' listed once`).toBe(-1);
+      cursor = at;
+    }
+    expect.soft(sent.indexOf("9 + 10", header), "'9 + 10' is in the restore's new input").toBeGreaterThan(header);
+    const [persisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
+    expect.soft((persisted!.contextSnapshot as { wakeCommentIds?: string[] } | null)?.wakeCommentIds,
+      "the restore run carries all three owed, oldest first").toEqual(owed.map(row => row.id));
+    // Its one reply answers ALL owed messages under the ONE answered rule.
+    await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id, authorType: "agent",
+      authorAgentId: f.agent.id, createdByRunId: run!.id, body: "Yes, picking up. 9 + 10 = 19.", createdAt: new Date(Date.now() + 2000) });
+    const answeredAfter = await answeredPersonMessageIds(db, { companyId: f.agent.companyId, issueId: f.issue.id,
+      commentIds: owed.map(row => row.id) });
+    expect([...owed].map(row => answeredAfter.has(row.id)), "the restore's reply answers all three").toEqual([true, true, true]);
   }, 60_000);
 
   // Flip (RFL 17:14Z): 6e0454bb changed uncommitted Stopping/Starting rows to one final row; person sees exactly Starting and their own comment byte-unchanged.
