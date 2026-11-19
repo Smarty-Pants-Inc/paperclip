@@ -282,6 +282,160 @@ async function requestApp(
 }
 
 describe("agent live run routes", () => {
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21297
+  // Keep reason: NEVER-OK trace custody. Real writer, Postgres, spill and HTTP GET.
+  it.each(["cli", "native-diagnostic", "native-source"] as const)("finalize-bound custody through real GET: %s", async kind => {
+    const { randomUUID, createHash } = await import("node:crypto");
+    const { promises: fs, appendFileSync } = await import("node:fs");
+    const path = await import("node:path");
+    const { sql, eq } = await import("drizzle-orm");
+    const { createDb, closeRegisteredClients, heartbeatRuns } = await import("@paperclipai/db");
+    const { startEmbeddedPostgresTestDatabase } = await import("./helpers/embedded-postgres.js");
+    const { createNativeRunLogTestTables } = await import("./helpers/native-run-log-database.js");
+    const { spillMemory } = await import("../services/object-run-log-spill.fixture.js");
+    const { createObjectRunLogStore, readObjectRunLogSpill, OBJECT_RUN_LOG_FINALIZE_ADMISSION_TIMEOUT_MS } = await vi.importActual<typeof import("../services/object-run-log-store.js")>("../services/object-run-log-store.js");
+    const { createHeartbeatRunOutput } = await vi.importActual<typeof import("../services/heartbeat/run-output.js")>("../services/heartbeat/run-output.js");
+    const { createNativeRunLogExporter, formatNativeRunLogEvent } = await import("../services/native-runtime/native-run-log-export.js");
+    const { nativeSha256 } = await import("../services/native-runtime/canonical.js");
+    const database = await startEmbeddedPostgresTestDatabase("finalize-bound-get-");
+    const db = createDb(database.connectionString, { maxConnections: 1, idleTimeoutSeconds: 0 });
+    const schema = `bound_get_${randomUUID().replaceAll("-", "")}`;
+    const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID();
+    const spillDir = path.join(await fs.mkdtemp(path.join(process.env.TMPDIR!, "bound-get-")), "data/run-logs/.spill");
+    const m = spillMemory();
+    const makeStore = () => createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", spillDir, flushMs: 30000,
+      assertWriterAuthority: async input => { await input.assertWriterAuthority?.(); } });
+    const store = makeStore(), peers: Awaited<ReturnType<typeof store.begin>>[] = [];
+    const open = fs.open.bind(fs);
+    // Named fault: peer spill writes fail ENOSPC, keeping all 64 MiB capacity occupied.
+    const peerSpillENOSPC = vi.spyOn(fs, "open").mockImplementation((...args: Parameters<typeof fs.open>) => {
+      if (String(args[0]).includes("capacity-peer-") && args[1] === "a")
+        return Promise.reject(Object.assign(Error("planted peer spill refusal"), { code: "ENOSPC" }));
+      return open(...args);
+    });
+    const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    let pending: Promise<unknown> | undefined, finalizing: ReturnType<typeof store.finalize> | undefined;
+    try {
+      await db.execute(sql.raw(`create schema ${schema}`));
+      await db.execute(sql.raw(`set search_path=${schema}`));
+      await createNativeRunLogTestTables(db);
+      await db.execute(sql`alter table heartbeat_runs add column scope_kind text not null default 'company'`);
+      await db.execute(sql`insert into heartbeat_runs(id,company_id,agent_id,status,runtime_mode) values(${runId},${companyId},${agentId},'running','legacy')`);
+      const [storedRun] = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status, runtimeMode: heartbeatRuns.runtimeMode, logStore: heartbeatRuns.logStore,
+        logRef: heartbeatRuns.logRef, logBytes: heartbeatRuns.logBytes, lastOutputSeq: heartbeatRuns.lastOutputSeq,
+        lastOutputAt: heartbeatRuns.lastOutputAt }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      const run = storedRun as typeof heartbeatRuns.$inferSelect;
+      const output = createHeartbeatRunOutput(db, { run: run!, runId, issueId: null, runLogStore: store,
+        identityRedactor: { chunk: (_stream, chunk) => chunk, redact: value => value }, secretKeys: new Set(),
+        appendRunEvent: async () => undefined, getCurrentUserRedactionOptions: async () => ({ enabled: false }) });
+      const callbacks = await output.begin(run!);
+      const target = output.handle!;
+      for (let n = 0; n < 8; n++) peers.push(await store.begin({ companyId, agentId, runId: `capacity-peer-${n}` }));
+      // Named fault: immutable object payload PUTs fail EIO (heads remain readable).
+      m.state.down = true;
+      const receipts = [];
+      for (const peer of peers) receipts.push((await store.enqueue!(peer, { ts: "peer", stream: "stdout", chunk: "x".repeat(8 * 1024 * 1024 - 512), seq: 1 })).committed.catch(error => error));
+      await store.flushInflightMirrors!().catch(() => undefined);
+      await Promise.all(receipts);
+      const nativeEvent = { schema: "paperclip.prp.event.v1" as const, schemaVersion: 1 as const,
+        sourceInstanceId: "bound-source", sourceEventId: "bound-source:1", sourceSeq: 1,
+        sourceKind: "runner" as const, runId, normalizedSessionId: "bound-session", eventType: "item.delta" as const,
+        priority: 2 as const, emittedAt: "2026-11-19T00:00:00.000Z", payload: { text: `native-refused:${"n".repeat(8192)}` } };
+      const chunk = kind === "native-source" ? formatNativeRunLogEvent(nativeEvent) : `${kind}: ${"y".repeat(8192)}`;
+      if (kind === "native-source") await db.execute(sql`insert into heartbeat_run_events(company_id,run_id,agent_id,seq,event_type,payload,source_instance_id,source_event_id,source_seq,source_payload_sha256)
+        values(${companyId},${runId},${agentId},1,'item.delta',${JSON.stringify({prpEvent:nativeEvent})}::jsonb,'bound-source','bound-source:1',1,${nativeSha256(nativeEvent)})`);
+      // Only admission time is virtual; peer storage and spill failures already finished.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      vi.setSystemTime(new Date("2026-11-19T00:00:00.000Z"));
+      const stream = kind === "cli" ? "stdout" : kind === "native-source" ? "stdout" : "stderr";
+      pending = kind === "native-source"
+        ? callbacks.appendIdentityRedactedLog(stream, chunk, false, { kind: "canonical_native", sourceCursor: 1 }).catch(error => error)
+        : callbacks.onLog(stream, chunk);
+      let settled = false;
+      finalizing = store.finalize(target).then(value => { settled = true; return value; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      await vi.advanceTimersByTimeAsync(OBJECT_RUN_LOG_FINALIZE_ADMISSION_TIMEOUT_MS - 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      vi.useRealTimers();
+      expect(await finalizing).toEqual({ bytes: null, sha256: null, compressed: false });
+      await pending;
+      await db.execute(sql`update heartbeat_runs set status='failed' where id=${runId}`);
+      const expected = Buffer.from(JSON.stringify({ ts: "2026-11-19T00:00:00.000Z", attemptId: target.attemptId, stream, chunk, seq: 1 }) + "\n");
+      const spill = await readObjectRunLogSpill(spillDir, target.logRef);
+      // Outcome oracle below uses actual spill bytes/index and the real GET, not logger calls.
+      const spillFile = await fs.readFile(spill.path).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return Buffer.alloc(0);
+        throw error;
+      });
+      if (kind === "native-source") expect(spill.unrecovered.length).toBe(0);
+      m.state.down = false;
+      peerSpillENOSPC.mockRestore();
+      await store.flushInflightMirrors!();
+      const restored = makeStore();
+      if (kind === "native-source") {
+        // Real exporter re-reads the durable native source after the refused cursor.
+        const resumed = createHeartbeatRunOutput(db, { run: run!, runId, issueId: null, runLogStore: restored,
+          identityRedactor: { chunk: (_s, c) => c, redact: v => v }, secretKeys: new Set(),
+          appendRunEvent: async () => undefined, getCurrentUserRedactionOptions: async () => ({ enabled: false }) });
+        const next = await resumed.begin(run!);
+        const exporter = createNativeRunLogExporter({ db, companyId, runId, afterCursor: resumed.handle!.initialSourceCursor!,
+          enqueue: (sourceCursor, text) => next.appendIdentityRedactedLog("stdout", text, false, { kind: "canonical_native", sourceCursor }),
+          flush: () => restored.flush!(resumed.handle!) });
+        await exporter.recover();
+        await exporter.recover();
+        const summary = await restored.finalize(resumed.handle!);
+        await db.execute(sql`update heartbeat_runs set log_bytes=${summary.bytes},log_sha256=${summary.sha256} where id=${runId}`);
+      }
+      vi.doMock("../services/run-log-store.js", async () => ({ ...(await vi.importActual<typeof import("../services/run-log-store.js")>("../services/run-log-store.js")), getRunLogStore: () => restored }));
+      const { heartbeatService } = await vi.importActual<typeof import("../services/heartbeat.js")>("../services/heartbeat.js");
+      const real = heartbeatService(db);
+      mockHeartbeatService.getRunLogAccess.mockImplementation(real.getRunLogAccess);
+      mockHeartbeatService.readLog.mockImplementation(real.readLog);
+      const app = await createApp(db as any, { type: "board", userId: "local-board", companyIds: [companyId], source: "local_implicit", isInstanceAdmin: false });
+      const get = () => requestApp(app, url => request(url).get(`/api/heartbeat-runs/${runId}/log?limitBytes=256000`));
+      const response = await get(), again = await get();
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(again.body.content).toBe(response.body.content);
+      const served = Buffer.from(response.body.content);
+      const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex");
+      console.info("BOUND_CUSTODY_BEFORE_ASSERT", JSON.stringify({ kind, expectedBytes: expected.length,
+        storedBytes: served.length, spilledBeforeHealing: spill.unrecovered.length, spillPath: spill.path,
+        expectedSha256: sha(expected), servedSha256: sha(served) }));
+      if (kind !== "native-source") {
+        expect(sha(served), "GET must return the refused source-less record exactly once").toBe(sha(expected));
+        expect(spill.unrecovered.equals(expected), "source-less refused record must be durably in spill").toBe(true);
+        expect(spill.records[0]).toMatchObject({ event: "spilled", bytes: expected.length,
+          cause: { code: "object_run_log_finalize_admission_timeout" } });
+        expect(spillFile.equals(expected)).toBe(true);
+      } else {
+        const lines = served.toString().trim().split("\n").map(line => JSON.parse(line));
+        expect(lines).toHaveLength(1);
+        expect(JSON.parse(lines[0].chunk)).toEqual(JSON.parse(chunk));
+      }
+      const row = (await db.execute(sql`select log_bytes,log_sha256 from heartbeat_runs where id=${runId}`))[0];
+      expect(Number(row!.log_bytes)).toBe(served.length);
+      expect(row!.log_sha256).toBe(sha(served));
+      console.info("BOUND_GET_ROW", JSON.stringify({ kind, runId, spillPath: spill.path, expectedBytes: expected.length,
+        servedBytes: served.length, servedSha256: sha(served), expectedSha256: sha(expected), row }));
+      if (process.env.OBJLOG_ROWS) appendFileSync(process.env.OBJLOG_ROWS, JSON.stringify({ kind, runId, spillPath: spill.path,
+        servedBytes: served.length, servedSha256: sha(served), expectedSha256: sha(expected), row }) + "\n");
+    } finally {
+      vi.useRealTimers();
+      if (pending) await pending;
+      if (finalizing) await finalizing;
+      peerSpillENOSPC.mockRestore();
+      m.state.down = false;
+      await store.flushInflightMirrors!();
+      for (const peer of peers) await store.finalize(peer);
+      warning.mockRestore(); vi.doUnmock("../services/run-log-store.js");
+      await db.execute(sql.raw(`drop schema if exists ${schema} cascade`));
+      await closeRegisteredClients(database.connectionString, { scope: "database" });
+      await database.cleanup();
+    }
+  }, 120_000);
+
   it.each([
     ["", 200], ["?limit=10&agentId=agent-1&summary=true", 10],
     ["?limit=99999", 1000], ["?limit=invalid", 200], ["?limit=-10", 1],
