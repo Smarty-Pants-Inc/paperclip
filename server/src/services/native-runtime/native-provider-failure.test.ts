@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { PrpEvent, PrpTerminalState } from "../../vendor/paperclip-runner/index.js";
 import { createNativeProviderFailureObservation, NATIVE_MODEL_NOT_FOUND_DIAGNOSTIC, NATIVE_MODEL_REJECTION_DIAGNOSTIC, NATIVE_MODEL_REJECTION_MESSAGE, NATIVE_PROVIDER_OVERLOADED_MESSAGE, readNativeTurnFailureDiagnostic } from "./native-provider-failure.js";
 
+import capturedPiOverload from "./__fixtures__/captured-pi-provider-overload.json" with { type: "json" };
+
 const model = "test-model";
 const response = {
   type: "error", status: 400,
@@ -147,6 +149,73 @@ describe("native provider failure observation", () => {
     expect(observed.forTerminal("turn", terminal)).toEqual({ errorCode: "native_provider_overloaded", errorMessage: NATIVE_PROVIDER_OVERLOADED_MESSAGE, diagnostic: { provider: "codex", category: "server_overloaded" } });
     expect(observed.forTerminal("different-turn", terminal)).toBeNull();
     expect(observed.forTerminal("turn", { ...terminal, runTerminalState: "succeeded" })).toBeNull();
+  });
+
+  // Captured turn.failed from f5a19940, sequence 271: Pi forwards the JSON body as message.
+  it.each([JSON.stringify(capturedPiOverload), `529 ${JSON.stringify(capturedPiOverload)}`])(
+    "classifies captured Pi overload by its typed body, not its wording: %s", message => {
+      const observed = createNativeProviderFailureObservation({ kind: "pi_rpc" });
+      observed.observe({ ...event, payload: { status: "failed", error: { code: "pi_provider_error", message } } });
+      expect(observed.forTerminal("turn", terminal)).toEqual({ errorCode: "native_provider_overloaded",
+        errorMessage: "The model is at capacity.", diagnostic: { provider: "pi_rpc", category: "server_overloaded" } });
+      expect(observed.providerFailureForTerminal("turn", terminal)).toMatchObject({ category: "overloaded",
+        message: "The model is at capacity.", retryability: "transient" });
+      expect(observed.unclassifiedTurnFailure("turn", terminal)).toBeNull();
+      expect(observed.forTerminal("different-turn", terminal)).toBeNull();
+      expect(observed.forTerminal("turn", { ...terminal, runTerminalState: "succeeded" })).toBeNull();
+      expect(observed.forTerminal("turn", { ...terminal, turnTerminalState: "cancelled" })).toBeNull();
+      expect(JSON.stringify(observed.forTerminal("turn", terminal))).not.toContain(capturedPiOverload.request_id);
+    },
+  );
+  it.each([
+    { error: { type: "overloaded_error", message: "Private wording can change" } },
+    { status: 529, message: "Private wording can change" },
+    { message: JSON.stringify({ status: 529, type: "error", error: { message: "Busy" } }) },
+    { message: JSON.stringify({ error: { type: "server_error", code: "server_is_overloaded", message: "Busy" } }) },
+    { message: JSON.stringify({ error: { code: "serverOverloaded", message: "Busy" } }) },
+    { providerFailure: { schema: "paperclip.provider-failure.v1", provider: "openai", phase: "turn",
+      category: "overloaded", message: "Busy", retryability: "transient" } },
+  ])("recognizes typed Pi overload variants %#", error => {
+    const observed = createNativeProviderFailureObservation({ kind: "pi_rpc" });
+    observed.observe({ ...event, payload: { status: "failed", error: { code: "pi_provider_error", ...error } } });
+    expect(observed.forTerminal("turn", terminal)?.errorCode).toBe("native_provider_overloaded");
+  });
+  it.each([
+    { message: "Overloaded" }, { message: "529 overloaded_error: Overloaded" },
+    { message: "Please retry: the server is overloaded" }, { message: "{broken JSON" },
+    { message: JSON.stringify({ error: { type: "invalid_request_error", message: "Overloaded" } }) },
+    { message: JSON.stringify({ error: { type: "rate_limit_error", message: "Overloaded" }, status: 429 }) },
+    { message: JSON.stringify({ error: { code: "insufficient_quota", message: "Overloaded" } }) },
+    { status: "529", message: "Overloaded" }, { message: JSON.stringify([capturedPiOverload]) },
+    { error: { type: "invalid_request_error" }, message: JSON.stringify(capturedPiOverload) },
+    { providerFailure: { schema: "paperclip.provider-failure.v1", provider: "anthropic", phase: "turn",
+      category: "authentication", message: "Overloaded", retryability: "requires_action" }, message: JSON.stringify(capturedPiOverload) },
+    { message: " ".repeat(16_001) + JSON.stringify(capturedPiOverload) },
+  ])("does not grant capacity retries from Pi prose or another typed failure %#", error => {
+    const observed = createNativeProviderFailureObservation({ kind: "pi_rpc" });
+    observed.observe({ ...event, payload: { status: "failed", error: { code: "pi_provider_error", ...error } } });
+    expect(observed.forTerminal("turn", terminal)).toBeNull();
+  });
+  it.each([
+    { sourceKind: "control_plane" as const }, { eventType: "item.failed" as const },
+    { turnId: undefined }, { payload: { status: "completed", error: { code: "pi_provider_error", message: JSON.stringify(capturedPiOverload) } } },
+    { payload: { status: "failed", error: { code: "pi_rpc_transport_failed", message: JSON.stringify(capturedPiOverload) } } },
+  ])("ignores non-authoritative Pi overload evidence %#", overrides => {
+    const observed = createNativeProviderFailureObservation({ kind: "pi_rpc" });
+    observed.observe({ ...event, payload: { status: "failed", error: { code: "pi_provider_error", message: JSON.stringify(capturedPiOverload) } }, ...overrides });
+    expect(observed.forTerminal("turn", terminal)).toBeNull();
+  });
+  it("does not let an overload body override Pi's native policy refusal", () => {
+    const observed = createNativeProviderFailureObservation({ kind: "pi_rpc" });
+    observed.observe({ ...event, payload: { status: "failed", error: { code: "pi_provider_error",
+      rawStopReason: "refusal", message: JSON.stringify(capturedPiOverload) } } });
+    expect(observed.forTerminal("turn", terminal)?.errorCode).toBe("provider_policy_refusal");
+    expect(observed.providerFailureForTerminal("turn", terminal)).toBeNull();
+  });
+  it.each(["codex", "opencode", "acpx"])("does not infer Pi overload for %s", kind => {
+    const observed = createNativeProviderFailureObservation({ kind });
+    observed.observe({ ...event, payload: { status: "failed", error: { code: "pi_provider_error", message: JSON.stringify(capturedPiOverload) } } });
+    expect(observed.forTerminal("turn", terminal)).toBeNull();
   });
 
   it.each(["usageLimitExceeded", "other", "unauthorized", undefined])("does not retry unrelated provider errors (%s)", (codexErrorInfo) => {

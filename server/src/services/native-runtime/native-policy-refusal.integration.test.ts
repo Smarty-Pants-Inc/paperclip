@@ -150,10 +150,22 @@ describe("Pi policy refusal: persistence, retry, unanswered message and Stop int
   it("keeps a normal 529 overloaded provider error retryable", async () => {
     const f = await failTurn('529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}');
     console.log("OVERLOAD_CONTROL", JSON.stringify({ runId: f.runId, errorCode: f.failedRun.errorCode, decision: f.decision.reasonCode, wakes: f.wakes.map(w => w.payload) }));
+    expect(f.failedRun).toMatchObject({ errorCode: "native_provider_overloaded", error: "The model is at capacity." });
+    const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.runId));
+    expect(retry).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: "native_provider_overloaded", scheduledRetryAttempt: 1 });
+    expect(f.wakes).toHaveLength(1);
+    expect(f.wakes[0].runId).toBe(retry.id);
+    expect(classifyContinuationFailure(f.failedRun).kind).not.toBe("non_retryable");
+  });
+
+  it("keeps a non-overload Pi provider error's finalization unchanged", async () => {
+    const f = await failTurn(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "Unknown tool field" } }));
     expect(f.failedRun.errorCode).toBe("native_run_failed");
+    expect(f.persistedFailure.providerFailure).toBeNull();
+    expect(f.failedRun.resultJson).not.toHaveProperty("providerFailure");
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.runId))).toHaveLength(0);
     expect(f.wakes).toHaveLength(1);
     expect(f.wakes[0].payload).toMatchObject({ retryCause: "native_run_failed" });
-    expect(classifyContinuationFailure(f.failedRun).kind).not.toBe("non_retryable");
   });
 
   it("retains a real requested Stop even on a policy refusal", async () => {

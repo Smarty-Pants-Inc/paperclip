@@ -7,6 +7,7 @@ export const NATIVE_MODEL_REJECTION_MESSAGE =
 
 export const NATIVE_PROVIDER_OVERLOADED_MESSAGE =
   "Selected model is at capacity. Please try a different model.";
+export const NATIVE_PI_PROVIDER_OVERLOADED_MESSAGE = "The model is at capacity.";
 export const NATIVE_PROVIDER_OVERLOADED_CODE = "native_provider_overloaded";
 export const NATIVE_PROVIDER_CAPACITY_MAX_RETRIES = 2;
 export const PROVIDER_POLICY_REFUSAL_CODE = "provider_policy_refusal";
@@ -56,6 +57,28 @@ function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
+}
+
+/** Pi's terminal error is provider evidence, not assistant/tool prose. Pinned
+ * packs forward the provider JSON body in `message`, sometimes prefixed by its
+ * HTTP status. Read its typed fields only; bare "Overloaded" is not authority. */
+function isPiProviderOverload(error: Record<string, unknown>): boolean {
+  if (error.code !== "pi_provider_error") return false;
+  const failure = readProviderFailure(error.providerFailure);
+  if (failure) return failure.category === "overloaded" && failure.retryability === "transient";
+  const overloaded = (body: Record<string, unknown>) => {
+    const detail = record(body.error);
+    const code = detail.code ?? detail.type ?? body.type;
+    return code === "overloaded_error" || code === "server_is_overloaded" || code === "serverOverloaded"
+      || body.status === 529 || body.statusCode === 529 || body.httpStatus === 529;
+  };
+  if (error.error !== undefined || error.type !== undefined || error.status !== undefined
+    || error.statusCode !== undefined || error.httpStatus !== undefined) return overloaded(error);
+  if (typeof error.message !== "string" || error.message.length > 16_000) return false;
+  try {
+    const body = record(JSON.parse(error.message.replace(/^[45]\d{2}\s+(?=\{)/, "")));
+    return overloaded(body);
+  } catch { return false; }
 }
 
 /** An API-key Codex turn whose configured model the Responses API answers with 404. */
@@ -272,6 +295,15 @@ export function createNativeProviderFailureObservation(provider: { kind: string;
         if (provider.kind === "pi_rpc" && isPiPolicyRefusal(error)) policyRefusedTurns.add(event.turnId);
         const failure = readProviderFailure(error.providerFailure);
         if (failure && !providerFailures.has(event.turnId)) providerFailures.set(event.turnId, failure);
+        if (provider.kind === "pi_rpc" && !policyRefusedTurns.has(event.turnId) && isPiProviderOverload(error)) {
+          overloadedTurnId = event.turnId;
+          // Reuse the existing provider explanation/thread notice. Its retry
+          // line comes from the scheduled successor, never an unconditional promise.
+          if (!failure) providerFailures.set(event.turnId, {
+            schema: "paperclip.provider-failure.v1", provider: "pi_rpc", phase: "turn",
+            category: "overloaded", message: NATIVE_PI_PROVIDER_OVERLOADED_MESSAGE, retryability: "transient",
+          });
+        }
       }
       if ((provider.kind !== "codex" && provider.kind !== "opencode") ||
           event.sourceKind !== "runner" || event.eventType !== "turn.failed" || !event.turnId) return;
@@ -329,8 +361,8 @@ export function createNativeProviderFailureObservation(provider: { kind: string;
       };
       if (turnId === overloadedTurnId) return {
         errorCode: NATIVE_PROVIDER_OVERLOADED_CODE,
-        errorMessage: NATIVE_PROVIDER_OVERLOADED_MESSAGE,
-        diagnostic: { ...NATIVE_PROVIDER_OVERLOADED_DIAGNOSTIC },
+        errorMessage: provider.kind === "pi_rpc" ? NATIVE_PI_PROVIDER_OVERLOADED_MESSAGE : NATIVE_PROVIDER_OVERLOADED_MESSAGE,
+        diagnostic: { ...NATIVE_PROVIDER_OVERLOADED_DIAGNOSTIC, provider: provider.kind },
       };
       // Every model rejection shares one result; only its closed diagnostic differs.
       const modelRejection = <T>(diagnostic: T) => ({

@@ -1364,6 +1364,15 @@ failures do not trigger this startup substitution.
 A committed Codex `turn.failed` event with `codexErrorInfo: serverOverloaded`,
 bound to the failed terminal turn and pinned execution identity, surfaces
 “Selected model is at capacity. Please try a different model.” directly.
+A bound Pi `pi_provider_error` also qualifies when its typed provider failure is
+transient `overloaded`, its provider error type/code is `overloaded_error`,
+`server_is_overloaded`, or `serverOverloaded`, or its numeric HTTP status is 529.
+Pinned Pi packs forward the provider JSON body in the error's message, optionally
+prefixed by an HTTP status; the server reads the body's typed fields, not free
+text such as “Overloaded”. Pi surfaces “The model is at capacity.” through the
+existing provider-failure notice. The thread says it will retry automatically
+only while a durable retry is scheduled; exhaustion does not promise a retry.
+Non-overload Pi errors and other providers keep their existing behavior.
 Paperclip preserves the accepted result and task history, then atomically records
 a durable automatic retry with its status decision. The first retry waits one
 minute; the second waits two minutes. Both spend the existing failure-retry
