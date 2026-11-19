@@ -35,7 +35,7 @@ import { registerAutomaticCompletionReviewWork } from "./native-runtime/automati
 import { registerObsoletePolicyReviewWork } from "./native-runtime/obsolete-policy-reviews.js";
 import { registerCancelledWorkspacePreservationWork } from "./native-runtime/native-failed-workspace-recovery.js";
 import { readUpgradeReadiness } from "./heartbeat/upgrade-readiness.js";
-import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { writeExecutionControl } from "./execution-control-notifications.js";
 import { readFreshWorkspaceReadiness, verifyRetryWorkspace, type ContinuationReadiness } from "./fresh-workspace-continuation.js";
 import { settleFailedNativeRecoveryPreparation } from "./native-runtime/native-recovery-preparation-failure.js";
@@ -4494,12 +4494,20 @@ export function heartbeatService(
         blocker ??= runBlocker;
         continue;
       }
-      if (needsRelease.has(run.id)) {
+      if (needsRelease.has(run.id) && options.serverRecordOnly) {
+        // Pause never awaits the provider. The orphan-lease sweep (recovery.ts
+        // retryTerminalRunLeaseRelease) releases it through this same path.
+        await db.transaction(tx => notifyDeliveryWork(tx, DELIVERY_QUEUES.orphanActiveLeases,
+          JSON.stringify({ companyId: run.companyId, runId: run.id }))).catch(err => {
+          logger.warn({ err, runId: run.id }, "could not hint the lease sweep; its periodic pass still releases the box");
+        });
+      } else if (needsRelease.has(run.id)) {
         await releaseEnvironmentLeasesForRun({ runId: run.id, companyId: run.companyId,
           agentId: run.agentId, status: run.status, providerResourceDisposition: "destroy",
           ...(options.trigger ? { trigger: options.trigger } : {}) });
       }
     }
+    if (options.serverRecordOnly) return blocker;
     return blocker ?? agentExecutionStopBlocker(db, agentIds);
   }
 
