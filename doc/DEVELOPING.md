@@ -4991,6 +4991,28 @@ when the sweep stops. Tracked files, uncommitted changes,
 untracked files, other ignored files (such as `.env` or local data), the branch,
 and its commits all stay. The workspace row stays active.
 
+Run-log spills are not regenerable output. In addition to configured-root
+protection, cleanup searches the whole candidate directory for the writer's
+`*.index.ndjson` files, without pruning directory names or limiting their depth.
+An unrecovered entry, an unreadable index, or an inspection error keeps the
+candidate whole. This also covers a guest's default root under `build/`, and a
+root whose `.env` or home setting changed after writing. A fully recovered spill
+adds no content-based refusal; other trace/ownership guards still apply.
+
+The content walk is bounded at 1,000,000 entries. The repository's installed
+`node_modules` measured 141,591 entries and a full content scan took about 1.6
+seconds, leaving roughly seven times headroom. No-spill candidates read directory
+entries only, not file contents. Every bound refusal logs `kept: walk bound hit`
+with `candidatePath`, `visitedEntries`, `maxEntries`, and the process-local
+cumulative `walkBoundHits` counter; count these warnings when diagnosing retained
+disk use. Do not silently treat a bound hit as permission to delete.
+
+The same content guard runs again at rename/removal boundaries, including
+whole-workspace removal, instance cleanup, immediate trash deletion, and stale
+trash purging. It does not replace the existing configured-root guards. Symlink
+target directories are not traversed, since removing a link does not remove its
+target.
+
 The removal is a rename into `.paperclip-compaction-trash` beside the worktree,
 made while the reaper holds the workspace lifecycle lock. The reaper checks the
 conditions above before the rename and again after it, in the same transaction.
