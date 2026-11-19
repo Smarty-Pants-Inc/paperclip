@@ -246,9 +246,9 @@ describeEmbeddedPostgres("B' steering rows: live carrier (i) and ignored steer a
   }
 
   /** The turn publishes its reply, ends (succeeded by default), settles and is released. */
-  async function finishTurn(chat: Chat, options: { status?: "succeeded" | "failed"; log?: boolean } = {}) {
+  async function finishTurn(chat: Chat, options: { status?: "succeeded" | "failed"; log?: boolean; reply?: boolean } = {}) {
     if (options.log !== false) await answeredLog(chat);
-    await db.insert(issueComments).values({
+    if (options.reply !== false) await db.insert(issueComments).values({
       companyId: chat.companyId, issueId: chat.issue.id, authorType: "agent", authorAgentId: chat.agentId,
       createdByRunId: chat.runId, body: "Agent reply",
     });
@@ -332,6 +332,26 @@ describeEmbeddedPostgres("B' steering rows: live carrier (i) and ignored steer a
       { eventType: "item.started", kind: "agentMessage", itemId: "turn-1:final", text: "" },
       { eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:final", text: "A done; M0006 was answered at the boundary." },
     ],
+    // TRULY IGNORED (b2): Pi reads B (its userMessage), the model runs tools, and the turn ends with NO
+    // agentMessage and no text at all after the read. Owed under the boundary rule AND under S-t's
+    // widened rule (answering text anywhere after the read in the same turn).
+    ignored: (b: string) => [
+      { eventType: "item.started", kind: "commandExecution", itemId: "turn-1:tool-1" },
+      { eventType: "tool.execution.started", itemId: "turn-1:tool-1" },
+      { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${b}` },
+      { eventType: "tool.execution.completed", itemId: "turn-1:tool-1" },
+      { eventType: "item.completed", kind: "commandExecution", itemId: "turn-1:tool-1" },
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:steered" },
+      { eventType: "item.completed", kind: "userMessage", itemId: "turn-1:steered" },
+      { eventType: "item.started", kind: "commandExecution", itemId: "turn-1:tool-2" },
+      { eventType: "tool.execution.started", itemId: "turn-1:tool-2" },
+      { eventType: "tool.execution.completed", itemId: "turn-1:tool-2" },
+      { eventType: "item.completed", kind: "commandExecution", itemId: "turn-1:tool-2" },
+      { eventType: "item.started", kind: "commandExecution", itemId: "turn-1:tool-3" },
+      { eventType: "tool.execution.started", itemId: "turn-1:tool-3" },
+      { eventType: "tool.execution.completed", itemId: "turn-1:tool-3" },
+      { eventType: "item.completed", kind: "commandExecution", itemId: "turn-1:tool-3" },
+    ],
     // Positive: B is read and reply text follows before the next tool. Pi streams the
     // tool call's start before the message ends, so the text block STARTS first.
     "read-answered": (b: string) => [
@@ -369,7 +389,7 @@ describeEmbeddedPostgres("B' steering rows: live carrier (i) and ignored steer a
     issueId: chat.issue.id, now: new Date(Date.now() + offsetMs) });
 
   /** m is steered into the live turn R through the real steer route; R's run log is the given shape; R ends and is released. */
-  async function steerAndEnd(chat: Chat, shape: keyof typeof SHAPES, status: "succeeded" | "failed") {
+  async function steerAndEnd(chat: Chat, shape: keyof typeof SHAPES, status: "succeeded" | "failed", reply = true) {
     const [m] = await send(chat, ["m, steered mid-turn"]);
     const [wake] = await deferredWakes(chat);
     mocks.steer.mockResolvedValueOnce({ turnId: "turn-1" });
@@ -379,7 +399,7 @@ describeEmbeddedPostgres("B' steering rows: live carrier (i) and ignored steer a
       ...SHAPES[shape](m!.id),
       { eventType: status === "failed" ? "turn.failed" : "turn.completed", itemId: "turn-1:end" },
     ]);
-    await finishTurn(chat, { status, log: false });
+    await finishTurn(chat, { status, log: false, reply });
     const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
     return { m: m!, ended: ended! };
   }
@@ -423,16 +443,41 @@ describeEmbeddedPostgres("B' steering rows: live carrier (i) and ignored steer a
       authorAgentId: chat.agentId, createdByRunId: runId, body });
   }
 
-  // (b2) ignored, normal end (PERSON CASE b2): m was delivered and READ, the model IGNORED it (no answering
-  // text after its read), and R ended SUCCEEDED with a reply to the earlier work. A plain later M2 is then
-  // answered by a run carrying M2. That reply does NOT answer m: m stays owed (carried next, or one true card).
+  /** The turn `run` reads its input and replies to it in text, publishes that reply, ends SUCCEEDED, settles and is released (the real release). */
+  async function answerTurn(chat: Chat, run: typeof heartbeatRuns.$inferSelect, text: string) {
+    if (run.status !== "running") {
+      await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+    }
+    const turn = { ...chat, runId: run.id };
+    await runLog(turn, [
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
+      { eventType: "item.started", kind: "agentMessage", itemId: "turn-1:reply", text: "" },
+      { eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:reply", text },
+      { eventType: "turn.completed", itemId: "turn-1:end" },
+    ]);
+    await finishTurn(turn, { log: false });
+  }
+
+  // (b2) TRULY ignored, normal end (PERSON CASE b2): m was delivered and READ, the model ran tools and the
+  // turn ended with NO text at all (no agentMessage after the read, no reply). m stays owed: the real release
+  // carries it next, ONCE, and a reply to the later M2 does not answer it.
   it("(b2) ignored steer, normal end, real release: m is carried next and a reply to the later M2 does not answer it", async () => {
     const chat = await seedChat();
-    const { m, ended } = await steerAndEnd(chat, "read-no-reply", "succeeded");
+    const { m, ended } = await steerAndEnd(chat, "ignored", "succeeded", false);
     expect(ended.status).toBe("succeeded");
-    // R's own reply (to the earlier work) is published.
+    // R's run log: m's read (userMessage item.started) then tool items, and NO agentMessage at all.
+    const rLog = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, chat.runId))
+      .orderBy(asc(heartbeatRunEvents.seq));
+    const kinds = rLog.map((event) => `${event.eventType}:${(event.payload as any).prpEvent.payload.kind ?? ""}`);
+    const readAt = kinds.lastIndexOf("item.started:userMessage");
+    expect(readAt).toBeGreaterThan(0);
+    expect(kinds.slice(readAt + 1).filter((kind) => kind.includes("commandExecution")).length).toBeGreaterThan(0);
+    expect(kinds.filter((kind) => kind.includes("agentMessage"))).toEqual([]);
+    expect(rLog.filter((event) => (event.payload as any).prpEvent.payload.text !== undefined)).toEqual([]);
+    expect(kinds.at(-1)).toBe("turn.completed:");
+    // R published no reply at all.
     expect((await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
-      eq(issueComments.createdByRunId, chat.runId), eq(issueComments.authorType, "agent")))).length).toBe(1);
+      eq(issueComments.createdByRunId, chat.runId), eq(issueComments.authorType, "agent")))).length).toBe(0);
     expect((ended.contextSnapshot as any).answeredSteeredCommentIds ?? []).not.toContain(m.id);
     expect((ended.resultJson as any).restoredSteeredCommentIds).toEqual([m.id]);
     expect(await answered(m.id)).toBe(false);
@@ -455,6 +500,61 @@ describeEmbeddedPostgres("B' steering rows: live carrier (i) and ignored steer a
     expect(m2Carriers.wakes[0]!.status).toBe("deferred_issue_execution");
     expect((await carriersOf(chat, m.id)).runs.map((run) => run.id)).toEqual([s!.id]);
     expect(await answered(m.id)).toBe(false);
+  });
+
+  // (b2) AFTER the real release: the truly ignored m is put back, ONE successor S's input contains m, S answers
+  // m ONCE (its reply after m's delivery), M2 is answered after it, and the real sweep posts NO card for m.
+  it("(b2) after release: ONE successor carries the ignored m and answers it once, M2 is answered after it, the sweep posts no card", async () => {
+    const chat = await seedChat();
+    const { m, ended } = await steerAndEnd(chat, "ignored", "succeeded", false);
+    expect(ended.status).toBe("succeeded");
+    // The REAL release put m back.
+    expect((ended.resultJson as any).restoredSteeredCommentIds).toEqual([m.id]);
+    expect((ended.contextSnapshot as any).answeredSteeredCommentIds ?? []).not.toContain(m.id);
+    expect(await answered(m.id)).toBe(false);
+    const [m2] = await send(chat, ["M2, a plain later message"]);
+    // ONE successor's input contains m: the run the release promoted, which holds the task.
+    const mCarriers = await carriersOf(chat, m.id);
+    expect(mCarriers.wakes).toHaveLength(0);
+    expect(mCarriers.runs).toHaveLength(1);
+    const s = mCarriers.runs[0]!;
+    expect((s.contextSnapshot as any).wakeCommentIds).toEqual([m.id]);
+    const [task] = await db.select().from(issues).where(eq(issues.id, chat.issue.id));
+    expect(task!.executionRunId).toBe(s.id);
+    expect(await answered(m.id)).toBe(false);
+    // MUTATION-POINT(successor-without-m)
+    // S reads its input (m) and answers it in text, publishes that reply, ends SUCCEEDED; the real release runs.
+    await answerTurn(chat, s, "m: answered.");
+    const sReplies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+      eq(issueComments.createdByRunId, s.id), eq(issueComments.authorType, "agent")));
+    expect(sReplies).toHaveLength(1);
+    const [mRow] = await db.select().from(issueComments).where(eq(issueComments.id, m.id));
+    expect(sReplies[0]!.createdAt.getTime()).toBeGreaterThanOrEqual(mRow!.createdAt.getTime());
+    expect(await answered(m.id)).toBe(true);
+    // M2 is answered AFTER it, by the run S's release promoted for M2 (m is not in its input).
+    const t = await carryingTurn(chat, m2!.id);
+    expect(t.id).not.toBe(s.id);
+    expect((t.contextSnapshot as any).wakeCommentIds ?? []).not.toContain(m.id);
+    expect(await answered(m2!.id)).toBe(false);
+    await answerTurn(chat, t, "M2: done.");
+    const tReplies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+      eq(issueComments.createdByRunId, t.id), eq(issueComments.authorType, "agent")));
+    expect(tReplies).toHaveLength(1);
+    expect(tReplies[0]!.createdAt.getTime()).toBeGreaterThanOrEqual(sReplies[0]!.createdAt.getTime());
+    expect(await answered(m2!.id)).toBe(true);
+    // m was carried by exactly ONE successor, never redelivered: one reply attributed to m (S's).
+    const after = await carriersOf(chat, m.id);
+    expect(after.wakes).toHaveLength(0);
+    expect(after.runs.map((run) => run.id)).toEqual([s.id]);
+    // The real sweep, now and well past every settle/wait bound: NO card for m (or M2); m answered, M2 answered.
+    for (const offset of [0, 60_000, 600_000]) {
+      const outcome = await sweep(chat, offset);
+      expect(outcome.kind).not.toBe("noticed");
+      expect(await notices(chat, m.id)).toHaveLength(0);
+      expect(await notices(chat, m2!.id)).toHaveLength(0);
+    }
+    expect(await answered(m.id)).toBe(true);
+    expect(await answered(m2!.id)).toBe(true);
   });
 
   // (b2) the same ignored steer while R still carries it as a steer (its read is in R's input,
