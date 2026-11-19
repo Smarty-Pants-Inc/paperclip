@@ -1550,6 +1550,16 @@ export async function finalizeNativeRun(input: Parameters<typeof finalizeNativeR
 }) {
   const finalized = await finalizeNativeRunAndProject(input);
   if (input.projectRunStatus && !input.skipRunTerminalCompletion) await completeNativeRunTerminal(input.db, input.runId);
+  if (finalized.phase === "committed") {
+    // Normal completion may have held the queue while this result was observed
+    // or applied. A standalone finalizer has no registry settlement tail: resume
+    // the SAME guarded drain after commit, including committed replay. Its
+    // terminal/cleanup guards keep a live owner held; its issue lock makes a
+    // concurrent settlement drain idempotent. Keep heartbeat loading lazy.
+    const { heartbeatService } = await import("../heartbeat.js");
+    await heartbeatService(input.db).releaseIssueExecutionAndPromote(
+      { id: input.runId, companyId: finalized.companyId }, { resumeStrandedQueue: true });
+  }
   return finalized;
 }
 
