@@ -1448,6 +1448,32 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     expect(carried.filter((id) => id !== chat.first.id)).toEqual([high!.id, low!.id, sent[2]!.id]);
     await joinOwnedWork();
   });
+  it("row11: tied default steers restore in steer order ahead of separately waiting input", async () => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const one = (await postDefault(chat, "First default steer").expect(201)).body;
+    const two = (await postDefault(chat, "Second default steer").expect(201)).body;
+    const [waiting] = await send(chat, ["Waiting explicit Queue"]);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    const acks = (run!.resultJson as any).queuedSteeringAcknowledgements;
+    await db.update(heartbeatRuns).set({ resultJson: { ...run!.resultJson, queuedSteeringAcknowledgements: {
+      [two.id]: { ...acks[two.id], acknowledgedAt: acks[one.id].acknowledgedAt }, [one.id]: acks[one.id],
+    } } }).where(eq(heartbeatRuns.id, chat.runId));
+    await runLog(chat, [
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
+      ...[one, two].map(message => ({ eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${message.id}` })),
+      { eventType: "turn.completed", itemId: "turn-1:end" },
+    ]);
+    await finishTurn(chat, { log: false });
+    const carriers = await carriersOf(chat, one.id);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+    const carried = carriers.runs.length ? (carriers.runs[0]!.contextSnapshot as any).wakeCommentIds : wakeCommentIds(carriers.wakes[0]!);
+    expect(carried).toEqual([one.id, two.id, waiting!.id]);
+    await releaseRun(chat);
+    for (const message of [one, two, waiting!]) {
+      const again = await carriersOf(chat, message.id);
+      expect(again.wakes.length + again.runs.length).toBe(1);
+    }
+  });
   const RECEIVED_MID_TASK = "Received mid-task (while you were working):";
 
   /** B is steered mid-turn, never read, and the turn ends: B is restored and carried into the next turn. */
