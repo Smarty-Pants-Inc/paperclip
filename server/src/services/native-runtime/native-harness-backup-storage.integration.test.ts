@@ -453,6 +453,30 @@ describeEmbeddedPostgres("durable native provider backups", () => {
     expect(artifact.reference).toMatchObject({ companyId: f.companyId, artifactId: artifact.id, objectKey: expect.any(String), material: expect.any(Object) });
     expect(await readFile(join(f.providerArtifacts.sourceRoot, "opencodeProxy"), "utf8")).toBe(f.original.opencodeProxy);
   });
+  it("RK5 (never-OK, S3): a settled run's checkpoint and its run-only provider artifact (in no backup) are kept past 7 days; no object is released", async () => {
+    const f = await artifactFixture(), put = f.storage.putFile.bind(f.storage);
+    const lostReply = vi.spyOn(f.storage, "putFile").mockImplementation(async input => { await put(input); throw new Error("artifact upload reply lost"); });
+    await expect(persistNativeHarnessBackup(f)).rejects.toThrow("artifact upload reply lost"); lostReply.mockRestore();
+    const [pin] = await f.db.select().from(nativeProviderArtifactReferences).where(eq(nativeProviderArtifactReferences.runId, f.runId));
+    expect(pin.backupId).toBeNull(); // in no backup: this object is the only copy of these bytes
+    await f.db.insert(nativeRunnerCheckpoints).values({ companyId: f.companyId, runId: f.runId,
+      issueId: f.issueId, part: "header", material: { retained: "RK5 checkpoint header" } });
+    await settle(f, new Date(Date.now() - 10 * 86_400_000));
+    const leaseId = randomUUID(), providerLeaseId = randomUUID(), confirmedAt = new Date();
+    await f.db.insert(environmentLeases).values({ id: leaseId, companyId: f.companyId, heartbeatRunId: f.runId,
+      issueId: f.issueId, provider: "daytona", providerLeaseId, status: "expired", cleanupStatus: "success", releasedAt: confirmedAt,
+      metadata: { remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId: f.companyId,
+        runId: f.runId, leaseId, provider: "daytona", providerLeaseId, state: "destroyed", confirmedAt: confirmedAt.toISOString() } } });
+    const remove = vi.spyOn(f.storage, "deleteObject");
+    const result = await nativeHarnessBackupExpirationService(f.db, { storage: f.storage }).tickCheckpoints();
+    expect(result.expiredCheckpoints).toBe(0); expect(result.checkpointCandidates).toBe(0); expect(result.failed).toBe(0);
+    expect(result.skipped.native_runner_checkpoint_kept).toBe(1);
+    expect(remove).not.toHaveBeenCalled();
+    expect((await f.db.select().from(nativeRunnerCheckpoints).where(eq(nativeRunnerCheckpoints.runId, f.runId)))[0].material)
+      .toEqual({ retained: "RK5 checkpoint header" });
+    expect(await f.db.select().from(nativeProviderArtifacts).where(eq(nativeProviderArtifacts.id, pin.artifactId))).toHaveLength(1);
+    expect(await f.db.select().from(nativeProviderArtifactReferences).where(eq(nativeProviderArtifactReferences.artifactId, pin.artifactId))).toHaveLength(1);
+  });
   it("retires an abandoned artifact upload through checkpoint expiration without losing deletion retries", async () => {
     const f = await artifactFixture(), put = f.storage.putFile.bind(f.storage);
     const lostReply = vi.spyOn(f.storage, "putFile").mockImplementation(async input => {
