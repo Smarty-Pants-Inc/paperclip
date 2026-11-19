@@ -31,6 +31,7 @@ import { AgentIdentity } from "@/components/AgentIdentity";
 import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
 import { agentChatDraft } from "@/lib/agent-chat-draft";
 import { trackRecentProject } from "@/lib/recent-projects";
+import { perMessageCardRunIds } from "../lib/per-message-cards";
 import { ExecutionBlockerNotice } from "../components/ExecutionBlockerNotice";
 import type { TaskComposerPause } from "../components/task-chat/TaskChatPausedTakeover";
 import { queueHeldByPersonStop } from "../components/task-chat/TaskChatQueuedMessages";
@@ -4369,6 +4370,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     [issue, comments, optimisticComments, currentUserId, assignmentActivity],
   );
 
+  const messageCardRunIds = useMemo(() => perMessageCardRunIds(comments), [comments]);
   const threadComments = useMemo(
     () =>
       mergeIssueComments(comments ?? [], optimisticComments)
@@ -8460,7 +8462,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           {resolvedDetailTab === "chat" && (
             // TODO(D10): replace Retry with a fresh thread from history.
             <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption} blockers={issue.blockedBy}
-              heldByPersonStop={heldByPersonStop}
+              heldByPersonStop={heldByPersonStop} messageCardRunIds={messageCardRunIds}
               issueId={issue.id} companyId={issue.companyId} agentName={agentMap.get(issue.assigneeAgentId ?? "")?.name} projectName={issue.project?.name}
               canRetry={canResolveBoardRecoveryAction &&
                 !(issue.executionBlocker?.canRetry === false &&

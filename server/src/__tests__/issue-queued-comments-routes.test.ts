@@ -3298,7 +3298,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     const seen = await sweepAt(f, failedAt, [2, 3, 11]);
     // +2 is inside the sweep's own 2 min wait bound; from +3 the card stands, once.
     expect(seen.map(s => s.notes.map(n => n.message)), JSON.stringify(seen)).toEqual([[], [typed], [typed]]);
-    expect(seen[1].notes[0].body).toBe("Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.");
+    expect(seen[1].notes[0].body).toBe("Your message wasn't answered. Sending it again is safe; if it fails again, start a new chat.");
   });
 
   // Ruling (b): the no-card gate keys on the SENDER's own Stop. REAL: the Stop is

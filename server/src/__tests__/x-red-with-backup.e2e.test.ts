@@ -1158,7 +1158,7 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
         // RFL 16:51Z: A4's MUST is exactly ONE note with the EXISTING text, no new text (rule 12);
         // the extra 'names a person action' rule is dropped for that row.
         if (scenario.expected !== "no-history-one-note") expect.soft(note.body, "names an existing person action, not merely 'starting' or an internal error")
-          .toMatch(/\bretry\b|assign this agent a new task|send (?:another|a new) message/i);
+          .toMatch(/\bretry\b|assign this agent a new task|start a new chat|send (?:another|a new) message/i);
       }
     }
     // Count ALL durable runs for this conversation; opening/later-work are not

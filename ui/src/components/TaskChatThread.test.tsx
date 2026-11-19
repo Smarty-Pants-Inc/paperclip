@@ -6742,9 +6742,9 @@ it("explains a missing provider runtime with an installation repair", () => {
 // detailsDefaultOpen false, the row shows only its title
 // (TaskChatSystemNotice.tsx:65), not the plain-words next step.
 describe("C9 unanswered person message notice (B' stranded sweep) in the chat", () => {
-  const BPRIME_NOT_ANSWERED = "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
-  const BPRIME_NO_RUN = "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
-  const NEXT_ACTION = "Send the message again; if it fails again, assign this agent a new task.";
+  const BPRIME_NOT_ANSWERED = "Your message wasn't answered. Sending it again is safe; if it fails again, start a new chat.";
+  const BPRIME_NO_RUN = "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, start a new chat.";
+  const NEXT_ACTION = "Send it again; if it fails again, start a new chat.";
   const at = (second: number) => new Date(`2026-11-13T20:00:${String(second).padStart(2, "0")}Z`);
   const personMessage = (id: string, body: string, second: number) => ({
     id, body, companyId: "company", issueId: "issue", authorType: "user" as const, authorAgentId: null,

@@ -106,9 +106,9 @@ export function agentPausedText(name: string) {
 }
 
 export const UNANSWERED_MESSAGE_TEXT =
-  "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
+  "Your message wasn't answered. Sending it again is safe; if it fails again, start a new chat.";
 export const UNANSWERED_MESSAGE_NO_RUN_TEXT =
-  "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
+  "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, start a new chat.";
 export const UNANSWERED_MESSAGE_WAITING_TEXT =
   "Your message is waiting for the agent to be free; it will start by itself.";
 export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
@@ -171,6 +171,9 @@ const SHOWN_CODES = new Set([
   "runner_remote_provider_artifact_incompatible", "runner_remote_provider_verification_unavailable",
   "provider_process_exited", "provider_initialize_timeout", "provider_request_timeout", "provider_transport_failed",
   "provider_session_open_rejected", "provider_session_open_timeout",
+  // The run's own code (an Interrupt successor whose predecessor's session could not be retired): shown true,
+  // never as unclassified_failure.
+  "native_predecessor_retirement_unproven",
 ]);
 
 // Refusals a new message meets the same way: the held text, not "send it again".
@@ -442,7 +445,11 @@ async function owedOlderMessageIds(db: Db, issue: DecisionIssue, newestId: strin
         or r.context_snapshot->>'conversationReplyBoundaryCommentId' = ${issueComments.id}::text
         or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${issueComments.id}::text
         or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${issueComments.id}::text)
-      and not ${failedCarrierRunSql("r", { id: sql`${issueComments.id}` })})`,
+      and not ${failedCarrierRunSql("r", { id: sql`${issueComments.id}` })}
+      -- The turn a person's Interrupt cut carried the message only until the cut: the Interrupt carry hands it to
+      -- the successor explicitly (routes/issues.ts interruptedTurnUnansweredCommentIds, first). That cut turn is no
+      -- live or answering carrier, so the successor's own end decides the message (its WORK card when it fails).
+      and not (r.status = 'cancelled' and coalesce(r.result_json ? 'queuedCommentInterruptQueueId', false)))`,
     // SUPERSEDE-LOSTDOUBLE-PER-BATCH-TO-PER-MESSAGE-1119 (RFL): no 'covering' rule. A failed run that carried
     // M1 AND M2 leaves TWO owed messages and so TWO cards, each naming its own message, retiring on its own.
     eq(issueComments.authorType, "user")))
@@ -607,7 +614,7 @@ async function decideCarriedSteerNotices(q: Db, issue: DecisionIssue, now: Date)
     notices.push({ reason, code, upgradeCommentId: noticed?.id ?? null, notice: buildStrandedRecoveryEscalationNotice({
       seed: { title: "Your message wasn't answered", tone: "warning",
         body: stopped ? UNANSWERED_CARRIED_STEER_STOPPED_TEXT : UNANSWERED_CARRIED_STEER_FAILED_TEXT,
-        nextAction: "Send the message again; if it fails again, assign this agent a new task." },
+        nextAction: "Send it again; if it fails again, start a new chat." },
       recoveryActionId: null, recoveryOwner: null, recoveryResponsibility: "user",
       sourceRun: { id: carrying.id, agentId: carrying.agentId, status: carrying.status, errorCode: code },
     }) });
@@ -1154,7 +1161,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
         : waiting ? "No action is needed; it will start by itself."
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : held || boundReached ? "Send a new message to try again."
-        : workingEnded ? UNANSWERED_MESSAGE_STARTED_NEXT_ACTION : "Send the message again; if it fails again, assign this agent a new task.",
+        : workingEnded ? UNANSWERED_MESSAGE_STARTED_NEXT_ACTION : "Send it again; if it fails again, start a new chat.",
     },
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,

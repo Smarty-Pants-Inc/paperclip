@@ -904,8 +904,8 @@ const runScenario = async (scenario: Scenario) => {
       expect(notes, "refused route must write EXACTLY ONE readable note").toHaveLength(1);
       expect(notes[0]!.body.trim().length).toBeGreaterThan(30);
       expect(notes[0]!.body, "readable next step, not an internal error code").not.toMatch(/native_predecessor_retirement_unproven|runner_harness_state_mismatch|stack trace/);
-      // Case-insensitive: the sweep's existing text reads '…, assign this agent a new task.'
-      expect(notes[0]!.body, "working next step: assign a new task to this agent").toMatch(/assign this agent a new task/i);
+      // Case-insensitive: the sweep's existing text reads '…, start a new chat.'
+      expect(notes[0]!.body, "working next step: start a new chat").toMatch(/start a new chat/i);
       // Resolve that next step through the real authorized issue-create route,
       // with no assignee wake (the agent is paused for this route-only probe).
       await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));

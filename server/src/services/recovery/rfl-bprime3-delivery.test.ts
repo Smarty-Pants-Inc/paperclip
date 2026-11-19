@@ -62,7 +62,7 @@ describe.skipIf(!support.supported)("RFL Bprime3 delivered first-turn messages",
       if (outcome !== "answers") {
         expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${f.messageId}`);
         expect(notices[0]!.body).toBe(outcome === "fails"
-          ? "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task."
+          ? "Your message wasn't answered. Sending it again is safe; if it fails again, start a new chat."
           : "This run finished without a reply to your message. Sending it again is safe.");
       }
     });

@@ -127,7 +127,7 @@ export async function f1PersonFlow(refusal: string, clock: "real" | "advancing",
   // The refused run's existing failure notice for the person's request (live:
   // e2453887, unanswered-person-message.ts writer), still current.
   if (replay) await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id, authorType: "system",
-    body: "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.",
+    body: "Your message wasn't answered. Sending it again is safe; if it fails again, start a new chat.",
     createdAt: new Date(t0 - 30_000), metadata: { version: 1, sourceRunId: source.id, recoveryResponsibility: "user",
       authorizationReason: `unanswered_message:${replay.requestId}`, sections: [] } } as typeof issueComments.$inferInsert);
   if (clock === "advancing") vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], shouldAdvanceTime: true });

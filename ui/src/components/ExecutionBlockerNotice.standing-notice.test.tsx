@@ -46,7 +46,7 @@ describe("chat card with a standing notice (C9 G1)", () => {
   });
 
   it("keeps a re-send-safe notice's Retry", async () => {
-    const text = "Your message wasn't answered (error: unclassified_failure). Sending it again is safe; if it fails again, assign this agent a new task.";
+    const text = "Your message wasn't answered (error: unclassified_failure). Sending it again is safe; if it fails again, start a new chat.";
     await render({ ...failed, canRetry: true, notice: { code: "unclassified_failure", text } });
     expect(container.textContent).toContain(text);
     expect(container.querySelector('[data-testid="task-execution-retry"]')?.textContent).toBe("Retry");

@@ -267,7 +267,9 @@ describe.skipIf(!support.supported)("Interrupt: a failed carrier never loses a m
     await evidence("L1", snapshot);
     // SUPERSEDE-LOSTDOUBLE-PER-BATCH-TO-PER-MESSAGE-1119 (RFL): was 'ONE card per lost batch'. Now ONE card PER owed
     // message the failed run carried (in thread order), each re-owed once: by a retry carrying it OR by its own card.
-    const owedCarried = [msg1!, msg2!].filter(id => failedCarried.includes(id));
+    // adopt-permsg-gaps (1): the cut turn's own message M0 (the WORK) is carried FIRST by the Interrupt into the same
+    // failed successor, so it is owed too and has its own card, first (it was silently dropped before).
+    const owedCarried = [f.m0, msg1!, msg2!].filter(id => failedCarried.includes(id));
     expect(retried.length + cards.filter(id => id === msg1).length, `MSG1 re-owed once: ${JSON.stringify(snapshot)}`).toBe(1);
     if (retried.length === 0) expect(cards, `one card per owed message, in order: ${JSON.stringify(snapshot)}`).toEqual(owedCarried);
   }, 120_000);

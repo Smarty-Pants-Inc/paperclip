@@ -36,8 +36,11 @@ const blockerAction: Record<string, string> = {
 };
 
 /** One ordinary interruption surface. Technical records remain in diagnostics. */
-export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers, heldByPersonStop }: {
+export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers, heldByPersonStop, messageCardRunIds }: {
   presentation: TaskInterruptionPresentation | null | undefined;
+  /** Runs whose owed messages each stand as their own card (perMessageCardRunIds): for that run's failure the
+   * cards are the ONE surface, so the generic failed line and its Retry give way to them. */
+  messageCardRunIds?: readonly string[];
   /** The chat's stopped bar stands (queueHeldByPersonStop): it is the ONE line. */
   heldByPersonStop?: boolean;
   companyId?: string;
@@ -132,6 +135,10 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
   // the stopped attempt is not a failure to retry (org 11-19 04:36Z).
   if (optimistic || !presentation || presentation.responsibility !== "system" || heldByPersonStop ||
       !["failed", "retry_scheduled"].includes(presentation.state)) return null;
+  // One true surface for one failure: this failed run's owed messages each have their own card (quoting it, with
+  // its own action), so a generic red line with a second Retry does not also stand above them.
+  if (presentation.state === "failed" && messageCardRunIds?.length
+    && [presentation.observedRunId, ...presentation.sourceRunIds].some(id => !!id && messageCardRunIds.includes(id))) return null;
   return (
     <div className={cn(presentation.state === "failed" && "pt-4", className)}>
       <div role="status" aria-label="Task status" className={cn(
