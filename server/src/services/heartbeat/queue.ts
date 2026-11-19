@@ -3,6 +3,7 @@ import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
 import { QUEUED_SEND_AFTER_STOP_KEY } from "../run-cancellation.js";
+import { readPersonStopHold } from "../acknowledged-native-stop.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
@@ -5199,9 +5200,24 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   )
                   .orderBy(asc(agentWakeupRequests.requestedAt))
               : [];
+          // Stop means stop (R4b): a message typed after a person's Stop runs
+          // FIRST and ALONE. A saved wake that the person's Stop held up to
+          // this very message is not adopted into its run (the ONE reader,
+          // called per wake); the release drain sends the held ones next, once.
+          const typedNow = queuedCommentIdsFromRunContext(enrichedContextSnapshot);
+          const heldByPersonStop = new Set<string>();
+          if (canCoalesceComments && typedNow.length) {
+            for (const wake of pendingComments) {
+              if (wake.id === executionWaitRequestId || wake.id === opts.queuedCommentInterruptId ||
+                  wake.id === opts.queuedCommentRequestId) continue;
+              if (await readPersonStopHold(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id,
+                agentId: wake.agentId, wakeId: wake.id, admittingTypedCommentIds: typedNow })) heldByPersonStop.add(wake.id);
+            }
+          }
           const adoptedComments = pendingComments.filter((wake) => {
             if (wake.id === executionWaitRequestId) return true;
             if (wake.id === opts.queuedCommentInterruptId || wake.id === opts.queuedCommentRequestId) return true;
+            if (heldByPersonStop.has(wake.id)) return false;
             const deferredPayload = parseObject(wake.payload);
             const deferredContext = parseObject(
               deferredPayload[DEFERRED_WAKE_CONTEXT_KEY],
