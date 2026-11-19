@@ -804,6 +804,23 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     expect(fresh).toContain("STEP1-RESULT-wrote-step1");
   });
 
+  it("C2 (C1 read-steer red): tier 1's SAME Pi session does not receive a steer it already read; a FRESH session still receives it", async () => {
+    const chat = await seedChat();
+    const { steerId, carry } = await steerThenInterrupt(chat, "read");
+    const successor = await admitSuccessor(chat, carry);
+    const payload = await buildPaperclipWakePayload({ db, companyId: chat.companyId, agentId: chat.agentId,
+      runId: successor.id, contextSnapshot: { ...(successor.contextSnapshot as Record<string, unknown>) } });
+    expect(payload?.comments.find(comment => comment.id === steerId)?.readInSession,
+      "the real Interrupt carry marks the steer as already read").toBe(true);
+    const same = renderPaperclipWakePrompt(payload, { resumedSession: false, sessionContinues: true });
+    expect(same, "tier 1's bootstrap renders with resumedSession false, but the same Pi session holds STEER").not.toContain(STEER);
+    expect(renderPaperclipWakePrompt(payload, { resumedSession: false }), "a fresh session never read STEER").toContain(STEER);
+    expect(renderPaperclipWakePrompt(payload, { resumedSession: true }), "a resumed session already read STEER").not.toContain(STEER);
+    expect(same, "the new Interrupt message must still be sent").toContain(MSG);
+    expect(await nativeSuccessorRequest(chat, successor, true), "the real native caller passes sessionContinues").not.toContain(STEER);
+    expect(await nativeSuccessorRequest(chat, successor, false), "fresh native requests still carry STEER").toContain(STEER);
+  });
+
   /** Real Pi tool events (tool_execution_start/end) through the REAL Pi projector, stored as the runner stores them. */
   async function piToolReceipts(chat: Chat, calls: Array<{ tool: string; args: Record<string, unknown>; output: string; isError?: boolean }>) {
     const projector = createPiEventProjector({ runId: chat.runId, turnId: `turn-${randomUUID()}` });
