@@ -1938,17 +1938,38 @@ export async function startSandboxCallbackBridgeServer(input: {
     maxBodyBytes: input.maxBodyBytes,
   });
   const nodeCommand = input.nodeCommand?.trim() || "node";
-  const startResult = await runSandboxBridgeControlCommand(input.runner, {
+  // Launch and admit the listener in one control RPC. The readiness check is
+  // immediate, with bounded short backoff, not the worker's idle long-list.
+  const readyResult = await runSandboxBridgeControlCommand(input.runner, {
     command: shellCommand,
     args: shellCommandArgs(
       [
+        "set -eu; umask 077",
         `mkdir -p ${shellQuote(directories.requestsDir)} ${shellQuote(directories.responsesDir)} ${shellQuote(directories.logsDir)}`,
         `rm -f ${shellQuote(directories.readyFile)} ${shellQuote(directories.pidFile)}`,
         `nohup ${shellQuote(nodeCommand)} ${shellQuote(remoteEntrypoint)} ` +
           `>> ${shellQuote(directories.logFile)} 2>&1 < /dev/null &`,
         "pid=$!",
+        "ready=",
+        "trap '[ -n \"$ready\" ] || kill \"$pid\" 2>/dev/null || :' EXIT HUP INT TERM",
         `printf '%s\\n' \"$pid\" > ${shellQuote(directories.pidFile)}`,
-        "printf '{\"pid\":%s}\\n' \"$pid\"",
+        "i=0",
+        `while [ \"$i\" -lt 200 ]; do`,
+        `  if [ -s ${shellQuote(directories.readyFile)} ]; then`,
+        `    cat ${shellQuote(directories.readyFile)}`,
+        "    ready=1",
+        "    exit 0",
+        "  fi",
+        `  if ! kill -0 \"$pid\" 2>/dev/null; then`,
+        `    cat ${shellQuote(directories.logFile)} >&2`,
+        "    exit 1",
+        "  fi",
+        "  i=$((i + 1))",
+        "  case $i in 1) sleep 0.01 ;; 2) sleep 0.02 ;; *) sleep 0.05 ;; esac",
+        "done",
+        `echo "Timed out waiting for bridge readiness." >&2`,
+        `if [ -s ${shellQuote(directories.logFile)} ]; then cat ${shellQuote(directories.logFile)} >&2; fi`,
+        "exit 1",
       ].join("\n"),
     ),
     cwd: input.remoteCwd,
@@ -1958,32 +1979,6 @@ export async function startSandboxCallbackBridgeServer(input: {
     },
     timeoutMs,
   });
-  requireSuccessfulResult("start sandbox callback bridge", startResult);
-
-  const readyResult = await runShell(
-    input.runner,
-    input.remoteCwd,
-    [
-      "i=0",
-      `while [ \"$i\" -lt 200 ]; do`,
-      `  if [ -s ${shellQuote(directories.readyFile)} ]; then`,
-      `    cat ${shellQuote(directories.readyFile)}`,
-      "    exit 0",
-      "  fi",
-      `  if [ -s ${shellQuote(directories.logFile)} ] && ! kill -0 \"$(cat ${shellQuote(directories.pidFile)} 2>/dev/null)\" 2>/dev/null; then`,
-      `    cat ${shellQuote(directories.logFile)} >&2`,
-      "    exit 1",
-      "  fi",
-      "  i=$((i + 1))",
-      "  sleep 0.05",
-      "done",
-      `echo "Timed out waiting for bridge readiness." >&2`,
-      `if [ -s ${shellQuote(directories.logFile)} ]; then cat ${shellQuote(directories.logFile)} >&2; fi`,
-      "exit 1",
-    ].join("\n"),
-    timeoutMs,
-    shellCommand,
-  );
   requireSuccessfulResult("wait for sandbox callback bridge readiness", readyResult);
 
   let readyData: { host?: string; port?: number; baseUrl?: string; pid?: number };

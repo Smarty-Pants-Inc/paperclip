@@ -18,6 +18,7 @@ import {
   getSandboxCallbackBridgeServerSource,
   HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
   sandboxCallbackBridgeDirectories,
+  SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT,
   syncRemoteTextFileWithHashSkip,
   syncSandboxCallbackBridgeEntrypoint,
   startSandboxCallbackBridgeServer,
@@ -2180,6 +2181,29 @@ describe("sandbox callback bridge", () => {
       expect((await fs.stat(destination)).mode & 0o777).toBe(0o600);
     }
     expect((await readdir(root)).filter(name => name.includes("paperclip-upload"))).toEqual([]);
+  });
+
+  // Keep reason: readiness must report a real listener, not just a launched PID.
+  it.each(["sh", "bash"] as const)("starts and admits a delayed gateway in one %s RPC at 150ms latency", async shellCommand => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "bridge-ready-rpc-"));
+    cleanupDirs.push(root);
+    await writeFile(path.join(root, SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT),
+      `await new Promise(resolve => setTimeout(resolve, 200));\n${getSandboxCallbackBridgeServerSource()}`);
+    const real = createExecRunner();
+    const execute = vi.fn(async (input: Parameters<typeof real.execute>[0]) => {
+      await new Promise(resolve => setTimeout(resolve, 150));
+      return real.execute(input);
+    });
+    const startedAt = performance.now();
+    const bridge = await startSandboxCallbackBridgeServer({ runner: { execute }, remoteCwd: root,
+      assetRemoteDir: root, queueDir: path.join(root, "queue"), bridgeToken: "fresh-readiness-token", shellCommand });
+    cleanupFns.push(bridge.stop);
+    const elapsedMs = Math.round(performance.now() - startedAt);
+    console.log(JSON.stringify({ row: "gateway-readiness-150ms", shellCommand, rpcs: execute.mock.calls.length, elapsedMs }));
+    expect.soft(execute).toHaveBeenCalledTimes(1);
+    const response = await fetch(`${bridge.baseUrl}/api/agents/me`, { headers: { authorization: "Bearer wrong" } });
+    expect(response.status).toBe(401);
+    expect(JSON.parse(await readFile(bridge.directories.readyFile, "utf8"))).toMatchObject({ port: bridge.port, pid: bridge.pid });
   });
 
   it("does not retry a small marker after an unknown control-RPC timeout", async () => {
