@@ -165,6 +165,7 @@ export function AgentActionButtons({
   showAssignIcon = true,
   assignIcon: AssignIcon = Plus,
   showChat = false,
+  showAssign = true,
   runLabel = "Run now",
   showStatus = true,
   showRun = true,
@@ -190,6 +191,8 @@ export function AgentActionButtons({
   showAssignIcon?: boolean;
   assignIcon?: typeof Plus;
   showChat?: boolean;
+  /** False hides the primary Assign task / New task button (another member's Smarty). */
+  showAssign?: boolean;
   runLabel?: string;
   showStatus?: boolean;
   showRun?: boolean;
@@ -536,7 +539,7 @@ export function AgentActionButtons({
             <Play className="size-4" />
             Finish setup
           </Button>
-        ) : (
+        ) : showAssign && (
           <Button
             size={size}
             onClick={() => openNewIssue({ assigneeAgentId: agent.id })}
@@ -563,7 +566,7 @@ export function AgentActionButtons({
           Raw tracing on
         </span>
       ) : null}
-      <Button
+      {showAssign && <Button
         variant="outline"
         size={size}
         onClick={() => openNewIssue({ assigneeAgentId: agent.id })}
@@ -572,7 +575,7 @@ export function AgentActionButtons({
       >
         <Plus className="h-3.5 w-3.5 sm:mr-1" />
         <span className="hidden sm:inline">{assignLabel}</span>
-      </Button>
+      </Button>}
       {needsSetup ? (
         <Button variant="outline" size={size} disabled={disabled} onClick={() => {
           if (!confirmNavigationStart(agentActionStartedDirtyRef)) return;

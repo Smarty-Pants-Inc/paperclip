@@ -2,13 +2,12 @@ import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { agentChatsApi } from "@/api/agentChats";
 import { agentsApi } from "@/api/agents";
-import { authApi } from "@/api/auth";
 import { accessApi } from "@/api/access";
-import { primaryAgentApi } from "@/api/primaryAgent";
 import { buildCompanyUserLabelMap } from "@/lib/company-members";
 import { QueryErrorState, useQueryView } from "@/components/QueryView";
 import { useCompany } from "@/context/CompanyContext";
 import { useAgentChatEnabled } from "@/hooks/useAgentChatEnabled";
+import { usePrimaryAgentOwner } from "@/hooks/usePrimaryAgentOwner";
 import { recordAgentChatVisit } from "@/lib/recent-agent-chats";
 import { queryKeys } from "@/lib/queryKeys";
 import { Link, useParams } from "@/lib/router";
@@ -26,11 +25,6 @@ export function AgentChat() {
     queryFn: () => agentsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
-  const session = useQuery({
-    queryKey: queryKeys.auth.session,
-    queryFn: () => authApi.getSession(),
-  });
-  const userId = session.data?.user?.id ?? session.data?.session?.userId ?? null;
   const agentsView = useQueryView(agents);
   const rosterAgent = agents.data?.find(
     (item) => item.id === agentRef || agentRouteRef(item) === agentRef,
@@ -42,15 +36,9 @@ export function AgentChat() {
       && !rosterAgent && isUuidLike(agentRef),
   });
   const agent = rosterAgent ?? (historyAgent.data?.companyId === selectedCompanyId ? historyAgent.data : undefined);
-  const primaries = useQuery({
-    queryKey: queryKeys.primaryAgent.members(selectedCompanyId!, userId ?? "local-board"),
-    queryFn: () => primaryAgentApi.list(selectedCompanyId!),
-    enabled: enabled && !!selectedCompanyId && session.isSuccess,
-  });
   // A shared primary is still interactive for its own member. Otherwise open
   // only the other member's conversation, never the viewer's chat by accident.
-  const ownPrimary = primaries.data?.some(item => item.agentId === agent?.id && item.userId === (userId ?? "local-board"));
-  const otherOwnerId = ownPrimary ? undefined : primaries.data?.find(item => item.agentId === agent?.id)?.userId;
+  const { session, userId, primaries, otherOwnerId } = usePrimaryAgentOwner(selectedCompanyId, agent?.id, enabled);
   const ownChatEnabled = enabled && !!agent && session.isSuccess && primaries.isSuccess && !otherOwnerId;
   const chatKey = queryKeys.agentChats.detail(selectedCompanyId, userId, agent?.id);
   const chat = useQuery({
