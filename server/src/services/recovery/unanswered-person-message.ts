@@ -681,7 +681,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   const agentId = issue.assigneeAgentId;
 
   const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt,
-    authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
+    authorUserId: issueComments.authorUserId, body: issueComments.body }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
     // The message this decision is for: a named owed message, else the newest.

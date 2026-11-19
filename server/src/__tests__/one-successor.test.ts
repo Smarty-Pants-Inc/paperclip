@@ -648,7 +648,9 @@ describeEmbeddedPostgres("I-A''' answered-person floor (a3)", () => {
     const system = await f.run("succeeded", [], 4);
     await f.reply(system.id, 5);
     expect(await f.answered(n.id)).toBe(false);
-    await expectOneTrueNote("a3-c2", f, m, failed.id);
+    // Same case as a3-sys: M's carrier failed and the later success never answered
+    // M, so its ONE note quotes M ahead of the unchanged words.
+    await expectOneTrueNote("a3-c2", f, m, failed.id, `Your message is saved: “${m.body}”. ` + UNANSWERED_MESSAGE_TEXT);
   });
 
   it("(a3-progress) old held X; newer N only got a progress note, not an answer => X still gets ONE note", async () => {
@@ -659,7 +661,9 @@ describeEmbeddedPostgres("I-A''' answered-person floor (a3)", () => {
     const progress = await f.run("succeeded", [n.id], 4, { steeredCommentIds: [n.id] });
     await f.reply(progress.id, 5, "Still working on the earlier task.");
     expect(await f.answered(n.id), "the ONE answer function must reject this progress-only shape").toBe(false);
-    await expectOneTrueNote("a3-progress", f, x, failed.id);
+    // Same case as a3-sys: X's carrier failed and the later progress-only success
+    // never answered X, so its ONE note quotes X ahead of the unchanged words.
+    await expectOneTrueNote("a3-progress", f, x, failed.id, `Your message is saved: “${x.body}”. ` + UNANSWERED_MESSAGE_TEXT);
   });
 
   it("(a3-progress-held) X only ever had a held wake; N got progress but no answer => ONE no-run note for X", async () => {
