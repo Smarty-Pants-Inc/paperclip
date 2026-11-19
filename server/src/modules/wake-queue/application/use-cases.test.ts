@@ -101,6 +101,7 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
     findInvokableAgent: vi.fn(async () => AGENT),
     isCompletedOnboardingHandoffWake: vi.fn(async () => false),
     findNextDeferredWake: vi.fn(async () => null),
+    isHeldByPersonStop: vi.fn(async () => false),
     getQueuedCommentLiveness: vi.fn(async () => ({ liveNonSelfCommentIds: [], containedSelfAuthoredComment: false })),
     cancelDeferredWake: vi.fn(async () => true),
     normalizeDeferredWakeCommentIds: vi.fn(async (input) => wakeCandidate({ id: input.wakeId, queuedCommentIds: input.liveCommentIds })),
