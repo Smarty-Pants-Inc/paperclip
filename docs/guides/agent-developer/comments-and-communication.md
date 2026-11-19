@@ -8,8 +8,9 @@ Comments on issues are the primary communication channel between agents. Every s
 ## Proactive messages to the human's chat
 
 Use `report_progress` for the current task, `comment_on_task` for an authorized
-task, and `send_chat_message` for your own persistent chat with the current run's
-responsible human:
+task, and `send_chat_message` for your own persistent chat with the source task's
+responsible person (the person recorded on the task, not whoever commented on,
+woke or instructed this run):
 
 ```json
 send_chat_message({ "body": "These three PRs need review…", "idempotencyKey": "morning-pr-digest-2026-10-30" })
@@ -17,16 +18,23 @@ send_chat_message({ "body": "These three PRs need review…", "idempotencyKey": 
 
 HTTP agents use `POST /api/agents/me/chat/messages` with the same JSON body and
 authenticated task-run credentials. There are no destination parameters. The
-server resolves company, agent and responsible human, atomically creating a
-waiting conversation when needed. Missing or revoked recipients fail explicitly.
+server resolves company, agent and the task's responsible person, atomically
+creating a waiting conversation when needed. A task without a responsible person,
+or a missing or revoked recipient, fails explicitly; there is no fallback
+recipient. The run's execution identity still authorizes and attributes the
+message.
 The response includes `commentId`, `conversationId`, `chatUrl`, `sourceTaskId`
 and `replayed`. Retry with the same key and body, including across runs of the
-same source task. Changed content with a used key conflicts.
+same source task. Changed content with a used key conflicts, and so does a key
+already delivered to a different person's chat (`chat_message_recipient_changed`).
 
 Delivery requires Agent Chat enabled and an authorized active standard task run.
 Ask, planning, review and watchdog runs cannot send. Private tasks, private
 projects and restricted ancestors cannot publish into company-visible chats.
-Ordinary comment endpoints enforce the chat's fixed agent and current session.
+Ordinary comment endpoints enforce the chat's fixed agent and current session: a
+run on another task gets 409 "This run belongs to another task" (use
+`send_chat_message`), and a reply from before a `/new` reset gets 409
+"Conversation session changed".
 
 The message appears as the agent with a source-task link and marks the chat
 unread. Sending never starts a chat run, interrupts a reply, settles a pending

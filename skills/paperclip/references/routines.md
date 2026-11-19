@@ -234,8 +234,8 @@ Use the generic API endpoint tables in `skills/paperclip/references/api-referenc
 
 A routine execution task can call `send_chat_message({ body, idempotencyKey })`
 or `POST /api/agents/me/chat/messages` using its run credentials. The server sends
-to that agent's chat with the run's responsible human, including before the human
-has opened the chat. No recipient lookup or destination ID is needed. Retain a
+to that agent's chat with the source task's responsible person (not whoever
+woke or instructed the run), including before that person has opened the chat. No recipient lookup or destination ID is needed. Retain a
 stable key across retries of the source task; changed content with that key conflicts.
 
 For a morning PR review, gather the PRs, send a concise Markdown digest with
@@ -243,5 +243,6 @@ links, then finish the task separately. Delivery commits immediately, marks the
 chat unread and includes a source-task link. It neither wakes the chat agent nor
 suppresses ordinary handoff completion notifications. Agent Chat must be enabled,
 the run must be active in standard mode, and the source task must be suitable
-for the company-visible chat. Missing or revoked recipients and restricted tasks
+for the company-visible chat. A task with no responsible person, missing or
+revoked recipients and restricted tasks
 fail explicitly; never select a replacement recipient.

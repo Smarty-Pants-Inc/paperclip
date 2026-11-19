@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
-import { documentRevisions, issueComments, type Db } from "@paperclipai/db";
+import { documentRevisions, issueComments, issues, type Db } from "@paperclipai/db";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
 import { assertAgentInteraction } from "../services/agent-interaction-policy.js";
 import { documentService } from "../services/documents.js";
@@ -45,6 +45,8 @@ import { recoveryPostgresSupport as support } from "./helpers/recovery-postgres.
 
   it("two native sends + a document_revisions write + assertAgentRunWriteAllowed: one reply each, document commits, no 40P01", async () => {
     const f = await server.fixture({ connectionScenario: "fresh", apiToolsEnabled: false, disableWakeOnDemand: true });
+    // send_chat_message reaches the source task's responsible person.
+    await server.db.update(issues).set({ responsibleUserId: f.responsibleUserId }).where(eq(issues.id, f.issueId));
     // Wait out deadlocks counted by earlier work, then take the baseline.
     await new Promise(resolve => setTimeout(resolve, 1_200));
     const deadlocksBefore = await deadlocks();

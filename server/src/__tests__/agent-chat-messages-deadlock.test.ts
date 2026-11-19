@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
-import { agents, issueComments, type Db } from "@paperclipai/db";
+import { agents, issueComments, issues, type Db } from "@paperclipai/db";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
 import { sendAgentChatMessage } from "../services/agent-chat-messages.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -29,6 +29,8 @@ import { recoveryPostgresSupport as support } from "./helpers/recovery-postgres.
 
   it("delivers exactly one chat message when a concurrent run write holds the agent row", async () => {
     const f = await server.fixture({ connectionScenario: "fresh", apiToolsEnabled: false, disableWakeOnDemand: true });
+    // send_chat_message reaches the source task's responsible person.
+    await server.db.update(issues).set({ responsibleUserId: f.responsibleUserId }).where(eq(issues.id, f.issueId));
     const input = { body: "Deadlock probe reply", idempotencyKey: `deadlock-${randomUUID()}` };
     let releaseOther!: () => void;
     const otherGate = new Promise<void>(resolve => { releaseOther = resolve; });

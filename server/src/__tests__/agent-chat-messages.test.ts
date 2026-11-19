@@ -13,6 +13,10 @@ import { recordAcceptedChatHandoff } from "../services/chat-completion-delivery.
 import { conversationReplay, deliverConversationComments, undeliveredConversationComments } from "../services/agent-conversations.js";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
 import { CROSS_ISSUE_INFLUENCE_LIMIT } from "../services/cross-issue-influence-limit.js";
+import { runnerBridgeDefinitions } from "../services/native-runtime/runner-bridge-tools.js";
+import { createHeartbeatRunPreparation } from "../services/heartbeat/run-preparation.js";
+import { initializeRunIdentity } from "../services/run-identity.js";
+import type { ChatMessageReceipt } from "../services/agent-chat-messages.js";
 import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
 import { recoveryPostgresSupport as support } from "./helpers/recovery-postgres.js";
 
@@ -29,8 +33,66 @@ import { recoveryPostgresSupport as support } from "./helpers/recovery-postgres.
     if (originalSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
     else process.env.PAPERCLIP_AGENT_JWT_SECRET = originalSecret;
   });
-  const fixture = () => server.fixture({ connectionScenario: "fresh", apiToolsEnabled: false, disableWakeOnDemand: true });
+  // send_chat_message reaches the source task's persisted responsible person
+  // (issues.responsibleUserId), which dispatch records on a real task.
+  const withTaskPerson = async <F extends { issueId: string; responsibleUserId: string | null }>(f: F) => {
+    await server.db.update(issues).set({ responsibleUserId: f.responsibleUserId }).where(eq(issues.id, f.issueId));
+    return f;
+  };
+  const fixture = async () => withTaskPerson(await server.fixture({ connectionScenario: "fresh", apiToolsEnabled: false, disableWakeOnDemand: true }));
   type Fixture = Awaited<ReturnType<typeof fixture>>;
+  const member = async (f: Fixture, name: string) => {
+    const userId = randomUUID();
+    await server.db.insert(authUsers).values({ id: userId, name, email: `${userId}@fixture.invalid`, emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
+    await server.db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "member" });
+    return userId;
+  };
+  let taskNumber = 100;
+  /** Another ordinary task of this agent, owned by `responsibleUserId`, with a running run executing for `executionUserId`. */
+  const taskFor = async (f: Fixture, responsibleUserId: string, executionUserId: string) => {
+    const issueId = randomUUID(), runId = randomUUID(), n = taskNumber++;
+    await server.db.insert(issues).values({ id: issueId, companyId: f.companyId, projectId: f.projectId, issueNumber: n,
+      identifier: "E" + f.companyId.replaceAll("-", "").slice(0, 8) + "-" + n, title: "Second person's task", status: "in_progress",
+      workMode: "standard", assigneeAgentId: f.agentId, responsibleUserId });
+    await server.db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId, status: "running",
+      runtimeMode: "native", nativeIssueId: issueId, responsibleUserId: executionUserId, contextSnapshot: { issueId } });
+    await server.db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    return { issueId, runId };
+  };
+  /**
+   * The by-line cause: another person O comments on P's task; the next run's
+   * execution identity is resolved by the real run-seed resolver (latest
+   * wake comment author) and activated, while the task stays P's.
+   */
+  const wokenBy = async (f: Fixture, otherUserId: string) => {
+    const wake = await issueService(server.db).addComment(f.issueId, "Please tell Paul where this stands.", { userId: otherUserId });
+    const seeded = await createHeartbeatRunPreparation(server.db).resolveResponsibleUserIdForRunSeed({
+      companyId: f.companyId, contextSnapshot: { issueId: f.issueId, wakeCommentId: wake.id },
+      issueContext: { id: f.issueId, responsibleUserId: f.responsibleUserId, parentId: null },
+      routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
+    });
+    expect(seeded).toBe(otherUserId);
+    await server.db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.runId));
+    const runId = randomUUID();
+    await server.db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId, status: "running",
+      runtimeMode: "native", nativeIssueId: f.issueId, invocationSource: "on_demand", triggerDetail: "system",
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: wake.id, wakeCommentIds: [wake.id] } });
+    await server.db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, f.issueId));
+    await initializeRunIdentity(server.db, { companyId: f.companyId, runId, issueId: f.issueId, responsibleUserId: seeded!, messageIds: [wake.id], cause: "instruction" });
+    const [run] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run.responsibleUserId).toBe(otherUserId);
+    expect((await issueService(server.db).getById(f.issueId))!.responsibleUserId).toBe(f.responsibleUserId);
+    const authority = new PaperclipRunnerToolAuthority(server.db, { companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, runId, apiUrl: server.apiUrl, apiToolsEnabled: false });
+    return { runId, authority, wakeCommentId: wake.id, as: { ...f, runId, responsibleUserId: otherUserId } };
+  };
+  const chatsOf = async (f: Fixture) => (await server.db.select().from(issues).where(eq(issues.companyId, f.companyId)))
+    .filter(issue => issue.conversationAgentId);
+  const agentHttpComment = (f: { agentId: string; companyId: string; runId: string; responsibleUserId: string | null }, issueId: string, body: string) =>
+    fetch(`${server.apiUrl}/api/issues/${issueId}/comments`, {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId, f.responsibleUserId)}` },
+      body: JSON.stringify({ body }),
+    });
   const input = { body: "## Morning review\n\nThree PRs need your review.", idempotencyKey: "morning-pr-digest" };
   const send = (f: Fixture, value: unknown = input) => sendAgentChatMessage(server.db, f, value);
   const httpSend = (f: Fixture, value: unknown = input, keyScope: AgentApiKeyScope = { kind: "standard" }, authorizingUserId?: string) => fetch(`${server.apiUrl}/api/agents/me/chat/messages`, {
@@ -311,20 +373,24 @@ import { recoveryPostgresSupport as support } from "./helpers/recovery-postgres.
   it("isolates two humans sharing an agent and two agents serving one human", async () => {
     const f = await fixture();
     const a = await send(f);
-    const userId = randomUUID();
-    await server.db.insert(authUsers).values({ id: userId, name: "Second human", email: `${userId}@fixture.invalid`, emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
-    await server.db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "member" });
-    await server.db.update(heartbeatRuns).set({ responsibleUserId: userId }).where(eq(heartbeatRuns.id, f.runId));
-    const b = await send(f);
+    const userId = await member(f, "Second human");
+    // The second human's own task. Its run executes for the first human, but
+    // the recipient is each task's responsible person, not the run identity.
+    const second = await taskFor(f, userId, f.responsibleUserId!);
+    const b = await send({ ...f, issueId: second.issueId, runId: second.runId });
     expect(b!.conversationId).not.toBe(a!.conversationId);
+    const conversationUser = async (id: string) => (await issueService(server.db).getById(id))!.conversationUserId;
+    expect(await conversationUser(a!.conversationId)).toBe(f.responsibleUserId);
+    expect(await conversationUser(b!.conversationId)).toBe(userId);
     const [agent] = await server.db.insert(agents).values({ companyId: f.companyId, name: "Second agent", status: "active", adapterType: "process" }).returning();
     const runId = randomUUID();
     await server.db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: agent.id, status: "running", issueId: f.issueId, responsibleUserId: userId });
     await server.db.update(issues).set({ assigneeAgentId: agent.id, executionRunId: runId }).where(eq(issues.id, f.issueId));
     const c = await send({ ...f, agentId: agent.id, runId });
     expect(new Set([a!.conversationId, b!.conversationId, c!.conversationId]).size).toBe(3);
+    expect(await conversationUser(c!.conversationId)).toBe(f.responsibleUserId);
     await expect(issueService(server.db).addComment(a!.conversationId, "Wrong agent", { agentId: agent.id, runId })).rejects.toThrow(/Only this conversation/);
-    await expect(issueService(server.db).addComment(b!.conversationId, "Bypass", { agentId: f.agentId, runId: f.runId })).rejects.toThrow(/earlier session/);
+    await expect(issueService(server.db).addComment(b!.conversationId, "Bypass", { agentId: f.agentId, runId: f.runId })).rejects.toThrow(/belongs to another task/);
   });
 
   it("delivers to its own chat while preserving pending questions and the original handoff completion", async () => {
@@ -348,7 +414,7 @@ import { recoveryPostgresSupport as support } from "./helpers/recovery-postgres.
       .toMatchObject([{ conversationId: origin.id, agentId: coordinator.id }]);
   });
 
-  it.each(["ask", "planning", "review", "watchdog", "stopped", "stale", "missing-human", "revoked", "private-task", "private-project", "private-ancestor", "paused-agent"])("rejects %s before creating a chat", async kind => {
+  it.each(["ask", "planning", "review", "watchdog", "stopped", "stale", "missing-human", "revoked", "private-task", "private-project", "private-ancestor", "paused-agent", "missing-task-person"])("rejects %s before creating a chat", async kind => {
     const f = await fixture();
     if (kind === "ask" || kind === "planning") await server.db.update(issues).set({ workMode: kind }).where(eq(issues.id, f.issueId));
     if (kind === "review") await server.db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, nativeReviewInteractionId: randomUUID(), nativeReviewDecisionId: randomUUID() } }).where(eq(heartbeatRuns.id, f.runId));
@@ -364,6 +430,7 @@ import { recoveryPostgresSupport as support } from "./helpers/recovery-postgres.
       await server.db.update(issues).set({ parentId: f.blockerId, privacyParentIssueId: f.blockerId, privacyRootIssueId: f.blockerId }).where(eq(issues.id, f.issueId));
     }
     if (kind === "paused-agent") await server.db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agentId));
+    if (kind === "missing-task-person") await server.db.update(issues).set({ responsibleUserId: null }).where(eq(issues.id, f.issueId));
     await expect(send(f)).rejects.toThrow();
     expect((await f.snapshot()).comments).toHaveLength(0);
     expect((await f.snapshot()).issues.filter(i => i.conversationAgentId)).toHaveLength(0);
@@ -407,7 +474,7 @@ import { recoveryPostgresSupport as support } from "./helpers/recovery-postgres.
       .toMatchObject([{ unreadMessageCount: 0, isUnreadForMe: false }]);
     await mark(a.commentId);
     expect(await unread()).toMatchObject({ isUnreadForMe: false, unreadMessageCount: 0 });
-    const foreign = await server.fixture({ connectionScenario: "fresh" });
+    const foreign = await withTaskPerson(await server.fixture({ connectionScenario: "fresh" }));
     const foreignMessage = (await send(foreign))!;
     expect((await mark(foreignMessage.commentId)).status).toBe(404);
     const chats = await fetch(`${server.apiUrl}/api/companies/${f.companyId}/chats`, { headers: { Cookie: cookie } });
@@ -416,5 +483,133 @@ import { recoveryPostgresSupport as support } from "./helpers/recovery-postgres.
     const detail = await fetch(`${server.apiUrl}/api/companies/${f.companyId}/chats/${f.agentId}`, { headers: { Cookie: cookie } });
     expect(detail.status).toBe(200);
     expect(await detail.json()).toMatchObject({ id: a.conversationId, unreadMessageCount: 0 });
+  });
+
+  describe("recipient is the source task's responsible person (CHATROUTE sections 4-5)", () => {
+    it("R1+R7: a run executing for O (woken by O's comment) reaches P's existing chat once, attributed to O", async () => {
+      const f = await fixture(), P = f.responsibleUserId!;
+      const pChat = await issueService(server.db).create(f.companyId, { title: "Chat with P", assigneeAgentId: f.agentId,
+        conversationAgentId: f.agentId, conversationUserId: P, conversationState: "waiting", status: "in_review" });
+      const O = await member(f, "Ops person");
+      const woken = await wokenBy(f, O);
+      const receipt = await woken.authority.execute({ tool: "send_chat_message", arguments: input, callId: randomUUID() }) as ChatMessageReceipt;
+      expect(receipt).toMatchObject({ conversationId: pChat.id, sourceTaskId: f.issueId, replayed: false });
+      expect(await woken.authority.recover({ tool: "send_chat_message", arguments: input, callId: randomUUID() }))
+        .toMatchObject({ result: { commentId: receipt.commentId, conversationId: pChat.id, replayed: true } });
+      expect(await sendAgentChatMessage(server.db, woken.as, input)).toMatchObject({ commentId: receipt.commentId, replayed: true });
+      expect((await chatsOf(f)).map(chat => [chat.id, chat.conversationUserId])).toEqual([[pChat.id, P]]);
+      const delivered = await server.db.select().from(issueComments).where(eq(issueComments.issueId, pChat.id));
+      expect(delivered).toHaveLength(1);
+      // R7: execution attribution stays O's; the destination is P's chat.
+      expect(delivered[0]).toMatchObject({ id: receipt.commentId, authorAgentId: f.agentId, createdByRunId: woken.runId, onBehalfOfUserId: O,
+        metadata: { chatMessage: { sourceTaskId: f.issueId, sourceRunId: woken.runId } } });
+      expect((await f.snapshot()).activity).toContainEqual(expect.objectContaining({ action: "issue.comment_added", entityId: pChat.id,
+        runId: woken.runId, details: expect.objectContaining({ conversationUserId: P, sourceTaskId: f.issueId }) }));
+      expect((await issueService(server.db).getById(f.issueId))!.responsibleUserId).toBe(P);
+    });
+
+    it("R2: when P has no chat yet, HTTP delivery from O's run creates exactly one chat with P", async () => {
+      const f = await fixture(), P = f.responsibleUserId!, O = await member(f, "Ops person");
+      const woken = await wokenBy(f, O);
+      const first = await httpSend(woken.as);
+      expect(first.status, await first.clone().text()).toBe(201);
+      const receipt = await first.json() as ChatMessageReceipt;
+      const retry = await httpSend(woken.as);
+      expect(retry.status).toBe(200);
+      expect(await retry.json()).toMatchObject({ commentId: receipt.commentId, conversationId: receipt.conversationId, replayed: true });
+      expect((await chatsOf(f)).map(chat => [chat.id, chat.conversationUserId, chat.responsibleUserId])).toEqual([[receipt.conversationId, P, P]]);
+      expect(await server.db.select().from(issueComments).where(eq(issueComments.issueId, receipt.conversationId))).toHaveLength(1);
+    });
+
+    it("R3: a task without a responsible person fails closed with a true error and never falls back to the run's person", async () => {
+      const f = await fixture(), O = await member(f, "Ops person");
+      const woken = await wokenBy(f, O);
+      await server.db.update(issues).set({ responsibleUserId: null }).where(eq(issues.id, f.issueId));
+      await expect(woken.authority.execute({ tool: "send_chat_message", arguments: input, callId: randomUUID() }))
+        .rejects.toMatchObject({ status: 403, message: "This task has no responsible person to receive the message" });
+      const response = await httpSend(woken.as);
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ error: "This task has no responsible person to receive the message" });
+      expect(await chatsOf(f)).toEqual([]);
+      expect(await server.db.select().from(issueComments).where(eq(issueComments.authorAgentId, f.agentId))).toEqual([]);
+    });
+
+    it("R5: a key already delivered to O's chat is an explicit recipient-change conflict, never a claim or a second delivery", async () => {
+      const f = await fixture(), P = f.responsibleUserId!, O = await member(f, "Ops person");
+      const woken = await wokenBy(f, O);
+      // The pre-fix destination: the same source-task key committed in O's chat.
+      await server.db.update(issues).set({ responsibleUserId: O }).where(eq(issues.id, f.issueId));
+      const toO = (await sendAgentChatMessage(server.db, woken.as, input))!;
+      expect((await issueService(server.db).getById(toO.conversationId))!.conversationUserId).toBe(O);
+      await server.db.update(issues).set({ responsibleUserId: P }).where(eq(issues.id, f.issueId));
+      const conflictShape = { status: 409, details: { code: "chat_message_recipient_changed", commentId: toO.commentId, conversationId: toO.conversationId } };
+      await expect(sendAgentChatMessage(server.db, woken.as, input)).rejects.toMatchObject(conflictShape);
+      await expect(woken.authority.execute({ tool: "send_chat_message", arguments: input, callId: randomUUID() })).rejects.toMatchObject({ status: 409 });
+      await expect(woken.authority.recover({ tool: "send_chat_message", arguments: input, callId: randomUUID() })).rejects.toMatchObject({ status: 409 });
+      const http = await httpSend(woken.as);
+      expect(http.status).toBe(409);
+      expect(await http.json()).toMatchObject({ code: "chat_message_recipient_changed" });
+      // No P chat was created by the refused retries; O's single message stays.
+      expect((await chatsOf(f)).map(chat => chat.conversationUserId)).toEqual([O]);
+      expect(await server.db.select().from(issueComments).where(eq(issueComments.authorAgentId, f.agentId))).toHaveLength(1);
+      // An intentional resend uses a new key and reaches P once.
+      const fresh = (await sendAgentChatMessage(server.db, woken.as, { ...input, idempotencyKey: "morning-pr-digest-resend" }))!;
+      expect((await issueService(server.db).getById(fresh.conversationId))!.conversationUserId).toBe(P);
+      expect(await server.db.select().from(issueComments).where(eq(issueComments.authorAgentId, f.agentId))).toHaveLength(2);
+    });
+
+    it("revalidates the task's responsible person under the source row lock", async () => {
+      const f = await fixture(), receipt = (await send(f))!, Q = await member(f, "New owner");
+      let unlock!: () => void, ready!: (pid: number) => void;
+      const locked = new Promise<number>(resolve => { ready = resolve; });
+      const release = new Promise<void>(resolve => { unlock = resolve; });
+      const gate = server.db.transaction(async tx => {
+        const [{ pid }] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+        await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, receipt.conversationId)).for("update");
+        ready(pid); await release;
+      });
+      const pid = await locked;
+      const delivery = httpSend(f, { ...input, idempotencyKey: "person-after-wait" });
+      try {
+        await vi.waitFor(async () => {
+          const [row] = await server.db.execute(sql<{ blocked: boolean }>`select exists(select 1 from pg_stat_activity
+            where datname=current_database() and ${pid}=any(pg_blocking_pids(pid))) as blocked`);
+          expect(row.blocked).toBe(true);
+        }, { timeout: 5_000, interval: 10 });
+        await server.db.update(issues).set({ responsibleUserId: Q }).where(eq(issues.id, f.issueId));
+        unlock(); await gate;
+        const response = await delivery;
+        expect(response.status).toBe(403);
+        expect(await response.json()).toMatchObject({ error: "The task's responsible person changed before this message was saved" });
+        expect((await f.snapshot()).comments).toHaveLength(1);
+      } finally { unlock(); await gate; await delivery; }
+    }, 30_000);
+
+    it("R6: a comment from another task's run gets the wrong-task 409; a stale-generation reply keeps its text", async () => {
+      const f = await fixture(), P = f.responsibleUserId!;
+      const pChat = await issueService(server.db).create(f.companyId, { title: "Chat with P", assigneeAgentId: f.agentId,
+        conversationAgentId: f.agentId, conversationUserId: P, conversationState: "waiting", status: "in_review" });
+      const wrongTask = await agentHttpComment(f, pChat.id, "Paul, here is the status");
+      expect(wrongTask.status).toBe(409);
+      const wrongBody = await wrongTask.json();
+      expect(wrongBody).toMatchObject({ code: "chat_reply_wrong_task" });
+      expect(wrongBody.error).toMatch(/^This run belongs to another task; .*Use send_chat_message to message your task's responsible person/);
+      expect(wrongBody.error).not.toMatch(/earlier session/);
+      // A run that does belong to this chat, but to its earlier session.
+      const replyRun = randomUUID();
+      await server.db.insert(heartbeatRuns).values({ id: replyRun, companyId: f.companyId, agentId: f.agentId, status: "running",
+        nativeIssueId: pChat.id, responsibleUserId: P, contextSnapshot: { issueId: pChat.id, conversationSessionGeneration: 0 } });
+      await server.db.update(issues).set({ executionRunId: replyRun, conversationState: "active" }).where(eq(issues.id, pChat.id));
+      await server.db.update(issues).set({ conversationSessionGeneration: 1 }).where(eq(issues.id, pChat.id));
+      await expect(issueService(server.db).addComment(pChat.id, "Stale reply", { agentId: f.agentId, runId: replyRun }))
+        .rejects.toMatchObject({ status: 409, message: "Conversation session changed; this reply belongs to an earlier session" });
+      expect(await server.db.select().from(issueComments).where(eq(issueComments.issueId, pChat.id))).toEqual([]);
+      // The tools say the same thing to the agent.
+      const comment = runnerBridgeDefinitions({ workspace: false, skills: false, api: true, mode: "standard" }).find(d => d.name === "comment_on_task")!;
+      expect(comment.description).toMatch(/this run belongs to another task.*use send_chat_message to message your task's responsible person/);
+      expect(comment.description).toMatch(/conversation session changed/);
+      const sendTool = f.authority.definitions().find(d => d.name === "send_chat_message")!;
+      expect(sendTool.description).toMatch(/this task's responsible person: the person recorded as responsible on the task, not whoever commented on, woke or instructed this run/);
+    });
   });
 });

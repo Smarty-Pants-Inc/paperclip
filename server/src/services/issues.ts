@@ -13826,12 +13826,21 @@ export function issueService(db: Db) {
         if (agentRunWritesRevoked(run) && !publishesAcceptedReplyOfCancelledRun(run, options)) throw conflict("This conversation turn was cancelled; it cannot post a reply");
         const runTaskId = run?.nativeIssueId ?? run?.issueId ?? run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
         if (options?.proactiveChatMessage) {
+          // The destination is the source task's persisted responsible
+          // person (company-scoped, owned by this agent), not the run's
+          // execution identity, which may be whoever instructed the work.
+          const [proactiveSource] = await dbOrTx.select({ responsibleUserId: issues.responsibleUserId, assigneeAgentId: issues.assigneeAgentId })
+            .from(issues).where(and(eq(issues.id, options.proactiveChatMessage.sourceTaskId), eq(issues.companyId, issue.companyId)));
           if (run?.status !== "running" || run.agentId !== actor.agentId || run.companyId !== issue.companyId
             || runTaskId !== options.proactiveChatMessage.sourceTaskId || runTaskId === issueId
             || current.conversationUserId !== options.proactiveChatMessage.userId
-            || run.responsibleUserId !== current.conversationUserId) {
+            || !proactiveSource?.responsibleUserId || proactiveSource.assigneeAgentId !== actor.agentId
+            || proactiveSource.responsibleUserId !== current.conversationUserId) {
             throw forbidden("Invalid background chat message authority");
           }
+        } else if (run && runTaskId !== issueId) {
+          throw conflict("This run belongs to another task; it cannot reply in this chat. Use send_chat_message to message your task's responsible person",
+            { code: "chat_reply_wrong_task" });
         } else if (runTaskId !== issueId || run?.contextSnapshot?.conversationSessionGeneration !== current.conversationSessionGeneration) {
           throw conflict("Conversation session changed; this reply belongs to an earlier session");
         }
