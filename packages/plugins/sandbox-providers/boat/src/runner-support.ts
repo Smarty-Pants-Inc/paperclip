@@ -55,7 +55,9 @@ export async function writeWorkspaceSentinel(params: PluginEnvironmentAcquireLea
   const token = workspaceSentinelToken(params, config, id);
   if (!token) return { path: sentinelPath, token: null, result: "skipped" };
   const made = await io.run(`mkdir -p ${quote(path.posix.dirname(sentinelPath))}`, 30_000);
-  if (made.timedOut || made.exitCode !== 0) throw new Error("Boat workspace sentinel directory creation failed.");
+  // Boat answered "timed out": ETIMEDOUT, the host's transient code (as plugin.ts request()).
+  if (made.timedOut) throw Object.assign(new Error("Boat workspace sentinel directory creation timed out."), { code: "ETIMEDOUT" });
+  if (made.exitCode !== 0) throw new Error("Boat workspace sentinel directory creation failed.");
   const content = JSON.stringify({ version: 1, token, companyId: params.companyId, environmentId: params.environmentId,
     agentId: params.agentId, executionWorkspaceId: params.executionWorkspaceId,
     ...(params.executionWorkspaceId ? {} : { projectlessIssueId: params.issueId }),

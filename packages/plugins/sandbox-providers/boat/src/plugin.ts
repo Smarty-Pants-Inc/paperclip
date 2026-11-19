@@ -1396,12 +1396,19 @@ async function findTimedOutCreation(config: Config, attemptId: string, owner: { 
     await delay(Math.min(BOAT_CREATE_LOOKUP_INTERVAL_MS, remaining));
   }
 }
-async function waitReady(config: Config, id: string, allowArchived = false, bound: { signal?: AbortSignal; deadline?: number; sendGuard?: () => void } = {}): Promise<any> {
+/** Boat 11-18/19: ready but files not yet hydrated at the cap. ETIMEDOUT is the
+ * host's transient code; "timed out" is the server's resume retry text. */
+function boatHydrationTimeout(id: string, hydration: any): Error {
+  const phase = typeof hydration?.phase === "string" && /^[a-z_]+$/.test(hydration.phase) ? hydration.phase : "unknown";
+  const percent = Number.isInteger(hydration?.percent) ? ` ${hydration.percent}%` : "";
+  return Object.assign(new Error(`Boat sandbox ${id} timed out before its files hydrated (${phase}${percent})`), { code: "ETIMEDOUT" });
+}
+async function waitReady(config: Config, id: string, allowArchived = false, bound: { signal?: AbortSignal; deadline?: number; sendGuard?: () => void } = {}, requireHydrated = false): Promise<any> {
   // A bounded caller (a 409 recovery) never waits past its call budget, and its
   // admission and lifecycle check runs before every poll (frozen8 F-01/F-03).
   const until = Math.min(Date.now() + 120_000, bound.deadline ?? Number.POSITIVE_INFINITY);
   const options: RequestOptions = { ...(bound.deadline !== undefined ? { deadline: bound.deadline } : {}), ...(bound.sendGuard ? { sendGuard: bound.sendGuard } : {}) };
-  let lastObservedState: unknown;
+  let lastObservedState: unknown, unhydrated: unknown;
   while (Date.now() < until) {
     let result: any;
     // A deadline-only caller (the acquisition budget) bounds each poll's own
@@ -1417,9 +1424,13 @@ async function waitReady(config: Config, id: string, allowArchived = false, boun
     }
     const s = result.sandbox ?? result;
     assertSandboxId(s, id);
-    if (["ready", "idle", "running"].includes(s.state)) return s;
-    if (s.state === "error" || (!allowArchived && s.state === "archived")) throw new BoatSandboxStateError(id, s.state);
-    lastObservedState = s.state;
+    // A box handed off as ready must also be hydrated: `hydrated` is Boat's end
+    // signal, not `percent` (docs.boat.dev/api/reference/sandboxes/get-sandbox.md:200-229,
+    // readiness.md:102). A box without the field keeps the state-only rule.
+    const isReady = ["ready", "idle", "running"].includes(s.state);
+    if (isReady && !(requireHydrated && s.hydrated === false)) return s;
+    if (!isReady && (s.state === "error" || (!allowArchived && s.state === "archived"))) throw new BoatSandboxStateError(id, s.state);
+    lastObservedState = s.state; unhydrated = isReady ? s.hydration ?? {} : undefined;
     // Bounded transition observation only; no idle worker poller. Ready webhook
     // delivery belongs to the host; this acquisition has no callback endpoint.
     try { await delay(Math.min(500, Math.max(0, until - Date.now())), undefined, bound.signal ? { signal: bound.signal } : undefined); }
@@ -1428,6 +1439,7 @@ async function waitReady(config: Config, id: string, allowArchived = false, boun
       throw error;
     }
   }
+  if (unhydrated !== undefined) throw boatHydrationTimeout(id, unhydrated);
   throw new Error(boatStartDeadlineMessage(id, lastObservedState));
 }
 async function waitSetup(config: Config, id: string, deadline?: number): Promise<any> {
@@ -2617,7 +2629,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         // A created or adopted box waits for ready inside the acquire budget.
         assertActive(adopted ? "adopt" : "create");
         assertActive("ready");
-        const ready = await waitReady(c, sb.id, false, { deadline }).catch(error => {
+        const ready = await waitReady(c, sb.id, false, { deadline }, true).catch(error => {
           if (error instanceof BoatSandboxStateError && error.state === "error") {
             startFailure = { phase: "create", elapsedMs: Math.min(Math.max(0, Date.now() - createStartedAt), BOAT_ACQUIRE_ATTEMPT_BUDGET_MS - 1),
               budgetMs: BOAT_ACQUIRE_ATTEMPT_BUDGET_MS, providerState: "error" };
@@ -2826,7 +2838,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       const sb = response.sandbox ?? response;
       assertSandboxId(sb, id);
       markOurResume(c, id);
-      sandbox = await waitReady(c, id, true);
+      sandbox = await waitReady(c, id, true, {}, true);
       runnerIngressGenerationStore.invalidate(ingressScopeKey(params, c, id));
     } else {
       // Boat auto-stop counts from create/last resume, not activity:
