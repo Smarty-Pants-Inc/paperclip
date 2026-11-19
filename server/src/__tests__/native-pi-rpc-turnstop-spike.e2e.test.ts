@@ -598,7 +598,9 @@ it.skipIf(!enabled).each(["interrupt", "stop", "no-ack", "finished"] as const)(`
     await writeFile(join(root, "proof.json"), JSON.stringify({ scenario, stopTurn, warmupIdentities, stages, requests }, null, 2) + "\n");
     await writeFile(join(root, "remote-pack-verification.json"), JSON.stringify(packVerificationCommands, null, 2) + "\n");
     if (db && agentId) {
-      await writeFile(join(root, "comments.json"), JSON.stringify(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)), null, 2));
+      const [hire] = await db.select().from(agents).where(eq(agents.id, agentId));
+      await writeFile(join(root, "hire-status.json"), JSON.stringify({ id: hire?.id, lifecycleState: hire?.lifecycleState, lifecycleError: hire?.lifecycleError }, null, 2));
+      if (issueId) await writeFile(join(root, "comments.json"), JSON.stringify(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)), null, 2));
       await writeFile(join(root, "wakeups.json"), JSON.stringify(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId)), null, 2));
       await writeFile(join(root, "leases.json"), JSON.stringify(await db.select().from(environmentLeases).where(eq(environmentLeases.companyId, companyId)), null, 2));
       const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
