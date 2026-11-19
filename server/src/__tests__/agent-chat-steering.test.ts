@@ -9,6 +9,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issues,
@@ -37,6 +38,7 @@ import {
 const mocks = vi.hoisted(() => ({
   steer: vi.fn(),
   probe: vi.fn(),
+  cancel: vi.fn(),
   actual: {} as Record<string, (...args: never[]) => unknown>,
 }));
 vi.mock("../services/native-runtime/native-session-executor.js", async (importOriginal) => {
@@ -44,7 +46,9 @@ vi.mock("../services/native-runtime/native-session-executor.js", async (importOr
   mocks.actual = actual as never;
   mocks.steer.mockImplementation(actual.steerNativeSession);
   mocks.probe.mockImplementation(actual.getNativeSessionSteeringState);
-  return { ...actual, steerNativeSession: mocks.steer, getNativeSessionSteeringState: mocks.probe };
+  mocks.cancel.mockImplementation(actual.cancelNativeSession);
+  return { ...actual, steerNativeSession: mocks.steer, getNativeSessionSteeringState: mocks.probe,
+    cancelNativeSession: mocks.cancel };
 });
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -67,6 +71,8 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     mocks.steer.mockImplementation(mocks.actual.steerNativeSession as never);
     mocks.probe.mockReset();
     mocks.probe.mockImplementation(mocks.actual.getNativeSessionSteeringState as never);
+    mocks.cancel.mockReset();
+    mocks.cancel.mockImplementation(mocks.actual.cancelNativeSession as never);
     await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
     await db.execute(sql`TRUNCATE TABLE companies CASCADE`);
   });
@@ -572,5 +578,103 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     expect(response.status).toBe(403);
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
     expect(run!.status).toBe("running");
+  });
+
+  /** The runner's durable run log for the live turn (validated PRP events, in order). */
+  async function runLog(chat: Chat, events: Array<{ eventType: string; kind?: string; itemId: string }>) {
+    // Allocate sequences as run-event ingestion does (heartbeat_runs.next_event_seq).
+    const [allocated] = await db.update(heartbeatRuns)
+      .set({ nextEventSeq: sql`${heartbeatRuns.nextEventSeq} + ${events.length}` })
+      .where(eq(heartbeatRuns.id, chat.runId)).returning({ next: heartbeatRuns.nextEventSeq });
+    const first = Number(allocated!.next) - events.length;
+    await db.insert(heartbeatRunEvents).values(events.map((event, index) => ({
+      companyId: chat.companyId, runId: chat.runId, agentId: chat.agentId, seq: first + index,
+      eventType: event.eventType, sourceEventId: randomUUID(),
+      payload: { prpEvent: { turnId: "turn-1", itemId: event.itemId, payload: event.kind ? { kind: event.kind } : {} } },
+    })));
+  }
+
+  /** The person's square Stop: the native session acknowledges a run-only stop, then the run is released. */
+  async function personStop(chat: Chat) {
+    mocks.cancel.mockImplementationOnce(async (runId: string) => {
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      await db.update(heartbeatRuns).set({ resultJson: { ...(run!.resultJson ?? {}), nativeCancellation: {
+        schema: "paperclip.native-cancellation.v1", runId, companyId: chat.companyId, issueId: run!.nativeIssueId,
+        scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+        intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(),
+      } } }).where(eq(heartbeatRuns.id, runId));
+      return { decision: { stopped: true }, auditId: randomUUID() };
+    });
+    await heartbeatService(db).cancelRun(chat.runId, "Cancelled by a board operator",
+      { resultJson: { cancelledByActorType: "user", cancelledByUserId: owner } });
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    expect(stopped!.status).toBe("cancelled");
+  }
+
+  const STOPPED_LINE = "Stopped. These messages are waiting: Send them, or delete any first.";
+
+  // S10 C1 (never-OK): a message steered into the running turn that the model
+  // had not read yet is dropped by Stop's clear_queue. After a person's Stop it
+  // waits again, at its place, and one Send delivers it once. A steer the model
+  // read (Pi's userMessage receipt) stays with the stopped turn: no double answer.
+  it.each(["unread", "read"] as const)("after a person's Stop, a steered message the model had not read waits again and one Send delivers it once (%s)", async (variant) => {
+    const chat = await seedChat();
+    const [b, c] = await send(chat, ["B, steered", "C, waiting"]);
+    const [wake] = await deferredWakes(chat);
+    mocks.steer.mockResolvedValueOnce({ turnId: "turn-1" });
+    expect((await steer(chat, b!.id, wake!.id)).status).toBe(200);
+    await runLog(chat, [
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
+      { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${b!.id}` },
+      // Pi put B into the conversation: the model read it.
+      ...(variant === "read" ? [{ eventType: "item.started", kind: "userMessage", itemId: "turn-1:steered" }] : []),
+    ]);
+    await personStop(chat);
+    const expected = variant === "unread" ? [b!.id, c!.id] : [c!.id];
+    const queue = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200);
+    expect(queue.body.entries.map((entry: any) => entry.comment.id)).toEqual(expected);
+    expect(queue.body.executionWait).toEqual({ reason: "stopped_by_person", message: STOPPED_LINE });
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    expect((stopped!.contextSnapshot as any).wakeCommentIds)
+      .toEqual(variant === "unread" ? [chat.first.id] : [chat.first.id, b!.id]);
+    expect(await answered(b!.id)).toBe(false);
+
+    // The owner's Send: one turn with the waiting messages, each once, in order.
+    const sent = await request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/queued-comments/interrupt`)
+      .send({ queueId: queue.body.queueId, revision: queue.body.revision, targetRunId: null });
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, chat.companyId),
+      sql`${heartbeatRuns.id} <> ${chat.runId}`));
+    expect(successors).toHaveLength(1);
+    expect((successors[0]!.contextSnapshot as any).wakeCommentIds).toEqual(expected);
+    expect(await deferredWakes(chat)).toHaveLength(0);
+    // A repeated Send neither doubles nor reopens it.
+    expect((await request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/queued-comments/interrupt`)
+      .send({ queueId: queue.body.queueId, revision: queue.body.revision, targetRunId: null })).status).toBe(409);
+    expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, chat.companyId),
+      sql`${heartbeatRuns.id} <> ${chat.runId}`))).toHaveLength(1);
+    // This fixture's agent has no runtime: let the successor's own execution
+    // settle before the next test truncates its rows.
+    await vi.waitFor(async () => {
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successors[0]!.id));
+      const [agent] = await db.select().from(agents).where(eq(agents.id, chat.agentId));
+      expect(["queued", "running"]).not.toContain(run!.status);
+      expect(agent!.status).not.toBe("running");
+    }, { timeout: 20_000, interval: 100 });
+  });
+
+  // S10 C2: A, /new, B behind a person's Stop. One Send runs A, then /new, then
+  // B, so the stopped list shows all three, the /new and B marked behind it.
+  it("after a person's Stop, the waiting list shows the messages behind a /new too", async () => {
+    const chat = await seedChat();
+    const sent = await send(chat, ["A", "/new", "B"]);
+    await personStop(chat);
+    const queue = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200);
+    expect(queue.body.executionWait).toEqual({ reason: "stopped_by_person", message: STOPPED_LINE });
+    expect(queue.body.entries.map((entry: any) => entry.comment.id)).toEqual(sent.map((comment) => comment.id));
+    expect(queue.body.entries.map((entry: any) => entry.behindReset)).toEqual([false, true, true]);
+    const wakes = await deferredWakes(chat);
+    expect(queue.body.queueId).toBe(wakes[0]!.id);
+    expect(queue.body.entries.slice(1).map((entry: any) => entry.queueId)).toEqual([wakes[1]!.id, wakes[2]!.id]);
   });
 });
