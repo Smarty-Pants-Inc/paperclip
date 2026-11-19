@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, agentWakeupRequests, authUsers, chatCompletionDeliveries as deliveries, companies, companyMemberships, createDb, heartbeatRuns,
+import { activityLog, agents, agentWakeupRequests, authUsers, chatCompletionDeliveries as deliveries, companies, companyMemberships, createDb, heartbeatRuns,
   issueComments, issueRecoveryActions, issues } from "@paperclipai/db";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
@@ -261,5 +261,39 @@ describePostgres("automatic chat-completion turns on a person's chat", () => {
     expect(runs.filter(r => ((r.contextSnapshot?.wakeCommentIds as string[] | undefined) ?? []).includes(old.commentId)),
       `the old message is never re-delivered: ${JSON.stringify(snapshot)}`).toEqual([]);
     expect(wakes.find(w => w.id === old.wakeId), JSON.stringify(snapshot)).toMatchObject({ status: "cancelled" });
+  }, 180_000);
+
+  /** SMA-4's live shape: a FAILED run (setup_failed + `error`) and the stranded card written for it. */
+  async function strandedCardFor(f: { companyId: string; agentId: string; chatId: string }, error: string) {
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "failed",
+      invocationSource: "automation", errorCode: "setup_failed", error,
+      startedAt: new Date(Date.now() - 2_000), finishedAt: new Date(Date.now() - 1_000),
+      contextSnapshot: { issueId: f.chatId, wakeReason: "chat_task_completed", conversationSessionGeneration: 0 } }).returning();
+    const [action] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.chatId,
+      kind: "stranded_assigned_issue", status: "active", ownerType: "board", cause: "stranded_assigned_issue",
+      fingerprint: `stranded:${run.id}`, nextAction: "Try again", evidence: { latestRunId: run.id, latestRunStatus: "failed",
+        latestRunErrorCode: "setup_failed", sourceRunId: null } }).returning();
+    return { run, action };
+  }
+
+  it("S-2: the sweep retires an EXISTING stranded card whose run failed only as a superseded completion turn (22d69698)", async () => {
+    const f = await seedChat();
+    const { run, action } = await strandedCardFor(f, "chat_completion_superseded");
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(after, JSON.stringify(after)).toMatchObject({ status: "resolved", outcome: "false_positive" });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0]).toMatchObject({ status: "failed" });
+    const recorded = await db.select().from(activityLog).where(and(eq(activityLog.companyId, f.companyId),
+      eq(activityLog.action, "issue.recovery_action_retired_superseded_completion")));
+    expect(recorded.map(row => (row.details as Record<string, unknown>).recoveryActionId)).toEqual([action.id]);
+  }, 180_000);
+
+  it("S-2 control: a REAL setup failure's stranded card stays", async () => {
+    const f = await seedChat();
+    const { action } = await strandedCardFor(f, "Workspace preparation failed");
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(after.status).not.toBe("resolved");
+    expect(after.outcome ?? null).toBeNull();
   }, 180_000);
 });
