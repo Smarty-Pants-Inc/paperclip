@@ -816,6 +816,9 @@ export class PiRpcHarnessSession implements HarnessSession {
   #effectiveContext(): Record<string, unknown> {
     const context = this.#resident?.context ?? this.#initialContext;
     return { model: this.#identity.model, piRpcThinkingLevel: this.#identity.piRpcThinkingLevel, piMetadata: this.#piMetadata,
+      // The transport owns the actual child PID. Keep it on session/turn events
+      // so warm turns can prove process continuity, not just history continuity.
+      piProcessPid: this.#transport.pid,
       toolDelivery: { api: context.api, nativeToolCount: context.nativeToolCount, dynamicToolCount: context.tools.length, totalToolCount: context.nativeToolCount + context.tools.length } };
   }
 

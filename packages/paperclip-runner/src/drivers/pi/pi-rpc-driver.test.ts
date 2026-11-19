@@ -20,7 +20,7 @@ import { readCompletedAssistantMessageCandidate } from "../../../../../server/sr
 class FailureTransport {
   closed = false;
   exited = false;
-  pid = null;
+  pid: number | null = null;
   wake?: () => void;
   queue: PiRpcRecord[] = [];
   failure?: Error;
@@ -51,9 +51,10 @@ class FailureTransport {
   async close() { this.closed = this.exited = true; this.wake?.(); }
 }
 const flushFailure = () => new Promise<void>(resolve => setImmediate(resolve));
-async function failureFixture(capture = true) {
+async function failureFixture(capture = true, pid: number | null = null) {
   const root = await mkdtemp(join(tmpdir(), "pi-failure-"));
   const transport = new FailureTransport();
+  transport.pid = pid;
   const session = await new PiRpcDriver({ runtimeDirectory: join(root, "runtime"), model: "neutral/model", piRpcThinkingLevel: "high", environment: { PI_CODING_AGENT_DIR: join(root, "agent") }, transportFactory: () => transport as unknown as PiRpcTransport })
     .openSession({ runId: "run-old", normalizedSessionId: "normalized", workingDirectory: root });
   const events: PrpEvent[] = [];
@@ -162,6 +163,28 @@ describe("PiRpcDriver thinking display", () => {
 });
 
 describe("PiRpcDriver", () => {
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21267
+  it("records the real Pi child PID on cold and warm turn events", async () => {
+    const f = await failureFixture(true, 4242);
+    try {
+      await f.session.startTurn({ message: { role: "user", text: "first" } });
+      f.transport.send({ type: "agent_start" });
+      const message = { role: "assistant", id: "pid-done", responseId: "pid-receipt", timestamp: 1,
+        provider: "neutral", model: "model", content: [{ type: "text", text: "done" }], usage: {}, stopReason: "stop" };
+      f.transport.send({ type: "message_start", message });
+      f.transport.send({ type: "message_end", message });
+      f.transport.send({ type: "agent_settled" });
+      await vi.waitFor(() => expect(f.events.some(e => e.eventType === "turn.completed")).toBe(true));
+      await f.session.attachRun!({ runId: "run-warm-pid" });
+      await f.session.startTurn({ message: { role: "user", text: "second" } });
+      await flushFailure();
+      const observed = f.events.filter(e => ["session.started", "turn.started"].includes(e.eventType));
+      expect(observed.map(e => e.runId)).toEqual(["run-old", "run-old", "run-warm-pid"]);
+      expect(observed.map(e => (e.payload.context as Record<string, unknown>).piProcessPid)).toEqual([4242, 4242, 4242]);
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  });
+
   it("k: runner session and RPC mode win over manager-supplied Pi environment", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-manager-env-"));
     const runtime = join(root, "copied-runner", "sessions");

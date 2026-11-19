@@ -97,7 +97,7 @@ import {
   NATIVE_CONTINUITY_STATE_ENTRIES, NATIVE_SESSION_ROOT_HELD_ENTRIES, describeUnexpectedNativeSessionRootEntries,
   isKnownNativeSessionRootEntry,
 } from "./native-session-root-entries.js";
-import { createRunPreparationTiming } from "../execution-preparation-timing.js";
+import { createRunPreparationTiming, drainRunPreparationPhases } from "../execution-preparation-timing.js";
 import { CONFIGURED_ENVIRONMENT_KEYS, configuredEnvironment, PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS } from "../../vendor/paperclip-runner/index.js";
 import { parseProviderPerformanceSpans } from "../../vendor/paperclip-runner/index.js";
 import { apiKeyBillingType } from "@paperclipai/adapter-utils/api-billing-type";
@@ -1162,7 +1162,9 @@ export async function claimWarmNativeInstructionCopy(input: {
     })) || prior.workspace.cwd !== input.workspace.cwd) return null;
   const scope = nativeSessionScopeKey(prior);
   const busyEntry = warmNativeSessions.get(scope);
-  if (busyEntry?.busy || settlingNativeSessionScopes.has(scope) || closingWarmNativeSessions.has(scope)) await waitForWarmNativeSessionSettled(scope);
+  if (busyEntry?.busy || settlingNativeSessionScopes.has(scope) || closingWarmNativeSessions.has(scope)) {
+    await createRunPreparationTiming(input.runId)("warm_release_wait", () => waitForWarmNativeSessionSettled(scope));
+  }
   // Re-read after the wait: the release may have retired or replaced the session.
   const entry = warmNativeSessions.get(scope);
   if (!entry || !entry.instructionWorkingCopy?.runId || entry.environmentId !== input.environmentId) return null;
@@ -1227,7 +1229,7 @@ export async function reserveWarmNativeInstructionDirectory(input: {
     // once, bounded like claimWarmNativeInstructionCopy's wait, then re-read.
     // Another run's claim (preparingRunId) is a real concurrent owner.
     if (!releaseWaited && !entry.preparingRunId && (entry.busy || settlingNativeSessionScopes.has(id) || closingWarmNativeSessions.has(id))) {
-      await waitForWarmNativeSessionRelease(id, entry);
+      await createRunPreparationTiming(input.runId)("warm_release_wait", () => waitForWarmNativeSessionRelease(id, entry));
       return reserveWarmNativeInstructionDirectory(input, true);
     }
     if (entry.busy || entry.preparingRunId) throw new Error("native_session_supervisor_busy");
@@ -1649,11 +1651,21 @@ async function measureNativeRunnerSpan<T>(
 
 /** Persist controller waits in the same run trace as provider-pack admission.
  * OpenTelemetry-only timing left this interval invisible in the span table. */
-function createNativeControllerTiming(runId: string, currentTrace: () => NativeRunTrace | undefined) {
+function createNativeControllerTiming(runId: string, currentTrace: () => NativeRunTrace | undefined,
+  beforeTrace?: NativeRunHistoricalSpan[]) {
   const time = createRunPreparationTiming(runId, "native.controller");
   return <T>(phase: Parameters<typeof time>[0], work: () => T | Promise<T>): Promise<T> =>
-    measureNativeControllerStep(phase, () => phase === "span_persistence" ? time(phase, work)
-      : measureNativeRunnerSpan(currentTrace(), `native.controller.${phase}`, () => time(phase, work), "task.provider_session"));
+    measureNativeControllerStep(phase, async () => {
+      if (phase === "span_persistence") return time(phase, work);
+      const trace = currentTrace();
+      if (trace || !beforeTrace) return measureNativeRunnerSpan(trace, `native.controller.${phase}`, () => time(phase, work), "task.provider_session");
+      // Warm restore runs BEFORE the trace exists. Retain its real interval,
+      // rather than losing it in the OTLP-only preparation timer.
+      const startedAtMs = Date.now();
+      let outcome: "ok" | "failed" = "failed";
+      try { const value = await time(phase, work); outcome = "ok"; return value; }
+      finally { beforeTrace.push({ name: `native.controller.${phase}`, startedAtMs, endedAtMs: Date.now(), outcome }); }
+    });
 }
 
 /**
@@ -11467,7 +11479,8 @@ async function executePaperclipNativeSessionUnnoticed(input: {
     // The shutdown sweep can have removed an idle owner while its remote
     // checkpoint is still being saved. The scope reservation also prevents
     // a later sweep from closing an owner this turn is about to acquire.
-    await closingWarmNativeSessions.get(sessionScopeId);
+    const closingOwner = closingWarmNativeSessions.get(sessionScopeId);
+    if (closingOwner) await createRunPreparationTiming(runId)("warm_release_wait", () => closingOwner);
 
     if (input.execution.schema === "paperclip.native-execution-input.v6" || input.execution.schema === "paperclip.native-execution-input.v8") {
       return await executePaperclipNativeSessionWithinScope(input, undefined, false, ownDiagnosticLease);
@@ -11861,16 +11874,17 @@ async function executePaperclipNativeSessionAttempt(
   const stagedRestart = input.restartRecovery?.kind === "reattach_remote_runner"
     ? await verifyStagedAttachmentRestart(input) : null;
   let controllerTrace: NativeRunTrace | undefined;
-  const timeController = createNativeControllerTiming(input.execution.binding.runId, () => controllerTrace);
+  const beforeTrace: NativeRunHistoricalSpan[] = [];
+  const timeController = createNativeControllerTiming(input.execution.binding.runId, () => controllerTrace, beforeTrace);
   const target = input.runnerExecutionTarget;
   const portableTarget = target?.kind === "remote" && target.transport === "sandbox" && target.runnerTask ? target : undefined;
   const companyId = input.execution.binding.companyId;
   const portablePreparationLeaseId = input.restartRecovery?.kind === "bootstrap_incomplete"
     ? input.restartRecovery.portablePreparationLeaseId : undefined;
-  const targetLease = portableTarget?.leaseId ? (await input.db.select({
+  const targetLease = portableTarget?.leaseId ? await timeController("preparation_lease_read", async () => (await input.db.select({
     metadata: environmentLeases.metadata, providerLeaseId: environmentLeases.providerLeaseId,
     ...(portablePreparationLeaseId ? { unlaunchedPortable: unlaunchedPortableTaskLease() } : {}),
-  }).from(environmentLeases).where(and(eq(environmentLeases.companyId, companyId), eq(environmentLeases.id, portableTarget.leaseId))))[0] : undefined;
+  }).from(environmentLeases).where(and(eq(environmentLeases.companyId, companyId), eq(environmentLeases.id, portableTarget.leaseId!))))[0]) : undefined;
   if (portablePreparationLeaseId && (portableTarget?.leaseId !== portablePreparationLeaseId || targetLease?.unlaunchedPortable !== true)) {
     throw remoteRecoveryLeaseMismatch("runner_verification", "plugin_task");
   }
@@ -11895,7 +11909,13 @@ async function executePaperclipNativeSessionAttempt(
     );
   }
   const identityCheckSpan = nativeSessionStartups.get(input.execution.binding.runId)?.warmOwnerIdentitySpan;
-  const preparationSpans = [...(input.preparationSpans ?? []), ...(identityCheckSpan ? [identityCheckSpan] : [])];
+  // Heartbeat drained its phases before dispatch. Attachment staging and any
+  // closing-owner wait can happen after that drain but before this trace exists.
+  // Keep those existing timings too, without duplicating the explicit receipts.
+  const latePreparationSpans = drainRunPreparationPhases(input.execution.binding.runId)
+    .filter(phase => !beforeTrace.some(span => span.name === phase.name));
+  const preparationSpans = [...(input.preparationSpans ?? []), ...latePreparationSpans, ...beforeTrace,
+    ...(identityCheckSpan ? [identityCheckSpan] : [])];
   const preparationStarts = nativeRunPreparationStarts(
     preparationSpans,
     Date.now(),
