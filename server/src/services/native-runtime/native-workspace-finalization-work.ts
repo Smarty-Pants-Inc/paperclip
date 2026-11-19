@@ -10,6 +10,7 @@ import { WORKSPACE_COMMAND_TIMEOUT_MS } from "../remote-workspace-transport.js";
 import { measureRunPhase, withRunWorkspaceFinalizationTiming } from "../execution-preparation-timing.js";
 import { nativeRunnerOwnershipNotHeldCondition } from "./native-runner-ownership.js";
 import { attemptNativeWorkspaceFinalization, recordNativeWorkspaceFinalizationFailure } from "./native-workspace-finalizer.js";
+import { WITHHELD_REPLY_SAVING_DEADLINE_MS } from "./native-withheld-reply-trigger.js";
 
 type Entry = { id: string; companyId: string; issueId: string; agentId: string; dueAt: number };
 type AttemptInput = Parameters<typeof attemptNativeWorkspaceFinalization>[0];
@@ -26,7 +27,7 @@ const OWNERSHIP_RECHECK_MS = 30_000;
  */
 export const COPYOUT_NO_ATTEMPT_BOUND_MS = 60_000;
 /**
- * A running attempt is never cut inside the time today's own timeouts give it:
+ * Without an earlier person-wait or reply deadline, a running attempt has the time today's own timeouts give it:
  * the helper install and the capture are one sandbox command each, and the
  * archive transfer is capped at MAX_SANDBOX_SYNC_TIMEOUT_MS
  * (remote-workspace-transport.ts transferArchive). A copy-out reports nothing
@@ -67,8 +68,8 @@ export function nativeWorkspaceFinalizationWork(db: Db, options: {
       // The bound ends a run only behind an epoch fence (fenceSourceWorkspace), which needs this reference.
       fenceable: sql<boolean>`coalesce(${heartbeatRuns.runnerProfileJson} #>> '{remoteWorkspace,state}' = 'prepared', false)
         or coalesce(${heartbeatRuns.runnerProfileJson} #>> '{nativeWorkspaceSync,state}' = 'prepared', false)`,
-      // A classic sync run has no epoch: it is ended only by the person-wait cap, behind the classic isolation
-      // (isolateClassicSourceWorkspace). With nobody parked it keeps the schedule it had before the bound.
+      // A classic sync run has no epoch: both clocks end it behind the same classic isolation
+      // (isolateClassicSourceWorkspace). The reply's own deadline applies even with nobody parked.
       classic: sql<boolean>`coalesce(${heartbeatRuns.runnerProfileJson} #>> '{remoteWorkspace,state}' = 'prepared', false) is not true`,
       // When the first person's message still parked behind this task was parked (epoch ms), or null.
       parkedAt: sql<number | null>`(select (extract(epoch from min(parked.requested_at)) * 1000)::float8
@@ -100,7 +101,7 @@ export function nativeWorkspaceFinalizationWork(db: Db, options: {
     // so copy-backs interrupted by a later restart cannot starve older retries.
     // The database clock may lead this process slightly; never defer such work.
     const pendingSince = Math.min(row.updatedAt.getTime(), Date.now());
-    return withinPersonWait(row, { id: row.id, companyId: row.companyId, issueId: row.issueId, agentId: row.agentId,
+    return withinCopyOutBound(row, { id: row.id, companyId: row.companyId, issueId: row.issueId, agentId: row.agentId,
       dueAt: Math.max(row.nextAttemptAt?.getTime() ?? pendingSince,
         row.leaseOwner ? row.leaseExpiresAt?.getTime() ?? 0 : 0) });
   }
@@ -125,13 +126,20 @@ export function nativeWorkspaceFinalizationWork(db: Db, options: {
     return !row.fenceable || row.parkedAt === null ? null
       : Math.max(Number(row.parkedAt), row.acceptedAt.getTime()) + personWaitCapMs;
   }
-  /** A fenceable run is checked again no later than its cap. With nobody parked
-   * that is one cap from now: a message parked after this cannot be due sooner. */
-  function withinPersonWait(row: Candidate, item: Entry): Entry {
+  /** ONE bound, TWO clocks: the reply's accepted + 10-minute deadline is always armed,
+   * and a parked person's five-minute cap may end the same wait sooner. Never restart
+   * the reply clock on an attempt, retry, owner release or worker restart. */
+  function replySavingEndsAt(row: Candidate) {
+    return row.fenceable ? row.acceptedAt.getTime() + WITHHELD_REPLY_SAVING_DEADLINE_MS : Number.POSITIVE_INFINITY;
+  }
+  function boundEndsAt(row: Candidate) {
+    return Math.min(replySavingEndsAt(row), personWaitEndsAt(row) ?? Number.POSITIVE_INFINITY);
+  }
+  /** Revisit no later than either clock, including while a lease or retry delay is held.
+   * Also look for a newly parked message within one cap, the soonest it can be due. */
+  function withinCopyOutBound(row: Candidate, item: Entry): Entry {
     if (!row.fenceable) return item;
-    const endsAt = personWaitEndsAt(row);
-    // A cap the finalizer refused to act on is rechecked like a pending stop.
-    const wait = endsAt === null ? personWaitCapMs : endsAt > now() ? endsAt - now() : OWNERSHIP_RECHECK_MS;
+    const wait = Math.max(0, Math.min(personWaitCapMs, boundEndsAt(row) - now()));
     return { ...item, dueAt: Math.min(item.dueAt, Date.now() + wait) };
   }
   /** When the bound fires: no attempt started for the bound after acceptance, a
@@ -167,8 +175,8 @@ export function nativeWorkspaceFinalizationWork(db: Db, options: {
     const scope = { companyId: current.companyId, runId: current.id };
     const [row] = await candidates(scope);
     if (!row) return null;
-    // The person-wait cap ends the run whatever it waits for: a retry delay too.
-    const waitEnded = (personWaitEndsAt(row) ?? Number.POSITIVE_INFINITY) <= now();
+    // Whichever clock comes first ends the run whatever it waits for: a retry delay too.
+    const waitEnded = boundEndsAt(row) <= now();
     if (waitEnded && await endStalled(row)) return null;
     const due = entry(row);
     if (due.dueAt > Date.now()) return due;
@@ -178,15 +186,15 @@ export function nativeWorkspaceFinalizationWork(db: Db, options: {
     }));
     // This worker serializes a task's checks, so an attempt that never returns
     // would also hold back the check that could end it. Stop waiting for it here.
-    // With nobody parked it has its timeout and then the no-attempt bound; with a
-    // person's message parked, its timeout once or the person-wait cap, the sooner.
+    // The reply deadline always applies. A parked person's cap (or first timeout)
+    // may end it earlier. Both clocks use the SAME terminal write and isolation/fence.
     const attemptStartedAt = now();
     let outcome: Awaited<typeof running> | { kind: "overrun" } | undefined;
     for (let latest: Candidate | undefined = row; !outcome;) {
       const waitEndsAt = latest && personWaitEndsAt(latest);
-      const endsAt = !latest ? Number.POSITIVE_INFINITY
-        : waitEndsAt == null ? row.classic ? Number.POSITIVE_INFINITY : attemptStartedAt + attemptTimeoutMs + noAttemptMs
-        : Math.min(attemptStartedAt + attemptTimeoutMs, waitEndsAt);
+      const endsAt = !latest ? Number.POSITIVE_INFINITY : Math.min(replySavingEndsAt(latest),
+        waitEndsAt == null ? row.classic ? Number.POSITIVE_INFINITY : attemptStartedAt + attemptTimeoutMs + noAttemptMs
+          : Math.min(attemptStartedAt + attemptTimeoutMs, waitEndsAt));
       if (!row.fenceable || !latest) outcome = await running;
       else if (endsAt <= now()) outcome = { kind: "overrun" };
       else {
@@ -210,11 +218,11 @@ export function nativeWorkspaceFinalizationWork(db: Db, options: {
       void running.catch(error => logger.warn({ runId: current.id, error }, "overrun native workspace finalization attempt failed"));
       return { ...due, dueAt: Date.now() + OWNERSHIP_RECHECK_MS };
     }
-    if (outcome.kind === "retry") return withinPersonWait(row, { ...due, dueAt: outcome.retryAt.getTime() });
+    if (outcome.kind === "retry") return withinCopyOutBound(row, { ...due, dueAt: outcome.retryAt.getTime() });
     if (outcome.kind === "waiting") {
       // A run without a fenceable epoch keeps the schedule it had before the bound.
       const stallAt = row.fenceable ? Math.min(row.classic ? Number.POSITIVE_INFINITY : await copyOutStallAt(row),
-        personWaitEndsAt(row) ?? Number.POSITIVE_INFINITY) : Number.POSITIVE_INFINITY;
+        boundEndsAt(row)) : Number.POSITIVE_INFINITY;
       const stalled = stallAt <= now();
       if (stalled && await endStalled(row)) return null;
       // A pending stop proof rechecks on its own; the board action stays visible meanwhile.
@@ -227,7 +235,7 @@ export function nativeWorkspaceFinalizationWork(db: Db, options: {
       // Revisited at its bound, and as before after a restart or a release notification.
       // A refused bound keeps its deadline armed (an active owner would otherwise drop it for ever).
       return !row.fenceable ? null : stalled ? { ...due, dueAt: Date.now() + OWNERSHIP_RECHECK_MS }
-        : withinPersonWait(row, { ...due, dueAt: Date.now() + (stallAt - now()) });
+        : withinCopyOutBound(row, { ...due, dueAt: Date.now() + (stallAt - now()) });
     }
     if (outcome.kind === "inactive" || (outcome.kind === "completed" && outcome.operation.status === "succeeded")) return null;
     // x1 while a person's message is parked: the first attempt that timed out ends the run; no retry holds them.
