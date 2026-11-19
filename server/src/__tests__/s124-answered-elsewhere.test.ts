@@ -290,7 +290,7 @@ describe("S124 fix: a parked Send whose held messages were carried by a run that
     expect((after.notes[0]!.metadata as any)?.authorizationReason).toBe(`unanswered_message:${f.message.id}`);
     expect(after.wake.status).toBe('deferred_issue_execution'); expect(heldIds(after.queue)).toEqual([f.message.id]);
   });
-  it('row 6 LATEST carrier decides: an earlier carrier replied, the latest carrier FAILED with no reply -> not retired, one note', async()=>{
+  it("an earlier carrier's own-input reply answers M; a later failed carrier doesn't re-owe it: retired, no note", async()=>{
     const f=await fixture(),at=Date.now();
     const deps=createHeartbeatQueueTestDependencies(db),queue=createHeartbeatQueue(db,deps);
     const wake=await stopAndSend(f,at,[f.message.id]);
