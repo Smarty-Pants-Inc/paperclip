@@ -207,9 +207,15 @@ export function proveHandedOffWarmLeases(db: Db, run: Run, opts?: { redispatch?:
   const work = (async (): Promise<ProofOutcome> => {
     const all = await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
       eq(environmentLeases.heartbeatRunId, run.id)));
+    // A healthy in-process turn stop is ordinary warm retention, not a handoff
+    // to a replacement Runner. Never ask that still-live owner to prove exit.
+    const hasRetainedNativeTurnStop = run.runnerProfileJson?.nativeRetainedIdleCheckpoint
+      ? (await import("./native-session-executor.js")).hasRetainedNativeTurnStop : undefined;
+    // Only the exact retained lease is exempt; other old writers still need proof.
+    const requiringProof = all.filter(lease => !hasRetainedNativeTurnStop?.(run, lease));
     // adopt-hung-stop: a handed-off stop already requested gets its receipt deadline (re-armed from the durable intent time).
-    for (const lease of all) await armHandedOffStopReceiptDeadline(db, run, lease);
-    const leases = all.filter(lease => handedOffWarmLease(run, lease) && !handedOffWarmLeaseSettled(run, lease));
+    for (const lease of requiringProof) await armHandedOffStopReceiptDeadline(db, run, lease);
+    const leases = requiringProof.filter(lease => handedOffWarmLease(run, lease) && !handedOffWarmLeaseSettled(run, lease));
     if (!leases.length) {
       for (const lease of all) recordWarmRetentionProbe(db, { companyId: run.companyId, runId: run.id, leaseId: lease.id },
         { phase: "proof", outcome: "skipped", elapsedMs: 0 });
