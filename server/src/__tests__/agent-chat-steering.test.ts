@@ -499,19 +499,36 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     } finally { resume(); await peer.close(); await pump; await rm(root, { recursive: true, force: true }); }
   }, 20_000);
 
-  it("S-j no terminal: a closed crashed stream carries only what its ingested facts leave unanswered, once", async () => {
+  it.each([false, true])("S-j no terminal: a closed crashed stream uses only ingested facts, once (read/text retained=%s)", async retained => {
     const chat = await seedChat(); await attachSteerable(chat);
-    const response = await postDefault(chat, "Read and answer both lost on crash").expect(201);
-    // No provider terminal and no read/text survived. Recovery's true failed line owns the run.
-    await runLog(chat, [
-      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
-      { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${response.body.id}` },
-    ]);
+    const response = await postDefault(chat, "Read and answer may both be lost on crash").expect(201);
+    const sourceInstanceId = randomUUID();
+    const port = new PaperclipControlPlanePort(db, { companyId: chat.companyId, issueId: chat.issue.id,
+      runId: chat.runId, agentId: chat.agentId, sessionId: "crashed-pi-session",
+      completionContractId: randomUUID(), completionContractSha256: `sha256:${"a".repeat(64)}`,
+      sourceInstanceId, controlPlaneSourceInstanceId: randomUUID() });
+    const events = [
+      { eventType: "item.started", itemId: "turn-1:input", payload: { kind: "userMessage" } },
+      { eventType: "item.completed", itemId: `turn-1:steer:${response.body.id}`, payload: { kind: "steering_acknowledgement" } },
+      ...(retained ? [
+        { eventType: "item.started", itemId: "turn-1:read", payload: { kind: "userMessage" } },
+        { eventType: "item.started", itemId: "turn-1:reply", payload: { kind: "agentMessage" } },
+        { eventType: "item.completed", itemId: "turn-1:reply", payload: { kind: "agentMessage", text: "Answer survived" } },
+      ] : []),
+    ];
+    for (const [index, event] of events.entries()) await port.appendEvent({ schema: "paperclip.prp.event.v1",
+      sourceInstanceId, sourceKind: "runner", sourceEventId: `${sourceInstanceId}:${index + 1}`, sourceSeq: index + 1,
+      runId: chat.runId, normalizedSessionId: "crashed-pi-session", turnId: "turn-1", schemaVersion: 1,
+      priority: 0, emittedAt: new Date().toISOString(), ...event } as PrpEvent);
+    // Recovery has joined the failed consumer and saved its true line. No terminal is invented.
     await finishTurn(chat, { status: "failed", log: false });
+    const held = await carriersOf(chat, response.body.id);
+    expect(held.wakes.length + held.runs.length).toBe(0);
+    await port.settleEventIngestion();
     await releaseRun(chat);
     const carriers = await carriersOf(chat, response.body.id);
-    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
-    expect(await answered(response.body.id)).toBe(false);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(retained ? 0 : 1);
+    expect(await answered(response.body.id)).toBe(retained);
   });
 
   it.each(["interrupt-first", "release-first", "concurrent"] as const)("S-d2: unread steers are carried once under the release lock (%s)", async order => {
@@ -1391,7 +1408,15 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const chat = await seedChat();
     const sent = await send(chat, ["X", "Y", "D, waiting"]);
     const [high, low] = [sent[0]!, sent[1]!].sort((left, right) => (left.id < right.id ? 1 : -1));
-    expect((await reorder(chat, [high!.id, low!.id, sent[2]!.id])).status).toBe(200);
+    // Pin ONLY this accounting fixture to c3's supported grouped-wake input
+    // (the form produced by the existing person's-Stop gather). Cross-wake
+    // drag/reorder is builder B's independent scope; no outcome assertion below changes.
+    const { withQueuedCommentIdsInWakePayload } = await import("../services/issue-queued-comment-queue.js");
+    const [group, ...remaining] = await deferredWakes(chat);
+    await db.update(agentWakeupRequests).set({ payload: withQueuedCommentIdsInWakePayload(group!.payload,
+      [high!.id, low!.id, sent[2]!.id]) }).where(eq(agentWakeupRequests.id, group!.id));
+    for (const wake of remaining) await db.update(agentWakeupRequests).set({ status: "coalesced", finishedAt: new Date() })
+      .where(eq(agentWakeupRequests.id, wake.id));
     for (const message of [high!, low!]) {
       const [wake] = await deferredWakes(chat);
       mocks.steer.mockResolvedValueOnce({ turnId: "turn-1" });
