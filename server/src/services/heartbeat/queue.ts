@@ -1,4 +1,5 @@
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { readPersonStopHold } from "../acknowledged-native-stop.js";
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
@@ -3625,6 +3626,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             }
           }
           let automaticParentRunId: string | null = null;
+          let automaticCarriedCommentIds: Set<string> | null = null;
           if (
             source === "automation" &&
             opts.requestedByActorType === "system"
@@ -3699,6 +3701,27 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   finishedAt: new Date(),
                 });
               return { kind: "skipped" as const };
+            }
+          }
+
+          // The native failure committer already owns this successor. Rebind
+          // its proven parent's pending input HERE, under ordinary admission's
+          // issue lock, never by launching a competing comment wake.
+          if (automaticParentRunId) {
+            const pending = await readContinuationCommentInput(tx as unknown as Db, {
+              companyId: agent.companyId, issueId, runId: automaticParentRunId,
+            });
+            if (Array.isArray(pending.carriedSteeredCommentIds) && pending.carriedSteeredCommentIds.length) {
+              const stop = await readPersonStopHold(tx as unknown as Db, { companyId: agent.companyId, issueId, agentId });
+              if (stop) {
+                await tx.insert(agentWakeupRequests).values({ companyId: agent.companyId, agentId, source, triggerDetail,
+                  reason: "message_predates_stop", payload: { issueId, stoppedRunId: stop.stoppedRunId }, status: "skipped",
+                  requestedByActorType: opts.requestedByActorType ?? null, requestedByActorId: opts.requestedByActorId ?? null,
+                  idempotencyKey: opts.idempotencyKey ?? null, finishedAt: new Date() });
+                return { kind: "skipped" as const };
+              }
+              Object.assign(enrichedContextSnapshot, pending);
+              automaticCarriedCommentIds = new Set(queuedCommentIdsFromRunContext(pending));
             }
           }
 
@@ -5180,7 +5203,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // Consume it with its successor even when chat keeps other messages
           // in separate turns, or finalization will deliver it a second time.
           const pendingComments =
-            (executionWaitRequestId || canCoalesceComments) &&
+            (executionWaitRequestId || canCoalesceComments || automaticCarriedCommentIds) &&
             (ownsReconstructionContinuation || !(await getExecutionBlocker(tx as unknown as Db, issue.companyId, issue.id)))
               ? await tx
                   .select()
@@ -5193,7 +5216,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                       sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
                       // Chat Retry already pins its complete authorized source
                       // batch. Keep separate board input for its own admission.
-                      canCoalesceComments || (opts.taskRetryRequestId && !failedChatRetry)
+                      canCoalesceComments || automaticCarriedCommentIds || (opts.taskRetryRequestId && !failedChatRetry)
                         ? undefined : eq(agentWakeupRequests.id, executionWaitRequestId!),
                     ),
                   )
@@ -5206,6 +5229,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             const deferredContext = parseObject(
               deferredPayload[DEFERRED_WAKE_CONTEXT_KEY],
             );
+            if (automaticCarriedCommentIds && !queuedCommentIdsFromWakePayload(wake.payload)
+              .some(id => automaticCarriedCommentIds!.has(id))) return false;
             // Dedicated interaction wakes carry their own source and session
             // contract. ID-only adoption must not erase that continuation.
             return (
@@ -5221,7 +5246,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           let adoptedCommentIds = [
             ...new Set([
               ...adoptedComments.flatMap((wake) =>
-                queuedCommentIdsFromWakePayload(wake.payload),
+                queuedCommentIdsFromWakePayload(wake.payload).filter(id => !automaticCarriedCommentIds || automaticCarriedCommentIds.has(id)),
               ),
               ...queuedCommentIdsFromRunContext(enrichedContextSnapshot),
             ]),
@@ -5298,20 +5323,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           }
 
           if (adoptedComments.length) {
-            await tx
-              .update(agentWakeupRequests)
-              .set({
-                status: "coalesced",
-                runId: newRun.id,
-                finishedAt: new Date(),
-                updatedAt: new Date(),
-              })
-              .where(
-                inArray(
-                  agentWakeupRequests.id,
-                  adoptedComments.map((wake) => wake.id),
-                ),
-              );
+            // A restored batch may also hold later Queue input. Transfer ONLY
+            // the comments this automation successor carries; leave the rest
+            // on their existing receipt, preserving Queue and /new ordering.
+            for (const wake of adoptedComments) {
+              const remaining = automaticCarriedCommentIds
+                ? queuedCommentIdsFromWakePayload(wake.payload).filter(id => !automaticCarriedCommentIds.has(id)) : [];
+              await tx.update(agentWakeupRequests).set(remaining.length
+                ? { payload: withQueuedCommentIdsInWakePayload(wake.payload, remaining), updatedAt: new Date() }
+                : { status: "coalesced", runId: newRun.id, finishedAt: new Date(), updatedAt: new Date() })
+                .where(and(eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.id, wake.id)));
+            }
             await tx
               .update(agentWakeupRequests)
               .set({

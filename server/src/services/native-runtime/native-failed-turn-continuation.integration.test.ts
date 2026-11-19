@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentWakeupRequests, companies, companyMemberships, completionContracts, createDb, heartbeatRuns, issues, nativeRunFinalizations, statusDecisions } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, companyMemberships, completionContracts, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, statusDecisions } from "@paperclipai/db";
+import { issueService } from "../issues.js";
 import type { ControlPlanePort, NativeExecutionInputV1, PrpEvent, PrpTerminalState } from "@paperclipai/paperclip-runner";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { CONTROL_PLANE_CONFORMANCE_RESULT } from "../../vendor/paperclip-runner/testing.js";
@@ -142,6 +143,88 @@ describe("native failed-turn continuation", () => {
       .filter(r => r.contextSnapshot?.issueId === issueId && r.contextSnapshot?.taskRetryRequestId === receipt.requestId);
     expect(retried).toHaveLength(1);
     await heartbeat.drainActiveRunExecutions();
+  }, 120_000);
+
+  // Captured gate regression: the real native failure committer above creates
+  // issue_status_changed. Its ONE ordinary dispatcher must take the restored
+  // person input, not run a second admission beside it. Provider execution here
+  // is controlled; this is not the full-server runner/Pi SIGKILL qualification.
+  it("carries a restored never-read steer in the existing failed-turn automation successor once", async () => {
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Continue with the person's added question",
+      status: "in_progress", workMode: "standard", assigneeAgentId: agentId,
+      createdByUserId: "board-user", responsibleUserId: "board-user" });
+    const [original, message] = await db.insert(issueComments).values([
+      { companyId, issueId, authorType: "user", authorUserId: "board-user", body: "Do the original work.", createdAt: new Date(Date.now() - 1_000) },
+      { companyId, issueId, authorType: "user", authorUserId: "board-user", body: "Also tell me what 17 + 25 is.", createdAt: new Date() },
+    ]).returning();
+    const failed = await failTurn(issueId, "opencode_server_exited", {
+      wakeCommentId: original.id, commentId: original.id, wakeCommentIds: [original.id, message.id],
+      steeredCommentIds: [message.id],
+    });
+    // Receipt captured at kill-before-read, deliberately no delivery event.
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failed.runId));
+    await db.update(heartbeatRuns).set({ resultJson: { ...source.resultJson,
+      queuedSteeringAcknowledgements: { [message.id]: { status: "acknowledged", queueId: null,
+        turnId: "captured-before-kill", acknowledgedAt: new Date().toISOString() } },
+    } }).where(eq(heartbeatRuns.id, source.id));
+    // Rehydrate the CAPTURED restoration receipt, not a direct release call:
+    // this case must retain the failure committer's own automation wake.
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...source.contextSnapshot,
+      wakeCommentIds: [original.id], steeredCommentIds: [] }, resultJson: { ...source.resultJson,
+      restoredSteeredCommentIds: [message.id], queuedSteeringAcknowledgements: { [message.id]: {
+        status: "acknowledged", queueId: null, turnId: "captured-before-kill", acknowledgedAt: new Date().toISOString() } },
+    } }).where(eq(heartbeatRuns.id, source.id));
+    const [later] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "board-user",
+      body: "A later queued message keeps its own delivery.", createdAt: new Date(Date.now() + 1) }).returning();
+    await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", triggerDetail: "manual",
+      reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user",
+      requestedByActorId: "board-user", idempotencyKey: `conversation-comment:${message.id}`,
+      payload: { issueId, commentId: later.id, _paperclipWakeContext: { issueId, commentId: later.id,
+        wakeCommentId: later.id, wakeCommentIds: [message.id, later.id], source: "issue.comment" } } });
+    // Occupy only the agent's capacity, on no issue. This admission/projection
+    // regression must not race unrelated provider provisioning or impersonate a
+    // Pi read; the separate full-server SIGKILL row owns that qualification.
+    const [occupied] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running" }).returning();
+    const heartbeat = heartbeatService(db);
+    try {
+      expect((await issueService(db).listComments(issueId)).find(comment => comment.id === message.id)).toMatchObject({
+        steeringStatus: null, deliveryOutcome: "ordinary", steeringUnavailableReason: "run_ended_before_read",
+      });
+      await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+      const successors = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+        .filter(run => run.id !== source.id && run.contextSnapshot?.issueId === issueId);
+      expect(successors, "use the one server-owned automation successor").toHaveLength(1);
+      expect(successors[0].invocationSource).toBe("automation");
+      expect(successors[0].contextSnapshot?.wakeCommentIds, "the successor INPUT must contain M").toContain(message.id);
+      expect(successors[0].contextSnapshot?.carriedSteeredCommentIds).toContain(message.id);
+      expect(successors[0].contextSnapshot?.wakeCommentIds).not.toContain(later.id);
+      const remaining = (await issueWakes(issueId)).find(wake => wake.status === "deferred_issue_execution" &&
+        !wake.runId && JSON.stringify(wake.payload).includes(later.id));
+      expect(remaining?.payload?._paperclipWakeContext).toMatchObject({ wakeCommentIds: [later.id] });
+      const pending = (await issueWakes(issueId)).filter(wake => !wake.runId &&
+        ["queued", "deferred_issue_execution"].includes(wake.status) &&
+        JSON.stringify(wake.payload).includes(message.id));
+      expect(pending, "no second unowned receipt can deliver M again").toEqual([]);
+      const displayed = await issueService(db).listComments(issueId);
+      expect(displayed.find(comment => comment.id === message.id)).toMatchObject({
+        steeringStatus: "carried", carriedIntoRunId: successors[0].id,
+      });
+      await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+      expect((await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.agentId, agentId),
+        eq(heartbeatRuns.retryOfRunId, source.id))))).toHaveLength(1);
+      // Captured delivery event for the read projection ONLY, not live-Pi proof.
+      await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: successors[0].id, seq: 1,
+        sourceEventId: "captured-pi-first-user-message", eventType: "item.started", payload: {
+          prpEvent: { runId: successors[0].id, eventType: "item.started", payload: { kind: "userMessage" } },
+        } });
+      expect((await issueService(db).listComments(issueId)).find(comment => comment.id === message.id)).toMatchObject({
+        steeringStatus: "delivered", carriedIntoRunId: successors[0].id, steeringDeliveryEventSeq: 1,
+      });
+    } finally {
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, occupied.id));
+      await heartbeat.drainActiveRunExecutions();
+    }
   }, 120_000);
 
   it("does not treat a copied retry intent id as a used continuation", async () => {

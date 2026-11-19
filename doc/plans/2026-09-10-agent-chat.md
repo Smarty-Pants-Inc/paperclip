@@ -11,6 +11,27 @@ Opening an unused conversation performs a read. First send or upload resolves it
 
 Idle conversations are `in_review` with server-owned `conversationState: waiting`. A new message makes the conversation active. A successful run parks it only after a durable agent response, with no later pending message. Failed or unanswered turns retain ordinary error handling. Finalizers, assignment recovery, liveness classification, timer eligibility, and work counts distinguish conversations from execution tasks. Completion or reassignment cannot terminate or transfer the container. Child completion does not wake the conversation.
 
+### Accepted steering after a failed turn
+
+A steering acknowledgement is not proof that Pi read the message. When the
+native failure handler has already requested an automatic continuation, ordinary
+admission carries the proven parent's still-pending person input in that same
+successor. It also transfers the matching deferred comment custody atomically;
+other queued input stays on its existing receipt. There is no second comment
+admission beside the automation successor. Deleted or already answered comments
+are not carried again. Pause and a person's Stop keep their existing holds;
+only `readPersonStopHold` establishes that a message predates a person's Stop.
+Explicit fresh-message admission still refuses comments from before the source
+turn began (`message_predates_run`); an accepted mid-turn steer is not stale.
+
+The comment read reports `steeringStatus: carried` with `carriedIntoRunId` while
+the successor owns that input, then `delivered` with `steeringDeliveryEventSeq`
+when its native user-message event records the read. A terminal source's unread
+acceptance never remains `accepted`: without a carrier the read reports
+`steeringStatus: null`, `deliveryOutcome: ordinary`, and
+`steeringUnavailableReason: run_ended_before_read`. These are delivery facts,
+not claims that the question was answered.
+
 ## Session boundaries
 
 Standalone `/new` is an ordinary queued user comment. The shared composer offers it as a slash command. It executes at a turn boundary without invoking the provider, increments `conversationSessionGeneration`, and records `conversationBoundaryCommentId` plus the generation on the command comment. Processing a retried command is idempotent. Only the matching agent/task provider session is deleted; agent-wide state and other task sessions are untouched.
