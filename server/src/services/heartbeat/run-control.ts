@@ -1,3 +1,4 @@
+import { publishStoppedNativeFinals } from "../native-runtime/native-stopped-final-replies.js";
 import { proveHandedOffWarmLeases } from "../native-runtime/handed-off-warm-lease.js";
 import { assertAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { withAccountingTransaction } from "../accounting-transaction.js";
@@ -1957,6 +1958,11 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         }
       })();
       const cancelled = cancellation.run;
+      // Only the audited Stop's own finalization publishes completed items.
+      // Do this before release can admit an Interrupt successor; never discover
+      // stopped-final publication from boot, reconciliation, or a sweep.
+      if (cancelled?.runtimeMode === "native" && cancelled.status === "cancelled")
+        await publishStoppedNativeFinals(db, { companyId: cancelled.companyId, runId: cancelled.id });
 
       if (cancellation.updated && cancelled) {
         if (readNativeStartupCleanup(cancelled)) await acknowledgeNativeStartupCleanup(db, { companyId: cancelled.companyId, runId: cancelled.id });

@@ -14,17 +14,22 @@ export function agentRunWritesRevoked(run: {
     && "state" in cancellation && cancellation.state === "requested");
 }
 
-/** The one exemption from agentRunWritesRevoked: the SERVER publishing the
- * accepted answer of a run whose only revocation is its settled cancel. A
- * superseded run, or a Stop that is still only requested, stays revoked. */
+/** Server-only reply publication after a settled cancel: an accepted result,
+ * or a completed item selected at the person's Stop finalization. Neither
+ * exemption restores agent writes. Superseded and pending-Stop runs stay revoked. */
 export function publishesAcceptedReplyOfCancelledRun(run: {
   status: string;
   resultJson?: Record<string, unknown> | null;
-} | null | undefined, options: { withheldAcceptedReply?: boolean; completionReply?: boolean } | null | undefined): boolean {
+} | null | undefined, options: { withheldAcceptedReply?: boolean; stoppedFinalReply?: boolean;
+  completionReplyItemId?: string; completionReply?: boolean } | null | undefined): boolean {
   const cancellation = run?.resultJson?.executionCancellation;
-  return options?.withheldAcceptedReply === true && options.completionReply === true && run?.status === "cancelled"
+  return (options?.withheldAcceptedReply === true || (options?.stoppedFinalReply === true && Boolean(options.completionReplyItemId)))
+    && options?.completionReply === true && run?.status === "cancelled"
     && !agentRunSuperseded(run)
-    && !(cancellation && typeof cancellation === "object" && "state" in cancellation && cancellation.state === "requested");
+    // The stopped-item publisher checks the run-bound native acknowledgement.
+    // That receipt can be settled while executionCancellation still says requested.
+    && (options.stoppedFinalReply === true || !(cancellation && typeof cancellation === "object"
+      && "state" in cancellation && cancellation.state === "requested"));
 }
 
 /**

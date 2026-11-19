@@ -13733,6 +13733,9 @@ export function issueService(db: Db) {
          * agent's own writes; it does not un-accept an answer the person already
          * saw streamed. Superseded runs and a still-pending Stop stay refused. */
         withheldAcceptedReply?: boolean;
+        /** Server-only: item completed before the person's current-process Stop
+         * acceptance, selected by publishStoppedNativeFinals at Stop finalization. */
+        stoppedFinalReply?: boolean;
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
         clientRequestId?: string;

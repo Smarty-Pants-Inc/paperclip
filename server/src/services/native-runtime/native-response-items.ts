@@ -1,4 +1,4 @@
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, lt, sql } from "drizzle-orm";
 import { heartbeatRunEvents, type Db } from "@paperclipai/db";
 import { completedPlanProposalIds, readCompletedAssistantMessageCandidate,
   readTruncatedCompletedAgentMessageItemId, readTruncatedCompletedAssistantMessageCandidate } from "../heartbeat-run-summary.js";
@@ -11,10 +11,16 @@ function record(value: unknown): Record<string, unknown> {
  * semantic summary or commentary. The selected final identifies its turn (and
  * excludes later disposition-only recovery turns). Publication holds the issue
  * lock and writes every item in the same transaction as its durable item key. */
-export async function nativeResponseItems(db: Db, input: { companyId: string; runId: string; text: string }) {
+export async function completedNativeResponseItems(db: Db, input: {
+  companyId: string; runId: string; beforeSeq?: number; agentId?: string; nativeSessionId?: string;
+}) {
   const rows = await db.select({ seq: heartbeatRunEvents.seq, eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload })
     .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, input.companyId),
       eq(heartbeatRunEvents.runId, input.runId),
+      input.beforeSeq === undefined ? undefined : lt(heartbeatRunEvents.seq, input.beforeSeq),
+      input.agentId ? eq(heartbeatRunEvents.agentId, input.agentId) : undefined,
+      input.nativeSessionId ? and(sql`${heartbeatRunEvents.payload} #>> '{prpEvent,runId}' = ${input.runId}`,
+        sql`${heartbeatRunEvents.payload} #>> '{prpEvent,normalizedSessionId}' = ${input.nativeSessionId}`) : undefined,
       sql`${heartbeatRunEvents.eventType} in ('item.completed', 'plan.proposed')`))
     .orderBy(asc(heartbeatRunEvents.seq));
   const proposedItemIds = completedPlanProposalIds(rows);
@@ -29,11 +35,18 @@ export async function nativeResponseItems(db: Db, input: { companyId: string; ru
       const deltaRows = await db.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
         .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, input.companyId),
           eq(heartbeatRunEvents.runId, input.runId), eq(heartbeatRunEvents.eventType, "item.delta"),
+          lt(heartbeatRunEvents.seq, row.seq),
           sql`${heartbeatRunEvents.payload} #>> '{prpEvent,itemId}' = ${itemId}`)).orderBy(asc(heartbeatRunEvents.seq));
       candidate = readTruncatedCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent: event, deltaRows });
     }
-    if (candidate?.channel === "final") candidates.push({ ...candidate, itemId, turnId: event.turnId });
+    if (candidate?.channel === "final") candidates.push({ ...candidate, itemId, turnId: event.turnId,
+      providerPhase: record(event.payload).providerPhase });
   }
+  return candidates;
+}
+
+export async function nativeResponseItems(db: Db, input: { companyId: string; runId: string; text: string }) {
+  const candidates = await completedNativeResponseItems(db, input);
   const selected = candidates.findLast(candidate => candidate.text === input.text);
   if (!selected) return [];
   const items = new Map<string, { itemId: string; text: string }>();
