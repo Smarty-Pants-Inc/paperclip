@@ -245,6 +245,9 @@ function TaskChatBubbleContent({
   return (
     <div
       data-conversation-message={isHuman ? "human" : "agent"}
+      data-testid={item.steeredIntoRunId ? "task-chat-steered-message" : undefined}
+      data-steered-into-run-id={item.steeredIntoRunId ?? undefined}
+      data-delivery={item.steeredIntoRunId ? "sent" : undefined}
       ref={readRef}
       className={cn(
         "flex w-full flex-col gap-1",
