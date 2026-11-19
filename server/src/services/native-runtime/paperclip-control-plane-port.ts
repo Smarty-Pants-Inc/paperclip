@@ -1,4 +1,5 @@
 import { redactSensitiveText } from "../../redaction.js";
+import { recordSteeredMessageEvidence } from "./steered-message-answers.js";
 import { notifyNativeResultCommit } from "../native-result-commit-notifications.js";
 import { measureNativeControllerStep } from "./native-controller-step-timing.js";
 import { notifyNativeWorkspaceFinalization } from "../native-workspace-finalization-notifications.js";
@@ -484,6 +485,10 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       assertWritable: () => this.#assertActive(options),
     }));
     this.#assertActive(options);
+    if ((event.eventType === "item.started" && event.payload.kind === "userMessage") ||
+      (event.eventType === "item.completed" && ["steering_acknowledgement", "agentMessage"].includes(String(event.payload.kind)))) {
+      await recordSteeredMessageEvidence(this.#db, this.#binding);
+    }
     const persistenceEndedAt = persistenceStartedAt + performance.now() - persistenceClock;
     let observation = pendingObservation ?? this.#deferredEventObservers.get(observerKey);
     if (!observation) observation = (async () => {
