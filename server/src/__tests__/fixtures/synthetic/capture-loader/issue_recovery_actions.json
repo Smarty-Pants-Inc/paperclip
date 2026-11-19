@@ -1,0 +1,12 @@
+[
+  {
+    "id": "00000000-0000-4000-8000-000000000007",
+    "company_id": "00000000-0000-4000-8000-000000000001",
+    "source_issue_id": "00000000-0000-4000-8000-000000000003",
+    "owner_agent_id": "00000000-0000-4000-8000-000000000002",
+    "kind": "synthetic",
+    "cause": "synthetic",
+    "fingerprint": "synthetic",
+    "next_action": "synthetic"
+  }
+]
