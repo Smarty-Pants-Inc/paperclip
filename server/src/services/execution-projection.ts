@@ -515,6 +515,14 @@ export function projectExecution(
         : "Reconnecting",
     );
   }
+  // A person's Stop or Pause settles a native run as native_retry_cancelled.
+  // Without a recovery action, quarantine or replacement denial it is stopped.
+  if (run.status === "cancelled" && coordinator?.phase === "terminal_failure" && coordinator.failureCode === "native_retry_cancelled"
+    && !recoveryAction && !cleanupQuarantined && !detail.replacementDenied) {
+    projection.cause = null;
+    projection.nextAction = "Send a new message to continue from saved work.";
+    return set("completed", "Stopped");
+  }
   if (coordinator?.phase === "terminal_failure" || recoveryAction || cleanupQuarantined) {
     if (
       !cleanupQuarantined &&
