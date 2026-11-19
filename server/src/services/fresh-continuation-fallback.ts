@@ -533,6 +533,10 @@ export async function admitUnfinishedTurnFreshThread(tx: Parameters<Parameters<D
     .orderBy(asc(nativeRunFinalizations.runId)).for("update");
   const [accepted] = await db.select({ id: nativeRunResults.id }).from(nativeRunResults).where(inArray(nativeRunResults.runId, ids)).limit(1);
   if (accepted || runs.length !== ids.length) return null;
+  // N4: P's journal (or its one quarantine copy; S0's fence moves P's root
+  // there) READ-ONLY: only lifecycle commands may be pending.
+  const { unfinishedTurnJournalRefusal } = await import("./native-runtime/native-session-executor.js");
+  if (unfinishedTurnJournalRefusal(source.runnerProfileJson?.nativeExecutionInput, source.id) !== null) return null;
   const successorBoxes = (await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
     eq(environmentLeases.heartbeatRunId, run.id)))).map(lease => `${lease.provider}\u0000${lease.providerLeaseId}`);
   for (const predecessor of runs) {

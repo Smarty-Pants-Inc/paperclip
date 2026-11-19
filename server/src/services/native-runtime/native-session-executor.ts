@@ -6485,6 +6485,38 @@ const LOCAL_RUNNER_LIFECYCLE_COMMANDS = new Set(["runner.suspend", "runner.drain
  * its attachment, an answer to a tool it already called, or a read. None
  * carries new user intent, and none can run without that Runner. When its
  * sandbox lease ended on another sandbox, no process remains to receive them. */
+/** Pending commands an unfinished turn may leave without new intent (7e625560 N4). */
+const UNFINISHED_TURN_LIFECYCLE_COMMANDS = new Set(["turn.interrupt", "turn.stop", "runner.suspend", "runner.drain", "runner.shutdown"]);
+/**
+ * READ-ONLY (7e625560 N4): a predecessor's controller journal, at its state
+ * root or, when only the fence's quarantine holds it, its one
+ * identity_indeterminate copy. Null when every non-lifecycle command completed
+ * and every tool input was answered; otherwise a closed reason. It never
+ * writes, scrubs, moves or settles the journal or its copy.
+ */
+export function unfinishedTurnJournalRefusal(executionValue: unknown, runId: string): string | null {
+  try {
+    const execution = parseNativeExecutionInput(executionValue);
+    const root = quarantinedOwnerStateRoot(scopedRunnerdStateRoot(execution));
+    if (!existsSync(root) || !isSafeNativeStateDirectory(root)) return "journal_absent";
+    const control = record(JSON.parse(readBoundedNativeFile(resolve(root, "control-plane", "control-plane-state.json"),
+      NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8")));
+    if (!RUNNERD_CONTROL_PLANE_STATE_SCHEMAS.has(String(control.schema)) || execution.binding.runId !== runId
+      || record(control.identity).runId !== runId) return "journal_identity_mismatch";
+    if (control.warmTransition != null || control.stagedRunAttachment != null) return "journal_staged";
+    const commands = (Array.isArray(control.commands) ? control.commands : []).map(record);
+    if (commands.some(command => command.status !== "completed" && !UNFINISHED_TURN_LIFECYCLE_COMMANDS.has(String(command.type)))) {
+      return "journal_command_pending";
+    }
+    const answered = new Set(commands.filter(command => command.type === "semantic_tool.result" && command.status === "completed")
+      .map(command => record(command.payload).sourceEventId));
+    return (Array.isArray(control.committedEvents) ? control.committedEvents : []).map(record).some(event =>
+      (event.eventType === "semantic_tool.input" || event.eventType === "mcp_app.tool_input") && !answered.has(event.sourceEventId))
+      ? "journal_tool_input_unanswered" : null;
+  } catch {
+    return "journal_unreadable";
+  }
+}
 const GONE_REMOTE_RUNNER_DELIVERY_COMMANDS = new Set(["run.attach", "semantic_tool.result", "session.snapshot",
   "session.goal.get"]);
 
