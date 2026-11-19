@@ -53,7 +53,7 @@ export function registerIssueRecoveryWork(
           cursor ? gt(issues.id, cursor) : undefined,
           statuses
             ? alsoBlockedWhen
-              ? or(inArray(issues.status, statuses), and(eq(issues.status, "blocked"), alsoBlockedWhen()))
+              ? or(inArray(issues.status, statuses), and(inArray(issues.status, ["blocked", "cancelled"]), alsoBlockedWhen()))
               : inArray(issues.status, statuses)
             : or(isNotNull(issues.checkoutRunId), isNotNull(issues.executionRunId),
                 // A diagnostic outlives its old binding. Keep re-checking its
@@ -165,6 +165,8 @@ export function registerIssueRecoveryWork(
   }
   // A blocked task is visited too while its person's last message is unanswered
   // (the stranded sweep's unanswered-message step, Smarty fork, TEMPORARY).
+  // So is a cancelled one: a subtree cancel over a person's held message gets
+  // its one card (RFL 06:48Z; unanswered-person-message.ts decideCancelledTask).
   const assignments = register(DELIVERY_QUEUES.strandedAssignments, ["todo", "in_progress", "in_review"], owner.stranded,
     () => unansweredPersonMessageCondition(issues.id, issues.companyId));
   const orphanBlockers = registerCompany(DELIVERY_QUEUES.orphanBlockers, "blockers", async scope => { await owner.orphanBlockers(scope); });
