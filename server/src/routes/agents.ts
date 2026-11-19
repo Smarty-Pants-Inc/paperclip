@@ -6452,6 +6452,9 @@ export function agentRoutes(
     let wakePayload = req.body.payload ?? null;
     let retryConversationContext: Record<string, unknown> = {};
     let retryNativeReviewContext: NativeReviewAssignmentContext | null = null;
+    if (req.body.messageId && !req.body.failedRunId) {
+      throw badRequest("A message retry names the failed run that carried it.");
+    }
     if (req.body.failedRunId) {
       assertBoard(req);
       if (
@@ -6482,6 +6485,17 @@ export function agentRoutes(
         throw conflict("Only a failed run or a verified eligible cancellation can start a new attempt.");
       }
       const failedContext = asRecord(failedRun.contextSnapshot) ?? {};
+      // SUPERSEDE-LOSTDOUBLE-PER-BATCH-TO-PER-MESSAGE-1119: one card per owed message, so its Retry re-sends
+      // THAT message only, and only when this failed run carried it (chats and tasks alike).
+      const carriedIds = [...new Set([
+        ...(Array.isArray(failedContext.wakeCommentIds) ? failedContext.wakeCommentIds : []),
+        failedContext.wakeCommentId,
+        failedContext.commentId,
+      ].filter((value): value is string => typeof value === "string" && value.trim().length > 0))];
+      const onlyMessageId = typeof req.body.messageId === "string" ? req.body.messageId : null;
+      if (onlyMessageId && !carriedIds.includes(onlyMessageId)) {
+        throw conflict("The failed run did not carry this message.");
+      }
       const issueId =
         typeof failedContext.issueId === "string"
           ? failedContext.issueId
@@ -6534,11 +6548,7 @@ export function agentRoutes(
             throw conflict("Conversation session changed; this older turn cannot be retried.");
           }
           retryConversationContext = { conversationSessionGeneration: generation };
-          const commentIds = [...new Set([
-            ...(Array.isArray(failedContext.wakeCommentIds) ? failedContext.wakeCommentIds : []),
-            failedContext.wakeCommentId,
-            failedContext.commentId,
-          ].filter((value): value is string => typeof value === "string" && value.trim().length > 0))];
+          const commentIds = onlyMessageId ? [onlyMessageId] : carriedIds;
           if (commentIds.length > 0) {
             retryConversationContext = {
               ...retryConversationContext,
@@ -6546,6 +6556,8 @@ export function agentRoutes(
               wakeCommentId: commentIds[commentIds.length - 1],
             };
           }
+        } else if (onlyMessageId) {
+          retryConversationContext = { wakeCommentIds: [onlyMessageId], wakeCommentId: onlyMessageId };
         }
       }
       const chatBinding = issueId
@@ -6564,6 +6576,10 @@ export function agentRoutes(
       if (chatBinding) {
         if (failedRun.status === "cancelled") {
           throw conflict("Send a new chat message to continue this stopped conversation.");
+        }
+        if (onlyMessageId) {
+          // The chat-run retry replays its whole saved request; never claim a one-message re-send it cannot do.
+          throw conflict("This chat retries its whole saved request; send the message again instead.");
         }
         if (!options.chatRunRetries || !req.actor.userId) {
           throw conflict("Chat retry authorization is unavailable.", {

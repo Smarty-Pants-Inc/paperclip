@@ -237,7 +237,7 @@ describe.skipIf(!support.supported)("Interrupt: a failed carrier never loses a m
     .where(eq(heartbeatRuns.companyId, f.companyId))).filter(r => !after.includes(r.id) &&
       ((r.contextSnapshot?.wakeCommentIds as string[] | undefined) ?? []).includes(id) && r.status !== "failed").map(r => r.id);
 
-  it("L1: chat, MSG1+MSG2 held in separate queues -> Interrupt -> the run carrying MSG1 FAILS before answering; MSG2 is answered by another wake ⇒ MSG1 is not silently lost (a retry carries it once, or ONE card says it was not answered)", async () => {
+  it("L1: chat, MSG1+MSG2 held in separate queues -> Interrupt -> the run carrying MSG1 FAILS before answering; MSG2 is answered by another wake ⇒ MSG1 is not silently lost (a retry carries it once, or ONE card PER owed message says it was not answered; SUPERSEDE-LOSTDOUBLE-PER-BATCH-TO-PER-MESSAGE-1119)", async () => {
     const f = await seedLiveTurn();
     const [msg1, msg2] = await type(f, ["MSG1", "MSG2"]);
     await barInterrupt(f, f.liveRunId);
@@ -265,7 +265,11 @@ describe.skipIf(!support.supported)("Interrupt: a failed carrier never loses a m
     const snapshot = { msg1, msg2, carrying: { id: carrying.id, ids: failedCarried }, answerer, settled, cards, retried,
       answeredMsg1: await answeredBy(f, msg1!), unanswered: await unanswered(f, [msg1!, msg2!]) };
     await evidence("L1", snapshot);
-    expect(retried.length + cards.length, `MSG1 re-owed: ${JSON.stringify(snapshot)}`).toBe(1);
+    // SUPERSEDE-LOSTDOUBLE-PER-BATCH-TO-PER-MESSAGE-1119 (RFL): was 'ONE card per lost batch'. Now ONE card PER owed
+    // message the failed run carried (in thread order), each re-owed once: by a retry carrying it OR by its own card.
+    const owedCarried = [msg1!, msg2!].filter(id => failedCarried.includes(id));
+    expect(retried.length + cards.filter(id => id === msg1).length, `MSG1 re-owed once: ${JSON.stringify(snapshot)}`).toBe(1);
+    if (retried.length === 0) expect(cards, `one card per owed message, in order: ${JSON.stringify(snapshot)}`).toEqual(owedCarried);
   }, 120_000);
 
   it("L1b (residual, live 06:15:44Z d2840901): after the failed carrier's card, the person types MSG3 and a run carrying ONLY MSG3 answers ⇒ MSG1 is still re-owed (not 'answered' by the later reply)", async () => {
@@ -290,7 +294,12 @@ describe.skipIf(!support.supported)("Interrupt: a failed carrier never loses a m
     const snapshot = { msg1, msg2, msg3, carried: carrying.contextSnapshot?.wakeCommentIds, cardsBefore, cards, retried,
       unanswered: await unanswered(f, [msg1!, msg2!]) };
     await evidence("L1b", snapshot);
-    expect(retried.length + cards.filter(id => id === msg1 || id === msg2).length, `MSG1 still re-owed: ${JSON.stringify(snapshot)}`).toBe(1);
+    // SUPERSEDE-LOSTDOUBLE-PER-BATCH-TO-PER-MESSAGE-1119 (RFL): was 'ONE card per lost batch'. Each owed message the
+    // failed run carried keeps ITS OWN card (MSG3's answer retires neither), and none gains a second.
+    const owedCarried = [msg1!, msg2!].filter(id => ((carrying.contextSnapshot?.wakeCommentIds as string[]) ?? []).includes(id));
+    expect(retried.length + cards.filter(id => id === msg1).length, `MSG1 still re-owed once: ${JSON.stringify(snapshot)}`).toBe(1);
+    if (retried.length === 0) expect(cards.filter(id => id === msg1 || id === msg2), `still one card per owed message: ${JSON.stringify(snapshot)}`).toEqual(owedCarried);
+    expect(cardsBefore, "the second pass adds no card").toEqual(cards.filter(id => cardsBefore.includes(id)));
   }, 120_000);
 
   it("D1: chat, MSG1+MSG2 held in separate queues -> Interrupt -> both answered (via whatever wakes); the stale MSG2 queue the chat still lists is Interrupted ⇒ NO later run wakes on either again", async () => {
