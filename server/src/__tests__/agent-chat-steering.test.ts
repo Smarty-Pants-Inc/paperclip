@@ -584,6 +584,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       });
       sent.push((await postDefault(chat, "Also check what's in the README").expect(201)).body.id);
       if (shape === "two-steers") sent.push((await postDefault(chat, "And explain the setup command").expect(201)).body.id);
+      await waitForPendingCommentSteers(); // POST returns custody, not native RPC acceptance.
       peer.releaseBoundary(false); // Read M, then start another tool in the SAME turn.
       peer.completeNextTool(shape !== "no-text", shape === "two-steers");
       peer.endTurn();
