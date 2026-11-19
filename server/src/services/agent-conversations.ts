@@ -1,5 +1,7 @@
 import { isContextCompactionRun } from "./context-compaction.js";
 import { trySteerConversationComment } from "./conversation-steering.js";
+import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "./issue-queued-comment-queue.js";
+import { notifyDeferredExecutionWork } from "./deferred-execution-notifications.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
@@ -680,6 +682,54 @@ export async function heldConversationComments(
   return comments.length ? { hold, comments } : null;
 }
 
+/** Append only to the last unclaimed plain-message batch. The issue lock is the
+ * same fence used by queue edits and promotion. Keep a receipt for this input
+ * in the same transaction: a repeated outbox pass must not answer it twice.
+ * /new and interaction wakes are hard boundaries, in both directions.
+ */
+async function appendConversationQueueComment(db: Db, comment: typeof issueComments.$inferSelect) {
+  if (isConversationReset(comment.body)) return false;
+  return db.transaction(async (tx) => {
+    const [issue] = await tx.select().from(issues).where(and(
+      eq(issues.companyId, comment.companyId), eq(issues.id, comment.issueId),
+    )).for("update");
+    if (!issue?.conversationAgentId || issue.conversationUserId !== comment.authorUserId) return false;
+    const key = `conversation-comment:${comment.id}`;
+    const [receipt] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, comment.companyId), eq(agentWakeupRequests.idempotencyKey, key),
+    )).limit(1);
+    if (receipt) return true;
+    const [tail] = await tx.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, issue.conversationAgentId),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+      sql`${agentWakeupRequests.status} in ('deferred_issue_execution', 'queued')`,
+    )).orderBy(desc(agentWakeupRequests.requestedAt), desc(agentWakeupRequests.createdAt), desc(agentWakeupRequests.id))
+      .for("update").limit(1);
+    if (!tail || tail.status !== "deferred_issue_execution" || tail.runId || tail.payload?.interactionId ||
+        tail.requestedByActorType !== "user" || tail.requestedByActorId !== comment.authorUserId) return false;
+    const ids = queuedCommentIdsFromWakePayload(tail.payload);
+    if (!ids.length) return false;
+    const rows = await tx.select({ id: issueComments.id, body: issueComments.body }).from(issueComments).where(and(
+      eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id), isNull(issueComments.deletedAt),
+      sql`${issueComments.id}::text in (${sql.join(ids.map(id => sql`${id}`), sql`, `)})`,
+    ));
+    if (rows.length !== ids.length || rows.some(row => isConversationReset(row.body))) return false;
+    await notifyDeferredExecutionWork(tx, { companyId: issue.companyId, requestId: tail.id });
+    await tx.update(agentWakeupRequests).set({
+      payload: withQueuedCommentIdsInWakePayload(tail.payload, [...ids, comment.id]),
+      coalescedCount: (tail.coalescedCount ?? 0) + 1, updatedAt: new Date(),
+    }).where(eq(agentWakeupRequests.id, tail.id));
+    await tx.insert(agentWakeupRequests).values({
+      companyId: issue.companyId, agentId: issue.conversationAgentId, source: "on_demand", triggerDetail: "manual",
+      reason: "issue_commented", status: "coalesced", idempotencyKey: key,
+      requestedByActorType: "user", requestedByActorId: comment.authorUserId,
+      payload: { issueId: issue.id, commentId: comment.id, coalescedIntoWakeupRequestId: tail.id },
+      finishedAt: new Date(),
+    });
+    return true;
+  });
+}
+
 /** Serialize durable outbox delivery across API servers; the normal wake queue owns execution. */
 export async function deliverConversationComments(
   db: Db,
@@ -732,6 +782,7 @@ export async function deliverConversationComments(
         if (!(await canDeliver(tx as unknown as Db)).invokable) return "deferred" as const;
         await resumeConversationForReset(db, comment);
         if (await trySteerConversationComment(db, comment)) continue;
+        if (await appendConversationQueueComment(db, comment)) continue;
         try {
           await enqueue(issue.conversationAgentId!, {
             source: "on_demand",
