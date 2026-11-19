@@ -2,19 +2,35 @@ import { createHash } from "node:crypto";
 import { buildGitAuthInvocation } from "./git-credentials.js";
 import type { EnvironmentLease } from "@paperclipai/shared";
 import { githubLauncherSource, githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
+import { classifyExecutionTargetGitContextFailure } from "./environment-provider-unavailable-error.js";
+import { NativeFailedBeforeProviderTurnError } from "./native-runtime/failed-before-provider-turn.js";
 import { cleanupGitHubOperationLaunchers, githubOperationLauncherDirectory, prepareGitHubOperationLaunchers, prepareGitHubExecutionEnvironment } from "@paperclipai/adapter-utils/execution-target";
 
 /** Delay only managed, read-only context discovery on concurrent direct runners.
- * The callback returns derived keys, never an old PATH or credential snapshot. */
-export async function prepareHeartbeatGitHubEnvironment(input: Parameters<typeof prepareGitHubExecutionEnvironment>[0] & { defer: boolean }) {
+ * The callback returns derived keys, never an old PATH or credential snapshot.
+ * Both calls classify a final remote Git probe failure (smarty-dev#21249): the
+ * immediate one as a transient provider failure (legacy bootstrap retry), the
+ * deferred one, which runs inside the native executor before any provider
+ * turn, as a failed-before-provider-turn error, so the task continues once on
+ * a fresh box instead of being blocked. */
+export async function prepareHeartbeatGitHubEnvironment(input: Parameters<typeof prepareGitHubExecutionEnvironment>[0] & {
+  defer: boolean;
+  environment?: { name: string; driver: string } | null;
+  providerLeaseId?: string | null;
+}) {
   const remote = input.target?.kind === "remote" && input.target.transport === "sandbox" ? input.target : null;
   if (!input.defer || input.hostCredentials || !remote?.runner || remote.runnerTask || remote.runner.allowConcurrentSyncOperations !== true) {
-    return { env: await prepareGitHubExecutionEnvironment(input), prepare: undefined };
+    return { env: await prepareGitHubExecutionEnvironment(input).catch((error: unknown) => {
+      throw classifyExecutionTargetGitContextFailure(error, input.environment);
+    }), prepare: undefined };
   }
   return {
     env: { ...input.env, PAPERCLIP_GIT_METADATA_ROOTS: "[]", PAPERCLIP_RUNNER_NETWORK_ROOTS: "[]",
       PAPERCLIP_GITHUB_AUTH_MODE: "managed", PAPERCLIP_RUNNER_NETWORK_ACCESS: input.networkAccess ? "enabled" : "disabled" },
-    prepare: () => prepareGitHubExecutionEnvironment({ ...input, env: {} }),
+    prepare: () => prepareGitHubExecutionEnvironment({ ...input, env: {} }).catch((error: unknown) => {
+      throw classifyExecutionTargetGitContextFailure(error, input.environment) === error
+        ? error : new NativeFailedBeforeProviderTurnError(input.providerLeaseId ?? null, error);
+    }),
   };
 }
 
