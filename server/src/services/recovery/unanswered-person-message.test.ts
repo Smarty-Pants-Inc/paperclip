@@ -1536,6 +1536,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     .where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent")));
   const one = async (f: { visible: () => Promise<Array<{ id: string; body: string }>> }) =>
     (await f.visible()).map(n => ({ id: n.id, body: n.body }));
+  const membersOf = (note: { metadata: unknown }) => ((note.metadata ?? {}) as Record<string, unknown>).unansweredMessageIds;
   /** Every note row ever written for the task's person messages, retired ones too. */
   const everNoted = async (f: { issueId: string }) => (await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system"),
@@ -1755,7 +1756,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const m2 = await f.message("Second, while paused");
     await f.sweep();
     const [pausedNote] = await f.visible();
-    expect((await f.visible()).map(n => ({ body: n.body, members: (n.metadata as Record<string, unknown>).unansweredMessageIds })))
+    expect((await f.visible()).map(n => ({ body: n.body, members: membersOf(n) })))
       .toEqual([{ body: PAUSED_TEXT, members: [m1, m2] }]);
     await resumeRoute(f);
     // PLANTED: Resume's one run for both saved messages (as T4b's real run carries both), still queued.
@@ -1771,7 +1772,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await settleAt(f, 2 * 60_000);
     await settleAt(f, 11 * 60_000);
     const after = await f.visible();
-    expect(after.map(n => ({ id: n.id, body: n.body, members: (n.metadata as Record<string, unknown>).unansweredMessageIds })))
+    expect(after.map(n => ({ id: n.id, body: n.body, members: membersOf(n) })))
       .toEqual([{ id: pausedNote!.id, body: NOT_ANSWERED, members: [m1, m2] }]);
     expect(await everNoted(f), "one note row, ever").toEqual([pausedNote!.id]);
   });
@@ -1792,7 +1793,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", finishedAt: new Date(Date.now() - 60_000) }).where(eq(heartbeatRuns.id, run));
     await settleAt(f, 2 * 60_000);
     await settleAt(f, 11 * 60_000);
-    expect((await f.visible()).map(n => ({ id: n.id, body: n.body, members: (n.metadata as Record<string, unknown>).unansweredMessageIds })))
+    expect((await f.visible()).map(n => ({ id: n.id, body: n.body, members: membersOf(n) })))
       .toEqual([{ id: pausedNote!.id, body: NOT_ANSWERED, members: [m1, m2] }]);
     expect(await everNoted(f), "one note row, ever").toEqual([pausedNote!.id]);
   });
