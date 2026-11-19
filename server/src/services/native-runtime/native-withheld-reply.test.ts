@@ -219,7 +219,14 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
       expect(got.status, JSON.stringify(got.body)).toBe(200);
       return { active: got.body.active?.cause as string | undefined, inspection: got.body.sourceInspection?.status as string | undefined };
     }
-    return { savedFilesSource, app, companyId, agentId, issueId, runId, leaseId, messageId, streamAndAccept, copyBack, coordinator, run, presentationWorker,
+    async function recoverSavedFiles(cause: string) {
+      const [action] = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, issueId),
+        eq(issueRecoveryActions.cause, cause)));
+      const got = await request(app).post(`/api/issues/${issueId}/recovery-actions/recover-workspace`)
+        .send({ actionId: action.id, runId, idempotencyKey: randomUUID() });
+      return { status: got.status, state: got.body.status as string | undefined };
+    }
+    return { savedFilesSource, recoverSavedFiles, app, companyId, agentId, issueId, runId, leaseId, messageId, streamAndAccept, copyBack, coordinator, run, presentationWorker,
       thread, replies, answered, expectAnsweredOnceAndNoNotice, failCopyBackThreeTimes, boardRetrySucceeds };
   }
 
@@ -255,6 +262,10 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     await s.expectAnsweredOnceAndNoNotice();
     // A restarted worker finds nothing left to publish.
     await s.presentationWorker(); await s.presentationWorker();
+    expect(await s.replies()).toHaveLength(1);
+    // REAL: the request behind the board's "Recover saved files" button is accepted for this state
+    // (POST /api/issues/:id/recovery-actions/recover-workspace, routes/issues.ts).
+    expect(await s.recoverSavedFiles("native_workspace_sync_out_retry_exhausted")).toEqual({ status: 202, state: "queued" });
     expect(await s.replies()).toHaveLength(1);
   }, 120_000);
 
