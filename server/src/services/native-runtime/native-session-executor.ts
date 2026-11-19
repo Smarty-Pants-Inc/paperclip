@@ -295,6 +295,7 @@ import type { FailedNativePredecessorProbe } from "./native-provider-work-proof.
 import type { EnvironmentDriverExecuteInput } from "../environment-runtime.js";
 import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { recordWarmRetentionProbe } from "./warm-retention-probe.js";
 import { createNativeCredentialUpdateOwner, appendNativeCredentialUpdate } from "./native-credential-updates.js";
 import { canonicalNativeJson, nativeSha256 } from "./canonical.js";
 import { RepeatedToolFailureGuard } from "./repeated-tool-failure-guard.js";
@@ -412,6 +413,8 @@ type ActiveNativeSession = {
   cancelRequested: boolean;
   /** Resolution, not timeout/rejection, of this owner's interrupt cleanup. */
   cancellationCleanupSucceeded?: boolean;
+  cancellationRequestedAtMs?: number;
+  cancellationCleanupTimedOut?: boolean;
   admissionAbort?: AbortController;
   cancellationSettled?: Promise<void>;
   restartDetach?: Promise<void>;
@@ -1447,7 +1450,14 @@ export async function handedOffWarmOwnerRunnerExited(input: { runId: string; pro
   for (const entry of warmNativeSessions.values()) {
     if (entry.runId !== input.runId || (input.providerLeaseId && entry.providerLeaseId !== input.providerLeaseId)) continue;
     if (entry.busy || entry.preparingRunId) return false;
-    return supersededOwnerRunnerExited(entry);
+    const startedAt = Date.now();
+    const stopped = await supersededOwnerRunnerExited(entry);
+    if (entry.sandboxLeaseDb) recordWarmRetentionProbe(entry.sandboxLeaseDb,
+      { companyId: entry.companyId, agentId: entry.agentId, runId: entry.runId,
+        leaseId: entry.sandboxLeaseId ?? null },
+      { phase: "proof_runner_stop", outcome: stopped ? "stopped_runner" : "unproven",
+        runnerStopProven: stopped, elapsedMs: Math.max(0, Date.now() - startedAt) });
+    return stopped;
   }
   return false;
 }
@@ -11062,6 +11072,8 @@ async function performNativeCancellation(
       dispatched = true;
       if (!active.cancelRequested) {
         active.cancelRequested = true;
+        active.cancellationRequestedAtMs = Date.now();
+        active.cancellationCleanupTimedOut = false;
         active.cancellationCleanupSucceeded = false;
         active.admissionAbort?.abort(new NativeCancellationPendingRecoveryError());
         active.cancellationSettled = new Promise<void>(resolve => { settleActiveCancellation = resolve; });
@@ -11089,6 +11101,7 @@ async function performNativeCancellation(
             if (!settled) {
               // A late resolution cannot certify cleanup inside the Stop bound.
               active.cancellationCleanupSucceeded = false;
+              active.cancellationCleanupTimedOut = true;
               cancellationAbort.abort(
                 new Error("native session cancellation cleanup timed out"),
               );
@@ -12793,6 +12806,7 @@ async function executePaperclipNativeSessionAttempt(
   // Snapshot provider admission with this observer, never a mutable reused
   // execution holder or a provider/origin claim inside diagnostic payloads.
   const observesPiRequests = input.execution.provider.kind === "pi_rpc";
+  let piAdmissionProbeRecorded = false;
   const controlPlane = new PaperclipControlPlanePort(
     input.db,
     {
@@ -12832,6 +12846,18 @@ async function executePaperclipNativeSessionAttempt(
         }
       },
       onCommittedEvent: async (event, cursor) => {
+        if (observesPiRequests && event.sourceKind === "runner"
+          && ["session.started", "session.resumed", "turn.started"].includes(event.eventType) && !piAdmissionProbeRecorded) {
+          piAdmissionProbeRecorded = true;
+          const context = record(event.payload.context);
+          const admission = record(record(event.payload.providerDescriptor).piNativeAdmission ?? context.piNativeAdmission);
+          const identity = record(admission.piProcessIdentity ?? context.piProcessIdentity);
+          recordWarmRetentionProbe(input.db, { ...input.execution.binding,
+            leaseId: input.runnerExecutionTarget?.kind === "remote" ? input.runnerExecutionTarget.leaseId ?? null : null },
+          { phase: "admission", boot_id: typeof identity.boot_id === "string" ? identity.boot_id : null,
+            piPid: typeof identity.piPid === "number" ? identity.piPid : null,
+            piProcessStartTicks: typeof identity.piProcessStartTicks === "string" ? identity.piProcessStartTicks : null });
+        }
         await controllerSteps.measure("recovery_notice", () => materializePiSessionRecoveryNotice({ db: input.db, execution: input.execution, event }));
         if (event.eventType === "run.result.proposed") {
           const at = Date.now();
@@ -13734,36 +13760,53 @@ async function executePaperclipNativeSessionAttempt(
               // Board Stop cancels the run, not Pi conversation C. Only Pi's
               // clean abort ladder certifies reusable idle after child cleanup;
               // other providers and every uncertain/error path keep retiring.
-              if (input.execution.provider.kind !== "pi_rpc" || lifecyclePolicy.mode !== "warm"
-                || warmSessionId === null || piCancellationUnsafe || terminalEvent.eventType !== "turn.cancelled"
-                || terminalEvent.runId !== input.execution.binding.runId
-                || terminalEvent.normalizedSessionId !== nativeSessionKey(input.execution)) return false;
               const active = activeNativeSessions.get(input.execution.binding.runId);
-              if (!active?.cancelRequested || active.session !== session) return false;
+              const probe = (reason: string, retained = false) => {
+                recordWarmRetentionProbe(input.db, { ...input.execution.binding,
+                  leaseId: input.runnerExecutionTarget?.kind === "remote" ? input.runnerExecutionTarget.leaseId ?? null : null },
+                { phase: "retention", retained, reason,
+                  elapsedMs: Math.max(0, Date.now() - (active?.cancellationRequestedAtMs ?? Date.now())) });
+                return retained;
+              };
+              if (input.execution.provider.kind !== "pi_rpc") return probe("not_pi_rpc");
+              if (lifecyclePolicy.mode !== "warm") return probe("not_warm");
+              if (warmSessionId === null) return probe("no_warm_session_id");
+              if (piCancellationUnsafe) return probe("pi_cancellation_unsafe");
+              if (terminalEvent.eventType !== "turn.cancelled") return probe("no_turn_cancelled");
+              if (terminalEvent.runId !== input.execution.binding.runId) return probe("terminal_run_mismatch");
+              if (terminalEvent.normalizedSessionId !== nativeSessionKey(input.execution)) return probe("terminal_session_mismatch");
+              if (!active?.cancelRequested) return probe("no_cancel_requested");
+              if (active.session !== session) return probe("active_session_mismatch");
               await active.cancellationSettled;
               signal.throwIfAborted();
-              if (active.cancellationCleanupSucceeded !== true || piCancellationUnsafe) return false;
+              if (active.cancellationCleanupSucceeded !== true) return probe(active.cancellationCleanupTimedOut ? "cleanup_race_lost_2s" : "cleanup_failed");
+              if (piCancellationUnsafe) return probe("pi_cancellation_unsafe");
               const [stoppedRun] = await input.db.select().from(heartbeatRuns).where(and(
                 eq(heartbeatRuns.id, input.execution.binding.runId),
                 eq(heartbeatRuns.companyId, input.execution.binding.companyId),
                 eq(heartbeatRuns.agentId, input.execution.binding.agentId),
                 eq(heartbeatRuns.nativeIssueId, input.execution.binding.issueId),
               )).limit(1);
-              if (!stoppedRun || !hasAcknowledgedNativeStopIntent(stoppedRun)) return false;
+              if (!stoppedRun) return probe("stopped_run_missing");
+              if (!hasAcknowledgedNativeStopIntent(stoppedRun)) return probe("not_user_stop");
               const snapshot = await session.snapshot({ signal });
               signal.throwIfAborted();
               const copy = input.instructionWorkingCopy;
-              if (copy && (copy.checkpointWarm ? !await copy.checkpointWarm() : await copy.hasChanges())) return false;
+              if (copy && (copy.checkpointWarm ? !await copy.checkpointWarm() : await copy.hasChanges())) return probe("instruction_checkpoint_failed");
               signal.throwIfAborted();
               const owner = warmNativeSessions.get(warmSessionId);
-              cancelledSessionRetained = snapshot.identity.runId === input.execution.binding.runId
-                && snapshot.identity.sessionId === nativeSessionKey(input.execution)
-                && snapshot.activeTurnId === null && Array.isArray(snapshot.pendingRuntimeRequests)
-                && snapshot.pendingRuntimeRequests.length === 0
-                && owner?.session === session && owner.ownerToken === warmSessionOwnerToken
-                && !owner.closeOnReleaseReason && !piCancellationUnsafe;
+              const reason = snapshot.identity.runId !== input.execution.binding.runId ? "snapshot_run_mismatch"
+                : snapshot.identity.sessionId !== nativeSessionKey(input.execution) ? "snapshot_session_mismatch"
+                : snapshot.activeTurnId !== null ? "snapshot_not_idle"
+                : !Array.isArray(snapshot.pendingRuntimeRequests) ? "pending_requests_unknown"
+                : snapshot.pendingRuntimeRequests.length !== 0 ? "pending_requests"
+                : owner?.session !== session ? "owner_session_mismatch"
+                : owner.ownerToken !== warmSessionOwnerToken ? "owner_token_mismatch"
+                : owner.closeOnReleaseReason ? "owner_closing"
+                : piCancellationUnsafe ? "pi_cancellation_unsafe" : "retained";
+              cancelledSessionRetained = reason === "retained";
               if (cancelledSessionRetained) retainedCancelledCheckpoint = snapshot;
-              return cancelledSessionRetained;
+              return probe(reason, cancelledSessionRetained);
             },
             sessionGoalControl: input.sessionGoalControl,
             resumeSessionGoalHeartbeat: input.resumeSessionGoalHeartbeat,
