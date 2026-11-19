@@ -68,7 +68,7 @@ describe.skipIf(!support.supported)("a message held for Continue on a SHARED pro
 
   /** One walk (rf-5's drive): turn 0, R, M parked while R saves, R's save fails for good, R's box stops, the gate runs.
    * `partial`: the REAL partial apply. `parkM: false`: nobody sends M (an ordinary failed run, no message held). */
-  async function drive(name: string, opts: { partial?: boolean; parkM?: boolean; holdSweep?: boolean; actions?: string[] } = {}) {
+  async function drive(name: string, opts: { partial?: boolean; parkM?: boolean; holdSweep?: boolean; waitingSweep?: boolean; actions?: string[] } = {}) {
     const { db } = context;
     const s = await liveScenario(context, { sharedProjectRoot: true });
     const out: Record<string, any> = { name, ids: { companyId: s.companyId, agentId: s.agentId, issueId: s.issueId }, snapshots: {} as Record<string, Snapshot>,
@@ -224,6 +224,12 @@ describe.skipIf(!support.supported)("a message held for Continue on a SHARED pro
       await recovery.ready;
       registerEnvironmentCleanupWork(db, delivery, { canRun: () => true, sweepPending: backoffMs => h.sweepPendingCleanupLeases({ backoffMs }), minimumSpacingMs: 1 });
       await pump(8000);
+      if (opts.waitingSweep) {
+        // PROBE only: the same +11 min sweep while R's box is NOT stopped yet (the task says the automatic wait line).
+        await snap("waiting");
+        out.waitingSweep = await settleUnansweredPersonMessagesForTask(db, { companyId: s.companyId, issueId: s.issueId, now: new Date(Date.now() + 11 * 60_000) });
+        await snap("waiting-after-11min-sweep");
+      }
       // PLANTED BOX-STOPPED: R's box stop receipt, in the shape of the real termination-receipt producer (the harness's
       // fake provider cannot stop a box that is a local directory).
       for (const lease of await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, terminalR.id)))
@@ -270,6 +276,13 @@ describe.skipIf(!support.supported)("a message held for Continue on a SHARED pro
   }
   const visibleNotes = (snapshot: Snapshot) => snapshot.comments.filter(comment => comment.authorType === "system")
     .map(comment => JSON.stringify([comment.body, comment.presentation ?? null, comment.metadata ?? null]));
+
+  // PROBE mode (evidence only, NO assertion; D2SHARED4_PROBE=1 writes every GET to D2SHARED4_PROBE_DIR): two states this
+  // fix does not change. (1) The +11 min sweep while R's box is still stopping (the automatic wait, not the hold).
+  // (2) The Inbox's GET after a plain Retry was sent to the route during the hold.
+  it.skipIf(!process.env.D2SHARED4_PROBE)("PROBE: the +11 min sweep in the automatic waiting state; the Inbox's GET after a plain Retry during the hold", async () => {
+    await drive("probe-waiting-sweep-and-plain-retry", { partial: true, waitingSweep: true, actions: ["retry"] });
+  }, 300_000);
 
   it("F1 HOLD-SWEEP: the REAL partial apply holds M; the +11 min sweep DURING the hold posts nothing (noticed 0; no send-again note, no 'wasn't answered' line); the card and the queue still say the partial sentence; Continue then answers M exactly once", async () => {
     const out = await drive("f1-hold-sweep", { partial: true, holdSweep: true, actions: ["continue", "continue-again"] });
