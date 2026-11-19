@@ -455,6 +455,33 @@ const companyOwedStops = new Map<string, OwedSpareStops>();
 const companyOwedStopLoads = new Map<string, Promise<OwedSpareStops>>();
 const companyOwedStopWrites = new Map<string, Promise<void>>();
 const owedStopRetryAt = new Map<string, number>();
+/**
+ * rf-4 U1c C2: the Boat config (key) this worker last held per company and
+ * environment, from an acquire. The maintenance tick services those owed stops
+ * with it, OFF and retired pools included; setup holds no key, so a cold worker
+ * keeps the durable debt until an acquire brings one (Boat's TTL is the fallback).
+ */
+const owedStopKeys = new Map<string, { config: Config; companyId: string; environmentId: string }>();
+/** True while a held key has an owed spare stop: the maintenance timer stays on. */
+function heldStopDebt(): boolean {
+  for (const held of owedStopKeys.values()) {
+    if (companyOwedStops.get(held.companyId)?.owed.some(entry => entry.environmentId === held.environmentId)) return true;
+  }
+  return false;
+}
+/** From the maintenance tick: retry owed stops whose back-off has ended, for every held key. */
+async function serviceOwedSpareStops(): Promise<void> {
+  const now = Date.now();
+  for (const held of [...owedStopKeys.values()]) {
+    if (shuttingDown) return;
+    const record = companyOwedStops.get(held.companyId);
+    if (!record?.owed.some(entry => entry.environmentId === held.environmentId)) continue;
+    // The same back-off as the keeper's: no retry before the recorded hold ends.
+    if (record.holds.some(hold => hold.environmentId === held.environmentId && hold.until > now)) continue;
+    try { await resumeOwedSpareStops(held.config, held.companyId, held.environmentId, true); }
+    catch { duplexLogger?.warn("Boat spare stop record resume failed", { companyId: held.companyId, environmentId: held.environmentId }); }
+  }
+}
 const owedStopWork = new Set<Promise<void>>();
 async function loadOwedSpareStops(companyId: string): Promise<OwedSpareStops> {
   const cached = companyOwedStops.get(companyId);
@@ -512,6 +539,8 @@ async function recordSpareStop(record: SpareStopRecord): Promise<void> {
   if (record.outcome === "failed") {
     owed.holds.push({ environmentId, configHash, until: record.until, failures: record.failures });
     owed.owed.push({ environmentId, configHash, spareId: record.spareId });
+    // rf-4 U1c C2: a stop owed under a held key keeps the maintenance tick on, even with every pool off.
+    if (owedStopKeys.has(JSON.stringify([companyId, environmentId]))) ensureSpareRefreshTimer();
   }
   await persistOwedSpareStops(companyId, owed);
 }
@@ -524,7 +553,8 @@ function trackOwedStopWork(work: Promise<void>): void {
  * credentials setup lacks): re-establish the recorded hold and retry every
  * owed spare stop, whatever the setting. A failed retry re-arms the hold.
  */
-async function resumeOwedSpareStops(config: Config, companyId: string, environmentId: string): Promise<void> {
+async function resumeOwedSpareStops(config: Config, companyId: string, environmentId: string, fromTick = false): Promise<void> {
+  owedStopKeys.set(JSON.stringify([companyId, environmentId]), { config, companyId, environmentId });
   const record = await loadOwedSpareStops(companyId);
   const now = Date.now();
   const hashes = new Set([...record.holds, ...record.owed].filter(entry => entry.environmentId === environmentId).map(entry => entry.configHash));
@@ -560,7 +590,9 @@ async function resumeOwedSpareStops(config: Config, companyId: string, environme
       } catch {
         const failures = (record.holds.find(hold => hold.environmentId === environmentId && hold.configHash === entry.configHash)?.failures ?? 0) + 1;
         const until = Date.now() + READY_SPARE_STOP_BACKOFF_MS;
-        readySpares.restoreStopBackoff(key, until, failures, [entry.spareId]);
+        // rf-4 U1c C2: a tick retry keeps the debt (never renewed) and retries after
+        // the same back-off; only a stop the keeper or an acquire saw fail holds creates back.
+        readySpares.restoreStopBackoff(key, fromTick ? 0 : until, failures, [entry.spareId]);
         await recordSpareStop({ outcome: "failed", key, spareId: entry.spareId, until, failures });
       }
     }
@@ -651,6 +683,12 @@ type RequestOptions = {
   deadline?: number;
   /** An enclosing call's admission check, run immediately before every send. */
   sendGuard?: () => void;
+  /**
+   * rf-4 U1c C1: a spare create's fresh policy read (the keeper's admitCreate
+   * path), re-run at the send boundary after every wait and before every resend.
+   * false (or a throw) refuses the send. Only spare-purpose creates pass it.
+   */
+  sendAdmission?: () => Promise<boolean>;
   /** Our own stop: it ends the box's lifecycle and is never revoked by it. */
   ownStop?: boolean;
   /** F-04B: only explicitly repeatable plugin probes retain the frozen7 transient shape. */
@@ -714,10 +752,10 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     signal = callSignal;
     const method = (init.method ?? "GET").toUpperCase();
     const route = path.replace(/^\/sandboxes\/[^/]+/, "/sandboxes/{sandboxId}");
-    const waitForRateLimitPause = async () => {
+    const waitForRateLimitPause = async (): Promise<boolean> => {
       const pauseUntil = boatRateLimitPauseUntil;
       const remaining = pauseUntil - Date.now();
-      if (remaining <= 0) return;
+      if (remaining <= 0) return false;
       const budget = deadline - Date.now();
       if (budget <= 0 || remaining > budget) {
         duplexLogger?.warn(`Boat IP rate-limit pause until ${new Date(pauseUntil).toISOString()}, call refused without a request`, {
@@ -730,6 +768,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
         throw Object.assign(requestError(config, init.method ?? "GET", path, 429, "http_error"), { code: "boat_ip_rate_limit_paused" });
       }
       await delay(remaining, undefined, { signal: callSignal });
+      return true;
     };
     const retryable429Routes: { method: string; pattern: RegExp }[] = [
       // POST /sandboxes (create): docs/llms-full.txt lines 9864, 9889-9890, 2174.
@@ -751,7 +790,19 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     const resumeCall = method === "POST" && /^\/sandboxes\/[^/?]+\/resume$/.test(path);
     let resumeRecoveryUsed = false;
     for (let attempt = 1; ; attempt++) {
-      await waitForRateLimitPause();
+      // rf-4 U1c C1: every resend follows a wait (Retry-After, a 409 or 5xx
+      // resend wait, an IP pause), and the setting may have turned off during it.
+      // The enclosing caller's fresh async admission runs after the last wait and
+      // before this send; a pause that begins during that read waits and re-reads.
+      let readmit = attempt > 1;
+      for (;;) {
+        if (await waitForRateLimitPause()) readmit = true;
+        if (!readmit || !responseOptions.sendAdmission) break;
+        readmit = false;
+        let admitted = false;
+        try { admitted = await responseOptions.sendAdmission(); } catch { admitted = false; }
+        if (!admitted) throw Object.assign(new Error("Boat spare create not sent: spares are no longer on for this pool"), { code: "boat_spare_create_not_admitted" });
+      }
       sendGuard();
       category = "network_error";
       httpStatus = null;
@@ -896,7 +947,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     if (responseOptions.requireJson && body === null) throw new Error(category);
     return body;
   } catch (error) {
-    if (error && typeof error === "object" && (error as { code?: unknown }).code === "boat_ip_rate_limit_paused") throw error;
+    if (error && typeof error === "object" && ["boat_ip_rate_limit_paused", "boat_spare_create_not_admitted"].includes(String((error as { code?: unknown }).code))) throw error;
     if (commandSend && (commandInFlight || possiblyRan)) {
       const reason: PossiblyRanReason = possiblyRan
         ?? (isOwnDeadline(error, signal) ? "timeout" : signal?.aborted ? "aborted" : "network_error");
@@ -1541,10 +1592,11 @@ async function createReadySpare(config: Config, key: ReadySpareKey, ttlSeconds: 
   const expiry = new Date(Date.now() + ttlSeconds * 1000).toISOString();
   const labels = { ...config.labels, owner: `paperclip:${key.companyId}`, purpose: "spare", expiry,
     environment: key.environmentId, configHash: key.configHash };
+  // rf-4 U1c C1: the keeper admitted this create once; a resend after any wait re-reads the setting first.
   const created = await request(config, "/sandboxes", {
     method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": randomUUID() },
     body: JSON.stringify(createSandboxBody(config, ttlSeconds, labels, from)),
-  });
+  }, false, { sendAdmission: () => admitSpareCreate(key) });
   const sandbox = created?.sandbox ?? created;
   if (typeof sandbox?.id !== "string" || !sandbox.id) throw new Error("Boat spare create response omitted sandbox.id");
   idleActivity.resource(activityKey(config, sandbox.id));
@@ -1742,7 +1794,7 @@ async function sweepSyncTemps(logger: PluginContext["logger"] | undefined): Prom
   } catch { /* Neither startup nor the timer fails on the sweep. */ }
 }
 function clearSpareRefreshTimerIfIdle(): void {
-  if ([...knownSparePools.values()].some(pool => pool.desired > 0)) return;
+  if ([...knownSparePools.values()].some(pool => pool.desired > 0) || heldStopDebt()) return;
   if (spareRefreshTimer) clearInterval(spareRefreshTimer);
   spareRefreshTimer = undefined;
 }
@@ -1805,7 +1857,10 @@ async function wakeCompanySparePools(companyId: string): Promise<void> {
   await Promise.all(work);
 }
 async function maintainReadySpares(reconcile = false): Promise<void> {
-  if (shuttingDown || ![...knownSparePools.values()].some(pool => pool.desired > 0)) return;
+  if (shuttingDown) return;
+  // rf-4 U1c C2: owed stops first, whatever the pools' settings (the last pool OFF included).
+  await serviceOwedSpareStops();
+  if (![...knownSparePools.values()].some(pool => pool.desired > 0)) return;
   if (spareMaintenanceWork) return spareMaintenanceWork;
   const work = (async () => {
     const activeByPool = new Map<string, boolean>();
@@ -2024,7 +2079,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     });
     readySpares.setStopRecordListener(record => { trackOwedStopWork(recordSpareStop(record)); });
     knownSparePools.clear();
-    companyOwedStops.clear(); owedStopRetryAt.clear(); spareSettingReadFailures.clear();
+    companyOwedStops.clear(); owedStopRetryAt.clear(); owedStopKeys.clear(); spareSettingReadFailures.clear();
     claimedSpareLeases.clear();
     runCreateLedgerReads.clear();
     runLeaseTtlCaps.clear();
@@ -2140,7 +2195,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     } finally {
       readySpares.reset();
       knownSparePools.clear();
-      companyOwedStops.clear(); owedStopRetryAt.clear();
+      companyOwedStops.clear(); owedStopRetryAt.clear(); owedStopKeys.clear();
       claimedSpareLeases.clear();
       runCreateLedgerReads.clear();
       spareClaimStore = undefined;
