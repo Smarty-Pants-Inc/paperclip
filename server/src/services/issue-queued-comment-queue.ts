@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import type { IssueComment, IssueQueuedCommentQueue } from "@paperclipai/shared";
 
-const QUEUE_CONTEXT_KEY = "_paperclipWakeContext";
-const QUEUE_IDS_KEY = "wakeCommentIds";
+/** The wake payload path of the queued message ids (read by queuedCommentIdsFromWakePayload and its SQL twin
+ * in deferred-execution-wait keepsWakeAcrossPauseSql). */
+export const QUEUE_CONTEXT_KEY = "_paperclipWakeContext";
+export const QUEUE_IDS_KEY = "wakeCommentIds";
 
 function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
