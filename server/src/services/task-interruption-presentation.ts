@@ -4,7 +4,7 @@ import { boundSetupCommandFailure, readSetupCommandFailure } from "./workspace-s
 import { and, desc, eq, inArray, isNull, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import { unidentifiedLocalLaunchRefusals } from "./native-local-process-stop.js";
 import { nativeSessionCleanupBlock } from "../vendor/paperclip-runner/index.js";
-import { agents, agentWakeupRequests, approvals, chatActions, companies, environmentLeases, heartbeatRuns, issueApprovals, issueRecoveryActions,
+import { agents, agentWakeupRequests, approvals, chatActions, companies, environmentLeases, heartbeatRuns, issueApprovals, issueComments, issueRecoveryActions,
   issues, issueTreeHoldMembers, issueTreeHolds, nativeRunFinalizations, projects, type Db } from "@paperclipai/db";
 import { unionAll } from "drizzle-orm/pg-core";
 import { EXECUTION_RECONCILIATION_CAUSES, HEARTBEAT_RUN_STATUSES, readProviderFailure, type TaskInterruptionPresentation } from "@paperclipai/shared";
@@ -559,6 +559,11 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
           and coalesce(${nativeRunFinalizations.failureDetail}->>'successorRunId', '') = '')`.mapWith(value => value == null ? null : new Date(value)),
       nativeFinalizationRetry: exhaustedNativeFinalizationCondition(),
       nativeFinalizationRetryPending: savedResultRetryPendingCondition(),
+      // adopt-g1-naming: the input this run itself carried (its own carry fields), so its failure card can name it.
+      carriedInput: sql<unknown>`jsonb_build_array(${heartbeatRuns.contextSnapshot}->'wakeCommentId',
+        ${heartbeatRuns.contextSnapshot}->'commentId', ${heartbeatRuns.contextSnapshot}->'wakeCommentIds',
+        ${heartbeatRuns.contextSnapshot}#>'{firstTurnQueuedInput,commentIds}', ${heartbeatRuns.contextSnapshot}->'steeredCommentIds',
+        ${heartbeatRuns.contextSnapshot}->'carriedSteeredCommentIds')`,
       // The run whose resultJson supplied providerFailure. A scheduled retry
       // shows its predecessor's reason, so redaction must use that run's registry.
       providerFailureRunId: sql<string>`case when ${heartbeatRuns.resultJson}->'providerFailure' is null
@@ -906,6 +911,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         agentAdapter: run.agentAdapter ?? "unknown" });
     }
   }
+  await nameCarriedMessages(db, companyId, result, runMap);
   // Upstream paperclipai/paperclip b4861d5e task-interruption-presentation.ts:824-840:
   // a card that offers Retry asks the task's execution blocker, and withholds
   // Retry where the blocker refuses it. C9 also selects tasks whose conversation
@@ -990,6 +996,72 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     }
   }
   return result;
+}
+
+const CARRIED_MESSAGE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CARRIED_MESSAGES_SHOWN = 10;
+const CARRIED_QUOTE_CHARS = 96;
+
+/** A short quote of a person message: one line, at most CARRIED_QUOTE_CHARS characters, cut at a word. */
+export function carriedMessageQuote(body: string) {
+  const text = body.replace(/\s+/g, " ").trim();
+  const chars = [...text];
+  if (chars.length <= CARRIED_QUOTE_CHARS) return text;
+  const head = chars.slice(0, CARRIED_QUOTE_CHARS - 1).join("");
+  const space = head.lastIndexOf(" ");
+  return `${(space > 40 ? head.slice(0, space) : head).replace(/[\s,.;:]+$/, "")}…`;
+}
+
+/** The ids a run's own carry fields list (wakeCommentIds etc.), deduplicated, in field order. */
+function carriedIds(value: unknown): string[] {
+  const ids: string[] = [];
+  const visit = (item: unknown) => {
+    if (Array.isArray(item)) item.forEach(visit);
+    else if (typeof item === "string" && CARRIED_MESSAGE_UUID.test(item) && !ids.includes(item.toLowerCase())) ids.push(item.toLowerCase());
+  };
+  visit(value);
+  return ids.slice(0, 50);
+}
+
+/**
+ * adopt-g1-naming (SUPERSEDE-G1-CARRIED-FAILED-FLOOR-B-1119): AT THE FAILURE, the failed carrier's own card
+ * names the person messages that run carried and that are not answered (the one answered predicate), quoted
+ * short, oldest first. Once the chat moves on the late sweep posts no card for them (the floor), so this card
+ * is where the person is told. A failed run that carried nothing person-authored keeps its card unchanged.
+ */
+async function nameCarriedMessages(db: Db, companyId: string, result: Map<string, TaskInterruptionPresentation | null>,
+  runMap: Map<string, { id: string; status: string; carriedInput?: unknown }>) {
+  const failedCards = [...result].flatMap(([issueId, presentation]) => {
+    const run = runMap.get(issueId);
+    const failureCard = presentation && (presentation.state === "failed"
+      || presentation.state === "waiting_for_user" && presentation.userAction === "budget");
+    if (!presentation || !failureCard || !run || presentation.observedRunId !== run.id
+      || ["queued", "running", "succeeded"].includes(run.status)) return [];
+    const ids = carriedIds(run.carriedInput);
+    return ids.length ? [{ issueId, presentation, ids }] : [];
+  });
+  if (!failedCards.length) return;
+  try {
+    const { answeredPersonMessageIds } = await import("./person-message-answer.js");
+    // One read for every card's person messages; then the one answered predicate per task.
+    const comments = await db.select({ id: issueComments.id, issueId: issueComments.issueId, body: issueComments.body })
+      .from(issueComments).where(and(eq(issueComments.companyId, companyId),
+        inArray(issueComments.issueId, failedCards.map(card => card.issueId)),
+        inArray(issueComments.id, [...new Set(failedCards.flatMap(card => card.ids))]),
+        eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)))
+      .orderBy(issueComments.createdAt, issueComments.id);
+    for (const { issueId, presentation, ids } of failedCards) {
+      const rows = comments.filter(row => row.issueId === issueId && ids.includes(row.id) && row.body.trim());
+      if (!rows.length) continue;
+      const answered = await answeredPersonMessageIds(db, { companyId, issueId, commentIds: rows.map(row => row.id) });
+      const named = rows.filter(row => !answered.has(row.id))
+        .slice(0, CARRIED_MESSAGES_SHOWN).map(row => ({ id: row.id, quote: carriedMessageQuote(row.body) }));
+      if (named.length) presentation.carriedMessages = named;
+    }
+  } catch (error) {
+    // Naming is additive: the failure card and its Retry stand without it.
+    logger.warn({ companyId, err: error }, "Could not name the messages a failed run carried");
+  }
 }
 
 export async function taskInterruptionPresentation(db: Db, issue: ProjectionIssue) {

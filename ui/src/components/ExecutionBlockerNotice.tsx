@@ -26,6 +26,14 @@ function budgetWaitText(presentation: TaskInterruptionPresentation) {
     ? `Couldn’t finish this attempt. Your message is saved. ${wait}`
     : `This task has not started. ${wait}`;
 }
+/** adopt-g1-naming: the failure card names the person messages the failed run carried, quoted, oldest first. */
+function CarriedMessages({ presentation }: { presentation: TaskInterruptionPresentation }) {
+  const messages = presentation.carriedMessages ?? [];
+  if (!messages.length) return null;
+  return <span className="block" data-testid="task-execution-carried">Not answered yet:{" "}
+    {messages.map((message, index) => <span key={message.id}>{index ? ", " : ""}<span className="italic"
+      data-testid="task-execution-carried-message">{`“${message.quote}”`}</span></span>)}</span>;
+}
 const isBudgetWait = (presentation: TaskInterruptionPresentation | null | undefined) =>
   presentation?.state === "waiting_for_user" && presentation.userAction === "budget";
 
@@ -75,6 +83,7 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
     return <ProviderFailureNotice failure={presentation.providerFailure} className={className}
       actions={canRetry && presentation.canRetry ? <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button> : undefined}>
       {presentation.notice && <p data-testid="task-execution-notice">{presentation.notice.text}</p>}
+      {presentation.state !== "retry_scheduled" && <CarriedMessages presentation={presentation} />}
       {presentation.state === "retry_scheduled" && <p>{step ? `${step}. ${retryIn}` : "Paperclip will retry automatically."}</p>}
       {isBudgetWait(presentation) && <p data-testid="task-execution-waiting">It is waiting for the budget to allow new work. Raise the budget in Costs.</p>}
     </ProviderFailureNotice>;
@@ -124,7 +133,7 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
       <div role="status" aria-label="Task status" data-testid="task-execution-waiting"
         className="flex items-center gap-3 rounded-lg bg-destructive/10 p-4 text-sm text-foreground">
         <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />
-        <span className="min-w-0 flex-1">{budgetWaitText(presentation)}</span>
+        <span className="min-w-0 flex-1">{budgetWaitText(presentation)}<CarriedMessages presentation={presentation} /></span>
       </div>
     </div>
   );
@@ -149,7 +158,8 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
             ? <>Couldn’t prepare the task folders. {presentation.workspaceFailure.message}</>
           : presentation.setupFailure
             ? <>Couldn’t set up the task workspace. {presentation.setupFailure.message}. Fix the command in the project’s workspace settings, then retry.</>
-            : "Couldn’t finish this attempt. Your message is saved."}</span>
+            : "Couldn’t finish this attempt. Your message is saved."}
+          {presentation.state === "failed" && <CarriedMessages presentation={presentation} />}</span>
         {canRetry && presentation.canRetry && <Button variant="outline" size="sm" className="shrink-0" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
       </div>
     </div>
