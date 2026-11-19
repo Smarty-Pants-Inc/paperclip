@@ -567,6 +567,8 @@ type PaperclipWakeComment = {
   authorId: string | null;
   readByEarlierTurn: boolean;
   receivedMidTask: boolean;
+  /** An Interrupt-carried steer Pi already read in the cut turn: omitted on a resumed (same) session. */
+  readInSession: boolean;
 };
 
 type PaperclipWakePlanReviewAuthor = {
@@ -952,6 +954,7 @@ function normalizePaperclipWakeComment(
     authorId: asString(author.id, "").trim() || null,
     readByEarlierTurn: asBoolean(comment.readByEarlierTurn, false),
     receivedMidTask: asBoolean(comment.receivedMidTask, false),
+    readInSession: asBoolean(comment.readInSession, false),
   };
 }
 
@@ -2330,9 +2333,14 @@ function renderPaperclipWakePromptBody(
     suppressIssueDescription?: boolean;
   } = {},
 ): string {
-  const normalized = normalizePaperclipWakePayload(value);
-  if (!normalized) return "";
   const resumedSession = options.resumedSession === true;
+  const wakePayload = normalizePaperclipWakePayload(value);
+  if (!wakePayload) return "";
+  // A steer Pi already read in the cut turn is in this same session: not injected again (one answer).
+  // A fresh session never saw it, so it is injected as carried input.
+  const normalized = resumedSession && wakePayload.comments.some((comment) => comment.readInSession)
+    ? { ...wakePayload, comments: wakePayload.comments.filter((comment) => !comment.readInSession) }
+    : wakePayload;
   const externalChatTurn = isNormalizedPaperclipExternalChatTurn(normalized);
   const externalChatReaderTurn =
     options.nativeWakeReaderAvailable === true &&
