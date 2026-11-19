@@ -556,8 +556,9 @@ export async function admitExplicitNativeContinuation(input: {
     // Native shape only: a Stop before native selection (runtimeMode still
     // 'legacy') is released by the legacy path, which does not gather the held
     // messages into the Send's queue, so it keeps today's admission.
-    const personStartupStop = Boolean(nativeQueuedSend && run.runtimeMode === "native" &&
-      await isPersonAcceptedStartupStop(db, { ...run, issueId }, { sendingWakeId: input.queuedCommentInterruptId }));
+    // The Send-er must be the person who stopped (the one same-person fact).
+    const personStartupStop = Boolean(nativeQueuedSend && await isPersonAcceptedStartupStop(db, { ...run, issueId },
+      { sendingWakeId: input.queuedCommentInterruptId, sendingUserId: actorId }));
     const cancelledStartup = await isCancelledNativeStartup(db, run, coordinator) || personStartupStop;
     if (partiallyDeliveredQueue && run.runtimeMode !== "native" && !unusedAdmission && !cancelledStartup && !failedPreparation) return null;
     if ((queuedInterrupt || queuedRequest) && !legacyUserTurn && !unusedAdmission &&
