@@ -7969,6 +7969,73 @@ export function issueRoutes(
     return entries;
   }
 
+  /**
+   * Agent Chat saves each message typed during a live turn as its own wake (no
+   * coalescing behind a running chat turn), while the chat lists them all under
+   * one Interrupt / Send (chatQueueTail). The click sends what it shows: the
+   * same person's plain waiting messages behind the clicked queue join it, in
+   * order, under the click's lock. As a person's Stop gathers them
+   * (gatherPersonStoppedChatMessages), a /new keeps its boundary: the first wake
+   * that is not plain ends the gathering, so A, /new, B never share a turn.
+   * Another person's wake, an interaction answer and a chat-inbound wake are
+   * never pulled in. Returns the clicked wake's payload, gathered.
+   */
+  async function gatherChatHeldMessagesForInterrupt(tx: IssueQueueTx, input: {
+    issue: { id: string; companyId: string; conversationAgentId?: string | null };
+    wake: typeof agentWakeupRequests.$inferSelect; actorId: string;
+  }): Promise<Record<string, unknown>> {
+    const headPayload = readObject(input.wake.payload);
+    if (!input.issue.conversationAgentId || input.wake.requestedByActorType !== "user" ||
+        input.wake.requestedByActorId !== input.actorId) return headPayload;
+    const waiting = await tx.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, input.issue.companyId), eq(agentWakeupRequests.agentId, input.wake.agentId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"), eq(agentWakeupRequests.requestedByActorType, "user"),
+      eq(agentWakeupRequests.requestedByActorId, input.actorId),
+      sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.issue.id}`,
+      sql`${agentWakeupRequests.payload} ->> 'interactionId' is null`,
+      sql`${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'interactionId' is null`,
+      sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
+    )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.createdAt), asc(agentWakeupRequests.id))
+      .for("update");
+    const headIndex = waiting.findIndex((wake) => wake.id === input.wake.id);
+    if (headIndex < 0) return headPayload;
+    const allIds = waiting.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload));
+    const comments = allIds.length ? await tx.select({ id: issueComments.id, body: issueComments.body,
+      authorType: issueComments.authorType, authorUserId: issueComments.authorUserId, deletedAt: issueComments.deletedAt })
+      .from(issueComments).where(and(eq(issueComments.companyId, input.issue.companyId),
+        eq(issueComments.issueId, input.issue.id), inArray(issueComments.id, allIds))) : [];
+    const byId = new Map(comments.map((comment) => [comment.id, comment]));
+    const plain = (wake: typeof agentWakeupRequests.$inferSelect) => {
+      const ids = queuedCommentIdsFromWakePayload(wake.payload);
+      return ids.length > 0 && readObject(readObject(wake.payload)._paperclipWakeContext).forceFreshSession !== true &&
+        ids.every((id) => {
+          const comment = byId.get(id);
+          return comment && !comment.deletedAt && comment.authorType === "user" && comment.authorUserId === input.actorId &&
+            !isConversationReset(comment.body);
+        });
+    };
+    if (!plain(waiting[headIndex]!)) return headPayload;
+    const gathered: typeof waiting = [];
+    for (const wake of waiting.slice(headIndex + 1)) {
+      if (readObject(wake.payload).queuedCommentInterrupt || !plain(wake)) break;
+      gathered.push(wake);
+    }
+    if (!gathered.length) return headPayload;
+    const now = new Date();
+    const ids = [...new Set([input.wake, ...gathered].flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload)))];
+    const payload = withQueuedCommentIdsInWakePayload(headPayload, ids);
+    await tx.update(agentWakeupRequests).set({ payload, coalescedCount: (input.wake.coalescedCount ?? 0) + gathered.length,
+      updatedAt: now }).where(and(eq(agentWakeupRequests.companyId, input.issue.companyId),
+      eq(agentWakeupRequests.id, input.wake.id)));
+    await tx.update(agentWakeupRequests).set({ status: "coalesced", finishedAt: now, updatedAt: now,
+      payload: sql`${agentWakeupRequests.payload} || jsonb_build_object('coalescedIntoWakeupRequestId', ${input.wake.id}::text)`,
+      error: "Sent with the chat's other queued messages by the person's Interrupt" })
+      .where(and(eq(agentWakeupRequests.companyId, input.issue.companyId),
+        inArray(agentWakeupRequests.id, gathered.map((wake) => wake.id)),
+        eq(agentWakeupRequests.status, "deferred_issue_execution")));
+    return payload;
+  }
+
   function assertQueueMutationTarget(input: {
     queue: IssueQueuedCommentQueue;
     queueId: string;
@@ -18144,16 +18211,18 @@ export function issueRoutes(
         // The click is durable fresh user intent, including when the message
         // predates a failed run's stop. Keep its content and original attribution.
         await notifyDeferredExecutionWork(tx, { companyId: issue.companyId, requestId: locked.wake.id });
+        // Agent Chat: the click sends every held message the chat lists under it.
+        const heldPayload = await gatherChatHeldMessagesForInterrupt(tx, { issue, wake: locked.wake, actorId: actor.actorId });
         // The live turn this click cuts has not answered its own message yet:
         // carry that message into the successor first, then the held ones.
-        const heldIds = queuedCommentIdsFromWakePayload(locked.wake.payload);
+        const heldIds = queuedCommentIdsFromWakePayload(heldPayload);
         const interruptedIds = locked.activeRun?.status === "running"
           ? await interruptedTurnUnansweredCommentIds(tx as unknown as Db, { companyId: issue.companyId,
             issueId: issue.id, run: locked.activeRun, held: heldIds })
           : [];
         const wakePayload = interruptedIds.length
-          ? withQueuedCommentIdsInWakePayload(locked.wake.payload, [...interruptedIds, ...heldIds])
-          : readObject(locked.wake.payload);
+          ? withQueuedCommentIdsInWakePayload(heldPayload, [...interruptedIds, ...heldIds])
+          : heldPayload;
         await tx.update(agentWakeupRequests).set({
           payload: { ...wakePayload, queuedCommentInterrupt: {
             actorId: actor.actorId, requestedAt: new Date().toISOString(),
