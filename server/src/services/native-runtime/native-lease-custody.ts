@@ -1,5 +1,7 @@
 import { and, desc, eq, inArray } from "drizzle-orm";
-import { environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeHarnessBackups, type Db } from "@paperclipai/db";
+import {
+  environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeHarnessBackups, type Db,
+} from "@paperclipai/db";
 import { getStorageService } from "../../storage/index.js";
 import { executionStartedEventPredicate } from "../pre-dispatch-execution-evidence.js";
 import {
@@ -39,8 +41,8 @@ export const NATIVE_CUSTODY_UNVERIFIED_REASON = "native_custody_unverified";
 /**
  * THE custody check before any destructive cleanup of a native lease,
  * ephemeral included (RFL 05:59Z): true when the lease's box may hold a native
- * harness session trace (a native run that started executing on this
- * provider allocation) and no VERIFIED saved copy exists. Verified means the
+ * harness session trace (a native run with ANY native session identity on
+ * this provider allocation) and no VERIFIED saved copy exists. Verified means the
  * existing helpers read the bytes: the lease's own or lease-chain backup stamp
  * verified by `verifyRecoverableNativeHarnessBackup`, or a `native_harness_backups` row of
  * the run whose stored object `verifyDurableNativeHarnessBackup` downloads and
@@ -52,13 +54,7 @@ export async function nativeLeaseCustodyMissing(db: Db, leaseId: string): Promis
   try {
     const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
     if (!lease?.heartbeatRunId || !lease.providerLeaseId) return false;
-    const [run] = await db.select({ runtimeMode: heartbeatRuns.runtimeMode }).from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.id, lease.heartbeatRunId), eq(heartbeatRuns.companyId, lease.companyId)));
-    if (run?.runtimeMode !== "native") return false;
-    // No execution ever started: no harness session exists to lose.
-    const [started] = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents)
-      .where(and(eq(heartbeatRunEvents.runId, lease.heartbeatRunId), executionStartedEventPredicate())).limit(1);
-    if (!started) return false;
+    if (!(await nativeRunSessionIdentity(db, lease, lease.heartbeatRunId))) return false;
     for (const stamp of [lease.metadata?.nativeHarnessBackup, await nativeLeaseChainCustodyStamp(db, lease).catch(() => null)]) {
       if (stamp && await verifyRecoverableNativeHarnessBackup({ db, companyId: lease.companyId,
         stamp, providerLeaseId: lease.providerLeaseId }).catch(() => false)) return false;
@@ -79,6 +75,28 @@ export async function nativeLeaseCustodyMissing(db: Db, leaseId: string): Promis
   } catch {
     return true;
   }
+}
+
+/** Native for custody = ANY native session identity of the run (rf-3 F3), not
+ * only a persisted start event: a lost event is not proof that no harness
+ * session ran in the box. Identity: a start event, or a native session id,
+ * resumed session id or recorded runner process. Without a start event, a
+ * runner-task lease the task was never dispatched to (`runnerTaskDispatched`,
+ * written at submit) is affirmative proof that this box ran no session. The
+ * resolved native mode, native issue id and coordinator row are written at
+ * claim, before any launch, so alone they are not a session: a pre-launch box
+ * is released as the never-launched proof (`nativeRunNeverLaunchedRunner`) allows. */
+async function nativeRunSessionIdentity(db: Db, lease: typeof environmentLeases.$inferSelect, runId: string): Promise<boolean> {
+  const [run] = await db.select({ runtimeMode: heartbeatRuns.runtimeMode, nativeSessionId: heartbeatRuns.nativeSessionId,
+    sessionIdAfter: heartbeatRuns.sessionIdAfter, processPid: heartbeatRuns.processPid,
+    processGroupId: heartbeatRuns.processGroupId, processStartedAt: heartbeatRuns.processStartedAt }).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, lease.companyId)));
+  if (run?.runtimeMode !== "native") return false;
+  const [started] = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents)
+    .where(and(eq(heartbeatRunEvents.runId, runId), executionStartedEventPredicate())).limit(1);
+  if (started) return true;
+  if (lease.metadata?.runnerTaskLease === true && lease.metadata?.runnerTaskDispatched !== true) return false;
+  return !!(run.nativeSessionId || run.sessionIdAfter || run.processPid || run.processGroupId || run.processStartedAt);
 }
 
 /** Recovery marker for the stop intent of a kept unsaved native box. */
