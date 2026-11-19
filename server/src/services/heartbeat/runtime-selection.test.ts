@@ -49,6 +49,8 @@ import { createSystemRecovery } from "../system-recovery-state.js";
 import { getExecutionBlocker } from "../execution-blocker.js";
 import { createReusableLeaseHandoff } from "../environment-lease-handoff.js";
 import { FRESH_THREAD_STARTED_NOTE } from "../native-runtime/fresh-thread-stop-gate.js";
+import { appendFileSync } from "node:fs";
+import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_NO_RUN_TEXT, UNANSWERED_MESSAGE_REASON_PREFIX } from "../recovery/unanswered-person-message.js";
 
 // Keep the real contract, session, and runtime-selection transactions. Replace only
 // filesystem materialization and sandbox synchronization at their external boundaries.
@@ -576,6 +578,85 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect((await notices()).filter(comment => comment.authorType === "system")).toHaveLength(1);
     expect(await canBypassFailedNativePredecessor(db, { companyId: f.agent.companyId, runId: f.run.id })).toBe(false);
   });
+
+  // RESTORE-INPUT (adopt-restore-input): a fresh-thread restore lists EVERY owed message as explicit input,
+  // oldest first, under the existing 'New comments in order:' header with the direct-answer line; and an older
+  // 'no run started' card retires once the restore run answers its message (the ONE answered rule, real sweep).
+  it("a fresh-thread restore names all five owed messages in order, and the restore's answer retires the older 'no run started' card", async () => {
+    const f = await piFixture();
+    f.input.workspace.executionWorkspace.cwd = instructionRoot;
+    const first = await selectHeartbeatRuntime(db, f.input);
+    if (!first.selected || !first.nativeExecution) throw new Error("Expected selection");
+    const base = Date.now() - 30 * 60_000;
+    const bodies = ["Owed one: what is 6 times 7?", "Owed two: name the capital of France.",
+      "Owed three: spell 'paperclip' backwards.", "Owed four: what colour is the sky?", "Owed five: say hello."];
+    const owed = [] as Array<typeof issueComments.$inferSelect>;
+    for (const [index, body] of bodies.entries()) {
+      const [row] = await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id,
+        authorType: "user", authorUserId: "local-board", body, createdAt: new Date(base + index * 60_000) }).returning();
+      owed.push(row!);
+    }
+    await db.insert(heartbeatRunEvents).values({ companyId: f.agent.companyId, agentId: f.agent.id, runId: f.run.id,
+      seq: 1, stream: "system", eventType: "native.process_start_requested" });
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), errorCode: "native_continuation_requires_reconciliation",
+      error: "native_controller_recovery_missing_evidence:snapshot_binding" }).where(eq(heartbeatRuns.id, f.run.id));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", attempt: 1, leaseOwner: null, leaseExpiresAt: null,
+      recoveryState: "blocked", failureCode: "native_continuation_requires_reconciliation" }).where(eq(nativeRunFinalizations.runId, f.run.id));
+    const [oldLease] = await db.insert(environmentLeases).values({ companyId: f.agent.companyId, heartbeatRunId: f.run.id,
+      issueId: f.issue.id, provider: "boat", providerLeaseId: `bx_legacy_${f.run.id}`, status: "released",
+      cleanupStatus: "success", acquiredAt: new Date(Date.now() - 1000), releasedAt: new Date(),
+      metadata: { pluginId: "fixture-boat" } }).returning();
+    await db.update(environmentLeases).set({ metadata: { pluginId: "fixture-boat", remoteExecutionTermination: {
+      schema: "paperclip.remote-termination.v1", companyId: oldLease.companyId, runId: f.run.id, leaseId: oldLease.id,
+      provider: oldLease.provider, providerLeaseId: oldLease.providerLeaseId, state: "stopped", confirmedAt: new Date().toISOString() } } })
+      .where(eq(environmentLeases.id, oldLease.id));
+    // The OLDER card kind, as the sweep writes it (10:49 / 12:23): 'Your message is saved, but no run started for it'.
+    const [noRunCard] = await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id,
+      authorType: "system", body: UNANSWERED_MESSAGE_NO_RUN_TEXT, createdAt: new Date(base + 2 * 60_000 + 30_000),
+      metadata: { authorizationReason: `${UNANSWERED_MESSAGE_REASON_PREFIX}${owed[1]!.id}` } as never }).returning();
+    const continued = await ensureFreshContinuation(db, { companyId: f.agent.companyId, runId: f.run.id,
+      trigger: "recovery_refused", delivery: "caller_owns" });
+    if (continued.kind !== "continued") throw new Error(JSON.stringify(continued));
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id, issueId: f.issue.id,
+      status: "running", scopeKind: "issue", createdAt: new Date(Date.now() + 1000),
+      contextSnapshot: { issueId: f.issue.id, recoveryActionId: continued.recoveryActionId, previousRunId: f.run.id, forceFreshSession: true,
+        ...(continued.isolation === "fresh_isolated_workspace" ? { freshContinuationIsolation: continued.recoveryActionId } : {}) } }).returning();
+    f.input.run = run!;
+    f.input.session.persistedNativeExecutionInput = null;
+    f.input.session.persistedRunnerProfile = {};
+    f.input.task.context = run!.contextSnapshot!;
+    f.input.session.getFreshSessionHandoff = createNativeSessionHandoffLoader({ db, companyId: f.agent.companyId,
+      agentId: f.agent.id, issueId: f.issue.id, before: run!.createdAt });
+    const selected = await selectHeartbeatRuntime(db, f.input);
+    if (!selected.selected || !selected.nativeExecution) throw new Error("Expected fresh selection");
+    expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
+      .some(comment => comment.body === FRESH_THREAD_STARTED_NOTE), "the real fresh-thread restore path ran").toBe(true);
+    await db.update(issues).set({ executionRunId: run!.id }).where(eq(issues.id, f.issue.id));
+    const answered = await answerWithNativePeer({ db, execution: selected.nativeExecution,
+      runnerInstanceId: selected.nativeRunnerInstanceId!, text: "42",
+      getFreshSessionHandoff: selected.getNativeFreshSessionHandoff! });
+    expect(answered.settled).toMatchObject({ status: "succeeded" });
+    // The request text exactly as the provider got it (the controlled peer's startTurn input).
+    const sent = answered.prompts.map(prompt => JSON.stringify((prompt as { turn: unknown }).turn)).join("\n")
+      .replace(/\\n/g, "\n").replace(/\\"/g, "\"");
+    appendFileSync(process.env.RESTORE_INPUT_CAPTURE ?? join(tmpdir(), "restore-input-capture.txt"), `${sent}\n`);
+    const header = sent.indexOf("New comments in order:");
+    expect.soft(header, "the owed messages are explicit queued input, not only saved history").toBeGreaterThanOrEqual(0);
+    expect.soft(sent).toMatch(/answer the (?:new|pending) comments (?:directly, )?in order/i);
+    let cursor = header;
+    for (const message of owed) {
+      const at = sent.indexOf(`comment ${message.id}`, cursor);
+      expect.soft(at, `owed message ${message.body} listed once, oldest first`).toBeGreaterThan(cursor);
+      expect.soft(sent.indexOf(`comment ${message.id}`, at + 1), `owed message ${message.body} listed once`).toBe(-1);
+      cursor = at;
+    }
+    // The restore run's reply (published by that run) answers its carried messages; the real sweep retires the card.
+    await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id, authorType: "agent",
+      authorAgentId: f.agent.id, createdByRunId: run!.id, body: "42", createdAt: new Date(Date.now() + 2000) });
+    await settleUnansweredPersonMessage(db, { companyId: f.agent.companyId, issueId: f.issue.id, now: new Date(Date.now() + 3000) });
+    const [card] = await db.select().from(issueComments).where(eq(issueComments.id, noRunCard!.id));
+    expect(card!.deletedAt, "the older 'no run started' card retires once the restore run answered its message").not.toBeNull();
+  }, 60_000);
 
   // Flip (RFL 17:14Z): 6e0454bb changed uncommitted Stopping/Starting rows to one final row; person sees exactly Starting and their own comment byte-unchanged.
   it("updates only the system-owned fresh-thread notice, never a person's matching metadata", async () => {
