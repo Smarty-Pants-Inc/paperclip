@@ -13,8 +13,9 @@ import { settledResponsePublicationSql } from "./native-response-publication-rec
 import { isNativeRunnerOwnershipHeld } from "./native-runner-ownership.js";
 import { FILE_LINE_KEPT, FILE_LINE_LOST, readReplyFileLine, type ReplyFileLine } from "@paperclipai/shared";
 import { acceptedReplyAlreadyPresented, acceptedResponseDigestMatches, NATIVE_WITHHELD_REPLY_FAILURE_CODES,
-  NATIVE_WITHHELD_REPLY_SCHEMA, REPLY_FILE_LINE_SAVED, selectAcceptedFinalAgentMessage } from "./native-run-finalizer.js";
+  NATIVE_WITHHELD_REPLY_SCHEMA, NATIVE_WORKSPACE_SYNC_OUT_STALLED, REPLY_FILE_LINE_SAVED, selectAcceptedFinalAgentMessage } from "./native-run-finalizer.js";
 import { WITHHELD_REPLY_SAVING_DEADLINE_MS, type WithheldReplyTrigger } from "./native-withheld-reply-trigger.js";
+import { abandonedRemoteWorkspaceFilesHeldForRun } from "../remote-workspace-abandoned-preparation.js";
 import { readNativeWorkspaceExportResume } from "./native-workspace-export-resume.js";
 import { readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
 
@@ -266,6 +267,8 @@ export async function publishWithheldAcceptedReply(
  * lease in the terminal transaction. Anything else is reported as not saved. */
 async function exportIsRetained(tx: Db, run: typeof heartbeatRuns.$inferSelect,
   coordinator: typeof nativeRunFinalizations.$inferSelect) {
+  // The no-progress bound set this run's files aside; they are kept while that hold stands.
+  if (coordinator.failureCode === NATIVE_WORKSPACE_SYNC_OUT_STALLED) return abandonedRemoteWorkspaceFilesHeldForRun(tx, run);
   if (coordinator.failureCode !== "native_workspace_sync_out_retry_exhausted") return false;
   const reference = readNativeWorkspaceSyncReference(record(run.runnerProfileJson).nativeWorkspaceSync);
   if (!reference) return false;
