@@ -1002,6 +1002,10 @@ export function recoveryService(
     ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
     /** Settle retained explicit retry claims through the queue-first release policy. */
     settleExplicitContinuationRetry?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>;
+    /** The one release drain for a TERMINAL execution owner whose own release never ran its drain (a native
+     * turn whose workspace finalization was busy returns before it: heartbeat.ts executor). It clears the lock
+     * and promotes deferred wakes under all its own gates; the bare clear below starts nothing. */
+    releaseTerminalExecutionOwner?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>;
     /**
      * Whether a failed or interrupted run has consumed every bounded
      * transient retry, so `scheduleRecoveryRetry` can no longer produce a
@@ -7089,6 +7093,17 @@ export function recoveryService(
         continue;
       }
 
+      // A terminal native owner whose release returned early (busy finalization) left its deferred wakes
+      // undrained (SMA-4 e39cfe75 + five completion reports, 11-19). Run the one release drain first; if it
+      // took the lock, this bare clear has nothing left to do.
+      if (owner && deps.releaseTerminalExecutionOwner && issue.executionRunId === owner.id
+        && ["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(owner.status)) {
+        await deps.releaseTerminalExecutionOwner(owner).catch(err =>
+          logger.warn({ err, issueId: issue.id, runId: owner.id }, "release drain from the stale-lock sweep failed; clearing only"));
+        const [after] = await db.select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
+          .from(issues).where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)));
+        if (!after || (after.executionRunId !== issue.executionRunId && after.checkoutRunId !== issue.checkoutRunId)) continue;
+      }
       await deps.beforeStaleLockClear?.(issue.id);
       const publications: ActivityPublication[] = [];
       const updated = await db.transaction(async tx => {
