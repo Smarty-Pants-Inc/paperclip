@@ -1702,7 +1702,10 @@ describe.skipIf(!existsSync("/proc/self/cmdline"))("remote runner launch stale s
       } else {
         expect(result.stdout).toBe("launched");
         expect((await readFile(join(root, "identity"), "utf8")).split("\n")[0]).toBe("nonce");
-        expect(await readFile(log, "utf8")).toContain(`runner_stale_lineage_partial: runner ${stale.pid}:`);
+        // Launch stderr is copied asynchronously after the detached child exits.
+        // Join that delivery just as the generation-stderr tests above do.
+        await vi.waitFor(async () => expect(await readFile(log, "utf8"))
+          .toContain(`runner_stale_lineage_partial: runner ${stale.pid}:`), { timeout: 5_000 });
       }
       for (const survivor of [other, trimmer, unknown]) expect(gone(survivor.pid!)).toBe(false);
     } finally {
@@ -16824,7 +16827,9 @@ describe("native warm session supervision", () => {
           normalizedSessionId: "session-runnerd-warm-authority",
           driverKind: "codex_app_server" as const,
           protocolVersion: 1 as const,
-          lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 500 },
+          // This is an authority-refresh fixture, not an idle-timeout race.
+          // Keep its live owner while the real checkpoint files are prepared.
+          lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 },
         },
       } as NativeExecutionInputV1;
       const second = {
@@ -17054,15 +17059,9 @@ describe("native warm session supervision", () => {
           });
         } else {
           expect(firstClose).not.toHaveBeenCalled();
-          await vi.waitFor(
-            () =>
-              expect(firstClose).toHaveBeenCalledWith({
-                reason: "warm native session idle timeout",
-              }),
-            {
-              timeout: 1_500,
-            },
-          );
+          await closeWarmNativeSessionsForEnvironment({ environmentId: "environment-runnerd-warm-authority",
+            reason: "warm authority fixture complete" });
+          expect(firstClose).toHaveBeenCalledExactlyOnceWith({ reason: "warm authority fixture complete" });
           if (managedGitHub) expect(githubAccess.stop).toHaveBeenCalledOnce();
         }
       } finally {
@@ -19747,7 +19746,9 @@ describe("runnerd provider runtime wiring", () => {
     driver = await cursorCloudTestDriver(current, environment, { createAgent, getRun: async () => ({ ...native }), streamRun: async function* () {} });
     const prior = await driver.openSession({ runId: current.binding.runId, normalizedSessionId: current.session.normalizedSessionId!, workingDirectory: current.workspace.cwd! });
     await prior.startTurn({ message: { role: "user", text: "Fail the controlled turn." } });
-    await vi.waitFor(async () => expect((await prior.read()).phase).toBe(mode === "active" ? "running" : "terminal"));
+    // Wait for the actual durable checkpoint; Vitest's default one-second
+    // precondition wait is not the replacement-safety contract under test.
+    await vi.waitFor(async () => expect((await prior.read()).phase).toBe(mode === "active" ? "running" : "terminal"), { timeout: 10_000 });
     if (mode !== "active" && mode !== "unacknowledged") await prior.acknowledgeTerminalDelivery((await prior.read()).pendingTerminalDelivery as { turnId: string; receiptId: string });
     const snapshot = await prior.snapshot();
     if (mode === "active") await prior.detachControllerForRestart!();
