@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -141,6 +141,115 @@ async function run(step: Step, fault: Fault, persistent: boolean) {
 }
 
 describe("object run log custody across flush / close / finalize failures", () => {
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7003907357
+  // NEVER-OK: the deadline releases the run, NOT its admitted log bytes.
+  it("bounds finalize admission with 8 peers holding memory after object AND spill writes fail", async () => {
+    const boundMs = 60_000;
+    const m = memory(), spillDir = mkdtempSync(path.join(os.tmpdir(), "objlog-finalize-bound-"));
+    const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", spillDir,
+      assertWriterAuthority: async () => undefined });
+    const peers = [], expected: Buffer[] = [], receipts: Array<Promise<unknown>> = [];
+    const targetAbort = new AbortController();
+    for (let n = 0; n < 8; n++)
+      peers.push(await store.begin({ companyId: "company", agentId: "agent", runId: `capacity-peer-${n}` }));
+    const target = await store.begin({ companyId: "company", agentId: "agent", runId: "capacity-target", signal: targetAbort.signal });
+    const open = fs.open.bind(fs);
+    // Named spill-writer injection: no bytes or index record can reach the local disk.
+    const spillWriteENOSPC = vi.spyOn(fs, "open").mockImplementation((...args: Parameters<typeof fs.open>) => {
+      if (String(args[0]).startsWith(spillDir) && args[1] === "a")
+        return Promise.reject(Object.assign(new Error(SECRET), { code: "ENOSPC" }));
+      return open(...args);
+    });
+    const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    let waiting: Promise<unknown> | undefined, finalizing: ReturnType<typeof store.finalize> | undefined;
+    let observed: { summary?: Awaited<ReturnType<typeof store.finalize>>; settled: boolean } = { settled: false };
+    let diagnostics: unknown[] = [], errors: unknown[] = [], waitingResult: unknown;
+    try {
+      // Named storage-provider injection: every immutable payload PUT fails EIO.
+      Object.assign(m.injection, { step: "first-flush", fault: "EIO", persistent: true });
+      for (const peer of peers) {
+        const chunk = "x".repeat(8 * 1024 * 1024 - 512);
+        expected.push(record(peer.attemptId, 1, chunk));
+        receipts.push((await store.enqueue!(peer, event(1, chunk))).committed.catch(error => error));
+      }
+      await store.flushInflightMirrors!().catch(error => error);
+      expect((await Promise.all(receipts)).every(value => value instanceof Error)).toBe(true);
+      expect(spillWriteENOSPC).toHaveBeenCalled();
+      vi.mocked(logger.warn).mockClear();
+      vi.mocked(logger.error).mockClear();
+      // Only the admission timer is virtual: the production journal and real
+      // spill writer above have finished failing before the clock advances.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      let admitted = false, admissionSettled = false;
+      waiting = store.enqueue!(target, event(1, "y".repeat(8192)))
+        .then(receipt => { admitted = true; return receipt.committed; })
+        .catch(error => error).then(value => { admissionSettled = true; return value; });
+      finalizing = store.finalize(target).then(summary => { observed = { summary, settled: true }; return summary; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(admitted).toBe(false);
+      expect(observed.settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(boundMs - 1);
+      expect(observed.settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(boundMs + 1);
+      diagnostics = [...vi.mocked(logger.warn).mock.calls];
+      errors = [...vi.mocked(logger.error).mock.calls];
+      const snapshot = { ...observed };
+      if (admissionSettled) waitingResult = await waiting;
+      if (process.env.OBJLOG_CUSTODY_EVIDENCE) appendFileSync(process.env.OBJLOG_CUSTODY_EVIDENCE,
+        `${JSON.stringify({ row: "finalize-admission-bound", peers: peers.length, boundMs, elapsedMs: 2 * boundMs,
+          heldBytes: expected.reduce((sum, bytes) => sum + bytes.length, 0), ...snapshot, admissionSettled,
+          admitted, diagnostics, errors })}\n`);
+      // Assertion-red at base / no-bound mutation: finalize is still waiting at 2x the bound.
+      expect(snapshot.settled).toBe(true);
+      expect(snapshot.summary).toEqual({ bytes: null, sha256: null, compressed: false });
+      expect(admissionSettled).toBe(true);
+      expect(waitingResult).toMatchObject({ code: "object_run_log_finalize_admission_timeout" });
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("persistence is incomplete"));
+      expect(diagnostics).toEqual(expect.arrayContaining([
+        [expect.objectContaining({ runId: "capacity-target", step: "admissions",
+          err: expect.objectContaining({ code: "object_run_log_finalize_admission_timeout" }),
+          capacity: { location: "memory", bytes: expected.reduce((sum, bytes) => sum + bytes.length, 0),
+            writers: peers.map(peer => ({ runId: peer.logRef.split("/")[2], bytes: expected[0]!.length,
+              storageError: expect.objectContaining({ code: "EIO" }), spillError: expect.objectContaining({ code: "ENOSPC" }) })) },
+        }), "Object run log finalization failed"],
+      ]));
+      expect(JSON.stringify([diagnostics, errors])).not.toContain(SECRET);
+    } finally {
+      // Release ONLY this row's target admission; the peers' admitted bytes are
+      // kept. Healing storage then proves all 8 complete streams survived.
+      targetAbort.abort(new Error("row cleanup"));
+      if (waiting) await waiting;
+      if (finalizing) await finalizing;
+      vi.useRealTimers();
+      spillWriteENOSPC.mockRestore();
+      m.injection.step = undefined;
+      try {
+        await store.flushInflightMirrors!();
+        for (let n = 0; n < peers.length; n++)
+          expect((await coldRead(m, peers[n]!.logRef)).equals(expected[n]!)).toBe(true);
+        await Promise.all(peers.map(peer => store.finalize(peer)));
+      } finally { warning.mockRestore(); }
+    }
+  }, 30_000);
+
+  it("finalizes normally with one healthy peer holding capacity", async () => {
+    const m = memory(), spillDir = mkdtempSync(path.join(os.tmpdir(), "objlog-finalize-control-"));
+    const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", spillDir,
+      assertWriterAuthority: async () => undefined });
+    const peer = await store.begin({ companyId: "company", agentId: "agent", runId: "healthy-peer" });
+    const target = await store.begin({ companyId: "company", agentId: "agent", runId: "healthy-target" });
+    const peerChunk = "x".repeat(8 * 1024 * 1024 - 512);
+    const peerReceipt = (await store.enqueue!(peer, event(1, peerChunk))).committed;
+    const receipt = (await store.enqueue!(target, event(1, "healthy"))).committed;
+    const result = await store.finalize(target);
+    const bytes = record(target.attemptId, 1, "healthy");
+    expect(result).toEqual({ bytes: bytes.length, sha256: sha(bytes), compressed: false });
+    expect(await receipt).toBe(bytes.length);
+    await peerReceipt;
+    await store.finalize(peer);
+    expect((await coldRead(m, target.logRef)).equals(bytes)).toBe(true);
+  }, 30_000);
+
   it.each(["first-flush", "second-flush", "close"] as const)("EIO once at %s: the re-read log is the admitted bytes, size and sha set", async step => {
     const r = await run(step, "EIO", false);
     expect(r.m.injection.fired).toBe(1);
