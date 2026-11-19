@@ -33,36 +33,18 @@ export function conversationMovedOnSql(m: Pick<PersonMessageSql, "companyId" | "
  * Keep the per-message floor's separate carried-message rule above intact. */
 export function newerPersonInputAnsweredSql(w: Pick<DeferredWakeSql, "companyId" | "issueId" | "requestedAt">,
   stillCarried?: SQL): SQL {
-  return sql`exists (select 1 from ${heartbeatRuns} newer_turn
-    where newer_turn.company_id = ${w.companyId} and newer_turn.status = 'succeeded'
+  // rf-5 Q2: 'answered' is THE one function (answeredPersonMessageSql), never a second predicate.
+  // The person moved past w when a person message created after it was ANSWERED; a carrier of the
+  // held input that started at or after that newer message still owns it (the Stop-held README).
+  return sql`exists (select 1 from ${issueComments} newer_person
+    where newer_person.company_id = ${w.companyId} and newer_person.issue_id = ${w.issueId}
+      and newer_person.author_type = 'user' and newer_person.deleted_at is null
+      and newer_person.created_at > ${w.requestedAt}
+      and ${answeredPersonMessageSql({ id: sql`newer_person.id`, companyId: sql`newer_person.company_id`,
+        issueId: sql`newer_person.issue_id`, createdAt: sql`newer_person.created_at` })}
       ${stillCarried ? sql`and not exists (select 1 from ${heartbeatRuns} later_carrier
-        where later_carrier.company_id = newer_turn.company_id and later_carrier.started_at >= newer_turn.started_at
-          and ${carriesCommentSql("later_carrier", stillCarried, false)})` : sql``}
-      and exists (select 1 from ${issueComments} newer_reply
-        where newer_reply.company_id = newer_turn.company_id and newer_reply.issue_id = ${w.issueId}
-          and newer_reply.created_by_run_id = newer_turn.id and newer_reply.author_type = 'agent'
-          and newer_reply.deleted_at is null)
-      and exists (select 1 from ${issueComments} newer_person
-        where newer_person.company_id = ${w.companyId} and newer_person.issue_id = ${w.issueId}
-          and newer_person.author_type = 'user' and newer_person.deleted_at is null
-          and newer_person.created_at > ${w.requestedAt}
-          and (${directInputCommentSql("newer_turn", sql`newer_person.id`)}
-            or exists (select 1 from ${agentWakeupRequests} claimed_input
-              where claimed_input.company_id = newer_turn.company_id
-                and (claimed_input.id = newer_turn.wakeup_request_id or claimed_input.run_id = newer_turn.id)
-                and (claimed_input.payload->>'commentId' = newer_person.id::text
-                  or claimed_input.payload->'_paperclipWakeContext'->>'commentId' = newer_person.id::text
-                  or claimed_input.payload->'_paperclipWakeContext'->>'wakeCommentId' = newer_person.id::text
-                  or coalesce(claimed_input.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? newer_person.id::text
-                  or coalesce(claimed_input.payload->'commentIds', '[]'::jsonb) ? newer_person.id::text
-                  or claimed_input.idempotency_key = 'conversation-comment:' || newer_person.id::text)))))`;
-}
-
-function directInputCommentSql(alias: string, commentId: SQL): SQL {
-  const context = sql`${sql.identifier(alias)}.context_snapshot`;
-  return sql`(${context}->>'wakeCommentId' = ${commentId}::text or ${context}->>'commentId' = ${commentId}::text
-    or coalesce(${context}->'wakeCommentIds', '[]'::jsonb) ? ${commentId}::text
-    or coalesce(${context}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${commentId}::text)`;
+        where later_carrier.company_id = newer_person.company_id and later_carrier.started_at >= newer_person.created_at
+          and ${carriesCommentSql("later_carrier", stillCarried, false)})` : sql``})`;
 }
 
 /** A Stop's held input outlives the next typed turn. The release saves the
