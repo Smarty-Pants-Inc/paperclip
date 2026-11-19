@@ -39,7 +39,10 @@ import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotic
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
   UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY, UNANSWERED_MESSAGE_WAITING_TEXT as WAITING,
-  PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS, PENDING_WAIT_START_BOUND_MS } from "./unanswered-person-message.js";
+  PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS, PENDING_WAIT_START_BOUND_MS,
+  UNANSWERED_MESSAGE_WORKING_TEXT, UNANSWERED_MESSAGE_WORKING_TITLE,
+  UNANSWERED_MESSAGE_STARTED_FAILED_TEXT as STARTED_FAILED, UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT as STARTED_NO_REPLY,
+} from "./unanswered-person-message.js";
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
 // visible notice from the stranded sweep, in plain words, with the code in the
@@ -1118,6 +1121,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
 
   // RFL 04:58Z: a PAUSED agent's chat. "Sending it again is safe" is false
   // advice there; the note says the agent is paused and who can resume it.
+  const WORKING = UNANSWERED_MESSAGE_WORKING_TEXT("Managed Pi");
   const PAUSED_TEXT = "Managed Pi is paused. Your message is saved, and it will run when Managed Pi is resumed. "
     + "A board user or Managed Pi's manager can resume Managed Pi.";
   const pause = (f: { agentId: string }) => db.update(agents).set({ status: "paused", lifecycleState: "paused",
@@ -1325,7 +1329,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     });
 
   it.each([[true, "waits"], [false, "waits"], [true, "runs"], [false, "runs"]] as const)(
-    "pause-resume 2: chat=%s, pause -> message -> resume (the turn %s): the SAME sweep replaces the paused note with ONE waiting note; the answer supersedes it",
+    "supersedes(pausefix: stale paused note after Resume; RFL record PENDING): pause-resume 2: chat=%s, pause -> message -> resume (the turn %s): the SAME sweep replaces the paused note with ONE note (working while its own run runs, else waiting); the answer supersedes it",
     async (chat, turn) => {
       const f = await fixture({ chat });
       await pauseRoute(f);
@@ -1336,11 +1340,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await resumeRoute(f);
       const run = turn === "runs" ? await f.run({ commentId, status: "running" }) : null;
       await f.sweep();
-      expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: pausedNote!.id, body: WAITING }]);
+      const replaced = turn === "runs" ? WORKING : WAITING;
+      expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: pausedNote!.id, body: replaced }]);
       const carrying = run ?? await f.run({ commentId, status: "running" });
       for (const ms of [2 * 60_000, 10 * 60_000]) {
         await settleAt(f, ms);
-        expect((await f.visible()).map(n => ({ id: n.id, body: n.body })), `+${ms}`).toEqual([{ id: pausedNote!.id, body: WAITING }]);
+        expect((await f.visible()).map(n => ({ id: n.id, body: n.body })), `+${ms}`).toEqual([{ id: pausedNote!.id, body: replaced }]);
       }
       await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, carrying));
       await f.reply(carrying);
@@ -1387,7 +1392,84 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: note!.id, body: NO_RUN }]);
     });
 
-  it("paused agent, then resumed: the saved message's run is the only run (B' starts none), no second note, the answer supersedes it", async () => {
+  // pausefix 2 (rf-5 P1, org 10:32Z): after a Resume, the stale paused note
+  // says 'working' ONLY while a run whose OWN input carries the message is
+  // RUNNING (w1); a queued/scheduled run, another message's run or another
+  // task's run keeps the waiting text. The working note never outlives its
+  // run (w2): the SAME note gets RFL's started-run text. One note (w3).
+  const pausedThenResumed = async (chat: boolean) => {
+    const f = await fixture({ chat });
+    await pauseRoute(f);
+    const commentId = await f.message("While paused: are you there?");
+    await f.sweep();
+    const [pausedNote] = await f.visible();
+    expect(pausedNote!.body).toBe(PAUSED_TEXT);
+    await resumeRoute(f);
+    return { f, commentId, pausedNote: pausedNote! };
+  };
+  const one = async (f: { visible: () => Promise<Array<{ id: string; body: string }>> }) =>
+    (await f.visible()).map(n => ({ id: n.id, body: n.body }));
+
+  it.each([true, false])("pausefix2 RED: chat=%s, its OWN run is running after the Resume: the SAME note says the agent is working on it (title, no next action); the answer supersedes it", async chat => {
+    const { f, commentId, pausedNote } = await pausedThenResumed(chat);
+    const run = await f.run({ commentId, status: "running" });
+    await f.sweep();
+    const notes = await f.visible();
+    expect(notes.map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: pausedNote.id, body: WORKING }]);
+    expect(notes[0]!.presentation).toMatchObject({ title: UNANSWERED_MESSAGE_WORKING_TITLE("Managed Pi") });
+    expect(JSON.stringify(notes[0]!.metadata)).not.toMatch(/Next action/);
+    await settleAt(f, 4 * 60_000);
+    expect(await one(f)).toEqual([{ id: pausedNote.id, body: WORKING }]);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run));
+    await f.reply(run);
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    expect(await answers(f)).toHaveLength(1);
+  });
+
+  it.each(["queued", "scheduled_retry"] as const)("pausefix2 w1: its own run is %s (not running): the SAME note is the waiting text, never 'working'", async status => {
+    const { f, commentId, pausedNote } = await pausedThenResumed(true);
+    await f.run({ commentId, status });
+    await f.sweep();
+    expect(await one(f)).toEqual([{ id: pausedNote.id, body: WAITING }]);
+  });
+
+  it.each(["another task", "another message on this task"] as const)("pausefix2 CONTROL: the agent's running run is %s's: the SAME note is the waiting text (true)", async other => {
+    const { f, commentId, pausedNote } = await pausedThenResumed(true);
+    if (other === "another task") {
+      const [otherIssue] = await db.insert(issues).values({ companyId: f.companyId, title: "Other work", assigneeAgentId: f.agentId,
+        status: "in_progress" }).returning();
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", runtimeMode: "native",
+        nativeIssueId: otherIssue!.id, contextSnapshot: { issueId: otherIssue!.id, wakeReason: "issue_assigned" } });
+      await f.run({ commentId, status: "queued" });
+    } else {
+      await f.run({ commentId: null, status: "running", wakeReason: "heartbeat_timer" });
+    }
+    await f.sweep();
+    expect(await one(f)).toEqual([{ id: pausedNote.id, body: WAITING }]);
+  });
+
+  it.each([
+    ["fails", "resuming", { status: "failed", errorCode: "adapter_failed" }, STARTED_FAILED],
+    ["is cancelled", "resuming", { status: "cancelled", errorCode: "cancelled" }, STARTED_FAILED],
+    ["succeeds with no reply", "resuming", { status: "succeeded", errorCode: null }, STARTED_NO_REPLY],
+    ["fails", "ready", { status: "failed", errorCode: "adapter_failed" }, STARTED_FAILED],
+    ["is cancelled", "ready", { status: "cancelled", errorCode: "cancelled" }, STARTED_FAILED],
+    ["succeeds with no reply", "ready", { status: "succeeded", errorCode: null }, STARTED_NO_REPLY],
+  ] as const)("pausefix2 w2: the working note's run %s without answering (agent %s): the SAME note becomes RFL's started-run text; one note", async (_end, state, end, text) => {
+    const { f, commentId, pausedNote } = await pausedThenResumed(true);
+    const run = await f.run({ commentId, status: "running" });
+    await f.sweep();
+    expect(await one(f)).toEqual([{ id: pausedNote.id, body: WORKING }]);
+    // 'ready': the lifecycle worker's resuming -> ready 'complete' (status idle).
+    if (state === "ready") await db.update(agents).set({ lifecycleState: "ready", status: "idle" }).where(eq(agents.id, f.agentId));
+    await db.update(heartbeatRuns).set({ ...end, finishedAt: new Date(Date.now() - 60_000) }).where(eq(heartbeatRuns.id, run));
+    await settleAt(f, 2 * 60_000);
+    expect(await one(f)).toEqual([{ id: pausedNote.id, body: text }]);
+    expect(JSON.stringify(await f.visible())).not.toMatch(/working on|safe/i);
+  });
+
+  it("supersedes(pausefix: stale paused note after Resume; RFL record PENDING): paused agent, then resumed: the saved message's run is the only run (B' starts none), no second note, the answer supersedes it", async () => {
     const f = await fixture();
     await pause(f);
     const commentId = await f.message("Are you there?");
@@ -1403,10 +1485,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const run = await f.run({ commentId, status: "running" });
     const [pausedNote] = await f.visible();
     await settleAt(f, 4 * 60_000);
-    // pause-resume (2): no longer paused, so the SAME note is the one waiting note, never the stale paused line.
-    expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: pausedNote!.id, body: WAITING }]);
+    // pausefix 2: no longer paused and its OWN run is running, so the SAME note says the agent is working on it.
+    expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: pausedNote!.id, body: WORKING }]);
     await settleAt(f, 20 * 60_000);
-    expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: pausedNote!.id, body: WAITING }]);
+    expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: pausedNote!.id, body: WORKING }]);
     expect(await runsCarrying()).toBe(1);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run));
     await f.reply(run);
