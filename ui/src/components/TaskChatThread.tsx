@@ -1216,6 +1216,29 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     return (liveRuns ?? []).find(live) ?? null;
   }, [activeRun, issueStatus, liveRuns, presentedReplyRunIds]);
 
+  // Runs the live-runs list (or the active run) had as running and has since
+  // dropped: the server has ended them. Only a run seen live here counts, so a
+  // reload or a pending list never reads a running run as ended.
+  const [droppedLiveRuns, setDroppedLiveRuns] = useState<{ issueId: typeof issueId; ids: ReadonlySet<string> }>(
+    () => ({ issueId, ids: EMPTY_RUN_IDS }));
+  const seenLiveRunIdsRef = useRef<{ issueId: typeof issueId; ids: Set<string> }>({ issueId, ids: new Set() });
+  const currentLiveRunIdsKey = [...(liveRuns ?? []), ...(activeRun ? [activeRun] : [])]
+    .filter((run) => !isTerminalRunStatus(run.status)).map((run) => run.id).sort().join(",");
+  useLayoutEffect(() => {
+    const current = new Set(currentLiveRunIdsKey ? currentLiveRunIdsKey.split(",") : []);
+    if (seenLiveRunIdsRef.current.issueId !== issueId) seenLiveRunIdsRef.current = { issueId, ids: new Set() };
+    const seen = seenLiveRunIdsRef.current.ids;
+    const dropped = [...seen].filter((id) => !current.has(id));
+    for (const id of current) seen.add(id);
+    setDroppedLiveRuns((prev) => {
+      const ids = new Set(prev.issueId === issueId ? prev.ids : []);
+      for (const id of current) ids.delete(id);
+      for (const id of dropped) ids.add(id);
+      return prev.issueId === issueId && sameRunIds(prev.ids, ids) ? prev : { issueId, ids };
+    });
+  }, [issueId, currentLiveRunIdsKey]);
+  const droppedLiveRunIds = droppedLiveRuns.issueId === issueId ? droppedLiveRuns.ids : EMPTY_RUN_IDS;
+
   // The live runner turn remains the sole owner of its response until the
   // canonical comment and settled activity are both ready. This state is
   // established in a layout effect so the live lane never disappears for a
@@ -2740,9 +2763,21 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
   const settlingFinishedAt = settlingRun
     ? linkedRunMetaById.get(settlingRun.id)?.finishedAt
     : undefined;
-  const tailStatus = liveRun
+  // The server's terminal event (paperclip.prp.terminal.v1, the runner's
+  // turn-end record the native finalizer commits the reply from) ends the
+  // turn: its final reply is in, the run is only finalizing. The live list may
+  // say 'running' some seconds more; the header reads finished meanwhile.
+  // Only a completed turn: a stopped or failed one keeps the Stop paths' own
+  // reading (C8).
+  const tailTerminalEntry = tailRunId
+    ? tailAllEntries.find((entry) => entry.kind === "run_terminal")
+    : undefined;
+  const tailTerminal = tailTerminalEntry?.kind === "run_terminal" && tailTerminalEntry.turnState === "completed" &&
+    tailTerminalEntry.runState === "succeeded" ? tailTerminalEntry : null;
+  const listedTailStatus = liveRun
     ? liveRun.status
     : (runs.find((run) => run.id === settlingRun?.id)?.status ?? "succeeded");
+  const tailStatus = tailTerminal && !isTerminalRunStatus(listedTailStatus) ? tailTerminal.runState : listedTailStatus;
   const tailStartedAtMs =
     tailSegmentStartMs ??
     (liveRun
@@ -2752,10 +2787,10 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
   const tailFinishedAtMs = liveRun
     ? liveRun.finishedAt
       ? toMs(liveRun.finishedAt)
-      : null
+      : tailTerminal ? toMs(tailTerminal.ts) : null
     : settlingFinishedAt
       ? toMs(settlingFinishedAt)
-      : null;
+      : tailTerminal ? toMs(tailTerminal.ts) : null;
   const tailToolSummary = useMemo(
     () => (tailRunId ? toolCountSummaryFromEntries(tailEntries) : null),
     // tailEntries is a fresh array each render; tailContentKey tracks its content.
@@ -3082,7 +3117,8 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
   // projection for that run (its held messages are a fresh wait) is not a turn
   // starting, so it shows no 'Working' lane. A new message still does.
   const [personStoppedRunId, setPersonStoppedRunId] = useState<string | null>(null);
-  const liveRunId = liveRun?.id ?? null;
+  // A turn whose terminal event is in has nothing left to stop.
+  const liveRunId = liveRun && !tailTerminal ? liveRun.id : null;
   const stopLiveRun = useMemo(() => liveRunId && onCancelRun ? async () => {
     setPersonStoppedRunId(liveRunId);
     try {
@@ -3093,15 +3129,21 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     }
   } : undefined, [liveRunId, onCancelRun]);
   // A 'working' body that only says its observed run is still running (no
-  // input waits on it, no recovery step) is not a turn starting once that run
-  // has posted its reply in this thread, whatever the runs list still says of
-  // it: the run is finalizing after its reply (gate 4 t1; B' gate 3 at 390,
-  // where the list read 'running' ~7 s more). A person's input still is.
+  // input waits on it, no recovery step) is not a turn starting once the
+  // server says that run is finished: its reply is presented, its terminal
+  // event is in its transcript, it is listed succeeded with its reply, or the
+  // live-runs list dropped it after having it (gate 4 t1; B' gate 3 at 390;
+  // s-steer8, where the issue runs list read 'running' ~8 s more). A reply
+  // alone is not that fact: a run that posted a mid-run comment and is still
+  // producing keeps its row (RFL on 4d84f57a). A person's input still shows.
   const workingObservedRunId = props.interruption?.state === "working" && !props.interruption.intentId
     && !props.interruption.recoveryStep ? props.interruption.observedRunId : null;
   const interruptionRunAnswered = Boolean(workingObservedRunId && (presentedReplyRunIds.has(workingObservedRunId) ||
-    comments.some((comment) => !comment.deletedAt && comment.authorType === "agent" &&
-      (comment.createdByRunId ?? comment.runId) === workingObservedRunId)));
+    (transcriptByRun.get(workingObservedRunId) ?? []).some((entry) => entry.kind === "run_terminal") ||
+    droppedLiveRunIds.has(workingObservedRunId) ||
+    (runs.find((run) => run.id === workingObservedRunId)?.status === "succeeded" &&
+      comments.some((comment) => !comment.deletedAt && comment.authorType === "agent" &&
+        (comment.createdByRunId ?? comment.runId) === workingObservedRunId))));
   const optimisticRunnerStartup =
     hasAgentAssignee &&
     !startupBlocked &&

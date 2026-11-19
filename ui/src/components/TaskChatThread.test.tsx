@@ -6647,6 +6647,68 @@ describe("TaskChatThread composer execution controls", () => {
       } finally { vi.useRealTimers(); }
     });
 
+    // s-steer8 (afterdone3/GRADE-q1c-s8.md, 1440 03:57 and 04:05, 390 04:17): DONE is in while the run is still
+    // listed running ~8 s ('Working for 2m 32s' + stop), then it drops and a fresh 'Working'/'Thinking' row showed.
+    it("after the final reply, no 'Working' and no stop for 20 s while the run is still listed running ~8 s, then dropped", async () => {
+      sidebarState.isMobile = mobile;
+      plantTranscript();
+      const listedRunning = { ...settled, status: "running", finishedAt: null };
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+      try {
+        vi.setSystemTime(new Date("2026-11-19T08:36:35.200Z"));
+        const props = { ...base, onCancelRun: vi.fn(async () => {}), interruption: working };
+        render(<TaskChatThread {...props} activeRun={live} linkedRuns={[listedRunning]} />);
+        await act(async () => {});
+        for (let sample = 0; sample <= 100; sample += 1) {
+          if (sample === 40) {
+            // ~8 s later the live run drops; the issue runs list still says 'running' a little longer.
+            render(<TaskChatThread {...props} linkedRuns={[listedRunning]} />);
+            await act(async () => {});
+          }
+          if (sample === 50) {
+            render(<TaskChatThread {...props} linkedRuns={[settled]} />);
+            await act(async () => {});
+          }
+          expect(container.textContent?.split("DONE").length, `sample ${sample}`).toBeGreaterThan(1);
+          expect(container.textContent, `sample ${sample * 200} ms`).not.toContain("Working");
+          expect(container.textContent, `sample ${sample * 200} ms`).not.toContain("Thinking");
+          expect(container.querySelector('[data-testid="task-chat-composer-stop"]'), `sample ${sample * 200} ms`).toBeNull();
+          await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+        }
+      } finally { vi.useRealTimers(); }
+    });
+
+    it("after a reload, a run whose terminal event is in shows no startup row while the runs list still says running", async () => {
+      sidebarState.isMobile = mobile;
+      plantTranscript();
+      const listedRunning = { ...settled, status: "running", finishedAt: null };
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+      try {
+        vi.setSystemTime(new Date("2026-11-19T08:36:35.200Z"));
+        render(<TaskChatThread {...base} linkedRuns={[listedRunning]} interruption={working} />);
+        await act(async () => {});
+        for (let sample = 0; sample <= 100; sample += 1) {
+          expect(liveLane(), `sample ${sample * 200} ms`).toBeNull();
+          expect(container.textContent, `sample ${sample * 200} ms`).not.toContain("Working");
+          expect(container.textContent, `sample ${sample * 200} ms`).not.toContain("Thinking");
+          await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+        }
+      } finally { vi.useRealTimers(); }
+    });
+
+    // RFL on 4d84f57a: a run that posted a MID-RUN comment and is still producing, with no live lane yet
+    // (a reload, liveRuns pending), was hidden by the 'has an agent comment' rule.
+    it("control: after a reload, a run still producing past its mid-run comment keeps its 'Working' row", async () => {
+      sidebarState.isMobile = mobile;
+      nativeTranscriptState.transcriptByRun.set(runId, [assistantEntry("2026-11-19T08:35:10.000Z", "17 + 25 = 42. Continuing…", "final")]);
+      const midRun = [comments[0], comment("7a1c0e55-3f0b-4c8e-9d2a-5b6f8e9a0c12", "agent", "17 + 25 = 42. Continuing…", "2026-11-19T08:35:10.500Z")];
+      const listedRunning = { ...settled, status: "running", finishedAt: null };
+      render(<TaskChatThread {...base} comments={midRun} linkedRuns={[listedRunning]} interruption={working} />);
+      await act(async () => {});
+      expect(liveLane()).not.toBeNull();
+      expect(container.textContent).toContain("Working");
+    });
+
     it("control: an agent comment from the run mid-run, with the run still live, keeps the live lane", async () => {
       sidebarState.isMobile = mobile;
       nativeTranscriptState.transcriptByRun.set(runId, [assistantEntry("2026-11-19T08:35:10.000Z", "Step 3 of 6 done.", "final")]);
