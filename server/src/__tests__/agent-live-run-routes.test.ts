@@ -286,7 +286,7 @@ async function requestApp(
 describe("agent live run routes", () => {
   // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21297
   // Keep reason: NEVER-OK trace custody. Real writer, Postgres, spill and HTTP GET.
-  it.each(["cli", "native-diagnostic", "native-source"] as const)("finalize-bound custody through real GET: %s", async kind => {
+  it.each(["cli", "native-diagnostic", "native-source", "cli-index-failure"] as const)("finalize-bound custody through real GET: %s", async kind => {
     const { randomUUID, createHash } = await import("node:crypto");
     const { promises: fs, appendFileSync } = await import("node:fs");
     const path = await import("node:path");
@@ -317,6 +317,7 @@ describe("agent live run routes", () => {
     });
     const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
     let pending: Promise<unknown> | undefined, finalizing: ReturnType<typeof store.finalize> | undefined;
+    let recoveredIndexEIO: { mockRestore(): void } | undefined;
     try {
       await db.execute(sql.raw(`create schema ${schema}`));
       await db.execute(sql.raw(`set search_path=${schema}`));
@@ -328,7 +329,7 @@ describe("agent live run routes", () => {
         const registry = await vi.importActual<typeof import("../services/run-secret-redaction.js")>("../services/run-secret-redaction.js");
         return registry.createRunSecretRedactionRegistry(db).redactionValuesForRun(company, id);
       });
-      const runtimeMode = kind === "cli" ? "legacy" : "native";
+      const runtimeMode = kind.startsWith("cli") ? "legacy" : "native";
       await db.execute(sql`insert into heartbeat_runs(id,company_id,agent_id,status,runtime_mode) values(${runId},${companyId},${agentId},'running',${runtimeMode})`);
       const [storedRun] = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
         status: heartbeatRuns.status, runtimeMode: heartbeatRuns.runtimeMode, logStore: heartbeatRuns.logStore,
@@ -357,7 +358,7 @@ describe("agent live run routes", () => {
       // Only admission time is virtual; peer storage and spill failures already finished.
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
       vi.setSystemTime(new Date("2026-11-19T00:00:00.000Z"));
-      const stream = kind === "cli" ? "stdout" : kind === "native-source" ? "stdout" : "stderr";
+      const stream = kind.startsWith("cli") || kind === "native-source" ? "stdout" : "stderr";
       pending = kind === "native-source"
         ? callbacks.appendIdentityRedactedLog(stream, chunk, false, { kind: "canonical_native", sourceCursor: 1 }).catch(error => error)
         : callbacks.onLog(stream, chunk);
@@ -399,6 +400,15 @@ describe("agent live run routes", () => {
       m.state.down = false;
       peerSpillENOSPC.mockRestore();
       await store.flushInflightMirrors!();
+      if (kind === "cli-index-failure") {
+        // Named fault: object storage heals, but appending the recovered index
+        // record fails EIO. A stale spill index must not claim stored bytes are missing.
+        recoveredIndexEIO = vi.spyOn(fs, "open").mockImplementation((...args: Parameters<typeof fs.open>) => {
+          if (String(args[0]) === spill.indexPath && args[1] === "a")
+            return Promise.reject(Object.assign(Error("planted recovery-index refusal"), { code: "EIO" }));
+          return open(...args);
+        });
+      }
       // For native runs GET itself re-exports the refused source cursor, after
       // adopting any diagnostic spill. A second GET must not duplicate either.
       const response = await get(), again = await get();
@@ -437,7 +447,7 @@ describe("agent live run routes", () => {
       expect(Number(row!.log_bytes)).toBe(served.length);
       // Native repair deliberately skips the full-log digest; byte custody is
       // independently SHA-checked above for both kinds of source-less record.
-      expect(row!.log_sha256).toBe(kind === "cli" ? sha(served) : null);
+      expect(row!.log_sha256).toBe(kind.startsWith("cli") ? sha(served) : null);
       console.info("BOUND_GET_ROW", JSON.stringify({ kind, runId, spillPath: spill.path, expectedBytes: expected.length,
         servedBytes: served.length, servedSha256: sha(served), expectedSha256: sha(expected), row }));
       if (process.env.OBJLOG_ROWS) appendFileSync(process.env.OBJLOG_ROWS, JSON.stringify({ kind, runId, spillPath: spill.path,
@@ -447,6 +457,7 @@ describe("agent live run routes", () => {
       if (pending) await pending;
       if (finalizing) await finalizing;
       peerSpillENOSPC.mockRestore();
+      recoveredIndexEIO?.mockRestore();
       m.state.down = false;
       await store.flushInflightMirrors!();
       for (const peer of peers) await store.finalize(peer);
