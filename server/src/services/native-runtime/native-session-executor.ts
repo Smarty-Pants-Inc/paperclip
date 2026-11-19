@@ -8910,6 +8910,23 @@ export function resolveNativeHarnessPersistenceProfile(
   };
 }
 
+/** Rebuild the read-only trace source after a controller restart. Uses the same
+ * session scope, persistence profile and remote layout as the live backend. */
+export function recoveredNativeSessionEvidenceSource(execution: NativeExecutionInput, remoteCwd: string) {
+  const sessionId = nativeSessionKey(execution);
+  const root = posix.join(remoteCwd, ".paperclip-runtime", "paperclip-runner", "sessions",
+    createHash("sha256").update(sessionId).digest("hex"));
+  return {
+    normalizedSessionId: sessionId,
+    sessionScopeDigest: createHash("sha256").update(nativeSessionScopeKey(execution)).digest("hex"),
+    directories: resolveNativeHarnessPersistenceProfile(execution).directories.map(directory => ({
+      name: directory.name,
+      sourcePath: directory.location === "runner" ? posix.join(root, "runner") : posix.join(root, "filesystem", directory.name),
+      excludeEntries: directory.excludeEntries ?? [],
+    })),
+  };
+}
+
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value && typeof value === "object") {

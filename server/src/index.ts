@@ -103,6 +103,7 @@ import { invalidateNativeReplacementDiscovery, reconcileSafeNativeReplacements }
 import { reconcileAbandonedExecutionControl } from "./services/execution-control-reconciliation.js";
 import { acknowledgeNativeStartupCleanup } from "./services/native-runtime/native-startup-cleanup.js";
 import { fenceOrphanedNativeStateStaging, sweepNativeStateStaging } from "./services/native-runtime/native-state-staging.js";
+import { registerNativeSessionEvidenceWork } from "./services/native-runtime/native-session-evidence-work.js";
 import { executionControlSchedule, registerExecutionControlWork } from "./services/execution-control-work.js";
 import { connectionIntentDeliveryService } from "./services/connection-intent-delivery.js";
 import { existsSync, readFileSync, rmSync } from "node:fs";
@@ -1559,6 +1560,12 @@ async function startServerWithDatabaseTeardown(
   });
   server.on("close", unsubscribeChatCompletions);
   const cleanupInspectionRuntime = environmentRuntimeService(db as any, { pluginWorkerManager });
+  // As with pending environment cleanup, this obligation survives a process
+  // restart and must not depend on heartbeat scheduling being enabled.
+  const warmEvidenceWork = registerNativeSessionEvidenceWork(db, deliveryWork, cleanupInspectionRuntime,
+    () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped);
+  trackHeartbeatSchedulerWork(warmEvidenceWork.ready);
+  server.on("close", () => { void warmEvidenceWork.stop(); });
   const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
   const historicalCleanup = historicalCleanupVerificationService(db as any, {
     inspectLease: lease => cleanupInspectionRuntime.inspectLeaseResource(lease.id),

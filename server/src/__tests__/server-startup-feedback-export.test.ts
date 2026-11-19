@@ -437,7 +437,8 @@ vi.mock("../services/skill-source-sync.js", () => ({
 }));
 
 vi.mock("../services/native-runtime/native-session-executor.js", () => ({
-  verifyStoppedNativeSessionForReplacement: vi.fn(async () => null),
+  verifyStoppedNativeSessionForAutomaticReplacement: vi.fn(async () => null),
+  nativeRunHasOpenGovernedWaitTool: vi.fn(() => false),
 }));
 
 // This suite verifies server startup scheduling; replacement correctness is
@@ -702,6 +703,10 @@ vi.mock("../auth/better-auth.js", () => ({
   resolveBetterAuthSessionFromHeaders: vi.fn(async () => null),
 }));
 
+vi.mock("../services/native-runtime/native-session-evidence-work.js", () => ({
+  registerNativeSessionEvidenceWork: vi.fn(() => ({ ready: Promise.resolve(), stop: vi.fn() })),
+}));
+import { registerNativeSessionEvidenceWork } from "../services/native-runtime/native-session-evidence-work.js";
 import { startServer } from "../index.ts";
 import { reconcileSafeNativeReplacements } from "../services/native-runtime/native-safe-replacement.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "../services/execution-control-deadline.js";
@@ -738,6 +743,12 @@ describe("startServer feedback export wiring", () => {
     process.env.BETTER_AUTH_SECRET = "test-secret";
   });
 
+
+  it.each([true, false])("starts the pending warm evidence sweep with heartbeat enabled=%s", async enabled => {
+    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: enabled }));
+    await startServer(); await settleStartupHousekeeping();
+    expect(registerNativeSessionEvidenceWork).toHaveBeenCalledTimes(1);
+  });
 
   it("refuses invalid cloud bootstrap prerequisites before signing, DB creation, or HTTP setup", async () => {
     const realConfig = await vi.importActual<typeof import("../config.js")>("../config.js");

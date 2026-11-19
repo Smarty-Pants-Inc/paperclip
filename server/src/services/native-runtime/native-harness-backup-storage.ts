@@ -319,6 +319,16 @@ async function persistNativeHarnessBackupOnce(input: PersistNativeHarnessBackupI
       }
     });
     for (const publication of publications) publishActivity(publication);
+  } catch (error) {
+    if ("kind" in input.owner && input.owner.kind === "session_evidence") {
+      // This attempt owns this pending row. A failed upload/readback must not
+      // remain in the in-progress publication queue alongside the next retry.
+      // Never demote a completed row, nor change the close-time backup writer.
+      await input.db.update(nativeHarnessBackups).set({ status: "failed", updatedAt: new Date() })
+        .where(and(eq(nativeHarnessBackups.id, binding.id), eq(nativeHarnessBackups.companyId, binding.companyId),
+          eq(nativeHarnessBackups.status, "pending")));
+    }
+    throw error;
   } finally { key.fill(0); await removeNativeHarnessBackup(scratch); }
 }
 
