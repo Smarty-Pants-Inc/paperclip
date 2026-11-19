@@ -51,13 +51,23 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
   // whose OWN carrying run FAILED without a reply was never seen through by the
   // agent, so a reply to a LATER message does not answer it. It stays owed
   // until a run that carries it (its re-delivery) answers, or its card stands.
+  // Reached clause (RFL 08:41Z): a reply to a LATER message answers m ONLY if m
+  // REACHED the agent: m was in some run's input (any carried key, including
+  // wakeCommentIds and context.commentId). A message held and never carried
+  // stays owed (carried next, or a true card). Imported history is answered by
+  // its own arm below, never by this one.
   return sql`(exists (select 1 from ${issueComments} a
     join ${heartbeatRuns} r on r.id = a.created_by_run_id and r.company_id = a.company_id
     where a.company_id = ${m.companyId} and a.issue_id = ${m.issueId} and a.author_type = 'agent' and a.deleted_at is null
       and a.created_at > ${m.createdAt}
       and exists (select 1 from ${issueComments} b
         where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
-          and (b.id = ${m.id} or (b.created_at > ${m.createdAt} and not ${failedCarrierSql(m)}))
+          and (b.id = ${m.id} or (b.created_at > ${m.createdAt} and not ${failedCarrierSql(m)}
+            and (exists (select 1 from ${heartbeatRuns} rc
+              where rc.company_id = ${m.companyId} and ${carriesCommentSql("rc", m.id)})
+              -- STEERING ARM (reached by steering): the compose adds: or (a Pi read event for m exists)
+              -- here, so a steered message the Pi read counts as reached. Not on this base.
+            )))
           and ${chainCarriesCommentSql("r", sql`b.id`, m)}))
     or exists (select 1 from ${issueThreadInteractions} q
       join ${heartbeatRuns} r on r.id = q.source_run_id and r.company_id = q.company_id
