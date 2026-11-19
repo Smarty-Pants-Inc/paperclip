@@ -25,7 +25,21 @@ import { startEmbeddedPostgresTestDatabase } from "./embedded-postgres.js";
 const box = vi.hoisted(() => ({ targets: new Map<string, unknown>(), inputs: [] as unknown[],
   nextBox: null as null | ((leaseId: string, real: () => Promise<any>, lease: any) => Promise<unknown>),
   /** The scripted provider turn of one run (the live-executor rows): returns after it accepted its own result. */
-  session: null as null | ((input: { execution: any; runnerInstanceId: string; db: unknown }) => Promise<unknown>) }));
+  session: null as null | ((input: { execution: any; runnerInstanceId: string; db: unknown }) => Promise<unknown>),
+  /** HELD-PUBLICATION-1: the first sync publication after arming waits here (one shot). */
+  publication: null as null | { armed: boolean; entered: () => void; release: Promise<void> } }));
+// NAMED INJECTION HELD-PUBLICATION-1 (FU-c): the run-reference publication of a finalized sync (persistRunReference,
+// native-workspace-sync.ts, the statement after the copy-back's LAST ownership check) waits until the test releases it.
+// Everything it then does is the product's own code.
+vi.mock("../../services/transaction-retry.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../services/transaction-retry.js")>();
+  return { ...actual, retryUnlessTransactionBound: ((...args: Parameters<typeof actual.retryUnlessTransactionBound>) => {
+    const gate = box.publication;
+    if (!gate?.armed || !/persistRunReference/.test(new Error().stack ?? "")) return actual.retryUnlessTransactionBound(...args);
+    gate.armed = false; gate.entered();
+    return gate.release.then(() => actual.retryUnlessTransactionBound(...args));
+  }) as typeof actual.retryUnlessTransactionBound };
+});
 vi.mock("../../services/environment-execution-target.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../../services/environment-execution-target.js")>();
   return { ...actual, resolveEnvironmentExecutionTarget: (async (input: { leaseId?: string | null }) =>
@@ -82,12 +96,12 @@ export async function openClassicLiveContext(prefix = "native-classic-bound-", r
   } };
 }
 /** The describe's afterEach. */
-export function resetClassicLiveBox() { vi.useRealTimers(); box.inputs.length = 0; box.session = null; box.nextBox = null; }
+export function resetClassicLiveBox() { vi.useRealTimers(); box.inputs.length = 0; box.session = null; box.nextBox = null; box.publication = null; }
 
 // SCRIPTED (named): the provider turn. It accepts its own result through PaperclipControlPlanePort, bound as
 //   native-session-executor.ts binds it (openRun, the stream, run.result.accepted, run.terminal, completeRun).
 // PLANTED (named): the task's workspace row for its saved directory, in the shape row K1's real P leaves behind.
-export async function liveScenario({ db, root }: ClassicLiveContext) {
+export async function liveScenario({ db, root }: ClassicLiveContext, options: { holdPublication?: boolean } = {}) {
   const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
   await db.insert(companies).values({ id: companyId, name: "Classic bound live", issuePrefix: `L${companyId.slice(0, 6)}`,
     defaultResponsibleUserId: PERSON, requireBoardApprovalForNewAgents: false });
@@ -189,7 +203,9 @@ export async function liveScenario({ db, root }: ClassicLiveContext) {
     await fs.writeFile(path.join(boxCwd, "report.md"), "report, REWRITTEN BY R (unsaved)\n");
     await fs.writeFile(path.join(boxCwd, "notes.md"), "R's new notes (unsaved)\n");
     faultedBox.index = boxIndex;
-    fault.stall = { entered: reached, release: stallRelease };
+    // HELD-PUBLICATION-1 instead of CLASSIC-STALL-1: R's copy-back runs to its last ownership check and is held there.
+    if (options.holdPublication) box.publication = { armed: true, entered: reached, release: stallRelease };
+    else fault.stall = { entered: reached, release: stallRelease };
     return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Rewrote the report." };
   };
   const runs = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)))
@@ -212,7 +228,15 @@ export async function liveScenario({ db, root }: ClassicLiveContext) {
     const state = readReplyFileLine(served?.resultJson?.replyFileLine);
     return { status: served?.status ?? null, state: state?.state ?? null, shown: replyFileLineText(state, { nowMs: Date.now(), recoverSavedFilesShown: false }) };
   };
-  return { companyId, agentId, issueId, app, boxes, runs, issue, say, agentComments, servedLine, faultedBox,
+  /** REAL: the run inspector's Workspace tab (GET /api/heartbeat-runs/:runId/workspace-operations), this run's save only. */
+  const inspectorSaves = async (runId: string) => {
+    const got = await request(app).get(`/api/heartbeat-runs/${runId}/workspace-operations`);
+    expect(got.status, JSON.stringify(got.body)).toBe(200);
+    return (got.body as Array<{ heartbeatRunId: string | null; phase: string; status: string; stderrExcerpt: string | null }>)
+      .filter(operation => operation.heartbeatRunId === runId && operation.phase === "workspace_finalize")
+      .map(operation => ({ status: operation.status, stderr: operation.stderrExcerpt }));
+  };
+  return { companyId, agentId, issueId, app, boxes, runs, issue, say, agentComments, servedLine, inspectorSaves, faultedBox,
     stallReached, releaseStall: () => { release(); fault.stall = null; } };
 }
 
