@@ -94,7 +94,7 @@ export async function withCarriedSteerDisplay<T extends { id: string; issueId: s
   const laterRuns = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, first.companyId),
     or(eq(heartbeatRuns.nativeIssueId, first.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${first.issueId}`),
-    inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry", "succeeded"])));
+    inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry", "succeeded", "failed", "timed_out"])));
   for (const run of laterRuns) {
     const context = object(run.context);
     // The steering run itself lists a steer in wakeCommentIds too (conversation-steering adds it to both);
