@@ -12,7 +12,7 @@ import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
 import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-migration.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { preserveNativeFailedWorkspace, preserveTaskRemoteWorkspaceWriter } from "./native-runtime/native-failed-workspace-recovery.js";
-import { handedOffWarmLeaseSettled } from "./native-runtime/handed-off-warm-lease.js";
+import { handedOffWarmLease, handedOffWarmLeaseSettled, handedOffWarmProofInFlight } from "./native-runtime/handed-off-warm-lease.js";
 import { createHash } from "node:crypto";
 import { appendHeartbeatRunEvent, stopAcceptanceEventSql } from "./heartbeat-run-events.js";
 import { canContinueCancelledRun, QUEUED_SEND_AFTER_STOP_KEY, queuedSendAfterStop, userStopBoundaryAt } from "./run-cancellation.js";
@@ -612,10 +612,17 @@ export async function admitExplicitNativeContinuation(input: {
       const handedOff = new Set<string>();
       for (const lease of leases) {
         if (hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease)) continue;
-        if (!await handedOffWarmLeaseSettled(run, lease)) break;
+        // rf-4 row 22a: DB-only read of the persisted proof; the remote proof runs
+        // outside any transaction (proveHandedOffWarmLeases), never under this one.
+        if (!handedOffWarmLeaseSettled(run, lease)) break;
         handedOff.add(lease.id);
       }
-      if (!leases.every(lease => handedOff.has(lease.id) || hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))) return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
+      const unsettled = leases.filter(lease => !handedOff.has(lease.id) && !hasRemoteTerminationReceipt(lease) && !hasRecoveredCleanupStopReceipt(lease));
+      if (unsettled.length) {
+        if (handedOffWarmProofInFlight(run.id) && unsettled.some(lease => handedOffWarmLease(run, lease)))
+          return blocked("interrupt_handoff", "Sending your messages.");
+        return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
+      }
       if (run.runtimeMode === "native" && !input.dryRun && !leases.every(lease => completeTerminatedRemoteNativeSessionCleanup({
         companyId, runId: run.id, remoteCleanupScope: remoteLeaseCleanupScope(lease)!,
       }))) return refused("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
