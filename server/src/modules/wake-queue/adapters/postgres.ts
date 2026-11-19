@@ -17,7 +17,7 @@ import { notifyUnsafeWorkspaceExportRecovery } from "../../../services/unsafe-wo
 import { notifyChatInboundWakeNotices } from "../../../services/chat-inbound-wake-notice-notifications.js";
 import { notifyChatRunMilestones } from "../../../services/chat-run-milestone-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-work-notifications.js";
-import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
+import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop, readPersonStopHold } from "../../../services/acknowledged-native-stop.js";
 import { readRunCancellation } from "../../../services/run-cancellation.js";
 import { CHAT_COMPLETION_WAKE_REASON, isCompletedOnboardingHandoffWake, supersedeStaleChatCompletionWake, clipForNote } from "../../../services/chat-completion-delivery.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
@@ -33,7 +33,7 @@ import { isGovernancePauseStop } from "../../../services/governance-pause-stop.j
 import { agentRunSupersededByFreshContinuation } from "../../../agent-run-cancellation.js";
 import { freshContinuationIsolatesRun } from "../../../services/fresh-continuation-fallback.js";
 import { hasNativePreDispatchFailureRecord } from "../../../services/heartbeat/run-failure-cause.js";
-import { canBypassFailedNativePredecessor } from "../../../services/native-runtime/native-provider-work-proof.js";
+import { canBypassFailedNativePredecessor, provesNoNativeRunProviderWork } from "../../../services/native-runtime/native-provider-work-proof.js";
 import type { Db } from "@paperclipai/db";
 import { deliveredQueuedCommentIds, EXTERNAL_CHAT_MESSAGE_WAKE_MUTATION, EXTERNAL_CHAT_MESSAGE_WAKE_REASON } from "../../../services/queued-comment-delivery.js";
 import { extractIssueReferenceIdentifiers, isUuidLike } from "@paperclipai/shared";
@@ -1253,6 +1253,18 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: ReleaseRun, iss
       eq(nativeRunFinalizations.runId, run.id), eq(nativeRunFinalizations.phase, "terminal_failure"),
       inArray(nativeRunFinalizations.failureCode, ["native_workspace_sync_out_retry_exhausted", "native_workspace_sync_out_unrecoverable"]))).limit(1);
   if (savedExportFailure) return false;
+  // A person's own Stop or task-tree Pause of a run still in startup has no
+  // provider session to acknowledge it, so it never reaches the acknowledged
+  // branch above. It is still the person's stop, not an unreconciled run:
+  // settle it as the acknowledged Stop's release does (no incident, task
+  // status kept, held messages gathered for the person's Send).
+  if (run.status === "cancelled" && run.errorCode === "cancelled"
+    && Object.keys(parseObject(run.resultJson?.startupCancellation)).length > 0
+    && (await readPersonStopHold(tx, { companyId: run.companyId, issueId: issue.id, agentId: run.agentId }))?.stoppedRunId === run.id
+    && await provesNoNativeRunProviderWork(tx, { companyId: run.companyId, runId: run.id })) {
+    await gatherPersonStoppedChatMessages(tx, run, issue, now);
+    return true;
+  }
   // The native owner, not HTTP status or the queue, proves no execution. An
   // affirmative pre-dispatch failure leaves the saved input on the normal
   // admission path; inventing a reconciliation hold would dead-end resends.
