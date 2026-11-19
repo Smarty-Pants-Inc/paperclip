@@ -11,8 +11,10 @@ import {
 } from "../services/workspace-instance-cleanup.js";
 import type { WorkspaceOperation } from "@paperclipai/shared";
 import type { WorkspaceOperationRecorder } from "../services/workspace-operations.js";
+import { logger } from "../middleware/logger.js";
 import { createObjectRunLogStore, readObjectRunLogSpill } from "../services/object-run-log-store.js";
-import { contentSpill, event, ids, spillMemory } from "../services/object-run-log-spill.fixture.js";
+import { contentSpill, custodySpill, event, ids, plantSpillCustodyFault, SPILL_CUSTODY_FAULTS, SPILL_CUSTODY_ROW,
+  spillCustodyFaults, spillMemory, type SpillCustodyFault } from "../services/object-run-log-spill.fixture.js";
 
 const tempRoots = new Set<string>();
 
@@ -120,28 +122,51 @@ describe("worktree instance cleanup", () => {
   });
 
   // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7002475364 (rf-3 condition 4)
+  // catch: rf-7 OBJLOG9 F1 (11-19): a record corrupted to zero bytes, `{}` or `[]` read as
+  // "recovered", and the only copy of the spilled bytes went with the instance.
   // Keep reason: NEVER-OK trace custody. This cleanup is the one path that
   // removes a whole instance root; run-log bytes that exist ONLY in the kept
-  // spill under it must never go with it.
-  it.each([
+  // spill under it must never go with it. The instance's real writer at its
+  // default spill root; "recovered" is a real recovery that cleanup reads
+  // back, and every other state is a planted, named fault.
+  const defaultRootSpills: Array<[string, "refused", boolean | "unreadable" | SpillCustodyFault]> = [
     ["holds run-log bytes object storage has not taken", "refused", false],
     ["holds recovered spill bytes retained as raw traces", "refused", true],
     ["has a record that cannot be read", "refused", "unreadable"],
-  ] as const)("an instance whose run-log spill %s is %s", async (_case, status, recovered) => {
+    ...spillCustodyFaults.map((fault): [string, "refused", SpillCustodyFault] => [`has unknown custody (${fault})`, "refused", fault]),
+  ];
+  it.each(defaultRootSpills)("an instance whose run-log spill %s is %s", async (_case, status, state) => {
     const worktreesDir = await makeTempRoot("paperclip-managed-worktrees-");
     const workspacePath = await makeTempRoot("paperclip-cleanup-workspace-");
     const instanceId = "pap-spill";
     const instanceRoot = path.join(worktreesDir, "instances", instanceId);
-    const spillDir = path.join(instanceRoot, "data", "run-logs", ".spill", "company", "agent");
-    await fs.mkdir(spillDir, { recursive: true });
-    const bytes = "{\"chunk\":\"admitted\"}\n";
-    const entry = { v: 1, event: "spilled", at: "2026-11-19T00:00:00Z", logRef: "company/agent/run", spillStart: 0,
-      bytes: bytes.length, sha256: "0".repeat(64), journalEnd: 0 };
-    await fs.writeFile(path.join(spillDir, "run.ndjson"), bytes);
-    await fs.writeFile(path.join(spillDir, "run.index.ndjson"),
-      recovered === "unreadable" ? "{torn" : [entry, ...(recovered ? [{ ...entry, event: "recovered", journalEnd: bytes.length }] : [])]
-        .map(line => `${JSON.stringify(line)}\n`).join(""));
+    await fs.mkdir(instanceRoot, { recursive: true });
     await writeWorkspaceEnv(workspacePath, worktreesDir, instanceId);
+    vi.stubEnv("PAPERCLIP_HOME", worktreesDir);
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", instanceId);
+    vi.stubEnv("RUN_LOG_SPILL_PATH", undefined);
+    vi.stubEnv("RUN_LOG_BASE_PATH", undefined);
+    const m = spillMemory();
+    const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", flushMs: 1000,
+      assertWriterAuthority: async () => undefined });
+    const handle = await store.begin({ ...ids, runId: "run" });
+    m.state.down = true;
+    const committed = (await store.enqueue!(handle, event(1, "admitted"))).committed.catch(() => undefined);
+    await store.finalize(handle);
+    await committed;
+    const fault = typeof state === "string" && state !== "unreadable" ? state : null;
+    if (state === true || (fault && SPILL_CUSTODY_FAULTS[fault].recovered)) {
+      m.state.down = false;
+      await store.recoverSpill!({ ...ids, runId: "run" });
+    }
+    const spill = await readObjectRunLogSpill(undefined, handle.logRef);
+    expect(spill.path).toBe(path.join(instanceRoot, "data", "run-logs", ".spill", "company", "agent", "run.ndjson"));
+    expect(spill.unrecovered.length > 0).toBe(state === false || state === "unreadable" || (!!fault && !SPILL_CUSTODY_FAULTS[fault].recovered));
+    if (state === "unreadable") await fs.writeFile(spill.indexPath, "{torn");
+    if (fault) await plantSpillCustodyFault({ ...spill, m, logRef: handle.logRef }, fault);
+    const bytes = await fs.readFile(spill.path), index = await fs.readFile(spill.indexPath).catch(() => null);
+    // Cleanup runs in the parent server, without the instance writer's environment.
+    vi.unstubAllEnvs();
     const { recorder, operations } = createRecorderDouble();
     const result = await cleanupWorktreeInstanceArtifacts({
       pointer: (await readWorktreeInstancePointer(workspacePath))!, workspaceId: "workspace-1", workspacePath,
@@ -149,10 +174,12 @@ describe("worktree instance cleanup", () => {
     });
     expect(result.status).toBe(status);
     if (status === "refused") {
-      expect(await fs.readFile(path.join(spillDir, "run.ndjson"), "utf8")).toBe(bytes);
+      expect(await fs.readFile(spill.path)).toEqual(bytes);
+      expect(await fs.readFile(spill.indexPath).catch(() => null)).toEqual(index);
       // TODAY keeps all raw traces, including recovered spill files. Recovery
       // never authorizes deleting the retained trace or weakening that guard.
-      expect(operations.at(-1)?.metadata).toMatchObject(recovered === true
+      // (The recovered row reaches this policy only because its read-back hashed equal.)
+      expect(operations.at(-1)?.metadata).toMatchObject(state === true
         ? { refusalReason: "raw_traces_kept", rawTraceDirectories: [path.join(instanceRoot, "data", "run-logs")] }
         : { refusalReason: "run_log_spill_unrecovered", unrecoveredRunLogSpills: ["company/agent/run"] });
     }
@@ -248,6 +275,31 @@ describe("worktree instance cleanup", () => {
       expect(await fs.readFile(spill.path)).toEqual(spill.bytes);
       expect(await fs.readFile(spill.indexPath)).toEqual(spill.index);
     }
+  });
+
+  // catch: rf-7 OBJLOG9 F1 (11-19); the bar: delete only on a positive record AND an equal read-back.
+  // Keep reason: NEVER-OK trace custody. Real writer and store, real recursive removal; each fault planted and named.
+  it.each(spillCustodyFaults)("keeps an instance whose content spill has unknown custody (%s)", async fault => {
+    const worktreesDir = await makeTempRoot("paperclip-content-instance-");
+    const workspacePath = await makeTempRoot("paperclip-content-workspace-");
+    const instanceId = "content-spill";
+    const instanceRoot = path.join(worktreesDir, "instances", instanceId);
+    await fs.mkdir(instanceRoot, { recursive: true });
+    await writeWorkspaceEnv(workspacePath, worktreesDir, instanceId);
+    const spill = await custodySpill(workspacePath, path.join(instanceRoot, "build"), fault);
+    const warn = vi.spyOn(logger, "warn");
+    const { recorder, operations } = createRecorderDouble();
+    const result = await cleanupWorktreeInstanceArtifacts({
+      pointer: (await readWorktreeInstancePointer(workspacePath))!, workspaceId: "workspace-1", workspacePath,
+      expectedInstanceId: instanceId, expectedInstanceRoot: instanceRoot, worktreesDir, recorder,
+    });
+    expect(result.status).toBe("refused");
+    expect(operations.at(-1)?.metadata).toMatchObject({ refusalReason: "run_log_spill_content_kept" });
+    expect(warn.mock.calls.filter(call => call[1] === SPILL_CUSTODY_ROW).map(call => call[0])).toContainEqual(
+      expect.objectContaining({ reason: spill.reason,
+        spill: path.join(await fs.realpath(instanceRoot), path.relative(instanceRoot, spill.path)) }));
+    expect(await fs.readFile(spill.path)).toEqual(spill.bytes);
+    expect(await fs.readFile(spill.indexPath).catch(() => null)).toEqual(spill.index);
   });
 
   it("preserves a collision-resistant active instance when persisted ownership is absent", async () => {

@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { logger } from "../middleware/logger.js";
 import { candidateHoldsUnrecoveredRunLogSpill, createObjectRunLogStore, readObjectRunLogSpill } from "../services/object-run-log-store.js";
 import { findWorktreeInstanceRawTraces } from "../services/workspace-instance-cleanup.js";
-import { contentSpill, event, ids, spillMemory } from "../services/object-run-log-spill.fixture.js";
+import { contentSpill, custodySpill, event, ids, SPILL_CUSTODY_ROW, spillCustodyFaults, spillMemory } from "../services/object-run-log-spill.fixture.js";
 import {
   WORKSPACE_COMPACTION_TRASH_DIR,
   deleteWorkspaceCompactionTrash,
@@ -161,6 +161,27 @@ describe("findRegenerableWorkspaceDirs", () => {
       expect(await fs.readFile(spill.path)).toEqual(spill.bytes);
       expect(await fs.readFile(spill.indexPath)).toEqual(spill.index);
     }
+  });
+
+  // catch: rf-7 OBJLOG9 F1 (11-19); the bar: delete only on a positive record AND an equal read-back.
+  // Keep reason: NEVER-OK trace custody, real writer and store, real rename/delete; each fault planted and named.
+  it.each(spillCustodyFaults)("keeps a spill of unknown custody through find, move and trash delete (%s)", async fault => {
+    const { worktreePath } = await createRepoWithWorktree(["build/", "dist/", ".env"]);
+    const spill = await custodySpill(worktreePath, path.join(worktreePath, "build"), fault);
+    await write(path.join(worktreePath, "dist", "control.js"));
+    const warn = vi.spyOn(logger, "warn");
+    const candidates = await findRegenerableWorkspaceDirs(worktreePath);
+    // Also pass a stale candidate list to exercise the destructive recheck.
+    const move = await moveWorkspaceDirsToTrash(worktreePath, ["build", "dist"]);
+    await deleteWorkspaceCompactionTrash(move.trashDir);
+    const rows = warn.mock.calls.filter(call => call[1] === SPILL_CUSTODY_ROW).map(call => call[0]);
+    warn.mockRestore();
+    expect(candidates).toEqual(["dist"]);
+    expect(move.moved.map(entry => entry.relativePath)).toEqual(["dist"]);
+    expect(await fs.stat(path.join(worktreePath, "dist")).then(() => true, () => false)).toBe(false);
+    expect(rows).toContainEqual(expect.objectContaining({ spill: spill.path, reason: spill.reason }));
+    expect(await fs.readFile(spill.path)).toEqual(spill.bytes);
+    expect(await fs.readFile(spill.indexPath).catch(() => null)).toEqual(spill.index);
   });
 
   // Keep reason: trace custody must not quietly make real dependency trees uncompactable.
