@@ -131,7 +131,8 @@ export async function acknowledgedNativeStopExecutionHasStopped(db: Db, run: Pic
       eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id))).limit(1);
     if (!owner) return false;
     const { handedOffWarmLeaseSettled } = await import("./native-runtime/handed-off-warm-lease.js");
-    for (const lease of unreceipted) if (!await handedOffWarmLeaseSettled(owner, lease)) return false;
+    // rf-4 row 22a: DB-only; the proof itself ran outside any transaction (run-control).
+    for (const lease of unreceipted) if (!handedOffWarmLeaseSettled(owner, lease)) return false;
     return true;
   }
   if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return false;
