@@ -613,8 +613,13 @@ describeEmbeddedPostgres("I-A''' answered-person floor (a3)", () => {
     const system = await f.run("succeeded", [], 4);
     await f.reply(system.id, 5);
     expect(await f.answered(m.id)).toBe(false);
-    await expectOneTrueNote("a3-sys", f, m, failed.id);
-    expect((await f.cards()).map(c => c.metadata?.authorizationReason)).toEqual([reason(m.id)]);
+    // The later success hid the failed carrier's card without answering M: the ONE
+    // note quotes M, exactly once, ahead of the unchanged words (neworg-floorP).
+    const quote = `Your message is saved: “${m.body}”. `;
+    await expectOneTrueNote("a3-sys", f, m, failed.id, quote + UNANSWERED_MESSAGE_TEXT);
+    const notes = await f.cards();
+    expect(notes.map(c => c.metadata?.authorizationReason)).toEqual([reason(m.id)]);
+    expect(notes[0]!.body.split(quote).length - 1, "the quote appears exactly once").toBe(1);
   });
 
   it.each(["cancelled", "failed"] as const)("(a3-1117) M carried by %s then N claimed and answered => no card or wake for M", async status => {
