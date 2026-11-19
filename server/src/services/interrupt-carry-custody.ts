@@ -56,9 +56,13 @@ export async function commentIdsCarriedElsewhere(
   const held = new Set<string>([
     ...runs.flatMap(({ status, contextSnapshot, resultJson }) => {
       const context = (contextSnapshot ?? {}) as Record<string, unknown>;
-      return [...strings((resultJson ?? {} as Record<string, unknown>).interruptCarriedSteeredCommentIds),
+      const result = (resultJson ?? {}) as Record<string, any>;
+      return [...strings(result.interruptCarriedSteeredCommentIds),
         ...(["queued", "running", "scheduled_retry"].includes(status)
-          ? [...strings(context.wakeCommentIds), ...strings([context.wakeCommentId, context.commentId])] : [])];
+          ? [...strings(context.wakeCommentIds), ...strings([context.wakeCommentId, context.commentId])] : [])]
+        // The pre-RPC reservation is not a carrier after definite refusal.
+        // Pending/acknowledged inputs retain their existing single-owner fence.
+        .filter(id => result.queuedSteeringAcknowledgements?.[id]?.status !== "rejected");
     }),
     ...wakes.filter(wake => !input.idempotencyKey || wake.idempotencyKey !== input.idempotencyKey).flatMap(({ payload }) =>
       strings(((payload ?? {}) as Record<string, any>)._paperclipWakeContext?.wakeCommentIds)),
