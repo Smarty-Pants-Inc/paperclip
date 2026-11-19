@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { writeFileSync } from "node:fs";
 import fixtures from "./__fixtures__/shared-root-hold-inbox.json";
+import waitingFixtures from "./__fixtures__/shared-root-waiting-inbox.json";
 
 // RENDERED rows (d2shared4, F2): the Inbox page, mounted whole, on the REAL bodies of the GETs it reads, while a
 // person's message M is held behind "Continue with the files as they are" (a reply's file save partly landed on the
@@ -15,6 +16,9 @@ import fixtures from "./__fixtures__/shared-root-hold-inbox.json";
 // press that row then sent through the real POST /api/issues/:id/retry and what the GETs said afterwards.
 // REAL: the Inbox page, its failed-run row and its retry mutation. MOCKED: the transport only (the api modules return
 // the fixture's bodies and record what the page sends).
+// d2shared5, (c): the SAME row one step earlier, while R's box is still stopping (the automatic wait). Its fixture
+// (shared-root-waiting-inbox.json, built by mkfixture-waiting.py of the d2shared5 report) is what server row WAITING of
+// the same server file read from the real routes in that state; nothing is planted for it.
 // Widths: jsdom has no layout engine, so "at 390 / at 1440" is what Tailwind's responsive display classes of the
 // rendered markup leave on screen at that viewport width (hidden, sm:flex, sm:hidden, ...), evaluated by onScreen().
 const routerMock = vi.hoisted(() => ({ location: { pathname: "/inbox/mine", search: "", hash: "" }, navigate: vi.fn() }));
@@ -62,12 +66,14 @@ async function act(callback: () => void | Promise<void>) {
 }
 
 type Fixture = (typeof fixtures)["held_continueRequired"] | (typeof fixtures)["afterPress"] | (typeof fixtures)["ordinaryFailedRun_noHold"]
-  | (typeof fixtures)["heldAfterPlainRetry"];
+  | (typeof fixtures)["heldAfterPlainRetry"] | (typeof waitingFixtures)["waiting_boxStopping"];
 const WIDTHS = [390, 1440] as const;
 // RFL's words (11:45Z), byte-exact, and the hold's ONE action.
 const PARTLY = "The last reply's file changes couldn't be saved, and part of them may already be in the project's files. Your message will start once you choose Continue.";
 const CONTINUE = "Continue with the files as they are";
 const TODAY = "Couldn’t finish this attempt. Your message is saved.";
+// The ONE line while the previous reply's environment is still stopping (packages/shared reply-file-line.ts).
+const WAITING = "Waiting for the previous environment to stop. Your message will start automatically.";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 // What is on screen at a viewport width, from Tailwind's responsive display classes (default breakpoints).
@@ -128,9 +134,9 @@ async function mount(fixture: Fixture, width: number) {
 }
 /** The failed-run row of R's task: the row whose link opens the task. */
 const failedRunRow = (fixture: Fixture) => host.querySelector(`a[href="/issues/${fixture.issueId}"]`)?.closest("div.group") ?? null;
-function dump(name: string, width: number, row: Element | null) {
+function dump(name: string, width: number, row: Element | null, source: string = fixtures.source) {
   if (!process.env.D2SHARED4_RENDER_DUMP) return;
-  const rendered = [`FIXTURE: ${name}`, `SOURCE: ${fixtures.source}`, `WIDTH: ${width}`, "",
+  const rendered = [`FIXTURE: ${name}`, `SOURCE: ${source}`, `WIDTH: ${width}`, "",
     "INBOX FAILED-RUN ROW, on screen:", row ? screenText(row, width) : "(no failed-run row)", "",
     `ROW BUTTONS, on screen: ${JSON.stringify(row ? labels(screenButtons(row, width)) : [])}`, "",
     "WHOLE INBOX PAGE, on screen:", screenText(host, width), ""].join("\n");
@@ -218,6 +224,33 @@ describe("the Inbox failed-run row while a message is held for Continue: the rea
       await vi.waitFor(() => expect(apiMocks.retryTask).toHaveBeenCalledTimes(1));
       // The plain Retry: no retry action.
       expect(apiMocks.retryTask.mock.calls[0]).toEqual([ordinary.issueId, { idempotencyKey: expect.stringMatching(UUID), observedRunId: ordinary.rRunId }]);
+    });
+  }
+});
+
+describe("the Inbox failed-run row while the message WAITS for the previous reply's environment to stop: the real GETs, rendered", () => {
+  for (const width of WIDTHS) {
+    it(`${width}px: the row says the task's ONE waiting sentence once and offers NOTHING to press (no 'Couldn't finish this attempt', no Retry, no Continue): the message starts by itself`, async () => {
+      const waiting = waitingFixtures.waiting_boxStopping;
+      // The real state: R's save failed for good, M is parked, nothing started, R's box is not stopped.
+      expect([waiting.runsThatCarryM, waiting.attributedRepliesToM, waiting.taskBlocker?.savedMessageWait]).toEqual([[], 0, "waiting"]);
+      await mount(waiting, width);
+      const row = await vi.waitFor(() => { const found = failedRunRow(waiting); expect(found, "the Inbox shows R's failed-run row").toBeTruthy(); return found!; });
+      dump("waiting_boxStopping", width, row, waitingFixtures.source);
+      expect(count(screenText(row, width), WAITING), "the waiting sentence, once, in the row").toBe(1);
+      expect(count(screenText(host, width), WAITING), "the waiting sentence, once, on the page").toBe(1);
+      expect(screenText(host, width)).not.toMatch(/Couldn[’']t finish this attempt|Retry is waiting|Your Retry is saved|refused to recover/);
+      expect(screenText(host, width)).not.toContain(PARTLY);
+      // The sentence is shown whole: never clipped to one line.
+      const sentence = [...row.querySelectorAll("span")].find(span => span.textContent === WAITING && onScreen(span, width))!;
+      expect(sentence.className).not.toMatch(/truncate|line-clamp|max-w-/);
+      // NOTHING to press: the message starts by itself. Never a plain Retry, never Continue.
+      expect(labels(remedies(row, width)), "the row's actions").toEqual([]);
+      expect(labels(screenButtons(host, width)).filter(label => label === "Retry" || label === CONTINUE)).toEqual([]);
+      expect(apiMocks.retryTask).not.toHaveBeenCalled();
+      // The SAME sentence the task and the queue line say, in the same real state (the task's blocker, the queue's wait).
+      expect(waiting.taskBlocker).toEqual({ nextAction: WAITING, savedMessageWait: "waiting" });
+      expect(waiting.queueWait).toMatchObject({ message: WAITING });
     });
   }
 });
