@@ -1623,10 +1623,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await everNoted(f), "one note row, ever").toEqual([pausedNote.id]);
     });
 
-  it.each([true, false])("pause-resume 2 (merged): chat=%s, sampled during 'resuming' with nothing queued yet: the paused note is retired at once; if nothing ever starts, the no-run words come back in the SAME row", async chat => {
+  it.each([true, false])("pause-resume 2 (merged): chat=%s, sampled during 'resuming' with nothing queued yet: the SAME row says 'resuming' at once (never 'is paused', never silence; RFL 11:06Z); if nothing ever starts, the no-run words replace it in the SAME row", async chat => {
     const { f, pausedNote } = await pausedThenResumed(chat);
+    // Literal, deliberately independent of the production constant.
+    const resuming = [{ id: pausedNote.id, body: "Managed Pi is resuming. Your message is saved and starts next." }];
+    expect(await one(f), "the Resume route itself rewrote the note (no sweep pass in between)").toEqual(resuming);
     await f.sweep();
-    expect(await one(f), "'resuming' is never paused").toEqual([]);
+    expect(await one(f), "'resuming' is never paused, and the line does not go silent").toEqual(resuming);
+    await settleAt(f, 60_000);
+    expect(await one(f), "inside the bound: still the one resuming line").toEqual(resuming);
     await settleAt(f, 11 * 60_000);
     expect(await one(f)).toEqual([{ id: pausedNote.id, body: NO_RUN }]);
     expect(await everNoted(f)).toEqual([pausedNote.id]);

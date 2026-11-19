@@ -18,7 +18,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 
 // Keep (PERSON CASE, merged fold): after a person Resumes a paused agent, a message waiting for its run shows
 // EXACTLY ONE true line (the run's header or the saved wake's panel line): never the stale '<agent> is paused' note
-// beside it, never silence. While the message's OWN run is running the note says WORKING; if that run ends
+// beside it, never silence. From the Resume until that line exists, the SAME note says 'resuming' (RFL 11:06Z). While the message's OWN run is running the note says WORKING; if that run ends
 // unanswered, the merged line's own words replace it IN PLACE (same id, one note).
 // REAL: POST /api/agents/:id/pause, POST /api/issues/:id/comments, POST /api/agents/:id/resume; the REAL lifecycle
 // worker (pausing -> paused, resuming -> ready); real admission, chat outbox delivery, claim and run creation on the
@@ -67,6 +67,7 @@ const PERSON = "mfold-person";
 const PAUSED = "Managed Pi is paused. Your message is saved, and it will run when Managed Pi is resumed. "
   + "A board user or Managed Pi's manager can resume Managed Pi.";
 const WORKING = "Managed Pi is working on your message.";
+const RESUMING = "Managed Pi is resuming. Your message is saved and starts next.";
 const NO_REPLY = "This run finished without a reply to your message. Sending it again is safe.";
 const samples: unknown[] = [];
 
@@ -222,17 +223,22 @@ describe.skipIf(!support.supported)("merged fold: after Resume a waiting message
     return { ...s, M, pausedNoteId: standing[0]!.id };
   }
 
-  it.each(["answer", "silent"] as const)("chat: paused note -> Resume ('resuming': the note retires) -> WAITING behind another run: exactly ONE true line (the run's header), no paused note -> its OWN run RUNNING: WORKING (same id) -> the run ends with %s", async ending => {
+  it.each(["answer", "silent"] as const)("chat: paused note -> Resume (the SAME note says 'resuming' until M's run exists) -> WAITING behind another run: exactly ONE true line (the run's header), no paused note -> its OWN run RUNNING: WORKING (same id) -> the run ends with %s", async ending => {
     const s = await pausedWithNote();
     await s.capture("paused", "chat", s.M);
     let release!: (outcome: "answer" | "silent") => void;
     let releaseOther!: (outcome: "answer" | "silent") => void;
     try {
-      // The Resume route alone: 'resuming'. The agent is not paused any more, so the note that says it is goes.
+      // The Resume route alone: 'resuming'. The agent is not paused any more, so the note that says it is paused
+      // says 'resuming' instead, IN PLACE (same id), by the Resume itself (no sweep pass in between); it stays the
+      // ONE line, sweep after sweep, until M's run exists (RFL 11:06Z; was: retired into silence).
       await s.resumeRoute();
+      expect(await s.notes(), "read right after the Resume response: the SAME note says 'resuming', never 'is paused'").toEqual([{ id: s.pausedNoteId, body: RESUMING }]);
       await s.sweep(0);
-      expect(await s.notes(), "sampled during 'resuming': '<agent> is paused' is no longer true and is retired").toEqual([]);
+      expect(await s.notes(), "sampled during 'resuming'").toEqual([{ id: s.pausedNoteId, body: RESUMING }]);
       await s.ready();
+      await s.sweep(0);
+      expect(await s.notes(), "ready, M's run not created yet: still the one resuming line").toEqual([{ id: s.pausedNoteId, body: RESUMING }]);
       // The agent's ONE slot is taken by its run on ANOTHER task (real POST there, real dispatch; that turn is held).
       fixture.holds[s.otherIssueId] = new Promise(resolve => { releaseOther = resolve; });
       fixture.holds[s.issueId] = new Promise(resolve => { release = resolve; });
@@ -243,6 +249,7 @@ describe.skipIf(!support.supported)("merged fold: after Resume a waiting message
       await s.until("M's queued run", async () => (await s.runs()).some(run => run.commentIds.includes(s.M)), s.deliver);
       const [queued] = (await s.runs()).filter(run => run.commentIds.includes(s.M));
       expect(queued!.status, "M is merely waiting: its run is queued").toBe("queued");
+      expect(await s.notes(), "the run's creation itself retired the resuming line (no sweep pass in between): its header is the one line").toEqual([]);
       for (const ms of [0, 30_000, 2 * 60_000, 11 * 60_000]) {
         await s.sweep(ms);
         expect(await s.notes(), `waiting +${ms}: no stale paused note and no other note beside the run's header`).toEqual([]);

@@ -201,6 +201,7 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "../execution-workspace-policy.js";
 import { readContinuationAttempt } from "../recovery/index.js";
+import { retireResumingNotesForQueuedRun } from "../recovery/unanswered-person-message.js";
 import { allowsDependencyBlockedWake, extractWakeCommentIds, wakeChatConversationsConflict } from "../../modules/run-dispatch/index.js";
 import { dispatchForAgent, outsideAgentDispatch } from "../agent-start-lock.js";
 import { AgentRunSlotsFull, assertAgentRunSlotFree } from "./run-slot-admission.js";
@@ -5379,6 +5380,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             })
             .returning()
             .then((rows) => rows[0]);
+
+          // The task's run now exists: its header is the one line, so a standing resuming line retires in this
+          // same transaction, under this issue lock (never two lines, never none).
+          await retireResumingNotesForQueuedRun(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id });
 
           if (ownsReconstructionContinuation) {
             await tx.update(issueRecoveryActions).set({ evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({

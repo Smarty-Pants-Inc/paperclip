@@ -198,6 +198,31 @@ export function createAgentLifecycle(db: Db, hooks: BudgetServiceHooks = {}, aut
   const agentLifecycle = lifecycle.createAgentLifecycle(db, effects);
   const requestHire = agentLifecycle.requestHire.bind(agentLifecycle);
   agentLifecycle.requestHire = (...args) => requestHireWithContentionRetry(db, requestHire, ...args);
+  // EVENT-DRIVEN (RFL 11:06Z): the Resume itself settles the agent's standing '<agent> is paused' notes (they say
+  // 'resuming' in place from now until the message's run exists), without waiting for a sweep pass. The Resume
+  // has committed; this never fails it.
+  const settleNotes = async (agent: { id: string; companyId: string } | null | undefined) => {
+    if (!agent) return;
+    try {
+      const { settlePausedNotesOnResume } = await import("./recovery/unanswered-person-message.js");
+      await settlePausedNotesOnResume(db, { companyId: agent.companyId, agentId: agent.id });
+    } catch (error) {
+      logger.warn({ companyId: agent.companyId, agentId: agent.id, errorDetail: lifecycleErrorDetail(error) },
+        "Could not settle the paused notes at Resume; the next sweep pass does");
+    }
+  };
+  const resumeAgent = agentLifecycle.resumeAgent.bind(agentLifecycle);
+  agentLifecycle.resumeAgent = async (...args) => {
+    const agent = await resumeAgent(...args);
+    await settleNotes(agent);
+    return agent;
+  };
+  const updateAndTransition = agentLifecycle.updateAndTransition.bind(agentLifecycle);
+  agentLifecycle.updateAndTransition = async (...args) => {
+    const agent = await updateAndTransition(...args);
+    if (args[1] === "resume") await settleNotes(agent);
+    return agent;
+  };
   return agentLifecycle;
 }
 

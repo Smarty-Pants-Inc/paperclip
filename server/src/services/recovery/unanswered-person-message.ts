@@ -95,11 +95,20 @@ export const UNANSWERED_MESSAGE_WORKING_CODE = "working_on_message";
 /** The working note's wording, in ONE place. */
 export const UNANSWERED_MESSAGE_WORKING_TEXT = (name: string) => `${name} is working on your message.`;
 export const UNANSWERED_MESSAGE_WORKING_TITLE = (name: string) => `${name} is working on it`;
-const WAITING_KIND_CODES = new Set(["agent_paused", UNANSWERED_MESSAGE_AGENT_SETUP_CODE, UNANSWERED_MESSAGE_WORKING_CODE]);
+/** After a Resume (RFL 11:06Z, ruled): from the moment the agent leaves 'paused' until the message's run header
+ * exists, the message's standing '<agent> is paused' note is REWRITTEN IN PLACE (same comment id, one note) to
+ * this line. It retires the moment the message's run is created (its header is then the one line). */
+export const UNANSWERED_MESSAGE_AGENT_RESUMING_CODE = "agent_resuming";
+/** proposed, pending RFL: the ONE constant for the resuming line's words. */
+export const UNANSWERED_MESSAGE_RESUMING_TEXT = (name: string) => `${name} is resuming. Your message is saved and starts next.`;
+export const UNANSWERED_MESSAGE_RESUMING_TITLE = (name: string) => `${name} is resuming`;
+const WAITING_KIND_CODES = new Set(["agent_paused", UNANSWERED_MESSAGE_AGENT_RESUMING_CODE, UNANSWERED_MESSAGE_AGENT_SETUP_CODE,
+  UNANSWERED_MESSAGE_WORKING_CODE]);
 /** The notes this sweep RETIRES while their message is still owed (a stale paused note after a Resume, a working
  * note whose run no longer runs). If the message is later owed a line again, that line is written into the SAME
  * row (same id): never a second note for one message. */
-const REVIVABLE_WAITING_CODES: ReadonlySet<string> = new Set([UNANSWERED_MESSAGE_AGENT_PAUSED_CODE, UNANSWERED_MESSAGE_WORKING_CODE]);
+const REVIVABLE_WAITING_CODES: ReadonlySet<string> = new Set([UNANSWERED_MESSAGE_AGENT_PAUSED_CODE,
+  UNANSWERED_MESSAGE_AGENT_RESUMING_CODE, UNANSWERED_MESSAGE_WORKING_CODE]);
 /** Paperclip's pause model: POST /agents/:id/resume is allowed for a board user
  * or an agent that manages the paused agent (routes/agents.ts:6017-6023 ->
  * assertCanManageAgentLifecycle :2613-2623 -> agent-subtree-management.ts:34-39
@@ -709,7 +718,10 @@ export const PENDING_WAIT_BOUND_MS = 2 * 60_000;
 /** What decideMessage found standing for the message (pausefix on the merged line): `staleNote` is a LIVE
  * waiting-kind note that is no longer true (an '<agent> is paused' note on an agent that is not paused; a working
  * note whose own run no longer runs). `retire` says the decision may retire it when it only waits. */
-type StandingNote = { staleNote?: RetireStale; retire?: boolean };
+type StandingNote = { staleNote?: RetireStale; retire?: boolean;
+  /** The live paused note of an agent that is not paused any more, with no line of the message's own yet (no live
+   * run on the task, no saved wake's panel line): while the decision only waits, the SAME row says 'resuming'. */
+  resuming?: Pick<NoticeDecision, "reason" | "notice" | "group" | "upgradeCommentId"> };
 
 /** The one predicate: run outside the fence to skip the lock in the common
  * case, and again unchanged inside it before writing. Reads only.
@@ -725,6 +737,12 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const decision = await decideMessage(q, issue, now, nativeBlockedRepairApplies, messageId, cardAnswerId, standing);
   if (standing.staleNote && (decision.kind === "explained" || (decision.kind === "pending" && standing.retire))) {
     return { ...decision, retireStale: standing.staleNote };
+  }
+  // The agent left 'paused' and the message only waits, with no line of its own yet: the paused note becomes the
+  // resuming line IN PLACE (never retired into silence, never left saying 'is paused').
+  if (standing.resuming && decision.kind === "pending" && !standing.retire) {
+    return { kind: "notice", code: UNANSWERED_MESSAGE_AGENT_RESUMING_CODE, ...standing.resuming,
+      ...(decision.recordWait ? { recordWait: decision.recordWait } : {}) };
   }
   return decision;
 }
@@ -879,19 +897,39 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   const working = !agentPaused && liveRuns.some(candidate => candidate.status === "running"
     && runCarriesMessage(candidate.contextSnapshot, message.id));
   // The note that is no longer true (never the person's own Stop: that returned above).
+  // The resume line (RFL 11:06Z): a live paused or resuming note of an agent that is NOT paused (and not in setup).
+  const resumeLine = Boolean(standingLive && !cardAnswer && !agentPaused && !setupShape
+    && (standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE || standingWaitingCode === UNANSWERED_MESSAGE_AGENT_RESUMING_CODE));
   if (standingLive && !cardAnswer && ((standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE && !agentPaused)
+    || (standingWaitingCode === UNANSWERED_MESSAGE_AGENT_RESUMING_CODE && !agentPaused)
     || (standingWaitingCode === UNANSWERED_MESSAGE_WORKING_CODE && !working))) {
     standing.staleNote = { noticeId: upgrading!, messageId: message.id };
-    // A stale paused note goes the moment the agent is not paused and the message only waits. A working note
-    // whose run stopped running goes when another line is there (a live run's header, or the saved wake's line,
-    // set below); with none, it stays for the ended run's short settle and is then replaced in place by this
-    // line's own words (failed / no reply), never left over an ended run.
-    standing.retire = standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE || liveRuns.length > 0;
+    // A paused note of an agent that is not paused any more never keeps saying 'is paused' and never goes into
+    // silence: with a line of the message's own already there (a live run's header; the saved wake's panel line,
+    // set below) it retires; with none it says 'resuming' IN PLACE (standing.resuming) until that line exists
+    // (the queued run's creation retires it: retireResumingNotesForQueuedRun). A working note whose run stopped
+    // running goes when another line is there; with none, it stays for the ended run's short settle and is then
+    // replaced in place by this line's own words (failed / no reply), never left over an ended run.
+    standing.retire = liveRuns.length > 0 || (standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE && setupShape);
+    if (resumeLine && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE && liveRuns.length === 0) {
+      const name = agentRow?.name?.trim() || "This agent";
+      const notice = buildStrandedRecoveryEscalationNotice({
+        seed: { title: UNANSWERED_MESSAGE_RESUMING_TITLE(name), body: UNANSWERED_MESSAGE_RESUMING_TEXT(name), tone: "info" },
+        recoveryActionId: null, recoveryOwner: null, recoveryResponsibility: "user", sourceRun: null, failureCode: undefined,
+      });
+      // No next action: nothing for the person to do while it resumes.
+      notice.metadata.sections = notice.metadata.sections
+        .map(section => ({ ...section, rows: section.rows.filter(row => row.label !== "Next action") }))
+        .filter(section => section.rows.length > 0);
+      notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, UNANSWERED_MESSAGE_AGENT_RESUMING_CODE)] });
+      standing.resuming = { reason, notice, upgradeCommentId: upgrading!, group: messageRun?.id ?? UNANSWERED_MESSAGE_NO_RUN_CODE };
+    }
   }
   // After a Resume the paused note says the agent is working on the message, in the SAME row: a standing stale
   // paused note, or the one this sweep retired while the message waited. No waiting note is ported (RFL
   // SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119): a message with no paused note keeps the run's header alone.
-  if (working && !cardAnswer && upgrading && (standingLive ? standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE : revive)) {
+  if (working && !cardAnswer && upgrading && (standingLive ? (standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE
+    || standingWaitingCode === UNANSWERED_MESSAGE_AGENT_RESUMING_CODE) : revive)) {
     const name = agentRow?.name?.trim() || "This agent";
     const notice = buildStrandedRecoveryEscalationNotice({
       seed: { title: UNANSWERED_MESSAGE_WORKING_TITLE(name), body: UNANSWERED_MESSAGE_WORKING_TEXT(name), tone: "info" },
@@ -1016,6 +1054,13 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   } else if (agentPaused) {
     code = UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   } else if (!run) {
+    // The resume line's message was sent while the agent was paused: its start is owed from the Resume, not from
+    // the message's own (long past) time. Bounded like every other further attempt (T0 is this wait's first pass)
+    // before any "no run started" words replace the resuming line in place.
+    if (resumeLine) {
+      const wait = await bounded(now.getTime() + 30_000);
+      if (wait) return wait;
+    }
     // Paperclip records a deferred or coalesced wake that could not start as
     // FAILED: that is the trigger. The grace covers a wake that threw before
     // any wake row existed (the comment route logs and returns 201).
@@ -1236,4 +1281,39 @@ export async function settleUnansweredPersonMessages(
     }
   }
   return result;
+}
+
+/** EVENT-DRIVEN (RFL 11:06Z): the Resume itself rewrites the agent's standing '<agent> is paused' notes, without
+ * waiting for the next sweep pass (which can wait behind the conversation delivery lock or a lifecycle plugin's
+ * retries). It runs the ONE sweep decision for each task of the agent that shows a live paused note, so the same
+ * fenced predicate decides: an agent a hold still pauses keeps its paused note. Never fails the Resume. */
+export async function settlePausedNotesOnResume(db: Db, input: { companyId: string; agentId: string; now?: Date }): Promise<number> {
+  const tasks = await db.selectDistinct({ issueId: issueComments.issueId }).from(issueComments)
+    .innerJoin(issues, and(eq(issues.id, issueComments.issueId), eq(issues.companyId, issueComments.companyId))).where(and(
+      eq(issueComments.companyId, input.companyId), eq(issues.assigneeAgentId, input.agentId),
+      eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+      sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
+      sql`${issueComments.metadata}->'sections' @> ${JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL,
+        value: UNANSWERED_MESSAGE_AGENT_PAUSED_CODE }] }])}::jsonb`)).limit(200);
+  let rewritten = 0;
+  for (const task of tasks) {
+    const outcome = await settleUnansweredPersonMessage(db, { companyId: input.companyId, issueId: task.issueId, now: input.now });
+    if (outcome.kind === "noticed" && outcome.code === UNANSWERED_MESSAGE_AGENT_RESUMING_CODE) rewritten += 1;
+  }
+  return rewritten;
+}
+
+/** EVENT-DRIVEN retire: a queued run of the task is being created in `tx`, UNDER THE TASK'S ROW LOCK
+ * (heartbeat/queue.ts issue-scoped admission; the same fence, in the same order, as this file's writers). A live
+ * run on the task is the line the sweep already retires the note for (decideMessage: liveRuns), so the resuming
+ * line retires in the SAME transaction that creates the run: a reader never sees both and never sees neither.
+ * The row keeps its member list and stays revivable (the working line is written into it). */
+export async function retireResumingNotesForQueuedRun(tx: Pick<Db, "execute">,
+  input: { companyId: string; issueId: string; now?: Date }): Promise<void> {
+  const now = (input.now ?? new Date()).toISOString();
+  await tx.execute(sql`update ${issueComments} n set deleted_at = ${now}::timestamptz, updated_at = ${now}::timestamptz
+    where n.company_id = ${input.companyId} and n.issue_id = ${input.issueId} and n.author_type = 'system' and n.deleted_at is null
+      and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+      and n.metadata->'sections' @> ${JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL,
+        value: UNANSWERED_MESSAGE_AGENT_RESUMING_CODE }] }])}::jsonb`);
 }
