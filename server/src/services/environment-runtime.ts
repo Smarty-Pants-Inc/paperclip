@@ -2862,7 +2862,8 @@ function createSandboxEnvironmentDriver(
     },
 
     async releaseRunLease(input) {
-      if (input.status === "expired" && input.lease.leasePolicy === "reuse_by_environment") {
+      if (input.status === "expired" &&
+          ["reuse_by_environment", "reuse_by_execution_workspace"].includes(input.lease.leasePolicy)) {
         return await destroyReusableSandboxLease({
           environment: input.environment,
           lease: input.lease,
