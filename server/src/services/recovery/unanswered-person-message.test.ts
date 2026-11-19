@@ -33,6 +33,8 @@ import { errorHandler } from "../../middleware/index.js";
 import { agentRoutes } from "../../routes/agents.js";
 import { executionProjectionsForRuns } from "../execution-projection.js";
 import { heartbeatService } from "../heartbeat.js";
+import { createAgentLifecycle } from "../agent-lifecycle.js";
+import { LIFECYCLE_ENVIRONMENT_WAIT_MESSAGE } from "../../modules/agent-lifecycle/application/retry.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { answeredPersonMessageSql } from "../person-message-answer.js";
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
@@ -48,7 +50,7 @@ import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from
 import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { settleUnansweredPersonMessage, settleUnansweredPersonMessagesForTask, unansweredPersonMessageCommentCondition,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
-  UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY,
+  UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY, UNANSWERED_MESSAGE_WORKING_TITLE,
   PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS } from "./unanswered-person-message.js";
 // mcomp: merged10 (de524143) retired the exported PENDING_WAIT_START_BOUND_MS; merged9's two "later too" rows keep
 // their own clock (ten minutes, the former start bound) so their assertions are unchanged.
@@ -1511,7 +1513,242 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(rowsOf(notices[0]!).some(row => row.label === "Failure code")).toBe(false);
   });
 
-  it("paused agent, then resumed: the saved message's run is the only run (B' starts none), no second note, the answer supersedes it", async () => {
+  // ---- pausefix on the merged line (mfold; tB2 al/pausefix-tb2 72519403 / 7c18f31d / 686b364d re-expressed) ----
+  // The merged line has NO waiting note of ours (RFL SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119): where tB2's rows
+  // expect "Your message is waiting to start", these expect the stale paused note RETIRED (the run's header or
+  // the saved wake's panel line is the one line). Where tB2's rows expect its started-run words, these expect
+  // this line's own words. The real-route rows are __tests__/pause-resume-one-line-routes.test.ts; the states here
+  // are PLANTED and named: the run rows (f.run), and the worker's 'complete' write (pausing -> paused). The pause
+  // and resume themselves are the real lifecycle writers the routes call (pauseAgent / resumeAgent).
+  const WORKING = "Managed Pi is working on your message.";
+  const pauseRoute = async (f: { agentId: string }) => {
+    await createAgentLifecycle(db).pauseAgent(f.agentId);
+    await db.update(agents).set({ lifecycleState: "paused" }).where(eq(agents.id, f.agentId)); // PLANTED: the worker's 'complete'
+  };
+  const resumeRoute = async (f: { agentId: string }) => {
+    await createAgentLifecycle(db).resumeAgent(f.agentId);
+    const [row] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(row).toMatchObject({ lifecycleState: "resuming", status: "paused", lifecycleHolds: [], pauseReason: null });
+  };
+  const noPausedLine = async (f: { visible: () => Promise<Array<{ body: string }>> }, when: string) =>
+    expect(JSON.stringify(await f.visible()), when).not.toMatch(/is paused|resume/i);
+  const agentAnswers = (f: { issueId: string }) => db.select().from(issueComments)
+    .where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent")));
+  const one = async (f: { visible: () => Promise<Array<{ id: string; body: string }>> }) =>
+    (await f.visible()).map(n => ({ id: n.id, body: n.body }));
+  /** Every note row ever written for the task's person messages, retired ones too. */
+  const everNoted = async (f: { issueId: string }) => (await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system"),
+    sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`))).map(row => row.id);
+  const pausedThenResumed = async (chat: boolean) => {
+    const f = await fixture({ chat });
+    await pauseRoute(f);
+    const commentId = await f.message("While paused: are you there?");
+    await f.sweep();
+    const [pausedNote] = await f.visible();
+    expect(pausedNote!.body).toBe(PAUSED_TEXT);
+    await resumeRoute(f);
+    return { f, commentId, pausedNote: pausedNote! };
+  };
+
+  // Keep: S10 gate 3, 2026-11-18 04:54Z: after a person's Stop and a Send the chat said '<agent> is paused'; nobody
+  // paused it. A 'pausing' / 'resuming' transition with no hold, pause reason or error ends by itself.
+  it.each(["pausing", "resuming"] as const)("paused-line: %s with no hold (PLANTED) after a Stop, then a Send -> never the paused line", async lifecycleState => {
+    const f = await fixture();
+    await f.run({ commentId: await f.message("Before Stop"), status: "cancelled", errorCode: "cancelled" });
+    await db.update(agents).set({ status: "paused", lifecycleState, lifecycleHolds: [], pauseReason: null, lifecycleError: null })
+      .where(eq(agents.id, f.agentId));
+    await f.message("After Stop, please continue.");
+    await f.sweep();
+    await noPausedLine(f, "+0");
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    await noPausedLine(f, "after the bound");
+  });
+
+  it("paused-line control: the pause route's hold on a 'pausing' agent keeps the paused line", async () => {
+    const f = await fixture();
+    await f.run({ commentId: await f.message("Before Stop"), status: "cancelled", errorCode: "cancelled" });
+    await createAgentLifecycle(db).pauseAgent(f.agentId);
+    expect((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0]).toMatchObject({ lifecycleState: "pausing", lifecycleHolds: ["manual"] });
+    await f.message("After Stop, please continue.");
+    await f.sweep();
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    expect((await f.visible()).map(n => n.body)).toEqual([PAUSED_TEXT]);
+  });
+
+  it.each([[true, null], [false, null], [true, LIFECYCLE_ENVIRONMENT_WAIT_MESSAGE], [false, LIFECYCLE_ENVIRONMENT_WAIT_MESSAGE]] as const)(
+    "pause-resume 1: chat=%s, pause -> resume ('resuming', lifecycleError=%s) -> message: no paused line at +0, +2 m, +10 m; answered once",
+    async (chat, lifecycleError) => {
+      const f = await fixture({ chat });
+      await pauseRoute(f);
+      await resumeRoute(f);
+      if (lifecycleError) await db.update(agents).set({ lifecycleError }).where(eq(agents.id, f.agentId));
+      const commentId = await f.message("After the resume: are you there?");
+      await f.sweep();
+      await noPausedLine(f, "+0");
+      const run = await f.run({ commentId, status: "running" });
+      await settleAt(f, 2 * 60_000);
+      await noPausedLine(f, "+2 m");
+      await settleAt(f, 10 * 60_000);
+      await noPausedLine(f, "+10 m");
+      expect(await f.visible(), "a message with no paused note keeps the run's header alone: no working note").toHaveLength(0);
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run));
+      await f.reply(run);
+      await settleAt(f, 11 * 60_000);
+      expect(await f.visible()).toHaveLength(0);
+      expect(await agentAnswers(f)).toHaveLength(1);
+    });
+
+  it.each([[true, "queued"], [false, "queued"], [true, "scheduled_retry"], [false, "scheduled_retry"]] as const)(
+    "pause-resume 2 (merged): chat=%s, pause -> message -> resume, its own run is %s (merely WAITING): the SAME sweep RETIRES the paused note (the run's header is the one line); never 'working'; the answer leaves nothing",
+    async (chat, status) => {
+      const { f, commentId, pausedNote } = await pausedThenResumed(chat);
+      const run = await f.run({ commentId, status });
+      await f.sweep();
+      expect(await one(f), "no stale paused note, no note of ours beside the header").toEqual([]);
+      for (const ms of [2 * 60_000, 10 * 60_000]) {
+        await settleAt(f, ms);
+        expect(await one(f), `+${ms}`).toEqual([]);
+      }
+      // Its OWN run is RUNNING now: the same row says working.
+      await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, run));
+      await f.sweep();
+      expect(await one(f)).toEqual([{ id: pausedNote.id, body: WORKING }]);
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run));
+      await f.reply(run);
+      await f.sweep();
+      expect(await f.visible()).toHaveLength(0);
+      expect(await agentAnswers(f)).toHaveLength(1);
+      expect(await everNoted(f), "one note row, ever").toEqual([pausedNote.id]);
+    });
+
+  it.each([true, false])("pause-resume 2 (merged): chat=%s, sampled during 'resuming' with nothing queued yet: the paused note is retired at once; if nothing ever starts, the no-run words come back in the SAME row", async chat => {
+    const { f, pausedNote } = await pausedThenResumed(chat);
+    await f.sweep();
+    expect(await one(f), "'resuming' is never paused").toEqual([]);
+    await settleAt(f, 11 * 60_000);
+    expect(await one(f)).toEqual([{ id: pausedNote.id, body: NO_RUN }]);
+    expect(await everNoted(f)).toEqual([pausedNote.id]);
+  });
+
+  it("pause-resume 2 (merged): paused again after the note was retired: the SAME row says paused again", async () => {
+    const { f, commentId, pausedNote } = await pausedThenResumed(true);
+    await f.run({ commentId, status: "queued" });
+    await f.sweep();
+    expect(await one(f)).toEqual([]);
+    await pauseRoute(f);
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "agent_paused", finishedAt: new Date(Date.now() - 60_000) })
+      .where(eq(heartbeatRuns.agentId, f.agentId)); // PLANTED: the pause route's cancel of the queued run
+    await settleAt(f, 60_000);
+    expect(await one(f)).toEqual([{ id: pausedNote.id, body: PAUSED_TEXT }]);
+  });
+
+  it.each([
+    ["the pause route's hold", null],
+    ["budget", { status: "paused", lifecycleState: "paused", lifecycleHolds: ["budget"], pauseReason: "budget", lifecycleError: null }],
+    ["company_paused", { status: "paused", lifecycleState: "paused", lifecycleHolds: ["company_paused"], pauseReason: "company_paused", lifecycleError: null }],
+    ["a pauseReason with no hold", { status: "paused", lifecycleState: "paused", lifecycleHolds: [], pauseReason: "manual", lifecycleError: null }],
+    ["a lifecycleError", { status: "paused", lifecycleState: "paused", lifecycleHolds: [], pauseReason: null, lifecycleError: "Saved execution configuration failed verification." }],
+  ] as const)("pause-resume 3 control: %s keeps the paused line ONCE while truly paused (chat and task)", async (_shape, row) => {
+    for (const chat of [true, false]) {
+      const f = await fixture({ chat });
+      if (row) await db.update(agents).set({ ...row, lifecycleHolds: [...row.lifecycleHolds] }).where(eq(agents.id, f.agentId)); // PLANTED shape
+      else await pauseRoute(f);
+      await f.message("Are you there?");
+      await f.sweep();
+      const [note] = await f.visible();
+      for (const ms of [2 * 60_000, 10 * 60_000]) {
+        await settleAt(f, ms);
+        expect(await one(f), `chat=${chat} +${ms}`).toEqual([{ id: note!.id, body: PAUSED_TEXT }]);
+      }
+    }
+  });
+
+  it.each([[true, null], [false, LIFECYCLE_ENVIRONMENT_WAIT_MESSAGE]] as const)(
+    "pause-resume 4 (merged): chat=%s, a 'resuming' that sticks (lifecycleError=%s) is never paused: no note inside the bound, then ONE no-run line",
+    async (chat, lifecycleError) => {
+      const f = await fixture({ chat });
+      await pauseRoute(f);
+      await resumeRoute(f);
+      if (lifecycleError) await db.update(agents).set({ lifecycleError }).where(eq(agents.id, f.agentId));
+      await f.message("After the resume: are you there?");
+      await f.sweep();
+      expect(await f.visible(), "+0").toHaveLength(0);
+      await settleAt(f, 11 * 60_000);
+      expect((await f.visible()).map(n => n.body)).toEqual([NO_RUN]);
+    });
+
+  it.each([true, false])("pausefix2 (merged): chat=%s, its OWN run is running after the Resume: the SAME note says the agent is working on it (title, no next action); the answer supersedes it", async chat => {
+    const { f, commentId, pausedNote } = await pausedThenResumed(chat);
+    const run = await f.run({ commentId, status: "running" });
+    await f.sweep();
+    const notes = await f.visible();
+    expect(notes.map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: pausedNote.id, body: WORKING }]);
+    expect(notes[0]!.presentation).toMatchObject({ title: UNANSWERED_MESSAGE_WORKING_TITLE("Managed Pi") });
+    expect(JSON.stringify(notes[0]!.metadata)).not.toMatch(/Next action/);
+    await settleAt(f, 4 * 60_000);
+    expect(await one(f)).toEqual([{ id: pausedNote.id, body: WORKING }]);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run));
+    await f.reply(run);
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    expect(await agentAnswers(f)).toHaveLength(1);
+  });
+
+  it.each(["another task", "another message on this task"] as const)("pausefix2 CONTROL (merged): the agent's running run is %s's: never 'working'; the stale paused note is retired", async other => {
+    const { f, commentId } = await pausedThenResumed(true);
+    if (other === "another task") {
+      const [otherIssue] = await db.insert(issues).values({ companyId: f.companyId, title: "Other work", assigneeAgentId: f.agentId,
+        status: "in_progress" }).returning();
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", runtimeMode: "native",
+        nativeIssueId: otherIssue!.id, contextSnapshot: { issueId: otherIssue!.id, wakeReason: "issue_assigned" } });
+      await f.run({ commentId, status: "queued" });
+    } else {
+      await f.run({ commentId: null, status: "running", wakeReason: "heartbeat_timer" });
+    }
+    await f.sweep();
+    expect(await one(f)).toEqual([]);
+    await settleAt(f, 60_000);
+    expect(JSON.stringify(await f.visible())).not.toMatch(/working on|is paused/i);
+  });
+
+  it.each([
+    ["fails", "resuming", { status: "failed", errorCode: "adapter_failed" }, NOT_ANSWERED],
+    ["succeeds with no reply", "resuming", { status: "succeeded", errorCode: null }, NO_REPLY],
+    ["fails", "ready", { status: "failed", errorCode: "adapter_failed" }, NOT_ANSWERED],
+    ["times out", "ready", { status: "timed_out", errorCode: "timeout" }, NOT_ANSWERED],
+    ["succeeds with no reply", "ready", { status: "succeeded", errorCode: null }, NO_REPLY],
+  ] as const)("pausefix2 w2 (merged): the working note's run %s without answering (agent %s): the SAME note gets this line's OWN words; one note", async (_end, state, end, text) => {
+    const { f, commentId, pausedNote } = await pausedThenResumed(true);
+    const run = await f.run({ commentId, status: "running" });
+    await f.sweep();
+    expect(await one(f)).toEqual([{ id: pausedNote.id, body: WORKING }]);
+    // PLANTED: the lifecycle worker's resuming -> ready 'complete' (status idle).
+    if (state === "ready") await db.update(agents).set({ lifecycleState: "ready", status: "idle" }).where(eq(agents.id, f.agentId));
+    await db.update(heartbeatRuns).set({ ...end, finishedAt: new Date(Date.now() - 60_000) }).where(eq(heartbeatRuns.id, run));
+    await settleAt(f, 2 * 60_000);
+    expect(await one(f)).toEqual([{ id: pausedNote.id, body: text }]);
+    await settleAt(f, 11 * 60_000);
+    expect(await one(f)).toEqual([{ id: pausedNote.id, body: text }]);
+    expect(JSON.stringify(await f.visible())).not.toMatch(/working on|is paused/i);
+    expect(await everNoted(f), "one note row, ever").toEqual([pausedNote.id]);
+  });
+
+  it("pausefix2 w2 (merged): the working note's run ended and a further attempt carrying the message is QUEUED: the working note is retired (that run's header is the line), then says working again in the SAME row", async () => {
+    const { f, commentId, pausedNote } = await pausedThenResumed(true);
+    const run = await f.run({ commentId, status: "running" });
+    await f.sweep();
+    expect(await one(f)).toEqual([{ id: pausedNote.id, body: WORKING }]);
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run));
+    const retry = await f.run({ commentId, status: "queued" });
+    await f.sweep();
+    expect(await one(f)).toEqual([]);
+    await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, retry));
+    await f.sweep();
+    expect(await one(f)).toEqual([{ id: pausedNote.id, body: WORKING }]);
+  });
+
+  it("supersedes(pausefix: stale paused note after Resume; RFL record SUPERSEDE-PAUSEFIX-RUNNING-1118): paused agent, then resumed: the saved message's run is the only run (B' starts none), no second note, the answer supersedes it", async () => {
     const f = await fixture();
     await pause(f);
     const commentId = await f.message("Are you there?");
@@ -1525,9 +1762,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     // Resumed: Paperclip delivers the saved message to one run of its own.
     await resume(f);
     const run = await f.run({ commentId, status: "running" });
+    const [pausedNote] = await f.visible();
     await settleAt(f, 4 * 60_000);
+    // pausefix 2: no longer paused and its OWN run is running, so the SAME note says the agent is working on it.
+    expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: pausedNote!.id, body: WORKING }]);
     await settleAt(f, 20 * 60_000);
-    expect((await f.visible()).map(n => n.body)).toEqual([PAUSED_TEXT]);
+    expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: pausedNote!.id, body: WORKING }]);
     expect(await runsCarrying()).toBe(1);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run));
     await f.reply(run);

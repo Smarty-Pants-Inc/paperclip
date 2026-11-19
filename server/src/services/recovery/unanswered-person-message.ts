@@ -87,7 +87,19 @@ export const UNANSWERED_MESSAGE_AGENT_SETUP_CODE = "agent_setup";
 // Preserve the sweep's existing start bound as the one shared ten-minute value.
 export { PENDING_WAIT_START_BOUND_MS };
 export const SETUP_WAIT_BOUND_MS = PENDING_WAIT_START_BOUND_MS;
-const WAITING_KIND_CODES = new Set(["agent_paused", UNANSWERED_MESSAGE_AGENT_SETUP_CODE]);
+/** A run whose OWN input carries the message is RUNNING: the agent is working on it (RFL record
+ * SUPERSEDE-PAUSEFIX-RUNNING-1118; tB2 al/pausefix-tb2 7c18f31d). It is what a stale '<agent> is paused' note
+ * becomes after a Resume, and ONLY while that run is running. Waiting-kind: the answer supersedes it; if the run
+ * ends unanswered, this line's own failed / no-reply words replace it in place. */
+export const UNANSWERED_MESSAGE_WORKING_CODE = "working_on_message";
+/** The working note's wording, in ONE place. */
+export const UNANSWERED_MESSAGE_WORKING_TEXT = (name: string) => `${name} is working on your message.`;
+export const UNANSWERED_MESSAGE_WORKING_TITLE = (name: string) => `${name} is working on it`;
+const WAITING_KIND_CODES = new Set(["agent_paused", UNANSWERED_MESSAGE_AGENT_SETUP_CODE, UNANSWERED_MESSAGE_WORKING_CODE]);
+/** The notes this sweep RETIRES while their message is still owed (a stale paused note after a Resume, a working
+ * note whose run no longer runs). If the message is later owed a line again, that line is written into the SAME
+ * row (same id): never a second note for one message. */
+const REVIVABLE_WAITING_CODES: ReadonlySet<string> = new Set([UNANSWERED_MESSAGE_AGENT_PAUSED_CODE, UNANSWERED_MESSAGE_WORKING_CODE]);
 /** Paperclip's pause model: POST /agents/:id/resume is allowed for a board user
  * or an agent that manages the paused agent (routes/agents.ts:6017-6023 ->
  * assertCanManageAgentLifecycle :2613-2623 -> agent-subtree-management.ts:34-39
@@ -568,6 +580,18 @@ const groupKey = (decision: NoticeDecision) => `${decision.group}|${decision.cod
 /** A decision that writes no notice: record a first deferral (T0) when it asks for it. */
 async function recordPendingDecision(db: Db, issue: DecisionIssue, decision: Exclude<Decision, NoticeDecision>, now: Date,
   nativeBlockedRepairApplies?: NativeBlockedRepairApplies): Promise<UnansweredMessageOutcome> {
+  if ((decision.kind === "pending" || decision.kind === "explained") && decision.retireStale) {
+    // The stale note stops covering this message, under the same issue fence and the same predicate re-read.
+    const stale = decision.retireStale;
+    await db.transaction(async tx => {
+      await tx.select({ id: issues.id }).from(issues)
+        .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
+      const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, nativeBlockedRepairApplies, stale.messageId);
+      if ((fenced.kind !== "pending" && fenced.kind !== "explained") || fenced.retireStale?.noticeId !== stale.noticeId) return;
+      await dropNoticeMember(tx as unknown as Db, issue, stale.noticeId, stale.messageId, now);
+    });
+  }
+  if (decision.kind === "explained") return { kind: "explained" };
   if (decision.kind === "pending") {
     if (decision.recordDeferral) {
       await appendHeartbeatRunEvent(db, { companyId: issue.companyId, runId: decision.recordDeferral.runId,
@@ -586,20 +610,26 @@ async function recordPendingDecision(db: Db, issue: DecisionIssue, decision: Exc
       const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, nativeBlockedRepairApplies,
         decision.cardAnswerId ? undefined : decision.messageId, decision.cardAnswerId);
       if (fenced.kind !== "person_stopped" || fenced.noticeId !== decision.noticeId) return;
-      const [notice] = await tx.select({ metadata: issueComments.metadata }).from(issueComments).where(and(
-        eq(issueComments.id, decision.noticeId!), eq(issueComments.companyId, issue.companyId),
-        eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt)));
-      if (!notice) return;
-      const metadata = (notice.metadata ?? {}) as Record<string, unknown>;
-      const listed = metadata[UNANSWERED_MESSAGE_GROUP_KEY];
-      const others = (Array.isArray(listed) ? listed as string[] : []).filter(id => id !== decision.messageId);
-      await tx.update(issueComments).set(others.length ? { updatedAt: now, metadata: { ...metadata,
-        [UNANSWERED_MESSAGE_GROUP_KEY]: others, authorizationReason: `${UNANSWERED_MESSAGE_REASON_PREFIX}${others[others.length - 1]}` } as never }
-        : { deletedAt: now, updatedAt: now }).where(eq(issueComments.id, decision.noticeId!));
+      await dropNoticeMember(tx as unknown as Db, issue, decision.noticeId!, decision.messageId, now);
     });
     return { kind: "person_stopped" };
   }
   return decision;
+}
+
+/** A live notice stops covering one message (under the caller's issue fence): it retires when it covered only
+ * that message; a group notice keeps its other members and is keyed to the latest of them. */
+async function dropNoticeMember(tx: Db, issue: DecisionIssue, noticeId: string, messageId: string, now: Date): Promise<void> {
+  const [notice] = await tx.select({ metadata: issueComments.metadata }).from(issueComments).where(and(
+    eq(issueComments.id, noticeId), eq(issueComments.companyId, issue.companyId),
+    eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt)));
+  if (!notice) return;
+  const metadata = (notice.metadata ?? {}) as Record<string, unknown>;
+  const listed = metadata[UNANSWERED_MESSAGE_GROUP_KEY];
+  const others = (Array.isArray(listed) ? listed as string[] : []).filter(id => id !== messageId);
+  await tx.update(issueComments).set(others.length ? { updatedAt: now, metadata: { ...metadata,
+    [UNANSWERED_MESSAGE_GROUP_KEY]: others, authorizationReason: `${UNANSWERED_MESSAGE_REASON_PREFIX}${others[others.length - 1]}` } as never }
+    : { deletedAt: now, updatedAt: now }).where(eq(issueComments.id, noticeId));
 }
 
 /** One owed group: write its ONE notice under the fence, keyed to its latest member that is still to be noticed. */
@@ -626,9 +656,10 @@ async function writeGroupNotice(db: Db, issue: DecisionIssue, now: Date, nativeB
     if (fenced.upgradeCommentId) {
       // The SAME note (same key) becomes the failure text: still one note.
       const [updated] = await tx.update(issueComments).set({ body: fenced.notice.body, presentation: fenced.notice.presentation,
-        metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason }, updatedAt: now })
+        metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason }, updatedAt: now,
+        ...(fenced.revive ? { deletedAt: null } : {}) })
         .where(and(eq(issueComments.id, fenced.upgradeCommentId), eq(issueComments.companyId, issue.companyId),
-          isNull(issueComments.deletedAt))).returning({ id: issueComments.id });
+          fenced.revive ? undefined : isNull(issueComments.deletedAt))).returning({ id: issueComments.id });
       return updated?.id ?? null;
     }
     const comment = await issueService(tx as unknown as Db).addComment(issue.id, fenced.notice.body, {}, {
@@ -644,18 +675,25 @@ async function writeGroupNotice(db: Db, issue: DecisionIssue, now: Date, nativeB
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
   assigneeAgentId: string | null; assigneeUserId: string | null };
 type WaitRecord = { messageId: string; runId: string | null; waitKind?: "setup"; startedAt?: string; boundMs?: number };
-type Decision = { kind: "none" | "answered" | "noticed_before" | "explained" | "out_of_scope" }
+/** The message's standing waiting-kind note stopped being true and another line already says what is true (the
+ * run's header, the saved wake's panel line, another notice): the note stops covering the message. */
+type RetireStale = { noticeId: string; messageId: string };
+type Decision = { kind: "none" | "answered" | "noticed_before" | "out_of_scope" }
+  | { kind: "explained"; retireStale?: RetireStale }
   /** The sender stopped the run that was answering this message; noticeId is its standing notice, if any. */
   | { kind: "person_stopped"; messageId: string; noticeId: string | null; cardAnswerId?: string }
   | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string };
-      recordWait?: WaitRecord }
+      recordWait?: WaitRecord; retireStale?: RetireStale }
   | NoticeDecision;
 type NoticeDecision = { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice>;
   recordWait?: WaitRecord;
   /** The owed group: the run that carried the message in its own input, or "no_run". */
   group: string;
   /** Set when this replaces the message's standing waiting note. */
-  upgradeCommentId?: string };
+  upgradeCommentId?: string;
+  /** The note to replace was retired by this sweep while the message stayed owed (REVIVABLE_WAITING_CODES): the
+   * SAME row carries the new line. */
+  revive?: true };
 
 /** The run event that records, once and durably, when this step first deferred
  * a person message's notice to the native blocked-request repair (T0). */
@@ -670,10 +708,32 @@ export const NATIVE_REPAIR_DEFERRAL_EVENT = "unanswered_message.native_repair_de
 export const PENDING_WAIT_ACTION = "issue.unanswered_message_wait";
 export const PENDING_WAIT_BOUND_MS = 2 * 60_000;
 
+/** What decideMessage found standing for the message (pausefix on the merged line): `staleNote` is a LIVE
+ * waiting-kind note that is no longer true (an '<agent> is paused' note on an agent that is not paused; a working
+ * note whose own run no longer runs). `retire` says the decision may retire it when it only waits. */
+type StandingNote = { staleNote?: RetireStale; retire?: boolean };
+
 /** The one predicate: run outside the fence to skip the lock in the common
- * case, and again unchanged inside it before writing. Reads only. */
+ * case, and again unchanged inside it before writing. Reads only.
+ * A standing '<agent> is paused' note is true only while the agent is paused. After a Resume, wherever the
+ * decision would only WAIT (a queued or running turn, a saved wake, a grace), the note is RETIRED: the run's
+ * header or the saved wake's panel line is the message's one line (SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119: no
+ * waiting note of ours beside it). A decision that writes (the working note, a failure text, the paused text
+ * again) goes into the SAME row. The person's own Stop (person_stopped) is decided before any of this and keeps
+ * its own retire. */
 async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   nativeBlockedRepairApplies?: NativeBlockedRepairApplies, messageId?: string, cardAnswerId?: string): Promise<Decision> {
+  const standing: StandingNote = {};
+  const decision = await decideMessage(q, issue, now, nativeBlockedRepairApplies, messageId, cardAnswerId, standing);
+  if (standing.staleNote && (decision.kind === "explained" || (decision.kind === "pending" && standing.retire))) {
+    return { ...decision, retireStale: standing.staleNote };
+  }
+  return decision;
+}
+
+async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
+  nativeBlockedRepairApplies: NativeBlockedRepairApplies | undefined, messageId: string | undefined,
+  cardAnswerId: string | undefined, standing: StandingNote): Promise<Decision> {
   if (issue.hiddenAt || !issue.assigneeAgentId || issue.assigneeUserId
     || !["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return { kind: "out_of_scope" };
   const agentId = issue.assigneeAgentId;
@@ -700,7 +760,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }))).limit(1);
   if (answer) return { kind: "answered" };
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
-  const [noticed] = await q.select({ id: issueComments.id,
+  const [noticed] = await q.select({ id: issueComments.id, deleted: sql<boolean>`${issueComments.deletedAt} is not null`,
     waiting: sql<boolean>`coalesce(${issueComments.metadata}->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)`,
     waitingCode: sql<string | null>`(select r->>'value' from jsonb_array_elements(coalesce(${issueComments.metadata}->'sections', '[]'::jsonb)) sec,
       jsonb_array_elements(coalesce(sec->'rows', '[]'::jsonb)) r where r->>'label' = ${WAITING_ROW_LABEL} limit 1)` })
@@ -741,6 +801,10 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   if (noticed && !noticed.waiting) return { kind: "noticed_before" };
   const upgrading = noticed?.waiting ? noticed.id : null;
   const standingWaitingCode = noticed?.waiting ? noticed.waitingCode : null;
+  // A paused or working note this sweep retired while the message stayed owed: not a standing note any more, but
+  // the row a later line for this message is written into (same id).
+  const revive = Boolean(noticed?.waiting && noticed.deleted && REVIVABLE_WAITING_CODES.has(standingWaitingCode ?? ""));
+  const standingLive = Boolean(upgrading && !noticed?.deleted);
   // A failed fresh continuation that descends from the message's run is the
   // run the person's message ended on: the automatic lineage, typed or not,
   // ends there (fork-lead a6342a4d4, fresh-continuation-chain.ts).
@@ -792,6 +856,57 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
     inArray(heartbeatRuns.status, LIVE))).limit(1);
   const liveRuns = otherLive ? [...live, otherLive] : live;
+  // The agent is paused only while a pause a person can act on holds NOW (Paperclip's lifecycle,
+  // modules/agent-lifecycle/adapters/postgres.ts): a lifecycle HOLD (the pause route adds its reason; Resume
+  // removes it; budget and company_paused are holds too), or, in a paused-like state, an explicit pauseReason
+  // with no hold or a lifecycle error. 'resuming' is NEVER paused: Resume (or 'complete' with no hold) moved it
+  // there and it ends in ready by itself (tB2 al/pausefix-tb2 72519403, the predicate only).
+  // Nothing runs while paused, so "sending it again" would do nothing: the note says it is paused and who can
+  // resume it (a waiting-kind note).
+  const [agentRow] = await q.select({ name: agents.name, status: agents.status, lifecycleState: agents.lifecycleState,
+    lifecycleHolds: agents.lifecycleHolds, pauseReason: agents.pauseReason, lifecycleError: agents.lifecycleError })
+    .from(agents).where(and(eq(agents.companyId, issue.companyId), eq(agents.id, agentId)));
+  const holds = agentRow?.lifecycleHolds ?? [];
+  const setupShape = Boolean(agentRow?.status === "paused" && ["preparing", "verifying"].includes(agentRow.lifecycleState)
+    && (agentRow.pauseReason == null || agentRow.pauseReason === "setup") && holds.length === 0 && !agentRow.lifecycleError);
+  const resuming = agentRow?.lifecycleState === "resuming";
+  const pausedLike = Boolean(agentRow && (agentRow.status === "paused" || ["paused", "pausing"].includes(agentRow.lifecycleState)));
+  const agentPaused = Boolean(!setupShape && !resuming && agentRow && (holds.length > 0
+    || (pausedLike && (agentRow.pauseReason != null || Boolean(agentRow.lifecycleError)))));
+  // A paused-like state that no pause holds ('resuming'; 'pausing' / 'paused' with no hold, reason or error) ends
+  // by itself: the saved message waits for it, bounded (below), with no note of ours.
+  const lifecycleTransit = Boolean(!setupShape && !agentPaused && (resuming || pausedLike));
+  // WORKING only while a run whose OWN input carries the message is RUNNING (not queued, claimed or
+  // scheduled_retry, nor another message's or another task's run): then the agent is answering it (7c18f31d).
+  const working = !agentPaused && liveRuns.some(candidate => candidate.status === "running"
+    && runCarriesMessage(candidate.contextSnapshot, message.id));
+  // The note that is no longer true (never the person's own Stop: that returned above).
+  if (standingLive && !cardAnswer && ((standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE && !agentPaused)
+    || (standingWaitingCode === UNANSWERED_MESSAGE_WORKING_CODE && !working))) {
+    standing.staleNote = { noticeId: upgrading!, messageId: message.id };
+    // A stale paused note goes the moment the agent is not paused and the message only waits. A working note
+    // whose run stopped running goes when another line is there (a live run's header, or the saved wake's line,
+    // set below); with none, it stays for the ended run's short settle and is then replaced in place by this
+    // line's own words (failed / no reply), never left over an ended run.
+    standing.retire = standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE || liveRuns.length > 0;
+  }
+  // After a Resume the paused note says the agent is working on the message, in the SAME row: a standing stale
+  // paused note, or the one this sweep retired while the message waited. No waiting note is ported (RFL
+  // SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119): a message with no paused note keeps the run's header alone.
+  if (working && !cardAnswer && upgrading && (standingLive ? standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE : revive)) {
+    const name = agentRow?.name?.trim() || "This agent";
+    const notice = buildStrandedRecoveryEscalationNotice({
+      seed: { title: UNANSWERED_MESSAGE_WORKING_TITLE(name), body: UNANSWERED_MESSAGE_WORKING_TEXT(name), tone: "info" },
+      recoveryActionId: null, recoveryOwner: null, recoveryResponsibility: "user", sourceRun: null, failureCode: undefined,
+    });
+    // No next action: nothing for the person to do while it works.
+    notice.metadata.sections = notice.metadata.sections
+      .map(section => ({ ...section, rows: section.rows.filter(row => row.label !== "Next action") }))
+      .filter(section => section.rows.length > 0);
+    notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, UNANSWERED_MESSAGE_WORKING_CODE)] });
+    return { kind: "notice", reason, code: UNANSWERED_MESSAGE_WORKING_CODE, notice, upgradeCommentId: upgrading,
+      group: messageRun?.id ?? UNANSWERED_MESSAGE_NO_RUN_CODE, ...(revive ? { revive: true as const } : {}) };
+  }
   if (liveRuns.some(candidate => candidate.status === "running")) {
     return { kind: "pending", recheckAt: now.getTime() + 30_000 };
   }
@@ -802,22 +917,12 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       return { kind: "pending", recheckAt: now.getTime() + 30_000 };
     }
   }
-  // The agent is paused (Paperclip's lifecycle: status paused, lifecycle state
-  // paused/pausing, or a lifecycle hold such as "manual"): nothing runs until
-  // it is resumed, so "sending it again" would do nothing. The note says it is
-  // paused and who can resume it; it stays a waiting-kind note, so after the
-  // resume the saved message's own run decides (its answer supersedes it).
-  const [agentRow] = await q.select({ name: agents.name, status: agents.status, lifecycleState: agents.lifecycleState,
-    lifecycleHolds: agents.lifecycleHolds, pauseReason: agents.pauseReason, lifecycleError: agents.lifecycleError })
-    .from(agents).where(and(eq(agents.companyId, issue.companyId), eq(agents.id, agentId)));
   // Setup uses the compatibility status "paused", but completes by itself.
   // Its saved message remains an obligation: use the existing sweep deadline
   // and bound, never a second wake. After ten minutes, one true setup note
   // stands until readiness or error. Explicit holds/pauses/errors keep their path.
   let settingUp = false;
-  if (agentRow?.status === "paused" && ["preparing", "verifying"].includes(agentRow.lifecycleState)
-    && (agentRow.pauseReason == null || agentRow.pauseReason === "setup")
-    && (agentRow.lifecycleHolds ?? []).length === 0 && !agentRow.lifecycleError) {
+  if (setupShape) {
     const wait = await bounded(now.getTime() + 30_000, true);
     if (wait) return wait;
     if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_SETUP_CODE) {
@@ -825,8 +930,6 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     }
     settingUp = true;
   }
-  const agentPaused = Boolean(!settingUp && agentRow && (agentRow.status === "paused" || ["paused", "pausing"].includes(agentRow.lifecycleState)
-    || (agentRow.lifecycleHolds ?? []).length > 0));
   // Import intentionally parks automations until activation. It lost neither
   // the message nor an attempt: do not annotate every carried-over open task.
   // Resume's existing eligibility notification rechecks the saved work.
@@ -886,7 +989,10 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       && wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
     // tB2 523dfe75:613-623 predicate only; do not port its waiting note.
     // This message's deferred receipt already has one visible panel line.
-    if (pendingExecutionWait) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+    if (pendingExecutionWait) {
+      standing.retire = true; // the saved wake's panel line is the one line
+      return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+    }
     if (!boardHold && !agentPaused && wakes.some(wake => wake.status !== "deferred" && wakeCarriesIssue(wake.payload, issue.id))) {
       const wait = await bounded(now.getTime() + 30_000);
       if (wait) return wait;
@@ -895,9 +1001,15 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   if (agentPaused) {
     const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
     if (due > now.getTime()) return { kind: "pending", recheckAt: due };
-    if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE) {
+    if (standingLive && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE) {
       return { kind: "pending", recheckAt: now.getTime() + 5 * 60_000 };
     }
+  }
+  // A lifecycle transit that no pause holds ends by itself (Resume's own drain then starts the saved message):
+  // wait for it, bounded like every other further attempt, before any "no run started" line.
+  if (lifecycleTransit && !settingUp && !run) {
+    const wait = await bounded(now.getTime() + 30_000);
+    if (wait) return wait;
   }
 
   let code: string;
@@ -1075,7 +1187,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // A card answer's notice is its own group: its words are the answer's, never shared with a typed message.
   return { kind: "notice", reason, code, notice,
     group: `${cardAnswer ? "card_answer:" : ""}${messageRun?.id ?? UNANSWERED_MESSAGE_NO_RUN_CODE}`,
-    ...(setupWaitRecord ? { recordWait: setupWaitRecord } : {}), ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
+    ...(setupWaitRecord ? { recordWait: setupWaitRecord } : {}), ...(upgrading ? { upgradeCommentId: upgrading } : {}),
+    ...(upgrading && revive ? { revive: true as const } : {}) };
 }
 
 
