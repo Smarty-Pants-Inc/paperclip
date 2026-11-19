@@ -85,6 +85,16 @@ export async function hasPendingRunCleanup(db: Db, companyId: string, runId: str
     eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, runId),
     sql`${environmentLeases.metadata}->'workspaceRecoveryCleanup' is not null`,
   ))).filter(hasRecoveredCleanupStopReceipt).map(lease => lease.id);
+  // adopt-hung-stop: a handed-off warm box whose stop receipt is overdue is stop
+  // debt (the sweep keeps retrying its stop) and is replaced before any reuse;
+  // it no longer holds the run's successor (handed-off-warm-lease.ts).
+  recoveredStopped.push(...(await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, runId),
+    eq(environmentLeases.status, "pending_cleanup"),
+    sql`${environmentLeases.metadata}->'handedOffWarmStopReceiptOverdue'->>'runId' = ${runId}`,
+    sql`${environmentLeases.metadata}->'replaceBeforeReuse' is not null`,
+    sql`${environmentLeases.metadata}->'sandboxStopAndRetain' is not null`,
+  ))).map(lease => lease.id));
   // A missing predecessor row owns nothing: deleting a run nulls its leases'
   // run reference and removes its finalization coordinator. Failing closed on
   // absence stranded the successor with no next action (invariants 3 and 7).
