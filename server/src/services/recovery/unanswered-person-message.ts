@@ -1,5 +1,7 @@
 import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql, messageCardEndedSinceSql, unansweredCardAnswerSql } from "../person-message-answer.js";
+import { answeredPersonMessageSql, messageCardEndedSinceSql, unansweredCardAnswerSql, UNANSWERED_MESSAGE_GROUP_KEY,
+  UNANSWERED_MESSAGE_REASON_PREFIX } from "../person-message-answer.js";
+export { UNANSWERED_MESSAGE_GROUP_KEY, UNANSWERED_MESSAGE_REASON_PREFIX };
 import {
   activityLog,
   agentWakeupRequests,
@@ -45,7 +47,6 @@ import { senderStoppedWhileAnswering, stoppedBySender } from "./person-stopped-m
  * fallback and assigned-work invariant) are merged down and their
  * conversation clause covers it.
  */
-export const UNANSWERED_MESSAGE_REASON_PREFIX = "unanswered_message:";
 /** A transient-retry line for the same message (heartbeat retries) is superseded the same way. */
 const RETRYING_MESSAGE_REASON_PREFIX = "retrying_message:";
 export const UNANSWERED_MESSAGE_LOOKBACK_MS = 24 * 60 * 60_000;
@@ -206,10 +207,10 @@ function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL 
   // disagree on a message (RFL 20:22Z: run-less agent comments never answer; org 20:29Z: imported history).
   return answeredPersonMessageSql(m);
 }
-/** The key of a notice's still-owed member list: one notice covers one owed GROUP (the person messages one failed
- * or reply-less run carried in its own input, or one no-run batch settled in the same pass). Its authorizationReason
- * names the latest still-owed member; a group of one has no list. */
-export const UNANSWERED_MESSAGE_GROUP_KEY = "unansweredMessageIds";
+// UNANSWERED_MESSAGE_GROUP_KEY (defined beside the one function, person-message-answer.ts) is the key of a notice's
+// still-owed member list: one notice covers one owed GROUP (the person messages one failed or reply-less run carried
+// in its own input, or one no-run batch settled in the same pass). Its authorizationReason names the latest
+// still-owed member; a group of one has no list.
 /** SQL: notice row n (alias) covers message id: its key names it, or its still-owed member list does. */
 const noticeCoversSql = (n: string, id: SQL) => sql`(substr(${sql.raw(n)}.metadata->>'authorizationReason',
     strpos(${sql.raw(n)}.metadata->>'authorizationReason', ':') + 1) = ${id}::text
