@@ -7288,6 +7288,89 @@ describe("IssueDetail", () => {
     expect(mockIssuesApi.update).not.toHaveBeenCalled();
   });
 
+  // C8 (live FAIL 06:00Z gate3): after the person's confirmed Stop the LIVE RUN
+  // lane ('Working for 37s · Running an unnamed tool') stayed until a poll.
+  // Planted, in the real route shapes: GET /issues/:id/live-runs and
+  // /active-run return the running native run; GET /issues/:id/runs lists it;
+  // POST /heartbeat-runs/:id/cancel answers the run 'cancelled' with the
+  // acknowledged native cancellation record (as the live response did). After
+  // the cancel every later live-runs/active-run (and, for the Stop row,
+  // runs) read is held pending, so only the cancel response itself can end
+  // the lane: no poll, no refetch round trip.
+  async function renderC8LiveNativeRun(width: number, cancel: () => Promise<unknown>, holdLinkedRuns = false) {
+    mockSidebarState.isMobile = width < 768;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    mockIssuesApi.update.mockClear();
+    mockAuthApi.getSession.mockResolvedValue({ session: { userId: "user-1" }, user: { id: "user-1" } });
+    const startedAt = new Date(Date.now() - 37_000).toISOString();
+    const liveRun = {
+      id: "run-active-1", status: "running", invocationSource: "on_demand", triggerDetail: "manual",
+      startedAt, finishedAt: null, createdAt: startedAt, agentId: "agent-1", agentName: "CodexCoder",
+      adapterType: "paperclip_runner", runtimeMode: "native", issueId: "issue-1", logBytes: null, lastOutputBytes: 354,
+    };
+    mockIssuesApi.get.mockResolvedValue(createIssue({ status: "in_progress", assigneeAgentId: "agent-1", executionRunId: "run-active-1" }));
+    mockAgentsApi.list.mockResolvedValue([createAgent()]);
+    mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([liveRun]);
+    mockHeartbeatsApi.activeRunForIssue.mockResolvedValue(liveRun);
+    mockActivityApi.runsForIssue.mockResolvedValue([{
+      runId: "run-active-1", status: "running", agentId: "agent-1", adapterType: "paperclip_runner", runtimeMode: "native",
+      startedAt, finishedAt: null, createdAt: startedAt, invocationSource: "on_demand", usageJson: null, resultJson: null,
+    }]);
+    mockHeartbeatsApi.get.mockReset().mockRejectedValue(new Error("Status request unavailable"));
+    mockHeartbeatsApi.cancel.mockReset().mockImplementation(cancel);
+    await act(async () => { renderIssueView(); });
+    const lane = () => {
+      const props = mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as {
+        activeRun?: { id: string; status: string } | null; liveRuns?: Array<{ id: string; status: string }>;
+        linkedRuns?: Array<{ runId: string; status: string }>; onCancelRun?: () => Promise<void>;
+      } | undefined;
+      // TaskChatThread's live lane rule (TaskChatThread.tsx liveRun): the active run, else a live list run.
+      const live = (run?: { status: string } | null) => run?.status === "running" || run?.status === "queued";
+      return { props, run: (live(props?.activeRun) ? props?.activeRun : props?.liveRuns?.find(live)) ?? null };
+    };
+    await waitForAssertion(() => {
+      expect(lane().run?.id).toBe("run-active-1");
+      expect(lane().props?.onCancelRun).toBeTypeOf("function");
+    });
+    const held = new Promise<never>(() => undefined);
+    mockHeartbeatsApi.liveRunsForIssue.mockReturnValue(held);
+    mockHeartbeatsApi.activeRunForIssue.mockReturnValue(held);
+    if (holdLinkedRuns) mockActivityApi.runsForIssue.mockReturnValue(held);
+    return lane;
+  }
+
+  it.each([390, 1440])("C8: the person's confirmed Stop ends the live run lane at once, with every run read still pending, at %i", async (width) => {
+    let cancelResponseAt = 0;
+    const lane = await renderC8LiveNativeRun(width, async () => (cancelResponseAt = Date.now(), {
+      id: "run-active-1", companyId: "company-1", runtimeMode: "native", status: "cancelled",
+      finishedAt: new Date().toISOString(), error: "Cancelled by a board operator", errorCode: "cancelled",
+      resultJson: { stopReason: "cancelled", nativeCancellation: {
+        schema: "paperclip.native-cancellation.v1", runId: "run-active-1", companyId: "company-1",
+        scope: "run", dispatchState: "acknowledged",
+      } },
+    }), true);
+    // The Stop's own settle waits on the held GET /issues/:id/runs; the lane must not.
+    await act(async () => { void lane().props!.onCancelRun!(); });
+    expect(mockHeartbeatsApi.cancel).toHaveBeenCalledExactlyOnceWith("run-active-1");
+    await waitForAssertion(() => expect(lane().run).toBeNull());
+    expect(Date.now() - cancelResponseAt).toBeLessThan(1_000);
+    expect(lane().props?.liveRuns?.map((run) => run.id)).not.toContain("run-active-1");
+    expect(lane().props?.activeRun ?? null).toBeNull();
+    expect(lane().props?.linkedRuns?.find((run) => run.runId === "run-active-1")?.status).toBe("cancelled");
+  });
+
+  it.each([390, 1440])("C8 control: a refused Stop keeps the live run lane, at %i", async (width) => {
+    const lane = await renderC8LiveNativeRun(width, async () => {
+      throw new ApiError("This run can no longer be stopped.", 409, {});
+    });
+    await act(async () => {
+      await expect(lane().props!.onCancelRun!()).rejects.toThrow("This run can no longer be stopped.");
+    });
+    for (let flush = 0; flush < 20; flush += 1) await flushReact();
+    expect(lane().run?.id).toBe("run-active-1");
+    expect(lane().run?.status).toBe("running");
+  });
+
   it("routes live-run finalization actions through run cancellation before issue status update", async () => {
     mockHeartbeatsApi.cancel.mockClear();
     mockIssuesApi.get.mockResolvedValue(
