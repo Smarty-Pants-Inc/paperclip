@@ -53,6 +53,8 @@ class RecordingPiPeer {
   active = false;
   closeGate?: Promise<void>;
   steerAckGate?: Promise<void>;
+  dropSteer = false;
+  steerError?: Error;
   holdClose() {
     let release!: () => void; this.closeGate = new Promise<void>(resolve => { release = resolve; });
     return release;
@@ -102,7 +104,9 @@ class RecordingPiPeer {
       this.toolStart("step-1");
       this.onPrompt?.(String(input?.message));
     } else if (type === "steer") {
-      this.pending.push(String(input?.message)); data = { disposition: "queued" };
+      if (this.steerError) throw this.steerError;
+      if (!this.dropSteer) this.pending.push(String(input?.message));
+      data = { disposition: "queued" };
       this.send({ type: "queue_update", steering: [...this.pending], followUp: [] });
       await this.steerAckGate;
     } else if (type === "abort") { this.finish(true); }
@@ -389,6 +393,80 @@ describe("person comment default steering eligibility and asynchronous receipt",
         .toBe((carrying.contextSnapshot?.steeredDeliveredAts as Record<string, string>)[message.id]);
     } finally { await f.close(); }
   }, 45_000);
+
+  // B4: fault only the provider receipt boundary. Timeout rows retain the real
+  // native timeout implementation; shorten its deadline, not the dispatch path.
+  it.each([true, false])("B4 timeout: Pi took M=%s; answer once, carry only unread input", async took => {
+    const f = await fixture(`B4-timeout-${took}`);
+    const realSteer = nativeExecutor.steerNativeSession;
+    const fault = vi.spyOn(nativeExecutor, "steerNativeSession").mockImplementation(input => realSteer({ ...input, timeoutMs: 40 }));
+    let release!: () => void;
+    f.peer.steerAckGate = new Promise<void>(resolve => { release = resolve; });
+    f.peer.dropSteer = !took;
+    try {
+      const message = await f.post(`TIMEOUT-${took}-M`);
+      await waitForPendingCommentSteers();
+      expect(f.commands("steer")).toHaveLength(1);
+      const [pending] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect((pending.resultJson?.queuedSteeringAcknowledgements as any)[message.id].status).toBe("pending");
+      f.peer.boundary();
+      if (took) {
+        // The RPC already timed out. A late ACK now binds the independently
+        // persisted Pi read/text facts; timeout alone must not dispatch twice.
+        release();
+        await vi.waitFor(async () => {
+          const [read] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+          expect(read.contextSnapshot?.answeredSteeredCommentIds).toContain(message.id);
+        });
+      }
+      await f.complete();
+      const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect((ended.resultJson?.restoredSteeredCommentIds as string[] | undefined) ?? []).toEqual(took ? [] : [message.id]);
+      // Ordinary release may already have promoted and answered the successor;
+      // count its actual native prompt below, not an intermediate wake shape.
+      release();
+      await f.startDelivery();
+      if (took) {
+        // Mid-run reply publication belongs to the parallel builder. This gate
+        // checks the native answer/read/carry boundary, not that separate writer.
+        expect(f.peer.replies.filter(reply => reply === `ANSWER:${message.body}`)).toHaveLength(1);
+        expect((await f.wakes()).filter(w => !w.runId && JSON.stringify(w.payload).includes(message.id))).toEqual([]);
+      } else await vi.waitFor(async () => { await f.assertAnsweredOnce([message]); }, { timeout: 15_000 });
+      expect(f.peer.consumed.filter(body => body === message.body)).toHaveLength(took ? 1 : 0);
+      const successors = f.owner.peers.slice(1).flatMap(peer => peer.requests.filter(r => r.type === "prompt"));
+      expect(successors.filter(r => String(r.input?.message).includes(message.body))).toHaveLength(took ? 0 : 1);
+    } finally { release(); fault.mockRestore(); await f.close(); }
+  }, 60_000);
+
+  it.each(["rpc-error", "generic-dispatch-error"] as const)("B4 dispatch %s: no 500 or unhandled rejection, one ordinary answer", async kind => {
+    const f = await fixture(`B4-${kind}`);
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown) => { unhandled.push(error); };
+    process.on("unhandledRejection", onUnhandled);
+    const fault = kind === "generic-dispatch-error"
+      ? vi.spyOn(nativeExecutor, "steerNativeSession").mockRejectedValueOnce(new Error("B4 generic dispatch fault")) : undefined;
+    if (kind === "rpc-error") f.peer.steerError = new Error("B4 provider RPC refused input");
+    try {
+      const message = await f.post(`ERROR-${kind}-M`);
+      await waitForPendingCommentSteers();
+      if (kind === "rpc-error") {
+        const thread = (await request(f.app).get(`/api/issues/${f.issueId}/comments`).expect(200)).body;
+        expect(thread.find((comment: any) => comment.id === message.id)).toMatchObject({
+          deliveryOutcome: "queued", steeringStatus: null, steeringUnavailableReason: expect.any(String),
+        });
+        expect((await f.queue()).entries.map((entry: any) => entry.comment.id)).toContain(message.id);
+      }
+      f.peer.boundary();
+      await f.complete();
+      await f.startDelivery();
+      await vi.waitFor(async () => { await f.assertAnsweredOnce([message]); }, { timeout: 15_000 });
+      expect(f.peer.consumed).not.toContain(message.body);
+      expect(f.owner.peers.slice(1).flatMap(peer => peer.requests.filter(r => r.type === "prompt"))
+        .filter(r => String(r.input?.message).includes(message.body))).toHaveLength(1);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally { fault?.mockRestore(); process.off("unhandledRejection", onUnhandled); await f.close(); }
+  }, 60_000);
 
   it("S-h2: 20 native POSTs return custody before Pi ACK or delivery, p95 under 1 second", async () => {
     const f = await fixture("B-latency");
