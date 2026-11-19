@@ -58,6 +58,9 @@ export function queueHeldByPersonStop(queue: IssueQueuedCommentQueue | null | un
 /** A paused chat agent (the Send route's own 409 code): the bar says the
  * server's paused line and offers no Send. */
 export const CHAT_AGENT_PAUSED_REASON = "queued_comment_chat_paused";
+/** The person's typed message ended their Stop's hold: it runs first and the
+ * held messages go right after it (the server's line). */
+export const CHAT_AFTER_TYPED_MESSAGE_REASON = "after_typed_message";
 
 export function reorderQueuedMessageEntries(
   entries: IssueQueuedCommentEntry[],
@@ -575,6 +578,9 @@ export function TaskChatQueuedMessages({
   // The paused line is a fact, not a promise: no Send on the bar or on a row.
   const stoppedPaused = queue.executionWait?.reason === CHAT_AGENT_PAUSED_REASON &&
     Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0;
+  // After the person's typed message ended their Stop's hold: a fact, no Send.
+  const afterTypedMessage = queue.executionWait?.reason === CHAT_AFTER_TYPED_MESSAGE_REASON &&
+    Boolean(queue.queueId) && entries.length > 0;
 
   if (entries.length === 0 && !visibleError && !statusMessage) return null;
 
@@ -630,7 +636,7 @@ export function TaskChatQueuedMessages({
           </div>
         </SortableContext>
       </DndContext>
-      {statusMessage ? <p role="status" className="border-t border-border px-3 py-1.5 text-xs text-muted-foreground">{statusMessage}</p> : null}
+      {statusMessage && !afterTypedMessage ? <p role="status" className="border-t border-border px-3 py-1.5 text-xs text-muted-foreground">{statusMessage}</p> : null}
       {stoppedByPerson ? (
         <div
           className="flex flex-wrap items-center gap-2 border-t border-border px-3 py-1.5 text-xs text-muted-foreground"
@@ -652,6 +658,9 @@ export function TaskChatQueuedMessages({
       ) : stoppedPaused ? (
         <p role="status" className="border-t border-border px-3 py-1.5 text-xs text-muted-foreground"
           data-testid="task-chat-queued-paused">{queue.executionWait!.message}</p>
+      ) : afterTypedMessage ? (
+        <p role="status" className="border-t border-border px-3 py-1.5 text-xs text-muted-foreground"
+          data-testid="task-chat-queued-after-typed">{queue.executionWait!.message}</p>
       ) : null}
       {visibleError ? (
         <div

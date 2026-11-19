@@ -40,6 +40,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 const fixture = vi.hoisted(() => ({
   calls: [] as { runId: string; ids: string[]; reason: string | null; ordered?: string[] }[],
   onFirst: undefined as undefined | ((input: { runId: string }) => Promise<void>),
+  /** Every later turn, while its run is running (before it answers). */
+  onTurn: undefined as undefined | ((input: { runId: string; ids: string[] }) => Promise<void>),
   db: undefined as unknown, companyId: "", agentId: "", issueId: "",
 }));
 
@@ -85,6 +87,7 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
         throw new actual.NativeCancellationPendingRecoveryError();
       }
       fixture.calls.push({ runId, ids, reason: ctx.wakeReason ?? null, ordered });
+      await fixture.onTurn?.({ runId, ids });
       await (fixture.db as any).insert(issueComments).values({ companyId: fixture.companyId, issueId: fixture.issueId,
         authorAgentId: fixture.agentId, authorType: "agent", createdByRunId: runId, origin: "comment", body: `answer from ${runId}` });
       return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "answered" };
@@ -454,6 +457,55 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
       expect(successorCalls().length, JSON.stringify(fixture.calls)).toBe(2);
     }, 120_000);
   }
+
+  // 2c' (rf-2 keyed re-run on compose2): T, typed by the stopping person, ends the hold; during T's run the
+  // held messages' queue line said the STORED 'Waiting for execution recovery' though nothing failed.
+  const AFTER_TYPED = { reason: "after_typed_message", message: "These go right after your new message." };
+  it("2c' R: Stop -> 3 held -> the person types T: during T's run the held messages' queue line (the real GET) says they go right after it, never 'execution recovery'; then each held one is answered once, after T", async () => {
+    const r = await stopWithHeld();
+    await r.tenMinutesPass();
+    expect(successorCalls(), "nothing ran by itself before T").toEqual([]);
+    const storedBefore = (await r.wakes()).filter(w => (w.ids ?? []).some(id => r.held.includes(id))).map(w => w.wait);
+    let typed = "";
+    const during: { runId: string; ids: string[]; queue: any; running: string[] }[] = [];
+    fixture.onTurn = async ({ runId, ids }) => {
+      const running = (await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, r.companyId), eq(heartbeatRuns.status, "running")))).map(run => run.id);
+      during.push({ runId, ids, queue: await r.queue(), running });
+    };
+    try {
+      typed = (await r.post("T typed").expect(201)).body.id as string;
+      await r.drive(4_000);
+      await r.tenMinutesPass();
+    } finally { fixture.onTurn = undefined; }
+    await evidence("2c-typed-line", { typed, held: r.held, storedBefore, during, calls: fixture.calls, wakes: await r.wakes() });
+    const tRun = during.find(turn => turn.ids.includes(typed));
+    expect(tRun, JSON.stringify(fixture.calls)).toBeTruthy();
+    expect(tRun!.running, "the GET was read during T's run").toContain(tRun!.runId);
+    expect(tRun!.queue.entries.map((entry: any) => entry.comment.id).sort(), JSON.stringify(tRun!.queue)).toEqual(r.held.slice().sort());
+    expect(tRun!.queue.executionWait, JSON.stringify(tRun!.queue)).toEqual(AFTER_TYPED);
+    expect(JSON.stringify(tRun!.queue)).not.toContain("execution recovery");
+    // Then the held ones: answered once each, after T.
+    expect(successorCalls()[0]?.ids, JSON.stringify(fixture.calls)).toEqual([typed]);
+    const answered = answeredIds();
+    for (const id of [typed, ...r.held]) expect(answered.filter(a => a === id).length, JSON.stringify(fixture.calls)).toBe(1);
+    for (const id of r.held) expect(answered.indexOf(id), JSON.stringify(fixture.calls)).toBeGreaterThan(answered.indexOf(typed));
+  }, 120_000);
+
+  it("2c' control: another person's message after my Stop does not change my held line (still the Stop's line, never 'go right after')", async () => {
+    const r = await stopWithHeld();
+    await r.drive(1_000);
+    const before = (await r.queue()).executionWait;
+    const theirs = await r.post("N other person", r.otherClient);
+    await r.drive(1_000);
+    const after = await r.queue();
+    const hold = await readPersonStopHold(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId, reportEndedByTypedMessage: true });
+    await evidence("2c-other-person", { theirs: { status: theirs.status, body: theirs.body }, before, after: after.executionWait, hold, wakes: await r.wakes() });
+    expect(before?.reason, JSON.stringify(before)).toBe("stopped_by_person");
+    expect(after.executionWait, JSON.stringify(after)).toEqual(before);
+    expect(hold?.endedByTypedCommentId, JSON.stringify(hold)).toBeUndefined();
+    for (const id of r.held) expect(answeredIds(), JSON.stringify(fixture.calls)).not.toContain(id);
+  }, 120_000);
 
   it("R5: an Interrupt (not a person's Stop) is no hold: the hold reader does not hold them", async () => {
     const r = await stopWithHeld({ stopKind: "interrupt" });
