@@ -1,5 +1,6 @@
 import { assertAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { withAccountingTransaction } from "../accounting-transaction.js";
+import { readRetryCardAnswerInput } from "../continuation-comment-input.js";
 import { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 export { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -1009,8 +1010,10 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     if (!issueId) return;
     await enqueueWakeup(wake.agentId, { source: "on_demand", triggerDetail: "manual", reason: "task_retry",
       requestedByActorType: "user", requestedByActorId: intent.actorId, taskRetryRequestId: wake.id,
+      // The card answers the retried run still owed (the one carry): or the fresh session never sees them.
       payload: { issueId }, contextSnapshot: { issueId, triggeredBy: "board", actorId: intent.actorId,
-        responsibleUserId: intent.actorId },
+        responsibleUserId: intent.actorId,
+        ...await readRetryCardAnswerInput(db, { companyId, issueId, runId: intent.sourceRunId }) },
       issueStateGuard: { assigneeAgentId: wake.agentId, statuses: ["todo", "in_progress", "in_review", "blocked"] },
       idempotencyKey: `task-retry-dispatch:${wake.id}` }, wake.id);
     // Admission held this Retry because its source run's files are saved and
