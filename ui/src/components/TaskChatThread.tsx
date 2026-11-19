@@ -9,7 +9,7 @@ import {
   scheduleIssueDetailPaintMeasure,
   recordIssueDetailReadiness,
 } from "@/lib/issue-detail-performance";
-import { hasWorkspaceRestoreFailure, readReplyFileLine, replyFileLineText, REPLY_FILES_NOT_SAVED_LINE, type ReplyFileLine } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, readReplyFileLine, replyFileLineText, type ReplyFileLine } from "@paperclipai/shared";
 import { useRecoverSavedFilesShown } from "@/lib/recover-saved-files-control";
 import { workspaceRestoreMarkerDetail } from "@/lib/workspace-restore-marker";
 import { credentialAccessNotice } from "@/lib/credential-access-notice";
@@ -992,15 +992,12 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     for (const run of [...(liveRuns ?? []), ...(activeRun ? [activeRun] : [])]) read(run.id, (run as { resultJson?: unknown }).resultJson);
     return lines;
   }, [linkedRuns, liveRuns, activeRun]);
-  // d2shared2 (proposed, pending RFL): the recovery card of a reply whose file line reads LOST, with the person's
-  // next message waiting behind it, says the ONE line. No decision is asked of the person: the message continues on
-  // the same checkout by itself.
-  const recoveryActionRunId = (props.recoveryAction?.evidence as Record<string, unknown> | null | undefined)?.runId;
-  const lostReplyCardHeadline = useMemo(() => {
-    if (typeof recoveryActionRunId !== "string" || !queuedCommentQueue?.entries.length) return null;
-    for (const line of replyFileLines.values()) if (line.runId === recoveryActionRunId && line.fileLine.state === "lost") return REPLY_FILES_NOT_SAVED_LINE;
-    return null;
-  }, [recoveryActionRunId, queuedCommentQueue, replyFileLines]);
+  // A reply whose file save failed for good, with the person's next message waiting behind it: the recovery card
+  // says the task's ONE sentence (the server's, ui/src/lib/saved-message-wait.ts), and while the message is held for
+  // the person's choice it offers that one action and no other.
+  const savedMessageWait = props.savedMessageWait ?? null;
+  const savedMessageContinue = savedMessageWait?.continueLabel && savedMessageWait.onContinue
+    ? { label: savedMessageWait.continueLabel, onClick: savedMessageWait.onContinue, pending: savedMessageWait.continuePending } : null;
   // "Saving…" is bounded: at its deadline the line re-renders as not saved yet.
   const [replyFileLineClock, setReplyFileLineClock] = useState(0);
   useEffect(() => {
@@ -3796,15 +3793,16 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                                 >
                                   <IssueRecoveryActionCard
                                     action={props.recoveryAction}
-                                    headline={lostReplyCardHeadline}
+                                    headline={savedMessageWait?.line ?? null}
+                                    primaryAction={savedMessageContinue}
                                     agentMap={agentMap}
                                     scheduledRetry={props.scheduledRetry}
-                                    onResolve={props.onResolveRecoveryAction}
-                                    onReissueIsolated={props.onReissueIsolatedRecoveryAction}
+                                    onResolve={savedMessageWait?.continueLabel ? undefined : props.onResolveRecoveryAction}
+                                    onReissueIsolated={savedMessageWait?.continueLabel ? undefined : props.onReissueIsolatedRecoveryAction}
                                     reissuePending={props.reissueIsolatedRecoveryActionPending}
-                                    onReconcileForward={props.onReconcileForwardRecoveryAction}
-                                    onBreakGlassOverride={props.onBreakGlassOverrideRecoveryAction}
-                                    onQuarantineRestore={props.onQuarantineRestoreRecoveryAction}
+                                    onReconcileForward={savedMessageWait?.continueLabel ? undefined : props.onReconcileForwardRecoveryAction}
+                                    onBreakGlassOverride={savedMessageWait?.continueLabel ? undefined : props.onBreakGlassOverrideRecoveryAction}
+                                    onQuarantineRestore={savedMessageWait?.continueLabel ? undefined : props.onQuarantineRestoreRecoveryAction}
                                     quarantineRestorePending={props.quarantineRestoreRecoveryActionPending}
                                     canBreakGlass={props.canBreakGlassRecoveryAction}
                                     reconcilePending={props.reconcileRecoveryActionPending}

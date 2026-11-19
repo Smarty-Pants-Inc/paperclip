@@ -595,6 +595,9 @@ interface IssueChatThreadProps {
   successfulRunHandoff?: SuccessfulRunHandoffState | null;
   scheduledRetry?: IssueScheduledRetry | null;
   recoveryAction?: IssueRecoveryAction | null;
+  /** A reply's file save failed for good while the person's message waits: the task's ONE sentence for the recovery
+   * card (ui/src/lib/saved-message-wait.ts), and its one action while the message is held for it. */
+  savedMessageWait?: { line: string; continueLabel: string | null; onContinue?: () => void; continuePending?: boolean } | null;
   onResolveRecoveryAction?: (outcome: RecoveryResolveOutcome) => void;
   onReissueIsolatedRecoveryAction?: (request: RecoveryReissueRequest) => void;
   reissueIsolatedRecoveryActionPending?: boolean;
