@@ -20,6 +20,7 @@ import { executionWorkspacesApi } from "../api/execution-workspaces";
 import { issuesApi } from "../api/issues";
 import { useSecondTick } from "../hooks/useSecondTick";
 import { taskRetryNotStartedReason } from "../hooks/useTaskRetry";
+import { readSavedMessageHold } from "../lib/saved-message-wait";
 import { agentsApi } from "../api/agents";
 import { heartbeatsApi } from "../api/heartbeats";
 import { instanceSettingsApi } from "../api/instanceSettings";
@@ -404,9 +405,13 @@ export function FailedRunInboxRow({
   const issueId = readIssueIdFromRun(run);
   const issue = issueId ? issueById.get(issueId) ?? null : null;
   const interruption = issue?.interruption;
+  // The task's saved message is HELD for the person's Continue: the row says the task's ONE sentence (the same the
+  // thread's card says) and offers that ONE action. A plain Retry would be accepted and start nothing.
+  const savedMessageHold = readSavedMessageHold(interruption);
   useSecondTick(interruption?.state === "retry_scheduled");
   const retrySeconds = Math.max(0, Math.ceil((Date.parse(interruption?.nextRetryAt ?? "") - Date.now()) / 1000));
   const displayError = isRetrying ? "Thinking"
+    : savedMessageHold ? savedMessageHold.line
     : interruption?.retryWait ? interruption.retryWait.message
     : interruption?.state === "working" ? "Thinking"
     : interruption?.state === "retry_scheduled" ? `Trying again in ${retrySeconds}s…`
@@ -418,7 +423,8 @@ export function FailedRunInboxRow({
           confirm_owner_stop: "Confirm the previous server stopped",
           confirm_run_stopped: "Confirm the previous run stopped",
         }[interruption.userAction ?? "resume"]) : runFailureMessage(run);
-  const retryAvailable = !interruption || (interruption.canRetry && interruption.retryAction !== "move_forward");
+  const retryAvailable = Boolean(savedMessageHold) || !interruption || (interruption.canRetry && interruption.retryAction !== "move_forward");
+  const retryLabel = savedMessageHold ? savedMessageHold.continueLabel : "Retry";
   const showUnreadSlot = unreadState !== null;
   const showUnreadDot = unreadState === "visible" || unreadState === "fading";
 
@@ -479,7 +485,8 @@ export function FailedRunInboxRow({
             <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
               {!interruption && <StatusBadge status={run.status} />}
               {linkedAgentName && issue ? <span>{linkedAgentName}</span> : null}
-              <span className="truncate max-w-(--sz-300px)">{displayError}</span>
+              <span className={savedMessageHold && !isRetrying ? "basis-full text-foreground" : "truncate max-w-(--sz-300px)"}
+                data-testid={savedMessageHold ? "failed-run-saved-message-hold" : undefined}>{displayError}</span>
               <span>{timeAgo(run.createdAt)}</span>
             </span>
           </span>
@@ -496,8 +503,8 @@ export function FailedRunInboxRow({
             onClick={onRetry}
             disabled={isRetrying}
           >
-            <RotateCcw className="mr-1.5 h-3.5 w-3.5" />
-            {isRetrying ? "Thinking" : "Retry"}
+            {!savedMessageHold && <RotateCcw className="mr-1.5 h-3.5 w-3.5" />}
+            {isRetrying ? "Thinking" : retryLabel}
           </Button>}
           {!showUnreadSlot && (
             <button
@@ -520,8 +527,8 @@ export function FailedRunInboxRow({
           onClick={onRetry}
           disabled={isRetrying}
         >
-          <RotateCcw className="mr-1.5 h-3.5 w-3.5" />
-          {isRetrying ? "Thinking" : "Retry"}
+          {!savedMessageHold && <RotateCcw className="mr-1.5 h-3.5 w-3.5" />}
+          {isRetrying ? "Thinking" : retryLabel}
         </Button>}
         {!showUnreadSlot && (
           <button
@@ -1995,7 +2002,11 @@ function StreamlinedInbox({
           idempotencyKey = crypto.randomUUID();
           retryRequestKeys.current.set(run.id, idempotencyKey);
         }
-        const result = await issuesApi.retryTask(issueId, { idempotencyKey, observedRunId: run.id }).catch(error => {
+        // Held for the person's Continue (the row then shows that ONE action): the press is the same
+        // "continue_with_files" the thread's card sends. Otherwise it is the plain Retry.
+        const savedMessageHold = readSavedMessageHold(issueById.get(issueId)?.interruption);
+        const result = await issuesApi.retryTask(issueId, { idempotencyKey, observedRunId: run.id,
+          ...(savedMessageHold ? { retryAction: savedMessageHold.retryAction } : {}) }).catch(error => {
           if (error instanceof ApiError && error.status >= 400 && error.status < 500)
             retryRequestKeys.current.delete(run.id);
           throw error;
