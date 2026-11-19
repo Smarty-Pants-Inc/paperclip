@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { IssueQueuedCommentQueue, TaskInterruptionPresentation } from "@paperclipai/shared";
 import { ExecutionBlockerNotice } from "@/components/ExecutionBlockerNotice";
 import { mergePendingIssueQueuedComments } from "@/lib/issue-queued-comment-queue";
+import { readCommentDelivery } from "@/api/comment-delivery";
+import { commentsToTaskChatItems } from "./task-chat-adapter";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { MemoryRouter } from "@/lib/router";
 import {
@@ -901,6 +903,53 @@ describe("TaskChatQueuedMessages", () => {
       expect(countdown()).toBeNull();
       await advance(10_000);
       expect(props.onSteer).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("steering by default: the waiting list shows what the server answered (Paul 11-19)", () => {
+    const sent = (extra: Record<string, unknown>) => ({ ...queue.entries[0]!.comment, id: "comment-new", body: "Check the deploy too", ...extra });
+
+    it.each([390, 1440])("the server answers QUEUE to a Send while working: the message is in the waiting list, never shown as sent at %ipx", (width) => {
+      window.innerWidth = width;
+      const answer = sent({ deliveryOutcome: "queued" });
+      const delivery = readCommentDelivery(answer);
+      expect(delivery.kind).toBe("queued");
+      const merged = mergePendingIssueQueuedComments({
+        issueId: "issue-1",
+        authoritativeQueue: { ...queue, entries: [] },
+        pendingComments: delivery.kind === "queued" ? [{ comment: answer, targetRunId: "run-1" }] : [],
+        fallbackProtocol: "paperclip_runner_v1",
+      });
+      render({ queue: merged! });
+      const list = container.querySelector('[data-testid="task-chat-queued-list"]')!;
+      expect(list).not.toBeNull();
+      expect(list.textContent).toContain("Check the deploy too");
+      const [item] = commentsToTaskChatItems([answer as never]);
+      expect(item && "steeredIntoRunId" in item ? item.steeredIntoRunId : undefined).toBeUndefined();
+      expect(container.querySelector('[data-testid="task-chat-steered-message"]')).toBeNull();
+    });
+
+    it.each([390, 1440])("the server answers STEER: the message is a sent thread item for that run, not a waiting row at %ipx", (width) => {
+      window.innerWidth = width;
+      const answer = sent({ steeredIntoRunId: "run-1", steeredAt: "2026-11-19T07:40:00.000Z" });
+      expect(readCommentDelivery(answer)).toEqual({ kind: "steered", runId: "run-1", steeredAt: "2026-11-19T07:40:00.000Z" });
+      const [item] = commentsToTaskChatItems([answer as never]);
+      expect(item && "steeredIntoRunId" in item ? item.steeredIntoRunId : null).toBe("run-1");
+      // Nothing waits: the list renders nothing for it.
+      render({ queue: { ...queue, entries: [] } });
+      expect(container.querySelector('[data-testid="task-chat-queued-list"]')).toBeNull();
+    });
+
+    it.each([390, 1440])("D5: a Send the server could not steer shows its reason in the waiting list at %ipx", (width) => {
+      window.innerWidth = width;
+      const answer = sent({ deliveryOutcome: "queued", steeringUnavailableReason: "This runner can't take messages mid-turn." });
+      const delivery = readCommentDelivery(answer);
+      expect(delivery).toEqual({ kind: "queued", steeringUnavailableReason: "This runner can't take messages mid-turn." });
+      render({ steeringUnavailableReason: delivery.kind === "queued" ? delivery.steeringUnavailableReason : null });
+      const line = container.querySelector('[data-testid="task-chat-queued-list"] [data-testid="task-chat-steering-unavailable"]')!;
+      expect(line).not.toBeNull();
+      expect(line.textContent).toBe("Steering paused: This runner can't take messages mid-turn. Will send after this turn.");
+      expect(container.textContent).toContain("First queued message");
     });
   });
 });
