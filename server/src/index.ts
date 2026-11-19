@@ -1914,7 +1914,8 @@ async function startServerWithDatabaseTeardown(
     // Its first pass runs in the background so it never delays readiness.
       void registerOwnershipReconciliationWork(db as any, deliveryWork,
       () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped,
-      { enabled: async () => !(await heartbeat.resolveSchedulingSuppression()).suppressed }).ready
+      { enabled: async () => !(await heartbeat.resolveSchedulingSuppression()).suppressed,
+        stopRetainedCustody: cleanupInspectionRuntime.stopRetainedCustodyLease }).ready
       .catch(err => logger.warn({ err }, "ownership reconciliation report pass failed"));
       await pass("ActiveRunSilence", () => heartbeat.registerActiveRunSilenceWork(deliveryWork,
       () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped).ready);

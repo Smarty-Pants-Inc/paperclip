@@ -1,4 +1,4 @@
-import { and, eq, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, issueRecoveryActions, workspaceOperations, type Db } from "@paperclipai/db";
 import { remoteWorkspaceRunReferenceSchema } from "@paperclipai/shared";
 import { retiredReusableLeasePredecessors } from "./environment-lease-handoff.js";
@@ -12,9 +12,10 @@ type Source = { companyId: string; issueId: string; runId: string; actionId: str
 
 /**
  * A restore hold stops a warm sandbox and changes its lease to
- * `retain_on_failure` only while its files are at risk. Once recovery has
- * saved them, return the sandbox to warm reuse so the next run resumes it
- * instead of paying a new allocation and a full workspace realize.
+ * `retain_on_failure` only while its files are at risk, or marks an already
+ * stopped reusable source without changing its policy. Once recovery has
+ * saved them, release that hold and return the sandbox to warm reuse so the
+ * next run resumes it instead of paying a new allocation and a full workspace realize.
  *
  * Call inside the transaction that completes the recovery. Every guard is
  * checked again against the current row, and the policy write is a
@@ -41,7 +42,10 @@ export async function settleRecoveredWorkspaceRestoreHolds(db: Db, input: Source
   if (!action || !Array.isArray(operationIds)) return [];
   const leases = await db.select().from(environmentLeases).where(and(
     eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.heartbeatRunId, run.id),
-    eq(environmentLeases.leasePolicy, "retain_on_failure"), eq(environmentLeases.status, "released"),
+    or(eq(environmentLeases.leasePolicy, "retain_on_failure"), and(
+      inArray(environmentLeases.leasePolicy, ["reuse_by_environment", "reuse_by_execution_workspace"]),
+      sql`${environmentLeases.metadata}->${LEGACY_WORKSPACE_RECOVERY_KEY}->>'originalLeasePolicy' = ${environmentLeases.leasePolicy}`)),
+    eq(environmentLeases.status, "released"),
     sql`${environmentLeases.metadata}->${LEGACY_WORKSPACE_RECOVERY_KEY}->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`,
     sql`${environmentLeases.metadata}->${LEGACY_WORKSPACE_RECOVERY_KEY}->>'runId' = ${run.id}`));
   const restored: string[] = [];
@@ -52,7 +56,11 @@ export async function settleRecoveredWorkspaceRestoreHolds(db: Db, input: Source
     // which only a `reuse_by_environment` acquisition writes.
     const original = marker.originalLeasePolicy
       ?? (isRecord(lease.metadata?.reusableSandboxLease) ? "reuse_by_environment" : undefined);
-    if (original !== "reuse_by_environment" || !lease.provider || !lease.providerLeaseId) continue;
+    // Already-reusable sources must name their unchanged policy explicitly;
+    // the historical retain_on_failure conversion remains environment-only.
+    if ((lease.leasePolicy === "retain_on_failure" ? original !== "reuse_by_environment" : original !== lease.leasePolicy)
+      || !lease.provider || !lease.providerLeaseId) continue;
+    const restoredPolicy = lease.leasePolicy === "retain_on_failure" ? "reuse_by_environment" : lease.leasePolicy;
     // The stop that the hold required is confirmed and nothing is reopening it.
     if (!hasConfirmedSandboxStopAndRetain(lease)) continue;
     // These files were saved by this recovery, from this exact allocation.
@@ -70,11 +78,11 @@ export async function settleRecoveredWorkspaceRestoreHolds(db: Db, input: Source
       eq(environmentLeases.provider, lease.provider), eq(environmentLeases.providerLeaseId, lease.providerLeaseId)));
     if (!retiredReusableLeasePredecessors(lease, history)) continue;
     const { [LEGACY_WORKSPACE_RECOVERY_KEY]: _held, ...metadata } = lease.metadata!;
-    const [updated] = await db.update(environmentLeases).set({ leasePolicy: "reuse_by_environment", updatedAt: new Date(),
+    const [updated] = await db.update(environmentLeases).set({ leasePolicy: restoredPolicy, updatedAt: new Date(),
       metadata: { ...metadata, [SETTLED_WORKSPACE_RESTORE_HOLD_KEY]: { ...marker, actionId: input.actionId,
-        snapshotOperationId: saved.id, restoredLeasePolicy: "reuse_by_environment", settledAt: new Date().toISOString() } },
+        snapshotOperationId: saved.id, restoredLeasePolicy: restoredPolicy, settledAt: new Date().toISOString() } },
     }).where(and(eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.id, lease.id),
-      eq(environmentLeases.heartbeatRunId, run.id), eq(environmentLeases.leasePolicy, "retain_on_failure"),
+      eq(environmentLeases.heartbeatRunId, run.id), eq(environmentLeases.leasePolicy, lease.leasePolicy),
       eq(environmentLeases.status, "released"), sql`${environmentLeases.metadata} = ${JSON.stringify(lease.metadata)}::jsonb`,
     )).returning({ id: environmentLeases.id });
     if (updated) restored.push(updated.id);

@@ -5,6 +5,7 @@ import { providerResourceDispositionForTerminalRun } from "../runner-environment
 export { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { RECOVERY_EXECUTION_WAIT_MESSAGE, isWellFormedExecutionWait, wellFormedExecutionWaitSql, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
+import { anchorParkedWakePayloadSql, personSendSql } from "./parked-wake-anchor.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { observeStoppedWorkspaceRecovery } from "../workspace-recovery.js";
 import { notifyScheduledRetryCancellation } from "../scheduled-retry-cancellation-notifications.js";
@@ -976,6 +977,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     }
     const deliveryPayload = response ? { ...payload } : withQueuedCommentIdsInWakePayload(payload, commentIds);
     delete deliveryPayload.queuedCommentInterrupt;
+    // S124: the park ends here; a later park anchors afresh.
+    delete deliveryPayload.firstParkedAt;
+    delete deliveryPayload.parkedNoticeAt;
     await enqueueWakeup(wake.agentId, {
       source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
       payload: deliveryPayload, contextSnapshot: response
@@ -1055,7 +1059,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       });
     }
     if (stoppedSource && scope.requestId) {
-      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date(),
+        payload: anchorParkedWakePayloadSql(agentWakeupRequests.payload, agentWakeupRequests.updatedAt,
+          personSendSql()) }).where(and(
         eq(agentWakeupRequests.id, scope.requestId), eq(agentWakeupRequests.companyId, stoppedSource.companyId),
         eq(agentWakeupRequests.status, "deferred_issue_execution"),
       ));
@@ -1090,7 +1096,10 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       seen.add(issueId);
       // Advance the cursor even for invalid evidence so one damaged task cannot
       // starve later requests in this bounded scan. Preserve concurrent edits.
-      const [claimed] = await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+      // S124d: the cursor rewrite keeps the person's FIRST deferral (set once).
+      const [claimed] = await db.update(agentWakeupRequests).set({ updatedAt: new Date(),
+        payload: anchorParkedWakePayloadSql(agentWakeupRequests.payload, agentWakeupRequests.updatedAt,
+          personSendSql()) }).where(and(
         eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
         eq(agentWakeupRequests.status, "deferred_issue_execution"),
         lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000)),

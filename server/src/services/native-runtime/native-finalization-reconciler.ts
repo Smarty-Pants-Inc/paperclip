@@ -897,6 +897,7 @@ export function registerOwnershipReconciliationWork(
     onReport?: (report: OwnershipReport) => void;
     /** False while heartbeat scheduling is suppressed for this instance. */
     enabled?: () => Promise<boolean>;
+    stopRetainedCustody?: (leaseId: string, attemptId: string) => Promise<boolean>;
   } = {},
 ) {
   const state = createOwnershipReportState();
@@ -940,7 +941,7 @@ export function registerOwnershipReconciliationWork(
       if (watchOnly && !pendingWake && (graceDueAt === null || Date.now() < graceDueAt)) {
         // Bounded and cheap: indexed listings of the settling kinds only.
         lastPassAt = Date.now();
-        const recheck = await recheckSettlingKinds(db);
+        const recheck = await recheckSettlingKinds(db, { stopRetainedCustody: options.stopRetainedCustody });
         // A settle changes the set; the next full pass reports it.
         if (recheck.settled.length > 0) { watchOnly = false; nextRunAt = Date.now(); return; }
         if (recheck.watched === 0) watchOnly = false;
@@ -950,7 +951,7 @@ export function registerOwnershipReconciliationWork(
       }
       lastPassAt = Date.now();
       pendingWake = false;
-      const report = await runOwnershipReconciliationPass(db, { state });
+      const report = await runOwnershipReconciliationPass(db, { state, stopRetainedCustody: options.stopRetainedCustody });
       const backstop = await applyOwnershipReportBackstops(db, report);
       const fingerprint = ownershipReportFingerprint(report);
       const changing = report.inProgress > 0 && fingerprint !== lastFingerprint;

@@ -41,8 +41,11 @@ import { CHAT_COMPLETION_WAKE_REASON } from "../chat-completion-delivery.js";
 import {
   acceptedStopOnlyReceipt,
   hasStopOnlyCleanup,
+  preparePendingCleanupCustodyStop,
   settleStopOnlyCleanup,
+  settleUnaddressableNativeCustody,
 } from "../sandbox-stop-and-retain.js";
+import { nativeCustodyKeptRecovery, nativeLeaseCustodyMissing } from "../native-runtime/native-lease-custody.js";
 import { discoverSettledNativeRunProcesses, inspectSettledNativeRunProcess, PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, recordNativeLocalProcessStopInTransaction, retryPendingSettledNativeRunProcesses } from "../native-local-process-stop.js";
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import { portableTaskPreparationLeaseId } from "../plugin-task-ownership.js";
@@ -1927,8 +1930,15 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
 
     let destroyed = 0;
     let capped = 0;
-    for (const row of rows) {
+    for (let row of rows) {
       if (pendingCleanupAttemptsInFlight.has(row.id)) continue;
+      // Convert an unsaved native allocation to stop-only BEFORE any hold can
+      // defer destruction: stopping preserves the very bytes those holds need.
+      if (!hasStopOnlyCleanup(row) && await nativeLeaseCustodyMissing(db, row.id)) {
+        row = await preparePendingCleanupCustodyStop(db, row, nativeCustodyKeptRecovery()) ?? row;
+      }
+      // Upgrade historical invalid intents without claiming destructive cleanup.
+      if (row.status !== "pending_cleanup" || await settleUnaddressableNativeCustody(db, row)) continue;
       if (!hasStopOnlyCleanup(row) && hasNativeHarnessBackupMissing(row)) {
         await deferPendingCleanupLease(row.id);
         continue;

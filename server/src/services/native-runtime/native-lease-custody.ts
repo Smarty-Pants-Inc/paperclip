@@ -1,0 +1,157 @@
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import {
+  environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeHarnessBackups, type Db,
+} from "@paperclipai/db";
+import { getStorageService } from "../../storage/index.js";
+import { executionStartedEventPredicate } from "../pre-dispatch-execution-evidence.js";
+import {
+  durableNativeHarnessStorage, NATIVE_HARNESS_DOWNLOAD_IDLE_TIMEOUT_MS, verifyDurableNativeHarnessBackup,
+  verifyRecoverableNativeHarnessBackup,
+} from "./native-harness-backup-storage.js";
+import { loadNativeHarnessBackupLeaseChain, loadNativeHarnessBackupLeaseRows, nativeHarnessBackupHasLaterProviderWork,
+  nativeSessionOfLeaseRun, newestNativeHarnessBackupStampOnChain } from "./native-retired-backup-source.js";
+
+type CustodyLease = Pick<typeof environmentLeases.$inferSelect, "id" | "companyId" | "providerLeaseId">;
+
+/** The lease's custody stamp across its warm-handoff lease CHAIN (the stop's
+ * close can stamp the admission row): the newest stamp of the session the tip
+ * served, with no provider work after it. Null when none. */
+export async function nativeLeaseChainCustodyStamp(db: Db, lease: CustodyLease,
+  normalizedSessionId?: string | null): Promise<unknown> {
+  if (!lease.providerLeaseId) return null;
+  const allocation = { companyId: lease.companyId, providerLeaseId: lease.providerLeaseId };
+  let chain = await loadNativeHarnessBackupLeaseChain(db, allocation);
+  if (!chain || chain.tip.id !== lease.id) {
+    const rows = await loadNativeHarnessBackupLeaseRows(db, allocation);
+    if (rows.length !== 1 || rows[0]!.id !== lease.id) return null;
+    chain = { tip: rows[0]!, predecessors: [] };
+  }
+  const stamp = newestNativeHarnessBackupStampOnChain(chain,
+    normalizedSessionId === undefined ? await nativeSessionOfLeaseRun(db, chain.tip) : normalizedSessionId, "cleanup");
+  if (!stamp || await nativeHarnessBackupHasLaterProviderWork(db, { companyId: lease.companyId,
+    normalizedSessionId: stamp.normalizedSessionId, completedAt: stamp.completedAt })) return null;
+  return stamp;
+}
+
+/** Names a native box kept (stopped, not destroyed) because no verified saved
+ * harness copy exists. Set on the orphan-recovery marker of the stop intent;
+ * the retained-orphan settle owns it, counts its custody attempts and
+ * escalates after the cleanup cap. */
+export const NATIVE_CUSTODY_UNVERIFIED_KEY = "nativeCustodyUnverified";
+export const NATIVE_CUSTODY_UNVERIFIED_REASON = "native_custody_unverified";
+
+/** A kept, possibly RUNNING allocation, not a termination receipt. Only the
+ * fresh-replacement admission caller may disregard this resource obligation.
+ * Ordinary cleanup, stop-proof and recovery readers must still see it. */
+export function hasRetainedUnaddressableNativeCustody(lease: Pick<typeof environmentLeases.$inferSelect,
+  "status" | "cleanupStatus" | "failureReason" | "heartbeatRunId" | "metadata">): boolean {
+  const recovery = lease.metadata?.orphanedRunLeaseRecovery as Record<string, unknown> | undefined;
+  const replacement = lease.metadata?.replaceBeforeReuse as Record<string, unknown> | undefined;
+  return !!lease.heartbeatRunId && lease.status === "retained" && lease.cleanupStatus === "failed"
+    && lease.failureReason === "native_custody_stop_unavailable"
+    && recovery?.nativeCustodyUnverified === true && recovery.recoveredOrphanedRunLease === true
+    && recovery.ownerProof === NATIVE_CUSTODY_UNVERIFIED_REASON && recovery.runId === lease.heartbeatRunId
+    && recovery.disposition === "retained_unstoppable"
+    && replacement?.schema === "paperclip.replace-before-reuse.v1" && replacement.runId === lease.heartbeatRunId;
+}
+
+/** SQL mirror shared by the retained-orphan owner and environment deletion.
+ * A policy cannot hide this still-live obligation; ordinary released rows do
+ * not qualify, even if they carry old recovery metadata. */
+export function retainedUnaddressableNativeCustodyCondition() {
+  return and(eq(environmentLeases.status, "retained"), eq(environmentLeases.cleanupStatus, "failed"),
+    eq(environmentLeases.failureReason, "native_custody_stop_unavailable"),
+    sql`${environmentLeases.heartbeatRunId} is not null`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,nativeCustodyUnverified}' = 'true'`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,recoveredOrphanedRunLease}' = 'true'`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,ownerProof}' = ${NATIVE_CUSTODY_UNVERIFIED_REASON}`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,runId}' = ${environmentLeases.heartbeatRunId}::text`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,disposition}' = 'retained_unstoppable'`,
+    sql`${environmentLeases.metadata}#>>'{replaceBeforeReuse,schema}' = 'paperclip.replace-before-reuse.v1'`,
+    sql`${environmentLeases.metadata}#>>'{replaceBeforeReuse,runId}' = ${environmentLeases.heartbeatRunId}::text`);
+}
+
+/**
+ * THE custody check before any destructive cleanup of a native lease,
+ * ephemeral included (RFL 05:59Z): true when the lease's box may hold a native
+ * harness session trace (a native run with ANY native session identity on
+ * this provider allocation) and no VERIFIED saved copy exists. Verified means the
+ * existing helpers read the bytes: the lease's own or lease-chain backup stamp
+ * verified by `verifyRecoverableNativeHarnessBackup`, or a `native_harness_backups` row of
+ * the run whose stored object `verifyDurableNativeHarnessBackup` downloads and
+ * digests against its reference. A row whose bytes are missing is not custody.
+ * Any read failure fails closed (custody missing).
+ */
+export async function nativeLeaseCustodyMissing(db: Db, leaseId: string): Promise<boolean> {
+  if (typeof (db as Partial<Db>)?.select !== "function") return false;
+  try {
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    if (!lease?.providerLeaseId) return false;
+    // A warm handoff changes the lease/run identity, not the box's contents.
+    // Every native holder of this allocation needs its own verified custody;
+    // even an irregular chain is evidence of possible contents, never absence.
+    const holders = await loadNativeHarnessBackupLeaseRows(db, { companyId: lease.companyId,
+      providerLeaseId: lease.providerLeaseId });
+    for (const holder of holders) {
+      if (holder.provider !== lease.provider || !holder.heartbeatRunId
+        || !await nativeRunSessionIdentity(db, holder, holder.heartbeatRunId)) continue;
+      if (!await nativeHolderHasCustody(db, holder, lease)) return true;
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/** The allocation tip may carry a predecessor's session stamp after close.
+ * A different holder/session's copy never discharges this holder's obligation. */
+async function nativeHolderHasCustody(db: Db, holder: typeof environmentLeases.$inferSelect,
+  allocation: typeof environmentLeases.$inferSelect): Promise<boolean> {
+  const sessionId = await nativeSessionOfLeaseRun(db, holder);
+  for (const stamp of [holder.metadata?.nativeHarnessBackup,
+    await nativeLeaseChainCustodyStamp(db, allocation, sessionId).catch(() => null)]) {
+    if (sessionId && (stamp as { normalizedSessionId?: unknown } | null)?.normalizedSessionId !== sessionId) continue;
+    if (stamp && await verifyRecoverableNativeHarnessBackup({ db, companyId: holder.companyId,
+      stamp, providerLeaseId: allocation.providerLeaseId! }).catch(() => false)) return true;
+  }
+  const copies = await db.select().from(nativeHarnessBackups).where(and(
+    eq(nativeHarnessBackups.companyId, holder.companyId), eq(nativeHarnessBackups.runId, holder.heartbeatRunId!),
+    inArray(nativeHarnessBackups.status, ["current", "superseded"]))).orderBy(desc(nativeHarnessBackups.createdAt)).limit(5);
+  if (copies.length === 0) return false;
+  let storage;
+  try { storage = durableNativeHarnessStorage() ?? getStorageService(); } catch { return false; }
+  for (const copy of copies) {
+    if (await verifyDurableNativeHarnessBackup({ db, storage, companyId: copy.companyId,
+      scopeDigest: copy.scopeDigest, manifestSha256: copy.manifestSha256, backupId: copy.id,
+      downloadIdleTimeoutMs: NATIVE_HARNESS_DOWNLOAD_IDLE_TIMEOUT_MS }).catch(() => false)) return true;
+  }
+  return false;
+}
+
+/** Native for custody = ANY native session identity of the run (rf-3 F3), not
+ * only a persisted start event: a lost event is not proof that no harness
+ * session ran in the box. Identity: a start event, or a native session id,
+ * resumed session id or recorded runner process. Without a start event, a
+ * runner-task lease the task was never dispatched to (`runnerTaskDispatched`,
+ * written at submit) is affirmative proof that this box ran no session. The
+ * resolved native mode, native issue id and coordinator row are written at
+ * claim, before any launch, so alone they are not a session: a pre-launch box
+ * is released as the never-launched proof (`nativeRunNeverLaunchedRunner`) allows. */
+async function nativeRunSessionIdentity(db: Db, lease: typeof environmentLeases.$inferSelect, runId: string): Promise<boolean> {
+  const [run] = await db.select({ runtimeMode: heartbeatRuns.runtimeMode, nativeSessionId: heartbeatRuns.nativeSessionId,
+    sessionIdAfter: heartbeatRuns.sessionIdAfter, processPid: heartbeatRuns.processPid,
+    processGroupId: heartbeatRuns.processGroupId, processStartedAt: heartbeatRuns.processStartedAt }).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, lease.companyId)));
+  if (run?.runtimeMode !== "native") return false;
+  const [started] = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents)
+    .where(and(eq(heartbeatRunEvents.runId, runId), executionStartedEventPredicate())).limit(1);
+  if (started) return true;
+  if (lease.metadata?.runnerTaskLease === true && lease.metadata?.runnerTaskDispatched !== true) return false;
+  return !!(run.nativeSessionId || run.sessionIdAfter || run.processPid || run.processGroupId || run.processStartedAt);
+}
+
+/** Recovery marker for the stop intent of a kept unsaved native box. */
+export function nativeCustodyKeptRecovery(): Record<string, unknown> {
+  return { recoveredOrphanedRunLease: true, [NATIVE_CUSTODY_UNVERIFIED_KEY]: true,
+    ownerProof: NATIVE_CUSTODY_UNVERIFIED_REASON };
+}
