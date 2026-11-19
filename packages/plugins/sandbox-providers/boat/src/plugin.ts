@@ -412,7 +412,36 @@ type RequestErrorCategory = "request_error" | "network_error" | "http_error" | "
  * `status` (integer HTTP status) and `code` (closed errno only) are the structure
  * the host's transient-retry classification reads through the SDK diagnostic;
  * the transient words serve the server's text-only resume retry. */
-function redactKey(config: Config, text: string): string { return config.apiKey ? text.split(config.apiKey).join("[REDACTED]") : text; }
+function redactKey(config: Config, text: string): string { return redactProviderText(config, text); }
+/** THE one source for every outbound provider diagnostic (errors, stacks, logs):
+ * masks our configured key, any bearer/Authorization credential, signed-URL query
+ * tokens (X-Amz-Signature/Credential/Security-Token, sig=, token=, _token=, ...)
+ * and JWTs. The plugin SDK has no redactor and the server's `redactSensitiveText`
+ * is not importable here (rf-4 U2 F1). */
+export function redactProviderText(config: Pick<Config, "apiKey">, text: string): string {
+  let out = config.apiKey ? text.split(config.apiKey).join("[REDACTED]") : text;
+  out = out.replace(/(?<![A-Za-z0-9])(Bearer)(\s+)[^\s,;"'&]+/gi, "$1$2[REDACTED]")
+    .replace(/(?<![A-Za-z0-9])(Basic)(\s+)[A-Za-z0-9+/]{8,}={0,2}/g, "$1$2[REDACTED]")
+    .replace(/(?<![A-Za-z0-9])(Authorization|Proxy-Authorization|X-Api-Key|Api-Key|Cookie)(\s*[:=]\s*)(?!(?:Bearer|Basic)\s)(?!\[REDACTED\])[^\s,;"'&]+/gi, "$1$2[REDACTED]")
+    .replace(/([?&;#\s]|^)([\w.-]*(?:token|sig|signature|credential|secret|password|passwd|api[_-]?key|access[_-]?key|session|auth)[\w.-]*=)[^&\s#"']+/gi, "$1$2[REDACTED]")
+    .replace(/\beyJ[\w-]{6,}\.[\w-]{6,}\.[\w-]*/g, "[REDACTED]");
+  return out;
+}
+function logHeader(config: Pick<Config, "apiKey">, value: string | null): string | null { return value === null ? null : providerWords(config, value, 200); }
+/** A Boat free-text field as one bounded, sanitised line, or null. */
+function providerWords(config: Pick<Config, "apiKey">, text: string, max = 500): string | null {
+  const words = redactProviderText(config, text.replace(/\s+/g, " ").trim());
+  return words ? words.slice(0, max) : null;
+}
+/** A Boat status for a diagnostic: a closed token as Boat sends it, else bounded and sanitised. */
+function providerStatus(config: Pick<Config, "apiKey">, status: unknown): string {
+  if (typeof status !== "string") return "unknown";
+  return /^[a-z_]{1,40}$/.test(status) ? status : `unrecognised (${providerWords(config, status, 80) ?? "empty"})`;
+}
+/** Boat's RFC 3339 timestamp, or null: never a free-text field posing as one. */
+function providerTimestamp(value: unknown): string | null {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/.test(value) && Number.isFinite(Date.parse(value)) ? value : null;
+}
 function requestError(config: Config, method: string, path: string, httpStatus: number | null, category: RequestErrorCategory, code?: string, boat409?: Boat409Fields, direct?: BoatDirectFields): Error & { httpStatus: number | null; category: RequestErrorCategory; status?: number; code?: string } & Boat409Fields & BoatDirectFields {
   const redact = (text: string) => redactKey(config, text);
   const closedCode = code !== undefined && TRANSPORT_ERROR_CODES.has(code) ? code : undefined;
@@ -629,10 +658,11 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
         }
       }
       const isIpLimit = String(errorCode) === "IP_RATE_LIMIT_EXCEEDED";
+      // Boat's body code and headers are provider text: through the one sanitiser (rf-4 U2 F1, J16).
       if (!isIpLimit && !responseOptions.closedLogs) duplexLogger?.warn("Boat API 429", {
-        method, route, attempt: `${attempt}/${maxSends}`, retryAfter: retryAfterText,
-        rateLimit: response.headers.get("RateLimit"), rateLimitPolicy: response.headers.get("RateLimit-Policy"),
-        ...(errorCode ? { code: errorCode } : {}),
+        method, route, attempt: `${attempt}/${maxSends}`, retryAfter: redactProviderText(config, retryAfterText),
+        rateLimit: logHeader(config, response.headers.get("RateLimit")), rateLimitPolicy: logHeader(config, response.headers.get("RateLimit-Policy")),
+        ...(errorCode ? { code: providerWords(config, String(errorCode), 120) } : {}),
       });
       await response.body?.cancel();
       const hasRateLimitWait = retryAfter !== null || isIpLimit;
@@ -641,8 +671,8 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
         boatRateLimitPauseUntil = Math.max(boatRateLimitPauseUntil, Date.now() + retryAfterMs);
         if (!responseOptions.closedLogs) duplexLogger?.warn("Boat IP rate-limit pause", {
           reason: "IP_RATE_LIMIT_EXCEEDED", pauseUntil: new Date(boatRateLimitPauseUntil).toISOString(),
-          retryAfter: retryAfterText, method, route,
-          rateLimit: response.headers.get("RateLimit"), rateLimitPolicy: response.headers.get("RateLimit-Policy"),
+          retryAfter: redactProviderText(config, retryAfterText), method, route,
+          rateLimit: logHeader(config, response.headers.get("RateLimit")), rateLimitPolicy: logHeader(config, response.headers.get("RateLimit-Policy")),
         });
         await waitForRateLimitPause();
       } else if (retryAfter !== null) {
@@ -1005,20 +1035,31 @@ async function stopSandbox(config: Config, id: string): Promise<{ providerLeaseI
     return await stopSandboxRequests(config, id);
   } finally { endBoxLifecycle(activityKey(config, id)); }
 }
-/** Boat's words for a refused stop: its `error` text or closed fields, key-redacted and bounded. */
+/** Boat's words for a refused stop: its `error` text or closed fields, sanitised and bounded. */
 function boatStopWords(config: Config, error: unknown): string | null {
   const text = typeof error === "string" ? error
     : error && typeof error === "object" ? [(error as { code?: unknown }).code, (error as { message?: unknown }).message]
       .filter((part): part is string => typeof part === "string" && !!part.trim()).join(": ") : "";
-  const words = redactKey(config, text.replace(/\s+/g, " ").trim());
-  return words ? words.slice(0, 500) : null;
+  return providerWords(config, text);
+}
+/** A stop diagnostic built from Boat's fields, through the one sanitiser (message and stack). */
+function stopDiagnostic(config: Config, message: string): Error {
+  const error = new Error(redactProviderText(config, message));
+  if (error.stack) error.stack = redactProviderText(config, error.stack);
+  return error;
+}
+/** Boat refused this box's stop and the back-off has not ended. */
+function stopRefusalActive(config: Config, id: string): boolean {
+  const refusal = stopRefusals.get(activityKey(config, id));
+  return refusal !== undefined && Date.now() < refusal.until;
 }
 function refuseStop(config: Config, id: string, stopId: string, status: string, error: unknown, snapshotCompletedAt: unknown): BoatStopRefusedError {
   const key = activityKey(config, id);
   const refusals = (stopRefusals.get(key)?.refusals ?? 0) + 1;
   const until = Date.now() + Math.min(BOAT_STOP_REFUSAL_BACKOFF_CAP_MS, BOAT_STOP_REFUSAL_BACKOFF_MS * 2 ** Math.min(refusals - 1, 20));
-  const refused = new BoatStopRefusedError(id, stopId, status, boatStopWords(config, error),
-    typeof snapshotCompletedAt === "string" && snapshotCompletedAt ? snapshotCompletedAt : null, new Date(until).toISOString(), refusals);
+  // Every field below leaves the worker (message, typed fields, RPC): one sanitiser, closed shapes.
+  const refused = new BoatStopRefusedError(redactKey(config, id), providerWords(config, stopId, 120) ?? "unknown", providerStatus(config, status),
+    boatStopWords(config, error), providerTimestamp(snapshotCompletedAt), new Date(until).toISOString(), refusals);
   stopRefusals.delete(key);
   stopRefusals.set(key, { until, refusals, error: refused });
   for (const oldest of stopRefusals.keys()) { if (stopRefusals.size <= BOAT_STOP_REFUSAL_MEMORY) break; stopRefusals.delete(oldest); }
@@ -1078,19 +1119,24 @@ async function stopSandboxRequests(config: Config, id: string): Promise<{ provid
         if (own.status === "failing" || own.status === "failed") {
           throw refuseStop(config, id, stopId, own.status, own.error, own.snapshotCompletedAt ?? sandbox.snapshotCompletedAt);
         }
-        if (own.status !== "pending") throw new Error(`Boat stop ${stopId} entered ${own.status}`);
+        if (own.status !== "pending") throw stopDiagnostic(config, `Boat stop ${stopId} entered ${providerStatus(config, own.status)}`);
       }
+    }
+    // No record (404): the box's own stop is Boat's word on OUR stop only when its id
+    // is the one POST /stop returned; `failing` there is the same refusal (rf-4 U2 F3, J5).
+    if (!readRecord && stopId !== undefined && seen?.id === stopId && (seen.status === "failing" || seen.status === "failed")) {
+      throw refuseStop(config, id, stopId, seen.status, seen.error, seen.snapshotCompletedAt ?? sandbox.snapshotCompletedAt);
     }
     // A missing id on 202 is not failure: observe the sandbox until its stop
     // appears/completes or it reaches the documented archived state.
     const observedId = typeof stop?.id === "string" && stop.id.trim() ? stop.id : stopId;
     if (observedId && stop?.status && !["pending", "failing", "completed"].includes(stop.status)) {
-      throw new Error(`Boat stop ${observedId} entered ${stop.status}`);
+      throw stopDiagnostic(config, `Boat stop ${observedId} entered ${providerStatus(config, stop.status)}`);
     }
     // Never force a stop or discard unsaved files.
     await delay(1500);
   }
-  throw new Error(`Boat stop ${stopId ?? id} did not complete${lastStatus ? ` (Boat status ${lastStatus})` : ""}`);
+  throw stopDiagnostic(config, `Boat stop ${stopId ?? id} did not complete${lastStatus ? ` (Boat status ${providerStatus(config, lastStatus)})` : ""}`);
 }
 // Existing SDK ownership envelope, consumed by core's creation inspection/reaper.
 function cleanupIdentity(config: Config, id: string, owner: { companyId: string; environmentId: string; runId?: string }, attemptId: string): PluginEnvironmentCreationCleanup {
@@ -1224,6 +1270,10 @@ async function bindDuplexLease(params: Omit<DuplexLease, "providerLeaseId">, id:
   duplexChannels.bind(lease);
 }
 async function retireForLifecycle(lease: DuplexLease): Promise<SshRetireWarning[]> {
+  // Inside a stop refusal's back-off with NO SSH state here, retirement has nothing
+  // to revoke (retire() is a no-op without state) and its read decides nothing: send
+  // no HTTP (rf-4 U2 F3, J18). Any state (a key to revoke) still takes the full path.
+  if (!sshCarrier.hasState(lease) && stopRefusalActive(parse(lease.config), lease.providerLeaseId)) return [];
   if (lease.config.duplexCarrier === "ssh" || sshCarrier.hasState(lease)) {
     // Finish any in-flight install before deciding whether guest file/command
     // retirement is safe; duplex suspension above prevents new opens racing it.
@@ -2130,7 +2180,14 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     let ttlRefresh: { status: "ok" | "unconfirmed"; at: string; archiveAfter: string | null }
       | { status: "failed"; at: string; category: RequestErrorCategory; httpStatus: number | null; archiveAfter: string | null } | undefined;
     let refreshExpiresAt: string | null = null;
-    if (!sandbox || !["ready", "idle", "running"].includes(sandbox.state)) {
+    // A RUNNING box whose stop Boat refused (our cached refusal, or the box's own stop
+    // reads `failing`) is not warm: Boat retries that stop until it archives the box,
+    // and "Only a resume ends it early (`superseded`)" (staged boat-llms-full.txt :1855;
+    // "a resume cancels the stop", :15380). So an explicit resume POSTs /resume here
+    // too; only its successful exact-id answer clears the refusal (markOurResume).
+    // A TTL PATCH alone cancels nothing (rf-4 U2 F2, J14).
+    const refusedStop = !!sandbox && (stopRefusals.has(activityKey(c, id)) || ["failing", "failed"].includes(sandbox.stop?.status));
+    if (!sandbox || !["ready", "idle", "running"].includes(sandbox.state) || refusedStop) {
       // boatdocs-0110c/api_reference_sandboxes_resume-sandbox.md:35-75,147-172.
       const response = await request(c, `/sandboxes/${encodeURIComponent(id)}/resume`, { method: "POST", body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(c), ...(c.boatEnvironment === undefined ? { noEnv: true } : {}) }) });
       const sb = response.sandbox ?? response;
