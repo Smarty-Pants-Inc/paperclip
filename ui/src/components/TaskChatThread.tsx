@@ -138,7 +138,7 @@ import { useDismissedTaskQuestions } from "@/hooks/useDismissedTaskQuestions";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { useIssuePlanDocument } from "@/hooks/useIssuePlanDocument";
-import { isRedundantAiRecoveryNotice, latestSameRunHandoffTimestamp } from "@/lib/issue-chat-messages";
+import { isRedundantAiRecoveryNotice, latestSameRunHandoffTimestamp, type IssueChatComment } from "@/lib/issue-chat-messages";
 import { isLiveIssueRun, isTerminalIssueStatus } from "@/lib/liveIssueIds";
 import {
   resolveTaskChatBlockers,
@@ -166,6 +166,42 @@ function toMs(value: Date | string | null | undefined): number {
   if (!value) return 0;
   const ms = new Date(value).getTime();
   return Number.isNaN(ms) ? 0 : ms;
+}
+
+type ThreadBackboneEntry = { ms: number; order: number; id: string; item: TaskChatItem };
+
+/**
+ * The '/new' comment is the server's lasting session boundary: the server
+ * stamps it with conversationSessionGeneration when the new session starts.
+ * No run lists it as input, so after the turn it has no conversation anchor
+ * of its own, and its createdAt is when it was queued, which can be before
+ * the previous answer. The new session begins with the first person message
+ * sent after it, so the divider sits right before that message, wherever the
+ * thread places it. An earlier anchor of its own still wins.
+ */
+function placeSessionBoundaries(
+  entries: ThreadBackboneEntry[],
+  comments: readonly IssueChatComment[],
+): void {
+  const entryById = new Map(entries.map((entry) => [entry.id, entry]));
+  const before = (a: ThreadBackboneEntry, b: ThreadBackboneEntry) =>
+    a.ms < b.ms || (a.ms === b.ms && a.order < b.order);
+  for (const boundary of comments) {
+    if (boundary.conversationSessionGeneration == null) continue;
+    const entry = entryById.get(boundary.id);
+    if (entry?.item.kind !== "marker" || entry.item.variant !== "session_start") continue;
+    const sentAtMs = toMs(boundary.createdAt);
+    let first: ThreadBackboneEntry | null = null;
+    for (const comment of comments) {
+      if (comment.id === boundary.id || comment.conversationSessionGeneration != null) continue;
+      if (comment.authorType !== "user" || toMs(comment.createdAt) <= sentAtMs) continue;
+      const message = entryById.get(comment.id);
+      if (message && (!first || before(message, first))) first = message;
+    }
+    if (!first || (boundary.conversationAnchorAt && before(entry, first))) continue;
+    entry.ms = first.ms;
+    entry.order = first.order - 0.0005;
+  }
 }
 
 function normalizedMessageText(value: string | null | undefined): string {
@@ -1489,6 +1525,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
         item,
       });
     });
+    placeSessionBoundaries(entries, visibleComments);
     for (const interaction of interactions ?? []) {
       // Withdrawn/superseded confirmations are retracted calls to action — drop
       // them so a dead card never stacks above the one that replaced it.
