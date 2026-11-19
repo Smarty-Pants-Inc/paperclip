@@ -658,6 +658,21 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       }
     }
   }
+  async function incompleteLog(logRef: string) {
+    // The writer's kept index survives process retirement/restart. Add only
+    // in-memory accounting: spilled batches have already released that count.
+    // Do not infer missing bytes from a null final size or an open head (a
+    // close/digest failure can leave every byte stored).
+    const { open } = await readSpillIndex(spillPaths(options.spillDir, logRef).indexPath);
+    let bytes = open.reduce((sum, entry) => sum + entry.bytes, 0);
+    const causes = open.map(entry => entry.cause ?? { name: "UnknownError" });
+    for (const state of writers.values()) if (state.handle.logRef === logRef && state.pendingBytes > 0) {
+      bytes += state.pendingBytes;
+      causes.push(state.failure ? finalizationError(state.failure) : { name: "ObjectRunLogPendingWrite" });
+    }
+    return bytes > 0 ? { incomplete: { bytes, causes: [...new Map(causes.map(cause =>
+      [JSON.stringify(cause), cause])).values()] } } : {};
+  }
   const api: RunLogStore = {
     async begin(input) {
       const logRef = `${input.companyId}/${input.agentId}/${input.runId}`;
@@ -885,6 +900,7 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       const store = journal(handle.logRef, opts.priority ?? "interactive"),
         snapshot = await store.head(opts.signal) ?? writers.get(handle)?.writer;
       if (!snapshot || snapshot.head.deleted) throw notFound("Run log not found");
+      const incomplete = await incompleteLog(handle.logRef);
       const offset = Math.max(0, opts.offset ?? 0),
         limit = opts.limitBytes ?? 256_000;
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_READ_BYTES)
@@ -920,7 +936,7 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       const nextOffset =
         offset + bytes.length < snapshot.head.end ? offset + bytes.length : undefined;
       if (!opts.alignStartToRecord || offset === 0 || bytes.length === 0)
-        return { content: bytes.toString("utf8"), nextOffset };
+        return { content: bytes.toString("utf8"), nextOffset, ...incomplete };
       const parts = [bytes];
       let before = offset;
       if (lookback > 0) {
@@ -944,6 +960,7 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       return {
         content: Buffer.concat(parts).toString("utf8"),
         nextOffset: nextOffset ?? offset + bytes.length,
+        ...incomplete,
       };
     },
     async flushInflightMirrors() {
