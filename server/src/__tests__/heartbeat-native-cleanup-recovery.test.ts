@@ -6,7 +6,7 @@ import { and, eq, sql } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentWakeupRequests, companies, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns,
+import { agents, agentWakeupRequests, companies, companyMemberships, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns,
   issueComments, issues, plugins } from "@paperclipai/db";
 import { executeNativeSession, nativeSessionCleanupBlock, NativeSessionCloseUnrecoverableError, onNativeSessionCleanupQuarantined,
   parseNativeExecutionInput, type NativeSession, type PrpStructuredRunResult } from "../vendor/paperclip-runner/index.js";
@@ -42,6 +42,8 @@ describe.skipIf(!support.supported)("operator-required remote cleanup admission 
     const pluginId = randomUUID(), provider = `cleanup-${pluginId}`, providerLeaseId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Cleanup recovery", defaultResponsibleUserId: "creator",
       issuePrefix: `CR${companyId.slice(0, 6)}` });
+    // access-overlay F3: the board reader of /execution is a real company member (the read gate now applies).
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "creator", status: "active", membershipRole: "owner" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Worker", adapterType: "paperclip_runner", status: "error" });
     await db.insert(issues).values({ id: issueId, companyId, title: "Continue saved work", status: "todo",
       assigneeAgentId: agentId, createdByUserId: "creator" });
@@ -165,7 +167,9 @@ describe.skipIf(!support.supported)("operator-required remote cleanup admission 
     }
     const readers: Array<[string, Record<string, unknown>]> = [
       ["the assignee's manager agent", { type: "agent", agentId: managerId, companyId: f.companyId, source: "agent_key" }],
-      ["a board user", { type: "board", userId: "creator", companyIds: [f.companyId], source: "session", isInstanceAdmin: false }],
+      // access-overlay F3: /execution now takes the issue:read decision, which needs the board actor's membership.
+      ["a board user", { type: "board", userId: "creator", companyIds: [f.companyId], source: "session", isInstanceAdmin: false,
+        memberships: [{ companyId: f.companyId, status: "active", membershipRole: "owner" }] }],
     ];
     if (f.message.authorAgentId) readers.unshift(["the requester agent",
       { type: "agent", agentId: f.message.authorAgentId, companyId: f.companyId, source: "agent_key" }]);

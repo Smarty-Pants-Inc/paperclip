@@ -2721,9 +2721,13 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       const denied = await request(caller)
         .post(`/api/issues/${seeded.issueId}/queued-comments/${seeded.commentIds[0]}/steer`)
         .send({ queueId: seeded.wakeId, targetRunId: seeded.runId, revision: boardQueue.body.revision })
-        .expect(403);
+        .expect(callerKind === "another-company" ? 404 : 403);
 
-      expect(denied.body).toMatchObject({
+      // access-overlay F10: the read gate runs FIRST, so another company's agent
+      // gets the same tenant 404 a missing task gets; same-company agents that
+      // can read the task still reach the board-only preflight.
+      if (callerKind === "another-company") expect(denied.body).toEqual({ error: "Issue not found" });
+      else expect(denied.body).toMatchObject({
         error: "Board access required",
         code: "board_access_required",
         remediation: expect.stringContaining("this denial is final"),
