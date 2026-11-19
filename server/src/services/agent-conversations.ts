@@ -30,6 +30,7 @@ import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { createHeartbeatTimerPolicy, parseHeartbeatPolicy } from "./heartbeat/timer-policy.js";
 import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { HttpError } from "../errors.js";
+import { commentCarriedSql } from "./interrupt-carry-custody.js";
 
 export type ConversationIdentity = {
   conversationAgentId?: string | null;
@@ -607,6 +608,9 @@ export async function undeliveredConversationComments(
         sql`not exists (select 1 from ${heartbeatRuns} steered_run where steered_run.company_id = ${companyId}
           and (steered_run.native_issue_id = ${issueId}::uuid or steered_run.context_snapshot->>'issueId' = ${issueId})
           and coalesce(steered_run.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? ${issueComments.id}::text)`, 
+        // ONE successor (adopt-one-successor): a steer the Interrupt or the run-end restore handed
+        // on (carry wake, interruptCarried/restoredSteeredCommentIds) is sent; never a second wake.
+        sql`not ${commentCarriedSql(companyId, issueId, sql`${issueComments.id}`)}`,
       ),
     )
     .orderBy(issueComments.createdAt, issueComments.id)

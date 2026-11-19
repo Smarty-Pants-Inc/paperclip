@@ -5,6 +5,7 @@ import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../a
 import { createAgentLifecycle } from "../agent-lifecycle.js";
 import { QUEUED_SEND_AFTER_STOP_KEY } from "../run-cancellation.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
+import { commentIdsCarriedElsewhere, SENT_WITH_OTHER_QUEUED_MESSAGES } from "../interrupt-carry-custody.js";
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
@@ -2748,6 +2749,28 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
     if (executionReconciliationWake && !issueId) return null;
     const durableRequest = opts.durableChatRequest;
+    // ONE successor (adopt-one-successor) dispatch re-filter: a person's comment wake never carries
+    // a message the ONE answered function says is answered, or that an Interrupt carry, another
+    // pending wake or a live run already holds. Nothing left: the wake completes as coalesced.
+    if (issueId && reason === "issue_commented" && opts.requestedByActorType === "user" && !durableRequest &&
+        !opts.queuedCommentInterruptId && !opts.queuedCommentRequestId && !opts.taskRetryRequestId && !executionWaitRequestId) {
+      const ids = [...new Set([...(Array.isArray(enrichedContextSnapshot.wakeCommentIds) ? enrichedContextSnapshot.wakeCommentIds : []),
+        wakeCommentId].filter((id): id is string => typeof id === "string" && id.length > 0))];
+      const [issueRow] = ids.length ? await db.select({ companyId: issues.companyId }).from(issues)
+        .where(eq(issues.id, issueId)) : [];
+      const [sameKey] = issueRow && opts.idempotencyKey ? await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.companyId, issueRow.companyId), eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey)))
+        .limit(1) : [];
+      const carried = issueRow && !sameKey ? await commentIdsCarriedElsewhere(db, { companyId: issueRow.companyId, issueId,
+        commentIds: ids, idempotencyKey: opts.idempotencyKey }) : new Set<string>();
+      if (ids.length && ids.every(id => carried.has(id))) {
+        const now = new Date();
+        await db.insert(agentWakeupRequests).values({ companyId: issueRow!.companyId, agentId, source, triggerDetail, reason,
+          payload, status: "coalesced", requestedByActorType: opts.requestedByActorType, requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null, error: SENT_WITH_OTHER_QUEUED_MESSAGES, finishedAt: now, updatedAt: now });
+        return null;
+      }
+    }
     let taskRetryActorId: string | null = null;
     delete enrichedContextSnapshot.boardMessageRetry;
     if (opts.taskRetryRequestId) {
