@@ -1102,15 +1102,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     for (const elapsed of [PENDING_WAIT_BOUND_MS + 1_000, 599_000, 601_000, 660_000]) {
       await settleAt(f, elapsed);
-      // M stays on its real receipt line. The earlier, separately owed
-      // planted-Stop message still MUST get its one notice on this merged base.
+      // M stays on its real receipt line. mcomp (merged9 item 3 + ruling 8): on this line the earlier message's
+      // Stop is the REAL route by its sender, so it is owed NO notice (merged9's earlierStoppedBySender replaces
+      // m10b's earlierOwedOnce, which was written for 98ea9cee's planted Stop).
       expect(await f.own()).toHaveLength(0);
-      await f.earlierOwedOnce();
+      await f.earlierStoppedBySender();
     }
-    // No second bounded-note clock for M. Preserve the earlier message's
-    // single durable wait record rather than silencing its distinct duty.
+    // No second bounded-note clock for M; the sender-stopped earlier message is not owed, so it never waits either.
     expect((await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId), eq(activityLog.action, PENDING_WAIT_ACTION))))
-      .map(row => (row.details as Record<string, unknown>).messageId)).toEqual([f.stoppedId]);
+      .map(row => (row.details as Record<string, unknown>).messageId)).toEqual([]);
   });
 
   it.each(["deferred", "deferred_issue_execution"].flatMap(status =>
