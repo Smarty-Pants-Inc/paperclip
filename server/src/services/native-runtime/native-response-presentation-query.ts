@@ -2,6 +2,7 @@ import { alias, QueryBuilder } from "drizzle-orm/pg-core";
 import { and, asc, eq, exists, gt, inArray, isNotNull, isNull, ne, notExists, or, sql } from "drizzle-orm";
 import { chatActions, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults, statusDecisions, statusDecisionEffects } from "@paperclipai/db";
 import type { NativeResponsePresentationScope } from "../native-response-presentation-notifications.js";
+import { conversationRunMessageOwedSql } from "../conversation-turn-answer.js";
 
 const laterDecisions = alias(statusDecisions, "later_status_decisions");
 
@@ -46,9 +47,13 @@ export function nativeResponsePresentationCandidates(scope?: NativeResponsePrese
           or(sql`(coalesce(${issues.conversationAgentId}::text, '') = '' or coalesce(${issues.conversationUserId}, '') = '')`,
             // An unsettled conversation turn. A held turn keeps the status its
             // gate committed; recovery applies the live path's answered rule.
-            and(or(ne(statusDecisions.reasonCode, "conversation_turn_finished"), eq(issues.status, "in_progress")),
+            // "Unsettled" is the saved state settleConversationTurn wrote from the one function, or, for a chat an
+            // earlier rule parked as answered, the one function itself: the run's own person message is still owed.
+            and(or(and(or(ne(statusDecisions.reasonCode, "conversation_turn_finished"), eq(issues.status, "in_progress")),
+                eq(issues.conversationState, "active")),
+                conversationRunMessageOwedSql({ companyId: sql`${heartbeatRuns.companyId}`, issueId: sql`${issues.id}`,
+                  contextSnapshot: sql`${heartbeatRuns.contextSnapshot}` })),
               eq(issues.conversationAgentId, heartbeatRuns.agentId), eq(issues.conversationUserId, heartbeatRuns.responsibleUserId),
-              eq(issues.conversationState, "active"),
               or(isNull(issues.executionRunId), eq(issues.executionRunId, heartbeatRuns.id)),
               sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issues.id}::text`,
               sql`jsonb_typeof(${heartbeatRuns.contextSnapshot}->'conversationSessionGeneration') = 'number'`,

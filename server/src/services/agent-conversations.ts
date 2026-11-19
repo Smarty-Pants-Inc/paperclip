@@ -30,6 +30,7 @@ import { createHeartbeatTimerPolicy, parseHeartbeatPolicy } from "./heartbeat/ti
 import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { HttpError } from "../errors.js";
 import { ONBOARDING_CHAT_GREETING_REASON } from "./onboarding-chat-prompt.js";
+import { answeredPersonMessageSql } from "./person-message-answer.js";
 
 export type ConversationIdentity = {
   conversationAgentId?: string | null;
@@ -292,17 +293,12 @@ export async function prepareConversationTurn(
       if (answered) {
         const progress = await tx.select({
           id: issueComments.id,
-          handled: sql<boolean>`exists (select 1 from ${heartbeatRuns} completed
-            where completed.company_id = ${run.companyId}::uuid and completed.agent_id = ${issue.conversationAgentId}::uuid
-              and completed.status = 'succeeded' and completed.context_snapshot->>'issueId' = ${issueId}
-              and completed.context_snapshot->>'conversationSessionGeneration' = ${String(generation)}
-              and coalesce(completed.context_snapshot->>'wakeCommentId', completed.context_snapshot->>'commentId') = issue_comments.id::text
-              and (exists (select 1 from issue_comments reply where reply.company_id = ${run.companyId}::uuid
-                and reply.issue_id = ${issueId}::uuid and reply.created_by_run_id = completed.id
-                and reply.origin = 'comment' and reply.author_agent_id = ${issue.conversationAgentId}::uuid and reply.deleted_at is null)
-                or exists (select 1 from issue_thread_interactions question where question.company_id = ${run.companyId}::uuid
-                  and question.issue_id = ${issueId}::uuid and question.source_run_id = completed.id
-                  and question.created_by_agent_id = ${issue.conversationAgentId}::uuid)))`,
+          // ANSWERED comes from the ONE function (person-message-answer.ts), the rule the unanswered-message
+          // sweep and the continuation carry read. Departure from upstream (which tested "a succeeded run of this
+          // session woke on the message and left any comment or any card"): a progress comment, a card that
+          // expired or the system cancelled, and a reply to another message no longer mark a message handled.
+          handled: sql<boolean>`${answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+            issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}`,
         }).from(issueComments).where(and(
           eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, issueId),
           isNull(issueComments.deletedAt), isNull(issueComments.createdByRunId), isNull(issueComments.authorAgentId),
@@ -351,15 +347,75 @@ export async function prepareConversationTurn(
   return result;
 }
 
+/** How far back an EARLIER person message still holds the chat's status (the sweep's lookback,
+ * recovery/unanswered-person-message.ts UNANSWERED_MESSAGE_LOOKBACK_MS: older than this it shows no notice either). */
+export const CONVERSATION_OWED_MESSAGE_LOOKBACK_MS = 24 * 60 * 60_000;
+
+/** The conversation turn's ANSWERED read: ONE call to answeredPersonMessageSql (person-message-answer.ts), the rule
+ * the unanswered-message sweep and the continuation carry read, so the chat's saved status ("In Review" /
+ * "In Progress" on the Properties Status row, the activity line, a status card's pill, a blocked task's reason and
+ * whether a final reply is still repaired) never says "answered" beside a "wasn't answered" notice, or the reverse.
+ * `own`: the person input this turn carries and whether it is answered: the person's answer to a card
+ *   (context.interactionId, at its answer time) when the turn resumes from one, else the turn's person message (the
+ *   reply boundary, else the wake comment). null when the turn carries no person input the one function reads.
+ * `owed`: one person message of the current session that is NOT answered: the turn's own, any later one, and any
+ *   earlier one within CONVERSATION_OWED_MESSAGE_LOOKBACK_MS. A legacy message row with no author type is outside the
+ *   one function (the sweep does not read it either); upstream's rule stands for it: owed when later than the wake.
+ * DEPARTURE FROM UPSTREAM (settleConversationTurn tested "the run left a comment or a pending card", then "a person
+ * message is later than the wake"): a progress-only comment or an expired card no longer parks the chat; a pending or
+ * person-answered card from a run that later failed does; an earlier message a reply never named keeps it open; and
+ * a second message the run's own input named (a batch) no longer does. */
+async function readConversationTurnAnswer(tx: Pick<Db, "execute">, input: { companyId: string; issueId: string;
+  wakeId: string | null; interactionId: string | null; boundaryCommentId: string | null; greeting: boolean }) {
+  const since = new Date(Date.now() - CONVERSATION_OWED_MESSAGE_LOOKBACK_MS).toISOString();
+  const uuid = (value: string | null) => value && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value) ? value : null;
+  input = { ...input, wakeId: uuid(input.wakeId), interactionId: uuid(input.interactionId) };
+  const laterThanWake = sql`(m.created_at, m.id) > (select w.created_at, w.id from ${issueComments} w where w.id = ${input.wakeId}::uuid)`;
+  const rows = [...await tx.execute(sql`select t.id, t.kind, t.own, t.answered from (
+      select inp.id, inp.kind, inp.own, inp.input_at, ${answeredPersonMessageSql({ id: sql.raw("inp.id"), companyId: sql.raw("inp.company_id"),
+        issueId: sql.raw("inp.issue_id"), createdAt: sql.raw("inp.input_at") })} as answered
+      from (
+        select m.id, m.company_id, m.issue_id, m.created_at as input_at, 'message' as kind,
+            (m.author_type = 'user' and m.id = ${input.wakeId}::uuid) as own
+          from ${issueComments} m
+          where m.company_id = ${input.companyId}::uuid and m.issue_id = ${input.issueId}::uuid and m.deleted_at is null
+            and m.id is distinct from ${input.boundaryCommentId}::uuid
+            and not exists (select 1 from ${issueComments} session_start where session_start.id = ${input.boundaryCommentId}::uuid
+              and (m.created_at, m.id) < (session_start.created_at, session_start.id))
+            and ((m.author_type = 'user' and (m.id = ${input.wakeId}::uuid or m.created_at > ${since}::timestamptz
+                or ${laterThanWake} or ${input.greeting}::boolean))
+              or (m.author_type is null and m.author_user_id is not null and (${laterThanWake}
+                or (${input.greeting}::boolean and ${input.wakeId}::uuid is null))))
+        union all
+        select q.id, q.company_id, q.issue_id, q.resolved_at, 'card_answer', true
+          from ${issueThreadInteractions} q
+          where q.id = ${input.interactionId}::uuid and q.company_id = ${input.companyId}::uuid and q.issue_id = ${input.issueId}::uuid
+            and q.resolved_by_user_id is not null and q.resolved_at is not null and q.status in ('answered', 'accepted', 'rejected')
+      ) inp
+    ) t where t.own or not t.answered
+    order by t.own desc, t.input_at, t.id limit 3`)] as unknown as Array<{ id: string; kind: "message" | "card_answer"; own: boolean; answered: boolean }>;
+  const own = rows.find(row => row.own && row.kind === "card_answer") ?? rows.find(row => row.own) ?? null;
+  const owed = rows.find(row => !row.answered) ?? null;
+  return { own: own ? { id: own.id, answered: own.answered } : null, owed: owed ? { id: owed.id } : null };
+}
+
 /** Finalizers only park a turn with a durable response, interaction, or processed /new. */
 export async function settleConversationTurn(
   db: Db,
   run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status" | "contextSnapshot">,
 ) {
-  if (run.status !== "succeeded") return false;
   const context = run.contextSnapshot ?? {};
   const issueId = typeof context.issueId === "string" ? context.issueId : null;
   if (!issueId) return false;
+  // A run that did not succeed settles nothing unless it carries a person message (below): only the one function
+  // can say that such a run still answered it (its pending card, or its accepted result published once).
+  const wakeId =
+    typeof context.conversationReplyBoundaryCommentId === "string"
+      ? context.conversationReplyBoundaryCommentId
+      : typeof context.wakeCommentId === "string"
+        ? context.wakeCommentId
+        : context.commentId;
+  if (run.status !== "succeeded" && typeof wakeId !== "string") return false;
   let publication: ActivityPublication | null = null;
   const settled = await db.transaction(async (tx) => {
     const [issue] = await tx
@@ -367,7 +423,7 @@ export async function settleConversationTurn(
         id: issues.id, companyId: issues.companyId, status: issues.status,
         conversationAgentId: issues.conversationAgentId, conversationUserId: issues.conversationUserId,
         conversationState: issues.conversationState, conversationSessionGeneration: issues.conversationSessionGeneration,
-        executionRunId: issues.executionRunId,
+        executionRunId: issues.executionRunId, conversationBoundaryCommentId: issues.conversationBoundaryCommentId,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
@@ -377,70 +433,60 @@ export async function settleConversationTurn(
       (issue.executionRunId && issue.executionRunId !== run.id)
     )
       return false;
-    const [response] = await tx
-      .select({ id: issueComments.id })
-      .from(issueComments)
-      .where(
-        and(
-          eq(issueComments.issueId, issueId),
-          eq(issueComments.createdByRunId, run.id),
-          eq(issueComments.origin, "comment"),
-          eq(issueComments.authorAgentId, issue.conversationAgentId!),
-          isNull(issueComments.deletedAt),
-        ),
-      )
-      .limit(1);
-    // Native question/plan waits use the durable interaction as the reply;
-    // their terminal prose is deliberately not materialized as a comment.
-    const [interaction] = !response && context.conversationReset !== true
-      ? await tx.select({ id: issueThreadInteractions.id })
-          .from(issueThreadInteractions)
-          .where(and(
-            eq(issueThreadInteractions.companyId, run.companyId),
-            eq(issueThreadInteractions.issueId, issueId),
-            eq(issueThreadInteractions.sourceRunId, run.id),
-            eq(issueThreadInteractions.createdByAgentId, issue.conversationAgentId!),
-            eq(issueThreadInteractions.status, "pending"),
-          ))
-          .limit(1)
-      : [];
-    if (!response && !interaction && context.conversationReset !== true) return false;
+    const reset = context.conversationReset === true;
+    // ANSWERED: the ONE call (see readConversationTurnAnswer). It replaces upstream's two tests here: "this run left
+    // a comment or a pending card" (the turn is answered) and "a person message is later than the wake" (more is owed).
+    const turn = await readConversationTurnAnswer(tx, {
+      companyId: run.companyId, issueId, wakeId: typeof wakeId === "string" ? wakeId : null,
+      interactionId: typeof context.interactionId === "string" ? context.interactionId : null,
+      boundaryCommentId: issue.conversationBoundaryCommentId,
+      greeting: context.wakeReason === ONBOARDING_CHAT_GREETING_REASON,
+    });
+    const own = reset ? null : turn.own;
+    if (run.status !== "succeeded" && !own?.answered) return false;
+    if (own) {
+      if (!own.answered) return false;
+    } else if (!reset) {
+      // No person message is this turn's own input (a greeting, a timer or a handed-back task, or a legacy message
+      // row with no author type, which the one function does not read): upstream's durable-response test stands.
+      const [response] = await tx
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.issueId, issueId),
+            eq(issueComments.createdByRunId, run.id),
+            eq(issueComments.origin, "comment"),
+            eq(issueComments.authorAgentId, issue.conversationAgentId!),
+            isNull(issueComments.deletedAt),
+          ),
+        )
+        .limit(1);
+      // Native question/plan waits use the durable interaction as the reply;
+      // their terminal prose is deliberately not materialized as a comment.
+      const [interaction] = !response
+        ? await tx.select({ id: issueThreadInteractions.id })
+            .from(issueThreadInteractions)
+            .where(and(
+              eq(issueThreadInteractions.companyId, run.companyId),
+              eq(issueThreadInteractions.issueId, issueId),
+              eq(issueThreadInteractions.sourceRunId, run.id),
+              eq(issueThreadInteractions.createdByAgentId, issue.conversationAgentId!),
+              eq(issueThreadInteractions.status, "pending"),
+            ))
+            .limit(1)
+        : [];
+      if (!response && !interaction) return false;
+    }
     if (
       context.conversationSessionGeneration !==
       issue.conversationSessionGeneration
     )
       return false;
     // Messages arriving during the reply remain actionable, including the
-    // crash window between their comment commit and wake enqueue.
-    const wakeId =
-      typeof context.conversationReplyBoundaryCommentId === "string"
-        ? context.conversationReplyBoundaryCommentId
-        : typeof context.wakeCommentId === "string"
-          ? context.wakeCommentId
-          : context.commentId;
-    const [wake] =
-      typeof wakeId === "string"
-        ? await tx
-            .select({ id: issueComments.id })
-            .from(issueComments)
-            .where(eq(issueComments.id, wakeId))
-        : [];
-    // The welcome has no synthetic human anchor. Every real user message
-    // arriving during that first reply is still owed a response.
-    const [pending] = wake || context.wakeReason === ONBOARDING_CHAT_GREETING_REASON
-      ? await tx
-          .select({ id: issueComments.id })
-          .from(issueComments)
-          .where(
-            and(
-              eq(issueComments.issueId, issueId),
-              isNull(issueComments.deletedAt),
-              sql`${issueComments.authorUserId} is not null`,
-              wake ? sql`(${issueComments.createdAt}, ${issueComments.id}) > (select cursor.created_at, cursor.id from issue_comments cursor where cursor.id = ${wake.id}::uuid)` : undefined,
-            ),
-          )
-          .limit(1)
-      : [];
+    // crash window between their comment commit and wake enqueue; so does
+    // every earlier message the one function still owes an answer.
+    const pending = turn.owed;
     const status = pending ? "in_progress" : "in_review";
     const conversationState = pending ? "active" : "waiting";
     if (
@@ -504,7 +550,9 @@ export async function settleConversationTurnForRun(
         'conversationSessionGeneration', ${heartbeatRuns.contextSnapshot}->'conversationSessionGeneration',
         'conversationReplyBoundaryCommentId', ${heartbeatRuns.contextSnapshot}->'conversationReplyBoundaryCommentId',
         'wakeCommentId', ${heartbeatRuns.contextSnapshot}->'wakeCommentId',
-        'commentId', ${heartbeatRuns.contextSnapshot}->'commentId'
+        'commentId', ${heartbeatRuns.contextSnapshot}->'commentId',
+        'interactionId', ${heartbeatRuns.contextSnapshot}->'interactionId',
+        'wakeReason', ${heartbeatRuns.contextSnapshot}->'wakeReason'
       ) else null end`,
   }).from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)));
   return run ? settleConversationTurn(db, run) : false;

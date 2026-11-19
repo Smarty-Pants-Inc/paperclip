@@ -986,8 +986,13 @@ import {
       expect(await settleConversationTurn(db, succeeded)).toBe(false);
       await db.update(issueThreadInteractions).set({ sourceRunId: run.id })
         .where(eq(issueThreadInteractions.id, interaction.id));
+      // F-B (answered = the one function): the run's pending card is the person's answerable next step whatever the
+      // run's later status, so a run that did not succeed parks the chat too (upstream: never). Without a card it
+      // still settles nothing (the three calls above and below).
       for (const status of ["failed", "cancelled", "timed_out"]) {
-        expect(await settleConversationTurn(db, { ...succeeded, status })).toBe(false);
+        expect(await settleConversationTurn(db, { ...succeeded, status })).toBe(true);
+        expect(isWaitingConversation((await db.select().from(issues).where(eq(issues.id, chat.id)))[0])).toBe(true);
+        await db.update(issues).set({ status: "in_progress", conversationState: "active" }).where(eq(issues.id, chat.id));
       }
       await db.update(issueThreadInteractions).set({ createdByAgentId: null })
         .where(eq(issueThreadInteractions.id, interaction.id));
@@ -1125,7 +1130,11 @@ import {
       const prepared = await prepareConversationTurn(db, answerRun);
       const preparedContext: Record<string, unknown> = prepared.context;
       expect(preparedContext.wakeCommentId).toBe(first.id);
-      expect(preparedContext.conversationReplyBoundaryCommentId).toBe(["answered", "new-message"].includes(scenario) ? newer.id : first.id);
+      // F-B (handled = the one function): the visible reply "Paris." from a succeeded run that names the message
+      // answers it whatever session generation that run's snapshot carries (stale-session is a PLANTED shape:
+      // generation 99 on a generation-0 chat; a real older-session run sits behind the /new boundary instead).
+      const handledNewer = ["answered", "new-message", "stale-session"].includes(scenario);
+      expect(preparedContext.conversationReplyBoundaryCommentId).toBe(handledNewer ? newer.id : first.id);
       // A retry reuses the frozen boundary, even if another message has arrived.
       if (scenario === "new-message") await svc.addComment(chat.id, "New instructions while you answer", { userId: "local-board" });
       const retry = await prepareConversationTurn(db, { ...answerRun, contextSnapshot: prepared.context });
@@ -1134,11 +1143,11 @@ import {
       await svc.addComment(chat.id, "You chose Blue.", { agentId, runId: answerRun.id });
       expect(await settleConversationTurn(db, { ...answerRun, status: "succeeded", contextSnapshot: prepared.context })).toBe(true);
       const [settled] = await db.select().from(issues).where(eq(issues.id, chat.id));
-      expect(settled.conversationState).toBe(scenario === "answered" ? "waiting" : "active");
+      expect(settled.conversationState).toBe(scenario === "answered" || scenario === "stale-session" ? "waiting" : "active");
       expect(retryContext.conversationReplayThroughCommentId).toBe(preparedContext.conversationReplayThroughCommentId);
       const replay = await conversationReplay(db, companyId, chat.id, first.id,
         preparedContext.conversationReplayThroughCommentId as string);
-      if (["answered", "new-message"].includes(scenario)) {
+      if (handledNewer) {
         expect(replay).toContain("What is the capital of France?");
         expect(replay).toContain("Paris.");
       } else {
@@ -1170,6 +1179,9 @@ import {
         "What outcome should the task deliver?",
         { agentId, runId: run.id },
       );
+      // The completion writes the run's terminal status before it settles the turn (run-completion.ts); the one
+      // function reads that saved status, so the fixture's run row says so too.
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, run.id));
       expect(await settleConversationTurn(db, succeeded)).toBe(true);
       const [idle] = await db
         .select()

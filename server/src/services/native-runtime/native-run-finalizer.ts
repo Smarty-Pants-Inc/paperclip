@@ -41,6 +41,7 @@ import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./
 import { getNativeAddressedInteractionGrant, readNativeAddressedInteractionId } from "./native-addressed-interaction.js";
 import { toolCallLoopContinuationKey } from "./repeated-tool-failure-guard.js";
 import { conversationNativeDecision, isConversation, settleConversationTurnForRun } from "../agent-conversations.js";
+import { conversationRunMessageOwed } from "../conversation-turn-answer.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { COMPLETION_REVIEW_STAGE_REASON, completionReviewStageEntry } from "../issue-execution-policy.js";
 import { randomUUID } from "node:crypto";
@@ -1201,10 +1202,13 @@ async function recoverCommittedNativeChatResponseInScope(
       // The turn is still the conversation's unsettled current turn. A held
       // turn keeps whatever status its gate committed; a finished turn
       // preserves in_progress.
+      // Twin of native-response-presentation-query.ts: unsettled by the saved state, or (a chat an earlier rule
+      // parked as answered) by the one function: the run's own person message is still owed.
+      const unsettledConversation = conversation && (((decision.reasonCode !== "conversation_turn_finished" || issue.status === "in_progress")
+        && issue.conversationState === "active") || await conversationRunMessageOwed(tx, input));
       const currentConversation = conversation
         && issue.conversationAgentId === run.agentId && issue.conversationUserId === run.responsibleUserId
-        && (decision.reasonCode !== "conversation_turn_finished" || issue.status === "in_progress")
-        && issue.conversationState === "active"
+        && unsettledConversation
         && (!issue.executionRunId || issue.executionRunId === run.id)
         && run.contextSnapshot?.issueId === issue.id
         && typeof run.contextSnapshot.conversationSessionGeneration === "number"
