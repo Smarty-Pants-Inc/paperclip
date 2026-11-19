@@ -97,9 +97,9 @@ export interface ObjectRunLogSpillRecord {
   sourceCursor?: number;
   cause?: ReturnType<typeof finalizationError>;
 }
-async function readSpillIndex(indexPath: string, missingIsEmpty = true) {
+async function readSpillIndex(indexPath: string) {
   const index = await fs.readFile(indexPath, "utf8").catch((error: NodeJS.ErrnoException) => {
-    if (missingIsEmpty && error.code === "ENOENT") return "";
+    if (error.code === "ENOENT") return "";
     throw error;
   });
   const records = index.split("\n").filter(Boolean).map(line => JSON.parse(line) as ObjectRunLogSpillRecord);
@@ -108,6 +108,198 @@ async function readSpillIndex(indexPath: string, missingIsEmpty = true) {
   return { records, spilled, recovered, open: spilled.filter(entry => !recovered.has(entry.spillStart)) };
 }
 const SPILL_INDEX_SUFFIX = ".index.ndjson";
+const SPILL_DATA_SUFFIX = ".ndjson";
+const SPILL_LOG_REF = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
+// A recovered copy is read back within this long, or the spill's custody stays unknown.
+const SPILL_READ_BACK_TIMEOUT_MS = 60_000;
+// Every run-log record, spilled or not, is `{"ts":…,"attemptId":…,"stream":…,"chunk":…}`.
+const RUN_LOG_RECORD_MARK = /"stream":"(?:stdout|stderr|system)","chunk":/;
+// A data file with no record is read this far for a run-log record before it is kept unread.
+const SPILL_ORPHAN_SCAN_MAX_BYTES = 64 * 1024 * 1024;
+
+/** One recovered range: where it belongs in the object log, and what the spill file holds for it. */
+interface SpillRecoveredRange {
+  journalStart: number;
+  bytes: number;
+  /** Of the spill file's bytes for this range. */
+  sha256: string;
+  /** The journal end its `recovered` record claims. */
+  journalEnd: number;
+}
+// Weakest to strongest evidence: with several stores, the row names the strongest.
+const SPILL_READ_BACK_FAILURES = ["recovered_copy_store_unavailable", "recovered_copy_missing",
+  "recovered_copy_unreadable", "recovered_copy_read_timeout", "recovered_copy_short", "recovered_copy_mismatch"] as const;
+type SpillReadBackFailure = { reason: typeof SPILL_READ_BACK_FAILURES[number] } & Record<string, unknown>;
+/** Read ranges back from one store's object log. null: every range hashes equal to the spill file. */
+type SpillReadBack = (logRef: string, ranges: SpillRecoveredRange[], signal: AbortSignal) => Promise<SpillReadBackFailure | null>;
+/**
+ * The object stores of this process (production has one). Each reads a
+ * recovered copy back through its own journal, so the deleting paths need no
+ * storage wiring: a spill is released only by a store that really holds it.
+ */
+const spillReadBackStores = new Set<SpillReadBack>();
+
+function isSpillRecord(value: unknown): value is ObjectRunLogSpillRecord {
+  const entry = value as Partial<ObjectRunLogSpillRecord> | null;
+  const offset = (n: unknown) => Number.isSafeInteger(n) && (n as number) >= 0;
+  return !!entry && typeof entry === "object" && !Array.isArray(entry) && entry.v === 1 &&
+    (entry.event === "spilled" || entry.event === "recovered") &&
+    typeof entry.logRef === "string" && SPILL_LOG_REF.test(entry.logRef) &&
+    offset(entry.spillStart) && offset(entry.journalEnd) && offset(entry.bytes) && entry.bytes! > 0 &&
+    typeof entry.sha256 === "string" && /^[a-f0-9]{64}$/.test(entry.sha256);
+}
+/**
+ * Whether a `*.ndjson` with NO record beside it holds run-log bytes. Other
+ * tools write `*.ndjson` too, and cleanup walks whole worktrees: only a file
+ * that is empty, or was read in full and holds no run-log record, is not a
+ * spill. A file too large to read in full is kept.
+ */
+async function orphanHoldsRunLogBytes(dataPath: string) {
+  const file = await fs.open(dataPath, "r").catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!file) return false;
+  try {
+    const chunk = Buffer.alloc(1024 * 1024);
+    for (let at = 0, tail = ""; at < SPILL_ORPHAN_SCAN_MAX_BYTES;) {
+      const { bytesRead } = await file.read(chunk, 0, chunk.length, at);
+      if (!bytesRead) return false;
+      // latin1 keeps every byte: the mark is ASCII and may straddle two reads.
+      const text = tail + chunk.toString("latin1", 0, bytesRead);
+      if (RUN_LOG_RECORD_MARK.test(text)) return true;
+      tail = text.slice(-64);
+      at += bytesRead;
+    }
+    return true;
+  } finally { await file.close(); }
+}
+/** sha256 of one range of the spill file; null when the file does not hold the whole range. */
+async function spillRangeSha(file: Awaited<ReturnType<typeof fs.open>>, start: number, length: number) {
+  const hash = createHash("sha256"), chunk = Buffer.alloc(Math.min(length, MAX_READ_BYTES));
+  for (let at = start; at < start + length;) {
+    const { bytesRead } = await file.read(chunk, 0, Math.min(chunk.length, start + length - at), at);
+    if (!bytesRead) return null;
+    hash.update(chunk.subarray(0, bytesRead));
+    at += bytesRead;
+  }
+  return hash.digest("hex");
+}
+
+/**
+ * THE deletion rule for a kept spill, shared by every path that can remove one
+ * (never-OK custody): the content guard and the spill listing below, and
+ * through them instance cleanup, the workspace reaper and the scheduled sweep.
+ * A spill's files may go ONLY when
+ *   (a) its record parses and POSITIVELY names every byte on disk recovered, AND
+ *   (b) the recovered copy, READ BACK from the object log, hashes equal
+ *       (sha256 of both) to the spill file's bytes for every range.
+ * Everything else keeps it. A record that is missing, empty, `{}`, `[]`, torn,
+ * or silent about bytes on disk is NOT recovery proof; neither is a read-back
+ * that fails, times out, comes back short or differs. Those are UNKNOWN: kept,
+ * with a custody row naming the spill and the reason. Only an empty data file,
+ * or a `*.ndjson` holding no run-log record at all, is not a spill.
+ * This never throws.
+ */
+async function runLogSpillCustody(indexPath: string): Promise<{ state: "none" | "recovered" } | { state: "kept"; reason: string }> {
+  const dataPath = `${indexPath.slice(0, -SPILL_INDEX_SUFFIX.length)}${SPILL_DATA_SUFFIX}`;
+  const kept = (reason: string, detail: Record<string, unknown> = {}) => {
+    // `unrecovered` is the ordinary state; each caller reports it in its own refusal.
+    if (reason !== "unrecovered")
+      logger.warn({ spill: dataPath, index: indexPath, reason, ...detail }, "kept: run-log spill custody unknown");
+    return { state: "kept" as const, reason };
+  };
+  try {
+    const absentIsNull = (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    };
+    const bytesOnDisk = async () => (await fs.stat(dataPath).catch(absentIsNull))?.size ?? 0;
+    let text: string | null;
+    try {
+      text = await fs.readFile(indexPath, "utf8").catch(absentIsNull);
+    } catch (error) {
+      return kept("index_unreadable", { error: finalizationError(error) });
+    }
+    const lines = (text ?? "").split("\n").filter(Boolean);
+    if (!lines.length) {
+      // No record and no bytes: an empty data file is not a spill. Bytes
+      // beside an empty record, and run-log bytes whose record is missing,
+      // are the only copy until proven otherwise.
+      const bytes = await bytesOnDisk();
+      if (text === null) return await orphanHoldsRunLogBytes(dataPath) ? kept("index_missing", { bytes }) : { state: "none" };
+      return bytes > 0 ? kept("index_empty", { bytes }) : { state: "none" };
+    }
+    const records: ObjectRunLogSpillRecord[] = [];
+    for (const line of lines) {
+      let entry: unknown;
+      try { entry = JSON.parse(line); } catch { return kept("index_unparseable"); }
+      // `{}`, `[]` and every other shape the writer never wrote.
+      if (!isSpillRecord(entry)) return kept("index_invalid_record");
+      records.push(entry);
+    }
+    const logRef = records[0]!.logRef, named = { logRef };
+    if (records.some(entry => entry.logRef !== logRef) ||
+      path.basename(indexPath) !== `${logRef.split("/")[2]}${SPILL_INDEX_SUFFIX}`)
+      return kept("index_names_another_run", named);
+    const same = (a: ObjectRunLogSpillRecord, b: ObjectRunLogSpillRecord) =>
+      a.spillStart === b.spillStart && a.bytes === b.bytes && a.sha256 === b.sha256;
+    const spilled = records.filter(entry => entry.event === "spilled");
+    const recoveries = records.filter(entry => entry.event === "recovered");
+    if (recoveries.some(entry => !spilled.some(range => same(range, entry))))
+      return kept("index_recovered_without_spilled", named);
+    // (a) Every spilled range needs its own `recovered` record...
+    if (spilled.some(range => !recoveries.some(entry => same(range, entry)))) return kept("unrecovered", named);
+    // ...and every byte on disk needs a range: bytes no record points at are proven nowhere.
+    let indexed = 0;
+    for (const range of [...spilled].sort((a, b) => a.spillStart - b.spillStart)) {
+      if (range.spillStart !== indexed)
+        return kept(range.spillStart > indexed ? "data_without_index_entry" : "index_overlapping_entries", named);
+      indexed += range.bytes;
+    }
+    const ranges: SpillRecoveredRange[] = [];
+    const file = await fs.open(dataPath, "r").catch(absentIsNull);
+    if (!file) return kept("spill_data_missing", named);
+    try {
+      const bytes = (await file.stat()).size;
+      if (bytes !== indexed)
+        return kept(bytes > indexed ? "data_without_index_entry" : "spill_data_short", { ...named, bytes, indexedBytes: indexed });
+      // adoptSpill's placement rule: the journal end a range was spilled at,
+      // moved past every earlier range spilled at that same end.
+      let position = -1;
+      for (const range of spilled) {
+        position = Math.max(position, range.journalEnd);
+        const sha256 = await spillRangeSha(file, range.spillStart, range.bytes);
+        if (sha256 !== range.sha256) return kept("spill_data_mismatch", { ...named, spillStart: range.spillStart });
+        ranges.push({ journalStart: position, bytes: range.bytes, sha256,
+          journalEnd: Math.max(...recoveries.filter(entry => same(range, entry)).map(entry => entry.journalEnd)) });
+        position += range.bytes;
+      }
+    } finally { await file.close(); }
+    // (b) Read the recovered copy back from where it lives.
+    const signal = AbortSignal.timeout(SPILL_READ_BACK_TIMEOUT_MS);
+    let failure: SpillReadBackFailure = { reason: "recovered_copy_store_unavailable" }, equal = false;
+    for (const readBack of spillReadBackStores) {
+      const result = await readBack(logRef, ranges, signal).catch((error): SpillReadBackFailure => ({
+        reason: signal.aborted ? "recovered_copy_read_timeout" : "recovered_copy_unreadable",
+        error: finalizationError(error),
+      }));
+      if (!result) {
+        equal = true;
+        break;
+      }
+      if (SPILL_READ_BACK_FAILURES.indexOf(result.reason) >= SPILL_READ_BACK_FAILURES.indexOf(failure.reason))
+        failure = result;
+    }
+    if (!equal) return kept(failure.reason, { ...named, ...failure });
+    // The proof is of the bytes that were read: a spill that changed meanwhile is not proven.
+    if (await fs.readFile(indexPath, "utf8").catch(absentIsNull) !== text || await bytesOnDisk() !== indexed)
+      return kept("spill_changed_during_inspection", named);
+    return { state: "recovered" };
+  } catch (error) {
+    return kept("spill_unreadable", { error: finalizationError(error) });
+  }
+}
 // Installed node_modules: 141,591 entries; full content guard about 1.6 s.
 // Seven times that tree fits; exceeding the budget keeps the candidate visibly.
 const SPILL_CUSTODY_WALK_MAX_ENTRIES = 1_000_000;
@@ -119,10 +311,11 @@ let spillCustodyWalkBoundHits = 0;
  * spillPaths fixes only <company>/<agent>/<run>.index.ndjson below a root, not
  * where that root lives. Use the writer's reader, not another index dialect.
  * Symlink targets are not walked: rename/rm removes links, never their targets.
- * With no matching index this does only directory reads, not file-content IO.
+ * With no `*.ndjson` name this does only directory reads, not file-content IO.
+ * Each spill it finds is decided by runLogSpillCustody, the one deletion rule.
  */
 export async function candidateHoldsUnrecoveredRunLogSpill(candidatePath: string): Promise<boolean> {
-  const pending = [candidatePath];
+  const pending = [candidatePath], inspected = new Set<string>();
   let visitedEntries = 0;
   try {
     while (pending.length) {
@@ -143,9 +336,14 @@ export async function candidateHoldsUnrecoveredRunLogSpill(candidatePath: string
           return true;
         }
         const entryPath = path.join(directory, entry.name);
-        if (entry.name.endsWith(SPILL_INDEX_SUFFIX)) {
-          // A discovered but now missing/unreadable/torn index fails closed.
-          if ((await readSpillIndex(entryPath, false)).open.length) return true;
+        // A spill is its record AND its data file. Either name finds it, so
+        // bytes whose record is gone are found too; each spill is decided once.
+        const spillIndex = entry.name.endsWith(SPILL_INDEX_SUFFIX) ? entryPath
+          : entry.isFile() && entry.name.endsWith(SPILL_DATA_SUFFIX)
+            ? `${entryPath.slice(0, -SPILL_DATA_SUFFIX.length)}${SPILL_INDEX_SUFFIX}` : undefined;
+        if (spillIndex && !inspected.has(spillIndex)) {
+          inspected.add(spillIndex);
+          if ((await runLogSpillCustody(spillIndex)).state === "kept") return true;
         }
         if (entry.isDirectory()) pending.push(entryPath);
       }
@@ -158,7 +356,11 @@ export async function candidateHoldsUnrecoveredRunLogSpill(candidatePath: string
   }
 }
 
-/** Every run (`<company>/<agent>/<run>`) whose spill holds bytes no flush has stored yet. */
+/**
+ * Every run (`<company>/<agent>/<run>`) whose spill is NOT proven recovered by
+ * runLogSpillCustody: bytes no flush has stored yet, and every spill whose
+ * record or recovered copy cannot prove otherwise.
+ */
 export async function listUnrecoveredObjectRunLogSpills(spillDir?: string) {
   const root = resolveObjectRunLogSpillDir(spillDir), found: string[] = [];
   const list = (dir: string) => fs.readdir(dir, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
@@ -169,14 +371,15 @@ export async function listUnrecoveredObjectRunLogSpills(spillDir?: string) {
     if (!company.isDirectory()) continue;
     for (const agent of await list(path.join(root, company.name))) {
       if (!agent.isDirectory()) continue;
-      for (const file of await list(path.join(root, company.name, agent.name))) {
-        if (!file.isFile() || !file.name.endsWith(SPILL_INDEX_SUFFIX)) continue;
-        const logRef = `${company.name}/${agent.name}/${file.name.slice(0, -SPILL_INDEX_SUFFIX.length)}`;
-        // A record that cannot be read counts as unstored: its bytes are never assumed safe elsewhere.
-        const unstored = await readSpillIndex(path.join(root, company.name, agent.name, file.name))
-          .then(index => index.open.length > 0, () => true);
-        if (unstored) found.push(logRef);
+      const directory = path.join(root, company.name, agent.name), runs = new Set<string>();
+      for (const file of await list(directory)) {
+        // The record names a spill and so does its data file, when the record is gone.
+        const suffix = [SPILL_INDEX_SUFFIX, SPILL_DATA_SUFFIX].find(end => file.name.endsWith(end));
+        if (file.isFile() && suffix) runs.add(file.name.slice(0, -suffix.length));
       }
+      for (const run of runs)
+        if ((await runLogSpillCustody(path.join(directory, `${run}${SPILL_INDEX_SUFFIX}`))).state === "kept")
+          found.push(`${company.name}/${agent.name}/${run}`);
     }
   }
   return found.sort();
@@ -312,15 +515,41 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       else activeUploads--;
     };
   }
-  function journal(logRef: string, readPriority?: ObjectJournalIOPriority) {
-    if (!/^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/.test(logRef))
+  function journal(logRef: string, readPriority?: ObjectJournalIOPriority, readCache?: false) {
+    if (!SPILL_LOG_REF.test(logRef))
       throw new Error("Invalid object log reference");
     return createObjectByteJournal({
       provider: options.provider,
       prefix: `${options.keyPrefix}/segments-v1/${logRef}`,
       readPriority,
+      readCache,
     });
   }
+  // Custody read-back (runLogSpillCustody): the recovered copy is read through
+  // this store's own journal, from object storage and never from the read cache.
+  spillReadBackStores.add(async (logRef, ranges, signal) => {
+    const store = journal(logRef, "background", false), snapshot = await store.head(signal);
+    if (!snapshot || snapshot.head.deleted) return { reason: "recovered_copy_missing" };
+    const journalEnd = snapshot.head.end;
+    for (const range of ranges) {
+      const stop = range.journalStart + range.bytes;
+      // A record that claims a journal end the object log does not reach names a short copy.
+      if (journalEnd < range.journalEnd || journalEnd < stop)
+        return { reason: "recovered_copy_short", journalEnd, recordedJournalEnd: range.journalEnd };
+      const hash = createHash("sha256");
+      for (let at = range.journalStart; at < stop; at += MAX_READ_BYTES) {
+        const bytes = await store.readRange(snapshot.head, at, Math.min(MAX_READ_BYTES, stop - at), signal);
+        if (bytes.length !== Math.min(MAX_READ_BYTES, stop - at))
+          return { reason: "recovered_copy_short", journalEnd, shortReadAt: at };
+        hash.update(bytes);
+      }
+      const journalSha256 = hash.digest("hex");
+      if (journalSha256 !== range.sha256)
+        return { reason: "recovered_copy_mismatch", journalStart: range.journalStart, bytes: range.bytes,
+          spillSha256: range.sha256, journalSha256 };
+    }
+    return null;
+  });
   function schedule(state: WriterState) {
     if (state.closed || state.failure || state.timer || state.flushing || !state.pending.length)
       return;
