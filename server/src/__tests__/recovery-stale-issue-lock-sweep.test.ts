@@ -1515,7 +1515,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     }
 
     it.each(["automation_no_new_person", "deferred_restore_recovery", "issue_blocker_stalled", "issue_monitor"])(
-      "boot-4b/406/4c: pre-boot %s starts no run and retains its obligation across two sweeps", async reason => {
+      "boot-4b/406/4c: pre-boot %s retains its base promotion or hold across two sweeps", async reason => {
         const c = await chat();
         if (reason === "issue_blocker_stalled") await db.update(issues).set({ status: "done",
           conversationAgentId: null, conversationUserId: null, conversationState: null }).where(eq(issues.id, c.issueId));
@@ -1526,12 +1526,63 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
         const ownerRun = await run(c, [], ago(hour));
         await busyFinalization(c, ownerRun);
         for (let pass = 0; pass < 2; pass++) await settleSavedOwner(c);
-        expect(await queuedRuns(w.id)).toEqual([]);
-        // Without independent kind-specific ownership proof, preserve rather
-        // than cancel: no restore/export bytes or monitor obligation is orphaned.
-        expect(await wake(w.id)).toMatchObject({ status: "deferred_issue_execution", runId: null, payload: w.payload });
+        const admitted = await queuedRuns(w.id);
+        if (reason === "issue_monitor") {
+          // A monitor is the durable check driver, not historical chat input.
+          expect(admitted).toHaveLength(1);
+          expect(await wake(w.id)).toMatchObject({ status: "queued", runId: admitted[0].id });
+        } else {
+          expect(admitted).toEqual([]);
+          // Restore/export and other held kinds retain their existing custody.
+          expect(await wake(w.id)).toMatchObject({ status: "deferred_issue_execution", runId: null, payload: w.payload });
+        }
         expect(await systemNotes(c)).toEqual([]);
-        console.info("boot-4c retained", JSON.stringify({ reason, wakeId: w.id, runCount: 0 }));
+        console.info("boot-4c retained", JSON.stringify({ reason, wakeId: w.id, runCount: admitted.length }));
+      });
+
+    it.each(["issue_monitor", "issue_monitor_due"])(
+      "F1: sole pre-boot %s driver promotes once and the check can re-arm its next deadline", async reason => {
+        const c = await chat();
+        await db.update(issues).set({ status: "in_progress", conversationAgentId: null,
+          conversationUserId: null, conversationState: null, monitorNextCheckAt: null })
+          .where(eq(issues.id, c.issueId));
+        const [w] = await db.insert(agentWakeupRequests).values({ companyId: c.companyId, agentId: c.agentId,
+          source: "automation", triggerDetail: "system", reason, requestedByActorType: "system",
+          status: "deferred_issue_execution", requestedAt: ago(4 * hour), payload: { issueId: c.issueId,
+            _paperclipWakeContext: { issueId: c.issueId, taskKey: c.issueId, wakeReason: reason,
+              source: "issue.monitor" } } }).returning();
+        const ownerRun = await run(c, [], ago(hour));
+        await busyFinalization(c, ownerRun);
+        await boot(c);
+        await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+        await settleSavedOwner(c);
+        const admitted = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, c.companyId),
+          inArray(heartbeatRuns.status, ["queued", "running"])));
+        console.info("F1 after boot", JSON.stringify({ reason, wake: await wake(w.id),
+          runs: admitted.map(r => ({ id: r.id, wakeupRequestId: r.wakeupRequestId, status: r.status })),
+          monitorNextCheckAt: (await issue(c)).monitorNextCheckAt }));
+        expect(admitted).toHaveLength(1);
+        expect(admitted[0].contextSnapshot).toMatchObject({ issueId: c.issueId, wakeReason: reason });
+        // Promotion admits the overdue check; it does NOT invent its next deadline.
+        expect((await issue(c)).monitorNextCheckAt).toBeNull();
+        // Simulate only the provider's useful result through the real issue service.
+        // The check explicitly schedules its next check, as it did before this fix.
+        const nextCheckAt = new Date(Date.now() + hour);
+        await issueService(db).update(c.issueId, { executionPolicy: {
+          mode: "normal", commentRequired: true, stages: [],
+          monitor: { nextCheckAt: nextCheckAt.toISOString(), notes: "Check the daily deployment again" },
+        } });
+        expect((await issue(c)).monitorNextCheckAt).toEqual(nextCheckAt);
+        for (let pass = 0; pass < 2; pass++) {
+          await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+          await settleSavedOwner(c);
+        }
+        const repeated = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, c.companyId),
+          inArray(heartbeatRuns.status, ["queued", "running"])));
+        expect(repeated.map(r => r.id)).toEqual(admitted.map(r => r.id));
+        expect((await issue(c)).monitorNextCheckAt).toEqual(nextCheckAt);
+        console.info("F1 re-armed", JSON.stringify({ reason, runId: admitted[0].id,
+          monitorNextCheckAt: (await issue(c)).monitorNextCheckAt, runCount: repeated.length }));
       });
 
     it("boot-4c: a pre-boot restore envelope with already-answered person input retains its system obligation", async () => {
