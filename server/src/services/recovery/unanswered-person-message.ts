@@ -417,9 +417,23 @@ export const PENDING_WAIT_ACTION = "issue.unanswered_message_wait";
 export const PENDING_WAIT_BOUND_MS = 2 * 60_000;
 
 /** The one predicate: run outside the fence to skip the lock in the common
- * case, and again unchanged inside it before writing. Reads only. */
+ * case, and again unchanged inside it before writing. Reads only.
+ * A standing '<agent> is paused' note is true only while the agent is paused:
+ * once it is not, the SAME sweep replaces it in place with the one waiting
+ * note wherever the decision would otherwise only wait (a running or queued
+ * turn, a resume in progress, a grace), never leaving it standing. A
+ * decision that writes (an answer, a failure text, a setup note) supersedes
+ * it in place as before. */
 async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   nativeBlockedRepairApplies?: NativeBlockedRepairApplies): Promise<Decision> {
+  const standing: { replacePaused?: (pending: Extract<Decision, { kind: "pending" }>) => Decision } = {};
+  const decision = await decideMessage(q, issue, now, nativeBlockedRepairApplies, standing);
+  return decision.kind === "pending" && standing.replacePaused ? standing.replacePaused(decision) : decision;
+}
+
+async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
+  nativeBlockedRepairApplies: NativeBlockedRepairApplies | undefined,
+  standing: { replacePaused?: (pending: Extract<Decision, { kind: "pending" }>) => Decision }): Promise<Decision> {
   if (issue.hiddenAt || !issue.assigneeAgentId || issue.assigneeUserId
     || !["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return { kind: "out_of_scope" };
   const agentId = issue.assigneeAgentId;
@@ -527,25 +541,54 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
     inArray(heartbeatRuns.status, LIVE))).limit(1);
   const liveRuns = otherLive ? [...live, otherLive] : live;
-  if (liveRuns.some(candidate => candidate.status === "running")) {
-    return { kind: "pending", recheckAt: now.getTime() + 30_000 };
-  }
-  // The agent is paused (Paperclip's lifecycle: status paused, lifecycle state
-  // paused/pausing, or a lifecycle hold such as "manual"): nothing runs until
-  // it is resumed, so "sending it again" would do nothing. The note says it is
-  // paused and who can resume it; it stays a waiting-kind note, so after the
-  // resume the saved message's own run decides (its answer supersedes it).
+  // The agent is paused only while a pause a person can act on holds NOW
+  // (Paperclip's lifecycle, modules/agent-lifecycle/adapters/postgres.ts):
+  // a lifecycle HOLD (the pause route adds its reason, :197; Resume removes
+  // it, :198; budget and company_paused are holds too, :272-289), or, in a
+  // paused-like state, an explicit pauseReason with no hold or a lifecycle
+  // error. 'resuming' is never paused: Resume (or 'complete' with no hold,
+  // :206) moved it there and it ends in ready by itself (domain/policy.ts).
+  // Nothing runs while paused, so "sending it again" would do nothing: the
+  // note says it is paused and who can resume it (a waiting-kind note).
   const [agentRow] = await q.select({ name: agents.name, status: agents.status, lifecycleState: agents.lifecycleState,
     lifecycleHolds: agents.lifecycleHolds, pauseReason: agents.pauseReason, lifecycleError: agents.lifecycleError })
     .from(agents).where(and(eq(agents.companyId, issue.companyId), eq(agents.id, agentId)));
+  const holds = agentRow?.lifecycleHolds ?? [];
+  const setupShape = Boolean(agentRow?.status === "paused" && ["preparing", "verifying"].includes(agentRow.lifecycleState)
+    && (agentRow.pauseReason == null || agentRow.pauseReason === "setup") && holds.length === 0 && !agentRow.lifecycleError);
+  const resuming = agentRow?.lifecycleState === "resuming";
+  const pausedLike = Boolean(agentRow && (agentRow.status === "paused" || ["paused", "pausing"].includes(agentRow.lifecycleState)));
+  const agentPaused = Boolean(!setupShape && !resuming && agentRow && (holds.length > 0
+    || (pausedLike && (agentRow.pauseReason != null || Boolean(agentRow.lifecycleError)))));
+  // A paused-like state that no pause holds ('resuming'; 'pausing'/'paused'
+  // with no hold, reason or error: an environment handoff,
+  // adapters/configuration.ts:48, or a Resume during 'pausing') ends by
+  // itself: its saved message waits, bounded.
+  const lifecycleTransit = Boolean(!setupShape && !agentPaused && (resuming || pausedLike));
+  // The standing paused note stops being true the moment the agent is not
+  // paused: whatever this sweep would only wait for, the SAME note becomes
+  // the one waiting note now (upgrade in place; its answer supersedes it).
+  if (!agentPaused && upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE) {
+    standing.replacePaused = pending => {
+      const notice = buildStrandedRecoveryEscalationNotice({
+        seed: { title: "Your message is waiting to start", body: UNANSWERED_MESSAGE_WAITING_TEXT, tone: "info",
+          nextAction: "No action is needed; it will start by itself." },
+        recoveryActionId: null, recoveryOwner: null, recoveryResponsibility: "user", sourceRun: null, failureCode: undefined,
+      });
+      notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, UNANSWERED_MESSAGE_WAITING_CODE)] });
+      return { kind: "notice", reason, code: UNANSWERED_MESSAGE_WAITING_CODE, notice, upgradeCommentId: upgrading,
+        ...(pending.recordWait ? { recordWait: pending.recordWait } : {}) };
+    };
+  }
+  if (liveRuns.some(candidate => candidate.status === "running")) {
+    return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+  }
   // Setup uses the compatibility status "paused", but completes by itself.
   // Its saved message remains an obligation: use the existing sweep deadline
   // and bound, never a second wake. After ten minutes, one true setup note
   // stands until readiness or error. Explicit holds/pauses/errors keep their path.
   let settingUp = false;
-  if (agentRow?.status === "paused" && ["preparing", "verifying"].includes(agentRow.lifecycleState)
-    && (agentRow.pauseReason == null || agentRow.pauseReason === "setup")
-    && (agentRow.lifecycleHolds ?? []).length === 0 && !agentRow.lifecycleError) {
+  if (setupShape) {
     const wait = await bounded(now.getTime() + 30_000, true);
     if (wait) return wait;
     if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_SETUP_CODE) {
@@ -553,17 +596,6 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     }
     settingUp = true;
   }
-  // A pause a person can act on is a lifecycle HOLD (the pause route adds its
-  // reason, modules/agent-lifecycle/adapters/postgres.ts:197; resume removes
-  // it, :198; pauseReason mirrors holds[0], :239) or an explicit pauseReason
-  // or lifecycle error. 'pausing'/'resuming' with none of those is a
-  // transition that ends by itself (an environment handoff,
-  // adapters/configuration.ts:48; with no hold, 'complete' goes on to
-  // 'resuming', postgres.ts:206, then ready): its saved message waits.
-  const lifecycleTransit = Boolean(!settingUp && agentRow && ["pausing", "resuming"].includes(agentRow.lifecycleState)
-    && (agentRow.lifecycleHolds ?? []).length === 0 && agentRow.pauseReason == null && !agentRow.lifecycleError);
-  const agentPaused = Boolean(!settingUp && !lifecycleTransit && agentRow && (agentRow.status === "paused" || ["paused", "pausing"].includes(agentRow.lifecycleState)
-    || (agentRow.lifecycleHolds ?? []).length > 0));
   // Import intentionally parks automations until activation. It lost neither
   // the message nor an attempt: do not annotate every carried-over open task.
   // Resume's existing eligibility notification rechecks the saved work.
@@ -573,8 +605,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   if (agentPaused) {
     const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
     if (due > now.getTime()) return { kind: "pending", recheckAt: due };
+    // Re-checked every 30 s (was 5 min) so the sweep after a Resume finds it.
     if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE) {
-      return { kind: "pending", recheckAt: now.getTime() + 5 * 60_000 };
+      return { kind: "pending", recheckAt: now.getTime() + 30_000 };
     }
   }
   let waitingToStart = false;
