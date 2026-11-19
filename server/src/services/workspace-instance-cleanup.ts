@@ -233,6 +233,33 @@ function resolveConfiguredInstanceRoot(pointer: WorktreeInstancePointer, expecte
   return { instanceRoot, instanceId };
 }
 
+/** Candidate roots used by the real writer, without loading a guest's env into this server. */
+export async function listWorktreeRunLogSpillRoots(input: {
+  workspacePath: string;
+  instanceRoot?: string;
+  pointer?: WorktreeInstancePointer | null;
+}): Promise<string[]> {
+  const pointer = input.pointer ?? await readWorktreeInstancePointer(input.workspacePath);
+  let instanceRoot = input.instanceRoot;
+  if (!instanceRoot && pointer) {
+    const configured = resolveConfiguredInstanceRoot(pointer);
+    if ("warning" in configured) {
+      if (configured.warning) throw new Error(configured.warning);
+    } else instanceRoot = configured.instanceRoot;
+  }
+  const readEnv = (file: string) => fs.readFile(file, "utf8").then(parseEnvContents, (error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return {};
+    throw error;
+  });
+  const envs = [{}, process.env, pointer ? parseEnvContents(pointer.envContents) : {},
+    await readEnv(path.join(input.workspacePath, ".env")),
+    ...(instanceRoot ? [await readEnv(path.join(instanceRoot, ".env"))] : [])];
+  // The parent and worktree can have different cwd values. Keep both possible
+  // resolutions of inherited relative overrides; never guess away a trace.
+  return [...new Set(envs.flatMap(env => [input.workspacePath, process.cwd()].map(cwd =>
+    resolveObjectRunLogSpillDir(undefined, { env, instanceRoot, cwd }))))];
+}
+
 function resolveManagedInstancesDir(worktreesDir?: string): string {
   const managedWorktreesDir = path.resolve(
     expandHomePrefix(
@@ -371,17 +398,9 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
   // resolver owns precedence and relative-path semantics, not this cleanup.
   let unrecoveredRunLogSpills: string[];
   try {
-    const instanceEnv = await fs.readFile(path.join(configuredInstanceRoot, ".env"), "utf8")
-      .then(parseEnvContents, (error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return {};
-        throw error;
-      });
-    const envs = [{}, process.env, instanceEnv, parseEnvContents(input.pointer.envContents)];
-    const roots = new Set(envs.map(env => resolveObjectRunLogSpillDir(undefined, {
-      env, instanceRoot: canonicalInstanceRoot, cwd: input.workspacePath,
-    })));
+    const roots = await listWorktreeRunLogSpillRoots({ ...input, instanceRoot: canonicalInstanceRoot });
     unrecoveredRunLogSpills = [...new Set((await Promise.all(
-      [...roots].map(root => listUnrecoveredObjectRunLogSpills(root)),
+      roots.map(root => listUnrecoveredObjectRunLogSpills(root)),
     )).flat())];
   } catch (error) {
     warning = `Refusing to remove instance directory "${configuredInstanceRoot}" because its run-log spill could not be read: ${error instanceof Error ? error.message : String(error)}`;
