@@ -26,6 +26,18 @@ describe("a run retry and its predecessor's pending sandbox creation", () => {
   let timeOut: boolean, failBeforeBox: boolean;
   const keys: string[] = [], destroyed: string[] = [];
   const boxes = new Map<string, string>();
+  // SUPERSEDE-RF4-J7-REFUSAL-SPENT-1119: a scripted create outcome. `before`
+  // fails with nothing made; `after` fails once the box exists (a lost reply).
+  // A key whose box is stopped replays as box_stopped; `bodyChanged` replays a
+  // known key as Boat's 409 idempotency_key_reused (the plugin's F1 body drift).
+  let script: { before?: () => Error; after?: () => Error } | null, bodyChanged: boolean;
+  const stopped = new Set<string>();
+  const running = () => [...boxes.values()].filter(box => !stopped.has(box) && !destroyed.includes(box));
+  const boatError = (status: number, code?: string) => Object.assign(new Error(`Boat create failed (HTTP ${status})`), { status, ...(code ? { code } : {}) });
+  // Over the worker RPC boundary, as the plugin SDK's acquire envelope carries it.
+  const rpcBoatError = (status: number, code: string) => new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+    message: `Boat create failed (HTTP ${status})`, data: { schema: "paperclip/environment-acquire-error/v1",
+      providerDiagnostic: { httpStatus: status }, creationIdempotencyCode: code } });
   beforeAll(async () => {
     if (!external) database = await startEmbeddedPostgresTestDatabase("sandbox-creation-retry-");
     db = createDb(external ?? database!.connectionString, { maxConnections: 4, idleTimeoutSeconds: 0, maxLifetimeSeconds: 0 });
@@ -34,6 +46,7 @@ describe("a run retry and its predecessor's pending sandbox creation", () => {
     await db.execute(sql`truncate sandbox_creation_operations, companies, environments, plugins cascade`);
     companyId = randomUUID(); environmentId = randomUUID(); agentId = randomUUID();
     timeOut = false; failBeforeBox = false; keys.length = 0; destroyed.length = 0; boxes.clear();
+    script = null; bodyChanged = false; stopped.clear();
     spool = await mkdtemp(join(tmpdir(), "sandbox-creation-retry-"));
     await db.insert(companies).values({ id: companyId, name: "Retry fixture", issuePrefix: "RTY" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Fixture", role: "engineer", adapterType: "codex_local" });
@@ -52,8 +65,12 @@ describe("a run retry and its predecessor's pending sandbox creation", () => {
           const key = input.creationOperationId;
           keys.push(key);
           if (failBeforeBox) throw Object.assign(new Error("Provider refused the create"), { code: "EPROVIDER" });
+          if (script?.before) throw script.before();
+          if (boxes.has(key) && bodyChanged) throw rpcBoatError(409, "idempotency_key_reused");
+          if (boxes.has(key) && stopped.has(boxes.get(key)!)) throw rpcBoatError(409, "boat_idempotency_box_stopped");
           if (!boxes.has(key)) boxes.set(key, `box-${boxes.size + 1}`);
           if (timeOut) throw Object.assign(new Error("Provider create timed out"), { code: "ETIMEDOUT" });
+          if (script?.after) throw script.after();
           return { providerLeaseId: boxes.get(key), metadata: { remoteCwd: "/workspace" } };
         }
         if (method === "environmentInspectLease") {
@@ -247,14 +264,101 @@ describe("a run retry and its predecessor's pending sandbox creation", () => {
     expect(readTransientLeaseAcquisitionFailure(error, { id: retry, companyId })).toEqual({ reason: "acquisition_incomplete" });
   });
 
-  it.each([false, true])("J7 firm refusal before absence recovery: config changed=%s preserves config boundary", async changed => {
-    const first = await run(); failBeforeBox = true;
-    await expect(acquire(first)).rejects.toThrow("refused"); failBeforeBox = false;
+  // SUPERSEDE-RF4-J7-REFUSAL-SPENT-1119: review-fleet-4's J7 pinned a refused
+  // creation as carried. The final rules (review-fleet-4 + RFL, 03:11-03:13Z)
+  // spend a FIRM refusal and carry every timeout, transient or unknown outcome.
+  /** The first run's create fails as scripted; the host fails it and schedules a retry run. */
+  async function failedThenRetry(outcome: { before?: () => Error; after?: () => Error }) {
+    const first = await run(); script = outcome;
+    await expect(acquire(first)).rejects.toThrow(); script = null;
     await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, first));
+    return { first, retry: await run(first) };
+  }
+
+  it.each([false, true])("SUPERSEDE-RF4-J7-REFUSAL-SPENT-1119: J7a a firm refusal (422) is spent; the retry uses a FRESH key (config changed=%s)", async changed => {
+    const { retry } = await failedThenRetry({ before: () => boatError(422) });
+    const [refused] = await db.select().from(sandboxCreationOperations);
+    expect(refused).toMatchObject({ id: keys[0], state: "resolved", leaseId: null, metadata: { creationReconciliationReason: "provider_refused_create" } });
     if (changed) await db.update(environments).set({ config: { provider: "creation-fixture", image: "changed", reuseLease: false } }).where(eq(environments.id, environmentId));
-    const retry = await run(first); await acquire(retry);
-    expect(new Set(keys).size).toBe(changed ? 2 : 1);
+    const { lease } = await acquire(retry);
+    expect(keys).toHaveLength(2);
+    expect(keys[1]).not.toBe(keys[0]);
+    expect(new Set(keys).size).toBe(2);
     expect(boxes.size).toBe(1);
+    expect(lease.providerLeaseId).toBe("box-1");
+  });
+
+  it.each([
+    ["429", () => boatError(429), false], ["503 after the box was made", () => boatError(503), true],
+  ] as const)("SUPERSEDE-RF4-J7-REFUSAL-SPENT-1119: J7b a transient %s is carried; the retry re-sends the SAME key", async (_name, error, made) => {
+    const { retry } = await failedThenRetry(made ? { after: error } : { before: error });
+    const { lease } = await acquire(retry);
+    expect(keys).toHaveLength(2);
+    expect(new Set(keys).size).toBe(1);
+    expect(boxes.size).toBe(1);
+    expect(lease.providerLeaseId).toBe("box-1");
+  });
+
+  it.each([
+    ["a 408", () => boatError(408)],
+    ["a plugin RPC timeout", () => new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.TIMEOUT, message: "environmentAcquireLease timed out" })],
+    ["an unknown outcome", () => new Error("socket hang up")],
+  ] as const)("SUPERSEDE-RF4-J7-REFUSAL-SPENT-1119: GUARD %s is STILL carried: same key, one box", async (_name, error) => {
+    const { retry } = await failedThenRetry({ after: error });
+    expect((await db.select().from(sandboxCreationOperations))[0]).toMatchObject({ state: "pending" });
+    const { lease } = await acquire(retry);
+    expect(new Set(keys).size).toBe(1);
+    expect(boxes.size).toBe(1);
+    expect(lease.providerLeaseId).toBe("box-1");
+  });
+
+  it("SUPERSEDE-RF4-J7-REFUSAL-SPENT-1119: in_progress a 409 idempotency_in_progress is carried, never spent", async () => {
+    const { retry } = await failedThenRetry({ after: () => rpcBoatError(409, "idempotency_in_progress") });
+    expect((await db.select().from(sandboxCreationOperations))[0]).toMatchObject({ state: "pending" });
+    const { lease } = await acquire(retry);
+    expect(new Set(keys).size).toBe(1);
+    expect(boxes.size).toBe(1);
+    expect(lease.providerLeaseId).toBe("box-1");
+  });
+
+  it("SUPERSEDE-RF4-J7-REFUSAL-SPENT-1119: key_reused is its own named error; the old box goes to cleanup before any fresh create", async () => {
+    const { retry } = await timedOutThenRetry();
+    bodyChanged = true;
+    const error = await acquire(retry).catch(error => error);
+    expect(error).toMatchObject({ name: "SandboxCreationKeyReusedError", code: "sandbox_creation_key_reused" });
+    expect(readTransientLeaseAcquisitionFailure(error, { id: retry, companyId })).toEqual({ reason: "creation_key_reused" });
+    // Until cleanup holds the old box, the creation stays carried-and-failing.
+    const again = await run(retry);
+    await expect(acquire(again)).rejects.toMatchObject({ code: "sandbox_creation_key_reused" });
+    expect(new Set(keys).size).toBe(1);
+    expect(running()).toEqual(["box-1"]);
+    await recover();
+    const [handed] = await db.select().from(sandboxCreationOperations);
+    expect(handed).toMatchObject({ id: keys[0], state: "cleanup_pending" });
+    const cleanupRow = (await db.select().from(environmentLeases))[0];
+    await runtime().retryPendingSandboxTeardown({ environment: (await environmentService(db).getById(environmentId))!,
+      lease: (await environmentService(db).getLeaseById(cleanupRow.id))! });
+    expect(destroyed).toEqual(["box-1"]);
+    bodyChanged = false;
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, again));
+    const { lease } = await acquire(await run(again));
+    expect(new Set(keys).size).toBe(2);
+    expect(lease.providerLeaseId).toBe("box-2");
+    expect(running()).toEqual(["box-2"]);
+  });
+
+  it("SUPERSEDE-RF4-J7-REFUSAL-SPENT-1119: box_stopped spends the creation; the next retry gets a FRESH key and ONE running box", async () => {
+    const { retry } = await timedOutThenRetry();
+    stopped.add("box-1");
+    await expect(acquire(retry)).rejects.toThrow("HTTP 409");
+    expect((await db.select().from(sandboxCreationOperations))[0]).toMatchObject({ state: "resolved",
+      metadata: { creationReconciliationReason: "provider_box_stopped" } });
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, retry));
+    const { lease } = await acquire(await run(retry));
+    expect(new Set(keys).size).toBe(2);
+    expect(lease).toMatchObject({ providerLeaseId: "box-2", status: "active" });
+    expect(running()).toEqual(["box-2"]);
+    expect([...stopped]).toEqual(["box-1"]);
   });
 
   it("R4: an ordinary first create is unchanged", async () => {
