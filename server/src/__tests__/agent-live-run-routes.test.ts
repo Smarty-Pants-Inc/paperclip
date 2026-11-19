@@ -704,6 +704,54 @@ describe("agent live run routes", () => {
     if (status === 404) expect(res.body).toEqual({ error: "Run log not found" });
   });
 
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7002475364 (rf-3 condition 1)
+  // Keep reason: NEVER-OK trace custody. Bytes object storage refused are in
+  // the kept spill; once storage is back, the log GET must return ALL admitted bytes.
+  it("returns ALL admitted bytes from the log GET after a persistent storage failure is restored", async () => {
+    const { spilledRun } = await vi.importActual<typeof import("../services/object-run-log-store-spill-recovery.test.js")>("../services/object-run-log-store-spill-recovery.test.js");
+    const { createObjectRunLogStore } = await vi.importActual<typeof import("../services/object-run-log-store.js")>("../services/object-run-log-store.js");
+    const { recoverSpilledRunLog } = await vi.importActual<typeof import("../services/heartbeat/run-log-spill-recovery.js")>("../services/heartbeat/run-log-spill-recovery.js");
+    const { createHash } = await import("node:crypto");
+    const runId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const r = await spilledRun(runId);
+    // The settled run row: storage refused the log, so its size and digest are unknown.
+    const row = { status: "failed", logBytes: null as number | null, logSha256: null as string | null };
+    const store = createObjectRunLogStore({ provider: r.m.provider, keyPrefix: "logs", spillDir: r.spillDir,
+      recoverSpill: process.env.OBJLOG_MUTATION === "recovery-off" ? false : undefined,
+      assertWriterAuthority: async () => undefined });
+    const handle = { store: "s3_segments" as const, logRef: r.logRef };
+    mockHeartbeatService.getRunLogAccess.mockResolvedValue({
+      id: runId, companyId: "company-1", scopeKind: "company", issueId: null, logStore: handle.store, logRef: handle.logRef,
+    });
+    // The read path of heartbeat.readLog: recover a settled run's spill, then read the object log.
+    mockHeartbeatService.readLog.mockImplementation(async (_run: unknown, opts: { offset?: number; limitBytes?: number }) => {
+      if (row.logBytes === null) await recoverSpilledRunLog(store, handle.logRef, {
+        eligible: async () => row.status !== "running" && row.logBytes === null,
+        settle: async summary => { Object.assign(row, { logBytes: summary.bytes, logSha256: summary.sha256 }); return true; },
+      }).catch(() => undefined);
+      return { runId, ...handle, ...(await store.read(handle, opts)) };
+    });
+    const app = await createApp();
+    const get = async () => {
+      let content = "";
+      for (let offset: number | undefined = 0; offset !== undefined;) {
+        const res = await requestApp(app, baseUrl => request(baseUrl).get(`/api/heartbeat-runs/${runId}/log?offset=${offset}&limitBytes=64`));
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        content += res.body.content;
+        offset = res.body.nextOffset;
+      }
+      return Buffer.from(content);
+    };
+    // Storage still down: the GET serves the stored prefix; the rest is in the kept spill.
+    expect(r.admitted.subarray(0, (await get()).length).equals(await get())).toBe(true);
+    expect(row.logBytes).toBeNull();
+    r.m.state.down = false;
+    const served = await get();
+    expect(served.toString()).toBe(r.admitted.toString());
+    expect(served.equals(r.admitted)).toBe(true);
+    expect(row).toMatchObject({ logBytes: r.admitted.length, logSha256: createHash("sha256").update(r.admitted).digest("hex") });
+  }, 60_000);
+
   it("does not read an object run log for another company", async () => {
     const res = await requestApp(await createApp({}, {
       type: "board", userId: "board-user", companyIds: ["company-2"], source: "session", isInstanceAdmin: false,
