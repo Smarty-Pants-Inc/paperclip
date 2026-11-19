@@ -91,8 +91,8 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
             or(inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]), pendingFailedNativeRetryCancellationCondition()),
             sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? 'pauseStop')`));
         }
-        // Pause completes on the server's own record (runs terminal, none executing
-        // here, no live controller lease); the box is released in the background.
+        // Pause never waits on the sandbox service: the box is released in the
+        // background. Host-local Stop proof (local processes, local leases) holds.
         // Terminate and cleanup still wait for whole-agent execution Stop proof.
         const blocker = await heartbeat.agentInvocationStopBlocker(ids, reason,
           { preservePauseDeferred: agent.lifecycleState === "pausing", serverRecordOnly: agent.lifecycleState === "pausing",

@@ -190,8 +190,8 @@ async function withBudgetStopDelivery<T>(db: Db, work: () => Promise<T>): Promis
 
 /** `preservePauseDeferred`: the stop comes from a pause, which keeps the
  * messages it deferred for delivery once the pause lifts. */
-/** serverRecordOnly (pause): Stop is proven by the server's own run record only;
- * box release goes to the existing lease sweep instead of being awaited. */
+/** serverRecordOnly (pause): skip provider-dependent Stop proof only; box
+ * release goes to the existing lease sweep instead of being awaited. */
 export type StopInvocationOptions = { preservePauseDeferred?: boolean; trigger?: string; serverRecordOnly?: boolean };
 
 /** Cancellation shares executor ownership and delegates lifecycle and admission effects. */

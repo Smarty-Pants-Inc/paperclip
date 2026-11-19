@@ -4507,8 +4507,7 @@ export function heartbeatService(
           ...(options.trigger ? { trigger: options.trigger } : {}) });
       }
     }
-    if (options.serverRecordOnly) return blocker;
-    return blocker ?? agentExecutionStopBlocker(db, agentIds);
+    return blocker ?? agentExecutionStopBlocker(db, agentIds, { skipRemoteProviderProof: options.serverRecordOnly });
   }
 
   async function stopInvocationsForAgents(agentIds: string[], reason: string, options: StopInvocationOptions = {}) {

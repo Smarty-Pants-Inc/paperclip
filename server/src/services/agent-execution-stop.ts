@@ -14,14 +14,18 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
   return (await agentExecutionStopBlocker(db, agentIds)) === null;
 }
 
-export async function agentExecutionStopBlocker(db: Db, agentIds: string[]): Promise<string | null> {
+/** skipRemoteProviderProof (pause): never wait on the sandbox service. Remote
+ * leases and their termination receipt are left to the lease sweep; local
+ * process, local lease and native owner proof are still checked here. */
+export async function agentExecutionStopBlocker(db: Db, agentIds: string[],
+  { skipRemoteProviderProof = false } = {}): Promise<string | null> {
   if (!agentIds.length) return null;
   const condition = inArray(heartbeatRuns.agentId, agentIds);
   const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(condition);
   return executionStopBlocker(db, condition, or(
     inArray(environmentLeases.heartbeatRunId, runIds),
     inArray(sql`${environmentLeases.metadata}->>'agentId'`, agentIds),
-  )!);
+  )!, undefined, true, skipRemoteProviderProof);
 }
 
 /** Task recovery uses read-only Stop proof, scoped to its owners rather than
@@ -63,7 +67,7 @@ function provedWarmTurnHandoff(run: Run, runLeases: Lease[], coordinator: Coordi
 }
 
 async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
-  expectedRunCount?: number, settleCoordinators = true): Promise<string | null> {
+  expectedRunCount?: number, settleCoordinators = true, skipRemoteProviderProof = false): Promise<string | null> {
   const runs = await db.select().from(heartbeatRuns).where(condition);
   // A missing or cross-company binding cannot establish execution Stop.
   if (expectedRunCount !== undefined && runs.length !== expectedRunCount) return "run_binding_unproven";
@@ -77,9 +81,10 @@ async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
     allLeases.filter(lease => lease.heartbeatRunId === run.id),
     coordinatorRows.find(row => row.runId === run.id))).map(run => run.id));
   const leases = allLeases.filter(lease => !lease.heartbeatRunId || !handedOff.has(lease.heartbeatRunId));
-  const deferred = leases.find(lease => lease.status === "active" && readLeaseReleaseDeferral(lease.metadata));
+  const proofLeases = leases.filter(lease => !skipRemoteProviderProof || !lease.provider || lease.provider === "local");
+  const deferred = proofLeases.find(lease => lease.status === "active" && readLeaseReleaseDeferral(lease.metadata));
   if (deferred) return `environment_lease_release_deferred:${readLeaseReleaseDeferral(deferred.metadata)!.reason}`;
-  if (leases.some(lease => (!lease.releasedAt && !(lease.status === "retained" && lease.cleanupStatus === "success")) || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed")) return "environment_lease_unreleased";
+  if (proofLeases.some(lease => (!lease.releasedAt && !(lease.status === "retained" && lease.cleanupStatus === "success")) || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed")) return "environment_lease_unreleased";
   const coordinators = await db.select().from(nativeRunFinalizations)
     .where(inArray(nativeRunFinalizations.runId, runIds));
   const now = new Date();
@@ -102,7 +107,7 @@ async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
     if (handedOff.has(run.id)) continue;
     const runLeases = leases.filter(lease => lease.heartbeatRunId === run.id);
     if (runLeases.some(lease => lease.provider && lease.provider !== "local")) {
-      if (run.status === "cancelled" && !runLeases.every(hasRemoteTerminationReceipt)) return "remote_stop_unconfirmed";
+      if (run.status === "cancelled" && !skipRemoteProviderProof && !runLeases.every(hasRemoteTerminationReceipt)) return "remote_stop_unconfirmed";
       continue;
     }
     let processAlive = Boolean(run.processPid && !absent(run.processPid));
