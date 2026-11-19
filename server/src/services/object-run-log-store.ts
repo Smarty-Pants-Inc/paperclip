@@ -108,7 +108,7 @@ async function readSpillIndex(indexPath: string, missingIsEmpty = true) {
   return { records, spilled, recovered, open: spilled.filter(entry => !recovered.has(entry.spillStart)) };
 }
 const SPILL_INDEX_SUFFIX = ".index.ndjson";
-// Measured on this repo's installed node_modules: 141,583 entries / 431 ms.
+// Installed node_modules: 141,591 entries; full content guard about 1.6 s.
 // Seven times that tree fits; exceeding the budget keeps the candidate visibly.
 const SPILL_CUSTODY_WALK_MAX_ENTRIES = 1_000_000;
 let spillCustodyWalkBoundHits = 0;
