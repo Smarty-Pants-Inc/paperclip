@@ -14,7 +14,7 @@ import { errorHandler } from "../middleware/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   authUsers,
@@ -757,12 +757,12 @@ import {
     // each once; a message deleted first is not sent. A paused or held chat
     // refuses Send with its reason and runs nothing until it is resumed. A
     // task keeps its rule: a Stop holds its queued comments for the next wake.
-    it.each(["task", "send", "delete-then-send", "agent-paused", "chat-held"] as const)("after a person's Stop nothing is sent; the owner's Send starts one turn with the waiting messages (%s)", async (variant) => {
+    it.each(["task", "send", "delete-then-send", "agent-paused", "chat-held", "recovery-wait"] as const)("after a person's Stop nothing is sent; the owner's Send starts one turn with the waiting messages (%s)", async (variant) => {
       const chatMode = variant !== "task";
       const runtimeCompany = randomUUID();
       const runtimeAgent = randomUUID();
       await db.insert(companies).values({ id: runtimeCompany, name: "Stop row",
-        issuePrefix: { task: "STPT", send: "STPS", "delete-then-send": "STPD", "agent-paused": "STPA", "chat-held": "STPH" }[variant], requireBoardApprovalForNewAgents: false });
+        issuePrefix: { task: "STPT", send: "STPS", "delete-then-send": "STPD", "agent-paused": "STPA", "chat-held": "STPH", "recovery-wait": "STPR" }[variant], requireBoardApprovalForNewAgents: false });
       const turns: { runId: string; commentIds: string[] }[] = [];
       const app = express();
       app.use(express.json());
@@ -868,10 +868,16 @@ import {
         // keeps the process recovery contract (an uncertain-effects
         // reconciliation hold), which is not the Stop row, so stamp it.
         const [running] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, stoppedRunId));
-        await db.update(heartbeatRuns).set({ resultJson: { ...(running.resultJson ?? {}),
+        // recovery-wait keeps the bare process adapter's own recovery contract,
+        // so the real Stop's recovery path writes its stored wait (the live
+        // shape, 2a 11-19 04:00Z).
+        if (variant !== "recovery-wait") await db.update(heartbeatRuns).set({ resultJson: { ...(running.resultJson ?? {}),
           conversationContinuation: CONVERSATION_CONTINUATION_POLICY } }).where(eq(heartbeatRuns.id, stoppedRunId));
         // The square Stop, and nothing else.
-        await heartbeat.cancelRun(stoppedRunId, "Cancelled by a board operator",
+        if (variant === "recovery-wait") {
+          // The real Stop route (the board's square Stop).
+          expect((await request(routes(null)).post(`/api/heartbeat-runs/${stoppedRunId}/cancel`).send({})).status).toBe(200);
+        } else await heartbeat.cancelRun(stoppedRunId, "Cancelled by a board operator",
           { resultJson: { cancelledByActorType: "user", cancelledByUserId: "local-board" } });
         const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, stoppedRunId));
         expect(stopped.status).toBe("cancelled");
@@ -891,6 +897,45 @@ import {
           expect(response.status).toBe(200);
           return response.body;
         };
+        if (variant === "recovery-wait") {
+          // A legacy process chat (no conversation-continuation stamp): the
+          // real Stop leaves a LIVE reconciliation hold and its recovery path
+          // stores a wait on the held wakes. Its Send cannot admit (it is not
+          // on S's native admission path), so no stopped bar offers one: the
+          // base wait line stays, now and later, while nothing runs (RFL
+          // 11-19 04:33Z).
+          const stored = await db.select().from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.agentId, runtimeAgent), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+          expect(stored.map((wake) => (wake.payload as Record<string, unknown>).executionWait)).toEqual(queuedIds.map(() => ({
+            reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." })));
+          const stopAt = Date.now();
+          vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true });
+          try {
+            for (const [label, offset] of [["+0", 0], ["+10s", 10_000], ["+2min", 120_000], ["+10min", 600_000]] as const) {
+              vi.setSystemTime(stopAt + offset);
+              if (offset) {
+                // The server's own sweeps at that time.
+                await heartbeat.resumeQueuedRuns();
+                await heartbeat.tickAgentTimers(new Date());
+                await heartbeat.tickIssueMonitors(new Date());
+              }
+              const bar = await readQueue();
+              expect([label, bar.executionWait]).toEqual([label, { reason: "execution_recovery",
+                message: "Waiting for execution recovery. Your message is saved." }]);
+              expect(bar.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(queuedIds);
+              if (process.env.HELDBAR_REPORT) (await import("node:fs")).appendFileSync(process.env.HELDBAR_REPORT, JSON.stringify({ label,
+                turns: turns.length, liveRuns: (await liveRuns()).length, held: await heldIds(),
+                runs: (await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
+                  .where(eq(heartbeatRuns.agentId, runtimeAgent))).length, bar }) + "\n");
+            }
+          } finally { vi.useRealTimers(); }
+          const [live] = await db.select({ cause: issueRecoveryActions.cause, status: issueRecoveryActions.status })
+            .from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issue.id));
+          expect(live).toMatchObject({ cause: "legacy_execution_requires_reconciliation", status: "active" });
+          expect(turns).toHaveLength(1);
+          expect(await liveRuns()).toHaveLength(0);
+          return;
+        }
         let queue = await readQueue();
         expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(queuedIds);
         expect(queue.entries.every((entry: { queueId?: string }) => !entry.queueId || entry.queueId === queue.queueId)).toBe(true);

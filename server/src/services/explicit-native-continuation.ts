@@ -180,6 +180,16 @@ export async function pendingContinuationDecisionWaits(db: Db, companyId: string
  * A user request authorizes a new conversation, not replay of the failed run.
  * Unknown action outcomes and all prior records stay intact.
  */
+/**
+ * S's native admission path: a person's Send after their Stop (a queued-comment
+ * interrupt) is admitted by this module only for a native Paperclip Runner
+ * agent (`nativeQueuedSend` below). Other chat adapters keep the legacy
+ * recovery contract, where a live reconciliation hold can refuse the Send.
+ */
+export function isNativeAdmissionAdapter(adapterType: string | null | undefined): boolean {
+  return adapterType === "paperclip_runner";
+}
+
 export async function admitExplicitNativeContinuation(input: {
   db: Db; companyId: string; issueId: string; agentId: string;
   actorType: string | null | undefined; actorId: string | null | undefined;
@@ -276,7 +286,7 @@ export async function admitExplicitNativeContinuation(input: {
   if (!retry && !taskRetry && !response && !comment?.body.trim()) return null;
   const [agent] = await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId)));
   if (!agent || (!isConversationAdapter(agent.adapterType) && agent.adapterType !== "paperclip_runner")) return null;
-  const agentIsNative = agent.adapterType === "paperclip_runner";
+  const agentIsNative = isNativeAdmissionAdapter(agent.adapterType);
   const interruptIntent = interruptQueue?.payload?.queuedCommentInterrupt as Record<string, unknown> | undefined;
   const interruptRequestedAt = typeof interruptIntent?.requestedAt === "string" ? new Date(interruptIntent.requestedAt) : null;
   const nativeQueuedSend = queuedInterrupt && agentIsNative;
