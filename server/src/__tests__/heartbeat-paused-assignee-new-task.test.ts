@@ -101,7 +101,8 @@ describePostgres("new task for a manually paused assignee", () => {
     const resumedAt = Date.now();
     await lifecycle.resumeAgent(f.agentId);
     const [resuming] = await db.select().from(agents).where(eq(agents.id, f.agentId));
-    expect(resuming).toMatchObject({ status: "paused", lifecycleState: "pausing", lifecycleHolds: [], pauseReason: null });
+    // SUPERSEDE-SMAA1873-RESUME-CANCELS-PAUSE-1118: a Resume while pausing now cancels the pause (RFL ruling 11-19); the row's point (the task waits while the agent is not ready, then runs once) is unchanged.
+    expect(resuming).toMatchObject({ status: "paused", lifecycleState: "resuming", lifecycleHolds: [], pauseReason: null });
     const issue = await issueService(db).create(f.companyId, {
       title: "Assign immediately after Resume", status: "todo", assigneeAgentId: f.agentId,
     });
