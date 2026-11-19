@@ -36,6 +36,7 @@ import { nativeHarnessBackupExpirationService } from "../services/native-runtime
 import { buildNativeHarnessBackupManifest } from "../services/native-runtime/native-session-executor.ts";
 import { createNativeHarnessBackupStamp, verifyNativeHarnessBackupStamp } from "../services/native-runtime/native-harness-backup-stamp.ts";
 import { createNativeSetupRuntime } from "../services/native-runtime/native-setup-evidence.js";
+import { nativeCheckpointRetirement } from "../services/native-runtime/native-runner-checkpoint-retirement.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { logger } from "../middleware/logger.js";
 
@@ -363,6 +364,33 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     const [authority] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, session.runId));
     expect(authority?.controllerGeneration).toBe(1);
     expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+  });
+
+  it.each(["fresh", "retired_before_rule"] as const)("RK4 (never-OK, no S3): a settled, unreferenced runner checkpoint (%s) past 7 days keeps every row byte for byte and fences no writer", async state => {
+    const session = await seedSession({ finalization: { phase: "committed" } });
+    await seedCheckpoint(session);
+    await db.delete(agentTaskSessions);
+    if (state === "retired_before_rule") {
+      // A retirement written by expiry before this rule, whose deletion never ran:
+      // its cursor and event parts still hold the controller journal.
+      await db.update(nativeRunnerCheckpoints).set({ material: nativeCheckpointRetirement({ companyId: session.companyId,
+        agentId: session.agentId, sessionId: session.sessionId, runIds: [session.runId] }) })
+        .where(eq(nativeRunnerCheckpoints.part, "header"));
+    }
+    const rows = async () => (await db.select({ part: nativeRunnerCheckpoints.part, material: nativeRunnerCheckpoints.material })
+      .from(nativeRunnerCheckpoints).where(eq(nativeRunnerCheckpoints.runId, session.runId))).sort((a, b) => a.part.localeCompare(b.part));
+    const before = JSON.stringify(await rows());
+    const later = nativeHarnessBackupExpirationService(db, { stateBase, closedForDays: 7, now: new Date(now.getTime() + 8 * DAY_MS),
+      isSessionBusy: () => false });
+    for (const expiration of [service(), later]) {
+      const result = await expiration.tickCheckpoints();
+      expect(result).toMatchObject({ expiredCheckpoints: 0, checkpointCandidates: 0, failed: 0 });
+      expect(result.skipped.native_runner_checkpoint_kept).toBe(1);
+    }
+    expect(JSON.stringify(await rows())).toBe(before);
+    expect((await rows()).map(row => row.part)).toEqual(["cursor", "event:1", "header"]);
+    const [authority] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, session.runId));
+    expect(authority?.controllerGeneration).toBe(0);
   });
 
   it.each(["resume", "lease", "lease_stamp", "recovery", "running", "recent", "open", "execution", "dry_run"])(
