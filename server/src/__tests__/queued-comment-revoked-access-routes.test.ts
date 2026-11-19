@@ -21,6 +21,7 @@ import {
 import { runningProcesses } from "../adapters/index.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -308,6 +309,28 @@ describeEmbeddedPostgres("queued-comment routes after a private-task grant is re
       .post(`/api/issues/${f.issueId}/queued-comments/${f.commentIds[GRANTED]}/steer`).send(body);
     expect(steered.status, JSON.stringify(steered.body)).toBe(200);
     expect(steerNativeSessionMock.mock.calls).toHaveLength(calls + 1);
+  });
+
+  it("chat queue: GET and POST interrupt on a private chat: revoked → 404 (not the owner-only 403); owner → sends", async () => {
+    await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+    const f = await seedPrivateHeldQueue();
+    // Planted: the same held queue as the owner's chat with the agent.
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: OWNER, conversationState: "active" })
+      .where(eq(issues.id, f.issueId));
+    await stopRunForSend(f);
+    const queue = await queueFor(f, OWNER);
+    const body = { queueId: f.wakeId, revision: queue.revision, targetRunId: null };
+    const before = await snapshot(f);
+    const revoked = app(f.companyId, REVOKED);
+    expectDenied(await request(revoked).get(`/api/issues/${f.issueId}/queued-comments`));
+    expectDenied(await request(revoked).post(`/api/issues/${f.issueId}/queued-comments/interrupt`).send(body));
+    await expectNothingChanged(f, before);
+    const sent = await request(app(f.companyId, OWNER)).post(`/api/issues/${f.issueId}/queued-comments/interrupt`).send(body);
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    expect(wake?.status).toBe("coalesced");
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake!.runId!));
+    expect(successor?.status).toBe("queued");
   });
 
   it("DELETE /issues/:id/queued-comments/:commentId: revoked → 404, message kept; granted → discards", async () => {
