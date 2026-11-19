@@ -34,6 +34,7 @@ import { selectTaskRetryInput } from "./chat-channels/task-retry-input.js";
 
 export async function taskRetryMutationAllowed(db: Db, input: {
   companyId: string; issueId: string; actorId: string; actorSource: TaskRetryIntent["actorSource"];
+  onBehalfOfUserId?: string;
 }) {
   const [issue] = await db.select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId,
     assigneeUserId: issues.assigneeUserId, conversationAgentId: issues.conversationAgentId })
@@ -45,10 +46,11 @@ export async function taskRetryMutationAllowed(db: Db, input: {
     // Dispatch re-checks the requesting agent's own authority, never a board one.
     const [requester] = await db.select({ status: agents.status }).from(agents)
       .where(and(eq(agents.companyId, input.companyId), eq(agents.id, input.actorId)));
-    if (!requester || ["terminated", "pending_approval"].includes(requester.status)) return false;
-    actor = { type: "agent", agentId: input.actorId, companyId: input.companyId, source: "agent_key" };
+    if (!requester || ["terminated", "pending_approval"].includes(requester.status) || !input.onBehalfOfUserId?.trim()) return false;
+    actor = { type: "agent", agentId: input.actorId, companyId: input.companyId, source: "agent_key",
+      onBehalfOfUserId: input.onBehalfOfUserId };
     try {
-      await assertAgentTaskRetryAllowed(db, actor, { companyId: input.companyId, assigneeAgentId: issue.assigneeAgentId,
+      await assertAgentTaskRetryAllowed(db, actor, { id: input.issueId, companyId: input.companyId, assigneeAgentId: issue.assigneeAgentId,
         conversationAgentId });
     } catch (error) {
       if (error instanceof HttpError && error.status === 403) return false;
@@ -80,6 +82,9 @@ export async function assertTaskRetryConversationAllowed(
 const taskRetryIntentSchema = z.object({
   schema: z.literal("paperclip.task-retry.v1"), generationId: z.string().uuid(), sourceRunId: z.string().uuid(),
   actorId: z.string().min(1), actorSource: z.enum(["local_implicit", "session", "board_key", "cloud_tenant", "agent"]).default("session"), strategy: z.enum(["evaluate", "continue", "fresh_isolated_workspace", "finalize_result"]),
+  // Authenticated responsible user at admission, never a primary-agent preference
+  // or a caller-supplied body field. Old agent intents without it fail closed.
+  onBehalfOfUserId: z.string().trim().min(1).optional(),
   chatActionId: z.string().uuid().optional(), canonicalIntentId: z.string().uuid().optional(),
   queuedChatRequestId: z.string().uuid().optional(),
   initiatedBy: z.enum(["restart_recovery", "provider_limit_reset"]).optional(),
@@ -272,6 +277,7 @@ export async function retireTaskRetriesContinuedBy(db: Db, input: {
 type TaskRetryRequest = {
   db: Db; companyId: string; issueId: string; actorId: string;
   idempotencyKey: string; observedRunId: string | null; actorSource?: string;
+  onBehalfOfUserId?: string;
   retryAction?: "move_forward";
   /** Paperclip requests the user's Retry itself: after a restart lost an
    * unstarted turn, or once a provider usage limit it waited on has reset. */
@@ -326,6 +332,11 @@ function admitTaskRetry(input: TaskRetryRequest) {
     const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, input.companyId),
       eq(issues.id, input.issueId))).for("update");
     if (!issue) throw notFound("Task not found");
+    if (input.actorSource === "agent") {
+      if (!input.onBehalfOfUserId?.trim()) throw forbidden("An agent Retry requires its authenticated responsible user.");
+      await assertAgentTaskRetryAllowed(db, { type: "agent", agentId: input.actorId, companyId: input.companyId,
+        onBehalfOfUserId: input.onBehalfOfUserId }, issue);
+    }
     await assertTaskRetryConversationAllowed(db, issue, input.actorId);
     const key = `task-retry:${input.idempotencyKey}`;
     const [sameRequest] = await tx.select().from(agentWakeupRequests).where(and(
@@ -381,6 +392,7 @@ function admitTaskRetry(input: TaskRetryRequest) {
       const canonicalId = (savedResult.kind === "joined" ? savedResult.generationId : null) ?? active?.id ?? null;
       const finalizeIntent: TaskRetryIntent = { schema: "paperclip.task-retry.v1", generationId: canonicalId ?? finalizeId,
         sourceRunId: latest.id, actorId: input.actorId,
+        ...(input.actorSource === "agent" ? { onBehalfOfUserId: input.onBehalfOfUserId } : {}),
         actorSource: taskRetryIntentSchema.shape.actorSource.parse(input.actorSource ?? "session"), strategy: "finalize_result",
         ...(canonicalId ? { canonicalIntentId: canonicalId } : {}) };
       const settled = { status: "coalesced", runId: latest.id, finishedAt: new Date(), updatedAt: new Date() } as const;
@@ -451,6 +463,7 @@ function admitTaskRetry(input: TaskRetryRequest) {
     const id = randomUUID();
     const intent: TaskRetryIntent = { schema: "paperclip.task-retry.v1", generationId: active?.id ?? id,
       sourceRunId: latest.id, actorId: input.actorId,
+      ...(input.actorSource === "agent" ? { onBehalfOfUserId: input.onBehalfOfUserId } : {}),
       actorSource: taskRetryIntentSchema.shape.actorSource.parse(input.actorSource ?? "session"), strategy: "evaluate",
       ...(active && activeIntent?.chatActionId ? { chatActionId: activeIntent.chatActionId } : {}),
       ...(active && activeIntent?.queuedChatRequestId ? { queuedChatRequestId: activeIntent.queuedChatRequestId } : {}),
@@ -609,7 +622,7 @@ async function continueRefusedTaskChatRetry(db: Db, wake: typeof agentWakeupRequ
         workspace.runId === evidence.runId && recoveredRunIds.includes(workspace.runId);
     })) return false;
     if (!await taskRetryMutationAllowed(tx as unknown as Db, { companyId: wake.companyId, issueId,
-      actorId: intent.actorId, actorSource: intent.actorSource })) return false;
+      actorId: intent.actorId, actorSource: intent.actorSource, onBehalfOfUserId: intent.onBehalfOfUserId })) return false;
     const [chatReceipt] = await tx.select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
       .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.id, chat.id)));
     if (chatReceipt && (chatReceipt.runId || !["failed", "skipped", "cancelled"].includes(chatReceipt.status))) return false;
@@ -694,7 +707,7 @@ export async function reconcileTaskChatRetryReceipts(db: Db, scope: { companyId?
         if (await retireSupersededTaskRetry(tx as unknown as Db, { companyId: wake.companyId, issueId,
           requestId: wake.id, sourceRunId: intent.sourceRunId })) return "denied";
         if (!await taskRetryMutationAllowed(tx as unknown as Db, { companyId: wake.companyId, issueId,
-          actorId: intent.actorId, actorSource: intent.actorSource })) return "denied";
+          actorId: intent.actorId, actorSource: intent.actorSource, onBehalfOfUserId: intent.onBehalfOfUserId })) return "denied";
         if (issue.conversationAgentId && (issue.conversationUserId !== intent.actorId ||
             !(await instanceSettingsService(tx as unknown as Db).getExperimental()).enableAgentChat)) return "denied";
         if (adapterExecutionControls.has(intent.sourceRunId) ||

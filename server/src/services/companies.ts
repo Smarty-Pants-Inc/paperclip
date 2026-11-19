@@ -263,10 +263,13 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
     while (suffix <= MAX_ISSUE_PREFIX_ATTEMPTS) {
       const candidate = `${base}${issuePrefixSuffixForAttempt(suffix)}`;
       try {
-        const rows = await db
+        // Callers such as approval effects may already be in a transaction.
+        // A prefix collision must roll back its own attempt/savepoint rather
+        // than poison that enclosing company + approval transaction.
+        const rows = await db.transaction(tx => tx
           .insert(companies)
           .values({ ...data, issuePrefix: candidate })
-          .returning();
+          .returning());
         return rows[0];
       } catch (error) {
         if (!isIssuePrefixConflict(error)) throw error;

@@ -10509,6 +10509,9 @@ export function issueRoutes(
     const { requestTaskRetry } = await import("../services/task-retry.js");
     const receipt = await requestTaskRetry({ db, companyId: issue.companyId, issueId: issue.id,
       ...req.body, actorId: getActorInfo(req).actorId, actorSource: agentRetry ? "agent" : req.actor.source,
+      // Non-chat Retry acts for the task/run's authenticated responsible board
+      // user (the creating/assigning principal), not whoever selected a primary.
+      onBehalfOfUserId: agentRetry ? req.actor.onBehalfOfUserId ?? undefined : undefined,
       prepareChatRetry: opts.chatRunRetries?.prepareFailedChatRunRetry });
     const actor = getActorInfo(req);
     const scheduledRetryRunId = "scheduledRetryRunId" in receipt ? receipt.scheduledRetryRunId : undefined;
