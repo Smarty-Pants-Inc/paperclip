@@ -295,7 +295,7 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     await fs.writeFile(path.join(process.env.TASK_OUT!, "own-q1-line.json"), JSON.stringify({ queue, wake, leases: r.allLeases }, null, 2));
     expect(r.allLeases.some(l => l.provider === "local" && !!l.releasedAt) && r.allLeases.some(l => l.provider === "fake"), "the real flow leaves a released local lease beside the sandbox lease").toBe(true);
     expect(queue.entries.map((e: any) => e.comment.id)).toEqual([r.commentId]); expect((wake.payload as any).executionWait ?? null, "no saved wait on a held message").toBeNull();
-    expect(queue.executionWait).toEqual({ reason: "stopped_by_person", message: "Stopped. These messages are waiting: Send them, or delete any first." }); }, 60_000);
+    expect(queue.executionWait).toEqual({ reason: "stopped_by_person", message: "Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first." }); }, 60_000);
   it("Q1 chat (a): a message typed while the box is still stopping runs once after the receipt", async () => {
     const r = await exercise("mid_turn", "q1-stopping", { chat: true });
     const later = await sweepRuns(r, 10_000);
