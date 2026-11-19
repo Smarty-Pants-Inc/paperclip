@@ -1310,6 +1310,22 @@ describe("narrow Bearer recognition at an immediate CSI boundary", () => {
     ]) expect(redactSensitiveText(input)).toBe(input);
   });
 
+  const anchorBody = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"; // 32 characters; no bare-prefix match.
+  it.each([
+    // CSI after the separator leaves prefixBearer glued in both views.
+    `prefixBearer \u001b[31m${anchorBody}${reset}`,
+    // CSI before the separator also leaves prefixBearer glued in both views.
+    `prefixBearer\u001b[31m ${anchorBody}`,
+  ])("preserves a glued Bearer with CSI after the scheme: %j", input => {
+    expect(redactSensitiveText(input)).toBe(input);
+  });
+
+  it("does not let CSI after Bearer create its only separator on V2", () => {
+    // V1 sees Bearer glued to the body; V2 has a word boundary but no preceding CSI.
+    const input = `prefix Bearer\u001b[31m${anchorBody}${reset}`;
+    expect(redactSensitiveText(input)).toBe(input);
+  });
+
   it("requires CSI immediately before the scheme, not merely earlier on the line", () => {
     for (const input of [
       `\u001b[31mprefixBearer ${token}${reset}`,
