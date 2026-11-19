@@ -1492,7 +1492,10 @@ describe("TaskChatComposer", () => {
       currentAssigneeValue="agent:codex" />);
 
     const actions = container.querySelector<HTMLElement>('[data-testid="task-chat-composer-actions"]')!;
-    expect(actions.lastElementChild?.lastElementChild).toBe(sendButton());
+    // supersedes(Send is the footer's literal last child; steer-ui 11-19 wraps it in the
+    // `task-chat-send` span that also anchors Send ▾): Send is still the last control.
+    expect((actions.lastElementChild?.lastElementChild as HTMLElement | null)?.dataset.testid).toBe("task-chat-send");
+    expect(actions.lastElementChild?.lastElementChild?.lastElementChild).toBe(sendButton());
     expect(actions.firstElementChild?.contains(sendButton())).toBe(false);
     expect(actions.lastElementChild?.querySelector('[data-testid="task-chat-composer-assignee"]')).not.toBeNull();
     expect(actions.querySelector('[data-testid="task-chat-composer-assignee"] [data-slot="agent-avatar"] img')).not.toBeNull();
