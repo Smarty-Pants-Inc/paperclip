@@ -166,7 +166,28 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
         metadata: { nativeHarnessBackup: { sessionScopeSha256: scope } },
       });
     }
-    return { companyId, agentId: agent!.id, issueId: issue!.id, runId: run!.id, sessionId, scopeId, scope, root, current };
+    const digest = await treeDigest(current);
+    return { companyId, agentId: agent!.id, issueId: issue!.id, runId: run!.id, sessionId, scopeId, scope, root, current, digest };
+  }
+
+  /** Seed-time content digest of a backup tree (paths + bytes), re-hashed by expectKept. */
+  async function treeDigest(directory: string): Promise<string> {
+    const hash = createHash("sha256");
+    const visit = async (current: string, relative: string): Promise<void> => {
+      for (const name of (await fs.readdir(current)).sort()) {
+        const full = path.join(current, name), entry = relative ? `${relative}/${name}` : name;
+        if ((await fs.lstat(full)).isDirectory()) { hash.update(`d:${entry}\0`); await visit(full, entry); }
+        else { hash.update(`f:${entry}\0`); hash.update(await fs.readFile(full)); }
+      }
+    };
+    await visit(directory, "");
+    return hash.digest("hex");
+  }
+
+  /** SUPERSEDE-HARNESS-BACKUP-RETENTION-KEEP-1118: the backup is still current and re-hashes to its seed digest. */
+  async function expectKept(session: { current: string; digest: string }) {
+    expect(await exists(session.current)).toBe(true);
+    expect(await treeDigest(session.current)).toBe(session.digest);
   }
 
   /** The real producers behind a stamp: buildNativeHarnessBackupManifest writes the
@@ -429,22 +450,25 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
 
     const result = await service().tick();
 
-    expect(result).toMatchObject({ checked: 1, candidates: 1, expired: 1 });
+    expect(result).toMatchObject({ checked: 1, candidates: 0, expired: 0 });
+    expect(result.skipped.native_backup_local_copy_kept).toBe(1);
+    await expectKept(session);
     expect(result.skipped.no_backup).toBeUndefined();
     expect(await fs.readFile(evidence, "utf8")).toBe("preserve setup evidence\n");
     await fs.rm(setupRuntime, { recursive: true, force: true });
   });
 
-  it("expires the backup of a session whose issue closed before the window and clears its resume pointer", async () => {
+  it("keeps the backup of a session whose issue closed before the window: still current, re-hashes, resume pointer kept", async () => {
     const session = await seedSession();
     const result = await service().tick();
 
-    expect(result).toMatchObject({ checked: 1, candidates: 1, expired: 1, clearedTaskSessions: 1, failed: 0 });
-    expect(result.reclaimedBytes).toBeGreaterThan(0);
-    expect(await exists(session.current)).toBe(false);
+    expect(result).toMatchObject({ checked: 1, candidates: 0, expired: 0, clearedTaskSessions: 0, failed: 0 });
+    expect(result.skipped.native_backup_local_copy_kept).toBe(1);
+    expect(result.reclaimedBytes).toBe(0);
+    await expectKept(session);
     expect(await exists(path.join(session.root, "control-plane", "control-plane-state.json"))).toBe(true);
-    expect(await fs.readdir(path.join(session.root, "failover-backups"))).toEqual([]);
-    expect(await taskSessionCount(session.agentId)).toBe(0);
+    expect(await fs.readdir(path.join(session.root, "failover-backups"))).toEqual(["current"]);
+    expect(await taskSessionCount(session.agentId)).toBe(1);
   });
 
   it("RK1 (never-OK, no S3): a destroyed box's backup, issue closed, no live lease, clock +8 days: tick, expireBackup and reconcileBackup keep it current and it re-hashes to its stamp", async () => {
@@ -471,7 +495,7 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
   // Data-safety regression: exercise the actual DB decision and recursive
   // deletion, including crash leftovers. No deletion or storage mocks.
   it.each(["backup", "continuity", "quarantine", "expired_backup", "retiring_backup", "expired_continuity", "expired_quarantine"])(
-    "keeps every Pi conversation byte forever when expiring %s", async kind => {
+    "keeps every Pi conversation byte in place when retention reaches %s", async kind => {
       const session = await seedSession();
       let source = session.current;
       if (kind === "continuity" || kind === "expired_continuity") source = await seedArchive(session.root);
@@ -500,55 +524,26 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
       }
       const old = new Date(now.getTime() - 10 * DAY_MS);
       await fs.utimes(source, old, old);
+      // An interrupted expiry's .expired- copy of the only backup is put back as current.
+      const keptAt = kind === "expired_backup" ? session.current : source;
+      const assertInPlace = async () => {
+        for (const [relative, bytes] of files) expect(await fs.readFile(path.join(keptAt, relative)), `${kind}: ${relative} kept in place`).toEqual(bytes);
+        expect(await exists(path.join(stateBase, "conversation-evidence"))).toBe(false);
+      };
       const result = await service().tick();
-      expect(result.failed).toBe(0);
-      // Retention must not just leave the final copy in another expiring name.
-      const evidence = path.join(stateBase, "conversation-evidence");
-      const find = async (directory: string): Promise<string[]> => {
-        const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
-        return (await Promise.all(entries.map(async entry => entry.isDirectory()
-          ? find(path.join(directory, entry.name)) : [path.join(directory, entry.name)]))).flat();
-      };
-      const assertBytes = async () => {
-        const retained = await find(evidence);
-        for (const [relative, bytes] of files) {
-          const copies = retained.filter(file => file.endsWith(`/${relative}`));
-          expect(copies.length, `${kind}: last durable copy of ${relative}`).toBeGreaterThan(0);
-          for (const copy of copies) expect(await fs.readFile(copy)).toEqual(bytes);
-        }
-      };
-      const proof = process.env.PAPERCLIP_NATIVE_RETENTION_EVIDENCE_DIR;
-      if (proof) {
-        await fs.mkdir(proof, { recursive: true });
-        const retained = await find(evidence);
-        await fs.writeFile(path.join(proof, `${kind}.json`), JSON.stringify({ kind, source, result,
-          sourceFilesAfter: await Promise.all([...files.keys()].map(async file => ({ file, present: await exists(path.join(source, file)) }))),
-          before: [...files].map(([file, bytes]) => ({ file, sha256: createHash("sha256").update(bytes).digest("hex") })),
-          retained: await Promise.all(retained.map(async file => ({ file,
-            sha256: createHash("sha256").update(await fs.readFile(file)).digest("hex") }))),
-        }, null, 2));
-      }
-      if (kind !== "expired_quarantine") {
-        expect(await fs.readdir(evidence)).toContain(session.scope);
-        const privateScope = await fs.lstat(path.join(evidence, session.scope));
-        expect(privateScope.mode & 0o777).toBe(0o700);
-      }
-      await assertBytes();
-      // A new service (no in-memory exemption) and a much later clock cannot
-      // prune the durable copy, even after the ordinary source has expired.
+      expect(result).toMatchObject({ failed: 0, expired: 0, evidenceRemoved: 0 });
+      await assertInPlace();
+      // A new service (no in-memory exemption) and a much later clock keep it too.
       await nativeHarnessBackupExpirationService(db, { stateBase, now: new Date(now.getTime() + 3650 * DAY_MS),
         isSessionBusy: () => false }).tick();
-      await assertBytes();
-      if (proof) {
-        await fs.cp(evidence, path.join(proof, kind), { recursive: true, force: false, errorOnExist: true });
-      }
+      await assertInPlace();
     },
   );
 
-  it("expires sessions of cancelled issues", async () => {
+  it("keeps the backup of a cancelled issue's session", async () => {
     const session = await seedSession({ issueStatus: "cancelled" });
-    expect(await service().tick()).toMatchObject({ expired: 1 });
-    expect(await exists(session.current)).toBe(false);
+    expect(await service().tick()).toMatchObject({ expired: 0, skipped: { native_backup_local_copy_kept: 1 } });
+    await expectKept(session);
   });
 
   it.each([
@@ -596,10 +591,10 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     expect(await taskSessionCount(session.agentId)).toBe(1);
   });
 
-  it("settled finalizations and expired leases do not block expiry", async () => {
+  it("settled finalizations and expired leases do not block retention, which keeps the backup", async () => {
     const session = await seedSession({ finalization: { phase: "committed" }, leaseStatus: "expired" });
-    expect(await service().tick()).toMatchObject({ expired: 1 });
-    expect(await exists(session.current)).toBe(false);
+    expect(await service().tick()).toMatchObject({ expired: 0, skipped: { native_backup_local_copy_kept: 1 } });
+    await expectKept(session);
   });
 
   it("retains incomplete native snapshot publications even after the issue closes", async () => {
@@ -614,13 +609,13 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
   it.each([
     ["committed", "resuming_session"],
     ["terminal_failure", "blocked"],
-  ] as const)("stale %s recovery state %s does not block expiry once the issue is closed", async (phase, recoveryState) => {
+  ] as const)("stale %s recovery state %s does not block retention once the issue is closed, which keeps the backup", async (phase, recoveryState) => {
     const session = await seedSession({ finalization: { phase, recoveryState } });
-    expect(await service().tick()).toMatchObject({ expired: 1 });
-    expect(await exists(session.current)).toBe(false);
+    expect(await service().tick()).toMatchObject({ expired: 0, skipped: { native_backup_local_copy_kept: 1 } });
+    await expectKept(session);
   });
 
-  it("reports candidates without deleting anything in dry run", async () => {
+  it("dry run reports no candidate for a kept backup and deletes nothing", async () => {
     const session = await seedSession();
     const result = await nativeHarnessBackupExpirationService(db, {
       stateBase,
@@ -629,13 +624,14 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
       isSessionBusy: () => false,
     }).tick();
 
-    expect(result).toMatchObject({ candidates: 1, expired: 0, clearedTaskSessions: 0 });
-    expect(result.candidateBytes).toBeGreaterThan(0);
-    expect(await exists(session.current)).toBe(true);
+    expect(result).toMatchObject({ candidates: 0, expired: 0, clearedTaskSessions: 0 });
+    expect(result.candidateBytes).toBe(0);
+    expect(result.skipped.native_backup_local_copy_kept).toBe(1);
+    await expectKept(session);
     expect(await taskSessionCount(session.agentId)).toBe(1);
   });
 
-  it("continues across ticks when a batch is bounded", async () => {
+  it("continues across ticks when a batch is bounded and keeps every backup", async () => {
     const sessions = [await seedSession(), await seedSession(), await seedSession()];
     const expiration = nativeHarnessBackupExpirationService(db, {
       stateBase,
@@ -644,9 +640,9 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
       isSessionBusy: () => false,
     });
 
-    expect(await expiration.tick()).toMatchObject({ checked: 2, expired: 2, truncated: true });
-    expect(await expiration.tick()).toMatchObject({ checked: 1, expired: 1, truncated: false });
-    for (const session of sessions) expect(await exists(session.current)).toBe(false);
+    expect(await expiration.tick()).toMatchObject({ checked: 2, expired: 0, truncated: true });
+    expect(await expiration.tick()).toMatchObject({ checked: 1, expired: 0, truncated: false });
+    for (const session of sessions) await expectKept(session);
   });
 
   it("uses the configured clock for the closed window", async () => {
@@ -658,7 +654,8 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     });
     expect((await early.tick()).skipped.recently_closed).toBe(1);
     expect(await exists(session.current)).toBe(true);
-    expect(await service().tick()).toMatchObject({ expired: 1 });
+    expect(await service().tick()).toMatchObject({ expired: 0, skipped: { native_backup_local_copy_kept: 1 } });
+    await expectKept(session);
   });
 
   it("restores a backup whose expiry stopped before its final check", async () => {
@@ -672,25 +669,25 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     expect(await exists(path.join(session.current, "manifest.json"))).toBe(true);
   });
 
-  it("drops an unconfirmed retired backup once a newer backup exists", async () => {
+  it("keeps an unconfirmed retired backup beside a newer backup", async () => {
     const session = await seedSession({ issueStatus: "in_progress" });
     const retiring = path.join(session.root, "failover-backups", `.retiring-${randomUUID()}`);
     await fs.mkdir(path.join(retiring, "codex-home"), { recursive: true });
 
     await service().tick();
 
-    expect(await exists(retiring)).toBe(false);
+    expect(await exists(path.join(retiring, "codex-home"))).toBe(true);
     expect(await exists(path.join(session.current, "manifest.json"))).toBe(true);
   });
 
-  it("finishes removing a backup left over from an interrupted expiry", async () => {
+  it("keeps a backup left over from an interrupted expiry beside the current one", async () => {
     const session = await seedSession({ issueStatus: "in_progress" });
     const leftover = path.join(session.root, "failover-backups", `.expired-${randomUUID()}`);
     await fs.mkdir(path.join(leftover, "codex-home"), { recursive: true });
 
     await service().tick();
 
-    expect(await exists(leftover)).toBe(false);
+    expect(await exists(path.join(leftover, "codex-home"))).toBe(true);
     expect(await exists(session.current)).toBe(true);
   });
   async function seedArchive(root: string, input: { stampedDaysAgo?: number; mtimeDaysAgo?: number; name?: string } = {}) {
@@ -789,23 +786,18 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     expect(backupErrors).toEqual([]);
   });
 
-  it("ordinary task close arms exact backup retention, deletes physical bytes and resume pointer, then stays quiet", async () => {
+  it("ordinary task close arms no backup deadline; the worker keeps the bytes and resume pointer past 7 days and stays quiet", async () => {
     const session = await seedSession({ issueStatus: "todo" });
     await startBackups(); await settled(); await quiet();
-    const closed = await issueService(db).update(session.issueId, { status: "done", companyGuard: session.companyId });
-    const deadline = new Date(closed!.completedAt!).getTime() + 7 * DAY_MS + 1;
-    await settled(deadline); await quiet(60_000);
-    await vi.advanceTimersByTimeAsync(deadline - Date.now() - 1);
-    expect(await exists(session.current)).toBe(true);
+    await issueService(db).update(session.issueId, { status: "done", companyGuard: session.companyId });
+    await settled(); await quiet(8 * DAY_MS);
+    await expectKept(session);
     expect(await taskSessionCount(session.agentId)).toBe(1);
-    await vi.advanceTimersByTimeAsync(1); await settled();
-    expect(await exists(session.current)).toBe(false);
-    expect(await taskSessionCount(session.agentId)).toBe(0);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, session.runId))).toHaveLength(1);
     expect(backupErrors).toEqual([]); await quiet();
   });
 
-  it("ordinary backup publication after quiet schedules its actual file age and leaves a durable cleanup result", async () => {
+  it("ordinary backup publication after quiet schedules no deadline and keeps the published backup", async () => {
     const session = await seedSession();
     const backupRoot = path.dirname(session.current);
     const pendingRoot = path.join(backupRoot, "pending-publication");
@@ -814,91 +806,31 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     const publishedAt = Date.now();
     await fs.utimes(pendingRoot, new Date(publishedAt), new Date(publishedAt));
     await publishNativeHarnessBackup({ db, companyId: session.companyId, scopeDigest: session.scope, backupRoot, pendingRoot });
-    const stat = await fs.stat(session.current);
-    const due = stat.mtime.getTime() + 7 * DAY_MS + 1;
-    await settled(due); await vi.advanceTimersByTimeAsync(due - Date.now()); await settled();
-    expect(await exists(session.current)).toBe(false); expect(await taskSessionCount(session.agentId)).toBe(0);
-    expect(await fs.readdir(backupRoot)).toEqual([]); await quiet();
+    await settled(); await quiet(8 * DAY_MS);
+    await expectKept(session); expect(await taskSessionCount(session.agentId)).toBe(1);
+    expect(await fs.readdir(backupRoot)).toEqual(["current"]); await quiet();
   });
 
-  it("a committed earlier close timestamp replaces the later deadline without early cleanup", async () => {
-    const session = await seedSession({ closedDaysAgo: 2 });
-    await startBackups(); await settled(now.getTime() + 5 * DAY_MS + 1);
-    const earlier = new Date(now.getTime() - 6 * DAY_MS);
-    await issueService(db).update(session.issueId, { completedAt: earlier });
-    const due = earlier.getTime() + 7 * DAY_MS + 1;
-    await settled(due); await quiet(60_000);
-    await vi.advanceTimersByTimeAsync(due - Date.now()); await settled();
-    expect(await exists(session.current)).toBe(false); await quiet();
-  });
-
-  it("holds nested ordinary close activation until the outer transaction commits", async () => {
-    const session = await seedSession({ issueStatus: "todo" });
-    await startBackups(); await settled();
-    let release!: () => void, written!: () => void;
-    const gate = new Promise<void>(resolve => { release = resolve; });
-    const staged = new Promise<void>(resolve => { written = resolve; });
-    const transaction = db.transaction(async outer => {
-      await outer.transaction(nested => issueService(db).update(session.issueId, { status: "done" }, nested));
-      written(); await gate;
-    });
-    await staged;
-    await vi.advanceTimersByTimeAsync(60_000);
-    expect(await exists(session.current)).toBe(true);
-    expect(await taskSessionCount(session.agentId)).toBe(1);
-    release(); await transaction;
-    const [closed] = await db.select().from(issues).where(eq(issues.id, session.issueId));
-    const due = new Date(closed!.completedAt!).getTime() + 7 * DAY_MS + 1;
-    await settled(due); await vi.advanceTimersByTimeAsync(due - Date.now()); await settled();
-    expect(await exists(session.current)).toBe(false); await quiet();
-  });
-
-  it("preserves failed cleanup retry across drain, then finishes its physical tombstone on resume", async () => {
-    const session = await seedSession(); const remove = fs.rm;
-    const fault = vi.spyOn(fs, "rm").mockImplementation(async (...args) => {
-      if (String(args[0]).includes(".expired-")) throw new Error("controlled drain retry failure");
-      return remove(...args);
-    });
-    await startBackups();
-    expect(backupErrors).toHaveLength(1); admitted = false; fault.mockRestore();
-    await quiet(60_000);
-    expect((await fs.readdir(path.dirname(session.current))).some(name => name.startsWith(".expired-"))).toBe(true);
-    admitted = true; await settled();
-    expect(await fs.readdir(path.dirname(session.current))).toEqual([]); await quiet();
-  });
-
-  it("reopen cancels a saved deadline and a later ordinary close restores retention", async () => {
-    const session = await seedSession({ closedDaysAgo: 2 });
-    await startBackups(); await settled(now.getTime() + 5 * DAY_MS + 1);
-    await issueService(db).update(session.issueId, { status: "todo" });
-    await settled(); await quiet(8 * DAY_MS); expect(await exists(session.current)).toBe(true);
-    const closed = await issueService(db).update(session.issueId, { status: "done" });
-    const due = new Date(closed!.completedAt!).getTime() + 7 * DAY_MS + 1;
-    await settled(due); await vi.advanceTimersByTimeAsync(due - Date.now()); await settled();
-    expect(await exists(session.current)).toBe(false); await quiet();
-  });
-
-  it("reconstructs a retained backup deadline on restart without changing business timestamps", async () => {
+  it("restart reconstructs no backup deadline, keeps the backup and does not change business timestamps", async () => {
     const session = await seedSession({ closedDaysAgo: 2 });
     const [before] = await db.select().from(issues).where(eq(issues.id, session.issueId));
-    const due = now.getTime() + 5 * DAY_MS + 1;
-    await startBackups(); await settled(due);
+    await startBackups(); await settled();
     await backupWorker!.stop(); await coordinator!.stop();
-    await startBackups(); await settled(due);
+    await startBackups(); await settled();
     const [after] = await db.select().from(issues).where(eq(issues.id, session.issueId));
     expect(after!.updatedAt).toEqual(before!.updatedAt); expect(after!.completedAt).toEqual(before!.completedAt);
-    await quiet();
+    await quiet(8 * DAY_MS); await expectKept(session);
   });
 
-  it("reports dry-run backups once and rechecks only after source invalidation", async () => {
+  it("dry run reports no kept backup and rechecks quietly after source invalidation", async () => {
     const session = await seedSession(); const report = vi.spyOn(logger, "info");
     await startBackups({ dryRun: true }); await settled();
-    expect(report.mock.calls.filter(call => call[1] === "native harness backup expiration")).toHaveLength(1);
-    expect(await taskSessionCount(session.agentId)).toBe(1); expect(await exists(session.current)).toBe(true);
+    expect(report.mock.calls.filter(call => call[1] === "native harness backup expiration")).toHaveLength(0);
+    expect(await taskSessionCount(session.agentId)).toBe(1); await expectKept(session);
     await quiet();
     noteNativeHarnessBackupChange(db, { companyId: session.companyId, scopeDigest: session.scope });
     await settled();
-    expect(report.mock.calls.filter(call => call[1] === "native harness backup expiration")).toHaveLength(2);
+    expect(report.mock.calls.filter(call => call[1] === "native harness backup expiration")).toHaveLength(0);
     await quiet();
   });
 
@@ -912,13 +844,14 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     const directories = vi.spyOn(fs, "readdir");
     try {
       const closed = await issueService(db).update(own.issueId, { status: "done" });
-      await settled(new Date(closed!.completedAt!).getTime() + 7 * DAY_MS + 1);
+      expect(closed!.status).toBe("done"); await settled();
       const unrelated = [other.companyId, other.agentId, other.runId, other.sessionId, other.issueId];
       expect(sql.filter(query => query.parameters.some(parameter =>
         unrelated.some(id => String(parameter).includes(id))))).toEqual([]);
       expect(directories.mock.calls.some(call => call[0] === stateBase
         || String(call[0]).startsWith(other.root))).toBe(false);
       expect(await exists(other.current)).toBe(true);
+      await expectKept(own);
     } finally { db.$client.options.debug = previous; directories.mockRestore(); }
     await quiet();
   });
@@ -929,9 +862,8 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     for (let index = 0; index < 80; index++) unrelated.push(await seedSession({ companyId: own.companyId,
       agentId: own.agentId, issueStatus: index % 2 ? "todo" : "done", closedDaysAgo: 2,
       runStatus: index % 3 ? "succeeded" : "running" }));
-    const due = now.getTime() + 5 * DAY_MS + 1;
     await startBackups({ isSessionBusy: digest => unrelated.some((entry, index) => index % 4 === 0 && entry.scope === digest) });
-    await settled(due); await quiet(60_000);
+    await settled(); await quiet(60_000);
     const reads = vi.spyOn(fs, "readFile");
     const queries: Array<{ query: string; parameters: unknown[] }> = [];
     const previous = db.$client.options.debug;
@@ -943,13 +875,13 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
           { completedAt: new Date(now.getTime() - DAY_MS) }, tx);
       });
       const writes = queries.length;
-      await settled(due);
+      await settled();
       expect(reads.mock.calls.map(call => String(call[0]))).toEqual([path.join(own.root, "control-plane", "control-plane-state.json")]);
       expect(queries.length - writes).toBeLessThanOrEqual(20);
       const otherIds = unrelated.flatMap(entry => [entry.issueId, entry.runId, entry.sessionId]);
       expect(queries.filter(query => query.parameters.some(parameter => otherIds.some(id => String(parameter).includes(id))))).toEqual([]);
     } finally { reads.mockRestore(); db.$client.options.debug = previous; }
-    await issueService(db).update(own.issueId, { status: "todo" }); await settled(due);
+    await issueService(db).update(own.issueId, { status: "todo" }); await settled();
     await quiet(); expect(await exists(own.current)).toBe(true);
   });
 
@@ -994,8 +926,7 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     const own = await seedSession({ closedDaysAgo: 2 });
     const other = await seedSession({ companyId: own.companyId, agentId: own.agentId, issueStatus: "todo" });
     const [linked] = await db.insert(issues).values({ companyId: own.companyId, title: "New linked task", status: "todo" }).returning();
-    const due = now.getTime() + 5 * DAY_MS + 1;
-    await startBackups(); await settled(due); await quiet(60_000);
+    await startBackups(); await settled(); await quiet(60_000);
     const reads = vi.spyOn(fs, "readFile");
     const runId = randomUUID();
     try {
@@ -1013,19 +944,17 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
         await notifyRetainedNativeSessionCleanup(tx, { companyId: own.companyId, runId, agentId: own.agentId });
         await tx.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
       });
-      const [closed] = await db.select().from(issues).where(eq(issues.id, linked!.id));
-      const later = new Date(closed!.completedAt!).getTime() + 7 * DAY_MS + 1;
-      await settled(later); reads.mockClear();
+      await settled(); reads.mockClear();
       const cleanupScope = { companyId: own.companyId, agentId: own.agentId };
       const observed = vi.fn(); const stop = onRetainedNativeSessionCleanupRelease(db, observed);
       releaseRetainedNativeSessionCleanup(db, cleanupScope, { companyId: own.companyId, runId });
       expect(observed).toHaveBeenCalledWith(cleanupScope, { companyId: own.companyId, runId }); stop();
-      await settled(later);
+      await settled();
       expect(reads.mock.calls.every(call => String(call[0]).startsWith(own.root))).toBe(true);
       expect(reads).toHaveBeenCalled();
       await issueService(db).update(linked!.id, { status: "todo" }); await settled();
     } finally { reads.mockRestore(); }
-    expect(await exists(other.current)).toBe(true); await quiet();
+    expect(await exists(other.current)).toBe(true); await expectKept(own); await quiet();
   });
 
   it("ordinary lease release without a run uses its source identity instead of other retained roots", async () => {
@@ -1039,40 +968,21 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
       expect(reads).toHaveBeenCalled();
       expect(reads.mock.calls.every(call => String(call[0]).startsWith(own.root))).toBe(true);
     } finally { reads.mockRestore(); }
-    expect(await exists(own.current)).toBe(false); expect(await exists(other.current)).toBe(true); await quiet();
+    await expectKept(own); expect(await exists(other.current)).toBe(true); await quiet();
   });
 
-  it("retains the future deadline when a lease metadata edit removes its last backup reference", async () => {
+  it("a lease metadata edit that removes its last backup reference schedules no deadline and keeps the backup", async () => {
     const own = await seedSession({ leaseStatus: "retained", closedDaysAgo: 2 });
     const other = await seedSession({ companyId: own.companyId, agentId: own.agentId, issueStatus: "todo" });
     await startBackups(); await settled();
     const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.companyId, own.companyId));
-    const reads = vi.spyOn(fs, "readFile"); const due = now.getTime() + 5 * DAY_MS + 1;
+    const reads = vi.spyOn(fs, "readFile");
     try {
-      await environmentService(db).updateLeaseMetadata(lease!.id, {}); await settled(due);
+      await environmentService(db).updateLeaseMetadata(lease!.id, {}); await settled();
       expect(reads).toHaveBeenCalled(); expect(reads.mock.calls.every(call => String(call[0]).startsWith(own.root))).toBe(true);
     } finally { reads.mockRestore(); }
-    await vi.advanceTimersByTimeAsync(due - Date.now()); await settled();
-    expect(await exists(own.current)).toBe(false); expect(await exists(other.current)).toBe(true); await quiet();
-  });
-
-  it("allows an ordinary task reopen while backup byte counting is held outside the retirement lock", async () => {
-    const own = await seedSession(); const lstat = fs.lstat;
-    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
-    const held = vi.spyOn(fs, "lstat").mockImplementation(async (...args) => {
-      if (String(args[0]) === path.join(own.current, "codex-home", "history.jsonl")) {
-        entered.resolve(); await release.promise;
-      }
-      return lstat(...args);
-    });
-    const startup = startBackups(); await entered.promise;
-    try {
-      await db.transaction(async tx => {
-        await tx.execute(sql`set local lock_timeout = '500ms'`);
-        await issueService(db).update(own.issueId, { status: "todo" }, tx);
-      });
-    } finally { release.resolve(); await startup; held.mockRestore(); }
-    await settled(); expect(await exists(own.current)).toBe(true); expect(backupErrors).toEqual([]); await quiet();
+    await quiet(8 * DAY_MS);
+    await expectKept(own); expect(await exists(other.current)).toBe(true); await quiet();
   });
 
   it.each(["EIO", "EACCES"])("retains a failed identity read as real retry debt (%s)", async code => {
@@ -1087,10 +997,10 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     const retry = coordinator!.nextWakeAt()!; expect(retry - Date.now()).toBeGreaterThanOrEqual(29_000);
     expect(await exists(own.current)).toBe(true); fault.mockRestore(); await quiet(5000);
     await vi.advanceTimersByTimeAsync(retry - Date.now()); await settled();
-    expect(await exists(own.current)).toBe(false); expect(await taskSessionCount(own.agentId)).toBe(0); await quiet();
+    await expectKept(own); expect(await taskSessionCount(own.agentId)).toBe(1); await quiet();
   });
 
-  it.each(["EIO", "EACCES"])("retains expired-only cleanup after a directory read failure (%s)", async code => {
+  it.each(["EIO", "EACCES"])("retains expired-only leftover after a directory read failure and restores it as current (%s)", async code => {
     const session = await seedSession();
     const backupRoot = path.dirname(session.current);
     const expired = path.join(backupRoot, `.expired-${randomUUID()}`);
@@ -1110,16 +1020,17 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     fault.mockRestore();
     await quiet(5000);
     await vi.advanceTimersByTimeAsync(retry! - Date.now()); await settled();
-    expect(await fs.readdir(backupRoot)).toEqual([]);
+    expect(await fs.readdir(backupRoot)).toEqual(["current"]);
+    await expectKept(session);
     await quiet();
   });
 
-  it("reconstructs future retention without issue row locks", async () => {
+  it("reconciles retention without issue row locks", async () => {
     await seedSession({ closedDaysAgo: 2 }); const queries: string[] = [];
     const previous = db.$client.options.debug;
     db.$client.options.debug = (_connection, query) => { queries.push(query); };
     try {
-      await startBackups(); await settled(now.getTime() + 5 * DAY_MS + 1);
+      await startBackups(); await settled();
       expect(queries.some(query => /for\s+share/i.test(query))).toBe(false);
     } finally { db.$client.options.debug = previous; }
     await quiet();
@@ -1185,25 +1096,18 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     expect(remove).not.toHaveBeenCalled(); remove.mockRestore();
   });
 
-  it.each([false, true])("finishes cleanup journals after ordinary agent deletion (restart %s)", async restart => {
-    const session = await seedSession(); const remove = fs.rm;
-    const fault = vi.spyOn(fs, "rm").mockImplementation(async (...args) => {
-      if (String(args[0]).includes(".expired-")) throw new Error("controlled orphan cleanup failure");
-      return remove(...args);
-    });
-    await startBackups();
-    expect(backupErrors).toHaveLength(1);
-    const retryAt = coordinator!.nextWakeAt()!;
+  it.each([false, true])("keeps the backup after ordinary agent deletion (restart %s)", async restart => {
+    const session = await seedSession();
+    await startBackups(); await settled();
     const backupRoot = path.dirname(session.current);
-    expect((await fs.readdir(backupRoot)).some(name => name.startsWith(".expired-"))).toBe(true);
     if (restart) { await backupWorker!.stop(); await coordinator!.stop(); }
     await db.update(agents).set({ status: "terminated", lifecycleState: "terminated" }).where(eq(agents.id, session.agentId));
     await agentService(db).remove(session.agentId);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, session.runId))).toEqual([]);
-    fault.mockRestore();
-    if (restart) await startBackups(); else await vi.advanceTimersByTimeAsync(retryAt - Date.now());
+    if (restart) await startBackups();
     await settled();
-    expect(await fs.readdir(backupRoot)).toEqual([]); expect(await taskSessionCount(session.agentId)).toBe(0);
+    expect(await fs.readdir(backupRoot)).toEqual(["current"]); await expectKept(session);
+    expect(backupErrors).toEqual([]);
     await quiet();
   });
 
@@ -1222,40 +1126,24 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     await quiet();
   });
 
-  it("retains live lease references and only removes the owning company's backup after lease release", async () => {
+  it("retains live lease references and keeps the owning company's backup after lease release", async () => {
     const first = await seedSession({ leaseStatus: "retained" });
     const other = await seedSession({ leaseStatus: "retained" });
     await startBackups(); await settled(); await quiet();
     await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({ status: "expired" })
       .where(eq(environmentLeases.companyId, first.companyId)), { companyId: first.companyId });
-    await settled(); expect(await exists(first.current)).toBe(false); expect(await exists(other.current)).toBe(true);
-    expect(await taskSessionCount(other.agentId)).toBe(1); await quiet();
+    await settled(); await expectKept(first); expect(await exists(other.current)).toBe(true);
+    expect(await taskSessionCount(other.agentId)).toBe(1); expect(await taskSessionCount(first.agentId)).toBe(1); await quiet();
   });
 
-  it("retries a partial physical deletion from its tombstone without recreating a resume pointer", async () => {
-    const session = await seedSession(); const remove = fs.rm; let failed = false;
-    const fault = vi.spyOn(fs, "rm").mockImplementation(async (...args) => {
-      if (!failed && String(args[0]).includes(".expired-")) { failed = true; throw new Error("controlled filesystem delete failure"); }
-      return remove(...args);
-    });
-    await startBackups();
-    await vi.waitFor(async () => { await vi.advanceTimersByTimeAsync(100); expect(backupErrors).toHaveLength(1); });
-    const retry = coordinator!.nextWakeAt()!; expect(retry - Date.now()).toBeGreaterThan(20_000);
-    expect(await taskSessionCount(session.agentId)).toBe(0); expect(await exists(session.current)).toBe(false);
-    fault.mockRestore(); await quiet(5000);
-    await vi.advanceTimersByTimeAsync(retry - Date.now()); await settled();
-    expect(await fs.readdir(path.join(session.root, "failover-backups"))).toEqual([]); await quiet();
-  });
-
-  it("retains a first ordinary close during drain and dispatches it after resume", async () => {
+  it("retains a first ordinary close during drain, dispatches it after resume and keeps the backup", async () => {
     const session = await seedSession({ issueStatus: "todo" });
     await startBackups(); await settled(); admitted = false;
-    const closed = await issueService(db).update(session.issueId, { status: "done" });
+    await issueService(db).update(session.issueId, { status: "done" });
     await vi.waitFor(async () => { await vi.advanceTimersByTimeAsync(1000); expect(idleWorkSnapshot().active).toBe(0); });
     await quiet(60_000); admitted = true;
-    const due = new Date(closed!.completedAt!).getTime() + 7 * DAY_MS + 1;
-    await settled(due); await vi.advanceTimersByTimeAsync(due - Date.now()); await settled();
-    expect(await exists(session.current)).toBe(false); await quiet();
+    await settled(); await quiet(8 * DAY_MS);
+    await expectKept(session); expect(await taskSessionCount(session.agentId)).toBe(1);
   });
 
   it("honors outer rollback for nested ordinary close and activates only on committed work", async () => {
@@ -1274,18 +1162,6 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     expect(saved!.status).toBe("todo");
   });
 
-  it("pages multiple company backups, preserves a busy one and wakes from process release", async () => {
-    const sessions = [await seedSession(), await seedSession(), await seedSession()]; let busy = true;
-    await startBackups({ maxEntries: 1, maxRemovals: 1, isSessionBusy: digest => busy && digest === sessions[1]!.scope });
-    await vi.waitFor(async () => { await vi.advanceTimersByTimeAsync(1000);
-      expect(await exists(sessions[0]!.current)).toBe(false); expect(await exists(sessions[2]!.current)).toBe(false);
-      expect(backupErrors.length).toBeGreaterThan(0);
-    });
-    expect(await exists(sessions[1]!.current)).toBe(true); busy = false;
-    noteNativeHarnessBackupChange(db, { companyId: sessions[1]!.companyId });
-    await settled(); expect(await exists(sessions[1]!.current)).toBe(false); await quiet();
-  });
-
   it("leaves empty evidence and retained backups quiet without invoking backup SQL", async () => {
     const session = await seedSession();
     const reads = vi.spyOn(db, "select"), writes = vi.spyOn(db, "transaction");
@@ -1294,7 +1170,7 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     reads.mockRestore(); writes.mockRestore(); await quiet();
   });
 
-  it("reconstructs and replaces the saved evidence deadline after a publication signal", async () => {
+  it("reconstructs and replaces the saved evidence pass after a publication signal; every archive is kept", async () => {
     const session = await seedSession({ issueStatus: "in_progress" });
     const first = await seedArchive(session.root, { stampedDaysAgo: 2 });
     const firstDeadline = now.getTime() + 5 * DAY_MS + 1;
@@ -1304,12 +1180,12 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     noteNativeRunnerEvidence(writtenAt);
     await settled(firstDeadline);
     await vi.advanceTimersByTimeAsync(firstDeadline - Date.now());
-    await settled(writtenAt + 7 * DAY_MS + 1); expect(await exists(first)).toBe(false);
+    await settled(writtenAt + 7 * DAY_MS + 1); expect(await exists(first)).toBe(true);
     await vi.advanceTimersByTimeAsync(writtenAt + 7 * DAY_MS + 1 - Date.now()); await settled();
-    expect(await exists(next)).toBe(false); expect(await exists(session.current)).toBe(true); await quiet();
+    expect(await exists(next)).toBe(true); expect(await exists(session.current)).toBe(true); await quiet();
   });
 
-  it.each(["session root", "archive directory"])("preserves an evidence inspection failure at %s until its concrete retry succeeds", async location => {
+  it.each(["session root", "archive directory"])("preserves an evidence inspection failure at %s until its concrete retry succeeds; the archive is kept", async location => {
     const session = await seedSession({ issueStatus: "in_progress" });
     const archive = await seedArchive(session.root);
     const original = fs.lstat;
@@ -1321,10 +1197,10 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     const retryAt = coordinator!.nextWakeAt()!; expect(await exists(archive)).toBe(true);
     denied.mockRestore(); await quiet(5000);
     await vi.advanceTimersByTimeAsync(retryAt - Date.now()); await settled();
-    expect(await exists(archive)).toBe(false); await quiet();
+    expect(await exists(archive)).toBe(true); await quiet();
   });
 
-  it("retries a busy evidence obligation and disarms after the session releases it", async () => {
+  it("retries a busy evidence obligation and disarms after the session releases it; the archive is kept", async () => {
     const session = await seedSession({ issueStatus: "in_progress" });
     const archive = await seedArchive(session.root); let busy = true;
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] }); vi.setSystemTime(now);
@@ -1335,17 +1211,17 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     expect(retryAt - inspectedAt!).toBeGreaterThanOrEqual(60 * 60_000);
     await quiet(5000); busy = false;
     await vi.advanceTimersByTimeAsync(retryAt - Date.now()); await settled();
-    expect(await exists(archive)).toBe(false); await quiet();
+    expect(await exists(archive)).toBe(true); await quiet();
   });
 
-  it("retains the first publication during drain and cleans up on resume", async () => {
+  it("retains the first publication during drain and keeps the archive on resume", async () => {
     const session = await seedSession({ issueStatus: "in_progress" });
     await startEvidence(); await settled(); admitted = false;
     const archive = await seedArchive(session.root);
     noteNativeRunnerEvidence(now.getTime() - 10 * DAY_MS);
     await vi.waitFor(async () => { await vi.advanceTimersByTimeAsync(1000); expect(idleWorkSnapshot().active).toBe(0); });
     await quiet(60_000); expect(await exists(archive)).toBe(true);
-    admitted = true; await settled(); expect(await exists(archive)).toBe(false); await quiet();
+    admitted = true; await settled(); expect(await exists(archive)).toBe(true); await quiet();
   });
 
   it("reconstructs the same retained deadline after restart", async () => {
@@ -1357,7 +1233,7 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     expect(coordinator!.nextWakeAt()).toBe(deadline);
   });
 
-  it("backs off a failed state-base inspection and lets publication reactivate it", async () => {
+  it("backs off a failed state-base inspection and lets publication reactivate it; the archive is kept", async () => {
     const session = await seedSession({ issueStatus: "in_progress" });
     const archive = await seedArchive(session.root), read = fs.readdir;
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] }); vi.setSystemTime(now);
@@ -1374,10 +1250,10 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     expect(coordinator!.nextWakeAt()! - inspectedAt!).toBeGreaterThanOrEqual(60 * 60_000);
     denied.mockRestore(); await quiet(5 * 60_000); expect(await exists(archive)).toBe(true);
     noteNativeRunnerEvidence(now.getTime() - 10 * DAY_MS);
-    await settled(); expect(await exists(archive)).toBe(false); await quiet();
+    await settled(); expect(await exists(archive)).toBe(true); await quiet();
   });
 
-  it("lets healthy saved expiry preempt a long-busy evidence retry", async () => {
+  it("lets a healthy saved evidence pass preempt a long-busy evidence retry; both archives are kept", async () => {
     const busy = await seedSession({ issueStatus: "in_progress" }), healthy = await seedSession({ issueStatus: "in_progress" });
     const held = await seedArchive(busy.root);
     const dueAt = now.getTime() + 10_001;
@@ -1386,7 +1262,7 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     await vi.advanceTimersByTimeAsync(dueAt - Date.now());
     await vi.waitFor(async () => {
       await vi.advanceTimersByTimeAsync(100);
-      expect(await exists(available)).toBe(false);
+      expect(await exists(available)).toBe(true);
       expect(idleWorkSnapshot().active).toBe(0);
       expect(coordinator!.nextWakeAt()! - Date.now()).toBeGreaterThan(59 * 60_000);
     });
@@ -1394,13 +1270,13 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     await quiet(60_000);
   });
 
-  it("reports reclaimed evidence bytes and dry-run mode", async () => {
+  it("reports no reclaimed evidence bytes and keeps the archive", async () => {
     const session = await seedSession({ issueStatus: "in_progress" });
     const archive = await seedArchive(session.root); const reported = vi.spyOn(logger, "info");
     await startEvidence(); await settled();
-    expect(reported.mock.calls).toEqual(expect.arrayContaining([[expect.objectContaining({ evidenceCandidates: 1,
-      evidenceRemoved: 1, evidenceReclaimedBytes: expect.any(Number), dryRun: false }), "native runner evidence retention"]]));
-    expect(await exists(archive)).toBe(false); await quiet();
+    expect(reported.mock.calls.some(call => call[1] === "native runner evidence retention"
+      && Number((call[0] as { evidenceRemoved?: number }).evidenceRemoved ?? 0) > 0)).toBe(false);
+    expect(await exists(archive)).toBe(true); await quiet();
   });
 
   it("schedules publication at the first removable instant after its retention boundary", async () => {
@@ -1410,12 +1286,12 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     noteNativeRunnerEvidence(writtenAt); await settled(writtenAt + 7 * DAY_MS + 1);
   });
 
-  it("uses bounded continuations without recounting an evidence session forever", async () => {
+  it("uses bounded continuations without recounting an evidence session forever; every entry is kept", async () => {
     const session = await seedSession({ issueStatus: "in_progress" });
     const archives = [await seedArchive(session.root), await seedArchive(session.root)];
     const quarantine = await seedQuarantine(session.scope);
     await startEvidence({ maxEntries: 1 }); await settled();
-    for (const archive of [...archives, quarantine]) expect(await exists(archive)).toBe(false);
+    for (const archive of [...archives, quarantine]) expect(await exists(archive)).toBe(true);
     await quiet();
   });
 
@@ -1445,30 +1321,31 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     expect(await exists(path.join(stateBase, "conversation-evidence"))).toBe(false);
   });
 
-  it("removes continuity archives older than the retention window and keeps recent ones", async () => {
+  it("keeps continuity archives older than the retention window as well as recent ones", async () => {
     const session = await seedSession({ issueStatus: "in_progress" });
     const old = await seedArchive(session.root, { stampedDaysAgo: 9 });
     const recent = await seedArchive(session.root, { stampedDaysAgo: 2 });
 
     const result = await evidenceService().tick();
 
-    expect(result).toMatchObject({ evidenceCandidates: 1, evidenceRemoved: 1, failed: 0 });
-    expect(result.evidenceReclaimedBytes).toBeGreaterThan(0);
+    expect(result).toMatchObject({ evidenceCandidates: 0, evidenceRemoved: 0, failed: 0 });
+    expect(result.evidenceReclaimedBytes).toBe(0);
+    expect(result.skipped.native_runner_evidence_kept).toBe(1);
     expect(result.skipped.recent_evidence).toBe(1);
-    expect(await exists(old)).toBe(false);
+    expect(await exists(old)).toBe(true);
     expect(await exists(recent)).toBe(true);
     expect(await exists(session.current)).toBe(true);
   });
 
-  it("removes the continuity-breaks folder once its archives are gone", async () => {
+  it("keeps the continuity-breaks folder because its archives are kept", async () => {
     const session = await seedSession({ issueStatus: "in_progress" });
     await seedArchive(session.root);
 
-    expect(await evidenceService().tick()).toMatchObject({ evidenceRemoved: 1 });
-    expect(await exists(path.join(session.root, "continuity-breaks"))).toBe(false);
+    expect(await evidenceService().tick()).toMatchObject({ evidenceRemoved: 0, skipped: { native_runner_evidence_kept: 1 } });
+    expect(await exists(path.join(session.root, "continuity-breaks"))).toBe(true);
   });
 
-  it("ages a continuity archive by its name and falls back to mtime for a future stamp", async () => {
+  it("ages a continuity archive by its name and falls back to mtime for a future stamp; the aged one is kept", async () => {
     const session = await seedSession({ issueStatus: "in_progress" });
     const stampedRecently = await seedArchive(session.root, { stampedDaysAgo: 1, mtimeDaysAgo: 30 });
     const futureStamp = await seedArchive(session.root, {
@@ -1480,9 +1357,9 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
       mtimeDaysAgo: 1,
     });
 
-    expect(await evidenceService().tick()).toMatchObject({ evidenceRemoved: 1 });
+    expect(await evidenceService().tick()).toMatchObject({ evidenceRemoved: 0, skipped: { recent_evidence: 2, native_runner_evidence_kept: 1 } });
     expect(await exists(stampedRecently)).toBe(true);
-    expect(await exists(futureStamp)).toBe(false);
+    expect(await exists(futureStamp)).toBe(true);
     expect(await exists(futureRecent)).toBe(true);
   });
 
@@ -1507,7 +1384,7 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     expect(await exists(quarantine)).toBe(true);
   });
 
-  it("keeps evidence when its session starts while the removal is being prepared", async () => {
+  it("keeps evidence reached before its session starts, before any removal is prepared", async () => {
     const scope = await emptyStateBase();
     const root = path.join(stateBase, scope);
     const archive = await seedArchive(root);
@@ -1515,12 +1392,12 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
 
     const result = await evidenceService({ isSessionBusy: () => ++checks > 1 }).tick();
 
-    expect(result).toMatchObject({ evidenceCandidates: 1, evidenceRemoved: 0 });
-    expect(result.skipped.session_active).toBe(1);
+    expect(result).toMatchObject({ evidenceCandidates: 0, evidenceRemoved: 0 });
+    expect(result.skipped.native_runner_evidence_kept).toBe(1);
     expect(await exists(archive)).toBe(true);
   });
 
-  it("reports evidence without deleting it in dry run", async () => {
+  it("dry run reports no evidence candidate and deletes nothing", async () => {
     const session = await seedSession({ issueStatus: "in_progress" });
     const archive = await seedArchive(session.root);
     const quarantine = await seedQuarantine(session.scope);
@@ -1529,8 +1406,9 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
 
     const result = await evidenceService({ dryRun: true }).tick();
 
-    expect(result).toMatchObject({ evidenceCandidates: 2, evidenceRemoved: 0, evidenceReclaimedBytes: 0 });
-    expect(result.evidenceCandidateBytes).toBeGreaterThan(0);
+    expect(result).toMatchObject({ evidenceCandidates: 0, evidenceRemoved: 0, evidenceReclaimedBytes: 0 });
+    expect(result.evidenceCandidateBytes).toBe(0);
+    expect(result.skipped.native_runner_evidence_kept).toBe(2);
     expect(await exists(archive)).toBe(true);
     expect(await exists(quarantine)).toBe(true);
     expect(await exists(leftover)).toBe(true);
@@ -1586,18 +1464,19 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     }
   });
 
-  it("removes quarantine entries older than the retention window and keeps recent ones", async () => {
+  it("keeps quarantine entries older than the retention window as well as recent ones", async () => {
     const scope = await emptyStateBase();
     const old = await seedQuarantine(scope, { stampedDaysAgo: 9 });
     const recent = await seedQuarantine(scope, { stampedDaysAgo: 2 });
 
     const result = await evidenceService().tick();
 
-    expect(result).toMatchObject({ evidenceCandidates: 1, evidenceRemoved: 1, failed: 0 });
+    expect(result).toMatchObject({ evidenceCandidates: 0, evidenceRemoved: 0, failed: 0 });
+    expect(result.skipped.native_runner_evidence_kept).toBe(1);
     expect(result.skipped.recent_evidence).toBe(1);
-    expect(await exists(old)).toBe(false);
+    expect(await exists(old)).toBe(true);
     expect(await exists(recent)).toBe(true);
-    expect(await fs.readdir(path.join(stateBase, "quarantine"))).toEqual([path.basename(recent)]);
+    expect(await fs.readdir(path.join(stateBase, "quarantine"))).toEqual([path.basename(old), path.basename(recent)].sort());
   });
 
   it("keeps cleanup source archives in quarantine", async () => {
@@ -1613,7 +1492,7 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     expect(await exists(entry)).toBe(true);
   });
 
-  it("finishes removing evidence left over from an interrupted removal", async () => {
+  it("keeps evidence left over from an interrupted removal", async () => {
     const session = await seedSession({ issueStatus: "in_progress" });
     const archive = await seedArchive(session.root, { stampedDaysAgo: 1 });
     const leftover = path.join(session.root, "continuity-breaks", `.expired-${randomUUID()}`);
@@ -1623,12 +1502,12 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
 
     await evidenceService().tick();
 
-    expect(await exists(leftover)).toBe(false);
-    expect(await exists(quarantineLeftover)).toBe(false);
+    expect(await exists(path.join(leftover, "codex-home"))).toBe(true);
+    expect(await exists(quarantineLeftover)).toBe(true);
     expect(await exists(archive)).toBe(true);
   });
 
-  it.each([false, true])("pages evidence removals across ticks (dry run %s)", async (dryRun) => {
+  it.each([false, true])("pages evidence across ticks and keeps every entry (dry run %s)", async (dryRun) => {
     const session = await seedSession({ issueStatus: "in_progress" });
     const archives = [await seedArchive(session.root), await seedArchive(session.root), await seedArchive(session.root)];
     const quarantine = await seedQuarantine(session.scope);
@@ -1641,13 +1520,14 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
       if (!result.truncated) break;
     }
 
-    expect(results.map((result) => result.evidenceCandidates)).toEqual([2, 2]);
-    expect(results.map((result) => result.truncated)).toEqual([true, false]);
-    for (const archive of archives) expect(await exists(archive)).toBe(dryRun);
-    expect(await exists(quarantine)).toBe(dryRun);
+    expect(results.map((result) => result.evidenceCandidates)).toEqual([0]);
+    expect(results.map((result) => result.truncated)).toEqual([false]);
+    expect(results[0]!.skipped.native_runner_evidence_kept).toBe(4);
+    for (const archive of archives) expect(await exists(archive)).toBe(true);
+    expect(await exists(quarantine)).toBe(true);
   });
 
-  it("does not recount a session's backup when its archives resume on the next tick", async () => {
+  it("does not count a kept session backup or its kept archives on either tick", async () => {
     const session = await seedSession();
     await seedArchive(session.root);
     await seedArchive(session.root);
@@ -1656,19 +1536,21 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     const first = await retention.tick();
     const second = await retention.tick();
 
-    expect(first).toMatchObject({ candidates: 1, evidenceCandidates: 1, truncated: true });
-    expect(second).toMatchObject({ candidates: 0, evidenceCandidates: 1, truncated: false });
+    expect(first).toMatchObject({ candidates: 0, evidenceCandidates: 0, truncated: false });
+    expect(first.skipped).toMatchObject({ native_backup_local_copy_kept: 1, native_runner_evidence_kept: 2 });
+    expect(second).toMatchObject({ candidates: 0, evidenceCandidates: 0, truncated: false });
+    await expectKept(session);
   });
-  it("removes old quarantine entries even when their session's issue is still open", async () => {
+  it("keeps old quarantine entries whether or not their session's issue is still open", async () => {
     const session = await seedSession({ issueStatus: "in_progress", backupAgeDays: 1 });
     const entry = await seedQuarantine(session.scope);
     await fs.cp(path.join(session.root, "control-plane"), path.join(entry, "control-plane"), { recursive: true });
 
-    expect(await evidenceService().tick()).toMatchObject({ evidenceRemoved: 1 });
-    expect(await exists(entry)).toBe(false);
+    expect(await evidenceService().tick()).toMatchObject({ evidenceRemoved: 0, skipped: { native_runner_evidence_kept: 1 } });
+    expect(await exists(entry)).toBe(true);
   });
 
-  it("stays quiet until retained evidence is due and wakes when new evidence is written", async () => {
+  it("stays quiet until retained evidence is due, wakes when new evidence is written, and keeps both", async () => {
     const session = await seedSession({ issueStatus: "in_progress", backupAgeDays: 1 });
     const recent = await seedArchive(session.root, { stampedDaysAgo: 2 });
     const retention = evidenceService();
@@ -1676,17 +1558,17 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
 
     expect((await retention.tick()).skipped.recent_evidence).toBe(1);
     expect((await retention.tick(at(4))).skipped.recent_evidence).toBeUndefined();
-    expect(await retention.tick(at(6))).toMatchObject({ evidenceRemoved: 1 });
-    expect(await exists(recent)).toBe(false);
+    expect(await retention.tick(at(6))).toMatchObject({ evidenceRemoved: 0, skipped: { native_runner_evidence_kept: 1 } });
+    expect(await exists(recent)).toBe(true);
 
     const written = await seedArchive(session.root, { stampedDaysAgo: 0 });
     expect(await retention.tick(at(8))).toMatchObject({ evidenceCandidates: 0 });
     retention.noteEvidence(now.getTime());
-    expect(await retention.tick(at(8))).toMatchObject({ evidenceRemoved: 1 });
-    expect(await exists(written)).toBe(false);
+    expect(await retention.tick(at(8))).toMatchObject({ evidenceRemoved: 0 });
+    expect(await exists(written)).toBe(true);
   });
 
-  it("retries evidence of a busy session on the next tick", async () => {
+  it("retries evidence of a busy session on the next tick and keeps it", async () => {
     const session = await seedSession({ issueStatus: "in_progress", backupAgeDays: 1 });
     const archive = await seedArchive(session.root);
     let busy = true;
@@ -1694,22 +1576,22 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
 
     expect(await retention.tick()).toMatchObject({ evidenceRemoved: 0 });
     busy = false;
-    expect(await retention.tick()).toMatchObject({ evidenceRemoved: 1 });
-    expect(await exists(archive)).toBe(false);
+    expect(await retention.tick()).toMatchObject({ evidenceRemoved: 0, skipped: { native_runner_evidence_kept: 1 } });
+    expect(await exists(archive)).toBe(true);
   });
 
-  it("reports dry-run evidence once until new evidence is written", async () => {
+  it("dry run reports no evidence candidate, before or after new evidence is written", async () => {
     const session = await seedSession({ issueStatus: "in_progress", backupAgeDays: 1 });
     await seedArchive(session.root);
     const retention = evidenceService({ dryRun: true });
 
-    expect(await retention.tick()).toMatchObject({ evidenceCandidates: 1 });
+    expect(await retention.tick()).toMatchObject({ evidenceCandidates: 0 });
     expect(await retention.tick()).toMatchObject({ evidenceCandidates: 0 });
     retention.noteEvidence(now.getTime());
-    expect(await retention.tick({ now: new Date(now.getTime() + 7 * DAY_MS) })).toMatchObject({ evidenceCandidates: 1 });
+    expect(await retention.tick({ now: new Date(now.getTime() + 7 * DAY_MS) })).toMatchObject({ evidenceCandidates: 0 });
   });
 
-  it("counts inspected archives and leftovers against the entry limit", async () => {
+  it("counts inspected archives against the entry limit and keeps leftovers", async () => {
     const session = await seedSession({ issueStatus: "in_progress", backupAgeDays: 1 });
     const archives = [
       await seedArchive(session.root, { stampedDaysAgo: 1 }),
@@ -1722,8 +1604,8 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
 
     const first = await retention.tick();
     expect(first).toMatchObject({ checked: 2, truncated: true });
-    expect(first.skipped.recent_evidence).toBeUndefined();
-    expect((await fs.readdir(path.join(session.root, "continuity-breaks"))).filter((name) => name.startsWith(".expired-"))).toHaveLength(1);
+    expect(first.skipped.recent_evidence).toBe(1);
+    expect((await fs.readdir(path.join(session.root, "continuity-breaks"))).filter((name) => name.startsWith(".expired-"))).toHaveLength(2);
 
     const results = [first];
     for (let i = 0; i < 6 && results.at(-1)!.truncated; i++) results.push(await retention.tick());
@@ -1731,11 +1613,11 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     expect(results.every((result) => result.checked <= 2)).toBe(true);
     expect(results.every((result) => (result.skipped.recent_evidence ?? 0) <= 2)).toBe(true);
     expect(results.reduce((sum, result) => sum + (result.skipped.recent_evidence ?? 0), 0)).toBe(3);
-    for (const leftover of leftovers) expect(await exists(leftover)).toBe(false);
+    for (const leftover of leftovers) expect(await exists(leftover)).toBe(true);
     for (const archive of archives) expect(await exists(archive)).toBe(true);
   });
 
-  it("stops removing leftovers once the sweep must stop", async () => {
+  it("keeps leftovers whether or not the sweep must stop", async () => {
     const session = await seedSession({ issueStatus: "in_progress", backupAgeDays: 1 });
     await fs.mkdir(path.join(session.root, "continuity-breaks"));
     const leftover = path.join(session.root, "continuity-breaks", `.expired-${randomUUID()}`);
@@ -1747,7 +1629,7 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     await retention.tick();
     expect(await exists(leftover)).toBe(true);
     await retention.tick();
-    expect(await exists(leftover)).toBe(false);
+    expect(await exists(leftover)).toBe(true);
   });
 
   it("keeps a due evidence pass pending when drain stops it before any session", async () => {
@@ -1758,11 +1640,11 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
 
     expect(await retention.tick()).toMatchObject({ checked: 0, truncated: true });
     draining = false;
-    expect(await retention.tick()).toMatchObject({ evidenceRemoved: 1 });
-    expect(await exists(archive)).toBe(false);
+    expect(await retention.tick()).toMatchObject({ evidenceRemoved: 0, skipped: { native_runner_evidence_kept: 1 } });
+    expect(await exists(archive)).toBe(true);
   });
 
-  it("finishes one-entry batches without recounting a resumed session", async () => {
+  it("finishes one-entry batches without recounting a resumed session and keeps every entry", async () => {
     const session = await seedSession({ issueStatus: "in_progress", backupAgeDays: 1 });
     const archives = [await seedArchive(session.root), await seedArchive(session.root)];
     const quarantine = await seedQuarantine(session.scope);
@@ -1775,7 +1657,7 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     }
 
     expect(results.at(-1)!.truncated).toBe(false);
-    for (const archive of archives) expect(await exists(archive)).toBe(false);
-    expect(await exists(quarantine)).toBe(false);
+    for (const archive of archives) expect(await exists(archive)).toBe(true);
+    expect(await exists(quarantine)).toBe(true);
   });
 });
