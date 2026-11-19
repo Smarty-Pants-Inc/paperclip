@@ -4993,16 +4993,38 @@ and its commits all stay. The workspace row stays active.
 
 Run-log spills are not regenerable output. In addition to configured-root
 protection, cleanup searches the whole candidate directory for the writer's
-`*.index.ndjson` files, without pruning directory names or limiting their depth.
-An unrecovered entry, an unreadable index, or an inspection error keeps the
-candidate whole. This also covers a guest's default root under `build/`, and a
-root whose `.env` or home setting changed after writing. A fully recovered spill
-adds no content-based refusal; other trace/ownership guards still apply.
+spill files (`*.index.ndjson` records and their `*.ndjson` data), without
+pruning directory names or limiting their depth. This also covers a guest's
+default root under `build/`, and a root whose `.env` or home setting changed
+after writing.
+
+One rule, `runLogSpillCustody` in `object-run-log-store.ts`, decides every spill
+for the spill listing and the content guard, and through them for instance
+cleanup, the workspace reaper and the scheduled sweep. A spill is released only
+when both hold:
+
+- its record parses and positively names every byte on disk recovered (a
+  `recovered` entry for each spilled range, and no bytes outside the ranges);
+- the recovered copy, read back from the object log through this process's
+  object run-log store (from object storage, never its read cache), has the same
+  sha256 as the spill file for every range.
+
+Everything else keeps the candidate whole: an unrecovered entry; a missing,
+empty, `{}`/`[]`, torn or unreadable record; bytes no record points at; and a
+read-back that fails, times out, comes back short or differs. Each of those
+unknown cases logs `kept: run-log spill custody unknown` with `spill`, `index`
+and `reason`; count these warnings when diagnosing retained disk use. A server
+with no object run-log store cannot read a copy back, so it keeps every spill it
+finds. A `*.ndjson` with no record beside it is treated as a spill unless it is
+empty or, read in full, holds no run-log record (files over 64 MiB are kept
+unread). The local run-log store writes the same record shape, so its logs keep
+their directory too. A released spill adds no content-based refusal; other
+trace/ownership guards still apply.
 
 The content walk is bounded at 1,000,000 entries. The repository's installed
 `node_modules` measured 141,591 entries and a full content scan took about 1.6
-seconds, leaving roughly seven times headroom. No-spill candidates read directory
-entries only, not file contents. Every bound refusal logs `kept: walk bound hit`
+seconds, leaving roughly seven times headroom. Candidates with no `*.ndjson`
+name read directory entries only, not file contents. Every bound refusal logs `kept: walk bound hit`
 with `candidatePath`, `visitedEntries`, `maxEntries`, and the process-local
 cumulative `walkBoundHits` counter; count these warnings when diagnosing retained
 disk use. Do not silently treat a bound hit as permission to delete.
