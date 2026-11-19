@@ -1846,7 +1846,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       expect(wakes[0]).toMatchObject({ idempotencyKey: `conversation-comment:${posted.body.id}`,
         status: "deferred_issue_execution", runId: null });
       expect((await carriersOf(chat, posted.body.id)).runs).toHaveLength(0);
-      return { chat, commentId: posted.body.id as string, clientRequestId, body, wake: wakes[0]! };
+      return { chat, commentId: posted.body.id as string, clientRequestId, body, wake: wakes[0]!, busyRunId: busy!.id };
     }
 
     async function readCaption(row: Awaited<ReturnType<typeof heldRestore>>, label: string) {
@@ -1869,6 +1869,64 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       return comment;
     }
 
+    /** Promote the actual held wake through run-end release and dispatch its real
+     * process adapter. Hold only the adapter boundary so cap-5 can read RUNNING;
+     * no test-created carrier/context or projection answer is substituted. */
+    async function runHeldWake(row: Awaited<ReturnType<typeof heldRestore>>, outcome: "answered" | "failed",
+      duringRun?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>) {
+      const { chat } = row;
+      const adapter = getServerAdapter("process");
+      const heartbeat = heartbeatService(db);
+      const cwd = await mkdtemp(join(tmpdir(), "caption-held-next-run-"));
+      let admit!: (runId: string) => void;
+      let unblock!: () => void;
+      const admitted = new Promise<string>(resolve => { admit = resolve; });
+      const blocked = new Promise<void>(resolve => { unblock = resolve; });
+      registerServerAdapter({ ...adapter, execute: async ctx => {
+        admit(ctx.runId);
+        await blocked;
+        const result = await adapter.execute(ctx);
+        if (outcome === "answered") await issueService(db).addComment(chat.issue.id,
+          `Answer to ${row.body}`, { agentId: chat.agentId, runId: ctx.runId });
+        return result;
+      } });
+      try {
+        await db.update(agents).set({ adapterType: "process", adapterConfig: { command: process.execPath,
+          args: ["-e", outcome === "failed" ? "process.stderr.write('caption carrier failed'); process.exit(1)" : "console.log('caption carrier answered')"], cwd },
+          runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } } }).where(eq(agents.id, chat.agentId));
+        runningProcesses.delete(chat.runId);
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+          .where(eq(heartbeatRuns.id, row.busyRunId));
+        const release = await releaseRun({ ...chat, runId: row.busyRunId });
+        await heartbeat.resumeQueuedRunsForAgent(chat.companyId, chat.agentId);
+        console.info("CAPTION_PROMOTION", JSON.stringify({ release }));
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const runId = await Promise.race([admitted, new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("held wake did not reach the real process adapter")), 20_000);
+        })]).finally(() => clearTimeout(timer));
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        expect(run!.status).toBe("running");
+        const context = run!.contextSnapshot as Record<string, any>;
+        expect(context.wakeCommentIds ?? [context.wakeCommentId ?? context.commentId]).toContain(row.commentId);
+        expect(context.steeredCommentIds ?? []).not.toContain(row.commentId);
+        console.info("CAPTION_CARRIER", JSON.stringify({ outcome, runId, wakeupRequestId: run!.wakeupRequestId,
+          status: run!.status, context }));
+        await duringRun?.(run!);
+        unblock();
+        await heartbeat.drainActiveRunExecutions();
+        await waitForPendingRunFailureReports();
+        const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        expect(ended!.status).toBe(outcome === "answered" ? "succeeded" : "failed");
+        expect(await answered(row.commentId)).toBe(outcome === "answered");
+        return ended!;
+      } finally {
+        unblock();
+        await heartbeat.drainActiveRunExecutions();
+        registerServerAdapter(adapter);
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+
     it("cap-1: unread steer held by a LIVE restore wake is queued with no unavailable reason", async () => {
       const row = await heldRestore();
       expect(await readCaption(row, "cap-1")).toMatchObject({ deliveryOutcome: "queued",
@@ -1879,9 +1937,48 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       const row = await heldRestore();
       await db.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date() })
         .where(eq(agentWakeupRequests.id, row.wake.id));
+      // A pre-cleanup build can retain the steering run's own M in both
+      // fields. That run is NOT a later carrier; keep this persisted-shape
+      // guard even though today's real restore removes both fields.
+      const [original] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, row.chat.runId));
+      await db.update(heartbeatRuns).set({ contextSnapshot: { ...original!.contextSnapshot,
+        steeredCommentIds: [row.commentId], wakeCommentIds: [row.chat.first.id, row.commentId] } })
+        .where(eq(heartbeatRuns.id, row.chat.runId));
       expect(await readCaption(row, "cap-2")).toMatchObject({ deliveryOutcome: "ordinary",
         steeringUnavailableReason: "run_ended_before_read", steeringStatus: null, carriedIntoRunId: null });
     });
+
+    it("cap-4: the held wake runs and answers M, so GET and POST are ordinary with no unavailable reason", async () => {
+      const row = await heldRestore();
+      await runHeldWake(row, "answered");
+      expect(await readCaption(row, "cap-4")).toMatchObject({ deliveryOutcome: "ordinary",
+        steeringUnavailableReason: null });
+    }, 60_000);
+
+    it("cap-5: the held wake is claimed and RUNNING, never run_ended_before_read", async () => {
+      const row = await heldRestore();
+      await runHeldWake(row, "answered", async run => {
+        const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, row.wake.id));
+        expect(wake!.runId).toBe(run.id);
+        expect(wake!.status).not.toBe("deferred_issue_execution");
+        expect(await readCaption(row, "cap-5")).toMatchObject({ deliveryOutcome: "ordinary",
+          steeringUnavailableReason: null });
+      });
+    }, 60_000);
+
+    it("cap-6: the later ordinary-input run fails unanswered; only its failure card names M once", async () => {
+      const row = await heldRestore();
+      const failed = await runHeldWake(row, "failed");
+      // The real task GET is the failure-card writer, not a stand-in card list.
+      const task = await request(app(row.chat.companyId)).get(`/api/issues/${row.chat.issue.id}`).expect(200);
+      console.info("CAPTION_FAILURE_CARD", JSON.stringify({ label: "cap-6", failedRunId: failed.id,
+        messageId: row.commentId, interruption: task.body.interruption }));
+      expect(task.body.interruption).toMatchObject({ state: "failed", observedRunId: failed.id,
+        carriedMessages: [{ id: row.commentId, quote: row.body }] });
+      expect(task.body.interruption.carriedMessages.filter((message: any) => message.id === row.commentId)).toHaveLength(1);
+      expect(await readCaption(row, "cap-6")).toMatchObject({ deliveryOutcome: "ordinary",
+        steeringUnavailableReason: null });
+    }, 60_000);
 
     it("cap-3: a carrier's userMessage item.started proves delivered, never an unavailable caption", async () => {
       const row = await heldRestore();
