@@ -88,6 +88,14 @@ export type ReadySpareOperations = {
    */
   settingMark?(): string;
   /**
+   * rf-4 U1 F1: re-read the environment's CURRENT spare setting from the host's
+   * durable config right before a spare create (and a spare TTL renewal).
+   * false (off, absent, unreadable, retired pool) sends nothing.
+   */
+  admitCreate?(): Promise<boolean>;
+  /** The plugin's one provider-text redactor; every stored stop error passes through it. */
+  redact?(text: string): string;
+  /**
    * Optional provider-side hourly check; fail closed on an unknown result.
    * `false` refuses (churn_cap). An object reports the durable count of spare
    * creates in the last hour (the provider inventory, which survives worker
@@ -117,9 +125,14 @@ export type StopBackoff = {
   stopFailures: number;
   backoffMs: number;
   until: string;
-  /** The last stop failure, e.g. "Boat stop stop_... did not complete". */
+  /** The last stop failure, e.g. "Boat stop stop_... did not complete", through operations.redact. */
   error: string;
 };
+
+/** A spare stop's outcome, for the plugin's durable record of owed stops and holds (rf-4 U1 F5/D). */
+export type SpareStopRecord =
+  | { outcome: "failed"; key: ReadySpareKey; spareId: string; until: number; failures: number }
+  | { outcome: "stopped"; key: ReadySpareKey; spareId: string };
 
 /** The named operator event at a spare refusal or over-ceiling run, and its health reason. */
 export type CreateCapRefusal = {
@@ -326,6 +339,9 @@ export class ReadySpareKeeper {
   private stopBackoffListener?: (backoff: StopBackoff) => void;
   /** Pools whose spare stops failed: no spare create before `until`. */
   private readonly stopBackoffs = new Map<string, { failures: number; until: number; error: string; logged: boolean }>();
+  /** Spares whose stop failed and has not since succeeded: never TTL-renewed (rf-4 U1B row H). */
+  private readonly stopFailedSpares = new Set<string>();
+  private stopRecordListener?: (record: SpareStopRecord) => void;
   private readonly failures = new Map<string, { count: number; retryAt: number }>();
   private readonly demandEvents = new Map<string, number[]>();
   private readonly stoppingSpares = new Set<string>();
@@ -342,6 +358,20 @@ export class ReadySpareKeeper {
   setRefusalListener(listener: ((refusal: CreateCapRefusal) => void) | undefined): void { this.refusalListener = listener; }
   /** Called once per back-off episode, when it first holds a create back. */
   setStopBackoffListener(listener: ((backoff: StopBackoff) => void) | undefined): void { this.stopBackoffListener = listener; }
+  /** Called at every spare stop outcome; the plugin persists failed stops and their hold. */
+  setStopRecordListener(listener: ((record: SpareStopRecord) => void) | undefined): void { this.stopRecordListener = listener; }
+  /** Re-establish a hold a previous worker recorded (rf-4 U1 F5). A later local hold wins. */
+  restoreStopBackoff(key: ReadySpareKey, until: number, failures: number, spareIds: readonly string[] = []): void {
+    for (const id of spareIds) this.stopFailedSpares.add(id);
+    if (!Number.isFinite(until) || until <= this.now()) return;
+    const poolId = readySparePoolKey(key);
+    const entry = this.stopBackoffs.get(poolId);
+    if (entry && entry.until >= until) return;
+    this.stopBackoffs.set(poolId, { failures: Math.max(1, Math.trunc(failures) || 1), until,
+      error: "a spare stop failed before this worker started", logged: false });
+  }
+  /** True while this spare's last stop failed (no TTL renewal). */
+  stopFailed(spareId: string): boolean { return this.stopFailedSpares.has(spareId); }
   /** The stop back-off in effect for this pool now, if any. */
   stopBackoffUntil(key: ReadySpareKey): number | undefined {
     const entry = this.stopBackoffs.get(readySparePoolKey(key));
@@ -539,6 +569,7 @@ export class ReadySpareKeeper {
     this.runCreates.clear(); this.usedCredits.clear(); this.providerCreates.clear(); this.tentativeCreates.clear(); this.createCeilings.clear(); this.capped.clear(); this.refusalCounts.clear();
     this.refusalListener = undefined;
     this.stopBackoffs.clear(); this.stopBackoffListener = undefined;
+    this.stopFailedSpares.clear(); this.stopRecordListener = undefined;
   }
 
   /**
@@ -562,12 +593,20 @@ export class ReadySpareKeeper {
     catch (error) {
       const poolId = readySparePoolKey(key);
       const failures = (this.stopBackoffs.get(poolId)?.failures ?? 0) + 1;
-      this.stopBackoffs.set(poolId, { failures, until: this.now() + READY_SPARE_STOP_BACKOFF_MS,
-        error: error instanceof Error ? error.message : String(error), logged: false });
+      const until = this.now() + READY_SPARE_STOP_BACKOFF_MS;
+      // rf-4 U1 F7: the stored (and later logged) error passes the plugin's one redactor.
+      const raw = error instanceof Error ? error.message : String(error);
+      let text = "spare stop failed";
+      try { if (operations.redact) text = operations.redact(raw); } catch { /* keep the closed text */ }
+      this.stopBackoffs.set(poolId, { failures, until, error: text, logged: false });
+      this.stopFailedSpares.add(spare.id);
+      try { this.stopRecordListener?.({ outcome: "failed", key, spareId: spare.id, until, failures }); } catch { /* Recording never changes the stop. */ }
       throw error;
     }
     finally { this.stoppingSpares.delete(spare.id); }
     this.stopBackoffs.delete(readySparePoolKey(key));
+    this.stopFailedSpares.delete(spare.id);
+    try { this.stopRecordListener?.({ outcome: "stopped", key, spareId: spare.id }); } catch { /* Recording never changes the stop. */ }
     return true;
   }
 
@@ -904,6 +943,17 @@ export class ReadySpareKeeper {
       reservations.push(reservation);
     }
     if (!reservations.length) return;
+    // rf-4 U1 F1: re-read the environment's current setting right before the
+    // POSTs. Off, absent, unreadable or a retired pool sends nothing.
+    if (operations.admitCreate) {
+      let admitted = false;
+      try { admitted = await operations.admitCreate(); } catch { admitted = false; }
+      if (!admitted || this.stopping) {
+        const recent = this.windowed(this.recentCreates, key.companyId);
+        for (const reservation of reservations) recent.delete(reservation);
+        return;
+      }
+    }
     // Right before the POSTs: 'off' (or a newer setting) that landed during
     // this pass's inventory reads cancels its unsent creates (rf-4 U1 F3).
     // The newest instruction runs next; a pass that has none is re-run, so a
@@ -973,6 +1023,8 @@ export class ReadySpareKeeper {
         }
         const spareTtl = spare.ttlSeconds ?? ttlSeconds;
         if (Date.parse(spare.expiresAt) > this.now() + spareTtl * 500) continue;
+        // rf-4 U1B row H: a spare whose stop failed is owed a stop, never a renewal.
+        if (this.stopFailedSpares.has(spare.id)) continue;
         try {
           const refreshed = await operations.refresh(current, spareTtl);
           const index = pool.findIndex(item => item.id === spare.id);
@@ -1007,6 +1059,7 @@ export class ReadySpareKeeper {
           continue;
         }
         if (Date.parse(spare.expiresAt) > spareThreshold) continue;
+        if (this.stopFailedSpares.has(spare.id)) continue; // Owed a stop, never a renewal (rf-4 U1B row H).
         try {
           const refreshed = await operations.refresh(spare, spareTtl);
           const index = pool.findIndex(item => item.id === spare.id);

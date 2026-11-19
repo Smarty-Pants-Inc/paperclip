@@ -3,9 +3,9 @@ import { posix } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { SYNC_TEMP_MAX_AGE_MS, sweepStaleSyncTemps, syncFiles } from "./file-sync.js";
 import { parseHttpDate } from "./http-date.js";
-import { createReadySpareClaimStore, ReadySpareKeeper, READY_SPARE_TTL_SECONDS, readyCreateCeilingPerHour, readySpareConfigHash, readySpareCount, readySpareDemandWindowMinutes,
+import { createReadySpareClaimStore, ReadySpareKeeper, READY_SPARE_STOP_BACKOFF_MS, READY_SPARE_TTL_SECONDS, readyCreateCeilingPerHour, readySpareConfigHash, readySpareCount, readySpareDemandWindowMinutes,
   readySpareEnvironmentIds, readySpareIdleMinutes, readySpareMax, readySparePoolKey,
-  type CreateCapRefusal, type ReadySpare, type ReadySpareClaimStore, type ReadySpareKey, type ReadySpareOperations } from "./ready-spares.js";
+  type CreateCapRefusal, type ReadySpare, type ReadySpareClaimStore, type ReadySpareKey, type ReadySpareOperations, type SpareStopRecord } from "./ready-spares.js";
 import { stageGuardian, type GuardianPreflight } from "./guardian-stage.js";
 import { BoatIdleActivity, trackBoatHooks } from "./idle-activity.js";
 import { assertBoatActivityAdmission, gateBoatHooks, withBoatLeaseActivity } from "./lease-gates.js";
@@ -39,7 +39,9 @@ const SPARE_ACTIVITY_EVENTS = ["agent.run.started", "agent.run.finished", "agent
 const idleActivity = new BoatIdleActivity();
 const readySpares = new ReadySpareKeeper();
 type KnownSparePool = { key: ReadySpareKey; ttlSeconds: number; desired: number; baseDesired: number; spareMax: number; demandWindowMinutes: number;
-  idleMinutes: number; operations: ReadySpareOperations; idleStopped: boolean };
+  idleMinutes: number; operations: ReadySpareOperations; idleStopped: boolean;
+  /** A replaced environment config's pool (rf-4 U1B row C): never refilled, renewed or re-targeted again. */
+  retired?: boolean };
 type CompanySpareActivity = { lastActivityAt?: number; lastLeaseAcquiredAt?: number };
 type AcquireOutcomeReason = "no_ready_spare" | "create_capped" | "refill_in_flight" | "env_not_listed" | "config_mismatch" | "claim_conflict" | "spares_disabled" | "idle";
 type AcquireOutcomeCounts = { spare: number; cold: number; reasons: Partial<Record<AcquireOutcomeReason, number>> };
@@ -394,6 +396,175 @@ async function recordCompanySpareActivity(companyId: string, leaseAcquired = fal
   const wake = wakeCompanySparePools(companyId);
   if (waitForWake) await wake;
   else void wake.catch(() => undefined);
+}
+/** Companies whose last spare-setting re-read failed; logged once until a read succeeds. */
+const spareSettingReadFailures = new Set<string>();
+/**
+ * rf-4 U1 F1: this environment's spare count in the company's CURRENT config,
+ * read from the host's durable config (`ctx.config.get`, SDK types.ts
+ * PluginConfigClient.get; the same read acquire makes). 0 when absent or not
+ * listed; undefined when the read fails (logged once).
+ */
+async function currentSpareCount(key: ReadySpareKey): Promise<number | undefined> {
+  const configClient = pluginContext?.config;
+  if (!configClient || typeof configClient.get !== "function") return 0;
+  try {
+    const companyConfig = await configClient.get(key.companyId);
+    spareSettingReadFailures.delete(key.companyId);
+    return readySpareEnvironmentIds(companyConfig).includes(key.environmentId) ? readySpareCount(companyConfig) : 0;
+  } catch {
+    if (!spareSettingReadFailures.has(key.companyId)) {
+      spareSettingReadFailures.add(key.companyId);
+      try { duplexLogger?.warn("Boat ready spare setting re-read failed; no spare is created until it reads", { companyId: key.companyId, environmentId: key.environmentId }); }
+      catch { /* Logging never changes admission. */ }
+    }
+    return undefined;
+  }
+}
+/**
+ * rf-4 U1 F1: the keeper asks right before every spare create POST (and every
+ * spare TTL renewal). Only a known, unretired pool whose environment the
+ * current durable setting still lists with spares > 0 is admitted. A setting
+ * that reads off with no config event is applied here, as acquire applies it.
+ */
+async function admitSpareCreate(key: ReadySpareKey): Promise<boolean> {
+  const poolId = readySparePoolKey(key);
+  const pool = knownSparePools.get(poolId);
+  if (shuttingDown || !pool || pool.retired || pool.baseDesired <= 0) return false;
+  const count = await currentSpareCount(key);
+  if (count === undefined || shuttingDown) return false;
+  if (count <= 0) {
+    const current = knownSparePools.get(poolId);
+    if (current && current.baseDesired > 0) queueSpareReconciliation(key, 0, current.ttlSeconds, current.operations, current.idleMinutes);
+    return false;
+  }
+  const current = knownSparePools.get(poolId);
+  return current === pool && !pool.retired && pool.baseDesired > 0;
+}
+/**
+ * rf-4 U1 F5 and U1B row D: failed spare stops outlive the worker. Per company,
+ * in the plugin's durable state (the store the spare activity already uses):
+ * each pool's owed-until hold and each spare whose stop is still owed.
+ */
+const SPARE_STOP_OWED_STATE_KEY = "stop-owed";
+type OwedSpareStops = {
+  holds: Array<{ environmentId: string; configHash: string; until: number; failures: number }>;
+  owed: Array<{ environmentId: string; configHash: string; spareId: string }>;
+};
+const companyOwedStops = new Map<string, OwedSpareStops>();
+const companyOwedStopLoads = new Map<string, Promise<OwedSpareStops>>();
+const companyOwedStopWrites = new Map<string, Promise<void>>();
+const owedStopRetryAt = new Map<string, number>();
+const owedStopWork = new Set<Promise<void>>();
+async function loadOwedSpareStops(companyId: string): Promise<OwedSpareStops> {
+  const cached = companyOwedStops.get(companyId);
+  if (cached) return cached;
+  const pending = companyOwedStopLoads.get(companyId);
+  if (pending) return pending;
+  const work = (async () => {
+    const record: OwedSpareStops = { holds: [], owed: [] };
+    try {
+      const state = await pluginContext?.state?.get?.({ scopeKind: "company", scopeId: companyId,
+        namespace: SPARE_ACTIVITY_NAMESPACE, stateKey: SPARE_STOP_OWED_STATE_KEY });
+      const value = state && typeof state === "object" && !Array.isArray(state) ? state as Record<string, unknown> : {};
+      const text = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+      if (Array.isArray(value.holds)) for (const row of value.holds) {
+        const hold = row as Record<string, unknown> | null;
+        if (hold && text(hold.environmentId) && text(hold.configHash) && Number.isFinite(hold.until)) {
+          record.holds.push({ environmentId: hold.environmentId, configHash: hold.configHash, until: Number(hold.until),
+            failures: Number.isInteger(hold.failures) && Number(hold.failures) > 0 ? Number(hold.failures) : 1 });
+        }
+      }
+      if (Array.isArray(value.owed)) for (const row of value.owed) {
+        const owed = row as Record<string, unknown> | null;
+        if (owed && text(owed.environmentId) && text(owed.configHash) && text(owed.spareId)) {
+          record.owed.push({ environmentId: owed.environmentId, configHash: owed.configHash, spareId: owed.spareId });
+        }
+      }
+    } catch { duplexLogger?.warn("Boat spare stop record read failed", { companyId }); }
+    if (!companyOwedStops.has(companyId)) companyOwedStops.set(companyId, record);
+    return companyOwedStops.get(companyId)!;
+  })();
+  companyOwedStopLoads.set(companyId, work);
+  try { return await work; }
+  finally { if (companyOwedStopLoads.get(companyId) === work) companyOwedStopLoads.delete(companyId); }
+}
+async function persistOwedSpareStops(companyId: string, record: OwedSpareStops): Promise<void> {
+  if (!pluginContext?.state?.set) return;
+  const context = pluginContext;
+  const previous = companyOwedStopWrites.get(companyId) ?? Promise.resolve();
+  const write = previous.catch(() => undefined).then(() => context.state.set({ scopeKind: "company", scopeId: companyId,
+    namespace: SPARE_ACTIVITY_NAMESPACE, stateKey: SPARE_STOP_OWED_STATE_KEY }, { holds: [...record.holds], owed: [...record.owed] }));
+  companyOwedStopWrites.set(companyId, write);
+  try { await write; }
+  catch { duplexLogger?.warn("Boat spare stop record write failed", { companyId }); }
+  finally { if (companyOwedStopWrites.get(companyId) === write) companyOwedStopWrites.delete(companyId); }
+}
+/** Keeper and owed-stop retries report here; the record is persisted at once. */
+async function recordSpareStop(record: SpareStopRecord): Promise<void> {
+  const { companyId, environmentId, configHash } = record.key;
+  const owed = await loadOwedSpareStops(companyId);
+  const now = Date.now();
+  if (record.outcome === "stopped" && !owed.owed.some(entry => entry.spareId === record.spareId)
+      && !owed.holds.some(hold => hold.environmentId === environmentId && hold.configHash === configHash)) return;
+  owed.holds = owed.holds.filter(hold => hold.until > now && !(hold.environmentId === environmentId && hold.configHash === configHash));
+  owed.owed = owed.owed.filter(entry => entry.spareId !== record.spareId);
+  if (record.outcome === "failed") {
+    owed.holds.push({ environmentId, configHash, until: record.until, failures: record.failures });
+    owed.owed.push({ environmentId, configHash, spareId: record.spareId });
+  }
+  await persistOwedSpareStops(companyId, owed);
+}
+function trackOwedStopWork(work: Promise<void>): void {
+  owedStopWork.add(work);
+  void work.catch(() => undefined).finally(() => owedStopWork.delete(work));
+}
+/**
+ * At this worker's first acquire for an environment (it carries the Boat
+ * credentials setup lacks): re-establish the recorded hold and retry every
+ * owed spare stop, whatever the setting. A failed retry re-arms the hold.
+ */
+async function resumeOwedSpareStops(config: Config, companyId: string, environmentId: string): Promise<void> {
+  const record = await loadOwedSpareStops(companyId);
+  const now = Date.now();
+  const hashes = new Set([...record.holds, ...record.owed].filter(entry => entry.environmentId === environmentId).map(entry => entry.configHash));
+  for (const configHash of hashes) {
+    const hold = record.holds.find(entry => entry.environmentId === environmentId && entry.configHash === configHash);
+    readySpares.restoreStopBackoff({ companyId, environmentId, configHash }, hold?.until ?? 0, hold?.failures ?? 1,
+      record.owed.filter(entry => entry.environmentId === environmentId && entry.configHash === configHash).map(entry => entry.spareId));
+  }
+  const owed = record.owed.filter(entry => entry.environmentId === environmentId);
+  const retryId = JSON.stringify([companyId, environmentId]);
+  if (!owed.length || now < (owedStopRetryAt.get(retryId) ?? 0)) return;
+  owedStopRetryAt.set(retryId, now + READY_SPARE_STOP_BACKOFF_MS);
+  trackOwedStopWork((async () => {
+    for (const entry of owed) {
+      if (shuttingDown) return;
+      const key = { companyId, environmentId, configHash: entry.configHash };
+      let sandbox: any;
+      try {
+        const result = await request(config, `/sandboxes/${encodeURIComponent(entry.spareId)}`, { method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000) }, true, { requireJson: true });
+        sandbox = result === null ? null : result?.sandbox ?? result;
+      } catch { continue; }
+      // Gone, archived, not ours or now a run's box: nothing more is owed.
+      if (sandbox === null || sandbox?.id !== entry.spareId || sandbox.state === "archived"
+          || sandbox.labels?.owner !== `paperclip:${companyId}` || sandbox.labels?.environment !== environmentId
+          || sandbox.labels?.purpose !== "spare" || (typeof sandbox.name === "string" && sandbox.name.startsWith("paperclip-claim:"))) {
+        await recordSpareStop({ outcome: "stopped", key, spareId: entry.spareId });
+        continue;
+      }
+      if (shuttingDown) return;
+      try {
+        await stopSandbox(config, entry.spareId);
+        await recordSpareStop({ outcome: "stopped", key, spareId: entry.spareId });
+      } catch {
+        const failures = (record.holds.find(hold => hold.environmentId === environmentId && hold.configHash === entry.configHash)?.failures ?? 0) + 1;
+        const until = Date.now() + READY_SPARE_STOP_BACKOFF_MS;
+        readySpares.restoreStopBackoff(key, until, failures, [entry.spareId]);
+        await recordSpareStop({ outcome: "failed", key, spareId: entry.spareId, until, failures });
+      }
+    }
+  })());
 }
 function parse(raw: Record<string, unknown>): Config {
   return {
@@ -1481,6 +1652,8 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       return true;
     },
     async refresh(spare, refreshTtlSeconds) {
+      // rf-4 U1B row H: a TTL renewal spends like a create; the pool's current setting gates it.
+      if (!await admitSpareCreate(key)) throw new Error("Boat spare TTL not renewed: spares are not on for this pool");
       const requestedAt = Date.now();
       const result = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
         method: "PATCH", signal: AbortSignal.timeout(5_000), body: JSON.stringify({ ttlSeconds: refreshTtlSeconds }),
@@ -1495,6 +1668,8 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
     stop: async spare => { await stopSandbox(config, spare.id); },
     desired: () => freshSpareDesired(key),
     settingMark: () => spareSettingEpoch(key.companyId, key.environmentId),
+    admitCreate: () => admitSpareCreate(key),
+    redact: text => redactProviderText(config, text),
     async allowCreate() {
       // Every spare-labelled box created in the last hour, claimed or not, in
       // any state: labels are immutable, so a claimed box still says spare.
@@ -1593,9 +1768,12 @@ function queueSpareReconciliation(key: ReadySpareKey, desired: number, ttlSecond
   const poolId = readySparePoolKey(key);
   for (const [oldPoolId, oldPool] of knownSparePools) {
     if (oldPool.key.companyId !== key.companyId || oldPool.key.environmentId !== key.environmentId
-        || oldPool.key.configHash === key.configHash || oldPool.desired === 0) continue;
-    // A retired config's pool is off: wakes and maintenance must not refill it.
+        || oldPool.key.configHash === key.configHash) continue;
+    // A retired config's pool is off for good (rf-4 U1B row C): wakes,
+    // maintenance and company setting edits never re-target it.
+    oldPool.retired = true;
     oldPool.baseDesired = 0;
+    if (oldPool.desired === 0) continue;
     oldPool.desired = 0;
     // A create already in flight under the previous config may finish after the
     // first retire pass. Reconcile again after it settles, but only if it left a
@@ -1613,7 +1791,7 @@ function queueSpareReconciliation(key: ReadySpareKey, desired: number, ttlSecond
 async function wakeCompanySparePools(companyId: string): Promise<void> {
   const work: Promise<void>[] = [];
   for (const pool of knownSparePools.values()) {
-    if (pool.key.companyId !== companyId || pool.baseDesired <= 0) continue;
+    if (pool.key.companyId !== companyId || pool.retired || pool.baseDesired <= 0) continue;
     pool.desired = readySpares.demandTarget(pool.key, pool.baseDesired, pool.spareMax, pool.demandWindowMinutes);
     pool.idleStopped = false;
     work.push(readySpares.reconcile(pool.key, pool.desired, pool.operations, true).catch(error => {
@@ -1634,12 +1812,16 @@ async function maintainReadySpares(reconcile = false): Promise<void> {
     }
     const refreshOperations = (key: ReadySpareKey) => {
       const poolId = readySparePoolKey(key);
-      return activeByPool.get(poolId) ? knownSparePools.get(poolId)?.operations : undefined;
+      const pool = knownSparePools.get(poolId);
+      // rf-4 U1B row H: renewal is per pool, only while that pool is on.
+      if (!pool || pool.retired || pool.baseDesired <= 0 || pool.desired <= 0) return undefined;
+      return activeByPool.get(poolId) ? pool.operations : undefined;
     };
     if (reconcile) await readySpares.refreshDue(READY_SPARE_TTL_SECONDS, refreshOperations);
     else await readySpares.refreshDueTimer(READY_SPARE_TTL_SECONDS, refreshOperations);
     for (const [poolId, pool] of knownSparePools) {
       if (shuttingDown) return;
+      if (pool.retired) continue; // Its retire passes ran when it was replaced.
       pool.desired = readySpares.demandTarget(pool.key, pool.baseDesired, pool.spareMax, pool.demandWindowMinutes);
       const active = activeByPool.get(poolId) === true;
       if (!reconcile) {
@@ -1833,10 +2015,13 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     preparedEnvDirectories.clear();
     readySpares.start();
     readySpares.setRefusalListener(reportCreateCapRefusal);
+    // backoff.error was stored through redactProviderText (operations.redact, rf-4 U1 F7).
     readySpares.setStopBackoffListener(backoff => {
       try { duplexLogger?.warn("Boat ready spare pool backing off after stop failures; no new spare until the back-off ends", { ...backoff }); } catch { /* Logging never changes admission. */ }
     });
+    readySpares.setStopRecordListener(record => { trackOwedStopWork(recordSpareStop(record)); });
     knownSparePools.clear();
+    companyOwedStops.clear(); owedStopRetryAt.clear(); spareSettingReadFailures.clear();
     claimedSpareLeases.clear();
     runCreateLedgerReads.clear();
     runLeaseTtlCaps.clear();
@@ -1880,7 +2065,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     const idleMinutes = readySpareIdleMinutes(newConfig);
     const active = await companySpareIsActive(companyId, idleMinutes);
     for (const pool of knownSparePools.values()) {
-      if (pool.key.companyId !== companyId) continue;
+      if (pool.key.companyId !== companyId || pool.retired) continue;
       pool.baseDesired = environments.includes(pool.key.environmentId) ? configuredCount : 0;
       pool.spareMax = spareMax;
       pool.demandWindowMinutes = demandWindowMinutes;
@@ -1944,13 +2129,15 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         if (syncTempSweepWork) await syncTempSweepWork;
         if (spareMaintenanceWork) await spareMaintenanceWork.catch(() => undefined);
         await readySpares.drain();
-        await Promise.all([...companySpareActivityWrites.values(), ...companyAcquireOutcomeWrites.values()].map(write => write.catch(() => undefined)));
+        await Promise.allSettled([...owedStopWork]);
+        await Promise.all([...companySpareActivityWrites.values(), ...companyAcquireOutcomeWrites.values(), ...companyOwedStopWrites.values()].map(write => write.catch(() => undefined)));
       } finally {
         try { await duplexChannels.shutdown(); } finally { await sshCarrier.close(); }
       }
     } finally {
       readySpares.reset();
       knownSparePools.clear();
+      companyOwedStops.clear(); owedStopRetryAt.clear();
       claimedSpareLeases.clear();
       runCreateLedgerReads.clear();
       spareClaimStore = undefined;
@@ -2053,11 +2240,38 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       } catch { duplexLogger?.warn("Boat ready spare setting lookup failed", { companyId: params.companyId }); }
     }
     const spareOperations = hasSpareSetting ? createReadySpareOperations(c, spareKey, ttl, from) : undefined;
+    // rf-4 U1 F5 / U1B row D: a previous worker's hold and owed stops, on or off.
+    if (hasSpareSetting) {
+      try { await resumeOwedSpareStops(c, params.companyId, params.environmentId); }
+      catch { duplexLogger?.warn("Boat spare stop record resume failed", { companyId: params.companyId, environmentId: params.environmentId }); }
+    }
     const policy = { baseDesired: baseSpares, spareMax, demandWindowMinutes };
     /** Queue spares from this acquire's setting read, unless 'off' or a newer setting landed since. */
     const queueSpares = (desired: number, operations: ReadySpareOperations) => {
-      if (spareSettingEpoch(params.companyId, params.environmentId) !== settingEpoch) return;
-      queueSpareReconciliation(spareKey, desired, ttl, operations, spareIdleMinutes, policy);
+      if (spareSettingEpoch(params.companyId, params.environmentId) === settingEpoch) {
+        queueSpareReconciliation(spareKey, desired, ttl, operations, spareIdleMinutes, policy);
+        return;
+      }
+      // rf-4 U1B row B: the newer setting's reader re-targets only pools it
+      // knows. If this pool is unknown, re-read the current setting and register
+      // it when spares are still on; off (or an unreadable setting) queues nothing.
+      if (knownSparePools.has(readySparePoolKey(spareKey))) return;
+      void (async () => {
+        for (let attempt = 0; attempt < 3 && !shuttingDown; attempt++) {
+          const epoch = spareSettingEpoch(params.companyId, params.environmentId);
+          let companyConfig: Record<string, unknown>;
+          try { companyConfig = await pluginContext!.config.get(params.companyId); } catch { return; }
+          if (shuttingDown || knownSparePools.has(readySparePoolKey(spareKey))) return;
+          if (spareSettingEpoch(params.companyId, params.environmentId) !== epoch) continue;
+          if (!readySpareEnvironmentIds(companyConfig).includes(params.environmentId)) return;
+          const count = readySpareCount(companyConfig);
+          if (count <= 0) return;
+          const freshPolicy = { baseDesired: count, spareMax: readySpareMax(companyConfig), demandWindowMinutes: readySpareDemandWindowMinutes(companyConfig) };
+          queueSpareReconciliation(spareKey, readySpares.demandTarget(spareKey, count, freshPolicy.spareMax, freshPolicy.demandWindowMinutes), ttl, operations,
+            readySpareIdleMinutes(companyConfig), freshPolicy);
+          return;
+        }
+      })().catch(() => undefined);
     };
     const createOrdinaryLease = async (): Promise<PluginEnvironmentLease> => {
       let id: string | undefined;
