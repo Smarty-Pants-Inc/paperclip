@@ -124,8 +124,9 @@ export async function acknowledgedNativeStopExecutionHasStopped(db: Db, run: Pic
   const leases = await db.select().from(environmentLeases).where(and(
     eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
   ));
-  if (warmRun && hasRetainedNativeTurnStop?.(warmRun) && leases.every(lease =>
-    hasRetainedNativeTurnStop(warmRun, lease) || hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))) return true;
+  if (warmRun && leases.length > 0 && leases.some(lease => lease.provider !== "local"
+    && hasRetainedNativeTurnStop?.(warmRun, lease)) && leases.every(lease =>
+    hasRetainedNativeTurnStop?.(warmRun, lease) || hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))) return true;
   // Provider PIDs are meaningful only on their own host. A recovered sandbox
   // queued for destroy keeps its verified stop; the destroy is only cleanup.
   if (leases.some(lease => lease.provider !== "local")) {
