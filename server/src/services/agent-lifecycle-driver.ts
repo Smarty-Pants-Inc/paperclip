@@ -96,7 +96,9 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
         // Terminate and cleanup still wait for whole-agent execution Stop proof.
         const blocker = await heartbeat.agentInvocationStopBlocker(ids, reason,
           { preservePauseDeferred: agent.lifecycleState === "pausing", serverRecordOnly: agent.lifecycleState === "pausing",
-            ...(agent.lifecycleOperation?.id ? { trigger: `lifecycle:${agent.lifecycleOperation.id}` } : {}) });
+            ...(agent.lifecycleOperation?.id ? { trigger: `lifecycle:${agent.lifecycleOperation.id}` } : {}),
+            ...(agent.lifecycleState === "pausing" && agent.lifecycleOperation?.id ? { pauseOperation: { agentId: agent.id,
+              operationId: agent.lifecycleOperation.id, version: agent.lifecycleVersion } } : {}) });
         if (blocker) return { pending: blocker };
       }
       return "complete";
