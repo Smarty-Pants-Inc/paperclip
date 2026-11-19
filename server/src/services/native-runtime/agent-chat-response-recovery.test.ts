@@ -20,6 +20,7 @@ import { createLifecycleWorker } from "../../modules/agent-lifecycle/application
 import { nativeRunProjectionWork } from "./native-run-projection-work.js";
 import { nativeResultCommitWork } from "./native-result-commit-work.js";
 import { completeNativeRunTerminal } from "./native-run-terminal.js";
+import { settleConversationTurnForRun } from "../agent-conversations.js";
 
 const runLogReads = vi.hoisted(() => [] as unknown[]);
 vi.mock("../run-log-store.js", async (importOriginal) => {
@@ -775,6 +776,36 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     expect(await work.load(f.input)).toEqual([]);
     await expect(recoverCommittedNativeChatResponse(db, f.input)).resolves.toBe(false);
     expect(await comments(f.runId)).toHaveLength(1);
+  });
+  // F-B A3 (rf-5 23:57Z): a run the OLD rule parked as "handled" (its only comment is a progress report) while its
+  // person message M is owed by the one function still gets its accepted final reply presented, ONCE.
+  // Real producers: completeRun + finalizeNativeRun (this file's fixture), issueService.addComment as the agent with
+  // the run id (the progress comment), settleConversationTurnForRun (the settle), the presentation work (the repair).
+  // PLANTED, named: the fixture's person message is given the author type the comment route writes; the
+  // report_progress receipt (the native tool path's); and, in the 'planted parked' row, the waiting / In Review state
+  // exactly as the old rule's settle left it.
+  it.each(["the real settle", "planted parked by the old rule"] as const)("A3: a progress-only run whose message is owed still gets its final reply presented once (%s)", async variant => {
+    const f = await fixture();
+    await db.update(issueComments).set({ authorType: "user" }).where(eq(issueComments.id, f.wakeId));
+    const progress = await issueService(db).addComment(f.issueId, "Still working on the hire.", { agentId: f.agentId, runId: f.runId });
+    await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+      semanticToolReceipts: { progress: { operationId: "report_progress", result: { commentId: progress.id } } } })}::jsonb` })
+      .where(eq(heartbeatRuns.id, f.runId));
+    if (variant === "the real settle") {
+      await expect(settleConversationTurnForRun(db, f.companyId, f.runId), "a progress comment parks nothing").resolves.toBe(false);
+      expect(await issue(f.issueId)).toMatchObject({ status: "in_progress", conversationState: "active" });
+    } else {
+      await db.update(issues).set({ status: "in_review", conversationState: "waiting", executionRunId: null }).where(eq(issues.id, f.issueId));
+    }
+    const work = nativeResponsePresentationWork(db), entries = await work.load(f.input);
+    expect(entries, "the run is still a final-reply repair candidate").toEqual([expect.objectContaining({ id: f.runId })]);
+    await expect(work.check(entries[0])).resolves.toBeNull();
+    const replies = (await comments(f.runId)).filter(comment => comment.id !== progress.id);
+    expect(replies).toEqual([expect.objectContaining({ body: f.reply, authorAgentId: f.agentId, createdByRunId: f.runId })]);
+    expect(await issue(f.issueId), "M is answered now: In Review").toMatchObject({ status: "in_review", conversationState: "waiting" });
+    expect(await work.load(f.input), "presented once: no longer a candidate").toEqual([]);
+    await expect(recoverCommittedNativeChatResponse(db, f.input)).resolves.toBe(false);
+    expect((await comments(f.runId)).filter(comment => comment.id !== progress.id)).toHaveLength(1);
   });
   it("recovers a server-finished yielded conversation from its completed unknown-channel reply", async () => {
     const f = await fixture(true, { disposition: "yielded", channel: "unknown" });
