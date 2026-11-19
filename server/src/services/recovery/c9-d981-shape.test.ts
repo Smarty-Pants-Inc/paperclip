@@ -112,12 +112,12 @@ describe.skipIf(!support.supported)("d981 shape: unrestored saved files, Retry n
     expect(rewrite!(text, true)).toBe(text);
   });
 
-  it("held conversation banner (HELD_PREDECESSOR_NOTICE) names no Retry and stays unchanged: its action is the new task", () => {
+  it("held conversation banner (HELD_PREDECESSOR_NOTICE) names no Retry and stays unchanged: it uses the current held notice", () => {
     const rewrite = (blockerModule as Record<string, unknown>).withoutUnavailableRetry as
       ((text: string, retryOffered: boolean) => string) | undefined;
     expect(typeof rewrite).toBe("function");
+    expect(HELD_PREDECESSOR_NOTICE).not.toMatch(/\bRetry\b/);
     expect(rewrite!(HELD_PREDECESSOR_NOTICE, false)).toBe(HELD_PREDECESSOR_NOTICE);
-    expect(HELD_PREDECESSOR_NOTICE).toContain("Assign this agent a new task to continue.");
   });
 
   it("B': the banner does not silence the message; after the bound it gets exactly one notice", async () => {
