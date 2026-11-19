@@ -126,6 +126,7 @@ export async function recordSteeredMessageEvidence(db: Db, input: { companyId: s
     await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context,
       answeredSteeredCommentIds: evidence.answered.filter(id => steered.includes(id)),
       steeredDeliveryEventSeqs: Object.fromEntries(Object.entries(evidence.deliveredEventSeqs).filter(([id]) => steered.includes(id))),
+      steeredDeliveredAts: Object.fromEntries(Object.entries(evidence.deliveredAts).filter(([id]) => steered.includes(id))),
     } }).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
   });
 }
@@ -134,6 +135,7 @@ export async function recordSteeredMessageEvidence(db: Db, input: { companyId: s
 export async function readSteeredMessageAnswers(db: Db, input: { companyId: string; runId: string }) {
   const rows = await db.select({
     seq: heartbeatRunEvents.seq,
+    createdAt: heartbeatRunEvents.createdAt,
     eventType: heartbeatRunEvents.eventType,
     turnId: sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId'`,
     itemId: sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId'`,
@@ -150,5 +152,8 @@ export async function readSteeredMessageAnswers(db: Db, input: { companyId: stri
         [...TOOL_KINDS].map((value) => sql`${value}`), sql`, `)})`),
     ),
   )).orderBy(asc(heartbeatRunEvents.seq));
-  return steeredMessageAnswers(rows.map((row) => ({ ...row, seq: Number(row.seq) })));
+  const evidence = steeredMessageAnswers(rows.map((row) => ({ ...row, seq: Number(row.seq) })));
+  const times = new Map(rows.map(row => [Number(row.seq), row.createdAt.toISOString()]));
+  return { ...evidence, deliveredAts: Object.fromEntries(Object.entries(evidence.deliveredEventSeqs)
+    .map(([id, seq]) => [id, times.get(seq)]).filter((entry): entry is [string, string] => typeof entry[1] === "string")) };
 }
