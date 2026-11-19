@@ -224,21 +224,9 @@ export async function readPersonStopHold(db: Db, input: {
     eq(heartbeatRuns.companyId, input.companyId), or(onIssue, eq(heartbeatRuns.issueId, input.issueId)),
     eq(heartbeatRuns.status, "running"))).limit(1)).length > 0;
   if (!input.reportEndedByTypedMessage && await isRunning()) return null;
-  const [stop] = await db.select({ runId: heartbeatRuns.id, status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson,
-    payload: heartbeatRunEvents.payload })
-    .from(heartbeatRunEvents).innerJoin(heartbeatRuns, and(eq(heartbeatRuns.id, heartbeatRunEvents.runId),
-      eq(heartbeatRuns.companyId, heartbeatRunEvents.companyId)))
-    .where(and(eq(heartbeatRunEvents.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), onIssue,
-      stopAcceptanceEventSql()))
-    .orderBy(desc(heartbeatRunEvents.createdAt), desc(heartbeatRunEvents.id)).limit(1);
-  const accepted = parseObject(stop?.payload);
-  const userId = typeof accepted.userId === "string" && accepted.userId ? accepted.userId : null;
-  const acceptedAt = typeof accepted.acceptedAt === "string" ? new Date(accepted.acceptedAt) : null;
-  if (!stop || accepted.schema !== "paperclip.stop-acceptance.v1" || accepted.kind !== "person_stop" ||
-      accepted.issueId !== input.issueId || !userId || !acceptedAt || !Number.isFinite(acceptedAt.getTime())) return null;
-  const stopped = recordedUserStop(stop);
-  if (!stopped || stopped.source !== "operator" || parseObject(stop.resultJson).cancelledByUserId !== userId ||
-      parseObject(stop.resultJson).queuedCommentInterruptQueueId) return null;
+  const stop = await readAcceptedPersonStop(db, input);
+  if (!stop) return null;
+  const { userId, acceptedAt } = stop;
   const [typedAfterStop] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     eq(issueComments.authorType, "user"), eq(issueComments.authorUserId, userId), isNull(issueComments.createdByRunId),
@@ -332,6 +320,31 @@ async function isPersonTreePauseCancel(db: Db, run: { companyId: string; issueId
   const [hold] = await db.select({ by: issueTreeHolds.createdByActorType }).from(issueTreeHolds)
     .where(and(eq(issueTreeHolds.companyId, run.companyId), eq(issueTreeHolds.id, gate.holdId)));
   return hold?.by === "user";
+}
+
+/** The person's accepted Stop on this agent's turns on the issue: the latest Stop/Interrupt acceptance is the
+ * Stop route's own `run.stop.accepted` row of kind `person_stop`, and its run recorded that person's Stop.
+ * Anything else (an Interrupt, an agent's or the system's cancel, no row) is null. (Factored out of
+ * readPersonStopHold unchanged, so the Send can name the Stop's person; adopt-hold-c1c2 C1.) */
+export async function readAcceptedPersonStop(db: Db, input: { companyId: string; issueId: string; agentId: string }):
+  Promise<{ runId: string; userId: string; acceptedAt: Date } | null> {
+  const onIssue = or(eq(heartbeatRuns.nativeIssueId, input.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`);
+  const [stop] = await db.select({ runId: heartbeatRuns.id, status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson,
+    payload: heartbeatRunEvents.payload })
+    .from(heartbeatRunEvents).innerJoin(heartbeatRuns, and(eq(heartbeatRuns.id, heartbeatRunEvents.runId),
+      eq(heartbeatRuns.companyId, heartbeatRunEvents.companyId)))
+    .where(and(eq(heartbeatRunEvents.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), onIssue,
+      stopAcceptanceEventSql()))
+    .orderBy(desc(heartbeatRunEvents.createdAt), desc(heartbeatRunEvents.id)).limit(1);
+  const accepted = parseObject(stop?.payload);
+  const userId = typeof accepted.userId === "string" && accepted.userId ? accepted.userId : null;
+  const acceptedAt = typeof accepted.acceptedAt === "string" ? new Date(accepted.acceptedAt) : null;
+  if (!stop || accepted.schema !== "paperclip.stop-acceptance.v1" || accepted.kind !== "person_stop" ||
+      accepted.issueId !== input.issueId || !userId || !acceptedAt || !Number.isFinite(acceptedAt.getTime())) return null;
+  const stopped = recordedUserStop(stop);
+  if (!stopped || stopped.source !== "operator" || parseObject(stop.resultJson).cancelledByUserId !== userId ||
+      parseObject(stop.resultJson).queuedCommentInterruptQueueId) return null;
+  return { runId: stop.runId, userId, acceptedAt };
 }
 
 /** The Stop's OWN board hold: the release wrote it for the very run the person

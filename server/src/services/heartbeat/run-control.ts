@@ -52,7 +52,10 @@ import {
   isAcknowledgedNativeStop,
   acknowledgedNativeApiStopExecutionHasStopped,
   acknowledgedNativeStopExecutionHasStopped,
+  isStoppingPersonsOwn,
+  readAcceptedPersonStop,
 } from "../acknowledged-native-stop.js";
+import { splitSavedWakeMessages } from "../../modules/wake-queue/adapters/chat-conversation-batch.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../../vendor/paperclip-runner/index.js";
 import {
   hasRemoteTerminationReceipt,
@@ -980,6 +983,33 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       if (sourceRun) await sweepPendingCleanupLeases({ explicitRetry: {
         companyId, runId: sourceRun.id, actorId, reason: "queued_comment_interrupt",
       } });
+    }
+    if (interrupted && !response && commentIds.length > 1) {
+      // R13b (adopt-hold-c1c2 C1): a person's Send after their own Stop carries ONLY that person's held
+      // messages. A task's wake can carry another person's message too (admission coalesced both authors
+      // before the Stop); those leave this wake for their own saved wake (the wake split), which runs after
+      // it, on its own path, once.
+      const sendActorId = actorId;
+      const split = await db.transaction(async tx => {
+        const stop = await readAcceptedPersonStop(tx as unknown as Db, { companyId, issueId, agentId: wake.agentId });
+        if (!stop) return null;
+        const authors = await tx.select({ id: issueComments.id, authorUserId: issueComments.authorUserId })
+          .from(issueComments).where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+            inArray(issueComments.id, commentIds)));
+        const authorOf = new Map(authors.map(row => [row.id, row.authorUserId]));
+        const kept = commentIds.filter(id => isStoppingPersonsOwn(authorOf.get(id), stop.userId) && isStoppingPersonsOwn(sendActorId, stop.userId));
+        const moved = commentIds.filter(id => !kept.includes(id));
+        if (!kept.length || !moved.length) return null;
+        const [current] = await tx.select().from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.id, queueId), eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"))).for("update");
+        if (!current) return null;
+        const currentIds = queuedCommentIdsFromWakePayload(current.payload);
+        if (currentIds.length !== commentIds.length || currentIds.some((id, index) => id !== commentIds[index])) return null;
+        return await splitSavedWakeMessages(tx as unknown as Db, current, { companyId, issueId, queuedCommentIds: currentIds,
+          payload: parseObject(current.payload), moved, placement: "after" }) ? kept : null;
+      });
+      if (split) commentIds = split;
     }
     const deliveryPayload = response ? { ...payload } : withQueuedCommentIdsInWakePayload(payload, commentIds);
     delete deliveryPayload.queuedCommentInterrupt;

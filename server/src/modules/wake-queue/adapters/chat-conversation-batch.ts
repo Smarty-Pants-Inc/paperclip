@@ -93,18 +93,40 @@ export async function splitOtherConversationMessages(
       .where(deferred);
     return true;
   }
+  await splitSavedWakeMessages(tx, row, { ...input, moved, placement: "before" });
+  return true;
+}
+
+/**
+ * The wake split: `moved` (some, not all, of the saved wake's messages) leave it for their own plain saved
+ * wake; this wake keeps its id (an interrupt names the wake by id) and the rest. `placement` orders the new
+ * wake just before this one (the conversation repair: they keep their place) or just after it (a person's
+ * Send carries only that person's held messages; the others run after it, on their own). No message is
+ * dropped. Returns false when another writer already moved the wake on (its messages stay where they are).
+ */
+export async function splitSavedWakeMessages(
+  tx: Db,
+  row: typeof agentWakeupRequests.$inferSelect,
+  input: { companyId: string; issueId: string; queuedCommentIds: string[]; payload: Record<string, unknown>;
+    moved: string[]; placement: "before" | "after" },
+): Promise<boolean> {
+  const moved = input.moved;
+  const kept = input.queuedCommentIds.filter((id) => !moved.includes(id));
+  const now = new Date();
+  const deferred = and(eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.id, row.id),
+    eq(agentWakeupRequests.status, "deferred_issue_execution"));
   const updated = await tx.update(agentWakeupRequests)
     .set({ payload: withQueuedCommentIdsInWakePayload(input.payload, kept), updatedAt: now })
     .where(deferred)
     .returning({ id: agentWakeupRequests.id });
   // Another writer already moved the wake on; its messages stay where they are.
-  if (updated.length === 0) return true;
+  if (updated.length === 0) return false;
   const latest = moved.at(-1)!;
   await tx.insert(agentWakeupRequests).values({
     companyId: input.companyId, agentId: row.agentId, source: "automation", triggerDetail: "system",
     reason: "issue_commented", status: "deferred_issue_execution",
     requestedByActorType: row.requestedByActorType, requestedByActorId: row.requestedByActorId,
-    requestedAt: new Date(row.requestedAt.getTime() - 1), updatedAt: now,
+    requestedAt: new Date(row.requestedAt.getTime() + (input.placement === "before" ? -1 : 1)), updatedAt: now,
     payload: withQueuedCommentIdsInWakePayload({ issueId: input.issueId, mutation: "comment", commentId: latest,
       [DEFERRED_WAKE_CONTEXT_KEY]: { issueId: input.issueId, taskId: input.issueId, wakeReason: "issue_commented",
         source: "issue.comment", wakeCommentIds: moved, wakeCommentId: latest } }, moved),

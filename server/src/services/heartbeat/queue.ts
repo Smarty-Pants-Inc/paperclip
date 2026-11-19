@@ -4,7 +4,7 @@ import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
 import { QUEUED_SEND_AFTER_STOP_KEY } from "../run-cancellation.js";
-import { readPersonStopHold } from "../acknowledged-native-stop.js";
+import { isStoppingPersonsOwn, readAcceptedPersonStop, readPersonStopHold } from "../acknowledged-native-stop.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
@@ -5229,10 +5229,32 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 agentId: wake.agentId, wakeId: wake.id, admittingTypedCommentIds: typedNow })) heldByPersonStop.add(wake.id);
             }
           }
+          // R13b (adopt-hold-c1c2 C1): a person's Send after their own Stop carries ONLY that person's held
+          // messages (the Send's batch, already split by resumeSavedComments). A saved wake with another
+          // person's message is not adopted into it; it stays deferred and runs after, on its own, once.
+          const notSamePersonHeld = new Set<string>();
+          const sendersStop = canCoalesceComments && opts.queuedCommentInterruptId && typedNow.length
+            ? await readAcceptedPersonStop(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id, agentId })
+            : null;
+          if (sendersStop) {
+            const candidateIds = [...new Set([...typedNow, ...pendingComments.flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload))])];
+            const authorOf = new Map((await tx.select({ id: issueComments.id, authorUserId: issueComments.authorUserId })
+              .from(issueComments).where(and(eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+                inArray(issueComments.id, candidateIds)))).map(row => [row.id, row.authorUserId]));
+            const samePerson = (id: string) => isStoppingPersonsOwn(authorOf.get(id), sendersStop.userId) && isStoppingPersonsOwn(opts.requestedByActorId, sendersStop.userId);
+            if (typedNow.every(samePerson)) {
+              for (const wake of pendingComments) {
+                if (wake.id === executionWaitRequestId || wake.id === opts.queuedCommentInterruptId ||
+                    wake.id === opts.queuedCommentRequestId) continue;
+                if (!queuedCommentIdsFromWakePayload(wake.payload).every(samePerson)) notSamePersonHeld.add(wake.id);
+              }
+            }
+          }
           const adoptedComments = pendingComments.filter((wake) => {
             if (wake.id === executionWaitRequestId) return true;
             if (wake.id === opts.queuedCommentInterruptId || wake.id === opts.queuedCommentRequestId) return true;
             if (heldByPersonStop.has(wake.id)) return false;
+            if (notSamePersonHeld.has(wake.id)) return false;
             const deferredPayload = parseObject(wake.payload);
             const deferredContext = parseObject(
               deferredPayload[DEFERRED_WAKE_CONTEXT_KEY],
