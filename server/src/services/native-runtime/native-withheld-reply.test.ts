@@ -887,7 +887,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     await s.expectAnsweredOnceAndNoNotice();
   }, 120_000);
 
-  it("L2 (shipped default): a coordinator replay after the PORT accepted -> still exactly 1 reply, the entry intact", async () => {
+  it("L2 (shipped default): a coordinator replay after the PORT accepted is refused without changing accepted state or posting again", async () => {
     setting.trigger = "shipped";
     const s = await scenario();
     let release!: (ok: boolean) => void;
@@ -898,12 +898,31 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     const [accepted] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, s.runId));
     const pending = { state: "pending", trigger: "acceptance", resultId: accepted.id };
     expect(await entry()).toMatchObject(pending);
-    // REAL: the coordinator replays the accepted result BEFORE any worker ran. It accepts nothing new
-    // (the port's result is the run's one accepted result), and it leaves the port's entry as written.
-    const before = await entry();
-    const first = await s.coordinatorReplay();
-    expect(["duplicate", "refused:native_result_replay_conflict"]).toContain(first);
-    expect(await entry()).toEqual(before);
+    async function expectReplayRefusedAndUnchanged(answered: boolean) {
+      const run = await s.run();
+      const results = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, s.runId));
+      const finalizations = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, s.runId));
+      const comments = await s.thread();
+      const answeredBefore = await s.answered();
+      expect(answeredBefore).toEqual([answered]);
+      // REAL: NativeRunCoordinatorStore.completeRun replays PaperclipControlPlanePort.completeRun's
+      // accepted result. The port hashes its binding too (paperclip-control-plane-port.ts:591);
+      // the store does not, so its digest check refuses this replay (native-run-coordinator-store.ts:392).
+      expect(await s.coordinatorReplay()).toBe("refused:native_result_replay_conflict");
+      // Full rows include status, resultJson (entry + presentationDecision), and all finalization fields.
+      expect(await s.run()).toEqual(run);
+      expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, s.runId))).toEqual(results);
+      expect(await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, s.runId))).toEqual(finalizations);
+      // Nothing new is posted, and any published reply (body, metadata and identity) stays untouched.
+      const afterComments = await s.thread();
+      expect(afterComments).toHaveLength(comments.length);
+      expect(afterComments).toEqual(comments);
+      expect((await s.run()).resultJson?.presentationDecision).toEqual(run.resultJson?.presentationDecision);
+      expect(await s.answered()).toEqual(answeredBefore);
+    }
+    // Before any worker ran, M remains unanswered and the port's pending entry stays intact.
+    expect(await s.replies()).toEqual([]);
+    await expectReplayRefusedAndUnchanged(false);
     expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, s.runId))).toHaveLength(1);
     // The entry still publishes: the worker's own discovery and check, as after a restart.
     await s.presentationWorker();
@@ -912,8 +931,10 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     expect(reply).toMatchObject({ body: ANSWER, createdByRunId: s.runId });
     const published = await entry();
     expect(published).toMatchObject({ state: "published", trigger: "acceptance", resultId: accepted.id, commentId: reply.id });
-    // The replay again, AFTER the publish, with four workers: still exactly 1, the entry not reset to pending.
-    expect(await s.coordinatorReplay()).toBe(first);
+    // After publication, the same refusal leaves M answered (true), the reply and its decision intact.
+    expect((await s.run()).resultJson).toMatchObject({ presentationDecision: { commentId: reply.id } });
+    await expectReplayRefusedAndUnchanged(true);
+    // Four more workers still leave exactly 1 reply, without resetting the entry to pending.
     await Promise.all([s.presentationWorker(), s.presentationWorker(), s.presentationWorker(), s.presentationWorker()]);
     expect(await s.publishAgain()).toEqual([false, false]);
     expect(await entry()).toEqual(published);
