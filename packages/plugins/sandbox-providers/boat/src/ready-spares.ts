@@ -28,6 +28,12 @@ export const READY_SPARE_TTL_SECONDS = 1_800;
  */
 export const READY_SPARE_STOP_BACKOFF_MS = 15 * 60_000;
 /**
+ * #21251: after this many failed retries of a pool's OWN owed spare stop (the
+ * maintenance tick's or an acquire's), that pool makes no new spare create until
+ * one of its stops succeeds. Other pools and run creates are never held by it.
+ */
+export const OWED_STOP_RETRY_FAILURES_BLOCKING_CREATES = 2;
+/**
  * A person waits on the warm claim (rf-4 U1 F6): it re-reads at most this many
  * candidates from Boat, and spends at most WARM_CLAIM_DEADLINE_MS in total,
  * before it falls back to a cold box. Adopted inventory can hold more matching
@@ -342,6 +348,8 @@ export class ReadySpareKeeper {
   /** Spares whose stop failed and has not since succeeded: never TTL-renewed (rf-4 U1B row H). */
   private readonly stopFailedSpares = new Set<string>();
   private stopRecordListener?: (record: SpareStopRecord) => void;
+  /** #21251: failed retries of each pool's owed spare stops since its last successful stop. */
+  private readonly owedStopRetryFailures = new Map<string, number>();
   private readonly failures = new Map<string, { count: number; retryAt: number }>();
   private readonly demandEvents = new Map<string, number[]>();
   private readonly stoppingSpares = new Set<string>();
@@ -369,6 +377,23 @@ export class ReadySpareKeeper {
     if (entry && entry.until >= until) return;
     this.stopBackoffs.set(poolId, { failures: Math.max(1, Math.trunc(failures) || 1), until,
       error: "a spare stop failed before this worker started", logged: false });
+  }
+  /** #21251: a retry of this pool's owed spare stop failed. */
+  noteOwedStopRetryFailed(key: ReadySpareKey): void {
+    const poolId = readySparePoolKey(key);
+    this.owedStopRetryFailures.set(poolId, (this.owedStopRetryFailures.get(poolId) ?? 0) + 1);
+  }
+  /** #21251: a previous worker's (durable) count of failed retries for this pool's owed stops. A higher local count wins. */
+  restoreOwedStopRetryFailures(key: ReadySpareKey, retries: number): void {
+    if (!Number.isFinite(retries) || retries <= 0) return;
+    const poolId = readySparePoolKey(key);
+    this.owedStopRetryFailures.set(poolId, Math.max(this.owedStopRetryFailures.get(poolId) ?? 0, Math.trunc(retries)));
+  }
+  /** #21251: a stop this pool owed succeeded (or nothing more is owed): its creates may resume. */
+  clearOwedStopRetryFailures(key: ReadySpareKey): void { this.owedStopRetryFailures.delete(readySparePoolKey(key)); }
+  /** #21251: true while this pool's own owed stop keeps failing; no new spare create for it. */
+  owedStopBlocksCreates(key: ReadySpareKey): boolean {
+    return (this.owedStopRetryFailures.get(readySparePoolKey(key)) ?? 0) >= OWED_STOP_RETRY_FAILURES_BLOCKING_CREATES;
   }
   /** True while this spare's last stop failed (no TTL renewal). */
   stopFailed(spareId: string): boolean { return this.stopFailedSpares.has(spareId); }
@@ -570,6 +595,7 @@ export class ReadySpareKeeper {
     this.refusalListener = undefined;
     this.stopBackoffs.clear(); this.stopBackoffListener = undefined;
     this.stopFailedSpares.clear(); this.stopRecordListener = undefined;
+    this.owedStopRetryFailures.clear();
   }
 
   /**
@@ -899,6 +925,8 @@ export class ReadySpareKeeper {
     const scope = { companyId: key.companyId, environmentId: key.environmentId, kind: "spare" as const };
     for (let i = 0; i < missing; i++) {
       if (this.stopping || this.now() < (this.failures.get(poolId)?.retryAt ?? 0) || this.stopBackoffHolds(key)) break;
+      // #21251: the pool's own owed stop keeps failing on retry: no new spare for it.
+      if (this.owedStopBlocksCreates(key)) break;
       const local = this.createCounts(key.companyId);
       const ceiling = this.createCeiling(key.companyId);
       // The ceiling counts every create, used or not; the churn cap counts only
