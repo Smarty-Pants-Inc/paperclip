@@ -36,7 +36,7 @@ import { answeredPersonMessageSql } from "../services/person-message-answer.js";
 import { configureAgentLifecycle, createAgentLifecycle } from "../services/agent-lifecycle.js";
 import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
-import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessage, settleUnansweredPersonMessages, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
 import { getServerAdapter, registerServerAdapter, runningProcesses } from "../adapters/index.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat/run-preparation.js";
 import { renderFirstTurnQueuedInput } from "../services/native-runtime/first-turn-queued-input.js";
@@ -554,5 +554,151 @@ describeEmbeddedPostgres("ONE successor per Interrupt (adopt-one-successor, 390 
     for (let i = 0; i < 2; i++) await deliverConversationComments(db, issue!, heartbeatService(db).wakeup);
     expect((await deliveriesOf(chat, m!.id)).map(w => w.id), "M re-sent while a live wake holds it").toEqual(held.map(w => w.id));
     expect((await undeliveredConversationComments(db, chat.companyId, chat.issue.id)).map(c => c.id)).not.toContain(m!.id);
+  });
+
+  // ---- adopt-held-floor3: ONE floor (person-message-answer.ts personMessageOwedSql) for the outbox AND the
+  // per-message sweep. SMA-4 11-19 13:53:36Z: 16 s after boot, wakes (issue_commented, issue_execution_promoted,
+  // conversation-comment:<11-17 ids>) for 3 messages answered on 11-17 by later turns; and 12:52:01Z the sweep's
+  // "Your message wasn't answered. Sending it again is safe" card with no new message. ----
+
+  /** An ACTIVE chat the stranded sweep visits (in_review, agent idle, not paused); enableAgentChat is ON (beforeAll). */
+  async function seedQuietChat() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Old chat", issuePrefix: `OC${Math.floor(Math.random() * 1e6)}`,
+      requireBoardApprovalForNewAgents: false });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Chat agent", role: "engineer", status: "idle", adapterType: "process" });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: owner, status: "active", membershipRole: "operator" });
+    await ensureHumanRoleDefaultGrants(db, { companyId, principalId: owner, membershipRole: "operator", grantedByUserId: null });
+    const issue = await issueService(db).create(companyId, { title: "Conversation", conversationAgentId: agentId,
+      conversationUserId: owner, assigneeAgentId: agentId, status: "in_review", conversationState: "waiting" });
+    return { companyId, agentId, issue };
+  }
+  type QuietChat = Awaited<ReturnType<typeof seedQuietChat>>;
+  const at = (base: number, s: number) => new Date(base + s * 1000);
+
+  /** Older builds' history: person message M (saved through the outbox: clientRequestId), its ONLY wake and its
+   * ONLY carrying run both `kind` (cancelled/failed); then the chat moved on: a later person message N, a run that
+   * STARTED after M, carried N, SUCCEEDED and posted an agent reply in the thread. */
+  async function oldExchange(chat: QuietChat, base: number, kind: "cancelled" | "failed") {
+    const person = async (body: string, t: Date) => (await db.insert(issueComments).values({ companyId: chat.companyId,
+      issueId: chat.issue.id, authorType: "user", authorUserId: owner, clientRequestId: randomUUID(), body,
+      createdAt: t, updatedAt: t }).returning())[0]!;
+    const carry = async (id: string, status: string, started: Date) => {
+      const context = { issueId: chat.issue.id, taskKey: chat.issue.id, wakeCommentId: id, commentId: id, wakeCommentIds: [id] };
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: chat.companyId, agentId: chat.agentId, status,
+        runtimeMode: "native", createdAt: at(started.getTime(), -1), startedAt: started, finishedAt: at(started.getTime(), 20),
+        contextSnapshot: context }).returning();
+      await db.insert(agentWakeupRequests).values({ companyId: chat.companyId, agentId: chat.agentId, source: "on_demand",
+        triggerDetail: "manual", reason: "issue_commented", status: status === "succeeded" ? "completed" : status,
+        idempotencyKey: `conversation-comment:${id}`, runId: run!.id, requestedByActorType: "user", requestedByActorId: owner,
+        payload: { issueId: chat.issue.id, commentId: id, _paperclipWakeContext: context },
+        requestedAt: at(started.getTime(), -2), updatedAt: at(started.getTime(), 20) });
+      return run!;
+    };
+    const m = await person(`M (${kind})`, at(base, 0));
+    await carry(m.id, kind, at(base, 2));
+    const n = await person("N: the next message", at(base, 60));
+    const s = await carry(n.id, "succeeded", at(base, 62));
+    await db.insert(issueComments).values({ companyId: chat.companyId, issueId: chat.issue.id, authorType: "agent",
+      authorAgentId: chat.agentId, createdByRunId: s.id, body: "Agent reply", createdAt: at(base, 80), updatedAt: at(base, 80) });
+    return m.id;
+  }
+
+  /** Every wake for `ids` other than the seeded history's own, and every unanswered-message card naming them. */
+  async function resent(chat: QuietChat, ids: string[], since: Date) {
+    const wakes = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId)))
+      .filter(w => w.requestedAt >= since && (ids.some(id => w.idempotencyKey === `conversation-comment:${id}`)
+        || ids.some(id => wakeCommentIds(w).includes(id) || ((w.payload as any)?.queuedCommentIds ?? []).includes(id))));
+    const cards = (await db.select().from(issueComments).where(eq(issueComments.companyId, chat.companyId)))
+      .filter(c => ids.some(id => (c.metadata as any)?.authorizationReason === `${UNANSWERED_MESSAGE_REASON_PREFIX}${id}`));
+    return { wakes: wakes.map(w => `${w.idempotencyKey}:${w.status}:${w.reason}`), cards: cards.map(c => c.body) };
+  }
+
+  /** The boot path: the REAL stranded sweep (heartbeat -> recovery reconcileStrandedAssignedIssues -> :5062
+   * deliverConversationComments, then the per-message sweep settleUnansweredPersonMessages), over a 10-min clock. */
+  async function bootSweeps(chat: QuietChat) {
+    for (const ahead of [0, 5 * 60_000, 10 * 60_000]) {
+      await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: chat.companyId, issueId: chat.issue.id });
+      await settleUnansweredPersonMessage(db, { companyId: chat.companyId, issueId: chat.issue.id, now: new Date(Date.now() + ahead) });
+    }
+  }
+
+  it("(floor-a) RED: an answered-past M (only wake cancelled, only carrier failed, a later succeeded run replied): no wake, no card", async () => {
+    const chat = await seedQuietChat();
+    const since = new Date();
+    const m = await oldExchange(chat, Date.now() - 50 * 60_000, "failed");
+    await db.update(agentWakeupRequests).set({ status: "cancelled" })
+      .where(eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${m}`));
+    await bootSweeps(chat);
+    expect(await resent(chat, [m], new Date(since.getTime() - 1)), "the stranded sweep re-sent or carded M").toEqual({ wakes: [], cards: [] });
+    expect((await undeliveredConversationComments(db, chat.companyId, chat.issue.id)).map(c => c.id)).not.toContain(m);
+  });
+
+  it("(floor-a') Paul's SMA-4 shape: 3 old messages (2 cancelled + 1 failed wake/run each), each moved past: zero wakes, zero cards (f)", async () => {
+    const chat = await seedQuietChat();
+    const since = new Date();
+    const base = Date.now() - 55 * 60_000;
+    const ids = [await oldExchange(chat, base, "cancelled"), await oldExchange(chat, base + 5 * 60_000, "cancelled"),
+      await oldExchange(chat, base + 10 * 60_000, "failed")];
+    await bootSweeps(chat);
+    const after = await resent(chat, ids, new Date(since.getTime() - 1));
+    expect(after.wakes, "(a') the 13:53 boot re-send").toEqual([]);
+    expect(after.cards, "(f) the 12:52 false 'wasn't answered' card").toEqual([]);
+    expect((await undeliveredConversationComments(db, chat.companyId, chat.issue.id)).map(c => c.id)).toEqual([]);
+  });
+
+  it("(floor-f) the 12:52 B''a class: the per-message sweep alone (no outbox re-send) writes NO card for Paul's 3 old messages", async () => {
+    const chat = await seedQuietChat();
+    const since = new Date();
+    const base = Date.now() - 55 * 60_000;
+    const ids = [await oldExchange(chat, base, "cancelled"), await oldExchange(chat, base + 5 * 60_000, "cancelled"),
+      await oldExchange(chat, base + 10 * 60_000, "failed")];
+    for (const ahead of [0, 5 * 60_000, 10 * 60_000]) {
+      await settleUnansweredPersonMessages(db, { companyId: chat.companyId, issueId: chat.issue.id, now: new Date(Date.now() + ahead) });
+      await settleUnansweredPersonMessage(db, { companyId: chat.companyId, issueId: chat.issue.id, now: new Date(Date.now() + ahead) });
+    }
+    expect((await resent(chat, ids, new Date(since.getTime() - 1))).cards, "the 12:52 false 'wasn't answered' card").toEqual([]);
+  });
+
+  it("(floor-c) neworg: M queued during T, T replies, a pause cancels M's wake, resume: M delivered once", async () => {
+    const chat = await seedChat();
+    const [m] = await send(chat, ["M: queued while you work"]);
+    await finishTurn(chat); // T (started BEFORE M) replies and succeeds: run START, not reply time, decides
+    const life = lifecycle();
+    try {
+      await life.pause(chat.agentId);
+      await db.update(agentWakeupRequests).set({ status: "cancelled" }).where(and(eq(agentWakeupRequests.companyId, chat.companyId),
+        eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${m!.id}`)));
+      expect(await deliveriesOf(chat, m!.id), "the pause cancelled M's wake").toEqual([]);
+      await life.resume(chat.agentId);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, chat.issue.id));
+      for (let i = 0; i < 2; i++) await deliverConversationComments(db, issue!, heartbeatService(db).wakeup);
+      expect(await deliveriesOf(chat, m!.id), `M delivered once: ${JSON.stringify(await wakeDump(chat))}`).toHaveLength(1);
+    } finally { await life.stop(); }
+  });
+
+  it("(floor-d) /new: a message before the chat's latest /new boundary is never re-sent; one after it is", async () => {
+    const chat = await seedQuietChat();
+    const person = async (body: string, t: Date) => (await db.insert(issueComments).values({ companyId: chat.companyId,
+      issueId: chat.issue.id, authorType: "user", authorUserId: owner, clientRequestId: randomUUID(), body,
+      createdAt: t, updatedAt: t }).returning())[0]!;
+    const base = Date.now() - 30 * 60_000;
+    const before = await person("before /new", at(base, 0));
+    const reset = await person("/new", at(base, 10));
+    const after = await person("after /new", at(base, 20));
+    await db.update(issues).set({ conversationBoundaryCommentId: reset.id }).where(eq(issues.id, chat.issue.id));
+    const owed = (await undeliveredConversationComments(db, chat.companyId, chat.issue.id)).map(c => c.id);
+    expect(owed).not.toContain(before.id);
+    expect(owed).toContain(after.id);
+  });
+
+  it("(floor-e) a NEW chat with nothing answered yet: its message is delivered as today", async () => {
+    const chat = await seedQuietChat();
+    const response = await request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/comments`)
+      .send({ body: "Hello", clientRequestId: randomUUID(), deliveryIntent: "queue" }).expect(201);
+    const wakes = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId)))
+      .filter(w => w.idempotencyKey === `conversation-comment:${response.body.id}`);
+    expect(wakes.map(w => w.status).filter(s => !["cancelled", "failed", "skipped"].includes(s))).toHaveLength(1);
   });
 });

@@ -31,6 +31,7 @@ import { createHeartbeatTimerPolicy, parseHeartbeatPolicy } from "./heartbeat/ti
 import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { HttpError } from "../errors.js";
 import { commentCarriedSql, WAKES_THAT_HOLD_A_MESSAGE } from "./interrupt-carry-custody.js";
+import { personMessageOwedSql } from "./person-message-answer.js";
 
 export type ConversationIdentity = {
   conversationAgentId?: string | null;
@@ -612,6 +613,9 @@ export async function undeliveredConversationComments(
         // ONE successor (adopt-one-successor): a steer the Interrupt or the run-end restore handed
         // on (carry wake, interruptCarried/restoredSteeredCommentIds) is sent; never a second wake.
         sql`not ${commentCarriedSql(companyId, issueId, sql`${issueComments.id}`)}`,
+        // adopt-held-floor3: ONE floor with the per-message sweep; a message the chat moved on past is never re-sent.
+        personMessageOwedSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+          issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }),
       ),
     )
     .orderBy(issueComments.createdAt, issueComments.id)

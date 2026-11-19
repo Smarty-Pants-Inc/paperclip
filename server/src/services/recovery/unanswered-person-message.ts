@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql, failedCarrierRunSql } from "../person-message-answer.js";
+import { answeredPersonMessageSql, failedCarrierRunSql, personMessageOwedSql } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -277,7 +277,7 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
   return sql`(exists (select 1 from ${issueComments} m
       where m.company_id = ${companyId} and m.issue_id = ${issueId} and m.author_type = 'user'
         and m.deleted_at is null and ${inScopeSql(rawMessage("m"), since)}
-        and not ${answeredSql(rawMessage("m"))}
+        and ${personMessageOwedSql(rawMessage("m"))}
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
           and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || m.id::text
           and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
@@ -301,7 +301,7 @@ export function unansweredPersonMessageCommentCondition(): SQL {
   return sql`((${issueComments.authorType} = 'user' and ${issueComments.deletedAt} is null
       and ${inScopeSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
         issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }, since)}
-      and not ${answeredSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      and ${personMessageOwedSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
         issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}
       and not exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
         and n.issue_id = ${issueComments.issueId}
@@ -711,8 +711,9 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   // scope, so an open obligation is never dropped silently by age.
   if (!message) return { kind: "none" };
   const [answer] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
-    eq(issueComments.id, message.id), answeredSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
-      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }))).limit(1);
+    // adopt-held-floor3: the ONE floor shared with the outbox; below it (answered, moved on past, behind /new) no card.
+    eq(issueComments.id, message.id), sql`not ${personMessageOwedSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}`)).limit(1);
   if (answer) return { kind: "answered" };
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
   const [noticed] = await q.select({ id: issueComments.id,

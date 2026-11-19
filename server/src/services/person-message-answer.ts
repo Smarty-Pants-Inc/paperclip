@@ -101,6 +101,33 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
     or ${importedPersonHistorySql(m)})`;
 }
 
+/**
+ * adopt-held-floor3: the ONE 'still owed' floor, read by BOTH the conversation outbox
+ * (agent-conversations.ts undeliveredConversationComments: no wake below it) and the per-message
+ * sweep (recovery/unanswered-person-message.ts: no card below it), so one never re-sends what the
+ * other cards. Message m is owed only while the conversation has NOT moved on past it:
+ * - answeredPersonMessageSql does not call it answered;
+ * - NO succeeded run on its issue that STARTED (started_at, never reply time: M queued during T,
+ *   T replies, a pause cancels M's wake ⇒ M still owed) after m was saved and posted an agent reply
+ *   in the thread (SMA-4 11-19 13:53Z: three 11-17 messages answered by later turns, re-sent at boot);
+ * - it is not behind the chat's latest /new boundary (issues.conversation_boundary_comment_id).
+ */
+export function personMessageOwedSql(m: PersonMessageSql): SQL {
+  return sql`(not ${answeredPersonMessageSql(m)}
+    and not exists (select 1 from ${heartbeatRuns} moved_on
+      where moved_on.company_id = ${m.companyId}
+        and (moved_on.native_issue_id = ${m.issueId} or moved_on.context_snapshot->>'issueId' = ${m.issueId}::text)
+        and moved_on.status = 'succeeded' and moved_on.started_at > ${m.createdAt}
+        and exists (select 1 from ${issueComments} moved_reply where moved_reply.company_id = moved_on.company_id
+          and moved_reply.issue_id = ${m.issueId} and moved_reply.created_by_run_id = moved_on.id
+          and moved_reply.author_type = 'agent' and moved_reply.deleted_at is null))
+    and not exists (select 1 from ${issues} reset_issue
+      join ${issueComments} reset_boundary on reset_boundary.id = reset_issue.conversation_boundary_comment_id
+        and reset_boundary.company_id = reset_issue.company_id and reset_boundary.issue_id = reset_issue.id
+      where reset_issue.id = ${m.issueId} and reset_issue.company_id = ${m.companyId}
+        and (${m.createdAt}, ${m.id}) < (reset_boundary.created_at, reset_boundary.id)))`;
+}
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
