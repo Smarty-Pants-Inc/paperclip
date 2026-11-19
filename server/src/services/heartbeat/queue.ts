@@ -11,7 +11,6 @@ import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
 import { isProcessRunAdmissionClosed, isReattachPhaseActive as isProcessReattachPhaseActive } from "./run-admission.js";
 import { continueFreshInTransaction, hasPendingFreshContinuation, isFreshIsolatedContinuationWake, settleCoalescedFreshContinuationHolds } from "../fresh-continuation-fallback.js";
-import { WORKSPACE_SYNC_OUT_STALL_KEY } from "../../agent-run-cancellation.js";
 import { deliverContinuationAsRun, foldWaitingRetriesIntoContinuation, foldWaitingRetriesIntoRecordedContinuation, undeliveredContinuation,
   undeliveredContinuationContext } from "../fresh-continuation-retry-fold.js";
 import { refreshRunStartYieldIfStale } from "../run-start-handover.js";
@@ -73,7 +72,8 @@ import {
 } from "../explicit-native-continuation.js";
 import { canRetryStoppedRun } from "../cancelled-native-startup.js";
 import { getExecutionBlocker } from "../execution-blocker.js";
-import { queuedRunOwnsIssue, queuedRunPredecessorHold } from "./queued-run-predecessor.js";
+import { PREDECESSOR_RELEASE_COLUMNS, PREDECESSOR_RELEASE_PRODUCERS, queuedRunOwnsIssue, queuedRunPredecessorHold,
+  readPredecessorRelease } from "./queued-run-predecessor.js";
 import { nativeManualAdmissionHoldsExecution } from "../native-runtime/native-runner-ownership.js";
 import { taskChatRetrySourceCleanupPending } from "../chat-channels/task-retry-authority.js";
 import { validateNativeWorkspaceReconstruction } from "../native-runtime/native-workspace-reconstruction.js";
@@ -467,6 +467,9 @@ export async function notifyOtherAgentsQueuedOnSettledIssue(db: Db, run: Pick<ty
 }
 
 export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDependencies) {
+  // The claim's predecessor release producers: ONE list, read by both of its checks through readPredecessorRelease.
+  // A further producer (for example a Pause certificate over the exact in-process executor) is appended HERE only.
+  const predecessorReleaseProducers = PREDECESSOR_RELEASE_PRODUCERS;
   const {
     setRunStatusFromLive,
     setWakeupStatus,
@@ -1207,7 +1210,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       // provider suspension, and lease release finish. A queued comment must
       // not acquire a fresh sandbox while its predecessor still owns that work.
       // The executor's finally block retries this agent after removing its owner.
-      const [settlingOwner] = await db.select({ id: heartbeatRuns.id })
+      // An ended run a release producer released (queued-run-predecessor.ts readPredecessorRelease: the ONE reader,
+      // shared with queuedRunPredecessorHold below) keeps its live executor without holding this run.
+      const liveOwners = await db.select(PREDECESSOR_RELEASE_COLUMNS)
         .from(heartbeatRuns)
         .where(and(
           eq(heartbeatRuns.companyId, run.companyId),
@@ -1215,11 +1220,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           eq(heartbeatRuns.runtimeMode, "native"),
           inArray(heartbeatRuns.id, [...activeRunExecutions]),
           sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
-          // A run the copy-back bound ended keeps a live executor (its hung copy-back) for as long as that hangs.
-          // It owns nothing of the task any more: its epoch is fenced, or its root and box are isolated from this run.
-          sql`jsonb_typeof(${heartbeatRuns.resultJson} #> array[${WORKSPACE_SYNC_OUT_STALL_KEY}, 'workspace']) is distinct from 'object'`,
         ))
-        .limit(1);
+        .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+      const settlingOwner = liveOwners.find(owner => !readPredecessorRelease(owner, predecessorReleaseProducers));
       if (settlingOwner) {
         logger.info({ runId: run.id, agentId: run.agentId, companyId: run.companyId, issueId,
           reason: "predecessor_settling_in_process", predecessorRunId: settlingOwner.id },
@@ -1415,7 +1418,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         return declined("task_chat_retry_source_cleanup_pending");
       }
       const predecessorHold = await queuedRunPredecessorHold(tx, { run, issueId, ownsIssue,
-        executionRunId: owner?.executionRunId, isTerminal: isHeartbeatRunTerminalStatus, isLive: id => liveRunExecutions.has(id) });
+        executionRunId: owner?.executionRunId, isTerminal: isHeartbeatRunTerminalStatus, isLive: id => liveRunExecutions.has(id),
+        releaseProducers: predecessorReleaseProducers });
       if (predecessorHold) return declined(predecessorHold.reason, predecessorHold.predecessorRunId);
       return { ownsIssue, blocked: false };
     }
