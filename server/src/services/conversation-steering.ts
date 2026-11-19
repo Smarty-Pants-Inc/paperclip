@@ -193,9 +193,17 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
           const [current] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).for("no key update");
           if (!current) return false;
           const context = object(current.contextSnapshot), result = object(current.resultJson), acks = object(result.queuedSteeringAcknowledgements);
+          // The ordinary receipt now owns M. Keep the refusal for display/audit,
+          // but not in the input-acknowledgement map: the shared owed floor counts
+          // every key there as historical carry, even after the reservation ends.
+          // A rejected RPC never carried M and must not suppress its one true card.
+          const queuedAcks = { ...acks };
+          delete queuedAcks[comment.id];
           await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context,
             wakeCommentIds: ids(context.wakeCommentIds).filter(id => id !== comment.id), steeredCommentIds: ids(context.steeredCommentIds).filter(id => id !== comment.id),
-          }, resultJson: { ...result, queuedSteeringAcknowledgements: { ...acks, [comment.id]: { ...object(acks[comment.id]), status: "rejected", steeringUnavailableReason } } } })
+          }, resultJson: { ...result, queuedSteeringAcknowledgements: queuedAcks,
+            rejectedSteeringAcknowledgements: { ...object(result.rejectedSteeringAcknowledgements),
+              [comment.id]: { ...object(acks[comment.id]), status: "rejected", steeringUnavailableReason } } } })
             .where(eq(heartbeatRuns.id, run.id));
           return true;
         });
@@ -269,7 +277,8 @@ export async function withSteeredCommentDisplay<T extends { id: string; issueId:
     const run = runs.find(run => ids(run.contextSnapshot?.steeredCommentIds).includes(comment.id));
     const ack = object(object(run?.resultJson?.queuedSteeringAcknowledgements)[comment.id]);
     const seq = object(run?.contextSnapshot?.steeredDeliveryEventSeqs)[comment.id];
-    const refused = runs.map(run => object(object(run.resultJson?.queuedSteeringAcknowledgements)[comment.id]))
+    const refused = runs.map(run => object(object(run.resultJson?.rejectedSteeringAcknowledgements)[comment.id]
+      ?? object(run.resultJson?.queuedSteeringAcknowledgements)[comment.id]))
       .find(ack => ack.status === "rejected" && typeof ack.steeringUnavailableReason === "string");
     const deliveredAt = object(run?.contextSnapshot?.steeredDeliveredAts)[comment.id];
     return { ...comment, steeredIntoRunId: run?.id ?? null, steeredAt: typeof ack.acknowledgedAt === "string" ? ack.acknowledgedAt : null,
