@@ -1,5 +1,6 @@
-import { and, asc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
-import { heartbeatRunEvents, heartbeatRuns, issueComments, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
+import { and, asc, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
+import { agentWakeupRequests, heartbeatRunEvents, heartbeatRuns, issueComments, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
+import { SENT_WITH_OTHER_QUEUED_MESSAGES } from "../interrupt-carry-custody.js";
 import { answeredPersonMessageSql } from "../person-message-answer.js";
 import { readSteeredMessageAnswers } from "./steered-message-answers.js";
 import { unreadSteeredMessageIds } from "../../vendor/paperclip-runner/index.js";
@@ -9,13 +10,23 @@ import { filterRunMessageInteractionDelivery } from "../agent-interaction-delive
 type Transaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 const strings = (value: unknown): string[] => Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
 
-/** Interrupt adopts unread PERSON steers in the caller's transaction.
- * Lock order is the release's issues row FOR UPDATE -> heartbeat_runs row FOR UPDATE.
- * The caller must put these ids into its successor input before committing.
+/** Interrupt OWNS every unanswered PERSON steer of the cut run (neworg-lead 11:56Z):
+ * read OR unread, every steered id the ONE answeredPersonMessageSql says is NOT answered
+ * is adopted here, in the caller's transaction, and recorded in
+ * resultJson.interruptCarriedSteeredCommentIds. Lock order is the release's issues row
+ * FOR UPDATE -> heartbeat_runs row FOR UPDATE; the run-end restore
+ * (restoreUnansweredSteersAtRunEnd) re-reads resultJson under that same run lock and
+ * skips every recorded id, so it never mints `conversation-comment:<id>` for them.
+ * The READ ones (Pi's userMessage for them is in the run log) are also recorded in
+ * interruptCarriedReadSteeredCommentIds: the successor's prompt omits their text when
+ * it continues the same Pi session and injects it on a fresh one (renderPaperclipWakePrompt).
+ * Any other non-terminal `conversation-comment:<id>` wake for an adopted id is retired
+ * (coalesced into the carry wake `carryWakeId`, which is never retired itself). The caller must put these ids into its successor input
+ * before committing.
  */
 export async function readUnreadSteeredForInterrupt(
   tx: Db | Transaction,
-  input: { issueId: string; runId: string },
+  input: { issueId: string; runId: string; carryWakeId?: string | null },
 ): Promise<string[]> {
   const [issue] = await tx.select({ companyId: issues.companyId }).from(issues)
     .where(eq(issues.id, input.issueId)).for("update");
@@ -29,9 +40,9 @@ export async function readUnreadSteeredForInterrupt(
   const scope = { ...input, companyId: issue.companyId };
   const unread = await readUnreadSteeredMessages(tx as Db, scope);
   const evidence = await readSteeredMessageAnswers(tx as Db, scope);
+  // A READ steer is NOT excluded: Pi's read alone is no answer (RFL); the ONE answer function decides below.
   const accounted = new Set([...strings(result.interruptCarriedSteeredCommentIds),
-    ...strings(result.restoredSteeredCommentIds), ...strings(result.stopRestoredSteeredCommentIds),
-    ...evidence.delivered]);
+    ...strings(result.restoredSteeredCommentIds), ...strings(result.stopRestoredSteeredCommentIds)]);
   // Include reserved steers whose acknowledgement is still in the ordered ingestion
   // suffix. Custody was recorded before RPC; absence of an ack is not permission to lose it.
   const order = [...new Set([...strings(context.steeredCommentIds), ...unread.map(message => message.id)])]
@@ -47,13 +58,23 @@ export async function readUnreadSteeredForInterrupt(
   const live = new Set(candidates.map(comment => comment.id));
   const ids = order.filter(id => live.has(id));
   if (!ids.length) return [];
+  const read = ids.filter(id => evidence.delivered.includes(id));
   const without = (value: unknown) => strings(value).filter(id => !ids.includes(id));
   await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context,
     wakeCommentIds: without(context.wakeCommentIds), steeredCommentIds: without(context.steeredCommentIds),
     ...(ids.includes(String(context.wakeCommentId)) ? { wakeCommentId: null } : {}),
     ...(ids.includes(String(context.commentId)) ? { commentId: null } : {}),
-  }, resultJson: { ...result, interruptCarriedSteeredCommentIds: [...strings(result.interruptCarriedSteeredCommentIds), ...ids] },
+  }, resultJson: { ...result, interruptCarriedSteeredCommentIds: [...strings(result.interruptCarriedSteeredCommentIds), ...ids],
+    ...(read.length ? { interruptCarriedReadSteeredCommentIds: [...strings(result.interruptCarriedReadSteeredCommentIds), ...read] } : {}) },
   }).where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, input.runId)));
+  // The carry owns them: no other wake may answer them a second time.
+  await tx.update(agentWakeupRequests).set({ status: "coalesced", error: SENT_WITH_OTHER_QUEUED_MESSAGES,
+    finishedAt: new Date(), updatedAt: new Date() }).where(and(
+    eq(agentWakeupRequests.companyId, issue.companyId), sql`${agentWakeupRequests.runId} is null`,
+    input.carryWakeId ? ne(agentWakeupRequests.id, input.carryWakeId) : undefined,
+    inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued"]),
+    inArray(agentWakeupRequests.idempotencyKey, ids.map(id => `conversation-comment:${id}`)),
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`));
   return ids;
 }
 

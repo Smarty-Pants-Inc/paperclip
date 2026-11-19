@@ -2437,6 +2437,17 @@ export async function buildPaperclipWakePayload(input: {
     ? await carriedSteerCommentIds(input.db, { companyId: input.companyId, issueId,
       commentIds: commentRows.filter(row => !row.deletedAt).map(row => row.id), currentRunId: input.runId ?? null })
     : new Set<string>();
+  // An Interrupt-carried steer Pi already READ in the cut turn (interruptCarriedReadSteeredCommentIds):
+  // the renderer omits its text when the successor continues that same Pi session, and injects it on a fresh one.
+  const readInSession = issueId && commentRows.length
+    ? new Set((await input.db.select({ result: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, input.companyId),
+      sql`(${heartbeatRuns.nativeIssueId} = ${issueId}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId})`,
+      sql`${heartbeatRuns.resultJson} ? 'interruptCarriedReadSteeredCommentIds'`,
+      input.runId ? sql`${heartbeatRuns.id} <> ${input.runId}` : undefined)))
+      .flatMap(({ result }) => { const ids = parseObject(result).interruptCarriedReadSteeredCommentIds;
+        return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : []; }))
+    : new Set<string>();
   const issueDescription = conversationMode ? null : issueSummary?.description ?? null;
   const issueDescriptionTruncated =
     issueDescription !== null &&
@@ -2507,6 +2518,7 @@ export async function buildPaperclipWakePayload(input: {
       createdAt: row.createdAt.toISOString(),
       ...(readByEarlierTurn.has(row.id) ? { readByEarlierTurn: true } : {}),
       ...(receivedMidTask.has(row.id) ? { receivedMidTask: true } : {}),
+      ...(readInSession.has(row.id) && !deletedAt ? { readInSession: true } : {}),
       author: row.authorAgentId
         ? { type: "agent", id: row.authorAgentId }
         : row.authorUserId
