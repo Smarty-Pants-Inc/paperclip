@@ -29,6 +29,8 @@ import {
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { agentRoutes } from "../routes/agents.js";
+import { activityRoutes } from "../routes/activity.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
@@ -3196,7 +3198,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     .where(eq(issueComments.issueId, f.issueId)))
     .filter(c => c.authorType === "system" && !c.deletedAt
       && String((c.metadata as Record<string, unknown> | null)?.authorizationReason ?? "").startsWith("unanswered_message:"))
-    .map(c => ({ message: String((c.metadata as Record<string, unknown>).authorizationReason).slice("unanswered_message:".length),
+    .map(c => ({ message: String((c.metadata as unknown as Record<string, unknown>).authorizationReason).slice("unanswered_message:".length),
       body: c.body }));
 
   async function sweepAt(f: { companyId: string; issueId: string }, from: Date, minutes: number[]) {
@@ -3297,5 +3299,140 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     // +2 is inside the sweep's own 2 min wait bound; from +3 the card stands, once.
     expect(seen.map(s => s.notes.map(n => n.message)), JSON.stringify(seen)).toEqual([[], [typed], [typed]]);
     expect(seen[1].notes[0].body).toBe("Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.");
+  });
+
+  // Ruling (b): the no-card gate keys on the SENDER's own Stop. REAL: the Stop is
+  // the board Stop route the UI calls (POST /api/heartbeat-runs/:runId/cancel,
+  // ui/src/api/heartbeats.ts), as a named board user; the thread's run marker is
+  // the runs GET the UI reads (GET /api/issues/:id/runs, activityApi.runsForIssue).
+  // PLANTED (named): as seedStoppableTurn, plus the second board user's membership.
+  function boardApp(companyId: string, userId: string) {
+    const testApp = express();
+    testApp.use(express.json());
+    testApp.use((req, _res, next) => {
+      (req as any).actor = { type: "board", source: "session", userId, companyIds: [companyId],
+        memberships: [{ companyId, status: "active", membershipRole: "operator" }], isInstanceAdmin: false };
+      next();
+    });
+    testApp.use("/api", issueRoutes(db, {} as any, {}));
+    testApp.use("/api", agentRoutes(db));
+    testApp.use("/api", activityRoutes(db));
+    testApp.use(errorHandler);
+    return testApp;
+  }
+
+  /** The real Stop route as `userId`; then (unless the cleanup hangs) the runner's ack and the executor's release, as stopTurn. */
+  async function stopByRoute(f: Awaited<ReturnType<typeof seedStoppableTurn>>, userId: string, cleanup: "ends" | "never_ends" = "ends") {
+    const cancelled = await request(boardApp(f.companyId, userId)).post(`/api/heartbeat-runs/${f.runId}/cancel`)
+      .send({ cancellationRequestId: randomUUID() });
+    expect(cancelled.status, JSON.stringify(cancelled.body)).toBe(200);
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    process.stdout.write(`NORUN2-STOP-ROUTE ${JSON.stringify({ by: userId, status: stopped.status,
+      cancelledByActorType: stopped.resultJson?.cancelledByActorType, cancelledByUserId: stopped.resultJson?.cancelledByUserId })}\n`);
+    expect(stopped.status).toBe("cancelled");
+    expect(stopped.resultJson?.cancelledByUserId).toBe(userId);
+    if (cleanup === "never_ends") {
+      // PLANTED (named): the Stop's cleanup never ends: the teardown owner keeps the
+      // finalization lease, the stopped process stays alive, and the executor never
+      // releases the task (executionRunId stays on the stopped run). No ack, no release.
+      await db.update(nativeRunFinalizations).set({ leaseOwner: "teardown-owner" }).where(eq(nativeRunFinalizations.runId, f.runId));
+      await db.update(heartbeatRuns).set({ processPid: process.pid }).where(eq(heartbeatRuns.id, f.runId));
+      await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+      return stopped;
+    }
+    await db.update(heartbeatRuns).set({ resultJson: { ...stopped.resultJson,
+      nativeCancellation: { ...(stopped.resultJson?.nativeCancellation as object ?? {}),
+        schema: "paperclip.native-cancellation.v1", runId: f.runId, companyId: f.companyId, issueId: f.issueId,
+        scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+        intentAuditId: "intent", acknowledgementAuditId: "ack" } }, processPid: process.pid, processGroupId: null })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", leaseOwner: "teardown-owner" })
+      .where(eq(nativeRunFinalizations.runId, f.runId));
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, f.issueId));
+    const service = heartbeatService(db);
+    await service.resumeRemoteStopComments((await service.getRun(f.runId))!);
+    await db.transaction(async tx => {
+      await tx.update(nativeRunFinalizations).set({ leaseOwner: null }).where(eq(nativeRunFinalizations.runId, f.runId));
+      await tx.update(heartbeatRuns).set({ processPid: 999_999_999 }).where(eq(heartbeatRuns.id, f.runId));
+      await notifyDeferredExecutionWork(tx, { companyId: f.companyId });
+      await notifyDeferredWakesForIssue(tx, { companyId: f.companyId, issueId: f.issueId });
+    });
+    return (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]!;
+  }
+
+  it.each(["chat", "task"] as const)("ruling (b) (vii) %s: ANOTHER board user's Stop of M0's turn leaves M0's sender the card, once", async (surface) => {
+    const f = await seedStoppableTurn(surface);
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: "second-board",
+      status: "active", membershipRole: "operator" });
+    const stopped = await stopByRoute(f, "second-board");
+    const seen = await sweepAt(f, stopped.finishedAt!, [2, 3, 11]);
+    process.stdout.write(`NORUN2-VII ${surface} ${JSON.stringify(seen)}\n`);
+    expect(seen.map(s => s.notes.map(n => n.message)), JSON.stringify(seen)).toEqual([[f.m0], [f.m0], [f.m0]]);
+  });
+
+  it.each(["chat", "task"] as const)("ruling (b) (viii) %s: NOT SILENT: with the card gone, M0's turn shows a true 'Stopped' marker from the runs GET at +2/+11", async (surface) => {
+    const f = await seedStoppableTurn(surface);
+    const stopped = await stopByRoute(f, "queue-owner");
+    const client = boardApp(f.companyId, "queue-owner");
+    for (const minute of [2, 11]) {
+      const seen = await sweepAt(f, stopped.finishedAt!, [minute]);
+      expect(seen[0].notes, JSON.stringify(seen)).toEqual([]);
+      const runs = await request(client).get(`/api/issues/${f.issueId}/runs`).expect(200);
+      const comments = await request(client).get(`/api/issues/${f.issueId}/comments`).expect(200);
+      const m0Run = (runs.body as any[]).find(run => run.runId === f.runId || run.id === f.runId);
+      const commentRows = (Array.isArray(comments.body) ? comments.body : comments.body.comments ?? comments.body.items ?? []) as any[];
+      process.stdout.write(`NORUN2-VIII ${surface} +${minute} ${JSON.stringify({ m0Run: m0Run && {
+        runId: m0Run.runId ?? m0Run.id, status: m0Run.status, startedAt: m0Run.startedAt, finishedAt: m0Run.finishedAt,
+        errorCode: m0Run.errorCode ?? null, error: m0Run.error ?? null,
+        resultJson: m0Run.resultJson ? { cancelledByActorType: m0Run.resultJson.cancelledByActorType,
+          cancelledByUserId: m0Run.resultJson.cancelledByUserId } : null,
+        contextSnapshot: m0Run.contextSnapshot ? { wakeCommentIds: m0Run.contextSnapshot.wakeCommentIds } : null },
+        runCount: (runs.body as any[]).length,
+        comments: commentRows.map(c => ({ id: c.id, authorType: c.authorType, body: String(c.body).slice(0, 80) })) })}\n`);
+      // TaskChatThread.tsx:2024: status cancelled with a startedAt renders "Stopped".
+      expect(m0Run, JSON.stringify(runs.body)).toBeTruthy();
+      expect(m0Run.status).toBe("cancelled");
+      expect(m0Run.startedAt).toBeTruthy();
+      expect(commentRows.map(c => c.id)).toContain(f.m0);
+    }
+  });
+
+  it.each(["chat", "task"] as const)("ruling (b) (vi) %s: the held wake never releases (the Stop's cleanup never ends): at +30 no false card, the held messages listed", async (surface) => {
+    const f = await seedStoppableTurn(surface);
+    const held = [await postMessage(f, "Reply exactly H1"), await postMessage(f, "Reply exactly H2"), await postMessage(f, "Reply exactly H3")];
+    const stopped = await stopByRoute(f, "queue-owner", "never_ends");
+    const seen = await sweepAt(f, stopped.finishedAt ?? stopped.updatedAt, [2, 11, 30]);
+    const queue = await request(boardApp(f.companyId, "queue-owner")).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+    const [issueRow] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const [fin] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId));
+    const listed = queue.body.entries.map((entry: any) => entry.comment.id as string);
+    const text = JSON.stringify({ executionWait: queue.body.executionWait ?? null, state: queue.body.state ?? null });
+    process.stdout.write(`NORUN2-VI ${surface} ${JSON.stringify({ seen: seen.map(s => ({ minute: s.minute, outcome: s.outcome, notes: s.notes })),
+      held, listed, executionWait: queue.body.executionWait ?? null, state: queue.body.state ?? null,
+      activeRunId: queue.body.activeRunId ?? null, steeringDisposition: queue.body.steeringDisposition ?? null,
+      executionRunId: issueRow.executionRunId, finalizationPhase: fin?.phase ?? null })}\n`);
+    expect(seen.map(s => s.notes), JSON.stringify(seen)).toEqual([[], [], []]);
+    expect(listed, JSON.stringify(queue.body)).toEqual(held);
+    expect(text).not.toMatch(/will start|starting|starts (soon|shortly|next)|about to start/i);
+  });
+
+  it.each(["chat", "task"] as const)("ruling (b) (vi) %s: the held wake never releases (the typed run hangs): at +30 no card on the stopped or held messages, the held messages listed", async (surface) => {
+    const f = await seedStoppableTurn(surface);
+    const held = [await postMessage(f, "Reply exactly H1"), await postMessage(f, "Reply exactly H2"), await postMessage(f, "Reply exactly H3")];
+    const stopped = await stopByRoute(f, "queue-owner");
+    const typed = await postMessage(f, "Reply exactly T");
+    // PLANTED (named): T's run never starts: the agent's one slot stays occupied (seedStoppableTurn's filler run).
+    await heartbeatService(db).resumeQueuedRuns();
+    const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter(run => run.contextSnapshot?.issueId === f.issueId && run.id !== f.runId);
+    const seen = await sweepAt(f, stopped.finishedAt!, [2, 11, 30]);
+    const queue = await request(boardApp(f.companyId, "queue-owner")).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+    const listed = queue.body.entries.map((entry: any) => entry.comment.id as string);
+    process.stdout.write(`NORUN2-VI-TYPED ${surface} ${JSON.stringify({ seen: seen.map(s => ({ minute: s.minute, outcome: s.outcome, notes: s.notes })),
+      held, typed, listed, typedRuns: runs.map(run => ({ id: run.id, status: run.status, wakeCommentIds: run.contextSnapshot?.wakeCommentIds ?? null })),
+      executionWait: queue.body.executionWait ?? null, state: queue.body.state ?? null })}\n`);
+    expect(seen.flatMap(s => s.notes).filter(n => n.message === f.m0 || held.includes(n.message)), JSON.stringify(seen)).toEqual([]);
+    expect(listed, JSON.stringify(queue.body)).toEqual(expect.arrayContaining(held));
+    expect(JSON.stringify(queue.body.executionWait ?? null)).not.toMatch(/will start|starting|starts (soon|shortly|next)|about to start/i);
   });
 });
