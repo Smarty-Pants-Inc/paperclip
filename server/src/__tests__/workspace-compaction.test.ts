@@ -1,9 +1,11 @@
 import { execFile } from "node:child_process";
+import { unlinkSync, writeFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { logger } from "../middleware/logger.js";
 import { candidateHoldsUnrecoveredRunLogSpill, createObjectRunLogStore, readObjectRunLogSpill } from "../services/object-run-log-store.js";
 import { listWorktreeRunLogSpillRoots } from "../services/workspace-instance-cleanup.js";
 import { contentSpill, event, ids, spillMemory } from "../services/object-run-log-spill.fixture.js";
@@ -48,7 +50,7 @@ async function createRepoWithWorktree(gitignore: string[]) {
 afterEach(async () => {
   for (const dir of tempDirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
   vi.unstubAllEnvs();
-});
+}, 300_000);
 
 describe("findRegenerableWorkspaceDirs", () => {
   it("returns only ignored, untracked directories with a regenerable name", async () => {
@@ -268,6 +270,77 @@ describe("isLinkedGitWorktree", () => {
 });
 
 describe("compaction trash", () => {
+  // Keep reason: NEVER-OK trace custody when the content walk cannot finish.
+  // No injected/exported bound exists: use real files past the production 1,000,000-entry bound.
+  it("keeps a deep unrecovered spill beyond the walk bound, then removes its recovered under-bound tree", async () => {
+    const { worktreePath } = await createRepoWithWorktree(["build/"]);
+    const candidate = path.join(worktreePath, "build");
+    await fs.mkdir(candidate);
+    // A stale discovery result must still be checked at the real reaper rename boundary.
+    const staleCandidates = await findRegenerableWorkspaceDirs(worktreePath);
+    expect(staleCandidates).toEqual(["build"]);
+    vi.stubEnv("RUN_LOG_SPILL_PATH", undefined);
+    vi.stubEnv("RUN_LOG_BASE_PATH", undefined);
+    const spillDir = path.join(candidate, ...Array.from({ length: 16 }, (_, i) => `depth-${i}`), "old-root");
+    const m = spillMemory();
+    const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", spillDir, flushMs: 1000,
+      assertWriterAuthority: async () => undefined });
+    const binding = { ...ids, runId: "walk-bound-custody" };
+    const handle = await store.begin(binding);
+    m.state.down = true;
+    const receipt = await store.enqueue!(handle, event(1, "the only copy lies beyond the walk bound"));
+    const committed = receipt.committed.catch(() => undefined);
+    await store.finalize(handle);
+    await committed;
+    const spill = await readObjectRunLogSpill(spillDir, handle.logRef);
+    expect(spill.unrecovered.length).toBeGreaterThan(0);
+    const bytes = await fs.readFile(spill.path), index = await fs.readFile(spill.indexPath);
+
+    // opendir exhausts each directory before descending into ANY pending child.
+    // Thus these immediate files force the bound before depth-0 is entered,
+    // independent of filesystem enumeration order; the real index is 19 levels down.
+    const maxEntries = 1_000_000;
+    for (let i = 0; i <= maxEntries; i++) writeFileSync(path.join(candidate, `padding-${i}`), "");
+    const warning = vi.spyOn(logger, "warn"); // Call through: preserve the actual path-bearing log line.
+    try {
+      const move = await moveWorkspaceDirsToTrash(worktreePath, staleCandidates);
+      expect(move.moved).toEqual([]);
+      await deleteWorkspaceCompactionTrash(move.trashDir);
+      expect(await fs.readFile(spill.path)).toEqual(bytes);
+      expect(await fs.readFile(spill.indexPath)).toEqual(index);
+      const boundLines = warning.mock.calls.filter(call => call[1] === "kept: walk bound hit");
+      expect(boundLines).toHaveLength(1);
+      expect(boundLines[0]![0]).toEqual({ candidatePath: candidate, visitedEntries: maxEntries + 1,
+        maxEntries, walkBoundHits: expect.any(Number) });
+      expect((boundLines[0]![0] as { walkBoundHits: number }).walkBoundHits).toBeGreaterThan(0);
+      console.info("walk-bound-spill-custody", { candidate, spillPath: spill.path, bytes: bytes.length,
+        indexBytes: index.length, boundLines: boundLines.length, ...boundLines[0]![0] as object });
+
+      // The SAME writer recovers the SAME spill; do not manufacture index records.
+      m.state.down = false;
+      await store.recoverSpill!(binding);
+      const recovered = await readObjectRunLogSpill(spillDir, handle.logRef);
+      expect(recovered.unrecovered.length).toBe(0);
+      expect(recovered.records.some(record => record.event === "recovered")).toBe(true);
+      expect(await fs.readFile(spill.path)).toEqual(bytes);
+      expect((await fs.readFile(spill.indexPath)).subarray(0, index.length)).toEqual(index);
+      // Remove only padding: the deep directory and both writer-created files stay in place.
+      for (let i = 0; i <= maxEntries; i++) unlinkSync(path.join(candidate, `padding-${i}`));
+      expect(await findRegenerableWorkspaceDirs(worktreePath)).toEqual(["build"]);
+      const control = await moveWorkspaceDirsToTrash(worktreePath, staleCandidates);
+      expect(control.moved.map(entry => entry.relativePath)).toEqual(["build"]);
+      await deleteWorkspaceCompactionTrash(control.trashDir);
+      expect(await fs.stat(candidate).then(() => true, () => false)).toBe(false);
+      expect(await fs.stat(control.trashDir).then(() => true, () => false)).toBe(false);
+      expect(await fs.stat(spill.path).then(() => true, () => false)).toBe(false);
+      expect(await fs.stat(spill.indexPath).then(() => true, () => false)).toBe(false);
+      expect(warning.mock.calls.filter(call => call[1] === "kept: walk bound hit")).toHaveLength(1);
+      console.info("walk-bound-spill-recovered-control", { candidate, removed: true, boundLines: 0 });
+    } finally {
+      warning.mockRestore();
+    }
+  }, 300_000);
+
   it("moves directories beside the worktree and restores them unchanged", async () => {
     const { worktreePath } = await createRepoWithWorktree(["node_modules/", "dist/"]);
     await write(path.join(worktreePath, "node_modules/a/index.js"), "dependency\n");
