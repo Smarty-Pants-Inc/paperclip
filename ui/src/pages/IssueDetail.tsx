@@ -30,7 +30,8 @@ import { mergeComposerRunSettings, type ComposerRunSettings } from "@/components
 import { AgentIdentity } from "@/components/AgentIdentity";
 import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
 import { agentChatDraft } from "@/lib/agent-chat-draft";
-import { loadFailedComposerSends, saveFailedComposerSend, removeFailedComposerSend, settleDraftSubmission, type ComposerSendRequest } from "@/lib/composer-draft";
+import { loadFailedComposerSends, loadDraftSubmission, saveFailedComposerSend, retryFailedComposerSend, releaseComposerRetry, subscribeComposerDraftChange, notifyComposerDraftChange, settleDraftSubmission, type ComposerSendRequest } from "@/lib/composer-draft";
+import { useDraftOwner } from "@/hooks/useDraftOwner";
 import { trackRecentProject } from "@/lib/recent-projects";
 import { ExecutionBlockerNotice } from "../components/ExecutionBlockerNotice";
 import type { TaskComposerPause } from "../components/task-chat/TaskChatPausedTakeover";
@@ -3926,25 +3927,36 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const commentDraftKey = issue ? (draftAgentId
     ? `paperclip:agent-chat-draft:${issue.companyId}:${currentUserId}:${draftAgentId}`
     : `paperclip:issue-comment-draft:${issue.id}`) : null;
+  const draftOwner = useDraftOwner();
   useEffect(() => {
     if (!commentDraftKey || !issue) return;
-    const restored = loadFailedComposerSends(commentDraftKey).filter(row =>
-      row.companyId === issue.companyId && row.authorUserId === currentUserId);
-    for (const row of restored) {
-      failedSendRequestsRef.current.set(row.clientId, {
-        kind: row.kind,
-        variables: { ...row.request, clientRequestId: row.clientRequestId, ...(row.interrupt === undefined ? {} : { interrupt: row.interrupt }) },
-      });
-    }
-    setOptimisticComments(current => [...current, ...restored
-      .filter(row => !current.some(entry => entry.clientId === row.clientId))
-      .map(row => ({
-        ...createOptimisticIssueComment({ companyId: row.companyId, issueId: row.issueId,
-          authorUserId: row.authorUserId, body: row.request.body, clientRequestId: row.clientRequestId }),
-        id: row.clientId, clientId: row.clientId, createdAt: new Date(row.createdAt), updatedAt: new Date(row.createdAt),
-        clientStatus: "failed" as const, failureReason: row.reason, targetIssueId: row.targetIssueId,
-      }))]);
-  }, [commentDraftKey, currentUserId]);
+    const restore = () => {
+      const retry = loadDraftSubmission(commentDraftKey)?.retry;
+      const restored = [...loadFailedComposerSends(commentDraftKey), ...(retry ? [retry] : [])].filter(row =>
+        row.companyId === issue.companyId && row.authorUserId === currentUserId);
+      for (const row of restored) {
+        failedSendRequestsRef.current.set(row.clientId, {
+          kind: row.kind,
+          variables: { ...row.request, clientRequestId: row.clientRequestId, ...(row.interrupt === undefined ? {} : { interrupt: row.interrupt }) },
+        });
+      }
+      setOptimisticComments(current => [...current.filter(entry => !restored.some(row => row.clientRequestId === entry.clientRequestId)), ...restored
+        .map(row => ({
+          ...createOptimisticIssueComment({ companyId: row.companyId, issueId: row.issueId,
+            authorUserId: row.authorUserId, body: row.request.body, clientRequestId: row.clientRequestId }),
+          id: row.clientId, clientId: row.clientId, createdAt: new Date(row.createdAt), updatedAt: new Date(row.createdAt),
+          ...(row === retry ? { clientStatus: "pending" as const, ...pendingDeliveryFields() }
+            : { clientStatus: "failed" as const, failureReason: row.reason }),
+          targetIssueId: row.targetIssueId,
+        }))]);
+    };
+    restore();
+    return subscribeComposerDraftChange(commentDraftKey, () => {
+      restore();
+      // A Retry may have settled in the previous mount's QueryClient.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(issueId!) });
+    });
+  }, [commentDraftKey, currentUserId, queryClient, issueId]);
   const keepFailedSend = useCallback((
     clientId: string, err: unknown, kind: "comment" | "reassign", variables: Record<string, unknown>,
     snapshot: OptimisticIssueComment | null,
@@ -5298,9 +5310,16 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         assertCurrentAccount();
         queryClient.setQueryData(queryKeys.issues.detail(writableIssueId), updated);
       }
-      return deliveryIntent
+      const comment = await (deliveryIntent
         ? issuesApi.addComment(writableIssueId, body, reopen, interrupt, attachmentIds, clientRequestId ?? createUuid(), deliveryIntent)
-        : issuesApi.addComment(writableIssueId, body, reopen, interrupt, attachmentIds, clientRequestId ?? createUuid());
+        : issuesApi.addComment(writableIssueId, body, reopen, interrupt, attachmentIds, clientRequestId ?? createUuid()));
+      // A receipt still settles its captured outbox after its page/account-cache
+      // observer unmounts. Do this before the account wrapper can fence UI updates.
+      if (commentDraftKey && clientRequestId && bubbleRetryRequestIdsRef.current.has(clientRequestId)) {
+        settleDraftSubmission(commentDraftKey, clientRequestId);
+        notifyComposerDraftChange(commentDraftKey);
+      }
+      return comment;
     },
     onMutate: async ({ body, reopen, interrupt, clientRequestId }) => {
       // Start cache cancellation immediately but do not put it in front of the
@@ -5345,7 +5364,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         : null;
 
       if (optimisticComment) {
-        setOptimisticComments((current) => [...current, optimisticComment]);
+        setOptimisticComments((current) => [...current.filter(entry => !clientRequestId || entry.clientRequestId !== clientRequestId), optimisticComment]);
       }
       if (previousIssue) {
         queryClient.setQueryData(
@@ -5473,10 +5492,10 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     onError: (err, variables, context) => {
       const failure = classifySendFailure(err);
       const bubbleRetry = !!variables.clientRequestId && bubbleRetryRequestIdsRef.current.has(variables.clientRequestId);
-      if (context?.optimisticCommentId && (failure === "rejected" || bubbleRetry)) {
-        // Refused for certain (nothing saved), or a bubble Retry whose words
-        // no composer holds: the bubble stays, 'Not sent', with Retry and
-        // Edit. onFinished must not drop it.
+      if (bubbleRetry) return; // Durable Retry custody settles outside observer callbacks.
+      if (context?.optimisticCommentId && failure === "rejected") {
+        // Refused for certain (nothing saved): the bubble stays 'Not sent'
+        // with Retry and Edit. onFinished must not drop it.
         keepFailedSend(context.optimisticCommentId, err, "comment", variables as Record<string, unknown>, context.optimisticComment);
         context.optimisticCommentId = null;
       } else if (context?.optimisticCommentId) {
@@ -5758,7 +5777,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         ? await issuesApi.getCore(issueId!, { cache: "no-store", fresh: true })
         : issue;
       assertCurrentAccount();
-      return issuesApi.update(issueId!, {
+      const updated = await issuesApi.update(issueId!, {
         comment: body,
         commentClientRequestId: clientRequestId,
         ...(attachmentIds?.length ? { attachmentIds } : {}),
@@ -5779,6 +5798,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         ...(reopen ? { status: "todo" } : {}),
         ...(interrupt ? { interrupt } : {}),
       });
+      if (updated.comment && commentDraftKey && clientRequestId && bubbleRetryRequestIdsRef.current.has(clientRequestId)) {
+        settleDraftSubmission(commentDraftKey, clientRequestId);
+        notifyComposerDraftChange(commentDraftKey);
+      }
+      return updated;
     },
     onMutate: async ({ body, reopen, reassignment, interrupt, clientRequestId }) => {
       // Cache cancellation can wait on an active request for several seconds.
@@ -5812,7 +5836,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         : null;
 
       if (optimisticComment) {
-        setOptimisticComments((current) => [...current, optimisticComment]);
+        setOptimisticComments((current) => [...current.filter(entry => !clientRequestId || entry.clientRequestId !== clientRequestId), optimisticComment]);
       }
       if (previousIssue) {
         queryClient.setQueryData(
@@ -5914,7 +5938,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     onError: (err, variables, context) => {
       const failure = classifySendFailure(err);
       const bubbleRetry = !!variables.clientRequestId && bubbleRetryRequestIdsRef.current.has(variables.clientRequestId);
-      if (context?.optimisticCommentId && (failure === "rejected" || bubbleRetry)) {
+      if (bubbleRetry) return; // Durable Retry custody settles outside observer callbacks.
+      if (context?.optimisticCommentId && failure === "rejected") {
         keepFailedSend(context.optimisticCommentId, err, "reassign", variables as Record<string, unknown>, context.optimisticComment);
         context.optimisticCommentId = null;
       } else if (context?.optimisticCommentId) {
@@ -7252,19 +7277,35 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const failedSendActions = useMemo<TaskChatFailedSendActions>(() => ({
     retry: (clientId) => {
       const request = failedSendRequestsRef.current.get(clientId);
-      if (!request) return;
-      if (commentDraftKey) removeFailedComposerSend(commentDraftKey, clientId);
+      if (!request || !commentDraftKey) return;
+      const failed = loadFailedComposerSends(commentDraftKey).find(row => row.clientId === clientId);
+      if (!failed || !retryFailedComposerSend(commentDraftKey, failed, draftOwner)) return;
       failedSendRequestsRef.current.delete(clientId);
-      setOptimisticComments((current) => current.filter((entry) => entry.clientId !== clientId));
       const requestId = typeof request.variables.clientRequestId === "string" ? request.variables.clientRequestId : null;
       if (requestId) {
         // The same request ID: the server dedupes a resend of a saved one.
         sendsKeptInThreadRef.current.delete(requestId);
         bubbleRetryRequestIdsRef.current.add(requestId);
       }
-      const settle = () => { if (requestId) bubbleRetryRequestIdsRef.current.delete(requestId); };
-      if (request.kind === "reassign") addCommentAndReassign.mutate(request.variables as never, { onSettled: settle });
-      else addComment.mutate(request.variables as never, { onSettled: settle });
+      // Promise settlement survives removal of the original mutation observer.
+      const sending = request.kind === "reassign"
+        ? addCommentAndReassign.mutateAsync(request.variables as never)
+        : addComment.mutateAsync(request.variables as never);
+      let definiteRefusal = false;
+      void sending.then(() => {
+        settleDraftSubmission(commentDraftKey, failed.clientRequestId);
+      }, error => {
+        if (classifySendFailure(error) !== "rejected") return; // Still uncertain.
+        definiteRefusal = true;
+        const persisted = saveFailedComposerSend(commentDraftKey, { ...failed, reason: describeError(error, { action: "post the comment" }).body });
+        if (persisted) settleDraftSubmission(commentDraftKey, failed.clientRequestId);
+      }).finally(() => {
+        // If storage refused the failed record, retain pending custody without
+        // authorizing an automatic resend of a known-definite refusal.
+        if (!definiteRefusal || !loadDraftSubmission(commentDraftKey)) releaseComposerRetry(failed.clientRequestId);
+        if (requestId) bubbleRetryRequestIdsRef.current.delete(requestId);
+        notifyComposerDraftChange(commentDraftKey);
+      });
     },
     edit: (clientId) => {
       const failed = optimisticComments.find((entry) => entry.clientId === clientId);
@@ -7273,7 +7314,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       if (failed) setFailedSendRestoreText({ key: clientId, body: failed.body });
     },
     restoreText: failedSendRestoreText,
-  }), [addComment, addCommentAndReassign, commentDraftKey, failedSendRestoreText, optimisticComments]);
+  }), [addComment, addCommentAndReassign, commentDraftKey, draftOwner, failedSendRestoreText, optimisticComments]);
   const handleCommentImageUpload = useCallback(
     async (file: File) => {
       const attachment = await uploadAttachment.mutateAsync(file);

@@ -30,6 +30,7 @@ import {
   clearDraftSubmission,
   settleDraftSubmission,
   removeFailedComposerSend,
+  subscribeComposerDraftChange,
   type ComposerDraftSubmission,
   type ComposerSendRequest,
 } from "@/lib/composer-draft";
@@ -453,7 +454,11 @@ export function TaskChatComposer({
   useEffect(() => {
     mountedTaskKey.current = draftKey;
     setUncertainSubmission(draftKey ? loadDraftSubmission(draftKey) : null);
+    const unsubscribe = draftKey ? subscribeComposerDraftChange(draftKey, () => {
+      setUncertainSubmission(loadDraftSubmission(draftKey));
+    }) : undefined;
     return () => {
+      unsubscribe?.();
       mountedTaskKey.current = undefined;
     };
   }, [draftKey]);

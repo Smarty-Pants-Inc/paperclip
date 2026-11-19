@@ -7196,6 +7196,7 @@ describe("IssueDetail", () => {
       delayMs?: number; failStatus?: 500 | 409; says?: "bare" | "queued"; echoClientRequestId?: boolean;
       // dupbubble2: only the first N POSTs fail (a Retry then succeeds).
       failTimes?: number;
+      holdRetry?: Promise<void>;
       // dupbubble2: an older server, no clientRequestId on any copy; and its copy's task.
       noClientRequestId?: boolean; serverIssueId?: string;
       // dupbubble2: an agent conversation whose ensureIssue resolves to a DIFFERENT task than the page's.
@@ -7228,6 +7229,7 @@ describe("IssueDetail", () => {
       const method = init?.method ?? "GET";
       if (method === "POST" && /\/api\/issues\/[^/]+\/comments$/.test(url)) {
         posts.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        if (posts.length === 2 && answer.holdRetry) await answer.holdRetry;
         if (answer.delayMs) await new Promise((resolve) => setTimeout(resolve, answer.delayMs));
         if (answer.failStatus && posts.length <= (answer.failTimes ?? Number.POSITIVE_INFINITY)) {
           return new Response(JSON.stringify({ error: answer.failStatus === 409 ? "Conflict: the task changed" : "Internal server error" }), {
@@ -8065,6 +8067,145 @@ describe("IssueDetail", () => {
     await waitForAssertion(() => expect(container.querySelector('[data-testid="stand-in-editor"]')).not.toBeNull());
     await flushReact();
   }
+
+  it.each([390, 1440])(
+    "independent custody: Retry remains recoverable when the page remounts before its second refusal at %i",
+    async width => {
+      const { post, posts, bubbles } = await renderSteeringPlacement(width, "steer", { delayMs: 700, failStatus: 409 });
+      await pressEnter();
+      expect(await waitUntil(() => notSent().length === 1)).toBe(true);
+      await remountWithDraftStorage();
+      expect(notSent()).toHaveLength(1);
+      await clickInFailed("Retry");
+      expect(await waitUntil(() => posts.length === 2, 300)).toBe(true);
+      const duringRetry = { editor: editorValue(), bubbles: bubbles().map(node => node.outerHTML), storage: { ...localStorage } };
+      await remountWithDraftStorage();
+      const immediatelyAfterRemount = { editor: editorValue(), bubbles: bubbles().map(node => node.outerHTML), storage: { ...localStorage } };
+      // Drain the actual second refusal, including the original mutation's callbacks.
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      for (let n = 0; n < 4; n++) await flushReact();
+      const afterRefusal = { editor: editorValue(), bubbles: bubbles().map(node => node.outerHTML), storage: { ...localStorage } };
+      if (process.env.STEER_UI_EVIDENCE) writeFileSync(`${process.env.STEER_UI_EVIDENCE}/independent-retry-remount-${width}.json`, JSON.stringify({ post, posts, duringRetry, immediatelyAfterRemount, afterRefusal }, null, 2));
+      expect(posts).toHaveLength(2);
+      expect(posts[1]).toEqual(posts[0]);
+      expect(notSent(), JSON.stringify(afterRefusal)).toHaveLength(1);
+      expect(bubbles()).toHaveLength(1);
+      expect(notSent()[0]!.textContent).toContain(post.body);
+      expect(editorValue()).toBe("");
+    }, 20_000,
+  );
+
+  it.each([390, 1440].flatMap(width => [
+    { width, outcome: "success", intent: "steer" as const },
+    { width, outcome: "409", intent: "steer" as const },
+    { width, outcome: "409", intent: "queue" as const },
+  ]))(
+    "dupbubble4: remount during held Retry → $outcome ($intent) keeps ONE durable pending request at $width",
+    async ({ width, outcome, intent }) => {
+      let release!: () => void;
+      const holdRetry = new Promise<void>(resolve => { release = resolve; });
+      const { post, posts, bubbles, state } = await renderSteeringPlacement(width, intent, {
+        delayMs: 100, failStatus: 409, failTimes: outcome === "success" ? 1 : 2,
+        echoClientRequestId: true, holdRetry,
+      });
+      // The remounted production surface reads its recent window, not the old
+      // mutation's QueryClient. Model the same saved request ID in that GET.
+      mockIssuesApi.recentComments.mockImplementation(async () => ({
+        comments: state.thread.map(comment => (comment as { id: string }).id === post.id
+          ? withRequestId(comment as object, posts[0]?.clientRequestId) : comment),
+        latestCommentId: (state.thread.at(-1) as { id: string } | undefined)?.id ?? null,
+        oldestCommentId: (state.thread[0] as { id: string } | undefined)?.id ?? null,
+        hasMore: false,
+      }));
+      if (intent === "queue") {
+        await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="task-chat-send-menu-toggle"]')!.click(); });
+        await flushReact();
+        await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="task-chat-send-menu-queue"]')!.click(); });
+      } else await pressEnter();
+      expect(await waitUntil(() => notSent().length === 1)).toBe(true);
+      await remountWithDraftStorage();
+      const draftKey = "paperclip:issue-comment-draft:issue-1";
+      await clickInFailed("Retry");
+      expect(await waitUntil(() => posts.length === 2, 300)).toBe(true);
+      // Release even if a custody assertion fails: no held task outlives this row.
+      let during: unknown;
+      let remounted: unknown;
+      const samples: Array<{ at: number; count: number }> = [];
+      try {
+        const { loadDraftSubmission, loadFailedComposerSends } = await import("../lib/composer-draft");
+        const assertPending = () => {
+          expect(bubbles()).toHaveLength(1);
+          expect(bubbles()[0]!.dataset.delivery).toBe("pending");
+          expect(bubbles()[0]!.textContent).toContain("Sending…");
+          expect(notSent()).toHaveLength(0);
+          expect(editorValue()).toBe("");
+          expect(loadDraftSubmission(draftKey)).toMatchObject({
+            attemptId: posts[0]!.clientRequestId, request: { body: post.body },
+            retry: { clientRequestId: posts[0]!.clientRequestId, request: { body: post.body } },
+          });
+          const { clientRequestId: _id, ...request } = posts[0]!;
+          expect(loadDraftSubmission(draftKey)?.request).toEqual(request);
+          expect(loadFailedComposerSends(draftKey)).toEqual([]);
+          expect(posts[1]).toEqual(posts[0]);
+          if (intent === "queue") expect(request.deliveryIntent).toBe("queue");
+        };
+        assertPending();
+        during = { bubbles: bubbles().map(node => node.outerHTML), storage: { ...localStorage } };
+        const started = performance.now();
+        samples.push(...await sampleBubbleCounts(bubbles, 300, started));
+        await remountWithDraftStorage();
+        assertPending();
+        samples.push(...await sampleBubbleCounts(bubbles, 600, started));
+        expect(samples.every(sample => sample.count === 1), JSON.stringify(samples)).toBe(true);
+        expect(posts).toHaveLength(2);
+        remounted = { bubbles: bubbles().map(node => node.outerHTML), storage: { ...localStorage } };
+      } finally {
+        release();
+        // Drain the held response even when a mutation kills a custody assertion.
+        await new Promise(resolve => setTimeout(resolve, 200));
+        for (let n = 0; n < 4; n++) await flushReact();
+      }
+      const settled = await waitUntil(() => outcome === "success"
+        ? bubbles().length === 1 && ["sent", "delivered"].includes(bubbles()[0]!.dataset.delivery ?? "")
+        : notSent().length === 1, 3000);
+      expect(settled, JSON.stringify({ posts, bubbles: bubbles().map(node => node.outerHTML), storage: { ...localStorage } })).toBe(true);
+      for (let n = 0; n < 4; n++) await flushReact();
+      const { loadDraftSubmission, loadFailedComposerSends } = await import("../lib/composer-draft");
+      expect(loadDraftSubmission(draftKey)).toBeNull();
+      expect(loadFailedComposerSends(draftKey)).toHaveLength(outcome === "success" ? 0 : 1);
+      expect(bubbles()).toHaveLength(1);
+      expect(editorValue()).toBe("");
+      expect(posts).toHaveLength(2);
+      if (process.env.STEER_UI_EVIDENCE) writeFileSync(`${process.env.STEER_UI_EVIDENCE}/dupbubble4-${outcome}-${intent}-${width}.json`, JSON.stringify({
+        posts, during, remounted, samples, settled: { bubbles: bubbles().map(node => node.outerHTML), storage: { ...localStorage } },
+      }, null, 2));
+      await remountWithDraftStorage();
+      expect(bubbles()).toHaveLength(1);
+      expect(notSent()).toHaveLength(outcome === "success" ? 0 : 1);
+      expect(editorValue()).toBe("");
+      expect(posts).toHaveLength(2);
+    }, 20_000,
+  );
+
+  it.each([390, 1440])(
+    "independent custody CONTROL: Retry's second refusal is visible and durable if it settles before remount at %i",
+    async width => {
+      const { post, posts, bubbles } = await renderSteeringPlacement(width, "steer", { delayMs: 250, failStatus: 409 });
+      await pressEnter();
+      expect(await waitUntil(() => notSent().length === 1)).toBe(true);
+      await remountWithDraftStorage();
+      expect(notSent()).toHaveLength(1);
+      await clickInFailed("Retry");
+      expect(await waitUntil(() => posts.length === 2 && notSent().length === 1)).toBe(true);
+      await remountWithDraftStorage();
+      expect(notSent()).toHaveLength(1);
+      expect(bubbles()).toHaveLength(1);
+      expect(notSent()[0]!.textContent).toContain(post.body);
+      expect(editorValue()).toBe("");
+      expect(posts).toHaveLength(2);
+      expect(posts[1]).toEqual(posts[0]);
+    }, 20_000,
+  );
 
   it.each([390, 1440])(
     "dupbubble3 F1: a restored refusal keeps the next draft; Edit transfers custody durably, once, without resend at %i",

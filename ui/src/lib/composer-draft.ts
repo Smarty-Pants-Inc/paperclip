@@ -120,6 +120,16 @@ export interface ComposerDraftSubmission {
   request?: ComposerSendRequest;
   /** The account that made `request`; only that account may replay it (see `useDraftOwner`). */
   requestOwner?: string;
+  /** A bubble Retry owns these words, not the editable next draft. */
+  retry?: ComposerFailedSend;
+}
+
+// A React remount must not replay a Retry whose POST still runs in this document.
+// A full document reload loses this set and uses the existing uncertain-send path.
+const activeBubbleRetries = new Set<string>();
+
+export function releaseComposerRetry(attemptId: string) {
+  activeBubbleRetries.delete(attemptId);
 }
 
 /** The retained request, only for the account that made it: another account in this browser never replays it. */
@@ -128,6 +138,7 @@ export function replayableRequest(
   owner: string | undefined,
 ): ComposerSendRequest | undefined {
   const request = submission?.request;
+  if (submission?.retry && activeBubbleRetries.has(submission.attemptId)) return undefined;
   if (owner === undefined || submission?.requestOwner !== owner || !request) return undefined;
   if (request.reassignment !== undefined || request.runSettings !== undefined || request.reopen === true) return undefined;
   return request;
@@ -174,19 +185,21 @@ export function loadDraftSubmission(
     const record = JSON.parse(raw);
     return record?.version === 1 &&
       record.draftKey === draftKey &&
-      Object.keys(record).every((key) => ["version", "draftKey", "attemptId", "reviewed", "nextDraftOffset", "submittedAttachmentIds", "request", "requestOwner"].includes(key)) &&
+      Object.keys(record).every((key) => ["version", "draftKey", "attemptId", "reviewed", "nextDraftOffset", "submittedAttachmentIds", "request", "requestOwner", "retry"].includes(key)) &&
       typeof record.attemptId === "string" &&
       /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(record.attemptId) &&
       typeof record.reviewed === "boolean" &&
       (record.nextDraftOffset === undefined || (Number.isSafeInteger(record.nextDraftOffset) && record.nextDraftOffset >= 0)) &&
       (record.submittedAttachmentIds === undefined || (Array.isArray(record.submittedAttachmentIds) && record.submittedAttachmentIds.length <= 256 && record.submittedAttachmentIds.every((id: unknown) => typeof id === "string" && id.length <= 128))) &&
       (record.request === undefined || isComposerSendRequest(record.request)) &&
-      (record.requestOwner === undefined || (typeof record.requestOwner === "string" && record.requestOwner.length <= 256))
+      (record.requestOwner === undefined || (typeof record.requestOwner === "string" && record.requestOwner.length <= 256)) &&
+      (record.retry === undefined || (isFailedComposerSend(record.retry) && record.retry.clientRequestId === record.attemptId))
       ? { attemptId: record.attemptId, reviewed: record.reviewed,
           ...(record.nextDraftOffset !== undefined ? { nextDraftOffset: record.nextDraftOffset } : {}),
           ...(record.submittedAttachmentIds !== undefined ? { submittedAttachmentIds: record.submittedAttachmentIds } : {}),
           ...(record.request !== undefined ? { request: record.request } : {}),
           ...(record.requestOwner !== undefined ? { requestOwner: record.requestOwner } : {}),
+          ...(record.retry !== undefined ? { retry: record.retry } : {}),
         }
       : null;
   } catch {
@@ -346,8 +359,15 @@ export interface ComposerFailedSend {
 export function loadFailedComposerSends(draftKey: string): ComposerFailedSend[] {
   const rows = loadStructuredDraft<unknown>(`${draftKey}:failed:v1`, []);
   if (!Array.isArray(rows)) return [];
-  return rows.filter((row): row is ComposerFailedSend =>
-    row && typeof row === "object" &&
+  // Pending custody wins if a crash occurred between the two storage writes.
+  const retryId = loadDraftSubmission(draftKey)?.retry?.clientId;
+  return rows.filter(isFailedComposerSend).filter(row => row.clientId !== retryId);
+}
+
+function isFailedComposerSend(value: unknown): value is ComposerFailedSend {
+  if (!value || typeof value !== "object") return false;
+  const row = value as Record<string, unknown>;
+  return Boolean(
     typeof row.clientId === "string" && typeof row.clientRequestId === "string" &&
     isComposerSendRequest(row.request) && typeof row.reason === "string" &&
     (row.kind === "comment" || row.kind === "reassign") &&
@@ -358,10 +378,38 @@ export function loadFailedComposerSends(draftKey: string): ComposerFailedSend[] 
     (row.targetIssueId === undefined || row.targetIssueId === null || typeof row.targetIssueId === "string"));
 }
 
+/** Same-document readers see only completed handoffs; reloads read durable custody. */
+export function notifyComposerDraftChange(draftKey: string) {
+  window.dispatchEvent(new CustomEvent("paperclip:composer-custody", { detail: draftKey }));
+}
+
+export function subscribeComposerDraftChange(draftKey: string, changed: () => void): () => void {
+  const local = (event: Event) => { if ((event as CustomEvent).detail === draftKey) changed(); };
+  window.addEventListener("paperclip:composer-custody", local);
+  return () => window.removeEventListener("paperclip:composer-custody", local);
+}
+
+/** Acquire recoverable pending custody BEFORE releasing the refused bubble. */
+export function retryFailedComposerSend(draftKey: string, failed: ComposerFailedSend, requestOwner?: string): boolean {
+  if (loadDraftSubmission(draftKey)) return false;
+  saveDraftSubmission(draftKey, {
+    attemptId: failed.clientRequestId, reviewed: false, nextDraftOffset: 0,
+    submittedAttachmentIds: [], request: failed.request, requestOwner, retry: failed,
+  });
+  if (loadDraftSubmission(draftKey)?.retry?.clientId !== failed.clientId) return false;
+  activeBubbleRetries.add(failed.clientRequestId);
+  removeFailedComposerSend(draftKey, failed.clientId);
+  notifyComposerDraftChange(draftKey);
+  return true;
+}
+
 export function saveFailedComposerSend(draftKey: string, failed: ComposerFailedSend) {
   saveStructuredDraft(`${draftKey}:failed:v1`, [
     ...loadFailedComposerSends(draftKey).filter(row => row.clientId !== failed.clientId), failed,
   ]);
+  const stored = loadStructuredDraft<unknown>(`${draftKey}:failed:v1`, []);
+  return Array.isArray(stored) && stored.some(row => isFailedComposerSend(row) &&
+    row.clientId === failed.clientId && row.clientRequestId === failed.clientRequestId && row.reason === failed.reason);
 }
 
 export function removeFailedComposerSend(draftKey: string, clientId: string) {
