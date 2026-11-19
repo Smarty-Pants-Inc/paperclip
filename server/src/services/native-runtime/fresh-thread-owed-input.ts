@@ -1,6 +1,6 @@
 import { and, asc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import { heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
-import { answeredPersonMessageSql } from "../person-message-answer.js";
+import { personMessageOwedSql } from "../person-message-answer.js";
 import { deriveCommentId, extractWakeCommentIds } from "../../modules/run-dispatch/index.js";
 
 /** The person-message window a fresh-thread restore carries (the unanswered-message sweep's own lookback). */
@@ -13,7 +13,7 @@ export const FRESH_THREAD_OWED_MESSAGES_MAX = 20;
  * (selectPiConversation / selectFreshContinuationThread consumed the recorded
  * fresh-continuation boundary) must not leave the person's owed messages in the
  * saved history only: the model then answers just the latest one. Every person
- * message the ONE answered rule (answeredPersonMessageSql) says is still owed is
+ * message the ONE owed floor (personMessageOwedSql) says is still owed is
  * carried as this run's explicit queued input, oldest first, each once:
  * - the run's context (wakeCommentIds/wakeCommentId/commentId), persisted on the
  *   run row, so the restore run CARRIES them and its reply answers them (the
@@ -36,22 +36,24 @@ export async function carryOwedMessagesIntoFreshThread(db: Db, input: {
     .from(issueComments).where(and(eq(issueComments.id, issue.boundaryId), eq(issueComments.companyId, input.companyId),
       eq(issueComments.issueId, input.issueId))).limit(1) : [];
   if (!issue || (issue.boundaryId && !boundary)) return [];
-  const notAnswered = sql`not ${answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
-    issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}`;
+  // The ONE owed floor (answered rule + moved-on floor + /new boundary): a carried message whose
+  // carrier failed while a later succeeded turn replied is NOT owed and never re-sent.
+  const owedFloor = personMessageOwedSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+    issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` });
   const owed = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, since),
     boundary ? sql`(${issueComments.createdAt}, ${issueComments.id}) > (${boundary.createdAt.toISOString()}::timestamptz, ${boundary.id}::uuid)` : undefined,
-    notAnswered,
+    owedFloor,
   )).orderBy(asc(issueComments.createdAt), asc(issueComments.id)).limit(FRESH_THREAD_OWED_MESSAGES_MAX);
   if (owed.length === 0) return [];
   const current = deriveCommentId(input.context, null);
   const candidates = [...new Set([...extractWakeCommentIds(input.context), ...(current ? [current] : []), ...owed.map(row => row.id)])];
-  // One order for the whole batch: thread order (oldest first), each id once. The ONE answered
-  // rule applies to the FINAL union: an inherited wake/comment id already answered is never re-sent.
+  // One order for the whole batch: thread order (oldest first), each id once. The ONE owed
+  // floor applies to the FINAL union: an inherited wake/comment id already answered or moved past is never re-sent.
   const ordered = (await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
-    inArray(issueComments.id, candidates), notAnswered)).orderBy(asc(issueComments.createdAt), asc(issueComments.id))).map(row => row.id);
+    inArray(issueComments.id, candidates), owedFloor)).orderBy(asc(issueComments.createdAt), asc(issueComments.id))).map(row => row.id);
   if (ordered.length === 0) return [];
   const carried = { wakeCommentIds: ordered, wakeCommentId: ordered.at(-1)!, commentId: ordered.at(-1)! };
   Object.assign(input.context, carried);
