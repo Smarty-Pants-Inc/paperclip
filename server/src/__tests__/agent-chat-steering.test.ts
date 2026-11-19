@@ -217,6 +217,13 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     return Boolean((rows as unknown as Array<{ answered: boolean }>)[0]?.answered);
   }
 
+  async function owed(commentId: string) {
+    const rows = await db.execute(sql`select ${personMessageOwedSql({
+      id: sql`m.id`, companyId: sql`m.company_id`, issueId: sql`m.issue_id`, createdAt: sql`m.created_at`,
+    })} as owed from issue_comments m where m.id = ${commentId}::uuid`);
+    return Boolean((rows as unknown as Array<{ owed: boolean }>)[0]?.owed);
+  }
+
   async function steer(chat: Chat, commentId: string, _queueId: string, client = app(chat.companyId)) {
     const queue = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200);
     return request(client)
@@ -474,14 +481,17 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
 
   // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21272
   // A3: exercise the real comment POST and ordinary wake admission/release.
-  it.each(["generic", "disconnect", "refusal", "probe", "unexpected-disposition", "newer-first", "stale-turn"] as const)("A3: %s steer failure returns 201 and the ordinary successor answers once", async variant => {
+  it.each((["generic", "disconnect", "refusal", "probe", "unexpected-disposition", "newer-first", "newer-first-never-carried", "stale-turn"] as const)
+    .map(variant => ({ variant, outcome: variant.startsWith("newer-first")
+      ? "a newer answered person input prevents re-send" : "the ordinary successor answers once" })))
+  ("A3: $variant steer failure returns 201 and $outcome", async ({ variant }) => {
     const chat = await seedChat(); await attachSteerable(chat);
     const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
     let refuseAfter201: (() => void) | undefined;
     if (variant === "generic") mocks.steer.mockImplementationOnce(() => new Promise((_resolve, reject) => {
       refuseAfter201 = () => reject(new Error("private person text must not be logged"));
     }));
-    else if (variant === "probe") mocks.probe.mockRejectedValueOnce(new Error("snapshot RPC disconnected"));
+    else if (variant === "probe" || variant === "newer-first-never-carried") mocks.probe.mockRejectedValueOnce(new Error("snapshot RPC disconnected"));
     else if (variant === "unexpected-disposition") mocks.steer.mockResolvedValueOnce({ disposition: "unexpected" });
     else mocks.steer.mockRejectedValueOnce(variant === "refusal"
       ? new NativeSessionSteeringError("steering_rejected", "refused")
@@ -512,20 +522,25 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const hydrated = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/comments/${messageId}`).expect(200);
     expect(hydrated.body).toMatchObject({ deliveryOutcome: "queued", steeringStatus: null,
       steeringUnavailableReason: thread.body.find((comment: any) => comment.id === messageId).steeringUnavailableReason });
-    if (variant !== "probe") expect(events.filter(event => event.type === "activity.logged" &&
+    if (variant !== "probe" && variant !== "newer-first-never-carried") expect(events.filter(event => event.type === "activity.logged" &&
       event.payload.action === "issue.comment_added" &&
       (event.payload.details as any)?.source === "steering.refused" &&
       (event.payload.details as any)?.commentId === messageId)).toHaveLength(1);
     const [reserved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
     expect((reserved!.contextSnapshot as any).steeredCommentIds ?? []).not.toContain(messageId);
     expect((reserved!.contextSnapshot as any).wakeCommentIds ?? []).not.toContain(messageId);
-    if (variant !== "probe") expect((reserved!.resultJson as any).queuedSteeringAcknowledgements[messageId].status).toBe("rejected");
+    if (variant !== "probe" && variant !== "newer-first-never-carried") {
+      const result = reserved!.resultJson as any;
+      expect((result.rejectedSteeringAcknowledgements?.[messageId] ?? result.queuedSteeringAcknowledgements?.[messageId]).status).toBe("rejected");
+    }
     await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup);
     const carriers = await carriersOf(chat, messageId);
     expect(carriers.wakes.length + carriers.runs.length).toBe(1);
-    if (variant === "newer-first") {
-      // Controlled completed N run: exercise refusal custody even when a later
-      // message's answer is already persisted before M's successor executes.
+    if (variant.startsWith("newer-first")) {
+      // RFL 17:07Z: an answered newer PERSON input makes the deferred receipt
+      // stale: no re-send. A DEFINITELY REJECTED reservation never carried M;
+      // its producer must leave M eligible for ONE truthful card under the
+      // unchanged person-message-answer.ts:181-218 floor, just like probe failure.
       const newer = await issueService(db).addComment(chat.issue.id, "N, answered first", { userId: owner });
       const [newerRun] = await db.insert(heartbeatRuns).values({ companyId: chat.companyId, agentId: chat.agentId,
         status: "succeeded", startedAt: new Date(), finishedAt: new Date(),
@@ -535,6 +550,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       await issueService(db).addComment(chat.issue.id, "ANSWER:N", { agentId: chat.agentId, runId: newerRun!.id });
       expect(await answered(newer.id)).toBe(true);
       expect(await answered(messageId)).toBe(false);
+      expect(await owed(messageId)).toBe(true);
     }
     const seen: string[][] = [];
     const responder = createServer(async (req, res) => {
@@ -559,6 +575,37 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       // This fixture calls the release adapter directly, outside heartbeat's
       // completion owner. Run the existing queued-run dispatcher after commit.
       await heartbeatService(db).resumeQueuedRunsForAgent(chat.companyId, chat.agentId);
+      if (variant.startsWith("newer-first")) {
+        await joinOwnedWork();
+        const outcomes = [];
+        for (let pass = 0; pass < 2; pass++) {
+          await releaseRun(chat);
+          await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup);
+          outcomes.push(await settleUnansweredPersonMessage(db, { companyId: chat.companyId, issueId: chat.issue.id,
+            now: new Date(Date.now() + 600_000) }));
+          await joinOwnedWork();
+        }
+        expect(seen).toEqual([]);
+        expect(await answered(messageId)).toBe(false); // moved past is not an answer
+        const remaining = await carriersOf(chat, messageId);
+        expect(remaining.wakes).toHaveLength(0);
+        expect(remaining.runs).toHaveLength(0);
+        const wakes = await db.select().from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, chat.companyId),
+          eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${messageId}`)));
+        expect(wakes).toHaveLength(1);
+        expect(wakes[0]).toMatchObject({ status: "cancelled", runId: null, error: "The conversation moved on" });
+        const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+          sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + messageId}`));
+        expect(notices).toHaveLength(1);
+        if (notices.length) expect(notices[0]!.body).toContain(`A3 ordinary ${variant}`);
+        const replies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+          eq(issueComments.body, `ANSWER:${messageId}`)));
+        expect(replies).toHaveLength(0);
+        if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `A3-${variant}-floor.json`),
+          JSON.stringify({ messageId, answered: await answered(messageId), owed: await owed(messageId), outcomes, notices }, null, 2));
+        return;
+      }
       await vi.waitFor(async () => {
         const replies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
           eq(issueComments.body, `ANSWER:${messageId}`)));
