@@ -502,8 +502,11 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       assertWritable: () => this.#assertActive(options),
     }));
     this.#assertActive(options);
+    // A failed/cancelled turn withdraws provisional streaming answers. Refresh
+    // before settling ingestion, so run-end release reads the final evidence.
     if ((event.eventType === "item.started" && event.payload.kind === "userMessage") ||
-      (event.eventType === "item.completed" && ["steering_acknowledgement", "agentMessage"].includes(String(event.payload.kind)))) {
+      (event.eventType === "item.completed" && ["steering_acknowledgement", "agentMessage"].includes(String(event.payload.kind))) ||
+      (event.sourceKind === "runner" && ["turn.completed", "turn.failed", "turn.cancelled"].includes(event.eventType))) {
       await recordSteeredMessageEvidence(this.#db, this.#binding);
     }
     if (event.sourceKind !== "control_plane" && (terminalTurn || event.eventType === "session.failed")) {
