@@ -6,11 +6,13 @@ import { canSelectFreshWorkspace, freshReadinessSchema, retainedIssueWorkspaceFo
 import { verifiedWorkspaceSnapshotReceipt } from "./workspace-recovery-snapshot.js";
 import { readTaskRetryIntent, retireTaskRetriesContinuedBy } from "./task-retry.js";
 import { isPreDispatchExecutionWaitVerified } from "./pre-dispatch-execution-wait.js";
-import { readSystemRecovery, savedFilesUnrecoverable, unrecoverableSavedFilesFailure, unrecoverableSavedFilesNotice } from "./system-recovery-state.js";
+import { readSystemRecovery, savedFilesUnrecoverable, unrecoverableSavedFilesFailure, unrecoverableSavedFilesNotice,
+  REPLY_FILES_NOT_SAVED_LINE, REPLY_FILES_PARTLY_SAVED_LINE } from "./system-recovery-state.js";
+import { replyFileLineReadsLost } from "./native-runtime/native-late-save-rule.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
 import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-migration.js";
-import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
+import { compareNativeWorkspaceSyncRootWithBaseline, readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { preserveNativeFailedWorkspace, preserveTaskRemoteWorkspaceWriter } from "./native-runtime/native-failed-workspace-recovery.js";
 import { createHash } from "node:crypto";
 import { appendHeartbeatRunEvent, stopAcceptanceEventSql } from "./heartbeat-run-events.js";
@@ -393,6 +395,9 @@ export async function admitExplicitNativeContinuation(input: {
   const sources: Run[] = [];
   let readiness: ContinuationReadiness | undefined;
   const freshSources = new Map<string, string>();
+  /** d2shared2: runs whose reply's file line reads LOST and whose saved-work recovery is spent. The person's message
+   * continues ON THE CURRENT checkout (never the new-workspace strategy, which starts empty for a local directory). */
+  const lostLineSources = new Map<string, Run>();
   const freshCandidates: Array<{ run: Run; intent: string; cause: string; evidence: Record<string, unknown>;
     remote: boolean; leaseIds: string[] }> = [];
   const stoppedSessions: Array<{ evidence: Record<string, unknown>; retire: () => boolean }> = [];
@@ -516,7 +521,13 @@ export async function admitExplicitNativeContinuation(input: {
         // instead of an endless finalizing wait (RC-50b, s14).
         if (!live.length || !live.every(row => row.recoveryState === "exhausted"))
           return blocked("finalizing_saved_result", "Paperclip is finishing the saved result.");
-        if (!freshIntent || !live.every(row => savedFilesUnrecoverable(readSystemRecovery(row.evidence))))
+        // The person was already told this reply's files could not be saved (its line reads LOST), and a late save
+        // of them never lands in the task's workspace (native-late-save-rule.ts, K15b: Retry export and the recovery
+        // worker keep them aside). So a spent recovery of those files holds nothing in the checkout: the message
+        // continues on the checkout as it is, with the not-saved notice in its input. Every stop proof below still
+        // applies. Proposed, pending RFL (option 2).
+        if (replyFileLineReadsLost(run.resultJson)) lostLineSources.set(run.id, run);
+        else if (!freshIntent || !live.every(row => savedFilesUnrecoverable(readSystemRecovery(row.evidence))))
           return live.some(row => row.retryClass === "service_required")
             ? blocked("saved_work_recovery_refused", "Paperclip refused to recover the saved files because a safety check on them cannot pass. Your Retry is saved.")
             : blocked("saved_work_recovery_failed", "Saving the agent's files failed. Retry to try again.");
@@ -525,10 +536,10 @@ export async function admitExplicitNativeContinuation(input: {
     // A repaired export no longer blocks execution. Its machine receipt still
     // binds the saved user turn; finalized file state alone is insufficient.
     if (["native_workspace_sync_out_unrecoverable", "native_workspace_sync_out_retry_exhausted"].includes(action.cause)
-      && !freshIntent && !await hasVerifiedWorkspaceRepair(db, run)) return blocked("workspace_repair_required",
+      && !freshIntent && !lostLineSources.has(run.id) && !await hasVerifiedWorkspaceRepair(db, run)) return blocked("workspace_repair_required",
       "Paperclip is recovering saved work before continuing. Your message is saved.");
     if ((run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson))
-      && !freshIntent && !await hasVerifiedWorkspaceRepair(db, run)) {
+      && !freshIntent && !lostLineSources.has(run.id) && !await hasVerifiedWorkspaceRepair(db, run)) {
       return blocked("workspace_repair_required", "Paperclip is recovering saved work before continuing. Your message is saved.");
     }
     const cancelledStartup = await isCancelledNativeStartup(db, run, coordinator);
@@ -658,7 +669,7 @@ export async function admitExplicitNativeContinuation(input: {
     }
     if (nativeQueuedSend && await hasPendingRunCleanup(db, companyId, run.id))
       return blocked("cleanup_pending", "Waiting for the previous run to finish cleanup. Your message is saved.");
-    if (freshIntent && !await hasVerifiedWorkspaceRepair(db, run)) {
+    if (freshIntent && !lostLineSources.has(run.id) && !await hasVerifiedWorkspaceRepair(db, run)) {
       freshSources.set(run.id, freshIntent);
       freshCandidates.push({ run, intent: freshIntent, cause: action.cause, evidence: strategyEvidence, remote,
         leaseIds: leases.map(lease => lease.id) });
@@ -708,6 +719,21 @@ export async function admitExplicitNativeContinuation(input: {
     ...(queuedInterrupt ? { queuedCommentInterruptId: input.queuedCommentInterruptId! } : {}),
     ...(taskRetry ? { taskRetryRequestId: input.taskRetryRequestId! } : {}), ...(readiness ? { readiness } : {}) };
   if (input.dryRun) return continuation;
+  // d2shared2 (rf-5 (a), BYTES): before the message runs on the current checkout, compare the checkout with the last
+  // saved state (the baseline the LOST run started from). A checkout that differs is never continued silently: the
+  // one line and the run's input notice then say so.
+  let currentCheckout: { sourceRunId: string; reason: "reply_files_lost"; checkout: "matches_last_save" | "differs" | "unknown";
+    baselineSha256: string | null; differing: string[] } | null = null;
+  for (const lost of lostLineSources.values()) {
+    const reference = readNativeWorkspaceSyncReference(lost.runnerProfileJson?.nativeWorkspaceSync);
+    const compared = reference ? await compareNativeWorkspaceSyncRootWithBaseline({ companyId, runId: lost.id, reference }) : null;
+    const checkout = compared?.state ?? "unknown";
+    if (!currentCheckout || (currentCheckout.checkout === "matches_last_save" && checkout !== "matches_last_save"))
+      currentCheckout = { sourceRunId: lost.id, reason: "reply_files_lost", checkout,
+        baselineSha256: compared?.baselineSha256 ?? null, differing: compared?.differing ?? [] };
+  }
+  const lostReplyLine = !currentCheckout ? null
+    : currentCheckout.checkout === "matches_last_save" ? REPLY_FILES_NOT_SAVED_LINE : REPLY_FILES_PARTLY_SAVED_LINE;
   for (const stopped of stoppedSessions) {
     if (!stopped.retire()) return blocked("local_cleanup", "The previous provider cleanup changed. Your message is saved.");
     await appendHeartbeatRunEvent(db, {
@@ -723,7 +749,7 @@ export async function admitExplicitNativeContinuation(input: {
       commentBodyHash: createHash("sha256").update(comment.body).digest("hex") } : {}),
     ...(queuedInterrupt ? { queuedCommentInterruptId: input.queuedCommentInterruptId } : {}),
     ...(queuedRequest ? { queuedCommentRequestId: input.queuedCommentRequestId } : {}), runId: input.successorRunId,
-    previousRunId: previous.id, recordedAt: new Date().toISOString() };
+    previousRunId: previous.id, recordedAt: new Date().toISOString(), ...(currentCheckout ? { currentCheckout } : {}) };
   if (input.queuedCommentInterruptId) await db.update(agentWakeupRequests).set({
     payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{queuedCommentInterrupt,continuation}', ${JSON.stringify(authorization)}::jsonb)`,
   }).where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, input.queuedCommentInterruptId),
@@ -753,6 +779,7 @@ export async function admitExplicitNativeContinuation(input: {
     await tx.update(issueRecoveryActions).set({
       status: "resolved", outcome: "cancelled", resolvedAt: new Date(), updatedAt: new Date(),
       nextAction: unrecoverable ? unrecoverableSavedFilesNotice(unrecoverable)
+        : lostReplyLine && lostLineSources.has(String(action.evidence.runId)) ? lostReplyLine
         : "The user started a fresh conversation turn. Prior action outcomes remain recorded.",
       resolutionNote: "The user continued after the prior execution stopped. No action outcomes were inferred.",
       wakePolicy: null, monitorPolicy: null,
@@ -771,6 +798,10 @@ export async function admitExplicitNativeContinuation(input: {
     const { issueService } = await import("./issues.js");
     await issueService(db).addComment(issueId, unrecoverableSavedFilesNotice(unrecoverable), {},
       { authorType: "system" }, tx);
+  } else if (lostReplyLine && actions.some(action => lostLineSources.has(String(action.evidence.runId)))) {
+    // The ONE line, once, at the moment the message starts (proposed, pending RFL).
+    const { issueService } = await import("./issues.js");
+    await issueService(db).addComment(issueId, lostReplyLine, {}, { authorType: "system" }, tx);
   }
   });
   await persistActivity(db, { companyId, actorType: "user", actorId,
