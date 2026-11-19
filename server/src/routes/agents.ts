@@ -2062,12 +2062,15 @@ export function agentRoutes(
   async function assertAgentDefaultEnvironmentSelection(
     companyId: string,
     environmentId: string | null | undefined,
-    options?: { allowedDrivers?: string[]; allowedSandboxProviders?: string[] },
+    options?: { allowedDrivers?: string[]; allowedSandboxProviders?: string[]; preserveExistingSelection?: boolean },
   ) {
     if (environmentId === undefined || environmentId === null) return;
     const environment = await environmentsSvc.getById(environmentId);
     if (!environment) {
       throw unprocessable("Selected environment was not found");
+    }
+    if (!options?.preserveExistingSelection && environment.companyId && environment.companyId !== companyId) {
+      throw unprocessable("This environment belongs to another company");
     }
     if (options?.allowedDrivers && !options.allowedDrivers.includes(environment.driver)) {
       throw unprocessable(`Environment driver "${environment.driver}" is not allowed here`);
@@ -5979,6 +5982,11 @@ export function agentRoutes(
       requestedRuntimeConfig = { ...(requestedRuntimeConfig ?? existing.runtimeConfig),
         aiConnection: { provider: "github", method: "api_key", mode: "responsible_user" } };
     }
+    // Reject an explicit foreign selection before any account validation or
+    // provider work can obscure the plain company-boundary error.
+    if (Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")) {
+      await assertAgentDefaultEnvironmentSelection(existing.companyId, patchData.defaultEnvironmentId as string | null);
+    }
     const nextAiBinding = aiRuntimeConnectionBindingSchema.safeParse(requestedRuntimeConfig ? requestedRuntimeConfig.aiConnection : existing.runtimeConfig.aiConnection).data;
     if (nextAiBinding) {
       await assertCanConfigureAgentSetup(req, existing);
@@ -6017,6 +6025,7 @@ export function agentRoutes(
         existing.companyId,
         nextDefaultEnvironmentId,
         {
+          preserveExistingSelection: !Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId"),
           allowedDrivers: allowedEnvironmentDriversForAgent(requestedAdapterType),
           allowedSandboxProviders: allowedSandboxProvidersForAgent(requestedAdapterType),
         },

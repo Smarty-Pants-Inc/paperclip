@@ -81,6 +81,8 @@ export interface EnvironmentProbeResult {
 }
 
 export interface Environment {
+  /** NULL/absent is instance-shared; otherwise only this company may newly select it. */
+  companyId?: string | null;
   id: string;
   name: string;
   description: string | null;

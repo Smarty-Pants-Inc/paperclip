@@ -5,6 +5,9 @@ export const environments = pgTable(
   "environments",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    // NULL is an instance-shared environment. Retain the owner identity even
+    // after company deletion; deletion must not silently make a private env shared.
+    companyId: uuid("company_id"),
     name: text("name").notNull(),
     description: text("description"),
     driver: text("driver").notNull().default("local"),

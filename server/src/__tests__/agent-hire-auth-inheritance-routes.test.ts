@@ -103,6 +103,8 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsTmpDir, "master.key");
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-agent-hire-auth-inheritance-");
     db = createDb(tempDb.connectionString);
+    // Permit the same boundary probe against the pre-migration baseline.
+    await db.execute(sql`ALTER TABLE environments ADD COLUMN IF NOT EXISTS company_id uuid`);
   }, 60_000);
 
   afterEach(async () => {
@@ -174,6 +176,43 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     const app = createApp(db, actor);
     return request(app).post(`/api/companies/${companyId}/agent-hires`).send(payload);
   }
+
+  // Keep: a company must never newly select another company's computer.
+  it.each(["agents", "agent-hires"])("company environment: /%s rejects foreign, accepts own and shared", async route => {
+    const companyId = await seedCompany();
+    const otherCompanyId = await seedCompany();
+    for (const ownership of ["foreign", "own", "shared"]) {
+      const [environment] = await db.insert(environments).values({ name: `Company target ${randomUUID()}`,
+        driver: "sandbox", config: { provider: "daytona" } }).returning();
+      const owner = ownership === "foreign" ? otherCompanyId : ownership === "own" ? companyId : null;
+      await db.execute(sql`UPDATE environments SET company_id = ${owner} WHERE id = ${environment.id}`);
+      const response = await request(createApp(db, userActor())).post(`/api/companies/${companyId}/${route}`)
+        .send({ name: `Company child ${ownership}`, role: "engineer", adapterType: "codex_local", defaultEnvironmentId: environment.id });
+      expect(response.status, JSON.stringify(response.body)).toBe(ownership === "foreign" ? 422 : 201);
+      if (ownership === "foreign") expect(response.body.error).toBe("This environment belongs to another company");
+      else expect((route === "agents" ? response.body : response.body.agent).defaultEnvironmentId).toBe(environment.id);
+    }
+  });
+
+  it("company environment: PATCH rejects foreign selections but preserves existing reads and unrelated edits", async () => {
+    const companyId = await seedCompany();
+    const otherCompanyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "codex_local", {});
+    const [environment] = await db.insert(environments).values({ name: `Foreign target ${randomUUID()}`,
+      driver: "sandbox", config: { provider: "daytona" } }).returning();
+    await db.execute(sql`UPDATE environments SET company_id = ${otherCompanyId} WHERE id = ${environment.id}`);
+    const app = createApp(db, userActor());
+    const rejected = await request(app).patch(`/api/agents/${parent.id}`).send({ defaultEnvironmentId: environment.id });
+    expect(rejected.status, JSON.stringify(rejected.body)).toBe(422);
+    expect(rejected.body.error).toBe("This environment belongs to another company");
+    await db.update(agents).set({ defaultEnvironmentId: environment.id }).where(eq(agents.id, parent.id));
+    const read = await request(app).get(`/api/agents/${parent.id}`);
+    expect(read.status).toBe(200);
+    expect(read.body.defaultEnvironmentId).toBe(environment.id);
+    const edited = await request(app).patch(`/api/agents/${parent.id}`).send({ name: "Existing cross-company agent" });
+    expect(edited.status, JSON.stringify(edited.body)).toBe(200);
+    expect(edited.body.defaultEnvironmentId).toBe(environment.id);
+  });
 
   function childEnvOf(res: request.Response): Record<string, unknown> {
     return ((res.body.agent?.adapterConfig as { env?: Record<string, unknown> } | undefined)?.env) ?? {};

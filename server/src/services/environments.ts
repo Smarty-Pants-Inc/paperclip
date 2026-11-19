@@ -228,6 +228,7 @@ function hasConstraintName(error: unknown, constraintName: string): boolean {
 function toEnvironment(row: EnvironmentRow): Environment {
   return {
     id: row.id,
+    companyId: row.companyId ?? null,
     name: row.name,
     description: row.description ?? null,
     driver: readEnum(row.driver, ENVIRONMENT_DRIVERS, "environment driver") ?? "local",
