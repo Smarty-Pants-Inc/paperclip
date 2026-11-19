@@ -62,14 +62,31 @@ export function readSteeredIntoRunId(comment: object | null | undefined): string
 }
 
 /**
+ * The client's own mark on a message sent while the agent works, before the
+ * POST answers. It is NEUTRAL: it claims neither sent nor queued, so it is
+ * not a client guess at steer vs queue. The thread shows it at once as a
+ * pending bubble ('Sending…'); the server's answer (`readCommentDelivery`)
+ * then confirms it on the same bubble (steered) or moves it (queued) or the
+ * send fails (the composer's error path keeps the text).
+ */
+export function pendingDeliveryFields(): { clientDelivery: "pending" } {
+  return { clientDelivery: "pending" };
+}
+
+export function isPendingDelivery(comment: object | null | undefined): boolean {
+  return !!comment && (comment as { clientDelivery?: unknown }).clientDelivery === "pending";
+}
+
+/**
  * How far a steered message got, as the server says: 'sent' (the server
  * handed it to the running turn: `steeringStatus` 'accepted') or 'delivered'
- * (Pi itself read it into the turn: `steeringStatus` 'delivered'). Null for a
+ * (Pi itself read it into the turn: `steeringStatus` 'delivered'). 'pending'
+ * only for the client's neutral mark before the POST answers. Null for a
  * message that was not steered.
  */
-export type SteeredDelivery = "sent" | "delivered";
+export type SteeredDelivery = "pending" | "sent" | "delivered";
 export function readSteeredDelivery(comment: object | null | undefined): SteeredDelivery | null {
-  if (!readSteeredIntoRunId(comment)) return null;
+  if (!readSteeredIntoRunId(comment)) return isPendingDelivery(comment) ? "pending" : null;
   return (comment as DeliveryFields).steeringStatus === "delivered" ? "delivered" : "sent";
 }
 

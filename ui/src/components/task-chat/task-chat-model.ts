@@ -149,7 +149,7 @@ export interface TaskChatMessageItem {
   /** The server steered this message into that running turn: it is sent, in the thread. */
   steeredIntoRunId?: string | null;
   /** The server's word for a steered message: 'sent' (handed to the turn) or 'delivered' (Pi read it). */
-  steeredDelivery?: "sent" | "delivered";
+  steeredDelivery?: "pending" | "sent" | "delivered";
   /** Run that wrote this agent reply; its MCP Apps views show with the reply. */
   sourceRunId?: string;
   /** Non-blocking verification limitations attached to the run's durable reply. */
