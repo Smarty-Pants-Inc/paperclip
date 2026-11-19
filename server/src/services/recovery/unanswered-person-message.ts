@@ -18,6 +18,7 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { logActivity } from "../activity-log.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { isWellFormedExecutionWait, wellFormedExecutionWaitSql } from "../deferred-execution-wait.js";
+import { readPersonStopHold } from "../acknowledged-native-stop.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
 import { PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "../native-runtime/native-provider-failure.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
@@ -728,10 +729,19 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   // message held by that Stop are the sender's to send again; a newer run (a
   // typed message, the held batch) is newer than the Stop and ends this, so
   // its failure still shows.
+  // Never silent (RFL 04:17Z): the STOPPED message is the one the stopped run
+  // itself carries (its wakeCommentIds / commentId); its turn shows 'Stopped'.
+  // Any other message is HELD, and is explained only while the ONE reader
+  // (readPersonStopHold) still finds its own wake deferred under that Stop. A
+  // held message whose wake was cancelled by anything else (a tree Pause's
+  // cancelUnclaimedWakeupsForTree) will never run: it gets its true card.
   const stop = (latest?.resultJson ?? {}) as Record<string, unknown>;
   if (latest?.status === "cancelled" && stop.cancelledByActorType === "user" && !stop.queuedCommentInterruptQueueId
     && typeof stop.cancelledByUserId === "string" && !!message.authorUserId && stop.cancelledByUserId === message.authorUserId
-    && message.createdAt <= (latest.finishedAt ?? latest.updatedAt)) return { kind: "explained" };
+    && message.createdAt <= (latest.finishedAt ?? latest.updatedAt)
+    && (runCarriesMessage(latest.contextSnapshot, message.id)
+      || await readPersonStopHold(q, { companyId: issue.companyId, issueId: issue.id, agentId, messageId: message.id })))
+    return { kind: "explained" };
   const run = messageRun && latest && latest.id !== messageRun.id
     && ["failed", "timed_out", "interrupted", "cancelled"].includes(latest.status)
     && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,

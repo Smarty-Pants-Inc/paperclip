@@ -31,6 +31,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { agentRoutes } from "../routes/agents.js";
 import { activityRoutes } from "../routes/activity.js";
+import { issueTreeControlRoutes } from "../routes/issue-tree-control.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
@@ -3434,5 +3435,74 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(seen.flatMap(s => s.notes).filter(n => n.message === f.m0 || held.includes(n.message)), JSON.stringify(seen)).toEqual([]);
     expect(listed, JSON.stringify(queue.body)).toEqual(expect.arrayContaining(held));
     expect(JSON.stringify(queue.body.executionWait ?? null)).not.toMatch(/will start|starting|starts (soon|shortly|next)|about to start/i);
+  });
+
+  // RFL 04:17Z (cut 2c): the no-card gate never turns a LOST held message into
+  // silence. A held message is explained only while its own wake is still
+  // deferred under the sender's Stop (readPersonStopHold), or the person
+  // deleted it. REAL: the comment POST, the Stop route, the tree Pause and its
+  // release (POST /api/issues/:id/tree-holds {mode:"pause"}, then
+  // /tree-holds/:holdId/release, issue-tree-control.ts: the Pause runs
+  // cancelUnclaimedWakeupsForTree), the Delete (DELETE /api/issues/:id/comments/:commentId)
+  // and the sweep. PLANTED (named): as seedStoppableTurn.
+  function treeApp(companyId: string, userId: string) {
+    const testApp = express();
+    testApp.use(express.json());
+    testApp.use((req, _res, next) => {
+      (req as any).actor = { type: "board", source: "session", userId, companyIds: [companyId],
+        memberships: [{ companyId, status: "active", membershipRole: "operator" }], isInstanceAdmin: false };
+      next();
+    });
+    testApp.use("/api", issueTreeControlRoutes(db));
+    testApp.use(errorHandler);
+    return testApp;
+  }
+
+  const wakesCarrying = async (f: { companyId: string; issueId: string }, messageId: string) => (await db.select()
+    .from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)))
+    .filter(wake => JSON.stringify(wake.payload ?? {}).includes(messageId))
+    .map(wake => ({ id: wake.id, status: wake.status, error: wake.error ?? null }));
+
+  it.each(["chat", "task"] as const)("lossguard R1 %s: Stop, held A, the REAL tree Pause cancels A's wake, release: A's TRUE card shows once at +2/+11 (never silent)", async (surface) => {
+    const f = await seedStoppableTurn(surface);
+    const a = await postMessage(f, "Reply exactly A");
+    const stopped = await stopByRoute(f, "queue-owner");
+    const heldWakes = await wakesCarrying(f, a);
+    // R3: while A's wake is still held under the sender's Stop, no card.
+    const whileHeld = await sweepAt(f, stopped.finishedAt!, [2]);
+    expect(whileHeld[0].notes, JSON.stringify(whileHeld)).toEqual([]);
+    const client = treeApp(f.companyId, "queue-owner");
+    const paused = await request(client).post(`/api/issues/${f.issueId}/tree-holds`).send({ mode: "pause", reason: "lossguard R1" });
+    expect(paused.status, JSON.stringify(paused.body)).toBeLessThan(300);
+    const holdId = paused.body.hold.id as string;
+    const released = await request(client).post(`/api/issues/${f.issueId}/tree-holds/${holdId}/release`).send({ reason: "lossguard R1 release" });
+    expect(released.status, JSON.stringify(released.body)).toBeLessThan(300);
+    const lostWakes = await wakesCarrying(f, a);
+    const releasedAt = new Date();
+    const seen = await sweepAt(f, releasedAt, [2, 11]);
+    process.stdout.write(`LOSSGUARD-R1 ${surface} ${JSON.stringify({ a, heldWakes, lostWakes, whileHeld: whileHeld[0].notes,
+      seen: seen.map(s => ({ minute: s.minute, outcome: s.outcome, notes: s.notes })) })}\n`);
+    expect(heldWakes.some(wake => ["deferred_issue_execution", "deferred"].includes(wake.status)), JSON.stringify(heldWakes)).toBe(true);
+    // The tree Pause cancelled A's held wake: A will never run.
+    expect(lostWakes.length, JSON.stringify(lostWakes)).toBeGreaterThan(0);
+    expect(lostWakes.every(wake => wake.status === "cancelled"), JSON.stringify(lostWakes)).toBe(true);
+    // A's TRUE card, once, at +2 and +11.
+    expect(seen.map(s => s.notes.map(n => n.message)), JSON.stringify(seen)).toEqual([[a], [a]]);
+    expect(seen[1].notes[0].body).toBe(seen[0].notes[0].body);
+  });
+
+  it.each(["chat", "task"] as const)("lossguard R2 %s: the person's own Delete of a held message: no card at +2/+3/+11", async (surface) => {
+    const f = await seedStoppableTurn(surface);
+    const a = await postMessage(f, "Reply exactly A");
+    const stopped = await stopByRoute(f, "queue-owner");
+    const deleted = await request(boardApp(f.companyId, "queue-owner")).delete(`/api/issues/${f.issueId}/comments/${a}`);
+    expect(deleted.status, JSON.stringify(deleted.body)).toBeLessThan(300);
+    const [row] = await db.select().from(issueComments).where(eq(issueComments.id, a));
+    const seen = await sweepAt(f, stopped.finishedAt!, [2, 3, 11]);
+    process.stdout.write(`LOSSGUARD-R2 ${surface} ${JSON.stringify({ a, row: row ? { deletedAt: row.deletedAt } : "removed",
+      wakes: await wakesCarrying(f, a), seen: seen.map(s => ({ minute: s.minute, outcome: s.outcome, notes: s.notes })) })}\n`);
+    // A held message's Delete discards it from the queue (the row is removed, its wake cancelled).
+    expect(!row || !!row.deletedAt, JSON.stringify(row)).toBe(true);
+    expect(seen.map(s => s.notes), JSON.stringify(seen)).toEqual([[], [], []]);
   });
 });
