@@ -1,19 +1,24 @@
 /**
  * The one adapter for how a sent chat message is delivered while the agent
  * works (steering-by-default). Every server field name for this contract
- * lives here, so the final names from the server change only this file.
+ * lives here, so a server rename changes only this file.
  *
  * The CLIENT never decides steer vs queue. It sends the person's pick (or
  * nothing, for the default Send) and shows what the server answered.
  *
- * PROVISIONAL server contract (neworg-lead):
+ * Server contract (neworg-lead, neworg/steer-server-c3 = 69c95176):
  * - request: `POST /api/issues/:id/comments` body `deliveryIntent`
- *   ('steer' | 'queue' | 'interrupt'). Omitted while the agent works = steer.
- * - response / thread data: a steered comment carries `steeredIntoRunId`
- *   (string | null) and `steeredAt` (ISO string | null).
- * - response: a queued comment says so with `deliveryOutcome: 'queued'`; when
- *   steering was asked for (or was the default) but the server could not
- *   steer, it also carries `steeringUnavailableReason` (the D5 reason).
+ *   ('steer' | 'queue' | 'interrupt'). Omitted = steer while a native Pi run
+ *   is attached; the ordinary path otherwise.
+ * - POST response and GET thread data: `steeredIntoRunId` (string | null),
+ *   `steeredAt` (ISO string | null), `steeringStatus`
+ *   ('accepted' | 'delivered' | null) and `steeringDeliveryEventSeq`
+ *   (number | null). 'accepted' is shown as SENT; only 'delivered' (Pi's own
+ *   persisted read of the message) is shown as DELIVERED, on the same bubble.
+ * - `deliveryOutcome: 'queued'` and `steeringUnavailableReason` (the D5
+ *   reason) arrive in the server's follow-up with these exact names. Until
+ *   then a queued POST answers with `steeredIntoRunId: null`, and the waiting
+ *   list comes from the server's queued-comments read.
  */
 
 export type CommentDeliveryIntent = "steer" | "queue" | "interrupt";
@@ -41,6 +46,7 @@ export type CommentDeliveryOutcome =
 type DeliveryFields = {
   steeredIntoRunId?: unknown;
   steeredAt?: unknown;
+  steeringStatus?: unknown;
   deliveryOutcome?: unknown;
   steeringUnavailableReason?: unknown;
 };
@@ -53,6 +59,18 @@ function stringOrNull(value: unknown): string | null {
 export function readSteeredIntoRunId(comment: object | null | undefined): string | null {
   if (!comment) return null;
   return stringOrNull((comment as DeliveryFields).steeredIntoRunId);
+}
+
+/**
+ * How far a steered message got, as the server says: 'sent' (the server
+ * handed it to the running turn: `steeringStatus` 'accepted') or 'delivered'
+ * (Pi itself read it into the turn: `steeringStatus` 'delivered'). Null for a
+ * message that was not steered.
+ */
+export type SteeredDelivery = "sent" | "delivered";
+export function readSteeredDelivery(comment: object | null | undefined): SteeredDelivery | null {
+  if (!readSteeredIntoRunId(comment)) return null;
+  return (comment as DeliveryFields).steeringStatus === "delivered" ? "delivered" : "sent";
 }
 
 /** Exactly what the server answered for one POST. Nothing here is a client guess. */
