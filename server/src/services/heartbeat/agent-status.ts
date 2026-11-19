@@ -23,6 +23,19 @@ function errorReason(reason: string | null | undefined) {
   return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
 }
 
+/**
+ * A failed run whose answer the person already has: its accepted reply is published (the withheld-reply path) and
+ * only saving its files failed. That is not an agent error, so the agent settles idle. The codes are
+ * NATIVE_WITHHELD_REPLY_FAILURE_CODES (native-run-finalizer.ts), read by value here to keep this module free of
+ * the finalizer's imports; agent-status.test.ts holds the two lists equal.
+ */
+export const ANSWERED_RUN_SAVE_FAILURE_CODES: readonly string[] = [
+  "native_workspace_sync_out_retry_exhausted", "native_workspace_sync_out_unrecoverable", "native_workspace_sync_out_stalled",
+];
+export function isAnsweredRunSaveFailure(run: { status?: string | null; errorCode?: string | null } | null | undefined) {
+  return run?.status === "failed" && ANSWERED_RUN_SAVE_FAILURE_CODES.includes(run.errorCode ?? "");
+}
+
 function settledStatus(outcome: string | undefined, keepIdleOnFailure = false) {
   return outcome === "failed" || outcome === "timed_out"
     ? keepIdleOnFailure && outcome === "failed" ? "idle" : "error"
@@ -169,7 +182,7 @@ export function createHeartbeatAgentStatus(db: Db) {
       const [existing] = await tx.select().from(agents)
         .where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId))).for("no key update");
       if (!existing || existing.lifecycleState !== "ready" || existing.status !== "running") return null;
-      const [committed] = await tx.select({ status: heartbeatRuns.status, error: heartbeatRuns.error })
+      const [committed] = await tx.select({ status: heartbeatRuns.status, error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode })
         .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
           eq(heartbeatRuns.agentId, run.agentId))).limit(1);
       if (!committed || !TERMINAL_RUN_STATUSES.has(committed.status)) return null;
@@ -178,7 +191,7 @@ export function createHeartbeatAgentStatus(db: Db) {
         ne(heartbeatRuns.id, run.id), inArray(heartbeatRuns.status, ["running", "queued"]),
       )).limit(1);
       if (active) return null;
-      const nextStatus = settledStatus(committed.status);
+      const nextStatus = settledStatus(committed.status, isAnsweredRunSaveFailure(committed));
       const now = new Date();
       await notifyStrandedAgentStatus(tx, { companyId: run.companyId, agentId: run.agentId });
       await notifyAttentionRetentionWork(tx, { companyId: run.companyId });
@@ -236,11 +249,11 @@ export function createHeartbeatAgentStatus(db: Db) {
           lte(agents.updatedAt, cutoff), settledAgentWorkCondition(liveRunIds(), now),
         ));
         if (!current) return null;
-        const [lastRun] = await tx.select({ status: heartbeatRuns.status, error: heartbeatRuns.error })
+        const [lastRun] = await tx.select({ status: heartbeatRuns.status, error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode })
           .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, candidate.companyId),
             eq(heartbeatRuns.agentId, candidate.id)))
           .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-        const nextStatus = settledStatus(lastRun?.status);
+        const nextStatus = settledStatus(lastRun?.status, isAnsweredRunSaveFailure(lastRun));
         await notifyAttentionRetentionWork(tx, { companyId: candidate.companyId });
         const [agent] = await tx.update(agents).set({ status: nextStatus,
           errorReason: nextStatus === "error" ? errorReason(lastRun?.error) : null, updatedAt: now,
