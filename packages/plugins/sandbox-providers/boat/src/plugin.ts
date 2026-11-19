@@ -170,6 +170,48 @@ function subscribeCompanyActivity(companyId: string): void {
 const BOAT_CALL_BUDGET_MS = 30_000;
 const BOAT_MAX_ATTEMPTS = 3;
 function activityKey(config: Config, id: string): string { return createHash("sha256").update(`${apiBase(config)}\0${config.apiKey}\0${id}`).digest("hex"); }
+/**
+ * One ownership mutex per provider account/box, shared by claim and ALL spare
+ * retirement paths. Hold it across the provider read/PATCH and every await up
+ * to stop completion: a fresh GET without this exclusion still races.
+ * Worker-local, not a distributed lock. Shutdown drains hooks/timer/debt work;
+ * after restart Boat's persisted claim name is read under the new worker's lock.
+ */
+const spareOwnershipWork = new Map<string, Promise<void>>();
+async function withSpareOwnership<T>(config: Config, id: string, work: () => Promise<T>): Promise<T> {
+  const key = activityKey(config, id);
+  const previous = spareOwnershipWork.get(key);
+  let release!: () => void;
+  const tail = new Promise<void>(resolve => { release = resolve; });
+  spareOwnershipWork.set(key, tail); // Reserve synchronously, before invoking work.
+  try {
+    if (previous) await previous;
+    return await work();
+  } finally {
+    release();
+    if (spareOwnershipWork.get(key) === tail) spareOwnershipWork.delete(key);
+  }
+}
+/** Never use the unconditional run-stop path on a stale spare observation. */
+async function stopUnclaimedSpare(config: Config, key: ReadySpareKey, id: string, beforeStop?: () => Promise<boolean>): Promise<boolean> {
+  return withSpareOwnership(config, id, async () => {
+    const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`, {
+      method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000),
+    }, false, { requireJson: true });
+    const sandbox = result?.sandbox ?? result;
+    if (sandbox?.id !== id) throw new Error("Boat spare ownership read did not confirm sandbox.id");
+    // Claim names survive worker restarts; immutable purpose=spare alone does
+    // NOT authorize stopping a box that has transferred to a person's run.
+    if (sandbox.labels?.owner !== `paperclip:${key.companyId}` || sandbox.labels?.environment !== key.environmentId
+        || sandbox.labels?.purpose !== "spare" || sandbox.name?.startsWith("paperclip-claim:")
+        || ["archived", "stopped", "cancelled"].includes(sandbox.state)) return true;
+    // Preserve the keeper's activity/target veto after our last provider read,
+    // while the SAME mutex still excludes every claim PATCH.
+    if (beforeStop && !await beforeStop()) return false;
+    await stopSandbox(config, id);
+    return true;
+  });
+}
 // smarty-dev#20974: Boat's documented 409 answers (troubleshooting 'Error
 // messages'; readiness.md:9-31). Only these closed values reach an error.
 // snapshot_data_expired is Boat's troubleshooting.md, 'Error messages',
@@ -501,7 +543,7 @@ async function currentSpareCount(key: ReadySpareKey): Promise<number | undefined
  * that reads off with no config event is applied here, as acquire applies it.
  */
 const admittedSpareCreates = new Map<string, Set<string>>();
-/** The same capacity rule owns create admission and unfinished-refill retention. */
+/** Local send admission; durable paid inventory gets a collective budget in list(). */
 function spareRefillHasCapacity(key: ReadySpareKey, refillId: string, desired: number): boolean {
   const admitted = admittedSpareCreates.get(readySparePoolKey(key));
   const others = [...(admitted ?? [])].filter(id => id !== refillId).length;
@@ -697,7 +739,7 @@ async function resumeOwedSpareStops(config: Config, companyId: string, environme
         // Persist first when possible; state availability never vetoes a safe
         // stop. Failed writes leave the existing debt in companyOwedStops.
         try { await persistOwedSpareStops(companyId, record); } catch { /* Retry the stop anyway. */ }
-        await stopSandbox(config, entry.spareId);
+        await stopUnclaimedSpare(config, key, entry.spareId);
         try { await recordSpareStop({ outcome: "stopped", key, spareId: entry.spareId }); } catch { /* Confirmed stop; stale durable debt can replay. */ }
       } catch {
         const failures = (record.holds.find(hold => hold.environmentId === environmentId && hold.configHash === entry.configHash)?.failures ?? 0) + 1;
@@ -2138,7 +2180,7 @@ async function createReadySpare(config: Config, key: ReadySpareKey, ttlSeconds: 
       return readySpareFromSandbox({ ...observation, labels }, ttlSeconds);
     } catch (error) {
       try {
-        await stopSandbox(config, sandbox.id);
+        await stopUnclaimedSpare(config, key, sandbox.id);
         await forgetSpareRefill(key, refill.id);
       } catch { /* Keep the identity until a later inventory confirms its fate. */ }
       throw error;
@@ -2190,9 +2232,16 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
         .map(sandbox => sandbox.labels["paperclip-refill"]).filter((id): id is string => typeof id === "string"));
       const resolving = new Set<string>();
       const surplusRefills = new Set<string>();
-      // Retain an unfinished paid box for warm continuation only while it can
-      // still be admitted at the current target. OFF and nonzero target cuts
-      // must expose surplus boxes to the keeper's durable owed-stop path.
+      // Allocate ONE shared inventory budget, not a separate 'room exists'
+      // decision per pending identity. Failed warm/cleanup continuations no
+      // longer appear in the local ready/admitted maps but remain paid boxes.
+      const readyCount = owned.filter(sandbox => sandbox.labels.configHash === key.configHash
+        && sandbox.name === `paperclip-spare:ready:${key.configHash}`
+        && ["ready", "idle", "running"].includes(sandbox.state)).length;
+      const visibleRefills = new Set(owned.map(sandbox => sandbox.labels["paperclip-refill"]));
+      const unsightedAdmissions = [...(admittedSpareCreates.get(readySparePoolKey(key)) ?? [])]
+        .filter(id => !visibleRefills.has(id)).length;
+      const pendingRoom = pool ? Math.max(0, pool.desired - readyCount - unsightedAdmissions) : Number.POSITIVE_INFINITY;
       const retainPending = !pool || (!pool.retired && pool.baseDesired > 0);
       try { await updateSpareRefills(key, pending => {
         for (let i = pending.length - 1; i >= 0; i--) {
@@ -2204,7 +2253,7 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
           }
           if (made && !settled.has(entry.id) && !dedupedBoxStop(made)) {
             entry.sandboxId = made.id;
-            if (retainPending && !entry.refused && (!pool || spareRefillHasCapacity(key, entry.id, pool.desired))) {
+            if (retainPending && !entry.refused && resolving.size < pendingRoom) {
               resolving.add(made.id);
               if (!busySpareRefills.has(entry.id)) resumableRefills.add(entry.id);
             } else surplusRefills.add(made.id);
@@ -2233,12 +2282,11 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       const sandbox = result?.sandbox ?? result;
       if (sandbox?.id !== spare.id || !sandbox.labels) return undefined;
       const current = readySpareFromSandbox(sandbox, ttlSeconds);
-      // A concurrent claim/target increase can make continuation admissible
-      // again between list and get. Recheck before authorizing retirement.
-      const pool = knownSparePools.get(readySparePoolKey(key));
-      if (spare.retireUnfinished && pool && !spareRefillHasCapacity(key, current.labels["paperclip-refill"], pool.desired)) {
-        current.retireUnfinished = true;
-      }
+      // Carry the collective inventory decision through this read. Re-running
+      // the old per-ID local capacity check here would hide all-pending surplus
+      // again. The keeper rechecks the current target before stopping; the
+      // ownership mutex independently excludes a concurrent successful claim.
+      if (spare.retireUnfinished) current.retireUnfinished = true;
       return current;
     },
     create: () => createReadySpare(config, key, ttlSeconds, from),
@@ -2252,26 +2300,28 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
     // No pre-claim guest commands: starting Pi can write another run's home.
     // Run preparation (including the sentinel) belongs to finishAcquisition.
     async claim(spare, name, claimTtlSeconds) {
-      const result = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
-        method: "PATCH", signal: AbortSignal.timeout(2500), body: JSON.stringify({ name, ttlSeconds: claimTtlSeconds }),
-      }, false, { requireJson: true });
-      const patched = result?.sandbox ?? result;
-      if (patched?.id !== spare.id || !["ready", "idle", "running"].includes(patched.state) || (patched.name && patched.name !== name)) return false;
-      // rf-4 U1 F2: a stop Boat recorded after the clean pre-claim GET shows in
-      // the PATCH answer or the verification GET. Either one abandons the claim.
-      if (abandonSickClaim(spare, patched, "patch") || patched.hydrated !== true) return false;
-      const observed = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
-        method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000),
-      }, false, { requireJson: true });
-      const sandbox = observed?.sandbox ?? observed;
-      if (sandbox?.id !== spare.id || !["ready", "idle", "running"].includes(sandbox.state) || sandbox.name !== name) return false;
-      if (abandonSickClaim(spare, sandbox, "verify") || sandbox.hydrated !== true) return false;
-      spare.name = name;
-      spare.state = sandbox.state;
-      spare.expiresAt = parseDeadline(sandbox.archiveAfter) ?? parseDeadline(sandbox.expiresAt) ?? new Date(Date.now() + claimTtlSeconds * 1000).toISOString();
-      spare.ttlSeconds = claimTtlSeconds;
-      spare.providerObservation = { ...(spare.providerObservation ?? {}), ...sandbox, id: spare.id, name };
-      return true;
+      return withSpareOwnership(config, spare.id, async () => {
+        const result = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
+          method: "PATCH", signal: AbortSignal.timeout(2500), body: JSON.stringify({ name, ttlSeconds: claimTtlSeconds }),
+        }, false, { requireJson: true });
+        const patched = result?.sandbox ?? result;
+        if (patched?.id !== spare.id || !["ready", "idle", "running"].includes(patched.state) || (patched.name && patched.name !== name)) return false;
+        // rf-4 U1 F2: a stop Boat recorded after the clean pre-claim GET shows in
+        // the PATCH answer or the verification GET. Either one abandons the claim.
+        if (abandonSickClaim(spare, patched, "patch") || patched.hydrated !== true) return false;
+        const observed = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
+          method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000),
+        }, false, { requireJson: true });
+        const sandbox = observed?.sandbox ?? observed;
+        if (sandbox?.id !== spare.id || !["ready", "idle", "running"].includes(sandbox.state) || sandbox.name !== name) return false;
+        if (abandonSickClaim(spare, sandbox, "verify") || sandbox.hydrated !== true) return false;
+        spare.name = name;
+        spare.state = sandbox.state;
+        spare.expiresAt = parseDeadline(sandbox.archiveAfter) ?? parseDeadline(sandbox.expiresAt) ?? new Date(Date.now() + claimTtlSeconds * 1000).toISOString();
+        spare.ttlSeconds = claimTtlSeconds;
+        spare.providerObservation = { ...(spare.providerObservation ?? {}), ...sandbox, id: spare.id, name };
+        return true;
+      });
     },
     async refresh(spare, refreshTtlSeconds) {
       // rf-4 U1B row H: a TTL renewal spends like a create; the pool's current setting gates it.
@@ -2287,7 +2337,7 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       return { ...spare, state: sandbox.state, expiresAt, ttlSeconds: refreshTtlSeconds,
         providerObservation: { ...(spare.providerObservation ?? {}), ...sandbox } };
     },
-    stop: async spare => { await stopSandbox(config, spare.id); },
+    stop: (spare, beforeStop) => stopUnclaimedSpare(config, key, spare.id, beforeStop),
     desired: () => freshSpareDesired(key),
     settingMark: () => spareSettingEpoch(key.companyId, key.environmentId),
     admitCreate: () => admitSpareCreate(key),

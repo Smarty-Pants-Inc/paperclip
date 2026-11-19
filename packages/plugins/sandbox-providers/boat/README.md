@@ -165,6 +165,25 @@ preserved in the provider observation; Boat documents
 it as null when a fresh box restored nothing, so true/null is valid. The claim is
 reserved in-process and in the plugin's database before the PATCH.
 
+Claim and unclaimed-spare retirement share one **worker-local, per-account/box
+ownership mutex**. Claim holds it through the name PATCH and verification GET;
+retirement holds it from an uncached ownership GET through the non-force stop's
+completion, including all intervening awaits. A claimed name vetoes retirement.
+This also covers pending-refill cleanup and owed-stop retries, not just the pool
+cut timer. If retirement wins, a later claim cannot hand off the stopped box; if
+claim wins, even a timer with a stale inventory/GET cannot stop its run's box.
+This is serialization, **not** a Boat compare-and-stop API. A fresh GET alone
+would not close the race.
+
+The lock lives only in this plugin worker. Graceful shutdown drains acquisition,
+maintenance, reconciliation and owed-stop work before resetting the keeper; a
+killed worker has no JavaScript continuation to resume. A replacement worker
+reconstructs custody from Boat's persisted `paperclip-claim:` name and rechecks it
+under its own lock. This does **not** coordinate overlapping independent plugin
+workers/processes holding the same Boat account. The database claim reservation
+prevents duplicate claims, but is not a distributed retirement lock; do not
+qualify overlapping-worker retirement from this single-worker protocol.
+
 Hire/environment probes never consume spares: the host passes `issueId: null`
 for these no-run allocations even though their `runId` is a synthetic UUID.
 `resolveSnapshotIdentity` probes and login acquisitions also bypass spare claims.
@@ -200,6 +219,12 @@ replacement identity. Every send
 re-reads the current target and reserves only its remaining room after ready
 inventory and concurrent sends; a lowered target cannot send the old batch.
 The next maintenance tick retires excess idle inventory by the same owed-stop path.
+That cut counts paid unfinished refills collectively, even after every warm and
+immediate cleanup failed: ready inventory consumes room first, then unfinished
+identities share the remaining slots. For example, three unfinished paid boxes
+cut to one expose exactly two for retirement in that tick; they cannot each
+independently claim the same one free slot. Claimed boxes consume no spare slot
+and are never candidates for this retirement.
 
 Failed owed-stop retries have their own durable counter, separate from keeper
 stop-failure/backoff totals. After two failed retry-service attempts for a pool's

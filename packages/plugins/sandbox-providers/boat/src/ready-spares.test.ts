@@ -101,9 +101,9 @@ describe("Boat ready spare keeper", () => {
     expect(keeper.ready(key).map(item => item.id)).toEqual([healthy.id]);
     expect(ops.stop).toHaveBeenCalledTimes(4);
     expect((ops.stop as ReturnType<typeof vi.fn>).mock.calls.map(([item]) => item.id).sort()).toEqual(["bx_cold", "bx_expired", "bx_stopped", "bx_wrong_hash"]);
-    expect(ops.stop).not.toHaveBeenCalledWith(otherCompany);
-    expect(ops.stop).not.toHaveBeenCalledWith(otherEnvironment);
-    expect(ops.stop).not.toHaveBeenCalledWith(claimed);
+    expect(ops.stop).not.toHaveBeenCalledWith(otherCompany, expect.any(Function));
+    expect(ops.stop).not.toHaveBeenCalledWith(otherEnvironment, expect.any(Function));
+    expect(ops.stop).not.toHaveBeenCalledWith(claimed, expect.any(Function));
     now += 2_000_000;
     expect(keeper.ready(key)).toHaveLength(1); // expiry is rechecked at claim time
   });
@@ -244,7 +244,7 @@ describe("Boat ready spare keeper", () => {
     await vi.waitFor(() => expect(ops.claim).toHaveBeenCalledTimes(1));
 
     await keeper.reconcileTimer(key, 0, ops);
-    expect(ops.stop).not.toHaveBeenCalledWith(candidate);
+    expect(ops.stop).not.toHaveBeenCalledWith(candidate, expect.any(Function));
     resolveClaim(true);
     await claiming;
   });
@@ -260,7 +260,7 @@ describe("Boat ready spare keeper", () => {
 
     expect(externalRows.has(candidate.id)).toBe(true); // another worker has reserved it; Boat's rename has landed
     await keeper.reconcileTimer(key, 0, ops);
-    expect(ops.stop).not.toHaveBeenCalledWith(candidate);
+    expect(ops.stop).not.toHaveBeenCalledWith(candidate, expect.any(Function));
     expect((ops as ReadySpareOperations & { get: ReturnType<typeof vi.fn> }).get).toHaveBeenCalledWith(candidate);
     expect(db.query).not.toHaveBeenCalled();
   });
@@ -277,7 +277,7 @@ describe("Boat ready spare keeper", () => {
     await keeper.reconcileTimer(key, 1, ops);
     expect(((ops as ReadySpareOperations & { get: ReturnType<typeof vi.fn> }).get).mock.calls.map(([item]) => item.id)).toEqual(["bx_surplus"]);
     expect(ops.stop).toHaveBeenCalledTimes(1);
-    expect(ops.stop).toHaveBeenCalledWith(expect.objectContaining({ id: "bx_surplus" }));
+    expect(ops.stop).toHaveBeenCalledWith(expect.objectContaining({ id: "bx_surplus" }), expect.any(Function));
     expect(db.query).not.toHaveBeenCalled();
   });
 
@@ -301,7 +301,7 @@ describe("Boat ready spare keeper", () => {
     const restarted = new ReadySpareKeeper(() => start, 12, createReadySpareClaimStore(db));
     await restarted.reconcile(key, 1, ops);
     expect(ops.claim).not.toHaveBeenCalled();
-    expect(ops.stop).not.toHaveBeenCalledWith(alreadyClaimed);
+    expect(ops.stop).not.toHaveBeenCalledWith(alreadyClaimed, expect.any(Function));
     expect(ops.create).toHaveBeenCalledTimes(1);
     expect(restarted.ready(key).map(item => item.id)).toEqual(["bx_created_1"]);
   });
@@ -326,7 +326,7 @@ describe("Boat ready spare keeper", () => {
     finishCreate(spare({ id: "bx_inflight" }));
     await Promise.all([filling, disabling]);
     expect(keeper.ready(key)).toEqual([]);
-    expect(ops.stop).toHaveBeenCalledWith(expect.objectContaining({ id: "bx_inflight" }));
+    expect(ops.stop).toHaveBeenCalledWith(expect.objectContaining({ id: "bx_inflight" }), expect.any(Function));
   });
 
   it("stops surplus spares when disabled or lowered and never deletes them", async () => {
@@ -387,7 +387,7 @@ describe("Boat ready spare keeper", () => {
     await keeper.refreshDue(1800, ops);
     expect(keeper.ready(key)).toEqual([]);
     expect(ops.refresh).not.toHaveBeenCalled();
-    expect(ops.stop).toHaveBeenCalledWith(expect.objectContaining({ id: "bx_abcdefgh" }));
+    expect(ops.stop).toHaveBeenCalledWith(expect.objectContaining({ id: "bx_abcdefgh" }), expect.any(Function));
   });
 
   it("refreshes near-expiry TTLs and makes a failed refresh unclaimable", async () => {

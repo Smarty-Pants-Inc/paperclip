@@ -118,6 +118,7 @@ type Harness = {
   failStopStateWrite?: boolean;
   failActivityRead?: boolean;
   activityReadFailures?: number;
+  activityReadHook?: () => Promise<void>;
   configReadHook?: (companyId?: string) => Promise<Record<string, unknown>>;
   restart(deliverConfig: boolean): Promise<void>;
   emit(eventType: string): Promise<void>;
@@ -165,7 +166,7 @@ async function harness(name: string): Promise<Harness> {
       return () => eventHandlers.delete(eventType);
     } },
     state: {
-      get: async (key: { scopeId?: string; stateKey: string }) => { if (h.failActivityRead && key.stateKey === "company-activity") { h.activityReadFailures = (h.activityReadFailures ?? 0) + 1; throw new Error("JUDGE injected activity read rejection"); } return state.get(`${key.scopeId}:${key.stateKey}`) ?? null; },
+      get: async (key: { scopeId?: string; stateKey: string }) => { if (key.stateKey === "company-activity") await h.activityReadHook?.(); if (h.failActivityRead && key.stateKey === "company-activity") { h.activityReadFailures = (h.activityReadFailures ?? 0) + 1; throw new Error("JUDGE injected activity read rejection"); } return state.get(`${key.scopeId}:${key.stateKey}`) ?? null; },
       set: async (key: { scopeId?: string; stateKey: string }, value: unknown) => { if (h.failStopStateWrite && key.stateKey === "stop-owed") throw new Error("injected state.set outage"); state.set(`${key.scopeId}:${key.stateKey}`, structuredClone(value)); },
     },
   };
@@ -401,6 +402,110 @@ describe("spare.9 live-findings boundary", () => {
     expect(h.boat.liveSpares()).toHaveLength(1);
     expect(h.boat.spareCreates(at)).toHaveLength(0);
     expect(hasDebt()).toBe(false);
+  });
+
+  // Never-OK guards from RFL's spare.10 verdict (shipped with the spare.12 BRIEF).
+  // The standalone HTTP harness was not shipped; reproduce its held-snapshot and
+  // held-activity interleavings here using the real plugin's 15-second timer.
+  it.each(["get", "activity"])("RFL claim wins retirement's stale %s; no claimed box stops 4 ms after acquire returns", async boundary => {
+    const h = await start(`rfl-race-${boundary}`);
+    h.config.spares = 3; await settle(h.configChanged());
+    await settle(taskAcquire(h, "rfl-seed")); await advance(5_000);
+    const initial = h.boat.liveSpares(); expect(initial).toHaveLength(3);
+    const victim = initial[1];
+    let hit = false, victimRead = false, released = false;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = () => { released = true; resolve(); }; });
+    vi.stubGlobal("fetch", async (input: unknown, init: RequestInit = {}) => {
+      const answer = await h.boat.fetch(input, init);
+      if (!victimRead && (init.method ?? "GET") === "GET" && new URL(String(input)).pathname.endsWith(`/sandboxes/${victim}`)) {
+        victimRead = true; // Capture the unclaimed response BEFORE letting the claim run.
+        if (boundary === "get") { hit = true; await held; }
+      }
+      if (init.method === "POST" && new URL(String(input)).pathname.endsWith("/stop")) {
+        // The provider is unconditional: the plugin, not this fake, must exclude claims.
+        expect(h.boat.boxes.get(new URL(String(input)).pathname.split("/").at(-2)!)!.name).not.toMatch(/^paperclip-claim:/);
+      }
+      return answer;
+    });
+    h.activityReadHook = async () => { if (victimRead && !released) { if (boundary === "activity") hit = true; await held; } };
+    h.config.spares = 1;
+    try {
+      await until(() => hit, "timer paused with stale unclaimed victim");
+      const [first, lease] = await settle(Promise.all([taskAcquire(h, "race-a"), taskAcquire(h, "race-b")]));
+      expect(first.providerLeaseId).toBe(initial[0]);
+      expect(lease.providerLeaseId).toBe(victim);
+      const returned = h.boat.mark("RFL both acquires returned");
+      await advance(4); release(); await advance(1_000);
+      expect(h.boat.boxes.get(victim)!.name).toMatch(/^paperclip-claim:/);
+      expect(h.boat.boxes.get(victim)!.state).not.toBe("archived");
+      expect(h.boat.log.filter(e => e.seq > returned && e.method === "POST" && e.path === `/sandboxes/${victim}/stop`)).toEqual([]);
+    } finally { if (!released) release(); h.activityReadHook = undefined; }
+  });
+
+  it("RFL retirement wins the ownership lock; claim PATCH cannot cross its held provider GET", async () => {
+    const h = await start("rfl-stop-lock");
+    const { s1: victim } = await seed(h);
+    const hash = h.boat.boxes.get(victim)!.labels.configHash;
+    await h.restart(false);
+    // Retained owed-stop state is a second retirement entry point, without the
+    // keeper's transient stoppingSpares set. It MUST share the claim mutex.
+    h.state.set(`${h.company}:stop-owed`, { holds: [], owed: [{ environmentId: h.env, configHash: hash, spareId: victim }] });
+    let reads = 0, hit = false;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    vi.stubGlobal("fetch", async (input: unknown, init: RequestInit = {}) => {
+      const answer = await h.boat.fetch(input, init);
+      if ((init.method ?? "GET") === "GET" && new URL(String(input)).pathname.endsWith(`/sandboxes/${victim}`) && ++reads === 2) {
+        hit = true; await held; // The ownership read INSIDE retirement's critical section.
+      }
+      return answer;
+    });
+    const mark = h.boat.mark("acquire supplies key; owed retirement and claim compete");
+    const claim = taskAcquire(h, "lock-b");
+    try {
+      await until(() => hit && reads >= 3, "retirement holds provider GET; claim has validated victim");
+      await advance(4);
+      expect(h.boat.log.filter(e => e.seq > mark && e.id === victim && e.method === "PATCH")).toEqual([]);
+      release();
+      const lease = await settle(claim);
+      expect(lease.providerLeaseId).not.toBe(victim);
+      expect(h.boat.boxes.get(victim)!.state).toBe("archived");
+    } finally { release(); await settle(Promise.resolve(claim).catch(() => undefined)); }
+  });
+
+  it.each([1, 3, 0])("RFL all three refills unfinished, target 3 to %s stops exactly surplus in one tick", async target => {
+    const h = await start(`rfl-all-pending-${target}`);
+    h.config.spares = 3; await settle(h.configChanged());
+    let fail = true;
+    vi.stubGlobal("fetch", async (input: unknown, init: RequestInit = {}) => {
+      const path = new URL(String(input)).pathname, method = init.method ?? "GET";
+      const id = /\/sandboxes\/([^/]+)/.exec(path)?.[1];
+      const box = id ? h.boat.boxes.get(id) : undefined;
+      if (box?.labels.purpose === "spare") {
+        if (fail && method === "GET" && path.endsWith(`/sandboxes/${id}`)) return response({ sandbox: { ...box, state: "error" } });
+        if (method === "POST" && path.endsWith("/stop")) {
+          if (fail) return response({ error: "RFL failed warm and immediate cleanup" }, 400);
+          expect((h.state.get(`${h.company}:stop-owed`) as any)?.owed.some((e: any) => e.spareId === id)).toBe(true);
+          expect(JSON.parse(String(init.body)).force).not.toBe(true);
+        }
+      }
+      return h.boat.fetch(input, init);
+    });
+    await settle(taskAcquire(h, "rfl-pending-seed")); await advance(5_000);
+    const ids = h.boat.liveSpares(); expect(ids).toHaveLength(3);
+    const pending = Object.values(h.state.get(`${h.company}:pending-refills`) as Record<string, any[]>).flat();
+    expect(new Set(pending.map(e => e.sandboxId))).toEqual(new Set(ids));
+    for (const id of ids) expect(h.boat.boxes.get(id)!.name).toBe("");
+    h.config.spares = target; fail = false;
+    const mark = h.boat.mark(`RFL all-pending CUT 3 to ${target}`), cutAt = Date.now();
+    await advance(TICK_MS);
+    const stops = h.boat.log.filter(e => e.seq > mark && e.method === "POST" && e.path?.endsWith("/stop"));
+    expect(stops).toHaveLength(3 - target);
+    expect(new Set(stops.map(e => e.id)).size).toBe(3 - target);
+    for (const stop of stops) expect(stop.at - cutAt).toBeLessThanOrEqual(TICK_MS);
+    expect(h.boat.liveSpares()).toHaveLength(target);
+    expect(h.boat.spareCreates(mark)).toHaveLength(0);
   });
 
   it.each(["refused", "expired"])("F2 %s identity cannot starve refill; absent expired identity is forgotten", async kind => {

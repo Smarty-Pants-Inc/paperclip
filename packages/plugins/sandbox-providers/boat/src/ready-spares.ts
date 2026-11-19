@@ -83,7 +83,8 @@ export type ReadySpareOperations = {
   warmUp?(spare: ReadySpare): Promise<"completed" | "missing_pack" | "failed" | "timeout">;
   claim(spare: ReadySpare, claimName: string, ttlSeconds: number): Promise<boolean>;
   refresh(spare: ReadySpare, ttlSeconds: number): Promise<ReadySpare>;
-  stop(spare: ReadySpare): Promise<void>;
+  /** Recheck the stop premise inside provider ownership exclusion, after its final box read. false vetoes. */
+  stop(spare: ReadySpare, beforeStop?: () => Promise<boolean>): Promise<void | boolean>;
   /**
    * Re-read company activity and return this pool's spare target right now.
    * The keeper calls it immediately before every POST /stop on a spare, so a
@@ -615,22 +616,27 @@ export class ReadySpareKeeper {
    * skipped and the caller keeps the candidate. Returns true when it stopped.
    */
   private async stopSpare(key: ReadySpareKey, spare: ReadySpare, operations: ReadySpareOperations, premise: StopPremise = {}): Promise<boolean> {
-    if (operations.desired) {
-      let fresh: number | undefined;
-      try { fresh = await operations.desired(); } catch { fresh = undefined; }
-      const vetoable = premise.surplusOf !== undefined || premise.maybeRefill === true;
-      if (fresh === undefined && vetoable) return false; // Unknown activity is never a reason to stop.
-      if (fresh !== undefined && premise.surplusOf !== undefined && fresh > premise.surplusOf) return false;
-      if (fresh !== undefined && fresh > 0 && premise.maybeRefill && (this.inFlightCreates.get(readySparePoolKey(key)) ?? 0) > 0
-          && spare.labels.configHash === key.configHash && spare.name !== `paperclip-spare:ready:${key.configHash}`
-          && !spare.name.startsWith("paperclip-claim:") && !isTerminalState(spare.state)) return false;
-    }
+    const stillDesired = async (): Promise<boolean> => {
+      if (operations.desired) {
+        let fresh: number | undefined;
+        try { fresh = await operations.desired(); } catch { fresh = undefined; }
+        const vetoable = premise.surplusOf !== undefined || premise.maybeRefill === true;
+        if (fresh === undefined && vetoable) return false; // Unknown activity is never a reason to stop.
+        if (fresh !== undefined && premise.surplusOf !== undefined && fresh > premise.surplusOf) return false;
+        if (fresh !== undefined && fresh > 0 && premise.maybeRefill && (this.inFlightCreates.get(readySparePoolKey(key)) ?? 0) > 0
+            && spare.labels.configHash === key.configHash && spare.name !== `paperclip-spare:ready:${key.configHash}`
+            && !spare.name.startsWith("paperclip-claim:") && !isTerminalState(spare.state)) return false;
+      }
+      return true;
+    };
+    if (!await stillDesired()) return false;
     this.stoppingSpares.add(spare.id);
+    let stopped = true;
     try {
       // Try durable debt first, but a state outage must not block the safe
       // direction. The plugin listener keeps the debt in memory before writing.
       try { await this.stopRecordListener?.({ outcome: "owed", key, spareId: spare.id }); } catch { /* Stop still owed locally. */ }
-      await operations.stop(spare);
+      stopped = await operations.stop(spare, stillDesired) !== false;
     }
     catch (error) {
       const poolId = readySparePoolKey(key);
@@ -648,8 +654,8 @@ export class ReadySpareKeeper {
     finally { this.stoppingSpares.delete(spare.id); }
     this.stopBackoffs.delete(readySparePoolKey(key));
     this.stopFailedSpares.delete(spare.id);
-    try { await this.stopRecordListener?.({ outcome: "stopped", key, spareId: spare.id }); } catch { /* Provider confirmed stop; stale durable debt is safe to replay. */ }
-    return true;
+    try { await this.stopRecordListener?.({ outcome: "stopped", key, spareId: spare.id }); } catch { /* Stop confirmed or no longer owed; stale durable debt is safe to replay. */ }
+    return stopped;
   }
 
   /** Replace a pool from one inventory pass without dropping candidates that pass did not see. */
