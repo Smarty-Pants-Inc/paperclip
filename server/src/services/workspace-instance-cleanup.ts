@@ -8,6 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
 import { expandHomePrefix } from "../home-paths.js";
+import { isValidLocalEncryptedMasterKey } from "../secrets/local-encrypted-provider.js";
 import { INSTANCE_HEARTBEAT_RUN_MARKER } from "./instance-run-marker.js";
 import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
 
@@ -125,6 +126,78 @@ export const WORKTREE_INSTANCE_RAW_TRACE_DIRECTORIES: ReadonlyArray<{ relativePa
 export const WORKTREE_INSTANCE_PROVIDER_HOME_NAMES = ["codex-home", "grok-home", "workspaces"] as const;
 export const WORKTREE_INSTANCE_AGENT_PROVIDER_HOME_NAMES = ["codex-home", "claude-runtime"] as const;
 export const WORKTREE_INSTANCE_COMPANY_PROVIDER_STATE_NAMES = ["codex-home", "grok-home", "acp-engine"] as const;
+
+/**
+ * The ALLOW-LIST: everything a worktree instance's create path writes under its
+ * root before any run (RFL ruling, rf-3 https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7001341272).
+ * The reaper removes an instance ONLY when its root holds nothing but this.
+ * By line:
+ * - the root itself: scripts/setup-paperclip-worktree.sh write_fallback_worktree_config()
+ *   fs.mkdirSync(instanceRoot) (:528)
+ * - secrets/: setup-paperclip-worktree.sh (:594, :607); cli/src/commands/worktree.ts
+ *   copySeededSecretsKey() mkdirSync(dirname(targetKeyFilePath)) (:1066), run by
+ *   `worktree init`/`ensure-seeded` seeding (:1689)
+ * - secrets/master.key, a master key: setup-paperclip-worktree.sh inline write (:595-598)
+ *   or copy of the source key (:608-609); worktree.ts copySeededSecretsKey() inline
+ *   write (:1073) or copy (:1097)
+ * NOT scaffold, by line: config.json and .env. Every worktree create path writes them
+ * to <worktree>/.paperclip, not the root (cli worktree-lib.ts resolveWorktreeLocalPaths()
+ * :212-213; setup-paperclip-worktree.sh :508-509, written at :590 and :639). `worktree init --no-seed`
+ * (setup-paperclip-worktree.sh :174) writes nothing under the root. Seeding
+ * then writes db/ and data/backups/seed/ (worktree.ts :1700, :1711), which are run data.
+ * Directories are never content in themselves, at any depth: only what they hold
+ * counts. A file is scaffold by NAME + CREATED SHAPE: secrets/master.key must be a
+ * regular file (not a symlink) whose bytes the provider's own decoder accepts as a
+ * 32-byte master key (local-encrypted-provider.ts isValidLocalEncryptedMasterKey()).
+ */
+export const WORKTREE_INSTANCE_SCAFFOLD_FILES: ReadonlyArray<string> = [path.join("secrets", "master.key")];
+const MASTER_KEY_MAX_BYTES = 4096;
+
+async function isScaffoldFile(full: string, relativePath: string, metadata: import("node:fs").Stats): Promise<boolean> {
+  if (!WORKTREE_INSTANCE_SCAFFOLD_FILES.includes(relativePath)) return false;
+  if (!metadata.isFile() || metadata.size > MASTER_KEY_MAX_BYTES) return false;
+  return isValidLocalEncryptedMasterKey(await fs.readFile(full, "utf8"));
+}
+
+/**
+ * The first path under the instance root that is NOT create-path scaffold, or
+ * null when the root holds nothing but scaffold. The walk never follows a symlink
+ * for deletion; a symlink counts BY ITS TARGET (realpath): a target inside the
+ * root is covered by the direct walk; an outside directory target is walked (and
+ * nothing there is scaffold); any other outside target is content; a dangling
+ * link holds nothing. Any unexpected error is thrown, so the caller keeps the
+ * instance (fail closed).
+ */
+export async function findNonScaffoldContent(instanceRoot: string): Promise<string | null> {
+  const realRoot = await fs.realpath(instanceRoot);
+  const visitedOutside = new Set<string>();
+  const visit = async (directory: string, relative: string | null): Promise<string | null> => {
+    for (const name of await fs.readdir(directory)) {
+      const full = path.join(directory, name);
+      const entryRelative = relative === null ? null : path.join(relative, name);
+      const metadata = await fs.lstat(full);
+      if (metadata.isSymbolicLink()) {
+        const target = await realpathOrNull(full);
+        if (target === null) continue;
+        if (isSameOrChildPath(target, realRoot)) continue;
+        if (!(await fs.stat(target)).isDirectory()) return full;
+        if (visitedOutside.has(target)) continue;
+        visitedOutside.add(target);
+        if ((await visit(target, null)) !== null) return full;
+        continue;
+      }
+      if (metadata.isDirectory()) {
+        const found = await visit(full, entryRelative);
+        if (found !== null) return found;
+        continue;
+      }
+      if (entryRelative !== null && (await isScaffoldFile(full, entryRelative, metadata))) continue;
+      return full;
+    }
+    return null;
+  };
+  return visit(realRoot, "");
+}
 
 /**
  * Whether a path holds content, resolved by REALPATH: a symlinked directory
@@ -268,6 +341,13 @@ export async function findWorktreeInstanceRawTraces(
     }
   }
   for (const home of providerHomes) if (await holdsContent(home)) found.push(home);
+  // Steps 1-4 stay as a FAST keep (and 2b and the out-of-root override candidates
+  // keep what the allow-list cannot see). 5. The ALLOW-LIST: anything under the
+  // root but the create-path scaffold keeps the whole instance.
+  if (found.length === 0) {
+    const content = await findNonScaffoldContent(instanceRoot);
+    if (content !== null) found.push(content);
+  }
   return found;
 }
 
@@ -279,10 +359,28 @@ export async function findWorktreeInstanceRawTraces(
  */
 async function usesEmbeddedDb(instanceRoot: string, envs: ReadonlyArray<Record<string, string | undefined>>): Promise<boolean> {
   if (envs.some((env) => env.DATABASE_URL?.trim())) return false;
+  // The config the guest actually loads: PAPERCLIP_CONFIG from its pointer (every
+  // worktree create path writes it: cli worktree-lib.ts buildWorktreeEnvEntries() :322;
+  // setup-paperclip-worktree.sh :616), plus <root>/config.json when present or when
+  // no PAPERCLIP_CONFIG is set. Every one must say embedded; any unreadable one, or a
+  // relative PAPERCLIP_CONFIG, fails closed (not embedded).
+  const configPaths: string[] = [];
+  for (const env of envs) {
+    const configured = env.PAPERCLIP_CONFIG?.trim();
+    if (!configured) continue;
+    const expanded = expandHomePrefix(configured);
+    if (!path.isAbsolute(expanded)) return false;
+    configPaths.push(path.resolve(expanded));
+  }
+  const rootConfig = path.join(instanceRoot, "config.json");
+  if (configPaths.length === 0 || (await traceEntryExists(rootConfig))) configPaths.push(rootConfig);
   try {
-    const config = JSON.parse(await fs.readFile(path.join(instanceRoot, "config.json"), "utf8")) as { database?: { mode?: unknown } };
-    const mode = config?.database?.mode ?? "embedded-postgres";
-    return mode === "embedded-postgres";
+    for (const configPath of configPaths) {
+      const config = JSON.parse(await fs.readFile(configPath, "utf8")) as { database?: { mode?: unknown } };
+      const mode = config?.database?.mode ?? "embedded-postgres";
+      if (mode !== "embedded-postgres") return false;
+    }
+    return true;
   } catch {
     return false;
   }

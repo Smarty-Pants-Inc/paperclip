@@ -96,7 +96,8 @@ describe("worktree instance cleanup", () => {
     const instanceId = "pap-16075";
     const instanceRoot = path.join(worktreesDir, "instances", instanceId);
     await fs.mkdir(path.join(instanceRoot, "db"), { recursive: true });
-    await fs.writeFile(path.join(instanceRoot, "marker"), "remove me", "utf8");
+    // Nothing but empty dirs: the allow-list removes only a scaffold-only root
+    // (an arbitrary file here would now keep the instance).
     await writeWorkspaceEnv(workspacePath, worktreesDir, instanceId);
 
     const pointer = await readWorktreeInstancePointer(workspacePath);

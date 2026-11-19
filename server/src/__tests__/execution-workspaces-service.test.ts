@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq, inArray, sql } from "drizzle-orm";
 import {
@@ -1482,8 +1483,10 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       const { deriveWorktreeInstanceId } = await import("../services/workspace-instance-cleanup.ts");
       const instanceId = deriveWorktreeInstanceId(seeded.worktreePath);
       const instanceRoot = path.join(worktreesDir, "instances", instanceId);
+      // An empty db/ dir only: no worktree create path writes <root>/config.json (the
+      // guest config is <worktree>/.paperclip/config.json, cli worktree-lib.ts
+      // resolveWorktreeLocalPaths() :212; scripts/setup-paperclip-worktree.sh :508).
       await fs.mkdir(path.join(instanceRoot, "db"), { recursive: true });
-      await fs.writeFile(path.join(instanceRoot, "config.json"), "{}\n", "utf8");
       // The real repo ignores `.paperclip/`; keep the pointer out of git status.
       await fs.appendFile(path.join(seeded.repoRoot, ".git", "info", "exclude"), ".paperclip/\n", "utf8");
       await fs.mkdir(path.join(seeded.worktreePath, ".paperclip"), { recursive: true });
@@ -1736,7 +1739,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect([...before.keys()].some((name) => name.startsWith(path.join("runtime", "custom-state", "conversation-evidence"))
         && name.endsWith("provider-stderr.log"))).toBe(true);
       // No other keep condition holds: the instance is kept ONLY by the relative override.
-      expect([...before.keys()].filter((name) => !name.startsWith(path.join("runtime", "custom-state")))).toEqual(["config.json"]);
+      expect([...before.keys()].filter((name) => !name.startsWith(path.join("runtime", "custom-state")))).toEqual([]);
       // Only the producer's own cwd resolves the value into the instance.
       const bases = [instance.instanceRoot, path.join(seeded.worktreePath, "server"), seeded.worktreePath, sweepCwd];
       expect(bases.filter((base) => path.resolve(base, relativeValue) === stateDir)).toEqual([producerCwd]);
@@ -1829,9 +1832,13 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     // master key: the key wraps the per-backup key of encrypted .pchn backups
     // whose reference rows live in that external DB
     // (native-harness-backup-storage.ts :250/:391). Removing the root loses it.
-    async function plantRootLocalKey(instanceRoot: string, databaseMode: "postgres" | "embedded-postgres") {
+    async function plantRootLocalKey(instanceRoot: string, databaseMode: "postgres" | "embedded-postgres", worktreePath: string) {
       await fs.rm(path.join(instanceRoot, "db"), { recursive: true, force: true });
-      await fs.writeFile(path.join(instanceRoot, "config.json"), `${JSON.stringify({ database: { mode: databaseMode } })}\n`, "utf8");
+      // The guest's config sits where the create path writes it, <worktree>/.paperclip/config.json,
+      // named by PAPERCLIP_CONFIG in the guest pointer (worktree-lib.ts buildWorktreeEnvEntries() :322).
+      const guestConfig = path.join(worktreePath, ".paperclip", "config.json");
+      await fs.writeFile(guestConfig, `${JSON.stringify({ database: { mode: databaseMode } })}\n`, "utf8");
+      await fs.appendFile(path.join(worktreePath, ".paperclip", ".env"), `PAPERCLIP_CONFIG=${JSON.stringify(guestConfig)}\n`, "utf8");
       // Planted (named): a 64-hex master key at resolveDefaultSecretsKeyFilePath().
       await fs.mkdir(path.join(instanceRoot, "secrets"), { recursive: true, mode: 0o700 });
       await fs.writeFile(path.join(instanceRoot, "secrets", "master.key"), "ab".repeat(32), { mode: 0o600 });
@@ -1840,7 +1847,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     it("F-KEY (never-OK): an external-Postgres instance with a root-local secrets master key is kept byte for byte", async () => {
       const seeded = await seedPastCooldown();
       const instance = await attachManagedWorktreeInstance(seeded);
-      await plantRootLocalKey(instance.instanceRoot, "postgres");
+      await plantRootLocalKey(instance.instanceRoot, "postgres", seeded.worktreePath);
+      // The root holds ONLY the scaffold key: the allow-list alone would remove it.
+      expect([...(await readTree(instance.instanceRoot)).keys()]).toEqual([path.join("secrets", "master.key")]);
       const before = await readTree(instance.instanceRoot);
 
       expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
@@ -1850,7 +1859,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     it("F-KEYc (control): an embedded-DB instance with an empty db and a root-local key is removed as today", async () => {
       const seeded = await seedPastCooldown();
       const instance = await attachManagedWorktreeInstance(seeded);
-      await plantRootLocalKey(instance.instanceRoot, "embedded-postgres");
+      await plantRootLocalKey(instance.instanceRoot, "embedded-postgres", seeded.worktreePath);
 
       await sweepAndExpectArchived(seeded, instance.worktreesDir);
       await expect(fs.lstat(instance.instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
@@ -1899,7 +1908,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       }
     }, 30_000);
 
-    it("F5 (control): a trace-free instance (no marker, empty db, empty named dirs and provider home, an outside symlink) is removed, the symlink's outside target intact", async () => {
+    it("F5 (control): a trace-free instance (no marker, empty db, empty named dirs and provider home, a symlink to an EMPTY outside dir) is removed, the symlink's outside target intact", async () => {
       const seeded = await seedPastCooldown();
       const instance = await attachManagedWorktreeInstance(seeded);
       for (const empty of [
@@ -1910,15 +1919,191 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         path.join("companies", seeded.companyId, "codex-home"),
       ]) await fs.mkdir(path.join(instance.instanceRoot, empty), { recursive: true });
       await withPointerEnv(instance, seeded, "PAPERCLIP_RUNNER_STATE_DIR=runtime/custom-state");
-      // Not a trace dir: removal unlinks it and never follows it out of the root.
+      // A symlink counts by its target (allow-list): an EMPTY target holds nothing.
+      // Removal unlinks it and never follows it out of the root.
       const outside = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reaper-outside-"));
       tempDirs.add(outside);
-      await fs.writeFile(path.join(outside, "keep.txt"), "outside the root\n", "utf8");
       await fs.symlink(outside, path.join(instance.instanceRoot, "scratch-link"));
 
       expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).not.toContain("raw traces");
       await expect(fs.lstat(instance.instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await fs.stat(outside)).isDirectory()).toBe(true);
+    }, 30_000);
+
+    // ALLOW-LIST (RFL ruling, rf-3 https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7001341272):
+    // the reaper removes an instance ONLY if its root holds nothing but the known
+    // create-path SCAFFOLD (workspace-instance-cleanup.ts WORKTREE_INSTANCE_SCAFFOLD).
+    // ANY other content anywhere under the root keeps the whole instance.
+
+    it("F5L (never-OK): a symlink in the root whose OUTSIDE target holds content keeps the instance; the target is intact", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      const outside = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reaper-outside-"));
+      tempDirs.add(outside);
+      await fs.writeFile(path.join(outside, "keep.txt"), "outside the root\n", "utf8");
+      await fs.symlink(outside, path.join(instance.instanceRoot, "scratch-link"));
+      const before = await readTree(instance.instanceRoot);
+
+      expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
+      expect(await readTree(instance.instanceRoot)).toEqual(before);
       expect(await fs.readFile(path.join(outside, "keep.txt"), "utf8")).toBe("outside the root\n");
+    }, 30_000);
+
+    it("AL1 (row 1, never-OK): a HISTORICAL producer cwd outside all 4 bases resolves a RELATIVE override into the root; its evidence there keeps the instance byte for byte", async () => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      const sweepRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reaper-cwd-"));
+      tempDirs.add(sweepRoot);
+      const sweepCwd = path.join(sweepRoot, "reaper", "process", "cwd");
+      await fs.mkdir(sweepCwd, { recursive: true });
+      // A cwd the CLI does not restrict (e.g. an operator shell, an old checkout):
+      // outside the instance root, <worktree>, <worktree>/server and the reaper's cwd.
+      const historicalRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-historical-"));
+      tempDirs.add(historicalRoot);
+      const producerCwd = path.join(historicalRoot, "some", "old", "shell", "cwd", "deep");
+      await fs.mkdir(producerCwd, { recursive: true });
+      const stateDir = path.join(instance.instanceRoot, "runtime", "custom-state");
+      const relativeValue = path.relative(producerCwd, stateDir);
+      expect(relativeValue.startsWith("..")).toBe(true);
+      await withPointerEnv(instance, seeded, `PAPERCLIP_RUNNER_STATE_DIR=${relativeValue}`);
+      const originalCwd = process.cwd();
+      process.chdir(producerCwd);
+      try {
+        await withEnv({ PAPERCLIP_HOME: instance.worktreesDir, PAPERCLIP_INSTANCE_ID: instance.instanceId,
+          PAPERCLIP_RUNNER_STATE_DIR: relativeValue }, async () => {
+          const { createNativeSetupRuntime, cleanupNativeSetupRuntime } = await import("../services/native-runtime/native-setup-evidence.ts");
+          const scratch = await createNativeSetupRuntime(seeded.companyId);
+          expect(scratch.startsWith(`${stateDir}${path.sep}`)).toBe(true);
+          await fs.writeFile(path.join(scratch, "provider-stderr.log"), "planted raw trace: historical producer cwd\n", { mode: 0o600 });
+          await cleanupNativeSetupRuntime(scratch, true);
+        });
+      } finally {
+        process.chdir(originalCwd);
+      }
+      const before = await readTree(instance.instanceRoot);
+      expect([...before.keys()].some((name) => name.startsWith(path.join("runtime", "custom-state", "conversation-evidence"))
+        && name.endsWith("provider-stderr.log"))).toBe(true);
+      // NONE of the 4 bases resolves the value into the root: only the allow-list can keep it.
+      const bases = [instance.instanceRoot, path.join(seeded.worktreePath, "server"), seeded.worktreePath, sweepCwd];
+      expect(bases.filter((base) => path.resolve(base, relativeValue) === stateDir)).toEqual([]);
+
+      process.chdir(sweepCwd);
+      try {
+        expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
+      } finally {
+        process.chdir(originalCwd);
+      }
+      expect(await readTree(instance.instanceRoot)).toEqual(before);
+    }, 30_000);
+
+    // Provider-config homes a provider CLI writes under HOME / XDG_* / GEMINI_CLI_HOME /
+    // OpenCode / ACP when one of those points INTO the root. Planted (named) content.
+    it.each([
+      ["$HOME/.claude (HOME)", path.join(".claude", "projects", "-work", "session-1.jsonl")],
+      ["$XDG_CONFIG_HOME/opencode (OpenCode config)", path.join(".config", "opencode", "opencode.json")],
+      ["$XDG_DATA_HOME/opencode (OpenCode sessions)", path.join(".local", "share", "opencode", "storage", "session", "ses_1.json")],
+      ["$GEMINI_CLI_HOME/.gemini (Gemini chats)", path.join(".gemini", "tmp", "0123abcd", "chats", "session-1.json")],
+      ["ACP agent state", path.join("acp", "sessions", "sess-1.json")],
+    ])("AL2 (row 2, never-OK): a provider-config home inside the root, %s, holding content keeps the instance byte for byte", async (_label, relativeFile) => {
+      const seeded = await seedPastCooldown();
+      const instance = await attachManagedWorktreeInstance(seeded);
+      const file = path.join(instance.instanceRoot, relativeFile);
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, '{"role":"assistant","text":"planted provider transcript"}\n', "utf8");
+      const before = await readTree(instance.instanceRoot);
+
+      expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
+      expect(await readTree(instance.instanceRoot)).toEqual(before);
+    }, 30_000);
+
+    // The REAL create path that makes an instance root before any run:
+    // scripts/setup-paperclip-worktree.sh write_fallback_worktree_config() (its node
+    // program, run byte for byte from the script): mkdir <root> (:528), secrets/ (:594/:607)
+    // and secrets/master.key, inline (:595-598) or copied from the source key (:608-609).
+    // It also writes the guest pointer <worktree>/.paperclip/.env and config.json.
+    async function createInstanceByRealCreatePath(seeded: Awaited<ReturnType<typeof seedTerminalWorkspace>>, keySource: "file" | "inline") {
+      const worktreesDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reaper-instances-"));
+      tempDirs.add(worktreesDir);
+      const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-source-instance-"));
+      tempDirs.add(sourceDir);
+      const sourceKey = path.join(sourceDir, "secrets", "master.key");
+      await fs.mkdir(path.dirname(sourceKey), { recursive: true });
+      await fs.writeFile(sourceKey, "cd".repeat(32), { mode: 0o600 });
+      await fs.writeFile(path.join(sourceDir, "config.json"), `${JSON.stringify({
+        database: { mode: "embedded-postgres", embeddedPostgresPort: 54329 },
+        server: { port: 3100 },
+        secrets: { provider: "local_encrypted", localEncrypted: { keyFilePath: sourceKey } },
+      })}\n`, "utf8");
+      if (keySource === "inline") {
+        await fs.writeFile(path.join(sourceDir, ".env"), `PAPERCLIP_SECRETS_MASTER_KEY=${Buffer.alloc(32, 7).toString("base64")}\n`, "utf8");
+      }
+      const { deriveWorktreeInstanceId } = await import("../services/workspace-instance-cleanup.ts");
+      const instanceId = deriveWorktreeInstanceId(seeded.worktreePath);
+      const instanceRoot = path.join(worktreesDir, "instances", instanceId);
+      await fs.appendFile(path.join(seeded.repoRoot, ".git", "info", "exclude"), ".paperclip/\n", "utf8");
+      const script = await fs.readFile(fileURLToPath(new URL("../../../scripts/setup-paperclip-worktree.sh", import.meta.url)), "utf8");
+      const fn = script.slice(script.indexOf("write_fallback_worktree_config() {"));
+      const program = fn.slice(fn.indexOf("node <<'EOF'\n") + "node <<'EOF'\n".length, fn.indexOf("\nEOF\n"));
+      expect(program).toContain("fs.mkdirSync(instanceRoot, { recursive: true });");
+      const { execFileSync } = await import("node:child_process");
+      execFileSync(process.execPath, ["-"], {
+        input: program,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: os.homedir(),
+          WORKTREE_NAME: path.basename(seeded.worktreePath),
+          PAPERCLIP_DIR: path.join(seeded.worktreePath, ".paperclip"),
+          SOURCE_CONFIG_PATH: path.join(sourceDir, "config.json"),
+          SOURCE_ENV_PATH: path.join(sourceDir, ".env"),
+          WORKTREE_INSTANCE_ID: instanceId,
+          PAPERCLIP_WORKTREES_DIR: worktreesDir,
+        },
+      });
+      await db.update(executionWorkspaces).set({ metadata: { worktreeInstanceRoot: instanceRoot } })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      return { worktreesDir, instanceId, instanceRoot };
+    }
+
+    it.each(["file", "inline"] as const)("AL3 (row 3, control): a FRESH unused instance made by the real create path (key %s), holding only the scaffold, is REMOVED", async (keySource) => {
+      const seeded = await seedPastCooldown();
+      const instance = await createInstanceByRealCreatePath(seeded, keySource);
+      // Only the scaffold: the root, secrets/ and secrets/master.key.
+      expect([...(await readTree(instance.instanceRoot)).keys()]).toEqual([path.join("secrets", "master.key")]);
+      const pointer = await fs.readFile(path.join(seeded.worktreePath, ".paperclip", ".env"), "utf8");
+      expect(pointer).toContain(`PAPERCLIP_INSTANCE_ID=${JSON.stringify(instance.instanceId)}`);
+      expect(pointer).toContain("PAPERCLIP_CONFIG=");
+
+      expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).not.toContain("raw traces");
+      await expect(fs.lstat(instance.instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    }, 30_000);
+
+    // Row 4: a scaffold file changed beyond its created form. The scaffold check is by
+    // NAME + CREATED SHAPE: secrets/master.key must be a regular file (not a symlink)
+    // whose bytes the provider's own decoder accepts as a 32-byte master key
+    // (local-encrypted-provider.ts isValidLocalEncryptedMasterKey()), and secrets/
+    // holds nothing else.
+    it.each([
+      ["master.key with bytes appended", async (root: string) => {
+        await fs.appendFile(path.join(root, "secrets", "master.key"), "\n# operator note: old key was 9f..\n");
+      }],
+      ["master.key replaced by a symlink to another key", async (root: string) => {
+        const real = path.join(root, "secrets", "master.key");
+        const other = path.join(path.dirname(path.dirname(root)), "other-master.key");
+        await fs.writeFile(other, "ef".repeat(32), { mode: 0o600 });
+        await fs.rm(real);
+        await fs.symlink(other, real);
+      }],
+      ["a second file beside master.key", async (root: string) => {
+        await fs.writeFile(path.join(root, "secrets", "master.key.previous"), "ab".repeat(32), { mode: 0o600 });
+      }],
+    ])("AL4 (row 4, never-OK): a scaffold changed beyond its created form, %s, keeps the instance byte for byte", async (_label, modify) => {
+      const seeded = await seedPastCooldown();
+      const instance = await createInstanceByRealCreatePath(seeded, "file");
+      await modify(instance.instanceRoot);
+      const before = await readTree(instance.instanceRoot);
+
+      expect(await sweepAndExpectArchived(seeded, instance.worktreesDir)).toContain("raw traces");
+      expect(await readTree(instance.instanceRoot)).toEqual(before);
     }, 30_000);
   });
 
