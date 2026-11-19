@@ -1587,8 +1587,11 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         if (options.expectedStatus && !fenced) return false;
         if (fenced) run = fenced;
         // Server-owned (source ids NULL) and in the fence's commit: a failed append rolls back the acceptance.
-        // Every accepted Interrupt leaves its row (it only denies); a person Stop counts only on a native run.
-        if (fenced && (options.stopAcceptance === "interrupt" || (options.stopAcceptance && fenced.runtimeMode === "native"))) await appendHeartbeatRunEvent(tx as unknown as Db, {
+        // Every accepted Interrupt leaves its row (it only denies); a person Stop counts on a native run, and on a
+        // native-bound (paperclip_runner) run whose Stop lands during startup, before native selection.
+        if (fenced && (options.stopAcceptance === "interrupt" || (options.stopAcceptance && fenced.runtimeMode === "native")
+          || (options.stopAcceptance === "person_stop"
+            && parseObject(fenced.runnerProfileJson?.adapterDispatch).adapterType === "paperclip_runner"))) await appendHeartbeatRunEvent(tx as unknown as Db, {
           companyId: fenced.companyId, runId, agentId: fenced.agentId, eventType: "lifecycle", stream: "system", level: "info",
           message: "run.stop.accepted", payload: { schema: "paperclip.stop-acceptance.v1", kind: options.stopAcceptance,
             issueId: handoffIssueId, userId: attribution.cancelledByUserId ?? null, acceptedAt: requestedAt }, keepRunUpdatedAt: true });
