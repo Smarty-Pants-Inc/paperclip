@@ -12,14 +12,14 @@ import { join } from "node:path";
 import { eq, inArray, sql } from "drizzle-orm";
 import { nativeSha256 } from "./canonical.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agentTaskSessions, agents, companies, controllerInstances, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, issueComments, nativeRunFinalizations, nativeRunResults, nativeRunnerCheckpoints } from "@paperclipai/db";
+import { agentTaskSessions, agents, companies, controllerInstances, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, issueComments, nativeRunFinalizations, nativeRunResults, nativeRunnerCheckpoints, toolInvocations } from "@paperclipai/db";
 import { decodeDurablePrpCheckpoint, DurablePrpControlPlane, NativeProviderTerminalFailure, parseNativeExecutionInput, QUALIFIED_PI_RPC_PROFILE, type DurablePrpCheckpoint, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/helpers/recovery-postgres.js";
 import { createIsolatedTestHome } from "../../__tests__/helpers/isolated-test-home.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
 import { assertNativeRunnerCheckpointOwner, loadNativeRunnerCheckpoint, nativeRunnerCheckpointWriter } from "./native-runner-checkpoint.js";
 import { assertNativeHarnessBackupOwner, nativeHarnessBackupOwner } from "./native-harness-backup-storage.js";
-import { assertNativeRetainedSandboxBinding, createNativeControllerRecovery, deferNativeControllerRecovery, deferNativeRunForBusyAgentDirectory, NATIVE_AGENT_DIRECTORY_BUSY_WAIT, importNativeControllerRecovery, NativeControllerRecoveryWaitingError, NATIVE_RETAINED_OWNER_WAIT, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
+import { assertNativeRetainedSandboxBinding, createNativeControllerRecovery, deferNativeControllerRecovery, deferNativeRunForBusyAgentDirectory, NATIVE_AGENT_DIRECTORY_BUSY_WAIT, importNativeControllerRecovery, NativeControllerRecoveryWaitingError, NATIVE_RETAINED_OWNER_WAIT, resolveNativeControllerRecovery, takeSkippedRunSessionCustody } from "./native-controller-recovery.js";
 import { claimNativeSessionResumptions } from "./native-finalization-reconciler.js";
 import { claimNativeRestartRecoveries, currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { NativePredecessorRetirementUnprovenError } from "./predecessor-retirement.js";
@@ -656,7 +656,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
   // either wrote a checkpoint (no `sessionCheckpoint` key at all). The
   // successor on a NEW box must restore from A's checkpoint, not fail on
   // `snapshot_binding`, and never over progress the cut runs made.
-  it.each(["no-progress", "write-tool", "other-session"] as const)(
+  it.each(["no-progress", "write-tool", "other-session", "foreign-receipt"] as const)(
     "recovers a successor on a new box from the newest valid checkpoint past runs cut before their first checkpoint (%s)", async shape => {
       const a = await seed();
       await importNativeControllerRecovery(db, { ...a.scope, expectedConfigDigest: compatibility.configDigest, supervisor: a.supervisor });
@@ -688,6 +688,14 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
       }
       if (shape === "write-tool") await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: cut[0], seq: 4,
         stream: "system", eventType: "tool.execution.started", payload: { name: "write_file", executionId: "call-1", transport: "process" } });
+      if (shape === "foreign-receipt") {
+        // (b) B called a non-process tool; only C holds a succeeded read receipt
+        // for that call id. C's receipt must not clear B's own call.
+        await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: cut[0], seq: 4, stream: "system",
+          eventType: "tool.execution.started", payload: { name: "write_file", executionId: "call-b", transport: "mcp" } });
+        await db.insert(toolInvocations).values({ companyId, runId: cut[1], toolName: "read_file", correlationId: "call-b",
+          riskLevel: "read", status: "succeeded" });
+      }
       const custody = async () => nativeSha256({
         runs: (await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.id, cut))).sort((x, y) => x.id.localeCompare(y.id)),
         lines: (await db.select().from(heartbeatRunEvents).where(inArray(heartbeatRunEvents.runId, cut)))
@@ -698,7 +706,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
         nativeSessionId: a.scope.normalizedSessionId, runnerInstanceId: randomUUID(), status: "running", runtimeMode: "native",
         createdAt: new Date(t0 + 90_000) });
       const recovered = await resolveNativeControllerRecovery(db, { ...a.scope, currentRunId: successorId });
-      if (shape === "write-tool") {
+      if (shape === "write-tool" || shape === "foreign-receipt") {
         expect(recovered).toEqual({ kind: "missing_evidence", reason: "progress_after_checkpoint" });
       } else if (shape === "other-session") {
         expect(recovered).toEqual({ kind: "missing_evidence", reason: "snapshot_binding" });
@@ -707,6 +715,34 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
         expect(recovered).toMatchObject({ kind: "recoverable", snapshot: { identity: { runId: a.scope.runId } } });
         if (recovered.kind !== "recoverable") return;
         expect(recovered.checkpoint.runId).toBe(a.scope.runId);
+        // (a) NEVER-OK: the restore names the cut runs it goes past, and their Pi
+        // session files are in custody with matching sha before the session is
+        // replaced; a failing copy refuses.
+        // Newest first, as the window walks back from the barrier.
+        expect(recovered.skippedRunIds).toEqual([...cut].reverse());
+        const box = await mkdtemp(join(tmpdir(), "ncr-custody-"));
+        try {
+          await mkdir(join(box, "pi", "sessions"), { recursive: true });
+          const trace = cut.map(id => JSON.stringify({ runId: id, type: "message" })).join("\n");
+          await writeFile(join(box, "pi", "sessions", "conversation.jsonl"), trace);
+          const taken = takeSkippedRunSessionCustody(box, recovered.skippedRunIds ?? []);
+          const sha = `sha256:${createHash("sha256").update(trace).digest("hex")}`;
+          expect(taken?.files).toEqual({ "pi/sessions/conversation.jsonl": sha });
+          const copied = await readFile(join(taken!.custodyRoot, "pi", "sessions", "conversation.jsonl"));
+          expect(`sha256:${createHash("sha256").update(copied).digest("hex")}`).toBe(sha);
+          expect(JSON.parse(await readFile(join(taken!.custodyRoot, "skipped-run-custody.json"), "utf8")))
+            .toMatchObject({ skippedRunIds: [...cut].reverse(), files: { "pi/sessions/conversation.jsonl": sha } });
+          recovered.checkpoint.restoreSessionDirectory(box);
+          expect(await readFile(join(taken!.custodyRoot, "pi", "sessions", "conversation.jsonl"), "utf8")).toBe(trace);
+          // A failing copy (custody parent is not a directory) refuses.
+          const blocked = await mkdtemp(join(tmpdir(), "ncr-custody-fail-"));
+          await mkdir(join(blocked, "pi"), { recursive: true });
+          await writeFile(join(blocked, "pi", "s.jsonl"), "x");
+          await writeFile(join(blocked, "continuity-breaks"), "not a directory");
+          expect(() => takeSkippedRunSessionCustody(blocked, recovered.skippedRunIds ?? []))
+            .toThrow("native_controller_recovery_missing_evidence:skipped_run_custody_failed");
+          await rm(blocked, { recursive: true, force: true });
+        } finally { await rm(box, { recursive: true, force: true }); }
         // The successor then runs on its new box through the real executor
         // and control plane; only the provider boundary is a scripted peer.
         const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successorId));

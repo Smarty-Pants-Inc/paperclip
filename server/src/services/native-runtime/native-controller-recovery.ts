@@ -1,5 +1,6 @@
-import { createHash } from "node:crypto";
-import { posix } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { posix, resolve as resolvePath } from "node:path";
 import { and, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, nativeRunnerCheckpoints, nativeRunResults, toolInvocations, type Db } from "@paperclipai/db";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
@@ -72,7 +73,10 @@ export function readNativeControllerRecovery(value: unknown, snapshot: unknown):
 }
 
 export type NativeControllerRecoveryOutcome =
-  | { kind: "recoverable"; snapshot: PersistedNativeSession; metadata: NativeControllerRecovery; checkpoint: DurablePrpCheckpoint }
+  | { kind: "recoverable"; snapshot: PersistedNativeSession; metadata: NativeControllerRecovery; checkpoint: DurablePrpCheckpoint;
+    /** Runs cut before their first checkpoint that this restore goes past; their
+     * Pi session files go into custody before the session is replaced. */
+    skippedRunIds?: string[] }
   | { kind: "waiting_for_owner"; deadline: Date }
   | { kind: "missing_evidence" | "unsupported" | "dependency_unavailable"; reason: string; cause?: unknown }
   | { kind: "no_prior_execution" };
@@ -433,10 +437,10 @@ async function sourcePastUncheckpointedCuts(db: Db, input: {
     break;
   }
   if (!source) return unchanged;
-  const events = await db.select({ eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload })
+  const events = await db.select({ runId: heartbeatRunEvents.runId, eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload })
     .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, input.companyId), inArray(heartbeatRunEvents.runId, skipped),
       inArray(heartbeatRunEvents.eventType, CUT_RUN_PROGRESS_EVENT_TYPES)));
-  const receipts = await db.select({ id: toolInvocations.id, correlationId: toolInvocations.correlationId, riskLevel: toolInvocations.riskLevel,
+  const receipts = await db.select({ runId: toolInvocations.runId, id: toolInvocations.id, correlationId: toolInvocations.correlationId, riskLevel: toolInvocations.riskLevel,
     status: toolInvocations.status }).from(toolInvocations).where(and(eq(toolInvocations.companyId, input.companyId),
     inArray(toolInvocations.runId, skipped)));
   const ownWork = receipts.some(row => row.riskLevel !== "read") || events.some(event => {
@@ -445,8 +449,10 @@ async function sourcePastUncheckpointedCuts(db: Db, input: {
     // the successor; it is not work of the cut turn.
     if (event.eventType.startsWith("item.")) return p.kind !== "userMessage";
     if (event.eventType !== "tool.execution.started") return true;
-    // Only a receipted, succeeded read is not a write.
-    return p.transport === "process" || !receipts.some(row => (row.id === p.executionId || row.correlationId === p.executionId)
+    // Only THIS run's own receipted, succeeded read is not a write: another
+    // skipped run's receipt never clears this run's tool call.
+    return p.transport === "process" || !receipts.some(row => row.runId === event.runId
+      && (row.id === p.executionId || row.correlationId === p.executionId)
       && row.riskLevel === "read" && row.status === "succeeded");
   });
   const [ownCheckpoint] = await db.select({ runId: nativeRunnerCheckpoints.runId }).from(nativeRunnerCheckpoints).where(and(
@@ -526,7 +532,44 @@ export async function resolveNativeControllerRecovery(db: Db, input: {
     || checkpoint.recoveryEvidence.normalizedSessionId !== input.normalizedSessionId) {
     return { kind: "missing_evidence", reason: "checkpoint_binding" };
   }
-  return { kind: "recoverable", snapshot: snapshot as unknown as PersistedNativeSession, metadata, checkpoint };
+  return { kind: "recoverable", snapshot: snapshot as unknown as PersistedNativeSession, metadata, checkpoint,
+    ...(past!.skipped.length ? { skippedRunIds: [...past!.skipped] } : {}) };
+}
+
+/** NEVER-OK: a restore past cut runs must not lose their session trace. Before
+ * `restoreSessionDirectory` replaces the session in `root`, copy its Pi session
+ * files (NATIVE_CONTINUITY_STATE_ENTRIES' `pi` and `pi-agent`) into the existing
+ * trace custody, `continuity-breaks/` (native-session-executor.ts
+ * retireFinishedPerTurnRunnerdOwner / moveNativeContinuityState, kept by
+ * native-harness-backup-expiration.ts), with a recorded sha per file, verified
+ * after the copy. Any failure throws: the caller refuses the restore. */
+export function takeSkippedRunSessionCustody(root: string, skippedRunIds: readonly string[]): { custodyRoot: string; files: Record<string, string> } | null {
+  if (skippedRunIds.length === 0) return null;
+  const fileSha = (path: string) => `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
+  try {
+    const custodyRoot = resolvePath(root, "continuity-breaks", `${Date.now()}-${randomUUID()}`);
+    mkdirSync(custodyRoot, { recursive: true, mode: 0o700 });
+    const files: Record<string, string> = {};
+    const copy = (relative: string) => {
+      const source = resolvePath(root, relative), target = resolvePath(custodyRoot, relative), stat = lstatSync(source);
+      if (stat.isSymbolicLink()) throw new Error(`symlink:${relative}`);
+      if (stat.isDirectory()) {
+        mkdirSync(target, { recursive: true, mode: 0o700 });
+        for (const name of readdirSync(source).sort()) copy(posix.join(relative, name));
+        return;
+      }
+      copyFileSync(source, target);
+      const sha = fileSha(source);
+      if (fileSha(target) !== sha) throw new Error(`sha_mismatch:${relative}`);
+      files[relative] = sha;
+    };
+    for (const entry of ["pi", "pi-agent"]) if (existsSync(resolvePath(root, entry))) copy(entry);
+    writeFileSync(resolvePath(custodyRoot, "skipped-run-custody.json"), `${JSON.stringify({
+      schema: "paperclip.native.skipped-run-custody.v1", skippedRunIds: [...skippedRunIds], files }, null, 2)}\n`, { mode: 0o600 });
+    return { custodyRoot, files };
+  } catch (cause) {
+    throw new Error("native_controller_recovery_missing_evidence:skipped_run_custody_failed", { cause });
+  }
 }
 
 /** Bounded internal migration of ONE retained source while its disk is available.

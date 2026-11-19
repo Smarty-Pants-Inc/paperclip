@@ -290,7 +290,7 @@ import {
   nativeRunResults,
 } from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
-import { assertNativeRetainedSandboxBinding, deferNativeControllerRecovery, NativeControllerRecoveryWaitingError, readNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
+import { assertNativeRetainedSandboxBinding, deferNativeControllerRecovery, NativeControllerRecoveryWaitingError, readNativeControllerRecovery, resolveNativeControllerRecovery, takeSkippedRunSessionCustody } from "./native-controller-recovery.js";
 import type { FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
 import type { EnvironmentDriverExecuteInput } from "../environment-runtime.js";
 import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
@@ -8229,6 +8229,7 @@ async function refreshFinishedPerTurnRunnerdProjectionOnce(
           if (readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8") !== referenceBytes) {
             return refuse("journal_changed");
           }
+          takeSkippedRunSessionCustody(root, recovered.skippedRunIds ?? []);
           onApply();
           recovered.checkpoint.restoreSessionDirectory(root);
         });
@@ -8263,6 +8264,7 @@ async function refreshFinishedPerTurnRunnerdProjectionOnce(
       if (readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8") !== referenceBytes) {
         return refuse("journal_changed");
       }
+      takeSkippedRunSessionCustody(root, recovered.skippedRunIds ?? []);
       onApply();
       const archiveParent = resolve(root, "continuity-breaks");
       mkdirSync(archiveParent, { recursive: true, mode: 0o700 });
@@ -8555,6 +8557,8 @@ async function restoreNativeControllerProjections(db: Db, execution: NativeExecu
     throw new NativeControllerRecoveryWaitingError(recovered.deadline);
   }
   if (recovered.kind !== "recoverable") throw nativeReconciliationError(`native_controller_recovery_${recovered.kind}:${recovered.reason}`, { cause: recovered.cause });
+  // A restore past cut runs first puts their Pi session files into custody; a failed copy refuses.
+  takeSkippedRunSessionCustody(root, recovered.skippedRunIds ?? []);
   recovered.checkpoint.restoreSessionDirectory(root);
   if (execution.session.lifecyclePolicy.mode === "warm") {
     persistWarmNativeCheckpoint(execution, recovered.metadata.configDigest, recovered.snapshot,
