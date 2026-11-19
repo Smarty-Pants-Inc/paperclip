@@ -123,6 +123,7 @@ describe("worktree instance cleanup", () => {
   it.each([
     ["holds run-log bytes object storage has not taken", "refused", false],
     ["holds recovered spill bytes retained as raw traces", "refused", true],
+    ["has a record that cannot be read", "refused", "unreadable"],
   ] as const)("an instance whose run-log spill %s is %s", async (_case, status, recovered) => {
     const worktreesDir = await makeTempRoot("paperclip-managed-worktrees-");
     const workspacePath = await makeTempRoot("paperclip-cleanup-workspace-");
@@ -135,7 +136,7 @@ describe("worktree instance cleanup", () => {
       bytes: bytes.length, sha256: "0".repeat(64), journalEnd: 0 };
     await fs.writeFile(path.join(spillDir, "run.ndjson"), bytes);
     await fs.writeFile(path.join(spillDir, "run.index.ndjson"),
-      [entry, ...(recovered ? [{ ...entry, event: "recovered", journalEnd: bytes.length }] : [])]
+      recovered === "unreadable" ? "{torn" : [entry, ...(recovered ? [{ ...entry, event: "recovered", journalEnd: bytes.length }] : [])]
         .map(line => `${JSON.stringify(line)}\n`).join(""));
     await writeWorkspaceEnv(workspacePath, worktreesDir, instanceId);
     const { recorder, operations } = createRecorderDouble();
