@@ -438,6 +438,7 @@ import {
   withQueuedCommentIdsInWakePayload,
 } from "../services/issue-queued-comment-queue.js";
 import { interruptedTurnUnansweredCommentIds } from "../services/interrupted-turn-input.js";
+import { answeredPersonMessageIds } from "../services/person-message-answer.js";
 import { readUnreadSteeredForInterrupt } from "../services/native-runtime/unread-steered-messages.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
@@ -7851,12 +7852,18 @@ export function issueRoutes(
       : null;
     // Messages the active run took into its first turn are no longer queued.
     const claimedByFirstTurn = queueState?.state === "deferred" ? firstTurnClaimedCommentIds(input.activeRun) : new Set<string>();
-    const comments = (await queueCommentsForWake(
+    const waiting = (await queueCommentsForWake(
       input.executor,
       input.issue.id,
       wake,
       response,
     )).filter((comment) => !claimedByFirstTurn.has(comment.id));
+    // An answered message is not waiting (adopt-carry-guards, RFL 11:41Z): after an
+    // Interrupt the successor can answer a message another wake still lists. The ONE
+    // answer reader decides (answeredPersonMessageIds); no second predicate.
+    const answered = await answeredPersonMessageIds(input.executor as Db, { companyId: input.issue.companyId,
+      issueId: input.issue.id, commentIds: waiting.map((comment) => comment.id) });
+    const comments = waiting.filter((comment) => !answered.has(comment.id));
     const assignedAgent = input.issue.assigneeAgentId
       ? await input.executor
           .select({ adapterType: agents.adapterType })
