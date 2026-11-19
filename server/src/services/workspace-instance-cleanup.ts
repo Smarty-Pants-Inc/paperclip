@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
 import { expandHomePrefix } from "../home-paths.js";
 import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
+import { listUnrecoveredObjectRunLogSpills, RUN_LOG_SPILL_SUBDIR } from "./object-run-log-store.js";
 
 const execFileAsync = promisify(execFile);
 const INSTANCE_ID_RE = /^[A-Za-z0-9_-]+$/;
@@ -361,6 +362,28 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
       canonicalInstanceRoot,
       canonicalManagedInstancesDir,
       refusalReason: "canonical_path_outside_managed_instances_dir",
+    });
+    return { status: "refused", instanceRoot: configuredInstanceRoot, warning };
+  }
+
+  // Run-log bytes that object storage refused exist only in the kept spill
+  // under this root (data/run-logs/.spill). They are never removed with it:
+  // the instance stays until its spill is stored in the object log.
+  let unrecoveredRunLogSpills: string[];
+  try {
+    unrecoveredRunLogSpills = await listUnrecoveredObjectRunLogSpills(
+      path.join(canonicalInstanceRoot, "data", "run-logs", RUN_LOG_SPILL_SUBDIR));
+  } catch (error) {
+    warning = `Refusing to remove instance directory "${configuredInstanceRoot}" because its run-log spill could not be read: ${error instanceof Error ? error.message : String(error)}`;
+    await recordRefusal({ canonicalInstanceRoot, refusalReason: "run_log_spill_unreadable" });
+    return { status: "refused", instanceRoot: configuredInstanceRoot, warning };
+  }
+  if (unrecoveredRunLogSpills.length) {
+    warning = `Refusing to remove instance directory "${configuredInstanceRoot}" because it holds ${unrecoveredRunLogSpills.length} run-log spill(s) that object storage has not taken.`;
+    await recordRefusal({
+      canonicalInstanceRoot,
+      refusalReason: "run_log_spill_unrecovered",
+      unrecoveredRunLogSpills: unrecoveredRunLogSpills.slice(0, 20),
     });
     return { status: "refused", instanceRoot: configuredInstanceRoot, warning };
   }

@@ -112,9 +112,10 @@ export async function listUnrecoveredObjectRunLogSpills(spillDir?: string) {
       for (const file of await list(path.join(root, company.name, agent.name))) {
         if (!file.isFile() || !file.name.endsWith(SPILL_INDEX_SUFFIX)) continue;
         const logRef = `${company.name}/${agent.name}/${file.name.slice(0, -SPILL_INDEX_SUFFIX.length)}`;
-        try {
-          if ((await readSpillIndex(spillPaths(spillDir, logRef).indexPath)).open.length) found.push(logRef);
-        } catch { /* Not a spill this store wrote; it is left as it is. */ }
+        // A record that cannot be read counts as unstored: its bytes are never assumed safe elsewhere.
+        const unstored = await readSpillIndex(path.join(root, company.name, agent.name, file.name))
+          .then(index => index.open.length > 0, () => true);
+        if (unstored) found.push(logRef);
       }
     }
   }
