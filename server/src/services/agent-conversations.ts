@@ -14,7 +14,7 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import type { NativeStatusDecision } from "./native-runtime/status-arbiter.js";
-import { and, desc, eq, isNull, notInArray, sql } from "drizzle-orm";
+import { and, desc, eq, isNull, notInArray, sql, type SQL } from "drizzle-orm";
 import {
   agents,
   agentTaskSessions,
@@ -34,7 +34,7 @@ import { createHeartbeatTimerPolicy, parseHeartbeatPolicy } from "./heartbeat/ti
 import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { HttpError } from "../errors.js";
 import { commentCarriedSql } from "./interrupt-carry-custody.js";
-import { personMessageOwedSql } from "./person-message-answer.js";
+import { deferredWakeIsStaleSql, personMessageOwedSql } from "./person-message-answer.js";
 
 export type ConversationIdentity = {
   conversationAgentId?: string | null;
@@ -587,6 +587,21 @@ export async function conversationReplay(
     .join("\n");
 }
 
+/** An unclaimed cancellation (for example an agent pause) never delivered the
+ * input. It may be sent again only while the saved wake has not been moved
+ * past. Keep claimed and stale receipts, including never-carried input whose
+ * only remaining response is its one unanswered-message note. */
+function retainedConversationReceiptSql(issueId: SQL): SQL {
+  return sql`(${agentWakeupRequests.status} <> 'cancelled'
+    or ${agentWakeupRequests.runId} is not null or ${agentWakeupRequests.claimedAt} is not null
+    or exists (select 1 from ${heartbeatRuns} receipt_run
+      where receipt_run.company_id = ${agentWakeupRequests.companyId}
+        and receipt_run.wakeup_request_id = ${agentWakeupRequests.id})
+    or ${deferredWakeIsStaleSql({ companyId: sql`${agentWakeupRequests.companyId}`,
+      agentId: sql`${agentWakeupRequests.agentId}`, issueId,
+      requestedAt: sql`${agentWakeupRequests.requestedAt}`, payload: sql`${agentWakeupRequests.payload}` })})`;
+}
+
 /** Comment rows form a durable outbox for the narrow commit-to-enqueue crash window. */
 export async function undeliveredConversationComments(
   db: Db,
@@ -606,7 +621,8 @@ export async function undeliveredConversationComments(
         eq(issueComments.origin, "comment"),
         sql`${issueComments.clientRequestId} is not null`,
         sql`not exists (select 1 from ${agentWakeupRequests} where ${agentWakeupRequests.companyId} = ${companyId}
-      and ${agentWakeupRequests.idempotencyKey} = 'conversation-comment:' || ${issueComments.id}::text)`,
+      and ${agentWakeupRequests.idempotencyKey} = 'conversation-comment:' || ${issueComments.id}::text
+      and ${retainedConversationReceiptSql(sql`${issueComments.issueId}`)})`,
         // A same-turn hand-off owns this input without a wake. This also closes
         // the POST/outbox crash window and keeps retries from creating a second run.
         sql`not exists (select 1 from ${heartbeatRuns} steered_run where steered_run.company_id = ${companyId}
@@ -714,6 +730,7 @@ async function appendConversationQueueComment(db: Db, comment: typeof issueComme
     const key = `conversation-comment:${comment.id}`;
     const [receipt] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, comment.companyId), eq(agentWakeupRequests.idempotencyKey, key),
+      retainedConversationReceiptSql(sql`${issue.id}::uuid`),
     )).limit(1);
     if (receipt) return true;
     const [tail] = await tx.select().from(agentWakeupRequests).where(and(

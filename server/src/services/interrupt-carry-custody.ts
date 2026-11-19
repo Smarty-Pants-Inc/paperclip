@@ -19,6 +19,11 @@ import { answeredPersonMessageIds } from "./person-message-answer.js";
 export function commentCarriedSql(companyId: string, issueId: string, id: SQL): SQL {
   return sql`(exists (select 1 from ${agentWakeupRequests} held where held.company_id = ${companyId}::uuid
       and held.payload->>'issueId' = ${issueId}::text
+      -- A pause can cancel a plain wake before any run claims it. Such a
+      -- receipt never took custody; actual Interrupt/restore run records below still do.
+      and (held.status <> 'cancelled' or held.run_id is not null or held.claimed_at is not null
+        or exists (select 1 from ${heartbeatRuns} receipt_run where receipt_run.company_id = held.company_id
+          and receipt_run.wakeup_request_id = held.id))
       and coalesce(held.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? (${id})::text)
     or exists (select 1 from ${heartbeatRuns} cut where cut.company_id = ${companyId}::uuid
       and (cut.native_issue_id = ${issueId}::uuid or cut.context_snapshot->>'issueId' = ${issueId}::text)
