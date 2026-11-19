@@ -197,6 +197,7 @@ export const trySteerConversationComment = trySteerPersonComment;
 export type SteeredCommentDisplay = {
   steeredIntoRunId: string | null;
   steeredAt: string | null;
+  steerDeliveredAt: string | null;
   steeringStatus: "accepted" | "delivered" | null;
   steeringDeliveryEventSeq: number | null;
   deliveryOutcome: "steered" | "queued" | "ordinary";
@@ -240,9 +241,11 @@ export async function withSteeredCommentDisplay<T extends { id: string; issueId:
     const run = runs.find(run => ids(run.contextSnapshot?.steeredCommentIds).includes(comment.id));
     const ack = object(object(run?.resultJson?.queuedSteeringAcknowledgements)[comment.id]);
     const seq = object(run?.contextSnapshot?.steeredDeliveryEventSeqs)[comment.id];
+    const deliveredAt = object(run?.contextSnapshot?.steeredDeliveredAts)[comment.id];
     return { ...comment, steeredIntoRunId: run?.id ?? null, steeredAt: typeof ack.acknowledgedAt === "string" ? ack.acknowledgedAt : null,
       steeringStatus: run ? typeof seq === "number" ? "delivered" : "accepted" : null,
       steeringDeliveryEventSeq: typeof seq === "number" ? seq : null,
+      steerDeliveredAt: typeof deliveredAt === "string" ? deliveredAt : null,
       deliveryOutcome: run ? "steered" : waiting.has(comment.id) ? "queued" : "ordinary",
       steeringUnavailableReason: !run && waiting.has(comment.id) && intents.get(comment.id) === "steer" ? unavailable : null };
   });
