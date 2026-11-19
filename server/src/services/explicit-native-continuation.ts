@@ -42,7 +42,7 @@ import { canResumePreservedResultFinalization } from "./preserved-result-finaliz
 import { isServerReplacementInterruption } from "./server-replacement-interruption.js";
 import { normalizeAgentNameKey } from "./agent-name-key.js";
 import { liftInterruptionBlock } from "./interruption-block-release.js";
-import { isAcknowledgedNativeStop, readPersonStopHold } from "./acknowledged-native-stop.js";
+import { isAcknowledgedNativeStop, isPersonAcceptedStartupStop, readPersonStopHold } from "./acknowledged-native-stop.js";
 
 type Run = Pick<typeof heartbeatRuns.$inferSelect,
   "id" | "companyId" | "agentId" | "status" | "startedAt" | "finishedAt" | "createdAt" |
@@ -550,7 +550,15 @@ export async function admitExplicitNativeContinuation(input: {
       && !freshIntent && !await hasVerifiedWorkspaceRepair(db, run)) {
       return blocked("workspace_repair_required", "Paperclip is recovering saved work before continuing. Your message is saved.");
     }
-    const cancelledStartup = await isCancelledNativeStartup(db, run, coordinator);
+    // A person's own accepted Stop (or task-tree Pause) of this run in startup
+    // is proven by the one fact the release and the projection also read; the
+    // person's Send then starts one successor with the held messages.
+    // Native shape only: a Stop before native selection (runtimeMode still
+    // 'legacy') is released by the legacy path, which does not gather the held
+    // messages into the Send's queue, so it keeps today's admission.
+    const personStartupStop = Boolean(nativeQueuedSend && run.runtimeMode === "native" &&
+      await isPersonAcceptedStartupStop(db, { ...run, issueId }, { sendingWakeId: input.queuedCommentInterruptId }));
+    const cancelledStartup = await isCancelledNativeStartup(db, run, coordinator) || personStartupStop;
     if (partiallyDeliveredQueue && run.runtimeMode !== "native" && !unusedAdmission && !cancelledStartup && !failedPreparation) return null;
     if ((queuedInterrupt || queuedRequest) && !legacyUserTurn && !unusedAdmission &&
         !(queuedRequest && run.runtimeMode === "native" &&
@@ -701,7 +709,11 @@ export async function admitExplicitNativeContinuation(input: {
         : blocked("local_cleanup", "Waiting for the previous provider and its tools to stop. Your message is saved.");
       stoppedSessions.push(stopped);
     }
-    if (nativeQueuedSend && await hasPendingRunCleanup(db, companyId, run.id))
+    // That Stop leaves its coordinator 'observed' (no controller ever claimed
+    // it); with no lease and no workspace finalizer there is nothing to clean.
+    if (nativeQueuedSend && !(personStartupStop && !leases.length
+        && run.runnerProfileJson?.nativeWorkspaceFinalizationOwner == null)
+        && await hasPendingRunCleanup(db, companyId, run.id))
       return blocked("cleanup_pending", "Waiting for the previous run to finish cleanup. Your message is saved.");
     if (freshIntent && !await hasVerifiedWorkspaceRepair(db, run)) {
       freshSources.set(run.id, freshIntent);

@@ -14,7 +14,7 @@ import { readSystemRecovery } from "./system-recovery-state.js";
 import { PROJECT_ACCESS_DENIED } from "./project-access-denial.js";
 import { authorizationService } from "./authorization.js";
 import { taskWorkspaceProjectRequirements } from "./task-workspace-access.js";
-import { isAcknowledgedNativeStop, readPersonStopHold } from "./acknowledged-native-stop.js";
+import { isAcknowledgedNativeStop, isPersonAcceptedStartupStop, readPersonStopHold } from "./acknowledged-native-stop.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
@@ -97,6 +97,8 @@ type ProjectionState = {
   approval: boolean;
   /** A board-owned workspace-owner fence on this run that no automatic proof has released. */
   ownerStopRequired?: boolean;
+  /** isPersonAcceptedStartupStop holds for this run (computed by the async loader). */
+  personAcceptedStartupStop?: boolean;
   unidentifiedLaunchConfirmable?: boolean;
   /** The latest wake for a task with no run yet, when admission refused it. */
   admissionWait?: { id: string; status: string; reason: string | null; agentId: string };
@@ -290,8 +292,12 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
   // Intentional Stop is not an unsuccessful attempt. This is presentation only;
   // physical containment and pending cleanup keep their execution-side gates.
   // So is a Stop whose only wait is the person's own messages it holds.
-  if ((!wait || input.personStopHeld) && run.runtimeMode === "native" && run.companyId === issue.companyId && run.nativeIssueId === issue.id
-      && isAcknowledgedNativeStop({ ...run, companyId: run.companyId, nativeIssueId: run.nativeIssueId })) return base;
+  // So is a person's own Stop or task-tree Pause of this run in STARTUP: the
+  // same fact Send admission and the release read (isPersonAcceptedStartupStop).
+  if ((!wait || input.personStopHeld || input.personAcceptedStartupStop) && run.runtimeMode === "native"
+      && run.companyId === issue.companyId && run.nativeIssueId === issue.id
+      && (input.personAcceptedStartupStop
+        || isAcknowledgedNativeStop({ ...run, companyId: run.companyId, nativeIssueId: run.nativeIssueId }))) return base;
   // A queued-message Interrupt stops this run to deliver that exact message.
   // The stop is the user's intent and the message starts next, so show the
   // hand-off as working, not as a failed attempt.
@@ -898,6 +904,8 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       agent: agentMap.get(issue.assigneeAgentId ?? ""), project: projectMap.get(issue.projectId ?? ""),
       company: companyRows[0], paused: pauses.has(issue.id), approval: approvalsSet.has(issue.id),
       ownerStopRequired: ownerStopRequired.has(`${issue.id}:${facts.run?.id}`),
+      personAcceptedStartupStop: Boolean(facts.run?.companyId === issue.companyId && await isPersonAcceptedStartupStop(db,
+        { ...facts.run!, companyId: issue.companyId, issueId: issue.id })),
       unidentifiedLaunchConfirmable: confirmableLaunches.has(issue.id),
       admissionWait: admissionWaitMap.get(issue.id),
       retryDependencies: retryDependencyMap.get(issue.id),
