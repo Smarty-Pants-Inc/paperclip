@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { onNativeHarnessBackupChange } from "../native-harness-backup-expiration-notifications.js";
+import * as publication from "./native-harness-backup-publication.js";
 import { publishNativeHarnessBackup } from "./native-harness-backup-publication.js";
 
 describe("native harness backup publication", () => {
@@ -334,5 +335,59 @@ describe("native harness backup rotation keeps the superseded copy (rotation-kee
     expect((await fs.stat(kept[0]!)).ino, "rename, not copy").toBe(pendingInode);
     expect(await fs.readFile(path.join(backupRoot, "current", relative))).toEqual(v0);
     expect((await fs.readdir(backupRoot)).sort()).toEqual(["current", "superseded"]);
+  });
+});
+
+// BRIEF pending-keep (rf-3, never-OK): the capture stages into
+// failover-backups/.pending-<uuid>. If the capture fails after writing there and
+// the source box is gone, that staging is the ONLY copy of the turn's trace. It
+// is renamed into superseded (same tree, atomic), never deleted. Only a staging
+// with nothing written in it may be removed.
+describe("a failed capture's .pending staging is kept (pending-keep)", () => {
+  let backupRoot = "";
+  afterEach(async () => { if (backupRoot) await fs.rm(path.dirname(backupRoot), { recursive: true, force: true }); backupRoot = ""; });
+  const sha = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+  const keep = (root: string, pending: string) =>
+    (publication as unknown as { keepFailedNativeHarnessBackupCapture?: (backupRoot: string, pendingRoot: string) => string | null })
+      .keepFailedNativeHarnessBackupCapture!(root, pending);
+  async function staging() {
+    backupRoot = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "native-backup-pending-keep-")), "failover-backups");
+    const pendingRoot = path.join(backupRoot, ".pending-0b0c5c8e-6a8e-4d1e-9f3a-5f7f3c2b1a00");
+    await fs.mkdir(pendingRoot, { recursive: true });
+    return pendingRoot;
+  }
+
+  it("PD-1: a capture that fails after writing part of its staging keeps those bytes in failover-backups/superseded (rename, re-hashes)", async () => {
+    const pendingRoot = await staging();
+    const relative = "codex-home/sessions/rollout-1.jsonl";
+    const bytes = Buffer.from('{"turn":7,"text":"only copy of turn seven"}\n');
+    await fs.mkdir(path.dirname(path.join(pendingRoot, relative)), { recursive: true });
+    await fs.writeFile(path.join(pendingRoot, relative), bytes);
+    const inode = (await fs.stat(pendingRoot)).ino;
+    const kept = keep(backupRoot, pendingRoot);
+    expect(existsSync(pendingRoot)).toBe(false);
+    expect(kept).toBeTruthy();
+    expect(path.dirname(kept!)).toBe(path.join(backupRoot, "superseded"));
+    expect(path.basename(kept!)).toMatch(/^\d{13}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-failed-capture$/);
+    expect((await fs.stat(kept!)).ino, "rename, not copy").toBe(inode);
+    expect(sha(await fs.readFile(path.join(kept!, relative)))).toBe(sha(bytes));
+    expect((await fs.readdir(backupRoot)).sort()).toEqual(["superseded"]);
+  });
+
+  it("PD-2 (control): an empty failed staging (nothing written) is removed, and nothing is added to superseded", async () => {
+    const pendingRoot = await staging();
+    expect(await fs.readdir(pendingRoot), "nothing written").toEqual([]);
+    expect(keep(backupRoot, pendingRoot)).toBeNull();
+    expect(existsSync(pendingRoot)).toBe(false);
+    expect(await fs.readdir(backupRoot)).toEqual([]);
+  });
+
+  it("PD-3: a staging holding only an empty subdirectory is kept (something was written), and a missing staging is a no-op", async () => {
+    const pendingRoot = await staging();
+    await fs.mkdir(path.join(pendingRoot, "codex-home"));
+    const kept = keep(backupRoot, pendingRoot);
+    expect(existsSync(path.join(kept!, "codex-home"))).toBe(true);
+    expect(keep(backupRoot, pendingRoot)).toBeNull();
+    expect(await fs.readdir(path.join(backupRoot, "superseded"))).toHaveLength(1);
   });
 });

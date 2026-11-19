@@ -3443,6 +3443,7 @@ describe("remote provider pack manifest", () => {
     const suspendedState = durableRunnerState({ runId: remoteExecution.binding.runId, runnerInstanceId: "bundled-image-runner",
       environmentLeaseId: "lease", normalizedSessionId: remoteExecution.session.normalizedSessionId }, "suspended");
     const remoteStateFiles = new Map<string, Buffer>();
+    const failedCapture = { root: "", files: new Map<string, Buffer>() };
     const syncOut = vi.fn(async (operations: StateFileOperation) => {
       if (inspectionResets > 0 && inspectionReset && operations.some(operation => operation.files.some(file => file.sourcePath.endsWith(`/${inspectionReset}`)))) {
         inspectionResets--;
@@ -3483,7 +3484,19 @@ describe("remote provider pack manifest", () => {
       const backup = vi.spyOn(harnessStorage, "persistNativeHarnessBackup").mockImplementation(async input => {
         expect(JSON.parse(await readFile(join(input.root, "manifest.json"), "utf8")).providerArtifacts).toEqual(newReceipt);
         // Only the first save fails; a later checkpoint of the same run saves.
-        if (provider === "opencode-new-durable-store-failed" && backup.mock.calls.length === 1) throw new Error("SlowDown: Please reduce your request rate.");
+        if (provider === "opencode-new-durable-store-failed" && backup.mock.calls.length === 1) {
+          // pending-keep: record exactly what the capture wrote to its staging before it fails.
+          failedCapture.root = input.root;
+          const visit = async (directory: string): Promise<void> => {
+            for (const entry of await readdir(directory, { withFileTypes: true })) {
+              const filename = join(directory, entry.name);
+              if (entry.isDirectory()) await visit(filename);
+              else failedCapture.files.set(relative(input.root, filename), await readFile(filename));
+            }
+          };
+          await visit(input.root);
+          throw new Error("SlowDown: Please reduce your request rate.");
+        }
         // The durable backup is stored; only the later local publication fails.
         if (provider === "opencode-new-durable-publish-failed") await rm(input.root, { recursive: true, force: true });
         return undefined as never;
@@ -3633,6 +3646,24 @@ describe("remote provider pack manifest", () => {
           await expect(driver.mock.calls.at(-1)![0].checkpoint!("settled")).rejects.toThrow();
           // Only a backup that was never stored makes the next run start fresh.
           if (provider === "opencode-new-durable-store-failed") {
+            // pending-keep (rf-3, never-OK): the capture failed after writing its
+            // .pending-* staging. Once the source box is gone that staging can be
+            // the only copy of the turn's trace: it is renamed into
+            // failover-backups/superseded/<ms>-<uuid>-failed-capture, never deleted,
+            // and every staged byte is there and re-hashes.
+            const backupRoot = dirname(failedCapture.root);
+            expect(basename(failedCapture.root)).toMatch(/^\.pending-/);
+            expect(failedCapture.files.size, "the capture wrote bytes before it failed").toBeGreaterThan(0);
+            expect(failedCapture.files.has("manifest.json")).toBe(true);
+            expect(existsSync(failedCapture.root), "the staging was moved, not left or copied").toBe(false);
+            const kept = (await readdir(join(backupRoot, "superseded"))).filter(name => name.endsWith("-failed-capture"));
+            expect(kept).toHaveLength(1);
+            expect(kept[0]).toMatch(/^\d{13}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-failed-capture$/);
+            const sha = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+            for (const [file, bytes] of failedCapture.files) {
+              expect(sha(await readFile(join(backupRoot, "superseded", kept[0]!, file))), file).toBe(sha(bytes));
+            }
+            expect((await readdir(backupRoot)).filter(name => name.startsWith(".pending-"))).toEqual([]);
             expect(providerStateUnsaved.mark).toHaveBeenCalledWith(preparedDb, remoteExecution.binding);
             // A later checkpoint of the same run that saves clears the mark once.
             providerStateUnsaved.clear.mockClear();
@@ -3655,6 +3686,14 @@ describe("remote provider pack manifest", () => {
         expect(providerStateUnsaved.mark).not.toHaveBeenCalled();
         expect(harnessStorage.persistNativeHarnessBackup).toHaveBeenCalledTimes(1);
         expect(checkpointReadResets).toBe(0);
+        if (provider === "opencode-new-durable-reset") {
+          // pending-keep control: the interrupted attempt wrote nothing to its
+          // staging, so that empty staging is removed, not kept.
+          const backupRoot = dirname(vi.mocked(harnessStorage.persistNativeHarnessBackup).mock.calls[0]![0].root);
+          const entries = await readdir(backupRoot);
+          expect(entries.filter(name => name.startsWith(".pending-"))).toEqual([]);
+          expect(entries).not.toContain("superseded");
+        }
         expect(inspectionResets).toBe(0);
         return;
       }
