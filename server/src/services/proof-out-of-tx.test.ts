@@ -42,7 +42,8 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.insert(companies).values({ id: companyId, name: "Warm Stop", defaultResponsibleUserId: "board", issuePrefix: `W${companyId.replaceAll("-", "")}` });
     await db.insert(agents).values({ id: agentId, companyId, name: "Native", role: "engineer", adapterType: "paperclip_runner", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
     await db.insert(issues).values({ id: issueId, companyId, title: "Chat", status: "in_progress", assigneeAgentId: agentId });
-    const leaseId = randomUUID(), providerLeaseId = "bx_warm";
+    // Each test seeds its own box: a box id shared across tests is held by the earlier test's lease (isolation only).
+    const leaseId = randomUUID(), providerLeaseId = `bx_warm_${leaseId}`;
     await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId, agentId, nativeIssueId: issueId, runtimeMode: "native",
       status: "cancelled", errorCode: "cancelled", contextSnapshot: { issueId }, finishedAt: stoppedAt,
       runnerProfileJson: { nativeResourceDisposition: variant === "ephemeral" ? "destroy" : "keep_running",
