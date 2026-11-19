@@ -70,7 +70,8 @@ export async function readContinuationCommentInput(db: Pick<Db, "select">, input
   companyId: string; issueId: string; runId: string | null | undefined;
 }): Promise<Record<string, unknown>> {
   if (!input.runId || !UUID.test(input.runId)) return {};
-  const [source] = await db.select({ contextSnapshot: heartbeatRuns.contextSnapshot, agentId: heartbeatRuns.agentId })
+  const [source] = await db.select({ contextSnapshot: heartbeatRuns.contextSnapshot, resultJson: heartbeatRuns.resultJson,
+    agentId: heartbeatRuns.agentId })
     .from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId),
     or(eq(heartbeatRuns.nativeIssueId, input.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`),
@@ -78,6 +79,17 @@ export async function readContinuationCommentInput(db: Pick<Db, "select">, input
   if (!source) return {};
   // A person's answer to the predecessor's question is pending input exactly as
   // a pending comment is: an automatic successor that drops it re-asks (RFL 09:35Z).
-  return pendingContinuationCommentInput(db, { companyId: input.companyId, issueId: input.issueId,
-    agentId: source.agentId, contextSnapshot: source.contextSnapshot });
+  const context = source.contextSnapshot ?? {}, result = source.resultJson ?? {};
+  const ids = (value: unknown): string[] => Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
+  // Release removes restored steers from the ended run's active custody. That
+  // does not remove the person's input from its already-authorized successor.
+  // Read both sides of that handoff; the ordinary pending-input reader still
+  // filters deleted, out-of-scope and already answered comments.
+  const steered = [...new Set([...ids(context.steeredCommentIds), ...ids(context.carriedSteeredCommentIds),
+    ...ids(result.restoredSteeredCommentIds), ...ids(result.stopRestoredSteeredCommentIds)])];
+  const pending = await pendingContinuationCommentInput(db, { companyId: input.companyId, issueId: input.issueId,
+    agentId: source.agentId, contextSnapshot: { ...context,
+      wakeCommentIds: [...new Set([...ids(context.wakeCommentIds), ...steered])] } });
+  const carried = steered.filter(id => ids(pending.wakeCommentIds).includes(id));
+  return carried.length ? { ...pending, carriedSteeredCommentIds: carried } : pending;
 }
