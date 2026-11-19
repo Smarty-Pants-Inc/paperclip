@@ -701,6 +701,78 @@ describe("persistent agent directories", () => {
     }finally{await applyDone;factory?.mockRestore();await unlock(db).catch(()=>{});vi.unstubAllEnvs();}
   },90000);
       });
+      // Independent NEVER-OK: a hash of a disposable controller projection is
+      // not durable custody. Real store.apply 422; deterministic S3 API fixture.
+      it("RF3-JUDGE durable custody: ephemeral local mirror cannot authorize destroying the sole recoverable box", async () => {
+        const relative = "memory/judge-durable-custody.md", bytes = Buffer.from("HELD BYTES MUST SURVIVE CONTROLLER REPLACEMENT\n");
+        const sha = fileHash(bytes), objects = new Map<string, Buffer>();
+        let refusedUploads = 0;
+        const objectStorage = {
+          provider: "s3" as const,
+          async putFile(input: { companyId: string; namespace: string; body: Readable; byteSize: number; sha256: string }) {
+            if (input.sha256 === sha) { refusedUploads++; throw new Error("JUDGE planted durable-object upload unavailable for the held edit"); }
+            const chunks: Buffer[] = []; for await (const chunk of input.body) chunks.push(Buffer.from(chunk));
+            const value = Buffer.concat(chunks); expect(value.length).toBe(input.byteSize); expect(fileHash(value)).toBe(input.sha256);
+            const objectKey = `${input.companyId}/${input.namespace}/${randomUUID()}`; objects.set(objectKey, value); return { objectKey };
+          },
+          async getObject(_owner: string, key: string) { const value = objects.get(key); if (!value) throw new Error("fixture object absent"); return { stream: Readable.from([value]) }; },
+          async headObject(_owner: string, key: string) { return { exists: objects.has(key), lastModified: new Date(0) }; },
+          async deleteObject(_owner: string, key: string) { objects.delete(key); },
+        };
+        vi.stubEnv("PAPERCLIP_EPHEMERAL_SERVER", "true");
+        vi.stubEnv("PAPERCLIP_DURABLE_AGENT_FILES", "true");
+        const storageSpy = vi.spyOn(storageModule, "getStorageService").mockImplementation(() => objectStorage as unknown as ReturnType<typeof storageModule.getStorageService>);
+        try {
+          await paulBundle();
+          const boat = await sandbox();
+          const copy = await boat.prepare({ warm: true });
+          const checkpoint = (await copies.checkpointWarm({ companyId, runId: copy.runId, target: boat.executionTarget }))!;
+          expect(checkpoint.receipt?.checkpointState).toBe("unchanged");
+          await fs.writeFile(path.join(copy.executionRoot, relative), bytes);
+          await fs.unlink(path.join(copy.executionRoot, "AGENTS.md"));
+          const held = (await copies.collectStopped({ companyId, runId: copy.runId, target: boat.executionTarget }))!;
+          expect(held.receipt?.savePending).toMatchObject({ permanent: true, permanentStatus: 422, reason: "The configured instruction entry cannot be deleted" });
+          // PLANTED terminal control-plane marker beside the real stopped collection.
+          await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, copy.runId));
+          expect(await fs.readFile(path.join(held.localRoot, relative))).toEqual(bytes);
+          const [durableHead] = await db.select().from(agentFileRoots).where(eq(agentFileRoots.agentId, agentId));
+          const durableHeadHasEdit = durableHead?.entries.some(entry => entry.path === relative) ?? false;
+          const objectStoreHasEdit = [...objects.values()].some(value => value.equals(bytes));
+          expect(durableHead).toBeTruthy();
+          expect(refusedUploads).toBeGreaterThan(0);
+          expect(objectStoreHasEdit).toBe(false);
+          const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, boat.executionTarget.leaseId));
+          vi.useFakeTimers({ toFake: ["Date"] });
+          let blocked: boolean, destroyClaim: string | null = null;
+          try {
+            vi.setSystemTime(Date.now() + 25 * 60 * 60_000);
+            blocked = await agentFileSaveHeldOnLease(db, lease!);
+            destroyClaim = await claimLeaseForDestroyUnlessHeld(db, lease!);
+          } finally { vi.useRealTimers(); }
+          if (!blocked!) {
+            expect(destroyClaim, "the actual allocation destroy claim also authorizes this box").not.toBeNull();
+            // PLANTED lifecycle effects, only on owned fixture directories:
+            // the gate authorized provider destruction, then this disposable
+            // controller is replaced. Neither is a claim of a live Boat action.
+            const controllerCache = path.dirname(root);
+            expect(controllerCache.startsWith(home + path.sep), "only this test's disposable controller cache may be removed").toBe(true);
+            await fs.rm(copy.executionRoot, { recursive: true, force: true });
+            await fs.rm(controllerCache, { recursive: true, force: true });
+          }
+          if (destroyClaim) await releaseLeaseDestroyClaim(db, lease!.id, destroyClaim);
+          const restarted = agentInstructionWorkingCopyService(db);
+          const recovered = await restarted.recoverStopped();
+          const afterRecovery = await restarted.get(companyId, copy.runId);
+          const read = async (p: string) => fs.readFile(p, "utf8").catch(error => `MISSING:${error.code}`);
+          const proof = { ephemeral: true, durableFiles: true, refusedUploads, objectStoreHasEdit, durableHeadHasEdit,
+            destroyAllowed: !blocked!, destroyClaimGranted: destroyClaim !== null, recovered, stillHeldAfterRecovery: agentFileSaveHeld(afterRecovery), pending: held.receipt?.savePending,
+            localAfterReplacement: await read(path.join(held.localRoot, relative)), remoteAfterDestroy: await read(path.join(copy.executionRoot, relative)),
+            canonical: await read(path.join(root, relative)) };
+          console.log("RF3_JUDGE_DURABLE_CUSTODY", JSON.stringify(proof));
+          await writeJudgeEvidence("rf3-judge-durable-custody.json", proof);
+          expect(blocked!, "a readable/hash-equal disposable localRoot is NOT a durable mirror; no stored object contains this edit").toBe(true);
+        } finally { storageSpy.mockRestore(); vi.unstubAllEnvs(); }
+      }, 120_000);
       // bd3 (rf-3 items 1 + 2, one WARM REMOTE row on the Boat sandbox fixture).
       // Real producer: chat A's last verified warm checkpoint records UNCHANGED,
       // then the run really edits its tree on the box (a new note, and it deletes
