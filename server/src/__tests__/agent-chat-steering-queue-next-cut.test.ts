@@ -273,23 +273,23 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
     mocks.steer.mockResolvedValue({ turnId: "turn-1" });
   }
 
-  
 
-  
 
-  
 
-  
 
-  
 
-  
 
-  
 
-  
 
-  
+
+
+
+
+
+
+
+
+
 
   /** Real admission + process-adapter drain. Replies record the exact carried
    * input ids and session; no saved wake shape is assumed by this witness. */
@@ -400,7 +400,7 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
   }, 30_000);
 
   // RED 2 (guard part): a reset is never merged, in either direction.
-  
+
 
   // RED 2 + RFL (2) merge boundary: plain runs merge on each side of a reset only.
   it('D1 "/new row is Queue only": merges plain messages on each side without crossing the reset' , async () => {
@@ -432,20 +432,20 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
   });
 
   // RED 4: the live native probe decides for a chat.
-  
+
 
   // Guard: a /new head is never offered for steering.
-  
+
 
   // RED 5 + code-lead (b) + GAP A: owner steer of the head.
-  
+
 
   // RED 7 + GAP A: settlement is not stuck 'active' and the steered message counts as answered.
-  
+
 
   // RFL (1): turn order. The steered head joins the running turn; the next
   // message keeps its place and is answered by the next turn, not this one.
-  
+
 
   // RFL (3): merged messages are each answered once, none lost, none doubled.
   it('D5 "Nothing is dropped": answers each merged message once in bar order after the turn' , async () => {
@@ -478,19 +478,19 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
   }, 30_000);
 
   // RED 6 + code-lead ORDER: only the head, never a /new, never behind a /new.
-  
 
-  
 
-  
 
-  
 
-  
+
+
+
+
+
 
   // RFL (4): a runner that cannot take a mid-turn steer reports it through the
   // live probe, and the message is never dropped: it stays queued for the turn boundary.
-  
+
 
   it('DESIGN row controls: a live steerable native Pi turn offers "Steer now" and consumes the queued row once', async () => {
     const chat = await seedChat();
@@ -682,7 +682,7 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
   }, 30_000);
 
   // rf5 F2: a single queued message edited into /new keeps its own wake and resets the session.
-  
+
 
   // rf5 F3: only the owner mutates a chat queue (same rule as Steer).
   it("refuses another board operator's reorder of the owner's chat queue (403)", async () => {
@@ -695,11 +695,11 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
     expect((await queueOf(chat)).queue.body).toEqual(before);
   });
 
-  
 
-  
 
-  
+
+
+
 
   /** The runner's durable run log for the live turn (validated PRP events, in order). */
   async function runLog(chat: Chat, events: Array<{ eventType: string; kind?: string; itemId: string; text?: string }>) {
@@ -740,11 +740,11 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
   // waits again, at its place, and one Send delivers it once. A steer the model
   // read (Pi's userMessage receipt) stays with the stopped turn: no double answer.
   // The answered rule: read is not answered. Only text after the read, before the next tool or the end, answers it.
-  
+
 
   // S10 C2: A, /new, B behind a person's Stop. One Send runs A, then /new, then
   // B, so the stopped list shows all three, the /new and B marked behind it.
-  
+
 
   // NEVER-OK (PV2 s3, run 0bf8d84e): a steered message the run did not answer is
   // never counted answered at a normal run end, and is never lost. The busy run has
@@ -808,7 +808,7 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
     return { wakes, runs };
   }
 
-  
+
   // rf5 F1/F2 (never-OK): the answered rule reads what the REAL Pi projector (pi-event-projector.ts) emits.
   // A streamed reply projects item.started agentMessage at its text_start, then item.completed (or
   // item.failed) at message_end. A receipt with no streamed text (final-only) projects ONLY item.completed:
@@ -854,12 +854,12 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
     return events.map((event) => `${event.eventType}:${(event.payload as any).kind ?? ""}`);
   }
 
-  
+
 
   // rf5 F3 (R-ONCE "in order"): two steers whose acknowledgements share one timestamp are restored in the order
   // they were steered, never re-sorted by JSONB key order. The person dragged the larger id to the head, so
   // JSONB key order (shorter, then bytewise) disagrees with the steering order.
-  
+
   const RECEIVED_MID_TASK = "Received mid-task (while you were working):";
 
   /** B is steered mid-turn, never read, and the turn ends: B is restored and carried into the next turn. */
@@ -896,10 +896,10 @@ describeEmbeddedPostgres("agent chat steering queue next cut", () => {
 
   // Follow-up 1: the carried steer's turn input says, in one prefix line, that it was received mid-task, then the
   // person's text unchanged. Only the carried steer: an ordinary queued message in the same turn has no label.
-  
+
 
   // Follow-up 2: the turn that carried a restored steer ends FAILED or cancelled without answering it. ONE true
   // notice for that message (the sweep's notice path, its own key), never a silent answered-mark, never twice;
   // also when a later message is the latest one.
-  
+
 });
