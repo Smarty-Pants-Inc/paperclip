@@ -28,7 +28,9 @@ export async function settleWarmRetention(db: Db, lease: typeof environmentLease
   if (lease.leasePolicy !== "reuse_by_environment" || !lease.heartbeatRunId) return { lease, disposition: desired };
   return db.transaction(async tx => {
     // Run -> lease matches terminalization's ownership lock order.
-    const [run] = await tx.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
+    const [run] = await tx.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, nativeIssueId: heartbeatRuns.nativeIssueId,
+      resultJson: heartbeatRuns.resultJson, runnerProfileJson: heartbeatRuns.runnerProfileJson,
+      status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
       providerWorkStarted: sql<unknown>`${heartbeatRuns.resultJson}#>'{executionRecovery,providerWorkStarted}'` })
       .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, lease.heartbeatRunId!),
         eq(heartbeatRuns.companyId, lease.companyId))).for("update");
@@ -41,15 +43,18 @@ export async function settleWarmRetention(db: Db, lease: typeof environmentLease
     let disposition = providerResourceDispositionForTerminalRun(desired, run.status, run.errorCode, run.providerWorkStarted);
     // Safety stops and explicit stop/destroy choices never become warm retention.
     if (run.status !== "succeeded" && disposition !== "keep_running") return { lease: current, disposition };
+    const completedTurn = run.status === "succeeded" || run.status === "cancelled"
+      && !!run.runnerProfileJson?.nativeRetainedIdleCheckpoint
+      && (await import("./native-runtime/native-session-executor.js")).hasRetainedNativeTurnStop?.(run) === true;
     const metadata = { ...current.metadata };
-    if (run.status === "succeeded" || metadata.warmFailureRunId !== lease.heartbeatRunId) {
+    if (completedTurn || metadata.warmFailureRunId !== lease.heartbeatRunId) {
       const prior = typeof metadata.warmFailureStreak === "number" && Number.isSafeInteger(metadata.warmFailureStreak)
         && metadata.warmFailureStreak >= 0 ? metadata.warmFailureStreak : 0;
-      metadata.warmFailureStreak = run.status === "succeeded" ? 0 : Math.min(prior + 1, Number.MAX_SAFE_INTEGER);
+      metadata.warmFailureStreak = completedTurn ? 0 : Math.min(prior + 1, Number.MAX_SAFE_INTEGER);
       metadata.warmFailureRunId = lease.heartbeatRunId;
       delete metadata.warmRetentionReasonCode;
     }
-    if (run.status !== "succeeded" && typeof metadata.warmFailureStreak === "number" && metadata.warmFailureStreak >= 2) {
+    if (!completedTurn && typeof metadata.warmFailureStreak === "number" && metadata.warmFailureStreak >= 2) {
       disposition = "stop_and_retain";
       metadata.warmRetentionReasonCode = failureLimitReason;
       await tx.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)
