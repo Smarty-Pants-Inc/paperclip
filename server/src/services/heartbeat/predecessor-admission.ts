@@ -13,6 +13,9 @@ import { remoteExecutionHasStopped } from "../remote-execution-termination.js";
 export const PREVIOUS_TURN_FILES_SET_ASIDE_NOTICE = "Your previous turn's file changes were not saved: they were set aside and are "
   + "kept for recovery. This workspace holds the last saved version without them. Work from the files as they are now, and do "
   + "not claim or assume those edits.";
+/** The same notice after a classic sync run: nothing was set aside or kept (the person's line is LOST). */
+export const PREVIOUS_TURN_FILES_NOT_SAVED_NOTICE = "Your previous turn's file changes were not saved. This workspace holds the "
+  + "last saved files without them. Work from the files as they are now, and do not claim or assume those edits.";
 export function readPreviousTurnWorkspaceNotice(context: Record<string, unknown> | null | undefined): string | null {
   const notice = context?.previousTurnWorkspaceNotice as { text?: unknown } | null | undefined;
   return typeof notice?.text === "string" && notice.text.trim() ? notice.text : null;
@@ -66,8 +69,15 @@ export async function fenceUnverifiedPredecessorsAtAdmission(db: Db, candidate: 
         await tx.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(${heartbeatRuns.resultJson},
           array[${WORKSPACE_SYNC_OUT_STALL_KEY}, 'noticeRunId'], ${JSON.stringify(run.id)}::jsonb)`, updatedAt: new Date() })
           .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, source.id)));
+        // A classic sync run was isolated, not fenced by an epoch: while the task has no root of its own
+        // again, the next run takes a new one, seeded from that run's saved seed (the existing readiness
+        // record). The conversation is kept, as on the epoch branch.
+        const classic = (source.resultJson?.[WORKSPACE_SYNC_OUT_STALL_KEY] as { workspace?: { kind?: unknown; readinessId?: unknown } }).workspace;
+        const isolated = classic?.kind === "classic_isolated";
         context = { ...context, previousRunId: source.id,
-          previousTurnWorkspaceNotice: { runId: source.id, text: PREVIOUS_TURN_FILES_SET_ASIDE_NOTICE } };
+          ...(isolated && !issue.executionWorkspaceId ? { freshContinuationIsolation: classic.readinessId } : {}),
+          previousTurnWorkspaceNotice: { runId: source.id,
+            text: isolated ? PREVIOUS_TURN_FILES_NOT_SAVED_NOTICE : PREVIOUS_TURN_FILES_SET_ASIDE_NOTICE } };
         fencedAny = true;
         continue;
       }

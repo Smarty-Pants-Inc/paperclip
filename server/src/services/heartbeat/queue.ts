@@ -9,6 +9,7 @@ import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
 import { isProcessRunAdmissionClosed, isReattachPhaseActive as isProcessReattachPhaseActive } from "./run-admission.js";
 import { continueFreshInTransaction, hasPendingFreshContinuation, isFreshIsolatedContinuationWake, settleCoalescedFreshContinuationHolds } from "../fresh-continuation-fallback.js";
+import { WORKSPACE_SYNC_OUT_STALL_KEY } from "../../agent-run-cancellation.js";
 import { deliverContinuationAsRun, foldWaitingRetriesIntoContinuation, foldWaitingRetriesIntoRecordedContinuation, undeliveredContinuation,
   undeliveredContinuationContext } from "../fresh-continuation-retry-fold.js";
 import { refreshRunStartYieldIfStale } from "../run-start-handover.js";
@@ -1211,6 +1212,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           eq(heartbeatRuns.runtimeMode, "native"),
           inArray(heartbeatRuns.id, [...activeRunExecutions]),
           sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+          // A run the copy-back bound ended keeps a live executor (its hung copy-back) for as long as that hangs.
+          // It owns nothing of the task any more: its epoch is fenced, or its root and box are isolated from this run.
+          sql`jsonb_typeof(${heartbeatRuns.resultJson} #> array[${WORKSPACE_SYNC_OUT_STALL_KEY}, 'workspace']) is distinct from 'object'`,
         ))
         .limit(1);
       if (settlingOwner) {

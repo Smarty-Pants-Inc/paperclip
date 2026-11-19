@@ -56,7 +56,8 @@ export function nativeWorkspaceFinalizationWork(db: Db, options: {
   attempt?: typeof attemptNativeWorkspaceFinalization;
   /** Tests shorten the bound or move its clock; production uses the constants. */
   copyOutBound?: { noAttemptMs?: number; attemptTimeoutMs?: number; personWaitCapMs?: number; now?: () => number };
-  onWorkspaceSettled(input: { runId: string; companyId: string; agentId: string; succeeded: boolean }): Promise<void>;
+  onWorkspaceSettled(input: { runId: string; companyId: string; agentId: string; succeeded: boolean;
+    skipEnvironmentSettlement?: boolean }): Promise<void>;
 }) {
   function candidates(scope?: NativeWorkspaceFinalizationScope, after?: string) {
     return db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
@@ -64,7 +65,11 @@ export function nativeWorkspaceFinalizationWork(db: Db, options: {
       leaseOwner: nativeRunFinalizations.leaseOwner, leaseExpiresAt: nativeRunFinalizations.leaseExpiresAt,
       updatedAt: nativeRunFinalizations.updatedAt, acceptedAt: nativeRunResults.createdAt,
       // The bound ends a run only behind an epoch fence (fenceSourceWorkspace), which needs this reference.
-      fenceable: sql<boolean>`coalesce(${heartbeatRuns.runnerProfileJson} #>> '{remoteWorkspace,state}' = 'prepared', false)`,
+      fenceable: sql<boolean>`coalesce(${heartbeatRuns.runnerProfileJson} #>> '{remoteWorkspace,state}' = 'prepared', false)
+        or coalesce(${heartbeatRuns.runnerProfileJson} #>> '{nativeWorkspaceSync,state}' = 'prepared', false)`,
+      // A classic sync run has no epoch: it is ended only by the person-wait cap, behind the classic isolation
+      // (isolateClassicSourceWorkspace). With nobody parked it keeps the schedule it had before the bound.
+      classic: sql<boolean>`coalesce(${heartbeatRuns.runnerProfileJson} #>> '{remoteWorkspace,state}' = 'prepared', false) is not true`,
       // When the first person's message still parked behind this task was parked (epoch ms), or null.
       parkedAt: sql<number | null>`(select (extract(epoch from min(parked.requested_at)) * 1000)::float8
         from agent_wakeup_requests parked where parked.company_id = ${nativeRunFinalizations.companyId}
@@ -143,9 +148,15 @@ export function nativeWorkspaceFinalizationWork(db: Db, options: {
    * refused: a run whose files cannot be fenced stays exactly as it was. */
   async function endStalled(row: Candidate) {
     const failure = await recordNativeWorkspaceFinalizationFailure(db, row.id, COPYOUT_STALLED);
-    if (failure.phase !== "terminal_failure") return false;
-    logger.warn({ runId: row.id, failureCode: failure.failureCode }, "native workspace copy-out made no progress; the run ended with its files kept");
-    await options.onWorkspaceSettled({ runId: row.id, companyId: row.companyId, agentId: row.agentId, succeeded: false });
+    if (failure.phase !== "terminal_failure") {
+      logger.warn({ runId: row.id, phase: failure.phase }, "native workspace copy-out bound refused: this run's files cannot be fenced or isolated (a root the task does not own, or a save that already succeeded)");
+      return false;
+    }
+    logger.warn({ runId: row.id, failureCode: failure.failureCode }, "native workspace copy-out made no progress; the run ended");
+    // A classic run's release never waits for its box (the settlement worker the terminal write notified owns
+    // it). A fenced epoch settles here, as before.
+    await options.onWorkspaceSettled({ runId: row.id, companyId: row.companyId, agentId: row.agentId, succeeded: false,
+      ...(row.classic ? { skipEnvironmentSettlement: true } : {}) });
     return true;
   }
   function check(current: Entry, signal?: AbortSignal): Promise<Entry | null> {
@@ -173,7 +184,8 @@ export function nativeWorkspaceFinalizationWork(db: Db, options: {
     let outcome: Awaited<typeof running> | { kind: "overrun" } | undefined;
     for (let latest: Candidate | undefined = row; !outcome;) {
       const waitEndsAt = latest && personWaitEndsAt(latest);
-      const endsAt = !latest ? Number.POSITIVE_INFINITY : waitEndsAt == null ? attemptStartedAt + attemptTimeoutMs + noAttemptMs
+      const endsAt = !latest ? Number.POSITIVE_INFINITY
+        : waitEndsAt == null ? row.classic ? Number.POSITIVE_INFINITY : attemptStartedAt + attemptTimeoutMs + noAttemptMs
         : Math.min(attemptStartedAt + attemptTimeoutMs, waitEndsAt);
       if (!row.fenceable || !latest) outcome = await running;
       else if (endsAt <= now()) outcome = { kind: "overrun" };
@@ -193,13 +205,16 @@ export function nativeWorkspaceFinalizationWork(db: Db, options: {
         void running.catch(error => logger.warn({ runId: current.id, error }, "overrun native workspace finalization attempt failed"));
         return null;
       }
-      outcome = await running;
+      // Refused (a root that cannot be isolated, or a save that already succeeded): never wait on the hung
+      // attempt for ever. Look again as for a pending stop; the attempt settles on its own.
+      void running.catch(error => logger.warn({ runId: current.id, error }, "overrun native workspace finalization attempt failed"));
+      return { ...due, dueAt: Date.now() + OWNERSHIP_RECHECK_MS };
     }
     if (outcome.kind === "retry") return withinPersonWait(row, { ...due, dueAt: outcome.retryAt.getTime() });
     if (outcome.kind === "waiting") {
       // A run without a fenceable epoch keeps the schedule it had before the bound.
-      const stallAt = row.fenceable ? Math.min(await copyOutStallAt(row), personWaitEndsAt(row) ?? Number.POSITIVE_INFINITY)
-        : Number.POSITIVE_INFINITY;
+      const stallAt = row.fenceable ? Math.min(row.classic ? Number.POSITIVE_INFINITY : await copyOutStallAt(row),
+        personWaitEndsAt(row) ?? Number.POSITIVE_INFINITY) : Number.POSITIVE_INFINITY;
       const stalled = stallAt <= now();
       if (stalled && await endStalled(row)) return null;
       // A pending stop proof rechecks on its own; the board action stays visible meanwhile.
@@ -210,7 +225,9 @@ export function nativeWorkspaceFinalizationWork(db: Db, options: {
         logger.info({ runId: current.id, reason: outcome.reason }, "native workspace finalization paused until the run is notified again");
       }
       // Revisited at its bound, and as before after a restart or a release notification.
-      return stalled || !row.fenceable ? null : withinPersonWait(row, { ...due, dueAt: Date.now() + (stallAt - now()) });
+      // A refused bound keeps its deadline armed (an active owner would otherwise drop it for ever).
+      return !row.fenceable ? null : stalled ? { ...due, dueAt: Date.now() + OWNERSHIP_RECHECK_MS }
+        : withinPersonWait(row, { ...due, dueAt: Date.now() + (stallAt - now()) });
     }
     if (outcome.kind === "inactive" || (outcome.kind === "completed" && outcome.operation.status === "succeeded")) return null;
     // x1 while a person's message is parked: the first attempt that timed out ends the run; no retry holds them.
