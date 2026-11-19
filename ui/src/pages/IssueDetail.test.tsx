@@ -728,9 +728,13 @@ vi.mock("@/components/ui/button", async (importOriginal) => {
   ),
   };
   return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
-    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
-      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
-    }) : Stub])) };
+    !actual[key] ? Stub
+      // A helper (e.g. buttonVariants) switches per call; a component per render.
+      : /^[a-z]/.test(key) ? (...args: unknown[]) =>
+        ((taskChatThreadFixture.Real ? actual[key] : Stub) as (...a: unknown[]) => unknown)(...args)
+      : React.forwardRef(function UiSwitch(props: object, ref) {
+        return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+      })])) };
 });
 
 vi.mock("@/components/ui/separator", async (importOriginal) => {
@@ -742,9 +746,13 @@ vi.mock("@/components/ui/separator", async (importOriginal) => {
   Separator: () => <hr />,
   };
   return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
-    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
-      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
-    }) : Stub])) };
+    !actual[key] ? Stub
+      // A helper (e.g. buttonVariants) switches per call; a component per render.
+      : /^[a-z]/.test(key) ? (...args: unknown[]) =>
+        ((taskChatThreadFixture.Real ? actual[key] : Stub) as (...a: unknown[]) => unknown)(...args)
+      : React.forwardRef(function UiSwitch(props: object, ref) {
+        return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+      })])) };
 });
 
 vi.mock("@/components/ui/popover", async (importOriginal) => {
@@ -760,9 +768,13 @@ vi.mock("@/components/ui/popover", async (importOriginal) => {
   ),
   };
   return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
-    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
-      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
-    }) : Stub])) };
+    !actual[key] ? Stub
+      // A helper (e.g. buttonVariants) switches per call; a component per render.
+      : /^[a-z]/.test(key) ? (...args: unknown[]) =>
+        ((taskChatThreadFixture.Real ? actual[key] : Stub) as (...a: unknown[]) => unknown)(...args)
+      : React.forwardRef(function UiSwitch(props: object, ref) {
+        return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+      })])) };
 });
 
 vi.mock("@/components/ui/dialog", async (importOriginal) => {
@@ -814,9 +826,13 @@ vi.mock("@/components/ui/dialog", async (importOriginal) => {
   }) => <h2 className={className}>{children}</h2>,
   };
   return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
-    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
-      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
-    }) : Stub])) };
+    !actual[key] ? Stub
+      // A helper (e.g. buttonVariants) switches per call; a component per render.
+      : /^[a-z]/.test(key) ? (...args: unknown[]) =>
+        ((taskChatThreadFixture.Real ? actual[key] : Stub) as (...a: unknown[]) => unknown)(...args)
+      : React.forwardRef(function UiSwitch(props: object, ref) {
+        return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+      })])) };
 });
 
 vi.mock("@/components/ui/sheet", async (importOriginal) => {
@@ -852,9 +868,13 @@ vi.mock("@/components/ui/sheet", async (importOriginal) => {
   SheetTitle: ({ children }: { children?: ReactNode }) => <h2>{children}</h2>,
   };
   return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
-    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
-      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
-    }) : Stub])) };
+    !actual[key] ? Stub
+      // A helper (e.g. buttonVariants) switches per call; a component per render.
+      : /^[a-z]/.test(key) ? (...args: unknown[]) =>
+        ((taskChatThreadFixture.Real ? actual[key] : Stub) as (...a: unknown[]) => unknown)(...args)
+      : React.forwardRef(function UiSwitch(props: object, ref) {
+        return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+      })])) };
 });
 
 vi.mock("@/components/ui/scroll-area", async (importOriginal) => {
@@ -866,9 +886,13 @@ vi.mock("@/components/ui/scroll-area", async (importOriginal) => {
   ScrollArea: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
   };
   return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
-    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
-      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
-    }) : Stub])) };
+    !actual[key] ? Stub
+      // A helper (e.g. buttonVariants) switches per call; a component per render.
+      : /^[a-z]/.test(key) ? (...args: unknown[]) =>
+        ((taskChatThreadFixture.Real ? actual[key] : Stub) as (...a: unknown[]) => unknown)(...args)
+      : React.forwardRef(function UiSwitch(props: object, ref) {
+        return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+      })])) };
 });
 
 vi.mock("@/components/ui/skeleton", async (importOriginal) => {
@@ -880,9 +904,13 @@ vi.mock("@/components/ui/skeleton", async (importOriginal) => {
   Skeleton: () => <div data-testid="skeleton" />,
   };
   return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
-    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
-      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
-    }) : Stub])) };
+    !actual[key] ? Stub
+      // A helper (e.g. buttonVariants) switches per call; a component per render.
+      : /^[a-z]/.test(key) ? (...args: unknown[]) =>
+        ((taskChatThreadFixture.Real ? actual[key] : Stub) as (...a: unknown[]) => unknown)(...args)
+      : React.forwardRef(function UiSwitch(props: object, ref) {
+        return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+      })])) };
 });
 
 vi.mock("@/components/ui/tabs", async (importOriginal) => {
@@ -911,9 +939,13 @@ vi.mock("@/components/ui/tabs", async (importOriginal) => {
   ),
   };
   return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
-    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
-      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
-    }) : Stub])) };
+    !actual[key] ? Stub
+      // A helper (e.g. buttonVariants) switches per call; a component per render.
+      : /^[a-z]/.test(key) ? (...args: unknown[]) =>
+        ((taskChatThreadFixture.Real ? actual[key] : Stub) as (...a: unknown[]) => unknown)(...args)
+      : React.forwardRef(function UiSwitch(props: object, ref) {
+        return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+      })])) };
 });
 
 vi.mock("@/components/ui/textarea", async (importOriginal) => {
@@ -927,9 +959,13 @@ vi.mock("@/components/ui/textarea", async (importOriginal) => {
   ),
   };
   return { ...actual, ...Object.fromEntries(Object.entries(stubs).map(([key, Stub]) => [key,
-    actual[key] ? React.forwardRef(function UiSwitch(props: object, ref) {
-      return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
-    }) : Stub])) };
+    !actual[key] ? Stub
+      // A helper (e.g. buttonVariants) switches per call; a component per render.
+      : /^[a-z]/.test(key) ? (...args: unknown[]) =>
+        ((taskChatThreadFixture.Real ? actual[key] : Stub) as (...a: unknown[]) => unknown)(...args)
+      : React.forwardRef(function UiSwitch(props: object, ref) {
+        return React.createElement((taskChatThreadFixture.Real ? actual[key] : Stub) as never, { ...props, ref } as never);
+      })])) };
 });
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -5762,21 +5798,9 @@ describe("IssueDetail", () => {
     const optimisticComment = queuedProps.comments?.find(
       (comment) => comment.body === "Queued run message",
     );
-    expect(optimisticComment).toMatchObject({
-      clientStatus: "queued",
-      queueState: "queued",
-      queueTargetRunId: "run-queued",
-    });
-    expect(queuedProps.queuedCommentQueue).toMatchObject({
-      queueId: null,
-      targetRunId: "run-queued",
-      protocol: "legacy",
-      entries: [
-        expect.objectContaining({
-          comment: expect.objectContaining({ body: "Queued run message" }),
-        }),
-      ],
-    });
+    // supersedes(the optimistic queued projection before the POST answers; RFL CONDITION steer-ui 11-19: the client never decides steer vs queue, and between the click and the POST's answer only the composer's pending state shows)
+    expect(optimisticComment).toBeUndefined();
+    expect(queuedProps.queuedCommentQueue?.entries ?? []).toHaveLength(0);
 
     await act(async () => {
       postedComment.resolve(createIssueComment({ body: "Queued run message" }));
@@ -5882,19 +5906,8 @@ describe("IssueDetail", () => {
     const pendingProps = mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as {
       queuedCommentQueue?: IssueQueuedCommentQueue | null;
     };
-    expect(pendingProps.queuedCommentQueue).toMatchObject({
-      queueId: null,
-      targetRunId: "run-native",
-      protocol: "paperclip_runner_v1",
-      entries: [
-        expect.objectContaining({
-          comment: expect.objectContaining({
-            id: expect.stringMatching(/^optimistic-/),
-            body: "Use the newer direction",
-          }),
-        }),
-      ],
-    });
+    // supersedes(the optimistic queued projection before the POST answers; RFL CONDITION steer-ui 11-19: the client never decides steer vs queue, and between the click and the POST's answer only the composer's pending state shows)
+    expect(pendingProps.queuedCommentQueue?.entries ?? []).toHaveLength(0);
 
     await act(async () => {
       postedComment.resolve(
@@ -5953,9 +5966,9 @@ describe("IssueDetail", () => {
     };
     const props = () => mockIssueChatThreadRender.mock.calls.at(-1)![0] as Props;
     await act(async () => { void props().onAdd(delivered.body); });
-    await waitForAssertion(() => {
-      expect(props().queuedCommentQueue?.entries[0]?.comment.body).toBe(delivered.body);
-    });
+    await flushReact();
+    // supersedes(the optimistic queued projection before the POST answers; RFL CONDITION steer-ui 11-19: the client never decides steer vs queue, and between the click and the POST's answer only the composer's pending state shows)
+    expect(props().queuedCommentQueue?.entries ?? []).toHaveLength(0);
     if (postOrder === "before") {
       await act(async () => postedComment.resolve(delivered));
       await flushReact();
@@ -6186,19 +6199,10 @@ describe("IssueDetail", () => {
     const optimisticComment = replacementProps.comments?.find(
       (comment) => comment.body === "Keep this bound to the original run",
     );
-    expect(optimisticComment).toMatchObject({
-      clientStatus: "queued",
-      queueTargetRunId: "run-original",
-    });
-
-    mockIssuesApi.getQueuedComments.mockResolvedValue(createQueuedCommentQueue({
-      targetRunId: "run-replacement", protocol: "legacy", steeringDisposition: "unsupported",
-    }));
-    await act(async () => {
-      await expect(replacementProps.onInterruptQueued(
-        optimisticComment!.queueTargetRunId!,
-      )).rejects.toThrow("The queued messages changed");
-    });
+    // supersedes(the optimistic queued projection before the POST answers; RFL CONDITION steer-ui 11-19: the client never decides steer vs queue, and between the click and the POST's answer only the composer's pending state shows)
+    // No optimistic queued item exists before the POST answers, so there is no
+    // Interrupt binding to rebind to the replacement run.
+    expect(optimisticComment).toBeUndefined();
     expect(mockIssuesApi.interruptQueuedComments).not.toHaveBeenCalled();
     expect(mockHeartbeatsApi.cancel).not.toHaveBeenCalled();
 
