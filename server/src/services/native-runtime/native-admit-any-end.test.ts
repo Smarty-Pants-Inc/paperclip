@@ -80,6 +80,8 @@ import { nativeWorkspaceFinalizationWork } from "./native-workspace-finalization
 import { attemptNativeWorkspaceFinalization } from "./native-workspace-finalizer.js";
 import { cleanupNativeWorkspaceSync, prepareNativeWorkspaceSync, readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
 import { reconcileNativeFinalizations } from "./native-finalization-reconciler.js";
+import { retryNativeWorkspaceExport } from "./native-workspace-export-retry.js";
+import { remoteTerminationReceipt } from "../remote-execution-termination.js";
 
 const STALLED = "native_workspace_sync_out_stalled";
 const PERSON = "admit-any-person";
@@ -274,7 +276,7 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
 
   /** REAL up to here: turn 0 saved; M woke R through the queue; R (a real run of the real executor) accepted its result
    * and hangs in its own teardown copy-back (CLASSIC-STALL-1); the person's next message is parked behind it. */
-  async function hungRWithParkedMessage(capMs: number) {
+  async function hungRWithParkedMessage(capMs: number, park = true) {
     const s = await liveScenario();
     const errors: unknown[] = [];
     const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: () => ({}) as never });
@@ -304,10 +306,11 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
     const [, r] = await s.runs();
     expect(r).toMatchObject({ status: "running", runtimeMode: "native" });
     expect(JSON.stringify(r.contextSnapshot)).toContain(m);
-    const next = await s.say("Also add a summary section to the report.");
+    // `park: false` (the Retry-export row): nobody is parked behind R when its save fails for the last time.
+    let next = park ? await s.say("Also add a summary section to the report.") : "";
     const wakesOf = async (commentId: string) => (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, s.agentId)))
       .filter(wake => JSON.stringify(wake.payload).includes(commentId)).sort((a, b) => a.requestedAt.getTime() - b.requestedAt.getTime());
-    await vi.waitFor(async () => expect((await wakesOf(next)).map(wake => wake.status)).toEqual(["deferred_issue_execution"]), { timeout: 10_000, interval: 50 });
+    if (park) await vi.waitFor(async () => expect((await wakesOf(next)).map(wake => wake.status)).toEqual(["deferred_issue_execution"]), { timeout: 10_000, interval: 50 });
     const run = async (id: string) => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)))[0];
     const coordinator = async (id: string) => (await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, id)))[0];
     /** REAL GET: how the agent reads to a person. */
@@ -344,7 +347,9 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
     const present = async () => { const worker = nativeResponsePresentationWork(db);
       for (const entry of await worker.load({ companyId: s.companyId, issueId: s.issueId })) await worker.check(entry); };
     const stop = async () => { s.releaseStall(); receipts.stop?.(); await delivery.stop(); await heartbeat.drainActiveRunExecutions(); };
-    return { s, heartbeat, errors, settled, sweep, r0, r, m, next, hostDir, wakesOf, run, coordinator, agentRead, admitParked, sweepUnanswered, thread, stop, present };
+    return { s, heartbeat, errors, settled, sweep, r0, r, m, get next() { return next; }, sayNext: async (body: string) => (next = await s.say(body)),
+      agentComments: s.agentComments,
+      hostDir, wakesOf, run, coordinator, agentRead, admitParked, sweepUnanswered, thread, stop, present };
   }
   type Hung = Awaited<ReturnType<typeof hungRWithParkedMessage>>;
   const NO_CAP = 3_600_000;
@@ -507,6 +512,96 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
   // carries a PERSON's message deferred, and release drains it once: adopt-lead's hold compose owns that change and
   // its row K16 (issue-tree-control.ts :1338-1349). The "one true line at once" fix and its PAUSE row live at
   // bb/admit fdefdda2 (+ the row in 217557c96) as the FALLBACK if K16 ever goes red.
+
+  // RETRY-EXPORT WINDOW (noflip limit 3 / rf-5 06:48Z (3)). Nobody is parked when R's save fails for the last time, so R
+  // keeps its files (KEPT) and its export recovery. The person presses Retry export: R's copy-back is reopened and, since
+  // K12, R is NOT `running` while it copies. A message sent in that window must not start a run on R's root.
+  // REAL: turn 0, R (the real executor), the retries, Retry export (retryNativeWorkspaceExport, the function behind
+  //   POST /api/issues/:id/recovery-actions/retry-workspace-export), the reopened copy-back (the finalization worker's
+  //   own load + check), the person's message (POST /comments), the queue's release and claim (resumeQueuedRuns).
+  // NAMED INJECTIONS: CLASSIC-STALL-1 re-armed on R's box for the reopened copy-back; SAVE-FAILS; CLOCK-SKIP.
+  // PLANTED (named): the box's stop receipt on R's lease (the provider's own receipt shape; no provider here), as
+  //   native-noflip.test.ts plants it. SCRIPTED: the provider console of Retry export (resumeRunLease).
+  it("RETRY-EXPORT WINDOW: a message sent while Retry export's reopened copy-back is in flight starts no run on R's root; after the save commits it is answered once, on the saved files; R stays FAILED", async () => {
+    const h = await hungRWithParkedMessage(NO_CAP, false);
+    let releaseReopened = () => {};
+    try {
+      // PLANTED (named): the lease's plugin pin. A provider lease always records its acquiring plugin; this harness's
+      // box has no provider plugin, and without the pin the retained-export marker cannot name its owner (line LOST).
+      await db.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || '{"pluginId":"plugin-test"}'::jsonb` })
+        .where(eq(environmentLeases.heartbeatRunId, h.r.id));
+      const ended = await exhaustRetries(h);
+      expect(ended).toMatchObject({ status: "failed", errorCode: "native_workspace_sync_out_retry_exhausted", finishedAt: expect.any(Date) });
+      await h.present();
+      expect(await h.s.servedLine(h.r.id)).toMatchObject({ status: "failed", state: "kept" });
+      const frozen = brief(await h.run(h.r.id));
+      const [action] = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, h.s.issueId),
+        eq(issueRecoveryActions.cause, "native_workspace_sync_out_retry_exhausted")));
+      expect(action).toMatchObject({ status: expect.stringMatching(/^(active|escalated)$/) });
+      const reference = record(record((await h.run(h.r.id)).runnerProfileJson).nativeWorkspaceSync);
+      const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, reference.leaseId));
+      // PLANTED: the box's stop receipt.
+      await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success", metadata: { ...lease.metadata,
+        remoteExecutionTermination: remoteTerminationReceipt(lease as never, { providerLeaseId: lease.providerLeaseId!, state: "stopped" }) } })
+        .where(eq(environmentLeases.id, lease.id));
+      // The reopened copy-back will hang on R's box (CLASSIC-STALL-1 re-armed), after Retry export's own probe passed.
+      h.s.fault.fail = false;
+      // REAL: Retry export.
+      const retried = await retryNativeWorkspaceExport({ db, companyId: h.s.companyId, issueId: h.s.issueId, actionId: action.id, runId: h.r.id,
+        actorId: PERSON, repairNote: "The sandbox provider is reachable again; the saved work is preserved.",
+        environmentRuntime: { resumeRunLease: vi.fn(async () => ({ providerLeaseId: lease.providerLeaseId, metadata: { remoteCwd: reference.remoteCwd } })),
+          retryPendingSandboxTeardown: vi.fn(async () => ({ providerLeaseId: lease.providerLeaseId, state: "stopped" })) } as never });
+      expect(retried).toMatchObject({ status: "queued" });
+      expect(brief(await h.run(h.r.id))).toEqual(frozen);
+      let reopenedReached!: () => void;
+      const reopened = new Promise<void>(resolve => { reopenedReached = resolve; });
+      h.s.fault.stall = { entered: reopenedReached, release: new Promise<void>(resolve => { releaseReopened = resolve; }) };
+      const copying = h.sweep(h.r.id).catch(error => error);
+      expect(await Promise.race([reopened.then(() => "window open"), sleep(30_000).then(() => "the reopened copy-back never reached R's box")])).toBe("window open");
+      // THE WINDOW. REAL: the person's message, then the queue's own release and claim for 6 s.
+      const turnsBefore = box.inputs.length;
+      const sent = await h.sayNext("Also add a summary section to the report.");
+      for (const startAt = Date.now(); Date.now() - startAt < 6_000;) { await h.heartbeat.resumeQueuedRuns(); await sleep(250); }
+      const inWindow = (await h.s.runs()).filter(run => JSON.stringify(run.contextSnapshot).includes(sent));
+      const windowWakes = (await h.wakesOf(sent)).map(wake => ({ status: wake.status, runId: wake.runId }));
+      // It is parked, with the product's own wait (explicit-native-continuation.ts: workspace_repair_required).
+      expect(windowWakes).toEqual([{ status: "deferred_issue_execution", runId: null }]);
+      expect(box.inputs.length - turnsBefore, "a provider turn started during the reopened window").toBe(0);
+      expect(inWindow.filter(run => run.startedAt), "a run started during the reopened window").toEqual([]);
+      expect(brief(await h.run(h.r.id))).toEqual(frozen);
+      // The save returns: the files are saved, the line moves once, R stays as it ended (K12, K15a).
+      releaseReopened(); h.s.fault.stall = null;
+      await copying;
+      await reconcileNativeFinalizations(db, [h.r.id], { environmentRuntime: {} as never }).catch(() => undefined);
+      await h.heartbeat.drainActiveRunExecutions();
+      await h.present();
+      expect(await h.coordinator(h.r.id)).toMatchObject({ phase: "committed" });
+      expect(await h.s.servedLine(h.r.id)).toMatchObject({ status: "failed", state: "saved" });
+      expect(brief(await h.run(h.r.id))).toEqual(frozen);
+      expect(await listing(h.hostDir)).toMatchObject({ "report.md": "report, REWRITTEN BY R (unsaved)\n", "notes.md": "R's new notes (unsaved)\n" });
+      // PLANTED (named): the box's stop after the commit (the environment settlement worker's stop-and-retain receipt;
+      // no provider here). Until it is recorded R's box is still R's, and the message stays parked behind its cleanup.
+      const stillParked = await h.admitParked(3_000);
+      expect(stillParked.runs).toEqual([]);
+      const [leaseAtCommit] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+      await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success", failureReason: null,
+        metadata: { ...leaseAtCommit.metadata, remoteExecutionTermination: remoteTerminationReceipt(leaseAtCommit as never,
+          { providerLeaseId: lease.providerLeaseId!, state: "stopped" }) } }).where(eq(environmentLeases.id, lease.id));
+      // The message is then answered ONCE, on the saved files (the task's own root, now holding R's saved edits).
+      const admitted = await h.admitParked(60_000);
+      expect(admitted.runs.map(run => run.status), "the message never started after the save committed").toHaveLength(1);
+      expect(admitted.turns).toBe(1);
+      await h.heartbeat.drainActiveRunExecutions();
+      const [p] = (await h.s.runs()).filter(run => run.id === admitted.runs[0].id);
+      expect(p).toMatchObject({ status: "succeeded" });
+      const pRoot = (await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, (await h.s.issue()).executionWorkspaceId!)))[0].cwd!;
+      expect(await listing(pRoot)).toMatchObject({ "report.md": "report, REWRITTEN BY R (unsaved)\n", "notes.md": "R's new notes (unsaved)\n" });
+      expect(brief(await h.run(h.r.id))).toEqual(frozen);
+      expect(pRoot).toBe(h.hostDir);
+      expect((await h.agentComments()).filter(comment => comment.createdByRunId === p.id)).toHaveLength(1);
+      evidence.RETRY_EXPORT_WINDOW = { R: frozen, windowWakes, inWindow: inWindow.map(brief), P: brief(p), pRoot, rRoot: h.hostDir };
+    } finally { releaseReopened(); await h.stop(); }
+  }, 300_000);
 
   it("CONTROL: an unrelated LIVE predecessor still blocks. After R ended and the parked message's run P started, a third message stays parked behind the live P and starts only when P ends", async () => {
     const h = await hungRWithParkedMessage(NO_CAP);
