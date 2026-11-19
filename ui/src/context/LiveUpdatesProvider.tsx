@@ -185,6 +185,20 @@ export function useTaskRunLiveUpdates(scope: {
       ? issueId === scope.issueId || issueId === scope.issueQueryRef
       : true;
     if (!matches) return;
+    const runId = readString(event.payload.runId);
+    const status = readString(event.payload.status);
+    if (event.type === "heartbeat.run.status" && runId && status && TERMINAL_RUN_STATUSES.has(status)) {
+      // Every open page drops an ended run at once, focused or not (a second
+      // window has no focus); the refetch after it reconciles with the server.
+      const liveKey = queryKeys.issues.liveRuns(scope.issueQueryRef);
+      const activeKey = queryKeys.issues.activeRun(scope.issueQueryRef);
+      void Promise.all([liveKey, activeKey].map((queryKey) => queryClient.cancelQueries({ queryKey }))).then(() => {
+        queryClient.setQueryData<LiveRunForIssue[]>(liveKey, (runs) => removeRunFromList(runs, runId));
+        queryClient.setQueryData<ActiveRunForIssue | null>(activeKey, (run) => run?.id === runId ? null : run);
+        refreshRuns();
+      });
+      return;
+    }
     const visible = resolveVisibleIssueRouteContext(queryClient, location.pathname);
     refreshRuns(Boolean(visible?.issueRefs.has(scope.issueQueryRef) && runEventMatchesVisibleIssue(visible, event.payload)));
   });
