@@ -7206,3 +7206,73 @@ describe.each([{ width: 390, mobile: true }, { width: 1440, mobile: false }])(
     expectEveryAnswerOnce(5, "reload");
   });
 });
+
+// RFL gate 4 s-steer8 (slashnew/GRADE.md): the divider showed at 03:03 between
+// A's answer and B, then was gone at 04:05. The '/new' comment is the server's
+// lasting boundary (conversationSessionGeneration), but no run lists it as input
+// (agent-chat-steering.test.ts drains A, /new, B with /new in no run), so after
+// the turn it has no conversation anchor and its createdAt is when it was queued.
+describe.each([{ width: 390, mobile: true }, { width: 1440, mobile: false }])("a queued /new at $width", ({ mobile }) => {
+  const agent = { id: "agent-1", name: "Runner", adapterType: "claude_local" } as Agent;
+  const at = (s: string) => `2026-11-19T14:${s}.000Z`;
+  const run = (runId: string, start: string, end: string) => ({ runId, status: "succeeded", runtimeMode: "legacy" as const,
+    agentId: agent.id, agentName: agent.name, adapterType: "claude_local", createdAt: at(start), startedAt: at(start), finishedAt: at(end) });
+  const person = (id: string, body: string, created: string, extra: Record<string, unknown> = {}) => ({
+    id, companyId: "company", issueId: "chat", authorType: "user" as const, authorAgentId: null, authorUserId: "owner",
+    body, presentation: null, metadata: null, createdAt: new Date(at(created)), updatedAt: new Date(at(created)), ...extra });
+  const answer = (id: string, body: string, created: string, runId: string) => ({
+    id, companyId: "company", issueId: "chat", authorType: "agent" as const, authorAgentId: agent.id, authorUserId: null,
+    createdByRunId: runId, runId, body, presentation: null, metadata: null, createdAt: new Date(at(created)), updatedAt: new Date(at(created)) });
+  // A, /new and B were queued during the WORK turn (31:00); A ran at 33:00, B at 35:00.
+  const work = [person("w", "Run the six steps", "30:00"), answer("w-done", "DONE", "30:50", "run-w")];
+  const a = person("a", "A: what is 2 + 5?", "31:00", { conversationAnchorAt: at("33:00"), conversationAnchorSequence: 0 });
+  const reset = person("new", "/new", "31:01", { conversationSessionGeneration: 1 });
+  const b = person("b", "B: what is 3 + 8?", "31:02", { conversationAnchorAt: at("35:00"), conversationAnchorSequence: 0 });
+  const aDone = answer("a-done", "2 + 5 is 7.", "33:30", "run-a");
+  const bDone = answer("b-done", "3 + 8 = 11", "35:30", "run-b");
+  const runs = [run("run-w", "30:00", "30:55"), run("run-a", "33:00", "33:40"), run("run-b", "35:00", "35:40")];
+  const show = (comments: unknown[], linkedRuns = runs) => {
+    sidebarState.isMobile = mobile;
+    render(<TaskChatThread issueId="chat" companyId="company" conversationMode conversationOwnerId="owner" currentUserId="owner"
+      issueStatus="in_review" issueAssigneeAgentId={agent.id} agentMap={new Map([[agent.id, agent]])}
+      comments={comments as ComponentProps<typeof TaskChatThread>["comments"]} linkedRuns={linkedRuns} onAdd={async () => {}} />);
+  };
+  const order = () => {
+    const text = container.textContent ?? "";
+    return { answerA: text.indexOf("2 + 5 is 7."), divider: text.indexOf("New session"), promptB: text.indexOf("B: what is 3 + 8?") };
+  };
+  const expectBetween = () => {
+    const { answerA, divider, promptB } = order();
+    expect(container.textContent).toContain("New session · Earlier messages and files are still available.".split(" · ")[1]);
+    expect(answerA).toBeGreaterThanOrEqual(0);
+    expect(divider, JSON.stringify(order())).toBeGreaterThan(answerA);
+    expect(promptB, JSON.stringify(order())).toBeGreaterThan(divider);
+  };
+
+  it("keeps the new-session divider between A's answer and B after the turn, more messages and a reload", async () => {
+    // During dispatch the thread had a live placement for /new (as at 03:03).
+    show([...work, a, aDone, { ...reset, conversationAnchorAt: at("35:00"), conversationAnchorSequence: 0 },
+      { ...b, conversationAnchorSequence: 1 }]);
+    expectBetween();
+    // B answered; the refetch carries only the server's facts (as at 04:05).
+    show([...work, a, aDone, reset, b, bDone]);
+    expectBetween();
+    // More messages after B.
+    const c = person("c", "C: and 4 + 4?", "36:00", { conversationAnchorAt: at("36:01"), conversationAnchorSequence: 0 });
+    show([...work, a, aDone, reset, b, bDone, c, answer("c-done", "4 + 4 = 8", "36:20", "run-c")],
+      [...runs, run("run-c", "36:01", "36:30")]);
+    expectBetween();
+    // Reload: a fresh mount from the same server data.
+    flushSync(() => root!.unmount());
+    root = createRoot(container);
+    show([...work, a, aDone, reset, b, bDone]);
+    await settleThreadLayout();
+    expectBetween();
+  });
+
+  it("shows no divider without a /new (control)", () => {
+    show([...work, a, aDone, b, bDone]);
+    expect(container.textContent).toContain("3 + 8 = 11");
+    expect(container.textContent).not.toContain("New session");
+  });
+});
