@@ -1,5 +1,5 @@
-import { and, desc, eq, sql } from "drizzle-orm";
-import { activityLog, agents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { activityLog, agents, agentWakeupRequests, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { acceptSteeredIdentity, reconcileSteeredIdentity, rejectSteeredIdentity, reserveSteeredIdentity, storedSteeringAcknowledgement } from "./run-identity.js";
 import { nativeRunHasStopRequest } from "./native-runtime/native-run-stop-request.js";
 
@@ -103,6 +103,8 @@ export type SteeredCommentDisplay = {
   steeredAt: string | null;
   steeringStatus: "accepted" | "delivered" | null;
   steeringDeliveryEventSeq: number | null;
+  deliveryOutcome: "steered" | "queued" | "ordinary";
+  steeringUnavailableReason: string | null;
 };
 
 /** Display is custody, not an answer. Only Pi's own read event says delivered. */
@@ -112,12 +114,40 @@ export async function withSteeredCommentDisplay<T extends { id: string; issueId:
   const runs = await db.select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot, resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.companyId, first.companyId), sql`(${heartbeatRuns.nativeIssueId} = ${first.issueId}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${first.issueId})`,
       sql`${heartbeatRuns.contextSnapshot} ? 'steeredCommentIds'`)).orderBy(desc(heartbeatRuns.createdAt));
+  const wakes = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, first.companyId),
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${first.issueId}`,
+    inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued"]),
+  ));
+  const waiting = new Set(wakes.flatMap(({ payload }) => {
+    const context = object(payload?._paperclipWakeContext);
+    return [...ids(context.wakeCommentIds), ...ids(payload?.commentIds),
+      ...[payload?.commentId, context.wakeCommentId, context.commentId].filter((id): id is string => typeof id === "string")];
+  }));
+  const receipts = await db.select({ details: activityLog.details }).from(activityLog).where(and(
+    eq(activityLog.companyId, first.companyId), eq(activityLog.entityId, first.issueId), eq(activityLog.action, "issue.comment_added"),
+    sql`${activityLog.details}->>'commentId' in (${sql.join(comments.map(comment => sql`${comment.id}`), sql`, `)})`,
+  ));
+  const intents = new Map(receipts.map(({ details }) => [String(details?.commentId), details?.deliveryIntent]));
+  const [chat] = await db.select({ agentId: issues.conversationAgentId }).from(issues)
+    .where(and(eq(issues.companyId, first.companyId), eq(issues.id, first.issueId)));
+  const [agent] = chat?.agentId ? await db.select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig }).from(agents)
+    .where(and(eq(agents.companyId, first.companyId), eq(agents.id, chat.agentId))) : [];
+  const [latest] = chat?.agentId ? await db.select({ status: heartbeatRuns.status, nativePhase: heartbeatRuns.nativePhase,
+    startedAt: heartbeatRuns.startedAt }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, first.companyId),
+      eq(heartbeatRuns.agentId, chat.agentId), sql`(${heartbeatRuns.nativeIssueId} = ${first.issueId}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${first.issueId})`))
+    .orderBy(desc(heartbeatRuns.createdAt)).limit(1) : [];
+  const unavailable = agent?.adapterType !== "paperclip_runner" || object(agent.adapterConfig).provider !== "pi_rpc"
+    ? "not a native Pi session" : !latest || !["running", "queued"].includes(latest.status) ? "run ended"
+      : !latest.startedAt || latest.status === "queued" || latest.nativePhase === "starting" ? "run starting" : "steering unavailable";
   return comments.map(comment => {
     const run = runs.find(run => ids(run.contextSnapshot?.steeredCommentIds).includes(comment.id));
     const ack = object(object(run?.resultJson?.queuedSteeringAcknowledgements)[comment.id]);
     const seq = object(run?.contextSnapshot?.steeredDeliveryEventSeqs)[comment.id];
     return { ...comment, steeredIntoRunId: run?.id ?? null, steeredAt: typeof ack.acknowledgedAt === "string" ? ack.acknowledgedAt : null,
       steeringStatus: run ? typeof seq === "number" ? "delivered" : "accepted" : null,
-      steeringDeliveryEventSeq: typeof seq === "number" ? seq : null };
+      steeringDeliveryEventSeq: typeof seq === "number" ? seq : null,
+      deliveryOutcome: run ? "steered" : waiting.has(comment.id) ? "queued" : "ordinary",
+      steeringUnavailableReason: !run && waiting.has(comment.id) && intents.get(comment.id) === "steer" ? unavailable : null };
   });
 }

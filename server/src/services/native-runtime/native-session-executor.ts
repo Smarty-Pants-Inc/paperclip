@@ -14141,6 +14141,10 @@ async function executePaperclipNativeSessionAttempt(
       // with a retry or release the still-live runner's lease.
       throw new NativeControllerDetachedForRestartError();
     }
+    // executeNativeSession has joined/aborted its ordered consumer, and startup
+    // cleanup above is proven settled. With no terminal (crash/lost connection),
+    // only the events actually retained may decide unread/answered input.
+    await controlPlane.settleEventIngestion();
     const protocolIntegrityFailure =
       error instanceof NativeSessionProtocolIntegrityError ? error : null;
     const ownershipUnverified =
