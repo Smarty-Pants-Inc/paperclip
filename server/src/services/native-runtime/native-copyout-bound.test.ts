@@ -34,7 +34,9 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 //   COPYOUT-STALL-1 ............. the box's sandbox commands block for one armed run until the test releases
 //                                 them (the seam the DF1 disk-full hook wraps, remote-workspaces.ts capture target)
 //   COPYOUT-SLOW-1 .............. the same seam, delaying each command of one armed run by a fixed time
-// PLANTED (named): the native run row R and its lease (the executor that creates them needs a live provider);
+//   COPYOUT-TIMEOUT-1 ........... the same seam: each command of one armed run reports that it timed out
+// PLANTED (named): the native run row R, its lease and its claim of M's wake (the executor that creates them
+//   needs a live provider);
 //   row 4b's foreign-host owner receipt (its producer is a controller that died mid-copy on another host).
 const box = vi.hoisted(() => ({ targets: new Map<string, unknown>(), storage: null as unknown, inputs: [] as unknown[],
   nextBox: null as null | ((leaseId: string) => Promise<unknown>) }));
@@ -78,7 +80,7 @@ import { FILE_LINE_KEPT_NO_BUTTON, readReplyFileLine, replyFileLineText } from "
 
 // At the base commit these names do not exist; the drafts stand in and every row is red on behaviour.
 const workModule = "./native-workspace-finalization-work.js";
-const bound: { COPYOUT_NO_ATTEMPT_BOUND_MS?: number } = await import(/* @vite-ignore */ workModule);
+const bound: { COPYOUT_NO_ATTEMPT_BOUND_MS?: number; COPYOUT_ATTEMPT_TIMEOUT_MS?: number; PERSON_WAIT_CAP_MS?: number } = await import(/* @vite-ignore */ workModule);
 const admissionModule = "../heartbeat/predecessor-admission.js";
 const admission: { PREVIOUS_TURN_FILES_SET_ASIDE_NOTICE?: string; readPreviousTurnWorkspaceNotice?: (context: unknown) => string | null;
   fenceUnverifiedPredecessorsAtAdmission: (db: Db, run: typeof heartbeatRuns.$inferSelect) => Promise<typeof heartbeatRuns.$inferSelect> }
@@ -156,7 +158,7 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
     // The box: a local directory; every sandbox command really runs.
     const remoteCwd = path.join(root, runId, "remote");
     await fs.mkdir(remoteCwd, { recursive: true });
-    const fault = { stall: null as null | { entered: () => void; release: Promise<void> }, slowMs: 0, commands: 0 };
+    const fault = { stall: null as null | { entered: () => void; release: Promise<void> }, slowMs: 0, timeOut: false, commands: 0 };
     const transfer: NonNullable<NonNullable<AdapterSandboxExecutionTarget["runner"]>["syncIn"]> = async operations => {
       for (const operation of operations) for (const file of operation.files) {
         await fs.mkdir(path.dirname(file.targetPath), { recursive: true });
@@ -173,6 +175,9 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
           // COPYOUT-STALL-1 / COPYOUT-SLOW-1.
           if (fault.stall) { fault.stall.entered(); await fault.stall.release; }
           if (fault.slowMs) await sleep(fault.slowMs);
+          // COPYOUT-TIMEOUT-1.
+          if (fault.timeOut) return { exitCode: null, stdout: "", stderr: "", signal: "SIGTERM", timedOut: true,
+            pid: process.pid, startedAt: new Date().toISOString() };
         }
         const result = await exec(input.command, input.args ?? [], { cwd: input.cwd ?? cwd,
           env: { ...process.env, ...input.env }, timeout: input.timeoutMs, maxBuffer: 8 * 1024 * 1024 });
@@ -199,6 +204,15 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
     const prepared = await prepareRemoteWorkspace({ db, storage, workspace: reserved, runId, lease: leaseRow as EnvironmentLease, target });
     await db.update(environmentLeases).set({ executionWorkspaceId: reserved.id }).where(eq(environmentLeases.id, leaseRow.id));
     await db.update(issues).set({ executionRunId: runId, executionWorkspaceId: reserved.id, status: "in_progress" }).where(eq(issues.id, issueId));
+    // PLANTED with R: M's wake is the one R was started from (the real claim sets both), so M is not a
+    // message parked behind R. Left alone, the planted R leaves M's own wake parked behind it.
+    const ownWake = and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
+      sql`${agentWakeupRequests.payload}->>'commentId' = ${messageId}`);
+    await vi.waitFor(async () => expect(await db.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests).where(ownWake))
+      .toEqual([{ status: "deferred_issue_execution" }]), { timeout: 10_000, interval: 25 });
+    const [carried] = await db.update(agentWakeupRequests).set({ status: "claimed", runId, claimedAt: new Date(), updatedAt: new Date() })
+      .where(ownWake).returning({ id: agentWakeupRequests.id });
+    await db.update(heartbeatRuns).set({ wakeupRequestId: carried.id }).where(eq(heartbeatRuns.id, runId));
     // R's edit, in the box only.
     const editPath = path.join(prepared.remoteRoot, "notes.md");
     await fs.writeFile(editPath, "R's unsaved edit\n");
@@ -223,7 +237,7 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
     }
     const settled: unknown[] = [];
     /** REAL: the copy-out worker's own discovery and check. */
-    function worker(copyOutBound?: { noAttemptMs?: number; attemptTimeoutMs?: number; now?: () => number }, handle: Db = db) {
+    function worker(copyOutBound?: { noAttemptMs?: number; attemptTimeoutMs?: number; personWaitCapMs?: number; now?: () => number }, handle: Db = db) {
       const options = { environmentRuntime: {} as never, onWorkspaceSettled: async (input: unknown) => { settled.push(input); },
         ...(copyOutBound ? { copyOutBound } : {}) };
       const work = nativeWorkspaceFinalizationWork(handle, options as never);
@@ -386,6 +400,17 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
     expect(cleared).toHaveLength(1);
     expect(cleared[0].statement).toMatch(/^update "issues" set .*"status" = \$\d+, "checkout_run_id" = \$\d+, "execution_run_id" = \$\d+, "execution_agent_name_key" = \$\d+, "execution_locked_at" = \$\d+.* where "issues"\."id" = \$\d+/);
 
+    await parkedMessageStarts(s, next.body.id, before, { cleared });
+    stall.release();
+  }, 280_000);
+
+  type Scenario = Awaited<ReturnType<typeof scenario>>;
+  /** The parked message `nextId` starts once R ended: the product's own release, admission and input. */
+  async function parkedMessageStarts(s: Scenario, nextId: string, before: Awaited<ReturnType<Scenario["snapshotBefore"]>>,
+    recorded: Record<string, unknown>, evidenceKey = "nextTurn") {
+    const next = { body: { id: nextId } };
+    const wakes = async () => (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, s.agentId)))
+      .filter(wake => JSON.stringify(wake.payload).includes(nextId));
     // REAL: the deferred-receipt worker and queued-run admission of a running server.
     const errors: unknown[] = [];
     const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: () => ({}) as never });
@@ -407,7 +432,7 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
       } while (Date.now() - boundAt < 90_000);
     } finally { receipts.stop?.(); await delivery.stop(); await heartbeat.drainActiveRunExecutions(); }
     const [successor] = (await successors()).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
-    evidence.nextTurn = { cleared, startedAfterMs, wakes: await wakes(), successor, providerTurnsReached: box.inputs.length, errors: errors.map(String) };
+    evidence[evidenceKey] = { ...recorded, startedAfterMs, wakes: await wakes(), successor, providerTurnsReached: box.inputs.length, errors: errors.map(String) };
     expect(successor).toBeTruthy();
     // The parked message became this run, by the product's own promotion.
     const promoted = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, s.agentId)))
@@ -453,9 +478,119 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
     }
     // R's own reply stays the one reply; nothing was posted in its name by the next turn.
     expect((await s.replies()).filter(reply => reply.createdByRunId === s.runId)).toHaveLength(1);
-    evidence.nextTurn = { ...record(evidence.nextTurn), reference, notice, admittedNextRuns: admitted.length, recoveryActions: await s.recovery(), issue: await s.issue() };
-    stall.release();
+    evidence[evidenceKey] = { ...record(evidence[evidenceKey]), reference, notice, admittedNextRuns: admitted.length, recoveryActions: await s.recovery(), issue: await s.issue() };
+  }
+
+  it("row (a), the person-wait cap: a person's message parked behind a hung first attempt of a LIVE owner -> the run ends at the cap, not at the attempt's 40 min; the message starts with the notice in its input", async () => {
+    expect(bound.PERSON_WAIT_CAP_MS).toBe(300_000);
+    expect(bound.COPYOUT_ATTEMPT_TIMEOUT_MS).toBe(40 * 60_000);
+    const s = await scenario();
+    await s.streamAndAccept();
+    const before = await s.snapshotBefore();
+    const stall = s.armStall();
+    // The production attempt timeout (40 min) and no-attempt bound (60 s). Only the cap is shortened: 5 min -> 2 s.
+    const CAP = 2_000;
+    const checking = s.worker({ personWaitCapMs: CAP }).check();
+    try {
+      await stall.reached;
+      // Nobody is parked yet: longer than the cap passes and the live attempt is not cut.
+      await sleep(CAP + 1_000);
+      expect(await s.attempts()).toEqual(["running"]);
+      expect((await s.run()).status).toBe("running");
+      // REAL: the person's next message arrives while R is still saving its files. It is parked.
+      const next = await request(s.app).post(`/api/issues/${s.issueId}/comments`).send({ body: "Also list the open questions.", clientRequestId: randomUUID() });
+      expect(next.status, JSON.stringify(next.body)).toBe(201);
+      const parked = async () => (await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, s.agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution")))).filter(wake => JSON.stringify(wake.payload).includes(next.body.id));
+      await vi.waitFor(async () => expect(await parked()).toHaveLength(1), { timeout: 10_000, interval: 50 });
+      const [wake] = await parked();
+      expect(wake).toMatchObject({ requestedByActorType: "user", requestedByActorId: PERSON, runId: null });
+      expect((await s.issue()).executionRunId).toBe(s.runId);
+      // R ends by the cap, counted from the parking (later than the acceptance here).
+      const checked = await Promise.race([checking, sleep(CAP + 20_000).then(() => "not ended by the cap" as const)]);
+      const endedAfterParkingMs = Date.now() - wake.requestedAt.getTime();
+      expect(checked).toEqual({ entries: 1, results: [null] });
+      expect(endedAfterParkingMs).toBeGreaterThanOrEqual(CAP);
+      expect(endedAfterParkingMs).toBeLessThan(CAP + 20_000);
+      // The owner of the hung attempt is live and still recorded; its attempt is still running.
+      expect(record((await s.run()).runnerProfileJson).nativeWorkspaceFinalizationOwner).toBeTruthy();
+      expect(await s.attempts()).toEqual(["running"]);
+      // It ended exactly as the no-attempt bound ends it: the same cause, the files kept, the epoch moved.
+      const kept = await s.expectEndedWithFilesKept(before);
+      await s.presentationWorker();
+      const [reply, ...more] = await s.replies();
+      expect(more).toEqual([]);
+      expect(reply).toMatchObject({ body: `${ANSWER}\n\n${FILE_LINE_KEPT_SET_ASIDE}`, createdByRunId: s.runId });
+      expect(await s.issue()).toMatchObject({ executionRunId: null, status: "blocked" });
+      // The parked message starts through the real deferred-receipt release, with the notice in its input.
+      await parkedMessageStarts(s, next.body.id, before, { capMs: CAP, endedAfterParkingMs, parkedAt: wake.requestedAt }, "personWaitCap");
+      // The hung capture returns after the cap: its save is refused and nothing changes.
+      stall.release();
+      await vi.waitFor(async () => expect(await s.attempts()).toEqual(["failed"]), { timeout: 30_000, interval: 50 });
+      const [snapshotOperation] = await db.select().from(workspaceOperations).where(and(eq(workspaceOperations.heartbeatRunId, s.runId),
+        eq(workspaceOperations.phase, "remote_workspace_snapshot")));
+      expect(JSON.stringify(snapshotOperation.metadata)).toContain("remote_workspace_publication_fenced");
+      expect(await s.committedSnapshots()).toEqual(before.committed);
+      expect((await s.recovery()).map(action => action.id)).toEqual([kept.action.id]);
+      expect((await s.replies()).filter(agentReply => agentReply.createdByRunId === s.runId)).toHaveLength(1);
+    } finally { stall.release(); await checking.catch(() => undefined); }
   }, 280_000);
+
+  it("row (cap), control: nobody parked + a hung attempt -> not cut at the cap; it keeps its own timeout and then the no-attempt bound", async () => {
+    const s = await scenario();
+    await s.streamAndAccept();
+    const before = await s.snapshotBefore();
+    const stall = s.armStall();
+    const startedAt = Date.now();
+    // The cap (400 ms) is far shorter than the attempt's own timeout (4 s) + the no-attempt bound (500 ms).
+    const checking = s.worker({ personWaitCapMs: 400, attemptTimeoutMs: 4_000, noAttemptMs: 500 }).check();
+    try {
+      await stall.reached;
+      await sleep(2_500);
+      // Six caps later the run is untouched.
+      expect(await s.attempts()).toEqual(["running"]);
+      expect((await s.run()).status).toBe("running");
+      expect(await s.coordinator()).toMatchObject({ failureCode: null });
+      expect(await checking).toEqual({ entries: 1, results: [null] });
+      const firedAfterMs = Date.now() - startedAt;
+      expect(firedAfterMs).toBeGreaterThanOrEqual(4_500);
+      await s.expectEndedWithFilesKept(before);
+      evidence.capControl = { capMs: 400, attemptTimeoutMs: 4_000, noAttemptMs: 500, firedAfterMs };
+    } finally { stall.release(); await checking.catch(() => undefined); }
+  }, 120_000);
+
+  it("row x1 (COPYOUT-TIMEOUT-1): a parked person's message + a first attempt that times out -> the run ends at that attempt; with nobody parked it is retried", async () => {
+    // Control: nobody parked. The timed-out attempt is retried as today.
+    const control = await scenario();
+    await control.streamAndAccept();
+    control.fault.timeOut = true;
+    const retried = await control.worker().check();
+    expect(await control.attempts()).toEqual(["failed"]);
+    expect(retried.results[0]).toMatchObject({ id: control.runId });
+    expect(await control.coordinator()).toMatchObject({ failureCode: "native_workspace_sync_out_failed", nextAttemptAt: expect.any(Date) });
+    expect((await control.coordinator()).phase).not.toBe("terminal_failure");
+    expect((await control.run()).status).toBe("running");
+
+    const s = await scenario();
+    await s.streamAndAccept();
+    const before = await s.snapshotBefore();
+    // REAL: the person's next message is parked behind R.
+    const next = await request(s.app).post(`/api/issues/${s.issueId}/comments`).send({ body: "Also list the open questions.", clientRequestId: randomUUID() });
+    expect(next.status, JSON.stringify(next.body)).toBe(201);
+    await vi.waitFor(async () => expect((await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, s.agentId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution")))).filter(wake => JSON.stringify(wake.payload).includes(next.body.id)))
+      .toHaveLength(1), { timeout: 10_000, interval: 50 });
+    s.fault.timeOut = true;
+    // The production constants: the cap is 5 min away; the first timed-out attempt ends R.
+    expect(await s.worker().check()).toEqual({ entries: 1, results: [null] });
+    expect(await s.attempts()).toEqual(["failed"]);
+    const [operation] = await db.select().from(workspaceOperations).where(and(eq(workspaceOperations.heartbeatRunId, s.runId),
+      eq(workspaceOperations.phase, "workspace_finalize")));
+    expect(JSON.stringify(operation.metadata)).toContain("remote_workspace_operation_timed_out");
+    await s.expectEndedWithFilesKept(before);
+    expect(await s.worker().check()).toEqual({ entries: 0, results: [] });
+    evidence.x1 = { attempts: await s.attempts(), cause: record(record(operation.metadata).workspaceSync).cause, coordinator: await s.coordinator() };
+  }, 120_000);
 
   it("row 2 (COPYOUT-SLOW-1): a copy slower than the no-attempt bound, inside its attempt timeout, is not cut and commits its files", async () => {
     const s = await scenario();
