@@ -1035,7 +1035,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     await s.expectAnsweredOnceAndNoNotice();
   }, 120_000);
 
-  it("P-c (shipped default): a person's message during workspace_finalizing is PARKED behind R; the task is freed only after R committed, with the file R wrote on disk", async () => {
+  it.each(["store", "port"] as const)("F3 P-c (%s acceptance, shipped default): a person's message during workspace_finalizing is PARKED behind R; the task is freed only after R committed, with the file R wrote on disk", async acceptance => {
     setting.trigger = "shipped";
     const s = await scenario({ wakeOnDemand: true, realSync: true });
     // FAKED BOX transport only: commands run in a separate local directory.
@@ -1065,7 +1065,9 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     box.resume.mockImplementation(async input => { await gate; return realSync.resumeNativeWorkspaceSync(input); });
-    await s.streamAndAccept();
+    // Both real acceptance producers share this publication/dispatch barrier row.
+    if (acceptance === "port") await s.streamAndAcceptThroughPort();
+    else await s.streamAndAccept();
     const copying = s.copyBack();
     let heartbeatForCleanup: ReturnType<typeof heartbeatService> | null = null;
     try {
@@ -1109,10 +1111,10 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     try {
       await dispatch.ready;
       const before = dispatches.length;
-      await l3Evidence("L3 F3 before publish", { messageId: followUp, task: await s.task(), wakes: await s.wakesFor(followUp), runs: await s.otherRuns() });
+      await l3Evidence("L3 F3 before publish", { acceptance, messageId: followUp, task: await s.task(), wakes: await s.wakesFor(followUp), runs: await s.otherRuns() });
       await s.presentationWorker();
       await vi.waitFor(() => expect(dispatches.length).toBeGreaterThan(before), { timeout: 10_000 });
-      await l3Evidence("L3 F3 after publish real queuedRunDispatch", { dispatches: dispatches.slice(before),
+      await l3Evidence("L3 F3 after publish real queuedRunDispatch", { acceptance, dispatches: dispatches.slice(before),
         task: await s.task(), wakes: await s.wakesFor(followUp), runs: await s.otherRuns(),
         finalizationPhase: (await s.coordinator()).phase,
         filePresent: await fs.stat(fileOfR).then(() => true, () => false) });
@@ -1147,7 +1149,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     // (called by resumeQueuedRuns) releases/promotes through the production wake queue.
     await heartbeat.resumeQueuedRuns();
     const promoted = await s.otherRuns();
-    await l3Evidence("L3 F3 after commit promotion", { messageId: followUp, committedAt, task: await s.task(), wakes: await s.wakesFor(followUp), promoted,
+    await l3Evidence("L3 F3 after commit promotion", { acceptance, messageId: followUp, committedAt, task: await s.task(), wakes: await s.wakesFor(followUp), promoted,
       fileReadByHarness: { path: fileOfR, body: await fs.readFile(fileOfR, "utf8") },
       limitation: "promoted run row + dispatch input contextSnapshot; no live provider/model file read" });
     expect(promoted).toHaveLength(1);
@@ -1156,7 +1158,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     expect(JSON.stringify(promoted[0].contextSnapshot)).toContain(followUp);
     expect(promoted[0].createdAt.getTime()).toBeGreaterThanOrEqual(committedAt);
     expect(await fs.readFile(fileOfR, "utf8")).toBe(contentOfR);
-    if (process.env.L3_EVIDENCE) await fs.copyFile(fileOfR, path.join(path.dirname(process.env.L3_EVIDENCE), "l3-exported-file.txt"));
+    if (process.env.L3_EVIDENCE) await fs.copyFile(fileOfR, path.join(path.dirname(process.env.L3_EVIDENCE), `f3-${acceptance}-exported-file.txt`));
     expect(committedAt).toBeGreaterThan(0);
     expect(await s.replies()).toHaveLength(1);
     } finally {
