@@ -22,6 +22,8 @@ export interface OptimisticIssueComment extends IssueComment {
   targetIssueId?: string | null;
   /** A definite rejection (nothing saved): the plain reason the bubble shows as 'Not sent'. */
   failureReason?: string | null;
+  /** Feed rows that existed before this send; never missing-ID echoes of it. */
+  preexistingCommentIds?: readonly string[];
 }
 
 export type IssueTimelineComment = IssueComment | OptimisticIssueComment;
@@ -64,6 +66,7 @@ export function createOptimisticIssueComment(params: {
   queueTargetRunId?: string | null;
   /** The id the POST carries; the server stores it on the comment (issue_comments.client_request_id). */
   clientRequestId?: string | null;
+  preexistingCommentIds?: readonly string[];
 }): OptimisticIssueComment {
   const now = new Date();
   const clientId = createOptimisticCommentId();
@@ -81,6 +84,7 @@ export function createOptimisticIssueComment(params: {
     clientStatus: params.clientStatus ?? "pending",
     queueTargetRunId: params.queueTargetRunId ?? null,
     clientRequestId: params.clientRequestId ?? null,
+    preexistingCommentIds: params.preexistingCommentIds,
     createdAt: now,
     updatedAt: now,
   };
@@ -148,6 +152,7 @@ function findPersistedCopy(
     if (requestId && persistedRequestId) return persistedRequestId === requestId;
     // Server ID absent (or a local copy that named none): only a send still in flight can be this echo; a definitely rejected one saved nothing.
     if (comment.clientStatus === "failed") return false;
+    if (comment.preexistingCommentIds?.includes(persisted.id)) return false;
     return persisted.issueId === target &&
       persisted.authorType === comment.authorType &&
       persisted.authorUserId === comment.authorUserId &&

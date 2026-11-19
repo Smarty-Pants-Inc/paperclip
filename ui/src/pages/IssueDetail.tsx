@@ -30,6 +30,7 @@ import { mergeComposerRunSettings, type ComposerRunSettings } from "@/components
 import { AgentIdentity } from "@/components/AgentIdentity";
 import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
 import { agentChatDraft } from "@/lib/agent-chat-draft";
+import { loadFailedComposerSends, saveFailedComposerSend, removeFailedComposerSend, settleDraftSubmission, type ComposerSendRequest } from "@/lib/composer-draft";
 import { trackRecentProject } from "@/lib/recent-projects";
 import { ExecutionBlockerNotice } from "../components/ExecutionBlockerNotice";
 import type { TaskComposerPause } from "../components/task-chat/TaskChatPausedTakeover";
@@ -3429,22 +3430,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   // Retries from a 'Not sent' bubble: no composer holds their words.
   const bubbleRetryRequestIdsRef = useRef(new Set<string>());
   const [failedSendRestoreText, setFailedSendRestoreText] = useState<{ key: string; body: string } | null>(null);
-  const keepFailedSend = useCallback((
-    clientId: string,
-    err: unknown,
-    kind: "comment" | "reassign",
-    variables: Record<string, unknown>,
-  ) => {
-    const reason = describeError(err, { action: "post the comment" }).body;
-    setOptimisticComments((current) => current.map((entry) => {
-      if (entry.clientId !== clientId) return entry;
-      const { clientDelivery: _clientDelivery, ...rest } = entry as OptimisticIssueComment & { clientDelivery?: unknown };
-      return { ...rest, clientStatus: "failed" as const, failureReason: reason };
-    }));
-    failedSendRequestsRef.current.set(clientId, { kind, variables });
-    const requestId = typeof variables.clientRequestId === "string" ? variables.clientRequestId : null;
-    if (requestId) sendsKeptInThreadRef.current.add(requestId);
-  }, []);
+  const optimisticCommentsRef = useRef(optimisticComments);
+  optimisticCommentsRef.current = optimisticComments;
   // The POST's resolved task, on the pending copy: a server echo without a
   // clientRequestId is matched against it, not against the page's task.
   const recordSendTarget = useCallback((clientRequestId: string | undefined, writableIssueId: string, page: Issue | null | undefined) => {
@@ -3934,6 +3921,58 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     enabled: !!selectedCompanyId,
   });
   const currentUserId = session?.user?.id ?? session?.session?.userId ?? null;
+  // Exactly the storage scope used by the mounted composer (agent chats are tab-scoped).
+  const draftAgentId = conversation?.agent?.id ?? issue?.conversationAgentId;
+  const commentDraftKey = issue ? (draftAgentId
+    ? `paperclip:agent-chat-draft:${issue.companyId}:${currentUserId}:${draftAgentId}`
+    : `paperclip:issue-comment-draft:${issue.id}`) : null;
+  useEffect(() => {
+    if (!commentDraftKey || !issue) return;
+    const restored = loadFailedComposerSends(commentDraftKey).filter(row =>
+      row.companyId === issue.companyId && row.authorUserId === currentUserId);
+    for (const row of restored) {
+      failedSendRequestsRef.current.set(row.clientId, {
+        kind: row.kind,
+        variables: { ...row.request, clientRequestId: row.clientRequestId, ...(row.interrupt === undefined ? {} : { interrupt: row.interrupt }) },
+      });
+    }
+    setOptimisticComments(current => [...current, ...restored
+      .filter(row => !current.some(entry => entry.clientId === row.clientId))
+      .map(row => ({
+        ...createOptimisticIssueComment({ companyId: row.companyId, issueId: row.issueId,
+          authorUserId: row.authorUserId, body: row.request.body, clientRequestId: row.clientRequestId }),
+        id: row.clientId, clientId: row.clientId, createdAt: new Date(row.createdAt), updatedAt: new Date(row.createdAt),
+        clientStatus: "failed" as const, failureReason: row.reason, targetIssueId: row.targetIssueId,
+      }))]);
+  }, [commentDraftKey, currentUserId]);
+  const keepFailedSend = useCallback((
+    clientId: string, err: unknown, kind: "comment" | "reassign", variables: Record<string, unknown>,
+    snapshot: OptimisticIssueComment | null,
+  ) => {
+    const reason = describeError(err, { action: "post the comment" }).body;
+    const entry = optimisticCommentsRef.current.find(row => row.clientId === clientId) ?? snapshot;
+    const requestId = typeof variables.clientRequestId === "string" ? variables.clientRequestId : null;
+    // Persist before composer settlement clears the pending submission. This record
+    // restores a Not-sent bubble only; it is never offered to automatic replay.
+    if (commentDraftKey && entry && requestId) {
+      const { clientRequestId: _id, interrupt, ...request } = variables;
+      saveFailedComposerSend(commentDraftKey, { clientId, clientRequestId: requestId,
+        request: request as unknown as ComposerSendRequest, reason, kind,
+        ...(typeof interrupt === "boolean" ? { interrupt } : {}),
+        companyId: entry.companyId, issueId: entry.issueId, authorUserId: entry.authorUserId,
+        createdAt: new Date(entry.createdAt).toISOString(), targetIssueId: entry.targetIssueId });
+      // Also release the uncertain-send fence when its composer unmounted before
+      // the refusal arrived. A definite rejection must never become auto-replay.
+      if (classifySendFailure(err) === "rejected") settleDraftSubmission(commentDraftKey, requestId);
+    }
+    setOptimisticComments(current => current.map(row => {
+      if (row.clientId !== clientId) return row;
+      const { clientDelivery: _delivery, ...rest } = row as OptimisticIssueComment & { clientDelivery?: unknown };
+      return { ...rest, clientStatus: "failed" as const, failureReason: reason };
+    }));
+    failedSendRequestsRef.current.set(clientId, { kind, variables });
+    if (requestId) sendsKeptInThreadRef.current.add(requestId);
+  }, [commentDraftKey]);
   useEffect(() => {
     if (!streamlinedUiEnabled || !issue || !sessionResolved) return;
     recordRecentTask(issue, currentUserId);
@@ -5299,6 +5338,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               queueTargetRunId: queuedComment?.id ?? null,
               // The server's copy carries it back: one bubble, whichever arrives first.
               clientRequestId,
+              preexistingCommentIds: comments.map(comment => comment.id),
             }),
             ...(workingRun ? pendingDeliveryFields() : {}),
           }
@@ -5318,6 +5358,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
       return {
         optimisticCommentId: optimisticComment?.clientId ?? null,
+        optimisticComment,
         queuedCommentTargetRunId: queuedComment?.id ?? null,
         workingRunId: workingRun?.id ?? null,
         previousIssue,
@@ -5436,7 +5477,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         // Refused for certain (nothing saved), or a bubble Retry whose words
         // no composer holds: the bubble stays, 'Not sent', with Retry and
         // Edit. onFinished must not drop it.
-        keepFailedSend(context.optimisticCommentId, err, "comment", variables as Record<string, unknown>);
+        keepFailedSend(context.optimisticCommentId, err, "comment", variables as Record<string, unknown>, context.optimisticComment);
         context.optimisticCommentId = null;
       } else if (context?.optimisticCommentId) {
         setOptimisticComments((current) =>
@@ -5766,6 +5807,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
             clientStatus: queuedComment ? "queued" : "pending",
             queueTargetRunId: queuedComment?.id ?? null,
             clientRequestId,
+            preexistingCommentIds: comments.map(comment => comment.id),
           })
         : null;
 
@@ -5786,6 +5828,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
       return {
         optimisticCommentId: optimisticComment?.clientId ?? null,
+        optimisticComment,
         queuedCommentTargetRunId: queuedComment?.id ?? null,
         previousIssue,
       };
@@ -5872,7 +5915,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       const failure = classifySendFailure(err);
       const bubbleRetry = !!variables.clientRequestId && bubbleRetryRequestIdsRef.current.has(variables.clientRequestId);
       if (context?.optimisticCommentId && (failure === "rejected" || bubbleRetry)) {
-        keepFailedSend(context.optimisticCommentId, err, "reassign", variables as Record<string, unknown>);
+        keepFailedSend(context.optimisticCommentId, err, "reassign", variables as Record<string, unknown>, context.optimisticComment);
         context.optimisticCommentId = null;
       } else if (context?.optimisticCommentId) {
         setOptimisticComments((current) =>
@@ -7210,6 +7253,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     retry: (clientId) => {
       const request = failedSendRequestsRef.current.get(clientId);
       if (!request) return;
+      if (commentDraftKey) removeFailedComposerSend(commentDraftKey, clientId);
       failedSendRequestsRef.current.delete(clientId);
       setOptimisticComments((current) => current.filter((entry) => entry.clientId !== clientId));
       const requestId = typeof request.variables.clientRequestId === "string" ? request.variables.clientRequestId : null;
@@ -7229,7 +7273,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       if (failed) setFailedSendRestoreText({ key: clientId, body: failed.body });
     },
     restoreText: failedSendRestoreText,
-  }), [addComment, addCommentAndReassign, failedSendRestoreText, optimisticComments]);
+  }), [addComment, addCommentAndReassign, commentDraftKey, failedSendRestoreText, optimisticComments]);
   const handleCommentImageUpload = useCallback(
     async (file: File) => {
       const attachment = await uploadAttachment.mutateAsync(file);
@@ -9043,7 +9087,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   currentUserId={currentUserId}
                   userLabelMap={userLabelMap}
                   userProfileMap={userProfileMap}
-                  draftKey={conversationAgent ? `paperclip:agent-chat-draft:${issue.companyId}:${currentUserId}:${conversationAgent.id}` : `paperclip:issue-comment-draft:${issue.id}`}
+                  draftKey={commentDraftKey!}
                   reassignOptions={commentReassignOptions}
                   currentAssigneeValue={actualAssigneeValue}
                   suggestedAssigneeValue={suggestedAssigneeValue}

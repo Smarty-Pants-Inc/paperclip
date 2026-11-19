@@ -29,6 +29,7 @@ import {
   saveDraftSubmission,
   clearDraftSubmission,
   settleDraftSubmission,
+  removeFailedComposerSend,
   type ComposerDraftSubmission,
   type ComposerSendRequest,
 } from "@/lib/composer-draft";
@@ -563,7 +564,16 @@ export function TaskChatComposer({
     const current = bodyRef.current;
     const next = current ? `${restoreText.body}\n\n${current}` : restoreText.body;
     changeBody(next);
-    if (draftKey) saveDraft(draftKey, next);
+    if (draftKey) {
+      saveDraft(draftKey, next);
+      // Transfer custody only after the ordinary draft (or the next-draft
+      // suffix of another in-flight send) durably holds these words.
+      const stored = loadDraft(draftKey);
+      const offset = loadDraftSubmission(draftKey)?.nextDraftOffset;
+      if (stored === next || (offset !== undefined && stored.slice(offset) === next)) {
+        removeFailedComposerSend(draftKey, restoreText.key);
+      }
+    }
   }, [restoreText]);
   const queuedEditRef = useRef(queuedEdit);
   queuedEditRef.current = queuedEdit;

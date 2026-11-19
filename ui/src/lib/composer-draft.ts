@@ -327,6 +327,51 @@ export function saveDraftAttachments(draftKey: string, attachments: unknown, att
     /* Disabled/full browser storage must not break the composer. */
   }
 }
+/** Definite refusals are NOT uncertain submissions: nothing may auto-replay them.
+ * Keep their custody separately so the next composer's draft stays editable. */
+export interface ComposerFailedSend {
+  clientId: string;
+  clientRequestId: string;
+  request: ComposerSendRequest;
+  reason: string;
+  kind: "comment" | "reassign";
+  interrupt?: boolean;
+  companyId: string;
+  issueId: string;
+  authorUserId: string | null;
+  createdAt: string;
+  targetIssueId?: string | null;
+}
+
+export function loadFailedComposerSends(draftKey: string): ComposerFailedSend[] {
+  const rows = loadStructuredDraft<unknown>(`${draftKey}:failed:v1`, []);
+  if (!Array.isArray(rows)) return [];
+  return rows.filter((row): row is ComposerFailedSend =>
+    row && typeof row === "object" &&
+    typeof row.clientId === "string" && typeof row.clientRequestId === "string" &&
+    isComposerSendRequest(row.request) && typeof row.reason === "string" &&
+    (row.kind === "comment" || row.kind === "reassign") &&
+    (row.interrupt === undefined || typeof row.interrupt === "boolean") &&
+    typeof row.companyId === "string" && typeof row.issueId === "string" &&
+    (row.authorUserId === null || typeof row.authorUserId === "string") &&
+    typeof row.createdAt === "string" && Number.isFinite(Date.parse(row.createdAt)) &&
+    (row.targetIssueId === undefined || row.targetIssueId === null || typeof row.targetIssueId === "string"));
+}
+
+export function saveFailedComposerSend(draftKey: string, failed: ComposerFailedSend) {
+  saveStructuredDraft(`${draftKey}:failed:v1`, [
+    ...loadFailedComposerSends(draftKey).filter(row => row.clientId !== failed.clientId), failed,
+  ]);
+}
+
+export function removeFailedComposerSend(draftKey: string, clientId: string) {
+  const remaining = loadFailedComposerSends(draftKey).filter(row => row.clientId !== clientId);
+  try {
+    if (remaining.length) saveStructuredDraft(`${draftKey}:failed:v1`, remaining);
+    else draftStorage(draftKey).removeItem(`${draftKey}:failed:v1`);
+  } catch { /* Disabled/full storage retains the mounted bubble. */ }
+}
+
 export function loadStructuredDraft<T>(draftKey: string, fallback: T): T {
   try {
     const value = draftStorage(draftKey).getItem(draftKey);

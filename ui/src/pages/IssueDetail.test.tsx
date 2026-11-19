@@ -8003,6 +8003,165 @@ describe("IssueDetail", () => {
     20_000,
   );
 
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4605
+  // rf-6's four independent regressions: history/no-loss, each at 390 and 1440.
+  it.each([390, 1440])(
+    "judge dupbubble2 history: an OLD missing-ID same-body row already in the feed cannot swallow a NEW pending send at %i",
+    async (width) => {
+      const { post, state, bubbles, finalThread } = await renderSteeringPlacement(width, "steer", { delayMs: 1200, echoClientRequestId: true });
+      const oldTime = new Date(Date.now() - 120_000).toISOString();
+      const old = { ...post, id: "judge-old-comment", issueId: "issue-1", clientRequestId: null, steeredIntoRunId: null, steeringStatus: null, createdAt: oldTime, updatedAt: oldTime };
+      await refetchThread(state, [...finalThread.filter((comment) => comment.id !== post.id), old as never]);
+      expect(await waitUntil(() => bubbles().length === 1, 3000)).toBe(true);
+      const before = bubbles().map((node) => node.outerHTML);
+      const started = await pressEnter();
+      const samples = await sampleBubbleCounts(bubbles, 900, started);
+      const during = bubbles().map((node) => node.outerHTML);
+      // Let the actual request settle before making the discriminating assertion.
+      expect(await waitUntil(() => bubbles().some((node) => node.dataset.delivery === "sent"), 3000)).toBe(true);
+      if (process.env.STEER_UI_EVIDENCE) writeFileSync(`${process.env.STEER_UI_EVIDENCE}/judge-old-history-${width}.json`, JSON.stringify({ before, samples, during, after: bubbles().map((node) => node.outerHTML) }, null, 2));
+      expect(samples.every((sample) => sample.count === 2), JSON.stringify(samples)).toBe(true);
+    },
+    20_000,
+  );
+
+  it.each([390, 1440])(
+    "judge dupbubble2 no-loss: a refused send survives a whole page remount with durable storage intact at %i",
+    async (width) => {
+      const { post, posts, bubbles } = await renderSteeringPlacement(width, "steer", { delayMs: 100, failStatus: 409 });
+      await pressEnter();
+      expect(await waitUntil(() => notSent().length === 1 || editorValue() === post.body, 3000)).toBe(true);
+      const before = { editor: editorValue(), bubbles: bubbles().map((node) => node.outerHTML), storage: { ...localStorage } };
+      expect(posts).toHaveLength(1);
+      // Preserve local/session storage. A new React tree and QueryClient model a fresh page:
+      // no author-local optimistic state or failed-request refs survive this boundary.
+      await act(async () => { root.unmount(); });
+      queryClient.clear();
+      queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+      root = createTooltipRoot(container);
+      await act(async () => { renderIssueView(); });
+      await waitForAssertion(() => expect(container.querySelector('[data-testid="stand-in-editor"]')).not.toBeNull());
+      await flushReact();
+      const after = { editor: editorValue(), bubbles: bubbles().map((node) => node.outerHTML), storage: { ...localStorage } };
+      if (process.env.STEER_UI_EVIDENCE) writeFileSync(`${process.env.STEER_UI_EVIDENCE}/judge-refusal-remount-${width}.json`, JSON.stringify({ before, after, posts }, null, 2));
+      expect(posts).toHaveLength(1); // A remount must not silently POST a refused input.
+      expect(editorValue().includes(post.body) || bubbles().length > 0, JSON.stringify(after)).toBe(true);
+      // Stronger fixed contract: restore the failed bubble, not two copies or an uncertain-send notice.
+      expect(notSent()).toHaveLength(1);
+      expect(bubbles()).toHaveLength(1);
+      expect(notSent()[0]!.textContent).toContain("Not sent: Conflict: the task changed");
+      expect(Array.from(notSent()[0]!.querySelectorAll("button")).map(node => node.textContent?.trim())).toEqual(["Retry", "Edit"]);
+      expect(editorValue()).toBe("");
+    },
+    20_000,
+  );
+
+  async function remountWithDraftStorage(children?: ReactNode) {
+    await act(async () => { root.unmount(); });
+    queryClient.clear();
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    root = createTooltipRoot(container);
+    await act(async () => { renderIssueView(children); });
+    await waitForAssertion(() => expect(container.querySelector('[data-testid="stand-in-editor"]')).not.toBeNull());
+    await flushReact();
+  }
+
+  it.each([390, 1440])(
+    "dupbubble3 F1: a restored refusal keeps the next draft; Edit transfers custody durably, once, without resend at %i",
+    async width => {
+      const { post, posts, bubbles } = await renderSteeringPlacement(width, "steer", { delayMs: 200, failStatus: 409 });
+      await pressEnter();
+      await act(async () => { markdownEditorFixture.change("next unsent draft"); });
+      expect(await waitUntil(() => notSent().length === 1)).toBe(true);
+      await remountWithDraftStorage();
+      expect(notSent()).toHaveLength(1);
+      expect(editorValue()).toBe("next unsent draft");
+      expect(posts).toHaveLength(1);
+      await clickInFailed("Edit");
+      const edited = `${post.body}\n\nnext unsent draft`;
+      expect(await waitUntil(() => editorValue() === edited)).toBe(true);
+      expect(bubbles()).toHaveLength(0);
+      await remountWithDraftStorage();
+      expect(editorValue()).toBe(edited);
+      expect(notSent()).toHaveLength(0);
+      expect(bubbles()).toHaveLength(0);
+      expect(posts).toHaveLength(1);
+    }, 20_000,
+  );
+
+  it.each([390, 1440])(
+    "dupbubble3 F1: Retry after remount preserves the refused request ID and Queue choice, and clears durable failure at %i",
+    async width => {
+      const { post, posts, waitingText } = await renderSteeringPlacement(width, "queue", {
+        delayMs: 100, failStatus: 409, failTimes: 1, echoClientRequestId: true, says: "queued",
+      });
+      await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="task-chat-send-menu-toggle"]')!.click(); });
+      await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="task-chat-send-menu-queue"]')!.click(); });
+      expect(await waitUntil(() => notSent().length === 1)).toBe(true);
+      expect(posts[0]).toMatchObject({ body: post.body, deliveryIntent: "queue" });
+      await remountWithDraftStorage();
+      expect(notSent()).toHaveLength(1);
+      expect(posts).toHaveLength(1);
+      await clickInFailed("Retry");
+      expect(await waitUntil(() => waitingText().includes(post.body))).toBe(true);
+      expect(posts).toHaveLength(2);
+      expect(posts[1]).toEqual(posts[0]);
+      expect(notSent()).toHaveLength(0);
+      await remountWithDraftStorage();
+      expect(notSent()).toHaveLength(0);
+      expect(editorValue()).toBe("");
+      expect(posts).toHaveLength(2);
+    }, 20_000,
+  );
+
+  it.each([390, 1440])(
+    "dupbubble3 F1: a definite refusal arriving after unmount cannot leave an auto-resend submission at %i",
+    async width => {
+      const { post, posts, bubbles } = await renderSteeringPlacement(width, "steer", { delayMs: 200, failStatus: 409 });
+      await pressEnter();
+      await act(async () => { root.unmount(); });
+      // The real mutation's refusal arrives with no mounted composer to settle it.
+      await new Promise(resolve => setTimeout(resolve, 350));
+      queryClient.clear();
+      queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+      root = createTooltipRoot(container);
+      await act(async () => { renderIssueView(); });
+      expect(await waitUntil(() => notSent().length === 1)).toBe(true);
+      await sampleBubbleCounts(bubbles, 400, performance.now());
+      expect(notSent()[0]!.textContent).toContain(post.body);
+      expect(bubbles()).toHaveLength(1);
+      expect(editorValue()).toBe("");
+      expect(posts).toHaveLength(1);
+    }, 20_000,
+  );
+
+  it.each([390, 1440])(
+    "dupbubble3 F1: agent-chat refusals use the composer's session storage and restore without replay at %i",
+    async width => {
+      const resolvedId = "resolved-chat-task";
+      const { post, posts, bubbles } = await renderSteeringPlacement(width, "steer", {
+        delayMs: 100, failStatus: 409, conversationResolvesTo: resolvedId,
+      });
+      await pressEnter();
+      expect(await waitUntil(() => notSent().length === 1)).toBe(true);
+      const failureKeys = Object.keys(sessionStorage).filter(key => key.endsWith(":failed:v1"));
+      expect(failureKeys).toHaveLength(1);
+      expect(Object.keys(localStorage).filter(key => key.endsWith(":failed:v1"))).toEqual([]);
+      const record = JSON.parse(sessionStorage.getItem(failureKeys[0]!)!)[0];
+      expect(record).toMatchObject({ request: { body: post.body }, clientRequestId: posts[0]!.clientRequestId,
+        targetIssueId: resolvedId, reason: "Conflict: the task changed" });
+      const pageIssue = createIssue({ status: "in_progress", assigneeAgentId: "agent-1", executionRunId: STEER_A2_POST_RESPONSE.steeredIntoRunId });
+      await remountWithDraftStorage(<TaskDetailSurface conversation={{
+        agent: createAgent({ adapterType: "paperclip_runner" }), issue: pageIssue,
+        ensureIssue: async () => createIssue({ id: resolvedId, identifier: "PAP-9" }),
+      }} />);
+      expect(notSent()).toHaveLength(1);
+      expect(bubbles()).toHaveLength(1);
+      expect(editorValue()).toBe("");
+      expect(posts).toHaveLength(1);
+    }, 20_000,
+  );
+
   it.each([390, 1440])(
     "dupbubble2 D2: Edit on the 'Not sent' bubble moves its words to the composer and removes the bubble (one place) at %i",
     async (width) => {
