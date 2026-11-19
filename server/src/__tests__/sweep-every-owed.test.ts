@@ -13,7 +13,8 @@ import { issueRoutes } from "../routes/issues.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { answeredPersonMessageIds } from "../services/person-message-answer.js";
 import {
-  settleUnansweredPersonMessages, UNANSWERED_MESSAGE_NO_RUN_TEXT, UNANSWERED_MESSAGE_REASON_PREFIX,
+  settleUnansweredPersonMessages, UNANSWERED_CARRIED_STEER_FAILED_TEXT, UNANSWERED_MESSAGE_NO_RUN_TEXT,
+  UNANSWERED_MESSAGE_REASON_PREFIX,
 } from "../services/recovery/unanswered-person-message.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -166,6 +167,46 @@ describe.skipIf(!support.supported)("the sweep cards every owed person message, 
     expect([...answered]).toContain(m3);
     expect(cards.filter(c => !c.deleted), JSON.stringify(cards)).toEqual([]);
     expect(cards.map(c => c.message), "no card for the answered resend; M1's one card retired").toEqual([f.m1]);
+  }, 120_000);
+
+  // rf-4's B' row (adopt-lead + rf-4, 10:09Z): cut A's carried-steer notice and sweep-every2's older cards in ONE
+  // pass. m was steered into a run that ended without answering it (restored), and the next turn carrying m FAILED
+  // before answering; M0 (seed's M1) is older and never reached the agent. Exactly ONE card for m (A's notice) and
+  // ONE for M0; further passes add nothing (never two for m).
+  it("row B': steered m whose carrying turn FAILED + older never-reached M0 => ONE card each, never two for m", async () => {
+    const f = await seed();
+    const m0 = f.m1;
+    const t = (m: number) => new Date(Date.now() - (30 - m) * 60_000);
+    const m = randomUUID();
+    await db.insert(issueComments).values({ id: m, companyId: f.companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: userId, body: "m, steered mid-turn", createdAt: t(4), updatedAt: t(4) });
+    // The turn m was steered into ended without reading it: its run end restored m (restoreUnansweredSteersAtRunEnd).
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "on_demand",
+      triggerDetail: "manual", status: "succeeded", runtimeMode: "native", startedAt: t(3.5), finishedAt: t(4.5),
+      responsibleUserId: userId, nativeIssueId: f.issueId, issueId: f.issueId,
+      contextSnapshot: { issueId: f.issueId, steeredCommentIds: [], responsibleUserId: userId },
+      resultJson: { restoredSteeredCommentIds: [m] } });
+    // The next turn carried m and FAILED before answering it.
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "on_demand",
+      triggerDetail: "manual", status: "failed", runtimeMode: "native", startedAt: t(5), finishedAt: t(5.5),
+      error: "adapter_failed: the provider exited", errorCode: "adapter_failed",
+      responsibleUserId: userId, nativeIssueId: f.issueId, issueId: f.issueId,
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: m, commentId: m, wakeCommentIds: [m], responsibleUserId: userId } });
+    const swept = await sweep(f);
+    const cards = await allCards(f);
+    await evidence("rowBprime", { m0, m, m2: f.m2, swept, cards });
+    const forM = cards.filter(c => c.message === m), forM0 = cards.filter(c => c.message === m0);
+    expect(forM, `exactly one card for m: ${JSON.stringify({ swept, cards })}`).toHaveLength(1);
+    expect(forM[0]!.body, "m's card is cut A's carried-steer notice").toBe(UNANSWERED_CARRIED_STEER_FAILED_TEXT);
+    expect(forM0, `exactly one card for M0: ${JSON.stringify({ swept, cards })}`).toHaveLength(1);
+    expect(forM0[0]!.body).toBe(UNANSWERED_MESSAGE_NO_RUN_TEXT);
+    expect(cards.filter(c => c.message === f.m2), "none for the answered M2").toEqual([]);
+    expect(cards.every(c => !c.deleted)).toBe(true);
+    // A second pass adds nothing: never two for m, never two for M0.
+    const again = await sweep(f);
+    const after = await allCards(f);
+    await evidence("rowBprime-second-pass", { again, after });
+    expect(after.map(c => c.message).sort(), JSON.stringify(after)).toEqual([m, m0].sort());
   }, 120_000);
 
   it("control: M1 and M2 both answered => no card", async () => {
