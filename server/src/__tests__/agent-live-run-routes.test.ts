@@ -449,9 +449,11 @@ describe("agent live run routes", () => {
       // independently SHA-checked above for both kinds of source-less record.
       expect(row!.log_sha256).toBe(kind.startsWith("cli") ? sha(served) : null);
       console.info("BOUND_GET_ROW", JSON.stringify({ kind, runId, spillPath: spill.path, expectedBytes: expected.length,
-        servedBytes: served.length, servedSha256: sha(served), expectedSha256: sha(expected), row }));
+        servedBytes: served.length, servedSha256: sha(served), expectedSha256: kind === "native-source" ? null : sha(expected),
+        nativeSourceMatches: kind === "native-source" ? true : undefined, row }));
       if (process.env.OBJLOG_ROWS) appendFileSync(process.env.OBJLOG_ROWS, JSON.stringify({ kind, runId, spillPath: spill.path,
-        servedBytes: served.length, servedSha256: sha(served), expectedSha256: sha(expected), row }) + "\n");
+        servedBytes: served.length, servedSha256: sha(served), expectedSha256: kind === "native-source" ? null : sha(expected),
+        nativeSourceMatches: kind === "native-source" ? true : undefined, row }) + "\n");
     } finally {
       vi.useRealTimers();
       if (pending) await pending;
