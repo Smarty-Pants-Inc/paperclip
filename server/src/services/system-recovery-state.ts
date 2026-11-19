@@ -241,20 +241,8 @@ function unrecoverableSavedFilesReason(failure: RecoveryFailure) {
   return recoveryRefusalReasons[failure.code] ?? "a safety check on the saved files did not pass";
 }
 
-/**
- * PROPOSED, PENDING RFL (d2shared2; the words are RFL's to rule). The ONE line a person reads when a reply's file
- * save failed for good (its line reads LOST: "The file changes from this reply couldn't be saved.") while their next
- * message waits. It is the board card's next action for that run, and the thread line posted once at the moment the
- * message starts ON THE SAME project checkout (explicit-native-continuation.ts, the LOST-line gate). It replaces
- * "... Your Retry is saved." (said to people who pressed no Retry) and "Create a new task to continue the work."
- */
-export const REPLY_FILES_NOT_SAVED_LINE = "Your message is saved. The last reply's file changes couldn't be saved; it starts now on the project's files.";
-/**
- * PROPOSED, PENDING RFL (d2shared2, rf-5 condition (a)). The same line when the checkout no longer equals the last
- * saved state (the failed copy-back applies file by file, so a part of the reply's changes can be in it, or the
- * saved state can no longer be read): the message never starts silently on a mixed tree.
- */
-export const REPLY_FILES_PARTLY_SAVED_LINE = "Your message is saved. The last reply's file changes couldn't all be saved, and some of them may be in the project's files; it starts now on the files as they are.";
+/** The words live in ONE place (packages/shared/src/reply-file-line.ts); PROPOSED, PENDING RFL (d2shared2). */
+export { REPLY_FILES_NOT_SAVED_LINE, REPLY_FILES_PARTLY_SAVED_LINE } from "@paperclipai/shared";
 
 export function unrecoverableSavedFilesNotice(failure: RecoveryFailure) {
   return `Paperclip could not recover the unsaved files from the previous run: ${unrecoverableSavedFilesReason(failure)}. `

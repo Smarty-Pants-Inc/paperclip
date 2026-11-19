@@ -25,6 +25,22 @@ export const FILE_LINE_SAVING = "Saving this turn's files…";
 /** `saving` past its deadline: never "Saving…" for ever. */
 export const FILE_LINE_NOT_SAVED_YET = "The file changes from this reply aren't saved yet.";
 
+/**
+ * PROPOSED, PENDING RFL (d2shared2; the words are RFL's to rule). The ONE line a person reads when a reply's file
+ * save failed for good (its line reads LOST) while their next message waits: the task's next action for that run
+ * (server execution-blocker.ts), the thread's recovery card (ui TaskChatThread.tsx), and the thread line posted once
+ * at the moment the message starts ON THE SAME project checkout (server explicit-native-continuation.ts). It replaces
+ * "... Your Retry is saved." (said to people who pressed no Retry), "Create a new task to continue the work." and
+ * the card's "This recovery needs a human decision."
+ */
+export const REPLY_FILES_NOT_SAVED_LINE = "Your message is saved. The last reply's file changes couldn't be saved; it starts now on the project's files.";
+/**
+ * PROPOSED, PENDING RFL (d2shared2, rf-5 condition (a)). The same line when the checkout no longer equals the last
+ * saved state (the failed copy-back applies file by file, so a part of the reply's changes can be in it, or the
+ * saved state can no longer be read): the message never starts silently on a mixed tree.
+ */
+export const REPLY_FILES_PARTLY_SAVED_LINE = "Your message is saved. The last reply's file changes couldn't all be saved, and some of them may be in the project's files; it starts now on the files as they are.";
+
 export function readReplyFileLine(value: unknown): ReplyFileLine | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const { state, deadlineAt } = value as Record<string, unknown>;
