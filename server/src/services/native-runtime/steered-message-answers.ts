@@ -12,6 +12,12 @@ export interface SteerAnswerEvent {
   hasText?: boolean | null;
 }
 
+/** A text item's evidence: where its item.started was, and whether it completed with non-empty text. */
+interface TextItem {
+  start?: number;
+  completed: boolean;
+}
+
 const STEER_ITEM = /:steer:(.+)$/;
 /**
  * Projector kinds of a tool call's item.started (Pi: pi-event-projector.ts toolPayload,
@@ -24,9 +30,18 @@ const TURN_END = new Set(["turn.completed", "turn.cancelled", "turn.failed"]);
 /**
  * The answered rule for steered person messages (never-OK, live on PV2 s3).
  * A steered message B is ANSWERED by its run only when the run log shows an assistant
- * TEXT item (kind agentMessage with completed non-empty text; never reasoning, never a
- * tool) that STARTED after B's delivery userMessage and before the next tool call
- * (item.started of a tool kind, or tool.execution.started) or the turn's end.
+ * TEXT item (kind agentMessage; never reasoning, never a tool) with a real item.started
+ * after B's delivery userMessage and before the next tool call (item.started of a tool
+ * kind, or tool.execution.started) or the turn's end, whose same item then COMPLETED
+ * (item.completed) with non-empty text.
+ *
+ * Start evidence is required (rf5 F1). The Pi projector (pi-event-projector.ts) emits a
+ * streamed text block's item.started at its first text_start/text_delta, i.e. where the
+ * text began, and its item.completed only at message_end. A receipt whose text was never
+ * streamed (final-only) projects ONLY item.completed: nothing records when that text
+ * began relative to B's read, so it is never an answer (B is carried: a possible
+ * duplicate, never a loss). A text item that ended item.failed (Pi stopReason error or
+ * aborted, rf5 F2) is not durable text and does not answer either.
  *
  * Delivery is Pi's userMessage item.started, paired as the restart recovery pairs it
  * (steering-delivery.ts unreadSteeredMessageIds): a turn's first userMessage is its own
@@ -46,9 +61,9 @@ export function steeredMessageAnswers(events: Iterable<SteerAnswerEvent>): {
   const inputs = new Map<string | null, number>();
   const early = new Map<string | null, number[]>();
   // A text block's position is where it STARTED: Pi streams a tool call's item.started
-  // before the assistant message ends and completes its text block.
-  const textStart = new Map<string, number>();
-  const texts: number[] = [];
+  // before the assistant message ends and completes its text block. Only a real
+  // item.started places it; a completion never invents a start.
+  const textItems = new Map<string, TextItem>();
   const boundaries: number[] = [];
   for (const event of list) {
     const turnId = event.turnId ?? null;
@@ -71,9 +86,12 @@ export function steeredMessageAnswers(events: Iterable<SteerAnswerEvent>): {
       if (index >= 0) deliveredAt.set(pending.splice(index, 1)[0]!.id, event.seq);
       else early.set(turnId, [...(early.get(turnId) ?? []), event.seq]);
     } else if (event.kind === "agentMessage" && (event.eventType === "item.started" || event.eventType === "item.completed")) {
-      const key = event.itemId ?? `seq:${event.seq}`;
-      if (!textStart.has(key)) textStart.set(key, event.seq);
-      if (event.eventType === "item.completed" && event.hasText) texts.push(textStart.get(key)!);
+      // An item with no id cannot be matched to its start, so it is never evidence.
+      if (!event.itemId) continue;
+      const item = textItems.get(event.itemId) ?? { completed: false };
+      textItems.set(event.itemId, item);
+      if (event.eventType === "item.started") item.start ??= event.seq;
+      else if (event.hasText && item.start !== undefined) item.completed = true;
     } else if (event.eventType === "tool.execution.started"
       || (event.eventType === "item.started" && TOOL_KINDS.has(event.kind ?? ""))
       || TURN_END.has(event.eventType)) {
@@ -84,7 +102,7 @@ export function steeredMessageAnswers(events: Iterable<SteerAnswerEvent>): {
     const at = deliveredAt.get(id);
     if (at === undefined) return false;
     const end = boundaries.find((seq) => seq > at) ?? Number.POSITIVE_INFINITY;
-    return texts.some((start) => start > at && start < end);
+    return [...textItems.values()].some((item) => item.completed && item.start! > at && item.start! < end);
   });
   return { acknowledged, delivered: acknowledged.filter((id) => deliveredAt.has(id)), answered };
 }
