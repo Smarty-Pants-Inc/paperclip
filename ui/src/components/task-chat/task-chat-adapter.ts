@@ -28,18 +28,15 @@ export interface TaskChatAdapterContext {
   reviewVerdictByRunId?: ReadonlyMap<string, NonNullable<TaskChatMessageItem["reviewVerdict"]>>;
 }
 
-/** The verdict an accepted run result recorded, read from the run's resultJson. */
+/**
+ * The verdict the server's finalizer recorded on the run (resultJson.reviewVerdict).
+ * It exists only for a review task, as read from the task's own record; the
+ * model's raw report is never shown as a verdict.
+ */
 export function acceptedRunResultVerdict(resultJson: unknown): "pass" | "fail" | undefined {
   if (!resultJson || typeof resultJson !== "object" || Array.isArray(resultJson)) return undefined;
-  const run = resultJson as Record<string, unknown>;
-  const semantic = run.semanticResult && typeof run.semanticResult === "object" ? (run.semanticResult as Record<string, unknown>).result : null;
-  for (const candidate of [run.nativeResult, run.acceptedResult, semantic]) {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
-    const result = candidate as Record<string, unknown>;
-    if (result.schema !== "paperclip.run_result.v1") continue;
-    return result.verdict === "pass" || result.verdict === "fail" ? result.verdict : undefined;
-  }
-  return undefined;
+  const verdict = (resultJson as Record<string, unknown>).reviewVerdict;
+  return verdict === "pass" || verdict === "fail" ? verdict : undefined;
 }
 
 function effectiveAgentId(comment: IssueChatComment): string | null {

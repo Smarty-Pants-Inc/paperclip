@@ -796,6 +796,8 @@ export interface IssueExecutionPolicy {
   monitor?: IssueExecutionMonitorPolicy | null;
   reviewPreset?: LowTrustReviewPresetPolicy;
   authorizationPolicy?: TrustAuthorizationPolicy;
+  /** "review": the deliverable is a verdict on work the assignee did not produce. */
+  taskKind?: "review";
   /**
    * Maximum consecutive agent-initiated changes-requested rounds before the
    * pending stage escalates to the responsible human. Null uses the server

@@ -75,7 +75,7 @@ import {
 } from "./chat-attachment-reuse.js";
 import { issueService } from "../issues.js";
 import { directParentReportDisabledForIssue } from "../direct-parent-report.js";
-import { buildIssueMonitorClearedPatch, COMPLETION_REVIEW_STAGE_REASON, COMPLETION_REVIEW_STAGE_REJECTED_REASON, completionReviewStageEntry, monitorClearReasonForIssue, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../issue-execution-policy.js";
+import { buildIssueMonitorClearedPatch, COMPLETION_REVIEW_STAGE_REASON, COMPLETION_REVIEW_STAGE_REJECTED_REASON, completionReviewStageEntry, monitorClearReasonForIssue, normalizeIssueExecutionPolicy, parseIssueExecutionState, isReviewTask } from "../issue-execution-policy.js";
 import { companySkillService } from "../company-skills.js";
 import { syncRoutineRunStatusForIssue } from "../routine-run-status.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
@@ -2576,7 +2576,7 @@ export async function commitNativeStatusDecision(input: {
       const dependents = await issueSvc.listWakeableBlockedDependents(
         input.issueId,
       );
-      const completedResultSummary = await tx
+      const completedResult = await tx
         .select({ resultJson: nativeRunResults.resultJson })
         .from(nativeRunResults)
         .where(
@@ -2586,12 +2586,16 @@ export async function commitNativeStatusDecision(input: {
           ),
         )
         .limit(1)
-        .then((rows) => {
-          const summary = record(record(rows[0]?.resultJson).result).summary;
-          return typeof summary === "string" && summary.trim().length > 0
-            ? summary.trim()
-            : null;
-        });
+        .then((rows) => record(record(rows[0]?.resultJson).result));
+      // A review task's Done means the review is finished, not that its
+      // subject passed. Carry a FAIL verdict to every party that Done wakes.
+      const completedReviewVerdict = isReviewTask(issue) && completedResult.verdict === "fail" ? "fail" as const : null;
+      const reportedSummary = typeof completedResult.summary === "string" && completedResult.summary.trim().length > 0
+        ? completedResult.summary.trim() : null;
+      const completedResultSummary = completedReviewVerdict
+        ? `Review verdict: FAIL. ${reportedSummary ?? ""}`.trim()
+        : reportedSummary;
+      const reviewVerdictPayload = completedReviewVerdict ? { resolvedBlockerReviewVerdict: completedReviewVerdict } : {};
       const parent = issue.parentId
         ? await issueSvc.getWakeableParentAfterChildCompletion(issue.parentId, {
             issueId: input.issueId,
@@ -2644,6 +2648,7 @@ export async function commitNativeStatusDecision(input: {
           payload: {
             resolvedBlockerIssueId: input.issueId,
             blockerIssueIds: dependent.blockerIssueIds,
+            ...reviewVerdictPayload,
             ...(childCompletionContext ?? {}),
           },
           contextSnapshot: childCompletionContext ?? undefined,
@@ -2666,7 +2671,7 @@ export async function commitNativeStatusDecision(input: {
           const dependencyWakeId = await enqueueWake({ tx: tx as unknown as Db, companyId: input.companyId,
             issueId: dependent.id, agentId: dependent.assigneeAgentId, reason: "issue_blockers_resolved",
             idempotencyKey: buildIssueBlockersResolvedWakeIdempotencyKey({ dependentIssueId: dependent.id, resolvedBlockerIssueId: input.issueId }),
-            payload: { resolvedBlockerIssueId: input.issueId, blockerIssueIds: dependent.blockerIssueIds },
+            payload: { resolvedBlockerIssueId: input.issueId, blockerIssueIds: dependent.blockerIssueIds, ...reviewVerdictPayload },
           });
           materialized.push({ effectKind: "dependency_wake", targetType: "agent_wakeup_request", targetId: dependencyWakeId,
             payload: { dependentIssueId: dependent.id, resolvedBlockerIssueId: input.issueId } });

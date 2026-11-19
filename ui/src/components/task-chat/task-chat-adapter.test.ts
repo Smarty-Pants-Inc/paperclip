@@ -148,11 +148,10 @@ describe("commentsToTaskChatItems", () => {
   });
 
   it("shows a finished review's FAIL verdict on the reply its run wrote", () => {
-    const resultJson = { nativeResult: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", verdict: "fail",
-      summary: "Review complete. Verdict: FAIL.", verification: [{ commandOrCheck: "pnpm test", status: "failed" }] } };
-    expect(acceptedRunResultVerdict(resultJson)).toBe("fail");
-    expect(acceptedRunResultVerdict({ nativeResult: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done" } })).toBeUndefined();
-    expect(acceptedRunResultVerdict({ nativeResult: { schema: "paperclip.run_result.v1", verdict: "FAILED" } })).toBeUndefined();
+    // The finalizer's recorded verdict (review tasks only), never the raw report.
+    expect(acceptedRunResultVerdict({ finalizationPhase: "committed", reviewVerdict: "fail" })).toBe("fail");
+    expect(acceptedRunResultVerdict({ nativeResult: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", verdict: "fail" } })).toBeUndefined();
+    expect(acceptedRunResultVerdict({ reviewVerdict: "FAILED" })).toBeUndefined();
     const comments = [{
       id: "c-review", body: "Review complete. Verdict: FAIL.", authorType: "agent", authorAgentId: "agent-1",
       createdByRunId: "run-1", createdAt: "2026-11-19T07:15:00.000Z",

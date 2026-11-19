@@ -2143,6 +2143,9 @@ async function finalizeNativeRunAndProject(input: {
           ? { nativeResult: result }
           : {}),
         verificationCaveats: assessment.verificationCaveats,
+        // The verdict of a review task, as the classifier read it from the
+        // task's own record. The task page shows this, never the raw report.
+        ...(assessment.reviewVerdict ? { reviewVerdict: assessment.reviewVerdict } : {}),
         ignoredAttentionRequests: assessment.ignoredAttentionRequests,
         issueStatusBefore: authoritativeIssue.status,
         issueStatusAfter: committed.issue.status,

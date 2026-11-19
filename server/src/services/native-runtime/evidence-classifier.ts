@@ -9,7 +9,9 @@ import {
   issueAttachments,
   issueThreadInteractions,
   issueWorkProducts,
+  issues,
 } from "@paperclipai/db";
+import { isReviewTask } from "../issue-execution-policy.js";
 import {
   normalizePrpResultSignals,
   type PrpIgnoredAttentionRequest,
@@ -40,7 +42,14 @@ export interface NativeEvidenceAssessment {
   objectiveSatisfied: boolean;
   allCriteriaSatisfied: boolean;
   verificationPassed: boolean;
+  /**
+   * A failed check of the agent's OWN work. On a review task (by the task's
+   * own record) that reports verdict "fail", failed checks are the review's
+   * findings about someone else's work, not failed verification.
+   */
   hasFailedVerification: boolean;
+  /** The recorded verdict of a review task; null on any other task. */
+  reviewVerdict?: "pass" | "fail" | null;
   hasBlockingRemainingWork: boolean;
   reportedDisposition: "done" | "blocked" | "needs_review" | "yielded";
   summary: string;
@@ -372,8 +381,20 @@ export async function classifyNativeEvidence(input: {
   const rejectedEvidence = resolvedRefs.filter((entry) => entry.outcome === "rejected").map((entry) => ({ ref: entry.ref, reasonCode: entry.reasonCode }));
   const unverifiableEvidence = resolvedRefs.filter((entry) => entry.outcome === "unverifiable").map((entry) => ({ ref: entry.ref, reasonCode: entry.reasonCode }));
   const allCriteriaSatisfied = contractCriteria.length > 0 && criterionAssessments.every((entry) => entry.outcome === "accepted");
-  const verificationPassed = verificationAssessments.length > 0 && verificationAssessments.every((entry) => entry.outcome === "accepted");
-  const hasFailedVerification = verificationAssessments.some((entry) => entry.claimStatus === "failed");
+  // Whether this is a review is read from the task's own record, never from
+  // the report. Only then does a reported verdict count.
+  const reviewTask = await input.db.select({ executionPolicy: issues.executionPolicy }).from(issues)
+    .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId))).limit(1)
+    .then((rows) => isReviewTask(rows[0]));
+  const reportedVerdict = input.result.verdict === "pass" || input.result.verdict === "fail" ? input.result.verdict : null;
+  const reviewVerdict = reviewTask ? reportedVerdict : null;
+  // A FAIL review's failed checks are its findings; its own remaining checks
+  // still have to hold up.
+  const ownChecks = reviewVerdict === "fail"
+    ? verificationAssessments.filter((entry) => entry.claimStatus !== "failed")
+    : verificationAssessments;
+  const verificationPassed = verificationAssessments.length > 0 && ownChecks.every((entry) => entry.outcome === "accepted");
+  const hasFailedVerification = reviewVerdict !== "fail" && verificationAssessments.some((entry) => entry.claimStatus === "failed");
   const continuationKind = continuation.kind;
   const actionableAttentionRequests: PrpNormalizedAttentionRequest[] = [];
   const ignoredAttentionRequests = [...normalizedSignals.ignoredAttentionRequests];
@@ -404,6 +425,7 @@ export async function classifyNativeEvidence(input: {
     allCriteriaSatisfied,
     verificationPassed,
     hasFailedVerification,
+    reviewVerdict,
     hasBlockingRemainingWork:
       remaining.some((entry) => entry.blocksCompletion === true)
       || (reported === "done" && Object.keys(blocker).length > 0),

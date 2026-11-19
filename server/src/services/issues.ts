@@ -216,6 +216,7 @@ import {
   applyIssueMonitorPolicyTransition,
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
+  assertTaskKindMutation,
 } from "./issue-execution-policy.js";
 import { assertQualityReviewPolicyMutation, assertQualityReviewPolicyReuse, assertRequiredQualityReviewComplete, requiredQualityReview } from "./required-quality-review.js";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -11175,6 +11176,8 @@ export function issueService(db: Db) {
           issueNumber,
           identifier,
         } as typeof issues.$inferInsert;
+        assertTaskKindMutation({ previousPolicy: null, nextPolicy: values.executionPolicy,
+          assigneeAgentId: values.assigneeAgentId, actorAgentId: values.createdByAgentId });
         if (values.status === "in_progress" && !values.startedAt) {
           values.startedAt = new Date();
         }
@@ -12127,6 +12130,9 @@ export function issueService(db: Db) {
           Object.assign(patch, monitorPatch);
         }
         if (issueData.executionPolicy !== undefined) assertQualityReviewPolicyMutation({ previousPolicy: receiptExisting.executionPolicy, nextPolicy: issueData.executionPolicy, actorAgentId, actorUserId });
+        assertTaskKindMutation({ previousPolicy: receiptExisting.executionPolicy,
+          nextPolicy: issueData.executionPolicy === undefined ? receiptExisting.executionPolicy : issueData.executionPolicy,
+          assigneeAgentId: patch.assigneeAgentId !== undefined ? patch.assigneeAgentId : receiptExisting.assigneeAgentId, actorAgentId });
         if ((patch.status ?? receiptExisting.status) === "done" &&
             (receiptExisting.status !== "done" || issueData.executionPolicy !== undefined)) {
           await assertRequiredQualityReviewComplete(tx as Db, { ...receiptExisting, executionPolicy: issueData.executionPolicy === undefined ? receiptExisting.executionPolicy : issueData.executionPolicy }, true);

@@ -11,7 +11,7 @@ import type {
   IssueMonitorScheduledBy,
 } from "@paperclipai/shared";
 import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
-import { unprocessable } from "../errors.js";
+import { forbidden, unprocessable } from "../errors.js";
 import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 
 type AssigneeLike = {
@@ -401,7 +401,9 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
   const reviewPreset = parsed.data.reviewPreset;
   const authorizationPolicy = parsed.data.authorizationPolicy;
 
-  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy
+  const taskKind = parsed.data.taskKind;
+
+  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy && !taskKind
     && parsed.data.maxReviewRounds == null && !parsed.data.requiredQualityReview) return null;
 
   return {
@@ -412,8 +414,33 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
     ...(monitor ? { monitor } : {}),
     ...(reviewPreset ? { reviewPreset } : {}),
     ...(authorizationPolicy ? { authorizationPolicy } : {}),
+    ...(taskKind ? { taskKind } : {}),
     ...(parsed.data.maxReviewRounds != null ? { maxReviewRounds: parsed.data.maxReviewRounds } : {}),
   };
+}
+
+/**
+ * A review task by its own record: the task's executionPolicy.taskKind is
+ * "review" (set by whoever delegated it, never by its assignee; see
+ * assertTaskKindMutation). The agent's report cannot make a task a review.
+ */
+export function isReviewTask(issue: { executionPolicy?: unknown } | null | undefined): boolean {
+  const policy = issue?.executionPolicy;
+  return Boolean(policy && typeof policy === "object" && !Array.isArray(policy)
+    && (policy as Record<string, unknown>).taskKind === "review");
+}
+
+/**
+ * An agent may not mark (or unmark) a task assigned to itself as a review:
+ * that would let its own failed checks pass as review findings.
+ */
+export function assertTaskKindMutation(input: {
+  previousPolicy: unknown; nextPolicy: unknown; assigneeAgentId: string | null | undefined; actorAgentId?: string | null;
+}) {
+  const before = isReviewTask({ executionPolicy: input.previousPolicy });
+  const after = isReviewTask({ executionPolicy: input.nextPolicy });
+  if (before === after || !input.actorAgentId || input.actorAgentId !== input.assigneeAgentId) return;
+  throw forbidden("An agent cannot change whether its own task is a review task", { code: "issue_task_kind_self_assigned" });
 }
 
 export function parseIssueExecutionState(input: unknown): IssueExecutionState | null {

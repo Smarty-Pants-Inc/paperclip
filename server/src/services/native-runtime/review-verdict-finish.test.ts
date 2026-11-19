@@ -22,11 +22,12 @@ let db: ReturnType<typeof createDb>;
 beforeAll(async () => { temporary = await startRecoveryPostgres("review-verdict-finish-"); db = createDb(temporary.connectionString); });
 afterAll(async () => { await temporary?.cleanup(); });
 
-async function fixture(title: string) {
+async function fixture(title: string, review = false) {
   const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID(), contractId = randomUUID();
   await db.insert(companies).values({ id: companyId, name: "Review verdict", issuePrefix: `R${companyId.slice(0, 7)}` });
   await db.insert(agents).values({ id: agentId, companyId, name: "Reviewer", adapterType: "paperclip_runner", status: "active" });
-  await db.insert(issues).values({ id: issueId, companyId, title, status: "in_progress", assigneeAgentId: agentId });
+  await db.insert(issues).values({ id: issueId, companyId, title, status: "in_progress", assigneeAgentId: agentId,
+    executionPolicy: review ? { mode: "normal", commentRequired: true, stages: [], taskKind: "review" } : null });
   await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issueId, status: "running", runtimeMode: "native", completionContractId: contractId,
     contextSnapshot: { issueId, source: "issue.assignment" } });
   await db.insert(completionContracts).values({ id: contractId, companyId, issueId, revision: 1, schemaVersion: "paperclip.completion-contract.v1", policyVersion: "phase6-v1", risk: "standard", completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal", canonicalSha256: randomUUID(), createdByActorType: "system", createdByActorId: "control", contractJson: { revision: "1", criteria: [{ id: "objective", requirement: title }] } });
@@ -45,7 +46,7 @@ const base = (verification: PrpStructuredRunResult["verification"]): PrpStructur
 });
 
 it("(a) accepts a finished review whose verdict is FAIL with its failed checks, and keeps the verdict in the recorded result", async () => {
-  const runId = await fixture("Review PR #42 (refund rounding)");
+  const runId = await fixture("Review PR #42 (refund rounding)", true);
   const report = { ...base(failedChecks), verdict: "fail" } as PrpStructuredRunResult;
   await expect(nativeCompletionFeedback(db, runId, report)).resolves.toMatch(/accepted/);
   // The recorded result keeps the verdict and the failed check unchanged.
@@ -59,11 +60,12 @@ it("(b) still refuses an implementation that claims done while its own check fai
   const runId = await fixture("Fix refund rounding");
   await expect(nativeCompletionFeedback(db, runId, base(failedChecks))).rejects.toThrow("failed verification");
   // A pass verdict cannot carry a failed check either.
-  await expect(nativeCompletionFeedback(db, runId, { ...base(failedChecks), verdict: "pass" } as PrpStructuredRunResult)).rejects.toThrow("failed verification");
+  await expect(nativeCompletionFeedback(db, runId, { ...base(failedChecks), verdict: "pass" } as PrpStructuredRunResult)).rejects.toThrow("verdict is only for a review task");
+  await expect(nativeCompletionFeedback(db, runId, { ...base(failedChecks), verdict: "fail" } as PrpStructuredRunResult)).rejects.toThrow("verdict is only for a review task");
 }, 60_000);
 
 it("(c) the refusal and the tool text tell the agent to report the failure truthfully, never to relabel it", async () => {
-  const runId = await fixture("Review PR #43");
+  const runId = await fixture("Review PR #43", true);
   const error = await nativeCompletionFeedback(db, runId, base(failedChecks)).then(() => null, (e: Error) => e.message);
   expect(error).toContain("Report the failure truthfully");
   expect(error).toContain('verdict "fail"');

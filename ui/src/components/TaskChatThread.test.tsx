@@ -2227,8 +2227,9 @@ describe("TaskChatThread runtime transcript selection", () => {
     };
     const linkedRun = (verdict?: string) => ({
       ...run, runId: run.id, status: "succeeded", finishedAt: "2026-11-19T07:15:10.000Z",
-      resultJson: { nativeResult: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: body,
-        ...(verdict ? { verdict } : {}), verification: [{ commandOrCheck: "pnpm test", status: "failed" }] } },
+      resultJson: { finalizationPhase: "committed", ...(verdict ? { reviewVerdict: verdict } : {}),
+        nativeResult: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: body,
+          verdict: "fail", verification: [{ commandOrCheck: "pnpm test", status: "failed" }] } },
     });
     renderThread({ comments: [reply], onAdd: async () => {}, issueStatus: "done", linkedRuns: [linkedRun("fail")] });
     expect(container.querySelector('[data-testid="task-chat-review-verdict"]')?.textContent).toBe("Verdict: FAIL");

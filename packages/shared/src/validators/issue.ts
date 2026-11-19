@@ -28,6 +28,7 @@ import {
   ISSUE_RECOVERY_ACTION_STATUSES,
   ISSUE_REVIEW_POLICIES,
   ISSUE_WORK_MODES,
+  ISSUE_TASK_KINDS,
   clampIssueRequestDepth,
   ISSUE_STATUSES,
   ISSUE_THREAD_INTERACTION_CONTINUATION_POLICIES,
@@ -489,6 +490,7 @@ export const issueExecutionPolicySchema = z.object({
   monitor: issueExecutionMonitorPolicySchema.optional().nullable(),
   reviewPreset: lowTrustReviewPresetPolicySchema.optional(),
   authorizationPolicy: trustAuthorizationPolicySchema.optional(),
+  taskKind: z.enum(ISSUE_TASK_KINDS).optional(),
   maxReviewRounds: z
     .number()
     .int()

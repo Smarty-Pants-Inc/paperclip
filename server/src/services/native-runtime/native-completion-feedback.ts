@@ -10,7 +10,7 @@ import { findSupersededExternalReviewRequests } from "./superseded-external-revi
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { issueService } from "../issues.js";
 import { isConversation } from "../agent-conversations.js";
-import { completionReviewStageEntry } from "../issue-execution-policy.js";
+import { completionReviewStageEntry, isReviewTask } from "../issue-execution-policy.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { isPublishedGitHubReviewCompletionContinuation, readPublishedGitHubReviewCompletionContinuation, resolveExternalChatResponseWaitAuthorization } from "./chat-attachment-reuse.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
@@ -176,11 +176,17 @@ export async function nativeCompletionFeedback(
     }
   }
   const signals = normalizePrpResultSignals(result);
-  // A finished review (or other verdict on work this agent did not produce)
-  // that found failures reports verdict "fail"; its failed checks are the
-  // findings, not unfinished work. Without that verdict, a failed check still
-  // means the agent's own work is not done.
-  const failedVerification = result.verdict !== "fail" &&
+  // Only a review task, by the task's own record (executionPolicy.taskKind
+  // "review", which its assignee cannot set), may report a verdict. On a
+  // review task, a verdict "fail" makes its failed checks the review's
+  // findings about work the agent did not produce: a finished review. On any
+  // other task the verdict is refused, so it cannot excuse the agent's own
+  // failed checks.
+  const reviewTask = isReviewTask(issue);
+  if (result.verdict != null && !reviewTask) {
+    throw new Error("This report was not accepted: verdict is only for a review task, and this task is not marked as one (its executionPolicy.taskKind is not \"review\"). A failed check here means your own work is not done. Remove verdict and report every check truthfully: finish the work, or report the concrete blocker. Never change a failed check to passed. If this task really is a review of work you did not produce, ask its owner to mark it as a review task.");
+  }
+  const failedVerification = !(reviewTask && result.verdict === "fail") &&
     signals.verification.some((entry) => entry.status === "failed");
   if (
     result.reportedWorkDisposition === "done" &&
@@ -215,7 +221,10 @@ export async function nativeCompletionFeedback(
     }
     throw new Error(
       "The done report includes unfinished work, failed verification, or an outstanding decision. Finish the work or report the concrete blocker/reviewer request. No human completion approval was created." +
-      " Report the failure truthfully. If your work is a review, audit, or other verdict on work you did not produce and it found failures, that is finished work: report done with verdict \"fail\" and keep those checks failed. Never change a failed check to passed." +
+      " Report the failure truthfully. Never change a failed check to passed." +
+      (reviewTask
+        ? " This is a review task: if your review found failures, that is finished work. Report done with verdict \"fail\" and keep those checks failed."
+        : " If this task is a review of work you did not produce, ask its owner to mark it as a review task; otherwise finish the work or report the concrete blocker.") +
       (failedActionChat ? ` Rejection fields: ${rejectionReasons}.` + " This chat turn may finish with a truthful report of the failed approved action; that does not mean the external action succeeded. Keep the failure, observed state, and unresolved work explicit in the summary. Verify the observed state factually. Use not_run with a truthful reason only for a check that could not run or complete because its dependency was unavailable. Do not change a failed check to passed or hide incomplete work. Do not automatically replay the action or request approval again to force success; report the outcome and let the user decide whether to retry." : ""),
     );
   }

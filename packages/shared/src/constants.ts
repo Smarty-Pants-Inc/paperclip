@@ -226,6 +226,13 @@ export const ISSUE_REVIEW_POLICIES = ["anyone", "not_creator", "human_only"] as 
 export type IssueReviewPolicy = (typeof ISSUE_REVIEW_POLICIES)[number];
 export const ISSUE_WORK_MODES = ["standard", "ask", "planning", "skill_test"] as const;
 export type IssueWorkMode = (typeof ISSUE_WORK_MODES)[number];
+/**
+ * What a task's deliverable is, recorded on the task itself (executionPolicy.taskKind).
+ * "review": the deliverable is a verdict on work the assignee did not produce
+ * (doc/execution-semantics.md "Review Delegation"); a negative verdict is a finished task.
+ */
+export const ISSUE_TASK_KINDS = ["review"] as const;
+export type IssueTaskKind = (typeof ISSUE_TASK_KINDS)[number];
 export const ISSUE_HARNESS_KINDS = ["skill_test"] as const;
 export type IssueHarnessKind = (typeof ISSUE_HARNESS_KINDS)[number];
 export const MAX_ISSUE_REQUEST_DEPTH = 1024;
