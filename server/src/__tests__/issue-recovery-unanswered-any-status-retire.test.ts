@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { expect, it } from "vitest";
 import { agents, completionContracts, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
+import { readContinuationCommentInput } from "../services/continuation-comment-input.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
@@ -164,8 +165,18 @@ describeIssueRecovery("unanswered notices retire on ANY task status, every famil
           options: [{ id: "first", label: "First" }] }] } as never }).returning({ id: issueThreadInteractions.id });
       await issueThreadInteractionService(f.db).answerQuestions({ id: f.issueId, companyId: f.companyId }, second!.id,
         { answers: [{ questionId: "scope", optionIds: ["first"] }] } as never, { userId: "recovery-user" });
-      // PLANTED: one failed run carried BOTH answers as its own input (a carry's interactionIds).
-      await f.run("failed", [], 120_000, { interactionIds: [first.cardId, second!.id], interactionId: second!.id });
+      // The REAL producer of a group of card answers (merged9 item 8, rf-5 merged8 F1): the ONE carry,
+      // continuation-comment-input.ts pendingContinuationInteractionInput, returns { interactionIds: [every still-owed
+      // answer the continued run named], interactionId: the latest }, and the sweep groups the answers one run carried
+      // under `card_answer:<run>` (unanswered-person-message.ts decideUnansweredMessage, the `group:` key). A run
+      // names several answers first where one resume delivers several cards (tool-gateway.ts:7103
+      // `interactionIds: cards.map(card => card.id)`, tool-action-delivery.ts:273); that first run is PLANTED here
+      // with that shape, and the failed continuation's context is the carry's own output (asserted).
+      const resumed = await f.run("failed", [], 110_000, { interactionIds: [first.cardId, second!.id], interactionId: second!.id });
+      const carried = await readContinuationCommentInput(f.db, { companyId: f.companyId, issueId: f.issueId, runId: resumed });
+      expect({ ...carried, interactionIds: (carried.interactionIds as string[]).slice().sort() }, "the real carry names both answers")
+        .toEqual({ interactionIds: [first.cardId, second!.id].sort(), interactionId: expect.any(String) });
+      await f.run("failed", [], 120_000, carried);
       await f.notice(1, new Date(Date.now() + 11 * 60_000));
       const [group] = await live(f);
       const members = (group!.metadata as { unansweredMessageIds?: string[] }).unansweredMessageIds;
@@ -182,6 +193,47 @@ describeIssueRecovery("unanswered notices retire on ANY task status, every famil
       expect((await f.notices()).map(n => n.deletedAt === null), "both answered: retired, never a second notice").toEqual([false]);
     });
   }
+
+  // merged9 item 8 (rf-5 merged8 F1), the CUT: no real producer writes ONE notice that covers a typed message AND a
+  // card answer. The sweep keys a card answer's notice `card_answer:<run>` and a message's `<run>`
+  // (unanswered-person-message.ts decideUnansweredMessage, the `group:` key), so a typed M and a card answer A of
+  // the same run get TWO notices, each of its own family (asserted first, real sweep). The mixed-membership read is
+  // therefore cut: a notice is read as ONE family, the one its key names (noticeInputsSql). A PLANTED notice that
+  // lists both (named so; nothing produces it) is read by its key's family only, so the other family's ids are not
+  // members: they neither retire it nor rewrite it.
+  it("a typed message and a card answer of one failed run get TWO notices (real sweep); a PLANTED typed+card notice is read as its key's family only", async () => {
+    const f = await seed("No mixed typed+card group");
+    const typed = await f.message(100_000, "And the changelog?");
+    const { cardId } = await answeredCard(f); // the REAL answer, stamped now: after the typed message
+    // PLANTED: one failed run whose own input names the typed message AND the card answer.
+    const failed = await f.run("failed", [typed], 120_000, { interactionId: cardId, interactionStatus: "answered" });
+    expect(await settleUnansweredPersonMessagesForTask(f.db, { companyId: f.companyId, issueId: f.issueId, now: new Date(Date.now() + 11 * 60_000) }),
+      "the real sweep step").toEqual({ noticed: 2, pending: 0 });
+    const real = await live(f);
+    expect(real.map(n => [(n.metadata as { authorizationReason: string }).authorizationReason, (n.metadata as { sourceRunId?: string }).sourceRunId,
+      (n.metadata as { unansweredMessageIds?: string[] }).unansweredMessageIds ?? null]).sort(),
+      "TWO notices of the same run, one per family; neither lists the other's input").toEqual([
+      [`unanswered_message:${cardId}`, failed, null], [`unanswered_message:${typed}`, failed, null]].sort());
+    const typedNotice = real.find(n => (n.metadata as { authorizationReason: string }).authorizationReason === `unanswered_message:${typed}`)!;
+    const cardNotice = real.find(n => n.id !== typedNotice.id)!;
+    // PLANTED mixed notice (nothing produces it): the typed message's notice is made to list the card answer too.
+    await f.db.update(issueComments).set({ metadata: sql`${issueComments.metadata} || ${JSON.stringify({ unansweredMessageIds: [cardId, typed] })}::jsonb` })
+      .where(eq(issueComments.id, typedNotice.id));
+    // The card answer is answered (planted run + reply naming it); the typed message is not.
+    await f.answer([], 180_000, { interactionId: cardId, interactionStatus: "answered" });
+    await f.close("done");
+    await f.worker();
+    const after = await f.notices();
+    expect(after.find(n => n.id === cardNotice.id)!.deletedAt, "the card answer's own notice retired (its family, its member)").not.toBeNull();
+    const mixed = after.find(n => n.id === typedNotice.id)!;
+    expect(mixed.deletedAt, "the typed message is still owed: its notice stays").toBeNull();
+    expect(mixed.metadata, "read as a MESSAGE notice: the card id is not a member, so the answered card rewrites nothing")
+      .toMatchObject({ unansweredMessageIds: [cardId, typed], authorizationReason: `unanswered_message:${typed}` });
+    // The typed message answered -> every member of its family is answered -> the notice retires.
+    await f.answer([typed], 240_000);
+    await f.worker();
+    expect((await f.notices()).map(n => n.deletedAt === null), "both retired, never a third notice").toEqual([false, false]);
+  });
 
   it("REAL answer path: the run's accepted result is published by the real finalizer, the task is closed done -> the worker retires the notice", async () => {
     const f = await seed("Real answer path");

@@ -283,19 +283,33 @@ function noticeCoversAnsweredCardSql(n: string): SQL {
     and ${answeredSql({ id: sql.raw("ca.id"), companyId: sql.raw("ca.company_id"), issueId: sql.raw("ca.issue_id"),
       createdAt: sql.raw("ca.resolved_at") })})`;
 }
-/** SQL (a derived table): EVERY person input notice row n (alias) covers, each with the one function's verdict: the
- * typed messages (comments) and the card answers (the card's id, at its answer time) its key or member list names.
- * Retirement and the mixed-group shrink read it for every notice family (failed run, no run, no reply, waiting
- * note, card answer), so a card answer is a member like a message: never retired or dropped with another's answer. */
+/** SQL: notice row n (alias) is a CARD-ANSWER notice: its key (authorizationReason, after the prefix) names a card
+ * of this task. The sweep never puts a card answer and a typed message in one notice (decideUnansweredMessage
+ * keys a card answer's group `card_answer:<run>`, a message's `<run>`), so the key's family is the notice's family. */
+function noticeKeyIsCardSql(n: string): SQL {
+  const notice = sql.raw(n);
+  return sql`exists (select 1 from ${issueThreadInteractions} key_card where key_card.company_id = ${notice}.company_id
+    and key_card.issue_id = ${notice}.issue_id
+    and key_card.id::text = substr(${notice}.metadata->>'authorizationReason', strpos(${notice}.metadata->>'authorizationReason', ':') + 1))`;
+}
+/** SQL (a derived table): EVERY person input notice row n (alias) covers, each with the one function's verdict.
+ * ONE family per notice, the one its key names (noticeKeyIsCardSql): a message notice's members are the typed
+ * messages (comments) its key or member list names, a card-answer notice's members are the card answers (the
+ * card's id, at its answer time). Retirement and the group shrink read it for every notice family (failed run, no
+ * run, no reply, waiting note, card answer), so an answer of a card-answer group is a member like a message of a
+ * message group: never retired or dropped with another's answer. There is NO mixed typed+card membership (rf-5
+ * merged8 F1, cut in merged9): no producer writes such a notice, and an id of the other family in a notice's list
+ * is not a member. */
 function noticeInputsSql(n: string): SQL {
   const notice = sql.raw(n);
   return sql`(select m.id, m.created_at as input_at, ${answeredSql(rawMessage("m"))} as answered from ${issueComments} m
       where m.company_id = ${notice}.company_id and m.issue_id = ${notice}.issue_id and ${noticeCoversSql(n, sql.raw("m.id"))}
+        and not ${noticeKeyIsCardSql(n)}
     union all
     select ca.id, ca.resolved_at as input_at, ${answeredSql({ id: sql.raw("ca.id"), companyId: sql.raw("ca.company_id"),
         issueId: sql.raw("ca.issue_id"), createdAt: sql.raw("ca.resolved_at") })} as answered from ${issueThreadInteractions} ca
       where ca.company_id = ${notice}.company_id and ca.issue_id = ${notice}.issue_id and ca.resolved_at is not null
-        and ${noticeCoversSql(n, sql.raw("ca.id"))})`;
+        and ${noticeCoversSql(n, sql.raw("ca.id"))} and ${noticeKeyIsCardSql(n)})`;
 }
 /** SQL over issue_thread_interactions rows (the outer table): an owed card answer with no notice yet. The recovery
  * worker reads it with one batched query per page, beside unansweredPersonMessageCommentCondition's (work.ts). */
