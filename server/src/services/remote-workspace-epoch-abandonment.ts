@@ -7,6 +7,7 @@ import { persistActivity } from "./activity-log.js";
 import { FRESH_CONTINUATION_CAUSE, FRESH_CONTINUATION_SCHEMA } from "./fresh-continuation-fallback.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
+import { ABANDONED_TASK_ROOT_KEY, ABANDONED_TASK_ROOT_SCHEMA } from "./task-workspace-selection.js";
 
 /** Abandons a source run's remote epoch only while it still owns it. Shared
  * by fallback and admission; caller holds the company-scoped issue/run locks. */
@@ -51,7 +52,8 @@ async function isTaskOwnRoot(workspace: typeof executionWorkspaces.$inferSelect,
  * the task. Its copy-back owner becomes a tombstone, so each later ownership
  * check of a still-running copy-back fails (`owner_replaced`) and no later claim
  * succeeds; its `prepared` reference stays, so its box is never adopted; the
- * task is detached from its root, and the next run is given a new root seeded
+ * task is detached from its root, the root's row is closed as abandoned (kept on
+ * disk, never served or selected again), and the next run is given a new root seeded
  * from this run's startup seed (the readiness record below). Null when the root
  * is not this task's own (a shared root has other writers and other readers):
  * such a run is never ended by the bound. Caller holds the task and run locks.
@@ -70,6 +72,14 @@ export async function isolateClassicSourceWorkspace(tx: Db, run: typeof heartbea
   await tx.update(heartbeatRuns).set({ runnerProfileJson: sql`jsonb_set(coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb),
     '{nativeWorkspaceFinalizationOwner}', ${JSON.stringify({ fenced: true, at: recordedAt.toISOString() })}::jsonb)` })
     .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id)));
+  // The root is ABANDONED, durably: its row is closed and names why. Every reader that picks a task's root (the
+  // Files fallback, the task workspace selectors, the open-workspace lists) takes open rows only, so none presents
+  // this root as the task's files again. It is closed, NOT archived: an archived row would hand the directory to
+  // the task-directory retention sweep, and these bytes are kept for explicit recovery (the path is named here).
+  await tx.update(executionWorkspaces).set({ closedAt: recordedAt, updatedAt: recordedAt,
+    metadata: { ...(workspace.metadata ?? {}), [ABANDONED_TASK_ROOT_KEY]: { schema: ABANDONED_TASK_ROOT_SCHEMA, reason: "copy_back_bound",
+      runId: run.id, issueId, cwd: workspace.cwd, abandonedAt: recordedAt.toISOString() } } })
+    .where(and(eq(executionWorkspaces.companyId, run.companyId), eq(executionWorkspaces.id, workspace.id)));
   const savedSeed = { sourceRunId: run.id, descriptorSha256: reference.descriptorSha256, baselineSha256: reference.baselineSha256 };
   const [readiness] = await tx.insert(issueRecoveryActions).values({ companyId: run.companyId, sourceIssueId: issueId,
     kind: "active_run_watchdog", status: "resolved", outcome: "restored", ownerType: "system", returnOwnerAgentId: run.agentId,
@@ -79,7 +89,8 @@ export async function isolateClassicSourceWorkspace(tx: Db, run: typeof heartbea
       sourceRunId: run.id, trigger: "copy_back_bound", isolation: "fresh_isolated_workspace", stopProof: "unproven_isolated",
       delivery: "caller_owns", recordedAt: recordedAt.toISOString(), savedSeed } } }).returning({ id: issueRecoveryActions.id });
   return { kind: "classic_isolated" as const, sourceRunId: run.id, workspaceId: workspace.id, readinessId: readiness!.id, savedSeed,
-    // The root and box stay as they are; a copy-back still running may yet write into that root, and nothing reads it.
+    // The root and box stay as they are; a copy-back still running may yet write into that root. Its row is closed
+    // above, so no person-facing reader and no selector serves it; it is read only by explicit recovery.
     quarantine: { state: "retained" as const, leaseId: reference.leaseId, providerLeaseId: reference.providerLeaseId,
       remoteCwd: reference.remoteCwd } };
 }
