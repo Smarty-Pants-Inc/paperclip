@@ -81,9 +81,8 @@ function chainCarriesCommentSql(alias: string, commentId: SQL, m: PersonMessageS
 // delivery; cancelled cards need evidence of a human skip/withdraw/cancel reply.
 const PERSON_MESSAGE_ANSWER_CARD_STATUSES = ["pending", "answered", "accepted", "rejected"] as const;
 
-/** A person message is answered by a published agent reply from a non-failed run attributed to it or to a later person input,
- * an open or resolved interaction card on its run chain, or imported history. A failed run's partial reply cannot
- * move a waiting person's queue past their input (st-failed-newer). Answering the card is new input;
+/** A person message is answered by a published agent reply attributed to it or to a later person input,
+ * an open or resolved interaction card on its run chain, or imported history. Answering the card is new input;
  * it never makes the original message unanswered again. Shared by recovery input selection (continuation-comment-input.ts) and the
  * unanswered-person-message notice, so the carry and the notice never disagree on a message.
  * - Provider acceptance/delivery alone is NOT an answer.
@@ -114,8 +113,7 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
         and coalesce(streamed.context_snapshot->'answeredSteeredCommentIds', '[]'::jsonb) ? ${m.id}::text)
     or exists (select 1 from ${issueComments} a
     join ${heartbeatRuns} r on r.id = a.created_by_run_id and r.company_id = a.company_id
-    where r.status <> 'failed'
-      and a.company_id = ${m.companyId} and a.issue_id = ${m.issueId} and a.author_type = 'agent' and a.deleted_at is null
+    where a.company_id = ${m.companyId} and a.issue_id = ${m.issueId} and a.author_type = 'agent' and a.deleted_at is null
       and a.created_at > ${m.createdAt}
       and exists (select 1 from ${issueComments} b
         where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
