@@ -943,6 +943,13 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     inArray(issueRecoveryActions.status, ["active", "escalated"])))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
   const boardHold = activeRecovery?.ownerType === "board" ? activeRecovery : null;
+  // A hold can be ACTION-BEARING for the person's saved message itself: a reply's file save failed for good, a part
+  // of it may be in the project's files, and the gate holds the message for the person's ONE action, "Continue with
+  // the files as they are". The task's card and the queue line then say that sentence and offer that action. That is
+  // a valid wait (the person was told why the message waits and what starts it), and sending the message again
+  // starts nothing while it stands: no note of this sweep beside it. The hold releases with the person's Continue;
+  // the carrying run then decides this message as any other.
+  if (activeRecovery && !agentPaused && !settingUp && await messageHeldForPersonContinue(q, issue)) return { kind: "explained" };
   if (!boardHold && !agentPaused && !settingUp) {
     const wakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status })
       .from(agentWakeupRequests).where(and(
@@ -1150,6 +1157,15 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
 }
 
+
+/** The task's saved message is HELD for the person's Continue. Read from the hold itself, never from this sweep's own
+ * guess: the task's execution blocker (execution-blocker.ts `savedMessageWait`), which reads the gate's own wait saved
+ * on the waiting message (reason checkout_continue_required, explicit-native-continuation.ts). It is the SAME reading
+ * the thread's card, the queue line and the Inbox row show, so the sweep and the screen cannot disagree. Reads only. */
+async function messageHeldForPersonContinue(q: Db, issue: { id: string; companyId: string }): Promise<boolean> {
+  const { getExecutionBlocker } = await import("../execution-blocker.js");
+  return (await getExecutionBlocker(q, issue.companyId, issue.id))?.savedMessageWait === "continue_required";
+}
 
 /** Resume (paused -> resuming) is an event: every open task of this agent whose
  * person's message carries a standing '<agent> is paused' note is handed to the
