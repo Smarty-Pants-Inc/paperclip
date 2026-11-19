@@ -17,7 +17,7 @@ import { issueTreeControlRoutes } from "../routes/issue-tree-control.js";
 import { issueService } from "../services/issues.js";
 import { deliverConversationComments } from "../services/agent-conversations.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
-import { readPersonStopHold } from "../services/acknowledged-native-stop.js";
+import { readPersonStopHold, readPersonStoppedPreviousTurn } from "../services/acknowledged-native-stop.js";
 import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_NO_RUN_TEXT } from "../services/recovery/unanswered-person-message.js";
 import { writeDeferredExecutionWait } from "../services/deferred-execution-wait.js";
 import { configureAgentLifecycle } from "../services/agent-lifecycle.js";
@@ -38,7 +38,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 // settle-then-throw after an acknowledged Stop; every later turn records the
 // comment ids it was given and answers once) and the provider ACK of the Stop.
 const fixture = vi.hoisted(() => ({
-  calls: [] as { runId: string; ids: string[]; reason: string | null; ordered?: string[] }[],
+  /** prompt: the next turn's built request text (task.prompt + continuationPrompt), as the provider gets it. */
+  calls: [] as { runId: string; ids: string[]; reason: string | null; ordered?: string[]; prompt?: string }[],
   onFirst: undefined as undefined | ((input: { runId: string }) => Promise<void>),
   /** Every later turn, while its run is running (before it answers). */
   onTurn: undefined as undefined | ((input: { runId: string; ids: string[] }) => Promise<void>),
@@ -81,12 +82,14 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
       // The run's input in its own order (agent-conversations' Stop row reads it this way).
       const ordered = (Array.isArray(ctx.wakeCommentIds) ? ctx.wakeCommentIds.map(String)
         : typeof ctx.wakeCommentId === "string" ? [ctx.wakeCommentId] : []) as string[];
+      const execution = input.execution as { task?: { prompt?: string }; continuationPrompt?: string | null };
+      const prompt = [execution.task?.prompt, execution.continuationPrompt].filter(Boolean).join("\n\n");
       if (fixture.calls.length === 0 && fixture.onFirst) {
-        fixture.calls.push({ runId, ids, reason: ctx.wakeReason ?? null, ordered });
+        fixture.calls.push({ runId, ids, reason: ctx.wakeReason ?? null, ordered, prompt });
         await fixture.onFirst({ runId });
         throw new actual.NativeCancellationPendingRecoveryError();
       }
-      fixture.calls.push({ runId, ids, reason: ctx.wakeReason ?? null, ordered });
+      fixture.calls.push({ runId, ids, reason: ctx.wakeReason ?? null, ordered, prompt });
       await fixture.onTurn?.({ runId, ids });
       await (fixture.db as any).insert(issueComments).values({ companyId: fixture.companyId, issueId: fixture.issueId,
         authorAgentId: fixture.agentId, authorType: "agent", createdByRunId: runId, origin: "comment", body: `answer from ${runId}` });
@@ -1062,6 +1065,63 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
     expect(await endedRunAcceptances(r.firstRunId)).toEqual([]);
     expect(await readPersonStopHold(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId, messageId: p })).toBeNull();
     expect((await r.queue()).executionWait?.reason).not.toBe("stopped_by_person");
+  }, 120_000);
+
+  // adopt-stop-marker (RFL F1, take v1-stop-late-g2-m4): after a person's Stop, the NEXT turn's input says the
+  // person stopped the previous turn and not to resume it unless asked; said once, only for a person's Stop.
+  const STOP_MARKER = "The person stopped your previous turn. Do not resume or redo that work unless they ask; answer their new message.";
+  const markerCount = (prompt: string | undefined) => (prompt ?? "").split(STOP_MARKER).length - 1;
+
+  it("stop-marker (a)+(b)+(d): Stop a running turn, then a new question: the next turn's input carries the marker ONCE; the turn after it carries none; its wording leaves resuming to the person's ask", async () => {
+    const r = await stopWithHeld();
+    await r.tenMinutesPass();
+    expect(successorCalls(), "nothing ran by itself").toEqual([]);
+    expect(markerCount(fixture.calls[0]?.prompt), "the stopped turn's own input had no marker").toBe(0);
+    const typed = (await r.post("9 + 10").expect(201)).body.id as string;
+    await r.drive(4_000);
+    await r.tenMinutesPass();
+    await evidence("stop-marker-a-b", { typed, calls: fixture.calls.map(call => ({ runId: call.runId, ids: call.ids,
+      marker: markerCount(call.prompt), head: call.prompt?.slice(0, 600) })) });
+    const [next, after] = successorCalls();
+    expect(next?.ids, JSON.stringify(fixture.calls.map(call => call.ids))).toEqual([typed]);
+    // (a) the first turn after the person's Stop: the marker, once, right under the wake heading.
+    expect(markerCount(next?.prompt), next?.prompt).toBe(1);
+    expect(next!.prompt!.indexOf(STOP_MARKER)).toBeLessThan(next!.prompt!.indexOf("Use this wake to continue the task"));
+    // (b) the turn after that (the held messages' own turn): no marker.
+    expect(after, "the held turn ran").toBeTruthy();
+    expect(markerCount(after?.prompt), after?.prompt).toBe(0);
+    // (d) 'continue' control: the wording permits resuming when the person asks.
+    expect(STOP_MARKER).toContain("unless they ask");
+  }, 120_000);
+
+  it("stop-marker (c): a queued-message Interrupt (not a person's Stop), then a message: no marker in the next turn's input", async () => {
+    const r = await stopWithHeld({ stopKind: "interrupt", count: 1 });
+    await r.tenMinutesPass();
+    const typed = (await r.post("9 + 10").expect(201)).body.id as string;
+    await r.drive(4_000);
+    await r.tenMinutesPass();
+    await evidence("stop-marker-c-interrupt", { typed, calls: fixture.calls.map(call => ({ runId: call.runId, ids: call.ids,
+      marker: markerCount(call.prompt) })) });
+    expect(successorCalls().filter(call => call.ids.includes(typed)).length, JSON.stringify(fixture.calls.map(call => call.ids))).toBe(1);
+    for (const call of successorCalls()) expect(markerCount(call.prompt), call.prompt).toBe(0);
+  }, 120_000);
+
+  it("stop-marker (c): a system-cancelled run, then a message: the ONE reader gives its next turn no marker (this harness parks every later turn after a system cancel, so the reader is asked for that turn's run)", async () => {
+    const r = await stopWithHeld({ stopKind: "system", count: 0 });
+    await r.post("9 + 10").expect(201);
+    await r.drive(1_000);
+    const [next] = await db.insert(heartbeatRuns).values({ companyId: r.companyId, agentId: r.agentId, status: "queued",
+      contextSnapshot: { issueId: r.issueId } }).returning();
+    expect(await readPersonStoppedPreviousTurn(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId,
+      runId: next!.id, runCreatedAt: next!.createdAt })).toBe(false);
+    // Contrast on the same state: the person's real Stop of that ended run (R17) makes it the first turn after a Stop.
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, next!.id));
+    const stopped = await request(r.client).post(`/api/heartbeat-runs/${r.firstRunId}/cancel`).send({});
+    expect(stopped.status, JSON.stringify(stopped.body)).toBe(200);
+    const [after] = await db.insert(heartbeatRuns).values({ companyId: r.companyId, agentId: r.agentId, status: "queued",
+      contextSnapshot: { issueId: r.issueId } }).returning();
+    expect(await readPersonStoppedPreviousTurn(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId,
+      runId: after!.id, runCreatedAt: after!.createdAt })).toBe(true);
   }, 120_000);
 
 });

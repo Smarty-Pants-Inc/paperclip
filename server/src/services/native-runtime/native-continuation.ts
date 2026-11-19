@@ -1,4 +1,5 @@
-import { isPaperclipExternalChatContractTurn, normalizePaperclipWakePayload, PAPERCLIP_EARLIER_READ_COMMENT_NOTE, PAPERCLIP_RECEIVED_MID_TASK_LABEL } from "@paperclipai/adapter-utils/server-utils";
+import { isPaperclipExternalChatContractTurn, normalizePaperclipWakePayload, PAPERCLIP_EARLIER_READ_COMMENT_NOTE, PAPERCLIP_RECEIVED_MID_TASK_LABEL,
+  PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE } from "@paperclipai/adapter-utils/server-utils";
 import type { CaseExecutionContext, projectCaseContinuation } from "../case-context.js";
 import { caseInstructionAlreadyRepresented } from "../case-context.js";
 
@@ -69,6 +70,8 @@ export function buildNativeContinuationPrompt(input: {
   // Do not substitute an unverified interaction outcome for an authorized answer.
   if (wake.interactionId && humanResponses.length === 0) return null;
   const events = {
+    // adopt-stop-marker: the same one line as the full wake prompt, first.
+    ...(wake.personStoppedPreviousTurn ? { personStop: PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE } : {}),
     ...(wake.githubReviewConfigurations.some((config) => !input.previousGitHubReviewConfigurationKeys?.includes(config.key))
       ? { reviewConfigurations: wake.githubReviewConfigurations.filter((config) => !input.previousGitHubReviewConfigurationKeys?.includes(config.key)) }
       : {}),

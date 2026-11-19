@@ -4278,3 +4278,26 @@ describe("wake continuation comment ownership", () => {
     expect(legacy).toContain(`"objective":"${objective}"`);
   });
 });
+
+describe("adopt-stop-marker: the first turn after a person's Stop", () => {
+  const wake = (extra: Record<string, unknown>) => ({
+    reason: "issue_commented",
+    issue: { id: "issue-1", identifier: "S-1", title: "Chat", status: "in_progress" },
+    commentIds: ["c1"], latestCommentId: "c1",
+    comments: [{ id: "c1", body: "9 + 10", authorType: "user", authorId: "u1", createdAt: "2026-11-19T10:24:35.000Z" }],
+    commentWindow: { requestedCount: 1, includedCount: 1, missingCount: 0 },
+    fallbackFetchNeeded: false,
+    ...extra,
+  });
+  it("says the one line once, under the heading, fresh and resumed; never without the server's field", async () => {
+    const { renderPaperclipWakePrompt: render, PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE: note } = await import("./server-utils.js");
+    expect(note).toBe("The person stopped your previous turn. Do not resume or redo that work unless they ask; answer their new message.");
+    for (const resumedSession of [false, true]) {
+      const marked = render(wake({ personStoppedPreviousTurn: true }), { resumedSession });
+      expect(marked.split(note).length - 1).toBe(1);
+      expect(marked.split("\n")[2]).toBe(note);
+      expect(render(wake({}), { resumedSession })).not.toContain(note);
+      expect(render(wake({ personStoppedPreviousTurn: "true" }), { resumedSession })).not.toContain(note);
+    }
+  });
+});

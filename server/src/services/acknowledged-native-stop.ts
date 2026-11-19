@@ -387,6 +387,23 @@ export function isSystemEndedRun(run: { status: string; resultJson: Record<strin
     && !recordedUserStop(run);
 }
 
+/** adopt-stop-marker (RFL F1): this run is the FIRST turn after a person's Stop when the ONE person-Stop fact
+ * (readAcceptedPersonStop) names this agent's run on the issue that came right before it. Its input then says
+ * so once (PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE), as Claude Code's '[Request interrupted by user]' does;
+ * a later turn, an Interrupt, an agent's or the system's cancel never match. */
+export async function readPersonStoppedPreviousTurn(db: Db, input: {
+  companyId: string; issueId: string; agentId: string; runId: string; runCreatedAt: Date;
+}): Promise<boolean> {
+  const stop = await readAcceptedPersonStop(db, input);
+  if (!stop) return false;
+  const onIssue = or(eq(heartbeatRuns.nativeIssueId, input.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`);
+  const [previous] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), onIssue,
+    sql`${heartbeatRuns.id} <> ${input.runId}`, sql`${heartbeatRuns.createdAt} <= ${input.runCreatedAt.toISOString()}::timestamptz`))
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+  return previous?.id === stop.runId;
+}
+
 /**
  * R17 (adopt-cutc2 3d; adopt-lead's pick, conditions rf-3 + rf-4 09:26Z): a board person's Stop of a run that
  * had ALREADY ENDED (e.g. the system cancelled it and its remote cleanup still parks the next message) counts as
