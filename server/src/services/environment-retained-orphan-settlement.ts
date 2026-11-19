@@ -161,14 +161,14 @@ export async function nextRetainedOrphanDueAt(db: Db, now: Date): Promise<Date |
   return row?.due ? new Date(row.due) : null;
 }
 
-/** C2, the one park key: a pending destroy whose stop is PROVED (own lease,
- * carried receipt scope) is parked when the provider's destroy answer was
+/** C2, the one park key: a pending destroy whose stop is PROVED (this exact
+ * lease of this run, carried receipt scope; never a sibling's receipt) is parked when the provider's destroy answer was
  * "stopped" (it retains the computer) or a NEVER-OK agent-file save hold
  * refuses its destroy claim (the debt stays visible). Never a provider flag. */
 type ParkLease = Pick<LeaseRow, "id" | "companyId" | "environmentId" | "heartbeatRunId" | "provider" | "providerLeaseId">;
 export async function parkedCleanupDisposition(db: Db, lease: ParkLease, now: Date, destroyAnswer?: unknown) {
   if (!await ownLeaseTerminated(db, { companyId: lease.companyId, environmentId: lease.environmentId,
-    providerLeaseId: lease.providerLeaseId, runId: lease.heartbeatRunId, leaseId: lease.id }, { carriedCleanupStop: true })) return undefined;
+    providerLeaseId: lease.providerLeaseId, runId: lease.heartbeatRunId, leaseId: lease.id }, { carriedCleanupStop: true, ownLeaseOnly: true })) return undefined;
   const code = (destroyAnswer as { state?: unknown } | undefined)?.state === "stopped" ? "provider_retains_resource"
     : await agentFileSaveHeldOnLease(db, lease) ? "held_for_unsaved_files" : undefined;
   return code && { state: "parked", code, observedAt: now.toISOString(), provider: lease.provider, providerLeaseId: lease.providerLeaseId,
