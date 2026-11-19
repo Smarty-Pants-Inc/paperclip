@@ -17,6 +17,7 @@ import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { PageSkeleton } from "../../components/PageSkeleton";
+import { QueryErrorState } from "../../components/QueryView";
 import {
   applyAgentSkillSnapshot,
   isReadOnlyUnmanagedSkillEntry,
@@ -75,17 +76,21 @@ export function AgentSkillsTab({ agent, companyId }: { agent: Agent; companyId?:
   // payload on every `isPending` flip (that was an infinite 422 retry storm).
   const failedSkillDraftRef = useRef<string[] | null>(null);
 
-  const { data: skillSnapshot, isLoading } = useQuery({
+  const skillSnapshotQuery = useQuery({
     queryKey: queryKeys.agents.skills(agent.id),
     queryFn: () => agentsApi.skills(agent.id, companyId),
     enabled: Boolean(companyId),
   });
 
-  const { data: companySkills } = useQuery({
+  const { data: skillSnapshot } = skillSnapshotQuery;
+
+  const companySkillsQuery = useQuery({
     queryKey: queryKeys.companySkills.list(companyId ?? ""),
     queryFn: () => companySkillsApi.list(companyId!),
     enabled: Boolean(companyId),
   });
+
+  const { data: companySkills } = companySkillsQuery;
 
   // Beta skills experimental flag — gates the per-agent release picker entirely.
   const { data: experimentalSettings } = useQuery({
@@ -394,6 +399,29 @@ export function AgentSkillsTab({ agent, companyId }: { agent: Agent; companyId?:
   };
 
   const libraryEmpty = libraryRows.length === 0;
+  const loadError = (skillSnapshot === undefined && skillSnapshotQuery.error)
+    || (companySkills === undefined && companySkillsQuery.error);
+
+  // A failed read is not an empty, saved library. Keep cached data on refetch errors.
+  if (loadError) {
+    return (
+      <div className="max-w-4xl">
+        <QueryErrorState
+          error={loadError}
+          action="load skills"
+          onRetry={() => {
+            void skillSnapshotQuery.refetch();
+            void companySkillsQuery.refetch();
+          }}
+          retrying={skillSnapshotQuery.isFetching || companySkillsQuery.isFetching}
+        />
+      </div>
+    );
+  }
+
+  if (skillSnapshotQuery.isLoading || companySkillsQuery.isLoading) {
+    return <div className="max-w-4xl"><PageSkeleton variant="list" /></div>;
+  }
 
   return (
     <div className="max-w-4xl space-y-4">
@@ -478,9 +506,7 @@ export function AgentSkillsTab({ agent, companyId }: { agent: Agent; companyId?:
         </div>
       ) : null}
 
-      {isLoading ? (
-        <PageSkeleton variant="list" />
-      ) : libraryEmpty && detectedRows.length === 0 ? (
+      {libraryEmpty && detectedRows.length === 0 ? (
         <EmptyLibraryCard />
       ) : (
         <div className="space-y-4">
