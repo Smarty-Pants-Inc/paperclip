@@ -10,7 +10,7 @@ import { notifyUnsafeWorkspaceExportRecovery } from "../../../services/unsafe-wo
 import { notifyChatInboundWakeNotices } from "../../../services/chat-inbound-wake-notice-notifications.js";
 import { notifyChatRunMilestones } from "../../../services/chat-run-milestone-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-work-notifications.js";
-import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop, readPersonStopHold } from "../../../services/acknowledged-native-stop.js";
+import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop, isPersonAcceptedStartupStop, readPersonStopHold } from "../../../services/acknowledged-native-stop.js";
 import { readRunCancellation } from "../../../services/run-cancellation.js";
 import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
@@ -23,7 +23,7 @@ import { isGovernancePauseStop } from "../../../services/governance-pause-stop.j
 import { agentRunSupersededByFreshContinuation } from "../../../agent-run-cancellation.js";
 import { freshContinuationIsolatesRun } from "../../../services/fresh-continuation-fallback.js";
 import { hasNativePreDispatchFailureRecord } from "../../../services/heartbeat/run-failure-cause.js";
-import { canBypassFailedNativePredecessor, provesNoNativeRunProviderWork } from "../../../services/native-runtime/native-provider-work-proof.js";
+import { canBypassFailedNativePredecessor } from "../../../services/native-runtime/native-provider-work-proof.js";
 import type { Db } from "@paperclipai/db";
 import { deliveredQueuedCommentIds, EXTERNAL_CHAT_MESSAGE_WAKE_MUTATION, EXTERNAL_CHAT_MESSAGE_WAKE_REASON } from "../../../services/queued-comment-delivery.js";
 import { extractIssueReferenceIdentifiers, isUuidLike } from "@paperclipai/shared";
@@ -992,10 +992,7 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: ReleaseRun, iss
   // branch above. It is still the person's stop, not an unreconciled run:
   // settle it as the acknowledged Stop's release does (no incident, task
   // status kept, held messages gathered for the person's Send).
-  if (run.status === "cancelled" && run.errorCode === "cancelled"
-    && Object.keys(parseObject(run.resultJson?.startupCancellation)).length > 0
-    && (await readPersonStopHold(tx, { companyId: run.companyId, issueId: issue.id, agentId: run.agentId }))?.stoppedRunId === run.id
-    && await provesNoNativeRunProviderWork(tx, { companyId: run.companyId, runId: run.id })) {
+  if (await isPersonAcceptedStartupStop(tx, { ...run, issueId: issue.id })) {
     await gatherPersonStoppedChatMessages(tx, run, issue, now);
     return true;
   }
