@@ -98,10 +98,89 @@ it("two simultaneous same-operation callers share the slow primary + hedge acqui
   expect(w.boxes.get("bx_hedge1")!.stopped).toBe(false);
   expect(w.creates).toHaveLength(2); money(w);
 });
+// Keep: never-OK. rf-4 spare.14 V2, same timing and API boundary.
+it("V2 settled same-run same-op caller at 190000 ms gets same winner with no new create and never stops winner", async () => {
+  const w = world([240_000, 40_000]);
+  const first = settle(plugin.definition.onEnvironmentAcquireLease!(params));
+  await vi.advanceTimersByTimeAsync(115_000);
+  const a: any = await first;
+  expect(a.error).toBeUndefined(); expect(a.lease.providerLeaseId).toBe("bx_hedge1");
+  await vi.advanceTimersByTimeAsync(75_000);
+  const second = settle(plugin.definition.onEnvironmentAcquireLease!({ ...params }));
+  await vi.advanceTimersByTimeAsync(1_000);
+  const b: any = await second;
+  console.info("V2 settled re-entry Boat boundary", JSON.stringify({ at: Date.now(), first: a, second: b, creates: w.creates, stops: w.stops, boxes: [...w.boxes] }));
+  expect(b.error).toBeUndefined(); expect(b.lease).toEqual(a.lease);
+  expect(w.creates).toHaveLength(2);
+  expect(w.stops).toEqual([{ id: "bx_hedge0", body: {} }]);
+  expect(w.boxes.get(a.lease.providerLeaseId)!.stopped).toBe(false); money(w);
+});
+it("error cleanup after losing local settlement history excludes the durably committed winner by id", async () => {
+  const w = world([240_000, 40_000]);
+  const r = await acquire(170_000);
+  expect(r.error).toBeUndefined(); expect(r.lease.providerLeaseId).toBe("bx_hedge1");
+  // Lose the local promise at replacement. The saved original acquisition
+  // deadline is expired: this error path must not stop a committed chat box.
+  vi.clearAllTimers(); vi.resetModules();
+  const restarted = (await import("./plugin.js")).default;
+  vi.useFakeTimers(); vi.setSystemTime(190_000);
+  await restarted.definition.setup(context);
+  const retry = settle(restarted.definition.onEnvironmentAcquireLease!(params));
+  await vi.advanceTimersByTimeAsync(1_000);
+  const result: any = await retry;
+  console.info("committed-winner exclusion Boat boundary", JSON.stringify({ result, stops: w.stops, boxes: [...w.boxes] }));
+  expect(result.error).toBeDefined();
+  expect(w.stops.filter(stop => stop.id === r.lease.providerLeaseId)).toEqual([]);
+  expect(w.boxes.get(r.lease.providerLeaseId)!.stopped).toBe(false);
+  expect(w.creates).toHaveLength(2); money(w);
+});
+it("settlement is retained until the original TTL, not renewed by repeated re-entry", async () => {
+  const w = world([240_000, 40_000]);
+  const r = await acquire(170_000);
+  await vi.advanceTimersByTimeAsync(1_530_000);
+  const cached: any = await settle(plugin.definition.onEnvironmentAcquireLease!(params));
+  expect(cached.lease).toEqual(r.lease);
+  await vi.advanceTimersByTimeAsync(100_000); // Original TTL at 1800000 ms.
+  const expired = settle(plugin.definition.onEnvironmentAcquireLease!(params));
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect((await expired as any).error).toBeDefined();
+  expect(w.creates).toHaveLength(2);
+  expect(w.stops.filter(stop => stop.id === r.lease.providerLeaseId)).toEqual([]);
+  expect(w.boxes.get(r.lease.providerLeaseId)!.stopped).toBe(false); money(w);
+});
+it("creation inspection cannot invert the durable winner reservation when the primary is listed first", async () => {
+  const w = world([240_000, 40_000]);
+  const r = await acquire(170_000);
+  expect(r.lease.providerLeaseId).toBe("bx_hedge1");
+  vi.clearAllTimers(); vi.resetModules();
+  const restarted = (await import("./plugin.js")).default;
+  vi.useFakeTimers(); vi.setSystemTime(190_000); await restarted.definition.setup(context);
+  await restarted.definition.onEnvironmentInspectLease!({ ...params, providerLeaseId: "hop", creationOperation: { id: "hop", runId: "hrun" } } as any);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(w.stops.filter(stop => stop.id === r.lease.providerLeaseId)).toEqual([]);
+  expect(w.boxes.get(r.lease.providerLeaseId)!.stopped).toBe(false);
+  expect(w.creates).toHaveLength(2); money(w);
+});
+it("failed-create cleanup retries exclude the returned winner from inventory and exact-id stops", async () => {
+  const w = world([240_000, 40_000]);
+  const r = await acquire(170_000);
+  expect(r.lease.providerLeaseId).toBe("bx_hedge1");
+  const observed = await plugin.definition.onEnvironmentInspectLease!({ ...params, providerLeaseId: "hop", creationOperation: { id: "hop", runId: "hrun" } } as any);
+  const cleanup = observed.creationCleanup!;
+  expect(cleanup.providerLeaseId).toBe("bx_hedge0");
+  await plugin.definition.onEnvironmentDestroyLease!({ ...params, providerLeaseId: cleanup.providerLeaseId, leaseMetadata: { failedCreateCleanup: cleanup } });
+  expect(w.boxes.get(r.lease.providerLeaseId)!.stopped).toBe(false);
+  const winnerCleanup = { ...cleanup, providerLeaseId: r.lease.providerLeaseId, observedProviderLeaseId: r.lease.providerLeaseId };
+  const result: any = await settle(plugin.definition.onEnvironmentDestroyLease!({ ...params, providerLeaseId: r.lease.providerLeaseId, leaseMetadata: { failedCreateCleanup: winnerCleanup } }) as Promise<any>);
+  console.info("failed-create cleanup returned-winner boundary", JSON.stringify({ result, stops: w.stops, boxes: [...w.boxes] }));
+  expect(result.error).toBeDefined();
+  expect(w.stops.filter(stop => stop.id === r.lease.providerLeaseId)).toEqual([]);
+  expect(w.boxes.get(r.lease.providerLeaseId)!.stopped).toBe(false); money(w);
+});
 it("different creation operations remain independent", async () => {
   const w = world([0, 0]);
   const first = settle(plugin.definition.onEnvironmentAcquireLease!(params));
-  const second = settle(plugin.definition.onEnvironmentAcquireLease!({ ...params, creationOperationId: "other-op", runId: "other-run" }));
+  const second = settle(plugin.definition.onEnvironmentAcquireLease!({ ...params, creationOperationId: "other-op" }));
   await vi.advanceTimersByTimeAsync(1_000);
   const a: any = await first, b: any = await second;
   expect(a.error).toBeUndefined(); expect(b.error).toBeUndefined();
@@ -188,6 +267,23 @@ it("first enters archived before H: existing failure, no hedge", async () => {
 it("first enters error before H: existing failure, no hedge", async () => {
   const w = world([240_000, 40_000], { errorAt: 74_000 }); const r = await acquire();
   expect(r.error).toBeDefined(); expect(w.creates).toHaveLength(1); money(w);
+});
+it.each([false, true])("a newly selected winner that fails setup before handoff is still cleaned up with its loser (resumed contender: %s)", async resumed => {
+  const w = world([240_000, 40_000]);
+  const request = { ...params, config: { ...cfg, setupScript: "true" } };
+  let work = settle(plugin.definition.onEnvironmentAcquireLease!(request));
+  if (resumed) {
+    await vi.advanceTimersByTimeAsync(76_000);
+    vi.clearAllTimers(); vi.resetModules();
+    const restarted = (await import("./plugin.js")).default;
+    vi.useFakeTimers(); vi.setSystemTime(76_000); await restarted.definition.setup(context);
+    work = settle(restarted.definition.onEnvironmentAcquireLease!(request));
+  }
+  await vi.advanceTimersByTimeAsync(resumed ? 109_000 : 185_000);
+  expect((await work as any).error).toBeDefined();
+  expect([...w.boxes.values()].every(box => box.stopped)).toBe(true);
+  expect(w.creates).toHaveLength(resumed ? 4 : 2); // Replays spend the same two keys.
+  money(w);
 });
 it("both remain provisioning: acquisition budget stays 180s and both are stopped", async () => {
   const w = world([400_000, 400_000]); const r = await acquire(185_000);

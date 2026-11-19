@@ -23,9 +23,18 @@ does; it contains no authentication header.
 Concurrent callers in one worker for the same company, environment, run and
 creation operation share the entire in-flight acquisition, including its winner,
 preparation and cleanup. They cannot run separate readiness races or stop each
-other's returned box. Different creation operations remain independent; a settled
-success or failure is removed from the in-flight map so a later retry can proceed.
-This is worker-local coalescing, not cross-worker arbitration.
+other's returned box. Different creation operations remain independent, even
+within the same run. A successful result stays available through the original
+lease TTL (shortened by a provider expiry when present); a delayed same-operation
+replay returns it without a new create or reusing the expired acquisition budget.
+Re-entry does not renew this retention window. Failures are evicted so a corrected
+retry can proceed. Expired entries are pruned on acquisition, not by an idle timer.
+This is worker-local coalescing, not cross-worker arbitration. If local result
+history is lost, error cleanup explicitly excludes the saved winner by ID, and
+reconstructing loser debt cannot invert that durable winner reservation. The
+failed-creation destroy path uses the same exclusion for inventory matches and
+refuses an exact-ID cleanup of that winner before changing its lease lifecycle.
+Explicit ordinary release/stop/destroy requests are unchanged.
 
 The winner decision is persisted before handing off. Losers enter the existing
 durable `stop-owed` queue, with exact known IDs and acquisition ownership; only
@@ -36,6 +45,10 @@ A replacement's credentialed acquisition restores and arms maintenance for its
 surviving debt even without a spare setting or a currently visible loser. Retry
 uses the existing 15-minute backoff (observed on the 15-second maintenance tick),
 without requiring another acquisition or inspection; settlement makes it idle.
+This still requires that **first credentialed replacement acquisition**: setup
+and health alone cannot resume stops because the SDK supplies no environment
+credential reference or authorized environment-config read to the worker. No
+resolved API key is persisted to work around that missing recovery path.
 An unanswered hedge POST retains identity-level debt through the shared
 30-minute creation-settle floor so a late box can be found and stopped. Core's
 abandoned-creation inspection reconstructs this debt if the worker died before

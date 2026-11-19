@@ -160,7 +160,10 @@ const inFlightAcquisitions = new Set<Promise<PluginEnvironmentLease>>();
 // One worker, one acquisition decision per run/creation operation. Coalesce the
 // whole hook, not merely hedge intent writes: independent readiness races can
 // otherwise choose opposite winners and stop a box already handed to a caller.
-const acquisitionsByCreation = new Map<string, Promise<PluginEnvironmentLease>>();
+// Keep a successful handoff through its original TTL, not just until promise
+// settlement: a delayed replay is the same decision, not new allocation work.
+// Expired results are pruned by the next acquire, with no idle timer.
+const acquisitionsByCreation = new Map<string, { work: Promise<PluginEnvironmentLease>; expiresAt?: number }>();
 function subscribeCompanyActivity(companyId: string): void {
   if (!pluginContext?.events?.on || activitySubscriptionCompanies.has(companyId)) return;
   for (const eventType of SPARE_ACTIVITY_EVENTS) {
@@ -1673,7 +1676,9 @@ async function oweProvisionLosers(config: Config, owner: { companyId: string; en
   record: ProvisionHedge, keepId: string): Promise<void> {
   const owed = await loadOwedSpareStops(owner.companyId);
   const spareId = `acquisition:${attemptId}`;
-  const acquisition: AcquisitionStopDebt = { attemptId, runId: owner.runId, keepId,
+  // A saved winner is an ownership reservation. Inspection/error recovery
+  // must not invert it merely because inventory lists the primary first.
+  const acquisition: AcquisitionStopDebt = { attemptId, runId: owner.runId, keepId: record.winnerId ?? keepId,
     ids: [record.firstId, ...(record.hedgeBoxId ? [record.hedgeBoxId] : [])],
     settleUntil: record.hedgeBoxId ? Date.now() : record.startedAt + BOAT_CREATION_SETTLE_MS };
   owed.owed = owed.owed.filter(entry => entry.spareId !== spareId);
@@ -2101,9 +2106,12 @@ function definiteRefusalStatus(error: unknown): number | undefined {
   return typeof status === "number" && Number.isInteger(status) && status >= 400 && status <= 499
     && ![408, 425, 429].includes(status) ? status : undefined;
 }
-async function cleanupAcquisition(config: Config, ids: string[], owner: { companyId: string; environmentId: string; runId?: string }, attemptId: string, cause: unknown, acquisitionDiagnostic?: PluginEnvironmentAcquisitionDiagnostic): Promise<void> {
+async function cleanupAcquisition(config: Config, ids: string[], owner: { companyId: string; environmentId: string; runId?: string }, attemptId: string, cause: unknown, committedWinnerId: string | undefined, acquisitionDiagnostic?: PluginEnvironmentAcquisitionDiagnostic): Promise<void> {
   const failures: unknown[] = []; let firstFailed: string | undefined;
   for (const id of ids) {
+    // Never let failed replay cleanup stop a box already reserved/returned by
+    // this operation. Keep the veto here, immediately before every stop path.
+    if (id === committedWinnerId) continue;
     for (let attempt = 0; attempt < 3; attempt++) {
       try { await stopSandbox(config, id); break; }
       catch (error) {
@@ -3148,9 +3156,12 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   onEnvironmentAcquireLease(params: PluginEnvironmentAcquireLeaseParams): Promise<PluginEnvironmentLease> {
     const acquisitionKey = params.creationOperationId
       ? JSON.stringify([params.companyId, params.environmentId, params.runId, params.creationOperationId]) : undefined;
-    const pending = acquisitionKey === undefined ? undefined : acquisitionsByCreation.get(acquisitionKey);
-    if (pending && !shuttingDown) return pending;
     const acquiredAt = Date.now();
+    for (const [key, entry] of acquisitionsByCreation) {
+      if (entry.expiresAt !== undefined && entry.expiresAt <= acquiredAt) acquisitionsByCreation.delete(key);
+    }
+    const pending = acquisitionKey === undefined ? undefined : acquisitionsByCreation.get(acquisitionKey);
+    if (pending && !shuttingDown) return pending.work;
     // review-fleet-4 C1: one line per acquisition, from this hook's every exit.
     const phases = acquirePhaseLine(params, acquiredAt);
     if (shuttingDown) {
@@ -3253,6 +3264,9 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         : new Date(Date.now() + ttl * 1000).toISOString()));
       const createBody = JSON.stringify(createSandboxBody(c, ttl, labels, from));
       const savedHedge = await loadProvisionHedge(params, attemptId);
+      // Snapshot the reservation from BEFORE this invocation: readiness below
+      // mutates savedHedge when a resumed contender wins, before setup/handoff.
+      const committedWinnerId = savedHedge?.winnerId;
       const createStartedAt = savedHedge?.startedAt ?? Date.now();
       // One budget bounds the whole acquisition: create, adoption, readiness,
       // setup and handoff (rf-4 U3 C1). Daytona: one deadline (daytona
@@ -3346,11 +3360,13 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
           });
           throw error;
         });
-        if (id) {
+        // The saved winner predates this invocation. A readiness/setup error
+        // on replay owns unfinished contenders, never the previous handoff.
+        if (id && id !== committedWinnerId) {
           await duplexChannels.suspend({ ...params, providerLeaseId: id });
           await retireForLifecycle({ ...params, providerLeaseId: id });
         }
-        await cleanupAcquisition(c, ids, params, attemptId, error, startFailure);
+        await cleanupAcquisition(c, ids, params, attemptId, error, committedWinnerId, startFailure);
         // #22194: Boat could not start the box, before any agent work. The SDK on
         // this line carries the acquisition diagnostic (providerState "error")
         // only with a cleanup envelope, so the stopped box's exact ownership
@@ -3428,11 +3444,23 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       if (!outcomeRecorded) await recordOutcomeOnce("cold", "config_mismatch");
     });
     inFlightAcquisitions.add(countedWork);
-    const result = countedWork.finally(() => {
+    const entry: { work: Promise<PluginEnvironmentLease>; expiresAt?: number } = { work: countedWork };
+    const forget = () => {
+      if (acquisitionKey !== undefined && acquisitionsByCreation.get(acquisitionKey) === entry) acquisitionsByCreation.delete(acquisitionKey);
+    };
+    const result = countedWork.then(lease => {
+      // Do not extend the TTL on re-entry. A provider deadline, when present,
+      // can shorten retention but can never lengthen the original lease TTL.
+      const until = acquiredAt + effectiveTtlSeconds(parse(params.config)) * 1000;
+      const providerUntil = lease.expiresAt == null ? NaN : Date.parse(lease.expiresAt);
+      entry.expiresAt = Number.isFinite(providerUntil) ? Math.min(until, providerUntil) : until;
+      if (!lease.providerLeaseId) forget();
+      return lease;
+    }, error => { forget(); throw error; }).finally(() => {
       inFlightAcquisitions.delete(countedWork);
-      if (acquisitionKey !== undefined && acquisitionsByCreation.get(acquisitionKey) === result) acquisitionsByCreation.delete(acquisitionKey);
     });
-    if (acquisitionKey !== undefined) acquisitionsByCreation.set(acquisitionKey, result);
+    entry.work = result;
+    if (acquisitionKey !== undefined) acquisitionsByCreation.set(acquisitionKey, entry);
     return result;
   },
   async onEnvironmentInspectLease(params: PluginEnvironmentInspectLeaseParams): Promise<PluginEnvironmentLeaseObservation> {
@@ -3616,11 +3644,8 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     return { ...receipt, ...(warnings.length ? { warnings } : {}) };
   },
   async onEnvironmentDestroyLease(params: PluginEnvironmentDestroyLeaseParams) {
-    if (params.providerLeaseId) await stopRunLeaseTtlRefresh(parse(params.config), params.providerLeaseId);
-    unbindClaimedSpare(params.providerLeaseId);
     if (!params.providerLeaseId) return;
     const c = parse(params.config);
-    preparedEnvDirectories.delete(params.providerLeaseId);
     if (params.leaseMetadata?.failedCreateCleanup !== undefined) {
       const cleanup = readEnvironmentCreationCleanupError({ data: { schema: "paperclip/environment-creation-cleanup/v1", cleanup: params.leaseMetadata.failedCreateCleanup } });
       if (!cleanup || cleanup.companyId !== params.companyId || cleanup.environmentId !== params.environmentId ||
@@ -3628,10 +3653,17 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
           cleanup.labels["paperclip-acquire"] !== cleanup.attemptId) throw new Error("Boat failed-creation cleanup ownership does not match");
       // A single create should allocate once. Still clean every labeled match,
       // including across pages; one durable row owns the complete attempt.
+      const committedWinnerId = (await loadProvisionHedge(cleanup, cleanup.attemptId))?.winnerId;
+      // A stale failed-create row is cleanup authority for unfinished boxes,
+      // never authority to end a successful handoff or its TTL maintenance.
+      if (params.providerLeaseId === committedWinnerId) throw new Error("Boat failed-creation cleanup cannot stop the committed acquisition winner");
       const ids = await acquisitionMatches(c, cleanup.attemptId, cleanup);
-      await cleanupAcquisition(c, ids.filter(id => id !== params.providerLeaseId), cleanup, cleanup.attemptId, new Error("Boat creation cleanup retry"));
+      await cleanupAcquisition(c, ids.filter(id => id !== params.providerLeaseId), cleanup, cleanup.attemptId, new Error("Boat creation cleanup retry"), committedWinnerId);
       // Always confirm the row's exact ID even if listing omits it.
     }
+    await stopRunLeaseTtlRefresh(c, params.providerLeaseId);
+    unbindClaimedSpare(params.providerLeaseId);
+    preparedEnvDirectories.delete(params.providerLeaseId);
     await duplexChannels.suspend({ ...params, providerLeaseId: params.providerLeaseId });
     const warnings = await retireForLifecycle({ ...params, providerLeaseId: params.providerLeaseId });
     const receipt = await stopSandbox(c, params.providerLeaseId);

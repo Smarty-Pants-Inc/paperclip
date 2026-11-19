@@ -1,5 +1,8 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import plugin from "./plugin.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+let plugin: (typeof import("./plugin.js"))["default"];
+// These are independent wire fixtures with deliberately identical request IDs.
+// Give each a fresh worker; same-worker settled re-entry must return its winner.
+beforeEach(async () => { vi.resetModules(); plugin = (await import("./plugin.js")).default; });
 import manifest from "./manifest.js";
 // Keep: provider boundary. Fixed identity/time allows literal wire-byte comparison
 // with 0.1.6, rather than merely asserting absence of one parsed property.

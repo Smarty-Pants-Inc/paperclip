@@ -14,6 +14,10 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe("0.1.3 review regressions", () => {
   it.each([{}, { team: "daily", owner: "configured-owner" }])("F1: acquire metadata preserves config labels for the real core selector: %j", async labels => {
+    // Independent label fixtures deliberately use the same literal request IDs.
+    // Give each a fresh worker rather than replaying the previous settlement.
+    vi.resetModules();
+    const plugin = (await import("./plugin.js")).default;
     const fetch = vi.fn()
       .mockResolvedValueOnce(response({ sandbox: { id: base.providerLeaseId, state: "provisioning" } }, 202))
       .mockResolvedValueOnce(response({ sandbox: { id: base.providerLeaseId, state: "ready" } }));
