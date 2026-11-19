@@ -1,6 +1,6 @@
 import { AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY } from "./agent-file-save-hold.js";
 import { notifyEnvironmentConfigChange, withEnvironmentConfigChange } from "./environment-config-revision.js";
-import { carryReusableLeasePreparation, createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
+import { carryReusableLeasePreparation, createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutPredecessorStopReceipts, withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
 import { inheritWarmRetentionMetadata } from "./environment-warm-retention.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
 import { clearRemoteWorkspaceLocationForReleasedLease } from "./remote-workspace-snapshot-retention.js";
@@ -1667,7 +1667,9 @@ export function environmentService(db: Db) {
                   );
                 }
                 const handoff = createReusableLeaseHandoff(retired[0]!, { ...values, id: replacementLeaseId! });
-                values.metadata = { ...inheritWarmRetentionMetadata(retired[0]!.metadata, carryReusableLeasePreparation(retired[0]!, { ...values, id: replacementLeaseId! })),
+                // adopt-receipt-own-run: never the predecessor run's stop receipt / termination.
+                values.metadata = { ...withoutPredecessorStopReceipts(inheritWarmRetentionMetadata(retired[0]!.metadata,
+                  carryReusableLeasePreparation(retired[0]!, { ...values, id: replacementLeaseId! }))),
                   reusableLeasePredecessor: handoff };
                 await tx.update(environmentLeases).set({ metadata: {
                   ...retired[0]!.metadata, reusableLeaseSuccessor: handoff,

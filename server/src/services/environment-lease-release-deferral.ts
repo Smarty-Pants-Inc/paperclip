@@ -80,7 +80,7 @@ export async function settleUnchangedNativeWorkspace(db: Db, runId: string, comp
     sql`coalesce(${heartbeatRuns.runnerProfileJson}->'remoteWorkspace', 'null'::jsonb) = 'null'::jsonb`,
     sql`not exists (select 1 from ${environmentLeases} where ${environmentLeases.companyId} = ${companyId}
       and ${environmentLeases.heartbeatRunId} = ${runId} and (${environmentLeases.status} in ('active', 'pending_cleanup', 'retained')
-        or coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? 'sandboxStopAndRetainReceipt'))`))
+        or ${environmentLeases.metadata}->'sandboxStopAndRetainReceipt'->>'runId' = ${runId}))`))
     .returning({ id: heartbeatRuns.id });
   return settled.length > 0;
 }

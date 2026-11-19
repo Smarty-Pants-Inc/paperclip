@@ -15,6 +15,24 @@ export function withoutReusableLeaseHandoff(metadata: Record<string, unknown> | 
   return result;
 }
 
+/** adopt-receipt-own-run: a stop receipt and termination record belong to the
+ * lease (and run) whose box stopped. A successor lease never inherits them. */
+export function withoutPredecessorStopReceipts(metadata: Record<string, unknown> | null | undefined) {
+  if (metadata == null) return null;
+  const { remoteExecutionTermination: _termination, sandboxStopAndRetainReceipt: _receipt, ...rest } = metadata;
+  return rest;
+}
+
+/** adopt-receipt-own-run: the lease's stop receipt (or termination record) only
+ * when it names the lease's OWN run. Another run's copy is not this lease's stop. */
+export function ownLeaseStopRecord(lease: { heartbeatRunId: string | null; metadata: Record<string, unknown> | null },
+  key: "sandboxStopAndRetainReceipt" | "remoteExecutionTermination"): Record<string, unknown> | null {
+  const value = lease.metadata?.[key];
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  return record.runId === lease.heartbeatRunId ? record : null;
+}
+
 export function preserveReusableLeaseHandoff(previous: Record<string, unknown> | null,
   metadata: Record<string, unknown> | null | undefined) {
   const result = withoutReusableLeaseHandoff(metadata);
