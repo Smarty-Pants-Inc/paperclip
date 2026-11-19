@@ -442,8 +442,8 @@ const support = await getEmbeddedPostgresTestSupport();
       await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, phase: "terminal_failure", attempt, controllerGeneration: attempt,
         recoveryState: "blocked", failureCode: "native_continuation_requires_reconciliation" });
     };
-    const stop = async (runId: string) => {
-      await heartbeat.releaseEnvironmentLeasesForRun({ runId, companyId, agentId, status: "failed" } as never);
+    const stop = async (runId: string, providerResourceDisposition?: "stop_and_retain") => {
+      await heartbeat.releaseEnvironmentLeasesForRun({ runId, companyId, agentId, status: "failed", providerResourceDisposition } as never);
       const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, runId));
       return row!;
     };
@@ -470,7 +470,9 @@ const support = await getEmbeddedPostgresTestSupport();
       commands: [{ seq: 1, type: "turn.start", status: "completed" }, { seq: 2, type: "turn.interrupt", status: "pending" },
         { seq: 3, type: "turn.stop", status: "pending" }, { seq: 4, type: "runner.suspend", status: "pending" }], committedEvents: [] }));
     await fail(P, 2);
-    const pLease = await stop(P);
+    const pLease = await stop(P, "stop_and_retain"); // the real stop-and-retain path (prepareSandboxStopAndRetain)
+    expect(calls.filter(call => call.providerLeaseId === boxes[0]).map(call => call.method), "P's box STOPPED, not destroyed")
+      .not.toContain("environmentDestroyLease");
     // The real receipt writer's typed receipt.
     expect(pLease.metadata?.remoteExecutionTermination).toMatchObject({ runId: P, providerLeaseId: boxes[0], state: "stopped" });
     // SEND -> S0 on box 1, refused (FAIL) and stopped through the same real path.
