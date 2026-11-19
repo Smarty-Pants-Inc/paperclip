@@ -819,6 +819,7 @@ type PaperclipWakePayload = {
   // Technical English with brief decision context.
   simplifiedEnglishInteractions: boolean;
   dependencyBlockedInteraction: boolean;
+  interruptedTurnCompletedTools: Array<{ name: string; output: string; outputTruncated: boolean }>;
   treeHoldInteraction: boolean;
   activeTreeHold: PaperclipWakeTreeHoldSummary | null;
   unresolvedBlockerIssueIds: string[];
@@ -1914,6 +1915,12 @@ export function normalizePaperclipWakePayload(
       payload.simplifiedEnglishInteractions,
       false,
     ),
+    interruptedTurnCompletedTools: Array.isArray(payload.interruptedTurnCompletedTools)
+      ? payload.interruptedTurnCompletedTools.flatMap((value) => {
+          const tool = parseObject(value);
+          return typeof tool.name === "string" && tool.name.trim()
+            ? [{ name: tool.name, output: asString(tool.output, ""), outputTruncated: asBoolean(tool.outputTruncated, false) }] : [];
+        }).slice(0, 32) : [],
     dependencyBlockedInteraction: asBoolean(
       payload.dependencyBlockedInteraction,
       false,
@@ -2596,6 +2603,16 @@ function renderPaperclipWakePromptBody(
         ...wakeSummaryLines,
       ];
 
+  // adopt-redo-fresh: a fresh session (new box) after the person's Interrupt never saw the cut turn.
+  // The tool calls that turn completed are listed from their durable receipts so they are not run twice.
+  if (!resumedSession && normalized.interruptedTurnCompletedTools.length > 0) {
+    lines.push("", "## Already done in the interrupted turn",
+      "The person interrupted your previous turn. These tool calls from it already completed (from their saved receipts). Do not run them again; continue from the next step.");
+    normalized.interruptedTurnCompletedTools.forEach((tool, index) => {
+      lines.push(`${index + 1}. ${markdownInlineCode(tool.name)}: completed`);
+      if (tool.output) lines.push(`   result${tool.outputTruncated ? " (excerpt)" : ""}: ${tool.output.replace(/\s+/g, " ").trim()}`);
+    });
+  }
   for (const config of normalized.githubReviewConfigurations) {
     lines.push("", "## Configured GitHub review instructions", config.instructions);
   }
