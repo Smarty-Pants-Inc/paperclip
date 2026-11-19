@@ -83,6 +83,7 @@ import type {
 } from "../../adapters/index.js";
 import { createRuntimeToolsToken } from "../../runtime-tools-token.js";
 import { parseObject } from "../../adapters/utils.js";
+import { steeringIngestionPending } from "../native-runtime/steering-ingestion.js";
 import {
   authorizeChatConversationForBoundRun,
   isExternalChatWaitAuthorizationContention,
@@ -2357,6 +2358,16 @@ const MAX_INTERRUPTED_TURN_CHAIN_RUNS = 16;
 const MAX_INTERRUPTED_TURN_EVENTS = 4096;
 const MAX_INTERRUPTED_TURN_ARGUMENTS_CHARS = 300;
 const MAX_INTERRUPTED_TURN_ARGUMENT_VALUE_CHARS = 120;
+/** adopt-receipts4: bounded wait for a cut run's ordered event ingestion to settle (its completions land). */
+export const INTERRUPT_CUT_INGESTION_WAIT_MS = 2_000;
+
+/** adopt-receipts4: a real Pi file tool's receipt carries no arguments (runner-core keeps tool_use items
+ * argument-free and its dynamic tool.execution target null); its own result names the path it wrote. */
+function piFileToolTargetFromResult(name: string, output: string): string | null {
+  if (name !== "write" && name !== "edit") return null;
+  const match = /^Successfully (?:wrote|replaced)\b[^\n]*? (?:to|in) (\/[^\n]+?)\.?$/u.exec(output.trim().split("\n")[0] ?? "");
+  return match?.[1] ?? null;
+}
 
 export type InterruptedTurnToolCall = {
   name: string;
@@ -2395,6 +2406,9 @@ export type InterruptCutToolCalls = {
   omitted: number;
   /** The chain reaches further back than the runs read (over the run cap): earlier calls are not counted. */
   earlierRunsOmitted: boolean;
+  /** adopt-receipts4: a cut run's record lost events from before the press (its ingestion stopped with a gap):
+   * a call after the last one listed may have run. */
+  recordIncomplete: boolean;
 };
 
 /** adopt-receipts3: every tool call since the last run on this task that ENDED WITH AN AGENT REPLY, when the
@@ -2406,7 +2420,7 @@ export type InterruptCutToolCalls = {
  * aborted) is interrupted. A non-bash call carries its arguments from the same call's item receipt. Over the
  * cap, the omitted count is returned so the input never implies everything is listed. */
 export async function readInterruptCutToolCalls(db: Db, input: { companyId: string; issueId: string; currentRunId: string }): Promise<InterruptCutToolCalls> {
-  const none: InterruptCutToolCalls = { calls: [], omitted: 0, earlierRunsOmitted: false };
+  const none: InterruptCutToolCalls = { calls: [], omitted: 0, earlierRunsOmitted: false, recordIncomplete: false };
   const [current] = await db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.currentRunId)));
   if (!current) return none;
@@ -2439,6 +2453,41 @@ export async function readInterruptCutToolCalls(db: Db, input: { companyId: stri
     chain.unshift(run.id);
   }
   if (chain.length === 0 || !cut) return none;
+  // adopt-receipts4: a step that finishes AT the press can still be in ordered ingestion when this successor
+  // builds its input. Wait, bounded, for each cut run's ingestion fence (the steering-ingestion receipt the
+  // native consumer settles at its terminal / stop) to close, like waitForSteeringIngestion.
+  const cutRunIds = previous.filter((run) => chain.includes(run.id) && interruptCut(run)).map((run) => run.id);
+  for (const deadline = Date.now() + INTERRUPT_CUT_INGESTION_WAIT_MS; ;) {
+    const pending = (await db.select({ resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.id, cutRunIds))))
+      .some((run) => steeringIngestionPending(run.resultJson));
+    const remaining = deadline - Date.now();
+    if (!pending || remaining <= 0) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(25, remaining)));
+  }
+  // A cut run whose ordered source record has a gap BEFORE the press (its interrupt acknowledgement) lost
+  // events when it was cut: a call that ran then has no receipt. Never let that read as "nothing ran".
+  const sourceRows = await db.select({ runId: heartbeatRunEvents.runId, instance: heartbeatRunEvents.sourceInstanceId,
+    seq: heartbeatRunEvents.sourceSeq, ack: sql<boolean>`(${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind') = 'interrupt_acknowledgement'` })
+    .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, input.companyId), inArray(heartbeatRunEvents.runId, cutRunIds),
+      sql`${heartbeatRunEvents.sourceSeq} is not null and ${heartbeatRunEvents.sourceInstanceId} is not null`,
+      sql`coalesce(${heartbeatRunEvents.payload}->'prpEvent'->>'sourceKind', 'runner') <> 'control_plane'`))
+    .orderBy(asc(heartbeatRunEvents.sourceSeq)).limit(MAX_INTERRUPTED_TURN_EVENTS);
+  const sources = new Map<string, { seqs: Set<number>; press: number | null; max: number }>();
+  for (const row of sourceRows) {
+    const key = `${row.runId}:${row.instance}`;
+    const source = sources.get(key) ?? { seqs: new Set<number>(), press: null, max: 0 };
+    const seq = Number(row.seq);
+    source.seqs.add(seq);
+    source.max = Math.max(source.max, seq);
+    if (row.ack && source.press === null) source.press = seq;
+    sources.set(key, source);
+  }
+  let recordIncomplete = false;
+  for (const source of sources.values()) {
+    const bound = source.press ?? source.max;
+    for (let seq = Math.min(...source.seqs); seq < bound; seq += 1) if (!source.seqs.has(seq)) { recordIncomplete = true; break; }
+  }
   const toolCallKinds = sql`(${heartbeatRunEvents.eventType} in ('tool.execution.started', 'tool.execution.completed')
     or (${heartbeatRunEvents.eventType} in ('item.started', 'item.delta', 'item.completed', 'item.failed')
       and ${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' in ('tool', 'commandExecution')))`;
@@ -2481,11 +2530,18 @@ export async function readInterruptCutToolCalls(db: Db, input: { companyId: stri
       if (!known && calls.size >= MAX_INTERRUPTED_TURN_TOOLS) continue;
       const output = typeof tool.output === "string" ? tool.output : known?.output ?? "";
       const isBash = tool.transport === "process" && tool.operation === "execute";
-      const args = isBash ? null : argumentsByItem.get(`${runId}:${readNonEmptyString(prp.itemId) ?? callId}`)
-        ?? argumentsByItem.get(key) ?? null;
+      const name = (readNonEmptyString(tool.name) ?? known?.name ?? "tool").slice(0, 300);
+      const args = isBash ? null : argumentsByItem.get(key)
+        ?? argumentsByItem.get(`${runId}:${readNonEmptyString(prp.itemId) ?? callId}`) ?? null;
+      // adopt-receipts4: real Pi persists no arguments for a non-shell call. Say so, with the path its own
+      // result names (write/edit), so the successor still knows WHICH file was written.
+      const resultPath = !isBash && !args && !readNonEmptyString(tool.target) ? piFileToolTargetFromResult(name, output) : null;
+      const unrecorded = !isBash && !args && !readNonEmptyString(tool.target)
+        ? `${resultPath ? `${resultPath}; ` : ""}arguments not recorded` : null;
       calls.set(key, {
-        name: (readNonEmptyString(tool.name) ?? known?.name ?? "tool").slice(0, 300),
-        target: (readNonEmptyString(tool.target) ?? args ?? known?.target ?? null)?.slice(0, MAX_INTERRUPTED_TURN_ARGUMENTS_CHARS + 1) ?? null,
+        name,
+        target: (readNonEmptyString(tool.target) ?? args ?? (known?.target && known.target !== "arguments not recorded" ? known.target : null)
+          ?? unrecorded)?.slice(0, MAX_INTERRUPTED_TURN_ARGUMENTS_CHARS + 1) ?? null,
         status,
         output: output.slice(0, MAX_INTERRUPTED_TURN_TOOL_OUTPUT_CHARS),
         outputTruncated: output.length > MAX_INTERRUPTED_TURN_TOOL_OUTPUT_CHARS || tool.outputTruncated === true,
@@ -2493,7 +2549,7 @@ export async function readInterruptCutToolCalls(db: Db, input: { companyId: stri
     }
   }
   return { calls: [...calls.values()], omitted: Math.max(0, seen.size - calls.size),
-    earlierRunsOmitted: earlierRunsOmitted || eventsCapped };
+    earlierRunsOmitted: earlierRunsOmitted || eventsCapped, recordIncomplete };
 }
 
 export async function buildPaperclipWakePayload(input: {
@@ -2601,7 +2657,7 @@ export async function buildPaperclipWakePayload(input: {
   // already holds them. Never invented: receipts only.
   const interruptCutTools = issueId && input.runId
     ? await readInterruptCutToolCalls(input.db, { companyId: input.companyId, issueId, currentRunId: input.runId })
-    : { calls: [], omitted: 0, earlierRunsOmitted: false };
+    : { calls: [], omitted: 0, earlierRunsOmitted: false, recordIncomplete: false };
   const interruptedTurnToolCalls = interruptCutTools.calls;
   const issueDescription = conversationMode ? null : issueSummary?.description ?? null;
   const issueDescriptionTruncated =
@@ -3086,7 +3142,8 @@ export async function buildPaperclipWakePayload(input: {
           updatedAt: safeContinuationSummary.updatedAt.toISOString(),
         }
       : null,
-    ...(interruptedTurnToolCalls.length ? { interruptedTurnToolCalls,
+    ...(interruptedTurnToolCalls.length || interruptCutTools.recordIncomplete ? { interruptedTurnToolCalls,
+      ...(interruptCutTools.recordIncomplete ? { interruptedTurnRecordIncomplete: true } : {}),
       ...(interruptCutTools.omitted > 0 ? { interruptedTurnToolCallsOmitted: interruptCutTools.omitted } : {}),
       ...(interruptCutTools.earlierRunsOmitted ? { interruptedTurnEarlierCallsOmitted: true } : {}) } : {}),
     commentIds,

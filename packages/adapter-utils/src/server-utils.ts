@@ -830,6 +830,8 @@ type PaperclipWakePayload = {
   interruptedTurnToolCallsOmitted: number;
   /** adopt-receipts3: the chain reaches further back than was read; earlier calls are not counted. */
   interruptedTurnEarlierCallsOmitted: boolean;
+  /** adopt-receipts4: the cut turn's record lost events from before the press; a further call may have run. */
+  interruptedTurnRecordIncomplete: boolean;
   treeHoldInteraction: boolean;
   activeTreeHold: PaperclipWakeTreeHoldSummary | null;
   unresolvedBlockerIssueIds: string[];
@@ -1938,6 +1940,7 @@ export function normalizePaperclipWakePayload(
     interruptedTurnToolCallsOmitted: Math.max(0, Math.floor(asNumber(payload.interruptedTurnToolCallsOmitted, 0)))
       + (Array.isArray(payload.interruptedTurnToolCalls) ? Math.max(0, payload.interruptedTurnToolCalls.length - 32) : 0),
     interruptedTurnEarlierCallsOmitted: asBoolean(payload.interruptedTurnEarlierCallsOmitted, false),
+    interruptedTurnRecordIncomplete: asBoolean(payload.interruptedTurnRecordIncomplete, false),
     dependencyBlockedInteraction: asBoolean(
       payload.dependencyBlockedInteraction,
       false,
@@ -2642,14 +2645,17 @@ function renderPaperclipWakePromptBody(
   // adopt-a2-order3: a person's STOP (server-owned personStoppedPreviousTurn; never set for an Interrupt) is not
   // an Interrupt: the new message is answered and the stopped work is NOT resumed or redone unless they ask.
   // None of the Interrupt's 'then continue' wording may reach a Stop successor.
-  const stopCarriesNewMessage = freshInterruptToolCalls.length > 0 && hasWakeCommentBatch && normalized.personStoppedPreviousTurn;
-  const interruptCarriesNewMessage = freshInterruptToolCalls.length > 0 && hasWakeCommentBatch && !normalized.personStoppedPreviousTurn;
-  if (freshInterruptToolCalls.length > 0) {
+  // adopt-receipts4: a step that finished AT the press can lose its receipt; the list is still shown, flagged.
+  const freshInterruptRecordIncomplete = !resumedSession && normalized.interruptedTurnRecordIncomplete;
+  const freshInterruptListShown = freshInterruptToolCalls.length > 0 || freshInterruptRecordIncomplete;
+  const stopCarriesNewMessage = freshInterruptListShown && hasWakeCommentBatch && normalized.personStoppedPreviousTurn;
+  const interruptCarriesNewMessage = freshInterruptListShown && hasWakeCommentBatch && !normalized.personStoppedPreviousTurn;
+  if (freshInterruptListShown) {
     lines.push("", "## Commands already run in the interrupted turn (do not run these again)",
       "This list may not include file edits made in that turn; check the files before redoing any edit.",
       `${stopCarriesNewMessage ? "The person stopped your previous turn and sent a new message. Answer their new message. Do not resume or redo the stopped work unless they ask; the completed calls below must not be run again." : interruptCarriesNewMessage ? "The person interrupted your previous turn and sent a new message. Answer their new message first. Then continue the task from the next unfinished step; the completed calls below must not be run again." : "The person interrupted your previous turn."} ${sessionHoldsInterruptedTurn
         ? "The tool calls below already ran in this session (completed or started); they are the calls recorded"
-        : "This fresh session does not hold that turn; the tool calls below are the calls recorded"} since your last reply (from their saved receipts), in order${normalized.interruptedTurnToolCallsOmitted > 0 || normalized.interruptedTurnEarlierCallsOmitted ? ", but NOT all of them: some were omitted (see the end of this list)" : ", all of them"}. ${stopCarriesNewMessage
+        : "This fresh session does not hold that turn; the tool calls below are the calls recorded"} since your last reply (from their saved receipts), in order${normalized.interruptedTurnToolCallsOmitted > 0 || normalized.interruptedTurnEarlierCallsOmitted || freshInterruptRecordIncomplete ? ", but NOT all of them: some were omitted (see the end of this list)" : ", all of them"}. ${stopCarriesNewMessage
         ? "Do not run them again."
         : interruptCarriesNewMessage
         ? "Do not run them again. A call marked interrupted was cut mid-flight. If it was only a wait or sleep, do not run it again unless the person asks. Otherwise check whether it took effect before you run it again."
@@ -2661,6 +2667,8 @@ function renderPaperclipWakePromptBody(
       lines.push(`${index + 1}. ${call}: ${state}`);
       if (tool.output) lines.push(`   ${tool.status === "failed" ? "error" : "result"}${tool.outputTruncated ? " (excerpt)" : ""}: ${tool.output.replace(/\s+/g, " ").trim()}`);
     });
+    // adopt-receipts4: a step that finished AT the press can lose its receipt in the cut; never drop it silently.
+    if (freshInterruptRecordIncomplete) lines.push(`${freshInterruptToolCalls.length + 1}. A further call may have run right before the interrupt (its receipt was lost in the cut): interrupted: it may or may not have taken effect. Check the workspace for the next step's effect before you run it.`);
     const omitted = normalized.interruptedTurnToolCallsOmitted;
     if (omitted > 0) lines.push(`${omitted} more tool call${omitted === 1 ? " was" : "s were"} recorded after these and omitted from this list (over the limit): they may have run. Check the workspace before you redo any step.`);
     if (normalized.interruptedTurnEarlierCallsOmitted) lines.push("Earlier tool calls in this interrupted work were omitted from this list (over the limit): check the workspace before you redo any step.");
