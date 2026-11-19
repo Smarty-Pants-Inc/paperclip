@@ -108,11 +108,20 @@ const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused", UNANSWER
 /** Paperclip's pause model: POST /agents/:id/resume is allowed for a board user
  * or an agent that manages the paused agent (routes/agents.ts:6017-6023 ->
  * assertCanManageAgentLifecycle :2613-2623 -> agent-subtree-management.ts:34-39
- * assertAgentLifecycleAuthority / assertCanManageSubordinateAgent). */
+ * assertAgentLifecycleAuthority / assertCanManageSubordinateAgent).
+ * No promise that the message will run (RFL 11-19 05:29Z, rf-5 T4 OBSERVED on
+ * the native path): a message sent while the agent is paused has its wake
+ * refused (409 'not invokable') and never runs after Resume. True until the
+ * deferred-wake fix lands; that unit restores the 'will run' words WITH a row
+ * proving the message runs. */
 export function agentPausedText(name: string) {
-  return `${name} is paused. Your message is saved, and it will run when ${name} is resumed. `
+  return `${name} is paused. Your message is saved. Send it again after ${name} is resumed. `
     + `A board user or ${name}'s manager can resume ${name}.`;
 }
+/** The next action of every while-paused note that asks for a resend (M's
+ * pause-stopped note and the paused note): resume first, then send again. */
+const agentPausedNextAction = (name: string) =>
+  `Ask a board user or ${name}'s manager to resume ${name}, then send it again.`;
 
 export const UNANSWERED_MESSAGE_TEXT =
   "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
@@ -791,9 +800,9 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   if (settingUp) {
     code = UNANSWERED_MESSAGE_AGENT_SETUP_CODE;
   } else if (agentPaused) {
-    // Only a message that is really deferred (it WILL run on Resume) gets the
-    // paused note; M, whose own run the Pause cancelled, is pause-stopped even
-    // while paused.
+    // A message whose own run the Pause did not cancel (such as P, sent while
+    // paused) gets the paused note, which promises no run; M, whose own run the
+    // Pause cancelled, is pause-stopped even while paused.
     code = pauseCancelledOwnRun ? PAUSE_STOPPED_WHILE_PAUSED_CODE : UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   } else if (waitingToStart) {
     // The ordinary carrying-run start bound is unchanged. A known queued
@@ -968,9 +977,9 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
       tone: paused ? "warning" : waiting ? "info" : "warning",
       nextAction: policyRefused ? "Automatic retry is disabled for this request."
         : settingUp ? "No action is needed; your message is saved."
-        : pauseStoppedWhilePaused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}, then send it again.`
+        : pauseStoppedWhilePaused ? agentPausedNextAction(pausedName)
         : pauseStopped ? "Send it again to continue."
-        : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
+        : paused ? agentPausedNextAction(pausedName)
         : waiting ? "No action is needed; it will start by itself."
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : held || boundReached ? "Send a new message to try again."
