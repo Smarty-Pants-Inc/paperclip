@@ -205,8 +205,7 @@ export async function executionProjectionsForRuns(
   const settlingPredecessorKeys = new Set<string>();
   const queuedRuns = runs.filter(run => run.status === "queued");
   const coordinatorByRun = new Map(coordinators.map((row) => [row.runId, row]));
-  // A person's Stop or Pause settles a native run as native_retry_cancelled.
-  const stoppedRuns = runs.filter(run => run.status === "cancelled" && coordinatorByRun.get(run.id)?.failureCode === "native_retry_cancelled");
+  const stoppedRuns = runs.filter(run => personCancelSettlement(run, coordinatorByRun.get(run.id)));
   const setupAgentIds = [...new Set([...queuedRuns.filter(run => !run.startedAt), ...stoppedRuns].map(run => run.agentId))];
   const setupAgents = setupAgentIds.length ? await read(async () => db
     .select({ id: agents.id, lifecycleState: agents.lifecycleState,
@@ -356,6 +355,21 @@ export async function executionProjectionForRun(
       runId,
     ) ?? null
   );
+}
+// The wake-queue release path (recordNativeTerminalRecoveryIfNeeded) writes this
+// code and its hold when a cancelled native run is not an acknowledged stop.
+const NATIVE_CANCEL_RECONCILIATION_CODE = "native_continuation_requires_reconciliation";
+/** A run cancelled by a person (their Stop or tree Pause, or their agent Pause)
+ * whose coordinator records only that cancel. */
+function personCancelSettlement(run: Run, coordinator: Coordinator | undefined) {
+  if (run.status !== "cancelled") return false;
+  if (coordinator?.phase === "terminal_failure" && coordinator.failureCode === "native_retry_cancelled") return true;
+  const cancellation = (run.resultJson?.cancellation ?? {}) as { initiator?: { type?: unknown }; expected?: unknown };
+  const byPerson = cancellation.initiator?.type === "user" || (run.errorCode === "agent_paused" && cancellation.expected === true);
+  return byPerson && (coordinator?.phase === "terminal_failure"
+    ? coordinator.failureCode === NATIVE_CANCEL_RECONCILIATION_CODE
+    // A startup cancel before any controller claimed the run (runtime selection's row).
+    : coordinator?.phase === "observed" && coordinator.attempt === 0 && !coordinator.leaseOwner && !coordinator.failureCode);
 }
 export function projectExecution(
   run: Run,
@@ -527,10 +541,13 @@ export function projectExecution(
         : "Reconnecting",
     );
   }
-  // A person's Stop or Pause settles a native run as native_retry_cancelled.
-  // Without a recovery action, quarantine or replacement denial it is stopped.
-  if (run.status === "cancelled" && coordinator?.phase === "terminal_failure" && coordinator.failureCode === "native_retry_cancelled"
-    && !recoveryAction && !cleanupQuarantined && !detail.replacementDenied) {
+  // A person's Stop or Pause whose coordinator records only the cancel is stopped,
+  // unless cleanup failed (any other recovery action, quarantine or replacement
+  // denial). The release path's own reconciliation hold for this cancel is not a
+  // cleanup failure: the fallback continues it from saved work.
+  const ownCancelHold = recoveryAction?.status !== "resolved" && recoveryAction?.cause === NATIVE_CANCEL_RECONCILIATION_CODE
+    && coordinator?.failureCode === NATIVE_CANCEL_RECONCILIATION_CODE && recoveryAction.evidence?.originalFailureCode === run.errorCode;
+  if (personCancelSettlement(run, coordinator) && (!recoveryAction || ownCancelHold) && !cleanupQuarantined && !detail.replacementDenied) {
     projection.cause = null;
     projection.nextAction = pauseActive ? "Resume to continue." : "Send a new message to continue from saved work.";
     return set("completed", "Stopped");
