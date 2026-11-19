@@ -7074,3 +7074,79 @@ describe("NOTE8 judge read-cutoff safety", () => {
     expect(markRead).not.toHaveBeenCalled();
   });
 });
+
+// Person case (app-lead multireply, red from run 130c114e): a person steers five
+// questions into ONE running turn and the server posts each answer as its own
+// agent comment from that same run (same createdByRunId/runId), the fifth being
+// the turn's final reply. Every answer shows, in order, each once: live, after
+// it settles and after a reload, at 390 and 1440. A later one never hides an
+// earlier one.
+describe.each([{ width: 390, mobile: true }, { width: 1440, mobile: false }])(
+  "one run posting five replies at $width", ({ width, mobile }) => {
+  const runId = "130c114e-5f1a-4c55-9a51-6b1d2c3e4f50";
+  const agent = { id: "4f7a3c27-9504-4b36-bbaf-96929c7a9127", name: "Runner", adapterType: "paperclip_runner" } as Agent;
+  const questions = ["Q-ONE what is two plus two", "Q-TWO name a primary colour", "Q-THREE spell cat backwards",
+    "Q-FOUR capital of France", "Q-FIVE largest planet"];
+  const answers = ["ANSWER-ONE four", "ANSWER-TWO red", "ANSWER-THREE tac", "ANSWER-FOUR Paris", "ANSWER-FIVE Jupiter"];
+  const at = (second: number) => `2026-11-19T19:53:${String(second).padStart(2, "0")}.000Z`;
+  const comment = (id: string, authorType: "user" | "agent", body: string, createdAt: string, extra: Record<string, unknown> = {}) => ({
+    id, companyId: "company", issueId: "issue", authorType, authorAgentId: authorType === "agent" ? agent.id : null,
+    authorUserId: authorType === "user" ? "user-1" : null, createdByRunId: authorType === "agent" ? runId : null,
+    runId: authorType === "agent" ? runId : null, body, presentation: null, metadata: null,
+    createdAt: new Date(createdAt), updatedAt: new Date(createdAt), ...extra });
+  // Q_i steered at 10i s, A_i posted at 10i+5 s (A5 is the turn's final reply).
+  const commentsThrough = (answered: number, steered: boolean) => [
+    comment("c-begin", "user", "Begin: I will ask you five things while you work.", at(0)),
+    ...questions.slice(0, answered).flatMap((question, index) => {
+      const qAt = at(10 * (index + 1));
+      return [comment(`c-q${index + 1}`, "user", question, qAt, steered
+        ? { consumedByRunId: runId, steeredIntoRunId: runId, conversationAnchorAt: new Date(qAt) } : {}),
+      comment(`c-a${index + 1}`, "agent", answers[index], at(10 * (index + 1) + 5))];
+    }),
+  ];
+  const transcriptThrough = (answered: number, terminal: boolean) => [
+    ...answers.slice(0, answered).map((text, index) => assistantEntry(at(10 * (index + 1) + 4), text, "final")),
+    ...(terminal ? [{ kind: "run_terminal", ts: at(58), turnState: "completed", runState: "succeeded", disposition: "completed" }] : []),
+  ];
+  const live = { id: runId, runtimeMode: "native" as const, status: "running", invocationSource: "on_demand",
+    triggerDetail: null, startedAt: at(1), finishedAt: null, createdAt: at(1),
+    agentId: agent.id, agentName: agent.name, adapterType: "paperclip_runner" };
+  const settled = { runId, runtimeMode: "native" as const, status: "succeeded", agentId: agent.id, adapterType: "paperclip_runner",
+    createdAt: live.createdAt, startedAt: live.startedAt, finishedAt: at(58) };
+  const base = { onAdd: async () => {}, issueId: "issue", issueStatus: "in_progress", companyId: "company",
+    issueAssigneeAgentId: agent.id, agentMap: new Map([[agent.id, agent]]) };
+  const expectEveryAnswerOnce = (count: number, phase: string) => {
+    const text = container.textContent ?? "";
+    let last = -1;
+    for (const [index, answer] of answers.slice(0, count).entries()) {
+      expect.soft(text.split(answer).length - 1, `${phase}: ${answer} shown exactly once`).toBe(1);
+      const position = text.indexOf(answer);
+      expect.soft(position, `${phase}: ${answer} after the previous answer`).toBeGreaterThan(last);
+      expect.soft(text.indexOf(questions[index]), `${phase}: ${questions[index]} above its answer`).toBeLessThan(position);
+      last = position;
+    }
+    for (const answer of answers.slice(count)) expect.soft(text, `${phase}: ${answer} not yet posted`).not.toContain(answer);
+  };
+
+  it.each([true, false])("shows all five answers live, settled and after a reload (steering metadata=%s)", async (steered) => {
+    sidebarState.isMobile = mobile;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    for (let answered = 1; answered <= 5; answered += 1) {
+      nativeTranscriptState.transcriptByRun.set(runId, transcriptThrough(answered, false));
+      render(<TaskChatThread {...base} comments={commentsThrough(answered, steered)} activeRun={live} />);
+      await act(async () => {});
+      expectEveryAnswerOnce(answered, `live (first frame) after answer ${answered}`);
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 400)); });
+      expectEveryAnswerOnce(answered, `live after answer ${answered}`);
+    }
+    nativeTranscriptState.transcriptByRun.set(runId, transcriptThrough(5, true));
+    render(<TaskChatThread {...base} comments={commentsThrough(5, steered)} linkedRuns={[settled]} />);
+    await act(async () => {});
+    expectEveryAnswerOnce(5, "settled");
+    flushSync(() => root?.unmount());
+    root = createRoot(container);
+    render(<TaskChatThread {...base} comments={commentsThrough(5, steered)} linkedRuns={[settled]} />);
+    await act(async () => {});
+    expectEveryAnswerOnce(5, "reload");
+  });
+});
