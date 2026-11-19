@@ -1,4 +1,5 @@
-import { personStopWakeCommentIds } from "./acknowledged-native-stop.js";
+import { keepsWakeAcrossPause, personMessageIds } from "./deferred-execution-wait.js";
+import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { notifyStrandedAgentStatus } from "./live-run-recovery-notifications.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
@@ -1344,20 +1345,18 @@ export function issueTreeControlService(db: Db) {
         eq(agentWakeupRequests.companyId, companyId), inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
         isNull(agentWakeupRequests.runId), inArray(sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'`, issueIds),
       )).for("update");
-      // A tree PAUSE only: a deferred wake carrying a person's live message
-      // (a person's Stop holds it, or it is simply parked) stays saved; the
-      // release drains it once. A subtree CANCEL skips nothing.
+      // A tree PAUSE only: the ONE pause-keep predicate (keepsWakeAcrossPause:
+      // a person's live message, or a wake the pause itself deferred) keeps it
+      // saved; the release drains it once. A subtree CANCEL skips nothing.
       const heldWakeIds = new Set<string>();
       if (mode === "pause") {
-        const parked = unclaimed.filter(wake => wake.status === "deferred_issue_execution" && wake.issueId);
-        const payloads = parked.length ? await tx.select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload })
-          .from(agentWakeupRequests).where(inArray(agentWakeupRequests.id, parked.map(wake => wake.id))) : [];
-        const idsByWake = new Map(payloads.map(row => [row.id, personStopWakeCommentIds(row.payload)]));
-        const commentIds = [...new Set([...idsByWake.values()].flat())];
-        const personComments = new Set(commentIds.length ? (await tx.select({ id: issueComments.id }).from(issueComments).where(and(
-          eq(issueComments.companyId, companyId), inArray(issueComments.id, commentIds), eq(issueComments.authorType, "user"),
-          isNull(issueComments.deletedAt)))).map(row => row.id) : []);
-        for (const wake of parked) if ((idsByWake.get(wake.id) ?? []).some(id => personComments.has(id))) heldWakeIds.add(wake.id);
+        const parked = unclaimed.filter(wake => wake.status === "deferred_issue_execution");
+        const payloads = parked.length ? await tx.select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status,
+          payload: agentWakeupRequests.payload }).from(agentWakeupRequests)
+          .where(inArray(agentWakeupRequests.id, parked.map(wake => wake.id))) : [];
+        const people = await personMessageIds(tx as unknown as Db, companyId,
+          payloads.flatMap(row => queuedCommentIdsFromWakePayload(row.payload)));
+        for (const row of payloads) if (keepsWakeAcrossPause(row, id => people.has(id))) heldWakeIds.add(row.id);
       }
       const affected = unclaimed.filter(wake => !heldWakeIds.has(wake.id));
       for (const agentId of new Set(affected.map(wake => wake.agentId))) await notifyStrandedAgentStatus(tx, { companyId, agentId });

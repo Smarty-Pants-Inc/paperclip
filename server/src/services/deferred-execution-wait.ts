@@ -1,6 +1,7 @@
 import { HttpError } from "../errors.js";
-import { and, eq, inArray, sql, type SQLWrapper } from "drizzle-orm";
-import { agentWakeupRequests, issues, type Db } from "@paperclipai/db";
+import { and, eq, inArray, isNull, sql, type SQLWrapper } from "drizzle-orm";
+import { agentWakeupRequests, issueComments, issues, type Db } from "@paperclipai/db";
+import { QUEUE_CONTEXT_KEY, QUEUE_IDS_KEY, queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { notifyDeferredExecutionWork } from "./deferred-execution-notifications.js";
 import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 
@@ -29,6 +30,47 @@ export function wellFormedExecutionWaitSql(payload: SQLWrapper) {
     and jsonb_typeof(${payload}->'executionWait'->'reason') = 'string'
     and btrim(${payload}->'executionWait'->>'reason') <> ''
     and jsonb_typeof(${payload}->'executionWait'->'message') = 'string')`;
+}
+
+/**
+ * The ONE pause-keep predicate (RFL 07:43Z / 07:45Z, person-only). A Pause, the
+ * agent's (run-control cancelPendingWakeupsForAgentsInternal, while 'pausing')
+ * or the task tree's (issue-tree-control cancelUnclaimedWakeupsForTree, mode
+ * "pause"), keeps an unclaimed deferred_issue_execution wake when:
+ * - it carries ANY live message a PERSON wrote (queuedCommentIdsFromWakePayload,
+ *   comment authorType 'user', not deleted). Not Stop-scoped: held by a
+ *   person's Stop, sent while paused, or simply parked; or
+ * - its wait's trigger is pause_lifted (the pause itself deferred it).
+ * Everything else is cancelled by BOTH Pauses, system-only work included even
+ * when it carries its own saved wait. Two forms of the same rule; no other copy.
+ */
+export function keepsWakeAcrossPause(wake: { status: string; payload: unknown }, isPersonMessage: (commentId: string) => boolean): boolean {
+  if (wake.status !== "deferred_issue_execution") return false;
+  const payload = wake.payload && typeof wake.payload === "object" && !Array.isArray(wake.payload)
+    ? wake.payload as Record<string, unknown> : {};
+  const wait = payload.executionWait && typeof payload.executionWait === "object" && !Array.isArray(payload.executionWait)
+    ? payload.executionWait as Record<string, unknown> : {};
+  if (wait.trigger === "pause_lifted") return true;
+  return queuedCommentIdsFromWakePayload(payload).some(isPersonMessage);
+}
+
+/** The JS form's person-message reader: the live PERSON-written comments among `commentIds`. */
+export async function personMessageIds(db: Pick<Db, "select">, companyId: string, commentIds: string[]): Promise<Set<string>> {
+  const ids = [...new Set(commentIds)].filter(id => /^[0-9a-f-]{36}$/i.test(id));
+  if (!ids.length) return new Set();
+  return new Set((await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.companyId, companyId),
+    inArray(issueComments.id, ids), eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)))).map(row => row.id));
+}
+
+/** SQL twin of keepsWakeAcrossPause over agent_wakeup_requests (correlated on the outer wake row). */
+export function keepsWakeAcrossPauseSql() {
+  const ids = sql`${agentWakeupRequests.payload}->${QUEUE_CONTEXT_KEY}->${QUEUE_IDS_KEY}`;
+  return sql<boolean>`(${agentWakeupRequests.status} = 'deferred_issue_execution' and (
+    coalesce(${agentWakeupRequests.payload}->'executionWait'->>'trigger', '') = 'pause_lifted'
+    or exists (select 1 from ${issueComments} where ${issueComments.companyId} = ${agentWakeupRequests.companyId}
+      and ${issueComments.authorType} = 'user' and ${issueComments.deletedAt} is null
+      and ${issueComments.id}::text in (select jsonb_array_elements_text(
+        case when jsonb_typeof(${ids}) = 'array' then ${ids} else '[]'::jsonb end)))))`;
 }
 
 /**

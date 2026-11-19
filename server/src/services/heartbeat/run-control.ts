@@ -3,7 +3,7 @@ import { withAccountingTransaction } from "../accounting-transaction.js";
 import { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 export { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 import { instanceSettingsService } from "../instance-settings.js";
-import { isWellFormedExecutionWait, wellFormedExecutionWaitSql, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
+import { isWellFormedExecutionWait, keepsWakeAcrossPauseSql, wellFormedExecutionWaitSql, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { observeStoppedWorkspaceRecovery } from "../workspace-recovery.js";
 import { notifyScheduledRetryCancellation } from "../scheduled-retry-cancellation-notifications.js";
@@ -1948,13 +1948,11 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           inArray(agentWakeupRequests.agentId, uniqueAgentIds),
           inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
           isNull(agentWakeupRequests.runId),
-          // A pause is temporary: a message it deferred waits for the pause to
-          // lift (work-intent outbox), so the pause's own stop keeps it. So does
-          // a message already saved under its own wait (executionWait, e.g. the
-          // queue a person's Stop holds for Send): the pause is not its trigger
-          // (rf-4 C2).
-          options.preservePauseDeferred ? sql`not (${agentWakeupRequests.status} = 'deferred_issue_execution'
-            and ${agentWakeupRequests.payload} ? 'executionWait')` : undefined,
+          // A pause is temporary: the ONE pause-keep predicate (a person's
+          // message, or a wake the pause itself deferred) decides what the
+          // pause's own stop keeps; system-only work is cancelled even with its
+          // own saved wait (RFL 07:43Z / 07:45Z; rf-4 C2 still holds).
+          options.preservePauseDeferred ? sql`not ${keepsWakeAcrossPauseSql()}` : undefined,
         ));
       if (!wakeups.length) return 0;
       for (const companyId of new Set(wakeups.map(row => row.companyId))) {
