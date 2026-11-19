@@ -30,7 +30,7 @@ import { hasNativeHarnessBackupMissing } from "../native-runtime/native-harness-
 import { startNativeSessionExecutionLeaseRenewal, type NativeExecutionLeaseRenewal } from "../native-runtime/native-execution-lease.js";
 import type { WorkspaceWorkers } from "../plugin-workspaces.js";
 import { listExpiredNativeRunnerAuthorities } from "../native-runtime/native-runner-checkpoint.js";
-import { createHeartbeatAgentStatus } from "./agent-status.js";
+import { createHeartbeatAgentStatus, isAnsweredRunSaveFailure } from "./agent-status.js";
 import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace-restore-recovery.js";
 import { preserveCancelledNativeWorkspaces, preserveOrphanedNativeWorkspace } from "../native-runtime/native-failed-workspace-recovery.js";
 import { hasNativeWorkspaceExportResume } from "../native-runtime/native-workspace-export-resume.js";
@@ -2261,6 +2261,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         ? null
         : (settledRun?.error ?? "native_workspace_sync_out_failed"),
       {
+        // The person already has this run's answer; only saving its files failed (agent-status.ts).
+        keepIdleOnFailure: isAnsweredRunSaveFailure(settledRun),
         wasFirstHeartbeat: settledRun
           ? timerClaimWasFirstHeartbeat(settledRun)
           : undefined,
