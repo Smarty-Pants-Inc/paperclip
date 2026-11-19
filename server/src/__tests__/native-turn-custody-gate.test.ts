@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -15,7 +15,8 @@ import { environmentRuntimeService } from "../services/environment-runtime.ts";
 import { environmentService } from "../services/environments.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
 import { buildNativeHarnessBackupManifest } from "../services/native-runtime/native-session-executor.ts";
-import { createNativeHarnessBackupStamp } from "../services/native-runtime/native-harness-backup-stamp.ts";
+import { createNativeHarnessBackupStamp, verifyNativeHarnessBackupStamp } from "../services/native-runtime/native-harness-backup-stamp.ts";
+import { nativeHarnessBackupExpirationService } from "../services/native-runtime/native-harness-backup-expiration.ts";
 import { publishNativeHarnessBackup } from "../services/native-runtime/native-harness-backup-publication.ts";
 import { escalateExpiredNativeTurnCustodyKeeps, NATIVE_TURN_CUSTODY_KEPT_KEY } from "../services/native-turn-custody.ts";
 
@@ -170,7 +171,7 @@ describeEmbeddedPostgres("native turn custody gate", () => {
     const written = { ...stamp!, ...(options.stampManifestOf ? { manifestSha256: options.stampManifestOf } : {}) };
     // PLANTED: the executor writes this exact key (exec:19518-19540).
     await environmentService(db).updateLeaseMetadata(lease.id, { ...(lease.metadata ?? {}), nativeHarnessBackup: written });
-    return { stamp: stamp!, scopeDigest };
+    return { stamp: stamp!, scopeDigest, normalizedSessionId, providerLeaseId: lease.providerLeaseId! };
   }
 
   async function workspace(box: { companyId: string; runId: string; issueId: string; executionWorkspaceId: string; lease: { id: string; providerLeaseId: string | null } },
@@ -319,6 +320,49 @@ describeEmbeddedPostgres("native turn custody gate", () => {
     expect(after.status).toBe(before.status);
     expect((after.metadata?.[NATIVE_TURN_CUSTODY_KEPT_KEY] as Record<string, unknown>).escalatedAt).toEqual(expect.any(String));
     expect(box.worker.erased()).toEqual([]);
+  });
+
+  it("R8 (never-OK, no S3): after the gate lets the box be destroyed, retention past 7 days keeps the local backup and it re-hashes to the stamp", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      expect(process.env.PAPERCLIP_STORAGE_PROVIDER ?? "local_disk").not.toBe("s3");
+      const box = await seedBox();
+      const backup = await produceBackup(box);
+      // The gate accepts the server's LOCAL copy (no S3); the turn-end destroy proceeds.
+      await box.runtime.releaseRunLeases(box.runId, "released", undefined, "destroy");
+      expect(box.worker.erased()).toEqual(["environmentDestroyLease"]);
+      // The box is gone; its lease is no longer live (expiration.ts LIVE_LEASE_STATUSES).
+      expect((await leaseOf(box.lease.id)).status).toBe("expired");
+      // The person's issue closes. PLANTED (named): the run's native session and issue
+      // columns, which the executor sets when it opens the session.
+      await db.update(heartbeatRuns).set({ nativeSessionId: backup.normalizedSessionId, nativeIssueId: box.issueId })
+        .where(eq(heartbeatRuns.id, box.runId));
+      await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, box.issueId));
+      // PLANTED (named): the runner's control-plane identity file beside the backup,
+      // written by the runner in the box (exec:6531), as in native-harness-backup-expiration.test.ts:148-152.
+      const root = path.join(stateBase, backup.scopeDigest);
+      await mkdir(path.join(root, "control-plane"), { recursive: true });
+      await writeFile(path.join(root, "control-plane", "control-plane-state.json"),
+        JSON.stringify({ identity: { runId: box.runId, normalizedSessionId: backup.normalizedSessionId, environmentLeaseId: box.lease.id } }));
+      const current = path.join(root, "failover-backups", "current");
+      expect((await stat(current)).isDirectory()).toBe(true);
+      expect(verifyNativeHarnessBackupStamp(backup.stamp, backup.providerLeaseId)).toBe(true);
+
+      // The clock advances past the 7-day window; retention runs every way it can.
+      vi.setSystemTime(new Date(Date.now() + 8 * 24 * 60 * 60 * 1000));
+      const retention = nativeHarnessBackupExpirationService(db, { stateBase, isSessionBusy: () => false });
+      const pass = await retention.tick();
+      expect(pass).toMatchObject({ expired: 0, failed: 0 });
+      expect(pass.skipped.native_backup_local_copy_kept).toBe(1);
+      expect((await retention.expireBackup(backup.scopeDigest)).expired).toBe(0);
+      expect((await retention.reconcileBackup(backup.scopeDigest))?.dueAt).toBeNull();
+
+      // Still there, and still re-hashes to the stamp the gate accepted.
+      expect((await stat(current)).isDirectory()).toBe(true);
+      expect(verifyNativeHarnessBackupStamp(backup.stamp, backup.providerLeaseId)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("site destroyClaimedSandboxLease: an environment-delete destroy of a warm native box without backup keeps it (no destroy claimed)", async () => {
