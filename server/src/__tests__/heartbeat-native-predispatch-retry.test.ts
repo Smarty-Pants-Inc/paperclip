@@ -12,6 +12,7 @@ import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { describe, expect, it, vi } from "vitest";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
+import { prepareHeartbeatGitHubEnvironment } from "../services/heartbeat-github-launchers.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { closeIdleWarmNativeSessionsForRestart, scopedRunnerdStateRoot } from "../services/native-runtime/native-session-executor.js";
 import { nativeRestartFixture, waitForCondition } from "./helpers/native-restart-fixture.js";
@@ -39,13 +40,15 @@ vi.mock("../services/budget-reservations.js", async importOriginal => {
 
 const support = await getRecoveryPostgresSupport({});
 
+type DeferredGitProbe = { failed: boolean; environmentId: string; probes: number };
+
 type AdmissionFailure = { remaining: number; turnNeverIssued: boolean; environmentId: string; provider: string;
   providerLeaseId: string; leasePolicy: "reuse_by_environment" | "reuse_by_execution_workspace"; failedRuns: string[];
   sessionRoots: string[] };
 
 function nativeBackend(db: ReturnType<typeof createDb>, options: { failDescriptorOnce?: { failed: boolean };
   unretiredPredecessorOnce?: { failed: boolean; environmentId: string; leasePolicy?: AdmissionFailure["leasePolicy"]; taskBlocked?: boolean; repeat?: string[] }; turnMessages?: Map<string, string>;
-  admissionFailure?: AdmissionFailure } = {}):
+  admissionFailure?: AdmissionFailure; deferredGitProbeOnce?: DeferredGitProbe } = {}):
   NonNullable<HeartbeatServiceOptions["nativeSessionBackendFactory"]> {
   return execution => {
     let identity: NativeRunIdentity;
@@ -85,6 +88,25 @@ function nativeBackend(db: ReturnType<typeof createDb>, options: { failDescripto
         if (options.failDescriptorOnce && !options.failDescriptorOnce.failed) {
           options.failDescriptorOnce.failed = true;
           throw Object.assign(new Error("could not serialize access due to concurrent update"), { name: "PostgresError", code: "40001" });
+        }
+        const probe = options.deferredGitProbeOnce;
+        if (probe && !probe.failed) {
+          // Boat storage incident (smarty-dev#21249): the native executor runs the
+          // deferred Git probe before any provider turn (GP-D1 proves that call);
+          // here the real heartbeat settles what it throws. The box's lease is live.
+          probe.failed = true;
+          const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, execution.binding.runId));
+          await db.insert(environmentLeases).values({ companyId: run!.companyId, environmentId: probe.environmentId,
+            issueId: execution.binding.issueId, heartbeatRunId: run!.id, provider: "boat", providerLeaseId: "box-1",
+            leasePolicy: "reuse_by_environment", status: "active", metadata: { remoteCwd: "/workspace" } });
+          const plan = await prepareHeartbeatGitHubEnvironment({ defer: true,
+            target: { kind: "remote", transport: "sandbox", providerKey: "boat", remoteCwd: "/workspace", runner: {
+              execute: async () => { probe.probes += 1; return { exitCode: 1, timedOut: false, signal: null, pid: null,
+                startedAt: new Date().toISOString(), stdout: "", stderr: "fatal: exec channel closed" }; },
+              allowConcurrentSyncOperations: true } } as never,
+            cwd: "/controller/workspace", env: {}, hostCredentials: false, networkAccess: true,
+            ...({ environment: { name: "Boat", driver: "sandbox" }, providerLeaseId: "box-1" } as object) });
+          await plan.prepare!();
         }
         const unretired = options.unretiredPredecessorOnce;
         if (unretired && (!unretired.failed || unretired.repeat)) {
@@ -416,6 +438,53 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
         eq(heartbeatRuns.retryOfRunId, runId)))).toHaveLength(1);
       const [settled] = await db.select().from(issues).where(eq(issues.id, issueId));
       expect(await taskInterruptionPresentation(db, settled!)).toMatchObject({ state: "resolved", canRetry: false });
+    } finally {
+      await heartbeat.drainActiveRunExecutions();
+      await closeIdleWarmNativeSessionsForRestart();
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(and(
+        eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["queued", "scheduled_retry"])));
+      await db.$client.end();
+    }
+  }, 90_000);
+
+  it("GP-D2: a deferred Git probe's final failure continues once on a fresh box instead of blocking the task", async () => {
+    const { companyId } = fixture.current;
+    const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
+    const [environment] = await db.insert(environments).values({ name: `boat-${randomUUID()}`, driver: "sandbox" }).returning();
+    const turnMessages = new Map<string, string>();
+    const probe: DeferredGitProbe = { failed: false, environmentId: environment!.id, probes: 0 };
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: nativeBackend(db, { deferredGitProbeOnce: probe, turnMessages }) });
+    try {
+      const { issueId, runId } = await startTask(db, heartbeat);
+      expect(probe.probes).toBe(2);
+      expect(turnMessages.has(runId)).toBe(false);
+      const [failed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(failed).toMatchObject({ status: "failed", runtimeMode: "native",
+        resultJson: expect.objectContaining({ failureCause: "native_failed_before_provider_turn",
+          executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+          predecessorRetirementFallback: expect.objectContaining({ providerWorkStarted: false, replacedProviderLeaseIds: ["box-1"] }) }) });
+      expect(failed!.error).toBe("The computer could not be set up before the agent started, so the task is continuing on a fresh one.");
+      expect(failed!.runnerProfileJson).toMatchObject({ failedBeforeProviderTurn: {
+        cause: "native_failed_before_provider_turn", technicalCause: "execution_target_git_context_unavailable" } });
+      // The old box is not resumed: the next acquisition replaces it.
+      const [lease] = await db.select().from(environmentLeases).where(and(eq(environmentLeases.heartbeatRunId, runId),
+        eq(environmentLeases.providerLeaseId, "box-1")));
+      expect(lease?.metadata).toMatchObject({ replaceBeforeReuse: { schema: "paperclip.replace-before-reuse.v1", runId } });
+      const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.retryOfRunId, runId)));
+      expect(successors).toEqual([expect.objectContaining({ scheduledRetryReason: "interrupted_preparation", scheduledRetryAttempt: 1 })]);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue!.status).not.toBe("blocked");
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+
+      expect(await heartbeat.promoteDueScheduledRetries()).toMatchObject({ promoted: 1 });
+      await heartbeat.resumeQueuedRuns();
+      await waitForCondition("the continuation to succeed", async () =>
+        (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successors[0]!.id)))[0]?.status === "succeeded");
+      await waitForCondition("the continuation to settle", () => heartbeat.getTaskDrainStatus().quiescent);
+      expect(turnMessages.has(successors[0]!.id)).toBe(true);
+      expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.retryOfRunId, runId)))).toHaveLength(1);
     } finally {
       await heartbeat.drainActiveRunExecutions();
       await closeIdleWarmNativeSessionsForRestart();

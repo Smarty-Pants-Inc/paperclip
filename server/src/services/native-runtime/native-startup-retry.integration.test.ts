@@ -42,6 +42,8 @@ import { accountRunCost } from "../run-cost-accounting.js";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
 import { agentProviderLimitCooldown } from "./native-startup-retry.js";
 import { resolveLocalRuntimeApiUrl, runtimeApiInternals } from "../../runtime-api.js";
+import { prepareHeartbeatGitHubEnvironment } from "../heartbeat-github-launchers.js";
+import { findNativeFailedBeforeProviderTurn } from "./failed-before-provider-turn.js";
 
 type SessionOpenStatus = "failed" | "rejected" | "indeterminate";
 
@@ -1105,4 +1107,49 @@ describe("native provider startup retry", () => {
       deferIneligible: false,
     })).toEqual([]);
   });
+  // Boat storage incident (smarty-dev#21249), review-fleet-4 C1: Paul's native
+  // Pi agents defer the execution-target Git probe into the native executor
+  // (heartbeat.ts prepareHeartbeatGitHubEnvironment defer -> runtime-execution
+  // prepareGitHubEnvironment -> native-session-executor prepareRunnerEnvironment).
+  // Before the fix a final probe failure there settled as an ambiguous
+  // native_session_interrupted: board-owned, issue blocked, no retry.
+  async function deferredProbeFailure(outcome: { exitCode: number | null; timedOut: boolean }) {
+    const seeded = await seedRun(await createAgent());
+    const execute = vi.fn(async () => ({ signal: null, stderr: "fatal: exec channel closed", stdout: "", pid: null,
+      startedAt: new Date().toISOString(), ...outcome }));
+    const plan = await prepareHeartbeatGitHubEnvironment({ defer: true,
+      target: { kind: "remote", transport: "sandbox", providerKey: "boat", remoteCwd: "/workspace",
+        runner: { execute, allowConcurrentSyncOperations: true } } as never,
+      cwd: "/controller/workspace", env: {}, hostCredentials: false, networkAccess: true,
+      ...({ environment: { name: "Boat", driver: "sandbox" }, providerLeaseId: "box-1" } as object) });
+    expect(plan.prepare).toBeTypeOf("function");
+    provider.execute.mockReset().mockImplementation(async () => { throw new Error("Unexpected provider start"); });
+    const error = await executePaperclipNativeSession({ db, execution: seeded.execution, runnerInstanceId: seeded.runnerInstanceId,
+      prepareGitHubEnvironment: plan.prepare,
+      backend: {
+        descriptor: async () => { throw new Error("Unexpected provider descriptor call"); },
+        openSession: async () => { throw new Error("Unexpected provider session call"); },
+      } }).then(() => null, (thrown: unknown) => thrown);
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(provider.execute).not.toHaveBeenCalled();
+    return { seeded, error };
+  }
+
+  it.each([["exit", { exitCode: 1, timedOut: false }], ["timeout", { exitCode: null, timedOut: true }]] as const)(
+    "GP-D1: a deferred Git probe that fails twice (%s) continues on a fresh sandbox instead of blocking the task", async (_kind, outcome) => {
+    const { seeded, error } = await deferredProbeFailure(outcome);
+    // The executor hands the heartbeat the failed-before-provider-turn error
+    // (heartbeat.ts preparePredecessorRetirementFallback: replace the box, one retry).
+    expect(findNativeFailedBeforeProviderTurn(error)).toMatchObject({ code: "native_failed_before_provider_turn",
+      providerLeaseId: "box-1", technicalCause: "execution_target_git_context_unavailable" });
+    // U14's diagnosis stays on the cause chain.
+    expect(String(((error as Error).cause as Error | undefined)?.message)).toContain("attempts=2");
+    const state = await read(seeded);
+    expect(state.coordinator.phase).not.toBe("terminal_failure");
+    expect(state.coordinator.failureCode).toBeNull();
+    expect(state.run.status).toBe("running");
+    expect(state.run.errorCode).toBeNull();
+    expect(state.issue.status).toBe("in_progress");
+    expect(state.action).toBeNull();
+  }, 30_000);
 });
