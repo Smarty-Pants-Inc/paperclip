@@ -86,7 +86,7 @@ import multer from "multer";
 import { z } from "zod";
 import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { readPersonStopHold } from "../services/acknowledged-native-stop.js";
+import { isStoppingPersonsOwn, readPersonStopHold } from "../services/acknowledged-native-stop.js";
 import { isNativeAdmissionAdapter } from "../services/explicit-native-continuation.js";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
@@ -8051,7 +8051,7 @@ export function issueRoutes(
       return ids.length > 0 && readObject(readObject(wake.payload)._paperclipWakeContext).forceFreshSession !== true &&
         ids.every((id) => {
           const comment = byId.get(id);
-          return comment && !comment.deletedAt && comment.authorType === "user" && comment.authorUserId === input.actorId &&
+          return comment && !comment.deletedAt && comment.authorType === "user" && isStoppingPersonsOwn(comment.authorUserId, input.actorId) &&
             !isConversationReset(comment.body);
         });
     };
