@@ -14,10 +14,6 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./pi-rpc-default-thinking": {
-      "types": "./dist/pi-rpc-default-thinking.d.ts",
-      "import": "./dist/pi-rpc-default-thinking.js"
-    },
     "./*": "./src/*.ts"
   },
   "publishConfig": {

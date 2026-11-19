@@ -153,6 +153,25 @@ The Pi and Kimi distribution lockfiles under `packages/paperclip-runner/scripts/
 are not on this list. They hold attested provider pins, so change them by hand
 (see `rules/acpx-profile-identity.mdc`).
 
+## Fork image-branch browser CI
+
+In the Smarty-Pants-Inc fork, `.github/workflows/pr.yml` also runs on pushes to
+`dl/img3-*`, `dl/img2-pack-*`, and `fl/*`. Those pushes run the existing Playwright
+suite in eight shards on GitHub-hosted Ubuntu, with at most two shards active per
+run. Each shard has a 30-minute timeout. LLM assertions stay disabled. Reports
+remain available as Actions artifacts for 14 days. PR checks retain the existing
+upstream reusable workflow; image pushes do not run that full PR workflow.
+
+The caller cancels superseded check runs for the same source branch. Two successful
+PR runs on 2026-11-12 used 52.53 and 54.83 runner-minutes for their eight browser
+shards (about 54 runner-minutes per image push at those revisions). This is measured
+job execution time, not billing or a promise for later revisions. The image lane
+has a 240 runner-minute timeout ceiling per uninterrupted push.
+
+Source-checkout package exports must work after a cold install, without prior
+`dist` output. The adapter-utils Pi thinking helper uses the existing source export
+pattern. Published packages retain the separate `publishConfig` built exports.
+
 ## Trusted PR Workflow
 
 The PR caller uses `paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`.

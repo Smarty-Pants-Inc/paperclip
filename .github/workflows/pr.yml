@@ -5,6 +5,15 @@ run-name: >-
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
+  push:
+    branches:
+      - 'dl/img3-*'
+      - 'dl/img2-pack-*'
+      - 'fl/*'
+
+concurrency:
+  group: fork-pr-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   actions: read
@@ -13,14 +22,14 @@ permissions:
 
 jobs:
   ci:
-    if: github.event.action != 'labeled' || github.event.label.name == 'profile-ci' || github.event.label.name == 'full-ci'
+    if: github.event_name == 'pull_request' && (github.event.action != 'labeled' || github.event.label.name == 'profile-ci' || github.event.label.name == 'full-ci')
     # Master requires CODEOWNERS review for .github/**, including this workflow.
     # The AWS runner group permits pr-trusted.yml@refs/heads/master.
     uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
 
   pi_rpc_closure:
     name: Native Pi RPC closure
-    if: github.event.action != 'labeled' || github.event.label.name == 'profile-ci' || github.event.label.name == 'full-ci'
+    if: github.event_name == 'pull_request' && (github.event.action != 'labeled' || github.event.label.name == 'profile-ci' || github.event.label.name == 'full-ci')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -73,3 +82,61 @@ jobs:
           # --check alone trusts the source pin; a real npm tree detects pin drift.
           node packages/paperclip-runner/scripts/materialize-pi-rpc-distribution.mjs "$closure_root/distribution"
           pnpm --filter @paperclipai/paperclip-runner check:pi-rpc-profile
+
+  image_e2e:
+    name: Image E2E shard (${{ matrix.shard }}/8)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.4
+          run_install: false
+      - name: Restore materialized dependencies and shared builds
+        uses: ./.github/actions/setup-ci-dependencies
+      - name: Verify runner Chrome
+        run: google-chrome --version
+      - name: Generate Paperclip config
+        run: |
+          mkdir -p ~/.paperclip/instances/default
+          cat > ~/.paperclip/instances/default/config.json << 'CONF'
+          {
+            "$meta": { "version": 1, "updatedAt": "2026-01-01T00:00:00.000Z", "source": "onboard" },
+            "database": { "mode": "embedded-postgres" },
+            "logging": { "mode": "file" },
+            "server": { "deploymentMode": "local_trusted", "host": "127.0.0.1", "port": 3100 },
+            "auth": { "baseUrlMode": "auto" },
+            "storage": { "provider": "local_disk" },
+            "secrets": { "provider": "local_encrypted", "strictMode": false }
+          }
+          CONF
+      - name: Run e2e tests
+        env:
+          PAPERCLIP_E2E_SKIP_LLM: "true"
+          PAPERCLIP_PLAYWRIGHT_CHANNEL: "chrome"
+        run: |
+          specs="$(node scripts/e2e-shard.mjs --shard-index $(( ${{ matrix.shard }} - 1 )) --shard-count 8)"
+          echo "shard ${{ matrix.shard }}/8 specs: $specs"
+          pnpm run test:e2e $specs
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: image-playwright-report-${{ matrix.shard }}
+          path: |
+            tests/e2e/playwright-report/
+            tests/e2e/test-results/
+          retention-days: 14
