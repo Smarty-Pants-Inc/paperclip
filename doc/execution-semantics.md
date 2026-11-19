@@ -5957,10 +5957,13 @@ The readiness wait is bounded by `STEERING_INGESTION_WAIT_MS = 1000` ms, outside
 issue/run locks. At expiry, the ONE transaction guard keeps the issue and input
 HELD, with no restored wake or successor. The ingestion receipt resumes the
 existing release owner after the terminal is ingested. No late-read pull-back
-guard exists. If the stream has no terminal (crash/lost connection), a stopped
-and joined consumer, or the existing recovery owner's proved absence/containment
-and true terminal line, closes this same fence. Only retained read/text facts
-then decide; if both read and answer were lost, carrying the message is correct.
+guard exists. A stopped and joined consumer closes this same fence, including
+an accepted Stop whose retained cancellation terminal has source-sequence gaps:
+no more read/text facts can arrive from that consumer. This does not waive the
+contiguous-cursor requirement for a natural run end while ingestion is pending.
+For crash/lost connection, the existing recovery owner's proved absence/containment
+and true terminal line also closes the fence. Only retained read/text facts then
+decide; if both read and answer were lost, carrying the message is correct.
 
 Interrupt adopts steered-but-unread PERSON comment ids through
 `readUnreadSteeredForInterrupt(tx, { issueId, runId }): Promise<string[]>`.
