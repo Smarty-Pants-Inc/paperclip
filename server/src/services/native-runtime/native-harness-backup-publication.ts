@@ -3,7 +3,6 @@ import { closeSync, constants as fsConstants, existsSync, fsyncSync, lstatSync, 
 import { resolve } from "node:path";
 import { logger } from "../../middleware/logger.js";
 import { noteNativeHarnessBackupChange } from "../native-harness-backup-expiration-notifications.js";
-import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 
 /**
  * BRIEF rotation-keep (RFL 11-19 03:00Z, R-keep-all-traces, never-OK): a
@@ -64,7 +63,9 @@ export async function publishNativeHarnessBackup(input: {
     renameSync(input.pendingRoot, currentRoot);
     await input.stamp?.(currentRoot);
   } catch (error) {
-    if (existsSync(currentRoot)) await removeNativeHarnessBackup(currentRoot);
+    // rf-3 04:04Z item B: the failed new copy is a trace too; move it into
+    // superseded (same tree rename), never delete it.
+    keepSupersededNativeHarnessBackup(input.backupRoot, currentRoot);
     if (movedCurrent && existsSync(previousRoot) && !existsSync(currentRoot)) renameSync(previousRoot, currentRoot);
     throw error;
   }
