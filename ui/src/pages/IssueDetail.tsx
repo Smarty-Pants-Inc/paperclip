@@ -4820,8 +4820,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         void queryClient.invalidateQueries({
           queryKey: ["issues", "tree-control-state", issueId ?? "pending"],
         });
+        // The person's Pause accepts the server's record that each turn's
+        // cancellation was acknowledged; a warm box may never send a stop receipt.
         await waitForStoppedRuns(
           created.preview.activeRuns.map((run) => run.id),
+          { acceptNativeCancellationRecord: true },
         );
       }
       return {
