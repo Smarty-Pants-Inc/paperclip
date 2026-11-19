@@ -2370,7 +2370,7 @@ function renderPaperclipWakePromptBody(
   if (!wakePayload) return "";
   // A steer Pi already read in the cut turn is in this same session: not injected again (one answer).
   // A fresh session never saw it, so it is injected as carried input.
-  const normalized = resumedSession && wakePayload.comments.some((comment) => comment.readInSession)
+  const normalized = sessionHoldsPriorTurns && wakePayload.comments.some((comment) => comment.readInSession)
     ? { ...wakePayload, comments: wakePayload.comments.filter((comment) => !comment.readInSession) }
     : wakePayload;
   const externalChatTurn = isNormalizedPaperclipExternalChatTurn(normalized);
