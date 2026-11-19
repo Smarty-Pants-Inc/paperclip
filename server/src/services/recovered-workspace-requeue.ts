@@ -1,8 +1,29 @@
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
-import { activityLog, agentWakeupRequests, heartbeatRuns, issueComments, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { readContinuationCommentInput } from "./continuation-comment-input.js";
 import { answeredPersonMessageIds } from "./person-message-answer.js";
 import { completedWorkspaceRecoveryCondition } from "./workspace-recovery-receipt.js";
+import { hasNativePreDispatchFailureRecord } from "./heartbeat/run-failure-cause.js";
+
+/** adopt-requeue-f1 (rf-4 rqold F1): the failed run provably never started
+ * provider work. Only then is replaying its messages a first delivery and not
+ * a redo. Proof is the run's own durable records: its executionRecovery says
+ * providerWorkStarted false (or its native pre-dispatch failure record does),
+ * AND it has no execution-start event (native.process_start_requested /
+ * native.process_identity_recorded: the executor writes the first before any
+ * backend may spawn, so a submitted turn or a tool that ran implies it).
+ * Missing proof counts as started. */
+async function failedRunProvesNoProviderWork(db: Db, run: { id: string; companyId: string }) {
+  const [row] = await db.select({ resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id)));
+  const result = row?.resultJson as Record<string, unknown> | null | undefined;
+  const recovery = result?.executionRecovery as { providerWorkStarted?: unknown } | undefined;
+  if (recovery?.providerWorkStarted !== false && !hasNativePreDispatchFailureRecord(result)) return false;
+  const [started] = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
+    inArray(heartbeatRunEvents.eventType, ["native.process_start_requested", "native.process_identity_recorded"]))).limit(1);
+  return !started;
+}
 
 /**
  * adopt-resolved-nothing2 (gate 7, chat 888e5d1d, 11-19): an Interrupt
@@ -67,6 +88,15 @@ export async function recoveredWorkspaceOwedMessages(db: Db, run: {
   const owed = persons.filter(row => !answered.has(row.id));
   const authorUserId = owed.at(-1)?.authorUserId ?? null;
   if (!owed.length || !authorUserId) return null;
+  // adopt-requeue-f1: a successor that started provider work is never silently
+  // replayed. The refusal is recorded once on the hold; nothing is queued, so
+  // each owed message keeps its own true card (the unanswered-message sweep).
+  if (!await failedRunProvesNoProviderWork(db, run)) {
+    const prior = hold.evidence.recoveredWorkspaceRequeue as { refused?: unknown } | undefined;
+    if (prior?.refused !== "provider_work_started") await recordRecoveredWorkspaceRequeue(db, hold.id,
+      { runId: null, commentIds: owed.map(row => row.id), refused: "provider_work_started" });
+    return null;
+  }
   return { hold, task, input, commentIds: owed.map(row => row.id), authorUserId };
 }
 
@@ -90,10 +120,12 @@ export async function liftRecoveredWorkspaceBlock(db: Db, owed: NonNullable<Awai
 
 /** Records the post-recovery dispatch on the hold: delivered (with its run) or
  * refused, so the DB says why a promised message did or did not run. */
-export async function recordRecoveredWorkspaceRequeue(db: Db, holdId: string, result: { runId: string | null; commentIds: string[] }) {
+export async function recordRecoveredWorkspaceRequeue(db: Db, holdId: string, result: { runId: string | null; commentIds: string[];
+  refused?: "provider_work_started" }) {
   await db.update(issueRecoveryActions).set({ evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
     recoveredWorkspaceRequeue: { at: new Date().toISOString(), commentIds: result.commentIds,
-      outcome: result.runId ? "enqueued" : "refused", runId: result.runId } })}::jsonb` })
+      outcome: result.runId ? "enqueued" : "refused", runId: result.runId,
+      ...(result.refused ? { refused: result.refused } : {}) } })}::jsonb` })
     .where(eq(issueRecoveryActions.id, holdId));
 }
 
@@ -111,6 +143,8 @@ export async function recoveredWorkspaceRequeueRuns(db: Db, companyId: string, i
     sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
     sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'invalidated'`,
     sql`coalesce(${issueRecoveryActions.evidence}->'recoveredWorkspaceRequeue'->>'outcome', '') <> 'enqueued'`,
+    // A provider-work refusal is final: the sweep never revisits it.
+    sql`coalesce(${issueRecoveryActions.evidence}->'recoveredWorkspaceRequeue'->>'refused', '') <> 'provider_work_started'`,
   )).orderBy(asc(issueRecoveryActions.createdAt)).limit(5);
   const runIds = [...new Set(holds.map(row => row.runId).filter((id): id is string => !!id && /^[0-9a-f-]{36}$/i.test(id)))];
   if (!runIds.length) return [];
