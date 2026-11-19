@@ -553,6 +553,49 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   });
 
   // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21272
+  it("A4: a joined Stop consumer closes a gapped terminal and lists its unread steer under the ONE Stop hold", async () => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const sent = await postDefault(chat, "Unread before Stop").expect(201);
+    const sourceInstanceId = randomUUID();
+    const port = new PaperclipControlPlanePort(db, { companyId: chat.companyId, issueId: chat.issue.id,
+      runId: chat.runId, agentId: chat.agentId, sessionId: "stop-session",
+      completionContractId: randomUUID(), completionContractSha256: `sha256:${"a".repeat(64)}`,
+      sourceInstanceId, controlPlaneSourceInstanceId: randomUUID() });
+    // Real Stop can discard part of the provider suffix: the retained terminal
+    // is NOT a contiguous cursor. Before consumer closure, retain custody.
+    const events = [
+      { sourceSeq: 1, eventType: "turn.started", itemId: "turn-1:start", payload: {} },
+      { sourceSeq: 2, eventType: "item.started", itemId: "turn-1:input", payload: { kind: "userMessage" } },
+      { sourceSeq: 3, eventType: "item.completed", itemId: `turn-1:steer:${sent.body.id}`, payload: { kind: "steering_acknowledgement" } },
+      { sourceSeq: 5, eventType: "turn.cancelled", itemId: "turn-1:end", payload: {} },
+    ];
+    for (const event of events) await port.appendEvent({ schema: "paperclip.prp.event.v1", schemaVersion: 1,
+      runId: chat.runId, normalizedSessionId: "stop-session", turnId: "turn-1", emittedAt: new Date().toISOString(),
+      sourceKind: "runner", priority: 0, sourceInstanceId, sourceEventId: randomUUID(), ...event } as PrpEvent);
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(),
+      resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || '{"cancelledByActorType":"user"}'::jsonb` })
+      .where(eq(heartbeatRuns.id, chat.runId));
+    await releaseRun(chat);
+    expect((await carriersOf(chat, sent.body.id)).wakes).toHaveLength(0);
+    // No append remains in flight. This is the existing executor's stopped/
+    // joined callback, not an elapsed deadline or a guessed missing read.
+    await port.settleEventIngestion();
+    await releaseRun(chat);
+    const { readPersonStopHold } = await import("../services/acknowledged-native-stop.js");
+    expect(await readPersonStopHold(db, { companyId: chat.companyId, issueId: chat.issue.id,
+      agentId: chat.agentId, messageId: sent.body.id })).toMatchObject({ stoppedRunId: chat.runId });
+    const queue = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200);
+    expect(queue.body.entries.map((entry: any) => entry.comment.id)).toEqual([sent.body.id]);
+    expect(queue.body.executionWait).toMatchObject({ reason: "stopped_by_person", message: STOPPED_LINE });
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    expect(stopped!.resultJson?.nativeSteeringIngestion).toMatchObject({ state: "consumer_stopped",
+      highestContiguousSourceSeq: 3, terminalSourceSeq: 5 });
+    expect(await answered(sent.body.id)).toBe(false);
+    const carriers = await carriersOf(chat, sent.body.id);
+    expect(carriers.wakes).toHaveLength(1); expect(carriers.runs).toHaveLength(0);
+  });
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21272
   it.each([false, true])("S-j/S-x: ordered Pi ingestion delayed past agent_end holds the steer, then answers once (past bound=%s)", async pastBound => {
     const chat = await seedChat(); await attachSteerable(chat);
     const root = await mkdtemp(join(tmpdir(), "chat-pi-late-ingestion-"));
