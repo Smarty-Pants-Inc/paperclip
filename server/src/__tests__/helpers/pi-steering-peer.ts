@@ -18,6 +18,17 @@ export async function openPiSteeringPeer(root: string, runId: string) {
     const message = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
     send({ type: "message_start", message }); send({ type: "message_end", message });
   };
+  const answer = () => {
+    const text = "Answered after reading the steer.";
+    const message = { role: "assistant", content: [{ type: "text", text }],
+      model: "model", provider: "neutral", api: "openai-completions", stopReason: "stop", timestamp: Date.now(),
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    send({ type: "message_start", message: { ...message, content: [] } });
+    send({ type: "message_update", assistantMessageEvent: { type: "text_start", contentIndex: 0 } });
+    send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: text } });
+    send({ type: "message_end", message });
+  };
   const peer = {
     pid: 44444,
     exited: false,
@@ -84,14 +95,16 @@ export async function openPiSteeringPeer(root: string, runId: string) {
         send({ type: "tool_execution_start", toolCallId: "next-tool", toolName: "bash", args: { command: "next" } });
         return;
       }
-      const message = { role: "assistant", content: [{ type: "text", text: "Answered after reading the steer." }],
-        model: "model", provider: "neutral", api: "openai-completions", stopReason: "stop", timestamp: Date.now(),
-        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-      send({ type: "message_start", message: { ...message, content: [] } });
-      send({ type: "message_update", assistantMessageEvent: { type: "text_start", contentIndex: 0 } });
-      send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Answered after reading the steer." } });
-      send({ type: "message_end", message });
+      answer();
+    },
+    /** Finish the post-read tool, optionally consume a second steer, then emit model text. */
+    completeNextTool(reply: boolean, readNextSteer = false) {
+      send({ type: "tool_execution_end", toolCallId: "next-tool", toolName: "bash", result: { content: [{ type: "text", text: "README contents" }] }, isError: false });
+      if (readNextSteer) {
+        const text = pending.shift(); if (text === undefined) throw new Error("No second queued steer at boundary");
+        user(text);
+      }
+      if (reply) answer();
     },
     endTurn() {
       send({ type: "turn_end" }); send({ type: "agent_end", messages: [] });
