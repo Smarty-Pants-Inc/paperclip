@@ -734,6 +734,57 @@ describe("TaskChatQueuedMessages", () => {
       Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: width });
     }
   });
+  // bb-2d-stopwords (RFL 22:22Z): a TASK's messages held by their sender's own Stop. Both bodies are planted verbatim
+  // from the real route: GET /api/issues/:id/queued-comments in native-admit-any-end.test.ts's STOP-WORDS row (the
+  // real comment POSTs, the real Stop route POST /api/heartbeat-runs/:id/cancel), read at 901d0ba2 (base)
+  // by the person who pressed Stop (ownGet) and, in the same state, by another board user (otherGet, the control:
+  // the stored recovery wait). The line names only what works in that hold: the row's Delete and a new message.
+  // Send is not offered there: its press (POST .../queued-comments/interrupt) is accepted and starts nothing.
+  it("a task's messages held by the person's own Stop: the panel says 'Not sent, because you pressed Stop.' once with what works (Delete, a new message), offers no Send and never says 'execution recovery'; another person's panel stays as it was (390 and 1440)", async () => {
+    const ownGet = JSON.parse(`{"issueId":"a5309f4a-c506-48cf-a502-1f0be04de213","queueId":"eccb9166-d9b4-4d39-9063-3e9854773969","state":"deferred","targetRunId":null,"revision":"1e0764d5b31f6087e2058caf55659372","protocol":"paperclip_runner_v1","steeringDisposition":"temporarily_unavailable","executionWait":{"reason":"execution_recovery","message":"Waiting for execution recovery. Your message is saved."},"entries":[{"comment":{"id":"42d53b47-f898-4b36-9c0d-5b91acfbba67","companyId":"16c171cd-b481-407d-82ab-fd30c59e5aa0","issueId":"a5309f4a-c506-48cf-a502-1f0be04de213","authorAgentId":null,"authorUserId":"admit-any-person","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"5114ebec-85c7-4afb-8d39-265510c32df3","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"Also add a summary section to the report.","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T22:49:59.122Z","updatedAt":"2026-11-19T22:49:59.122Z"},"position":0,"canEdit":true,"canDiscard":true},{"comment":{"id":"86a3e580-51f2-4170-9b0e-8fd6b647d804","companyId":"16c171cd-b481-407d-82ab-fd30c59e5aa0","issueId":"a5309f4a-c506-48cf-a502-1f0be04de213","authorAgentId":null,"authorUserId":"admit-any-person","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"72291158-b32c-4338-aba7-b8885b1e0c66","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"And add a short changelog.","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T22:49:59.272Z","updatedAt":"2026-11-19T22:49:59.272Z"},"position":1,"canEdit":true,"canDiscard":true}]}`) as IssueQueuedCommentQueue;
+    const otherGet = JSON.parse(`{"issueId":"a5309f4a-c506-48cf-a502-1f0be04de213","queueId":"eccb9166-d9b4-4d39-9063-3e9854773969","state":"deferred","targetRunId":null,"revision":"1e0764d5b31f6087e2058caf55659372","protocol":"paperclip_runner_v1","steeringDisposition":"temporarily_unavailable","executionWait":{"reason":"execution_recovery","message":"Waiting for execution recovery. Your message is saved."},"entries":[{"comment":{"id":"42d53b47-f898-4b36-9c0d-5b91acfbba67","companyId":"16c171cd-b481-407d-82ab-fd30c59e5aa0","issueId":"a5309f4a-c506-48cf-a502-1f0be04de213","authorAgentId":null,"authorUserId":"admit-any-person","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"5114ebec-85c7-4afb-8d39-265510c32df3","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"Also add a summary section to the report.","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T22:49:59.122Z","updatedAt":"2026-11-19T22:49:59.122Z"},"position":0,"canEdit":false,"canDiscard":false},{"comment":{"id":"86a3e580-51f2-4170-9b0e-8fd6b647d804","companyId":"16c171cd-b481-407d-82ab-fd30c59e5aa0","issueId":"a5309f4a-c506-48cf-a502-1f0be04de213","authorAgentId":null,"authorUserId":"admit-any-person","onBehalfOfUserId":null,"authorType":"user","createdByRunId":null,"derivedAuthorAgentId":null,"derivedCreatedByRunId":null,"derivedAuthorSource":null,"clientRequestId":"72291158-b32c-4338-aba7-b8885b1e0c66","conversationSessionGeneration":null,"origin":"comment","fastResponseRequestId":null,"body":"And add a short changelog.","presentation":null,"metadata":null,"deletedAt":null,"deletedByType":null,"deletedByAgentId":null,"deletedByUserId":null,"deletedByRunId":null,"sourceTrust":null,"createdAt":"2026-11-19T22:49:59.272Z","updatedAt":"2026-11-19T22:49:59.272Z"},"position":1,"canEdit":false,"canDiscard":false}]}`) as IssueQueuedCommentQueue;
+    const line = "Not sent, because you pressed Stop. Delete any, or send a new message: these go with it.";
+    expect(ownGet.entries.map(entry => entry.comment.id)).toEqual(otherGet.entries.map(entry => entry.comment.id));
+    expect(otherGet.executionWait).toEqual({ reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." });
+    const width = window.innerWidth;
+    try {
+      for (const innerWidth of [390, 1440]) {
+        Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: innerWidth });
+        window.dispatchEvent(new Event("resize"));
+        const onInterrupt = vi.fn().mockResolvedValue(undefined);
+        const props = render({ queue: ownGet, onInterrupt });
+        await act(async () => {});
+        expect([innerWidth, container.textContent!.split("Not sent, because you pressed Stop.").length - 1]).toEqual([innerWidth, 1]);
+        const said = container.querySelector('[data-testid="task-chat-queued-own-stop"]');
+        expect(said?.textContent).toBe(line);
+        expect(said?.getAttribute("role")).toBe("status");
+        expect(container.textContent).not.toMatch(/execution recovery/i);
+        // No button that would not do what it says: nothing sends from this panel; each row keeps its Delete.
+        expect([...container.querySelectorAll("button")].filter(button => /Send|Steer|Interrupt/.test(button.textContent ?? ""))).toHaveLength(0);
+        expect(container.querySelector('[data-testid="task-chat-queued-stopped"]')).toBeNull();
+        for (const entry of ownGet.entries) {
+          expect(container.querySelector(`[data-testid="task-chat-queued-message-${entry.comment.id}"]`)?.textContent).toContain(entry.comment.body);
+          expect(container.querySelector(`[data-testid="task-chat-queued-interrupt-${entry.comment.id}"]`)).toBeNull();
+          expect(container.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-discard-${entry.comment.id}"]`)?.disabled).toBe(false);
+        }
+        // Delete, pressed: the panel asks the real discard for that message at the GET's revision, and sends nothing.
+        const last = ownGet.entries.at(-1)!.comment.id;
+        await act(async () => { container.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-discard-${last}"]`)!.click(); });
+        expect(props.onDiscard).toHaveBeenCalledWith(last, ownGet.revision);
+        expect(onInterrupt).not.toHaveBeenCalled();
+        // CONTROL: the other person's real GET (the stored recovery wait, byte for byte) renders as it did: no Stop line.
+        render({ queue: otherGet, onInterrupt: vi.fn().mockResolvedValue(undefined) });
+        await act(async () => {});
+        expect(container.textContent).not.toContain("you pressed Stop");
+        expect(container.querySelector('[data-testid="task-chat-queued-own-stop"]')).toBeNull();
+        for (const entry of otherGet.entries)
+          expect(container.querySelector(`[data-testid="task-chat-queued-interrupt-${entry.comment.id}"]`)?.textContent).toBe("Send");
+      }
+    } finally {
+      Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: width });
+    }
+  });
+  // bb-2d-stopwords: end of the row.
   // heldbar-r2 (B), org 11-19 04:36Z: after a person's own Stop the page
   // shows the stopped bar and NOT the pink "Couldn't finish this attempt"
   // banner with Retry. The bodies are planted verbatim from the real routes in

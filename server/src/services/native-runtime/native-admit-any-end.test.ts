@@ -86,6 +86,13 @@ import { remoteTerminationReceipt } from "../remote-execution-termination.js";
 const STALLED = "native_workspace_sync_out_stalled";
 const PERSON = "admit-any-person";
 const THE_LINE = "The file changes from this reply couldn't be saved.";
+// bb-2d-stopwords (RFL 22:22Z): what the queue panel says for messages held by their sender's OWN Stop. The reason is
+// the hold's own (acknowledged-native-stop.ts readPersonStopHold: who pressed Stop, and when), never a stored wait's
+// text. The line names only what works in that hold: the row's Delete, and a new message (it carries the held ones).
+const OWN_STOP_REASON = "held_by_own_stop";
+const OWN_STOP_LINE = { one: "Not sent, because you pressed Stop. Delete it, or send a new message: this one goes with it.",
+  many: "Not sent, because you pressed Stop. Delete any, or send a new message: these go with it." };
+const RECOVERY_WAIT = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const record = (value: unknown) => (value && typeof value === "object" ? value : {}) as Record<string, any>;
 const evidence: Record<string, unknown> = {};
@@ -507,6 +514,11 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
       expect(panel.status, JSON.stringify(panel.body)).toBe(200);
       expect((panel.body.entries as Array<{ comment: { id: string } }>).map(entry => entry.comment.id), JSON.stringify(panel.body)).toEqual([h.next]);
       process.stdout.write(`ADMIT-STOP-PANEL ${JSON.stringify({ sweepLines: lines.length, executionWait: panel.body.executionWait ?? null, entries: panel.body.entries.length })}\n`);
+      // bb-2d-stopwords: that panel says why the message is held and what the person can do, in the hold's OWN words.
+      // On 901d0ba2 it read the stored wait of the Stop's own recovery path, "Waiting for execution recovery. Your
+      // message is saved.": false, nothing is recovering.
+      expect(panel.body.executionWait, JSON.stringify(panel.body)).toEqual({ reason: OWN_STOP_REASON, message: OWN_STOP_LINE.one });
+      expect(JSON.stringify(panel.body)).not.toMatch(/execution recovery/i);
       // The person's next message starts ONE run that carries both.
       const again = await h.s.say("Please continue: add the summary section.");
       const before = box.inputs.length;
@@ -519,6 +531,98 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
       expect(brief(await h.run(h.r.id))).toEqual(frozen);
       evidence.STOP = { R: frozen, sweepLines: lines.map(comment => comment.body),
         panel: { executionWait: panel.body.executionWait ?? null, entries: (panel.body.entries as Array<{ comment: { id: string } }>).map(entry => entry.comment.id) },
+        laterRuns: later.map(brief) };
+    } finally { await h.stop(); }
+  }, 300_000);
+
+  // bb-2d-stopwords (RFL 22:22Z). PERSON CASE: a person presses Stop and messages they sent are held by that Stop
+  // (I-A'': no sweep card, the queue panel lists them). The panel's line says what is TRUE and what they can do, and
+  // each action it names does what it says.
+  // REAL: the messages (POST /api/issues/:id/comments), the Stop (POST /api/heartbeat-runs/:id/cancel), the panel
+  // (GET /api/issues/:id/queued-comments), Delete (DELETE /api/issues/:id/queued-comments/:commentId), the new
+  // message (POST /api/issues/:id/comments), the start (heartbeat.resumeQueuedRuns, the real executor).
+  // SCRIPTED (named): the provider turn. PLANTED: nothing.
+  // CONTROL (same state, same GET): ANOTHER board user, who did not press Stop, still reads the stored recovery wait
+  // byte for byte; "you pressed Stop" is said only to the person who did.
+  // NOT OFFERED on this line, on purpose: Send (POST .../queued-comments/interrupt). In this state its press is
+  // accepted and starts nothing (the gate keeps the wake: controller_settling, "The cancelled run still needs
+  // verified cleanup."); measured on 901d0ba2, see the task's result.md.
+  it("STOP-WORDS: messages held by the person's OWN Stop -> the panel's GET says 'Not sent, because you pressed Stop.' and the two things that work, never 'execution recovery'; Delete removes that message; a new message starts exactly ONE run that carries what is left; another person keeps the stored recovery wait", async () => {
+    const h = await hungRWithParkedMessage(NO_CAP);
+    try {
+      const second = await h.s.say("And add a short changelog.");
+      // Both messages wait on ONE saved wake (the earlier wake reads "coalesced").
+      await vi.waitFor(async () => expect((await h.wakesOf(second)).map(wake => wake.status)).toContain("deferred_issue_execution"), { timeout: 10_000, interval: 50 });
+      const stopped = await request(h.s.app).post(`/api/heartbeat-runs/${h.r.id}/cancel`).send({ cancellationRequestId: randomUUID() });
+      expect(stopped.status, JSON.stringify(stopped.body)).toBe(200);
+      expect(brief(await h.run(h.r.id))).toMatchObject({ status: "cancelled" });
+      expect((await h.admitParked(5_000)).runs).toEqual([]);
+      h.s.releaseStall();
+      await h.heartbeat.drainActiveRunExecutions();
+      await h.sweep(h.r.id);
+      await h.present();
+      const ids = (body: { entries: Array<{ comment: { id: string } }> }) => body.entries.map(entry => entry.comment.id);
+      const read = async (app = h.s.app) => {
+        const got = await request(app).get(`/api/issues/${h.s.issueId}/queued-comments`);
+        expect(got.status, JSON.stringify(got.body)).toBe(200);
+        return got.body as { queueId: string; revision: string; state: string | null; executionWait: { reason: string; message: string } | null;
+          entries: Array<{ comment: { id: string } }> };
+      };
+      // The hold as the product stored it (which producer wrote the wait the panel used to read).
+      const heldWake = (await h.wakesOf(h.next)).find(wake => wake.status === "deferred_issue_execution")!;
+      const stoppedRun = await h.run(h.r.id);
+      process.stdout.write(`STOPWORDS-HOLD ${JSON.stringify({ wakeId: heldWake.id, wakeStatus: heldWake.status, wakeReason: heldWake.reason,
+        storedWait: record(heldWake.payload).executionWait ?? null, stop: { status: stoppedRun.status,
+          cancelledByActorType: record(stoppedRun.resultJson).cancelledByActorType, cancelledByUserId: record(stoppedRun.resultJson).cancelledByUserId } })}\n`);
+      const panel = await read();
+      process.stdout.write(`STOPWORDS-GET ${JSON.stringify(panel)}\n`);
+      expect(panel.queueId).toBe(heldWake.id);
+      expect(ids(panel), JSON.stringify(panel)).toEqual([h.next, second]);
+      // What the panel's GET says at each step is asserted ONCE, at the end of the row, so the two actions below are
+      // pressed through their real routes whatever the line reads (their own assertions are hard).
+      const said: Record<string, unknown> = { held: panel.executionWait, recoveryWordsInGet: /execution recovery/i.test(JSON.stringify(panel)),
+        stopLinesInGet: JSON.stringify(panel).split("Not sent, because you pressed Stop.").length - 1 };
+      // CONTROL: another board user of the company reads the SAME queue. They did not press Stop.
+      const OTHER = "admit-any-other-person";
+      const other = express(); other.use(express.json());
+      other.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: OTHER, companyIds: [h.s.companyId],
+        memberships: [{ companyId: h.s.companyId, membershipRole: "owner", status: "active" }], isInstanceAdmin: true }; next(); });
+      other.use("/api", issueRoutes(db, {} as never, {})); other.use(errorHandler);
+      const theirs = await read(other);
+      process.stdout.write(`STOPWORDS-GET-OTHER ${JSON.stringify(theirs)}\n`);
+      expect(ids(theirs)).toEqual([h.next, second]);
+      expect(theirs.executionWait).toEqual(RECOVERY_WAIT);
+      // DELETE (the row's trash): that message is gone, the other stays held, nothing starts.
+      const runsBefore = (await h.s.runs()).length, turnsBefore = box.inputs.length;
+      const removed = await request(h.s.app).delete(`/api/issues/${h.s.issueId}/queued-comments/${second}`)
+        .send({ queueId: panel.queueId, revision: panel.revision });
+      expect(removed.status, JSON.stringify(removed.body)).toBe(200);
+      for (let pass = 0; pass < 4; pass += 1) { await h.heartbeat.resumeQueuedRuns(); await sleep(250); }
+      const afterDelete = await read();
+      expect(ids(afterDelete), JSON.stringify(afterDelete)).toEqual([h.next]);
+      said.afterDelete = afterDelete.executionWait;
+      expect((await h.thread()).map(comment => comment.id)).not.toContain(second);
+      expect([(await h.s.runs()).length, box.inputs.length]).toEqual([runsBefore, turnsBefore]);
+      // A NEW MESSAGE (the composer's Send): exactly ONE run, and it carries the held message that is left.
+      const again = await h.s.say("Please continue: add the summary section.");
+      for (const startAt = Date.now(); Date.now() - startAt < 30_000 && box.inputs.length === turnsBefore;) { await h.heartbeat.resumeQueuedRuns(); await sleep(250); }
+      await h.heartbeat.drainActiveRunExecutions();
+      for (let pass = 0; pass < 4; pass += 1) { await h.heartbeat.resumeQueuedRuns(); await sleep(250); }
+      await h.heartbeat.drainActiveRunExecutions();
+      const later = (await h.s.runs()).slice(2);
+      expect(later.map(run => run.status), JSON.stringify(later.map(brief))).toEqual(["succeeded"]);
+      expect(box.inputs.length - turnsBefore).toBe(1);
+      expect(JSON.stringify(later[0].contextSnapshot)).toContain(again);
+      expect(JSON.stringify(later[0].contextSnapshot)).toContain(h.next);
+      expect(JSON.stringify(later[0].contextSnapshot)).not.toContain(second);
+      expect((await h.wakesOf(h.next)).map(wake => wake.status)).not.toContain("deferred_issue_execution");
+      const afterNew = await read();
+      expect(ids(afterNew), JSON.stringify(afterNew)).toEqual([]);
+      said.afterNewMessage = afterNew.executionWait ?? null;
+      process.stdout.write(`STOPWORDS-SAID ${JSON.stringify(said)}\n`);
+      expect(said).toEqual({ held: { reason: OWN_STOP_REASON, message: OWN_STOP_LINE.many }, recoveryWordsInGet: false, stopLinesInGet: 1,
+        afterDelete: { reason: OWN_STOP_REASON, message: OWN_STOP_LINE.one }, afterNewMessage: null });
+      evidence.STOPWORDS = { said, panel, other: theirs.executionWait, afterDelete: { executionWait: afterDelete.executionWait, entries: ids(afterDelete) },
         laterRuns: later.map(brief) };
     } finally { await h.stop(); }
   }, 300_000);
