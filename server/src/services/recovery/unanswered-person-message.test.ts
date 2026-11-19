@@ -4,14 +4,11 @@ import express from "express";
 import request from "supertest";
 import { agentRoutes } from "../../routes/agents.js";
 import { errorHandler } from "../../middleware/index.js";
-import { registerServerAdapter, unregisterServerAdapter } from "../../adapters/index.js";
 import {
   activityLog,
   agentWakeupRequests,
   agents,
   approvals,
-  authUsers,
-  companyMemberships,
   companies,
   createDb,
   heartbeatRuns,
@@ -1173,7 +1170,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   // RFL 04:58Z: a PAUSED agent's chat. "Sending it again is safe" is false
   // advice there; the note says the agent is paused and who can resume it.
   const WORKING = UNANSWERED_MESSAGE_WORKING_TEXT("Managed Pi");
-  const PAUSED_TEXT = "Managed Pi is paused. Your message is saved, and it will run when Managed Pi is resumed. "
+  const PAUSED_TEXT = "Managed Pi is paused. Your message is saved. Send it again after Managed Pi is resumed. "
     + "A board user or Managed Pi's manager can resume Managed Pi.";
   const pause = (f: { agentId: string }) => db.update(agents).set({ status: "paused", lifecycleState: "paused",
     lifecycleHolds: ["manual"], pauseReason: "manual" }).where(eq(agents.id, f.agentId));
@@ -2200,69 +2197,43 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect((await runsCarrying(f, M)).map(row => row.id)).toEqual([turn]);
     }, 60_000);
 
-    it("P posted DURING the pause is really deferred: its note says it will run when resumed, and after the real Resume P runs ONCE", async () => {
+    // rf-5 T4 (OBSERVED on the native path): P's wake is refused (409) while
+    // paused, nothing re-offers it, and P never runs after Resume. This row
+    // does NOT model the native path's run after Resume (a local adapter
+    // would plant a run the native path never starts), so it asserts only the
+    // note: it promises no run until the deferred-wake fix lands with a row
+    // proving P runs.
+    it("P posted DURING the pause (its wake refused 409): P's note says to send it again after Resume, never 'will run' (does not model the native path's run after Resume)", async () => {
       const f = await fixture();
-      // A local test adapter executes the run P's promoted wake starts (a
-      // native turn cannot run here); wake, deferral, promotion, claim and
-      // run creation are the production paths.
-      const adapterType = `pausenote_r2_${randomUUID().slice(0, 8)}`;
-      const executed: string[] = [];
-      registerServerAdapter({ type: adapterType, supportsLocalAgentJwt: false,
-        execute: async (input: { runId: string }) => { executed.push(input.runId); return { exitCode: 0, signal: null, timedOut: false, resultJson: {} }; },
-        testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }) } as never);
-      try {
-        await db.update(agents).set({ adapterType, adapterConfig: {} }).where(eq(agents.id, f.agentId));
-        // The person is an active member (the run acts for them).
-        await db.insert(authUsers).values({ id: f.userId, name: "Person", email: `${f.userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
-        await db.insert(companyMemberships).values({ companyId: f.companyId, principalId: f.userId, principalType: "user", status: "active",
-          membershipRole: "member" });
-        const heartbeat = heartbeatService(db);
-        const app = routes(f);
-        const worker = lifecycleWorker();
-        // M's live turn is what the Pause stops; P comes after, during the pause.
-        const M = await f.message("Please continue.");
-        const turn = await liveTurn(f, M);
-        await exitedRunnerProcess(turn);
-        const paused = await request(app).post(`/api/agents/${f.agentId}/pause`).send({});
-        expect(paused.status, JSON.stringify(paused.body)).toBe(200);
-        expect(await runRow(turn)).toMatchObject({ status: "cancelled", errorCode: "agent_paused" });
-        await worker.process(f.agentId);
-        expect((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0]).toMatchObject({ lifecycleState: "paused" });
-        const P = await f.message("Also, please check this while you're paused.");
-        // The comment route's own wake for P (routes/issues.ts, reason issue_commented): refused and saved.
-        await expect(heartbeat.wakeup(f.agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
-          payload: { issueId: f.issueId, commentId: P, mutation: "comment" },
-          contextSnapshot: { issueId: f.issueId, taskId: f.issueId, commentId: P, wakeCommentId: P, source: "issue.comment",
-            wakeReason: "issue_commented" },
-          requestedByActorType: "user", requestedByActorId: f.userId })).rejects.toMatchObject({ status: 409 });
-        const saved = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId)))
-          .filter(wake => (wake.payload as { commentId?: string }).commentId === P);
-        expect(saved).toEqual([expect.objectContaining({ status: "deferred_issue_execution", runId: null })]);
-        expect(await runsCarrying(f, P)).toHaveLength(0);
-        await settleAt(f, 2 * 60_000);
-        await settleAt(f, 11 * 60_000);
-        expect(await bodies(f)).toEqual([PAUSED_TEXT]);
-        const resumed = await request(app).post(`/api/agents/${f.agentId}/resume`).send({});
-        expect(resumed.status, JSON.stringify(resumed.body)).toBe(200);
-        await worker.process(f.agentId);
-        expect((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0]).toMatchObject({ lifecycleState: "ready" });
-        for (let pass = 0; pass < 2; pass += 1) {
-          await heartbeat.resumeQueuedRuns();
-          await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId });
-          await heartbeat.drainActiveRunExecutions();
-        }
-        // The promise is kept: P really runs, once.
-        const pRuns = await runsCarrying(f, P);
-        console.log("pausenote-r2 row 2 run list", JSON.stringify(pRuns.map(row => ({ id: row.id, status: row.status,
-          errorCode: row.errorCode, startedAt: row.startedAt, finishedAt: row.finishedAt }))));
-        expect(pRuns).toHaveLength(1);
-        expect(pRuns[0]!.startedAt).not.toBeNull();
-        expect(executed.filter(id => id === pRuns[0]!.id)).toHaveLength(1);
-        // M's cancelled turn is not re-run by the Resume.
-        expect((await runsCarrying(f, M)).filter(row => row.id !== pRuns[0]!.id).map(row => row.id)).toEqual([turn]);
-      } finally {
-        await heartbeatService(db).drainActiveRunExecutions();
-        unregisterServerAdapter(adapterType);
+      const app = routes(f);
+      const worker = lifecycleWorker();
+      // M's live turn is what the Pause stops; P comes after, during the pause.
+      const M = await f.message("Please continue.");
+      const turn = await liveTurn(f, M);
+      await exitedRunnerProcess(turn);
+      const paused = await request(app).post(`/api/agents/${f.agentId}/pause`).send({});
+      expect(paused.status, JSON.stringify(paused.body)).toBe(200);
+      expect(await runRow(turn)).toMatchObject({ status: "cancelled", errorCode: "agent_paused" });
+      await worker.process(f.agentId);
+      expect((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0]).toMatchObject({ lifecycleState: "paused" });
+      const P = await f.message("Also, please check this while you're paused.");
+      // The comment route's own wake for P (routes/issues.ts, reason issue_commented): refused.
+      await expect(heartbeatService(db).wakeup(f.agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
+        payload: { issueId: f.issueId, commentId: P, mutation: "comment" },
+        contextSnapshot: { issueId: f.issueId, taskId: f.issueId, commentId: P, wakeCommentId: P, source: "issue.comment",
+          wakeReason: "issue_commented" },
+        requestedByActorType: "user", requestedByActorId: f.userId })).rejects.toMatchObject({ status: 409 });
+      expect(await runsCarrying(f, P)).toHaveLength(0);
+      for (const ms of [2 * 60_000, 11 * 60_000]) {
+        await settleAt(f, ms);
+        const notes = await f.visible();
+        const pNotes = notes.filter(n => (n.metadata as Record<string, unknown> | null)?.authorizationReason === `unanswered_message:${P}`);
+        expect(pNotes.map(n => n.body), `+${ms}`).toEqual([PAUSED_TEXT]);
+        console.log("pausenote-r3 row 2 P note", ms, JSON.stringify(pNotes[0]!.metadata));
+        expect(pNotes[0]!.body).toBe("Managed Pi is paused. Your message is saved. Send it again after Managed Pi is resumed. "
+          + "A board user or Managed Pi's manager can resume Managed Pi.");
+        expect(JSON.stringify(pNotes[0])).toContain("Ask a board user or Managed Pi's manager to resume Managed Pi, then send it again.");
+        expect(JSON.stringify(notes)).not.toContain("will run");
       }
     }, 120_000);
 
