@@ -1,4 +1,4 @@
-import { pendingNativeWithheldReply, WITHHELD_REPLY_TRIGGER } from "./native-withheld-reply-trigger.js";
+import { writeAcceptanceWithheldReplyEntry } from "./native-withheld-reply-acceptance.js";
 import { notifyNativeResultCommit } from "../native-result-commit-notifications.js";
 import { notifyNativeWorkspaceFinalization } from "../native-workspace-finalization-notifications.js";
 import { isNativeResponseEvidence, notifyNativeResponsePresentation } from "../native-response-presentation-notifications.js";
@@ -8,7 +8,7 @@ import { isSafeNativeChatProgressEventType } from "../safe-native-chat-progress.
 import { notifyChatNativeProgress } from "../chat-native-progress-notifications.js";
 import { createHash } from "node:crypto";
 
-import { and, desc, eq, inArray, lt, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, lt } from "drizzle-orm";
 
 import type { Db } from "@paperclipai/db";
 import { trackRunIntake } from "../run-intake-stall-watch.js";
@@ -446,22 +446,17 @@ export class NativeRunCoordinatorStore {
             updatedAt: new Date(),
           },
         });
-      // The acceptance hook of the withheld-reply outbox. Under
-      // WITHHELD_REPLY_TRIGGER = "acceptance" the statement that accepts the
-      // result also writes the pending entry, and the reply-presentation worker
-      // publishes the answer now instead of after the copy-back.
-      const publishAtAcceptance = WITHHELD_REPLY_TRIGGER === "acceptance";
       await tx
         .update(heartbeatRuns)
         .set({
           nativePhase: "workspace_finalizing",
           nativePhaseUpdatedAt: new Date(),
           updatedAt: new Date(),
-          ...(publishAtAcceptance ? { resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)
-            || ${JSON.stringify(pendingNativeWithheldReply(inserted.id, null, "acceptance"))}::jsonb` } : {}),
         })
         .where(eq(heartbeatRuns.id, this.#binding.runId));
-      if (publishAtAcceptance) await notifyNativeResponsePresentation(tx, this.#binding);
+      // The acceptance hook of the withheld-reply outbox, shared with the
+      // runner's own accepting path (PaperclipControlPlanePort.completeRun).
+      await writeAcceptanceWithheldReplyEntry(tx, this.#binding, inserted.id);
       return { disposition: "committed" as const, resultId: inserted.id };
     });
   }

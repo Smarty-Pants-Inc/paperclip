@@ -42,6 +42,7 @@ import { lockNativeRunnerCheckpointOwner, nativeRunnerCheckpointOwnerLock, valid
 import { crashPoint } from "@paperclipai/shared/crash-points";
 import { provesNoNativeRunProviderWork } from "./native-provider-work-proof.js";
 import { recordRunEventCommitted } from "../server-metrics.js";
+import { writeAcceptanceWithheldReplyEntry } from "./native-withheld-reply-acceptance.js";
 
 export interface PaperclipControlPlaneBinding {
   companyId: string;
@@ -816,6 +817,10 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
         },
         updatedAt: new Date(),
       }).where(eq(heartbeatRuns.id, this.#binding.runId));
+      // The acceptance hook of the withheld-reply outbox: this is the runner's
+      // real accepting path, so it writes the same publish entry, in this
+      // accepting transaction, as NativeRunCoordinatorStore.completeRun.
+      await writeAcceptanceWithheldReplyEntry(tx, this.#binding, inserted.id);
       this.#assertActive(options);
       return true;
     });
