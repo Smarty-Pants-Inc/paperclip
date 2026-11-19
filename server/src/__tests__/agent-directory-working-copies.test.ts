@@ -8,6 +8,7 @@ import { heartbeatService } from "../services/heartbeat.js";
 import { createHeartbeatInstructionWorkingCopy } from "../services/heartbeat/instruction-working-copy.js";
 import * as fileStoreModule from "../services/agent-file-store.js";
 import * as storeModule from "../services/agent-file-store.js";
+import * as fileDurability from "../services/agent-file-durability.js";
 import { withDedicatedDbConnection } from "@paperclipai/db";
 import * as fileCheckpoints from "../services/agent-file-checkpoints.js";
 import * as instructionAuthorization from "../services/agent-instruction-authorization.js";
@@ -2526,6 +2527,78 @@ describe("persistent agent directories", () => {
     });
     afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
+    // Mutation gap: plant cancellation at the real post-persist/pre-commit
+    // line, not at apply entry. Reuse this durable-storage fixture; DB and
+    // canonical disk reads are real and precede any restoring store read.
+    it("RF3 POST-PERSIST ABORT: DB rows and canonical tree stay unchanged and the session lock is released", async () => {
+      // Complete the one-time legacy adoption before arming the fault. An
+      // abort during adoption is pre-merge and cannot expose this mutation.
+      await agentFileStore(db).read(companyId, agentId, entryFile, board());
+      const copy = await run({ warm: true });
+      const note = `post-persist run bytes ${randomUUID()}\n`;
+      await fs.writeFile(path.join(copy.localRoot, "post-persist-note.txt"), note);
+      const controller = new AbortController();
+      const reason = new Error("RF3 abort after persist before commit");
+      const canonicalRows = async () => ({
+        roots: await db.select().from(agentFileRoots).where(eq(agentFileRoots.agentId, agentId)),
+        audit: await db.select().from(activityLog).where(eq(activityLog.entityId, agentId)),
+      });
+      const before = { rows: await canonicalRows(), treeHash: directorySnapshotSha256(await snapshotAgentFiles(root, false)) };
+      expect(before.rows.roots).toHaveLength(1);
+      const realPersist = fileDurability.persistDurableAgentFiles;
+      const actualStore = fileStoreModule.agentFileStore;
+      let applies = 0, persisted = 0, applyDone: Promise<void> | undefined;
+      const persistFault = vi.spyOn(fileDurability, "persistDurableAgentFiles").mockImplementation(async (...args) => {
+        const result = await realPersist(...args);
+        if (args[3] === true) return result;
+        const [pending] = await args[0].select().from(agentFileRoots).where(eq(agentFileRoots.agentId, agentId));
+        expect(pending.entries.find(entry => entry.path === "post-persist-note.txt")).toMatchObject({ kind: "file", sha256: fileHash(Buffer.from(note)) });
+        // PLANTED FAULT: durable rows have really been persisted in the open
+        // store transaction; locked() has not returned to transaction commit.
+        persisted++;
+        controller.abort(reason);
+        return result;
+      });
+      const factory = vi.spyOn(fileStoreModule, "agentFileStore").mockImplementation((...args) => {
+        const store = actualStore(...args), realApply = store.apply.bind(store);
+        vi.spyOn(store, "apply").mockImplementation(async (...applyArgs) => {
+          applies++;
+          let finish!: () => void;
+          applyDone = new Promise<void>(resolve => { finish = resolve; });
+          try { return await realApply(...applyArgs); } finally { finish(); }
+        });
+        return store;
+      });
+      const service = agentInstructionWorkingCopyService(db);
+      factory.mockRestore();
+      let error: unknown, after: typeof before | undefined, lockReleased = false;
+      try {
+        await service.collectStopped({ companyId, runId: copy.runId, signal: controller.signal }).catch(caught => { error = caught; });
+        // collectStopped may reject as soon as its lock session is terminated;
+        // wait for the actual apply transaction before observing its outcome.
+        await applyDone;
+        after = { rows: await canonicalRows(), treeHash: directorySnapshotSha256(await snapshotAgentFiles(root, false)) };
+        await withDedicatedDbConnection(db, async dedicated => {
+          const key = `agent-directory:${companyId}:${agentId}`;
+          const [lock] = await dedicated.execute(sql`select pg_try_advisory_lock(hashtextextended(${key}, 0)) as acquired`);
+          lockReleased = lock?.acquired === true;
+          if (lockReleased) await dedicated.execute(sql`select pg_advisory_unlock(hashtextextended(${key}, 0))`);
+        });
+        await writeJudgeEvidence("rf3-post-persist-abort.json", {
+          applies, persisted, aborted: controller.signal.aborted, error: String(error), before, after, lockReleased,
+          source: await fs.readFile(path.join(copy.localRoot, "post-persist-note.txt"), "utf8"),
+          canonical: await fs.readFile(path.join(root, "post-persist-note.txt"), "utf8").catch(() => null),
+        });
+      } finally { await applyDone; persistFault.mockRestore(); }
+      expect(applies).toBe(1);
+      expect(persisted).toBe(1);
+      expect(controller.signal.aborted).toBe(true);
+      expect(error).toBe(reason);
+      expect(lockReleased, "the save's session advisory lock must be released").toBe(true);
+      expect.soft(after?.rows, "no canonical DB rows may change after cancellation").toEqual(before.rows);
+      expect.soft(after?.treeHash, "canonical tree SHA256 must be identical before and after cancellation").toBe(before.treeHash);
+      expect(await fs.readFile(path.join(copy.localRoot, "post-persist-note.txt"), "utf8")).toBe(note);
+    }, 30_000);
     it.each([false, true])("JUDGE failed conflict upload must retain source through production retirement (warm=%s)", async warm => {
       const store = agentFileStore(db);
       await store.write({ ...target(), path: "daily.md", bytes: Buffer.from("C"), baseHash: null }, board());
