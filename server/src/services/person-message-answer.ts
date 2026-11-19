@@ -168,8 +168,9 @@ export function personMessageOwedSql(m: PersonMessageSql): SQL {
         and exists (select 1 from ${issueComments} moved_reply where moved_reply.company_id = moved_on.company_id
           and moved_reply.issue_id = ${m.issueId} and moved_reply.created_by_run_id = moved_on.id
           and moved_reply.author_type = 'agent' and moved_reply.deleted_at is null)
-        -- RFL 19:05Z: the person moved past m only when this turn CLAIMED a newer PERSON message; a turn that
-        -- only revived work or answered a system wake (merely started later) does not.
+        -- RFL 19:05Z/19:17Z: besides this succeeded replying turn, a PERSON message newer than m must have been
+        -- ANSWERED (the one answered function); a turn that only revived work or answered a system wake does not
+        -- move the person past m.
         and exists (select 1 from ${issueComments} newer_person
           where newer_person.company_id = ${m.companyId} and newer_person.issue_id = ${m.issueId}
             and newer_person.author_type = 'user' and newer_person.deleted_at is null
