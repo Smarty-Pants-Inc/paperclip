@@ -58,11 +58,13 @@ describe("Boat ready spare keeper", () => {
     expect(readySpareDemandWindowMinutes({})).toBe(10);
     expect(readySpareDemandWindowMinutes({ spareDemandWindowMinutes: 5 })).toBe(5);
     expect(readySpareDemandWindowMinutes({ spareDemandWindowMinutes: 61 })).toBe(10);
-    expect(readySpareDemandTarget(1, 1, 3)).toBe(2);
-    expect(readySpareDemandTarget(1, 2, 3)).toBe(3);
-    expect(readySpareDemandTarget(1, 4, 5)).toBe(5);
-    expect(readySpareDemandTarget(1, 8, 3)).toBe(3);
+    // F2: a claim is a replacement, not permission to grow the idle pool.
+    expect(readySpareDemandTarget(1, 1, 3)).toBe(1);
+    expect(readySpareDemandTarget(1, 2, 3)).toBe(1);
+    expect(readySpareDemandTarget(1, 4, 5)).toBe(1);
+    expect(readySpareDemandTarget(1, 8, 3)).toBe(1);
     expect(readySpareDemandTarget(3, 1, 5)).toBe(3);
+    expect(readySpareDemandTarget(3, 8, 2)).toBe(2);
     expect(readySpareConfigHash({ type: "small", labels: { b: "2", a: "1" } }))
       .toBe(readySpareConfigHash({ labels: { a: "1", b: "2" }, type: "small" }));
     expect(readySpareConfigHash({ type: "small" })).not.toBe(readySpareConfigHash({ type: "large" }));
@@ -111,7 +113,7 @@ describe("Boat ready spare keeper", () => {
     const keeper = new ReadySpareKeeper(() => now);
     expect(keeper.recordDemand(key)).toBe(1);
     expect(keeper.recordDemand(key)).toBe(2);
-    expect(keeper.demandTarget(key, 1, 3, 10)).toBe(3);
+    expect(keeper.demandTarget(key, 1, 3, 10)).toBe(1);
     expect(keeper.demandCount({ companyId: key.companyId, environmentId: "env-b" }, 10)).toBe(0);
     now += 10 * 60_000;
     expect(keeper.demandCount(key, 10)).toBe(0);
@@ -151,7 +153,7 @@ describe("Boat ready spare keeper", () => {
     expect(warmUp).not.toHaveBeenCalledWith(claimed);
   });
 
-  it("fills to demand target concurrently and stops the surplus when demand expires", async () => {
+  it("F2 fills the configured size concurrently and stops surplus after a size reduction",  async () => {
     let now = start;
     const keeper = new ReadySpareKeeper(() => now, 12);
     const f = operations();
@@ -166,7 +168,7 @@ describe("Boat ready spare keeper", () => {
     });
     keeper.recordDemand(key);
     keeper.recordDemand(key);
-    await keeper.reconcile(key, keeper.demandTarget(key, 1, 3, 10), f.ops);
+    await keeper.reconcile(key, keeper.demandTarget(key, 3, 3, 10), f.ops);
     expect(maximum).toBe(3);
     expect(keeper.ready(key)).toHaveLength(3);
     now += 10 * 60_000;

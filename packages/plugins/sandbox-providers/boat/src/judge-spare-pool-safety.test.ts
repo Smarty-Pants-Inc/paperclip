@@ -361,11 +361,12 @@ describe('JUDGE off-path completeness', () => {
   }
   it('JUDGE-OFF-ADOPTION: delivered off event cannot be undone by a delayed discovery callback', async()=>{
     const h=await harness('judge-off-adoption');h.boat.listDelayOnceMs=2_400; // within the real 2.5-second inventory budget
-    await settle(h.acquire('run-delayed-adopt'));expect(h.boat.creates()).toHaveLength(0);
+    // F1 discovery now precedes the run create: deliver OFF while it is pending.
+    const acquire=h.acquire('run-delayed-adopt');await advance(100);expect(h.boat.creates()).toHaveLength(0);
     h.config.spares=0;await settle(plugin.definition.onConfigChanged!({...h.config},{companyId:h.company} as any));
-    const offAt=Date.now();await advance(15_000);
-    console.log('JUDGE-ADOPTION-CREATES',JSON.stringify(h.boat.creates().filter(e=>e.at>=offAt)));
-    expect(h.boat.creates().filter(e=>e.at>=offAt)).toHaveLength(0);
+    const offAt=Date.now();await settle(acquire);await advance(15_000);
+    console.log('JUDGE-ADOPTION-CREATES',JSON.stringify(h.boat.creates('spare').filter(e=>e.at>=offAt)));
+    expect(h.boat.creates('spare').filter(e=>e.at>=offAt)).toHaveLength(0);
   });
   it('JUDGE-OFF-ADMISSION: delivered off during the pre-create inventory read must cancel an unsent spare POST',async()=>{
     const h=await harness('judge-off-admission');const s1=await seed(h);await idleStopAttempt(h,s1);

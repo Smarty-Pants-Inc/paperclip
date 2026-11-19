@@ -514,7 +514,7 @@ describe("JUDGE independent counter and money rows", () => {
     held.release();
     await settle(racing);
     await advance(5_000);
-    expect(h.boat.liveSpares(), "unrelated company must not fence the demand-target replacement (base 1 + one claim = 2)").toHaveLength(2);
+    expect(h.boat.liveSpares(), "F2: unrelated company must not fence the one fixed-size replacement").toHaveLength(1);
   });
 });
 

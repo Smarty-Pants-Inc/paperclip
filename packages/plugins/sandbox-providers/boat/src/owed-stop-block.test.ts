@@ -30,7 +30,7 @@ const START = Date.UTC(2026, 10, 18, 23, 30, 0);
 
 type Box = { id: string; labels: Record<string, string>; name: string; state: string;
   readyAt: number; archiveAfter: string; createdAt: string; team: { id: string }; stop?: { id: string; status: string } };
-type LogEntry = { seq: number; at: number; kind: "boat" | "event" | "mark"; method?: string; path?: string; id?: string; purpose?: string; configHash?: string; note?: string };
+type LogEntry = { seq: number; at: number; kind: "boat" | "event" | "mark"; method?: string; path?: string; id?: string; purpose?: string; configHash?: string; note?: string; idleSpares?: number; force?: boolean };
 type Hold = { method: string; path: RegExp; hit: boolean; released: boolean; release(): void; wait: Promise<void> };
 
 const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -79,10 +79,10 @@ class FakeBoat {
         state: "creating", readyAt: Date.now() + CREATE_LATENCY_MS,
         archiveAfter: new Date(Date.now() + body.ttlSeconds * 1000).toISOString(), createdAt: new Date().toISOString(), team: { id: "team-spare-off" } };
       this.boxes.set(box.id, box);
-      this.record({ kind: "boat", method, path: route, id: box.id, purpose, configHash: body.labels.configHash });
+      this.record({ kind: "boat", method, path: route, id: box.id, purpose, configHash: body.labels.configHash, idleSpares: this.liveSpares().length });
       return response({ sandbox: { ...box } }, 202);
     }
-    this.record({ kind: "boat", method, path: route, ...(id ? { id } : {}) });
+    this.record({ kind: "boat", method, path: route, ...(id ? { id } : {}), ...(route.endsWith("/stop") ? { force: body?.force === true } : {}) });
     if (method === "GET" && route === "/sandboxes") {
       const labels = url.searchParams.getAll("label").map(label => label.split("="));
       const matching = [...this.boxes.values()].map(box => this.observe(box))
@@ -322,6 +322,17 @@ describe("#21251: a pool whose own owed stop keeps failing makes no new spare cr
     expect(poolSpareCreates(h, h.env, cappedAt)).toEqual([]);
   });
 
+  it("S1-PAID a successful owed stop clears its future hold immediately", async () => {
+    const { h, s1, state } = await stuckOwedStop("s1-paid-before-expiry");
+    state.refuse = false;
+    const at = h.boat.mark("pay debt before backoff expiry");
+    await settle(h.acquire("pay-before-expiry"));
+    await advance(5_000);
+    expect(h.boat.boxes.get(s1)!.state).toBe("archived");
+    expect(poolSpareCreates(h, h.env, at)).toHaveLength(1);
+    expect((h.state.get(`${h.company}:stop-owed`) as any).holds).toEqual([]);
+  });
+
   it("S7-B an unrelated stop result cannot erase an expired owed-retry cap across two restarts", async () => {
     const { h, s1 } = await stuckOwedStop("s7-expired-debt");
     await settle(h.acquireOther("seed-other"));
@@ -410,6 +421,18 @@ describe("spares-ON gate-5 rows", () => {
     expect(h.boat.spareCreates(at)).toHaveLength(1);
   });
 
+  it("F1-RUNNING a wake cannot discard a healthy warmed running spare before its claim", async () => {
+    const h = await start("f1-wake-running");
+    const { s1 } = await seed(h);
+    h.boat.boxes.get(s1)!.state = "running";
+    await settle(h.emit("issue.comment.created"));
+    const at = h.boat.mark("message after wake with warmed running spare");
+    expect((await settle(h.acquire("running-spare-message"))).providerLeaseId).toBe(s1);
+    await advance(5_000);
+    expect(h.boat.log.filter(e => e.seq > at && e.purpose === "run")).toEqual([]);
+    expect(h.boat.liveSpares()).toHaveLength(1);
+  });
+
   it("F2 size 1 and three sequential claims: one refill each, never two idle spares", async () => {
     const h = await start("f2-no-paired-refills");
     await seed(h);
@@ -420,6 +443,7 @@ describe("spares-ON gate-5 rows", () => {
       await advance(5_000);
       expect(h.boat.spareCreates(at)).toHaveLength(1);
       expect(h.boat.liveSpares()).toHaveLength(1);
+      expect(h.boat.spareCreates().every(e => e.idleSpares! <= 1), "all create boundaries, not just settled inventory").toBe(true);
     }
   });
 
@@ -430,7 +454,7 @@ describe("spares-ON gate-5 rows", () => {
     const at = h.boat.mark("durable spares=0; no config event");
     await advance(TICK_MS);
     expect(h.boat.boxes.get(s1)!.state).toBe("archived");
-    expect(h.boat.log.some(e => e.seq > at && e.method === "POST" && e.path === `/sandboxes/${s1}/stop`)).toBe(true);
+    expect(h.boat.log.filter(e => e.seq > at && e.method === "POST" && e.path === `/sandboxes/${s1}/stop`).map(e => e.force)).toEqual([false]);
     expect(h.boat.spareCreates(at)).toEqual([]);
     await advance(4 * TICK_MS);
     expect(h.boat.liveSpares()).toEqual([]);
@@ -444,6 +468,31 @@ describe("spares-ON gate-5 rows", () => {
     const at = h.boat.mark("off before next event wake");
     await settle(h.emit("issue.comment.created"));
     await advance(5_000);
+    expect(h.boat.spareCreates(at)).toEqual([]);
+  });
+
+  it("S6 spare creates yield to an IP 429 nextStartAt and never send after OFF", async () => {
+    const h = await start("s6-next-start-pause");
+    const { s1 } = await seed(h);
+    h.boat.boxes.get(s1)!.state = "archived";
+    let refused = false;
+    const at = h.boat.mark("IP 429 with nextStartAt only");
+    const nextStartAt = new Date(Date.now() + 60_000).toISOString();
+    vi.stubGlobal("fetch", async (input: unknown, init: RequestInit = {}) => {
+      if (!refused && new URL(String(input)).pathname.endsWith(`/sandboxes/${s1}`)) {
+        refused = true;
+        return response({ code: "IP_RATE_LIMIT_EXCEEDED", nextStartAt }, 429);
+      }
+      return h.boat.fetch(input, init);
+    });
+    const probe = Promise.resolve(plugin.definition.onEnvironmentInspectLease!(leaseParams(h, s1) as any)).catch(() => undefined);
+    await until(() => refused, "IP limit response");
+    const wake = h.emit("issue.comment.created").catch(() => undefined);
+    await advance(10_000);
+    expect(h.boat.spareCreates(at)).toEqual([]);
+    h.config.spares = 0;
+    await settle(Promise.all([probe, wake, h.configChanged()]));
+    await advance(60_000);
     expect(h.boat.spareCreates(at)).toEqual([]);
   });
 
