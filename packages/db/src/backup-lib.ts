@@ -591,6 +591,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     }
 
     await sql`SELECT 1`;
+    await sql`SET search_path = pg_catalog`;
 
     const emit = (line: string) => writer.emit(line);
     const emitStatement = (statement: string) => {
@@ -789,19 +790,16 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       }
 
       // Primary key
-      const pk = await sql<{ constraint_name: string; column_names: string[] }[]>`
-        SELECT c.conname AS constraint_name,
-               array_agg(a.attname ORDER BY array_position(c.conkey, a.attnum)) AS column_names
+      const pk = await sql<{ constraint_name: string; definition: string }[]>`
+        SELECT c.conname AS constraint_name, pg_get_constraintdef(c.oid) AS definition
         FROM pg_constraint c
         JOIN pg_class t ON t.oid = c.conrelid
         JOIN pg_namespace n ON n.oid = t.relnamespace
-        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
         WHERE n.nspname = ${schema_name} AND t.relname = ${tablename} AND c.contype = 'p'
-        GROUP BY c.conname
+        ORDER BY c.conname
       `;
       for (const p of pk) {
-        const cols = p.column_names.map((c) => `"${c}"`).join(", ");
-        colDefs.push(`  CONSTRAINT "${p.constraint_name}" PRIMARY KEY (${cols})`);
+        colDefs.push(`  CONSTRAINT ${quoteIdentifier(p.constraint_name)} ${p.definition}`);
       }
 
       emit(`CREATE TABLE ${qualifiedTableName} (`);
@@ -823,32 +821,32 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     }
 
     // Unique constraints must exist before foreign keys that reference them.
-    const allUniqueConstraints = await sql<{
+    const allTableConstraints = await sql<{
       constraint_name: string;
       schema_name: string;
       tablename: string;
-      column_names: string[];
+      constraint_type: string;
+      definition: string;
     }[]>`
       SELECT c.conname AS constraint_name,
              n.nspname AS schema_name,
              t.relname AS tablename,
-             array_agg(a.attname ORDER BY array_position(c.conkey, a.attnum)) AS column_names
+             c.contype AS constraint_type,
+             pg_get_constraintdef(c.oid) AS definition
       FROM pg_constraint c
       JOIN pg_class t ON t.oid = c.conrelid
       JOIN pg_namespace n ON n.oid = t.relnamespace
-      JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
-      WHERE c.contype = 'u'
+      WHERE c.contype IN ('u', 'c', 'x')
         AND ${sql.unsafe(nonSystemSchemaPredicate("n.nspname"))}
-      GROUP BY c.conname, n.nspname, t.relname
       ORDER BY n.nspname, t.relname, c.conname
     `;
-    const uniques = allUniqueConstraints.filter((entry) => includedTableNames.has(tableKey(entry.schema_name, entry.tablename)));
+    const tableConstraints = allTableConstraints.filter((entry) => includedTableNames.has(tableKey(entry.schema_name, entry.tablename)));
+    const uniques = tableConstraints.filter((entry) => entry.constraint_type === "u");
 
     if (uniques.length > 0) {
       emit("-- Unique constraints");
       for (const u of uniques) {
-        const cols = u.column_names.map((c) => `"${c}"`).join(", ");
-        emitStatement(`ALTER TABLE ${quoteQualifiedName(u.schema_name, u.tablename)} ADD CONSTRAINT "${u.constraint_name}" UNIQUE (${cols});`);
+        emitStatement(`ALTER TABLE ${quoteQualifiedName(u.schema_name, u.tablename)} ADD CONSTRAINT ${quoteIdentifier(u.constraint_name)} ${u.definition};`);
       }
       emit("");
     }
@@ -860,34 +858,24 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       constraint_name: string;
       source_schema: string;
       source_table: string;
-      source_columns: string[];
       target_schema: string;
       target_table: string;
-      target_columns: string[];
-      update_rule: string;
-      delete_rule: string;
+      definition: string;
     }[]>`
       SELECT
         c.conname AS constraint_name,
         srcn.nspname AS source_schema,
         src.relname AS source_table,
-        array_agg(sa.attname ORDER BY key_columns.ordinal_position) AS source_columns,
         tgtn.nspname AS target_schema,
         tgt.relname AS target_table,
-        array_agg(ta.attname ORDER BY key_columns.ordinal_position) AS target_columns,
-        CASE c.confupdtype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END AS update_rule,
-        CASE c.confdeltype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END AS delete_rule
+        pg_get_constraintdef(c.oid) AS definition
       FROM pg_constraint c
       JOIN pg_class src ON src.oid = c.conrelid
       JOIN pg_namespace srcn ON srcn.oid = src.relnamespace
       JOIN pg_class tgt ON tgt.oid = c.confrelid
       JOIN pg_namespace tgtn ON tgtn.oid = tgt.relnamespace
-      JOIN LATERAL unnest(c.conkey, c.confkey) WITH ORDINALITY AS key_columns(source_attnum, target_attnum, ordinal_position) ON true
-      JOIN pg_attribute sa ON sa.attrelid = src.oid AND sa.attnum = key_columns.source_attnum
-      JOIN pg_attribute ta ON ta.attrelid = tgt.oid AND ta.attnum = key_columns.target_attnum
       WHERE c.contype = 'f'
         AND ${sql.unsafe(nonSystemSchemaPredicate("srcn.nspname"))}
-      GROUP BY c.conname, srcn.nspname, src.relname, tgtn.nspname, tgt.relname, c.confupdtype, c.confdeltype
       ORDER BY srcn.nspname, src.relname, c.conname
     `;
     const fks = allForeignKeys.filter(
@@ -947,10 +935,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     if (fks.length > 0) {
       emit("-- Foreign keys");
       for (const fk of fks) {
-        const srcCols = fk.source_columns.map((c) => `"${c}"`).join(", ");
-        const tgtCols = fk.target_columns.map((c) => `"${c}"`).join(", ");
         emitStatement(
-          `ALTER TABLE ${quoteQualifiedName(fk.source_schema, fk.source_table)} ADD CONSTRAINT "${fk.constraint_name}" FOREIGN KEY (${srcCols}) REFERENCES ${quoteQualifiedName(fk.target_schema, fk.target_table)} (${tgtCols}) ON UPDATE ${fk.update_rule} ON DELETE ${fk.delete_rule};`,
+          `ALTER TABLE ${quoteQualifiedName(fk.source_schema, fk.source_table)} ADD CONSTRAINT ${quoteIdentifier(fk.constraint_name)} ${fk.definition};`,
         );
       }
       emit("");
@@ -1015,6 +1001,51 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         await writer.drain();
       }
       emit("");
+    }
+
+    const postDataConstraints = tableConstraints.filter((entry) => entry.constraint_type !== "u");
+    if (postDataConstraints.length > 0) {
+      emit("-- Check and exclusion constraints");
+      for (const constraint of postDataConstraints) {
+        emitStatement(`ALTER TABLE ${quoteQualifiedName(constraint.schema_name, constraint.tablename)} ADD CONSTRAINT ${quoteIdentifier(constraint.constraint_name)} ${constraint.definition};`);
+      }
+      emit("");
+    }
+
+    const [statisticsSupport] = await sql<{ supported: boolean }[]>`
+      SELECT current_setting('server_version_num')::int >= 140000
+        AND to_regprocedure('pg_catalog.pg_get_statisticsobjdef(oid)') IS NOT NULL AS supported
+    `;
+    if (statisticsSupport?.supported) {
+      const statistics = await sql<{
+        schema_name: string;
+        statistic_name: string;
+        table_schema: string;
+        tablename: string;
+        statistics_target: number | null;
+        definition: string;
+      }[]>`
+        SELECT n.nspname AS schema_name, s.stxname AS statistic_name,
+               tn.nspname AS table_schema, t.relname AS tablename,
+               s.stxstattarget AS statistics_target, pg_get_statisticsobjdef(s.oid) AS definition
+        FROM pg_statistic_ext s
+        JOIN pg_namespace n ON n.oid = s.stxnamespace
+        JOIN pg_class t ON t.oid = s.stxrelid
+        JOIN pg_namespace tn ON tn.oid = t.relnamespace
+        WHERE ${sql.unsafe(nonSystemSchemaPredicate("n.nspname"))}
+        ORDER BY n.nspname, s.stxname
+      `;
+      for (const statistic of statistics) {
+        if (!includedTableNames.has(tableKey(statistic.table_schema, statistic.tablename))) continue;
+        if (statistic.schema_name !== "public" && !schemas.has(statistic.schema_name)) {
+          emitStatement(`CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(statistic.schema_name)};`);
+          schemas.add(statistic.schema_name);
+        }
+        emitStatement(`${statistic.definition};`);
+        if (statistic.statistics_target !== null && statistic.statistics_target >= 0) {
+          emitStatement(`ALTER STATISTICS ${quoteQualifiedName(statistic.schema_name, statistic.statistic_name)} SET STATISTICS ${statistic.statistics_target};`);
+        }
+      }
     }
 
     const allTriggers = await sql<{
