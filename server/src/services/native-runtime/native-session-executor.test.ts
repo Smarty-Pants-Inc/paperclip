@@ -6592,6 +6592,14 @@ describe("retained native cleanup activation", () => {
     "active_finalization_lease",
     "active_provider_process",
   ])("preserves exact original evidence for %s", async (mode) => {
+    if (["settled", "provider_transport_failed", "canonical_source"].includes(mode)) {
+      // These are offline Codex maintenance/custody rows, not Pi Stop or
+      // retained-turn qualification. Keep the original 15s budget and exact
+      // evidence assertions; neither a 2s nor a 5s Pi wait is a prerequisite.
+      expect(execution.provider.kind).toBe("codex");
+      expect(execution.session.driverKind).toBe("codex_app_server");
+      expect(execution.session.lifecyclePolicy?.mode).toBe("per_turn");
+    }
     const directory = await mkdtemp(
       join(tmpdir(), "paperclip-maintenance-activation-"),
     );
