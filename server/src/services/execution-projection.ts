@@ -392,7 +392,7 @@ export function projectExecution(
   const detail = coordinator?.failureDetail ?? {};
   const successorRunId = text(detail.successorRunId);
   const projection: ExecutionProjection = {
-    // A live run is always stoppable by the board (POST /heartbeat-runs/:id/cancel);
+    // A live run is always stoppable by the board or a managing agent (POST /heartbeat-runs/:id/cancel);
     // a failed native run is stoppable only while its retry is still pending.
     canStop: run.status === "running" || run.status === "queued" || (
       run.runtimeMode === "native" && run.status === "failed" && run.driverKind !== "grok_bot_mcp" && !!run.nativeIssueId

@@ -36,7 +36,7 @@ import { notifyScheduledRetryCancellation } from "../scheduled-retry-cancellatio
 import { notifyChatResponseAvailability } from "../chat-response-availability.js";
 import { notifyChatInboundWakeNotices } from "../chat-inbound-wake-notice-notifications.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
-import { assertTaskRetryConversationAllowed, readTaskRetryIntent, readTaskRetryBoardMessageOrigin, retireSupersededTaskRetry, taskRetryMutationAllowed } from "../task-retry.js";
+import { assertTaskRetryConversationAllowed, readTaskRetryIntent, readTaskRetryBoardMessageOrigin, retireSupersededTaskRetry, taskRetryMutationAllowed, taskRetryRequesterType } from "../task-retry.js";
 import { insertIssueComment } from "../issue-comment-writes.js";
 import { withExternalAdmissionGuard, assertNoExternalOverlap } from "../../modules/external-agents/index.js";
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
@@ -2748,22 +2748,25 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     if (executionReconciliationWake && !issueId) return null;
     const durableRequest = opts.durableChatRequest;
     let taskRetryActorId: string | null = null;
+    let taskRetryActorType: "user" | "agent" = "user";
     delete enrichedContextSnapshot.boardMessageRetry;
     if (opts.taskRetryRequestId) {
       const [receipt] = await db.select().from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.id, opts.taskRetryRequestId), eq(agentWakeupRequests.agentId, agentId),
         eq(agentWakeupRequests.status, "deferred_issue_execution"),
-        eq(agentWakeupRequests.requestedByActorType, "user"),
+        inArray(agentWakeupRequests.requestedByActorType, ["user", "agent"]),
         sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId ?? ""}`,
       ));
       const retry = readTaskRetryIntent(receipt?.payload);
       if (!receipt || retry?.generationId !== receipt.id || retry.canonicalIntentId || retry.queuedChatRequestId ||
-          retry.actorId !== receipt.requestedByActorId) return null;
+          retry.actorId !== receipt.requestedByActorId ||
+          receipt.requestedByActorType !== taskRetryRequesterType(retry.actorSource)) return null;
       const chatRetry = retry.chatActionId && durableRequest?.id === retry.chatActionId &&
         durableRequest.failedRunRetry?.failedRunId === retry.sourceRunId;
       if (retry.chatActionId ? !chatRetry :
-          opts.requestedByActorType !== "user" || retry.actorId !== opts.requestedByActorId) return null;
+          opts.requestedByActorType !== taskRetryRequesterType(retry.actorSource) || retry.actorId !== opts.requestedByActorId) return null;
       taskRetryActorId = retry.actorId;
+      taskRetryActorType = taskRetryRequesterType(retry.actorSource);
       enrichedContextSnapshot.forceFreshSession = true;
       enrichedContextSnapshot.previousRunId = retry.sourceRunId;
       enrichedContextSnapshot.taskRetryRequestId = receipt.id;
@@ -3190,8 +3193,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       return null;
     }
 
+    // An agent's task Retry (#21271) meets the same gates as a person's Retry.
+    const userOrRetryWake = opts.requestedByActorType === "user" || Boolean(taskRetryActorId);
     const worktreeExecutionCutoff =
-      opts.requestedByActorType === "user"
+      userOrRetryWake
         ? null
         : await getWorktreeExecutionCutoff();
 
@@ -3204,7 +3209,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     if (!company || company.status !== "active") {
       if (caseRequest) return null;
       const companyStatus = company?.status ?? "missing";
-      if (opts.requestedByActorType === "user") {
+      if (userOrRetryWake) {
         // A paused company is a temporary hold; an archived one is not.
         if (companyStatus === "paused" && (await canSaveDeferredMessage()))
           throw await saveDeferredMessage("company.inactive", "Company is not active", { status: companyStatus });
@@ -3554,7 +3559,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               // system wake. Admission validates the saved user comment or board click.
               (opts.queuedCommentInterruptId ?? opts.queuedCommentRequestId) === executionWaitRequestId
                 ? undefined : eq(agentWakeupRequests.requestedByActorType,
-                    durableRequest ? opts.requestedByActorType ?? "" : "user"),
+                    durableRequest ? opts.requestedByActorType ?? "" : taskRetryActorId ? taskRetryActorType : "user"),
               opts.queuedCommentInterruptId === executionWaitRequestId
                 ? sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'actorId' = ${opts.requestedByActorId ?? ""}`
                 : opts.queuedCommentRequestId === executionWaitRequestId ? undefined
@@ -4209,7 +4214,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             Object.assign(enrichedContextSnapshot, undeliveredContinuationContext(continuationToDeliver, enrichedContextSnapshot));
           if ((executionBlocker || opts.queuedCommentInterruptId) && !ownsReconstructionContinuation && !(await admitExplicitNativeContinuation({
             db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
-            agentId, actorType: taskRetryActorId ? "user" : opts.requestedByActorType, actorId: taskRetryActorId ?? opts.requestedByActorId,
+            agentId, actorType: taskRetryActorId ? taskRetryActorType : opts.requestedByActorType, actorId: taskRetryActorId ?? opts.requestedByActorId,
             reason: taskRetryActorId ? "task_retry" : durableRequest && !failedChatRetry ? "issue_commented" : reason,
             commentId: wakeCommentId ?? null, failedRunId: opts.failedRunId, successorRunId: explicitContinuationRunId,
             queuedCommentInterruptId: opts.queuedCommentInterruptId,
@@ -5105,7 +5110,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
           const explicitContinuation = await admitExplicitNativeContinuation({
             db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
-            agentId, actorType: taskRetryActorId ? "user" : opts.requestedByActorType, actorId: taskRetryActorId ?? opts.requestedByActorId,
+            agentId, actorType: taskRetryActorId ? taskRetryActorType : opts.requestedByActorType, actorId: taskRetryActorId ?? opts.requestedByActorId,
             reason: taskRetryActorId ? "task_retry" : durableRequest && !failedChatRetry ? "issue_commented" : reason,
             commentId: wakeCommentId ?? null, failedRunId: opts.failedRunId, successorRunId: explicitContinuationRunId,
             queuedCommentInterruptId: opts.queuedCommentInterruptId,

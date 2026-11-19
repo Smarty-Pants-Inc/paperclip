@@ -66,6 +66,7 @@ import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { assertAgentTaskRetryAllowed } from "../services/agent-task-retry-authority.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -10491,19 +10492,23 @@ export function issueRoutes(
   });
 
   router.post("/issues/:id/retry", validate(taskRetrySchema), async (req, res) => {
-    assertBoard(req);
+    // A board user, or (#21271) an agent for a non-chat task assigned to itself
+    // or to an agent it manages. Both enter the same durable requestTaskRetry.
+    const agentRetry = req.actor.type === "agent";
+    if (!agentRetry) assertBoard(req);
     const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
     if (!issue || !(await assertIssueReadAllowed(req, res, issue))) return;
     const decision = await decideIssueAccess(req, issue, "issue:mutate");
     if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
-    if (issue.conversationAgentId) {
+    if (agentRetry) await assertAgentTaskRetryAllowed(db, req.actor, issue);
+    else if (issue.conversationAgentId) {
       if (!(await instanceSettings.getExperimental()).enableAgentChat) throw notFound("Agent Chat is disabled");
       if (!req.actor.userId || req.actor.userId !== issue.conversationUserId)
         throw forbidden("Only the conversation owner can retry a chat run");
     }
     const { requestTaskRetry } = await import("../services/task-retry.js");
     const receipt = await requestTaskRetry({ db, companyId: issue.companyId, issueId: issue.id,
-      ...req.body, actorId: getActorInfo(req).actorId, actorSource: req.actor.source,
+      ...req.body, actorId: getActorInfo(req).actorId, actorSource: agentRetry ? "agent" : req.actor.source,
       prepareChatRetry: opts.chatRunRetries?.prepareFailedChatRunRetry });
     const actor = getActorInfo(req);
     const scheduledRetryRunId = "scheduledRetryRunId" in receipt ? receipt.scheduledRetryRunId : undefined;

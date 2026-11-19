@@ -727,6 +727,9 @@ export const APPROVAL_TYPES = [
   "approve_ceo_strategy",
   "budget_override_required",
   "request_board_approval",
+  // A person's selected primary agent asks to create one new organization for
+  // them; approving it creates that exact organization once (#21271).
+  "create_company",
 ] as const;
 export type ApprovalType = (typeof APPROVAL_TYPES)[number];
 

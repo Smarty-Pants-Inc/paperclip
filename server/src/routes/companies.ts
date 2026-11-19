@@ -67,6 +67,7 @@ import {
   workTimelineService,
 } from "../services/index.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
+import { provisionCompany } from "../services/company-provisioning.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import type { StorageService } from "../storage/types.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo, hasCompanyAccess } from "./authz.js";
@@ -1218,38 +1219,9 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       throw forbidden("Instance admin required");
     }
     const ownerPrincipalId = req.actor.userId ?? "local-board";
-    const company = await svc.create({
-      ...req.body,
-      defaultResponsibleUserId: req.body.defaultResponsibleUserId ?? ownerPrincipalId,
+    const company = await provisionCompany(db, { svc, access, budgets, logActivity }, {
+      company: req.body, ownerPrincipalId, actorUserId: req.actor.userId ?? null,
     });
-    await access.ensureMembership(company.id, "user", ownerPrincipalId, "owner", "active");
-    await access.ensureRoleDefaultGrants(
-      company.id,
-      ownerPrincipalId,
-      "owner",
-      req.actor.userId ?? null,
-    );
-    await logActivity(db, {
-      companyId: company.id,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
-      action: "company.created",
-      entityType: "company",
-      entityId: company.id,
-      details: { name: company.name },
-    });
-    if (company.budgetMonthlyCents > 0) {
-      await budgets.upsertPolicy(
-        company.id,
-        {
-          scopeType: "company",
-          scopeId: company.id,
-          amount: company.budgetMonthlyCents,
-          windowKind: "calendar_month_utc",
-        },
-        req.actor.userId ?? "board",
-      );
-    }
     res.status(201).json(company);
   });
 

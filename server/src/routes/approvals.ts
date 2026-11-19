@@ -9,7 +9,8 @@ import {
   resolveApprovalSchema,
   resubmitApprovalSchema,
 } from "@paperclipai/shared";
-import { notFound, unprocessable } from "../errors.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
+import { approveCompanyCreation, requestCompanyCreation } from "../services/company-creation-approval.js";
 import { resolvableApprovalStatuses } from "../lib/approval-records.js";
 import { attentionAlreadyClosedError } from "../services/attention-already-closed.js";
 import { attentionHandledDetails, attentionHandledFor, type AttentionHandledFor } from "../services/attention-receipts.js";
@@ -405,6 +406,21 @@ export function approvalRoutes(
       : [];
     const uniqueIssueIds = Array.from(new Set(issueIds));
     const { issueIds: _issueIds, ...approvalInput } = req.body;
+    if (approvalInput.type === "create_company") {
+      // #21271: only the owner's selected primary agent; one card per request.
+      const { approval, created } = await requestCompanyCreation(db, { companyId, actor: req.actor, payload: approvalInput.payload });
+      const actor = getActorInfo(req);
+      if (created) {
+        if (uniqueIssueIds.length > 0) {
+          await issueApprovalsSvc.linkManyForApproval(approval.id, uniqueIssueIds, { agentId: actor.agentId, userId: null });
+        }
+        await logActivity(db, { companyId, actorType: actor.actorType, actorId: actor.actorId, agentId: actor.agentId,
+          action: "approval.created", entityType: "approval", entityId: approval.id,
+          details: { type: approval.type, issueIds: uniqueIssueIds } });
+      }
+      res.status(created ? 201 : 200).json(redactApprovalPayload(approval));
+      return;
+    }
     const normalizedPayload =
       approvalInput.type === "hire_agent"
         ? await secretsSvc.normalizeHireApprovalPayloadForPersistence(
@@ -468,7 +484,12 @@ export function approvalRoutes(
     const decidedByUserId = req.actor.userId ?? "board";
     // Who the card was for, read before the decision (PAP-749 plan §6).
     const handledFor = await approvalHandledFor(id, req.actor.userId);
-    const { approval, applied } = await svc.approve(id, decidedByUserId, req.body.decisionNote);
+    const card = await svc.getById(id);
+    // #21271: a create_company card runs its one creation effect, under the same
+    // approver gates as POST /api/companies; a replay returns the same company.
+    const { approval, applied } = card?.type === "create_company"
+      ? await approveCompanyCreation(db, { approvalId: id, actor: req.actor, decisionNote: req.body.decisionNote })
+      : await svc.approve(id, decidedByUserId, req.body.decisionNote);
 
     if (applied) {
       const linkedIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);
@@ -586,6 +607,9 @@ export function approvalRoutes(
     }
     const decidedByUserId = req.actor.userId ?? "board";
     const handledFor = await approvalHandledFor(id, req.actor.userId);
+    const card = await svc.getById(id);
+    if (card?.type === "create_company" && typeof card.payload.reservedCompanyId === "string" && card.status !== "rejected")
+      throw conflict("This organization is already being created; approve it again to finish.");
     const { approval, applied } = await svc.reject(id, decidedByUserId, req.body.decisionNote);
 
     if (applied) {

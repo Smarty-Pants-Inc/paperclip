@@ -15,7 +15,7 @@ import { LEASE_RELEASE_DEFERRAL_KEY, nativeRunNeverLaunchedRunner, readLeaseRele
   settleUnchangedNativeWorkspace, wakeStoppingAgentLifecycle, nextLeaseReleaseTriggers, nextLeaseReleaseBootIds, nextLeaseReleaseRetryAt,
   type LeaseReleaseDeferral } from "../environment-lease-release-deferral.js";
 import { pendingFailedNativeRetryCancellationCondition } from "../native-runtime/native-cancellation-request.js";
-import { readTaskRetryIntent, reconcileTaskChatRetryReceipts } from "../task-retry.js";
+import { readTaskRetryIntent, reconcileTaskChatRetryReceipts, taskRetryRequesterType } from "../task-retry.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, readNativeLocalProcessStop, recordedLocalExecutionStopped } from "../native-local-process-stop.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import { pendingCaseHandoffForRun, cancelCaseHandoffsForIssue, isCaseHandoffSourceReleased } from "./case-handoff-lifecycle.js";
@@ -1003,9 +1003,10 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     const [wake] = await db.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, requestId),
       eq(agentWakeupRequests.status, "deferred_issue_execution"), eq(agentWakeupRequests.reason, "task_retry"),
-      eq(agentWakeupRequests.requestedByActorType, "user"),
+      inArray(agentWakeupRequests.requestedByActorType, ["user", "agent"]),
     ));
     const intent = readTaskRetryIntent(wake?.payload);
+    if (intent && wake && wake.requestedByActorType !== taskRetryRequesterType(intent.actorSource)) return;
     if (intent?.queuedChatRequestId) {
       await reconcileTaskChatRetryReceipts(db, { companyId, requestId });
       return;
@@ -1014,10 +1015,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         intent.actorId !== wake.requestedByActorId) return;
     const issueId = readNonEmptyString(wake.payload?.issueId);
     if (!issueId) return;
+    const agentRetry = intent.actorSource === "agent";
     await enqueueWakeup(wake.agentId, { source: "on_demand", triggerDetail: "manual", reason: "task_retry",
-      requestedByActorType: "user", requestedByActorId: intent.actorId, taskRetryRequestId: wake.id,
-      payload: { issueId }, contextSnapshot: { issueId, triggeredBy: "board", actorId: intent.actorId,
-        responsibleUserId: intent.actorId },
+      requestedByActorType: taskRetryRequesterType(intent.actorSource), requestedByActorId: intent.actorId, taskRetryRequestId: wake.id,
+      // An agent's Retry names the agent; it never claims a person as responsible.
+      payload: { issueId }, contextSnapshot: agentRetry ? { issueId, triggeredBy: "agent", actorId: intent.actorId }
+        : { issueId, triggeredBy: "board", actorId: intent.actorId, responsibleUserId: intent.actorId },
       issueStateGuard: { assigneeAgentId: wake.agentId, statuses: ["todo", "in_progress", "in_review", "blocked"] },
       idempotencyKey: `task-retry-dispatch:${wake.id}` }, wake.id);
     // Admission held this Retry because its source run's files are saved and
