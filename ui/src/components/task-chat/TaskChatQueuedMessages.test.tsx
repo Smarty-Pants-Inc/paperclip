@@ -83,10 +83,13 @@ describe("TaskChatQueuedMessages", () => {
     return props;
   }
 
-  it("keeps saved input visible without duplicating the task status", () => {
-    const message = "Waiting for the previous environment to stop. Your message will start automatically.";
-    render({ queue: { ...queue, executionWait: { reason: "remote_cleanup", message } } });
-    expect(container.textContent).not.toContain(message);
+  // Planted component control, paired with captured real GET rows rendered by
+  // TaskChatExecutionWait.real-route.test.tsx on task and chat.
+  it("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119: planted receipt-backed input has exactly one truthful deferred status", () => {
+    const message = "Your message is saved. It starts once the stopped run finishes cleaning up.";
+    render({ queue: { ...queue, targetRunId: null, executionWait: { reason: "remote_cleanup", message } } });
+    expect([...container.querySelectorAll('p[role="status"]')].map(node => node.textContent)).toEqual([message]);
+    expect(container.textContent?.split(message)).toHaveLength(2);
     expect(container.textContent).toContain("First queued message");
     render();
     expect(container.textContent).not.toContain(message);

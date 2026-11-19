@@ -49,7 +49,10 @@ import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotic
 import { settleUnansweredPersonMessage, settleUnansweredPersonMessagesForTask, unansweredPersonMessageCommentCondition,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
   UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY,
-  PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS, PENDING_WAIT_START_BOUND_MS } from "./unanswered-person-message.js";
+  PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS } from "./unanswered-person-message.js";
+// mcomp: merged10 (de524143) retired the exported PENDING_WAIT_START_BOUND_MS; merged9's two "later too" rows keep
+// their own clock (ten minutes, the former start bound) so their assertions are unchanged.
+const PENDING_WAIT_START_BOUND_MS = 10 * 60_000;
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
 // visible notice from the stranded sweep, in plain words, with the code in the
@@ -994,6 +997,8 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   // Keep: S10-1, gate 3, 2026-11-17: Stop cancelled 6a1cdfa9; the next
   // message's 6558f709 wake waited on remote_cleanup, then 0a65c27c answered.
   // The sweep falsely said "no run started" while that attempt was pending.
+  // planted state-only controls; paired with production admission + real GET
+  // rows of the same wake shape in execution-wait-one-line-routes.test.ts.
   async function stoppedMessageWithWait(status: string, executionWait: unknown) {
     const f = await fixture();
     // The Stop is the REAL route (merged9 item 3, RULING-FIXTURES-FROM-REAL-PRODUCER-1118): the sender presses Stop
@@ -1092,26 +1097,16 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await f.earlierStoppedBySender();
     });
 
-  it("waitnote: execution_recovery uses the existing start bound and posts ONE no-run note after it", async () => {
+  it("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119: planted execution_recovery stays on the panel line, with no no-run note beyond ten minutes", async () => {
     const f = await stoppedMessageWithWait("deferred_issue_execution", { reason: "execution_recovery", message: "Recovery will retry automatically." });
     await f.sweep();
-    expect(await f.own()).toHaveLength(0);
-    await settleAt(f, PENDING_WAIT_BOUND_MS + 1_000);
-    // waitnote port: upstream 021d56649 retired the waiting NOTE (the turn header says "Waiting to start"); a pending wait shows no note.
-    expect(await f.own()).toHaveLength(0);
-    await settleAt(f, PENDING_WAIT_START_BOUND_MS - 1_000);
-    expect(await f.own()).toHaveLength(0);
-    await settleAt(f, PENDING_WAIT_START_BOUND_MS + 1_000);
-    const notes = await f.own();
-    expect(notes).toHaveLength(1);
-    expect(notes[0]!.body).toBe(NO_RUN);
-    expect(codeOf(notes[0]!)).toBe("no_run");
-    await settleAt(f, PENDING_WAIT_START_BOUND_MS + 60_000);
-    expect(await f.own()).toHaveLength(1);
-    await f.earlierStoppedBySender();
-    // T0 is recorded ONCE, for the one message that waited (the sender-stopped message is not owed, so it never waits).
-    expect((await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId), eq(activityLog.action, PENDING_WAIT_ACTION))))
-      .map(row => (row.details as Record<string, unknown>).messageId).sort()).toEqual([f.commentId]);
+    for (const elapsed of [PENDING_WAIT_BOUND_MS + 1_000, 599_000, 601_000, 660_000]) {
+      await settleAt(f, elapsed);
+      expect(await f.visible()).toHaveLength(0);
+    }
+    // A stored executionWait is already visible; no second bounded-note clock.
+    expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId), eq(activityLog.action, PENDING_WAIT_ACTION))))
+      .toHaveLength(0);
   });
 
   it.each(["deferred", "deferred_issue_execution"].flatMap(status =>
@@ -1289,11 +1284,11 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
-  // RFL 03:16Z (E3.04): only a RUNNING turn is unbounded. A queued run that
-  // carries the message is bounded. Upstream's turn header names that wait
-  // (#21447 useWaitingToStart: "Waiting to start" after 30 s for a run whose
-  // status is queued and whose execution projection names no hold, cause null;
-  // #21564: named once, in the header), so B' adds no thread note of its own.
+  // SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 supersedes E3.04's second bound:
+  // a carrying queued run keeps upstream's one header, including past ten
+  // minutes. With no named hold it says "Waiting to start" after 30 s
+  // (#21447 useWaitingToStart, #21564); a full agent has "Waiting for <name>".
+  // The production route + rendered-header row covers that busy-agent shape.
   const headerSaysWaitingToStart = async (f: { companyId: string }, runId: string) => {
     const projection = (await executionProjectionsForRuns(db, f.companyId, [runId])).get(runId);
     expect(projection, "the turn header reads this run's execution projection").toBeDefined();
@@ -1319,12 +1314,11 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
-  // RFL 03:26Z: the wait must stay bounded. A carrying run that still has not
-  // started by T0 + 10 min gets ONE no-run note; until then the turn header
-  // says it is waiting to start, and the obligation stays open.
+  // SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119: a queued RUN owns its header
+  // until it starts or ends. A no-run note beside that header is a second line.
   const rowsOf = (notice: { metadata: unknown }) =>
     ((notice.metadata as { sections?: Array<{ rows: Array<{ label?: string; value?: string }> }> })?.sections ?? []).flatMap(section => section.rows);
-  it("E3.04 (2nd bound): a carrying queued run that never starts -> the turn header says it is waiting to start, no note until ~10 min, then ONE no-run note; its answer supersedes it", async () => {
+  it("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119: planted carrying queued run keeps 'Waiting to start', no note after ten minutes; its answer leaves none", async () => {
     const f = await fixture();
     const commentId = await f.message();
     const queued = await f.run({ commentId, status: "queued" });
@@ -1337,23 +1331,17 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await settleAt(f, 6 * 60_000);
     expect(await f.visible()).toHaveLength(0);
     await settleAt(f, 11 * 60_000);
-    let notices = await f.visible();
-    expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_RUN);
-    // Keep c2's written-open notice contract on the surviving bounded note.
-    expect(notices[0]!.presentation).toMatchObject({ detailsDefaultOpen: true });
-    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
-    expect(rowsOf(notices[0]!).some(row => row.label === "Waiting code")).toBe(false);
+    expect(await f.visible()).toHaveLength(0);
+    await headerSaysWaitingToStart(f, queued);
     await settleAt(f, 12 * 60_000);
-    expect(await f.visible()).toHaveLength(1);
+    expect(await f.visible()).toHaveLength(0);
     await db.update(heartbeatRuns).set({ status: "succeeded", startedAt: new Date(), finishedAt: new Date() }).where(eq(heartbeatRuns.id, queued));
     await f.reply(queued);
     await settleAt(f, 13 * 60_000);
-    notices = await f.visible();
-    expect(notices).toHaveLength(0);
+    expect(await f.visible()).toHaveLength(0);
   });
 
-  it("E3.04 (2nd bound) control: the carrying run starts at 5 min -> no note at any point (header waited, then a running turn), and its answer leaves none", async () => {
+  it("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 planted control: the carrying run starts at 5 min -> no note (header waited, then a running turn), and its answer leaves none", async () => {
     const f = await fixture();
     const commentId = await f.message();
     const queued = await f.run({ commentId, status: "queued" });
@@ -1800,11 +1788,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await settleUnansweredPersonMessage(db, { ...f, now: new Date(Date.now() + 180_000) }))
       .toMatchObject({ kind: "pending" });
     expect(await f.visible()).toHaveLength(0);
-    // A real output-cap successor still queued beyond the ordinary start
-    // bound is waiting work, not permission to send duplicate input.
+    // A planted output-cap successor still queued beyond the former start
+    // bound retains the header, not permission to send duplicate input.
     expect(await settleUnansweredPersonMessage(db, { ...f, now: new Date(Date.now() + 20 * 60_000) }))
       .toMatchObject({ kind: "pending" });
     expect(await f.visible()).toHaveLength(0);
+    await headerSaysWaitingToStart(f, successor);
     await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, successor));
     expect(await settleUnansweredPersonMessage(db, { ...f, now: new Date(Date.now() + 240_000) }))
       .toMatchObject({ kind: "pending" });
