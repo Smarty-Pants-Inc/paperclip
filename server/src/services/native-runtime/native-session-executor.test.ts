@@ -12040,6 +12040,328 @@ describe("bounded stopped instruction collection", () => {
   });
 });
 
+// READ.md §4 / case card pl-warm-evidence-copy: a succeeded warm Boat run keeps
+// its box and session (keep_running), and its provider trace still gets a
+// verified, evidence-only copy off the box right after the turn settles.
+describe("warm native session evidence copy", () => {
+  const EVIDENCE_KIND = "paperclip.native-session-evidence.v1";
+  async function warmEvidenceFixture(label: string) {
+    const tables = await import("@paperclipai/db");
+    const { and, sql } = await import("drizzle-orm");
+    const { logger } = await import("../../middleware/logger.js");
+    const { promisify } = await import("node:util");
+    const executeCommand = promisify(execFile);
+    const { startRecoveryPostgres } = await import("../../__tests__/helpers/recovery-postgres.js");
+    const { prepareNativeHeartbeatRun } = await import("./prepare-native-run.js");
+    const { buildNativeCompletionContract } = await import("./completion-contracts.js");
+    const { createLocalDiskStorageProvider } = await import("../../storage/local-disk-provider.js");
+    const { createStorageService } = await import("../../storage/service.js");
+    const home = await realpath(await mkdtemp(join(tmpdir(), `warm-evidence-${label}-`)));
+    const previousHome = process.env.PAPERCLIP_HOME;
+    process.env.PAPERCLIP_HOME = home;
+    const database = await startRecoveryPostgres(`warm-evidence-${label}-`);
+    const db = tables.createDb(database.connectionString);
+    const companyId = randomUUID(), agentId = randomUUID(), userId = randomUUID(), environmentId = randomUUID(), issueId = randomUUID();
+    const remoteCwd = join(home, "remote");
+    await mkdir(remoteCwd, { recursive: true });
+    // The real storage service over local-disk object storage.
+    const realStorage = createStorageService(createLocalDiskStorageProvider(join(home, "objects")));
+    const storageFaults = { putFailures: 0 };
+    const storage = new Proxy(realStorage, { get(target, property) {
+      if (property === "putFile") return async (...args: Parameters<typeof realStorage.putFile>) => {
+        if (storageFaults.putFailures > 0) { storageFaults.putFailures--; throw new Error("injected storage outage before publication"); }
+        return realStorage.putFile(...args);
+      };
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+    } }) as typeof realStorage;
+    const storageSpy = vi.spyOn(harnessStorage, "durableNativeHarnessStorage").mockReturnValue(storage);
+    // The remote command runner fixture: real shell commands on a local "box".
+    const commands: string[] = [];
+    const evidenceGate = { stalled: null as null | Promise<void>, reached: null as null | (() => void) };
+    const commandRunner: import("@paperclipai/adapter-utils/command-managed-runtime").CommandManagedRuntimeRunner = { execute: async input => {
+      const command = `${input.command} ${(input.args ?? []).join(" ")}`;
+      commands.push(command);
+      if (evidenceGate.stalled && command.includes("tar ") && command.includes("-czf -")) {
+        evidenceGate.reached?.();
+        await evidenceGate.stalled;
+      }
+      const env = { PATH: process.env.PATH, ...input.env }, args = [...(input.args ?? [])];
+      if (input.stdin != null && (args[0] === "-c" || args[0] === "-lc")) {
+        Object.assign(env, { PAPERCLIP_TEST_STDIN: input.stdin });
+        args[1] = `printf '%s' "$PAPERCLIP_TEST_STDIN" | (${args[1]})`;
+      }
+      try {
+        const result = await executeCommand(input.command, args, { cwd: input.cwd, env, timeout: input.timeoutMs, maxBuffer: 64 * 1024 * 1024 });
+        return { exitCode: 0, signal: null, timedOut: false, ...result, pid: null, startedAt: new Date().toISOString() };
+      } catch (error) {
+        const failed = error as { code?: number; stdout?: string; stderr?: string };
+        return { exitCode: typeof failed.code === "number" ? failed.code : 1, signal: null, timedOut: false,
+          stdout: failed.stdout ?? "", stderr: failed.stderr ?? "", pid: null, startedAt: new Date().toISOString() };
+      }
+    } };
+    const codexHome = join(remoteCwd, ".paperclip-runtime", "paperclip-runner", "sessions",
+      createHash("sha256").update(environmentId).digest("hex"), "filesystem", "codex-home");
+    const session = { close: vi.fn(async () => undefined) };
+    let turnNumber = 0;
+    const currentTurn: { execution?: NativeExecutionInputV3; leaseId?: string } = {};
+    state.execute.mockReset().mockImplementation(async options => {
+      await options.onSession?.(session);
+      // The provider writes this turn's history into its persistent home.
+      turnNumber++;
+      await mkdir(join(codexHome, "sessions"), { recursive: true });
+      await writeFile(join(codexHome, "sessions", "rollout.jsonl"),
+        `${await readFile(join(codexHome, "sessions", "rollout.jsonl"), "utf8").catch(() => "")}{"turn":${turnNumber},"text":"turn-${turnNumber} history"}\n`);
+      await writeFile(join(codexHome, "auth.json"), "{\"secret\":\"never copied\"}");
+      // What the real Runner commits for this run: its durable control-plane identity.
+      const stateRoot = executorModule.scopedRunnerdStateRoot(currentTurn.execution!);
+      await mkdir(join(stateRoot, "control-plane"), { recursive: true });
+      await writeFile(join(stateRoot, "control-plane", "control-plane-state.json"), JSON.stringify(durableControlPlaneState({
+        runId: currentTurn.execution!.binding.runId, normalizedSessionId: environmentId, runnerInstanceId: environmentId,
+        environmentLeaseId: currentTurn.leaseId })));
+      return { result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" },
+        turnId: `warm-turn-${turnNumber}`, normalizedSessionId: environmentId, providerSessionId: environmentId,
+        driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    });
+    await db.insert(tables.companies).values({ id: companyId, name: "Warm evidence", issuePrefix: "WEV" });
+    await db.insert(tables.authUsers).values({ id: userId, name: "Editor", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+    await db.insert(tables.agents).values({ id: agentId, companyId, name: "Warm evidence", adapterConfig: {} });
+    await db.insert(tables.environments).values({ id: environmentId, name: "Owned fake remote", driver: "sandbox" });
+    const [issue] = await db.insert(tables.issues).values({ id: issueId, companyId, title: "Warm evidence", status: "in_progress", assigneeAgentId: agentId }).returning();
+    let prior: NativeExecutionInputV3 | undefined;
+    let priorLease = "";
+    const turnMs: number[] = [];
+    const runTurn = async () => {
+      const runId = randomUUID(), leaseId = randomUUID();
+      if (prior) {
+        // keep_running hand-back of the reusable lease (environment-runtime 4882-4902).
+        await db.update(tables.environmentLeases).set({ status: "retained", cleanupStatus: "success" }).where(eq(tables.environmentLeases.id, priorLease));
+        // Heartbeat persists the settled run's native input (its runner profile).
+        const [settled] = await db.select().from(tables.heartbeatRuns).where(eq(tables.heartbeatRuns.id, prior.binding.runId));
+        await db.update(tables.heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(),
+          runnerProfileJson: { ...(settled?.runnerProfileJson as Record<string, unknown> | null ?? {}), nativeExecutionInput: prior } })
+          .where(eq(tables.heartbeatRuns.id, prior.binding.runId));
+      }
+      const [run] = await db.insert(tables.heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId,
+        status: "running", runtimeMode: "native", nativeIssueId: issueId, nativeSessionId: environmentId, runnerInstanceId: environmentId,
+        contextSnapshot: { issueId } }).returning();
+      await db.insert(tables.nativeRunFinalizations).values({ runId, companyId, issueId, phase: "observed" });
+      await db.update(tables.issues).set({ executionRunId: runId }).where(eq(tables.issues.id, issueId));
+      await db.insert(tables.environmentLeases).values({ id: leaseId, companyId, environmentId, heartbeatRunId: runId,
+        provider: "daytona", providerLeaseId: "same-warm-box", leasePolicy: "reuse_by_environment", metadata: { remoteCwd } });
+      await prepareNativeHeartbeatRun({ db, run: run!, issue: issue!, environmentLeaseId: leaseId });
+      const [contract] = await db.select().from(tables.completionContracts).where(eq(tables.completionContracts.issueId, issueId));
+      const target = { kind: "remote" as const, transport: "sandbox" as const, providerKey: "daytona", environmentId, leaseId, remoteCwd,
+        runner: commandRunner, sandboxLeaseAcquisition: { outcome: prior ? "resumed" as const : "created" as const, providerLeaseId: "same-warm-box" } };
+      const current: NativeExecutionInputV3 = { ...execution, schema: "paperclip.native-execution-input.v3",
+        executionMode: "default", planningContext: null, runtimeContext: nativeRuntimeContextFixture(),
+        completionContract: { id: contract!.id, sha256: contract!.canonicalSha256, schemaVersion: "paperclip.completion-contract.v1",
+          contract: buildNativeCompletionContract(issue!, { revision: contract!.revision }) }, binding: { companyId, agentId, issueId, runId, executionWorkspaceId: runId },
+        workspace: { cwd: remoteCwd, repoUrl: null, repoRef: null, branchName: null },
+        session: { ...execution.session, normalizedSessionId: environmentId, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 8 * 60 * 60_000 } } };
+      currentTurn.execution = current; currentTurn.leaseId = leaseId;
+      const started = performance.now();
+      // The paperclip_runner adapter path (heartbeat runtime-execution.ts useRunnerd).
+      await executePaperclipNativeSession({ db, execution: current, runnerInstanceId: environmentId, runnerExecutionTarget: target,
+        useRunnerd: true, runnerIngressAuthorized: true });
+      turnMs.push(performance.now() - started);
+      prior = current; priorLease = leaseId;
+      return { runId, leaseId };
+    };
+    const evidenceRows = (runId: string, status?: string) => db.select().from(tables.nativeHarnessBackups).where(and(
+      eq(tables.nativeHarnessBackups.runId, runId), sql`${tables.nativeHarnessBackups.reference}->>'kind' = ${EVIDENCE_KIND}`,
+      status ? eq(tables.nativeHarnessBackups.status, status) : undefined));
+    const waitFor = async <T,>(read: () => Promise<T>, done: (value: T) => boolean, timeoutMs = 20_000): Promise<T> => {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const value = await read();
+        if (done(value) || Date.now() >= deadline) return value;
+        await new Promise(resolveDelay => setTimeout(resolveDelay, 50));
+      }
+    };
+    const leaseMetadata = async (leaseId: string) => (await db.select().from(tables.environmentLeases)
+      .where(eq(tables.environmentLeases.id, leaseId)))[0]?.metadata as Record<string, unknown> | null;
+    /** Read the stored object back and open it: hash, then the archive's files. */
+    const openEvidence = async (row: typeof tables.nativeHarnessBackups.$inferSelect) => {
+      const { createLocalEncryptedCipher } = await import("../../secrets/local-encrypted-provider.js");
+      const { restoreNativeHarnessArchive } = await import("./native-harness-backup-archive.js");
+      const { createDecipheriv } = await import("node:crypto");
+      const ref = row.reference as { objectKey: string; sha256: string; byteSize: number; material: string; companyId: string; scopeDigest: string; id: string; kind?: string };
+      const object = await realStorage.getObject(ref.companyId, ref.objectKey);
+      const chunks: Buffer[] = [];
+      for await (const chunk of object.stream) chunks.push(Buffer.from(chunk));
+      const encrypted = Buffer.concat(chunks);
+      const wrapped = JSON.parse(createLocalEncryptedCipher("read").decrypt(ref.material as never));
+      const decipher = createDecipheriv("aes-256-gcm", Buffer.from(wrapped.key, "base64"), Buffer.from(wrapped.iv, "base64"));
+      decipher.setAAD(Buffer.from(JSON.stringify(["paperclip.native-harness-object.v1", ref.companyId, ref.scopeDigest, ref.id])));
+      decipher.setAuthTag(Buffer.from(wrapped.tag, "base64"));
+      const scratch = await mkdtemp(join(tmpdir(), "warm-evidence-open-"));
+      await writeFile(join(scratch, "archive"), Buffer.concat([decipher.update(encrypted), decipher.final()]));
+      await restoreNativeHarnessArchive(join(scratch, "archive"), join(scratch, "restored"));
+      return { objectSha256: createHash("sha256").update(encrypted).digest("hex"), byteSize: encrypted.length, ref,
+        manifest: JSON.parse(await readFile(join(scratch, "restored", "manifest.json"), "utf8")),
+        root: join(scratch, "restored") };
+    };
+    /** sha256 + bytes of the box's provider directory, excluding launch credentials. */
+    const boxInventory = async () => {
+      const { stdout } = await executeCommand("sh", ["-c", `export LC_ALL=C; cd '${codexHome}'; find . \\( -path ./auth.json \\) -prune -o -type f -print | sort | while IFS= read -r f; do b=$(wc -c < "$f" | tr -d ' '); h=$(sha256sum < "$f"); printf '%s %s %s\\n' "\${h%% *}" "$b" "$f"; done`]);
+      return { listing: stdout, sha256: createHash("sha256").update(stdout).digest("hex") };
+    };
+    const boxTree = async () => (await executeCommand("sh", ["-c", `cd '${remoteCwd}' && find . | LC_ALL=C sort`])).stdout;
+    const cleanup = async () => {
+      // Let any copy still in flight settle before stopping its database.
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 200));
+      await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "test cleanup" }).catch(() => undefined);
+      storageSpy.mockRestore();
+      await database.cleanup().catch(() => undefined);
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
+      await rm(home, { recursive: true, force: true }).catch(() => undefined);
+    };
+    return { db, tables, companyId, issueId, environmentId, session, runTurn, evidenceRows, waitFor, openEvidence, boxInventory, boxTree,
+      leaseMetadata, storageFaults, evidenceGate, commands, turnMs, cleanup, realStorage, codexHome, logger };
+  }
+
+  it("(a)(d) copies each succeeded warm turn's trace off the box before any close, verified, while the warm box and session are reused", async () => {
+    const f = await warmEvidenceFixture("warm");
+    try {
+      const first = await f.runTurn();
+      console.log(JSON.stringify({ warmEvidenceFirstTurnMs: Math.round(f.turnMs[0]!) }));
+      // The run returned without waiting for the copy; the session stays warm and open.
+      expect(f.session.close).not.toHaveBeenCalled();
+      const [row1] = await f.waitFor(() => f.evidenceRows(first.runId, "current"), rows => rows.length === 1);
+      expect(row1, "a succeeded warm turn has an off-box evidence copy before any close / 8 h / lease end").toBeDefined();
+      expect(f.session.close).not.toHaveBeenCalled();
+      const box1 = await f.boxInventory();
+      const opened1 = await f.openEvidence(row1!);
+      // Object read back: hash and size match the receipt; contents match the box.
+      expect(opened1.objectSha256).toBe(opened1.ref.sha256);
+      expect(opened1.byteSize).toBe(opened1.ref.byteSize);
+      expect(opened1.manifest).toMatchObject({ kind: EVIDENCE_KIND, restorable: false, companyId: f.companyId, runId: first.runId,
+        normalizedSessionId: f.environmentId, providerLeaseId: "same-warm-box" });
+      expect(opened1.manifest.directories[0]).toMatchObject({ name: "codex-home", sha256: box1.sha256 });
+      expect(opened1.manifest.directories[0].afterSha256).toBe(box1.sha256);
+      expect(await readFile(join(opened1.root, "codex-home", "sessions", "rollout.jsonl"), "utf8")).toContain("turn-1 history");
+      await expect(readFile(join(opened1.root, "codex-home", "auth.json"))).rejects.toMatchObject({ code: "ENOENT" });
+      // Bound to company, run and the normalized session scope; a distinct per-run scope.
+      expect(row1).toMatchObject({ companyId: f.companyId, runId: first.runId, issueId: f.issueId, status: "current" });
+      // The pending marker written at schedule time clears once the copy is complete.
+      expect((await f.waitFor(() => f.leaseMetadata(first.leaseId), metadata => metadata?.nativeSessionEvidencePending === undefined, 5_000))
+        ?.nativeSessionEvidencePending).toBeUndefined();
+      // (d) The next run on the same warm box reuses the same session and gets its own copy.
+      const second = await f.runTurn();
+      expect(state.execute.mock.calls.at(-1)?.[0].existingSession).toBe(f.session);
+      expect(f.session.close).not.toHaveBeenCalled();
+      const [row2] = await f.waitFor(() => f.evidenceRows(second.runId, "current"), rows => rows.length === 1);
+      expect(row2).toBeDefined();
+      expect(row2!.scopeDigest).not.toBe(row1!.scopeDigest);
+      const opened2 = await f.openEvidence(row2!);
+      expect(await readFile(join(opened2.root, "codex-home", "sessions", "rollout.jsonl"), "utf8")).toMatch(/turn-1 history[\s\S]*turn-2 history/);
+      expect(opened2.manifest.directories[0].sha256).toBe((await f.boxInventory()).sha256);
+      // Row (a) still current: the second copy did not supersede the first run's evidence.
+      expect(await f.evidenceRows(first.runId, "current")).toHaveLength(1);
+      console.log(JSON.stringify({ warmEvidenceTurnMs: f.turnMs.map(ms => Math.round(ms)) }));
+    } finally { await f.cleanup(); }
+  }, 120_000);
+
+  it("(b)(3) restore and destroy/recoverability decisions ignore the evidence kind", async () => {
+    const f = await warmEvidenceFixture("restore");
+    try {
+      const first = await f.runTurn();
+      console.log(JSON.stringify({ warmEvidenceFirstTurnMs: Math.round(f.turnMs[0]!) }));
+      const [row] = await f.waitFor(() => f.evidenceRows(first.runId, "current"), rows => rows.length === 1);
+      expect(row).toBeDefined();
+      const restoreRoot = join(tmpdir(), `warm-evidence-restore-${randomUUID()}`);
+      const opened = await f.openEvidence(row!);
+      // The session's own resumable scope (sha256 of the session scope key).
+      const sessionScope = opened.manifest.sessionScopeDigest as string;
+      expect(sessionScope).toMatch(/^[a-f0-9]{64}$/);
+      expect(row!.scopeDigest).not.toBe(sessionScope);
+      // The session scope has no resumable backup: restore finds nothing, never the evidence copy.
+      expect(await harnessStorage.restoreDurableNativeHarnessBackup({ db: f.db, storage: f.realStorage, companyId: f.companyId,
+        scopeDigest: sessionScope, backupRoot: restoreRoot })).toBe(false);
+      // Even an evidence row placed in the session's own scope as `current` is
+      // ignored by restore and by the recoverability proof destroy/retire use.
+      await f.db.update(f.tables.nativeHarnessBackups).set({ scopeDigest: sessionScope }).where(eq(f.tables.nativeHarnessBackups.id, row!.id));
+      expect(await harnessStorage.restoreDurableNativeHarnessBackup({ db: f.db, storage: f.realStorage, companyId: f.companyId,
+        scopeDigest: sessionScope, backupRoot: restoreRoot })).toBe(false);
+      expect(await harnessStorage.verifyDurableNativeHarnessBackup({ db: f.db, storage: f.realStorage, companyId: f.companyId,
+        scopeDigest: sessionScope, manifestSha256: row!.manifestSha256 })).toBe(false);
+      // The copy wrote no lease stamp: a destroy still needs the resumable/custody proof.
+      const metadata = await f.leaseMetadata(first.leaseId);
+      expect(metadata?.nativeHarnessBackup).toBeUndefined();
+      expect(metadata?.nativeHarnessBackupMissing).toBeUndefined();
+    } finally { await f.cleanup(); }
+  }, 120_000);
+
+  it("(c)(4) a storage failure before publication leaves no complete receipt, the box untouched and a pending marker; a retry completes, and exhausted retries raise one alarm line", async () => {
+    const f = await warmEvidenceFixture("storage");
+    const alarms = vi.spyOn(f.logger, "error");
+    try {
+      f.storageFaults.putFailures = 1;
+      const treeBefore = await f.boxTree();
+      const first = await f.runTurn();
+      console.log(JSON.stringify({ warmEvidenceFirstTurnMs: Math.round(f.turnMs[0]!) }));
+      const boxBefore = await f.boxInventory();
+      const marked = await f.waitFor(() => f.leaseMetadata(first.leaseId),
+        metadata => Number((metadata?.nativeSessionEvidencePending as { attempts?: number } | undefined)?.attempts) >= 1, 15_000);
+      expect(marked?.nativeSessionEvidencePending, "an observable evidence-copy-pending marker").toMatchObject({ runId: first.runId, attempts: 1,
+        lastError: expect.stringContaining("injected storage outage") });
+      expect(await f.evidenceRows(first.runId, "current"), "never a false complete").toHaveLength(0);
+      // The later bounded retry completes and clears the marker.
+      const [row] = await f.waitFor(() => f.evidenceRows(first.runId, "current"), rows => rows.length === 1, 20_000);
+      expect(row).toBeDefined();
+      expect((await f.waitFor(() => f.leaseMetadata(first.leaseId), metadata => metadata?.nativeSessionEvidencePending === undefined, 5_000))
+        ?.nativeSessionEvidencePending).toBeUndefined();
+      // Read-only on the box: same bytes, no new entries.
+      expect((await f.boxInventory()).sha256).toBe(boxBefore.sha256);
+      expect((await f.boxTree()).split("\n").filter(line => line.includes(".paperclip-checkpoint"))).toEqual([]);
+      expect(treeBefore).not.toContain("codex-home");
+      // (4) Every attempt fails: one alarm line with the watcher's fields; the marker stays.
+      f.storageFaults.putFailures = 1_000;
+      const second = await f.runTurn();
+      const stuck = await f.waitFor(() => f.leaseMetadata(second.leaseId),
+        metadata => Number((metadata?.nativeSessionEvidencePending as { attempts?: number } | undefined)?.attempts) >= 3, 30_000);
+      await f.waitFor(async () => alarms.mock.calls.filter(call => String(call[1] ?? "").startsWith("custody_evidence_pending_alarm")), calls => calls.length > 0, 5_000);
+      const alarmCalls = alarms.mock.calls.filter(call => String(call[1] ?? "").startsWith("custody_evidence_pending_alarm"));
+      expect(alarmCalls).toHaveLength(1);
+      expect(alarmCalls[0]![0]).toMatchObject({ boxId: "same-warm-box", providerLeaseId: "same-warm-box", companyId: f.companyId, runId: second.runId });
+      expect(stuck?.nativeSessionEvidencePending).toMatchObject({ runId: second.runId, attempts: 3 });
+      expect(await f.evidenceRows(second.runId, "current")).toHaveLength(0);
+      f.storageFaults.putFailures = 0;
+    } finally { alarms.mockRestore(); await f.cleanup(); }
+  }, 120_000);
+
+  it("(1)(2) the next message on the same warm session starts while the copy is stalled; a source that changes mid-copy is retried, never stored partial", async () => {
+    const f = await warmEvidenceFixture("stall");
+    try {
+      let release!: () => void;
+      f.evidenceGate.stalled = new Promise<void>(resolveGate => { release = resolveGate; });
+      const reached = new Promise<void>(resolveReached => { f.evidenceGate.reached = resolveReached; });
+      const first = await f.runTurn();
+      console.log(JSON.stringify({ warmEvidenceFirstTurnMs: Math.round(f.turnMs[0]!) }));
+      await Promise.race([reached, new Promise((_, reject) => setTimeout(() => reject(new Error("evidence copy never started")), 15_000))]);
+      // The copy of turn 1 is stalled mid-copy (inventory taken, tar not yet run).
+      const second = await f.runTurn();
+      expect(state.execute.mock.calls.at(-1)?.[0].existingSession).toBe(f.session);
+      expect(await f.evidenceRows(first.runId)).toHaveLength(0);
+      // Turn 2 changed the files after turn 1's copy took its inventory.
+      f.evidenceGate.stalled = null;
+      release();
+      const [row1] = await f.waitFor(() => f.evidenceRows(first.runId, "current"), rows => rows.length === 1, 30_000);
+      expect(row1).toBeDefined();
+      const opened = await f.openEvidence(row1!);
+      // Never the stale inventory with the newer bytes: the stored manifest is self-consistent with its files.
+      expect(opened.manifest.directories[0].sha256).toBe(opened.manifest.directories[0].copiedSha256);
+      expect(opened.manifest.directories[0].sha256).toBe(opened.manifest.directories[0].afterSha256);
+      expect(await readFile(join(opened.root, "codex-home", "sessions", "rollout.jsonl"), "utf8")).toContain("turn-1 history");
+      // Only complete rows exist for run 1: no pending/partial row left beside the retried one.
+      expect((await f.evidenceRows(first.runId)).map(row => row.status)).toEqual(["current"]);
+      await f.waitFor(() => f.evidenceRows(second.runId, "current"), rows => rows.length === 1, 20_000);
+      console.log(JSON.stringify({ warmEvidenceStalledTurnMs: f.turnMs.map(ms => Math.round(ms)) }));
+    } finally { f.evidenceGate.stalled = null; await f.cleanup(); }
+  }, 120_000);
+});
+
 describe("native warm session supervision", () => {
   it.each(["collect", "close-failure", "stopped", "destroyed", "missing-lease", "foreign-run", "foreign-environment", "deleted-environment", "claim-edit", "claim-add", "claim-remove", "claim-remove-entry", "claim-canonical", "claim-config", "claim-uncertain"])("composes remote warm ownership with real DB successor leases and current-run collection: %s", async ending => {
     const tables = await import("@paperclipai/db");
