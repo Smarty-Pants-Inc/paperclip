@@ -10,6 +10,7 @@ import { logger } from "../middleware/logger.js";
 import { notifyEnvironmentCleanup, writeEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 import { hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "./remote-execution-termination.js";
+import { readCreationRetryOutcome, SandboxCreationKeyReusedError } from "./environment-provider-unavailable-error.js";
 
 export type SandboxCreationOperation = typeof sandboxCreationOperations.$inferSelect;
 
@@ -178,6 +179,26 @@ export async function createOwnedSandbox(
     crashPoint("sandbox.create.after_provider_before_lease");
     return { ...lease, metadata: { ...lease.metadata, creationOperationId: operation.id } };
   } catch (error) {
+    // Plugin task/login creations keep their own exact-lease recovery below.
+    const outcome = recoverablePluginCreation(operation) ? "carried" : readCreationRetryOutcome(error);
+    if (outcome !== "carried") {
+      // Only a still-unowned pending creation: never one with a recorded box.
+      const unowned = and(eq(sandboxCreationOperations.id, operation.id), eq(sandboxCreationOperations.state, "pending"),
+        sql`${sandboxCreationOperations.leaseId} is null`, sql`${sandboxCreationOperations.metadata}->>'creationProviderLeaseId' is null`);
+      // Spent: Boat said no (or the key's box is stopped). Retiring the operation
+      // frees its key, so the host's next retry mints a fresh one. key_reused is
+      // not spent here: the earlier create may have made a box. It stays carried
+      // and due now, so recovery's provider inspect hands that box to cleanup
+      // (cleanup_pending) before any retry may create afresh.
+      await db.update(sandboxCreationOperations).set(outcome !== "key_reused" ? { state: "resolved", updatedAt: new Date(),
+        metadata: sql`${sandboxCreationOperations.metadata} || ${JSON.stringify({ creationReconciliationReason:
+          outcome === "refused" ? "provider_refused_create" : "provider_box_stopped" })}::jsonb` }
+        : { nextAttemptAt: new Date(), updatedAt: new Date(),
+          metadata: sql`${sandboxCreationOperations.metadata} || '{"creationKeyReused":true}'::jsonb` }).where(unowned)
+        .catch(() => logger.warn({ errorKind: "sandbox_creation_outcome_record_failed", operationId: operation.id, outcome },
+          "Sandbox creation keeps its carried key"));
+      if (outcome === "key_reused") throw new SandboxCreationKeyReusedError(error);
+    }
     if (recoverablePluginCreation(operation)) {
       try {
         await writeEnvironmentCleanup(db, tx => tx.update(sandboxCreationOperations).set({ nextAttemptAt: new Date(), updatedAt: new Date() })

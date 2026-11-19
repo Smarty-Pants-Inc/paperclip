@@ -24,6 +24,24 @@ function field(value: unknown, key: string): unknown {
 }
 
 /**
+ * Closed set of provider idempotency outcomes a failed create may name (as the
+ * thrown error's or a cause's string `code`). The host decides from it whether
+ * a retry re-sends the creation key (in_progress), retires it (box_stopped),
+ * or must first hand the earlier creation's box to cleanup (key_reused).
+ */
+export const ENVIRONMENT_CREATION_IDEMPOTENCY_CODES = ["idempotency_in_progress", "idempotency_key_reused", "boat_idempotency_box_stopped"] as const;
+export type EnvironmentCreationIdempotencyCode = typeof ENVIRONMENT_CREATION_IDEMPOTENCY_CODES[number];
+const IDEMPOTENCY_CODES = new Set<unknown>(ENVIRONMENT_CREATION_IDEMPOTENCY_CODES);
+
+function creationIdempotencyCode(error: unknown): EnvironmentCreationIdempotencyCode | undefined {
+  for (let cause = error, depth = 0; cause && depth < 4; cause = field(cause, "cause"), depth++) {
+    const code = field(cause, "code");
+    if (IDEMPOTENCY_CODES.has(code)) return code as EnvironmentCreationIdempotencyCode;
+  }
+  return undefined;
+}
+
+/**
  * Worker side: the RPC error data for a failed acquisition. A creation whose
  * cleanup could not be confirmed keeps its ownership envelope and adds the
  * status of the create call only, never of the compensating lookup or delete.
@@ -31,11 +49,20 @@ function field(value: unknown, key: string): unknown {
 export function environmentAcquireErrorData(error: unknown): unknown {
   const createError = error instanceof PluginEnvironmentCreationCleanupError ? error.errors[0] : error;
   const providerDiagnostic = providerErrorDiagnostic(createError);
+  const idempotency = creationIdempotencyCode(createError);
+  const extra = { ...(providerDiagnostic ? { providerDiagnostic } : {}), ...(idempotency ? { creationIdempotencyCode: idempotency } : {}) };
   const cleanup = environmentCreationCleanupErrorData(error, true);
-  if (cleanup && typeof cleanup === "object") {
-    return providerDiagnostic ? { ...cleanup, providerDiagnostic } : cleanup;
-  }
-  return providerDiagnostic ? { schema: SCHEMA, providerDiagnostic } : undefined;
+  if (cleanup && typeof cleanup === "object") return { ...cleanup, ...extra };
+  return providerDiagnostic || idempotency ? { schema: SCHEMA, ...extra } : undefined;
+}
+
+/** Host side: the provider idempotency outcome named on an acquisition RPC error. */
+export function readEnvironmentCreationIdempotencyCode(error: unknown): EnvironmentCreationIdempotencyCode | null {
+  const data = field(error, "data");
+  const schema = field(data, "schema");
+  if (schema !== SCHEMA && schema !== CLEANUP_SCHEMA) return null;
+  const code = field(data, "creationIdempotencyCode");
+  return IDEMPOTENCY_CODES.has(code) ? code as EnvironmentCreationIdempotencyCode : null;
 }
 
 /** Host side: read and re-validate the provider diagnostic from an RPC error. */

@@ -1,4 +1,5 @@
-import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, readEnvironmentAcquireErrorDiagnostic, readEnvironmentAcquisitionDiagnostic } from "@paperclipai/plugin-sdk";
+import { ENVIRONMENT_CREATION_IDEMPOTENCY_CODES, JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, readEnvironmentAcquireErrorDiagnostic, readEnvironmentAcquisitionDiagnostic,
+  readEnvironmentCreationIdempotencyCode, type EnvironmentCreationIdempotencyCode } from "@paperclipai/plugin-sdk";
 import type { ProviderFailure } from "@paperclipai/shared";
 import { getEnvironmentAcquisitionDiagnostic } from "./environment-acquisition-diagnostics.js";
 
@@ -27,13 +28,27 @@ const TRANSIENT_ERROR_CODES = new Set([
  * the provider reported a provisional creation that did not finish, or a
  * control-plane database query failed while the lease was taken.
  */
-type TransientLeaseFailureReason = "acquisition_incomplete" | "database_error" | "creation_reclaimed";
+type TransientLeaseFailureReason = "acquisition_incomplete" | "database_error" | "creation_reclaimed" | "creation_in_progress" | "creation_key_reused";
 type TransientProviderEvidence = { httpStatus?: number; errorCode?: string; acquisitionTimedOut?: true; reason?: TransientLeaseFailureReason };
 
 /** A retry's carried creation was reclaimed by recovery before it attached. */
 export class SandboxCreationReclaimedError extends Error {
   readonly code = "sandbox_creation_reclaimed";
   constructor() { super("Sandbox creation ownership has already transferred"); this.name = "SandboxCreationReclaimedError"; }
+}
+
+/**
+ * The provider refused a retry's carried creation key as reused with a
+ * different body (Boat's 409 idempotency_key_reused). The earlier create with
+ * that key may have made a box, so the creation is neither spent nor created
+ * afresh until recovery has handed that box to cleanup.
+ */
+export class SandboxCreationKeyReusedError extends Error {
+  readonly code = "sandbox_creation_key_reused";
+  constructor(cause: unknown) {
+    super("The sandbox provider refused the retried creation key as reused (409 idempotency_key_reused); the earlier attempt's sandbox is handed to cleanup before a new one is created", { cause });
+    this.name = "SandboxCreationKeyReusedError";
+  }
 }
 
 function own(value: unknown, key: string): unknown {
@@ -65,6 +80,49 @@ export function readTransientEnvironmentProviderFailure(error: unknown): Transie
     if (typeof statusValue === "number" && statusValue >= 400) return null;
   }
   return null;
+}
+
+const IDEMPOTENCY_CODES = new Set<unknown>(ENVIRONMENT_CREATION_IDEMPOTENCY_CODES);
+function creationIdempotencyCode(error: unknown): EnvironmentCreationIdempotencyCode | null {
+  for (let cause = error, depth = 0; cause && depth < 5; cause = own(cause, "cause"), depth++) {
+    const code = readEnvironmentCreationIdempotencyCode(cause) ?? own(cause, "code");
+    if (IDEMPOTENCY_CODES.has(code)) return code as EnvironmentCreationIdempotencyCode;
+  }
+  return null;
+}
+
+// Timeout-shaped or retry-later 4xx: the create may still have made a box.
+// A 409 that names no idempotency outcome is never taken as a refusal either.
+const CARRIED_CLIENT_STATUSES = new Set([408, 409, 425, 429, 499]);
+
+/**
+ * What a host retry does with a failed create's creation operation.
+ * - carried: re-send the same id/key. Any timeout or unknown outcome, 408 and
+ *   other timeout-shaped 4xx, 429, 5xx, unavailable/network, and Boat's
+ *   409 idempotency_in_progress: the outcome may have made a box.
+ * - refused / box_stopped (spent): a FIRM refusal (any other 4xx: Boat said no and made nothing) or the
+ *   plugin's typed boat_idempotency_box_stopped. The next retry mints a fresh key.
+ * - key_reused: Boat's 409 idempotency_key_reused. The earlier create with that
+ *   key may have made a box; it is spent only once cleanup owns that box.
+ * Typed idempotency codes are authoritative; then any carried evidence on the
+ * chain wins over a refusal. Message text is never parsed.
+ */
+export function readCreationRetryOutcome(error: unknown): "carried" | "refused" | "box_stopped" | "key_reused" {
+  const idempotency = creationIdempotencyCode(error);
+  if (idempotency === "idempotency_key_reused") return "key_reused";
+  if (idempotency === "idempotency_in_progress") return "carried";
+  if (idempotency === "boat_idempotency_box_stopped") return "box_stopped";
+  let refused = false;
+  for (let cause = error, depth = 0; cause && depth < 5; cause = own(cause, "cause"), depth++) {
+    if (cause instanceof JsonRpcCallError && cause.code === PLUGIN_RPC_ERROR_CODES.TIMEOUT) return "carried";
+    if (readEnvironmentAcquisitionDiagnostic(cause)) return "carried";
+    const status = readEnvironmentAcquireErrorDiagnostic(cause)?.httpStatus
+      ?? [own(cause, "status"), own(cause, "statusCode")].find(value => Number.isInteger(value));
+    if (typeof status !== "number") continue;
+    if (status < 400 || status >= 500 || CARRIED_CLIENT_STATUSES.has(status)) return "carried";
+    refused = true;
+  }
+  return refused ? "refused" : "carried";
 }
 
 /** A definite non-transient HTTP status anywhere on the chain is authoritative: retrying cannot change it. */
@@ -114,6 +172,12 @@ export function readTransientLeaseAcquisitionFailure(
 ): TransientProviderEvidence | null {
   const provider = readTransientEnvironmentProviderFailure(error);
   if (provider) return provider;
+  // The retry re-sends the same key: Boat's documented "retry shortly", and a
+  // reused key whose earlier box recovery hands to cleanup before a fresh create.
+  for (let cause = error, depth = 0; cause && depth < 5; cause = own(cause, "cause"), depth++) {
+    if (cause instanceof SandboxCreationKeyReusedError) return { reason: "creation_key_reused" };
+  }
+  if (creationIdempotencyCode(error) === "idempotency_in_progress") return { reason: "creation_in_progress" };
   if (definiteNonTransientStatus(error)) return null;
   for (let cause = error, depth = 0; cause && depth < 5; cause = own(cause, "cause"), depth++) {
     const acquisition = getEnvironmentAcquisitionDiagnostic(cause, run);
@@ -130,6 +194,8 @@ const REASON_LABELS: Record<TransientLeaseFailureReason, string> = {
   acquisition_incomplete: "sandbox creation did not finish",
   database_error: "a database query failed while recording the lease",
   creation_reclaimed: "recovery was stopping the earlier attempt's sandbox",
+  creation_in_progress: "the provider was still creating the sandbox",
+  creation_key_reused: "the provider refused the retried creation key as reused; the earlier attempt's sandbox is handed to cleanup first",
 };
 
 function category(evidence: TransientProviderEvidence): ProviderFailure["category"] {
