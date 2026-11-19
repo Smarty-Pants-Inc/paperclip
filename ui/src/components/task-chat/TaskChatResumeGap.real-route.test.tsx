@@ -44,7 +44,7 @@ type Sample = { variant: "ordinary" | "lock" | "busy"; state: State; ms: number;
 const samples = (process.env.RGAP_ROW_INPUT
   ? JSON.parse(readFileSync(process.env.RGAP_ROW_INPUT, "utf8")) : capturedRows) as unknown as Sample[];
 // Literals, independent of the production constants.
-const RESUMING = "Managed Pi is resuming. Your message is saved and starts next.";
+const RESUMING = "Managed Pi is resuming. Your message is saved and will start when Managed Pi is ready.";
 const WORKING = "Managed Pi is working on your message.";
 const rendered: unknown[] = [];
 const count = (text: string | null | undefined, needle: string) => (text ?? "").split(needle).length - 1;

@@ -2,16 +2,16 @@
   {
     "variant": "ordinary",
     "state": "resuming",
-    "ms": 2,
+    "ms": 1,
     "lifecycleState": "ready",
-    "messageId": "2ba7f0e6-73e3-4c95-a3a1-610126d201f5",
-    "noteId": "39c4473b-63d1-4e62-b36c-d52a253e4e79",
-    "readAt": "2026-11-19T11:54:19.579Z",
+    "messageId": "57258456-10f4-4002-8564-5c1df06fa246",
+    "noteId": "c220eec5-f47d-4bd8-bd02-a4d79ca9f2ba",
+    "readAt": "2026-11-19T12:35:53.499Z",
     "comments": [
       {
-        "id": "39c4473b-63d1-4e62-b36c-d52a253e4e79",
-        "companyId": "1bb70974-2c89-455d-af6a-395f182351e4",
-        "issueId": "6bb3d407-1b6d-4c02-b197-c3b9bb035e2f",
+        "id": "c220eec5-f47d-4bd8-bd02-a4d79ca9f2ba",
+        "companyId": "91cc79c8-bddd-4151-a991-2ab1dffbc2af",
+        "issueId": "81ba4b6e-ef30-47ed-862d-74b3eec0962a",
         "authorAgentId": null,
         "authorUserId": null,
         "onBehalfOfUserId": null,
@@ -24,7 +24,7 @@
         "conversationSessionGeneration": null,
         "origin": "comment",
         "fastResponseRequestId": null,
-        "body": "Managed Pi is resuming. Your message is saved and starts next.",
+        "body": "Managed Pi is resuming. Your message is saved and will start when Managed Pi is ready.",
         "presentation": {
           "kind": "system_notice",
           "tone": "info",
@@ -35,7 +35,7 @@
           "version": 1,
           "recoveryResponsibility": "user",
           "sourceRunId": null,
-          "authorizationReason": "unanswered_message:2ba7f0e6-73e3-4c95-a3a1-610126d201f5",
+          "authorizationReason": "unanswered_message:57258456-10f4-4002-8564-5c1df06fa246",
           "sections": [
             {
               "title": "Status",
@@ -55,13 +55,13 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:19.442Z",
-        "updatedAt": "2026-11-19T11:54:19.473Z"
+        "createdAt": "2026-11-19T12:35:53.217Z",
+        "updatedAt": "2026-11-19T12:35:53.355Z"
       },
       {
-        "id": "2ba7f0e6-73e3-4c95-a3a1-610126d201f5",
-        "companyId": "1bb70974-2c89-455d-af6a-395f182351e4",
-        "issueId": "6bb3d407-1b6d-4c02-b197-c3b9bb035e2f",
+        "id": "57258456-10f4-4002-8564-5c1df06fa246",
+        "companyId": "91cc79c8-bddd-4151-a991-2ab1dffbc2af",
+        "issueId": "81ba4b6e-ef30-47ed-862d-74b3eec0962a",
         "authorAgentId": null,
         "authorUserId": "rgap-person",
         "onBehalfOfUserId": null,
@@ -70,7 +70,7 @@
         "derivedAuthorAgentId": null,
         "derivedCreatedByRunId": null,
         "derivedAuthorSource": null,
-        "clientRequestId": "3b60a445-e872-4c8f-ad89-176804154125",
+        "clientRequestId": "41b8dbc2-fecc-446d-b32a-b9b9c1344ed8",
         "conversationSessionGeneration": null,
         "origin": "comment",
         "fastResponseRequestId": null,
@@ -83,12 +83,12 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:04.399Z",
-        "updatedAt": "2026-11-19T11:54:04.399Z"
+        "createdAt": "2026-11-19T12:35:38.144Z",
+        "updatedAt": "2026-11-19T12:35:38.144Z"
       }
     ],
     "queue": {
-      "issueId": "6bb3d407-1b6d-4c02-b197-c3b9bb035e2f",
+      "issueId": "81ba4b6e-ef30-47ed-862d-74b3eec0962a",
       "queueId": null,
       "state": null,
       "targetRunId": null,
@@ -102,16 +102,16 @@
   {
     "variant": "ordinary",
     "state": "header",
-    "ms": 1100,
+    "ms": 1102,
     "lifecycleState": "ready",
-    "messageId": "2ba7f0e6-73e3-4c95-a3a1-610126d201f5",
-    "noteId": "39c4473b-63d1-4e62-b36c-d52a253e4e79",
-    "readAt": "2026-11-19T11:54:20.702Z",
+    "messageId": "57258456-10f4-4002-8564-5c1df06fa246",
+    "noteId": "c220eec5-f47d-4bd8-bd02-a4d79ca9f2ba",
+    "readAt": "2026-11-19T12:35:54.651Z",
     "comments": [
       {
-        "id": "39c4473b-63d1-4e62-b36c-d52a253e4e79",
-        "companyId": "1bb70974-2c89-455d-af6a-395f182351e4",
-        "issueId": "6bb3d407-1b6d-4c02-b197-c3b9bb035e2f",
+        "id": "c220eec5-f47d-4bd8-bd02-a4d79ca9f2ba",
+        "companyId": "91cc79c8-bddd-4151-a991-2ab1dffbc2af",
+        "issueId": "81ba4b6e-ef30-47ed-862d-74b3eec0962a",
         "authorAgentId": null,
         "authorUserId": null,
         "onBehalfOfUserId": null,
@@ -127,19 +127,19 @@
         "body": "",
         "presentation": null,
         "metadata": null,
-        "deletedAt": "2026-11-19T11:54:20.621Z",
+        "deletedAt": "2026-11-19T12:35:54.517Z",
         "deletedByType": null,
         "deletedByAgentId": null,
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:19.442Z",
-        "updatedAt": "2026-11-19T11:54:20.621Z"
+        "createdAt": "2026-11-19T12:35:53.217Z",
+        "updatedAt": "2026-11-19T12:35:54.517Z"
       },
       {
-        "id": "2ba7f0e6-73e3-4c95-a3a1-610126d201f5",
-        "companyId": "1bb70974-2c89-455d-af6a-395f182351e4",
-        "issueId": "6bb3d407-1b6d-4c02-b197-c3b9bb035e2f",
+        "id": "57258456-10f4-4002-8564-5c1df06fa246",
+        "companyId": "91cc79c8-bddd-4151-a991-2ab1dffbc2af",
+        "issueId": "81ba4b6e-ef30-47ed-862d-74b3eec0962a",
         "authorAgentId": null,
         "authorUserId": "rgap-person",
         "onBehalfOfUserId": null,
@@ -148,7 +148,7 @@
         "derivedAuthorAgentId": null,
         "derivedCreatedByRunId": null,
         "derivedAuthorSource": null,
-        "clientRequestId": "3b60a445-e872-4c8f-ad89-176804154125",
+        "clientRequestId": "41b8dbc2-fecc-446d-b32a-b9b9c1344ed8",
         "conversationSessionGeneration": null,
         "origin": "comment",
         "fastResponseRequestId": null,
@@ -161,24 +161,24 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:04.399Z",
-        "updatedAt": "2026-11-19T11:54:04.399Z"
+        "createdAt": "2026-11-19T12:35:38.144Z",
+        "updatedAt": "2026-11-19T12:35:38.144Z"
       }
     ],
     "queue": {
-      "issueId": "6bb3d407-1b6d-4c02-b197-c3b9bb035e2f",
-      "queueId": "7132d008-4607-4c5a-87e7-d15ed5b381c3",
+      "issueId": "81ba4b6e-ef30-47ed-862d-74b3eec0962a",
+      "queueId": "70bbcc88-f483-46e6-bdc4-3775bc54469a",
       "state": "queued",
       "targetRunId": null,
-      "revision": "89682938b6ecedfbcf1c985a2346d887",
+      "revision": "c3ff5fd3f8fd7e99ea70bc3c9a47cb64",
       "protocol": "legacy",
       "steeringDisposition": "unsupported",
       "entries": [
         {
           "comment": {
-            "id": "2ba7f0e6-73e3-4c95-a3a1-610126d201f5",
-            "companyId": "1bb70974-2c89-455d-af6a-395f182351e4",
-            "issueId": "6bb3d407-1b6d-4c02-b197-c3b9bb035e2f",
+            "id": "57258456-10f4-4002-8564-5c1df06fa246",
+            "companyId": "91cc79c8-bddd-4151-a991-2ab1dffbc2af",
+            "issueId": "81ba4b6e-ef30-47ed-862d-74b3eec0962a",
             "authorAgentId": null,
             "authorUserId": "rgap-person",
             "onBehalfOfUserId": null,
@@ -187,7 +187,7 @@
             "derivedAuthorAgentId": null,
             "derivedCreatedByRunId": null,
             "derivedAuthorSource": null,
-            "clientRequestId": "3b60a445-e872-4c8f-ad89-176804154125",
+            "clientRequestId": "41b8dbc2-fecc-446d-b32a-b9b9c1344ed8",
             "conversationSessionGeneration": null,
             "origin": "comment",
             "fastResponseRequestId": null,
@@ -200,8 +200,8 @@
             "deletedByUserId": null,
             "deletedByRunId": null,
             "sourceTrust": null,
-            "createdAt": "2026-11-19T11:54:04.399Z",
-            "updatedAt": "2026-11-19T11:54:04.399Z"
+            "createdAt": "2026-11-19T12:35:38.144Z",
+            "updatedAt": "2026-11-19T12:35:38.144Z"
           },
           "position": 0,
           "canEdit": true,
@@ -211,7 +211,7 @@
       ]
     },
     "run": {
-      "id": "2a0a2491-930d-4b8a-a22a-ee9762656e63",
+      "id": "491c8a04-20bc-43e5-a3d3-84c3b438d7b8",
       "status": "queued",
       "execution": {
         "canStop": true,
@@ -230,23 +230,23 @@
         "predecessorRunId": null,
         "successorRunId": null
       },
-      "createdAt": "2026-11-19T11:54:20.563Z",
+      "createdAt": "2026-11-19T12:35:54.405Z",
       "startedAt": null
     }
   },
   {
     "variant": "ordinary",
     "state": "working",
-    "ms": 1199,
+    "ms": 1299,
     "lifecycleState": "ready",
-    "messageId": "2ba7f0e6-73e3-4c95-a3a1-610126d201f5",
-    "noteId": "39c4473b-63d1-4e62-b36c-d52a253e4e79",
-    "readAt": "2026-11-19T11:54:20.774Z",
+    "messageId": "57258456-10f4-4002-8564-5c1df06fa246",
+    "noteId": "c220eec5-f47d-4bd8-bd02-a4d79ca9f2ba",
+    "readAt": "2026-11-19T12:35:54.809Z",
     "comments": [
       {
-        "id": "39c4473b-63d1-4e62-b36c-d52a253e4e79",
-        "companyId": "1bb70974-2c89-455d-af6a-395f182351e4",
-        "issueId": "6bb3d407-1b6d-4c02-b197-c3b9bb035e2f",
+        "id": "c220eec5-f47d-4bd8-bd02-a4d79ca9f2ba",
+        "companyId": "91cc79c8-bddd-4151-a991-2ab1dffbc2af",
+        "issueId": "81ba4b6e-ef30-47ed-862d-74b3eec0962a",
         "authorAgentId": null,
         "authorUserId": null,
         "onBehalfOfUserId": null,
@@ -270,7 +270,7 @@
           "version": 1,
           "recoveryResponsibility": "user",
           "sourceRunId": null,
-          "authorizationReason": "unanswered_message:2ba7f0e6-73e3-4c95-a3a1-610126d201f5",
+          "authorizationReason": "unanswered_message:57258456-10f4-4002-8564-5c1df06fa246",
           "sections": [
             {
               "title": "Status",
@@ -290,13 +290,13 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:19.442Z",
-        "updatedAt": "2026-11-19T11:54:20.722Z"
+        "createdAt": "2026-11-19T12:35:53.217Z",
+        "updatedAt": "2026-11-19T12:35:54.672Z"
       },
       {
-        "id": "2ba7f0e6-73e3-4c95-a3a1-610126d201f5",
-        "companyId": "1bb70974-2c89-455d-af6a-395f182351e4",
-        "issueId": "6bb3d407-1b6d-4c02-b197-c3b9bb035e2f",
+        "id": "57258456-10f4-4002-8564-5c1df06fa246",
+        "companyId": "91cc79c8-bddd-4151-a991-2ab1dffbc2af",
+        "issueId": "81ba4b6e-ef30-47ed-862d-74b3eec0962a",
         "authorAgentId": null,
         "authorUserId": "rgap-person",
         "onBehalfOfUserId": null,
@@ -305,7 +305,7 @@
         "derivedAuthorAgentId": null,
         "derivedCreatedByRunId": null,
         "derivedAuthorSource": null,
-        "clientRequestId": "3b60a445-e872-4c8f-ad89-176804154125",
+        "clientRequestId": "41b8dbc2-fecc-446d-b32a-b9b9c1344ed8",
         "conversationSessionGeneration": null,
         "origin": "comment",
         "fastResponseRequestId": null,
@@ -318,12 +318,12 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:04.399Z",
-        "updatedAt": "2026-11-19T11:54:04.399Z"
+        "createdAt": "2026-11-19T12:35:38.144Z",
+        "updatedAt": "2026-11-19T12:35:38.144Z"
       }
     ],
     "queue": {
-      "issueId": "6bb3d407-1b6d-4c02-b197-c3b9bb035e2f",
+      "issueId": "81ba4b6e-ef30-47ed-862d-74b3eec0962a",
       "queueId": null,
       "state": null,
       "targetRunId": null,
@@ -333,14 +333,14 @@
       "entries": []
     },
     "run": {
-      "id": "2a0a2491-930d-4b8a-a22a-ee9762656e63",
+      "id": "491c8a04-20bc-43e5-a3d3-84c3b438d7b8",
       "status": "running",
       "execution": {
         "canStop": true,
         "phase": "reconnecting",
         "label": "Confirming execution",
         "cause": null,
-        "lastConfirmedActivityAt": "2026-11-19T11:54:20.694Z",
+        "lastConfirmedActivityAt": "2026-11-19T12:35:54.594Z",
         "retryAt": null,
         "attempt": 1,
         "maxAttempts": 3,
@@ -352,23 +352,23 @@
         "predecessorRunId": null,
         "successorRunId": null
       },
-      "createdAt": "2026-11-19T11:54:20.563Z",
-      "startedAt": "2026-11-19T11:54:20.694Z"
+      "createdAt": "2026-11-19T12:35:54.405Z",
+      "startedAt": "2026-11-19T12:35:54.594Z"
     }
   },
   {
     "variant": "lock",
     "state": "resuming",
-    "ms": 1,
+    "ms": 0,
     "lifecycleState": "ready",
-    "messageId": "cc8e71dd-18a6-4383-9db1-bfdb911c75a4",
-    "noteId": "2b0489a7-2e9f-48fa-9584-a6961a9f942b",
-    "readAt": "2026-11-19T11:54:37.130Z",
+    "messageId": "03d95d72-b6b4-4f84-9635-69641e2adb1c",
+    "noteId": "46952de8-c99d-4b72-ae7c-db061051daa5",
+    "readAt": "2026-11-19T12:36:12.178Z",
     "comments": [
       {
-        "id": "2b0489a7-2e9f-48fa-9584-a6961a9f942b",
-        "companyId": "21fa12e3-4425-4372-85d2-d19f8de4808f",
-        "issueId": "2cf688ff-d62f-40ef-a298-f78981e59410",
+        "id": "46952de8-c99d-4b72-ae7c-db061051daa5",
+        "companyId": "94bea3c0-04ad-47a9-b846-49782659f443",
+        "issueId": "88c1e8b9-6923-419f-ac1d-846021c44eb2",
         "authorAgentId": null,
         "authorUserId": null,
         "onBehalfOfUserId": null,
@@ -381,7 +381,7 @@
         "conversationSessionGeneration": null,
         "origin": "comment",
         "fastResponseRequestId": null,
-        "body": "Managed Pi is resuming. Your message is saved and starts next.",
+        "body": "Managed Pi is resuming. Your message is saved and will start when Managed Pi is ready.",
         "presentation": {
           "kind": "system_notice",
           "tone": "info",
@@ -392,7 +392,7 @@
           "version": 1,
           "recoveryResponsibility": "user",
           "sourceRunId": null,
-          "authorizationReason": "unanswered_message:cc8e71dd-18a6-4383-9db1-bfdb911c75a4",
+          "authorizationReason": "unanswered_message:03d95d72-b6b4-4f84-9635-69641e2adb1c",
           "sections": [
             {
               "title": "Status",
@@ -412,13 +412,13 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:36.917Z",
-        "updatedAt": "2026-11-19T11:54:37.039Z"
+        "createdAt": "2026-11-19T12:36:11.873Z",
+        "updatedAt": "2026-11-19T12:36:12.018Z"
       },
       {
-        "id": "cc8e71dd-18a6-4383-9db1-bfdb911c75a4",
-        "companyId": "21fa12e3-4425-4372-85d2-d19f8de4808f",
-        "issueId": "2cf688ff-d62f-40ef-a298-f78981e59410",
+        "id": "03d95d72-b6b4-4f84-9635-69641e2adb1c",
+        "companyId": "94bea3c0-04ad-47a9-b846-49782659f443",
+        "issueId": "88c1e8b9-6923-419f-ac1d-846021c44eb2",
         "authorAgentId": null,
         "authorUserId": "rgap-person",
         "onBehalfOfUserId": null,
@@ -427,7 +427,7 @@
         "derivedAuthorAgentId": null,
         "derivedCreatedByRunId": null,
         "derivedAuthorSource": null,
-        "clientRequestId": "0c455a7a-186d-4d18-990e-8cfa08dee04d",
+        "clientRequestId": "6014d435-a0c8-4491-ae9c-396d1d91152a",
         "conversationSessionGeneration": null,
         "origin": "comment",
         "fastResponseRequestId": null,
@@ -440,12 +440,12 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:21.884Z",
-        "updatedAt": "2026-11-19T11:54:21.884Z"
+        "createdAt": "2026-11-19T12:35:56.810Z",
+        "updatedAt": "2026-11-19T12:35:56.810Z"
       }
     ],
     "queue": {
-      "issueId": "2cf688ff-d62f-40ef-a298-f78981e59410",
+      "issueId": "88c1e8b9-6923-419f-ac1d-846021c44eb2",
       "queueId": null,
       "state": null,
       "targetRunId": null,
@@ -459,16 +459,16 @@
   {
     "variant": "lock",
     "state": "resuming-lock-held",
-    "ms": 3100,
+    "ms": 3101,
     "lifecycleState": "ready",
-    "messageId": "cc8e71dd-18a6-4383-9db1-bfdb911c75a4",
-    "noteId": "2b0489a7-2e9f-48fa-9584-a6961a9f942b",
-    "readAt": "2026-11-19T11:54:40.227Z",
+    "messageId": "03d95d72-b6b4-4f84-9635-69641e2adb1c",
+    "noteId": "46952de8-c99d-4b72-ae7c-db061051daa5",
+    "readAt": "2026-11-19T12:36:15.275Z",
     "comments": [
       {
-        "id": "2b0489a7-2e9f-48fa-9584-a6961a9f942b",
-        "companyId": "21fa12e3-4425-4372-85d2-d19f8de4808f",
-        "issueId": "2cf688ff-d62f-40ef-a298-f78981e59410",
+        "id": "46952de8-c99d-4b72-ae7c-db061051daa5",
+        "companyId": "94bea3c0-04ad-47a9-b846-49782659f443",
+        "issueId": "88c1e8b9-6923-419f-ac1d-846021c44eb2",
         "authorAgentId": null,
         "authorUserId": null,
         "onBehalfOfUserId": null,
@@ -481,7 +481,7 @@
         "conversationSessionGeneration": null,
         "origin": "comment",
         "fastResponseRequestId": null,
-        "body": "Managed Pi is resuming. Your message is saved and starts next.",
+        "body": "Managed Pi is resuming. Your message is saved and will start when Managed Pi is ready.",
         "presentation": {
           "kind": "system_notice",
           "tone": "info",
@@ -492,7 +492,7 @@
           "version": 1,
           "recoveryResponsibility": "user",
           "sourceRunId": null,
-          "authorizationReason": "unanswered_message:cc8e71dd-18a6-4383-9db1-bfdb911c75a4",
+          "authorizationReason": "unanswered_message:03d95d72-b6b4-4f84-9635-69641e2adb1c",
           "sections": [
             {
               "title": "Status",
@@ -512,13 +512,13 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:36.917Z",
-        "updatedAt": "2026-11-19T11:54:37.039Z"
+        "createdAt": "2026-11-19T12:36:11.873Z",
+        "updatedAt": "2026-11-19T12:36:12.018Z"
       },
       {
-        "id": "cc8e71dd-18a6-4383-9db1-bfdb911c75a4",
-        "companyId": "21fa12e3-4425-4372-85d2-d19f8de4808f",
-        "issueId": "2cf688ff-d62f-40ef-a298-f78981e59410",
+        "id": "03d95d72-b6b4-4f84-9635-69641e2adb1c",
+        "companyId": "94bea3c0-04ad-47a9-b846-49782659f443",
+        "issueId": "88c1e8b9-6923-419f-ac1d-846021c44eb2",
         "authorAgentId": null,
         "authorUserId": "rgap-person",
         "onBehalfOfUserId": null,
@@ -527,7 +527,7 @@
         "derivedAuthorAgentId": null,
         "derivedCreatedByRunId": null,
         "derivedAuthorSource": null,
-        "clientRequestId": "0c455a7a-186d-4d18-990e-8cfa08dee04d",
+        "clientRequestId": "6014d435-a0c8-4491-ae9c-396d1d91152a",
         "conversationSessionGeneration": null,
         "origin": "comment",
         "fastResponseRequestId": null,
@@ -540,12 +540,12 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:21.884Z",
-        "updatedAt": "2026-11-19T11:54:21.884Z"
+        "createdAt": "2026-11-19T12:35:56.810Z",
+        "updatedAt": "2026-11-19T12:35:56.810Z"
       }
     ],
     "queue": {
-      "issueId": "2cf688ff-d62f-40ef-a298-f78981e59410",
+      "issueId": "88c1e8b9-6923-419f-ac1d-846021c44eb2",
       "queueId": null,
       "state": null,
       "targetRunId": null,
@@ -559,16 +559,16 @@
   {
     "variant": "lock",
     "state": "header",
-    "ms": 4099,
+    "ms": 4200,
     "lifecycleState": "ready",
-    "messageId": "cc8e71dd-18a6-4383-9db1-bfdb911c75a4",
-    "noteId": "2b0489a7-2e9f-48fa-9584-a6961a9f942b",
-    "readAt": "2026-11-19T11:54:41.241Z",
+    "messageId": "03d95d72-b6b4-4f84-9635-69641e2adb1c",
+    "noteId": "46952de8-c99d-4b72-ae7c-db061051daa5",
+    "readAt": "2026-11-19T12:36:16.407Z",
     "comments": [
       {
-        "id": "2b0489a7-2e9f-48fa-9584-a6961a9f942b",
-        "companyId": "21fa12e3-4425-4372-85d2-d19f8de4808f",
-        "issueId": "2cf688ff-d62f-40ef-a298-f78981e59410",
+        "id": "46952de8-c99d-4b72-ae7c-db061051daa5",
+        "companyId": "94bea3c0-04ad-47a9-b846-49782659f443",
+        "issueId": "88c1e8b9-6923-419f-ac1d-846021c44eb2",
         "authorAgentId": null,
         "authorUserId": null,
         "onBehalfOfUserId": null,
@@ -584,19 +584,19 @@
         "body": "",
         "presentation": null,
         "metadata": null,
-        "deletedAt": "2026-11-19T11:54:41.173Z",
+        "deletedAt": "2026-11-19T12:36:16.282Z",
         "deletedByType": null,
         "deletedByAgentId": null,
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:36.917Z",
-        "updatedAt": "2026-11-19T11:54:41.173Z"
+        "createdAt": "2026-11-19T12:36:11.873Z",
+        "updatedAt": "2026-11-19T12:36:16.282Z"
       },
       {
-        "id": "cc8e71dd-18a6-4383-9db1-bfdb911c75a4",
-        "companyId": "21fa12e3-4425-4372-85d2-d19f8de4808f",
-        "issueId": "2cf688ff-d62f-40ef-a298-f78981e59410",
+        "id": "03d95d72-b6b4-4f84-9635-69641e2adb1c",
+        "companyId": "94bea3c0-04ad-47a9-b846-49782659f443",
+        "issueId": "88c1e8b9-6923-419f-ac1d-846021c44eb2",
         "authorAgentId": null,
         "authorUserId": "rgap-person",
         "onBehalfOfUserId": null,
@@ -605,7 +605,7 @@
         "derivedAuthorAgentId": null,
         "derivedCreatedByRunId": null,
         "derivedAuthorSource": null,
-        "clientRequestId": "0c455a7a-186d-4d18-990e-8cfa08dee04d",
+        "clientRequestId": "6014d435-a0c8-4491-ae9c-396d1d91152a",
         "conversationSessionGeneration": null,
         "origin": "comment",
         "fastResponseRequestId": null,
@@ -618,24 +618,24 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:21.884Z",
-        "updatedAt": "2026-11-19T11:54:21.884Z"
+        "createdAt": "2026-11-19T12:35:56.810Z",
+        "updatedAt": "2026-11-19T12:35:56.810Z"
       }
     ],
     "queue": {
-      "issueId": "2cf688ff-d62f-40ef-a298-f78981e59410",
-      "queueId": "daf2ec0f-22da-4edd-a39a-46fdfb036e0f",
+      "issueId": "88c1e8b9-6923-419f-ac1d-846021c44eb2",
+      "queueId": "5897377e-a007-4bf7-a6de-eebd2fc75db0",
       "state": "queued",
       "targetRunId": null,
-      "revision": "5abfee7fae0189ea9dbe1450ab80bcab",
+      "revision": "1e96ef9b11deeb285206e27db3ffb671",
       "protocol": "legacy",
       "steeringDisposition": "unsupported",
       "entries": [
         {
           "comment": {
-            "id": "cc8e71dd-18a6-4383-9db1-bfdb911c75a4",
-            "companyId": "21fa12e3-4425-4372-85d2-d19f8de4808f",
-            "issueId": "2cf688ff-d62f-40ef-a298-f78981e59410",
+            "id": "03d95d72-b6b4-4f84-9635-69641e2adb1c",
+            "companyId": "94bea3c0-04ad-47a9-b846-49782659f443",
+            "issueId": "88c1e8b9-6923-419f-ac1d-846021c44eb2",
             "authorAgentId": null,
             "authorUserId": "rgap-person",
             "onBehalfOfUserId": null,
@@ -644,7 +644,7 @@
             "derivedAuthorAgentId": null,
             "derivedCreatedByRunId": null,
             "derivedAuthorSource": null,
-            "clientRequestId": "0c455a7a-186d-4d18-990e-8cfa08dee04d",
+            "clientRequestId": "6014d435-a0c8-4491-ae9c-396d1d91152a",
             "conversationSessionGeneration": null,
             "origin": "comment",
             "fastResponseRequestId": null,
@@ -657,25 +657,24 @@
             "deletedByUserId": null,
             "deletedByRunId": null,
             "sourceTrust": null,
-            "createdAt": "2026-11-19T11:54:21.884Z",
-            "updatedAt": "2026-11-19T11:54:21.884Z"
+            "createdAt": "2026-11-19T12:35:56.810Z",
+            "updatedAt": "2026-11-19T12:35:56.810Z"
           },
           "position": 0,
           "canEdit": true,
-          "canDiscard": true,
-          "behindReset": false
+          "canDiscard": true
         }
       ]
     },
     "run": {
-      "id": "b4988283-d889-4955-b813-0cbafa8c8750",
+      "id": "f5942b8d-a221-4d9a-bed6-d4bacd55a401",
       "status": "running",
       "execution": {
         "canStop": true,
         "phase": "reconnecting",
         "label": "Confirming execution",
         "cause": null,
-        "lastConfirmedActivityAt": "2026-11-19T11:54:41.214Z",
+        "lastConfirmedActivityAt": "2026-11-19T12:36:16.343Z",
         "retryAt": null,
         "attempt": 1,
         "maxAttempts": 3,
@@ -687,23 +686,23 @@
         "predecessorRunId": null,
         "successorRunId": null
       },
-      "createdAt": "2026-11-19T11:54:41.121Z",
-      "startedAt": "2026-11-19T11:54:41.214Z"
+      "createdAt": "2026-11-19T12:36:16.159Z",
+      "startedAt": "2026-11-19T12:36:16.343Z"
     }
   },
   {
     "variant": "lock",
     "state": "working",
-    "ms": 4199,
+    "ms": 4300,
     "lifecycleState": "ready",
-    "messageId": "cc8e71dd-18a6-4383-9db1-bfdb911c75a4",
-    "noteId": "2b0489a7-2e9f-48fa-9584-a6961a9f942b",
-    "readAt": "2026-11-19T11:54:41.336Z",
+    "messageId": "03d95d72-b6b4-4f84-9635-69641e2adb1c",
+    "noteId": "46952de8-c99d-4b72-ae7c-db061051daa5",
+    "readAt": "2026-11-19T12:36:16.483Z",
     "comments": [
       {
-        "id": "2b0489a7-2e9f-48fa-9584-a6961a9f942b",
-        "companyId": "21fa12e3-4425-4372-85d2-d19f8de4808f",
-        "issueId": "2cf688ff-d62f-40ef-a298-f78981e59410",
+        "id": "46952de8-c99d-4b72-ae7c-db061051daa5",
+        "companyId": "94bea3c0-04ad-47a9-b846-49782659f443",
+        "issueId": "88c1e8b9-6923-419f-ac1d-846021c44eb2",
         "authorAgentId": null,
         "authorUserId": null,
         "onBehalfOfUserId": null,
@@ -727,7 +726,7 @@
           "version": 1,
           "recoveryResponsibility": "user",
           "sourceRunId": null,
-          "authorizationReason": "unanswered_message:cc8e71dd-18a6-4383-9db1-bfdb911c75a4",
+          "authorizationReason": "unanswered_message:03d95d72-b6b4-4f84-9635-69641e2adb1c",
           "sections": [
             {
               "title": "Status",
@@ -747,13 +746,13 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:36.917Z",
-        "updatedAt": "2026-11-19T11:54:41.238Z"
+        "createdAt": "2026-11-19T12:36:11.873Z",
+        "updatedAt": "2026-11-19T12:36:16.395Z"
       },
       {
-        "id": "cc8e71dd-18a6-4383-9db1-bfdb911c75a4",
-        "companyId": "21fa12e3-4425-4372-85d2-d19f8de4808f",
-        "issueId": "2cf688ff-d62f-40ef-a298-f78981e59410",
+        "id": "03d95d72-b6b4-4f84-9635-69641e2adb1c",
+        "companyId": "94bea3c0-04ad-47a9-b846-49782659f443",
+        "issueId": "88c1e8b9-6923-419f-ac1d-846021c44eb2",
         "authorAgentId": null,
         "authorUserId": "rgap-person",
         "onBehalfOfUserId": null,
@@ -762,7 +761,7 @@
         "derivedAuthorAgentId": null,
         "derivedCreatedByRunId": null,
         "derivedAuthorSource": null,
-        "clientRequestId": "0c455a7a-186d-4d18-990e-8cfa08dee04d",
+        "clientRequestId": "6014d435-a0c8-4491-ae9c-396d1d91152a",
         "conversationSessionGeneration": null,
         "origin": "comment",
         "fastResponseRequestId": null,
@@ -775,12 +774,12 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:21.884Z",
-        "updatedAt": "2026-11-19T11:54:21.884Z"
+        "createdAt": "2026-11-19T12:35:56.810Z",
+        "updatedAt": "2026-11-19T12:35:56.810Z"
       }
     ],
     "queue": {
-      "issueId": "2cf688ff-d62f-40ef-a298-f78981e59410",
+      "issueId": "88c1e8b9-6923-419f-ac1d-846021c44eb2",
       "queueId": null,
       "state": null,
       "targetRunId": null,
@@ -790,14 +789,14 @@
       "entries": []
     },
     "run": {
-      "id": "b4988283-d889-4955-b813-0cbafa8c8750",
+      "id": "f5942b8d-a221-4d9a-bed6-d4bacd55a401",
       "status": "running",
       "execution": {
         "canStop": true,
         "phase": "reconnecting",
         "label": "Confirming execution",
         "cause": null,
-        "lastConfirmedActivityAt": "2026-11-19T11:54:41.214Z",
+        "lastConfirmedActivityAt": "2026-11-19T12:36:16.343Z",
         "retryAt": null,
         "attempt": 1,
         "maxAttempts": 3,
@@ -809,23 +808,23 @@
         "predecessorRunId": null,
         "successorRunId": null
       },
-      "createdAt": "2026-11-19T11:54:41.121Z",
-      "startedAt": "2026-11-19T11:54:41.214Z"
+      "createdAt": "2026-11-19T12:36:16.159Z",
+      "startedAt": "2026-11-19T12:36:16.343Z"
     }
   },
   {
     "variant": "busy",
     "state": "resuming",
-    "ms": 2,
+    "ms": 1,
     "lifecycleState": "ready",
-    "messageId": "290ceade-33e7-4639-9b6c-337e9abf5fbd",
-    "noteId": "80f1ee63-000f-43b1-8e00-d4fcd83a857a",
-    "readAt": "2026-11-19T11:54:57.839Z",
+    "messageId": "5b109b7c-9c48-4a54-b377-04526a3bcf11",
+    "noteId": "c51879af-06d0-425d-87c4-1825aeaf55c8",
+    "readAt": "2026-11-19T12:36:33.400Z",
     "comments": [
       {
-        "id": "80f1ee63-000f-43b1-8e00-d4fcd83a857a",
-        "companyId": "bef65dfc-f928-4918-a4a6-4d3b01f45535",
-        "issueId": "7c075673-4556-43bb-a3a6-8cacf72a6cd8",
+        "id": "c51879af-06d0-425d-87c4-1825aeaf55c8",
+        "companyId": "1fcfc7bc-c475-4352-a073-d22f7c8dc169",
+        "issueId": "d1510bfe-08ae-4c39-b906-95306b3390c5",
         "authorAgentId": null,
         "authorUserId": null,
         "onBehalfOfUserId": null,
@@ -838,7 +837,7 @@
         "conversationSessionGeneration": null,
         "origin": "comment",
         "fastResponseRequestId": null,
-        "body": "Managed Pi is resuming. Your message is saved and starts next.",
+        "body": "Managed Pi is resuming. Your message is saved and will start when Managed Pi is ready.",
         "presentation": {
           "kind": "system_notice",
           "tone": "info",
@@ -849,7 +848,7 @@
           "version": 1,
           "recoveryResponsibility": "user",
           "sourceRunId": null,
-          "authorizationReason": "unanswered_message:290ceade-33e7-4639-9b6c-337e9abf5fbd",
+          "authorizationReason": "unanswered_message:5b109b7c-9c48-4a54-b377-04526a3bcf11",
           "sections": [
             {
               "title": "Status",
@@ -869,13 +868,13 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:57.689Z",
-        "updatedAt": "2026-11-19T11:54:57.753Z"
+        "createdAt": "2026-11-19T12:36:33.137Z",
+        "updatedAt": "2026-11-19T12:36:33.261Z"
       },
       {
-        "id": "290ceade-33e7-4639-9b6c-337e9abf5fbd",
-        "companyId": "bef65dfc-f928-4918-a4a6-4d3b01f45535",
-        "issueId": "7c075673-4556-43bb-a3a6-8cacf72a6cd8",
+        "id": "5b109b7c-9c48-4a54-b377-04526a3bcf11",
+        "companyId": "1fcfc7bc-c475-4352-a073-d22f7c8dc169",
+        "issueId": "d1510bfe-08ae-4c39-b906-95306b3390c5",
         "authorAgentId": null,
         "authorUserId": "rgap-person",
         "onBehalfOfUserId": null,
@@ -884,7 +883,7 @@
         "derivedAuthorAgentId": null,
         "derivedCreatedByRunId": null,
         "derivedAuthorSource": null,
-        "clientRequestId": "6291a5c0-2954-40e7-9eda-6edac826b692",
+        "clientRequestId": "1a73096e-8876-4654-8bf8-82574a8506b1",
         "conversationSessionGeneration": null,
         "origin": "comment",
         "fastResponseRequestId": null,
@@ -897,12 +896,12 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:42.655Z",
-        "updatedAt": "2026-11-19T11:54:42.655Z"
+        "createdAt": "2026-11-19T12:36:18.079Z",
+        "updatedAt": "2026-11-19T12:36:18.079Z"
       }
     ],
     "queue": {
-      "issueId": "7c075673-4556-43bb-a3a6-8cacf72a6cd8",
+      "issueId": "d1510bfe-08ae-4c39-b906-95306b3390c5",
       "queueId": null,
       "state": null,
       "targetRunId": null,
@@ -916,16 +915,16 @@
   {
     "variant": "busy",
     "state": "waiting-behind",
-    "ms": 1100,
+    "ms": 1200,
     "lifecycleState": "ready",
-    "messageId": "290ceade-33e7-4639-9b6c-337e9abf5fbd",
-    "noteId": "80f1ee63-000f-43b1-8e00-d4fcd83a857a",
-    "readAt": "2026-11-19T11:54:58.951Z",
+    "messageId": "5b109b7c-9c48-4a54-b377-04526a3bcf11",
+    "noteId": "c51879af-06d0-425d-87c4-1825aeaf55c8",
+    "readAt": "2026-11-19T12:36:34.625Z",
     "comments": [
       {
-        "id": "80f1ee63-000f-43b1-8e00-d4fcd83a857a",
-        "companyId": "bef65dfc-f928-4918-a4a6-4d3b01f45535",
-        "issueId": "7c075673-4556-43bb-a3a6-8cacf72a6cd8",
+        "id": "c51879af-06d0-425d-87c4-1825aeaf55c8",
+        "companyId": "1fcfc7bc-c475-4352-a073-d22f7c8dc169",
+        "issueId": "d1510bfe-08ae-4c39-b906-95306b3390c5",
         "authorAgentId": null,
         "authorUserId": null,
         "onBehalfOfUserId": null,
@@ -941,19 +940,19 @@
         "body": "",
         "presentation": null,
         "metadata": null,
-        "deletedAt": "2026-11-19T11:54:58.893Z",
+        "deletedAt": "2026-11-19T12:36:34.490Z",
         "deletedByType": null,
         "deletedByAgentId": null,
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:57.689Z",
-        "updatedAt": "2026-11-19T11:54:58.893Z"
+        "createdAt": "2026-11-19T12:36:33.137Z",
+        "updatedAt": "2026-11-19T12:36:34.490Z"
       },
       {
-        "id": "290ceade-33e7-4639-9b6c-337e9abf5fbd",
-        "companyId": "bef65dfc-f928-4918-a4a6-4d3b01f45535",
-        "issueId": "7c075673-4556-43bb-a3a6-8cacf72a6cd8",
+        "id": "5b109b7c-9c48-4a54-b377-04526a3bcf11",
+        "companyId": "1fcfc7bc-c475-4352-a073-d22f7c8dc169",
+        "issueId": "d1510bfe-08ae-4c39-b906-95306b3390c5",
         "authorAgentId": null,
         "authorUserId": "rgap-person",
         "onBehalfOfUserId": null,
@@ -962,7 +961,7 @@
         "derivedAuthorAgentId": null,
         "derivedCreatedByRunId": null,
         "derivedAuthorSource": null,
-        "clientRequestId": "6291a5c0-2954-40e7-9eda-6edac826b692",
+        "clientRequestId": "1a73096e-8876-4654-8bf8-82574a8506b1",
         "conversationSessionGeneration": null,
         "origin": "comment",
         "fastResponseRequestId": null,
@@ -975,24 +974,24 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:42.655Z",
-        "updatedAt": "2026-11-19T11:54:42.655Z"
+        "createdAt": "2026-11-19T12:36:18.079Z",
+        "updatedAt": "2026-11-19T12:36:18.079Z"
       }
     ],
     "queue": {
-      "issueId": "7c075673-4556-43bb-a3a6-8cacf72a6cd8",
-      "queueId": "fbc81974-e2d5-44ea-9c6c-35cdcefe0b5b",
+      "issueId": "d1510bfe-08ae-4c39-b906-95306b3390c5",
+      "queueId": "1b7e13b5-08a7-4ba9-b3af-7ab16efa4de3",
       "state": "queued",
       "targetRunId": null,
-      "revision": "5ad4d9ba3bdf48f4077eebf9977f1efe",
+      "revision": "0495f7fdd66f361b48c300fb22cd6a37",
       "protocol": "legacy",
       "steeringDisposition": "unsupported",
       "entries": [
         {
           "comment": {
-            "id": "290ceade-33e7-4639-9b6c-337e9abf5fbd",
-            "companyId": "bef65dfc-f928-4918-a4a6-4d3b01f45535",
-            "issueId": "7c075673-4556-43bb-a3a6-8cacf72a6cd8",
+            "id": "5b109b7c-9c48-4a54-b377-04526a3bcf11",
+            "companyId": "1fcfc7bc-c475-4352-a073-d22f7c8dc169",
+            "issueId": "d1510bfe-08ae-4c39-b906-95306b3390c5",
             "authorAgentId": null,
             "authorUserId": "rgap-person",
             "onBehalfOfUserId": null,
@@ -1001,7 +1000,7 @@
             "derivedAuthorAgentId": null,
             "derivedCreatedByRunId": null,
             "derivedAuthorSource": null,
-            "clientRequestId": "6291a5c0-2954-40e7-9eda-6edac826b692",
+            "clientRequestId": "1a73096e-8876-4654-8bf8-82574a8506b1",
             "conversationSessionGeneration": null,
             "origin": "comment",
             "fastResponseRequestId": null,
@@ -1014,8 +1013,8 @@
             "deletedByUserId": null,
             "deletedByRunId": null,
             "sourceTrust": null,
-            "createdAt": "2026-11-19T11:54:42.655Z",
-            "updatedAt": "2026-11-19T11:54:42.655Z"
+            "createdAt": "2026-11-19T12:36:18.079Z",
+            "updatedAt": "2026-11-19T12:36:18.079Z"
           },
           "position": 0,
           "canEdit": true,
@@ -1025,7 +1024,7 @@
       ]
     },
     "run": {
-      "id": "fdbd07ad-8342-447e-bec8-0ec64754fc34",
+      "id": "b1a2449f-de1e-4c89-9b77-612fa46f6398",
       "status": "queued",
       "execution": {
         "canStop": true,
@@ -1044,7 +1043,7 @@
         "predecessorRunId": null,
         "successorRunId": null,
         "agentQueue": {
-          "agentId": "f0c8a30c-57a5-4225-b754-0452e5c81af7",
+          "agentId": "bb3a070b-dc57-4046-866c-6037e8f19b3f",
           "agentName": "Managed Pi",
           "maxConcurrentRuns": 1,
           "runningCount": 1,
@@ -1052,23 +1051,23 @@
           "queuedCount": 1
         }
       },
-      "createdAt": "2026-11-19T11:54:58.844Z",
+      "createdAt": "2026-11-19T12:36:34.405Z",
       "startedAt": null
     }
   },
   {
     "variant": "busy",
     "state": "header",
-    "ms": 2100,
+    "ms": 2199,
     "lifecycleState": "ready",
-    "messageId": "290ceade-33e7-4639-9b6c-337e9abf5fbd",
-    "noteId": "80f1ee63-000f-43b1-8e00-d4fcd83a857a",
-    "readAt": "2026-11-19T11:54:59.948Z",
+    "messageId": "5b109b7c-9c48-4a54-b377-04526a3bcf11",
+    "noteId": "c51879af-06d0-425d-87c4-1825aeaf55c8",
+    "readAt": "2026-11-19T12:36:35.618Z",
     "comments": [
       {
-        "id": "80f1ee63-000f-43b1-8e00-d4fcd83a857a",
-        "companyId": "bef65dfc-f928-4918-a4a6-4d3b01f45535",
-        "issueId": "7c075673-4556-43bb-a3a6-8cacf72a6cd8",
+        "id": "c51879af-06d0-425d-87c4-1825aeaf55c8",
+        "companyId": "1fcfc7bc-c475-4352-a073-d22f7c8dc169",
+        "issueId": "d1510bfe-08ae-4c39-b906-95306b3390c5",
         "authorAgentId": null,
         "authorUserId": null,
         "onBehalfOfUserId": null,
@@ -1084,19 +1083,19 @@
         "body": "",
         "presentation": null,
         "metadata": null,
-        "deletedAt": "2026-11-19T11:54:58.893Z",
+        "deletedAt": "2026-11-19T12:36:34.490Z",
         "deletedByType": null,
         "deletedByAgentId": null,
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:57.689Z",
-        "updatedAt": "2026-11-19T11:54:58.893Z"
+        "createdAt": "2026-11-19T12:36:33.137Z",
+        "updatedAt": "2026-11-19T12:36:34.490Z"
       },
       {
-        "id": "290ceade-33e7-4639-9b6c-337e9abf5fbd",
-        "companyId": "bef65dfc-f928-4918-a4a6-4d3b01f45535",
-        "issueId": "7c075673-4556-43bb-a3a6-8cacf72a6cd8",
+        "id": "5b109b7c-9c48-4a54-b377-04526a3bcf11",
+        "companyId": "1fcfc7bc-c475-4352-a073-d22f7c8dc169",
+        "issueId": "d1510bfe-08ae-4c39-b906-95306b3390c5",
         "authorAgentId": null,
         "authorUserId": "rgap-person",
         "onBehalfOfUserId": null,
@@ -1105,7 +1104,7 @@
         "derivedAuthorAgentId": null,
         "derivedCreatedByRunId": null,
         "derivedAuthorSource": null,
-        "clientRequestId": "6291a5c0-2954-40e7-9eda-6edac826b692",
+        "clientRequestId": "1a73096e-8876-4654-8bf8-82574a8506b1",
         "conversationSessionGeneration": null,
         "origin": "comment",
         "fastResponseRequestId": null,
@@ -1118,24 +1117,24 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:42.655Z",
-        "updatedAt": "2026-11-19T11:54:42.655Z"
+        "createdAt": "2026-11-19T12:36:18.079Z",
+        "updatedAt": "2026-11-19T12:36:18.079Z"
       }
     ],
     "queue": {
-      "issueId": "7c075673-4556-43bb-a3a6-8cacf72a6cd8",
-      "queueId": "fbc81974-e2d5-44ea-9c6c-35cdcefe0b5b",
+      "issueId": "d1510bfe-08ae-4c39-b906-95306b3390c5",
+      "queueId": "1b7e13b5-08a7-4ba9-b3af-7ab16efa4de3",
       "state": "queued",
       "targetRunId": null,
-      "revision": "5ad4d9ba3bdf48f4077eebf9977f1efe",
+      "revision": "0495f7fdd66f361b48c300fb22cd6a37",
       "protocol": "legacy",
       "steeringDisposition": "unsupported",
       "entries": [
         {
           "comment": {
-            "id": "290ceade-33e7-4639-9b6c-337e9abf5fbd",
-            "companyId": "bef65dfc-f928-4918-a4a6-4d3b01f45535",
-            "issueId": "7c075673-4556-43bb-a3a6-8cacf72a6cd8",
+            "id": "5b109b7c-9c48-4a54-b377-04526a3bcf11",
+            "companyId": "1fcfc7bc-c475-4352-a073-d22f7c8dc169",
+            "issueId": "d1510bfe-08ae-4c39-b906-95306b3390c5",
             "authorAgentId": null,
             "authorUserId": "rgap-person",
             "onBehalfOfUserId": null,
@@ -1144,7 +1143,7 @@
             "derivedAuthorAgentId": null,
             "derivedCreatedByRunId": null,
             "derivedAuthorSource": null,
-            "clientRequestId": "6291a5c0-2954-40e7-9eda-6edac826b692",
+            "clientRequestId": "1a73096e-8876-4654-8bf8-82574a8506b1",
             "conversationSessionGeneration": null,
             "origin": "comment",
             "fastResponseRequestId": null,
@@ -1157,8 +1156,8 @@
             "deletedByUserId": null,
             "deletedByRunId": null,
             "sourceTrust": null,
-            "createdAt": "2026-11-19T11:54:42.655Z",
-            "updatedAt": "2026-11-19T11:54:42.655Z"
+            "createdAt": "2026-11-19T12:36:18.079Z",
+            "updatedAt": "2026-11-19T12:36:18.079Z"
           },
           "position": 0,
           "canEdit": true,
@@ -1168,7 +1167,7 @@
       ]
     },
     "run": {
-      "id": "fdbd07ad-8342-447e-bec8-0ec64754fc34",
+      "id": "b1a2449f-de1e-4c89-9b77-612fa46f6398",
       "status": "queued",
       "execution": {
         "canStop": true,
@@ -1187,23 +1186,23 @@
         "predecessorRunId": null,
         "successorRunId": null
       },
-      "createdAt": "2026-11-19T11:54:58.844Z",
+      "createdAt": "2026-11-19T12:36:34.405Z",
       "startedAt": null
     }
   },
   {
     "variant": "busy",
     "state": "working",
-    "ms": 3200,
+    "ms": 3300,
     "lifecycleState": "ready",
-    "messageId": "290ceade-33e7-4639-9b6c-337e9abf5fbd",
-    "noteId": "80f1ee63-000f-43b1-8e00-d4fcd83a857a",
-    "readAt": "2026-11-19T11:55:01.040Z",
+    "messageId": "5b109b7c-9c48-4a54-b377-04526a3bcf11",
+    "noteId": "c51879af-06d0-425d-87c4-1825aeaf55c8",
+    "readAt": "2026-11-19T12:36:36.713Z",
     "comments": [
       {
-        "id": "80f1ee63-000f-43b1-8e00-d4fcd83a857a",
-        "companyId": "bef65dfc-f928-4918-a4a6-4d3b01f45535",
-        "issueId": "7c075673-4556-43bb-a3a6-8cacf72a6cd8",
+        "id": "c51879af-06d0-425d-87c4-1825aeaf55c8",
+        "companyId": "1fcfc7bc-c475-4352-a073-d22f7c8dc169",
+        "issueId": "d1510bfe-08ae-4c39-b906-95306b3390c5",
         "authorAgentId": null,
         "authorUserId": null,
         "onBehalfOfUserId": null,
@@ -1227,7 +1226,7 @@
           "version": 1,
           "recoveryResponsibility": "user",
           "sourceRunId": null,
-          "authorizationReason": "unanswered_message:290ceade-33e7-4639-9b6c-337e9abf5fbd",
+          "authorizationReason": "unanswered_message:5b109b7c-9c48-4a54-b377-04526a3bcf11",
           "sections": [
             {
               "title": "Status",
@@ -1247,13 +1246,13 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:57.689Z",
-        "updatedAt": "2026-11-19T11:55:00.928Z"
+        "createdAt": "2026-11-19T12:36:33.137Z",
+        "updatedAt": "2026-11-19T12:36:36.546Z"
       },
       {
-        "id": "290ceade-33e7-4639-9b6c-337e9abf5fbd",
-        "companyId": "bef65dfc-f928-4918-a4a6-4d3b01f45535",
-        "issueId": "7c075673-4556-43bb-a3a6-8cacf72a6cd8",
+        "id": "5b109b7c-9c48-4a54-b377-04526a3bcf11",
+        "companyId": "1fcfc7bc-c475-4352-a073-d22f7c8dc169",
+        "issueId": "d1510bfe-08ae-4c39-b906-95306b3390c5",
         "authorAgentId": null,
         "authorUserId": "rgap-person",
         "onBehalfOfUserId": null,
@@ -1262,7 +1261,7 @@
         "derivedAuthorAgentId": null,
         "derivedCreatedByRunId": null,
         "derivedAuthorSource": null,
-        "clientRequestId": "6291a5c0-2954-40e7-9eda-6edac826b692",
+        "clientRequestId": "1a73096e-8876-4654-8bf8-82574a8506b1",
         "conversationSessionGeneration": null,
         "origin": "comment",
         "fastResponseRequestId": null,
@@ -1275,12 +1274,12 @@
         "deletedByUserId": null,
         "deletedByRunId": null,
         "sourceTrust": null,
-        "createdAt": "2026-11-19T11:54:42.655Z",
-        "updatedAt": "2026-11-19T11:54:42.655Z"
+        "createdAt": "2026-11-19T12:36:18.079Z",
+        "updatedAt": "2026-11-19T12:36:18.079Z"
       }
     ],
     "queue": {
-      "issueId": "7c075673-4556-43bb-a3a6-8cacf72a6cd8",
+      "issueId": "d1510bfe-08ae-4c39-b906-95306b3390c5",
       "queueId": null,
       "state": null,
       "targetRunId": null,
@@ -1290,14 +1289,14 @@
       "entries": []
     },
     "run": {
-      "id": "fdbd07ad-8342-447e-bec8-0ec64754fc34",
+      "id": "b1a2449f-de1e-4c89-9b77-612fa46f6398",
       "status": "running",
       "execution": {
         "canStop": true,
         "phase": "reconnecting",
         "label": "Confirming execution",
         "cause": null,
-        "lastConfirmedActivityAt": "2026-11-19T11:55:00.152Z",
+        "lastConfirmedActivityAt": "2026-11-19T12:36:36.103Z",
         "retryAt": null,
         "attempt": 0,
         "maxAttempts": 3,
@@ -1309,8 +1308,8 @@
         "predecessorRunId": null,
         "successorRunId": null
       },
-      "createdAt": "2026-11-19T11:54:58.844Z",
-      "startedAt": "2026-11-19T11:55:00.013Z"
+      "createdAt": "2026-11-19T12:36:34.405Z",
+      "startedAt": "2026-11-19T12:36:35.849Z"
     }
   }
 ]

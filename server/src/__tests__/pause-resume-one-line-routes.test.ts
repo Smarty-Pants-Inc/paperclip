@@ -67,7 +67,7 @@ const PERSON = "mfold-person";
 const PAUSED = "Managed Pi is paused. Your message is saved, and it will run when Managed Pi is resumed. "
   + "A board user or Managed Pi's manager can resume Managed Pi.";
 const WORKING = "Managed Pi is working on your message.";
-const RESUMING = "Managed Pi is resuming. Your message is saved and starts next.";
+const RESUMING = "Managed Pi is resuming. Your message is saved and will start when Managed Pi is ready.";
 const NO_REPLY = "This run finished without a reply to your message. Sending it again is safe.";
 const samples: unknown[] = [];
 

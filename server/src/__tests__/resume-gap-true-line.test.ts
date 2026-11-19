@@ -61,7 +61,7 @@ const NAME = "Managed Pi", PERSON = "rgap-person";
 // Literals, deliberately independent of the production constants.
 const PAUSED = "Managed Pi is paused. Your message is saved, and it will run when Managed Pi is resumed. "
   + "A board user or Managed Pi's manager can resume Managed Pi.";
-const RESUMING = "Managed Pi is resuming. Your message is saved and starts next.";
+const RESUMING = "Managed Pi is resuming. Your message is saved and will start when Managed Pi is ready.";
 const WORKING = "Managed Pi is working on your message.";
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const captures: unknown[] = [];

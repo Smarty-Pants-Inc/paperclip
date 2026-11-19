@@ -99,8 +99,8 @@ export const UNANSWERED_MESSAGE_WORKING_TITLE = (name: string) => `${name} is wo
  * exists, the message's standing '<agent> is paused' note is REWRITTEN IN PLACE (same comment id, one note) to
  * this line. It retires the moment the message's run is created (its header is then the one line). */
 export const UNANSWERED_MESSAGE_AGENT_RESUMING_CODE = "agent_resuming";
-/** proposed, pending RFL: the ONE constant for the resuming line's words. */
-export const UNANSWERED_MESSAGE_RESUMING_TEXT = (name: string) => `${name} is resuming. Your message is saved and starts next.`;
+/** The ONE constant for the resuming line's words. */
+export const UNANSWERED_MESSAGE_RESUMING_TEXT = (name: string) => `${name} is resuming. Your message is saved and will start when ${name} is ready.`;
 export const UNANSWERED_MESSAGE_RESUMING_TITLE = (name: string) => `${name} is resuming`;
 const WAITING_KIND_CODES = new Set(["agent_paused", UNANSWERED_MESSAGE_AGENT_RESUMING_CODE, UNANSWERED_MESSAGE_AGENT_SETUP_CODE,
   UNANSWERED_MESSAGE_WORKING_CODE]);
