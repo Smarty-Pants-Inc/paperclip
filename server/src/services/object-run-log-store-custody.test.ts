@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -233,5 +233,36 @@ describe("object run log custody across flush / close / finalize failures", () =
     expect(after.records.map(entry => entry.event)).toEqual(["spilled", "recovered"]);
     // Recovery never deletes or truncates the kept spill.
     expect(readFileSync(kept.path).equals(spilledFile)).toBe(true);
+  }, 30_000);
+  it("keeps the bytes with the writer when the local spill is refused too, and stores them at the next flush", async () => {
+    const m = memory(), blocked = path.join(mkdtempSync(path.join(os.tmpdir(), "objlog-spill-")), "not-a-directory");
+    writeFileSync(blocked, "");
+    const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", flushMs: 1000, spillDir: blocked,
+      assertWriterAuthority: async () => undefined });
+    const handle = await store.begin({ companyId: "company", agentId: "agent", runId: "custody-no-spill" });
+    await store.append(handle, event(1, "one"));
+    Object.assign(m.injection, { step: "first-flush", fault: "EIO", persistent: true });
+    // Two records: the second is admitted behind the failing batch's flush.
+    const receipts = [(await store.enqueue!(handle, event(2, "two"))).committed.catch((error: unknown) => error)];
+    const flushing = store.flush!(handle).catch((error: unknown) => error);
+    receipts.push((await store.enqueue!(handle, event(3, "three"))).committed.catch((error: unknown) => error));
+    expect(await flushing).toMatchObject({ code: "EIO" });
+    const all = Buffer.concat([1, 2, 3].map(seq => record(handle.attemptId, seq, ["one", "two", "three"][seq - 1]!)));
+    const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    vi.mocked(logger.warn).mockClear();
+    vi.mocked(logger.error).mockClear();
+    try {
+      expect(await store.finalize(handle)).toEqual({ bytes: null, sha256: null, compressed: false });
+      expect((await Promise.all(receipts)).every(value => value instanceof Error)).toBe(true);
+      // Neither store took the bytes: that is said out loud, and the writer is not released.
+      expect(vi.mocked(logger.warn).mock.calls.at(-1)).toEqual([expect.objectContaining({ step: "flush",
+        unspilledBytes: all.length - (await coldRead(m, handle.logRef)).length }), "Object run log finalization failed"]);
+      expect(vi.mocked(logger.error).mock.calls.some(([value]) => (value as { step?: string }).step === "spill")).toBe(true);
+      // Object storage heals. The shutdown flush stores the held bytes, in admitted order.
+      m.injection.step = undefined;
+      await store.flushInflightMirrors!();
+      expect((await coldRead(m, handle.logRef)).equals(all)).toBe(true);
+      await expect(store.flush!(handle)).rejects.toThrow("writer not found");
+    } finally { warning.mockRestore(); }
   }, 30_000);
 });
