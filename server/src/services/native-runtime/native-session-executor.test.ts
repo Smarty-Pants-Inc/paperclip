@@ -1702,7 +1702,15 @@ describe.skipIf(!existsSync("/proc/self/cmdline"))("remote runner launch stale s
       } else {
         expect(result.stdout).toBe("launched");
         expect((await readFile(join(root, "identity"), "utf8")).split("\n")[0]).toBe("nonce");
-        expect(await readFile(log, "utf8")).toContain(`runner_stale_lineage_partial: runner ${stale.pid}:`);
+        const sharedAtLaunch = await readFile(log, "utf8");
+        const generation = await readFile(join(root, "diagnostics", `runnerd.launch-stderr.nonce.${result.pid}.log`), "utf8");
+        if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `stale-holder-${kind.replaceAll(" ", "-")}.json`),
+          JSON.stringify({ kind, stalePid: stale.pid, launchPid: result.pid, status: result.status, stdout: result.stdout, sharedAtLaunch, generation }));
+        // A successful partial launch writes the durable generation before exec.
+        // Its bounded shared log is an asynchronous copy, not the launch receipt.
+        expect(generation).toContain(`runner_stale_lineage_partial: runner ${stale.pid}:`);
+        await vi.waitFor(async () => expect(await readFile(log, "utf8"))
+          .toContain(`runner_stale_lineage_partial: runner ${stale.pid}:`), { timeout: 5_000 });
       }
       for (const survivor of [other, trimmer, unknown]) expect(gone(survivor.pid!)).toBe(false);
     } finally {
