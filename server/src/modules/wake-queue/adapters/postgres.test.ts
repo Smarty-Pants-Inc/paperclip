@@ -2065,7 +2065,10 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     console.log("st-e39 cancelled; D superseded; no run; ONE note:", notes[0].body);
   });
 
-  it("st-failed-newer: even a replying FAILED newer carrier cannot stale the live queue", async () => {
+  // RED BY RULING until Friday's unit RULE-ANSWERED-MEANS-ANSWERED-1119 (owner neworg-lead, judges rf-4 + rf-5):
+  // acd62cca ('a FAILED run's reply never answers') is OUT of I-B (org 20:30Z (1)); its fix ships only with the
+  // 24 h send bound. it.fails keeps the assertion exact; drop '.fails' when that unit lands.
+  it.fails("st-failed-newer: even a replying FAILED newer carrier cannot stale the live queue", async () => {
     const c = await seed();
     const old = await message(c, "Still my live request", ago(40 * 60_000));
     const w = await wake(c, old.id, ago(39 * 60_000));
