@@ -504,6 +504,14 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   // run the person's message ended on: the automatic lineage, typed or not,
   // ends there (fork-lead a6342a4d4, fresh-continuation-chain.ts).
   const latest = runs[0];
+  // Stop means stop: the person stopped this task's latest turn (the chat
+  // bar's own reading, routes/issues.ts buildQueuedCommentQueue) after this
+  // message was saved. The stopped message and any message held by that Stop
+  // are the person's to send again; a newer run (a typed message, the held
+  // batch) is newer than the Stop and ends this, so its failure still shows.
+  const stop = (latest?.resultJson ?? {}) as Record<string, unknown>;
+  if (latest?.status === "cancelled" && stop.cancelledByActorType === "user" && !stop.queuedCommentInterruptQueueId
+    && message.createdAt <= (latest.finishedAt ?? latest.updatedAt)) return { kind: "explained" };
   const run = messageRun && latest && latest.id !== messageRun.id
     && ["failed", "timed_out", "interrupted", "cancelled"].includes(latest.status)
     && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
