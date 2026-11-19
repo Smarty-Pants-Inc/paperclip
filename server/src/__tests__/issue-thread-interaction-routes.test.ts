@@ -3386,12 +3386,11 @@ describe("issue thread interaction routes", () => {
   });
 
   it("contains task-bridge resolvers at the ordinary issue mutation boundary", async () => {
-    mockAccessDecide.mockResolvedValue({
-      allowed: false,
-      action: "issue:mutate",
-      reason: "deny_task_bridge_scope",
-      explanation: "Denied by task bridge scope.",
-    });
+    // access-overlay F6: the route first asks whether the task is visible (issue:read
+    // stays allowed for the task-bridge agent); the write boundary is what denies.
+    mockAccessDecide.mockImplementation(async (input: { action?: string }) => input.action === "issue:read"
+      ? { allowed: true, action: "issue:read", reason: "allow_role_default", explanation: "Visible." }
+      : { allowed: false, action: "issue:mutate", reason: "deny_task_bridge_scope", explanation: "Denied by task bridge scope." });
     const app = await createApp({
       type: "agent",
       agentId: ASSIGNEE_AGENT_ID,

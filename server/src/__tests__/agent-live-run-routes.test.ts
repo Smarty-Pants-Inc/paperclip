@@ -1728,6 +1728,9 @@ describe("agent live run routes", () => {
 
   it("marks traced re-runs as explicit resumes so terminal issue context can execute", async () => {
     const issueId = "22222222-2222-4222-8222-222222222222";
+    // access-overlay F4: a wake that names a task reads that task first (missing == private == 404).
+    mockIssueService.getById.mockResolvedValue({ id: issueId, companyId: "company-1", projectId: null, parentId: null,
+      assigneeAgentId: routeAgentId, assigneeUserId: null, status: "done" });
     const res = await requestApp(await createApp(), (baseUrl) =>
       request(baseUrl)
         .post(`/api/agents/${routeAgentId}/wakeup?companyId=company-1`)

@@ -21198,7 +21198,7 @@ export function issueRoutes(
     validate(upsertIssueFeedbackVoteSchema),
     async (req, res) => {
       const id = req.params.id as string;
-      const issue = await getReadableIssue(
+      const issue = await getAccessibleResource(
         req,
         res,
         svc.getById(id),
