@@ -415,6 +415,8 @@ type ActiveNativeSession = {
   cancelRequested: boolean;
   /** Resolution, not timeout/rejection, of this owner's interrupt cleanup. */
   cancellationCleanupSucceeded?: boolean;
+  /** Local wait budget only; expiry never certifies provider cleanup. */
+  cancellationCleanupGraceMs?: number;
   cancellationRequestedAtMs?: number;
   cancellationCleanupTimedOut?: boolean;
   admissionAbort?: AbortController;
@@ -685,6 +687,9 @@ const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set([
   "timed_out",
 ]);
 const NATIVE_SESSION_CANCELLATION_CLEANUP_GRACE_MS = 2_000;
+// Pi's queue/abort/native-settlement deadline is five seconds. Do not revoke
+// qualification at the generic two-second grace before that deadline can pass.
+const PI_NATIVE_SESSION_CANCELLATION_CLEANUP_GRACE_MS = 5_000;
 const NATIVE_RUNTIME_REQUEST_RESOLUTION_CACHE_MAX = 256;
 type NativeRuntimeRequestResolution = {
   runId: string;
@@ -11190,7 +11195,7 @@ async function performNativeCancellation(
               new Promise<false>((resolve) => {
                 cleanupTimer = setTimeout(
                   () => resolve(false),
-                  NATIVE_SESSION_CANCELLATION_CLEANUP_GRACE_MS,
+                  active.cancellationCleanupGraceMs ?? NATIVE_SESSION_CANCELLATION_CLEANUP_GRACE_MS,
                 );
               }),
             ]);
@@ -14125,7 +14130,9 @@ async function executePaperclipNativeSessionAttempt(
                 await input.onLog?.("stderr", "[paperclip] GitHub access for this turn is unavailable after a server restart; the session retires at run end (github_access_restart_reattach).\n").catch(() => undefined);
               }
               if (session) {
-                const active: ActiveNativeSession = { session, cancelRequested: false, admissionAbort: new AbortController() };
+                const active: ActiveNativeSession = { session, cancelRequested: false, admissionAbort: new AbortController(),
+                  cancellationCleanupGraceMs: input.execution.provider.kind === "pi_rpc"
+                    ? PI_NATIVE_SESSION_CANCELLATION_CLEANUP_GRACE_MS : NATIVE_SESSION_CANCELLATION_CLEANUP_GRACE_MS };
                 activeNativeSessions.set(input.execution.binding.runId, active);
                 const startup = nativeSessionStartups.get(input.execution.binding.runId);
                 const stopBeforeProviderTurn = startup?.stopRequested === true && startup.sessionPublished !== true
