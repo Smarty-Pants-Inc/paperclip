@@ -1,3 +1,4 @@
+import { assertOutboxEquivalence } from "./helpers/assert-outbox-equivalence.js";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { once } from "node:events";
@@ -115,6 +116,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     mocks.cancel.mockReset();
     mocks.cancel.mockImplementation(mocks.actual.cancelNativeSession as never);
     await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+    await assertOutboxEquivalence(db, "agent-chat-steering");
     await db.execute(sql`TRUNCATE TABLE companies CASCADE`);
   });
 
