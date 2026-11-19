@@ -13,6 +13,7 @@ import { agentFileRoots, agentInstructionWorkingCopies, agents, authUsers, close
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentInstructionWorkingCopyService, collectStoppedInstructionCopyWithRetries } from "../services/agent-instruction-working-copies.js";
 import { AgentDirectoryOperationBusyError, agentFileSaveHeld, drainAgentFileCheckpoints } from "../services/agent-directory-working-copies.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { agentFileCopiesToCollectOnLease, agentFileCopyRetirementSettled, holdUncollectedAgentFileCopy } from "../services/agent-file-save-hold.js";
 import * as saveHold from "../services/agent-file-save-hold.js";
 import { resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
@@ -49,6 +50,7 @@ describe("agent directory collection aborted after the canonical commit boundary
   const objects = new Map<string, Buffer>();
   /** Every real store.apply of every service built in a row (counted around the real call). */
   const applyCount = { started: 0, settled: 0 };
+  let lastApplySettledAt = 0;
   /** R6: armed by plantAbortInReleaseCleanup; consumed by the sandbox runner below. */
   let cleanupFault: { armed: boolean; controller: AbortController; reason: Error; reached: () => void; gate: Promise<void> } | null = null;
   /** R8: counts remote capture commands; the second one (the retry's) aborts and hangs. */
@@ -228,13 +230,13 @@ describe("agent directory collection aborted after the canonical commit boundary
     vi.stubEnv("PAPERCLIP_DURABLE_AGENT_FILES", "true");
     vi.spyOn(storageModule, "getStorageService").mockImplementation(() => memoryStorage() as unknown as ReturnType<typeof storageModule.getStorageService>);
     abortSignal = null; cleanupFault = null; captureFault = null; runnerCalls.length = 0; releases.length = 0; objects.clear();
-    applyCount.started = 0; applyCount.settled = 0;
+    applyCount.started = 0; applyCount.settled = 0; lastApplySettledAt = 0;
     const actualStore = fileStoreModule.agentFileStore;
     vi.spyOn(fileStoreModule, "agentFileStore").mockImplementation((...args) => {
       const store = actualStore(...args), realApply = store.apply.bind(store);
       vi.spyOn(store, "apply").mockImplementation(async (...applyArgs) => {
         applyCount.started++;
-        try { return await realApply(...applyArgs); } finally { applyCount.settled++; }
+        try { return await realApply(...applyArgs); } finally { applyCount.settled++; lastApplySettledAt = performance.now(); }
       });
       return store;
     });
@@ -351,6 +353,87 @@ describe("agent directory collection aborted after the canonical commit boundary
     expect.soft(after).toMatchObject({ manifestHasNote: true, treeHasNote: true });
     expect.soft(after.generation).not.toBe(before.generation);
     expect.soft(lockFreeAfter, "the lock is released once the apply settled").toBe(true);
+  }, 60_000);
+
+  // There is no periodic lock-release worker: serial()'s finally unlocks the
+  // collector session; this real worker releases the saved SOURCE afterwards.
+  // These rows deliberately observe the lock before even creating that worker.
+  it.each([false, true])("R9 settled late-abort lock is free before real source cleanup (worker admission delayed: %s)", async delayed => {
+    const UNLOCK_TIMEOUT_MS = 2_000; // releaseOperationLock's real timeout
+    const LOCK_OBSERVATION_SLACK_MS = 500;
+    const CLEANUP_ADMISSION_RETRY_MS = 30_000; // scoped-deadline-work retryMs, NOT a sweep period
+    const WORKER_COMPLETION_SLACK_MS = 5_000;
+    const { service, copy, executionTarget, runId, note } = await stoppedRunWithUnsavedNote({ agentFileLateAbortSettleMs: 200 });
+    const { controller, persisted, release } = plantAbortAfterPersist(note, true);
+    const collection = outcomeOf(service.collectStopped({ companyId, runId, target: executionTarget, signal: controller.signal }));
+    await Promise.race([persisted, collection]);
+    const atBound = await Promise.race([collection, sleep(5_000).then(() => null)]);
+    const lockFreeWhileLanding = await independentPoolCanTakeLock();
+    release();
+    // Start the stopwatch at the real apply's finally, NOT after a drain,
+    // cleanup pass, or collection return. Do not join the operation before
+    // probing: a stuck unlock must fail this observation rather than hang it.
+    const applyDeadline = performance.now() + 5_000;
+    while (!lastApplySettledAt && performance.now() < applyDeadline) await sleep(10);
+    expect(lastApplySettledAt, "fixture: the real apply settled").toBeGreaterThan(0);
+    let lockFreeBeforeWorker = false;
+    const lockDeadline = lastApplySettledAt + UNLOCK_TIMEOUT_MS + LOCK_OBSERVATION_SLACK_MS;
+    do {
+      lockFreeBeforeWorker = await independentPoolCanTakeLock();
+      if (lockFreeBeforeWorker) break;
+      await sleep(10);
+    } while (performance.now() < lockDeadline);
+    const lockAcquiredAfterSettleMs = performance.now() - lastApplySettledAt;
+    const beforeWorker = await copyRow(runId);
+    const sourceBeforeWorker = await fs.readFile(path.join(copy.executionRoot, noteName), "utf8").catch(() => null);
+    // The normal case boots immediately. The delayed case lets the REAL
+    // coordinator schedule its boot-admission retry, then opens admission;
+    // no wake(), fake timers, direct release(), or worker.run() short-circuit.
+    let admitted = !delayed;
+    const errors: string[] = [];
+    const worker = createDeliveryWorkCoordinator({ owner: db, canRun: () => admitted, onError: error => { errors.push(String(error)); } });
+    const workerStartedAt = performance.now();
+    let nextWakeAfterBoot: number | null = null;
+    let cleaned = false;
+    try {
+      await service.registerDirectoryCleanupWork(worker, () => admitted, async () => true).ready;
+      nextWakeAfterBoot = worker.nextWakeAt();
+      admitted = true;
+      const cleanupDeadline = workerStartedAt + (delayed ? CLEANUP_ADMISSION_RETRY_MS : 0) + WORKER_COMPLETION_SLACK_MS;
+      do {
+        cleaned = (await copyRow(runId)).receipt?.cleanupPending === false;
+        if (cleaned) break;
+        await sleep(25);
+      } while (performance.now() < cleanupDeadline);
+      const after = await canonical(note);
+      const afterWorker = await copyRow(runId);
+      const sourceAfterWorker = await fs.readFile(path.join(copy.executionRoot, noteName), "utf8").catch(() => null);
+      await evidence(`r9-cleanup-${delayed ? "delayed" : "normal"}.json`, {
+        realTimers: true, workerHasFixedPeriod: false, cleanupAdmissionRetryMs: CLEANUP_ADMISSION_RETRY_MS,
+        unlockTimeoutMs: UNLOCK_TIMEOUT_MS, lockObservationSlackMs: LOCK_OBSERVATION_SLACK_MS,
+        lockFreeWhileLanding, lockFreeBeforeWorker, lockAcquiredAfterSettleMs,
+        reported: atBound?.row?.errorCode, error: atBound?.error ? String(atBound.error) : null,
+        beforeWorker: { state: beforeWorker.state, abortCameTooLate: beforeWorker.receipt?.abortCameTooLate, cleanupPending: beforeWorker.receipt?.cleanupPending, sourcePresent: sourceBeforeWorker === note },
+        delayed, nextWakeAfterBoot, cleaned, cleanupObservedAfterWorkerBootMs: performance.now() - workerStartedAt,
+        afterWorker: { state: afterWorker.state, cleanupPending: afterWorker.receipt?.cleanupPending, sourcePresent: sourceAfterWorker !== null },
+        workerErrors: errors, applies: { ...applyCount }, after,
+      });
+      expect.soft(atBound?.row?.errorCode).toBe("AGENT_FILES_SAVE_STILL_RUNNING");
+      expect.soft(atBound?.error).toBeNull();
+      expect.soft(lockFreeWhileLanding).toBe(false);
+      expect.soft(lockFreeBeforeWorker, "collector unlock does not depend on cleanup admission").toBe(true);
+      expect.soft(lockAcquiredAfterSettleMs).toBeLessThanOrEqual(UNLOCK_TIMEOUT_MS + LOCK_OBSERVATION_SLACK_MS);
+      expect.soft(beforeWorker).toMatchObject({ state: "saved", receipt: { abortCameTooLate: true } });
+      expect.soft(beforeWorker.receipt?.cleanupPending).not.toBe(false);
+      expect.soft(sourceBeforeWorker).toBe(note);
+      if (delayed) expect.soft(nextWakeAfterBoot, "real coordinator scheduled its admission retry").not.toBeNull();
+      expect.soft(cleaned, "the real cleanup worker must release the saved source").toBe(true);
+      expect.soft(sourceAfterWorker).toBeNull();
+      expect.soft(afterWorker).toMatchObject({ state: "saved", receipt: { cleanupPending: false } });
+      expect.soft(errors).toEqual([]);
+      expect.soft(applyCount).toEqual({ started: 1, settled: 1 });
+      expect.soft(after).toMatchObject({ manifestHash: after.treeHash, manifestHasNote: true, treeHasNote: true });
+    } finally { await worker.stop(); }
   }, 60_000);
 
   it("R3 the caller treats 'saved, abort came too late' as saved: one apply, no retry, no re-collection, no hold, and the aborted run takes no further step", async () => {
