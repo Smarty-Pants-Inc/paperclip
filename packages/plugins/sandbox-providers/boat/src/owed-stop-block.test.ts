@@ -517,3 +517,164 @@ describe("spares-ON gate-5 rows", () => {
     expect(bodies.filter(body => body.labels.purpose === "spare").map(body => body.type)).toEqual(["large"]);
   });
 });
+
+// R-C, BRIEF.md money boundary: the real acquire/keeper/request hooks against
+// the existing stateful fake Boat. A 422 creates no box; the next POST accepts
+// one but loses its answer with ETIMEDOUT. Like create-idem R1, that pending box
+// is absent from inventory until a repeated POST resolves its idempotency key.
+describe("spare.7 combined create-retry money row", () => {
+  it("R-C a claimed spare's refill gets 422 then ETIMEDOUT: one key, one box, one claim and no pool overflow", async () => {
+    const h = await start("rc-refill-retry");
+    const { s1 } = await seed(h);
+    const at = h.boat.mark("R-C claim with a refused then lost-answer refill");
+    const sends: { key: string | null; body: string; result: string; box?: string }[] = [];
+    const accepted = new Map<string, { body: string; box: Box }>();
+    let hidden: string | undefined;
+    vi.stubGlobal("fetch", async (input: unknown, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const method = init.method ?? "GET";
+      if (method === "POST" && url.pathname.endsWith("/sandboxes") && JSON.parse(String(init.body)).labels.purpose === "spare") {
+        const key = new Headers(init.headers).get("Idempotency-Key");
+        const body = String(init.body);
+        const send = { key, body, result: "" } as typeof sends[number];
+        sends.push(send);
+        if (sends.length === 1) {
+          send.result = "HTTP 422, no box";
+          h.boat.record({ kind: "boat", method, path: "/sandboxes", purpose: "spare", note: send.result, idleSpares: h.boat.liveSpares().length });
+          return response({ error: { code: "validation_error" } }, 422);
+        }
+        const prior = key ? accepted.get(key) : undefined;
+        if (prior) {
+          if (prior.body !== body) return response({ error: { code: "idempotency_key_reused" } }, 409);
+          send.box = prior.box.id;
+          send.result = "same-key dedupe";
+          hidden = undefined;
+          return response({ sandbox: { ...h.boat.observe(prior.box) } }, 202);
+        }
+        const created = await h.boat.fetch(input, init);
+        const sandbox = (await created.clone().json()).sandbox as Box;
+        send.box = sandbox.id;
+        if (key) accepted.set(key, { body, box: h.boat.boxes.get(sandbox.id)! });
+        if (sends.length === 2) {
+          hidden = sandbox.id;
+          send.result = "accepted, answer lost: ETIMEDOUT";
+          throw Object.assign(new Error("R-C lost create answer"), { code: "ETIMEDOUT" });
+        }
+        hidden = undefined;
+        send.result = "accepted a NEW box";
+        return created;
+      }
+      const result = await h.boat.fetch(input, init);
+      if (hidden && method === "GET" && url.pathname.endsWith("/sandboxes")) {
+        const body = await result.json();
+        body.sandboxes = body.sandboxes.filter((box: Box) => box.id !== hidden);
+        return response(body);
+      }
+      return result;
+    });
+    const lease = await settle(h.acquire("rc-one-message"));
+    for (let retry = 0; retry < 4 && sends.length < 3; retry++) {
+      await advance(3_000);
+      // A provider refusal/lost answer rejects this maintenance wake; the
+      // next ordinary wake retries after the keeper's existing backoff.
+      await settle(h.emit("issue.comment.created").catch(() => undefined));
+    }
+    await advance(5_000);
+    const creates = h.boat.spareCreates(at).filter(e => e.id);
+    const claimPatches = h.boat.log.filter(e => e.seq > at && e.method === "PATCH" && e.id === s1);
+    const evidence = { claimedId: lease.providerLeaseId, expectedClaimId: s1, claimPatches: claimPatches.length,
+      sends, uniqueKeys: new Set(sends.map(send => send.key)).size,
+      createdSpareIds: creates.map(e => e.id), createBoundaryIdleCounts: creates.map(e => e.idleSpares),
+      liveSpareIds: h.boat.liveSpares(), log: h.boat.log.filter(e => e.seq > at) };
+    if (process.env.RC_EVIDENCE) writeFileSync(process.env.RC_EVIDENCE, JSON.stringify(evidence, null, 2));
+    expect(lease.providerLeaseId, "the person's claim is the exact pre-existing ready spare").toBe(s1);
+    expect(claimPatches, "exactly one successful claim PATCH").toHaveLength(1);
+    expect(sends, "422, lost answer, then repeated create").toHaveLength(3);
+    expect(new Set(sends.map(send => send.key)).size, "one refill must keep its idempotency key across retries").toBe(1);
+    expect(creates, "one actual Boat spare box, not merely one eventually retained box").toHaveLength(1);
+    expect(creates.every(e => e.idleSpares! <= 1), "idle target holds at EVERY create boundary").toBe(true);
+    expect(h.boat.liveSpares()).toHaveLength(1);
+  });
+});
+
+// R-C, BRIEF.md money boundary: the real acquire/keeper/request hooks against
+// the existing stateful fake Boat. A 422 creates no box; the next POST accepts
+// one but loses its answer with ETIMEDOUT. Like create-idem R1, that pending box
+// is absent from inventory until a repeated POST resolves its idempotency key.
+describe("spare.8 restart create-retry money row", () => {
+  it("R-C-RESTART restart between 422 and ETIMEDOUT keeps one durable refill key and one box", async () => {
+    const h = await start("rc-refill-restart");
+    const { s1 } = await seed(h);
+    const at = h.boat.mark("R-C claim with a refused then lost-answer refill");
+    const sends: { key: string | null; body: string; result: string; box?: string }[] = [];
+    const accepted = new Map<string, { body: string; box: Box }>();
+    let hidden: string | undefined;
+    vi.stubGlobal("fetch", async (input: unknown, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const method = init.method ?? "GET";
+      if (method === "POST" && url.pathname.endsWith("/sandboxes") && JSON.parse(String(init.body)).labels.purpose === "spare") {
+        const key = new Headers(init.headers).get("Idempotency-Key");
+        const body = String(init.body);
+        const send = { key, body, result: "" } as typeof sends[number];
+        sends.push(send);
+        if (sends.length === 1) {
+          send.result = "HTTP 422, no box";
+          h.boat.record({ kind: "boat", method, path: "/sandboxes", purpose: "spare", note: send.result, idleSpares: h.boat.liveSpares().length });
+          return response({ error: { code: "validation_error" } }, 422);
+        }
+        const prior = key ? accepted.get(key) : undefined;
+        if (prior) {
+          if (prior.body !== body) return response({ error: { code: "idempotency_key_reused" } }, 409);
+          send.box = prior.box.id;
+          send.result = "same-key dedupe";
+          hidden = undefined;
+          return response({ sandbox: { ...h.boat.observe(prior.box) } }, 202);
+        }
+        const created = await h.boat.fetch(input, init);
+        const sandbox = (await created.clone().json()).sandbox as Box;
+        send.box = sandbox.id;
+        if (key) accepted.set(key, { body, box: h.boat.boxes.get(sandbox.id)! });
+        if (sends.length === 2) {
+          hidden = sandbox.id;
+          send.result = "accepted, answer lost: ETIMEDOUT";
+          throw Object.assign(new Error("R-C lost create answer"), { code: "ETIMEDOUT" });
+        }
+        hidden = undefined;
+        send.result = "accepted a NEW box";
+        return created;
+      }
+      const result = await h.boat.fetch(input, init);
+      if (hidden && method === "GET" && url.pathname.endsWith("/sandboxes")) {
+        const body = await result.json();
+        body.sandboxes = body.sandboxes.filter((box: Box) => box.id !== hidden);
+        return response(body);
+      }
+      return result;
+    });
+    const lease = await settle(h.acquire("rc-one-message"));
+    expect(sends).toHaveLength(1);
+    await h.restart(true);
+    await settle(h.acquire("rc-register-pool-after-restart"));
+    for (let retry = 0; retry < 4 && sends.length < 3; retry++) {
+      await advance(3_000);
+      // A provider refusal/lost answer rejects this maintenance wake; the
+      // next ordinary wake retries after the keeper's existing backoff.
+      await settle(h.emit("issue.comment.created").catch(() => undefined));
+    }
+    await advance(5_000);
+    const creates = h.boat.spareCreates(at).filter(e => e.id);
+    const claimPatches = h.boat.log.filter(e => e.seq > at && e.method === "PATCH" && e.id === s1);
+    const evidence = { claimedId: lease.providerLeaseId, expectedClaimId: s1, claimPatches: claimPatches.length,
+      sends, uniqueKeys: new Set(sends.map(send => send.key)).size,
+      createdSpareIds: creates.map(e => e.id), createBoundaryIdleCounts: creates.map(e => e.idleSpares),
+      liveSpareIds: h.boat.liveSpares(), log: h.boat.log.filter(e => e.seq > at) };
+    if (process.env.RC_RESTART_EVIDENCE) writeFileSync(process.env.RC_RESTART_EVIDENCE, JSON.stringify(evidence, null, 2));
+    expect(lease.providerLeaseId, "the person's claim is the exact pre-existing ready spare").toBe(s1);
+    expect(claimPatches, "exactly one successful claim PATCH").toHaveLength(1);
+    expect(sends, "422, lost answer, then repeated create").toHaveLength(3);
+    expect(new Set(sends.map(send => send.key)).size, "one refill must keep its idempotency key across retries").toBe(1);
+    expect(creates, "one actual Boat spare box, not merely one eventually retained box").toHaveLength(1);
+    expect(creates.every(e => e.idleSpares! <= 1), "idle target holds at EVERY create boundary").toBe(true);
+    expect(h.boat.liveSpares()).toHaveLength(1);
+  });
+});

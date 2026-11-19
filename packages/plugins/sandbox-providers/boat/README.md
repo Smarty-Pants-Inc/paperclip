@@ -91,8 +91,10 @@ means **no spares**. For each listed environment in an active company, `spares`
 is the desired count **and hard idle-pool bound**, further limited by `spareMax`.
 Claims replace a spare; they never expand that bound. Acquisition history still
 uses `spareDemandWindowMinutes` for compatibility, but does not scale the pool.
-Set **`spares=0`** to disable creation and retire unclaimed idle spares by
-confirmed, non-force stop (never delete). A delivered config change applies it
+Set **`spares=0`** to disable creation and retire every unclaimed spare,
+including ready, idle and running boxes, by confirmed, non-force stop (never
+delete). Stop debt is recorded before the request and retained until Boat
+confirms completion. A delivered config change applies it
 immediately; the next existing 15-second maintenance tick also re-reads the
 durable setting, so OFF does not depend on delivery of a config event. Once
 retirement/debt settles, the spare timer stops. No environment edit is needed.
@@ -144,6 +146,19 @@ The replacement starts immediately after a claim, up to the fixed pool size.
 Mismatched, stopped, expired or unfinished unclaimed spares are retired by the
 reconciler, never deleted. Failed starts use exponential backoff (up to 15 minutes).
 
+Each logical refill persists one key and its exact create body in company-scoped
+plugin state (`boat-create-expiry`, `pending-refills`) before its first POST.
+Refused or timed-out sends reuse that identity, including after a plugin restart;
+visible pending inventory is adopted by that same refill. The run and refill
+paths share the key-making and stable-expiry helpers. The stored body contains
+the configured create fields (including any setup script or labels), not the
+Boat authentication header. Unreadable or unwritable identity state fails closed.
+An unresolved identity past Boat's 24-hour key lifetime, or a key-reused refusal,
+requires reconciliation rather than silently minting a new key. Every send
+re-reads the current target and reserves only its remaining room after ready
+inventory and concurrent sends; a lowered target cannot send the old batch.
+The next maintenance tick retires excess idle inventory by the same owed-stop path.
+
 Failed owed-stop retries have their own durable counter, separate from keeper
 stop-failure/backoff totals. After two failed retry-service attempts for a pool's
 own owed stop, that pool creates nothing until its debt is paid. One failed
@@ -154,7 +169,7 @@ that counter at zero; their owed IDs and timed holds are still restored and
 serviced when an acquire supplies the Boat key.
 
 Spare calls honor Boat's worker-wide IP 429 pause, including an absolute
-`nextStartAt` timestamp. Send admission re-reads the spare setting after waits,
+`nextStartAt` timestamp. Send admission re-reads the spare setting before every POST and after waits,
 so a delayed create is not sent after OFF.
 
 Two hourly limits bound what spares can cost (smarty-dev#20869):

@@ -500,7 +500,8 @@ async function currentSpareCount(key: ReadySpareKey): Promise<number | undefined
  * current durable setting still lists with spares > 0 is admitted. A setting
  * that reads off with no config event is applied here, as acquire applies it.
  */
-async function admitSpareCreate(key: ReadySpareKey): Promise<boolean> {
+const admittedSpareCreates = new Map<string, Set<string>>();
+async function admitSpareCreate(key: ReadySpareKey, refillId?: string): Promise<boolean> {
   const poolId = readySparePoolKey(key);
   const pool = knownSparePools.get(poolId);
   if (shuttingDown || !pool || pool.retired || pool.baseDesired <= 0) return false;
@@ -512,7 +513,16 @@ async function admitSpareCreate(key: ReadySpareKey): Promise<boolean> {
     return false;
   }
   const current = knownSparePools.get(poolId);
-  return current === pool && !pool.retired && pool.baseDesired > 0;
+  if (current !== pool || pool.retired || pool.baseDesired <= 0) return false;
+  pool.baseDesired = count;
+  pool.desired = readySpares.demandTarget(key, count, pool.spareMax, pool.demandWindowMinutes);
+  if (refillId === undefined) return true; // TTL renewal does not reserve another box.
+  const admitted = admittedSpareCreates.get(poolId) ?? new Set<string>();
+  const others = [...admitted].filter(id => id !== refillId).length;
+  if (readySpares.ready(key).length + others >= pool.desired) return false;
+  admitted.add(refillId);
+  admittedSpareCreates.set(poolId, admitted);
+  return true;
 }
 /**
  * rf-4 U1 F5 and U1B row D: failed spare stops outlive the worker. Per company,
@@ -582,7 +592,10 @@ async function loadOwedSpareStops(companyId: string): Promise<OwedSpareStops> {
           record.owed.push({ environmentId: owed.environmentId, configHash: owed.configHash, spareId: owed.spareId });
         }
       }
-    } catch { duplexLogger?.warn("Boat spare stop record read failed", { companyId }); }
+    } catch (error) {
+      duplexLogger?.warn("Boat spare stop record read failed", { companyId });
+      throw error; // Unknown debt must never replace the durable record with empty state.
+    }
     if (!companyOwedStops.has(companyId)) companyOwedStops.set(companyId, record);
     return companyOwedStops.get(companyId)!;
   })();
@@ -591,14 +604,14 @@ async function loadOwedSpareStops(companyId: string): Promise<OwedSpareStops> {
   finally { if (companyOwedStopLoads.get(companyId) === work) companyOwedStopLoads.delete(companyId); }
 }
 async function persistOwedSpareStops(companyId: string, record: OwedSpareStops): Promise<void> {
-  if (!pluginContext?.state?.set) return;
+  if (!pluginContext?.state?.set) throw new Error("Boat spare stop requires durable plugin state");
   const context = pluginContext;
   const previous = companyOwedStopWrites.get(companyId) ?? Promise.resolve();
   const write = previous.catch(() => undefined).then(() => context.state.set({ scopeKind: "company", scopeId: companyId,
     namespace: SPARE_ACTIVITY_NAMESPACE, stateKey: SPARE_STOP_OWED_STATE_KEY }, { holds: [...record.holds], owed: [...record.owed] }));
   companyOwedStopWrites.set(companyId, write);
   try { await write; }
-  catch { duplexLogger?.warn("Boat spare stop record write failed", { companyId }); }
+  catch (error) { duplexLogger?.warn("Boat spare stop record write failed", { companyId }); throw error; }
   finally { if (companyOwedStopWrites.get(companyId) === write) companyOwedStopWrites.delete(companyId); }
 }
 /** Keeper and owed-stop retries report here; the record is persisted at once. */
@@ -610,7 +623,12 @@ async function recordSpareStop(record: SpareStopRecord): Promise<void> {
       && !owed.holds.some(hold => hold.environmentId === environmentId && hold.configHash === configHash)) return;
   const previous = owed.holds.find(hold => hold.environmentId === environmentId && hold.configHash === configHash);
   owed.owed = owed.owed.filter(entry => entry.spareId !== record.spareId);
-  if (record.outcome === "failed") owed.owed.push({ environmentId, configHash, spareId: record.spareId });
+  if (record.outcome !== "stopped") owed.owed.push({ environmentId, configHash, spareId: record.spareId });
+  if (record.outcome === "owed") {
+    if (owedStopKeys.has(JSON.stringify([companyId, environmentId]))) ensureSpareRefreshTimer();
+    await persistOwedSpareStops(companyId, owed);
+    return;
+  }
   // A hold's time may expire, but its retry count belongs to the unpaid debt.
   owed.holds = owed.holds.filter(hold => ((hold.until > now && !(hold.environmentId === environmentId && hold.configHash === configHash)) || owed.owed.some(entry =>
     entry.environmentId === hold.environmentId && entry.configHash === hold.configHash))
@@ -671,6 +689,9 @@ async function resumeOwedSpareStops(config: Config, companyId: string, environme
       }
       if (shuttingDown) return;
       try {
+        // A previously failed persistence may have left only the local debt.
+        // Commit it before retrying the provider, just as the keeper does.
+        await persistOwedSpareStops(companyId, record);
         await stopSandbox(config, entry.spareId);
         await recordSpareStop({ outcome: "stopped", key, spareId: entry.spareId });
       } catch {
@@ -885,7 +906,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       // resend wait, an IP pause), and the setting may have turned off during it.
       // The enclosing caller's fresh async admission runs after the last wait and
       // before this send; a pause that begins during that read waits and re-reads.
-      let readmit = attempt > 1;
+      let readmit = responseOptions.sendAdmission !== undefined;
       for (;;) {
         if (await waitForRateLimitPause()) readmit = true;
         if (!readmit || !responseOptions.sendAdmission) break;
@@ -1478,6 +1499,8 @@ const BOAT_IDEMPOTENCY_KEY_LIFE_MS = 24 * 60 * 60 * 1000;
 const CREATE_EXPIRY_NAMESPACE = "boat-create-expiry";
 const CREATE_EXPIRY_STATE_KEY = "by-creation";
 type CreateExpiries = Record<string, { expiry: string; at: number }>;
+/** The sole key maker for ordinary creates and durable spare refills. */
+function creationIdentityId(requested?: string): string { return requested ?? randomUUID(); }
 const createExpiries = new Map<string, { expiry: string; at: number }>();
 const createExpiryWrites = new Map<string, Promise<void>>();
 async function creationExpiry(companyId: string, creationId: string, ttlSeconds: number): Promise<string> {
@@ -2001,34 +2024,118 @@ function readySpareFromSandbox(sandbox: any, ttlSeconds: number): ReadySpare {
     providerObservation: sandbox as Record<string, unknown>,
   };
 }
-async function createReadySpare(config: Config, key: ReadySpareKey, ttlSeconds: number, from?: string): Promise<ReadySpare> {
-  const expiry = new Date(Date.now() + ttlSeconds * 1000).toISOString();
-  const labels = { ...config.labels, owner: `paperclip:${key.companyId}`, purpose: "spare", expiry,
-    environment: key.environmentId, configHash: key.configHash };
-  // rf-4 U1c C1: the keeper admitted this create once; a resend after any wait re-reads the setting first.
-  const created = await request(config, "/sandboxes", {
-    method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": randomUUID() },
-    body: JSON.stringify(createSandboxBody(config, ttlSeconds, labels, from)),
-  }, false, { sendAdmission: () => admitSpareCreate(key) });
-  const sandbox = created?.sandbox ?? created;
-  if (typeof sandbox?.id !== "string" || !sandbox.id) throw new Error("Boat spare create response omitted sandbox.id");
-  idleActivity.resource(activityKey(config, sandbox.id));
-  try {
-    const ready = await waitReady(config, sandbox.id);
-    const setup = config.setupScript === undefined ? ready : await waitSetup(config, sandbox.id);
-    const name = `paperclip-spare:ready:${key.configHash}`;
-    const updated = await request(config, `/sandboxes/${encodeURIComponent(sandbox.id)}`, {
-      method: "PATCH", signal: AbortSignal.timeout(5_000), body: JSON.stringify({ name, ttlSeconds }),
-    }, false, { requireJson: true });
-    const warmedSandbox = updated?.sandbox ?? updated;
-    if (warmedSandbox?.id !== sandbox.id || !["ready", "idle", "running"].includes(warmedSandbox.state)) {
-      throw new Error("Boat spare was not running after setup");
+type SpareRefill = { id: string; body: string; at: number; sandboxId?: string; refused?: boolean };
+type SpareRefills = Record<string, SpareRefill[]>;
+const spareRefillWrites = new Map<string, Promise<void>>();
+const busySpareRefills = new Set<string>();
+/** Serialize the existing plugin-state read/modify/write seam per company.
+ * Unknown state is NOT an empty ledger: fail before a create, never mint a
+ * replacement key because a state read or write failed. The authentication
+ * header is not part of this record (configured body fields are).
+ */
+async function updateSpareRefills(key: ReadySpareKey, update: (pending: SpareRefill[]) => Promise<void> | void): Promise<void> {
+  const state = pluginContext?.state;
+  if (!state?.get || !state.set) throw new Error("Boat spare refill requires durable plugin state");
+  const scope = { scopeKind: "company" as const, scopeId: key.companyId, namespace: CREATE_EXPIRY_NAMESPACE, stateKey: "pending-refills" };
+  const previous = spareRefillWrites.get(key.companyId) ?? Promise.resolve();
+  const write = previous.catch(() => undefined).then(async () => {
+    const value = await state.get(scope);
+    if (value !== null && value !== undefined && (typeof value !== "object" || Array.isArray(value))) throw new Error("Boat spare refill state is invalid");
+    const stored = structuredClone((value ?? {}) as SpareRefills);
+    for (const entries of Object.values(stored)) {
+      if (!Array.isArray(entries) || entries.some(entry => !entry || typeof entry.id !== "string" || typeof entry.body !== "string" || !Number.isFinite(entry.at))) {
+        throw new Error("Boat spare refill identity is invalid");
+      }
     }
-    const observation = { ...setup, ...warmedSandbox, id: sandbox.id, name };
-    return readySpareFromSandbox({ ...observation, labels }, ttlSeconds);
-  } catch (error) {
-    try { await stopSandbox(config, sandbox.id); } catch { /* Boat-side TTL remains the crash-safe stop. */ }
-    throw error;
+    const poolId = readySparePoolKey(key);
+    const pending = stored[poolId] ?? [];
+    await update(pending);
+    if (pending.length) stored[poolId] = pending;
+    else delete stored[poolId];
+    await state.set(scope, stored);
+  });
+  spareRefillWrites.set(key.companyId, write);
+  try { await write; }
+  finally { if (spareRefillWrites.get(key.companyId) === write) spareRefillWrites.delete(key.companyId); }
+}
+async function forgetSpareRefill(key: ReadySpareKey, id: string): Promise<void> {
+  await updateSpareRefills(key, pending => {
+    const index = pending.findIndex(entry => entry.id === id);
+    if (index >= 0) pending.splice(index, 1);
+  });
+}
+async function createReadySpare(config: Config, key: ReadySpareKey, ttlSeconds: number, from?: string): Promise<ReadySpare> {
+  let identity: SpareRefill | undefined;
+  try {
+    await updateSpareRefills(key, async pending => {
+      identity = pending.find(entry => !busySpareRefills.has(entry.id));
+      if (!identity) {
+        const id = creationIdentityId();
+        const expiry = await creationExpiry(key.companyId, id, ttlSeconds);
+        const labels = { ...config.labels, owner: `paperclip:${key.companyId}`, purpose: "spare", expiry,
+          environment: key.environmentId, configHash: key.configHash, "paperclip-refill": id };
+        identity = { id, body: JSON.stringify(createSandboxBody(config, ttlSeconds, labels, from)), at: Date.now() };
+        pending.push(identity);
+      }
+      busySpareRefills.add(identity.id);
+    });
+    const refill = identity!;
+    // Boat's key expires after 24h. An unresolved older identity cannot safely
+    // be re-sent or replaced: inventory/operator reconciliation must resolve it.
+    if (refill.refused || Date.now() - refill.at >= BOAT_IDEMPOTENCY_KEY_LIFE_MS) throw new Error("Boat spare refill identity requires reconciliation");
+    const admit = () => admitSpareCreate(key, refill.id);
+    if (!await admit()) throw new Error("Boat spare create not admitted at the current target");
+    let sandbox: any;
+    if (refill.sandboxId) {
+      const found = await request(config, `/sandboxes/${encodeURIComponent(refill.sandboxId)}`, { signal: AbortSignal.timeout(10_000) }, false, { requireJson: true });
+      sandbox = found?.sandbox ?? found;
+    } else {
+      let created: any;
+      try {
+        created = await request(config, "/sandboxes", {
+          method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": refill.id }, body: refill.body,
+        }, false, { sendAdmission: admit });
+      } catch (error) {
+        if (boatCreateCode(error) === "idempotency_key_reused") {
+          await updateSpareRefills(key, pending => { const entry = pending.find(entry => entry.id === refill.id); if (entry) entry.refused = true; });
+        }
+        throw error;
+      }
+      sandbox = created?.sandbox ?? created;
+      if (typeof sandbox?.id !== "string" || !sandbox.id) throw new Error("Boat spare create response omitted sandbox.id");
+      await updateSpareRefills(key, pending => { const entry = pending.find(entry => entry.id === refill.id); if (entry) entry.sandboxId = sandbox.id; });
+    }
+    const stopped = dedupedBoxStop(sandbox);
+    if (stopped) throw new BoatDedupedBoxStoppedError(sandbox.id, stopped);
+    const labels = JSON.parse(refill.body).labels as Record<string, string>;
+    idleActivity.resource(activityKey(config, sandbox.id));
+    try {
+      const ready = await waitReady(config, sandbox.id);
+      const setup = config.setupScript === undefined ? ready : await waitSetup(config, sandbox.id);
+      const name = `paperclip-spare:ready:${key.configHash}`;
+      const updated = await request(config, `/sandboxes/${encodeURIComponent(sandbox.id)}`, {
+        method: "PATCH", signal: AbortSignal.timeout(5_000), body: JSON.stringify({ name, ttlSeconds }),
+      }, false, { requireJson: true });
+      const warmedSandbox = updated?.sandbox ?? updated;
+      if (warmedSandbox?.id !== sandbox.id || !["ready", "idle", "running"].includes(warmedSandbox.state)) {
+        throw new Error("Boat spare was not running after setup");
+      }
+      const observation = { ...setup, ...warmedSandbox, id: sandbox.id, name };
+      await forgetSpareRefill(key, refill.id);
+      return readySpareFromSandbox({ ...observation, labels }, ttlSeconds);
+    } catch (error) {
+      try {
+        await stopSandbox(config, sandbox.id);
+        await forgetSpareRefill(key, refill.id);
+      } catch { /* Keep the identity until a later inventory confirms its fate. */ }
+      throw error;
+    }
+  } finally {
+    if (identity) {
+      busySpareRefills.delete(identity.id);
+      const poolId = readySparePoolKey(key);
+      admittedSpareCreates.get(poolId)?.delete(identity.id);
+    }
   }
 }
 const BOAT_STOP_STATUSES = new Set(["pending", "failing", "completed", "superseded"]);
@@ -2052,8 +2159,28 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
   return {
     async list() {
       const sandboxes = await listBoatSandboxes(config, scoped, AbortSignal.timeout(2500));
-      return sandboxes.filter(sandbox => sandbox.labels.owner === `paperclip:${key.companyId}` && sandbox.labels.environment === key.environmentId && sandbox.labels.purpose === "spare")
-        .map(sandbox => readySpareFromSandbox(sandbox, ttlSeconds));
+      const owned = sandboxes.filter(sandbox => sandbox.labels.owner === `paperclip:${key.companyId}` && sandbox.labels.environment === key.environmentId && sandbox.labels.purpose === "spare");
+      // A restart can land after the ready PATCH but before its state receipt.
+      // Durable inventory then settles that refill, even if a run claimed it.
+      const settled = new Set<string>(owned.filter(sandbox => sandbox.labels.configHash === key.configHash
+        && (sandbox.name === `paperclip-spare:ready:${key.configHash}` || sandbox.name?.startsWith("paperclip-claim:")
+          || ["archived", "stopped", "error", "cancelled"].includes(sandbox.state)))
+        .map(sandbox => sandbox.labels["paperclip-refill"]).filter((id): id is string => typeof id === "string"));
+      const resolving = new Set<string>();
+      if (owned.some(sandbox => typeof sandbox.labels["paperclip-refill"] === "string")) await updateSpareRefills(key, pending => {
+        for (let i = pending.length - 1; i >= 0; i--) {
+          const entry = pending[i];
+          if (settled.has(entry.id) && !busySpareRefills.has(entry.id)) { pending.splice(i, 1); continue; }
+          const made = owned.find(sandbox => sandbox.labels.configHash === key.configHash && sandbox.labels["paperclip-refill"] === entry.id);
+          if (made && !settled.has(entry.id) && !dedupedBoxStop(made)) {
+            entry.sandboxId = made.id;
+            resolving.add(made.id);
+          }
+        }
+      });
+      // Pending creates are not stale inventory to stop. The durable refill
+      // resolves/adopts and warms that exact id instead of allocating another.
+      return owned.filter(sandbox => !resolving.has(sandbox.id)).map(sandbox => readySpareFromSandbox(sandbox, ttlSeconds));
     },
     async get(spare, signal) {
       const result = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
@@ -2494,13 +2621,18 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     readySpares.setStopBackoffListener(backoff => {
       try { duplexLogger?.warn("Boat ready spare pool backing off after stop failures; no new spare until the back-off ends", { ...backoff }); } catch { /* Logging never changes admission. */ }
     });
-    readySpares.setStopRecordListener(record => { trackOwedStopWork(recordSpareStop(record)); });
+    readySpares.setStopRecordListener(record => {
+      const work = recordSpareStop(record);
+      trackOwedStopWork(work);
+      return work;
+    });
     knownSparePools.clear();
     companyOwedStops.clear(); owedStopRetryAt.clear(); owedStopKeys.clear(); spareSettingReadFailures.clear();
     claimedSpareLeases.clear();
     runCreateLedgerReads.clear();
     runLeaseTtlCaps.clear();
     createExpiries.clear();
+    busySpareRefills.clear(); admittedSpareCreates.clear();
     pluginContext = ctx; duplexContext = ctx.duplexChannel; duplexLogger = ctx.logger;
     for (const unsubscribe of activityUnsubscribers) unsubscribe();
     activityUnsubscribers = [];
@@ -2696,7 +2828,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     if (params.requestedExpiresAt != null) throw new Error("Boat auto-stop TTL cannot enforce a hard requestedExpiresAt deadline.");
     const ttl = effectiveTtlSeconds(c);
     const remoteCwd = workspaceDirectory(params.requestedCwd ?? "/home/user/paperclip-workspace");
-    const attemptId = params.creationOperationId ?? randomUUID();
+    const attemptId = creationIdentityId(params.creationOperationId);
     const createLabels = (expiry: string) => ({ ...c.labels, owner: `paperclip:${params.companyId}`, purpose: params.purpose ?? "run", expiry, environment: params.environmentId, run: params.runId, ...(params.creationOperationId ? { creation: params.creationOperationId } : {}), "paperclip-acquire": attemptId });
     // Check outside allocation cleanup: no create was attempted on a failed pin check.
     // Lead measurement 11-12: create.from accepts a NAME, not the snapshot UUID.

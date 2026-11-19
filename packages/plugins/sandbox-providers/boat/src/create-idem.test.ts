@@ -199,3 +199,42 @@ describe("Boat create re-sent under the same creation id (create-retry money uni
     await expect(plugin.definition.onEnvironmentAcquireLease!(params)).resolves.toMatchObject({ providerLeaseId: "bx_1" });
   });
 });
+
+// R-A reconstruction only: the supplied spare.5 commit has no named F1 / 422
+// then ETIMEDOUT row. All existing create-idem rows above stay unchanged.
+describe("spare.7 requested ordinary create sequence", () => {
+  it("R-A 422 then ETIMEDOUT under one host creation id makes exactly one Boat box", async () => {
+    const boat = fakeBoat();
+    const original = globalThis.fetch;
+    const sends: { key: string | null; body: string; result: string }[] = [];
+    vi.stubGlobal("fetch", async (input: any, init: any = {}) => {
+      if ((init.method ?? "GET") === "POST" && new URL(String(input)).pathname.endsWith("/sandboxes")) {
+        const send = { key: new Headers(init.headers).get("Idempotency-Key"), body: String(init.body), result: "" };
+        sends.push(send);
+        if (sends.length === 1) {
+          send.result = "422 no box";
+          return response({ error: { code: "validation_error" } }, 422);
+        }
+        if (sends.length === 2) {
+          await original(input, init);
+          send.result = "accepted, answer lost: ETIMEDOUT";
+          vi.setSystemTime(new Date(Date.now() + 90_001));
+          throw Object.assign(new Error("R-A lost create answer"), { code: "ETIMEDOUT" });
+        }
+        send.result = "same-key dedupe";
+      }
+      return original(input, init);
+    });
+    await expect(plugin.definition.onEnvironmentAcquireLease!(params)).rejects.toMatchObject({ status: 422 });
+    vi.setSystemTime(new Date(Date.now() + 40_000));
+    await expect(plugin.definition.onEnvironmentAcquireLease!(params)).rejects.toMatchObject({ code: "ETIMEDOUT" });
+    vi.setSystemTime(new Date(Date.now() + 40_000));
+    const lease = await plugin.definition.onEnvironmentAcquireLease!(params);
+    expect(sends).toHaveLength(3);
+    expect(new Set(sends.map(send => send.key))).toEqual(new Set(["op-1"]));
+    expect(new Set(sends.map(send => send.body)).size).toBe(1);
+    expect(boat.boxes).toEqual(["bx_1"]);
+    expect(lease.providerLeaseId).toBe("bx_1");
+    console.log("R-A evidence", JSON.stringify({ sends, boxes: boat.boxes, providerLeaseId: lease.providerLeaseId }));
+  });
+});

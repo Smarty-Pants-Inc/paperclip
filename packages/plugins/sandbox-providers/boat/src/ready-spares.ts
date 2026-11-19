@@ -137,6 +137,7 @@ export type StopBackoff = {
 
 /** A spare stop's outcome, for the plugin's durable record of owed stops and holds (rf-4 U1 F5/D). */
 export type SpareStopRecord =
+  | { outcome: "owed"; key: ReadySpareKey; spareId: string }
   | { outcome: "failed"; key: ReadySpareKey; spareId: string; until: number; failures: number; retries?: number }
   | { outcome: "stopped"; key: ReadySpareKey; spareId: string };
 
@@ -344,7 +345,7 @@ export class ReadySpareKeeper {
   private readonly stopBackoffs = new Map<string, { failures: number; until: number; error: string; logged: boolean }>();
   /** Spares whose stop failed and has not since succeeded: never TTL-renewed (rf-4 U1B row H). */
   private readonly stopFailedSpares = new Set<string>();
-  private stopRecordListener?: (record: SpareStopRecord) => void;
+  private stopRecordListener?: (record: SpareStopRecord) => void | Promise<void>;
   /** #21251: failed retries of each pool's owed spare stops since its last successful stop. */
   private readonly owedStopRetryFailures = new Map<string, number>();
   private readonly failures = new Map<string, { count: number; retryAt: number }>();
@@ -364,7 +365,7 @@ export class ReadySpareKeeper {
   /** Called once per back-off episode, when it first holds a create back. */
   setStopBackoffListener(listener: ((backoff: StopBackoff) => void) | undefined): void { this.stopBackoffListener = listener; }
   /** Called at every spare stop outcome; the plugin persists failed stops and their hold. */
-  setStopRecordListener(listener: ((record: SpareStopRecord) => void) | undefined): void { this.stopRecordListener = listener; }
+  setStopRecordListener(listener: ((record: SpareStopRecord) => void | Promise<void>) | undefined): void { this.stopRecordListener = listener; }
   /** Re-establish a hold a previous worker recorded (rf-4 U1 F5). A later local hold wins. */
   restoreStopBackoff(key: ReadySpareKey, until: number, failures: number, spareIds: readonly string[] = []): void {
     for (const id of spareIds) this.stopFailedSpares.add(id);
@@ -616,7 +617,11 @@ export class ReadySpareKeeper {
           && !spare.name.startsWith("paperclip-claim:") && !isTerminalState(spare.state)) return false;
     }
     this.stoppingSpares.add(spare.id);
-    try { await operations.stop(spare); }
+    try {
+      // Debt must exist before the side effect, including a worker cutover.
+      await this.stopRecordListener?.({ outcome: "owed", key, spareId: spare.id });
+      await operations.stop(spare);
+    }
     catch (error) {
       const poolId = readySparePoolKey(key);
       const failures = (this.stopBackoffs.get(poolId)?.failures ?? 0) + 1;
@@ -627,13 +632,13 @@ export class ReadySpareKeeper {
       try { if (operations.redact) text = operations.redact(raw); } catch { /* keep the closed text */ }
       this.stopBackoffs.set(poolId, { failures, until, error: text, logged: false });
       this.stopFailedSpares.add(spare.id);
-      try { this.stopRecordListener?.({ outcome: "failed", key, spareId: spare.id, until, failures }); } catch { /* Recording never changes the stop. */ }
+      try { await this.stopRecordListener?.({ outcome: "failed", key, spareId: spare.id, until, failures }); } catch { /* Keep the original stop error. */ }
       throw error;
     }
     finally { this.stoppingSpares.delete(spare.id); }
     this.stopBackoffs.delete(readySparePoolKey(key));
     this.stopFailedSpares.delete(spare.id);
-    try { this.stopRecordListener?.({ outcome: "stopped", key, spareId: spare.id }); } catch { /* Recording never changes the stop. */ }
+    await this.stopRecordListener?.({ outcome: "stopped", key, spareId: spare.id });
     return true;
   }
 
@@ -805,13 +810,18 @@ export class ReadySpareKeeper {
     const poolId = readySparePoolKey(key);
     const listed = await operations.list();
     if (this.stopping || (this.inFlightClaims.get(poolId) ?? 0) > 0) return;
-    const keep = listed.filter(spare => spare.labels.owner === `paperclip:${key.companyId}`
-      && spare.labels.environment === key.environmentId && spare.labels.purpose === "spare"
-      && spare.labels.configHash === key.configHash
-      && spare.name === `paperclip-spare:ready:${key.configHash}`
-      && (spare.state === "ready" || spare.state === "idle"));
-    const eligible = keep.filter(spare => !this.claiming.has(spare.id) && !this.stoppingSpares.has(spare.id));
     const target = Math.max(0, Math.min(MAX_READY_SPARES, Math.trunc(desired)));
+    const retirable = (spare: ReadySpare) => spare.labels.owner === `paperclip:${key.companyId}`
+      && spare.labels.environment === key.environmentId && spare.labels.purpose === "spare"
+      && !spare.name.startsWith("paperclip-claim:")
+      && (target === 0 ? !isTerminalState(spare.state)
+        : spare.labels.configHash === key.configHash && spare.name === `paperclip-spare:ready:${key.configHash}`
+          && (spare.state === "ready" || spare.state === "idle"));
+    const keep = listed.filter(retirable);
+    // Existing debt is serviced by the owed-stop retry path, at its backoff,
+    // never by a fresh keeper stop on every tick (which would erase retry counts).
+    const eligible = keep.filter(spare => !this.claiming.has(spare.id) && !this.stoppingSpares.has(spare.id)
+      && !this.stopFailedSpares.has(spare.id));
     const selected = eligible.slice(0, target);
     for (const surplus of eligible.slice(selected.length)) {
       if (this.stopping) return;
@@ -819,11 +829,7 @@ export class ReadySpareKeeper {
       try { current = await operations.get(surplus); }
       catch { continue; } // Unknown provider state is never a reason to stop a spare.
       if (this.stopping) return;
-      if (current?.id !== surplus.id || current.labels.owner !== `paperclip:${key.companyId}`
-        || current.labels.environment !== key.environmentId || current.labels.purpose !== "spare"
-        || current.labels.configHash !== key.configHash
-        || current.name !== `paperclip-spare:ready:${key.configHash}`
-        || (current.state !== "ready" && current.state !== "idle") || this.claiming.has(surplus.id)) continue;
+      if (!current || current.id !== surplus.id || !retirable(current) || this.claiming.has(surplus.id)) continue;
       if (!await this.stopSpare(key, current, operations, { surplusOf: target })) selected.push(current);
     }
     this.commitPool(poolId, selected, listed);
