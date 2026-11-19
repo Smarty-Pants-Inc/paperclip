@@ -45,6 +45,7 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
 }));
 
 const mockRunSecretRedactionRegistry = vi.hoisted(() => ({
+  redactionValuesForRun: vi.fn(async (_companyId: string, _runId: string): Promise<string[]> => []),
   redactForRuns: vi.fn(async (_companyId: string, values: unknown[]) => values),
   redactForRun: vi.fn(
     async (_companyId: string, _runId: string, value: unknown) => value,
@@ -116,7 +117,8 @@ function registerModuleMocks() {
     issueService: () => mockIssueService,
   }));
 
-  vi.doMock("../services/run-secret-redaction.js", () => ({
+  vi.doMock("../services/run-secret-redaction.js", async () => ({
+    ...(await vi.importActual<typeof import("../services/run-secret-redaction.js")>("../services/run-secret-redaction.js")),
     createRunSecretRedactionRegistry: () => mockRunSecretRedactionRegistry,
   }));
 
@@ -295,7 +297,7 @@ describe("agent live run routes", () => {
     const { spillMemory } = await import("../services/object-run-log-spill.fixture.js");
     const { createObjectRunLogStore, readObjectRunLogSpill, OBJECT_RUN_LOG_FINALIZE_ADMISSION_TIMEOUT_MS } = await vi.importActual<typeof import("../services/object-run-log-store.js")>("../services/object-run-log-store.js");
     const { createHeartbeatRunOutput } = await vi.importActual<typeof import("../services/heartbeat/run-output.js")>("../services/heartbeat/run-output.js");
-    const { createNativeRunLogExporter, formatNativeRunLogEvent } = await import("../services/native-runtime/native-run-log-export.js");
+    const { formatNativeRunLogEvent } = await import("../services/native-runtime/native-run-log-export.js");
     const { nativeSha256 } = await import("../services/native-runtime/canonical.js");
     const database = await startEmbeddedPostgresTestDatabase("finalize-bound-get-");
     const db = createDb(database.connectionString, { maxConnections: 1, idleTimeoutSeconds: 0 });
@@ -320,7 +322,14 @@ describe("agent live run routes", () => {
       await db.execute(sql.raw(`set search_path=${schema}`));
       await createNativeRunLogTestTables(db);
       await db.execute(sql`alter table heartbeat_runs add column scope_kind text not null default 'company'`);
-      await db.execute(sql`insert into heartbeat_runs(id,company_id,agent_id,status,runtime_mode) values(${runId},${companyId},${agentId},'running','legacy')`);
+      await db.execute(sql`alter table agent_identity_keys add column revoked_at timestamptz`);
+      // Native recovery reads the actual (empty) secret registry; no credential fixture.
+      mockRunSecretRedactionRegistry.redactionValuesForRun.mockImplementation(async (company, id) => {
+        const registry = await vi.importActual<typeof import("../services/run-secret-redaction.js")>("../services/run-secret-redaction.js");
+        return registry.createRunSecretRedactionRegistry(db).redactionValuesForRun(company, id);
+      });
+      const runtimeMode = kind === "cli" ? "legacy" : "native";
+      await db.execute(sql`insert into heartbeat_runs(id,company_id,agent_id,status,runtime_mode) values(${runId},${companyId},${agentId},'running',${runtimeMode})`);
       const [storedRun] = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
         status: heartbeatRuns.status, runtimeMode: heartbeatRuns.runtimeMode, logStore: heartbeatRuns.logStore,
         logRef: heartbeatRuns.logRef, logBytes: heartbeatRuns.logBytes, lastOutputSeq: heartbeatRuns.lastOutputSeq,
@@ -378,8 +387,10 @@ describe("agent live run routes", () => {
       mockHeartbeatService.readLog.mockImplementation(real.readLog);
       const app = await createApp(db as any, { type: "board", userId: "local-board", companyIds: [companyId], source: "local_implicit", isInstanceAdmin: false });
       const get = () => requestApp(app, url => request(url).get(`/api/heartbeat-runs/${runId}/log?limitBytes=256000`));
+      let beforeGet: unknown;
       if (kind !== "native-source") {
         const incomplete = await get();
+        beforeGet = incomplete.body;
         expect(incomplete.status, JSON.stringify(incomplete.body)).toBe(200);
         expect(incomplete.body.content).toBe("");
         expect(incomplete.body.incomplete).toMatchObject({ bytes: expected.length,
@@ -388,20 +399,8 @@ describe("agent live run routes", () => {
       m.state.down = false;
       peerSpillENOSPC.mockRestore();
       await store.flushInflightMirrors!();
-      if (kind === "native-source") {
-        // Real exporter re-reads the durable native source after the refused cursor.
-        const resumed = createHeartbeatRunOutput(db, { run: run!, runId, issueId: null, runLogStore: restored,
-          identityRedactor: { chunk: (_s, c) => c, redact: v => v }, secretKeys: new Set(),
-          appendRunEvent: async () => undefined, getCurrentUserRedactionOptions: async () => ({ enabled: false }) });
-        const next = await resumed.begin(run!);
-        const exporter = createNativeRunLogExporter({ db, companyId, runId, afterCursor: resumed.handle!.initialSourceCursor!,
-          enqueue: (sourceCursor, text) => next.appendIdentityRedactedLog("stdout", text, false, { kind: "canonical_native", sourceCursor }),
-          flush: () => restored.flush!(resumed.handle!) });
-        await exporter.recover();
-        await exporter.recover();
-        const summary = await restored.finalize(resumed.handle!);
-        await db.execute(sql`update heartbeat_runs set log_bytes=${summary.bytes},log_sha256=${summary.sha256} where id=${runId}`);
-      }
+      // For native runs GET itself re-exports the refused source cursor, after
+      // adopting any diagnostic spill. A second GET must not duplicate either.
       const response = await get(), again = await get();
       expect(response.status, JSON.stringify(response.body)).toBe(200);
       expect(again.body.content).toBe(response.body.content);
@@ -409,6 +408,17 @@ describe("agent live run routes", () => {
       expect(again.body).not.toHaveProperty("incomplete");
       const served = Buffer.from(response.body.content);
       const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex");
+      if (process.env.OBJLOG_ROWS) {
+        const evidence = `${process.env.OBJLOG_ROWS}-${kind}`;
+        await fs.mkdir(evidence, { recursive: true });
+        for (const [name, bytes] of Object.entries({ "expected.ndjson": expected, "spill-before.ndjson": spillFile,
+          "index-before.ndjson": Buffer.from(spill.records.map(entry => JSON.stringify(entry) + "\n").join("")),
+          "get-before.json": Buffer.from(JSON.stringify(beforeGet ?? null, null, 2)),
+          "get-after.json": Buffer.from(JSON.stringify(response.body, null, 2)),
+          "index-after.ndjson": await fs.readFile(spill.indexPath).catch((error: NodeJS.ErrnoException) => {
+            if (error.code === "ENOENT") return Buffer.alloc(0); throw error;
+          }) })) await fs.writeFile(path.join(evidence, name), bytes, { mode: 0o600 });
+      }
       console.info("BOUND_CUSTODY_BEFORE_ASSERT", JSON.stringify({ kind, expectedBytes: expected.length,
         storedBytes: served.length, spilledBeforeHealing: spill.unrecovered.length, spillPath: spill.path,
         expectedSha256: sha(expected), servedSha256: sha(served) }));
@@ -425,7 +435,9 @@ describe("agent live run routes", () => {
       }
       const row = (await db.execute(sql`select log_bytes,log_sha256 from heartbeat_runs where id=${runId}`))[0];
       expect(Number(row!.log_bytes)).toBe(served.length);
-      expect(row!.log_sha256).toBe(sha(served));
+      // Native repair deliberately skips the full-log digest; byte custody is
+      // independently SHA-checked above for both kinds of source-less record.
+      expect(row!.log_sha256).toBe(kind === "cli" ? sha(served) : null);
       console.info("BOUND_GET_ROW", JSON.stringify({ kind, runId, spillPath: spill.path, expectedBytes: expected.length,
         servedBytes: served.length, servedSha256: sha(served), expectedSha256: sha(expected), row }));
       if (process.env.OBJLOG_ROWS) appendFileSync(process.env.OBJLOG_ROWS, JSON.stringify({ kind, runId, spillPath: spill.path,

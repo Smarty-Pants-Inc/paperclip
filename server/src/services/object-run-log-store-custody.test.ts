@@ -191,37 +191,48 @@ describe("object run log custody across flush / close / finalize failures", () =
       await vi.advanceTimersByTimeAsync(boundMs - 1);
       expect(observed.settled).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
+      // The deadline has fired; source-less refusal now performs real disk I/O
+      // before acknowledging custody. Let that I/O finish without advancing the
+      // admission deadline (the -1 ms assertion above still protects the bound).
+      vi.useRealTimers();
+      await vi.waitFor(() => expect(observed.settled).toBe(true), { timeout: 2000 });
       const settledAtBound = observed.settled;
-      await vi.advanceTimersByTimeAsync(boundMs);
       diagnostics = [...vi.mocked(logger.warn).mock.calls];
       errors = [...vi.mocked(logger.error).mock.calls];
       const snapshot = { ...observed };
       if (admissionSettled) waitingResult = await waiting;
       if (process.env.OBJLOG_CUSTODY_EVIDENCE) appendFileSync(process.env.OBJLOG_CUSTODY_EVIDENCE,
-        `${JSON.stringify({ row: "finalize-admission-bound", peers: peers.length, boundMs, elapsedMs: 2 * boundMs,
+        `${JSON.stringify({ row: "finalize-admission-bound", peers: peers.length, boundMs, elapsedMs: boundMs,
           heldBytes: expected.reduce((sum, bytes) => sum + bytes.length, 0), settledAtBound, ...snapshot, admissionSettled,
           admitted, diagnostics, errors })}\n`);
-      // Assertion-red at base / no-bound mutation: finalize is still waiting at 2x the bound.
+      // No-bound mutation: the bounded wait above cannot finish. No bytes may be discarded.
       expect(snapshot.settled).toBe(true);
       expect(settledAtBound).toBe(true);
       expect(snapshot.summary).toEqual({ bytes: null, sha256: null, compressed: false });
       expect(admissionSettled).toBe(true);
       expect(waitingResult).toMatchObject({ code: "object_run_log_finalize_admission_timeout" });
       expect(warning).toHaveBeenCalledWith(expect.stringContaining("persistence is incomplete"));
+      const refusedBytes = record(target.attemptId, 1, "y".repeat(8192));
+      const readWhileHeld = await store.read({ store: target.store, logRef: target.logRef });
+      expect(readWhileHeld).toMatchObject({ content: "", incomplete: { bytes: refusedBytes.length,
+        causes: [{ code: "object_run_log_finalize_admission_timeout" }] } });
       expect(diagnostics).toEqual(expect.arrayContaining([
         [expect.objectContaining({ runId: "capacity-target", step: "admissions",
           err: expect.objectContaining({ code: "object_run_log_finalize_admission_timeout" }),
           capacity: { location: "memory", stored: false, spilled: false,
-            bytes: expected.reduce((sum, bytes) => sum + bytes.length, 0),
-            writers: peers.map(peer => ({ runId: peer.logRef.split("/")[2], bytes: expected[0]!.length,
-              storageError: expect.objectContaining({ code: "EIO" }), spillError: expect.objectContaining({ code: "ENOSPC" }) })) },
+            bytes: expected.reduce((sum, bytes) => sum + bytes.length, 0) + record(target.attemptId, 1, "y".repeat(8192)).length,
+            writers: [...peers.map(peer => ({ runId: peer.logRef.split("/")[2], bytes: expected[0]!.length,
+              storageError: expect.objectContaining({ code: "EIO" }), spillError: expect.objectContaining({ code: "ENOSPC" }) })),
+              { runId: "capacity-target", bytes: record(target.attemptId, 1, "y".repeat(8192)).length,
+                storageError: expect.objectContaining({ code: "object_run_log_finalize_admission_timeout" }),
+                spillError: expect.objectContaining({ code: "ENOSPC" }) }], },
         }), "Object run log finalization failed"],
       ]));
       expect(JSON.stringify([diagnostics, errors])).not.toContain(SECRET);
     } finally {
       // Release ONLY this row's target admission; the peers' admitted bytes are
       // kept. Healing storage then proves all 8 complete streams survived.
-      targetAbort.abort(new Error("row cleanup"));
+      if (!observed.settled) targetAbort.abort(new Error("row cleanup"));
       if (waiting) await waiting;
       if (finalizing) await finalizing;
       vi.useRealTimers();
@@ -229,6 +240,7 @@ describe("object run log custody across flush / close / finalize failures", () =
       m.injection.step = undefined;
       try {
         await store.flushInflightMirrors!();
+        expect((await coldRead(m, target.logRef)).equals(record(target.attemptId, 1, "y".repeat(8192)))).toBe(true);
         for (let n = 0; n < peers.length; n++)
           expect((await coldRead(m, peers[n]!.logRef)).equals(expected[n]!)).toBe(true);
         await Promise.all(peers.map(peer => store.finalize(peer)));
