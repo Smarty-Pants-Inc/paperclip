@@ -1531,6 +1531,83 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     }
   });
 
+  // adopt-stop-escape (gate 7's 888e5d1d shape): a person's Stop at the first
+  // tool line, the Runner's receipt never recorded, so the wake-queue release
+  // blocked the stopped run (recoveryState "blocked") and the hand-off proof
+  // stopped its box (lease pending_cleanup). The next message resumed the box
+  // and refused retained_sandbox_binding on every attempt. The person's Stop
+  // is the fact: the successor drops the unrestorable retained state. A
+  // non-person predecessor with an unproven Runner, and an Interrupt, still refuse.
+  it.each([
+    { name: "person Stop, Runner unprovable", stop: "person", restores: true },
+    { name: "person Stop, already blocked, Runner unprovable", stop: "person", blocked: true, restores: true },
+    { name: "failed predecessor, live unproven Runner", stop: "failed", restores: false },
+    { name: "Interrupt, Runner unprovable", stop: "interrupt", restores: false },
+    { name: "agent cancel, Runner unprovable", stop: "agent", restores: false },
+  ] as const)("a resumed box after $name", async variant => {
+    const fixture = await seed(), environmentId = randomUUID(), workspaceId = randomUUID(), runId = randomUUID();
+    const providerLeaseId = randomUUID(), base = join(root, `sandbox-${runId}`, "paperclip-workspace");
+    const cwd = join(base, ".paperclip-workspaces", `${workspaceId}-1-${randomUUID()}`);
+    await mkdir(cwd, { recursive: true });
+    const userId = `user-${randomUUID()}`;
+    const resultJson = variant.stop === "person" ? { cancelledByActorType: "user", cancelledByUserId: userId,
+      executionCancellation: { state: "requested", requestedAt: new Date().toISOString() } }
+      : variant.stop === "interrupt" ? { operatorInterrupted: true, interruptionSource: "issue_comment_interrupt",
+        cancelledByActorType: "user", cancelledByUserId: userId,
+        executionCancellation: { state: "requested", requestedAt: new Date().toISOString() } }
+      : variant.stop === "agent" ? { cancelledByActorType: "agent", cancelledByAgentId: agentId } : {};
+    await db.update(heartbeatRuns).set({ status: variant.stop === "failed" ? "failed" : "cancelled", resultJson,
+      errorCode: variant.stop === "interrupt" ? "operator_interrupted" : null })
+      .where(eq(heartbeatRuns.id, fixture.scope.runId));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", resultId: null, leaseOwner: null, leaseExpiresAt: null,
+      recoveryState: "blocked" in variant ? "blocked" : null,
+      failureCode: "blocked" in variant ? "native_continuation_requires_reconciliation" : "native_retry_cancelled" })
+      .where(eq(nativeRunFinalizations.runId, fixture.scope.runId));
+    await db.insert(environments).values({ id: environmentId, name: `Stopped ${environmentId}`, driver: "sandbox" });
+    // The hand-off proof stopped and kept the box: pending_cleanup refuses the binding.
+    await db.insert(environmentLeases).values({ companyId, environmentId, issueId: fixture.scope.issueId,
+      heartbeatRunId: fixture.scope.runId, provider: "daytona", providerLeaseId, status: "pending_cleanup",
+      leasePolicy: "reuse_by_environment", metadata: { remoteCwd: cwd } });
+    const identity = { runId: fixture.scope.runId, normalizedSessionId: fixture.scope.normalizedSessionId,
+      runnerInstanceId: fixture.native.runnerInstanceId, environmentLeaseId: fixture.native.environmentLeaseId,
+      turnId: fixture.native.turnId, itemId: fixture.native.itemId };
+    // Fake Boat at the provider edge: every probe of the resumed box is
+    // inconclusive (no launch marker answer), so nothing proves the Runner gone.
+    const commands: string[] = [];
+    const execute = (request: { command: string; args?: string[] }) => {
+      commands.push((request.args ?? []).join(" "));
+      return Promise.resolve({ stdout: "", stderr: "marker unreadable", exitCode: 1, timedOut: false });
+    };
+    const execution = parseNativeExecutionInput({
+      schema: "paperclip.native-execution-input.v1", provider: { kind: "codex", model: null },
+      binding: { companyId, agentId, issueId: fixture.scope.issueId, runId, executionWorkspaceId: workspaceId },
+      task: { identifier: "NCD-1", title: "Answer after Stop", description: null, prompt: "9 + 10", workMode: "standard" },
+      workspace: { cwd, repoUrl: null, repoRef: null, branchName: null },
+      session: { normalizedSessionId: fixture.scope.normalizedSessionId, driverKind: "codex_app_server",
+        protocolVersion: 1, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 900_000 } },
+      completionContract: { id: randomUUID(), sha256: "fixture", schemaVersion: "paperclip.completion-contract.v1",
+        contract: { revision: "1", objective: "Answer", criteria: [{ id: "objective", requirement: "Answer" }] } },
+      credentialBindings: [], interactionResponses: [],
+    });
+    const controller = join(root, `controller-${runId}`);
+    await mkdir(join(controller, "control-plane"), { recursive: true });
+    await writeFile(join(controller, "control-plane", "control-plane-state.json"),
+      JSON.stringify({ schema: "paperclip.runner.durable.control-plane-state.v2", identity }));
+    const target = { kind: "remote", transport: "sandbox", environmentId, leaseId: randomUUID(), providerKey: "daytona",
+      remoteCwd: cwd, sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId }, runner: { execute } } as const;
+    const restore = () => restoreRemoteSuspendedRunnerCheckpoint({ db, execution, runnerExecutionTarget: target as never }, controller);
+
+    if (variant.restores) {
+      // Deterministic: the same successor input passes on every attempt.
+      await restore();
+      await restore();
+    } else {
+      await expect(restore()).rejects.toThrow("native_controller_recovery_missing_evidence:retained_sandbox_binding");
+    }
+    // Never adopts the stopped Runner's state either way.
+    await expect(readFile(join(controller, "plugin-runner-state.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it.each(["live-owner", "expired-owner", "provider-attempt", "stopped", "operator-stop", "own-process", "inherited-then-own-process", "inherited-then-own-identity"])("does not publish an admission wait after authority changes: %s", async scenario => {
     const fixture = await seed(), runId = randomUUID();
     const scope = { ...fixture.scope, runId };

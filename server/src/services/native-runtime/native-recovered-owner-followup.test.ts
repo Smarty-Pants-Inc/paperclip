@@ -1793,6 +1793,34 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
         /base64 <|paperclip-runner-generation-(marker|check)/.test(JSON.stringify(request)))).toBe(true);
     }, 60_000);
 
+  // adopt-stop-escape: a person's Stop at the first tool line whose Runner
+  // receipt was never recorded. The wake-queue release blocked the stopped
+  // run (recoveryState "blocked", native_continuation_requires_reconciliation)
+  // and the hand-off proof stopped its box (pending_cleanup). The next message
+  // resumes that box through the real executor admission. Base: the retained
+  // read refused retained_sandbox_binding on every attempt (deterministic, no
+  // fallback). Now the person's Stop drops the retained Runner read; the next
+  // fence (owner retirement) still cannot retire an unacknowledged Stop, so the
+  // run takes the typed replace-the-sandbox fallback instead of the dead end.
+  it.each(["lost", "live"] as const)("admission after a person's unacknowledged Stop on a resumed box (generation %s)", async generation => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "codex", lifecycle: "warm" });
+    const followUp = await admitFollowUp(prior);
+    await recordPriorLeaseOnSameSandbox(prior, followUp, generation);
+    await db.update(environmentLeases).set({ status: "pending_cleanup" }).where(eq(environmentLeases.heartbeatRunId, prior.runId));
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled", resultJson: { cancelledByActorType: "user",
+      cancelledByUserId: "board-user", executionCancellation: { state: "requested", requestedAt: new Date().toISOString() } } })
+      .where(eq(heartbeatRuns.id, prior.runId));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", resultId: null, leaseOwner: null, leaseExpiresAt: null,
+      recoveryState: "blocked", failureCode: "native_continuation_requires_reconciliation" })
+      .where(eq(nativeRunFinalizations.runId, prior.runId));
+    await db.delete(nativeRunResults).where(eq(nativeRunResults.runId, prior.runId));
+    const outcome = await followUp.start("resumed", undefined, true);
+    if (process.env.STOP_ESCAPE_PROBE) await writeFile(`${process.env.STOP_ESCAPE_PROBE}-${generation}`, `${outcome}\n${followUp.logs.join("")}`);
+    expectFreshSandboxFallback(outcome, prior, followUp);
+    expect(followUp.logs.join("")).toContain(generation === "lost" ? "not retired: owner_terminal_failure"
+      : "not retired: restarted_sandbox_runner_generation_not_lost");
+  }, 60_000);
+
   // RFL F1: Boat may resume the same machine with its programs running. The
   // restarted label alone never retires an owner whose process is still live.
   it("keeps a settled warm owner held on a restarted sandbox while its process generation is still live", async () => {

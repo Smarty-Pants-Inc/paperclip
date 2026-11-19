@@ -143,7 +143,7 @@ import { imageGenerationBindingForRun } from "./generate-image-tool.js";
 import { readVerifiedRemoteWorkspaceFile } from "./remote-deliverable-file.js";
 import { copyBackCodexAuth } from "@paperclipai/adapter-codex-local/server";
 import { nativeCompletionFeedback } from "./native-completion-feedback.js";
-import { hasAcknowledgedNativeLifecycleStopIntent, hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, hasAcknowledgedNativeRunStopReceipt } from "../acknowledged-native-stop.js";
+import { hasAcknowledgedNativeLifecycleStopIntent, hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, hasAcknowledgedNativeRunStopReceipt, hasRecordedUserStopRequest } from "../acknowledged-native-stop.js";
 import { stoppedCodexTurnIsTextOnly } from "./stopped-codex-turn.js";
 import { nativeUserStopRecoveryHeld, stopJournalLeftUndeliveredTool, userStopLeftUncertainty } from "./native-user-stop-settlement.js";
 import { prepareVerifiedRemoteProviderPack, providerPackProvenanceReuseAllowed, useVerifiedPreinstalledRemoteProviderPack, shouldUseBundledAcpxImageAssets } from "./remote-provider-pack.js";
@@ -8318,6 +8318,30 @@ async function failedPredecessorRunnerGone(input: { db: Db; execution: NativeExe
   }
 }
 
+/** The predecessor was ended by a person's own Stop (the Stop route's user
+ * record, not an Interrupt, terminalization or an agent's cancel) and holds no
+ * committed result or live controller lease. Its retained Runner state, gone
+ * or unprovable, is not a conversation anyone may still owe: the Stop is the
+ * fact, whether or not the Runner's receipt or a reconciliation hold exists. */
+async function personStoppedPredecessor(input: { db: Db; execution: NativeExecutionInput },
+  prior: RunnerdDurableIdentity): Promise<boolean> {
+  const { companyId, issueId } = input.execution.binding;
+  try {
+    const [row] = await input.db.select({ run: heartbeatRuns, owner: nativeRunFinalizations }).from(heartbeatRuns)
+      .innerJoin(nativeRunFinalizations, and(eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId),
+        eq(nativeRunFinalizations.runId, heartbeatRuns.id)))
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, prior.runId)));
+    if (!row || row.run.status !== "cancelled" || row.run.nativeIssueId !== issueId || row.owner.issueId !== issueId
+      || row.owner.resultId !== null || row.owner.leaseOwner !== null) return false;
+    const result = row.run.resultJson ?? {};
+    if (result.operatorInterrupted === true || result.terminalizationStopConfirmed === true
+      || result.reassignmentStopRequested === true || row.run.errorCode === "operator_interrupted") return false;
+    return hasRecordedUserStopRequest(row.run) || hasAcknowledgedNativeStopIntent(row.run);
+  } catch {
+    return false;
+  }
+}
+
 /** The banner text for a conversation held behind an unfinished predecessor. */
 import { HELD_PREDECESSOR_NOTICE } from "./held-predecessor-notice-text.js";
 import { providerIdentityResetLine } from "./provider-identity-reset-notice.js";
@@ -8447,6 +8471,9 @@ export async function restoreRemoteSuspendedRunnerCheckpoint(input: {
       // decide. Anything else keeps the refusal, made visible once.
       if (!(error instanceof Error) || error.message !== "native_controller_recovery_missing_evidence:retained_sandbox_binding") throw error;
       if (await failedPredecessorRunnerGone(input, target, prior)) return;
+      // A person's own Stop ended the predecessor: its unrestorable retained
+      // Runner state is dropped, never a refusal repeated on every message.
+      if (await personStoppedPredecessor(input, prior)) return;
       throw error;
     }
     movedAllocation = retained.remoteCwd !== target.remoteCwd;
