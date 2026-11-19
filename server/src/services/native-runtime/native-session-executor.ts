@@ -406,7 +406,7 @@ import {
   type NativeRestartRecoveryClaim,
   carriesSettledPredecessorSession,
 } from "./native-restart-recovery.js";
-import { pauseRevokedTurn, resetTurnAuthority, revokeTurnAuthority } from "./turn-authority-revocation.js";
+import { captureTurnAuthority, pauseRevokedTurn, resetTurnAuthority, revokeTurnAuthority, type TurnAuthorityOwner } from "./turn-authority-revocation.js";
 
 type ActiveNativeSession = {
   session: NativeSession;
@@ -416,6 +416,8 @@ type ActiveNativeSession = {
   admissionAbort?: AbortController;
   cancellationSettled?: Promise<void>;
   restartDetach?: Promise<void>;
+  /** The turn owner (executor epoch + attempt generation) this provider session was published under. */
+  turnAuthority?: TurnAuthorityOwner | null;
 };
 
 class NativeResultPendingFinalizationError extends Error {
@@ -11022,6 +11024,9 @@ async function performNativeCancellation(
         active.cancellationCleanupSucceeded = false;
         active.admissionAbort?.abort(new NativeCancellationPendingRecoveryError());
         active.cancellationSettled = new Promise<void>(resolve => { settleActiveCancellation = resolve; });
+        // The cancelling owner's captured turn owner: a revoke landing after a
+        // replacement executor, reset or new provider session certifies nothing.
+        const turnOwner = active.turnAuthority !== undefined ? active.turnAuthority : captureTurnAuthority(runId);
         try {
           if (active.session.cancel) {
             const cancellationAbort = new AbortController();
@@ -11031,7 +11036,7 @@ async function performNativeCancellation(
             }).cleanup;
             // The synchronous cancel is the turn-authority transition
             // (NativeSessionCancellation); its cleanup below is passive.
-            revokeTurnAuthority(runId, "session_cancel");
+            revokeTurnAuthority(runId, "session_cancel", turnOwner);
             let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
             const settled = await Promise.race([
               cleanup.then(
@@ -11065,12 +11070,12 @@ async function performNativeCancellation(
             ]).finally(() => { if (boundTimer) clearTimeout(boundTimer); });
             if (returned) {
               active.cancellationCleanupSucceeded = true;
-              revokeTurnAuthority(runId, "interrupt");
+              revokeTurnAuthority(runId, "interrupt", turnOwner);
             } else {
               // The runner did not answer within the bound: the server's own
               // fence revokes the turn; a late result certifies nothing.
               active.cancellationCleanupSucceeded = false;
-              revokeTurnAuthority(runId, "revocation_bound");
+              revokeTurnAuthority(runId, "revocation_bound", turnOwner);
               void interrupted.catch(() => undefined);
             }
           }
@@ -13964,8 +13969,8 @@ async function executePaperclipNativeSessionAttempt(
                 await input.onLog?.("stderr", "[paperclip] GitHub access for this turn is unavailable after a server restart; the session retires at run end (github_access_restart_reattach).\n").catch(() => undefined);
               }
               if (session) {
-                const active: ActiveNativeSession = { session, cancelRequested: false, admissionAbort: new AbortController() };
-                resetTurnAuthority(input.execution.binding.runId);
+                const turnAuthority = resetTurnAuthority(input.execution.binding.runId);
+                const active: ActiveNativeSession = { session, cancelRequested: false, admissionAbort: new AbortController(), turnAuthority };
                 activeNativeSessions.set(input.execution.binding.runId, active);
                 const startup = nativeSessionStartups.get(input.execution.binding.runId);
                 const stopBeforeProviderTurn = startup?.stopRequested === true && startup.sessionPublished !== true
