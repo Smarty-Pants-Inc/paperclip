@@ -135,11 +135,6 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
       memberships: [{ companyId, membershipRole: "owner", status: "active" }], isInstanceAdmin: true }; next(); });
     app.use("/api", agentRoutes(db, {} as never)); app.use("/api", issueRoutes(db, {} as never, {})); app.use(errorHandler);
 
-    // REAL: the person's message M.
-    const sent = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: "Please add the notes file.", clientRequestId: randomUUID() });
-    expect(sent.status, JSON.stringify(sent.body)).toBe(201);
-    const messageId: string = sent.body.id;
-
     const [contract] = await db.insert(completionContracts).values({ companyId, issueId, revision: 1,
       schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "standard", completionAuthority: "server_arbiter",
       incompleteCriteriaPolicy: "preserve_non_terminal", contractJson: { revision: "test", objective: "Add the notes file", criteria: [] },
@@ -148,7 +143,17 @@ describe.skipIf(!support.supported)("copy-out no-progress bound: the run ends wi
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issueId, nativeSessionId: sessionId,
       runnerInstanceId: runnerId, completionContractId: contract.id, completionContractSha256: contract.canonicalSha256,
       status: "running", runtimeMode: "native", responsibleUserId: PERSON, startedAt: new Date(),
-      contextSnapshot: { issueId, source: "assignment", wakeReason: "issue_commented", wakeCommentId: messageId, commentId: messageId } });
+      contextSnapshot: { issueId, source: "assignment", wakeReason: "issue_commented" } });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    // REAL: the person's message M.
+    const sent = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: "Please add the notes file.", clientRequestId: randomUUID() });
+    expect(sent.status, JSON.stringify(sent.body)).toBe(201);
+    const messageId: string = sent.body.id;
+
+    // (R is planted before M is sent, so M's wake is deterministically saved behind it and never races the
+    // planting as a queued wake; R then carries M.)
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, source: "assignment", wakeReason: "issue_commented",
+      wakeCommentId: messageId, commentId: messageId } }).where(eq(heartbeatRuns.id, runId));
     const [environment] = await db.insert(environments).values({ name: `Box ${runId}`, driver: "sandbox", status: "active",
       config: { provider: "fake", image: "fixture:test", reuseLease: true } }).returning();
     await db.update(agents).set({ defaultEnvironmentId: environment.id }).where(eq(agents.id, agentId));
