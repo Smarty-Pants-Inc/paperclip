@@ -1013,6 +1013,17 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- the clock tick re-reads Date.now() at a deadline.
     [projectedComments, replyFileLines, recoverSavedFilesShown, replyFileLineClock],
   );
+  // Once a run's reply is presented the turn is answered: it is no longer the
+  // live "Working" turn, even while its files are still being copied back.
+  const presentedReplyRunIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const comment of comments) {
+      const line = comment.deletedAt ? undefined : replyFileLines.get(comment.id);
+      if (line) ids.add(line.runId);
+    }
+    return ids;
+  }, [comments, replyFileLines]);
+
   const commentItems = useMemo(
     () =>
       commentsToTaskChatItems(renderedComments, {
@@ -1199,9 +1210,10 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
   // The single in-flight run whose turn we stream live (non-terminal).
   const liveRun = useMemo(() => {
     if (isTerminalIssueStatus(issueStatus)) return null;
-    if (activeRun && isLiveIssueRun(activeRun, issueStatus)) return activeRun;
-    return (liveRuns ?? []).find((r) => isLiveIssueRun(r, issueStatus)) ?? null;
-  }, [activeRun, issueStatus, liveRuns]);
+    const live = (run: { id: string; status: string }) => isLiveIssueRun(run, issueStatus) && !presentedReplyRunIds.has(run.id);
+    if (activeRun && live(activeRun)) return activeRun;
+    return (liveRuns ?? []).find(live) ?? null;
+  }, [activeRun, issueStatus, liveRuns, presentedReplyRunIds]);
 
   // The live runner turn remains the sole owner of its response until the
   // canonical comment and settled activity are both ready. This state is
