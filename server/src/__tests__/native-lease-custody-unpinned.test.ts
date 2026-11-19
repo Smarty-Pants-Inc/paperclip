@@ -22,6 +22,10 @@ import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.j
 import { createStorageService } from "../storage/service.js";
 import { nativeRestartFixture, waitForCondition } from "./helpers/native-restart-fixture.js";
 import { getRecoveryPostgresSupport } from "./helpers/recovery-postgres-fixture.js";
+import { hasPendingRunCleanup } from "../services/execution-blocker.js";
+import { hasRemoteTerminationReceipt, remoteExecutionHasStopped } from "../services/remote-execution-termination.js";
+import { releasableRetainedOrphanCondition } from "../services/environment-retained-orphan-settlement.js";
+import { settleOwnableKind } from "../services/recovery/ownership-invariant-report.js";
 
 // A closed local harness transcript is source material, not a durable-copy
 // receipt. The real online owner must still authorize, publish and restore it.
@@ -181,7 +185,8 @@ describe.skipIf(!support.supported)("unaddressable native custody releases fresh
       expect(old!.metadata?.nativeHarnessBackup).toBeUndefined();
       const archive = await seedClosedHarnessTranscript(db, runtimeRoot, failedSource!, old!);
       const assertOldCustody = () => {
-        expect(old).toMatchObject({ status: "released", cleanupStatus: "success" });
+        expect(old).toMatchObject(scenario === "pinned" ? { status: "released", cleanupStatus: "success" }
+          : { status: "retained", cleanupStatus: "failed", failureReason: "native_custody_stop_unavailable" });
         expect(old!.metadata?.orphanedRunLeaseRecovery).toMatchObject({ nativeCustodyUnverified: true });
         expect(calls.filter(call => /Destroy|Release/.test(call.method) && call.box === oldBox)).toEqual([]);
         if (scenario === "pinned") {
@@ -229,6 +234,16 @@ describe.skipIf(!support.supported)("unaddressable native custody releases fresh
         await expect(db.transaction(tx => assertSettledNativeHarnessBackupSource(tx as unknown as typeof db, owner!))).rejects.toThrow("native_harness_preservation_source_unsettled");
         await db.update(environmentLeases).set({ metadata: sourceLease!.metadata }).where(eq(environmentLeases.id, old!.id));
       }
+      if (scenario !== "pinned") {
+        // The admission exception is not a general "box gone" claim. Even a
+        // verified transcript cannot turn this retained live box into destroy.
+        const [kept] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, old!.id));
+        expect(hasRemoteTerminationReceipt(kept!)).toBe(false);
+        expect(await remoteExecutionHasStopped(db, companyId, run!.id)).toBe(false);
+        expect(await hasPendingRunCleanup(db, companyId, run!.id)).toBe(true);
+        await runtime.releaseRunLeases(run!.id, "released", undefined, "destroy");
+        expect(calls.filter(call => /Destroy|Release/.test(call.method) && call.box === oldBox)).toEqual([]);
+      }
       const [currentIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
       const presentation = await taskInterruptionPresentation(db, currentIssue!);
       if (scenario === "successor cannot start") {
@@ -275,7 +290,8 @@ describe.skipIf(!support.supported)("unaddressable native custody releases fresh
         config: { provider: "historical-unregistered-provider", image: "fake:test" } }).returning();
       const oldBox = `sealed-old-${randomUUID()}`;
       const [lease] = await db.insert(environmentLeases).values({ environmentId: environment!.id, companyId, agentId, issueId,
-        heartbeatRunId: runId, providerLeaseId: oldBox, status: "pending_cleanup", cleanupStatus: "failed", cleanupAttempts: 4,
+        heartbeatRunId: runId, provider: "historical-unregistered-provider", providerLeaseId: oldBox,
+        status: "pending_cleanup", cleanupStatus: "failed", cleanupAttempts: 4,
         metadata: { driver: "plugin", sandboxProvider: true, remote: true,
           orphanedRunLeaseRecovery: { nativeCustodyUnverified: true, reason: "native_harness_copy_unverified", recoveredAt: new Date().toISOString() },
           sandboxStopAndRetain: { schema: "paperclip.sandbox-stop-and-retain.v1", requestId: "legacy-invalid-stop", nativeCustodyUnverified: true,
@@ -283,7 +299,7 @@ describe.skipIf(!support.supported)("unaddressable native custody releases fresh
       expect(await db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.runId, runId))).toEqual([]);
       await heartbeat.sweepPendingCleanupLeases();
       const [retained] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease!.id));
-      expect(retained).toMatchObject({ status: "released", cleanupStatus: "success" });
+      expect(retained).toMatchObject({ status: "retained", cleanupStatus: "failed", failureReason: "native_custody_stop_unavailable" });
       expect(retained!.metadata?.orphanedRunLeaseRecovery).toMatchObject({ nativeCustodyUnverified: true,
         disposition: "retained_unstoppable", reason: "provider_plugin_pin_missing" });
       expect(retained!.metadata?.sandboxStopAndRetain).toBeUndefined();
@@ -319,6 +335,19 @@ describe.skipIf(!support.supported)("unaddressable native custody releases fresh
       const restored = join(runtimeRoot, `custody-restored-${randomUUID()}`);
       expect(await restoreDurableNativeHarnessBackup({ db, storage, companyId, scopeDigest, backupRoot: restored })).toBe(true);
       expect(await readFile(join(restored, "current", "codex-home", "sessions", "transcript.json"), "utf8")).toBe(transcript);
+      expect(manager.call).not.toHaveBeenCalled();
+      // The real retained-orphan owner lists the possibly running paid box,
+      // including after its transcript is saved and its provider expiry passes.
+      await db.update(environmentLeases).set({ expiresAt: new Date(Date.now() - 1_000) }).where(eq(environmentLeases.id, lease!.id));
+      const listed = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(releasableRetainedOrphanCondition());
+      expect(listed.map(row => row.id)).toContain(lease!.id);
+      for (let attempt = 0; attempt < 6; attempt += 1) await settleOwnableKind(db, "environment_retained_orphan_sandbox");
+      const [tracked] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease!.id));
+      expect(tracked).toMatchObject({ status: "retained", cleanupStatus: "failed", releasedAt: null,
+        metadata: expect.objectContaining({ nativeCustodyAttempts: 5, nativeCustodyEscalated: true }) });
+      expect(hasRemoteTerminationReceipt(tracked!)).toBe(false);
+      expect(await remoteExecutionHasStopped(db, companyId, runId)).toBe(false);
+      expect(await hasPendingRunCleanup(db, companyId, runId)).toBe(true);
       expect(manager.call).not.toHaveBeenCalled();
       console.log("UNPINNED_SEALED_COPY_ROW", JSON.stringify({ oldBox, oldStatus: retained!.status,
         providerCalls: 0, copied, transcriptRestored: true }));

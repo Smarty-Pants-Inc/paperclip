@@ -10,7 +10,7 @@ import { isBuiltinSandboxProvider } from "./sandbox-provider-runtime.js";
 import { hasBoundRemoteStopReceipt, hasRemoteTerminationReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { hasNativeWorkspaceExportResume, readNativeWorkspaceExportResume, settleNativeWorkspaceExportResume } from "./native-runtime/native-workspace-export-resume.js";
 import type { SandboxAbsenceProof } from "./sandbox-absence-proof.js";
-import { NATIVE_CUSTODY_UNVERIFIED_KEY } from "./native-runtime/native-lease-custody.js";
+import { NATIVE_CUSTODY_UNVERIFIED_KEY, nativeCustodyKeptRecovery } from "./native-runtime/native-lease-custody.js";
 import { REPLACE_BEFORE_REUSE_KEY, REPLACE_BEFORE_REUSE_SCHEMA } from "./native-runtime/predecessor-retirement.js";
 
 type Lease = Pick<typeof environmentLeases.$inferSelect,
@@ -292,12 +292,11 @@ export async function retryUnconfirmedSourceSandboxStop(db: Db, lease: typeof en
   return updated ?? null;
 }
 
-/** No addressable stop is not a provider retry. Keep the allocation and its
- * unsaved-session obligation, but release this run's cleanup ownership so its
- * replacement can allocate a fresh box. `released` describes the lease, NOT a
- * physical stop: no termination or stop-and-retain receipt is manufactured.
- * The existing backup path can still read/stamp this row. Without a receipt it
- * cannot enter retained-orphan destruction or become a proven restore source. */
+/** No addressable stop is not a successful release. Retain the possibly live
+ * allocation and its unsaved-session obligation. The retained-orphan owner
+ * lists and escalates it; only fresh-replacement admission may disregard it.
+ * Preserve the failed intent/evidence under that obligation, never as a usable
+ * stop receipt. Provider expiry stays untouched; no database TTL proves stop. */
 export async function settleUnaddressableNativeCustody(db: Db, lease: Lease,
   recovery: Record<string, unknown> = {}) {
   const intent = lease.metadata?.[SANDBOX_STOP_AND_RETAIN_KEY] as Record<string, unknown> | undefined;
@@ -309,12 +308,14 @@ export async function settleUnaddressableNativeCustody(db: Db, lease: Lease,
   const reason = typeof lease.metadata?.pluginId !== "string" || !lease.metadata.pluginId.trim()
     ? "provider_plugin_pin_missing" : "stop_binding_invalid";
   const [updated] = await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
-    status: "released", cleanupStatus: "success", failureReason: "native_custody_stop_unavailable",
-    releasedAt: now, updatedAt: now,
+    status: "retained", cleanupStatus: "failed", failureReason: "native_custody_stop_unavailable",
+    releasedAt: null, updatedAt: now,
     metadata: sql`(coalesce(${environmentLeases.metadata}, '{}'::jsonb) - 'sandboxStopAndRetain'
       - 'sandboxStopAndRetainReceipt' - 'remoteExecutionTermination' - 'pendingCleanupController' - 'releaseDeferral') || ${JSON.stringify({
-      [ORPHANED_SANDBOX_RECOVERY_KEY]: { ...recovery, ...intent, [NATIVE_CUSTODY_UNVERIFIED_KEY]: true,
-        runId: lease.heartbeatRunId, recoveredAt: now.toISOString(), disposition: "retained_unstoppable", reason },
+      [ORPHANED_SANDBOX_RECOVERY_KEY]: { ...recovery, ...intent, ...nativeCustodyKeptRecovery(),
+        runId: lease.heartbeatRunId, recoveredAt: now.toISOString(), disposition: "retained_unstoppable", reason,
+        stopEvidence: { intent: intent ?? null, receipt: lease.metadata?.sandboxStopAndRetainReceipt ?? null,
+          termination: lease.metadata?.remoteExecutionTermination ?? null } },
       [REPLACE_BEFORE_REUSE_KEY]: lease.metadata?.[REPLACE_BEFORE_REUSE_KEY] ?? {
         schema: REPLACE_BEFORE_REUSE_SCHEMA, runId: lease.heartbeatRunId, predecessorRunId: null, recordedAt: now.toISOString() },
       pendingCleanupInFlight: false, pendingCleanupLeaseExpiresAtMs: 0,
