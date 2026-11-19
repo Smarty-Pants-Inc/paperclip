@@ -1812,4 +1812,90 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       expect(forC.every((notice) => !notice.body.includes("received mid-task"))).toBe(true);
     }
   });
+
+  describe("restored steer captions at the thread GET and POST receipt boundary", () => {
+    // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21272
+    // RFL/rf-4, cap-1..3: custody is not loss. These real-PG route rows do not
+    // certify installed UI wording or model behavior; only the native RPC is stubbed.
+    async function heldRestore() {
+      const chat = await seedChat();
+      await attachSteerable(chat);
+      await runLog(chat, [{ eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" }]);
+      const clientRequestId = randomUUID();
+      const body = "M: answer this when you are free";
+      const posted = await postDefault(chat, body, { clientRequestId }).expect(201);
+      await waitForPendingCommentSteers();
+      expect(posted.body).toMatchObject({ steeringStatus: "accepted", steeredIntoRunId: chat.runId });
+      await runLog(chat, [{ eventType: "turn.completed", itemId: "turn-1:end" }]);
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, chat.runId));
+      const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+      await settleConversationTurn(db, ended!);
+      // Another turn already owns execution when T's finalizer releases. It
+      // does not carry M; the real restore must leave M in a waiting wake.
+      const [busy] = await db.insert(heartbeatRuns).values({ companyId: chat.companyId, agentId: chat.agentId,
+        status: "running", runtimeMode: "native", startedAt: new Date(),
+        contextSnapshot: { issueId: chat.issue.id, taskKey: chat.issue.id } }).returning();
+      await db.update(issues).set({ executionRunId: busy!.id, executionLockedAt: new Date() })
+        .where(eq(issues.id, chat.issue.id));
+      await releaseRun(chat);
+      const [restorer] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+      expect((restorer!.resultJson as any).restoredSteeredCommentIds).toEqual([posted.body.id]);
+      const wakes = await deferredWakes(chat);
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]).toMatchObject({ idempotencyKey: `conversation-comment:${posted.body.id}`,
+        status: "deferred_issue_execution", runId: null });
+      expect((await carriersOf(chat, posted.body.id)).runs).toHaveLength(0);
+      return { chat, commentId: posted.body.id as string, clientRequestId, body, wake: wakes[0]! };
+    }
+
+    async function readCaption(row: Awaited<ReturnType<typeof heldRestore>>, label: string) {
+      const { chat, commentId, clientRequestId, body } = row;
+      const thread = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/comments`).expect(200);
+      const comment = thread.body.find((entry: any) => entry.id === commentId);
+      expect(comment).toBeTruthy();
+      // Idempotent POST hydrates the SAME comment through the receipt path,
+      // without sending a second message or starting a second answer.
+      const receipt = await postDefault(chat, body, { clientRequestId }).expect(201);
+      const fields = (value: any) => ({ id: value.id, deliveryOutcome: value.deliveryOutcome,
+        steeringStatus: value.steeringStatus, steeringUnavailableReason: value.steeringUnavailableReason,
+        carriedIntoRunId: value.carriedIntoRunId, steeringDeliveryEventSeq: value.steeringDeliveryEventSeq });
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, row.wake.id));
+      console.info("CAPTION_ROW", JSON.stringify({ label, issueId: chat.issue.id, endedRunId: chat.runId,
+        wake: { id: wake!.id, key: wake!.idempotencyKey, status: wake!.status, runId: wake!.runId },
+        get: fields(comment), post: fields(receipt.body) }));
+      expect(fields(receipt.body)).toEqual(fields(comment));
+      expect(receipt.body.id).toBe(commentId);
+      return comment;
+    }
+
+    it("cap-1: unread steer held by a LIVE restore wake is queued with no unavailable reason", async () => {
+      const row = await heldRestore();
+      expect(await readCaption(row, "cap-1")).toMatchObject({ deliveryOutcome: "queued",
+        steeringUnavailableReason: null, steeringStatus: null, carriedIntoRunId: null });
+    });
+
+    it("cap-2: cancelled restore wake and no carrier retains run_ended_before_read", async () => {
+      const row = await heldRestore();
+      await db.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date() })
+        .where(eq(agentWakeupRequests.id, row.wake.id));
+      expect(await readCaption(row, "cap-2")).toMatchObject({ deliveryOutcome: "ordinary",
+        steeringUnavailableReason: "run_ended_before_read", steeringStatus: null, carriedIntoRunId: null });
+    });
+
+    it("cap-3: a carrier's userMessage item.started proves delivered, never an unavailable caption", async () => {
+      const row = await heldRestore();
+      const context = (row.wake.payload as any)._paperclipWakeContext;
+      const [carrier] = await db.insert(heartbeatRuns).values({ companyId: row.chat.companyId, agentId: row.chat.agentId,
+        status: "running", runtimeMode: "native", startedAt: new Date(), wakeupRequestId: row.wake.id,
+        contextSnapshot: { ...context, carriedSteeredCommentIds: [row.commentId] } }).returning();
+      await db.update(agentWakeupRequests).set({ status: "completed", runId: carrier!.id, finishedAt: new Date() })
+        .where(eq(agentWakeupRequests.id, row.wake.id));
+      await runLog({ ...row.chat, runId: carrier!.id }, [
+        { eventType: "item.started", kind: "userMessage", itemId: "turn-1:carried-input" },
+      ]);
+      expect(await readCaption(row, "cap-3")).toMatchObject({ steeringStatus: "delivered",
+        steeringUnavailableReason: null, carriedIntoRunId: carrier!.id, steeringDeliveryEventSeq: expect.any(Number) });
+    });
+  });
 });
