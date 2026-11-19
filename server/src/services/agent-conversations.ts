@@ -362,9 +362,11 @@ export const CONVERSATION_OWED_MESSAGE_LOOKBACK_MS = 24 * 60 * 60_000;
  *   earlier one within CONVERSATION_OWED_MESSAGE_LOOKBACK_MS. A legacy message row with no author type is outside the
  *   one function (the sweep does not read it either); upstream's rule stands for it: owed when later than the wake.
  * DEPARTURE FROM UPSTREAM (settleConversationTurn tested "the run left a comment or a pending card", then "a person
- * message is later than the wake"): a progress-only comment or an expired card no longer parks the chat; a pending or
- * person-answered card from a run that later failed does; an earlier message a reply never named keeps it open; and
- * a second message the run's own input named (a batch) no longer does. */
+ * message is later than the wake"): upstream's "the run left a comment or a pending card" is kept as the evidence
+ * that the run responded, and the one function now also has to say the turn's own person input is answered: a
+ * progress-only comment no longer parks the chat, and a pending card from a run that later failed does. For what
+ * is still owed, an earlier message a reply never named keeps the chat open, and a second message the run's own
+ * input named (a batch) no longer does. */
 async function readConversationTurnAnswer(tx: Pick<Db, "execute">, input: { companyId: string; issueId: string;
   wakeId: string | null; interactionId: string | null; boundaryCommentId: string | null; greeting: boolean }) {
   const since = new Date(Date.now() - CONVERSATION_OWED_MESSAGE_LOOKBACK_MS).toISOString();
@@ -408,7 +410,7 @@ export async function settleConversationTurn(
   const issueId = typeof context.issueId === "string" ? context.issueId : null;
   if (!issueId) return false;
   // A run that did not succeed settles nothing unless it carries a person message (below): only the one function
-  // can say that such a run still answered it (its pending card, or its accepted result published once).
+  // can say that such a run still answered it (its pending card).
   const wakeId =
     typeof context.conversationReplyBoundaryCommentId === "string"
       ? context.conversationReplyBoundaryCommentId
@@ -443,41 +445,39 @@ export async function settleConversationTurn(
       greeting: context.wakeReason === ONBOARDING_CHAT_GREETING_REASON,
     });
     const own = reset ? null : turn.own;
-    if (run.status !== "succeeded" && !own?.answered) return false;
-    if (own) {
-      if (!own.answered) return false;
-    } else if (!reset) {
-      // No person message is this turn's own input (a greeting, a timer or a handed-back task, or a legacy message
-      // row with no author type, which the one function does not read): upstream's durable-response test stands.
-      const [response] = await tx
-        .select({ id: issueComments.id })
-        .from(issueComments)
-        .where(
-          and(
-            eq(issueComments.issueId, issueId),
-            eq(issueComments.createdByRunId, run.id),
-            eq(issueComments.origin, "comment"),
-            eq(issueComments.authorAgentId, issue.conversationAgentId!),
-            isNull(issueComments.deletedAt),
-          ),
-        )
-        .limit(1);
-      // Native question/plan waits use the durable interaction as the reply;
-      // their terminal prose is deliberately not materialized as a comment.
-      const [interaction] = !response
-        ? await tx.select({ id: issueThreadInteractions.id })
-            .from(issueThreadInteractions)
-            .where(and(
-              eq(issueThreadInteractions.companyId, run.companyId),
-              eq(issueThreadInteractions.issueId, issueId),
-              eq(issueThreadInteractions.sourceRunId, run.id),
-              eq(issueThreadInteractions.createdByAgentId, issue.conversationAgentId!),
-              eq(issueThreadInteractions.status, "pending"),
-            ))
-            .limit(1)
-        : [];
-      if (!response && !interaction) return false;
-    }
+    // Upstream's evidence that THIS run responded (its comment, or its pending card) still stands, unchanged; a
+    // run that left nothing settles nothing. What it no longer decides alone is whether that response ANSWERED:
+    const [response] = await tx
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.createdByRunId, run.id),
+          eq(issueComments.origin, "comment"),
+          eq(issueComments.authorAgentId, issue.conversationAgentId!),
+          isNull(issueComments.deletedAt),
+        ),
+      )
+      .limit(1);
+    // Native question/plan waits use the durable interaction as the reply;
+    // their terminal prose is deliberately not materialized as a comment.
+    const [interaction] = !response && context.conversationReset !== true
+      ? await tx.select({ id: issueThreadInteractions.id })
+          .from(issueThreadInteractions)
+          .where(and(
+            eq(issueThreadInteractions.companyId, run.companyId),
+            eq(issueThreadInteractions.issueId, issueId),
+            eq(issueThreadInteractions.sourceRunId, run.id),
+            eq(issueThreadInteractions.createdByAgentId, issue.conversationAgentId!),
+            eq(issueThreadInteractions.status, "pending"),
+          ))
+          .limit(1)
+      : [];
+    if (!response && !interaction && context.conversationReset !== true) return false;
+    // ... the turn's own person input must be ANSWERED by the one function (a progress comment is not an answer),
+    // and only that makes a run that did not succeed a settled turn (its pending card is the person's next step).
+    if (own ? !own.answered : run.status !== "succeeded") return false;
     if (
       context.conversationSessionGeneration !==
       issue.conversationSessionGeneration
