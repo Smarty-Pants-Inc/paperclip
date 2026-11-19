@@ -2873,11 +2873,12 @@ export function createPluginWorkerHandle(
     const invocationId = readNonEmptyString(
       (request as { paperclipInvocationId?: unknown }).paperclipInvocationId,
     );
-    // Never let a forged/retired id or an already company-scoped invocation
-    // acquire authority from configuration. Resolve the context again after the
-    // read, so an invocation retired while the database was pending stays denied.
+    // Only a LIVE company-scoped invocation bypasses configuration. An ended
+    // or unknown id has no authority: refresh exactly as for untagged work and
+    // resolve again after the read in case an invocation ended while awaiting it.
+    const entry = invocationId ? activeInvocations.get(invocationId) : undefined;
     if (!options.loadProactiveCompanyScopes ||
-        (invocationId && activeInvocations.get(invocationId)?.scope !== null) ||
+        (entry && entry.scope !== null) ||
         !referencedCompanyId(request.method, request.params)) return proactiveCompanyScopes;
 
     try {
@@ -2903,20 +2904,28 @@ export function createPluginWorkerHandle(
     const invocationId = readNonEmptyString(
       (message as { paperclipInvocationId?: unknown }).paperclipInvocationId,
     );
-    if (!invocationId) {
+    const entry = invocationId ? activeInvocations.get(invocationId) : undefined;
+    if (!entry) {
       const params = message.params;
-      if ((message.method === "state.get" || message.method === "state.set" || message.method === "state.delete") &&
-          isRecord(params) && params.scopeKind === "company") {
-        // Plugin-owned state needs no agent/person authority. Mint a company-only
-        // proactive scope even while an agent invocation is active, using the
-        // actual state scopeId (never an unrelated top-level companyId).
-        const companyId = readNonEmptyString(params.scopeId);
-        return companyId && companyScopes.has(companyId)
+      const ownState = message.method === "state.get" || message.method === "state.set" || message.method === "state.delete";
+      if ((ownState && isRecord(params) && params.scopeKind === "company") || message.method === "config.get") {
+        // Untagged and stale-id keeper work gets ONLY host-derived company
+        // authority for this plugin's own state/config. Never reuse the ended
+        // invocation's actor, traceparent, provider budget or resource scope.
+        if (!isRecord(params) || (ownState && params.scopeKind !== "company") ||
+            (params.pluginId !== undefined && params.pluginId !== pluginId)) {
+          return { invalidInvocationScope: true };
+        }
+        const companyId = readNonEmptyString(ownState ? params.scopeId : params.companyId);
+        const namedCompanyId = readNonEmptyString(params.companyId);
+        return companyId && companyScopes.has(companyId) && (!namedCompanyId || namedCompanyId === companyId)
           ? { invocationScope: { companyId } }
           : { invalidInvocationScope: true };
       }
+      // A stale id never authorizes any other API, including on an idle host.
+      if (invocationId) return { invalidInvocationScope: true };
       // Other untagged calls must not escape an active agent's invocation scope
-      // or borrow its identity. Only plugin-owned company state is exempt above.
+      // or borrow its identity. Only plugin-owned company state/config is exempt.
       if (Array.from(activeInvocations.values()).some(entry => entry.scope?.agentOrigin)) {
         return { invalidInvocationScope: true };
       }
@@ -2938,8 +2947,6 @@ export function createPluginWorkerHandle(
         Array.from(pendingRequests.values()).some((pending) => pending.invocationId);
       return hasActiveInvocation ? { invalidInvocationScope: true } : {};
     }
-    const entry = activeInvocations.get(invocationId);
-    if (!entry) return { invalidInvocationScope: true };
     // A plugin-instance invocation (such as a job) carries no company of its
     // own. Resolve explicit company references using the same configured-company
     // allowlist as proactive calls, without inheriting another invocation's scope.
@@ -3011,18 +3018,19 @@ export function createPluginWorkerHandle(
     try {
       const companyScopes = await companyScopesForWorkerRequest(request);
       const context = contextForWorkerMessage(request, companyScopes);
+      const invocationId = readNonEmptyString((request as { paperclipInvocationId?: unknown }).paperclipInvocationId);
+      const hostDerivedScope = !invocationId || !activeInvocations.has(invocationId);
       if (context.invalidInvocationScope) throw Object.assign(new Error("Missing or unknown invocation scope"), {
         code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
       });
       const source = context.invocationScope?.agentOrigin;
       const origin = source && context.invocationScope ? { ...source, companyId: context.invocationScope.companyId } : undefined;
       const result = await withPluginInteractionOrigin(origin, () => handler(request.params, context));
-      if (!readNonEmptyString((request as { paperclipInvocationId?: unknown }).paperclipInvocationId) &&
-          method.startsWith("state.") && context.invocationScope?.companyId) {
+      if (hostDerivedScope && (method.startsWith("state.") || method === "config.get") && context.invocationScope?.companyId) {
         // Keep host-derived state work distinguishable from the concurrent actor.
         // Use the existing plugin log sink; never log the state key or value.
         const meta = { method, scopeSource: "host-derived scope", actorType: "plugin", actorId: pluginId };
-        const message = "Plugin state call with host-derived scope";
+        const message = method === "config.get" ? "Plugin config call with host-derived scope" : "Plugin state call with host-derived scope";
         try {
           if (options.hostHandlers.log) {
             await options.hostHandlers.log({ level: "info", companyId: context.invocationScope.companyId, message, meta }, context);

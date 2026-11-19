@@ -204,22 +204,23 @@ describe("plugin jobs after event notifications", () => {
 describe("job invocation scope trust boundary", () => {
   function createHandle() {
     const configGet = vi.fn<HostServices["config"]["get"]>(async () => ({ enabled: true }));
+    const companyGet = vi.fn<HostServices["companies"]["get"]>(async () => null);
     const handle = createPluginWorkerHandle("test.plugin", {
       entrypointPath: path.join(FIXTURES_DIR, "plugin-worker-job-scope.cjs"),
       manifest: TEST_MANIFEST, config: {},
       instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" }, apiVersion: 1,
       autoRestart: false, proactiveCompanyScopes: ["company-a", "company-b"],
-      hostHandlers: createHostClientHandlers({ pluginId: "test.plugin", capabilities: [],
-        services: { config: { get: configGet } } as unknown as HostServices }),
+      hostHandlers: createHostClientHandlers({ pluginId: "test.plugin", capabilities: ["companies.read"],
+        services: { config: { get: configGet }, companies: { get: companyGet } } as unknown as HostServices }),
     });
-    return { handle, configGet };
+    return { handle, configGet, companyGet };
   }
   const job = (jobKey: string): HostToWorkerMethods["runJob"][0] => ({ job: {
     jobKey, runId: "scope-probe", trigger: "schedule", scheduledAt: new Date().toISOString(),
   } });
 
-  it.each(["forged", "replayed", "expired"])("denies a %s job id even for a configured company", async (mode) => {
-    const { handle, configGet } = createHandle();
+  it.each(["forged", "replayed", "expired"])("treats a %s job id as plugin-only own-config work, never general API authority", async (mode) => {
+    const { handle, configGet, companyGet } = createHandle();
     try {
       await handle.start();
       let invocationId = "forged-job-invocation";
@@ -231,9 +232,14 @@ describe("job invocation scope trust boundary", () => {
         invocationId = snapshot.invocationId;
         expect(invocationId).toEqual(expect.any(String));
       }
-      await expect(handle.call("getData", { key: "probe", params: { invocationId } }))
+      await expect(handle.call("getData", { key: "probe", params: { invocationId } })).resolves.toEqual({ enabled: true });
+      expect(configGet).toHaveBeenCalledExactlyOnceWith({ companyId: "company-a" }, { invocationScope: { companyId: "company-a" } });
+      await expect(handle.call("getData", { key: "probe", params: { invocationId, method: "companies.get" } }))
         .rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED });
-      expect(configGet).not.toHaveBeenCalled();
+      await expect(handle.call("getData", { key: "probe", params: { invocationId, companyId: "unconfigured" } }))
+        .rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED });
+      expect(configGet).toHaveBeenCalledTimes(1);
+      expect(companyGet).not.toHaveBeenCalled();
     } finally { await handle.stop(); }
   });
 
@@ -248,8 +254,8 @@ describe("job invocation scope trust boundary", () => {
     } finally { await handle.stop(); }
   });
 
-  it("retires a job id on SIGKILL and refuses its replay after worker restart", async () => {
-    const { handle, configGet } = createHandle();
+  it("retires a job id on SIGKILL and gives replay only host-derived own-config scope after restart", async () => {
+    const { handle, configGet, companyGet } = createHandle();
     try {
       await handle.start();
       const pending = handle.call("runJob", job("wait")).catch((error) => error);
@@ -265,11 +271,13 @@ describe("job invocation scope trust boundary", () => {
       expect(await pending).toMatchObject({ message: expect.stringContaining("SIGKILL") });
       expect(handle.diagnostics()).toMatchObject({ pid: null, pendingRequests: 0 });
       await handle.start();
-      await expect(handle.call("getData", { key: "probe", params: { invocationId } }))
+      await expect(handle.call("getData", { key: "probe", params: { invocationId } })).resolves.toEqual({ enabled: true });
+      expect(configGet).toHaveBeenCalledExactlyOnceWith({ companyId: "company-a" }, { invocationScope: { companyId: "company-a" } });
+      await expect(handle.call("getData", { key: "probe", params: { invocationId, method: "companies.get" } }))
         .rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED });
-      expect(configGet).not.toHaveBeenCalled();
+      expect(companyGet).not.toHaveBeenCalled();
       await expect(handle.call("runJob", job("config"))).resolves.toEqual({ enabled: true });
-      expect(configGet).toHaveBeenCalledTimes(1);
+      expect(configGet).toHaveBeenCalledTimes(2);
     } finally { await handle.stop(); }
   });
 });

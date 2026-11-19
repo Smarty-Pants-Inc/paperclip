@@ -324,12 +324,19 @@ company reference in a job or proactive host RPC. Config saves and removals made
 through another server process therefore apply without restarting the worker;
 if that read fails, the call is denied rather than using cached authority.
 Unconfigured companies and wildcard company access remain denied. Timer-driven
-`state.get`, `state.set`, and `state.delete` calls without an invocation ID may
-access only the calling plugin's own company-scoped state for a configured
-company, even while an agent invocation is active. The host derives this
-proactive scope from the state key's `scopeId`; it carries no agent or person
-identity. Other calls without invocation IDs remain refused while an agent-origin
-invocation is active. Unknown or retired invocation IDs remain denied.
+`state.get`, `state.set`, and `state.delete` calls without a live invocation ID
+may access only the calling plugin's own company-scoped state for a configured
+company, even while an agent invocation is active. `config.get` may likewise read
+only that plugin's own configuration in an explicitly named configured company.
+The host derives fresh company-only authority from the state key's `scopeId` or
+the config read's `companyId`; a conflicting company or another plugin target is
+refused. Ended, retired and unknown invocation IDs are treated like untagged
+keeper work for these operations: they never recover the old invocation's agent,
+person, traceparent, provider budget or resource authority. Other calls carrying
+stale IDs remain refused, including on idle hosts. Other untagged calls remain
+refused while an agent-origin invocation is active. Existing idle untagged
+plugin-local state namespaces are unchanged; this does not grant those namespaces
+to stale IDs. Live invocation IDs retain their existing scope and trace behavior.
 
 ### Scoped plugin API routes
 
