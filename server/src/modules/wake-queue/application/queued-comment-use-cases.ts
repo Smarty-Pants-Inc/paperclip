@@ -280,7 +280,9 @@ export function createDiscardQueuedComment(deps: { issueLock: QueuedCommentIssue
           throw new QueuedCommentMutationForbiddenError("Only the queued message author can discard it");
         }
 
-        const deleted = await tx.deleteComment({ issueId: input.issue.id, commentId: input.commentId });
+        const deleted = await tx.deleteComment({
+          issueId: input.issue.id, commentId: input.commentId, actor: input.actor, now: input.now,
+        });
         if (!deleted) {
           throw new QueuedCommentMutationError("queued_comment_not_pending", "The queued message is no longer pending");
         }

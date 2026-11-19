@@ -1182,6 +1182,9 @@ export const issueCommentMetadataSchema = z
     // A notice's wording is immutable. Later state appends a new notice and
     // points the previous one at it instead of rewriting conversation history.
     supersededByCommentId: z.uuid().optional(),
+    // Set with deletedAt when a person deletes a queued message before dispatch.
+    // The row keeps its words on the server; the thread never shows it.
+    discardedFromQueue: z.literal(true).optional(),
     sourceChannel: z.enum(CHAT_PROVIDERS).optional(),
     // Names the outside source of quoted outside text (inbound email, chat edit);
     // description only, never authorization (smarty-dev#20830).

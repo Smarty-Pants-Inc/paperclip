@@ -9,7 +9,7 @@ import { notifyCancelledWorkspacePreservation } from "../../../services/cancelle
 import { notifyInstructionCollection } from "../../../services/instruction-collection-notifications.js";
 import { notifyChatInboundWakeNotices } from "../../../services/chat-inbound-wake-notice-notifications.js";
 import { notifyChatRunMilestones } from "../../../services/chat-run-milestone-notifications.js";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
 import type { IssueComment, IssueQueuedCommentQueue } from "@paperclipai/shared";
@@ -107,11 +107,25 @@ function buildTransaction(tx: Db, companyId: string, issueId: string, deps: Queu
       return row ? toRunRow(row) : null;
     },
 
-    async deleteComment({ issueId, commentId }) {
+    async deleteComment({ issueId, commentId, actor, now }) {
       await notifyChatRunMilestones(tx, { companyId, issueId });
+      // Soft discard: the row and its words stay; deletedAt keeps it out of every
+      // agent input and the discardedFromQueue marker keeps it out of the thread.
       const row = await tx
-        .delete(issueComments)
-        .where(and(eq(issueComments.id, commentId), eq(issueComments.issueId, issueId), eq(issueComments.companyId, companyId)))
+        .update(issueComments)
+        .set({
+          deletedAt: now,
+          deletedByType: actor.actorType,
+          deletedByAgentId: actor.actorType === "agent" ? actor.agentId : null,
+          deletedByUserId: actor.actorType === "user" ? actor.actorId : null,
+          deletedByRunId: actor.runId,
+          metadata: sql`coalesce(${issueComments.metadata}, '{"version":1}'::jsonb) || '{"discardedFromQueue":true}'::jsonb`,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issueComments.id, commentId), eq(issueComments.issueId, issueId), eq(issueComments.companyId, companyId),
+          isNull(issueComments.deletedAt),
+        ))
         .returning()
         .then((rows) => rows[0] ?? null);
       return row ? (row as IssueComment) : null;

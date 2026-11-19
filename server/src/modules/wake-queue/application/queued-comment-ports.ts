@@ -111,10 +111,17 @@ export interface QueuedCommentQueueTransaction {
     ids: string[];
     updatedAt: Date;
   }): Promise<QueuedCommentRunRow | null>;
-  /** Returns the full deleted comment row so the caller can echo it back as the delete route's response body. */
+  /**
+   * Soft-discards a queued comment: marks it deleted (and discarded from the
+   * queue) but keeps the row and its words, so a person's message is never
+   * erased by a Delete. Returns the full row so the caller can echo it back as
+   * the delete route's response body; `null` when it was already gone.
+   */
   deleteComment(input: {
     issueId: string;
     commentId: string;
+    actor: QueuedCommentActor;
+    now: Date;
   }): Promise<IssueComment | null>;
   cancelWake(input: { wakeId: string; reason: string; now: Date }): Promise<void>;
   /**

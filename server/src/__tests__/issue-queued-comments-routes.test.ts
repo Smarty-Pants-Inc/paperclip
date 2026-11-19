@@ -2214,9 +2214,53 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     if (promoted) expect((queueRun?.contextSnapshot as any)?.wakeCommentIds).toEqual([
       seeded.commentIds[1],
     ]);
-    expect(await db.select().from(issueComments).where(eq(issueComments.id, seeded.commentIds[0]))).toEqual([]);
+    // Re-pin (delundo): cancellation keeps the person's words on the row, marked deleted.
+    const [kept] = await db.select().from(issueComments).where(eq(issueComments.id, seeded.commentIds[0]));
+    expect(kept).toMatchObject({ body: "First queued message", deletedByUserId: "queue-owner" });
+    expect(kept?.deletedAt).toBeInstanceOf(Date);
     const remaining = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`);
     expect(remaining.body.entries.map((entry: any) => entry.comment.id)).toEqual([seeded.commentIds[1]]);
+  });
+
+  it("keeps a discarded queued message's words on the server, out of the thread and the agent's input", async () => {
+    const seeded = await seedQueue();
+    const discard = async (commentId: string) => {
+      const queue = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`);
+      const res = await request(app(seeded.companyId))
+        .delete(`/api/issues/${seeded.issueId}/queued-comments/${commentId}`)
+        .send({ queueId: seeded.wakeId, revision: queue.body.revision });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    };
+    const thread = async (agent?: boolean) => {
+      const res = await request(app(seeded.companyId, "queue-owner", agent ? { agentId: seeded.agentId, runId: seeded.runId } : undefined))
+        .get(`/api/issues/${seeded.issueId}/comments`);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      return (res.body as Array<{ id: string; body: string }>);
+    };
+    const wakeIds = async () => (await db.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId)))[0];
+
+    await discard(seeded.commentIds[0]);
+    const [first] = await db.select().from(issueComments).where(eq(issueComments.id, seeded.commentIds[0]));
+    expect(first, "the discarded comment row must still exist").toBeDefined();
+    expect(first).toMatchObject({ body: "First queued message", deletedByType: "user", deletedByUserId: "queue-owner" });
+    expect(first?.deletedAt).toBeInstanceOf(Date);
+    expect((first?.metadata as any)?.discardedFromQueue).toBe(true);
+    expect(((await wakeIds())?.payload as any)?._paperclipWakeContext?.wakeCommentIds).toEqual([seeded.commentIds[1]]);
+    for (const agent of [false, true]) {
+      const rows = await thread(agent);
+      expect(rows.map((row) => row.id)).toEqual([seeded.commentIds[1]]);
+      expect(JSON.stringify(rows)).not.toContain("First queued message");
+    }
+
+    await discard(seeded.commentIds[1]);
+    expect((await wakeIds())?.status).toBe("cancelled");
+    const kept = await db.select({ id: issueComments.id, body: issueComments.body, deletedAt: issueComments.deletedAt })
+      .from(issueComments).where(eq(issueComments.issueId, seeded.issueId));
+    expect(kept.map((row) => row.body).sort()).toEqual(["First queued message", "Second queued message"]);
+    expect(kept.every((row) => row.deletedAt instanceof Date)).toBe(true);
+    expect(await thread()).toEqual([]);
+    expect(await thread(true)).toEqual([]);
   });
 
   it.each(["discard", "cancel"] as const)("reports an explicit conflict after queued-run dispatch has begun (%s)", async (mode) => {
@@ -2293,8 +2337,11 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
 
     const reloaded = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`);
     expect(reloaded.body.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual([seeded.commentIds[1]]);
+    // Re-pin (delundo): the discarded row stays, its words kept, marked deleted by the board user.
     const deleted = await db.select().from(issueComments).where(eq(issueComments.id, seeded.commentIds[0]));
-    expect(deleted).toHaveLength(0);
+    expect(deleted).toHaveLength(1);
+    expect(deleted[0]).toMatchObject({ body: "First queued message", deletedByType: "user", deletedByUserId: "queue-owner" });
+    expect(deleted[0]?.deletedAt).toBeInstanceOf(Date);
     const wake = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId)).then(rows => rows[0]);
     expect((wake?.payload as any)._paperclipWakeContext.wakeCommentIds).toEqual([seeded.commentIds[1]]);
     const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, seeded.issueId));

@@ -427,7 +427,7 @@ describe("discardQueuedComment", () => {
     const result = await discard({ issue: ISSUE, actor: USER_ACTOR, commentId: "comment-1",
       queueId: "wake-1", revision: "rev-1", now: new Date(), logActivity: true });
 
-    expect(transaction.deleteComment).toHaveBeenCalledWith({ issueId: ISSUE.id, commentId: "comment-1" });
+    expect(transaction.deleteComment).toHaveBeenCalledWith(expect.objectContaining({ issueId: ISSUE.id, commentId: "comment-1" }));
     expect(transaction.cancelWake).toHaveBeenCalledOnce();
     expect(result.cancelledRun).toEqual({ id: "run-1" });
     expect(transaction.logActivity).toHaveBeenCalledWith(expect.objectContaining({

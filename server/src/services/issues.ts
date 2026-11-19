@@ -326,6 +326,9 @@ const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_MS =
   ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const ISSUE_CREATE_IDEMPOTENCY_KEY_CLEANUP_BATCH_SIZE = 500;
 const DELETED_ISSUE_COMMENT_BODY = "";
+// A queued message a person deleted before dispatch keeps its row and words
+// (soft discard) but never appears in the thread: it was never sent.
+const notDiscardedQueuedComment = sql`NOT (${issueComments.deletedAt} IS NOT NULL AND coalesce(${issueComments.metadata} ? 'discardedFromQueue', false))`;
 const ISSUE_WAKE_DIAGNOSTICS_ACTIVITY_ACTIONS = [
   "issue.tree_hold_wakeup_deferred",
 ] as const;
@@ -13496,7 +13499,7 @@ export function issueService(db: Db) {
           ? Math.min(Math.floor(opts.limit), MAX_ISSUE_COMMENT_PAGE_LIMIT)
           : null;
 
-      const conditions = [eq(issueComments.issueId, issueId)];
+      const conditions = [eq(issueComments.issueId, issueId), notDiscardedQueuedComment];
       if (opts?.companyId) conditions.push(eq(issueComments.companyId, opts.companyId));
       if (opts?.humanOnly) conditions.push(or(
         eq(issueComments.authorType, "user"),
@@ -13572,7 +13575,7 @@ export function issueService(db: Db) {
             latestCommentAt: issueComments.createdAt,
           })
           .from(issueComments)
-          .where(eq(issueComments.issueId, issueId))
+          .where(and(eq(issueComments.issueId, issueId), notDiscardedQueuedComment))
           .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
           .limit(1)
           .then((rows) => rows[0] ?? null),
@@ -13581,7 +13584,7 @@ export function issueService(db: Db) {
             totalComments: sql<number>`count(*)::int`,
           })
           .from(issueComments)
-          .where(eq(issueComments.issueId, issueId))
+          .where(and(eq(issueComments.issueId, issueId), notDiscardedQueuedComment))
           .then((rows) => rows[0] ?? null),
       ]);
 
