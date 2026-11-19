@@ -464,6 +464,18 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
         expect(sent.status, JSON.stringify(sent.body)).toBe(201); ids.push(sent.body.id);
         await new Promise(res => setTimeout(res, 20));
       }
+      // C1 (rf-5): the comment route answers 201 BEFORE it admits the message's wake
+      // (routes/issues.ts: heartbeat.wakeup(...) is not awaited; its comment_wake_pending
+      // marker is deleted after admission). A row that plants or reads wake state right
+      // after the POSTs raced that admission; it lost under the whole file's load. Wait
+      // until every intent is settled and every message sits on a held wake.
+      await waitFor(async () => {
+        const wakes = await db.select({ status: agentWakeupRequests.status, payload: agentWakeupRequests.payload }).from(agentWakeupRequests)
+          .where(and(eq(agentWakeupRequests.companyId, r.companyId), eq(agentWakeupRequests.agentId, r.agentId)));
+        if (wakes.some(w => w.status === "comment_wake_pending")) return false;
+        const held = wakes.filter(w => w.status === "deferred_issue_execution").map(w => JSON.stringify(w.payload));
+        return ids.every(id => held.some(p => p.includes(id)));
+      }, 20_000);
       return ids;
     };
     const stop = async () => {
@@ -552,9 +564,10 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     const earlier = r.holds.find(h => ["active", "escalated"].includes(h.status));
     const turn = await plantedTurnStop(r);
     const ids = await turn.send(3);
-    if (surface === "task") await db.update(agentWakeupRequests).set({ payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{executionWait}',
+    if (surface === "task") expect((await db.update(agentWakeupRequests).set({ payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{executionWait}',
       ${JSON.stringify({ reason: "execution_active", message: "Waiting for the current run. Your message is saved." })}::jsonb)` })
-      .where(and(eq(agentWakeupRequests.agentId, r.agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+      .where(and(eq(agentWakeupRequests.agentId, r.agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")))
+      .returning({ id: agentWakeupRequests.id })).length, "the planted wait landed on the held wake").toBeGreaterThan(0);
     const wakesBefore = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, r.agentId));
     await turn.stop();
     const header = (await request(r.app).get(`/api/issues/${r.issueId}/queued-comments`)).body;
