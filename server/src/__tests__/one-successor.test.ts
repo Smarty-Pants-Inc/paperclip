@@ -624,6 +624,128 @@ describeEmbeddedPostgres("ONE successor per Interrupt (adopt-one-successor, 390 
     }
   }
 
+  // ---- neworg-floor-custody (G1): README held by the person's Stop, then "9 + 10" replies before its carrier.
+  // Captured DB history, as in oldExchange, but M is saved by the real route/outbox and the Stop's real release
+  // holds its wake. Provider outcomes are seeded; the stranded sweep, outbox and held-wake promotion are real.
+  async function heldReadmeAfterMath() {
+    const chat = await seedChat();
+    const base = Date.now() - 30 * 60_000;
+    await db.update(issueComments).set({ createdAt: at(base, -20), updatedAt: at(base, -20) })
+      .where(eq(issueComments.id, chat.first.id));
+    await db.update(heartbeatRuns).set({ createdAt: at(base, -19), startedAt: at(base, -18) })
+      .where(eq(heartbeatRuns.id, chat.runId));
+    const [m] = await send(chat, ["What does the README say?"]);
+    await db.update(issueComments).set({ createdAt: at(base, 0), updatedAt: at(base, 0) })
+      .where(eq(issueComments.id, m!.id));
+    await db.update(agentWakeupRequests).set({ requestedAt: at(base, 0), updatedAt: at(base, 0) })
+      .where(eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${m!.id}`));
+    await db.update(heartbeatRuns).set({ status: "cancelled", nativeIssueId: chat.issue.id, errorCode: "cancelled", finishedAt: at(base, 2),
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: owner,
+        cancellation: { source: "operator", expected: true, initiator: { type: "user", id: owner },
+          reason: "Cancelled by a board operator", recordedAt: at(base, 2).toISOString() },
+        nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: chat.runId,
+          companyId: chat.companyId, issueId: chat.issue.id, scope: "run", reasonCode: "cancellation_run_only",
+          dispatchState: "acknowledged", dispatched: true, intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID() } },
+    }).where(eq(heartbeatRuns.id, chat.runId));
+    runningProcesses.delete(chat.runId);
+    await releaseRun(chat);
+    const [held] = await commentWakes(chat, m!.id);
+    expect(held, "the person's Stop holds M, without starting its carrier").toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(wakeCommentIds(held!)).toContain(m!.id);
+    const [n] = await db.insert(issueComments).values({ companyId: chat.companyId, issueId: chat.issue.id,
+      authorType: "user", authorUserId: owner, clientRequestId: randomUUID(), body: "9 + 10",
+      createdAt: at(base, 10), updatedAt: at(base, 10) }).returning();
+    const context = { issueId: chat.issue.id, taskKey: chat.issue.id, wakeCommentId: n!.id, wakeCommentIds: [n!.id] };
+    const [r1] = await db.insert(heartbeatRuns).values({ companyId: chat.companyId, agentId: chat.agentId,
+      runtimeMode: "native", status: "succeeded", createdAt: at(base, 11), startedAt: at(base, 12), finishedAt: at(base, 20),
+      contextSnapshot: context }).returning();
+    await db.insert(agentWakeupRequests).values({ companyId: chat.companyId, agentId: chat.agentId, source: "on_demand",
+      triggerDetail: "manual", reason: "issue_commented", status: "completed", runId: r1!.id,
+      requestedByActorType: "user", requestedByActorId: owner, idempotencyKey: `conversation-comment:${n!.id}`,
+      payload: { issueId: chat.issue.id, commentId: n!.id, _paperclipWakeContext: context }, requestedAt: at(base, 10) });
+    await db.insert(issueComments).values({ companyId: chat.companyId, issueId: chat.issue.id, authorType: "agent",
+      authorAgentId: chat.agentId, createdByRunId: r1!.id, body: "19", createdAt: at(base, 20), updatedAt: at(base, 20) });
+    // Capture R1 immediately before release: its completed answer must not discharge the still-held README.
+    await db.update(issues).set({ executionRunId: r1!.id, executionLockedAt: at(base, 12) }).where(eq(issues.id, chat.issue.id));
+    expect(await answered(m!.id)).toBe(false);
+    return { chat, m: m!, r1: r1!, held: held!, base };
+  }
+  type HeldReadme = Awaited<ReturnType<typeof heldReadmeAfterMath>>;
+
+  async function finishHeldReadme(state: HeldReadme, status: "succeeded" | "failed") {
+    const { chat, m, r1, held, base } = state;
+    const released = await releaseRun({ ...chat, runId: r1.id });
+    const [promoted] = await commentWakes(chat, m.id);
+    expect(promoted!.id, "the hold delivers its original wake, not a replacement").toBe(held.id);
+    expect(promoted!.runId, JSON.stringify({ released, wakes: await wakeDump(chat) })).toBeTruthy();
+    const [r2] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, promoted!.runId!));
+    expect((r2!.contextSnapshot as any).wakeCommentIds).toContain(m.id);
+    await db.update(heartbeatRuns).set({ status, createdAt: at(base, 29), startedAt: at(base, 30), finishedAt: at(base, 40),
+      ...(status === "failed" ? { errorCode: "adapter_failed" } : {}) }).where(eq(heartbeatRuns.id, r2!.id));
+    // The wake delivered the input; it completed even when the provider's carrying run failed.
+    await db.update(agentWakeupRequests).set({ status: "completed", finishedAt: at(base, 40) })
+      .where(eq(agentWakeupRequests.id, held.id));
+    if (status === "succeeded") await db.insert(issueComments).values({ companyId: chat.companyId, issueId: chat.issue.id,
+      authorType: "agent", authorAgentId: chat.agentId, createdByRunId: r2!.id, body: "The README describes Paperclip.",
+      createdAt: at(base, 40), updatedAt: at(base, 40) });
+    const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, r2!.id));
+    await settleConversationTurn(db, finished!);
+    // Leave the provider's persisted terminal state for the real stranded sweep to reconcile.
+    return r2!;
+  }
+
+  async function custodyCards(chat: Chat) {
+    return (await db.select().from(issueComments).where(eq(issueComments.companyId, chat.companyId)))
+      .filter(c => c.deletedAt === null && (c.metadata as any)?.authorizationReason?.startsWith(UNANSWERED_MESSAGE_REASON_PREFIX));
+  }
+
+  it("(custody-1) RED: the Stop-held README's later carrier fails after 9 + 10 replied: exactly one named card, no outbox re-send", async () => {
+    const state = await heldReadmeAfterMath();
+    await finishHeldReadme(state, "failed");
+    const since = new Date();
+    await bootSweeps(state.chat);
+    const cards = await custodyCards(state.chat);
+    console.info(`custody-1: cards=${cards.length}, wakes=${(await commentWakes(state.chat, state.m.id)).length}, answered=${await answered(state.m.id)}`);
+    expect(cards, "G1: the run that CARRIED README failed; the math reply must not silence its card").toHaveLength(1);
+    expect((cards[0]!.metadata as any).authorizationReason).toBe(`${UNANSWERED_MESSAGE_REASON_PREFIX}${state.m.id}`);
+    expect(cards[0]!.body).toContain("wasn't answered");
+    expect(JSON.stringify((cards[0]!.metadata as any).sections)).toContain(state.m.body);
+    expect((await resent(state.chat, [state.m.id], since)).wakes).toEqual([]);
+    expect(await commentWakes(state.chat, state.m.id)).toHaveLength(1);
+    expect(await undeliveredConversationComments(db, state.chat.companyId, state.chat.issue.id)).toEqual([]);
+  });
+
+  it("(custody-2) control: the Stop-held README's later carrier succeeds and replies once: no card, no new wake", async () => {
+    const state = await heldReadmeAfterMath();
+    const r2 = await finishHeldReadme(state, "succeeded");
+    const since = new Date();
+    await bootSweeps(state.chat);
+    expect(await answered(state.m.id)).toBe(true);
+    expect(await custodyCards(state.chat)).toEqual([]);
+    expect((await resent(state.chat, [state.m.id], since)).wakes).toEqual([]);
+    expect(await commentWakes(state.chat, state.m.id)).toHaveLength(1);
+    expect(await db.select().from(issueComments).where(eq(issueComments.createdByRunId, r2.id))).toHaveLength(1);
+    expect(await undeliveredConversationComments(db, state.chat.companyId, state.chat.issue.id)).toEqual([]);
+    console.info("custody-2: replies=1, cards=0, newWakes=0");
+  });
+
+  it("(custody-3) README still held after 9 + 10 replied: outbox makes no second wake; the hold delivers one carrier", async () => {
+    const state = await heldReadmeAfterMath();
+    expect((await carriersOf(state.chat, state.m.id)).runs).toEqual([]);
+    for (let i = 0; i < 2; i++) {
+      expect(await undeliveredConversationComments(db, state.chat.companyId, state.chat.issue.id)).toEqual([]);
+      await deliverConversationComments(db, state.chat.issue, heartbeatService(db).wakeup);
+    }
+    expect((await commentWakes(state.chat, state.m.id)).map(w => ({ id: w.id, status: w.status, runId: w.runId })))
+      .toEqual([{ id: state.held.id, status: "deferred_issue_execution", runId: null }]);
+    const r2 = await finishHeldReadme(state, "succeeded");
+    await bootSweeps(state.chat);
+    expect((await carriersOf(state.chat, state.m.id)).runs.map(r => r.id)).toEqual([r2.id]);
+    expect((await commentWakes(state.chat, state.m.id)).map(w => w.id)).toEqual([state.held.id]);
+    expect(await custodyCards(state.chat)).toEqual([]);
+    console.info("custody-3: heldWakes=1, extraWakes=0, carriers=1, cards=0");
+  });
+
   it("(floor-a) RED: an answered-past M (only wake cancelled, only carrier failed, a later succeeded run replied): no wake, no card", async () => {
     const chat = await seedQuietChat();
     const since = new Date();
