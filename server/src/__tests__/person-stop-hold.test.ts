@@ -48,6 +48,8 @@ const fixture = vi.hoisted(() => ({
   failNextBeforeProvider: undefined as undefined | (() => Error),
   /** Run ids whose turn failed before provider work. */
   failedBeforeProvider: [] as string[],
+  /** adopt-marker2: what the failing run recorded before it failed (e.g. its runner's session.started). */
+  beforeProviderFailure: undefined as undefined | ((runId: string) => Promise<void>),
 }));
 
 vi.mock("../services/heartbeat/runtime-selection.js", async importOriginal => {
@@ -96,6 +98,7 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
       if (fixture.failNextBeforeProvider) {
         const failure = fixture.failNextBeforeProvider();
         fixture.failNextBeforeProvider = undefined;
+        await fixture.beforeProviderFailure?.(runId);
         fixture.failedBeforeProvider.push(runId);
         throw failure;
       }
@@ -194,7 +197,7 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
       assigneeAgentId: agentId, ...(setupOptions.task ? {} : { conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" }),
       responsibleUserId: userId, issueNumber: 1, identifier: `${issuePrefix}-1`, startedAt: new Date() });
     fixture.db = db; fixture.companyId = companyId; fixture.agentId = agentId; fixture.issueId = issueId;
-    fixture.calls = []; fixture.failedBeforeProvider = []; fixture.failNextBeforeProvider = undefined;
+    fixture.calls = []; fixture.failedBeforeProvider = []; fixture.failNextBeforeProvider = undefined; fixture.beforeProviderFailure = undefined;
     const clientFor = (actorUserId: string, isInstanceAdmin = false) => {
       const client = express();
       client.use(express.json());
@@ -1138,6 +1141,80 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
       restoreRunId: restore!.id, restoreMarked, afterRunId: after!.id, afterMarked });
     expect(restoreMarked, "the first run after the Stop that starts a provider turn carries the marker").toBe(true);
     expect(afterMarked, "the turn after it carries none").toBe(false);
+  }, 180_000);
+
+  /** adopt-marker2: real Stop, real Send; the Send's run (the successor) records `events` as its runner would (sourced
+   * events), plus an optional session checkpoint, then fails before any answer. Returns the ONE reader's verdict for
+   * the automatic restore after it and for the turn after that. */
+  async function markerAfterFailedSuccessor(label: string, events: string[], sessionCheckpoint?: Record<string, unknown>) {
+    const r = await stopWithHeld();
+    const queuePath = `/api/issues/${r.issueId}/queued-comments`;
+    const queue = (await request(r.client).get(queuePath).expect(200)).body;
+    expect(queue.executionWait?.reason).toBe("stopped_by_person");
+    const sourceInstanceId = `runner-${randomUUID()}`;
+    fixture.beforeProviderFailure = async runId => {
+      let seq = 10_000;
+      for (const eventType of events) {
+        seq += 1;
+        await db.insert(heartbeatRunEvents).values({ companyId: r.companyId, runId, agentId: r.agentId, seq, eventType,
+          stream: "system", level: "info", message: eventType, payload: { sessionId: "pi-session-1" },
+          sourceInstanceId, sourceEventId: `${sourceInstanceId}:${seq}`, sourceSeq: seq });
+      }
+      if (sessionCheckpoint) await db.update(heartbeatRuns).set({ runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson},
+        '{}'::jsonb) || ${JSON.stringify({ sessionCheckpoint })}::jsonb` }).where(eq(heartbeatRuns.id, runId));
+    };
+    fixture.failNextBeforeProvider = () => new Error("runner_session_failed: test failure after the session opened");
+    const sent = await request(r.client).post(`${queuePath}/interrupt`).send({ queueId: queue.queueId, revision: queue.revision, targetRunId: null });
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    await waitFor(async () => { await r.drive(300); return fixture.failedBeforeProvider.length > 0; }, 30_000);
+    const failedRunId = fixture.failedBeforeProvider[0]!;
+    await waitFor(async () => { const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failedRunId));
+      return row && !["queued", "running"].includes(row.status); }, 30_000);
+    const [failed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failedRunId));
+    expect(failed!.status).toBe("failed");
+    const recorded = await db.select({ eventType: heartbeatRunEvents.eventType, sourceEventId: heartbeatRunEvents.sourceEventId })
+      .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, failedRunId), sql`${heartbeatRunEvents.sourceEventId} is not null`));
+    expect(recorded.map(row => row.eventType)).toEqual(events);
+    expect(successorCalls(), "the successor never answered").toEqual([]);
+    const marker = (run: { id: string; createdAt: Date }) => readPersonStoppedPreviousTurn(db, { companyId: r.companyId,
+      issueId: r.issueId, agentId: r.agentId, runId: run.id, runCreatedAt: run.createdAt });
+    const [restore] = await db.insert(heartbeatRuns).values({ companyId: r.companyId, agentId: r.agentId, status: "queued",
+      contextSnapshot: { issueId: r.issueId, wakeReason: "issue_continuation_needed", previousRunId: failedRunId } }).returning();
+    const restoreMarked = await marker(restore!);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, restore!.id));
+    const [after] = await db.insert(heartbeatRuns).values({ companyId: r.companyId, agentId: r.agentId, status: "queued",
+      contextSnapshot: { issueId: r.issueId } }).returning();
+    const afterMarked = await marker(after!);
+    await evidence(label, { stoppedRunId: r.firstRunId, failedRunId, failedStatus: failed!.status, failedError: failed!.error,
+      recordedSuccessorEvents: recorded, sessionCheckpoint: sessionCheckpoint ?? null,
+      restoreRunId: restore!.id, restoreMarked, afterRunId: after!.id, afterMarked });
+    return { restoreMarked, afterMarked };
+  }
+
+  it("stop-marker-restore (e) adopt-marker2: Stop, real Send; the Send's run OPENS its session (harness.ready, session.started) and fails before any turn; the automatic restore after it still carries the marker; the turn after it does not", async () => {
+    const { restoreMarked, afterMarked } = await markerAfterFailedSuccessor("stop-marker-restore-e-session-started",
+      ["harness.ready", "session.started"]);
+    expect(restoreMarked, "opening a session is not a turn: the restore is the first turn after the Stop").toBe(true);
+    expect(afterMarked, "the turn after it carries none").toBe(false);
+  }, 180_000);
+
+  it("stop-marker-restore (e2) adopt-marker2: a resumed session (harness.ready, session.resumed, session.updated) that fails before any turn leaves the marker too", async () => {
+    const { restoreMarked } = await markerAfterFailedSuccessor("stop-marker-restore-e2-session-resumed",
+      ["harness.ready", "session.resumed", "session.updated"]);
+    expect(restoreMarked).toBe(true);
+  }, 180_000);
+
+  it("stop-marker-restore (f) adopt-marker2: a successor that DID submit a turn (turn.submitted) and then failed consumed the marker; the restore after it carries none", async () => {
+    const { restoreMarked, afterMarked } = await markerAfterFailedSuccessor("stop-marker-restore-f-turn-submitted",
+      ["harness.ready", "session.started", "turn.submitted"]);
+    expect(restoreMarked, "the successor's turn already showed the provider the marker").toBe(false);
+    expect(afterMarked).toBe(false);
+  }, 180_000);
+
+  it("stop-marker-restore (f2) adopt-marker2: a successor whose session checkpoint holds an active turn id consumed the marker (no turn event needed)", async () => {
+    const { restoreMarked } = await markerAfterFailedSuccessor("stop-marker-restore-f2-active-turn",
+      ["harness.ready", "session.started"], { activeTurnId: "turn-1", terminalTurns: [] });
+    expect(restoreMarked).toBe(false);
   }, 180_000);
 
   it("stop-marker-restore (d): one true note at a time: the failed Send's 'Send a new message to try again' note retires when the automatic fresh thread starts (its started note supersedes it); another unanswered note stays", async () => {

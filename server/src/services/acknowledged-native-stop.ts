@@ -391,9 +391,11 @@ export function isSystemEndedRun(run: { status: string; resultJson: Record<strin
  * (readAcceptedPersonStop) names this agent's STOPPED run on the issue, and no run of this agent on the issue
  * between that stopped run and this one actually started a provider turn. Its input then says so once
  * (PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE), as Claude Code's '[Request interrupted by user]' does.
- * adopt-marker-restore (rf-4): a run in between that ENDED without provider work (e.g. the Send's run that
- * failed native_continuation_requires_reconciliation before any turn) never consumed the marker, so the first
- * run that does reach the provider (the automatic fresh-thread restore, a retry, a new message) carries it.
+ * adopt-marker-restore (rf-4): a run in between that ENDED without starting a provider turn (e.g. the Send's run
+ * that failed native_continuation_requires_reconciliation before any turn) never consumed the marker, so the first
+ * run that does start a turn (the automatic fresh-thread restore, a retry, a new message) carries it.
+ * adopt-marker2: a run that only opened its session (harness.ready / session.started / session.resumed) and failed
+ * before a turn did not consume it either (startedProviderTurnForStopMarker).
  * A later turn (one that reached the provider since), an Interrupt, an agent's or the system's cancel never match. */
 export async function readPersonStoppedPreviousTurn(db: Db, input: {
   companyId: string; issueId: string; agentId: string; runId: string; runCreatedAt: Date;
@@ -411,14 +413,44 @@ export async function readPersonStoppedPreviousTurn(db: Db, input: {
     sql`${heartbeatRuns.createdAt} >= ${stopped.createdAt.toISOString()}::timestamptz`,
     sql`${heartbeatRuns.createdAt} <= ${input.runCreatedAt.toISOString()}::timestamptz`));
   if (between.length === 0) return true;
-  const { provesNoNativeRunProviderWork } = await import("./native-runtime/native-provider-work-proof.js");
   for (const run of between) {
-    // Only an ENDED-unsuccessful run with no recorded provider work leaves the marker for the next one; a run
-    // that succeeded, is still live, or whose provider work is unknown consumed (or may yet consume) it.
+    // Only an ENDED-unsuccessful run that never started a provider TURN leaves the marker for the next one; a run
+    // that succeeded, is still live, or started (or may have started) a turn consumed (or may yet consume) it.
     if (!MARKER_PASSING_RUN_STATUSES.includes(run.status)) return false;
-    if (!(await provesNoNativeRunProviderWork(db, { companyId: input.companyId, runId: run.id }))) return false;
+    if (await startedProviderTurnForStopMarker(db, { companyId: input.companyId, runId: run.id })) return false;
   }
   return true;
+}
+
+/** adopt-marker2 (rf4-bppd F4.1): the Stop marker's OWN 'consumed' test. The marker is shown to the provider only
+ * inside a turn's input, so a run in between consumed it only when it started a provider TURN: a turn / item / tool /
+ * semantic tool / run result event (turn.submitted, turn.started, ...), a tool call, an accepted or finalized result,
+ * or a session checkpoint with an active (or settled) turn. Readiness alone (harness.ready, session.started,
+ * session.resumed, session.updated, a runner-sourced event, a provider RPC result of the session open) is NOT a turn:
+ * a successor that opened its session and failed before any turn leaves the marker for the next run.
+ * Marker-local on purpose: provesNoNativeRunProviderWork (native-provider-work-proof.ts) counts readiness as
+ * provider work for its own callers and stays unchanged. Unreadable rows count as a started turn (fail closed:
+ * the marker is never shown twice). */
+async function startedProviderTurnForStopMarker(db: Db, input: { companyId: string; runId: string }): Promise<boolean> {
+  const { companyId, runId } = input;
+  const result = await db.execute(sql`select
+    exists (select 1 from heartbeat_run_events event where event.company_id = ${companyId} and event.run_id = ${runId}
+      and event.event_type ~ '^(turn|item|tool|semantic_tool|run[.]result)[.]') as "turnEvent",
+    exists (select 1 from tool_invocations invocation where invocation.company_id = ${companyId}
+      and invocation.run_id = ${runId}) as "toolInvocation",
+    exists (select 1 from native_run_results result where result.company_id = ${companyId}
+      and result.run_id = ${runId}) as "acceptedResult",
+    exists (select 1 from native_run_finalizations coordinator where coordinator.run_id = ${runId}
+      and coordinator.result_id is not null) as "finalizedResult",
+    exists (select 1 from heartbeat_runs run where run.company_id = ${companyId} and run.id = ${runId}
+      and (run.runner_profile_json->'sessionCheckpoint'->>'activeTurnId' is not null
+        or (jsonb_typeof(run.runner_profile_json->'sessionCheckpoint'->'terminalTurns') = 'array'
+          and jsonb_array_length(run.runner_profile_json->'sessionCheckpoint'->'terminalTurns') > 0))) as "checkpointTurn"`);
+  const rows = (Array.isArray(result) ? result : (result as { rows?: unknown[] }).rows ?? []) as Array<Record<string, unknown>>;
+  const row = rows[0];
+  if (!row) return true;
+  return [row.turnEvent, row.toolInvocation, row.acceptedResult, row.finalizedResult, row.checkpointTurn]
+    .some(value => value !== false);
 }
 
 /** A run between the stopped run and this one that ended in these states, with no provider work recorded,
