@@ -1,15 +1,15 @@
 // Raw protocol probes complement the real SDK job fixture: a worker must not
-// turn a forged or retired invocation id into configured-company authority.
+// turn a forged or retired invocation id into actor or general API authority.
 const readline = require("node:readline");
 let lastInvocationId;
 let nextId = 0;
 const pending = new Map();
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 const reply = (id, result) => send({ jsonrpc: "2.0", id, result });
-function config(original, invocationId, companyId = "company-a") {
+function config(original, invocationId, companyId = "company-a", method = "config.get") {
   const id = `config-${++nextId}`;
   pending.set(id, original.id);
-  send({ jsonrpc: "2.0", id, method: "config.get", params: { companyId },
+  send({ jsonrpc: "2.0", id, method, params: { companyId },
     paperclipInvocationId: invocationId });
 }
 readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", (line) => {
@@ -32,7 +32,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line
       break;
     case "getData":
       if (message.params.key === "snapshot") reply(message.id, { invocationId: lastInvocationId });
-      else config(message, message.params.params.invocationId);
+      else config(message, message.params.params.invocationId, message.params.params.companyId, message.params.params.method);
       break;
     case "performAction":
       config(message, message.paperclipInvocation?.id, message.params.params.companyId);
