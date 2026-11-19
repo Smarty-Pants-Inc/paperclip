@@ -24,6 +24,7 @@ import {
   issueRecoveryActions,
   nativeRunFinalizations,
   nativeRunResults,
+  issueTreeHolds,
   issues,
   runIdentityContexts,
 } from "@paperclipai/db";
@@ -32,6 +33,7 @@ import { issueRoutes } from "../routes/issues.js";
 import { agentRoutes } from "../routes/agents.js";
 import { activityRoutes } from "../routes/activity.js";
 import { issueTreeControlRoutes } from "../routes/issue-tree-control.js";
+import { issueTreeControlService } from "../services/issue-tree-control.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
@@ -43,6 +45,7 @@ import { claimFirstTurnQueuedInput } from "../services/native-runtime/first-turn
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { registerDeferredReceiptWork } from "../services/heartbeat/deferred-receipt-work.js";
 import { notifyDeferredExecutionWork, notifyDeferredWakesForIssue } from "../services/deferred-execution-notifications.js";
+import { registerIssueRecoveryWork } from "../services/recovery/work.js";
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition, unansweredPersonMessageCondition } from "../services/recovery/unanswered-person-message.js";
 import { answeredPersonMessageSql } from "../services/person-message-answer.js";
 import {
@@ -3581,5 +3584,113 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(retired.deletedAt, JSON.stringify(retired)).not.toBeNull();
     const [kept] = await db.select().from(issueComments).where(eq(issueComments.id, cardB!));
     expect(kept.deletedAt).toBeNull();
+  });
+  // RFL 06:48Z: a subtree CANCEL over the sender's HELD message. REAL: comment
+  // POST, the Stop route, the subtree cancel route (POST /api/issues/:id/tree-holds
+  // {mode:"cancel"}, issue-tree-control.ts: cancelUnclaimedWakeupsForTree +
+  // cancelIssueStatusesForHold), the Delete, the comment POST for 'send again'
+  // and the sweep. PLANTED (named): seedStoppableTurn; the NULL-actor cancel
+  // (issueTreeControlService with a system actor: no route admits a NULL
+  // actor; the route's own cancel steps called in its order); the agent reply
+  // of the 'send again' run. The task surface only: the cancel route refuses a
+  // persistent conversation (createHold).
+  const CANCELLED_CARD = "This task was cancelled, so your message didn't run. Sending it again reopens the task and starts one run.";
+  async function heldThenCancel(by: string | null) {
+    const f = await seedStoppableTurn("task");
+    const a = await postMessage(f, "Reply exactly A");
+    const stopped = await stopByRoute(f, "queue-owner");
+    if (by) {
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: by,
+        status: "active", membershipRole: "operator" }).onConflictDoNothing();
+      const cancelled = await request(treeApp(f.companyId, by)).post(`/api/issues/${f.issueId}/tree-holds`).send({ mode: "cancel", reason: "cancel card" });
+      expect(cancelled.status, JSON.stringify(cancelled.body)).toBeLessThan(300);
+    } else {
+      const svc = issueTreeControlService(db);
+      const made = await svc.createHold(f.companyId, f.issueId, { mode: "cancel", reason: "cancel card (system)",
+        actor: { actorType: "system", actorId: "system", agentId: null, userId: null, runId: null } as any });
+      await svc.cancelUnclaimedWakeupsForTree(f.companyId, f.issueId, "Cancelled because an active subtree cancel hold was created");
+      await svc.cancelIssueStatusesForHold(f.companyId, f.issueId, made.hold.id);
+    }
+    const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const [hold] = await db.select().from(issueTreeHolds).where(and(eq(issueTreeHolds.rootIssueId, f.issueId), eq(issueTreeHolds.mode, "cancel")));
+    const seen = await sweepAt(f, stopped.finishedAt!, [2, 11]);
+    process.stdout.write(`CANCELCARD ${by ?? "NULL"} ${JSON.stringify({ a, status: task.status, holdBy: hold?.createdByUserId ?? null,
+      wakes: await wakesCarrying(f, a), seen })}\n`);
+    expect(task.status).toBe("cancelled");
+    return { f, a, seen };
+  }
+
+  it("cancel card: the SENDER cancels the subtree over her held message: no card at +2/+11", async () => {
+    const { seen } = await heldThenCancel("queue-owner");
+    expect(seen.map(s => s.notes), JSON.stringify(seen)).toEqual([[], []]);
+  });
+
+  it.each(["other-board-user", null] as const)("cancel card: %s cancels over the sender's held message: ONE card with the exact words at +2/+11", async (by) => {
+    const { f, a, seen } = await heldThenCancel(by);
+    expect(seen.map(s => s.notes), JSON.stringify(seen)).toEqual([[{ message: a, body: CANCELLED_CARD }], [{ message: a, body: CANCELLED_CARD }]]);
+    expect(seen.map(s => s.outcome)).toEqual(["noticed", "noticed_before"]);
+    // The REAL recovery worker's page query (work.ts strandedAssignments) visits the cancelled task.
+    const visited: { issueId?: string; unanswered?: boolean }[] = [];
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
+    const worker = registerIssueRecoveryWork(db, coordinator, {
+      stranded: async scope => { if (scope.issueId === f.issueId) visited.push({ issueId: scope.issueId, unanswered: (scope as any).unanswered }); },
+      orphanBlockers: async () => {}, recoveryActions: async () => {}, dependencies: async () => ({ enqueueFailed: 0 }),
+      locks: async () => {}, watchdogs: async () => ({ incomplete: 0 }), schedulingSuppressed: async () => false,
+    }, () => true);
+    try {
+      await worker.ready;
+      for (let i = 0; i < 50 && visited.length === 0; i++) await new Promise(resolve => setTimeout(resolve, 100));
+    } finally { await worker.stop(); }
+    process.stdout.write(`CANCELCARD-WORKER ${by ?? "NULL"} ${JSON.stringify(visited)}\n`);
+    expect(visited[0], JSON.stringify(visited)).toEqual({ issueId: f.issueId, unanswered: true });
+  });
+
+  it("cancel card: send again (the sender, a board operator): the task reopens, ONE run, answered once, the card gone", async () => {
+    const { f, a, seen } = await heldThenCancel("other-board-user");
+    expect(seen[1].notes, JSON.stringify(seen)).toEqual([{ message: a, body: CANCELLED_CARD }]);
+    const runsBefore = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.nativeIssueId, f.issueId))).map(r => r.id);
+    const b = await postMessage(f, "Reply exactly A");
+    const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    // The comment route's wake is dispatched after the response: wait for it (bounded).
+    const readB = async () => ({ runsB: (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter(r => !runsBefore.includes(r.id) && JSON.stringify(r.contextSnapshot ?? {}).includes(b)), wakesB: await wakesCarrying(f, b) });
+    let { runsB, wakesB } = await readB();
+    for (let i = 0; i < 50 && runsB.length + wakesB.length === 0; i++) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      ({ runsB, wakesB } = await readB());
+    }
+    process.stdout.write(`CANCELCARD-SEND-AGAIN ${JSON.stringify({ a, b, status: task.status,
+      runsB: runsB.map(r => ({ id: r.id, status: r.status })), wakesB })}\n`);
+    expect(task.status).not.toBe("cancelled");
+    expect(runsB.length + wakesB.filter(w => !["cancelled", "failed", "completed"].includes(w.status)).length, JSON.stringify({ runsB, wakesB })).toBeGreaterThan(0);
+    expect(runsB.length, JSON.stringify(runsB)).toBeLessThanOrEqual(1);
+    // PLANTED: B's run replies once (its agent comment, created by that run).
+    let runB = runsB[0]?.id;
+    if (!runB) {
+      runB = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runB, companyId: f.companyId, agentId: f.agentId, invocationSource: "on_demand",
+        status: "succeeded", runtimeMode: "native", nativeIssueId: f.issueId, finishedAt: new Date(),
+        contextSnapshot: { issueId: f.issueId, commentId: b, wakeCommentId: b, wakeCommentIds: [b] } });
+    }
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
+      createdByRunId: runB, body: "A" });
+    await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId, now: new Date(Date.now() + 2 * 60_000) });
+    const notes = await liveNotes(f);
+    const answered = (await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.id, a),
+      answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+        issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })))).length;
+    process.stdout.write(`CANCELCARD-SEND-AGAIN-AFTER ${JSON.stringify({ notes, answered })}\n`);
+    expect(answered).toBe(1);
+    expect(notes, JSON.stringify(notes)).toEqual([]);
+  });
+
+  it("cancel card: the sender's Delete of A: the card gone", async () => {
+    const { f, a, seen } = await heldThenCancel("other-board-user");
+    expect(seen[1].notes, JSON.stringify(seen)).toEqual([{ message: a, body: CANCELLED_CARD }]);
+    const deleted = await request(boardApp(f.companyId, "queue-owner")).delete(`/api/issues/${f.issueId}/comments/${a}`);
+    process.stdout.write(`CANCELCARD-DELETE ${JSON.stringify({ status: deleted.status, body: deleted.body })}\n`);
+    expect(deleted.status, JSON.stringify(deleted.body)).toBeLessThan(300);
+    await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId, now: new Date(Date.now() + 2 * 60_000) });
+    expect(await liveNotes(f)).toEqual([]);
   });
 });
