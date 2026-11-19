@@ -8364,6 +8364,23 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/issues/{id}/queued-comments/{commentId}/restore",
+  tags: ["issues"],
+  summary: "Undo a queued-comment Delete: the same person, within a short window, restores it in its queue position",
+  request: {
+    params: z.object({ id: z.string(), commentId: z.string() }),
+  },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/heartbeat-runs/{runId}/runtime-requests/{requestId}/resolve",
   tags: ["runs"],
   summary: "Resolve a pending Paperclip runner runtime request",

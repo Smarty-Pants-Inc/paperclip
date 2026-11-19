@@ -19,7 +19,9 @@ export type QueuedCommentMutationErrorCode =
   | "queued_comment_stale_queue"
   | "queued_comment_revision_conflict"
   | "queued_comment_order_mismatch"
-  | "conversation_reset_requires_own_message";
+  | "conversation_reset_requires_own_message"
+  | "queued_comment_restore_expired"
+  | "queued_comment_not_restorable";
 
 /** The route maps this 1:1 onto the `conflict(...)` HTTP error it threw before this move, using `code` and `message` unchanged. */
 export class QueuedCommentMutationError extends Error {
@@ -282,6 +284,12 @@ export function createDiscardQueuedComment(deps: { issueLock: QueuedCommentIssue
 
         const deleted = await tx.deleteComment({
           issueId: input.issue.id, commentId: input.commentId, actor: input.actor, now: input.now,
+          // Where the message sat, so Undo can put it back in the same place.
+          restorePoint: {
+            queueId: locked.wake.id,
+            order: locked.queue.entries.map((candidate) => candidate.comment.id),
+            wakeStatus: locked.wake.status,
+          },
         });
         if (!deleted) {
           throw new QueuedCommentMutationError("queued_comment_not_pending", "The queued message is no longer pending");

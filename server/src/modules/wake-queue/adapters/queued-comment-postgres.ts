@@ -12,7 +12,7 @@ import { notifyChatRunMilestones } from "../../../services/chat-run-milestone-no
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
-import type { IssueComment, IssueQueuedCommentQueue } from "@paperclipai/shared";
+import type { IssueComment, IssueCommentMetadata, IssueQueuedCommentQueue } from "@paperclipai/shared";
 import {
   buildQueuedCommentQueueSnapshot,
   decideQueuedCommentQueueSteering,
@@ -24,7 +24,8 @@ import { logActivity as persistActivityLogRow, type ActivityPublication } from "
 import { decideQueuedCommentWakeLookup } from "../domain/policy.js";
 import { firstTurnClaimedCommentIds, firstTurnQueuedCommentIds, firstTurnWakeColumns } from "../../../services/native-runtime/first-turn-queued-input.js";
 import { parseObject, readNonEmptyString } from "../domain/values.js";
-import { QueuedCommentMutationError } from "../application/queued-comment-use-cases.js";
+import { QueuedCommentMutationError, QueuedCommentMutationForbiddenError } from "../application/queued-comment-use-cases.js";
+import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
 import type {
   LockedQueuedCommentState,
   QueuedCommentActor,
@@ -107,7 +108,7 @@ function buildTransaction(tx: Db, companyId: string, issueId: string, deps: Queu
       return row ? toRunRow(row) : null;
     },
 
-    async deleteComment({ issueId, commentId, actor, now }) {
+    async deleteComment({ issueId, commentId, actor, now, restorePoint }) {
       await notifyChatRunMilestones(tx, { companyId, issueId });
       // Soft discard: the row and its words stay; deletedAt keeps it out of every
       // agent input and the discardedFromQueue marker keeps it out of the thread.
@@ -119,7 +120,9 @@ function buildTransaction(tx: Db, companyId: string, issueId: string, deps: Queu
           deletedByAgentId: actor.actorType === "agent" ? actor.agentId : null,
           deletedByUserId: actor.actorType === "user" ? actor.actorId : null,
           deletedByRunId: actor.runId,
-          metadata: sql`coalesce(${issueComments.metadata}, '{"version":1}'::jsonb) || '{"discardedFromQueue":true}'::jsonb`,
+          metadata: sql`coalesce(${issueComments.metadata}, '{"version":1}'::jsonb) || ${JSON.stringify({
+            discardedFromQueue: true, ...(restorePoint ? { queuedDiscard: restorePoint } : {}),
+          })}::jsonb`,
           updatedAt: now,
         })
         .where(and(
@@ -388,4 +391,118 @@ export function createQueuedCommentIssueLockWriter(db: Db, deps: QueuedCommentQu
       });
     },
   };
+}
+
+/** How long after a Delete the same person can still restore the message (Undo). The bar offers Undo for ~8 s. */
+export const QUEUED_COMMENT_RESTORE_WINDOW_MS = 60_000;
+
+const DISCARD_REASON = "Queued message discarded before dispatch";
+
+/**
+ * Undo of a queued Delete. Under the issue lock: the comment must be a
+ * discarded queued message, deleted by this same person within the window.
+ * It is put back into its own queue (the wake it was discarded from) at its
+ * original place among the messages still waiting, and deletedAt is cleared.
+ * When that Delete had emptied the queue (wake cancelled by the discard), the
+ * wake is revived as a deferred wake holding only this message and the
+ * deferred-execution worker is hinted, so it is admitted once, in order, by
+ * the ordinary path. A queue that has already been dispatched cannot take it
+ * back: that is refused and the message stays deleted.
+ */
+export async function restoreDiscardedQueuedComment(
+  db: Db,
+  deps: QueuedCommentQueuePostgresAdapterDeps,
+  input: { issue: { id: string; companyId: string }; actor: QueuedCommentActor; commentId: string; now: Date; windowMs?: number },
+): Promise<{ queueId: string }> {
+  const { companyId } = input.issue;
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as Db;
+    await tx.select({ id: issues.id }).from(issues)
+      .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, companyId))).for("update");
+    const comment = await tx.select().from(issueComments).where(and(
+      eq(issueComments.id, input.commentId), eq(issueComments.issueId, input.issue.id), eq(issueComments.companyId, companyId),
+    )).for("update").limit(1).then((rows) => rows[0] ?? null);
+    const metadata = parseObject(comment?.metadata);
+    const point = parseObject(metadata.queuedDiscard);
+    const queueId = readNonEmptyString(point.queueId);
+    if (!comment || !comment.deletedAt || metadata.discardedFromQueue !== true || !queueId) {
+      throw new QueuedCommentMutationError("queued_comment_not_restorable", "This message can't be restored");
+    }
+    if (input.actor.actorType !== "user" || !comment.deletedByUserId || comment.deletedByUserId !== input.actor.actorId) {
+      throw new QueuedCommentMutationForbiddenError("Only the person who deleted this message can restore it");
+    }
+    if (input.now.getTime() - new Date(comment.deletedAt).getTime() > (input.windowMs ?? QUEUED_COMMENT_RESTORE_WINDOW_MS)) {
+      throw new QueuedCommentMutationError("queued_comment_restore_expired", "Too late to undo: the message stays deleted");
+    }
+    const wakeRow = await tx.select().from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.id, queueId), eq(agentWakeupRequests.companyId, companyId)))
+      .for("update").limit(1).then((rows) => rows[0] ?? null);
+    if (!wakeRow || readNonEmptyString(parseObject(wakeRow.payload).issueId) !== input.issue.id) {
+      throw new QueuedCommentMutationError("queued_comment_not_restorable", "This message can't be restored");
+    }
+    const originalOrder = Array.isArray(point.order) ? point.order.filter((id): id is string => typeof id === "string") : [];
+    const currentIds = queuedCommentIdsFromWakePayload(wakeRow.payload);
+    const pending = wakeRow.status === "deferred_issue_execution";
+    let queueRunRow: RunRow | null = null;
+    if (!pending && wakeRow.status === "queued" && wakeRow.runId) {
+      queueRunRow = await tx.select().from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id, wakeRow.runId), eq(heartbeatRuns.companyId, companyId)))
+        .for("update").limit(1).then((rows) => rows[0] ?? null);
+    }
+    const revivable = wakeRow.status === "cancelled" && wakeRow.error === DISCARD_REASON && currentIds.length <= 1;
+    if (!pending && queueRunRow?.status !== "queued" && !revivable) {
+      throw new QueuedCommentMutationError("queued_comment_not_restorable",
+        "Too late to undo: the other queued messages were already sent. The message stays deleted.");
+    }
+    // Same place: right after the nearest earlier message (in the order at
+    // Delete) that is still waiting, else first.
+    const withoutSelf = revivable ? [] : currentIds.filter((id) => id !== input.commentId);
+    const before = originalOrder.slice(0, Math.max(0, originalOrder.indexOf(input.commentId)));
+    let insertAt = 0;
+    for (const id of before) {
+      const at = withoutSelf.indexOf(id);
+      if (at >= 0) insertAt = Math.max(insertAt, at + 1);
+    }
+    const ids = [...withoutSelf.slice(0, insertAt), input.commentId, ...withoutSelf.slice(insertAt)];
+
+    const restoredMetadata = { ...metadata };
+    delete restoredMetadata.discardedFromQueue;
+    delete restoredMetadata.queuedDiscard;
+    await tx.update(issueComments).set({
+      deletedAt: null, deletedByType: null, deletedByAgentId: null, deletedByUserId: null, deletedByRunId: null,
+      metadata: restoredMetadata as unknown as IssueCommentMetadata, updatedAt: input.now,
+    }).where(eq(issueComments.id, comment.id));
+    await deps.syncCommentReferences(comment.id, tx);
+    await deps.syncCommentExternalObjectsSafely(comment.id, tx);
+
+    if (revivable) {
+      // The Delete emptied the queue and cancelled its wake (and any queued
+      // run). Revive the wake as deferred with only this message; the
+      // deferred-execution worker admits it once through the ordinary path.
+      await tx.update(agentWakeupRequests).set({
+        status: "deferred_issue_execution", runId: null, finishedAt: null, error: null,
+        payload: withQueuedCommentIdsInWakePayload(wakeRow.payload, ids), updatedAt: input.now,
+      }).where(eq(agentWakeupRequests.id, wakeRow.id));
+      await notifyDeferredExecutionWork(tx, { companyId, requestId: wakeRow.id });
+    } else {
+      await tx.update(agentWakeupRequests).set({
+        payload: withQueuedCommentIdsInWakePayload(wakeRow.payload, ids), updatedAt: input.now,
+      }).where(eq(agentWakeupRequests.id, wakeRow.id));
+      if (queueRunRow) {
+        const updated = await tx.update(heartbeatRuns).set({
+          contextSnapshot: withQueuedCommentIdsInRunContext(parseObject(queueRunRow.contextSnapshot), ids), updatedAt: input.now,
+        }).where(and(eq(heartbeatRuns.id, queueRunRow.id), eq(heartbeatRuns.status, "queued")))
+          .returning({ id: heartbeatRuns.id });
+        // Rolls the whole restore back: the message stays deleted.
+        if (updated.length === 0) {
+          throw new QueuedCommentMutationError("queued_comment_not_restorable",
+            "Too late to undo: the other queued messages were already sent. The message stays deleted.");
+        }
+      }
+    }
+    await notifyStatusCardIssueChange(tx, companyId);
+    await tx.update(issues).set({ updatedAt: input.now })
+      .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, companyId)));
+    return { queueId: wakeRow.id };
+  });
 }

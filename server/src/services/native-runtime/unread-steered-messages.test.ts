@@ -13,6 +13,8 @@ import {
 } from "@paperclipai/db";
 
 import { readUnreadSteeredMessages } from "./unread-steered-messages.js";
+import { importedPersonHistorySql } from "../person-message-answer.js";
+import { sql } from "drizzle-orm";
 import { queuedInteractionSteeringBody } from "../queued-interaction-response.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -58,11 +60,14 @@ describeEmbeddedPostgres("unread steered messages", () => {
     const issueId = await seedIssue(companyId, agentId, 1, prefix);
     const otherIssueId = await seedIssue(companyId, agentId, 2, prefix);
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", contextSnapshot: { issueId } });
-    const [read, unread, notValidated, otherIssue] = await db.insert(issueComments).values([
+    const [read, unread, notValidated, otherIssue, deleted] = await db.insert(issueComments).values([
       { companyId, issueId, authorUserId: "board", body: "Already read" },
       { companyId, issueId, authorUserId: "board", body: "HELLO unread" },
       { companyId, issueId, authorUserId: "board", body: "Never acknowledged by the transport" },
       { companyId, issueId: otherIssueId, authorUserId: "board", body: "Another task" },
+      // delundo2: a message the person deleted is never replayed, even with an unread acknowledgement.
+      { companyId, issueId, authorUserId: "board", body: "DELETED words", deletedAt: new Date(), deletedByType: "user",
+        deletedByUserId: "board", metadata: { version: 1, discardedFromQueue: true } as never },
     ]).returning();
     const [interaction] = await db.insert(issueThreadInteractions).values({
       companyId, issueId, kind: "ask_user_questions", status: "answered", effectiveResolverPolicy: "human_only",
@@ -81,6 +86,7 @@ describeEmbeddedPostgres("unread steered messages", () => {
       event("item.completed", "t1", "steering_acknowledgement", `t1:steer:${notValidated!.id}`, false),
       event("item.completed", "t1", "steering_acknowledgement", `t1:steer:${otherIssue!.id}`),
       event("item.completed", "t1", "steering_acknowledgement", `t1:steer:${interaction!.id}`),
+      event("item.completed", "t1", "steering_acknowledgement", `t1:steer:${deleted!.id}`),
       // A model output item alone is not read evidence.
       event("item.started", "t1", "agentMessage", "t1:message"),
       event("turn.failed", "t1", null),
@@ -94,5 +100,32 @@ describeEmbeddedPostgres("unread steered messages", () => {
     // The continuation's input reaches the model: nothing is delivered twice.
     await db.insert(heartbeatRunEvents).values(event("item.started", "t2", "userMessage", "t2:input"));
     expect(await readUnreadSteeredMessages(db, { companyId, runId, issueId })).toEqual([]);
+  });
+
+  // delundo2 (RFL B3-S2, alias p): a deleted imported person message is never
+  // counted as answered history; the live one still is.
+  it("never treats a deleted person message as imported (answered) history", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const prefix = `P${companyId.replaceAll("-", "").slice(0, 6)}`;
+    await db.insert(companies).values({ id: companyId, name: "Paperclip", issuePrefix: prefix, requireBoardApprovalForNewAgents: false });
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "Codex", role: "engineer", status: "idle",
+      adapterType: "paperclip_runner", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
+    const issueId = await seedIssue(companyId, agentId, 1, prefix);
+    const [live, deleted] = await db.insert(issueComments).values([
+      { companyId, issueId, authorType: "user", authorUserId: "board", body: "Imported, live", origin: "import" },
+      { companyId, issueId, authorType: "user", authorUserId: "board", body: "Imported, deleted", origin: "import",
+        deletedAt: new Date(), deletedByType: "user", deletedByUserId: "board" },
+    ]).returning();
+    const imported = async (id: string) => {
+      const rows = await db.execute(sql`select ${importedPersonHistorySql({
+        id: sql`m.id`, companyId: sql`m.company_id`, issueId: sql`m.issue_id`, createdAt: sql`m.created_at`,
+      })} as imported from issue_comments m where m.id = ${id}::uuid`);
+      return Boolean((rows as unknown as Array<{ imported: boolean }>)[0]?.imported);
+    };
+    expect(await imported(live!.id)).toBe(true);
+    expect(await imported(deleted!.id)).toBe(false);
   });
 });

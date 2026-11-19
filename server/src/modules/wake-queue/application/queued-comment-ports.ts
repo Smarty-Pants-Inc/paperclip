@@ -122,6 +122,8 @@ export interface QueuedCommentQueueTransaction {
     commentId: string;
     actor: QueuedCommentActor;
     now: Date;
+    /** The queue the message sat in, its order then and the wake's status, kept for Undo (restore). */
+    restorePoint?: QueuedCommentRestorePoint;
   }): Promise<IssueComment | null>;
   cancelWake(input: { wakeId: string; reason: string; now: Date }): Promise<void>;
   /**
@@ -186,3 +188,10 @@ export interface QueuedCommentIssueLockWriter {
     fn: (locked: LockedQueuedCommentState, transaction: QueuedCommentQueueTransaction) => Promise<T>,
   ): Promise<T>;
 }
+
+/** Saved on a discarded queued comment's metadata (`queuedDiscard`) so restore can put it back where it was. */
+export type QueuedCommentRestorePoint = {
+  queueId: string;
+  order: string[];
+  wakeStatus: string;
+};

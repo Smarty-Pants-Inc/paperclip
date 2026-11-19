@@ -1185,6 +1185,13 @@ export const issueCommentMetadataSchema = z
     // Set with deletedAt when a person deletes a queued message before dispatch.
     // The row keeps its words on the server; the thread never shows it.
     discardedFromQueue: z.literal(true).optional(),
+    // Where a discarded queued message sat (queue, order, wake status), so the
+    // same person's Undo can restore it in place within a short window.
+    queuedDiscard: z.object({
+      queueId: z.string(),
+      order: z.array(z.string()),
+      wakeStatus: z.string(),
+    }).optional(),
     sourceChannel: z.enum(CHAT_PROVIDERS).optional(),
     // Names the outside source of quoted outside text (inbound email, chat edit);
     // description only, never authorization (smarty-dev#20830).

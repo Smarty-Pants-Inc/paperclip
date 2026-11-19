@@ -2263,6 +2263,143 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(await thread(true)).toEqual([]);
   });
 
+  describe("delundo2: Delete is immediate on the server; Undo restores it in place", () => {
+    const wakeOf = async (wakeId: string) => (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0]!;
+    const wakeIdsOf = async (wakeId: string) => ((await wakeOf(wakeId)).payload as any)?._paperclipWakeContext?.wakeCommentIds;
+    const commentOf = async (id: string) => (await db.select().from(issueComments).where(eq(issueComments.id, id)))[0]!;
+    async function discard(seeded: Awaited<ReturnType<typeof seedQueue>>, commentId: string) {
+      const queue = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
+      const res = await request(app(seeded.companyId))
+        .delete(`/api/issues/${seeded.issueId}/queued-comments/${commentId}`)
+        .send({ queueId: seeded.wakeId, revision: queue.body.revision });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    }
+    const restore = (seeded: Awaited<ReturnType<typeof seedQueue>>, commentId: string, userId = "queue-owner") =>
+      request(app(seeded.companyId, userId)).post(`/api/issues/${seeded.issueId}/queued-comments/${commentId}/restore`).send({});
+    /** The turn ends and the dispatcher admits the next turn (no model is invoked: the agent's slot is busy). */
+    async function endTurn(seeded: Awaited<ReturnType<typeof seedQueue>>) {
+      await db.update(agents).set({ adapterType: "claude_local", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+        .where(eq(agents.id, seeded.agentId));
+      await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, seeded.runId));
+      await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, seeded.issueId));
+      await db.insert(heartbeatRuns).values({ companyId: seeded.companyId, agentId: seeded.agentId,
+        status: "running", contextSnapshot: { issueId: randomUUID() } });
+    }
+    async function endTurnAndAdmit(seeded: Awaited<ReturnType<typeof seedQueue>>) {
+      await endTurn(seeded);
+      // The deferred-receipt sweep only reconsiders a saved wake past its age gate.
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date(0) }).where(eq(agentWakeupRequests.id, seeded.wakeId));
+      await heartbeatService(db).resumeQueuedRuns();
+      await heartbeatService(db).resumeQueuedRuns();
+      const all = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, seeded.companyId));
+      const successors = all
+        .filter((run) => run.id !== seeded.runId && (run.contextSnapshot as any)?.issueId === seeded.issueId);
+      return successors.map((run) => (run.contextSnapshot as any)?.wakeCommentIds);
+    }
+    async function seedThree() {
+      const seeded = await seedQueue();
+      const thirdId = randomUUID();
+      await db.insert(issueComments).values({ id: thirdId, companyId: seeded.companyId, issueId: seeded.issueId,
+        authorType: "user", authorUserId: "queue-owner", body: "Third queued message",
+        createdAt: new Date("2026-08-22T15:03:00.000Z"), updatedAt: new Date("2026-08-22T15:03:00.000Z") });
+      const ids = [...seeded.commentIds, thirdId];
+      const wake = await wakeOf(seeded.wakeId);
+      await db.update(agentWakeupRequests).set({ payload: { ...(wake.payload as any),
+        _paperclipWakeContext: { ...(wake.payload as any)._paperclipWakeContext, wakeCommentIds: ids } } })
+        .where(eq(agentWakeupRequests.id, seeded.wakeId));
+      return { ...seeded, ids };
+    }
+
+    it("a deleted message is never claimed when the turn ends, nor in the next turn's input", async () => {
+      const seeded = await seedThree();
+      await discard(seeded, seeded.ids[1]!);
+      expect((await commentOf(seeded.ids[1]!)).deletedAt).toBeInstanceOf(Date);
+      expect(await endTurnAndAdmit(seeded)).toEqual([[seeded.ids[0], seeded.ids[2]]]);
+      // The next turn has not started yet: Undo still puts it back in place, in that turn's input.
+      const res = await restore(seeded, seeded.ids[1]!);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.entries.map((entry: any) => entry.comment.id)).toEqual(seeded.ids);
+      const wake = await wakeOf(seeded.wakeId);
+      const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake.runId!));
+      expect(successor!.status).toBe("queued");
+      expect((successor!.contextSnapshot as any)?.wakeCommentIds).toEqual(seeded.ids);
+    });
+
+    it("Undo after its queue was dispatched is refused and the message stays deleted", async () => {
+      const seeded = await seedThree();
+      await discard(seeded, seeded.ids[1]!);
+      expect(await endTurnAndAdmit(seeded)).toEqual([[seeded.ids[0], seeded.ids[2]]]);
+      const wake = await wakeOf(seeded.wakeId);
+      await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, wake.runId!));
+      const late = await restore(seeded, seeded.ids[1]!);
+      expect(late.status, JSON.stringify(late.body)).toBe(409);
+      expect(late.body.details?.code).toBe("queued_comment_not_restorable");
+      expect((await commentOf(seeded.ids[1]!)).deletedAt).toBeInstanceOf(Date);
+    });
+
+    it("Interrupt never carries a deleted message", async () => {
+      const seeded = await seedThree();
+      await discard(seeded, seeded.ids[0]!);
+      await discard(seeded, seeded.ids[2]!);
+      const client = app(seeded.companyId);
+      const queue = await request(client).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
+      expect(queue.body.entries.map((entry: any) => entry.comment.id)).toEqual([seeded.ids[1]]);
+      await endTurn(seeded);
+      const res = await request(client).post(`/api/issues/${seeded.issueId}/queued-comments/interrupt`).send({
+        queueId: seeded.wakeId, revision: queue.body.revision, targetRunId: null });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const carried = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, seeded.companyId)))
+        .filter((run) => run.id !== seeded.runId && (run.contextSnapshot as any)?.issueId === seeded.issueId)
+        .map((run) => (run.contextSnapshot as any)?.wakeCommentIds);
+      expect(carried).toEqual([[seeded.ids[1]]]);
+      expect(await wakeIdsOf(seeded.wakeId)).toEqual([seeded.ids[1]]);
+    });
+
+    it("restore within the bound puts it back in the same place (deletedAt cleared) and it is answered once, in order", async () => {
+      const seeded = await seedThree();
+      await discard(seeded, seeded.ids[1]!);
+      expect(await wakeIdsOf(seeded.wakeId)).toEqual([seeded.ids[0], seeded.ids[2]]);
+      const res = await restore(seeded, seeded.ids[1]!);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.entries.map((entry: any) => entry.comment.id)).toEqual(seeded.ids);
+      const back = await commentOf(seeded.ids[1]!);
+      expect(back).toMatchObject({ body: "Second queued message", deletedAt: null, deletedByUserId: null });
+      expect((back.metadata as any)?.discardedFromQueue).toBeUndefined();
+      expect(await wakeIdsOf(seeded.wakeId)).toEqual(seeded.ids);
+      // A second Undo is refused: it is already back.
+      expect((await restore(seeded, seeded.ids[1]!)).status).toBe(409);
+      expect(await endTurnAndAdmit(seeded)).toEqual([seeded.ids]);
+    });
+
+    it("restore after a Delete emptied the queue revives it: same order, answered once", async () => {
+      const seeded = await seedQueue();
+      await discard(seeded, seeded.commentIds[0]);
+      await discard(seeded, seeded.commentIds[1]);
+      expect((await wakeOf(seeded.wakeId)).status).toBe("cancelled");
+      expect((await restore(seeded, seeded.commentIds[1])).status).toBe(200);
+      const res = await restore(seeded, seeded.commentIds[0]);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.entries.map((entry: any) => entry.comment.id)).toEqual(seeded.commentIds);
+      expect((await wakeOf(seeded.wakeId)).status).toBe("deferred_issue_execution");
+      expect(await endTurnAndAdmit(seeded)).toEqual([seeded.commentIds]);
+    });
+
+    it("restore after the bound is refused; another person can never restore", async () => {
+      const seeded = await seedQueue();
+      await discard(seeded, seeded.commentIds[0]);
+      const other = await restore(seeded, seeded.commentIds[0], "other-operator");
+      expect(other.status, JSON.stringify(other.body)).toBe(403);
+      await db.update(issueComments).set({ deletedAt: new Date(Date.now() - 61_000) })
+        .where(eq(issueComments.id, seeded.commentIds[0]));
+      const late = await restore(seeded, seeded.commentIds[0]);
+      expect(late.status, JSON.stringify(late.body)).toBe(409);
+      expect(late.body.details?.code).toBe("queued_comment_restore_expired");
+      expect((await commentOf(seeded.commentIds[0])).deletedAt).toBeInstanceOf(Date);
+      expect(await wakeIdsOf(seeded.wakeId)).toEqual([seeded.commentIds[1]]);
+    });
+  });
+
   it.each(["discard", "cancel"] as const)("reports an explicit conflict after queued-run dispatch has begun (%s)", async (mode) => {
     const seeded = await seedQueue();
     const initial = await request(app(seeded.companyId))

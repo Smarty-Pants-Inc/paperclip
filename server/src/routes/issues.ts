@@ -18667,6 +18667,36 @@ export function issueRoutes(
     },
   );
 
+  // Undo of a queued Delete. Same authz as the discard route; only the person
+  // who deleted it, within the server's window, and back in the same place.
+  router.post("/issues/:id/queued-comments/:commentId/restore", async (req, res) => {
+    assertBoard(req);
+    if (!req.actor.userId) throw forbidden("Board user context required");
+    const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    await assertChatQueueOwner(req, issue, "restore a chat's queued messages");
+    const actor = getActorInfo(req);
+    const commentId = req.params.commentId as string;
+    const { queueId } = await runQueuedCommentMutation(() =>
+      queuedCommentQueue.restoreQueuedComment({ issue, actor, commentId, now: new Date() }),
+    );
+    await logActivity(db, {
+      companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
+      agentId: actor.agentId, runId: actor.runId, agentApiKeyId: actor.agentApiKeyId,
+      action: "issue.queued_comment_restored", entityType: "issue", entityId: issue.id,
+      details: { commentId, queueId },
+    });
+    const fresh = await svc.getById(issue.id);
+    const queue = await buildQueuedCommentQueue({
+      executor: db,
+      issue: fresh ?? issue,
+      activeRun: await resolveActiveIssueRun(fresh ?? issue, { queueStateOnly: true }),
+      actor,
+    });
+    res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+  });
+
   router.get("/issues/:id/chat-handoffs", async (req, res) => {
     assertBoard(req);
     if (!req.actor.userId) throw forbidden("Board user context required");

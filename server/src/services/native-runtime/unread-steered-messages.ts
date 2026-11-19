@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { heartbeatRunEvents, issueComments, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { unreadSteeredMessageIds } from "../../vendor/paperclip-runner/index.js";
 import { queuedInteractionSteeringBody } from "../queued-interaction-response.js";
@@ -48,9 +48,19 @@ export async function readUnreadSteeredMessages(
       eq(issueComments.companyId, input.companyId),
       eq(issueComments.issueId, input.issueId),
       inArray(issueComments.id, uuids),
+      // A deleted (discarded) message is never replayed to the agent.
+      isNull(issueComments.deletedAt),
     ));
+  const deletedIds = new Set(
+    (await db.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, input.companyId),
+      eq(issueComments.issueId, input.issueId),
+      inArray(issueComments.id, uuids),
+      isNotNull(issueComments.deletedAt),
+    ))).map((row) => row.id),
+  );
   for (const comment of comments) texts.set(comment.id, comment.body);
-  const remaining = uuids.filter((id) => !texts.has(id));
+  const remaining = uuids.filter((id) => !texts.has(id) && !deletedIds.has(id));
   if (remaining.length > 0) {
     // A steered interaction response uses the interaction id.
     const interactions = await db

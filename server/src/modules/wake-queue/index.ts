@@ -5,7 +5,7 @@ import {
   createWakeAdmissionReader,
   createWakeAdmissionWriter,
 } from "./adapters/postgres.js";
-import { createQueuedCommentIssueLockWriter } from "./adapters/queued-comment-postgres.js";
+import { createQueuedCommentIssueLockWriter, restoreDiscardedQueuedComment } from "./adapters/queued-comment-postgres.js";
 import type { QueuedCommentQueuePostgresAdapterDeps } from "./adapters/queued-comment-postgres.js";
 import { createAdmitWakeBehindIssueExecution, createReleaseIssueExecution } from "./application/use-cases.js";
 import {
@@ -125,6 +125,9 @@ export function createQueuedCommentQueue(db: Db, deps: QueuedCommentQueuePostgre
     editQueuedComment: createEditQueuedComment({ issueLock }),
     reorderQueuedComments: createReorderQueuedComments({ issueLock }),
     discardQueuedComment: createDiscardQueuedComment({ issueLock }),
+    /** Undo of a queued Delete: same person, within the window, back in place. */
+    restoreQueuedComment: (input: Parameters<typeof restoreDiscardedQueuedComment>[2]) =>
+      restoreDiscardedQueuedComment(db, deps, input),
   };
 }
 

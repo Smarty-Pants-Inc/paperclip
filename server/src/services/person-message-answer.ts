@@ -63,6 +63,8 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
       and a.created_at > ${m.createdAt}
       and exists (select 1 from ${issueComments} b
         where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
+          -- A deleted message is never evidence that another one was answered.
+          and b.deleted_at is null
           and (b.id = ${m.id} or (b.created_at > ${m.createdAt}
             -- A steer can overtake an earlier queued message: it answers only itself.
             and not coalesce(r.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? b.id::text))
@@ -84,7 +86,7 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
 
 /** SQL: message m is a PERSON comment that arrived by a company import (see answeredPersonMessageSql). */
 export function importedPersonHistorySql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }): SQL {
-  return sql`exists (select 1 from ${issueComments} p where p.id = ${m.id} and p.author_type = 'user'
+  return sql`exists (select 1 from ${issueComments} p where p.id = ${m.id} and p.author_type = 'user' and p.deleted_at is null
     and case when p.origin = 'import' then true else ${m.createdAt} < coalesce(
       (select min(l.created_at) from ${activityLog} l where l.company_id = ${m.companyId}
         and l.action = ${ISSUE_IMPORTED_ACTION} and l.entity_type = 'issue' and l.entity_id = ${m.issueId}::text),
