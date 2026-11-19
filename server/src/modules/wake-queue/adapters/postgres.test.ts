@@ -2127,84 +2127,136 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     console.log("st-together both input ids in ONE replying run; no card, no resend");
   });
 
-  it.each(["wakeCommentIds", "commentId", "wakeCommentId", "firstTurnQueuedInput", "claimed-wake"])(
-    "st-claim: THE answer function decides whether newer PERSON input in %s stales the old receipt", async field => {
+  it.each([
+    ...["wakeCommentIds", "commentId", "wakeCommentId", "firstTurnQueuedInput", "claimed-wake"]
+      .map(field => ({ field, answer: "original", carried: false })),
+    ...["original", "failed", "progress-only", "answered"].flatMap(answer =>
+      [false, true].filter(carried => answer !== "original" || carried)
+        .map(carried => ({ field: "claimed-wake", answer, carried }))),
+  ])("st-claim: $field / $answer / old carried=$carried: THE answer function decides", async ({ field, answer, carried }) => {
       const c = await seed();
       const old = await message(c, "Old request never claimed", ago(40 * 60_000));
       const w = await wake(c, old.id, ago(39 * 60_000));
+      if (carried) {
+        const carrier = await run(c, [old.id], ago(38 * 60_000), "failed");
+        await db.update(heartbeatRuns).set({ finishedAt: ago(37 * 60_000) }).where(eq(heartbeatRuns.id, carrier.id));
+      }
       const newer = await message(c, "Newer person input", ago(20 * 60_000));
       const inputWake = field === "claimed-wake" ? await wake(c, newer.id, ago(19 * 60_000), "completed") : null;
-      const r = await run(c, [], ago(18 * 60_000), "succeeded", inputWake?.id);
-      const context = { issueId: c.issueId, ...(field === "wakeCommentIds" ? { wakeCommentIds: [newer.id] }
+      const r = await run(c, [], ago(18 * 60_000), answer === "failed" ? "failed" : "succeeded", inputWake?.id);
+      const context = { issueId: c.issueId, ...(field === "wakeCommentIds" || answer !== "original" ? { wakeCommentIds: [newer.id] }
         : field === "commentId" ? { commentId: newer.id } : field === "wakeCommentId" ? { wakeCommentId: newer.id }
         : field === "firstTurnQueuedInput" ? { firstTurnQueuedInput: { commentIds: [newer.id] } } : {}) };
       await db.update(heartbeatRuns).set({ contextSnapshot: context, ...(inputWake ? { nativeIssueId: null } : {}) })
         .where(eq(heartbeatRuns.id, r.id));
-      await reply(c, r.id);
+      // Preserve the original claim-only fixture. Add a FAILED replying claim,
+      // a progress-only claim (no published reply), and a genuinely answered claim.
+      if (answer !== "progress-only") await reply(c, r.id);
+      const answered = field !== "claimed-wake" || answer === "answered";
       const evidence = await answerEvidence(c, newer.id, w);
-      console.log("st-claim", field, "answer evidence", evidence);
-      if (field === "claimed-wake") {
-        // RFL 19:17Z: a wake claim alone is not attribution under THE answer
-        // function. No run-side carry key connects this reply to newer.
-        expect(evidence).toEqual({ answered: false, stale: false });
-        await sweep(c); expect(await cards(c, old.id)).toEqual([]);
-        expect((await drain(c, r.id)).outcome.kind).toBe("promoted");
-        await finishQueued(c, w, "Old live request answered");
-        await sweep(c);
-        expect(await cards(c, old.id)).toEqual([]);
-        expect(await noRunFor(old.id)).toHaveLength(1);
-        console.log("st-claim claimed-wake: newer unanswered; old promoted and answered once, cards 0");
-        return;
-      }
-      expect(evidence).toEqual({ answered: true, stale: true });
-      // Also exercise custody before promotion: a stale deferred receipt must
-      // not hide its never-claimed input from the real sweep.
-      await sweep(c); expect(await cards(c, old.id)).toHaveLength(1);
-      await drain(c, r.id); await sweep(c);
-      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0])
-        .toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
-      expect(await cards(c, old.id)).toHaveLength(1); expect(await noRunFor(old.id)).toEqual([]);
-      console.log("st-claim", field, "stale before drain; one named card, no run");
-    });
-
-  it.each(["no-input", "reply-boundary-only", "unclaimed-wake", "no-reply", "deleted-reply"])(
-    "st-not-claim: THE answer function decides whether %s moves the live queue on", async shape => {
-      const c = await seed();
-      const old = await message(c, "Still waiting", ago(40 * 60_000));
-      const w = await wake(c, old.id, ago(39 * 60_000));
-      const newer = await message(c, "Newer but not answered", ago(20 * 60_000));
-      const r = await run(c, ["no-reply", "deleted-reply"].includes(shape) ? [newer.id] : [], ago(18 * 60_000));
-      if (shape === "reply-boundary-only") await db.update(heartbeatRuns).set({ contextSnapshot: {
-        issueId: c.issueId, conversationReplyBoundaryCommentId: newer.id } }).where(eq(heartbeatRuns.id, r.id));
-      if (shape === "unclaimed-wake") await wake(c, newer.id, ago(19 * 60_000), "cancelled");
-      if (shape !== "no-reply") await reply(c, r.id);
-      if (shape === "deleted-reply") await db.update(issueComments).set({ deletedAt: new Date() })
-        .where(eq(issueComments.createdByRunId, r.id));
-      const evidence = await answerEvidence(c, newer.id, w);
-      console.log("st-not-claim", shape, "answer evidence", evidence);
-      if (shape === "reply-boundary-only") {
-        // Unlike the replaced direct-input predicate, THE answer function
-        // explicitly counts conversationReplyBoundaryCommentId as a carry.
-        expect(evidence).toEqual({ answered: true, stale: true });
-        await sweep(c); expect(await cards(c, old.id)).toHaveLength(1);
-        expect((await drain(c, r.id)).outcome.kind).toBe("released");
-        await sweep(c);
+      console.log("st-claim", field, answer, { carried, ...evidence });
+      expect(evidence.answered).toBe(answered);
+      const newerCarriers = await noRunFor(newer.id);
+      const finalizer = answer === "failed" ? await run(c, [], ago(10 * 60_000)) : r;
+      if (answered) {
+        // Floor B / RFL 17:07Z: never-carried M keeps ONE true note;
+        // carried M gets NO late card. Keep this count explicit for RFL.
+        const expectedCards = carried ? 0 : 1;
+        await sweep(c); expect(await cards(c, old.id)).toHaveLength(expectedCards);
+        for (let pass = 0; pass < 2; pass++) { await drain(c, finalizer.id); await sweep(c); }
         expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0])
           .toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
         const notices = await cards(c, old.id);
-        expect(notices).toHaveLength(1);
-        expect(notices[0].body).toContain(`Your message is saved: "${old.body}".`);
-        expect(await noRunFor(old.id)).toEqual([]);
-        console.log("st-not-claim reply-boundary-only: newer answered; old never carried, ONE naming card, no run");
-        return;
+        expect(notices).toHaveLength(expectedCards);
+        if (!carried) {
+          expect(notices[0].body).toContain("no run started for it");
+          expect(notices[0].body).toContain(`Your message is saved: "${old.body}".`);
+        }
+        expect(await noRunFor(old.id)).toHaveLength(carried ? 1 : 0);
+      } else {
+        // A claim, a failed run's reply, or progress alone cannot pass M over.
+        await sweep(c); expect(await cards(c, old.id)).toHaveLength(0);
+        expect((await drain(c, finalizer.id)).outcome.kind).toBe("promoted");
+        const delivered = await finishQueued(c, w, "Old live request answered");
+        await drain(c, delivered.id); await sweep(c);
+        expect(await cards(c, old.id)).toHaveLength(0);
+        expect(await noRunFor(old.id)).toHaveLength(carried ? 2 : 1);
+        expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0].runId).toBe(delivered.id);
       }
-      expect(evidence).toEqual({ answered: false, stale: false });
-      await sweep(c); expect(await cards(c, old.id)).toEqual([]);
-      expect((await drain(c, r.id)).outcome.kind).toBe("promoted");
-      await finishQueued(c, w, "Waiting message answered");
-      await sweep(c); expect(await cards(c, old.id)).toEqual([]);
-      expect(await noRunFor(old.id)).toHaveLength(1);
-      console.log("st-not-claim", shape, "live custody, promoted and answered; no card");
+      // Releasing/sweeping again must never re-send an already answered input.
+      expect(await noRunFor(newer.id)).toEqual(newerCarriers);
+      if (inputWake) expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.wakeupRequestId, inputWake.id))).toEqual([{ id: r.id }]);
+      expect(await cards(c, newer.id)).toHaveLength(0);
+      expect(evidence).toEqual({ answered, stale: answered });
+      console.log("st-claim result", field, answer, { carried, oldCarriers: (await noRunFor(old.id)).length,
+        oldCards: (await cards(c, old.id)).length, newerCarriers: newerCarriers.length });
+    });
+
+  it.each([
+    ...["no-input", "reply-boundary-only", "unclaimed-wake", "no-reply", "deleted-reply"]
+      .map(shape => ({ shape, answer: "original", carried: false })),
+    ...["original", "failed", "progress-only"].flatMap(answer =>
+      [false, true].filter(carried => answer !== "original" || carried)
+        .map(carried => ({ shape: "reply-boundary-only", answer, carried }))),
+  ])("st-not-claim: $shape / $answer / old carried=$carried: THE answer function decides", async ({ shape, answer, carried }) => {
+      const c = await seed();
+      const old = await message(c, "Still waiting", ago(40 * 60_000));
+      const w = await wake(c, old.id, ago(39 * 60_000));
+      if (carried) {
+        const carrier = await run(c, [old.id], ago(38 * 60_000), "failed");
+        await db.update(heartbeatRuns).set({ finishedAt: ago(37 * 60_000) }).where(eq(heartbeatRuns.id, carrier.id));
+      }
+      const newer = await message(c, "Newer but not answered", ago(20 * 60_000));
+      const r = await run(c, ["no-reply", "deleted-reply"].includes(shape) ? [newer.id] : [], ago(18 * 60_000),
+        answer === "failed" ? "failed" : "succeeded");
+      if (shape === "reply-boundary-only") await db.update(heartbeatRuns).set({ contextSnapshot: {
+        issueId: c.issueId, conversationReplyBoundaryCommentId: newer.id } }).where(eq(heartbeatRuns.id, r.id));
+      if (shape === "unclaimed-wake") await wake(c, newer.id, ago(19 * 60_000), "cancelled");
+      if (shape !== "no-reply" && answer !== "progress-only") await reply(c, r.id);
+      if (shape === "deleted-reply") await db.update(issueComments).set({ deletedAt: new Date() })
+        .where(eq(issueComments.createdByRunId, r.id));
+      // The original reply-boundary-only fixture has no direct-input or wake
+      // claim; THE answer function nevertheless attributes its published reply.
+      const answered = shape === "reply-boundary-only" && answer === "original";
+      const evidence = await answerEvidence(c, newer.id, w);
+      console.log("st-not-claim", shape, answer, { carried, ...evidence });
+      expect(evidence.answered).toBe(answered);
+      const finalizer = answer === "failed" ? await run(c, [], ago(10 * 60_000)) : r;
+      if (answered) {
+        // Floor B / RFL 17:07Z: explicit and easy to flip if RFL amends it.
+        const expectedCards = carried ? 0 : 1;
+        await sweep(c); expect(await cards(c, old.id)).toHaveLength(expectedCards);
+        for (let pass = 0; pass < 2; pass++) {
+          expect((await drain(c, finalizer.id)).outcome.kind).toBe("released"); await sweep(c);
+        }
+        expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0])
+          .toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
+        const notices = await cards(c, old.id);
+        expect(notices).toHaveLength(expectedCards);
+        if (!carried) {
+          expect(notices[0].body).toContain("no run started for it");
+          expect(notices[0].body).toContain(`Your message is saved: "${old.body}".`);
+        }
+        expect(await noRunFor(old.id)).toHaveLength(carried ? 1 : 0);
+      } else {
+        await sweep(c); expect(await cards(c, old.id)).toHaveLength(0);
+        expect((await drain(c, finalizer.id)).outcome.kind).toBe("promoted");
+        const delivered = await finishQueued(c, w, "Waiting message answered");
+        await drain(c, delivered.id); await sweep(c);
+        expect(await cards(c, old.id)).toHaveLength(0);
+        expect(await noRunFor(old.id)).toHaveLength(carried ? 2 : 1);
+        expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0].runId).toBe(delivered.id);
+      }
+      // Boundary-only N must never gain a second carrier after it was answered.
+      expect(await noRunFor(newer.id)).toHaveLength(["no-reply", "deleted-reply"].includes(shape) ? 1 : 0);
+      expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(sql`${heartbeatRuns.contextSnapshot}->>'conversationReplyBoundaryCommentId' = ${newer.id}`))
+        .toHaveLength(shape === "reply-boundary-only" ? 1 : 0);
+      expect(await cards(c, newer.id)).toHaveLength(0);
+      expect(evidence).toEqual({ answered, stale: answered });
+      console.log("st-not-claim result", shape, answer, { carried, oldCarriers: (await noRunFor(old.id)).length,
+        oldCards: (await cards(c, old.id)).length });
     });
 
   it.each(["issue_monitor", "restored_run"])("st-system: stale %s names its held update once, with no run", async reason => {
