@@ -2,7 +2,7 @@ import { notifyNativeEnvironmentSettlement } from "../services/native-environmen
 import { notifyRetainedNativeSessionCleanup, onRetainedNativeSessionCleanupRelease, releaseRetainedNativeSessionCleanup } from "../services/retained-native-session-cleanup-notifications.js";
 import { environmentService } from "../services/environments.js";
 import { agentService } from "../services/agents.js";
-import { publishNativeHarnessBackup } from "../services/native-runtime/native-harness-backup-publication.js";
+import { NATIVE_HARNESS_BACKUP_SUPERSEDED_DIRECTORY, publishNativeHarnessBackup } from "../services/native-runtime/native-harness-backup-publication.js";
 import { registerNativeHarnessBackupExpirationWork } from "../services/native-runtime/native-harness-backup-expiration-work.js";
 import { noteNativeHarnessBackupChange } from "../services/native-harness-backup-expiration-notifications.js";
 import { writeEnvironmentCleanup } from "../services/environment-cleanup-notifications.js";
@@ -722,6 +722,31 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
 
     expect(await exists(path.join(retiring, "codex-home"))).toBe(true);
     expect(await exists(path.join(session.current, "manifest.json"))).toBe(true);
+  });
+
+  // BRIEF rotation-keep (RFL 11-19 03:00Z): rotation moves a superseded copy to
+  // failover-backups/superseded/<ms>-<uuid>; the retention KEEP keeps it too.
+  it("ROT-K: keeps rotation's superseded copies past the window: tick, expireBackup and reconcileBackup leave them whole and they re-hash", async () => {
+    const session = await seedSession({ closedDaysAgo: 30, backupAgeDays: 30 });
+    const kept = path.join(session.root, "failover-backups", NATIVE_HARNESS_BACKUP_SUPERSEDED_DIRECTORY, `${Date.now() - 20 * DAY_MS}-${randomUUID()}`);
+    const bytes = Buffer.from('{"type":"session","id":"superseded"}\n{"only":"copy of an earlier turn"}\n');
+    await fs.mkdir(path.join(kept, "pi"), { recursive: true });
+    await fs.writeFile(path.join(kept, "pi", "session.jsonl"), bytes);
+    await fs.writeFile(path.join(kept, "manifest.json"), '{"providerKind":"pi_rpc"}');
+    const digest = await treeDigest(kept);
+    const old = new Date(now.getTime() - 20 * DAY_MS);
+    await fs.utimes(kept, old, old); await fs.utimes(path.dirname(kept), old, old);
+    expect(await service().tick()).toMatchObject({ expired: 0, failed: 0 });
+    const later = nativeHarnessBackupExpirationService(db, { stateBase, now: new Date(now.getTime() + 3650 * DAY_MS),
+      closedForDays: 7, isSessionBusy: () => false });
+    expect(await later.tick()).toMatchObject({ expired: 0, failed: 0 });
+    expect((await later.expireBackup(session.scope)).expired).toBe(0);
+    expect((await later.reconcileBackup(session.scope))?.dueAt ?? null).toBeNull();
+    expect(await treeDigest(kept)).toBe(digest);
+    expect(await fs.readFile(path.join(kept, "pi", "session.jsonl"))).toEqual(bytes);
+    expect((await fs.readdir(path.join(session.root, "failover-backups"))).sort()).toEqual(["current", "superseded"]);
+    expect(await exists(path.join(stateBase, "conversation-evidence"))).toBe(false);
+    await expectKept(session);
   });
 
   it("keeps a backup left over from an interrupted expiry beside the current one", async () => {
