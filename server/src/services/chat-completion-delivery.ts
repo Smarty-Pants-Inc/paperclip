@@ -99,6 +99,12 @@ function current(row: NonNullable<Awaited<ReturnType<typeof loadAudience>>>) {
     row.source.conversationSessionGeneration === row.handoff.sessionGeneration;
 }
 
+/** A title or quoted text in a system note: one line, at most ~60 characters, then an ellipsis. */
+export function clipForNote(text: string | null | undefined, max = 60): string {
+  const line = String(text ?? "").replace(/\s+/g, " ").trim();
+  return line.length > max ? `${line.slice(0, max - 1).trimEnd()}…` : line;
+}
+
 /** Retire ONLY the pending deliveries named by this stale wake, in the
  * cancellation transaction. The status CAS is also the note's idempotency gate:
  * a retry (or a second wake naming D) cannot write the same finished-task news.
@@ -118,11 +124,17 @@ export async function supersedeStaleChatCompletionWake(tx: Connection, input: {
     const advanced = await tx.update(deliveries).set({ status: "superseded" })
       .where(and(eq(deliveries.companyId, input.companyId), eq(deliveries.id, delivery.id),
         inArray(deliveries.status, [...pending]))).returning({ id: deliveries.id });
-    if (advanced.length) named.push(`${task.identifier ?? task.id} — ${task.title} ${task.status === "done" ? "finished" : "is no longer a pending completion report"}.`);
+    // Only finished tasks are news; a task no longer done owes no report (superseded silently).
+    if (advanced.length && task.status === "done") named.push(`${task.identifier ?? task.id} — ${clipForNote(task.title)}`);
   }
   if (!named.length) return;
+  // RFL words 18:26Z: say it is LATE and that nothing new happened; at most 3 named, then 'and N more'.
+  const listed = named.slice(0, 3).join("; ") + (named.length > 3 ? `; and ${named.length - 3} more` : "");
+  const body = named.length === 1
+    ? `Finished earlier (this report was delayed): ${listed}.`
+    : `Finished earlier (these reports were delayed): ${listed}.`;
   await insertIssueComment(tx, { companyId: input.companyId, issueId: input.conversationId,
-    authorType: "system", body: named.join("\n"),
+    authorType: "system", body,
     metadata: { version: 1, sections: [], authorizationReason: `stale_chat_completion:${input.wakeId}` } });
 }
 
