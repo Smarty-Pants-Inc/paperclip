@@ -1,5 +1,45 @@
 # Boat sandbox provider 0.1.16-spare (unreleased)
 
+## Operator-only fault-proxy API override
+
+Normal environments omit `apiBaseUrl` and use `https://boat.dev/api/v1`; no
+operator file is needed. Fault-proxy testing may set `apiBaseUrl` only when the
+plugin worker can read the fixed file `/paperclip/boat-fault-proxy/ALLOWED` on a
+**read-only mount**. The operator mounts it into the worker's filesystem namespace
+and puts exactly one HTTP(S) base URL on its single trimmed line. This uses the
+existing [standard Node filesystem API surface](../../../../doc/plugins/PLUGIN_SPEC.md#14-sdk-surface),
+not a server change or a worker environment-variable grant.
+
+The configured URL must equal that line after URL normalization (including host
+case, default ports and trailing slashes). The host must be a single DNS label
+such as `boat-fault-proxy`, or `127.0.0.1`, `::1`, or `localhost`. Userinfo, query
+strings, fragments, public dotted hosts and other IP addresses are refused. For
+example, the file and environment can both specify
+`http://boat-fault-proxy:18991/api/v1`.
+
+The plugin rejects symlinks at the file and every parent, including `/paperclip`,
+before resolving the real path. It finds the longest covering mount point in
+`/proc/self/mountinfo` and requires **per-mount** `ro` options; file permissions or
+read-only superblock options alone do not suffice. A writable child mount cannot
+borrow authority from a read-only parent. Missing or unreadable files, unverifiable
+mounts, symlinks, forbidden URLs and mismatches fail configuration validation with
+an `apiBaseUrl` reason. Direct hooks and authenticated sends recheck the same
+boundary. There is no fallback request to Boat when an override is refused.
+
+Only the deployment operator may create/change the mount and its contents. Keep
+`/paperclip` and its mount-source ancestors outside agent/workspace write access;
+read-only mounting in the worker does not protect a writable source on the host.
+The worker must not have mount/namespace administration privileges. No driver
+config value can choose the file or mountinfo path. A module-level path seam is
+restricted to tests and cannot be called outside `NODE_ENV=test`.
+
+All authenticated Boat API route families use the selected base; redirects remain
+refused. Provider-signed storage uploads keep their signed destination and never
+receive Boat Authorization. The enable warning contains no URL, host, key or
+configuration object, and refusal messages contain only closed reasons. The
+scripted-fetch rows in `src/plugin.test.ts` cover this boundary; they do not by
+themselves establish deployment mount isolation or live Boat qualification.
+
 ## Held run lease auto-stop TTL
 
 Boat's [auto-stop timer](https://docs.boat.dev/long-running-tasks/auto-stop)

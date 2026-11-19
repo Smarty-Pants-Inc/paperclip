@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { posix } from "node:path";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { dirname, posix } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { SYNC_TEMP_MAX_AGE_MS, sweepStaleSyncTemps, syncFiles } from "./file-sync.js";
 import { parseHttpDate } from "./http-date.js";
@@ -35,21 +36,72 @@ function validRunLeaseRenewCap(value: unknown): value is number {
 }
 const API = "https://boat.dev/api/v1";
 let apiBaseUrlWarned = false;
-/** Test-only, server-env authority; validate again even for callers bypassing config validation. */
+const FAULT_PROXY_FILE = "/paperclip/boat-fault-proxy/ALLOWED";
+const MOUNTINFO_FILE = "/proc/self/mountinfo";
+let faultProxyTestPaths: { allowedFile: string; mountinfoFile: string } | undefined;
+/** Module-only test seam; neither path is configurable by an environment/driver config. */
+export function setFaultProxyPathsForTest(paths?: { allowedFile: string; mountinfoFile: string }): void {
+  if (process.env.NODE_ENV !== "test") throw new Error("Boat fault-proxy paths are test-only.");
+  faultProxyTestPaths = paths;
+}
+/** Closed messages only: never echo a URL, filesystem exception, key or config. */
+function faultProxyRefused(reason: string): never { throw new Error(`Boat apiBaseUrl refused: ${reason}.`); }
+function faultProxyUrl(value: unknown): string {
+  try {
+    if (typeof value !== "string" || /[\r\n\t]/.test(value.trim())) throw new Error();
+    const url = new URL(value);
+    const localHost = ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname);
+    const containerHost = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(url.hostname);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || /[?#]/.test(url.href) ||
+      /^[^:]+:\/+[^/]*@/.test(value.trim().replace(/\\/g, "/")) || !(localHost || containerHost)) throw new Error();
+    return url.href.replace(/\/+$/, "");
+  } catch { return faultProxyRefused("URL not allowed (HTTP(S), container DNS label or loopback only; no userinfo, query or fragment)"); }
+}
+function operatorProxyBase(): string {
+  const allowedFile = faultProxyTestPaths?.allowedFile ?? FAULT_PROXY_FILE;
+  const mountinfoFile = faultProxyTestPaths?.mountinfoFile ?? MOUNTINFO_FILE;
+  // Check the lexical path BEFORE realpath: a symlink from a writable directory
+  // to a read-only-mounted target must never confer operator authority. Include
+  // /paperclip itself (and its ancestors), not just the final file.
+  for (let path = allowedFile; ; path = dirname(path)) {
+    let stat: ReturnType<typeof lstatSync>;
+    try { stat = lstatSync(path); }
+    catch { return faultProxyRefused("no operator file (or operator path is unreadable)"); }
+    if (stat.isSymbolicLink()) return faultProxyRefused("operator file or parent is a symlink");
+    if (path === allowedFile ? !stat.isFile() : !stat.isDirectory()) return faultProxyRefused("operator path is not a regular file and directories");
+    if (dirname(path) === path) break;
+  }
+  let realFile: string, mountinfo: string;
+  try { realFile = realpathSync(allowedFile); mountinfo = readFileSync(mountinfoFile, "utf8"); }
+  catch { return faultProxyRefused("cannot verify read-only operator mount"); }
+  let coveringMount: { point: string; options: string[] } | undefined;
+  // mountinfo field 6 is the per-mount options, NOT the superblock options
+  // after " - ". A writable child mount wins over a read-only ancestor.
+  for (const line of mountinfo.split("\n")) {
+    const fields = line.split(" ");
+    if (fields.length < 10 || !fields.includes("-")) continue;
+    const point = fields[4].replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(parseInt(octal, 8)));
+    if (!(realFile === point || realFile.startsWith(point === "/" ? "/" : `${point}/`))) continue;
+    if (!coveringMount || point.length >= coveringMount.point.length) coveringMount = { point, options: fields[5].split(",") };
+  }
+  if (!coveringMount?.options.includes("ro")) return faultProxyRefused("operator file mount is not read-only");
+  let content: string;
+  try { content = readFileSync(allowedFile, "utf8").trim(); }
+  catch { return faultProxyRefused("operator file cannot be read"); }
+  if (!content || /[\r\n]/.test(content)) return faultProxyRefused("URL not allowed (operator file must contain one nonempty URL line)");
+  return faultProxyUrl(content);
+}
+/** Recheck operator authority even for direct hooks and immediately before sends. */
 function apiBase(config: Record<string, unknown>): string {
   if (config.apiBaseUrl === undefined) return API;
-  if (process.env.PAPERCLIP_BOAT_FAULT_PROXY_ALLOWED !== "1") throw new Error("Boat apiBaseUrl requires PAPERCLIP_BOAT_FAULT_PROXY_ALLOWED=1 in the server process environment.");
-  let url: URL;
-  try {
-    if (typeof config.apiBaseUrl !== "string") throw new Error();
-    url = new URL(config.apiBaseUrl);
-    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || /[?#]/.test(url.href) || /^[^:]+:\/+[^/]*@/.test(config.apiBaseUrl.trim().replace(/\\/g, "/"))) throw new Error();
-  } catch { throw new Error("Boat apiBaseUrl must be an http: or https: URL without userinfo, query or fragment."); }
+  const allowedBase = operatorProxyBase();
+  const configuredBase = faultProxyUrl(config.apiBaseUrl);
+  if (configuredBase !== allowedBase) return faultProxyRefused("URL mismatch with operator file");
   if (!apiBaseUrlWarned && duplexLogger) {
-    duplexLogger.warn("Boat apiBaseUrl fault-proxy override enabled", { host: typeof config.apiKey === "string" && config.apiKey.trim() ? url.host.split(config.apiKey.trim()).join("[REDACTED]") : url.host });
+    duplexLogger.warn("Boat apiBaseUrl fault-proxy override enabled");
     apiBaseUrlWarned = true;
   }
-  return url.href.replace(/\/+$/, "");
+  return allowedBase;
 }
 const SPARE_ACTIVITY_EVENTS = ["agent.run.started", "agent.run.finished", "agent.run.failed", "agent.run.cancelled",
   "issue.comment.created", "issue.created", "issue.updated"] as const;
