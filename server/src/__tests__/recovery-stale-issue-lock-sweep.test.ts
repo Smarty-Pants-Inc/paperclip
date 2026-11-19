@@ -2,8 +2,9 @@ import { persistHeartbeatRunProcessMetadata } from "../services/heartbeat/run-li
 import { currentProcessSpaceHash } from "../services/controller-process-identity.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { settleOwnableKind } from "../services/recovery/ownership-invariant-report.js";
 import {
   subscribeDatabaseWork,
   costEvents,
@@ -1507,6 +1508,127 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       await db.update(nativeRunFinalizations).set({ phase: "committed" })
         .where(eq(nativeRunFinalizations.runId, r.id));
     }
+
+    async function settleSavedOwner(c: Awaited<ReturnType<typeof chat>>) {
+      const ownerId = (await issue(c)).executionRunId;
+      if (ownerId) await settleOwnableKind(db, "issue_execution_lock", { runIds: [ownerId] });
+    }
+
+    it.each(["automation_no_new_person", "deferred_restore_recovery", "issue_blocker_stalled", "issue_monitor"])(
+      "boot-4b/406/4c: pre-boot %s starts no run and retains its obligation across two sweeps", async reason => {
+        const c = await chat();
+        if (reason === "issue_blocker_stalled") await db.update(issues).set({ status: "done",
+          conversationAgentId: null, conversationUserId: null, conversationState: null }).where(eq(issues.id, c.issueId));
+        const [w] = await db.insert(agentWakeupRequests).values({ companyId: c.companyId, agentId: c.agentId,
+          source: "automation", triggerDetail: "system", reason, requestedByActorType: "system",
+          status: "deferred_issue_execution", requestedAt: ago(4 * hour), payload: { issueId: c.issueId,
+            _paperclipWakeContext: { issueId: c.issueId, taskKey: c.issueId, wakeReason: reason } } }).returning();
+        const ownerRun = await run(c, [], ago(hour));
+        await busyFinalization(c, ownerRun);
+        for (let pass = 0; pass < 2; pass++) await settleSavedOwner(c);
+        expect(await queuedRuns(w.id)).toEqual([]);
+        // Without independent kind-specific ownership proof, preserve rather
+        // than cancel: no restore/export bytes or monitor obligation is orphaned.
+        expect(await wake(w.id)).toMatchObject({ status: "deferred_issue_execution", runId: null, payload: w.payload });
+        expect(await systemNotes(c)).toEqual([]);
+        console.info("boot-4c retained", JSON.stringify({ reason, wakeId: w.id, runCount: 0 }));
+      });
+
+    it("boot-4c: a pre-boot restore envelope with already-answered person input retains its system obligation", async () => {
+      const c = await chat();
+      const m = await message(c, "Already answered before this restart", ago(4 * hour));
+      const r = await run(c, [m.id], ago(3 * hour));
+      await reply(c, r, "Answered the saved person input");
+      const [w] = await db.insert(agentWakeupRequests).values({ companyId: c.companyId, agentId: c.agentId,
+        source: "automation", reason: "deferred_restore_recovery", requestedByActorType: "system",
+        status: "deferred_issue_execution", requestedAt: ago(4 * hour), payload: { issueId: c.issueId,
+          _paperclipWakeContext: { issueId: c.issueId, taskKey: c.issueId, wakeReason: "deferred_restore_recovery",
+            wakeCommentIds: [m.id] } } }).returning();
+      await busyFinalization(c, r);
+      await settleSavedOwner(c);
+      expect(await queuedRuns(w.id)).toEqual([]);
+      expect(await wake(w.id)).toMatchObject({ status: "deferred_issue_execution", runId: null, payload: w.payload });
+      expect(await systemNotes(c)).toEqual([]);
+    });
+
+    it("boot-4d: platform's five pre-boot shapes yield ONE five-task naming note and ZERO runs", async () => {
+      const c = await chat();
+      const ids: string[] = [];
+      for (let index = 1; index <= 5; index++) {
+        const [task] = await db.insert(issues).values({ companyId: c.companyId, identifier: `BOOT-${index}`,
+          title: `Finished platform task ${index}`, status: "done", completedAt: ago(5 * hour) }).returning();
+        await db.insert(chatTaskHandoffs).values({ companyId: c.companyId, taskId: task.id,
+          conversationId: c.issueId, agentId: c.agentId, sessionGeneration: 0 });
+        const [delivery] = await db.insert(chatCompletionDeliveries).values({ companyId: c.companyId,
+          taskId: task.id, statusVersion: task.statusVersion, status: "queued" }).returning();
+        ids.push(delivery.id);
+      }
+      const [completion] = await db.insert(agentWakeupRequests).values({ companyId: c.companyId, agentId: c.agentId,
+        source: "automation", reason: "issue_execution_deferred", requestedByActorType: "system",
+        status: "deferred_issue_execution", requestedAt: ago(4 * hour), payload: { issueId: c.issueId,
+          chatCompletionDeliveryIds: ids, interactionOrigin: { actorType: "system", actorId: "chat_completion_delivery" },
+          _paperclipWakeContext: { issueId: c.issueId, taskKey: c.issueId, wakeReason: "chat_task_completed" } } }).returning();
+      const scopes = [c];
+      const held: string[] = [];
+      for (let index = 0; index < 4; index++) {
+        const done = index === 0;
+        const [task] = await db.insert(issues).values({ companyId: c.companyId, title: `Saved wake ${index}`,
+          status: done ? "done" : "blocked", assigneeAgentId: c.agentId }).returning();
+        const reason = done ? "issue_blocker_stalled" : "issue_commented";
+        const [w] = await db.insert(agentWakeupRequests).values({ companyId: c.companyId, agentId: c.agentId,
+          source: "automation", reason, requestedByActorType: done ? "system" : "agent",
+          requestedByActorId: done ? "monitor" : c.agentId, status: "deferred_issue_execution", requestedAt: ago(4 * hour),
+          payload: { issueId: task.id, _paperclipWakeContext: { issueId: task.id, taskKey: task.id, wakeReason: reason } } }).returning();
+        held.push(w.id); scopes.push({ ...c, issueId: task.id });
+      }
+      for (const scope of scopes) await busyFinalization(scope, await run(scope, [], ago(hour)));
+      for (let pass = 0; pass < 2; pass++) for (const scope of scopes) await settleSavedOwner(scope);
+      // Opt-in wall-clock boot soak for the platform's boot + 10 minute row.
+      // The ordinary regression remains quick; the evidence run uses the same
+      // rows and repeats the real sweep after ten minutes, not a clock mock.
+      if (process.env.PAPERCLIP_COMPLETION_BOOT_SOAK === "1") {
+        console.info("boot-4d soak started", new Date().toISOString());
+        await new Promise(resolve => setTimeout(resolve, 10 * 60_000));
+        for (const scope of scopes) await settleSavedOwner(scope);
+        console.info("boot-4d soak finished", new Date().toISOString());
+      }
+      expect(await queuedRuns(completion.id)).toEqual([]);
+      expect(await wake(completion.id)).toMatchObject({ status: "cancelled", runId: null });
+      for (const id of held) {
+        expect(await queuedRuns(id)).toEqual([]);
+        expect(await wake(id)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      }
+      const notes = await systemNotes(c);
+      expect(notes).toHaveLength(1);
+      expect(notes[0].body).toBe("Finished earlier (these reports were delayed): BOOT-1 — Finished platform task 1; BOOT-2 — Finished platform task 2; BOOT-3 — Finished platform task 3; and 2 more.");
+      expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, c.companyId),
+        inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"])))).toEqual([]);
+    }, 11 * 60_000);
+
+    it("boot-person: a pre-boot system envelope carrying OWED person input still promotes once", async () => {
+      const c = await chat();
+      const m = await message(c, "Owed person input from before restart", ago(4 * hour));
+      const w = await deferred(c, m.id, m.createdAt);
+      await db.update(agentWakeupRequests).set({ requestedByActorType: "system" }).where(eq(agentWakeupRequests.id, w.id));
+      const ownerRun = await run(c, [], ago(hour));
+      await busyFinalization(c, ownerRun);
+      await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+      expect(await queuedRuns(w.id)).toHaveLength(1);
+      expect((await queuedRuns(w.id))[0].contextSnapshot).toMatchObject({ wakeCommentIds: [m.id] });
+      expect(await systemNotes(c)).toEqual([]);
+    });
+
+    it("post-boot-auto: automation requested during the live turn still promotes", async () => {
+      const c = await chat();
+      const ownerRun = await run(c, [], ago(10 * 60_000));
+      const [w] = await db.insert(agentWakeupRequests).values({ companyId: c.companyId, agentId: c.agentId,
+        source: "automation", triggerDetail: "system", reason: "automation_no_new_person", requestedByActorType: "system",
+        status: "deferred_issue_execution", requestedAt: new Date(), payload: { issueId: c.issueId,
+          _paperclipWakeContext: { issueId: c.issueId, taskKey: c.issueId, wakeReason: "automation_no_new_person" } } }).returning();
+      await busyFinalization(c, ownerRun);
+      await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+      expect(await queuedRuns(w.id)).toHaveLength(1);
+    });
 
     it("ib-a: sweep drains a fresh person message after busy finalization; one answer, no card or boot resend", async () => {
       const c = await chat();

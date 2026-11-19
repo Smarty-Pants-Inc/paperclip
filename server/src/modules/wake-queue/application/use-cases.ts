@@ -251,6 +251,10 @@ async function runReleaseDrain(
         ...(retainDeliveredCommentBindings ? { retainDeliveredCommentBindings: true } : {}),
       });
     }
+    if (liveness.heldBeforeBoot) {
+      preservedWakeIds.push(candidate.id);
+      continue;
+    }
     if (liveness.conversationMovedOn && (candidate.requestedByActorType === "system" || liveness.liveNonSelfCommentIds.length === 0)) {
       await ports.transaction.cancelDeferredWake({ companyId: run.companyId, wakeId: candidate.id,
         agentId: candidate.agentId, reason: "The conversation moved on", now: input.now });
