@@ -46,16 +46,16 @@ export async function carryOwedMessagesIntoFreshThread(db: Db, input: {
     boundary ? sql`(${issueComments.createdAt}, ${issueComments.id}) > (${boundary.createdAt.toISOString()}::timestamptz, ${boundary.id}::uuid)` : undefined,
     owedFloor,
   )).orderBy(asc(issueComments.createdAt), asc(issueComments.id)).limit(FRESH_THREAD_OWED_MESSAGES_MAX);
-  if (owed.length === 0) return [];
   const current = deriveCommentId(input.context, null);
   const candidates = [...new Set([...extractWakeCommentIds(input.context), ...(current ? [current] : []), ...owed.map(row => row.id)])];
+  if (candidates.length === 0) return [];
   // One order for the whole batch: thread order (oldest first), each id once. The ONE owed
   // floor applies to the FINAL union: an inherited wake/comment id already answered or moved past is never re-sent.
   const ordered = (await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     inArray(issueComments.id, candidates), owedFloor)).orderBy(asc(issueComments.createdAt), asc(issueComments.id))).map(row => row.id);
-  if (ordered.length === 0) return [];
-  const carried = { wakeCommentIds: ordered, wakeCommentId: ordered.at(-1)!, commentId: ordered.at(-1)! };
+  // Nothing owed: still floor the inherited ids out (an answered message is never re-sent).
+  const carried = { wakeCommentIds: ordered, wakeCommentId: ordered.at(-1) ?? null, commentId: ordered.at(-1) ?? null };
   Object.assign(input.context, carried);
   await db.update(heartbeatRuns).set({
     contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify(carried)}::jsonb`,
