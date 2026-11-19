@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentWakeupRequests, agents, authUsers, issueTreeHolds, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
@@ -577,8 +577,6 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
       .filter(c => c.body.includes("no run started")).map(c => c.body);
   };
   const wakesOf = async (r: { wakes: Ctx["wakes"] }, ids: string[]) => (await r.wakes()).filter(w => (w.ids ?? []).some(id => ids.includes(id)));
-  const heldIdsNow = async (r: { wakes: Ctx["wakes"] }) => (await r.wakes()).filter(w => w.status === "deferred_issue_execution")
-    .flatMap(w => w.ids ?? []);
 
   // D1 (ruling (c)): agent-conversations' Stop row variants send / delete-then-send / agent-paused / chat-held,
   // RETARGETED from the legacy `process` adapter (a direct heartbeat.cancelRun) to a NATIVE run stopped through
@@ -586,13 +584,43 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
   // Setup only changed; the assertions are agent-conversations.test.ts's, one for one.
   for (const variant of ["send", "delete-then-send", "agent-paused", "chat-held"] as const) {
     it(`D1 Stop row (${variant}), native + real Stop route: after a person's Stop nothing is sent; the owner's Send starts one turn with the waiting messages`, async () => {
-      const r = await stopWithHeld();
+      // C2 (review-fleet-5): the pre-Stop checks the original row made, read at the same moment (all three
+      // saved behind the running turn, before the Stop), asserted below one for one.
+      let preStop: { heldIds: string[]; calls: number; busyQueue: any } | undefined;
+      // The original's heldIds(): the deferred wakes' wakeCommentIds, read in the wakes' own (requested) order.
+      const heldIds = async (agentId: string) => (await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")))
+        .orderBy(agentWakeupRequests.requestedAt))
+        .flatMap(wake => {
+          const ids = (wake.payload as Record<string, any>)?._paperclipWakeContext?.wakeCommentIds;
+          return Array.isArray(ids) ? ids : [];
+        });
+      const r = await stopWithHeld({ beforeStop: async (ctx, _held, _runId) => {
+        preStop = { heldIds: await heldIds(ctx.agentId), calls: fixture.calls.length,
+          busyQueue: (await request(ctx.client).get(`/api/issues/${ctx.issueId}/queued-comments`).expect(200)).body };
+      } });
       const queuedIds = r.held;
       const queuePath = `/api/issues/${r.issueId}/queued-comments`;
+      const liveRuns = async () => db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.agentId, r.agentId), inArray(heartbeatRuns.status, ["queued", "running"])));
+      // All three are saved behind the running turn, none dispatched yet.
+      expect(preStop?.heldIds).toEqual(queuedIds);
+      expect(preStop?.calls).toBe(1);
+      // FALLBACK 2 gives each posted message its own wake. The read must show the whole waiting list even
+      // BEFORE Stop gathers those wakes.
+      const busyQueue = preStop!.busyQueue;
+      expect(busyQueue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(queuedIds);
+      expect(busyQueue.entries.map((entry: { comment: { body: string } }) => entry.comment.body)).toEqual(["H1 held", "H2 held", "H3 held"]);
+      expect(busyQueue.entries.slice(1).every((entry: { queueId?: string; queueRevision?: string }) =>
+        entry.queueId && entry.queueId !== busyQueue.queueId && entry.queueRevision)).toBe(true);
+      expect(new Set([busyQueue.queueId, ...busyQueue.entries.slice(1).map((entry: { queueId: string }) => entry.queueId)]).size).toBe(3);
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, r.firstRunId));
+      expect(stopped!.status).toBe("cancelled");
       // Stop means stop: nothing is sent and nothing is lost.
       await r.drive(1_500);
       expect(fixture.calls).toHaveLength(1);
-      expect(await heldIdsNow(r)).toEqual(queuedIds);
+      expect(await liveRuns()).toHaveLength(0);
+      expect(await heldIds(r.agentId)).toEqual(queuedIds);
       const readQueue = async () => {
         const response = await request(r.client).get(queuePath);
         expect(response.status).toBe(200);
@@ -636,7 +664,8 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
           : "This chat is paused. Resume it to send these messages.");
         await r.drive(1_500);
         expect(fixture.calls).toHaveLength(1);
-        expect(await heldIdsNow(r)).toEqual(queuedIds);
+        expect(await liveRuns()).toHaveLength(0);
+        expect(await heldIds(r.agentId)).toEqual(queuedIds);
         expect((await readQueue()).entries).toHaveLength(3);
         if (hold) await db.update(issueTreeHolds).set({ status: "released", releasedAt: new Date() }).where(eq(issueTreeHolds.id, hold.id));
         else {
@@ -655,7 +684,8 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
       await waitFor(async () => {
         await r.drive(300);
         const answered = successorCalls().flatMap(call => call.ids);
-        return expected.every(id => answered.includes(id));
+        if (!expected.every(id => answered.includes(id))) return false;
+        return (await liveRuns()).length === 0;
       }, 30_000);
       // A repeated Send of the same queue neither doubles nor reopens it.
       expect((await request(r.client).post(`${queuePath}/interrupt`).send(sendBody())).status).toBe(409);
@@ -668,7 +698,7 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
       const answers = await db.select().from(issueComments).where(and(eq(issueComments.issueId, r.issueId),
         eq(issueComments.authorAgentId, r.agentId)));
       expect(answers.map(answer => answer.createdByRunId)).toEqual([fixture.calls[1]!.runId]);
-      expect(await heldIdsNow(r)).toEqual([]);
+      expect(await heldIds(r.agentId)).toEqual([]);
       expect((await readQueue()).entries).toHaveLength(0);
     }, 120_000);
   }
