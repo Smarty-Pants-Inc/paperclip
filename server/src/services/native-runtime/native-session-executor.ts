@@ -1652,6 +1652,16 @@ async function measureNativeRunnerSpan<T>(
 // Newly attributed preparation waits must not add one awaited run-log INSERT
 // each to the path being shortened. The trace's existing deferred-row queue is
 // joined by finish(); timestamps and outcomes still describe the actual await.
+// Admission leaves are exclusive: do not put a second timed wrapper around
+// finishStartupContextForFallback / emitReuse / prepareRunnerEnvironment.
+// NativeExecutionContext.wait races the operation against cancellation; it has
+// no serial work queue. Time it together with the leaf it guards.
+const DEFERRED_WARM_ADMISSION_CONTROLLER_STEPS = new Set([
+  "startup_context_clear", "warm_owner_forget", "warm_admission_task_describe", "warm_predecessor_retire",
+  "warm_owner_projection", "warm_instruction_check", "warm_instruction_close", "warm_reuse_runner",
+  "warm_reuse_provider_session", "warm_reuse_release", "case_handoff_read", "interaction_read", "tools_refresh_read",
+  "github_environment", "wake_binding",
+]);
 const DEFERRED_PREPARATION_CONTROLLER_STEPS = new Set([
   "reattach_lease_check", "checkpoint_restore", "staged_attachment_verify", "startup_reuse", "span_persistence",
   "warm_task_describe", "portable_source", "warm_task_resume", "warm_owner_detach", "warm_checkpoint_recovery",
@@ -1668,9 +1678,10 @@ function createNativeControllerTiming(runId: string, currentTrace: () => NativeR
   return <T>(phase: Parameters<typeof time>[0], work: () => T | Promise<T>): Promise<T> =>
     measureNativeControllerStep(phase, async () => {
       const trace = currentTrace();
-      if (trace && DEFERRED_PREPARATION_CONTROLLER_STEPS.has(phase)) {
+      if (trace && (DEFERRED_PREPARATION_CONTROLLER_STEPS.has(phase) || DEFERRED_WARM_ADMISSION_CONTROLLER_STEPS.has(phase))) {
         const scope = trace.start(`native.controller.${phase}`, {
-          parentName: phase === "github_access" || phase === "github_activate" ? "task.provider_session" : "task.prepare",
+          parentName: DEFERRED_WARM_ADMISSION_CONTROLLER_STEPS.has(phase) || phase === "github_access" || phase === "github_activate"
+            ? "task.provider_session" : "task.prepare",
         });
         let outcome: "ok" | "failed" = "failed";
         try { const value = await trace.run(scope, () => time(phase, work)); outcome = "ok"; return value; }
@@ -13168,8 +13179,9 @@ async function executePaperclipNativeSessionAttempt(
   const finishStartupContextForFallback = async () => {
     if (claimedStartupContext && !claimedStartupContextCleared) {
       const context = claimedStartupContext;
-      await context.wait(() => clearNativeStartupContext(input.db, { companyId: input.execution.binding.companyId,
-        runId: input.execution.binding.runId, contextId: context.id, leaseOwner, controllerGeneration }));
+      await timeController("startup_context_clear", () => context.wait(() => clearNativeStartupContext(input.db, {
+        companyId: input.execution.binding.companyId, runId: input.execution.binding.runId,
+        contextId: context.id, leaseOwner, controllerGeneration })));
       claimedStartupContextCleared = true;
     }
     (executionContext ?? claimedStartupContext)?.finish();
@@ -13178,8 +13190,8 @@ async function executePaperclipNativeSessionAttempt(
   };
   if (warmSessionId !== null && warmConfigDigest !== null && canRecoverWarmOwner) {
     const registered = warmNativeSessions.get(warmSessionId);
-    const entry = registered && await forgetUnretiredOwnerOnOtherSandbox(warmSessionId, registered, input.runnerExecutionTarget)
-      ? undefined : registered;
+    const entry = registered && await timeController("warm_owner_forget", () =>
+      forgetUnretiredOwnerOnOtherSandbox(warmSessionId, registered, input.runnerExecutionTarget)) ? undefined : registered;
     if (entry?.released) requireReleasedWarmScope(input, releasedWarmRunner(readWarmNativeEnvelope(input.execution)),
         readRunnerdDurableIdentity(scopedRunnerdStateRoot(input.execution)));
     if (entry || remoteWarmRecovery?.releasedSource) {
@@ -13197,9 +13209,9 @@ async function executePaperclipNativeSessionAttempt(
       if ((entry?.pluginTaskId || remoteWarmRecovery?.releasedSource) && taskTarget?.kind === "remote" && taskTarget.transport === "sandbox" && taskTarget.runnerTask) {
         const priorDescription = pluginTaskDescription?.taskId === taskTarget.sandboxLeaseAcquisition?.providerLeaseId
           ? pluginTaskDescription : undefined;
-        const description=priorDescription ?? environmentTaskResultSchema.parse(await (executionContext
+        const description=priorDescription ?? environmentTaskResultSchema.parse(await timeController("warm_admission_task_describe", () => executionContext
           ? executionContext.wait(() => taskTarget.runnerTask!({kind:"describe"}, { executionContext }))
-          : taskTarget.runnerTask({kind:"describe"})));
+          : taskTarget.runnerTask!({kind:"describe"})));
         if(description.kind !== "description") throw new Error("Plugin Runner description unavailable");
         pluginTaskDescription=description;
         if (executionContext && description.executionContextVersion === 1) executionContext.pluginSupported = true;
@@ -13228,7 +13240,8 @@ async function executePaperclipNativeSessionAttempt(
         entry.busy = true;
         entry.closeOnReleaseReason = "warm native session configuration changed";
         try {
-          await retireWarmPredecessor(entry, entry.closeOnReleaseReason, { preserveInstructionsForRunId: input.execution.binding.runId });
+          await timeController("warm_predecessor_retire", () => retireWarmPredecessor(entry, entry.closeOnReleaseReason!, {
+            preserveInstructionsForRunId: input.execution.binding.runId }));
           forgetWarmNativeSession(warmSessionId, entry);
         } catch (error) {
           // This late preparation step is outside the earlier task-prepare
@@ -13242,7 +13255,8 @@ async function executePaperclipNativeSessionAttempt(
         } finally { entry.busy = false; }
         if (preparedCopy) throw new Error("native_instruction_preparation_configuration_changed");
         if (input.useRunnerd && input.runnerExecutionTarget?.kind === "remote") {
-          await refreshRetiredWarmOwnerProjection(controllerProjectionInput(input, { runId: entry.runId, issueId: entry.issueId }));
+          await timeController("warm_owner_projection", () => refreshRetiredWarmOwnerProjection(
+            controllerProjectionInput(input, { runId: entry.runId, issueId: entry.issueId })));
         }
         persistedWarmSession = loadWarmNativeCheckpoint(
           input.execution,
@@ -13255,11 +13269,11 @@ async function executePaperclipNativeSessionAttempt(
         if (entry.instructionWorkingCopy?.runId && entry.instructionPreparationRunId !== input.execution.binding.runId) {
           throw new Error("native_instruction_materialization_not_claimed");
         }
-        if (entry.instructionPreparationRunId !== undefined && await (executionContext
+        if (entry.instructionPreparationRunId !== undefined && await timeController("warm_instruction_check", () => executionContext
           ? executionContext.wait(() => entry.instructionWorkingCopy!.hasChanges()) : entry.instructionWorkingCopy!.hasChanges())) {
           entry.closeOnReleaseReason = "warm instruction copy changed during preparation";
           try {
-            await closeWarmNativeSession(entry, entry.closeOnReleaseReason);
+            await timeController("warm_instruction_close", () => closeWarmNativeSession(entry, entry.closeOnReleaseReason!));
             forgetWarmNativeSession(warmSessionId, entry);
           } finally { entry.busy = false; }
           throw new Error("native_instruction_preparation_copy_changed");
@@ -13276,16 +13290,17 @@ async function executePaperclipNativeSessionAttempt(
         entry.idleTimer = null;
         existingWarmSession = entry.session;
         const emitReuse = async () => {
-          await emitStartupReuse(input.onEvent, "runner", { state: "reused", reason: "verified_reuse" });
+          await timeController("warm_reuse_runner", () => emitStartupReuse(input.onEvent, "runner", { state: "reused", reason: "verified_reuse" }));
           executionContext?.assertOpen();
-          await emitStartupReuse(input.onEvent, "provider_session", { state: "reused", reason: "verified_reuse" });
+          await timeController("warm_reuse_provider_session", () => emitStartupReuse(input.onEvent, "provider_session", { state: "reused", reason: "verified_reuse" }));
           trace.setBudgetStart("warm");
         };
         try {
           if (executionContext) await executionContext.wait(emitReuse); else await emitReuse();
         } catch (error) {
           if (lifecyclePolicy.mode === "warm") {
-            await releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken, lifecyclePolicy.idleTimeoutMs, true).catch(() => undefined);
+            await timeController("warm_reuse_release", () => releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken,
+              lifecyclePolicy.idleTimeoutMs, true)).catch(() => undefined);
           }
           throw error;
         }
@@ -13304,10 +13319,10 @@ async function executePaperclipNativeSessionAttempt(
     await finishStartupContextForFallback();
   }
   async function resolvePendingGovernedWait() {
-    const handoff = await nativeCaseHandoffResult(input.db, { ...input.execution.binding,
-      completionContract: input.execution.completionContract.contract });
+    const handoff = await timeController("case_handoff_read", () => nativeCaseHandoffResult(input.db, { ...input.execution.binding,
+      completionContract: input.execution.completionContract.contract }));
     if (handoff) return handoff;
-    const interaction = await input.db
+    const interaction = await timeController("interaction_read", () => input.db
       .select({
         id: issueThreadInteractions.id,
         title: issueThreadInteractions.title,
@@ -13320,7 +13335,7 @@ async function executePaperclipNativeSessionAttempt(
         desc(issueThreadInteractions.id),
       )
       .limit(1)
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
     if (interaction)
       return nativeGovernedWaitResult({
         interaction,
@@ -13328,7 +13343,7 @@ async function executePaperclipNativeSessionAttempt(
       });
     // A ready connection can become installed after the provider snapshot was
     // pinned. Its already-durable wake is also a valid reason to end this turn.
-    const [refresh] = await input.db
+    const [refresh] = await timeController("tools_refresh_read", () => input.db
       .select({
         id: agentWakeupRequests.id,
         key: agentWakeupRequests.idempotencyKey,
@@ -13349,7 +13364,7 @@ async function executePaperclipNativeSessionAttempt(
           ]),
         ),
       )
-      .limit(1);
+      .limit(1));
     return refresh?.key
       ? nativeToolsRefreshWaitResult({
           wakeId: refresh.id,
@@ -13406,8 +13421,8 @@ async function executePaperclipNativeSessionAttempt(
     if (!overlapGitHubPreparation) {
       if (executionContext) await executionContext.wait(prepareRunnerEnvironment); else await prepareRunnerEnvironment();
     }
-    const resolveWake = () => timeController("wake_binding", () => resolveCurrentWakeCommentsBinding(input.db, input.execution.binding));
-    const expectedCurrentWakeComments = await (executionContext ? executionContext.wait(resolveWake) : resolveWake());
+    const resolveWake = () => resolveCurrentWakeCommentsBinding(input.db, input.execution.binding);
+    const expectedCurrentWakeComments = await timeController("wake_binding", () => executionContext ? executionContext.wait(resolveWake) : resolveWake());
     let remoteWarmRecoveryPending = remoteWarmRecovery !== undefined;
     const beginRetainedRunAttachment = (session: NativeSession) => () => {
       session.beginRunAttachment?.({ identity: { runId: input.execution.binding.runId, sessionId: session.identity().sessionId,
