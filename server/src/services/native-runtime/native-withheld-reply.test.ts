@@ -210,6 +210,12 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
       await port.completeRun({ result: RESULT, terminal: TERMINAL, turnId: "answer-turn",
         callerResultId: `${runnerId}:${runId}:result`, callerDedupeKey: `${runId}:${contract.canonicalSha256}` });
     }
+    /** REAL: the runner's own idempotent confirmation of its accepted result: the SAME PaperclipControlPlanePort.completeRun
+     * call, with the same callerResultId / callerDedupeKey (native-session-runtime.ts:3822, "a lost acknowledgement
+     * can mean committed success"). */
+    const portReplay = () => port.completeRun({ result: RESULT, terminal: TERMINAL, turnId: "answer-turn",
+      callerResultId: `${runnerId}:${runId}:result`, callerDedupeKey: `${runId}:${contract.canonicalSha256}` })
+      .then(() => "confirmed", (error: Error) => `refused:${error.message}`);
     /** REAL: a coordinator replay of the same accepted result (NativeRunCoordinatorStore.completeRun). */
     const coordinatorReplay = () => store.completeRun({ result: RESULT, terminal: TERMINAL, turnId: "answer-turn" })
       .then(done => done.disposition, (error: Error) => `refused:${error.message}`);
@@ -371,7 +377,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
         run: wake.runId ? (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake.runId)))[0] ?? null : null })));
     }
     const otherRuns = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).filter(row => row.id !== runId);
-    return { streamAndAcceptThroughPort, coordinatorReplay, untouchedByPublish, personSays, wakesFor, otherRuns, task, servedRun, fileLine, line, acceptedAt, publishAgain, expectRenderFixture, savedFilesSource, recoverSavedFiles, app, companyId, agentId, issueId, runId, leaseId, messageId, streamAndAccept, copyBack, coordinator, run, presentationWorker,
+    return { streamAndAcceptThroughPort, portReplay, coordinatorReplay, untouchedByPublish, personSays, wakesFor, otherRuns, task, servedRun, fileLine, line, acceptedAt, publishAgain, expectRenderFixture, savedFilesSource, recoverSavedFiles, app, companyId, agentId, issueId, runId, leaseId, messageId, streamAndAccept, copyBack, coordinator, run, presentationWorker,
       thread, replies, answered, expectAnsweredOnceAndNoNotice, failCopyBackThreeTimes, boardRetrySucceeds };
   }
 
@@ -1168,5 +1174,319 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
       await realSync.cleanupNativeWorkspaceSync(s.runId);
       await fs.rm(root, { recursive: true, force: true });
     }
+  }, 120_000);
+
+  // ---- W1-W5: the judge's shape, on the MERGED line, through the merged runner's real acceptance path. ----
+  //
+  // The merged runner accepts a result at packages/paperclip-runner/src/native-session-runtime.ts:3822
+  // (options.controlPlane.completeRun, after the expected control events at :3788). Its controlPlane is the
+  // PaperclipControlPlanePort bound at server/src/services/native-runtime/native-session-executor.ts:12809;
+  // the accepting transaction is paperclip-control-plane-port.ts completeRun (:700), and the publish entry is
+  // written there at :823 (writeAcceptanceWithheldReplyEntry). Every W row accepts through that port
+  // (streamAndAcceptThroughPort: openRun, the stream, run.result.accepted, run.terminal, completeRun, with the
+  // runner's own callerResultId / callerDedupeKey), on the SHIPPED switch, and the reply is posted by the
+  // REGISTERED reply-presentation worker: no row calls the publisher by hand before the reply shows.
+  // Outcomes are read from the real GET /api/issues/:id/comments and GET /api/issues/:id/runs; "answered" is
+  // the merged line's one rule (answeredPersonMessageSql) and "0 notices" the merged sweep
+  // (settleUnansweredPersonMessagesForTask) plus the thread's own notice comments.
+  // PLANTED (as in every row of this file): the run row R that carries M and its sandbox lease. FAKED: the box.
+  async function withRegisteredWorker<T>(body: (errors: unknown[]) => Promise<T>): Promise<T> {
+    const errors: unknown[] = [];
+    const delivery = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => errors.push(error) });
+    const worker = nativeResponsePresentationWork(db).register(delivery, () => true);
+    try { await worker.ready; return await body(errors); } finally { worker.stop(); await delivery.stop(); }
+  }
+  type Scenario = Awaited<ReturnType<typeof scenario>>;
+  /** The thread's notice comments about an unanswered message (what the person would see). */
+  const noticesIn = async (s: Scenario) => (await s.thread()).filter(comment =>
+    String(comment.metadata?.authorizationReason ?? "").startsWith(UNANSWERED_MESSAGE_REASON_PREFIX));
+  /** The reply within 5 s of the port's acceptance, by the registered worker. */
+  async function replyWithinFiveSeconds(s: Scenario, label: string) {
+    const acceptedAt = performance.now();
+    await vi.waitFor(async () => expect(await s.replies()).toHaveLength(1), { timeout: 5_000, interval: 20 });
+    const tookMs = performance.now() - acceptedAt;
+    timing(label, acceptedAt);
+    expect(tookMs).toBeLessThan(5_000);
+    const [reply] = await s.replies();
+    expect(reply).toMatchObject({ body: ANSWER, authorAgentId: s.agentId, createdByRunId: s.runId });
+    return reply;
+  }
+
+  it("W1 (merged, port acceptance, healthy): 1 reply within 5 s with 'Saving…'; the copy-back commits, the line clears, M answered once, 0 notices", async () => {
+    setting.trigger = "shipped";
+    const s = await scenario();
+    box.resume.mockResolvedValue(true);
+    await withRegisteredWorker(async errors => {
+      await s.streamAndAcceptThroughPort();
+      const reply = await replyWithinFiveSeconds(s, "W1 port acceptance -> published reply (registered worker)");
+      expect(await s.coordinator()).toMatchObject({ phase: "workspace_finalizing" });
+      expect(await s.run()).toMatchObject({ status: "running", nativePhase: "workspace_finalizing" });
+      expect(await s.fileLine()).toEqual({ commentId: reply.id, state: "saving",
+        deadlineAt: new Date(await s.acceptedAt() + SAVING_DEADLINE_MS).toISOString() });
+      expect(await s.line()).toBe(FILE_LINE_SAVING);
+      expect(await s.answered()).toEqual([true]);
+      // REAL: the healthy copy-back, then the commit, with the worker still registered.
+      await s.copyBack();
+      expect(await s.coordinator()).toMatchObject({ phase: "committed" });
+      await vi.waitFor(async () => expect((await s.run()).status).toBe("succeeded"), { timeout: 15_000, interval: 25 });
+      await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
+      expect((await s.replies()).map(comment => comment.id)).toEqual([reply.id]);
+      expect(await s.fileLine()).toEqual({ commentId: reply.id, state: "saved" });
+      expect(await s.line()).toBeNull();
+      expect(await s.task()).toEqual(HEALTHY_TASK_AFTER_COMMIT(s.runId));
+      expect(errors).toEqual([]);
+    });
+    await s.expectAnsweredOnceAndNoNotice();
+  }, 120_000);
+
+  it("W1c (merged, port acceptance, healthy, an Agent Chat conversation): the person's chat gets 1 reply within 5 s; the commit settles the turn and posts nothing more; M answered once, 0 notices", async () => {
+    setting.trigger = "shipped";
+    const s = await scenario({ chat: true });
+    box.resume.mockResolvedValue(true);
+    await withRegisteredWorker(async errors => {
+      await s.streamAndAcceptThroughPort();
+      const reply = await replyWithinFiveSeconds(s, "W1c port acceptance (chat) -> published reply (registered worker)");
+      expect(await s.coordinator()).toMatchObject({ phase: "workspace_finalizing" });
+      expect(await s.line()).toBe(FILE_LINE_SAVING);
+      expect(await s.answered()).toEqual([true]);
+      await s.copyBack();
+      expect(await s.coordinator()).toMatchObject({ phase: "committed" });
+      await vi.waitFor(async () => expect((await s.run()).status).toBe("succeeded"), { timeout: 15_000, interval: 25 });
+      await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
+      expect(await s.publishAgain()).toEqual([false, false]);
+      expect((await s.replies()).map(comment => [comment.id, comment.body])).toEqual([[reply.id, ANSWER]]);
+      expect(await s.line()).toBeNull();
+      expect(errors).toEqual([]);
+    });
+    await s.expectAnsweredOnceAndNoNotice();
+  }, 120_000);
+
+  it("W2 (merged, port acceptance; NAMED INJECTION 'hanging copy-out'): the reply within 5 s, once; M answered and 0 notices WHILE the copy hangs; past the deadline never 'Saving…'", async () => {
+    setting.trigger = "shipped";
+    const s = await scenario();
+    // NAMED INJECTION 'hanging copy-out': the box's export (resumeNativeWorkspaceSync, the faked box) is
+    // entered and never returns until `release` is called. Everything around it is the real finalizer.
+    let release!: (ok: boolean) => void;
+    const hung = new Promise<boolean>(resolve => { release = resolve; });
+    box.resume.mockImplementation(() => hung);
+    let copying: Promise<unknown> = Promise.resolve();
+    try {
+      await withRegisteredWorker(async errors => {
+        await s.streamAndAcceptThroughPort();
+        let copyBackEnded = false;
+        copying = s.copyBack().finally(() => { copyBackEnded = true; });
+        const reply = await replyWithinFiveSeconds(s, "W2 port acceptance, copy-out hanging -> published reply (registered worker)");
+        await vi.waitFor(() => expect(box.resume).toHaveBeenCalledTimes(1), { timeout: 15_000, interval: 20 });
+        expect(copyBackEnded).toBe(false);
+        expect(await s.coordinator()).toMatchObject({ phase: "workspace_finalizing" });
+        expect(await s.run()).toMatchObject({ status: "running", nativePhase: "workspace_finalizing" });
+        expect(await s.task()).toEqual({ status: "in_progress", executionRunId: s.runId });
+        expect(await s.line()).toBe(FILE_LINE_SAVING);
+        // While it still hangs: M is answered, and the merged sweep, asked 30 min later, has nothing to say.
+        await s.expectAnsweredOnceAndNoNotice();
+        expect(await noticesIn(s)).toEqual([]);
+        // Bounded: a copy that stays hung past acceptance + 10 min is never 'Saving…' for ever.
+        expect(await s.line({ nowMs: await s.acceptedAt() + SAVING_DEADLINE_MS })).toBe(FILE_LINE_NOT_SAVED_YET);
+        // Once: more worker passes and the publisher called again post nothing.
+        await Promise.all([s.presentationWorker(), s.presentationWorker(), s.presentationWorker(), s.presentationWorker()]);
+        expect(await s.publishAgain()).toEqual([false, false]);
+        expect((await s.replies()).map(comment => comment.id)).toEqual([reply.id]);
+        expect(copyBackEnded).toBe(false);
+        expect(errors).toEqual([]);
+        // The hang ends; the copy-out succeeds; the commit posts nothing more.
+        release(true);
+        await copying;
+        expect(await s.coordinator()).toMatchObject({ phase: "committed" });
+        await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
+        expect((await s.replies()).map(comment => comment.id)).toEqual([reply.id]);
+        expect(await s.line()).toBeNull();
+      });
+    } finally { release(true); await copying.catch(() => {}); }
+    await s.expectAnsweredOnceAndNoNotice();
+  }, 120_000);
+
+  it("W3 (merged, port acceptance -> the reply shows -> the agent is paused, the box is gone): the reply stays, once; 'Saving…' settles to the LOST line; M answered, 0 notices", async () => {
+    setting.trigger = "shipped";
+    const s = await scenario();
+    await withRegisteredWorker(async errors => {
+      await s.streamAndAcceptThroughPort();
+      const reply = await replyWithinFiveSeconds(s, "W3 port acceptance -> published reply (registered worker)");
+      expect(await s.line()).toBe(FILE_LINE_SAVING);
+      // REAL: the pause route cancels the agent's running run, AFTER its result was accepted and its reply shown.
+      const paused = await request(s.app).post(`/api/agents/${s.agentId}/pause`).send({});
+      expect(paused.status, JSON.stringify(paused.body)).toBe(200);
+      expect(await s.run()).toMatchObject({ status: "cancelled", errorCode: "agent_paused" });
+      // The cancel removed nothing and added nothing.
+      expect((await s.replies()).map(comment => [comment.id, comment.body])).toEqual([[reply.id, ANSWER]]);
+      expect(await s.answered()).toEqual([true]);
+      // The box: a pause stops and releases it (PLANTED: the lease's expired state, as in R2 / A3).
+      await db.update(environmentLeases).set({ status: "expired", releasedAt: new Date() }).where(eq(environmentLeases.id, s.leaseId));
+      await s.copyBack();
+      expect(await s.coordinator()).toMatchObject({ phase: "terminal_failure", failureCode: "native_workspace_sync_out_unrecoverable" });
+      await vi.waitFor(async () => expect(await s.fileLine()).toEqual({ commentId: reply.id, state: "lost" }), { timeout: 15_000, interval: 25 });
+      expect(await s.line()).toBe(FILE_LINE_LOST);
+      await Promise.all([s.presentationWorker(), s.presentationWorker(), s.presentationWorker(), s.presentationWorker()]);
+      expect(await s.publishAgain()).toEqual([false, false]);
+      expect((await s.replies()).map(comment => [comment.id, comment.body])).toEqual([[reply.id, ANSWER]]);
+      expect(errors).toEqual([]);
+    });
+    await s.expectAnsweredOnceAndNoNotice();
+    await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
+    expect(await s.replies()).toHaveLength(1);
+  }, 120_000);
+
+  it("W4 (merged; a message PARKED BEFORE the port's acceptance): R's reply shows once while R copies; the parked message stays parked until R ends, then gets exactly 1 run", async () => {
+    setting.trigger = "shipped";
+    const s = await scenario({ wakeOnDemand: true, realSync: true });
+    // The F3 P-c box: FAKED transport only (commands run in a separate local directory); REAL
+    // prepareNativeWorkspaceSync + resumeNativeWorkspaceSync copy R's file and unblock the real lease cleanup.
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "withheld-reply-w4-"));
+    const hostWorkspace = path.join(root, "host"), remoteWorkspace = path.join(root, "box");
+    await fs.mkdir(hostWorkspace);
+    const fileOfR = path.join(hostWorkspace, "src-util.ts"), contentOfR = `// renamed by run ${s.runId}\nexport const helper2 = 1;\n`;
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, s.leaseId));
+    const target: AdapterSandboxExecutionTarget = { kind: "remote", transport: "sandbox", providerKey: "test",
+      leaseId: s.leaseId, remoteCwd: remoteWorkspace, timeoutMs: 30_000,
+      runner: { execute: input => new Promise(resolve => {
+        const child = execFile(input.command, input.args ?? [], { cwd: input.cwd, env: { ...process.env, ...input.env },
+          timeout: input.timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => resolve({
+            exitCode: error ? 1 : 0, signal: error?.signal ?? null, timedOut: error?.killed ?? false,
+            stdout, stderr, pid: child.pid ?? null, startedAt: new Date().toISOString(),
+          }));
+        child.stdin?.on("error", () => undefined); child.stdin?.end(input.stdin ?? "");
+      }) },
+    };
+    box.targets.set(s.leaseId, target);
+    const realSync = await vi.importActual<typeof import("./native-workspace-sync.js")>("./native-workspace-sync.js");
+    await realSync.prepareNativeWorkspaceSync({ db, companyId: s.companyId, workspaceId: s.issueId,
+      workspaceLocalDir: hostWorkspace, runId: s.runId, lease: lease as EnvironmentLease, target, resourceDisposition: "destroy" });
+    await fs.writeFile(path.join(remoteWorkspace, "src-util.ts"), contentOfR);
+    // NAMED INJECTION 'hanging copy-out': the real export waits at this gate.
+    let open!: () => void;
+    const gate = new Promise<void>(resolve => { open = resolve; });
+    const release = (_ok: boolean) => open();
+    box.resume.mockImplementation(async input => { await gate; return realSync.resumeNativeWorkspaceSync(input); });
+    // FAKED BOX ONLY: the driver reports its sandbox stopped; the real runtime persists cleanup and receipt.
+    const teardown = environmentRuntimeService(db, { drivers: [{
+      driver: "sandbox",
+      releaseRunLease: async ({ lease, status }) => environmentService(db).releaseLease(lease.id, status, {
+        cleanupStatus: "success",
+        remoteExecutionTermination: remoteTerminationReceipt(lease, { providerLeaseId: lease.providerLeaseId, state: "stopped" }),
+      }),
+    } as EnvironmentRuntimeDriver] });
+    const heartbeat = heartbeatService(db, { environmentRuntime: teardown });
+    let copying: Promise<unknown> = Promise.resolve();
+    try {
+      // REAL: the person's second message arrives while R is still working, BEFORE R's result is accepted.
+      const parked = await s.personSays("Also update the README, please.");
+      await vi.waitFor(async () => expect(await s.wakesFor(parked)).toHaveLength(1), { timeout: 15_000, interval: 25 });
+      await heartbeat.sweepStaleIssueLocks({ companyId: s.companyId, issueId: s.issueId });
+      const isParked = async () => {
+        expect((await s.wakesFor(parked)).map(wake => [wake.status, wake.runId])).toEqual([["deferred_issue_execution", null]]);
+        expect(await s.otherRuns()).toEqual([]);
+        expect(await s.task()).toEqual({ status: "in_progress", executionRunId: s.runId });
+      };
+      await isParked();
+      expect(await s.replies()).toEqual([]);
+      const reply = await withRegisteredWorker(async errors => {
+        await s.streamAndAcceptThroughPort();
+        copying = s.copyBack();
+        const reply = await replyWithinFiveSeconds(s, "W4 port acceptance with a parked message -> published reply (registered worker)");
+        await vi.waitFor(() => expect(box.resume).toHaveBeenCalledTimes(1), { timeout: 15_000, interval: 20 });
+        // R's reply is in the thread and R is still copying: the parked message is STILL parked.
+        await heartbeat.sweepStaleIssueLocks({ companyId: s.companyId, issueId: s.issueId });
+        await heartbeat.resumeQueuedRuns();
+        await isParked();
+        expect(await s.coordinator()).toMatchObject({ phase: "workspace_finalizing" });
+        await expect(fs.readFile(fileOfR, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+        // M is answered by R's one reply; the reply is NOT an answer to the parked message (R's input does not name it).
+        expect(await s.answered()).toEqual([true]);
+        expect((await s.replies()).map(comment => comment.id)).toEqual([reply.id]);
+        expect(await noticesIn(s)).toEqual([]);
+        expect(errors).toEqual([]);
+        return reply;
+      });
+      // R's copy-out ends and R commits; the commit posts nothing more.
+      release(true);
+      await copying;
+      expect(await s.coordinator()).toMatchObject({ phase: "committed" });
+      expect((await s.run()).status).toBe("succeeded");
+      // The file R wrote is on disk before anything frees the task.
+      expect(await fs.readFile(fileOfR, "utf8")).toBe(contentOfR);
+      const committedAt = (await s.coordinator()).updatedAt.getTime();
+      expect((await s.replies()).map(comment => comment.id)).toEqual([reply.id]);
+      expect((await s.wakesFor(parked)).map(wake => [wake.status, wake.runId])).toEqual([["deferred_issue_execution", null]]);
+      // REAL: lease cleanup, the terminal-lock service and the stranded-queue recovery stand in for the PLANTED
+      // executor's missing finally (as in F3 P-c); no hand edit to the task or the parked wake.
+      await heartbeat.releaseEnvironmentLeasesForRun({ runId: s.runId, companyId: s.companyId, agentId: s.agentId, status: "succeeded" });
+      await issueService(db).clearExecutionRunIfTerminal(s.issueId);
+      expect((await s.task()).executionRunId).toBeNull();
+      await heartbeat.resumeQueuedRuns();
+      const promoted = await s.otherRuns();
+      // LIMIT NAMED: no live provider is attached, so this is the promoted RUN ROW and its dispatch input,
+      // not a model's answer to the parked message. Exactly one run, created after R committed, naming it.
+      expect(promoted).toHaveLength(1);
+      expect(JSON.stringify(promoted[0].contextSnapshot)).toContain(parked);
+      expect(promoted[0].createdAt.getTime()).toBeGreaterThanOrEqual(committedAt);
+      // R's reply is still the only agent reply, and still M's one answer.
+      expect((await s.replies()).map(comment => [comment.id, comment.createdByRunId])).toEqual([[reply.id, s.runId]]);
+      expect(await s.answered()).toEqual([true]);
+      expect(await s.line()).toBeNull();
+    } finally {
+      release(true);
+      await copying.catch(() => {});
+      await heartbeat.drainActiveRunExecutions();
+      await realSync.cleanupNativeWorkspaceSync(s.runId);
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it("W5 (merged; never twice): the runner's own completeRun confirmation, replayed through the port before the worker, after the reply and after the commit, posts nothing more", async () => {
+    setting.trigger = "shipped";
+    const s = await scenario();
+    let release!: (ok: boolean) => void;
+    const hung = new Promise<boolean>(resolve => { release = resolve; });
+    box.resume.mockImplementation(() => hung);
+    const entry = async () => ((await s.run()).resultJson as Record<string, any>).nativeWithheldReply;
+    let copying: Promise<unknown> = Promise.resolve();
+    try {
+      await s.streamAndAcceptThroughPort();
+      const [accepted] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, s.runId));
+      const pending = await entry();
+      expect(pending).toMatchObject({ state: "pending", trigger: "acceptance", resultId: accepted.id });
+      // REAL: the port's replay of the same accepted result is an idempotent confirmation: one result row, the same entry.
+      expect(await s.portReplay()).toBe("confirmed");
+      expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, s.runId))).toHaveLength(1);
+      expect(await entry()).toEqual(pending);
+      expect(await s.replies()).toEqual([]);
+      const reply = await withRegisteredWorker(async errors => {
+        // The replay's wake reaches the registered worker; it publishes the one entry.
+        expect(await s.portReplay()).toBe("confirmed");
+        await s.presentationWorker();
+        const reply = await replyWithinFiveSeconds(s, "W5 port replay -> published reply");
+        const published = await entry();
+        expect(published).toMatchObject({ state: "published", trigger: "acceptance", resultId: accepted.id, commentId: reply.id });
+        copying = s.copyBack();
+        await vi.waitFor(() => expect(box.resume).toHaveBeenCalledTimes(1), { timeout: 15_000, interval: 20 });
+        // After the reply, while the copy hangs: the confirmation again, and four worker passes.
+        expect(await s.portReplay()).toBe("confirmed");
+        await Promise.all([s.presentationWorker(), s.presentationWorker(), s.presentationWorker(), s.presentationWorker()]);
+        expect(await entry()).toEqual(published);
+        expect((await s.replies()).map(comment => comment.id)).toEqual([reply.id]);
+        expect(errors).toEqual([]);
+        return reply;
+      });
+      release(true);
+      await copying;
+      expect(await s.coordinator()).toMatchObject({ phase: "committed" });
+      // After the commit: the confirmation again, the worker again, the publisher again.
+      expect(await s.portReplay()).toBe("confirmed");
+      await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
+      expect(await s.publishAgain()).toEqual([false, false]);
+      expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, s.runId))).toHaveLength(1);
+      expect((await s.replies()).map(comment => [comment.id, comment.body])).toEqual([[reply.id, ANSWER]]);
+      expect(await s.line()).toBeNull();
+    } finally { release(true); await copying.catch(() => {}); }
+    await s.expectAnsweredOnceAndNoNotice();
   }, 120_000);
 });
