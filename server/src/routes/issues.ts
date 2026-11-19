@@ -433,6 +433,7 @@ import {
   queuedCommentQueueRevision,
   withQueuedCommentIdsInWakePayload,
 } from "../services/issue-queued-comment-queue.js";
+import { interruptedTurnUnansweredCommentIds } from "../services/interrupted-turn-input.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -18143,8 +18144,18 @@ export function issueRoutes(
         // The click is durable fresh user intent, including when the message
         // predates a failed run's stop. Keep its content and original attribution.
         await notifyDeferredExecutionWork(tx, { companyId: issue.companyId, requestId: locked.wake.id });
+        // The live turn this click cuts has not answered its own message yet:
+        // carry that message into the successor first, then the held ones.
+        const heldIds = queuedCommentIdsFromWakePayload(locked.wake.payload);
+        const interruptedIds = locked.activeRun?.status === "running"
+          ? await interruptedTurnUnansweredCommentIds(tx as unknown as Db, { companyId: issue.companyId,
+            issueId: issue.id, run: locked.activeRun, held: heldIds })
+          : [];
+        const wakePayload = interruptedIds.length
+          ? withQueuedCommentIdsInWakePayload(locked.wake.payload, [...interruptedIds, ...heldIds])
+          : readObject(locked.wake.payload);
         await tx.update(agentWakeupRequests).set({
-          payload: { ...readObject(locked.wake.payload), queuedCommentInterrupt: {
+          payload: { ...wakePayload, queuedCommentInterrupt: {
             actorId: actor.actorId, requestedAt: new Date().toISOString(),
             ...(locked.queue.protocol === "paperclip_runner_v1" && locked.activeRun?.status === "running"
               ? { targetRunId: locked.activeRun.id } : {}),
