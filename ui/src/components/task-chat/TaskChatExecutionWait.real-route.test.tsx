@@ -64,6 +64,18 @@ describe("SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119 rendered real GET rows", () =>
     act(() => root.render(<MemoryRouter><QueryClientProvider client={query}><ThemeProvider><TooltipProvider>{children}</TooltipProvider></ThemeProvider></QueryClientProvider></MemoryRouter>));
   }
 
+  it("pins RFL 03:34Z words byte-exactly on real-route receipts, independently of production constants", () => {
+    const expected: Record<string, string> = {
+      "agent.not_invokable": "Your message is saved. This agent is paused, so it starts when the agent is resumed.",
+      execution_recovery: "Your message is saved. It's waiting until the previous run is recovered.",
+      execution_active: "Your message is saved. It's waiting for the current run to finish.",
+    };
+    for (const row of deferred.filter(row => row.reason in expected)) {
+      expect(row.queue?.executionWait?.message).toBe(expected[row.reason]);
+      expect(row.expectedLine).toBe(expected[row.reason]);
+    }
+  });
+
   it("has real-route evidence for every deferred reason and both surfaces", () => {
     expect(new Set(deferred.map(row => row.reason))).toEqual(new Set(["remote_cleanup", "execution_recovery", "execution_active", "agent.not_invokable"]));
     expect(new Set(deferred.map(row => row.surface))).toEqual(new Set(["task", "chat"]));

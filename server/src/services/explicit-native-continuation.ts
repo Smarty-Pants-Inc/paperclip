@@ -21,7 +21,7 @@ import { hasNativeLocalProcessStop, hasHistoricalSuspendedNativeSession, nativeG
 import { completeTerminatedLocalNativeSessionCleanup, completeTerminatedRemoteNativeSessionCleanup, nativeSessionCleanupBlock } from "../vendor/paperclip-runner/index.js";
 import { hasRecoveredCleanupStopReceipt, hasRemoteTerminationReceipt, remoteLeaseCleanupScope } from "./remote-execution-termination.js";
 // SUPERSEDE-WAITNOTE-UPSTREAM-HEADER-1119, RFL 01:31Z: one ruled copy owner.
-import { REMOTE_CLEANUP_EXECUTION_WAIT_MESSAGE } from "./deferred-execution-wait.js";
+import { ACTIVE_EXECUTION_WAIT_MESSAGE, REMOTE_CLEANUP_EXECUTION_WAIT_MESSAGE } from "./deferred-execution-wait.js";
 import { z } from "zod";
 import { and, desc, eq, gt, inArray, isNull, ne, not, or, sql, type SQL } from "drizzle-orm";
 import {
@@ -675,7 +675,7 @@ export async function admitExplicitNativeContinuation(input: {
     inArray(heartbeatRuns.status, ["running", "queued", "scheduled_retry"]),
     ne(heartbeatRuns.id, input.successorRunId),
   )).limit(1);
-  if (active) return blocked("execution_active", "Waiting for the current run. Your message is saved.");
+  if (active) return blocked("execution_active", ACTIVE_EXECUTION_WAIT_MESSAGE);
   const previous = taskRetry ? sources.find(run => run.id === taskRetry.sourceRunId)!
     : executedSources.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0]!;
   // Prove required task history is available before retiring any hold.
