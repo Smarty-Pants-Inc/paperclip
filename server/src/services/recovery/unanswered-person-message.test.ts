@@ -8,6 +8,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
   issueComments,
@@ -24,8 +25,12 @@ import {
   environmentLeases,
 } from "@paperclipai/db";
 import { and, asc, eq, gt, isNull, sql } from "drizzle-orm";
+import express from "express";
+import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
+import { errorHandler } from "../../middleware/index.js";
+import { agentRoutes } from "../../routes/agents.js";
 import { executionProjectionsForRuns } from "../execution-projection.js";
 import { heartbeatService } from "../heartbeat.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
@@ -936,13 +941,51 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   // The sweep falsely said "no run started" while that attempt was pending.
   async function stoppedMessageWithWait(status: string, executionWait: unknown) {
     const f = await fixture();
-    // PLANTED Stop: a cancelled run with no cancel-actor record and no turn events, so by ruling 8 it is NOT the
-    // sender's own Stop of a run that had started answering (the real-route rows of this shape, the person's real
-    // Stop with a message waiting behind it, are __tests__/sender-stop-hold.test.ts). Its message is therefore owed
-    // by the joint rule (b3e2a04fe: the sweep owes EVERY unanswered message): it has its own ONE notice, asserted
-    // by earlierOwedOnce below; each row's own assertions read the notices of the message it is about (own).
+    // The Stop is the REAL route (merged9 item 3, RULING-FIXTURES-FROM-REAL-PRODUCER-1118): the sender presses Stop
+    // on the run that had started answering "Before Stop" (POST /api/heartbeat-runs/:runId/cancel,
+    // routes/agents.ts:7564-7585 -> heartbeatService.cancelRun). The route records the SENDER
+    // (resultJson.cancelledByActorType "user" + cancelledByUserId = the request's user, :7581-7584), so by ruling 8
+    // (person-stopped-message.ts senderStoppedWhileAnswering) "Before Stop" is ended by its sender's own Stop: it is
+    // owed NO notice (earlierStoppedBySender below). Planted, and named so: the running run row and its two turn
+    // events (the model read the message and began to answer; no model is launched here), and the fixture clock:
+    // the stopped run's own timestamps are moved back as a whole onto the fixture's past clock, as f.sweep does for
+    // notices, so the Stop precedes the "After Stop" message. The cancel record itself is untouched.
+    // Real paths that end a run WITHOUT recording the sender keep the message owed (a TRUE notice), by line:
+    //   - a managing agent's Stop: routes/agents.ts:7574-7580 (cancelledByActorType "agent");
+    //   - a system cancel: heartbeatService.cancelRun with no cancel actor (row
+    //     answered-stop-and-card.test.ts "negative: the SYSTEM cancels the run");
+    //   - another board user's Stop (same route, another userId; row "negative: ANOTHER user's Stop");
+    //   - the sender's Stop of a run that had NOT read the message (row "negative: the sender's own Stop of a run
+    //     that had NOT read M"). Those rows carry the notice; this fixture is the sender's own Stop.
     const stoppedId = await f.message("Before Stop");
-    await f.run({ commentId: stoppedId, status: "cancelled", errorCode: "cancelled" });
+    const stoppedRunId = await f.run({ commentId: stoppedId, status: "running" });
+    await db.update(heartbeatRuns).set({ startedAt: f.at(), scopeKind: "issue", issueId: f.issueId }).where(eq(heartbeatRuns.id, stoppedRunId));
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: stoppedRunId, phase: "observed" });
+    await db.insert(heartbeatRunEvents).values(["userMessage", "agentMessage"].map((kind, index) => ({
+      companyId: f.companyId, agentId: f.agentId, runId: stoppedRunId, seq: index + 1, eventType: "item.started",
+      sourceEventId: `source-${randomUUID()}`, payload: { prpEvent: { eventType: "item.started", turnId: `turn-${stoppedRunId}`,
+        itemId: `item-${index}`, payload: { kind, item: { type: kind } } } } })));
+    const stopApp = express(); stopApp.use(express.json());
+    stopApp.use((req, _res, next) => { (req as unknown as { actor: unknown }).actor = { type: "board", userId: f.userId, source: "session",
+      companyIds: [f.companyId], isInstanceAdmin: true, memberships: [{ companyId: f.companyId, status: "active", membershipRole: "owner" }] }; next(); });
+    stopApp.use("/api", agentRoutes(db)); stopApp.use(errorHandler);
+    const stopResponse = await request(stopApp).post(`/api/heartbeat-runs/${stoppedRunId}/cancel`).send({});
+    expect(stopResponse.status, JSON.stringify(stopResponse.body)).toBe(200);
+    const [stoppedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, stoppedRunId));
+    expect(stoppedRun, "what the real Stop route recorded").toMatchObject({ status: "cancelled", errorCode: "cancelled",
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: f.userId } });
+    await db.update(heartbeatRuns).set({ finishedAt: f.at(), updatedAt: f.at() }).where(eq(heartbeatRuns.id, stoppedRunId));
+    // What ELSE the real route leaves in this harness: with no runner to acknowledge the stop, ONE board-owned hold
+    // on the stopped run (the same footprint __tests__/sender-stop-hold.test.ts asserts). While that hold stands,
+    // the sender's later message whose wake waits in line is kept by their own Stop (STOP_HOLD_YIELDS_TO_SENDER_STOP):
+    // those real-route rows are sender-stop-hold.test.ts. THESE rows are about the wait AFTER the Stop completed
+    // (S10-1's record: the next wake was promoted and its run answered, which a standing hold does not allow), so
+    // the hold is PLANTED as resolved, named here; nothing else of the Stop is touched.
+    const stopHolds = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(stopHolds.map(hold => [hold.kind, hold.status, hold.ownerType, (hold.evidence as Record<string, unknown>).runId]),
+      "the real Stop route's hold").toEqual([["active_run_watchdog", "active", "board", stoppedRunId]]);
+    await db.update(issueRecoveryActions).set({ status: "resolved", resolvedAt: f.at(), outcome: "planted: the stop completed" })
+      .where(eq(issueRecoveryActions.id, stopHolds[0]!.id));
     const commentId = await f.message("After Stop, please continue.");
     const now = new Date();
     const createdAt = new Date(now.getTime() - 120_000);
@@ -952,13 +995,16 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       source: "on_demand", reason: "issue_execution_deferred", requestedByActorType: "user",
       requestedByActorId: f.userId, status, payload, createdAt, updatedAt: createdAt }).returning();
     const own = async () => (await f.visible()).filter(note => noticeCovers(note, commentId));
-    const earlierOwedOnce = async () => {
-      const notes = (await f.visible()).filter(note => noticeCovers(note, stoppedId));
-      expect(notes.map(note => [note.metadata?.authorizationReason, note.body]), "the earlier, planted-Stop message: its ONE notice")
-        .toEqual([[`unanswered_message:${stoppedId}`, NOT_ANSWERED]]);
-      expect((await f.visible()).filter(note => !noticeCovers(note, stoppedId) && !noticeCovers(note, commentId)), "no other notice").toEqual([]);
+    // supersedes(98ea9cee earlierOwedOnce: "the earlier, planted-Stop message: its ONE notice"; RFL ruling 8 +
+    // RULING-FIXTURES-FROM-REAL-PRODUCER-1118): the real Stop route records the sender, so the message the sender
+    // stopped is owed nothing: no notice for it, ever (retired ones included), and no other notice on the task.
+    const earlierStoppedBySender = async () => {
+      const everWritten = (await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system"))))
+        .filter(note => noticeCovers(note, stoppedId));
+      expect(everWritten.map(note => [note.metadata?.authorizationReason, note.body]), "the sender's own Stop: no notice for the stopped message, ever").toEqual([]);
+      expect((await f.visible()).filter(note => !noticeCovers(note, commentId)), "no other notice").toEqual([]);
     };
-    return { ...f, commentId, stoppedId, wakeId: wake!.id, now, own, earlierOwedOnce };
+    return { ...f, commentId, stoppedId, stoppedRunId, wakeId: wake!.id, now, own, earlierStoppedBySender };
   }
 
   it.each(["deferred", "deferred_issue_execution"])(
@@ -988,7 +1034,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         .filter(note => noticeCovers(note, f.commentId));
       // waitnote port: no waiting note was ever written upstream, so no (retired) history row exists either.
       expect(history.map(note => note.body)).toEqual([]);
-      await f.earlierOwedOnce();
+      await f.earlierStoppedBySender();
     });
 
   it("waitnote: execution_recovery uses the existing start bound and posts ONE no-run note after it", async () => {
@@ -1007,11 +1053,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(codeOf(notes[0]!)).toBe("no_run");
     await settleAt(f, PENDING_WAIT_START_BOUND_MS + 60_000);
     expect(await f.own()).toHaveLength(1);
-    await f.earlierOwedOnce();
-    // T0 is recorded ONCE per message that waited: this row's message, and the earlier planted-Stop message (owed
-    // by the joint rule), each exactly once.
+    await f.earlierStoppedBySender();
+    // T0 is recorded ONCE, for the one message that waited (the sender-stopped message is not owed, so it never waits).
     expect((await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId), eq(activityLog.action, PENDING_WAIT_ACTION))))
-      .map(row => (row.details as Record<string, unknown>).messageId).sort()).toEqual([f.commentId, f.stoppedId].sort());
+      .map(row => (row.details as Record<string, unknown>).messageId).sort()).toEqual([f.commentId]);
   });
 
   it.each(["deferred", "deferred_issue_execution"].flatMap(status =>
@@ -1026,7 +1071,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const notes = await f.own();
       expect(notes).toHaveLength(1);
       expect(notes[0]!.body).toBe(NO_RUN);
-      await f.earlierOwedOnce();
+      await f.earlierStoppedBySender();
     });
 
   it("waitnote guard: an unrelated deferred wait and a coalesced receipt alone do not silence a failed message", async () => {
