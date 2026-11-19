@@ -1317,6 +1317,22 @@ function createTimedOut(error: unknown): boolean {
  * no envelope that carries them without a cleanup record (upstream #22194's
  * PluginEnvironmentAcquisitionError).
  */
+/** Core's creation settle floor (sandbox-creation-operations.ts CREATION_SETTLE_FLOOR_MS). */
+const BOAT_CREATION_SETTLE_MS = 30 * 60_000;
+/** This worker's creates whose POST timed out: attempt -> settle deadline. Lost on restart, where core's own settle deadline still holds absence inconclusive. */
+const unsettledCreates = new Map<string, number>();
+function noteUnsettledCreate(attemptId: string, startedAt: number): void {
+  const now = Date.now();
+  for (const [attempt, until] of unsettledCreates) if (until <= now) unsettledCreates.delete(attempt);
+  unsettledCreates.set(attemptId, startedAt + BOAT_CREATION_SETTLE_MS);
+}
+function createStillSettling(attemptId: string): boolean {
+  const until = unsettledCreates.get(attemptId);
+  if (until === undefined) return false;
+  if (Date.now() < until) return true;
+  unsettledCreates.delete(attemptId);
+  return false;
+}
 async function findTimedOutCreation(config: Config, attemptId: string, owner: { companyId: string; environmentId: string; runId?: string }, createError: unknown, createStartedAt: number): Promise<string> {
   if (!createTimedOut(createError) || shuttingDown) throw createError;
   const capAt = createStartedAt + BOAT_CREATE_ATTEMPT_MS;
@@ -2489,6 +2505,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         try {
           created = await request(c, "/sandboxes", { method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": attemptId }, body: JSON.stringify(createSandboxBody(c, ttl, labels, from)) });
         } catch (createError) {
+          if (createTimedOut(createError)) noteUnsettledCreate(attemptId, createStartedAt);
           // #20828: adopt the box our timed-out create made; never send a second create.
           created = { sandbox: { id: await findTimedOutCreation(c, attemptId, params, createError, createStartedAt) } };
           adopted = true;
@@ -2597,6 +2614,10 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       const ids = await acquisitionMatches(c, params.creationOperation.id, owner);
       // Report operation-scoped absence as destroyed: core owns the settle
       // deadline and bounded absence budget; early absence stays inconclusive there.
+      // A create this worker sent that timed out stays inconclusive here until
+      // core's settle floor has passed, so core keeps inspecting at its retry
+      // interval and a late box is found and stopped (adopt-boat-late-box2).
+      if (!ids.length && createStillSettling(params.creationOperation.id)) throw new Error("Boat creation identity is not visible yet; retry inspection");
       if (!ids.length) return { providerLeaseId: params.creationOperation.id, state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt: new Date().toISOString() };
       return { providerLeaseId: ids[0], state: "unknown", creationCleanup: cleanupIdentity(c, ids[0], owner, params.creationOperation.id) };
     }
