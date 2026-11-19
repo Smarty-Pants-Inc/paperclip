@@ -8,7 +8,7 @@ import type { InProgressRecord, SettleOutcome } from "./recovery/ownership-regis
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { ORPHANED_SANDBOX_RECOVERY_KEY, prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
 import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "./reusable-sandbox-kept-marker.js";
-import { NATIVE_CUSTODY_UNVERIFIED_REASON, nativeLeaseCustodyMissing } from "./native-runtime/native-lease-custody.js";
+import { hasRetainedUnaddressableNativeCustody, NATIVE_CUSTODY_UNVERIFIED_REASON, nativeLeaseCustodyMissing } from "./native-runtime/native-lease-custody.js";
 import { PENDING_CLEANUP_SWEEP_ATTEMPT_CAP } from "./environment-cleanup-state.js";
 import { logger } from "../middleware/logger.js";
 
@@ -21,10 +21,27 @@ const OPEN_RUN_STATUSES = ["queued", "scheduled_retry", "running"];
 
 type LeaseRow = typeof environmentLeases.$inferSelect;
 
-/** A retained orphan: the ownership settle stopped and kept its sandbox, and
- * the stop is confirmed. Or an abandoned warm sandbox (see below). */
+/** A stopped retained orphan, an abandoned warm sandbox (see below), or a
+ * kept native-custody allocation whose stop could not be addressed. */
 export function retainedOrphanSandboxCondition() {
-  return or(orphanedRunSandboxCondition(), abandonedWarmSandboxCondition(), supersededRunningWarmSandboxCondition());
+  return or(orphanedRunSandboxCondition(), abandonedWarmSandboxCondition(), supersededRunningWarmSandboxCondition(),
+    unaddressableNativeCustodyCondition());
+}
+
+/** SQL listing mirror of hasRetainedUnaddressableNativeCustody. Unlike a
+ * stopped source, this possibly RUNNING paid box remains listed even while a
+ * successor uses another box. An open task must not hide its operator debt. */
+function unaddressableNativeCustodyCondition() {
+  return and(eq(environmentLeases.status, "retained"), eq(environmentLeases.cleanupStatus, "failed"),
+    eq(environmentLeases.failureReason, "native_custody_stop_unavailable"),
+    sql`${environmentLeases.heartbeatRunId} is not null`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,nativeCustodyUnverified}' = 'true'`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,recoveredOrphanedRunLease}' = 'true'`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,ownerProof}' = ${NATIVE_CUSTODY_UNVERIFIED_REASON}`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,runId}' = ${environmentLeases.heartbeatRunId}::text`,
+    sql`${environmentLeases.metadata}#>>'{orphanedRunLeaseRecovery,disposition}' = 'retained_unstoppable'`,
+    sql`${environmentLeases.metadata}#>>'{replaceBeforeReuse,schema}' = 'paperclip.replace-before-reuse.v1'`,
+    sql`${environmentLeases.metadata}#>>'{replaceBeforeReuse,runId}' = ${environmentLeases.heartbeatRunId}::text`);
 }
 
 /** The newest lease row for its sandbox: an older row was handed on. */
@@ -148,10 +165,12 @@ function alwaysHeldSql() {
       and other.status in ('active', 'retained', 'pending_cleanup')))`;
 }
 
-/** Retained orphans that nothing appears to reference now. */
+/** The existing owner's worklist: releasable stopped orphans, plus every
+ * unaddressable native-custody allocation that needs tracking/escalation. */
 // The listing is built once, so it reads the database clock.
 export function releasableRetainedOrphanCondition(now?: Date) {
-  return and(retainedOrphanSandboxCondition(), sql`not ${alwaysHeldSql()}`, sql`not (${softlyHeldSql(now)})`);
+  return or(unaddressableNativeCustodyCondition(),
+    and(retainedOrphanSandboxCondition(), sql`not ${alwaysHeldSql()}`, sql`not (${softlyHeldSql(now)})`));
 }
 
 /** When the next retained orphan's retention window ends while only soft
@@ -185,7 +204,11 @@ export async function nextRetainedOrphanDueAt(db: Db, now: Date): Promise<Date |
  *   retention window no recovery path accepts the stopped sandbox as a source
  *   (`hasConfirmedSandboxStopAndRetain`), so these no longer hold it.
  *
- * Then it hands the sandbox to the pending-cleanup sweep for destruction,
+ * An unaddressable native-custody allocation is the exception: list it even
+ * while the task is open, cap/escalate its unresolved stop, and never infer
+ * termination from its provider expiry or a saved transcript.
+ *
+ * Otherwise hand the sandbox to the pending-cleanup sweep for destruction,
  * with a compare-and-swap on the exact row it judged. It never calls a
  * provider itself and never runs on the turn path.
  */
@@ -199,6 +222,27 @@ export async function settleRetainedOrphanSandbox(db: Db, record: InProgressReco
     const [lease] = await tx.select().from(environmentLeases).where(and(eq(environmentLeases.id, record.recordId),
       eq(environmentLeases.heartbeatRunId, runId), retainedOrphanSandboxCondition())).for("update");
     if (!lease || !lease.provider || !lease.providerLeaseId) return { settled: false, reason: "no_longer_a_retained_orphan" };
+    if (hasRetainedUnaddressableNativeCustody(lease)) {
+      // No receipt and no addressable stop: never queue destruction, even if
+      // the transcript is now in custody or provider expiry has passed. Use
+      // the existing retained-orphan attempt cap and operator escalation.
+      const [run] = await tx.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, lease.companyId)));
+      if (!run || !TERMINAL_RUN_STATUSES.includes(run.status)) return { settled: false, reason: "run_active" };
+      const recorded = Number(lease.metadata?.nativeCustodyAttempts ?? 0);
+      const attempts = Math.min(PENDING_CLEANUP_SWEEP_ATTEMPT_CAP,
+        (Number.isFinite(recorded) && recorded >= 0 ? Math.floor(recorded) : 0) + 1);
+      const escalate = attempts >= PENDING_CLEANUP_SWEEP_ATTEMPT_CAP && lease.metadata?.nativeCustodyEscalated !== true;
+      if (attempts === recorded && !escalate) return { settled: false, reason: "native_custody_stop_unavailable" };
+      await tx.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({
+        nativeCustodyAttempts: attempts, ...(escalate ? { nativeCustodyEscalated: true } : {}) })}::jsonb` })
+        .where(eq(environmentLeases.id, lease.id));
+      if (escalate) logger.warn({ leaseId: lease.id, environmentId: lease.environmentId, runId, attempts,
+        provider: lease.provider, providerLeaseId: lease.providerLeaseId, expiresAt: lease.expiresAt,
+        reason: lease.failureReason },
+        "environment lease needs operator attention; retained native box may still be running and its stop cannot be addressed");
+      return { settled: false, reason: "native_custody_stop_unavailable" };
+    }
     const held = await heldBy(tx, lease, runId, context.now);
     if (held) return { settled: false, reason: held };
     if (lease.status === "retained") {

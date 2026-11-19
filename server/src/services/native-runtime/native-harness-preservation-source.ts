@@ -8,6 +8,7 @@ import { tryLockNativeWorkspaceFinalization } from "./native-workspace-finalizat
 import { nativeHarnessStateBase, readNativeHarnessBackupStamp, verifyNativeHarnessBackupStampAsync } from "./native-harness-backup-stamp.js";
 import { readNativeHarnessBackupSource } from "./native-harness-backup-source.js";
 import { withWorkspaceLockKeepalive } from "./native-workspace-lock-keepalive.js";
+import { hasRetainedUnaddressableNativeCustody } from "./native-lease-custody.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 type Coordinator = typeof nativeRunFinalizations.$inferSelect;
@@ -33,7 +34,8 @@ const leaseDigest = (row: Lease) => nativeSha256({ heartbeatRunId: row.heartbeat
 // grants neither provider termination nor restore/destruction authority.
 const retainedNativeCustody = (lease: Lease, runId: string) => {
   const recovery = lease.metadata?.orphanedRunLeaseRecovery as Record<string, unknown> | undefined;
-  return lease.heartbeatRunId === runId && lease.status === "released" && lease.cleanupStatus === "success"
+  return lease.heartbeatRunId === runId
+    && (lease.status === "released" && lease.cleanupStatus === "success" || hasRetainedUnaddressableNativeCustody(lease))
     && recovery?.nativeCustodyUnverified === true && recovery.recoveredOrphanedRunLease === true
     && recovery.ownerProof === "native_custody_unverified" && recovery.runId === runId;
 };

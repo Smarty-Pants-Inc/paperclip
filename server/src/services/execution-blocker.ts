@@ -21,6 +21,7 @@ import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-loc
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
 import { EXECUTION_FINALIZATION_DEADLINE_EXCEEDED, EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "./execution-control-deadline.js";
 import { NATIVE_HUMAN_SELF_HANDOFF_KEY } from "./native-runtime/native-human-self-handoff.js";
+import { hasRetainedUnaddressableNativeCustody } from "./native-runtime/native-lease-custody.js";
 
 const blockerContextKeys = ["issueId", "taskId", "source", "connectionIntentResolution",
   "interactionKind", "interactionStatus", "mutation", "interactionId"] as const;
@@ -77,7 +78,8 @@ const blockerRunFields = {
 export const EXECUTION_BLOCKER_PERSON_RETRY_ACTION =
   "A person can use Retry on this task, or send it a new message, to continue once the previous execution has stopped. Agents cannot retry it for them.";
 
-export async function hasPendingRunCleanup(db: Db, companyId: string, runId: string): Promise<boolean> {
+export async function hasPendingRunCleanup(db: Db, companyId: string, runId: string,
+  admission?: { replacedProviderLeaseIds: string[] }): Promise<boolean> {
   if (await nativeManualAdmissionHoldsExecution(db, { companyId, runId })) return true;
   // Recovery saved the files and re-stopped this sandbox before queueing its
   // destroy. That destroy is resource cleanup, not a live owner of the run.
@@ -95,6 +97,16 @@ export async function hasPendingRunCleanup(db: Db, companyId: string, runId: str
     sql`${environmentLeases.metadata}->'replaceBeforeReuse' is not null`,
     sql`${environmentLeases.metadata}->'sandboxStopAndRetain' is not null`,
   ))).map(lease => lease.id));
+  // ONLY fresh-replacement queue admission can disregard this run's kept
+  // allocation. It is still live resource debt for every ordinary reader;
+  // no controller, workspace finalizer or other lease is excluded here.
+  if (admission?.replacedProviderLeaseIds.length) {
+    const kept = await db.select().from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, runId),
+      inArray(environmentLeases.providerLeaseId, admission.replacedProviderLeaseIds),
+    ));
+    recoveredStopped.push(...kept.filter(hasRetainedUnaddressableNativeCustody).map(lease => lease.id));
+  }
   // A missing predecessor row owns nothing: deleting a run nulls its leases'
   // run reference and removes its finalization coordinator. Failing closed on
   // absence stranded the successor with no next action (invariants 3 and 7).

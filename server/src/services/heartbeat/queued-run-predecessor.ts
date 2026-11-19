@@ -2,6 +2,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 import { hasPendingRunCleanup } from "../execution-blocker.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
+import { readPredecessorRetirementFallback } from "../native-runtime/predecessor-retirement.js";
 
 export type QueuedRunPredecessorHold = {
   reason: "predecessor_still_executing" | "predecessor_cleanup_pending";
@@ -34,6 +35,7 @@ export async function queuedRunPredecessorHold(db: Db, input: {
   for (const previousRunId of new Set([executionOwnerId, ownsIssue ? run.retryOfRunId : null])) {
     if (!previousRunId || previousRunId === run.id) continue;
     const [previous] = await db.select({ status: heartbeatRuns.status, agentId: heartbeatRuns.agentId,
+      resultJson: heartbeatRuns.resultJson,
       issueId: heartbeatRuns.issueId, nativeIssueId: heartbeatRuns.nativeIssueId,
       supersededByFreshContinuation: sql<boolean>`${heartbeatRuns.resultJson} ? 'freshContinuationSupersededAt'`,
       contextIssueId: sql<unknown>`coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId')`,
@@ -53,7 +55,11 @@ export async function queuedRunPredecessorHold(db: Db, input: {
     // A fresh continuation replaced the predecessor: its writes are revoked
     // and it shares no workspace with this run (a fenced remote epoch or a
     // new isolated workspace), so its cleanup continues without holding it.
-    if (!previous?.supersededByFreshContinuation && await hasPendingRunCleanup(db, run.companyId, previousRunId)) {
+    const replacement = previousRunId === run.retryOfRunId && run.scheduledRetryReason === "interrupted_preparation"
+      ? readPredecessorRetirementFallback(previous?.resultJson) : null;
+    if (!previous?.supersededByFreshContinuation && await hasPendingRunCleanup(db, run.companyId, previousRunId,
+      replacement && Array.isArray(replacement.replacedProviderLeaseIds)
+        ? { replacedProviderLeaseIds: replacement.replacedProviderLeaseIds } : undefined)) {
       return { reason: "predecessor_cleanup_pending", predecessorRunId: previousRunId };
     }
   }
