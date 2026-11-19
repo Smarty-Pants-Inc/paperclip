@@ -4,7 +4,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog, agentWakeupRequests, agents, environmentLeases, environments, authUsers, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
-  executionWorkspaces, executionWorkspaceSnapshots, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, workspaceOperations,
+  executionWorkspaces, executionWorkspaceSnapshots, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, workspaceOperations,
 } from "@paperclipai/db";
 import express from "express";
 import request from "supertest";
@@ -174,7 +174,7 @@ describe.skipIf(!support.supported)("Interrupt: after a failed successor's saved
 
   /** The successor starts (native), fails before any provider work; finalization pins its files (the real
    * producer), then the run end releases it (the real release). */
-  async function successorFails(f: F, runId: string) {
+  async function successorFails(f: F, runId: string, options: { providerWork?: boolean } = {}) {
     const errorCode = "native_predecessor_retirement_unproven";
     const started = new Date(Date.now() - 30_000);
     await db.update(heartbeatRuns).set({ status: "running", startedAt: started, runtimeMode: "native", nativeIssueId: f.issueId,
@@ -186,9 +186,12 @@ describe.skipIf(!support.supported)("Interrupt: after a failed successor's saved
     const [failed] = await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), nativePhase: "terminal_failure",
       error: `${errorCode}: The previous run's session on this sandbox could not be retired`, errorCode,
       resultJson: { stopReason: "adapter_failed", failureCause: errorCode,
-        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: options.providerWork === true },
         workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [leaseId] } } })
       .where(eq(heartbeatRuns.id, runId)).returning();
+    // rqold F1: the successor HAD started provider work (the executor's durable start record; a turn was submitted).
+    if (options.providerWork) await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId, agentId: f.agentId,
+      seq: 1, eventType: "native.process_start_requested", stream: "system", level: "info" });
     await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", leaseOwner: null, failureCode: errorCode })
       .where(eq(nativeRunFinalizations.runId, runId));
     // gate 7: the carrying wake FAILED with the run.
@@ -286,7 +289,7 @@ describe.skipIf(!support.supported)("Interrupt: after a failed successor's saved
   }
 
   /** gate 7's chain up to issue.workspace_recovered. */
-  async function chain(aged: boolean) {
+  async function chain(aged: boolean, options: { providerWork?: boolean } = {}) {
     const f = await seedLiveTurn({ aged });
     const owed = await type(f, ["work more", "6 x 7?", "capital of France?"]);
     await barInterrupt(f);
@@ -295,7 +298,7 @@ describe.skipIf(!support.supported)("Interrupt: after a failed successor's saved
     expect(successors, "ONE successor").toHaveLength(1);
     const successor = successors[0]!;
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.blockerRunId));
-    const hold = await successorFails(f, successor.id);
+    const hold = await successorFails(f, successor.id, options);
     await workersPass(f, 0);
     const afterFailure = await state(f, successor.id, hold.id);
     // b79f0559's shape: resolved 'blocked', 'invalidated', nativeFailureBlock present, the kept-message promise.
@@ -397,8 +400,8 @@ describe.skipIf(!support.supported)("Interrupt: after a failed successor's saved
 
   /** gate 7's 888e5d1d as the new build finds it: recovery completed (workspace_recovered) under the OLD build,
    * whose onRecovered queued nothing; the workers have passed; the chat sits 'blocked', untouched. */
-  async function bootShape() {
-    const { f, owed, successor, hold } = await chain(true);
+  async function bootShape(options: { providerWork?: boolean } = {}) {
+    const { f, owed, successor, hold } = await chain(true, options);
     const failed = await workspaceRecovered(f, successor.id, hold.id);
     await workersPass(f, 1);
     const atBoot = await state(f, successor.id, hold.id);
@@ -453,5 +456,44 @@ describe.skipIf(!support.supported)("Interrupt: after a failed successor's saved
     await evidence("B2", { owed, after });
     expect(after.live, JSON.stringify(after)).toEqual([]);
     expect(after.hold?.requeue).toBeUndefined();
+  }, 180_000);
+
+  /** adopt-requeue-f1 (rf-4 rqold F1): the failed successor HAD started provider work. Replaying its messages could
+   * do an action twice; nothing is silently replayed: no run, each owed message keeps its one true card, and the
+   * hold records the refusal. */
+  async function providerWorkRefused(label: string, f: F, owed: string[], successor: { id: string }, holdId: string,
+    dispatch: () => Promise<unknown>) {
+    await dispatch();
+    await workersPass(f, 1);
+    await dispatch();
+    await workersPass(f, 30);
+    await dispatch();
+    const later = await state(f, successor.id, holdId);
+    const [failedRow] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor.id));
+    const runsAfter = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter(r => r.contextSnapshot?.issueId === f.issueId && r.createdAt > failedRow!.finishedAt!)
+      .map(r => ({ id: r.id, status: r.status, ids: r.contextSnapshot?.wakeCommentIds }));
+    const keyed = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.idempotencyKey, `recovered-workspace-requeue:${holdId}`)));
+    await evidence(label, { owed, successor: successor.id, later, runsAfter, keyed: keyed.length });
+    expect(runsAfter, `no replay of a successor that started provider work: ${JSON.stringify({ later, runsAfter })}`).toEqual([]);
+    expect(keyed, "no requeue wake").toEqual([]);
+    // The true cards are the card path's own (unchanged here): one card per failed carrier's batch
+    // (interrupt-lostdouble L1/L1b), told on the batch's newest owed message, which names the failed run's input.
+    expect(later.cards, `the true card, exactly once: ${JSON.stringify(later)}`).toEqual([owed.at(-1)]);
+    expect(later.hold?.requeue, "the hold records the refusal").toMatchObject({ outcome: "refused",
+      refused: "provider_work_started", runId: null, commentIds: [f.m0, ...owed] });
+  }
+
+  it("F1 onRecovered: the failed successor HAD started provider work ⇒ no run, the owed messages keep their true card, the hold records 'refused: provider_work_started'", async () => {
+    const { f, owed, successor, hold } = await chain(true, { providerWork: true });
+    const failed = await workspaceRecovered(f, successor.id, hold.id);
+    await providerWorkRefused("F1", f, owed, successor, hold.id,
+      () => heartbeatService(db).resumeRemoteStopComments(failed as never));
+  }, 180_000);
+
+  it("F1-boot: the stranded sweep's visit to the same shape (provider work started) ⇒ no run, the true cards, the refusal recorded", async () => {
+    const { f, owed, successor, hold } = await bootShape({ providerWork: true });
+    await providerWorkRefused("F1-boot", f, owed, successor, hold.id, () => strandedSweepVisit(f));
   }, 180_000);
 });
