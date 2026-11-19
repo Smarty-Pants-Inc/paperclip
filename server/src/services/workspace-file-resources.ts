@@ -22,6 +22,7 @@ import type {
   WorkspaceFileSource,
 } from "@paperclipai/shared";
 import type { RemoteWorkspaceFiles, RemoteWorkspaceFileAccess, RemoteWorkspaceFileEntry } from "./remote-workspace-files.js";
+import { isAbandonedTaskRoot } from "./task-workspace-selection.js";
 import { HttpError, notFound, unprocessable } from "../errors.js";
 import {
   isWorkspaceGitScanError,
@@ -1223,6 +1224,8 @@ export function workspaceFileResourceService(db: Db, actor?: AuthorizationActor,
       for (const row of executionRows) {
         if (seen.has(row.id)) continue;
         seen.add(row.id);
+        // An abandoned root holds a run's UNSAVED files. It is never a task's files, whichever task still names it.
+        if (isAbandonedTaskRoot(row)) continue;
         candidates.push(candidateFromExecutionWorkspace(row));
       }
     }
