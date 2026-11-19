@@ -967,6 +967,34 @@ describe.skipIf(!support.supported)("a person's Stop holds the messages behind i
   }, 120_000);
 
 
+  // adopt-cutc3 (2): rf3 R17's shape, and Boat's stop receipt lands before the Send (as in R1 / C1 R13b). The
+  // system-cancelled run owns TWO leases: the real producer's LOCAL lease and the warm remote box. The remote
+  // receipt binds only the remote one; admission used to demand it of the local one too, so nothing ever ran.
+  it("rf3 R17 + Boat's receipt: after the receipt lands, the person's Send answers the held message ONCE (no false sweep card)", async () => {
+    const r = await stopWithHeld({ stopKind: 'system', count: 0 });
+    const p = (await r.post('PERSON request while previous run is saving').expect(201)).body.id as string;
+    await r.drive(400);
+    const leases = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, r.firstRunId));
+    expect(leases.map(l => l.provider).sort(), "the stopped run's own local lease and the warm remote box").toEqual(["daytona", "local"]);
+    const stopped = await request(r.client).post(`/api/heartbeat-runs/${r.firstRunId}/cancel`).send({});
+    expect(stopped.status, JSON.stringify(stopped.body)).toBe(200);
+    expect(await readPersonStopHold(db, { companyId: r.companyId, issueId: r.issueId, agentId: r.agentId, messageId: p }))
+      .toMatchObject({ stoppedRunId: r.firstRunId, userId });
+    const q = await r.queue();
+    expect(q.executionWait?.reason).toBe('stopped_by_person');
+    await r.boatStopAnswers();
+    await r.drive(400);
+    expect(successorCalls(), "the receipt alone sends nothing: the Stop still holds").toEqual([]);
+    const sent = await request(r.client).post(`/api/issues/${r.issueId}/queued-comments/interrupt`)
+      .send({ queueId: q.queueId ?? q.id, targetRunId: r.firstRunId, revision: q.revision });
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    await r.drive(4000);
+    await sweep(r, 3); await sweep(r, 11);
+    await evidence('cutc3-R17-receipt-sent', { p, calls: fixture.calls, wakes: await r.wakes(), cards: await cards(r, [p]) });
+    assertExactlyOnce([p]);
+    expect(await cards(r, [p])).toEqual([]);
+  }, 120_000);
+
   // 3d (adopt-lead's pick; rf-3 + rf-4 09:26Z conditions): a person's Stop of an ALREADY-ENDED latest run.
   const endedRunAcceptances = async (runId: string) => (await db.select().from(heartbeatRunEvents).where(and(
     eq(heartbeatRunEvents.runId, runId), eq(heartbeatRunEvents.message, "run.stop.accepted")))).map(row => row.payload as any);
