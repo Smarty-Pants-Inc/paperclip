@@ -3623,8 +3623,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 return { kind: "deferred" as const };
               };
               if (!await taskRetryMutationAllowed(tx as unknown as Db, { companyId: agent.companyId, issueId,
-                actorId: retry.actorId, actorSource: retry.actorSource }))
-                return declineRetry("retry_authority_denied", "The user who requested Retry can no longer change this task.");
+                actorId: retry.actorId, actorSource: retry.actorSource, onBehalfOfUserId: retry.onBehalfOfUserId }))
+                return declineRetry("retry_authority_denied", retry.actorSource === "agent"
+                  ? "The agent that requested Retry can no longer change this task."
+                  : "The user who requested Retry can no longer change this task.");
               if (retry.boardMessageOrigin) {
                 const origin = await readTaskRetryBoardMessageOrigin(tx as unknown as Db, { companyId: agent.companyId,
                   issueId, agentId, sourceRunId: retry.sourceRunId, actorId: retry.actorId });
@@ -3807,7 +3809,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   retry.actorId !== taskRetryActorId || retry.sourceRunId !== durableRequest.failedRunRetry?.failedRunId)
                 throw new FailedChatRunRetryAuthorizationError();
               if (!await taskRetryMutationAllowed(tx as unknown as Db, { companyId: agent.companyId, issueId,
-                actorId: retry.actorId, actorSource: retry.actorSource })) return { kind: "deferred" as const };
+                actorId: retry.actorId, actorSource: retry.actorSource, onBehalfOfUserId: retry.onBehalfOfUserId })) return { kind: "deferred" as const };
             }
           } else {
             if (

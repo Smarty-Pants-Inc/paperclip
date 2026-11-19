@@ -1105,8 +1105,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     const agentRetry = intent.actorSource === "agent";
     await enqueueWakeup(wake.agentId, { source: "on_demand", triggerDetail: "manual", reason: "task_retry",
       requestedByActorType: taskRetryRequesterType(intent.actorSource), requestedByActorId: intent.actorId, taskRetryRequestId: wake.id,
-      // An agent's Retry names the agent; it never claims a person as responsible.
-      payload: { issueId }, contextSnapshot: agentRetry ? { issueId, triggeredBy: "agent", actorId: intent.actorId }
+      // Keep agent attribution separate from its authenticated human principal.
+      payload: { issueId }, contextSnapshot: agentRetry ? { issueId, triggeredBy: "agent", actorId: intent.actorId,
+        responsibleUserId: intent.onBehalfOfUserId }
         : { issueId, triggeredBy: "board", actorId: intent.actorId, responsibleUserId: intent.actorId },
       issueStateGuard: { assigneeAgentId: wake.agentId, statuses: ["todo", "in_progress", "in_review", "blocked"] },
       idempotencyKey: `task-retry-dispatch:${wake.id}` }, wake.id);
