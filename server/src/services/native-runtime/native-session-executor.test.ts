@@ -4,6 +4,8 @@ import { activeNativeExecutionRunIds } from "./native-active-runs.js";
 import { onRetainedNativeSessionCleanupRelease } from "../retained-native-session-cleanup-notifications.js";
 import { readIdleLocalWork, markIdleStartupComplete, markIdleIngressTracked } from "../idle-local-work.js";
 import * as runnerCheckpoint from "./native-runner-checkpoint.js";
+import * as checkpointManifest from "./remote-checkpoint-manifest.js";
+import { logger } from "../../middleware/logger.js";
 import * as harnessStorage from "./native-harness-backup-storage.js";
 import * as sandboxRunnerPortHolders from "./sandbox-runner-port-holders.js";
 import * as stagedAttachmentRecovery from "./native-staged-attachment-recovery.js";
@@ -5629,6 +5631,71 @@ describe("remote provider checkpoint snapshots", () => {
       }),
     ).rejects.toThrow("runner_remote_checkpoint_exclusion_invalid");
   });
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7001525641
+  // Never-OK trace custody: an invalid transfer may be the only surviving copy.
+  it.each(["kept", "rename fails", "rename and logging fail"] as const)(
+    "keeps the extracted checkpoint payload when verification fails: %s",
+    async scenario => {
+      const root = await mkdtemp(join(tmpdir(), "checkpoint-failed-verify-"));
+      const archiveSource = join(root, "source");
+      const parent = join(root, "durable-sessions", "session", "failover-backups", ".pending-test");
+      const targetPath = join(parent, "codex-home");
+      const bytes = Buffer.from("only surviving session trace\n");
+      const digest = createHash("sha256").update(bytes).digest("hex");
+      const verify = checkpointManifest.verifyLocalCheckpointManifest;
+      let verificationError: unknown;
+      const verifySpy = vi.spyOn(checkpointManifest, "verifyLocalCheckpointManifest").mockImplementation(async (...args) => {
+        try { await verify(...args); } catch (error) { verificationError = error; throw error; }
+      });
+      const warnSpy = vi.spyOn(logger, "warn");
+      if (scenario === "rename and logging fail") warnSpy.mockImplementation(() => { throw new Error("logging unavailable"); });
+      try {
+        await mkdir(archiveSource, { recursive: true });
+        await mkdir(targetPath, { recursive: true });
+        await writeFile(join(archiveSource, "session.jsonl"), bytes);
+        await writeFile(join(targetPath, "previous.jsonl"), "previous checkpoint");
+        const archive = execFileSync("tar", ["-czf", "-", "-C", archiveSource, "."]);
+        // The source box is gone before extraction; only the archive remains.
+        await rm(archiveSource, { recursive: true });
+        if (scenario !== "kept") await mkdir(join(parent, "superseded"), { mode: 0o500 });
+        const execute = vi.fn()
+          .mockResolvedValueOnce({ exitCode: 0, timedOut: false, stdout: "", stderr: "" })
+          .mockResolvedValueOnce({ exitCode: 0, timedOut: false, stdout: `1 ${bytes.length + 1}\n`, stderr: "" })
+          .mockResolvedValueOnce({ exitCode: 0, timedOut: false, stdout: archive.toString("base64"), stderr: "" });
+        const failure = await syncRemoteRunnerDirectoryOut({
+          runner: { execute } as never, sourcePath: "/gone/codex-home", targetPath, mode: 0o700,
+        }).then(() => null, error => error);
+        expect(failure).toBe(verificationError);
+        expect(failure).toBeInstanceOf(Error);
+        expect(failure.message).toBe("runner_remote_checkpoint_manifest_mismatch");
+        expect(await readFile(join(targetPath, "previous.jsonl"), "utf8")).toBe("previous checkpoint");
+        let payload: string;
+        if (scenario === "kept") {
+          const kept = await readdir(join(parent, "superseded"));
+          expect(kept).toHaveLength(1);
+          expect(kept[0]).toMatch(/^\d+-[0-9a-f-]+-failed-verify$/);
+          payload = join(parent, "superseded", kept[0]!, "payload");
+          expect((await readdir(parent)).filter(name => name.startsWith(".paperclip-checkpoint-"))).toEqual([]);
+        } else {
+          const staging = (await readdir(parent)).filter(name => name.startsWith(".paperclip-checkpoint-"));
+          expect(staging).toHaveLength(1);
+          payload = join(parent, staging[0]!, "payload");
+          expect(warnSpy).toHaveBeenCalledWith(
+            expect.objectContaining({ event: "native_checkpoint_failed_verify_keep_deferred" }),
+            expect.any(String),
+          );
+        }
+        expect(createHash("sha256").update(await readFile(join(payload, "session.jsonl"))).digest("hex")).toBe(digest);
+        expect(await readFile(join(payload, "session.jsonl"))).toEqual(bytes);
+      } finally {
+        verifySpy.mockRestore();
+        warnSpy.mockRestore();
+        if (scenario !== "kept") await chmod(join(parent, "superseded"), 0o700);
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("rejects unsafe fallback archives without replacing durable state", async () => {
     const root = await mkdtemp(join(tmpdir(), "paperclip-checkpoint-unsafe-"));
