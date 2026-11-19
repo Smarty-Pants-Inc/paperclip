@@ -50,6 +50,7 @@ import { ProviderToolIconsProvider } from "@/components/ProviderToolIcon";
 import { McpAppTurnViews, mcpAppRunRefreshKey } from "@/components/mcp-app/McpAppTurnViews";
 import { ToolCallProgressProvider } from "@/components/task-chat/tool-call-progress";
 import { TaskChatRunnerHeader, TaskChatRunnerTurn } from "@/components/task-chat/TaskChatRunnerTurn";
+import { RUN_STALLED_LINE, useRunStalled } from "@/components/task-chat/useRunStalled";
 import { partitionRunHealthItems } from "@/components/task-chat/TaskChatRunHealthBanner";
 import {
   TaskChatTurnStatusIsland,
@@ -1173,6 +1174,33 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     if (activeRun && isLiveIssueRun(activeRun, issueStatus)) return activeRun;
     return (liveRuns ?? []).find((r) => isLiveIssueRun(r, issueStatus)) ?? null;
   }, [activeRun, issueStatus, liveRuns]);
+
+  // The person's message the live run carries, while it is still waiting for its answer and nothing else on the
+  // thread already speaks for it: no agent reply after it, and no "wasn't answered" notice (the sweep's group
+  // notice owns the thread then; never two lines). Derived from data the thread already has: the run's wake
+  // comment and its last event time (api/heartbeats.ts lastEventAt, kept current by LiveUpdatesProvider; no new
+  // server notice row).
+  const stalledRunMessageId = useMemo(() => {
+    if (!liveRun || liveRun.status !== "running") return null;
+    const messageId = liveRun.contextWakeCommentId ?? liveRun.contextCommentId ?? null;
+    const message = messageId ? comments.find((comment) => comment.id === messageId && comment.authorType === "user") : null;
+    if (!message) return null;
+    const sentMs = toMs(message.createdAt);
+    const answered = comments.some((comment) => comment.authorType === "agent" && toMs(comment.createdAt) > sentMs);
+    const noticed = comments.some((comment) => {
+      const reason = (comment.metadata as { authorizationReason?: unknown } | null | undefined)?.authorizationReason;
+      return comment.authorType === "system" && typeof reason === "string" && reason.startsWith("unanswered_message:");
+    });
+    return answered || noticed ? null : message.id;
+  }, [comments, liveRun]);
+  // The run's last event: the newest of the live event time (socket), the saved last-output time the GET returns
+  // (outputSilence.lastOutputAt; it survives a reload) and, for a run that never had an event, its start.
+  const runStalled = useRunStalled(
+    stalledRunMessageId !== null,
+    liveRun
+      ? Math.max(toMs(liveRun.lastEventAt), toMs(liveRun.outputSilence?.lastOutputAt), toMs(liveRun.startedAt ?? liveRun.createdAt))
+      : null,
+  );
 
   // The live runner turn remains the sole owner of its response until the
   // canonical comment and settled activity are both ready. This state is
@@ -3699,6 +3727,16 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                                   )}
                                   </TaskChatShimmerScope>
                                 </div>
+                              ) : null}
+                              {runStalled ? (
+                                <p
+                                  className="mt-2 px-1 text-xs text-muted-foreground"
+                                  role="status"
+                                  data-testid="task-chat-run-stalled-line"
+                                  data-run-id={liveRun?.id}
+                                >
+                                  {RUN_STALLED_LINE}
+                                </p>
                               ) : null}
                               {tailTaskCreationItems.map(item => (
                                 <div key={item.id} data-thread-anchor={item.id} data-thread-item-kind={item.kind} className="mt-4">
