@@ -1,9 +1,26 @@
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { DeadlineReconciliationSnapshot } from "./deadline-reconciliation.js";
 import { takeCompanyWorkBatch } from "./company-work-batch.js";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { DELIVERY_QUEUES, type DeliveryQueue } from "./delivery-work-notifications.js";
 import { logger } from "../middleware/logger.js";
+
+// TEMP: one async context per dispatched check, including owner SQL/transactions.
+export const recoveryCheckDiagnostic = new AsyncLocalStorage<{
+  sqlMs: number; queries: number; slowestSqlMs: number; slowestQuery: string | null;
+  outcome: string; pendingDeadline?: number; effects?: Record<string, number>;
+}>();
+let diagnosticWindowAt = -Infinity, diagnosticLines = 0;
+function logDiagnostic(fields: Record<string, unknown>) {
+  try {
+    const now = Date.now();
+    if (now < diagnosticWindowAt || now - diagnosticWindowAt >= 60_000) { diagnosticWindowAt = now; diagnosticLines = 0; }
+    if (diagnosticLines >= 200) return;
+    diagnosticLines++;
+    logger.info(fields, "[recovery-diag]");
+  } catch { /* Diagnostics must not change recovery. */ }
+}
 
 // TEMP gate-only diagnostics. No timers, queries, or scheduling decisions.
 export type RecoveryDiagnosticCanRun = (() => boolean) & {
@@ -72,24 +89,41 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
   let lastDiagnosticAt = -Infinity;
   let lastCompletedPassAt: number | null = null;
   let dueEntryCount = 0, checksRunThisPass = 0;
+  type Cause = "pendingDeadline" | "rearmedAfterCheck" | "freshDirtyScope" | "scopeRescan";
+  const provenance = new Map<string, { cause: Cause; hintKind?: string; fromDueAt?: number; dueAt: number }>();
+  const checkedIds = new Set<string>();
+  let previousDue = new Set<string>();
+  let passDetails: Record<string, unknown> = {};
+  const hintCounts: Record<string, number> = {};
+  const hintSources: Record<string, number> = {};
+  const hintKind = (hint: string) => {
+    if (hint === "*") return "*";
+    try { return JSON.parse(hint).issueId ? "issue" : "company"; } catch { return "invalid"; }
+  };
+  const noteHint = (hint: string, source: string) => {
+    const kind = hintKind(hint);
+    hintCounts[kind] = (hintCounts[kind] ?? 0) + 1;
+    hintSources[source] = (hintSources[source] ?? 0) + 1;
+  };
+  noteHint("*", "startup");
   function diagnostic(phase: string, extra: Record<string, unknown> = {}) {
     if (!recoveryQueues.has(options.queue)) return;
     const now = Date.now();
-    if (now - lastDiagnosticAt < 60_000) return;
+    if (phase !== "pass-completed" && phase !== "pass-failed" && phase !== "pass-aborted" && phase !== "pass-interrupted" && now - lastDiagnosticAt < 60_000) return;
     // Logging failure must never change recovery, including its error path.
     try {
       lastDiagnosticAt = now;
       const backoffs = (map: typeof failures, key: string) => [...map].slice(0, 25).map(([id, failure]) => ({
         [key]: id, ...failure, backoffMs: Math.max(0, failure.retryAt - now),
       }));
-      logger.info({ queue: options.queue, phase,
+      logDiagnostic({ queue: options.queue, phase,
         ...canRun.recoveryDiagnostics?.(), ...options.diagnostics?.(),
         dueEntryCount, checksRunThisPass, pendingEntryCount: entries.size, dirtyScopeCount: dirty.size,
         scopeFailureCount: scopeFailures.size, entryFailureCount: failures.size,
         scopeFailures: backoffs(scopeFailures, "scope"), entryFailures: backoffs(failures, "id"),
         lastCompletedPassAgoMs: lastCompletedPassAt === null ? null : now - lastCompletedPassAt,
-        ...extra,
-      }, "[recovery-diag]");
+        ...passDetails, ...extra,
+      });
     } catch { /* Diagnostic-only: retain the original scheduling and failure. */ }
   }
   const observeCoordinatorGate = (gates: Record<string, boolean | null>) =>
@@ -122,11 +156,16 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
     pausePassiveMaintenance: true,
     onStop: () => { recoveryGateObservers.get(coordinator)?.delete(observeCoordinatorGate); stopped = true; revision++; options.onStop?.(); },
     onSettled: hints => { revision++; for (const hint of hints ?? ["*"]) {
+      noteHint(hint, "onSettled (source unavailable)");
       dirty.add(hint); versions.set(hint, (versions.get(hint) ?? 0) + 1);
     } },
     run: async signal => {
       revision++; running = true;
       let passStarted = false, passFailed = false, passCompleted = false;
+      const passAt = performance.now();
+      let loadMs = 0;
+      let beforePassMs = 0, checkMs = 0, checkSqlMs = 0;
+      let diagnosticPassId: string | null = null;
       try {
         if (!canRun()) { diagnostic("pass-blocked", { canRun: false }); return; }
         if (Date.now() < earliest) return;
@@ -138,11 +177,14 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
         earliest = Date.now() + (options.minimumPassIntervalMs ?? 1000);
         passStarted = true;
         dueEntryCount = 0; checksRunThisPass = 0;
+        diagnosticPassId = `${ownerRevision}:${revision}`;
+        passDetails = { passId: diagnosticPassId };
+        const beforeAt = performance.now();
         try { await options.beforePass?.(); } catch (error) {
           for (const hint of ready) failed(scopeFailures, hint);
           for (const entry of entries.values()) if (entry.dueAt <= Date.now()) failed(failures, entry.id);
           throw error;
-        }
+        } finally { beforePassMs = performance.now() - beforeAt; }
         const errors: unknown[] = [];
         const requested = ready.includes("*")
           ? ["*", ...ready.filter(hint => hint !== "*")].slice(0, 25)
@@ -155,18 +197,27 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
           let decoded = false;
           try {
             scope = options.decodeScope(hint); decoded = true;
+            const rescan = scans.has(hint);
             const scan = scans.get(hint) ?? { version: versions.get(hint) ?? 0, seen: new Set<string>() };
             scans.set(hint, scan);
-            const loaded = await options.load(scope, signal);
+            const loadAt = performance.now();
+            let loaded: Awaited<ReturnType<typeof options.load>>;
+            try { loaded = await options.load(scope, signal); }
+            finally { loadMs += performance.now() - loadAt; }
             const result = Array.isArray(loaded) ? { rows: loaded, complete: true } : loaded;
             for (const entry of result.rows ?? []) {
               const pending = entries.get(entry.id);
-              entries.set(entry.id, pending && options.mergeEntry ? options.mergeEntry(pending, entry) : entry);
+              const merged = pending && options.mergeEntry ? options.mergeEntry(pending, entry) : entry;
+              entries.set(entry.id, merged);
+              if (!pending || merged.dueAt !== pending.dueAt) provenance.set(entry.id, {
+                cause: pending || checkedIds.has(entry.id) ? "rearmedAfterCheck" : rescan ? "scopeRescan" : "freshDirtyScope",
+                hintKind: hintKind(hint), fromDueAt: pending?.dueAt, dueAt: merged.dueAt,
+              });
               for (const [other, progress] of scans) if (options.matches(entry, options.decodeScope(other))) progress.seen.add(entry.id);
             }
-            if (!result.complete) { dirty.add(hint); continue; }
+            if (!result.complete) { noteHint(hint, "incomplete scope re-scan"); dirty.add(hint); continue; }
             if (result.rows !== null) for (const entry of entries.values()) if (options.matches(entry, scope) && !scan.seen.has(entry.id)) {
-              entries.delete(entry.id); failures.delete(entry.id);
+              entries.delete(entry.id); failures.delete(entry.id); provenance.delete(entry.id);
             }
             scans.delete(hint);
             const reconstructionInterval = typeof options.reconstructionIntervalMs === "function"
@@ -174,11 +225,12 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
             if (reconstructionInterval > 0) {
               reconstructAfter.set(hint, Date.now() + reconstructionInterval);
             }
-            if ((versions.get(hint) ?? 0) !== scan.version) dirty.add(hint); else versions.delete(hint);
+            if ((versions.get(hint) ?? 0) !== scan.version) { noteHint(hint, "scope changed during scan"); dirty.add(hint); } else versions.delete(hint);
             if (!scope) scopeFailures.clear(); else scopeFailures.delete(hint);
           } catch (error) {
             const retryHint = decoded ? hint : "*";
             if (!decoded) { scans.delete(hint); versions.delete(hint); }
+            noteHint(retryHint, "scope load error");
             dirty.add(retryHint); failed(scopeFailures, retryHint); errors.push(error);
           }
         }
@@ -188,6 +240,18 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
           .sort((a, b) => (options.priority?.(b) ?? 0) - (options.priority?.(a) ?? 0)
             || a.dueAt - b.dueAt || a.id.localeCompare(b.id));
         dueEntryCount = due.length;
+        const newlyDue = due.filter(entry => !previousDue.has(entry.id));
+        const dueReasons: Record<string, number> = { pendingDeadline: 0, rearmedAfterCheck: 0, freshDirtyScope: 0, scopeRescan: 0, unknown: 0 };
+        const freshDirtyHints: Record<string, number> = {};
+        for (const entry of newlyDue) {
+          const origin = provenance.get(entry.id);
+          dueReasons[origin?.cause ?? "unknown"]++;
+          if (origin?.cause === "freshDirtyScope" && origin.hintKind) freshDirtyHints[origin.hintKind] = (freshDirtyHints[origin.hintKind] ?? 0) + 1;
+        }
+        previousDue = new Set(due.map(entry => entry.id));
+        passDetails = { passId: diagnosticPassId, newlyDueCount: newlyDue.length, dueReasons, freshDirtyHints,
+          rearmHistoryLimit: 2048,
+          newlyDueEntries: newlyDue.map(entry => ({ id: entry.id, companyId: entry.companyId, ...provenance.get(entry.id) })) };
         const batch = takeCompanyWorkBatch(due, options.batchSize ?? 25, lastCompany); lastCompany = batch.lastCompany;
         // An owner may share more than one resource (for example a task and an
         // endpoint). Merge intersecting keys before dispatch so waiting siblings
@@ -244,13 +308,34 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
         const notify = () => { const resolve = changed; changed = null; resolve?.(); };
         const checkEntry = async (entry: Entry) => {
           checksRunThisPass++;
+          previousDue.delete(entry.id);
           running += 1;
+          const checkAt = performance.now(), dueLagMs = Date.now() - entry.dueAt;
+          const timing = { sqlMs: 0, queries: 0, slowestSqlMs: 0, slowestQuery: null as string | null, outcome: "none" };
           try {
-            const current = await options.check(entry, signal);
-            if (current) entries.set(entry.id, current); else entries.delete(entry.id);
+            const current = await recoveryCheckDiagnostic.run(timing, () => options.check(entry, signal));
+            if (current) {
+              entries.set(entry.id, current);
+              provenance.set(entry.id, { cause: "pendingDeadline", fromDueAt: entry.dueAt, dueAt: current.dueAt });
+              if (timing.outcome === "none") timing.outcome = "pending deadline";
+            } else { entries.delete(entry.id); provenance.delete(entry.id); }
+            checkedIds.add(entry.id);
+            // Diagnostic-only identity history, bounded independently of queue state.
+            if (checkedIds.size > 2048) checkedIds.delete(checkedIds.values().next().value!);
             failures.delete(entry.id);
-          } catch (error) { failed(failures, entry.id); errors.push(error); }
+          } catch (error) { timing.outcome = "error"; failed(failures, entry.id); errors.push(error); }
           finally {
+            const ms = performance.now() - checkAt;
+            checkMs += ms; checkSqlMs += timing.sqlMs;
+            if (recoveryQueues.has(options.queue)) logDiagnostic({ queue: options.queue, phase: "check", passId: diagnosticPassId,
+              kind: options.queue === DELIVERY_QUEUES.taskWatchdogs ? "watchdog" :
+                options.queue === DELIVERY_QUEUES.orphanBlockers || options.queue === DELIVERY_QUEUES.activeRecoveryActions ? "company" : "issue",
+              id: entry.id, issueId: options.queue === DELIVERY_QUEUES.taskWatchdogs ||
+                options.queue === DELIVERY_QUEUES.orphanBlockers || options.queue === DELIVERY_QUEUES.activeRecoveryActions ? null : entry.id,
+              companyId: entry.companyId,
+              dueLagMs, ms, ...timing,
+              sqlTimingBoundary: "postgres-js unsafe consumption; includes pool/network/event-loop waits and unsafe savepoints; excludes driver-tagged SQL/BEGIN/COMMIT",
+            });
             running -= 1;
             lastChecked.set(entry.id, Date.now());
             notify();
@@ -324,7 +409,16 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
       } catch (error) { passFailed = true; lastRunFailed = true; throw error; }
       finally {
         if (passStarted) {
-          diagnostic(passFailed ? "pass-failed" : signal.aborted ? "pass-aborted" : passCompleted ? "pass-completed" : "pass-interrupted");
+          diagnostic(passFailed ? "pass-failed" : signal.aborted ? "pass-aborted" : passCompleted ? "pass-completed" : "pass-interrupted", {
+            passMs: performance.now() - passAt, loadMs, beforePassMs, checkMs, checkSqlMs,
+            dirtyHintsByKind: { ...hintCounts },
+            remainingDirtyHintsByKind: [...dirty].reduce<Record<string, number>>((counts, hint) => {
+              const kind = hintKind(hint); counts[kind] = (counts[kind] ?? 0) + 1; return counts;
+            }, {}),
+            dirtyHintSources: Object.entries(hintSources).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([source, count]) => ({ source, count })),
+          });
+          for (const key of Object.keys(hintCounts)) delete hintCounts[key];
+          for (const key of Object.keys(hintSources)) delete hintSources[key];
           if (passCompleted) lastCompletedPassAt = Date.now();
         }
         running = false; revision++;
@@ -343,6 +437,7 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
   }
   function invalidate(hint = "*") {
     revision++;
+    noteHint(hint, "invalidate/refresh");
     dirty.add(hint); versions.set(hint, (versions.get(hint) ?? 0) + 1);
     worker.wake();
   }

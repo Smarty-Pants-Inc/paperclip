@@ -4,9 +4,84 @@ import { agentWakeupRequests, issueComments, issueRecoveryActions, issueRelation
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES, type DeliveryQueue } from "../delivery-work-notifications.js";
 import type { IssueRecoveryScope } from "../issue-recovery-notifications.js";
-import { registerScopedDeadlineWork } from "../scoped-deadline-work.js";
+import { recoveryCheckDiagnostic, registerScopedDeadlineWork } from "../scoped-deadline-work.js";
 import { recoveryActionSweepCondition } from "./blocker-stall-wakeups.js";
 import { unansweredPersonMessageCommentCondition, unansweredPersonMessageCondition } from "./unanswered-person-message.js";
+
+// TEMP gate-only: observe the *shared* driver so closed-over owner services and
+// their transactions are measured too. Never execute a lazy query to time it.
+const diagnosticClients = new WeakSet<object>();
+export function installRecoverySqlDiagnostics(db: Db) {
+  type Method = (this: unknown, ...args: unknown[]) => unknown;
+  function visit(value: unknown) {
+    if ((!value || typeof value !== "object") && typeof value !== "function") return;
+    const target = value as Record<string, unknown>;
+    if (diagnosticClients.has(target)) return;
+    diagnosticClients.add(target);
+    const unsafe = target.unsafe;
+    if (typeof unsafe === "function") target.unsafe = function (this: unknown, ...args: unknown[]) {
+      const result = Reflect.apply(unsafe, this, args);
+      const timing = recoveryCheckDiagnostic.getStore();
+      if (!timing || !result || typeof result !== "object") return result;
+      try {
+        const query = result as Record<string, unknown>, then = query.then;
+        if (typeof then !== "function") return result;
+        let consumed = false;
+        query.then = function (this: unknown, ...handlers: unknown[]) {
+          if (consumed) return Reflect.apply(then, this, handlers);
+          consumed = true;
+          const start = performance.now();
+          timing.queries++;
+          const finish = () => {
+            try {
+              const ms = performance.now() - start;
+              timing.sqlMs += ms;
+              if (ms >= timing.slowestSqlMs) {
+                timing.slowestSqlMs = ms;
+                // Values/params are never emitted. Strip literals and comments
+                // before truncation (including raw SQL's dollar-quoted values).
+                timing.slowestQuery = typeof args[0] === "string" ? args[0]
+                  .replace(/'(?:''|\\[\s\S]|[^'])*'|\$([A-Za-z_][A-Za-z_0-9]*)?\$[\s\S]*?\$\1\$|\/\*[\s\S]*?\*\/|--[^\n]*|\b\d+(?:\.\d+)?\b/g, "?")
+                  .replace(/\s+/g, " ").slice(0, 120) : null;
+              }
+            } catch { /* Diagnostic-only. */ }
+          };
+          let promise: unknown;
+          try { promise = Reflect.apply(then, this, []); }
+          catch (error) { finish(); throw error; }
+          const measured = Promise.resolve(promise).then(value => { finish(); return value; }, error => { finish(); throw error; });
+          return Reflect.apply(measured.then, measured, handlers);
+        } satisfies Method;
+      } catch { /* Unsupported/mocked driver: leave the query alone. */ }
+      return result;
+    } satisfies Method;
+    for (const name of ["begin", "savepoint"]) {
+      const original = target[name];
+      if (typeof original !== "function") continue;
+      target[name] = function (this: unknown, ...args: unknown[]) {
+        return Reflect.apply(original, this, args.map(arg => typeof arg !== "function" ? arg : function (this: unknown, ...inner: unknown[]) {
+          try { visit(inner[0]); } catch { /* Diagnostic-only. */ }
+          return Reflect.apply(arg, this, inner);
+        }));
+      } satisfies Method;
+    }
+  }
+  try { visit(db.$client); } catch { /* Diagnostic-only. */ }
+}
+function observeResult(result: unknown, next: number | null) {
+  try {
+    const timing = recoveryCheckDiagnostic.getStore();
+    if (!timing) return;
+    const counts = result && typeof result === "object" ? result as Record<string, unknown> : {};
+    const dispatchKeys = ["assignmentDispatched", "dispatchRequeued", "continuationRequeued", "dispositionRepairRequeued", "reviewParticipantRequeued"];
+    timing.effects = Object.fromEntries([...dispatchKeys, "unansweredMessagesNoticed"].filter(key => typeof counts[key] === "number")
+      .map(key => [key, Number(counts[key])]));
+    const positive = (keys: string[]) => keys.some(key => typeof counts[key] === "number" && Number(counts[key]) > 0);
+    timing.outcome = positive(dispatchKeys)
+      ? "delivered" : positive(["unansweredMessagesNoticed"]) ? "note" : next !== null ? "pending deadline" : "none";
+    if (next !== null) timing.pendingDeadline = next;
+  } catch { /* Diagnostic-only, including unfamiliar owner results. */ }
+}
 
 type Entry = { id: string; companyId: string; dueAt: number; unanswered?: boolean };
 /** `unanswered`: whether this task has a person's message to settle (stranded worker only). */
@@ -33,6 +108,7 @@ export function registerIssueRecoveryWork(
   },
   canRun: () => boolean,
 ) {
+  installRecoverySqlDiagnostics(db);
   function register(queue: DeliveryQueue, statuses: string[] | null, check: (scope: Scope) => Promise<unknown>,
     alsoBlockedWhen?: () => ReturnType<typeof unansweredPersonMessageCondition>) {
     const cursors = new Map<string, string>();
@@ -92,9 +168,10 @@ export function registerIssueRecoveryWork(
       check: async entry => {
         if (!enabled) return null;
         let next: number | null = null;
-        await check({ companyId: entry.companyId, issueId: entry.id,
+        const result = await check({ companyId: entry.companyId, issueId: entry.id,
           ...(entry.unanswered === undefined ? {} : { unanswered: entry.unanswered }),
           onDeferredDeadline: at => { next = next === null ? at : Math.min(next, at); } });
+        observeResult(result, next);
         return next === null ? null : { ...entry, dueAt: next };
       },
     }, canRun);
@@ -127,8 +204,9 @@ export function registerIssueRecoveryWork(
       check: async entry => {
         if (!enabled) return null;
         let next: number | null = null;
-        await sweep.checkIssue({ companyId: entry.companyId, issueId: entry.id,
+        const result = await sweep.checkIssue({ companyId: entry.companyId, issueId: entry.id,
           onDeferredDeadline: at => { next = next === null ? at : Math.min(next, at); } });
+        observeResult(result, next);
         return next === null ? null : { ...entry, dueAt: next };
       },
     }, canRun);

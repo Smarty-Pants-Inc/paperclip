@@ -32,6 +32,7 @@ function fixture(gate: "warmStandby" | "idleTaskDrain" | "schedulerStopped" | "t
 }
 
 it("names a blocked gate, reports pass counts, and shares a 60-second worker rate limit", async () => {
+  // Diag2 keeps blocked-state throttling, but emits every pass/check up to the shared 200/min cap.
   const f = fixture();
   try {
     expect(f.task().nextRunAt?.()).toBe(130_000);
@@ -44,14 +45,14 @@ it("names a blocked gate, reports pass counts, and shares a 60-second worker rat
     await vi.advanceTimersByTimeAsync(1);
     f.resume();
     await f.task().run(new AbortController().signal);
-    expect(f.info).toHaveBeenCalledTimes(2);
+    expect(f.info.mock.calls.filter(([fields]) => (fields as any).phase === "check")).toHaveLength(2);
     expect(f.info).toHaveBeenLastCalledWith(expect.objectContaining({ phase: "pass-completed", enabled: true,
       schedulingSuppressed: false, dueEntryCount: 2, checksRunThisPass: 2, scopeFailures: [], entryFailures: [],
       lastCompletedPassAgoMs: null }), "[recovery-diag]");
     f.worker.invalidate();
     await vi.advanceTimersByTimeAsync(1_000);
     await f.task().run(new AbortController().signal);
-    expect(f.info).toHaveBeenCalledTimes(2);
+    expect(f.info.mock.calls.filter(([fields]) => (fields as any).phase === "pass-completed")).toHaveLength(2);
     await vi.advanceTimersByTimeAsync(59_000);
     f.worker.invalidate();
     await f.task().run(new AbortController().signal);
