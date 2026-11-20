@@ -462,7 +462,11 @@ it.each([500, 8])("BOUND native: coalesce %i ms before end gets one real answeri
       .where(eq(nativeRunFinalizations.runId, f.runId));
     await db.update(issues).set({ executionRunId: null, checkoutRunId: null, executionAgentNameKey: null, executionLockedAt: null })
       .where(eq(issues.id, f.issueId));
-    await db.update(agentWakeupRequests).set({ updatedAt: last }).where(eq(agentWakeupRequests.id, wake.id));
+    // The bound's quiet clock is the last COALESCE (requested_at / the coalesce marker),
+    // never updated_at (rf-3 C1 on 7d1ee176): backdate those, not updatedAt.
+    await db.update(agentWakeupRequests).set({ updatedAt: last, requestedAt: last,
+      payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{_paperclipLastCoalescedAt}', to_jsonb(${last.toISOString()}::text))` })
+      .where(eq(agentWakeupRequests.id, wake.id));
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(last.getTime() + gap) })
       .where(eq(heartbeatRuns.id, f.runId));
     await hb.sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
