@@ -1058,9 +1058,11 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
         codeBlockEditorDescriptors: [FALLBACK_CODE_BLOCK_DESCRIPTOR],
       }),
       codeMirrorPlugin({ codeBlockLanguages: CODE_BLOCK_LANGUAGES }),
-      markdownShortcutPlugin(),
     ];
+    // Chat sends text as typed; only explicit commands should apply formatting.
+    // Other editor surfaces retain MDXEditor's markdown typing shortcuts.
     if (verbatimText) all.push(typedFencePlugin());
+    else all.push(markdownShortcutPlugin());
     all.push(imagePlugin({ imageUploadHandler: imageHandler, disableImageSettingsButton: true }));
     return all;
   }, [hasImageUpload, verbatimText]);
