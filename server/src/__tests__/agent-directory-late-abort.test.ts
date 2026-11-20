@@ -1092,4 +1092,128 @@ describe("agent directory collection aborted after the canonical commit boundary
     expect.soft(pinsAfter, "the bookkeeping continued after the answer").toEqual([]);
     expect.soft(lockFreeAfter).toBe(true);
   }, 60_000);
+
+  // UNVERIFIED-PROJECTION READERS (rf-3 3b(iv), smarty-dev#20787). Person case:
+  // a save fails after its tree merge AND the rollback restore ITSELF fails (a
+  // double fault). The on-disk files then hold bytes that were never saved, and
+  // the projection is marked unverified (its generation marker is removed).
+  // A person reading the agent's instructions through feedback or through the
+  // support inspection must get the saved files (restored from the durable
+  // head under the agent row lock) or a truthful "not available", never the
+  // failed save's bytes. Boundary: the REAL readers (feedbackService
+  // .saveIssueVote -> its trace bundle; readCustomerSuccessResource), a real
+  // agent, real PostgreSQL and files, and rf-3's failed-restore plant below.
+
+  /**
+   * PLANTED FAULT, named at its line: rf-3's failed-restore plant (rf3-mcoll9
+   * judge-mcoll9-next.test.ts, "JUDGE next unsafe"). The rollback of a failed
+   * save puts each kept file back with fs.rename from its `.agent-files-undo-`
+   * directory; the SECOND of those renames fails with EIO, so the restore
+   * stops part-way and the tree keeps bytes of the failed save.
+   */
+  function plantFailedRestore() {
+    const realRename = fs.rename.bind(fs);
+    const fault = { undoRenames: 0, failed: 0 };
+    const spy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (String(from).includes(".agent-files-undo-") && ++fault.undoRenames === 2) {
+        fault.failed++;
+        throw Object.assign(new Error("PLANTED restore failure: the rollback's undo rename fails part-way"), { code: "EIO" }); // PLANTED FAILURE (rf-3's failed-restore plant)
+      }
+      return realRename(from, to);
+    });
+    return { fault, remove: () => spy.mockRestore() };
+  }
+
+  it.each(["feedback", "customer-success inspection"] as const)("R16 the rollback restore itself fails (rf-3's failed-restore plant: PostgreSQL rejects the durable head, then the undo rename fails with EIO): the real %s reader returns the saved files or 'not available', never the failed save's bytes", async reader => {
+    // The saved (durable) files before the run. `0-first.txt` sorts before the
+    // entry file, so the entry file is the second undo rename: the planted one.
+    const saved: Record<string, string> = { [entryFile]: "# Policy\n", "0-first.txt": "saved first file\n", "edit-me.txt": "pre-existing edited file\n",
+      "delete-me.txt": "pre-existing deleted file\n", "outside/deep/untouched.bin": "outside merge entries must never change\n" };
+    for (const [name, body] of Object.entries(saved)) {
+      await fs.mkdir(path.dirname(path.join(root, name)), { recursive: true });
+      await fs.writeFile(path.join(root, name), body);
+    }
+    const { service, copy, executionTarget, runId, note } = await stoppedRunWithUnsavedNote({ agentFileLateAbortSettleMs: 200 });
+    // The stopped run's changes. Its save fails: none of these bytes is ever saved.
+    const neverSaved = { entry: "# NEVER SAVED instructions of the failed save\n", edit: "new failed-save edit\n" };
+    const run = (name: string) => path.join(copy.executionRoot, name);
+    await fs.writeFile(run("0-first.txt"), "new failed-save first file\n");
+    await fs.writeFile(run(entryFile), neverSaved.entry);
+    await fs.writeFile(run("edit-me.txt"), neverSaved.edit);
+    await fs.rm(run("delete-me.txt"));
+    await fs.mkdir(run("added"), { recursive: true });
+    await fs.writeFile(run("added/new.txt"), "new failed-save addition\n");
+    const before = await canonical(note);
+    const [savedHead] = await observer.select().from(agentFileRoots).where(eq(agentFileRoots.agentId, agentId));
+    const savedListing = (savedHead?.entries ?? []).flatMap(entry => entry.kind === "file" ? [[entry.path, entry.size] as const] : []).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+    expect(before.manifestHash, "fixture: manifest == tree before the collection").toBe(before.treeHash);
+    const rejection = await plantDurableHeadRejection(); // PLANTED: the real persist fails after the tree merge
+    const restoreFault = plantFailedRestore(); // PLANTED: the rollback restore of that failed save fails part-way (EIO)
+    const { controller, fault, persisting } = plantAbortAsPersistStarts(note, false);
+    const collection = outcomeOf(service.collectStopped({ companyId, runId, target: executionTarget, signal: controller.signal }));
+    await Promise.race([persisting, collection]);
+    const failure = await collection;
+    await drainAgentFileCheckpoints();
+    await appliesSettled();
+    restoreFault.remove();
+    await rejection.disarm();
+    // RAW: the double fault as it is on disk and in PostgreSQL, before any reader.
+    const markerPath = path.join(path.dirname(root), "file-sync", "durable-generation");
+    const readMarker = () => fs.readFile(markerPath, "utf8").catch(() => null);
+    const onDisk = async (name: string) => fs.readFile(path.join(root, name), "utf8").catch(() => null);
+    const faulted = { marker: await readMarker(), ...await canonical(note), entry: await onDisk(entryFile), edit: await onDisk("edit-me.txt") };
+
+    let returned: { entry: string | null; edit: string | null; listing: unknown; unavailable: string | null; raw: unknown };
+    if (reader === "feedback") {
+      // READER: the real feedback path. A person votes on the agent's comment; the
+      // trace bundle carries the agent's current instructions (listing + entry body).
+      const { feedbackService } = await import("../services/feedback.js");
+      const { issues, issueComments } = await import("@paperclipai/db");
+      const issueId = randomUUID(), commentId = randomUUID();
+      await db.insert(issues).values({ id: issueId, companyId, title: "Feedback on an agent whose last save failed", status: "todo", priority: "medium", createdByUserId: userId });
+      await db.insert(issueComments).values({ id: commentId, companyId, issueId, authorAgentId: agentId, body: "The agent's answer." });
+      const feedback = feedbackService(db);
+      await feedback.saveIssueVote({ issueId, targetType: "issue_comment", targetId: commentId, vote: "up", authorUserId: userId, allowSharing: true });
+      const [trace] = await feedback.listFeedbackTraces({ companyId, issueId, includePayload: true });
+      const context = ((trace?.payloadSnapshot as { bundle?: { agentContext?: Record<string, unknown> | null } } | null)?.bundle?.agentContext ?? null);
+      const instructions = (context?.instructions ?? null) as { entryBody?: string | null; files?: Array<{ path: string; size: number }> } | null;
+      const notes = (trace?.payloadSnapshot as { redactionSummary?: { notes?: string[] } } | null)?.redactionSummary?.notes ?? [];
+      returned = { entry: instructions?.entryBody ?? null, edit: null,
+        listing: instructions?.files ? instructions.files.map(file => [file.path, file.size] as const).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0) : null,
+        unavailable: instructions ? null : notes.find(item => /agent_instructions_unavailable/.test(item)) ?? "instructions omitted without a reason", raw: { instructions, notes } };
+    } else {
+      // READER: the real support inspection of the agent's instruction files.
+      const { readCustomerSuccessResource } = await import("../services/customer-success-inspection.js");
+      const inspect = async (file?: string) => await readCustomerSuccessResource(db, memoryStorage() as never,
+        { operation: "instructions.file", companyId, resourceId: agentId, ...(file ? { path: file } : {}) } as never) as { available: boolean; reason?: string; content?: string };
+      const text = (answer: { available: boolean; content?: string }) => answer.available ? Buffer.from(answer.content ?? "", "base64").toString("utf8") : null;
+      const entry = await inspect(), edit = await inspect("edit-me.txt");
+      returned = { entry: text(entry), edit: text(edit), listing: null, unavailable: entry.available && edit.available ? null : String(entry.reason ?? edit.reason), raw: { entry, edit } };
+    }
+    const after = { marker: await readMarker(), ...await canonical(note), entry: await onDisk(entryFile), edit: await onDisk("edit-me.txt") };
+    await evidence(`r16-failed-restore-${reader === "feedback" ? "feedback" : "inspection"}-reader.json`, { reader, plant: { persistRejectedBy: "PostgreSQL trigger on agent_file_roots", restore: restoreFault.fault, fault: { ...fault, abortedAt: undefined } },
+      failure: { error: failure.error ? String(failure.error) : null, row: briefRow(failure.row) }, saved: { entry: saved[entryFile], edit: saved["edit-me.txt"], listing: savedListing }, neverSaved, before, faulted, returned, after });
+    // The fixture really is the double fault: a failed save whose restore failed, marked unverified.
+    expect.soft(fault, "fixture: one apply whose REAL persist failed after the tree merge").toMatchObject({ applies: 1, appliesSettled: 1, realPersistCalls: 1, treeMergedAtPersist: true });
+    expect.soft(restoreFault.fault, "fixture: the rollback restore failed at its second undo rename (rf-3's plant)").toEqual({ undoRenames: 2, failed: 1 });
+    expect.soft(failure, "fixture: the failed save is recorded as held, never 'saved'").toMatchObject({ error: null, row: failedHold });
+    expect.soft(faulted.marker, "fixture: the projection is marked UNVERIFIED (no generation marker)").toBeNull();
+    expect.soft(faulted.manifestHash, "fixture: the on-disk files no longer match the durable manifest").not.toBe(faulted.treeHash);
+    expect.soft(faulted.generation, "fixture: nothing of the failed save was committed").toBe(before.generation);
+    expect.soft({ entry: faulted.entry, edit: faulted.edit }, "fixture: the files on disk hold the failed save's never-saved bytes").toEqual(neverSaved);
+    // The outcome: what the real reader returned.
+    expect.soft(returned.entry, "the reader never returns the failed save's never-saved entry bytes").not.toContain("NEVER SAVED");
+    expect.soft(returned.edit ?? "", "the reader never returns the failed save's never-saved file bytes").not.toBe(neverSaved.edit);
+    if (returned.unavailable !== null) {
+      expect.soft(returned.unavailable, "a reader that cannot restore says the files are not available while they are verified").toMatch(/verif|agent_instructions_unavailable/);
+    } else {
+      expect.soft(returned.entry?.trimEnd(), "the saved entry file, restored from the durable head").toBe(saved[entryFile]!.trimEnd());
+      if (reader === "feedback") expect.soft(returned.listing, "the saved file listing (paths and sizes), not the failed save's").toEqual(savedListing);
+      else expect.soft(returned.edit, "the saved file bytes, restored from the durable head").toBe(saved["edit-me.txt"]);
+      expect.soft(after.marker, "the reader restored the projection under the guard: it is marked at the durable generation again").toBe(before.generation);
+      expect.soft(after.manifestHash, "and the on-disk files match the durable manifest again").toBe(after.treeHash);
+      expect.soft({ entry: after.entry, edit: after.edit }).toEqual({ entry: saved[entryFile], edit: saved["edit-me.txt"] });
+    }
+    expect.soft(after.generation, "a read never changes what is saved").toBe(before.generation);
+  }, 90_000);
 });
