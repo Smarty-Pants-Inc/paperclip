@@ -18,6 +18,19 @@ import { beforeAll } from "vitest";
  *
  * Read `.value` only inside a test body. It throws before `beforeAll` runs.
  */
+/**
+ * The budget of the one-time graph load. A route graph is most of the server,
+ * transformed and evaluated in this hook. Measured for the agents routes
+ * (agent-instructions-routes.test.ts) on an idle 32-core host: 11.5 s in
+ * `loadGraph` (`../middleware/index.js` 9.5 s, then `../routes/agents.js`
+ * 2.0 s), against 0.2 s for all 27 tests after it. The default 30 s hook
+ * budget is only 2.6 times that. A loaded host crosses it, and vitest then
+ * reports every test of the file as skipped: none runs (rf-3,
+ * smarty-dev#20787). Like the embedded-Postgres boot hooks, this hook
+ * therefore carries its own budget: ten times the measured load.
+ */
+export const MODULE_GRAPH_LOAD_TIMEOUT_MS = 120_000;
+
 export function hoistModuleGraph<T>(
   registerMocks: () => void,
   loadGraph: () => Promise<T>,
@@ -27,7 +40,7 @@ export function hoistModuleGraph<T>(
   beforeAll(async () => {
     registerMocks();
     graph = await loadGraph();
-  });
+  }, MODULE_GRAPH_LOAD_TIMEOUT_MS);
 
   return {
     get value(): T {
