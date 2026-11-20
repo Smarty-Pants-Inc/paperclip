@@ -37,7 +37,7 @@ async function admissionHeartbeat(db: Db): Promise<DotHeartbeat> {
   const configured = heartbeatContexts.get(db);
   if (configured) return configured;
   const { heartbeatService } = await import("../../services/heartbeat.js");
-  return processHeartbeatFor(db) ?? heartbeatService(db);
+  return processHeartbeatFor(db, "dot-admission") ?? heartbeatService(db);
 }
 export function dotRunnerBroker(db: Db, options?: { heartbeat?: DotHeartbeat }) {
   if (options?.heartbeat) heartbeatContexts.set(db, options.heartbeat);

@@ -10,14 +10,28 @@ import { describe, expect, it } from "vitest";
 // processHeartbeatFor(db) / wiredHeartbeatFor(db). Cancelling STARTS runs too
 // (cancelRun promotes the deferred successor and starts the agent's next queued
 // run; cancelBudgetScopeWork cancels through cancelRun), so only truly read-only
-// callers are allow-listed, and an allow-listed file that calls a run-starting
-// method fails the guard.
+// callers are allow-listed. An allow-listed file may call ONLY its named methods
+// on a bare instance; any other method (run-starting or not yet classified) fails
+// the guard, and so does a run-starting method anywhere in the file.
 const SRC = join(dirname(fileURLToPath(import.meta.url)), "..");
-const READ_ONLY: Record<string, string> = {
-  "services/heartbeat-registry.ts": "the registry's own fallback when nothing is registered (tests)",
-  "routes/activity.ts": "heartbeat.getRunReadAccess only (read)",
+const READ_ONLY: Record<string, { why: string; methods: string[] }> = {
+  "services/heartbeat-registry.ts": { why: "the registry's own fallback when nothing is registered (tests)", methods: [] },
+  "routes/activity.ts": { why: "heartbeat.getRunReadAccess only (read)", methods: ["getRunReadAccess"] },
 };
-const RUN_STARTING = /\.(cancelRun|cancelBudgetScopeWork|releaseIssueExecutionAndPromote|wakeup|startNextQueuedRunForAgent)\b/;
+const RUN_STARTING = /\.(cancelRun|cancelBudgetScopeWork|releaseIssueExecutionAndPromote|sweepStaleIssueLocks|wakeup|startNextQueuedRunForAgent)\b/;
+const isComment = (line: string) => /^\s*(\/\/|\*)/.test(line);
+
+/** Methods an allow-listed file calls on a bare heartbeatService(...) instance, by line. */
+function bareMethodCalls(lines: string[]): { names: string[]; calls: Array<{ line: number; method: string; text: string }> } {
+  const code = lines.map(line => isComment(line) ? "" : line);
+  const names = [...code.join("\n").matchAll(/\b(?:const|let|var)\s+([\w$]+)\s*(?::[^=]+)?=\s*heartbeatService\(/g)].map(m => m[1]!);
+  const calls: Array<{ line: number; method: string; text: string }> = [];
+  code.forEach((line, index) => {
+    const patterns = [/heartbeatService\([^)]*\)\s*\??\.\s*([\w$]+)/g, ...names.map(name => new RegExp(`(?<![\\w$.])${name.replace(/\$/g, "\\$")}\\s*\\??\\.\\s*([\\w$]+)`, "g"))];
+    for (const pattern of patterns) for (const m of line.matchAll(pattern)) calls.push({ line: index + 1, method: m[1]!, text: line.trim() });
+  });
+  return { names, calls };
+}
 
 function sourceFiles(dir: string): string[] {
   return readdirSync(dir).flatMap(name => {
@@ -33,12 +47,21 @@ describe("process heartbeat guard", () => {
     for (const file of sourceFiles(SRC)) {
       const rel = relative(SRC, file).replaceAll("\\", "/");
       const lines = readFileSync(file, "utf8").split("\n");
-      if (READ_ONLY[rel]) {
+      const allowed = READ_ONLY[rel];
+      if (allowed) {
         lines.forEach((line, index) => {
-          if (!/^\s*(\/\/|\*)/.test(line) && RUN_STARTING.test(line)) {
+          if (!isComment(line) && RUN_STARTING.test(line)) {
             offenders.push(`${rel}:${index + 1}: allow-listed as read-only but starts runs: ${line.trim()}`);
           }
         });
+        const { names, calls } = bareMethodCalls(lines);
+        for (const call of calls) {
+          if (!allowed.methods.includes(call.method)) {
+            offenders.push(`${rel}:${call.line}: allow-listed for ${allowed.methods.join(", ") || "no methods"} but calls .${call.method} on a bare heartbeat: ${call.text}`);
+          }
+        }
+        // An entry whose bare instance can no longer be found would allow anything silently.
+        if (allowed.methods.length > 0 && names.length === 0) offenders.push(`${rel}: allow-list entry but no bare heartbeatService(...) instance found`);
         continue;
       }
       lines.forEach((line, index) => {

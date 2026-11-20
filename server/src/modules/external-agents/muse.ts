@@ -44,7 +44,7 @@ export function museExternalAgents(db:Db, options?:{heartbeat?:Heartbeat;publicO
 function createMuseBroker(db:Db, publicOrigin?:string) {
   const identity=museIdentity(db);
   const connectionResource=()=>{try{return musePublicOrigin(publicOrigin)+MUSE_RESOURCE_PATH;}catch{return "";}};
-  async function heartbeat() { const configured=heartbeatContexts.get(db); if(configured)return configured; return processHeartbeatFor(db) ?? (await import("../../services/heartbeat.js")).heartbeatService(db); }
+  async function heartbeat() { const configured=heartbeatContexts.get(db); if(configured)return configured; return processHeartbeatFor(db, "muse-broker") ?? (await import("../../services/heartbeat.js")).heartbeatService(db); }
   function agentActor(s:AgentConnectionSubject,runId?:string,responsibleUserId?:string|null):AuthorizationActor {return {type:"agent",agentId:s.agentId,companyId:s.companyId,runId,authorizingUserId:s.authorizingUserId,onBehalfOfUserId:responsibleUserId};}
   function authorizerActor(s:AgentConnectionSubject):AuthorizationActor { return {type:"board",userId:s.authorizingUserId,source:"session",ignoreInstanceAdmin:true}; }
   async function subjectBinding(s:AgentConnectionSubject,ready=true,paused=false,stopControl=false) {

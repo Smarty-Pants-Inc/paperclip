@@ -133,4 +133,26 @@ describe("promotion paths use the process's wired heartbeat (plugin sandbox prov
       expect(registryMisses()).toEqual([]);
     } finally { clearProcessHeartbeat(db); }
   });
+
+  it("(viii) misses at DIFFERENT call sites each warn once (no shared label silences a later site)", async () => {
+    const dbA = standInDb();
+    const dbB = standInDb(); // a Db object other than the registered one
+    registerProcessHeartbeat(dbA, heartbeatService(dbA as any, { pluginWorkerManager } as any) as any);
+    try {
+      const { summarySlotRoutes } = await import("../routes/summary-slots.js");
+      const { statusCardRoutes } = await import("../routes/status-cards.js");
+      const { secretRoutes } = await import("../routes/secrets.js");
+      for (let round = 0; round < 2; round += 1) {
+        summarySlotRoutes(dbB);
+        statusCardRoutes(dbB);
+        secretRoutes(dbB);
+      }
+      const sites = registryMisses().map(([obj]) => (obj as { site: string }).site);
+      const perSite = Object.fromEntries(["summary-slot-routes", "status-card-routes", "secret-routes"]
+        .map(site => [site, sites.filter(s => s === site).length]));
+      console.info("row-viii", JSON.stringify({ sites, perSite }));
+      expect(perSite).toEqual({ "summary-slot-routes": 1, "status-card-routes": 1, "secret-routes": 1 });
+      expect(sites).toHaveLength(3);
+    } finally { clearProcessHeartbeat(dbA); }
+  });
 });
