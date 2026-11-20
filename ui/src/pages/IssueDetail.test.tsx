@@ -7728,6 +7728,76 @@ describe("IssueDetail", () => {
     }
   }
 
+  it.each([390, 1440].flatMap((width) => [
+    { width, secondReason: null },
+    { width, secondReason: "second steering reason" },
+  ]))(
+    "ssf1: a second Queue preserves earlier reasons and shows the newest visible one ($width, $secondReason)",
+    async ({ width, secondReason }) => {
+      const { post, runId, state, posts } = await sendSteeringUnavailable(width);
+      expect(await waitUntil(() => steeringLine() !== null)).toBe(true);
+      expect(steeringLine()?.textContent).toBe(STALE_STEER_LINE);
+      const firstQueue = QUEUE_SF_QUEUED_COMMENTS_GET;
+      const second = {
+        ...post, id: "ba2e7da8-2ed1-4854-a6e8-a255289791c6", body: "Second waiting message", clientRequestId: null as string | null,
+        steeringUnavailableReason: secondReason,
+      };
+      const originalFetch = vi.mocked(globalThis.fetch).getMockImplementation()!;
+      vi.mocked(globalThis.fetch).mockImplementation(async (input, init) => {
+        if (init?.method === "POST" && /\/api\/issues\/[^/]+\/comments$/.test(String(input))) {
+          const request = JSON.parse(String(init.body));
+          posts.push(request);
+          second.clientRequestId = request.clientRequestId;
+          state.thread = [...state.thread, second];
+          state.queue = {
+            ...firstQueue, revision: "ssf1-both",
+            entries: [...firstQueue.entries, { ...firstQueue.entries[0], comment: second }],
+          };
+          return new Response(JSON.stringify(second), { status: 201, headers: { "content-type": "application/json" } });
+        }
+        return originalFetch(input, init);
+      });
+      await act(async () => { markdownEditorFixture.change(second.body); });
+      await flushReact();
+      await act(async () => {
+        container.querySelector<HTMLButtonElement>('[data-testid="task-chat-send-menu-toggle"]')!.click();
+      });
+      await act(async () => {
+        container.querySelector<HTMLButtonElement>('[data-testid="task-chat-send-menu-queue"]')!.click();
+      });
+      expect(await waitUntil(() => posts.length === 2 && !!queueBar()?.textContent?.includes(second.body))).toBe(true);
+      expect(posts[1].deliveryIntent).toBe("queue");
+      expect(await waitUntil(() => queryClient.isMutating() === 0)).toBe(true);
+      await readQueueAgain();
+      const list = () => container.querySelector('[data-testid="task-chat-queued-list"]')?.textContent;
+      expect(list()).toContain(post.body);
+      expect(list()).toContain(second.body);
+      expect(steeringLine()?.textContent).toBe(secondReason
+        ? `Steering paused: ${secondReason} Will send after this turn.` : STALE_STEER_LINE);
+      writeStaleSteerEvidence(`ssf1-both-${secondReason ? "two-reasons" : "no-reason"}-${width}`);
+
+      if (secondReason) {
+        // Answer the newest warning first: the older visible reason must return.
+        state.queue = firstQueue;
+        state.thread = state.thread.map((comment) => (comment as { id: string }).id === second.id
+          ? { ...second, consumedByRunId: runId } : comment);
+      } else {
+        // Answer A while the explicit Queue B remains: its row cannot keep A's warning alive.
+        state.queue = { ...firstQueue, revision: "ssf1-second-only",
+          entries: [{ ...firstQueue.entries[0], comment: second }] };
+        state.thread = [...answeredThread(post, runId), second];
+      }
+      await act(async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments("PAP-1") }); });
+      await readQueueAgain();
+      expect(await waitUntil(() => secondReason
+        ? steeringLine()?.textContent === STALE_STEER_LINE : steeringLine() === null)).toBe(true);
+      expect(list()).toContain(secondReason ? post.body : second.body);
+      expect(list()).not.toContain(secondReason ? second.body : post.body);
+      writeStaleSteerEvidence(`ssf1-answered-${secondReason ? "two-reasons" : "no-reason"}-${width}`);
+    },
+    20_000,
+  );
+
   it.each([390, 1440])(
     "stalesteer RED: a Send answered queued with a reason shows the line with its row; once the server answers it (queue read empty) the line is gone with no empty bar at %i",
     async (width) => {
