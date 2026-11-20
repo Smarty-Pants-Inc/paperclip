@@ -18751,7 +18751,25 @@ describeEmbeddedPostgres("tool access service", () => {
     },
   );
 
-  it.each(["*", "owner/repo", "*,owner/repo"])("connects GitHub App repository scope %s through the route and refreshes installation access", async (repositories) => {
+  it.each<[string | string[], number, boolean]>([
+    ["*", 201, true],
+    ["owner/repo", 201, false],
+    ["*,owner/repo", 422, false],
+    // Setup trims surrounding whitespace before parsing the standalone star.
+    [" *", 201, true],
+    ["* ", 201, true],
+    ["\n*\n", 201, true],
+    // A star mixed with a name must never broaden access, in either order.
+    ["*\nSmarty-Pants-Inc/x", 422, false],
+    ["Smarty-Pants-Inc/x\n*", 422, false],
+    [["*", "Smarty-Pants-Inc/x"], 400, false],
+    // Required setup input and empty parsed lists are refusals, not wildcards.
+    ["", 400, false],
+    [" ", 400, false],
+    ["\n", 400, false],
+    [",", 422, false],
+    [",,", 422, false],
+  ])("connects GitHub App repository scope %s through the route and refreshes installation access", async (repositories, expectedStatus, allRepositories) => {
     const company = await createCompany(db);
     const app = createRouteApp(db);
     const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey
@@ -18793,21 +18811,23 @@ describeEmbeddedPostgres("tool access service", () => {
       }
       throw new Error(`Unexpected GitHub request: ${path}`);
     });
-    const connect = (scope: string) => request(app).post(`/api/companies/${company.id}/tools/apps/connect`).send({
+    const connect = (scope: string | string[]) => request(app).post(`/api/companies/${company.id}/tools/apps/connect`).send({
       galleryKey: "github", connectionMethodKey: "app-installation", grantKind: "organization", name: `GitHub ${scope}`,
       configValues: { version: "1", appId: "123", installationId: "456", repositories: scope, permissionProfile: "author" },
       credentialValues: { "credentials.privateKey": privateKey },
     });
     const response = await connect(repositories);
-    if (repositories.includes(",")) {
-      expect(response.status).toBe(422);
-      expect(response.body.details).toMatchObject({ code: "github_app_access_unavailable", reason: "configuration" });
+    expect(response.status, JSON.stringify(response.body)).toBe(expectedStatus);
+    if (expectedStatus !== 201) {
+      if (expectedStatus === 422) {
+        expect(response.body.details).toMatchObject({ code: "github_app_access_unavailable", reason: "configuration" });
+      }
       expect(mints).toEqual([]);
       expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, company.id))).toEqual([]);
       return;
     }
     expect(response.status, JSON.stringify(response.body)).toBe(201);
-    expect(mints).toEqual([repositories === "*" ? { permissions } : { repositories: ["repo"], permissions }]);
+    expect(mints).toEqual([allRepositories ? { permissions } : { repositories: ["repo"], permissions }]);
     const connectionId = response.body.connectionId as string;
     const readGrant = async () => {
       const result = await request(app).get(`/api/tool-connections/${connectionId}/grants`);
@@ -18817,9 +18837,9 @@ describeEmbeddedPostgres("tool access service", () => {
     };
     const initial = await readGrant();
     expect(initial.providerTenant.github.repositories.map((repo: { fullName: string }) => repo.fullName))
-      .toEqual(repositories === "*" ? installationRepositories.map(repo => repo.full_name) : ["owner/repo"]);
-    expect(initial.providerTenant.github.repositorySelection).toBe(repositories === "*" ? "all" : "selected");
-    if (repositories === "*") {
+      .toEqual(allRepositories ? installationRepositories.map(repo => repo.full_name) : ["owner/repo"]);
+    expect(initial.providerTenant.github.repositorySelection).toBe(allRepositories ? "all" : "selected");
+    if (allRepositories) {
       expect(listedPages).toContain(2);
       const before = await request(app).get(`/api/tool-connections/${connectionId}`);
       installationRepositories.push({ id: 102, full_name: "owner/added-later", private: true });
