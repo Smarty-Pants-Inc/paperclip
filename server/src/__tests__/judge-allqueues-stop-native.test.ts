@@ -61,6 +61,23 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
       const { issueComments } = await import("@paperclipai/db");
       await (fixture.db as any).insert(issueComments).values({ companyId: fixture.companyId, issueId: fixture.issueId,
         authorAgentId: fixture.agentId, authorType: "agent", createdByRunId: runId, origin: "comment", body: `answer from ${runId}` });
+      // A real succeeding native turn ends with its ACCEPTED terminal result and a
+      // COMMITTED finalization (control-plane result + reconciler). Without this the
+      // faked turn stays phase 'observed', and a Send queued behind it waits forever
+      // in explicit-native-continuation's controller_settling check (rf-11 F2).
+      const { heartbeatRuns: runsTable, nativeRunResults } = await import("@paperclipai/db");
+      const { eq } = await import("drizzle-orm");
+      const resultId = (await import("node:crypto")).randomUUID();
+      const fdb = fixture.db as any;
+      const [own] = await fdb.select({ contractId: runsTable.completionContractId }).from(runsTable).where(eq(runsTable.id, runId));
+      const contractId = own?.contractId;
+      if (!contractId) throw new Error("fixture: the native turn has no completion contract");
+      await fdb.insert(nativeRunResults).values({ id: resultId, companyId: fixture.companyId, issueId: fixture.issueId, runId,
+        completionContractId: contractId, serverFingerprint: resultId, schemaStatus: "accepted", canonicalSha256: resultId,
+        resultJson: { terminal: { runTerminalState: "succeeded" } } });
+      // The control plane commits the accepted result before the turn returns (no later reconciler pass needed).
+      const { nativeRunFinalizations: fin } = await import("@paperclipai/db");
+      await fdb.update(fin).set({ resultId, phase: "committed", leaseOwner: null }).where(eq(fin.runId, runId));
       return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "answered" };
     }) as typeof actual.executePaperclipNativeSession,
   };
@@ -208,7 +225,7 @@ describe.skipIf(!support.supported)("optS-dd F3: answers-once with a succeeding 
       .map(run => run.id);
     const waiting = wakes.filter(w => ["deferred_issue_execution", "queued"].includes(w.status))
       .map(w => ({ id: w.id, status: w.status, wait: (w.payload as any)?.executionWait?.reason,
-        ids: (w.payload as any)?._paperclipWakeContext?.wakeCommentIds }));
+        ids: (w.payload as any)?._paperclipWakeContext?.wakeCommentIds, by: w.requestedByActorId }));
     return { perRun, replies: replies.map(r => ({ runId: r.createdByRunId, body: r.body })), answeredBy, waiting,
       calls: [...fixture.calls] };
   }
@@ -227,7 +244,9 @@ describe.skipIf(!support.supported)("optS-dd F3: answers-once with a succeeding 
     expect(a.perRun[0]!.replies).toEqual([`answer from ${a.perRun[0]!.id}`]);
     expect(a.replies, "exactly one persisted agent reply").toHaveLength(1);
     for (const id of s.held) expect(a.answeredBy(id), `${id} answered exactly once`).toHaveLength(1);
-    expect(a.waiting, "no waiting wake left").toEqual([]);
+    // Only the planted other person's hold may still wait; it never runs for this person (rf-11 F3/F4).
+    expect(a.waiting.filter(w => (w.ids ?? []).some((id: string) => s.held.includes(id))), "no own waiting wake left").toEqual([]);
+    expect(a.waiting.every(w => w.by !== userId), "only another person's hold still waits").toBe(true);
   }, 120_000);
 
   it("Send + typed M4 together: M4 answered once, then M1-M3 each once; no message twice (persisted)", async () => {
@@ -249,7 +268,9 @@ describe.skipIf(!support.supported)("optS-dd F3: answers-once with a succeeding 
     const order = a.perRun.map(run => run.id);
     expect(order.indexOf(a.answeredBy(m4)[0]!)).toBeLessThanOrEqual(order.indexOf(a.answeredBy(s.held[0]!)[0]!));
     for (const id of s.held) expect(a.answeredBy(id)[0], "M1-M3 answered together").toBe(a.answeredBy(s.held[0]!)[0]);
-    expect(a.waiting, "no second waiting wake").toEqual([]);
-    expect((queue.body.entries ?? []).length, "nothing left held").toBe(0);
+    expect(a.waiting.filter(w => (w.ids ?? []).some((id: string) => [m4, ...s.held].includes(id))), "no own second waiting wake").toEqual([]);
+    expect(a.waiting.every(w => w.by !== userId), "only another person's hold still waits").toBe(true);
+    expect(a.perRun.flatMap(run => run.ids).every(id => [m4, ...s.held].includes(id)), "no run carried another person's input").toBe(true);
+    expect((queue.body.entries ?? []).filter((e: any) => e.comment.authorUserId === userId).length, "nothing of the person's left held").toBe(0);
   }, 120_000);
 });

@@ -179,6 +179,13 @@ async function runReleaseDrain(
       preservedWakeIds.push(candidate.id);
       continue;
     }
+    // A person chat runs automatically only for its own person: another
+    // person's held input stays held for its own author's run (rf-11 F3).
+    if (issue.conversationAgentId && issue.conversationUserId && candidate.requestedByActorType === "user"
+      && candidate.requestedByActorId && candidate.requestedByActorId !== issue.conversationUserId) {
+      preservedWakeIds.push(candidate.id);
+      continue;
+    }
 
     // A lead can post its closing comment before committing Done. Check
     // again when the source run releases its queue, using every original

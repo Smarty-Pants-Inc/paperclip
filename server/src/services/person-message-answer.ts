@@ -48,7 +48,11 @@ export function deferredWakeIsStaleSql(w: DeferredWakeSql): SQL {
             and stop_hold.id::text = ${w.payload}->'executionWait'->>'recoveryActionId'
             and stop_hold.cause = 'native_continuation_requires_reconciliation'
             and stop_hold.evidence->>'runId' = stopped.id::text))))`;
-  return sql`(not ${personStopHold} and ${newerPersonInputAnsweredSql(w)})`;
+  // The person's own Send (queuedCommentInterrupt) is their explicit direction to
+  // answer these held messages; a newer answered message (typed M4 beside the Send)
+  // never makes that Send stale (rf-11 F2: M1-M3 were cancelled as "moved on").
+  const personSend = sql`(${w.payload}->'queuedCommentInterrupt'->>'actorId' is not null)`;
+  return sql`(not ${personStopHold} and not ${personSend} and ${newerPersonInputAnsweredSql(w)})`;
 }
 
 function carriesCommentSql(alias: string, commentId: SQL, requireSteeredText: boolean): SQL {

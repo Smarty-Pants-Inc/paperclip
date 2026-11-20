@@ -158,7 +158,10 @@ const OUT = process.env.RF5_OUT!;
       const expected=held.slice(1);
       expect(successors.flatMap(t=>t.commentIds)).toEqual(expected);
       if(row !== "twice") expect(successors[0]?.commentIds,"exact input of the immediate next turn").toEqual(expected);
-      expect((final.queue.body.entries ?? []),JSON.stringify(final.queue.body)).toHaveLength(0);
+      // The person's own held input is all answered; the other person's hold stays held (never run for him).
+      const left=(final.queue.body.entries ?? []) as any[];
+      expect(left.filter(e=>e.comment.authorUserId!=="nr-other"),JSON.stringify(final.queue.body)).toHaveLength(0);
+      expect(left.every(e=>e.comment.authorUserId==="nr-other"),"only the other person's hold is left").toBe(true);
     } finally {
       save(); await heartbeat.cancelActiveForAgent(agentId).catch(() => undefined);
       await new Promise<void>(resolve => listener.close(() => resolve())); await rm(cwd, { recursive: true, force: true });
