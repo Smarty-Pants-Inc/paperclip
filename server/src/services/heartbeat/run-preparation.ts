@@ -2586,15 +2586,29 @@ export async function buildPaperclipWakePayload(input: {
     : new Set<string>();
   // An Interrupt-carried steer Pi already READ in the cut turn (interruptCarriedReadSteeredCommentIds):
   // the renderer omits its text when the successor continues that same Pi session, and injects it on a fresh one.
-  const readInSession = issueId && commentRows.length
-    ? new Set((await input.db.select({ result: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+  // answered-b2: the read is bound to the EXACT session that read it (the cut run's recorded native session) and to
+  // that run; native-execution-input.ts omits it only when the successor resumes THAT session from THAT run. A read
+  // with no session recorded (or one that no longer matches the run's session) proves no custody: re-delivered.
+  const readInSession = new Map<string, { sessionId: string; runId: string }>();
+  if (issueId && commentRows.length) {
+    const rows = await input.db.select({ id: heartbeatRuns.id, sessionId: heartbeatRuns.nativeSessionId, result: heartbeatRuns.resultJson })
+      .from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, input.companyId),
       sql`(${heartbeatRuns.nativeIssueId} = ${issueId}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId})`,
       sql`${heartbeatRuns.resultJson} ? 'interruptCarriedReadSteeredCommentIds'`,
-      input.runId ? sql`${heartbeatRuns.id} <> ${input.runId}` : undefined)))
-      .flatMap(({ result }) => { const ids = parseObject(result).interruptCarriedReadSteeredCommentIds;
-        return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : []; }))
-    : new Set<string>();
+      input.runId ? sql`${heartbeatRuns.id} <> ${input.runId}` : undefined))
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
+    for (const { id: runId, sessionId, result } of rows) {
+      const parsed = parseObject(result), ids = parsed.interruptCarriedReadSteeredCommentIds;
+      const sessions = parseObject(parsed.interruptCarriedReadSessionIds);
+      for (const id of Array.isArray(ids) ? ids : []) {
+        // The newest cut run that read it owns the binding; an unbound newer read voids an older one.
+        if (typeof id !== "string" || readInSession.has(id)) continue;
+        readInSession.set(id, sessionId && sessions[id] === sessionId ? { sessionId, runId } : { sessionId: "", runId });
+      }
+    }
+    for (const [id, binding] of readInSession) if (!binding.sessionId) readInSession.delete(id);
+  }
   // adopt-receipts2: every tool call of the person's Interrupt chain (each cut turn since the last run that
   // ended another way), from their own durable tool.execution receipts: done, failed, or cut mid-flight. The
   // renderer injects them only into a fresh session (new box), which never saw them; a resumed session
@@ -2673,7 +2687,8 @@ export async function buildPaperclipWakePayload(input: {
       createdAt: row.createdAt.toISOString(),
       ...(readByEarlierTurn.has(row.id) ? { readByEarlierTurn: true } : {}),
       ...(receivedMidTask.has(row.id) ? { receivedMidTask: true } : {}),
-      ...(readInSession.has(row.id) && !deletedAt ? { readInSession: true } : {}),
+      ...(readInSession.has(row.id) && !deletedAt ? { readInSession: true, readInSessionId: readInSession.get(row.id)!.sessionId,
+        readInSessionRunId: readInSession.get(row.id)!.runId } : {}),
       author: row.authorAgentId
         ? { type: "agent", id: row.authorAgentId }
         : row.authorUserId

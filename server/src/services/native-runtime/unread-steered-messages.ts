@@ -2,7 +2,7 @@ import { and, asc, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRunEvents, heartbeatRuns, issueComments, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
 import { SENT_WITH_OTHER_QUEUED_MESSAGES } from "../interrupt-carry-custody.js";
 import { answeredPersonMessageSql } from "../person-message-answer.js";
-import { readSteeredMessageAnswers } from "./steered-message-answers.js";
+import { carriedReadSessions, readSteeredMessageAnswers } from "./steered-message-answers.js";
 import { unreadSteeredMessageIds } from "../../vendor/paperclip-runner/index.js";
 import { queuedInteractionSteeringBody } from "../queued-interaction-response.js";
 import { filterRunMessageInteractionDelivery } from "../agent-interaction-delivery.js";
@@ -65,7 +65,8 @@ export async function readUnreadSteeredForInterrupt(
     ...(ids.includes(String(context.wakeCommentId)) ? { wakeCommentId: null } : {}),
     ...(ids.includes(String(context.commentId)) ? { commentId: null } : {}),
   }, resultJson: { ...result, interruptCarriedSteeredCommentIds: [...strings(result.interruptCarriedSteeredCommentIds), ...ids],
-    ...(read.length ? { interruptCarriedReadSteeredCommentIds: [...strings(result.interruptCarriedReadSteeredCommentIds), ...read] } : {}) },
+    ...(read.length ? { interruptCarriedReadSteeredCommentIds: [...strings(result.interruptCarriedReadSteeredCommentIds), ...read],
+      ...carriedReadSessions(result, read, run.nativeSessionId) } : {}) },
   }).where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, input.runId)));
   // The carry owns them: no other wake may answer them a second time.
   await tx.update(agentWakeupRequests).set({ status: "coalesced", error: SENT_WITH_OTHER_QUEUED_MESSAGES,

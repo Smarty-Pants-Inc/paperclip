@@ -1,5 +1,15 @@
 import { and, asc, eq, isNotNull, or, sql } from "drizzle-orm";
-import { heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
+
+/** answered-b2: each carried READ steer is bound to the Pi session that read it (the cut run's native session).
+ * The successor omits it only when it resumes THAT session from THIS run (native-execution-input.ts); with no
+ * session recorded nothing is bound, so it is re-delivered. */
+export function carriedReadSessions(result: Record<string, unknown>, read: string[], sessionId: string | null | undefined) {
+  if (!sessionId || !read.length) return {};
+  const recorded = result.interruptCarriedReadSessionIds;
+  return { interruptCarriedReadSessionIds: { ...(recorded && typeof recorded === "object" && !Array.isArray(recorded) ? recorded : {}),
+    ...Object.fromEntries(read.map(id => [id, sessionId])) } };
+}
 
 /** One durable run-log event, in persisted sequence order (heartbeat_run_events). */
 export interface SteerAnswerEvent {
@@ -119,7 +129,8 @@ const kind = sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->'payl
  */
 export async function recordSteeredMessageEvidence(db: Db, input: { companyId: string; runId: string }) {
   await db.transaction(async tx => {
-    const [run] = await tx.select({ context: heartbeatRuns.contextSnapshot, result: heartbeatRuns.resultJson }).from(heartbeatRuns)
+    const [run] = await tx.select({ context: heartbeatRuns.contextSnapshot, result: heartbeatRuns.resultJson,
+      sessionId: heartbeatRuns.nativeSessionId }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId))).for("update");
     const context = run?.context ?? {}, result = run?.result ?? {};
     const ids = (value: unknown) => Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
@@ -131,8 +142,13 @@ export async function recordSteeredMessageEvidence(db: Db, input: { companyId: s
     if (!steered.length && !carried.some(id => !recordedRead.includes(id))) return;
     const evidence = await readSteeredMessageAnswers(tx as unknown as Db, input);
     const lateRead = carried.filter(id => !recordedRead.includes(id) && evidence.delivered.includes(id));
-    if (lateRead.length) await tx.update(heartbeatRuns).set({ resultJson: { ...result,
-      interruptCarriedReadSteeredCommentIds: [...recordedRead, ...lateRead] } })
+    // answered-b2 fence: under this run lock, a FINALIZED cut run (native_run_finalizations committed) is never
+    // rewritten; its late read stays unrecorded, so the successor re-delivers the steer (base behaviour).
+    const [finalized] = lateRead.length ? await tx.select({ phase: nativeRunFinalizations.phase }).from(nativeRunFinalizations)
+      .where(and(eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.runId, input.runId),
+        eq(nativeRunFinalizations.phase, "committed"))).limit(1) : [];
+    if (lateRead.length && !finalized) await tx.update(heartbeatRuns).set({ resultJson: { ...result,
+      interruptCarriedReadSteeredCommentIds: [...recordedRead, ...lateRead], ...carriedReadSessions(result, lateRead, run?.sessionId) } })
       .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
     if (!steered.length) return;
     // Replace this run's projection, never union it: a failed/cancelled terminal
