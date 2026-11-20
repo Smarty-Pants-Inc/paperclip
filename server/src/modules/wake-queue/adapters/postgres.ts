@@ -2,7 +2,7 @@ import { deferredPersonWakeQuietAtSql } from "../../../services/deferred-person-
 import { UNANSWERED_MESSAGE_LOOKBACK_MS } from "../../../services/recovery/unanswered-person-message.js";
 import { DEFERRED_PERSON_WAKE_BOUND_MS } from "../domain/policy.js";
 import { getServerProcessStartedAt } from "../../../server-info.js";
-import { settleUnansweredPersonMessage } from "../../../services/recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessage, type UnansweredNoteAnnouncement } from "../../../services/recovery/unanswered-person-message.js";
 import { insertIssueComment } from "../../../services/issue-comment-writes.js";
 import { lockAgentForRunAdmission } from "../../../services/heartbeat-run-admission-lock.js";
 import { pendingContinuationCommentInput } from "../../../services/continuation-comment-input.js";
@@ -102,7 +102,7 @@ import type {
   WakeQueueHost,
   WakeQueueTransaction,
 } from "../application/ports.js";
-import type { RunSummary } from "../application/types.js";
+import type { PostCommitEffect, RunSummary } from "../application/types.js";
 
 const DEFERRED_WAKE_STATUS = "deferred_issue_execution";
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
@@ -258,7 +258,8 @@ function buildHost(_tx: Db, deps: WakeQueuePostgresAdapterDeps): WakeQueueHost {
   };
 }
 
-function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, run: ReleaseRun): WakeQueueTransaction {
+function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, run: ReleaseRun,
+  noteAnnouncements: UnansweredNoteAnnouncement[]): WakeQueueTransaction {
   const treeControlSvc = issueTreeControlService(tx);
   const issuesSvc = issueService(tx);
   const interruptQueueId = run.runtimeMode !== "native" && run.status === "cancelled"
@@ -520,8 +521,9 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           const messages = commentIds.length ? await tx.select({ id: issueComments.id }).from(issueComments).where(and(
             eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
             eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt), inArray(issueComments.id, commentIds))) : [];
+          // Its notes are announced only after this release transaction commits (post-commit effects).
           for (const message of messages) await settleUnansweredPersonMessage(tx, {
-            companyId, issueId, settleMessageId: message.id, now,
+            companyId, issueId, settleMessageId: message.id, now, announcements: noteAnnouncements,
           });
         } else if (issueId && cancelled.requestedByActorType === "system") {
           // A system update is not a person input to resend. Its cancelled
@@ -1943,7 +1945,8 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
 
         const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot,
           recoveryOnly: recoveryOnly && !handoffAssigneeAgentId, ...(handoffAssigneeAgentId ? { handoffAssigneeAgentId } : {}) };
-        const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run) });
+        const noteAnnouncements: UnansweredNoteAnnouncement[] = [];
+        const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run, noteAnnouncements) });
         // Explicit retry admission requires the exact source's task claim.
         // Preserve it only when the existing queue-first recovery policy
         // requests that retry. The clear/restore stays inside this task lock.
@@ -1956,7 +1959,14 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           }).where(and(eq(issues.companyId, input.companyId), eq(issues.id, issueRow.id),
             sql`${issues.executionRunId} is null`));
         }
-        return { ...result, run: runSnapshot };
+        // The notes this transaction saved reach an open chat only after it commits, through the caller's
+        // post-commit effects; a rollback discards them with the notes. No note saved: the result is returned as before.
+        if (!noteAnnouncements.length) return { ...result, run: runSnapshot };
+        const postCommitEffects: PostCommitEffect[] = [
+          ...noteAnnouncements.map((note) => ({ kind: "unanswered_note_saved" as const, ...note })),
+          ...result.postCommitEffects,
+        ];
+        return { ...result, postCommitEffects, run: runSnapshot };
       });
     },
   };
