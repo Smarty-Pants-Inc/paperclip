@@ -10052,11 +10052,26 @@ export class NativeEnvironmentProbeCleanupError extends AggregateError {
     readonly operationError: unknown,
     readonly cleanupErrors: readonly unknown[],
     readonly retryCleanup?: () => Promise<void>,
+    /** Runs the probe's control-plane authority release (a no-op once released)
+     * and reads it back; never touches the probe box. */
+    readonly releaseAuthority?: () => Promise<NativeProbeAuthorityRelease>,
   ) {
     const errors = [...(operationError === undefined ? [] : [operationError]), ...cleanupErrors];
     super(errors, errors.map(error => error instanceof Error ? error.message : "Native probe cleanup failed.").join("; "), { cause: operationError ?? cleanupErrors[0] });
     this.name = "NativeEnvironmentProbeCleanupError";
   }
+}
+
+/** The probe's control-plane authority (its PRP route registration, keyed by
+ * run id) as read back after its release ran. `runId` names it; no secret. */
+export type NativeProbeAuthorityRelease = { readonly released: boolean; readonly runId?: string };
+
+/** Off-box only: run the retained probe's authority release (idempotent; a
+ * no-op if it already released) and read it back. A box that is gone cannot
+ * run the on-box retirement that precedes this step in `retryCleanup`. */
+export async function releaseNativeProbeAuthority(error: unknown): Promise<NativeProbeAuthorityRelease> {
+  if (!(error instanceof NativeEnvironmentProbeCleanupError) || !error.releaseAuthority) return { released: false };
+  return error.releaseAuthority();
 }
 
 function retainNativeProbeCleanup(cleanup: (retry: boolean) => Promise<void>) {
@@ -10113,6 +10128,7 @@ export async function probeNativeRunnerEnvironment(options: {
   let registrationReleaseOperation: Promise<void> | undefined;
   let registrationReleaseFailed = false;
   let releaseRegistration: (() => Promise<void>) | undefined;
+  let registrationRunId: string | undefined;
   let cleanupCallbackOperation: Promise<void> | undefined;
   let cleanupCallbackFailed = false;
   let credentialRefreshOperation: Promise<void> | undefined;
@@ -10139,6 +10155,7 @@ export async function probeNativeRunnerEnvironment(options: {
       const operation = (async () => {
         controller.signal.throwIfAborted();
         registrationCleanupConfirmed = false;
+        if (typeof identity?.runId === "string" && identity.runId) registrationRunId = identity.runId;
         const registration = await options.transportOptions!.controlPlaneRegistration!(authority, identity, controller.signal);
         const release = () => registrationReleaseOperation ??= Promise.resolve()
           .then(() => registration.release())
@@ -10351,7 +10368,18 @@ export async function probeNativeRunnerEnvironment(options: {
         }
         await observeProbeCleanupStep(() => awaitProbeCleanup(confirmCleanup(retry), deadline, "confirming credential handoff"), "confirming credential handoff", "retained_retry", options.transportOptions?.onDiagnostic);
       });
-      throw new NativeEnvironmentProbeCleanupError(retained.retired, failure, teardownErrors, retained.retryCleanup);
+      const releaseAuthority = async (): Promise<NativeProbeAuthorityRelease> => {
+        const named = registrationRunId ? { runId: registrationRunId } : {};
+        if (!registrationCleanupConfirmed) {
+          if (registrationReleaseFailed) { registrationReleaseOperation = undefined; registrationReleaseFailed = false; }
+          if (!releaseRegistration) return { released: false, ...named };
+          try { await awaitProbeCleanup(releaseRegistration(), Date.now() + cleanupBudget, "releasing original probe authority"); }
+          catch { return { released: false, ...named }; }
+        }
+        // Read back the record the release writes.
+        return { released: registrationCleanupConfirmed, ...named };
+      };
+      throw new NativeEnvironmentProbeCleanupError(retained.retired, failure, teardownErrors, retained.retryCleanup, releaseAuthority);
     }
   }
   if (failure !== undefined) throw failure;

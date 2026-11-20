@@ -27,7 +27,14 @@ type Cleanup = {
   /** The probe box's lease was denied on a retirement retry: the on-box part is moot. */
   boxGone?: boolean;
   stallAlarmed?: boolean;
+  /** Off-box: run the probe's control-plane authority release (idempotent)
+   * and read it back. Present on native probe entries. */
+  releaseAuthority?: () => Promise<RetainedAuthorityRelease>;
+  /** The box was gone and the authority release did not read back released. */
+  authorityUnreleased?: boolean;
+  authorityAlarmed?: boolean;
 };
+export type RetainedAuthorityRelease = { readonly released: boolean; readonly runId?: string };
 /** An owned probe cleanup still pending after this long parks its owning
  * agent for Retry (checked on that agent's next lifecycle attempt, never on a
  * timer). The entry stays retained and keeps retrying on same-account actions. */
@@ -73,11 +80,12 @@ function sandboxLeaseStartDenied(error: unknown): boolean {
   };
   return visit(error, 0);
 }
-function alarm(entry: Cleanup, code: "native_probe_cleanup_box_gone" | "native_probe_cleanup_stalled", message: string) {
+function alarm(entry: Cleanup, code: "native_probe_cleanup_box_gone" | "native_probe_cleanup_stalled" | "native_probe_cleanup_authority_unreleased",
+  message: string, extra?: Record<string, unknown>) {
   try {
     logger.error({ code, companyId: entry.scope.companyId, accountKeyHash: retainedAiAccountKeyHash(entry.scope.accountKey),
       ...(entry.agentId ? { agentId: entry.agentId } : {}), ...(entry.home ? { runtimeHome: entry.home } : {}),
-      pendingMs: Date.now() - entry.retainedAt }, message);
+      pendingMs: Date.now() - entry.retainedAt, ...extra }, message);
   } catch { /* Diagnostics must not change cleanup behavior. */ }
 }
 function cleaningScope(scope: RetainedAiCleanupScope) {
@@ -94,11 +102,26 @@ function attempt(entry: Cleanup): Promise<void> {
         try { await entry.retryRetirement!(); }
         catch (error) {
           // The probe box is gone: its on-box handoff can never be confirmed and
-          // nothing runs there. The transport's off-box steps (authority
-          // release, refresh preservation) precede that handoff step; this
-          // runtime's off-box cleanup (credential write-back, home removal)
-          // still runs below and is read back before the entry is dropped.
+          // nothing runs there. The retry stopped at its first on-box step, so
+          // its off-box authority release may never have run: run it here
+          // (a no-op once released) and read it back before anything is
+          // dropped. This runtime's off-box cleanup (credential write-back,
+          // home removal) then runs below and is read back too.
           if (!sandboxLeaseStartDenied(error)) throw error;
+          if (entry.releaseAuthority) {
+            const release = await entry.releaseAuthority().catch((): RetainedAuthorityRelease => ({ released: false }));
+            if (!release.released) {
+              entry.authorityUnreleased = true;
+              if (!entry.authorityAlarmed) {
+                entry.authorityAlarmed = true;
+                alarm(entry, "native_probe_cleanup_authority_unreleased",
+                  "Native probe box was gone and its control-plane authority release did not read back released; the cleanup stays retained",
+                  { authority: "runner_prp_route", ...(release.runId ? { authorityRunId: release.runId } : {}) });
+              }
+              throw error;
+            }
+            entry.authorityUnreleased = false;
+          }
           entry.boxGone = true;
         }
         entry.retired = "confirmed";
@@ -130,7 +153,7 @@ export function retainAiCredentialCleanup(input: {
   // Accept legacy Google home metadata for compatibility. Only the explicit
   // bindRetainedAiCredentialHome mapping grants home-to-account authority.
   scope: RetainedAiCleanupScope; cleanup: () => Promise<void>; retired?: Promise<void>; retryRetirement?: () => Promise<void>; home?: string;
-  agentId?: string;
+  agentId?: string; releaseAuthority?: () => Promise<RetainedAuthorityRelease>;
 }): void {
   const scopeKey = key(input.scope);
   const entries = retained.get(scopeKey) ?? new Set<Cleanup>();
@@ -143,7 +166,8 @@ export function retainAiCredentialCleanup(input: {
     return;
   }
   const entry: Cleanup = { scope: { ...input.scope }, home: input.home, cleanup: input.cleanup, retryRetirement: input.retryRetirement,
-    agentId: input.agentId, retired: input.retired ? "pending" : "confirmed", retainedAt: Date.now() };
+    agentId: input.agentId, retired: input.retired ? "pending" : "confirmed", retainedAt: Date.now(),
+    ...(input.releaseAuthority ? { releaseAuthority: input.releaseAuthority } : {}) };
   entries.add(entry); retained.set(scopeKey, entries);
   if (input.retired) void input.retired.then(() => {
     entry.retired = "confirmed";
@@ -170,6 +194,12 @@ export async function reconcileRetainedAiCleanup(scope: RetainedAiCleanupScope, 
     if (options?.agentId !== undefined && entry.agentId !== undefined && entry.agentId !== options.agentId) continue;
     try { await attempt(entry); }
     catch (error) {
+      // The box is gone but its authority did not read back released: park the
+      // owning agent truthfully; the entry stays retained for the next retry.
+      if (options?.agentId !== undefined && entry.agentId === options.agentId && entry.authorityUnreleased) {
+        throw unprocessable("The native account test's machine was gone and its connection to this server could not be confirmed closed.",
+          { code: "native_probe_cleanup_authority_unreleased" });
+      }
       // The time bound: the owning agent's own attempt, once its entry has been
       // pending this long, parks it for Retry. The entry stays retained.
       if (options?.agentId !== undefined && entry.agentId === options.agentId

@@ -164,6 +164,12 @@ export async function registerRunnerPrpAuthority(input: {
   };
 }
 
+/** Read back a run's PRP control-plane authority: true while its registration
+ * (the record `release()` deletes) is still held on this server. */
+export function runnerPrpAuthorityRegistered(runId: string): boolean {
+  return registrations.has(runId);
+}
+
 export function queueLiveRunnerPrpCommand(input: {
   companyId: string;
   issueId: string;

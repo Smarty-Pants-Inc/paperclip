@@ -11,6 +11,7 @@ import type { PiThinkingCatalogModel } from "@paperclipai/adapter-utils/pi-rpc-d
 type RunnerModule = typeof import("@paperclipai/paperclip-runner");
 
 export type {
+  NativeProbeAuthorityRelease,
   NativePiRpcProfileSnapshot,
   PiThinkingLevel,
   NativeCursorCloudConfig,
@@ -123,6 +124,7 @@ export const NativeSessionCleanupQuarantinedError =
 export const NativeSessionProtocolIntegrityError =
   runner.NativeSessionProtocolIntegrityError;
 export const NativeEnvironmentProbeCleanupError = runner.NativeEnvironmentProbeCleanupError;
+export const releaseNativeProbeAuthority = runner.releaseNativeProbeAuthority;
 export const SemanticToolOutcomeUnknownError = runner.SemanticToolOutcomeUnknownError;
 export const dispatchToolCallback = runner.dispatchToolCallback;
 export const recoverToolCallback = runner.recoverToolCallback;

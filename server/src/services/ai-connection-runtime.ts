@@ -23,7 +23,8 @@ import { WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE } from "@paperclipai/adapter-utils/
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { decideGrokAuthMerge } from "@paperclipai/adapter-grok-local/server";
-import { NativeEnvironmentProbeCleanupError, sanitizeAntigravityCredential } from "../vendor/paperclip-runner/index.js";
+import { NativeEnvironmentProbeCleanupError, releaseNativeProbeAuthority, sanitizeAntigravityCredential } from "../vendor/paperclip-runner/index.js";
+import { runnerPrpAuthorityRegistered } from "../realtime/runner-prp-ws.js";
 import { readLocalAiCredentialFile } from "./local-ai-credential-file.js";
 import { prepareAntigravityCredentialWriteback } from "./native-runtime/antigravity-runner-credentials.js";
 import { quotaCredentialHash, quotaCredentialRecovery, RetiredCredentialRecoveryError } from "./quota-credential-recovery.js";
@@ -746,6 +747,12 @@ export async function withManagedAiProbe<T>(
       const retryCleanup = (error as { retryCleanup?: () => Promise<void> }).retryCleanup;
       retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope!, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup, retired: error.retired,
         agentId: input.agentId,
+        // Off-box: run the probe's control-plane authority release and read it
+        // back (the transport's confirmation and this server's registration).
+        releaseAuthority: async () => {
+          const release = await releaseNativeProbeAuthority(error);
+          return { ...release, released: release.released && !(release.runId && runnerPrpAuthorityRegistered(release.runId)) };
+        },
         ...(typeof retryCleanup === "function" ? { retryRetirement: () => retryCleanup.call(error) } : {}) });
       try {
         warnNativeProbeCleanupPending({ accountKeyHash: retainedAiAccountKeyHash(runtime.retainedCleanupScope!.accountKey),

@@ -29,6 +29,7 @@ const reasons = {
   native_probe_cleanup_failed: "The execution test failed and its runtime could not be closed cleanly. Paperclip finished the test's cleanup.",
   native_probe_cleanup_unfinished: "The execution test failed and its runtime could not be closed cleanly. Paperclip could not finish the test's cleanup: the test's temporary runtime home is still on this server, and Paperclip tries again to remove it the next time this AI connection is used.",
   native_probe_cleanup_box_gone: "Paperclip could not finish the test's cleanup on its test machine: the machine was released before it confirmed the test's credential handoff. Paperclip finished the test's cleanup on this server and removed its temporary runtime home.",
+  native_probe_cleanup_authority_unreleased: "Paperclip could not finish the test's cleanup: its test machine was released before it confirmed the test's credential handoff, and Paperclip could not confirm that the test's connection to this server was closed. The test's temporary runtime home stays on this server, and Paperclip tries again to finish the cleanup the next time this AI connection is used.",
   native_probe_cleanup_stalled: "Paperclip could not finish the test's cleanup within 10 minutes: its credential handoff or runtime home removal is still unconfirmed. The test's temporary runtime home stays on this server, and Paperclip tries again to finish the cleanup the next time this AI connection is used.",
 } as const;
 
@@ -39,7 +40,7 @@ const configurationFailures = new Set([
   // A failed test whose native close was unrecoverable: a true failure, not cleanup still running.
   "native_probe_cleanup_failed", "native_probe_cleanup_unfinished",
   // A probe cleanup whose box is gone, or that stayed pending past its bound: park for Retry.
-  "native_probe_cleanup_box_gone", "native_probe_cleanup_stalled",
+  "native_probe_cleanup_box_gone", "native_probe_cleanup_stalled", "native_probe_cleanup_authority_unreleased",
 ]);
 
 export function lifecycleVerificationNeedsRetry(context: LifecycleFailure, error: unknown): boolean {
@@ -55,7 +56,7 @@ export function lifecycleFailureCode(error: unknown): string | undefined {
   const detailCode = readHttpErrorCode(error);
   if (detailCode === "native_probe_cleanup_pending" || detailCode === "native_probe_cleanup_failed"
     || detailCode === "native_probe_cleanup_unfinished" || detailCode === "native_probe_cleanup_box_gone"
-    || detailCode === "native_probe_cleanup_stalled") return detailCode;
+    || detailCode === "native_probe_cleanup_stalled" || detailCode === "native_probe_cleanup_authority_unreleased") return detailCode;
   const candidate = error as { code?: unknown; cause?: { code?: unknown } } | null;
   const codes = [candidate?.code, candidate?.cause?.code];
   if (codes.includes(PLUGIN_RPC_ERROR_CODES.TIMEOUT)) return "PLUGIN_RPC_TIMEOUT";
