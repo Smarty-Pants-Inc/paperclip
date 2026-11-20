@@ -242,6 +242,56 @@ it.each(["ever-attached", "run-state"])("hung %s writes take two five-second att
   }
 }, 30_000);
 
+it("one quarantine listing timeout retries once and the first turn succeeds with GitHub", async () => {
+  let armed = false;
+  let attempts = 0;
+  const f = await fixture({ fault: script => armed && script.includes("basename") && ++attempts === 1 ? "timeout" : undefined });
+  const broker = await f.create();
+  armed = true;
+  try {
+    const deactivate = await broker.activate({ ...scope, runId: "run" });
+    armed = false;
+    expect(attempts).toBe(2);
+    expect((await f.hostRequest(f.generations[0])).status).toBe(200);
+    expect(f.resolveCredentials).toHaveBeenCalledOnce();
+    await deactivate();
+  } finally { armed = false; }
+}, 30_000);
+
+it("hung quarantine listing gets two five-second attempts, refuses authority, and Retry activates", async () => {
+  let armed = false;
+  let attempts = 0;
+  const f = await fixture({ fault: script => armed && script.includes("basename") && ++attempts <= 2 ? "hang" : undefined });
+  const broker = await f.create();
+  armed = true;
+  const started = Date.now();
+  const activation = broker.activate({ ...scope, runId: "failed-run" }).then(deactivate => ({ deactivate }), error => ({ error }));
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([activation, new Promise<never>((_, reject) => {
+      deadline = setTimeout(() => reject(new Error("listing exceeded its two five-second bounds")), 13_000);
+    })]);
+    const elapsedMs = Date.now() - started;
+    expect(result).toMatchObject({ error: { message: "GitHub access couldn't be set up for this turn", code: "native_github_setup_failed" } });
+    expect(attempts).toBe(2);
+    expect(elapsedMs).toBeGreaterThanOrEqual(10_000);
+    expect(elapsedMs).toBeLessThan(13_000);
+    expect((await f.hostRequest(f.generations[0])).status).toBe(403);
+    expect(f.resolveCredentials).not.toHaveBeenCalled();
+    console.log("QUARANTINE_HUNG_BOUND", JSON.stringify({ attempts, elapsedMs }));
+  } finally {
+    if (deadline) clearTimeout(deadline);
+    armed = false;
+    f.releaseHangs();
+    const result = await activation;
+    if ("deactivate" in result) await result.deactivate();
+  }
+  const deactivate = await broker.activate({ ...scope, runId: "retry-run" });
+  expect((await f.hostRequest(f.generations[1])).status).toBe(200);
+  expect((await f.hostRequest(f.generations[0])).status).toBe(403);
+  await deactivate();
+}, 30_000);
+
 it("failed quarantine listing rejects authority for that generation, records GitHub setup reason, and Retry activates", async () => {
   let armed = false;
   const f = await fixture({ fail: script => armed && script.includes("basename") });
