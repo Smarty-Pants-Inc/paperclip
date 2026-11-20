@@ -171,6 +171,7 @@ export function typedFencePlugin(): RealmPlugin {
 interface SourceNode {
   type: string;
   value?: string;
+  url?: string;
   position?: { start: { offset?: number }; end: { offset?: number } };
   children?: SourceNode[];
 }
@@ -179,8 +180,9 @@ interface SourceNode {
  * The person's text from a draft an older build stored as markdown: what its
  * markdown import showed. Text keeps its characters with the escapes and
  * character references resolved (`a\*b\*c` is `a*b*c`), a hard break is a
- * newline, and every other construct (formatting, links, images, code) keeps
- * its source, as the older build would have sent it.
+ * newline, and an autolink whose only text child exactly matches its parsed
+ * URL becomes that URL. Other constructs (formatting, named links, images,
+ * code) keep their source, with child-text escapes resolved as before.
  */
 export function legacyMarkdownDraftToText(markdown: string): string {
   const source = markdown.replace(/\r\n?/g, "\n");
@@ -188,6 +190,14 @@ export function legacyMarkdownDraftToText(markdown: string): string {
   const visit = (node: SourceNode) => {
     const start = node.position?.start.offset;
     const end = node.position?.end.offset;
+    // The parser resolves markdown escapes in both the label and destination.
+    // Do not normalize URLs: a trailing slash difference is a named link too.
+    if (node.type === "link" && node.url !== undefined && node.children?.length === 1
+      && node.children[0].type === "text" && node.children[0].value === node.url
+      && start !== undefined && end !== undefined) {
+      edits.push({ start, end, text: node.url });
+      return;
+    }
     if ((node.type === "text" || node.type === "break") && start !== undefined && end !== undefined) {
       edits.push({ start, end, text: node.type === "text" ? node.value ?? "" : "\n" });
       return;

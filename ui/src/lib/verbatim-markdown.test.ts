@@ -224,6 +224,17 @@ describe("drafts an older build stored as markdown", () => {
     ["line one\\\nline two", "line one\nline two"],
     ["```py\nprint('a\\_b')\n```", "```py\nprint('a\\_b')\n```"],
     ["plain words", "plain words"],
+    ["[https://example.com/a_b/~user?q=x_y](https://example.com/a_b/~user?q=x_y)", "https://example.com/a_b/~user?q=x_y"],
+    [String.raw`https://example.com/a\_b/\~user?q=x\_y`, "https://example.com/a_b/~user?q=x_y"],
+    [String.raw`[https://example.com/a\_b/\~user?q=x\_y](https://example.com/a_b/~user?q=x_y)`, "https://example.com/a_b/~user?q=x_y"],
+    [String.raw`[https://example.com/a\_b](https://example.com/a\_b)`, "https://example.com/a_b"],
+    ["before [https://x/a_b](https://x/a_b) after", "before https://x/a_b after"],
+    // A real link keeps its markdown structure, with child-text escapes resolved.
+    [String.raw`[different\_text](https://example.com/a_b)`, "[different_text](https://example.com/a_b)"],
+    ["[https://example.com](https://example.com/)", "[https://example.com](https://example.com/)"],
+    ["[https://example.com/](https://example.com)", "[https://example.com/](https://example.com)"],
+    ["[**https://example.com**](https://example.com)", "[**https://example.com**](https://example.com)"],
+    ["[https://example.com`/a`](https://example.com/a)", "[https://example.com`/a`](https://example.com/a)"],
   ])("restores %j as the person's text %j", (stored, text) => {
     expect(legacyMarkdownDraftToText(stored)).toBe(text);
   });
