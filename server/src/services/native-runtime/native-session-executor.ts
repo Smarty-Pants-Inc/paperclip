@@ -14367,7 +14367,10 @@ async function executePaperclipNativeSessionAttempt(
     // previous run's prefix cannot make this run's cursor reach its terminal.
     // Close with the exact consumer-stopped proof, preserving retained reads,
     // answers and ACKs, and let the existing wired release owner resume a hold.
-    await controlPlane.settleEventIngestion();
+    // A settle failure must never lose a completed turn (rf-3 (iii)): the held
+    // release stays held and the stale-lock sweep's recovery retries it.
+    await controlPlane.settleEventIngestion().catch(err =>
+      logger.warn({ err, runId: input.execution.binding.runId }, "steering ingestion settle after a normal end failed; the release stays held for recovery"));
     // Persist provider accounting before any workspace/issue finalization. A
     // detached controller or failed finalizer must not lose a completed turn.
     // session.usage() may be an attachment baseline, a partial report, or a
