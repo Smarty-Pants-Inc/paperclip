@@ -28,6 +28,7 @@ import * as verbatimMarkdown from "../lib/verbatim-markdown";
 const mdxEditorMockState = vi.hoisted(() => ({
   linkValidator: null as ((url: string) => boolean) | null,
   pluginDefinitions: [] as unknown[],
+  markdownShortcut: { name: "markdownShortcutPlugin" },
   toMarkdownOptions: undefined as unknown,
   linkOptions: null as { disableAutoLink?: boolean } | null,
   emitMountEmptyReset: false,
@@ -219,7 +220,7 @@ vi.mock("@mdxeditor/editor", async () => {
       return {};
     },
     listsPlugin: () => ({}),
-    markdownShortcutPlugin: () => ({}),
+    markdownShortcutPlugin: () => mdxEditorMockState.markdownShortcut,
     quotePlugin: () => ({}),
     realmPlugin: (plugin: unknown) => () => plugin,
     tablePlugin: () => ({}),
@@ -380,6 +381,18 @@ describe("MarkdownEditor", () => {
     } finally {
       await act(async () => root.unmount());
       typedFence.mockRestore();
+    }
+  });
+
+  it.each([false, true])("keeps markdown typing shortcuts only outside verbatim mode (%s)", async (verbatimText) => {
+    const root = createRoot(container);
+    try {
+      await act(async () => {
+        root.render(<MarkdownEditor value="" onChange={() => {}} {...(verbatimText ? { verbatimText: true } : {})} />);
+      });
+      expect(mdxEditorMockState.pluginDefinitions.includes(mdxEditorMockState.markdownShortcut)).toBe(!verbatimText);
+    } finally {
+      await act(async () => root.unmount());
     }
   });
 
