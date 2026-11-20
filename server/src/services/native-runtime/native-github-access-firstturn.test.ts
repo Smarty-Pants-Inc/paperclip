@@ -121,6 +121,11 @@ it("cold real GitHub create + activate uses at most six remote execs and publish
     serialDepth: { create: createDepth, activate: depth - createDepth, total: depth } }));
   f.setPhase("cleanup");
   await deactivate();
+  const pauseWrites = f.calls.filter(call => call.phase === "cleanup" &&
+    call.script.includes("run-state.json") && !call.script.includes("ever-attached"));
+  expect(pauseWrites).toHaveLength(3);
+  expect(pauseWrites.filter(call => /(?:^|\n)printf '%s'/.test(call.script))).toHaveLength(1);
+  expect(pauseWrites.filter(call => /(?:^|\n)base64 -d </.test(call.script))).toHaveLength(1);
   expect(depth).toBeLessThanOrEqual(6);
   expect(count).toBeLessThanOrEqual(6);
 }, 30_000);
