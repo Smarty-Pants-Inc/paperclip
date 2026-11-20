@@ -35,10 +35,11 @@ import { routeApp, type BoardActor } from "./helpers/route-test-harness.js";
 // Never-OK (rf-4 F2, RFL 05:59Z): a native lease's box is never destroyed
 // without a VERIFIED saved harness copy. No copy: it is stopped and kept,
 // named, owned by the retained-orphan settle, retried, and escalated after
-// the cleanup cap. A verified copy: destroyed as today.
+// the cleanup cap. Released-box cleanup also requires its stop receipt and a
+// completed provider snapshot read back for the exact allocation.
 const support = await getEmbeddedPostgresTestSupport();
 const PROVIDER_METHODS = ["environmentAcquireLease", "environmentExecute", "environmentReleaseLease",
-  "environmentDestroyLease", "environmentStopLease"];
+  "environmentDestroyLease", "environmentStopLease", "environmentInspectLease"];
 const KIND = "environment_retained_orphan_sandbox";
 
 describe.skipIf(!support.supported)("native lease custody before any destructive cleanup", () => {
@@ -50,8 +51,8 @@ describe.skipIf(!support.supported)("native lease custody before any destructive
   }, 90_000);
   afterAll(async () => { await tempDb?.cleanup(); });
 
-  /** A provider that answers stop and destroy with exact receipts; records backups at each call. */
-  function provider(pluginId: string, companyId: string) {
+  /** Exact stop/destroy receipts and optional completed snapshot read-back at the provider boundary. */
+  function provider(pluginId: string, companyId: string, withSnapshot: boolean) {
     const calls: Array<{ method: string; providerLeaseId?: string; backupsAtCall: number }> = [];
     const manager = {
       isRunning: vi.fn((id: string) => id === pluginId),
@@ -59,6 +60,8 @@ describe.skipIf(!support.supported)("native lease custody before any destructive
       call: vi.fn(async (_id: string, method: string, params: { providerLeaseId?: string }) => {
         const backups = await db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.companyId, companyId));
         calls.push({ method, providerLeaseId: params.providerLeaseId, backupsAtCall: backups.length });
+        if (method === "environmentInspectLease") return { providerLeaseId: params.providerLeaseId, state: "stopped",
+          ...(withSnapshot ? { snapshot: { id: `snapshot-${params.providerLeaseId}`, state: "completed" } } : {}) };
         if (method === "environmentStopLease") return { providerLeaseId: params.providerLeaseId, state: "stopped" };
         if (method === "environmentDestroyLease" || method === "environmentReleaseLease")
           return { providerLeaseId: params.providerLeaseId, state: "destroyed" };
@@ -66,10 +69,12 @@ describe.skipIf(!support.supported)("native lease custody before any destructive
       }),
     } as unknown as PluginWorkerManager;
     return { manager, calls, destroys: () => calls.filter(c => c.method === "environmentDestroyLease"),
-      stops: () => calls.filter(c => c.method === "environmentStopLease") };
+      stops: () => calls.filter(c => c.method === "environmentStopLease"),
+      inspections: () => calls.filter(c => c.method === "environmentInspectLease") };
   }
 
-  async function seed(opts: { runStatus?: "cancelled" | "running"; runtimeMode?: "native" | "legacy"; started?: boolean } = {}) {
+  async function seed(opts: { runStatus?: "cancelled" | "running"; runtimeMode?: "native" | "legacy"; started?: boolean;
+    completedSnapshot?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     const environmentId = randomUUID(), pluginId = randomUUID(), userId = `board-${companyId.slice(0, 8)}`;
     const pluginKey = `paperclip.custody-${pluginId.slice(0, 8)}`;
@@ -120,7 +125,8 @@ describe.skipIf(!support.supported)("native lease custody before any destructive
         remoteCwd: "/workspace", sandboxState: "started", sandboxLeaseAcquisition: { outcome: "created" } } }).returning();
     const actor: BoardActor = { type: "board", userId, companyIds: [companyId], memberships: [{ companyId,
       membershipRole: "owner", status: "active" }], isInstanceAdmin: false, source: "session" } as unknown as BoardActor;
-    return { companyId, agentId, issueId, runId, box, leaseId: lease!.id, actor, ...provider(pluginId, companyId) };
+    return { companyId, agentId, issueId, runId, box, leaseId: lease!.id, actor,
+      ...provider(pluginId, companyId, opts.completedSnapshot ?? false) };
   }
 
   /** A saved harness copy row of the run; `withBytes` stores its object bytes. */
@@ -188,8 +194,8 @@ describe.skipIf(!support.supported)("native lease custody before any destructive
     expectStoppedAndKept(lease, f.box);
   }, 30_000);
 
-  it("(d) retry: the copy becomes verified later -> destroyed on the next sweep", async () => {
-    const f = await seed();
+  it("(d) retry: the copy becomes verified later -> destroyed on the next sweep with stop receipt and completed snapshot", async () => {
+    const f = await seed({ completedSnapshot: true });
     const copy = await saveCopy(f, false);
     const heartbeat = await sweep(f);
     expectStoppedAndKept(await leaseRow(f.leaseId), f.box);
@@ -204,8 +210,36 @@ describe.skipIf(!support.supported)("native lease custody before any destructive
       await heartbeat.sweepPendingCleanupLeases();
     const lease = await leaseRow(f.leaseId);
     console.log("ROW_D", JSON.stringify({ calls: f.calls, status: lease.status }));
+    expect(lease.metadata?.workspaceRecoveryCleanup).toMatchObject({ stopReceipt: {
+      companyId: f.companyId, runId: f.runId, leaseId: f.leaseId, providerLeaseId: f.box, state: "stopped",
+    } });
+    expect(f.inspections()).toEqual([{ method: "environmentInspectLease", providerLeaseId: f.box, backupsAtCall: 1 }]);
     expect(f.destroys()).toEqual([{ method: "environmentDestroyLease", providerLeaseId: f.box, backupsAtCall: 1 }]);
     expect(lease.status).toBe("expired");
+  }, 30_000);
+
+  it("(d sibling) retry: verified copy and stop receipt without a completed snapshot -> held, never destroyed", async () => {
+    const f = await seed({ completedSnapshot: false });
+    const copy = await saveCopy(f, false);
+    const heartbeat = await sweep(f);
+    expectStoppedAndKept(await leaseRow(f.leaseId), f.box);
+    expect(f.destroys()).toEqual([]);
+    copy.store();
+    const settled = await settleOwnableKind(db, KIND);
+    expect(settled.map(r => r.recordId)).toContain(f.leaseId);
+    for (let tick = 0; tick < 3 && f.inspections().length === 0; tick += 1)
+      await heartbeat.sweepPendingCleanupLeases();
+    const lease = await leaseRow(f.leaseId);
+    console.log("ROW_D_WITHOUT_SNAPSHOT", JSON.stringify({ calls: f.calls, status: lease.status,
+      holdReason: lease.metadata?.pendingCleanupHoldReason }));
+    expect(lease.metadata?.workspaceRecoveryCleanup).toMatchObject({ stopReceipt: {
+      companyId: f.companyId, runId: f.runId, leaseId: f.leaseId, providerLeaseId: f.box, state: "stopped",
+    } });
+    expect(f.inspections()).toEqual([{ method: "environmentInspectLease", providerLeaseId: f.box, backupsAtCall: 1 }]);
+    expect(f.destroys()).toHaveLength(0);
+    expect(lease).toMatchObject({ status: "pending_cleanup", metadata: {
+      pendingCleanupHoldReason: "completed_provider_snapshot_missing",
+    } });
   }, 30_000);
 
   it("(e) a copy that never verifies: kept stopped, counted, escalated once after the cleanup cap", async () => {
