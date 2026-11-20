@@ -3491,57 +3491,76 @@ export function heartbeatService(
           message: "run started",
         }));
 
+        executionControl.controller.signal.throwIfAborted();
+        // Log setup and validated GitHub discovery own disjoint state. Drain both
+        // before failure/teardown; Promise.all would leave a sibling preparing
+        // against a released environment. Keep serial-order error precedence.
+        const [outputPreparation, githubPreparation] = await Promise.allSettled([
+          (async () => {
+            const output = await timePreparation("run_output", () => runOutput.begin(currentRun));
+            if (runScopedMentionedSkillKeys.length > 0) {
+              await output.onLog(
+                "stdout",
+                `[paperclip] Enabled run-scoped skills from issue mentions: ${runScopedMentionedSkillKeys.join(", ")}\n`,
+              );
+            }
+            for (const warning of runtimeWorkspaceWarnings) {
+              const logEntry = formatRuntimeWorkspaceWarningLog(warning);
+              await output.onLog(logEntry.stream, logEntry.chunk);
+            }
+            return output;
+          })(),
+          (async () => {
+            await timePreparation("workspace_validation", () => assertGitSensitiveAdapterWorkspaceValid({
+              adapterType: agent.adapterType,
+              agentId: agent.id,
+              issue: issueRef
+                ? {
+                    id: issueRef.id,
+                    identifier: issueRef.identifier,
+                    projectId: issueRef.projectId,
+                    projectWorkspaceId: issueRef.projectWorkspaceId,
+                  }
+                : null,
+              resolvedWorkspace,
+              executionWorkspace,
+              persistedExecutionWorkspace,
+              executionTarget,
+              environmentDriver: selectedEnvironment?.driver ?? "provider_api",
+              leaseMetadata: activeEnvironmentLease?.lease.metadata ?? {},
+            }));
+            // Preserve immutable runtime selection, after the running-agent check.
+            const nativeRuntimeResolution = resolveHeartbeatNativeRuntimeMode({
+              persisted: run,
+              enabled: resolvedInstanceSettings.experimental.enableNativeRunner === true,
+              museEnabled: resolvedInstanceSettings.experimental.enableMuse === true,
+              grokEnabled: resolvedInstanceSettings.experimental.enableGrokBot === true && resolvedInstanceSettings.experimental.enablePublicMcp === true,
+              dotEnabled: resolvedInstanceSettings.experimental.enableOpenAiDot === true && resolvedInstanceSettings.experimental.enablePublicMcp === true,
+              runtimeConfig: agent.runtimeConfig, adapterConfig: agent.adapterConfig,
+              agent: { id: agent.id, companyId: agent.companyId, status: runningAgent.status, adapterType: agent.adapterType },
+              issue: issueRef, target: executionTarget, workspaceId: persistedExecutionWorkspace?.id ?? null,
+            });
+            const githubEnvironment = await timePreparation("github_environment", () => prepareHeartbeatGitHubEnvironment({
+              defer: !useAgentGitHubEnv && nativeRuntimeResolution.kind === "native" && nativeRuntimeResolution.profile.backend === "pi_rpc",
+              target: executionTarget, cwd: executionWorkspace.cwd,
+              env: Object.fromEntries(Object.entries(parseObject(runtimeConfig.env)).filter(
+                (entry): entry is [string, string] => typeof entry[1] === "string")),
+              hostCredentials: useHostGitHub,
+              networkAccess: trustPreset.kind === "standard" && process.env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled",
+              // Classifies a final Git probe failure on both the immediate and the deferred call.
+              environment: selectedEnvironment, providerLeaseId: activeEnvironmentLease?.lease.providerLeaseId ?? null,
+            }));
+            return { nativeRuntimeResolution, githubEnvironment };
+          })(),
+        ]);
+        if (outputPreparation.status === "rejected") throw outputPreparation.reason;
+        if (githubPreparation.status === "rejected") throw githubPreparation.reason;
+        executionControl.controller.signal.throwIfAborted();
         const { currentUserRedactionOptions, appendIdentityRedactedLog, onLog, onPersistedNativeLog, onAdapterMeta, onAdapterEvent,
-          finishAdapterEvents } = await timePreparation("run_output", () => runOutput.begin(currentRun));
-        if (runScopedMentionedSkillKeys.length > 0) {
-          await onLog(
-            "stdout",
-            `[paperclip] Enabled run-scoped skills from issue mentions: ${runScopedMentionedSkillKeys.join(", ")}\n`,
-          );
-        }
-        for (const warning of runtimeWorkspaceWarnings) {
-          const logEntry = formatRuntimeWorkspaceWarningLog(warning);
-          await onLog(logEntry.stream, logEntry.chunk);
-        }
-        await timePreparation("workspace_validation", () => assertGitSensitiveAdapterWorkspaceValid({
-          adapterType: agent.adapterType,
-          agentId: agent.id,
-          issue: issueRef
-            ? {
-                id: issueRef.id,
-                identifier: issueRef.identifier,
-                projectId: issueRef.projectId,
-                projectWorkspaceId: issueRef.projectWorkspaceId,
-              }
-            : null,
-          resolvedWorkspace,
-          executionWorkspace,
-          persistedExecutionWorkspace,
-          executionTarget,
-          environmentDriver: selectedEnvironment?.driver ?? "provider_api",
-          leaseMetadata: activeEnvironmentLease?.lease.metadata ?? {},
-        }));
-        // Preserve immutable runtime selection, after the running-agent check.
-        const nativeRuntimeResolution = resolveHeartbeatNativeRuntimeMode({
-          persisted: run,
-          enabled: resolvedInstanceSettings.experimental.enableNativeRunner === true,
-          museEnabled: resolvedInstanceSettings.experimental.enableMuse === true,
-          grokEnabled: resolvedInstanceSettings.experimental.enableGrokBot === true && resolvedInstanceSettings.experimental.enablePublicMcp === true,
-          dotEnabled: resolvedInstanceSettings.experimental.enableOpenAiDot === true && resolvedInstanceSettings.experimental.enablePublicMcp === true,
-          runtimeConfig: agent.runtimeConfig, adapterConfig: agent.adapterConfig,
-          agent: { id: agent.id, companyId: agent.companyId, status: runningAgent.status, adapterType: agent.adapterType },
-          issue: issueRef, target: executionTarget, workspaceId: persistedExecutionWorkspace?.id ?? null,
-        });
-        const githubEnvironment = await timePreparation("github_environment", () => prepareHeartbeatGitHubEnvironment({
-          defer: !useAgentGitHubEnv && nativeRuntimeResolution.kind === "native" && nativeRuntimeResolution.profile.backend === "pi_rpc",
-          target: executionTarget, cwd: executionWorkspace.cwd,
-          env: Object.fromEntries(Object.entries(parseObject(runtimeConfig.env)).filter(
-            (entry): entry is [string, string] => typeof entry[1] === "string")),
-          hostCredentials: useHostGitHub,
-          networkAccess: trustPreset.kind === "standard" && process.env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled",
-          // Classifies a final Git probe failure on both the immediate and the deferred call.
-          environment: selectedEnvironment, providerLeaseId: activeEnvironmentLease?.lease.providerLeaseId ?? null,
-        }));
+          finishAdapterEvents } = outputPreparation.value;
+        // Runtime selection remains downstream: it consumes this environment,
+        // output callbacks and the context written by runtime-services startup.
+        const { nativeRuntimeResolution, githubEnvironment } = githubPreparation.value;
         if (useAgentGitHubEnv) githubEnvironment.env.PAPERCLIP_GITHUB_AUTH_MODE = "agent_env";
         runtimeConfig = { ...runtimeConfig, env: githubEnvironment.env };
         if (!useHostGitHub && !providerApiPlacement) {
