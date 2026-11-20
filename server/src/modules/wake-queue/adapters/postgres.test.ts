@@ -2037,6 +2037,64 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     console.log("mc-7 rollback preserves deferred wake/no card; committed release writes ONE");
   });
 
+  // neworg-trace-reason: ONE "not promoted" line per release that leaves its deferred head (or no head) unpromoted.
+  const NOT_PROMOTED_KEYS = ["event", "reason", "outcome", "issueId", "runId", "headWakeId", "headStatus",
+    "headCoalescedCount", "releaseTxStartedAt"].sort();
+  function notPromotedLines(info: { mock: { calls: unknown[][] } }) {
+    const lines = info.mock.calls.filter(([, message]) => message === "Issue execution release not promoted")
+      .map(([fields]) => fields as Record<string, unknown>);
+    for (const line of lines) {
+      expect(Object.keys(line).sort()).toEqual(NOT_PROMOTED_KEYS); // ids and enums only: no text field
+      expect(new Date(String(line.releaseTxStartedAt)).toISOString()).toBe(line.releaseTxStartedAt);
+    }
+    return lines.map(({ releaseTxStartedAt: _at, ...rest }) => rest);
+  }
+  function notPromotedLine(reason: string, outcome: string, issueId: string | null, runId: string, headWakeId: string | null) {
+    return { event: "issue_execution_release_not_promoted", reason, outcome, issueId, runId, headWakeId,
+      headStatus: headWakeId ? "deferred_issue_execution" : null, headCoalescedCount: null };
+  }
+
+  it("rn-1: no deferred head -> ONE not-promoted line, reason no_head", async () => {
+    const c = await seed();
+    const m = await message(c, "Answered daily-work question", ago(day));
+    const r = await run(c, [m.id], ago(day - 60_000));
+    await reply(c, r.id);
+    const info = vi.spyOn(logger, "info");
+    const result = await drain(c, r.id);
+    expect(result.outcome.kind).not.toBe("promoted");
+    const lines = notPromotedLines(info);
+    expect(lines).toEqual([notPromotedLine("no_head", result.outcome.kind, c.issueId, r.id, null)]);
+    expect(JSON.stringify(lines)).not.toContain(m.body);
+  });
+
+  it("rn-2: a live successor holds the task -> reason successor_exists (live owner held), head not read", async () => {
+    const c = await seed();
+    const m = await message(c, "Last-second message behind a finishing run", ago(60_000));
+    const w = await wake(c, m.id, ago(50_000));
+    const r = await run(c, [], ago(day));
+    await db.insert(heartbeatRuns).values({ companyId: c.companyId, agentId: c.agentId, status: "running",
+      runtimeMode: "native", nativeIssueId: c.issueId, startedAt: ago(30_000), contextSnapshot: { issueId: c.issueId } });
+    const info = vi.spyOn(logger, "info");
+    const result = await drain(c, r.id);
+    expect(result.outcome.kind).toBe("released");
+    const lines = notPromotedLines(info);
+    expect(lines).toEqual([notPromotedLine("successor_exists", "released", c.issueId, r.id, null)]);
+    expect(JSON.stringify(lines)).not.toContain(m.body);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0].status).toBe("deferred_issue_execution");
+  });
+
+  it("rn-3: stranded-queue resume of a still-live source -> reason source_not_terminal", async () => {
+    const c = await seed();
+    const m = await message(c, "Message behind a live run", ago(60_000));
+    await wake(c, m.id, ago(50_000));
+    const r = await run(c, [], ago(day), "running");
+    await db.update(heartbeatRuns).set({ finishedAt: null }).where(eq(heartbeatRuns.id, r.id));
+    const info = vi.spyOn(logger, "info");
+    const result = await drain(c, r.id, true);
+    expect(result.outcome.kind).toBe("released");
+    expect(notPromotedLines(info)).toEqual([notPromotedLine("source_not_terminal", "released", c.issueId, r.id, null)]);
+  });
+
   it("sw-1: old never-claimed wake is cancelled, never promoted; sweep writes exactly ONE true card", async () => {
     const { c, old, w, r } = await movedChat();
     const info = vi.spyOn(logger, "info");
@@ -2044,12 +2102,14 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     const cancellation = info.mock.calls.filter(([, message]) => message === "Deferred wake cancelled: conversation moved on");
     expect(cancellation).toHaveLength(1);
     expect(cancellation[0][0]).toEqual({ wakeId: w.id, issueId: c.issueId, commentIdsCount: 1 });
-    const releases = info.mock.calls.filter(([, message]) => message === "Issue execution release decision");
+    const releases = info.mock.calls.filter(([, message]) => message === "Issue execution release decision (wake queue)");
     expect(releases).toHaveLength(1);
-    expect(releases[0][0]).toEqual({ caller: "wake_queue.release_drain", runId: r.id, issueId: c.issueId,
+    expect(releases[0][0]).toEqual({ event: "issue_execution_release_drain", caller: "wake_queue.release_drain", runId: r.id, issueId: c.issueId,
       companyId: c.companyId, outcome: result.outcome.kind, reason: result.outcome.kind,
       deferredHeadWakeId: w.id, promotedWakeId: null });
-    expect(JSON.stringify([...cancellation, ...releases])).not.toContain(old.body);
+    const notPromoted = notPromotedLines(info);
+    expect(notPromoted).toEqual([notPromotedLine("conversation_moved_on", result.outcome.kind, c.issueId, r.id, w.id)]);
+    expect(JSON.stringify([...cancellation, ...releases, ...notPromoted])).not.toContain(old.body);
     const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id));
     console.log("sw-1 drain", result.outcome.kind, "wake", saved.status, saved.error);
     expect(saved).toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
@@ -2117,10 +2177,11 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     const info = vi.spyOn(logger, "info");
     const result = await drain(c, r.id);
     expect(result.outcome.kind).toBe("promoted");
-    const releases = info.mock.calls.filter(([, message]) => message === "Issue execution release decision");
+    const releases = info.mock.calls.filter(([, message]) => message === "Issue execution release decision (wake queue)");
     expect(releases).toHaveLength(1);
-    expect(releases[0][0]).toEqual({ caller: "wake_queue.release_drain", runId: r.id, issueId: c.issueId,
+    expect(releases[0][0]).toEqual({ event: "issue_execution_release_drain", caller: "wake_queue.release_drain", runId: r.id, issueId: c.issueId,
       companyId: c.companyId, outcome: "promoted", reason: "promoted", deferredHeadWakeId: w.id, promotedWakeId: w.id });
+    expect(notPromotedLines(info)).toEqual([]);
     expect(JSON.stringify(releases)).not.toContain(fresh.body);
     expect(await noRunFor(fresh.id)).toHaveLength(1);
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0].runId).toBeTruthy();

@@ -469,13 +469,19 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     expect(traces).toHaveLength(1);
     expect(traces[0][0]).toEqual({ commentId: response.body.id, issueId: chat.issue.id,
       runId: variant === "non-Pi" ? null : chat.runId,
-      reason: variant === "non-Pi" ? "unsupported_adapter" : variant === "stale-turn" ? "stale_turn" : "steering_temporarily_unavailable",
-      wakeId: null, wakeStatus: "unknown" });
+      // A refused RPC logs the STORED refusal code and the receipt it queued into (rf-3 fix 1).
+      reason: variant === "non-Pi" ? "unsupported_adapter" : variant === "stale-turn" ? "steering_stale_turn" : "steering_temporarily_unavailable",
+      wakeId: variant === "stale-turn" ? expect.any(String) : null, wakeStatus: variant === "stale-turn" ? "queued" : "unknown" });
     expect(JSON.stringify(traces)).not.toContain(`Fallback ${variant}`);
     expect(Object.keys(traces[0][0] as object).sort()).toEqual(["commentId", "issueId", "reason", "runId", "wakeId", "wakeStatus"]);
     info.mockRestore();
     const carriers = await carriersOf(chat, response.body.id);
     expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+    if (variant === "stale-turn") {
+      const [queuedWake] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${response.body.id}`));
+      expect((traces[0][0] as Record<string, unknown>).wakeId).toBe(queuedWake.id);
+    }
     expect(await answered(response.body.id)).toBe(false);
     // An RPC refusal occurs after POST's custody decision. Depending on whether
     // its reconciliation beat response projection, the receipt is still pending

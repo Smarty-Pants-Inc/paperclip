@@ -1218,8 +1218,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
     options: { suppressImmediateRecovery?: boolean; resumeStrandedQueue?: boolean; personWakeBound?: boolean; deferredPostCommitEffects?: WakeQueuePostCommitEffect[] } = {},
   ) {
-    const trace = { caller: "heartbeat.release", runId: run.id, issueId: null as string | null,
-      companyId: run.companyId, outcome: "error", deferredHeadWakeId: null, promotedWakeId: null as string | null };
+    const trace = { event: "issue_execution_release_heartbeat", caller: "heartbeat.release", runId: run.id, issueId: null as string | null,
+      companyId: run.companyId, outcome: "error", promotedWakeId: null as string | null };
     try {
       const [source] = await db.select({
         errorCode: heartbeatRuns.errorCode,
@@ -1282,7 +1282,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       }
       throw error;
     } finally {
-      logger.info(trace, "Issue execution release decision");
+      logger.info(trace, "Issue execution release (heartbeat)");
     }
   }
 
