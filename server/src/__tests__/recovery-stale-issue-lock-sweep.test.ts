@@ -1,3 +1,6 @@
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { registerIssueRecoveryWork } from "../services/recovery/work.js";
+import { wiredHeartbeatFor } from "../services/heartbeat-registry.js";
 import { reconcileNativeFinalizations } from "../services/native-runtime/native-finalization-reconciler.js";
 import { pendingNativeWithheldReply } from "../services/native-runtime/native-withheld-reply-trigger.js";
 import { nativeResponsePresentationWork } from "../services/native-runtime/native-response-presentation-work.js";
@@ -52,7 +55,7 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
 import { withQueuedCommentIdsInWakePayload } from "../services/issue-queued-comment-queue.js";
 import { createReleaseIssueExecution } from "../modules/wake-queue/application/use-cases.js";
-import { createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
+import { createAdmissionTransactionScope, createWakeAdmissionWriter, createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
 
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_STALE_LOCK_TEST_DATABASE_URL");
 const embeddedPostgresSupport = external ? { supported: true, reason: undefined } : await getEmbeddedPostgresTestSupport();
@@ -1449,7 +1452,8 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
         status: "in_review", assigneeAgentId: agent.id, responsibleUserId: owner,
         conversationAgentId: agent.id, conversationUserId: owner, conversationState: "waiting" }).returning();
       startTaskDrain({}); // No provider dispatch; admission, custody and sweeps remain real.
-      return { companyId: company.id, agentId: agent.id, issueId: issue.id, heartbeat: heartbeatService(db) };
+      return { companyId: company.id, agentId: agent.id, issueId: issue.id,
+        heartbeat: await wiredHeartbeatFor(db, "test:deferred-person-bound:chat") };
     }
     type Chat = Awaited<ReturnType<typeof chat>>;
     async function message(c: Chat, body: string, at: Date) {
@@ -1523,6 +1527,163 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       const ownerId = (await issue(c)).executionRunId;
       if (ownerId) await settleOwnableKind(db, "issue_execution_lock", { runIds: [ownerId] });
     }
+
+    async function boundFixture(gapMs = 500) {
+      const c = await chat();
+      const last = ago(13_000);
+      const messages = await Promise.all(["first", "last", "very last"].map((text, i) =>
+        message(c, `BOUND ${text}`, new Date(last.getTime() - (2 - i) * 100))));
+      const w = await deferred(c, messages[0].id, new Date(last.getTime() - 200));
+      // Actual queue coalesces, each committed separately. Only persisted times
+      // are moved backwards to exercise the 12-second bound without a clock mock.
+      for (let i = 1; i < messages.length; i++) await db.transaction(async tx => {
+        await createWakeAdmissionWriter().mergeIntoExistingDeferredWake(
+          createAdmissionTransactionScope(c.companyId, tx as unknown as typeof db), {
+            companyId: c.companyId, existingDeferredWakeId: w.id, manualUserWakeActorId: owner,
+            mergedPayload: withQueuedCommentIdsInWakePayload(w.payload, messages.slice(0, i + 1).map(m => m.id)),
+            nextCoalescedCount: i + 1,
+          });
+      });
+      await db.update(agentWakeupRequests).set({ updatedAt: last }).where(eq(agentWakeupRequests.id, w.id));
+      const r = await run(c, [], ago(30_000), "succeeded", new Date(last.getTime() + gapMs));
+      await db.insert(nativeRunFinalizations).values({ companyId: c.companyId, issueId: c.issueId,
+        runId: r.id, phase: "committed" });
+      return { c, w, r, messages };
+    }
+    function boundRelease() {
+      return createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, {
+        resolveResponsibleUserId: async () => owner,
+        getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+        resolveSessionBeforeForWakeup: async () => null,
+      }), recovery: { escalateStrandedAssignedIssue: async () => {},
+        escalateStrandedRecoveryIssueInPlace: async () => {} } });
+    }
+    it.each([500, 8])("BOUND: last coalesce %i ms before normal end drains every message once", async gap => {
+      const { c, w, r, messages } = await boundFixture(gap);
+      await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+      const runs = await queuedRuns(w.id);
+      expect(runs).toHaveLength(1);
+      expect(new Set(runs[0].contextSnapshot?.wakeCommentIds)).toEqual(new Set(messages.map(m => m.id)));
+      await Promise.all([c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId }),
+        boundRelease()({ companyId: c.companyId, runId: r.id, now: new Date(), suppressImmediateRecovery: true })]);
+      expect(await queuedRuns(w.id)).toHaveLength(1);
+      process.stdout.write(`BOUND evidence ${JSON.stringify({ gap, wakeId: w.id, sourceRunId: r.id,
+        promotedRunId: runs[0].id, commentIds: runs[0].contextSnapshot?.wakeCommentIds })}\n`);
+    });
+    it("BOUND: simultaneous person's Send, sweep and end release admit one carrier", async () => {
+      const { c, w, r, messages } = await boundFixture();
+      // Send records its intent under the issue lock, then invokes this real
+      // continuation owner, exactly as queued-comments/interrupt does.
+      const send = async () => {
+        await db.transaction(async tx => {
+          await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, c.issueId)).for("update");
+          const [saved] = await tx.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id));
+          if (saved.status === "deferred_issue_execution") await tx.update(agentWakeupRequests).set({
+            payload: { ...saved.payload, queuedCommentInterrupt: { actorId: owner, requestedAt: new Date().toISOString() } },
+            updatedAt: new Date(),
+          }).where(eq(agentWakeupRequests.id, w.id));
+        });
+        await c.heartbeat.resumeQueuedCommentInterrupt(c.companyId, w.id, { retryCleanup: true });
+      };
+      await Promise.all([
+        c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId }),
+        boundRelease()({ companyId: c.companyId, runId: r.id, now: new Date(), suppressImmediateRecovery: true }),
+        send(),
+      ]);
+      const admitted = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, c.companyId)))
+        .filter(x => x.id !== r.id);
+      expect(admitted).toHaveLength(1);
+      const context = admitted[0].contextSnapshot!;
+      expect(new Set([...(context.wakeCommentIds as string[] ?? []), context.wakeCommentId].filter(Boolean)))
+        .toEqual(new Set(messages.map(m => m.id)));
+      process.stdout.write(`BOUND race evidence ${JSON.stringify({ wakeId: w.id, runId: admitted[0].id, context })}\n`);
+    });
+    it.each(["paused", "running", "finalizing", "system", "agent"])("BOUND: %s stays held", async hold => {
+      const { c, w, r } = await boundFixture();
+      if (hold === "paused") await db.update(agents).set({ status: "paused" }).where(eq(agents.id, c.agentId));
+      if (hold === "running") await db.update(heartbeatRuns).set({ status: "running", finishedAt: null })
+        .where(eq(heartbeatRuns.id, r.id));
+      if (hold === "finalizing") await db.update(nativeRunFinalizations).set({ phase: "applied" })
+        .where(eq(nativeRunFinalizations.runId, r.id));
+      if (hold === "system" || hold === "agent") await db.update(agentWakeupRequests)
+        .set({ source: "automation", requestedByActorType: hold, reason: "issue_commented" })
+        .where(eq(agentWakeupRequests.id, w.id));
+      await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+      expect(await wake(w.id)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect(await queuedRuns(w.id)).toHaveLength(0);
+    });
+    it("BOUND: real periodic worker discovers an unlocked wake and honors its deadline", async () => {
+      const { c, w } = await boundFixture();
+      const last = ago(11_000);
+      await db.update(agentWakeupRequests).set({ updatedAt: last }).where(eq(agentWakeupRequests.id, w.id));
+      const errors: unknown[] = [];
+      const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true,
+        onError: err => errors.push(err) });
+      const worker = registerIssueRecoveryWork(db, coordinator, {
+        schedulingSuppressed: async () => false, locks: c.heartbeat.sweepStaleIssueLocks,
+        stranded: async () => {}, orphanBlockers: async () => {}, recoveryActions: async () => {},
+        dependencies: async () => ({ enqueueFailed: 0 }), watchdogs: async () => ({ incomplete: 0 }),
+      }, () => true);
+      const started = Date.now();
+      try {
+        await worker.ready;
+        while (!(await queuedRuns(w.id)).length && Date.now() - started < 4_000)
+          await new Promise(resolve => setTimeout(resolve, 50));
+        const runs = await queuedRuns(w.id);
+        expect(errors).toEqual([]);
+        expect(runs).toHaveLength(1);
+        expect(Date.now() - last.getTime()).toBeLessThan(15_000);
+        process.stdout.write(`BOUND worker evidence ${JSON.stringify({ wakeId: w.id, runId: runs[0].id,
+          lastCoalesce: last.toISOString(), elapsedMs: Date.now() - started })}\n`);
+      } finally { await worker.stop(); await coordinator.stop(); }
+    });
+    it("BOUND: held automation heads stay byte-for-byte unchanged beside a due person wake", async () => {
+      const { c, w } = await boundFixture();
+      const [heldSystem, heldAgent] = await db.insert(agentWakeupRequests).values(["system", "agent"].map(actor => ({
+        companyId: c.companyId, agentId: c.agentId, source: "automation", requestedByActorType: actor,
+        reason: "issue_commented", status: "deferred_issue_execution", requestedAt: ago(day),
+        payload: { issueId: c.issueId, guard: actor }, updatedAt: ago(day),
+      }))).returning();
+      await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+      expect(await queuedRuns(w.id)).toHaveLength(1);
+      expect(await wake(heldSystem.id)).toEqual(heldSystem);
+      expect(await wake(heldAgent.id)).toEqual(heldAgent);
+    });
+    it("BOUND: boot's >24h person message keeps its one-note/no-run rule", async () => {
+      const c = await chat();
+      const old = ago(2 * day);
+      const m = await message(c, "BOUND old saved question", old);
+      const w = await deferred(c, m.id, old);
+      await db.update(agentWakeupRequests).set({ createdAt: old, updatedAt: old }).where(eq(agentWakeupRequests.id, w.id));
+      const r = await run(c, [], ago(hour));
+      await db.insert(nativeRunFinalizations).values({ companyId: c.companyId, issueId: c.issueId,
+        runId: r.id, phase: "committed" });
+      // The persisted old boot already observed the pending receipt. Age
+      // that real observation too, so the existing two-minute notice grace
+      // is expired rather than changing the notice/owed definitions here.
+      await boot(c); await unansweredSweep(c);
+      await db.update(activityLog).set({ createdAt: ago(3 * 60_000) }).where(and(
+        eq(activityLog.companyId, c.companyId), eq(activityLog.action, "issue.unanswered_message_wait")));
+      await unansweredSweep(c);
+      const notes = await systemNotes(c);
+      expect(notes).toHaveLength(1);
+      for (let pass = 0; pass < 2; pass++) {
+        await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+        await boot(c); await unansweredSweep(c);
+      }
+      expect(await queuedRuns(w.id)).toHaveLength(0);
+      expect(await systemNotes(c)).toEqual(notes);
+    });
+    it("BOUND: last coalesce, not creation, owns the deadline hint", async () => {
+      const { c, w } = await boundFixture();
+      const latest = new Date();
+      await db.update(agentWakeupRequests).set({ updatedAt: latest }).where(eq(agentWakeupRequests.id, w.id));
+      const hints: number[] = [];
+      await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId,
+        onDeferredDeadline: at => hints.push(at) });
+      expect(await queuedRuns(w.id)).toHaveLength(0);
+      expect(hints).toContain(latest.getTime() + 12_000);
+    });
 
     it.each(["observed", "applied"] as const)("SYNCOUT: persisted %s result fails copyback across restart, ends and carries later person input", async phase => {
       const c = await chat();
