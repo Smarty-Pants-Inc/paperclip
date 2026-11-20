@@ -1,4 +1,5 @@
 import { beginIdleTrackedWork } from "./task-admission.js";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -110,8 +111,26 @@ async function readSpillIndex(indexPath: string) {
 const SPILL_INDEX_SUFFIX = ".index.ndjson";
 const SPILL_DATA_SUFFIX = ".ndjson";
 const SPILL_LOG_REF = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
-// A recovered copy is read back within this long, or the spill's custody stays unknown.
-const SPILL_READ_BACK_TIMEOUT_MS = 60_000;
+/**
+ * ONE guard pass reads recovered copies back for at most this long in total.
+ * The deleting paths ask while they hold the workspace lifecycle lock, and a
+ * person's next turn waits on that lock: a store that stops answering costs a
+ * pass this budget once, not one read deadline per spill.
+ */
+export const RUN_LOG_SPILL_READ_BACK_BUDGET_MS = 30_000;
+const spillCustodyPass = new AsyncLocalStorage<{ readBackDeadline?: number }>();
+/**
+ * Run `work` as one guard pass: every custody decision made inside it shares
+ * one read-back budget, counted from its first read-back. When the budget is
+ * spent, each spill not yet read back is KEPT (`read_back_budget_exhausted`,
+ * with its custody row) for the next pass; none is released unread. A pass
+ * begun inside another joins it, so one deleting operation is one pass however
+ * many times it asks.
+ */
+export function runLogSpillCustodyPass<T>(work: () => Promise<T>): Promise<T> {
+  return spillCustodyPass.getStore() ? work() : spillCustodyPass.run({}, work);
+}
+const SPILL_CUSTODY_ROW = "kept: run-log spill custody unknown";
 // Every run-log record, spilled or not, is `{"ts":…,"attemptId":…,"stream":…,"chunk":…}`.
 const RUN_LOG_RECORD_MARK = /"stream":"(?:stdout|stderr|system)","chunk":/;
 // A data file with no record is read this far for a run-log record before it is kept unread.
@@ -197,16 +216,19 @@ async function spillRangeSha(file: Awaited<ReturnType<typeof fs.open>>, start: n
  * Everything else keeps it. A record that is missing, empty, `{}`, `[]`, torn,
  * or silent about bytes on disk is NOT recovery proof; neither is a read-back
  * that fails, times out, comes back short or differs. Those are UNKNOWN: kept,
- * with a custody row naming the spill and the reason. Only an empty data file,
- * or a `*.ndjson` holding no run-log record at all, is not a spill.
+ * with a custody row naming the spill and the reason. Only an empty data file
+ * is not a spill; so is, OUTSIDE the spill directory only, a `*.ndjson` with
+ * no record beside it that holds no run-log record at all.
+ * `insideSpillDir`: the file sits in a run-log spill directory, where every
+ * non-empty file is the only copy until proven otherwise, whatever it holds.
  * This never throws.
  */
-async function runLogSpillCustody(indexPath: string): Promise<{ state: "none" | "recovered" } | { state: "kept"; reason: string }> {
+async function runLogSpillCustody(indexPath: string, insideSpillDir: boolean): Promise<{ state: "none" | "recovered" } | { state: "kept"; reason: string }> {
   const dataPath = `${indexPath.slice(0, -SPILL_INDEX_SUFFIX.length)}${SPILL_DATA_SUFFIX}`;
   const kept = (reason: string, detail: Record<string, unknown> = {}) => {
     // `unrecovered` is the ordinary state; each caller reports it in its own refusal.
     if (reason !== "unrecovered")
-      logger.warn({ spill: dataPath, index: indexPath, reason, ...detail }, "kept: run-log spill custody unknown");
+      logger.warn({ spill: dataPath, index: indexPath, reason, ...detail }, SPILL_CUSTODY_ROW);
     return { state: "kept" as const, reason };
   };
   try {
@@ -227,8 +249,13 @@ async function runLogSpillCustody(indexPath: string): Promise<{ state: "none" | 
       // beside an empty record, and run-log bytes whose record is missing,
       // are the only copy until proven otherwise.
       const bytes = await bytesOnDisk();
-      if (text === null) return await orphanHoldsRunLogBytes(dataPath) ? kept("index_missing", { bytes }) : { state: "none" };
-      return bytes > 0 ? kept("index_empty", { bytes }) : { state: "none" };
+      if (text !== null) return bytes > 0 ? kept("index_empty", { bytes }) : { state: "none" };
+      // No record at all. Inside the spill directory the file is not opened:
+      // any bytes are kept, readable and decodable or not. Only outside it,
+      // where cleanup walks whole worktrees and other tools write `*.ndjson`
+      // too, is the file read for a run-log record.
+      return (insideSpillDir ? bytes > 0 : await orphanHoldsRunLogBytes(dataPath))
+        ? kept("index_missing", { bytes }) : { state: "none" };
     }
     const records: ObjectRunLogSpillRecord[] = [];
     for (const line of lines) {
@@ -276,8 +303,12 @@ async function runLogSpillCustody(indexPath: string): Promise<{ state: "none" | 
         position += range.bytes;
       }
     } finally { await file.close(); }
-    // (b) Read the recovered copy back from where it lives.
-    const signal = AbortSignal.timeout(SPILL_READ_BACK_TIMEOUT_MS);
+    // (b) Read the recovered copy back from where it lives, inside this pass's budget.
+    const pass = spillCustodyPass.getStore()!;
+    const budgetLeft = (pass.readBackDeadline ??= Date.now() + RUN_LOG_SPILL_READ_BACK_BUDGET_MS) - Date.now();
+    if (budgetLeft <= 0)
+      return kept("read_back_budget_exhausted", { ...named, budgetMs: RUN_LOG_SPILL_READ_BACK_BUDGET_MS });
+    const signal = AbortSignal.timeout(budgetLeft);
     let failure: SpillReadBackFailure = { reason: "recovered_copy_store_unavailable" }, equal = false;
     for (const readBack of spillReadBackStores) {
       const result = await readBack(logRef, ranges, signal).catch((error): SpillReadBackFailure => ({
@@ -305,6 +336,25 @@ async function runLogSpillCustody(indexPath: string): Promise<{ state: "none" | 
 const SPILL_CUSTODY_WALK_MAX_ENTRIES = 1_000_000;
 let spillCustodyWalkBoundHits = 0;
 
+/** One path a guard pass KEPT, and why. */
+export interface RunLogSpillKept {
+  /** `<company>/<agent>/<run>` for a spill; for any other kept file, its path below the spill directory. */
+  logRef: string;
+  path: string;
+  reason: string;
+}
+/**
+ * Inside a spill directory a non-empty file that is neither a spill nor its
+ * record has no record that could name it recovered: kept, with a custody row.
+ */
+async function spillDirFileKept(filePath: string) {
+  const bytes = (await fs.stat(filePath)).size;
+  if (!bytes) return null;
+  const reason = "spill_dir_file_without_record";
+  logger.warn({ spill: filePath, reason, bytes }, SPILL_CUSTODY_ROW);
+  return reason;
+}
+
 /**
  * Destructive cleanup's content guard. Roots/configuration can drift after a
  * writer spills: search the WHOLE candidate, at any depth, pruning no names.
@@ -313,27 +363,34 @@ let spillCustodyWalkBoundHits = 0;
  * Symlink targets are not walked: rename/rm removes links, never their targets.
  * With no `*.ndjson` name this does only directory reads, not file-content IO.
  * Each spill it finds is decided by runLogSpillCustody, the one deletion rule.
+ * A directory named `.spill` is the writer's default spill directory wherever
+ * the walk meets it: below it EVERY non-empty file is kept unless a record
+ * proves it recovered. Returns the first kept path and its reason, or null.
  */
-export async function candidateHoldsUnrecoveredRunLogSpill(candidatePath: string): Promise<boolean> {
+export function findKeptRunLogSpillContent(candidatePath: string) {
+  return runLogSpillCustodyPass(() => keptRunLogSpillContent(candidatePath));
+}
+async function keptRunLogSpillContent(candidatePath: string): Promise<{ path: string; reason: string } | null> {
   const pending = [candidatePath], inspected = new Set<string>();
   let visitedEntries = 0;
   try {
     while (pending.length) {
       const directory = pending.pop()!;
+      const insideSpillDir = directory.split(path.sep).includes(RUN_LOG_SPILL_SUBDIR);
       let entries;
       try {
         entries = await fs.opendir(directory);
       } catch (error) {
         // An already-absent candidate has nothing to lose. All other inspection
         // failures (including disappearing children) refuse destructive work.
-        if (directory === candidatePath && (error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        if (directory === candidatePath && (error as NodeJS.ErrnoException).code === "ENOENT") return null;
         throw error;
       }
       for await (const entry of entries) {
         if (++visitedEntries > SPILL_CUSTODY_WALK_MAX_ENTRIES) {
           logger.warn({ candidatePath, visitedEntries, maxEntries: SPILL_CUSTODY_WALK_MAX_ENTRIES,
             walkBoundHits: ++spillCustodyWalkBoundHits }, "kept: walk bound hit");
-          return true;
+          return { path: candidatePath, reason: "walk_bound_hit" };
         }
         const entryPath = path.join(directory, entry.name);
         // A spill is its record AND its data file. Either name finds it, so
@@ -343,46 +400,72 @@ export async function candidateHoldsUnrecoveredRunLogSpill(candidatePath: string
             ? `${entryPath.slice(0, -SPILL_DATA_SUFFIX.length)}${SPILL_INDEX_SUFFIX}` : undefined;
         if (spillIndex && !inspected.has(spillIndex)) {
           inspected.add(spillIndex);
-          if ((await runLogSpillCustody(spillIndex)).state === "kept") return true;
+          const custody = await runLogSpillCustody(spillIndex, insideSpillDir);
+          if (custody.state === "kept")
+            return { path: `${spillIndex.slice(0, -SPILL_INDEX_SUFFIX.length)}${SPILL_DATA_SUFFIX}`, reason: custody.reason };
+        } else if (!spillIndex && insideSpillDir && entry.isFile()) {
+          const reason = await spillDirFileKept(entryPath);
+          if (reason) return { path: entryPath, reason };
         }
         if (entry.isDirectory()) pending.push(entryPath);
       }
     }
-    return false;
+    return null;
   } catch (error) {
     logger.warn({ candidatePath, visitedEntries, error: finalizationError(error) },
       "kept: run-log spill content could not be read");
-    return true;
+    return { path: candidatePath, reason: "content_unreadable" };
   }
+}
+export async function candidateHoldsUnrecoveredRunLogSpill(candidatePath: string): Promise<boolean> {
+  return await findKeptRunLogSpillContent(candidatePath) !== null;
 }
 
 /**
- * Every run (`<company>/<agent>/<run>`) whose spill is NOT proven recovered by
- * runLogSpillCustody: bytes no flush has stored yet, and every spill whose
- * record or recovered copy cannot prove otherwise.
+ * Everything in a spill directory that runLogSpillCustody does NOT prove
+ * recovered: bytes no flush has stored yet, every spill whose record or
+ * recovered copy cannot prove otherwise, and every other non-empty file (the
+ * writer puts nothing there but spills and their records). Each with its path
+ * and reason, one guard pass for the whole directory.
  */
-export async function listUnrecoveredObjectRunLogSpills(spillDir?: string) {
-  const root = resolveObjectRunLogSpillDir(spillDir), found: string[] = [];
-  const list = (dir: string) => fs.readdir(dir, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT" || error.code === "ENOTDIR") return [];
-    throw error;
-  });
-  for (const company of await list(root)) {
-    if (!company.isDirectory()) continue;
-    for (const agent of await list(path.join(root, company.name))) {
-      if (!agent.isDirectory()) continue;
-      const directory = path.join(root, company.name, agent.name), runs = new Set<string>();
+export function listKeptObjectRunLogSpills(spillDir?: string): Promise<RunLogSpillKept[]> {
+  return runLogSpillCustodyPass(async () => {
+    const root = resolveObjectRunLogSpillDir(spillDir), kept: RunLogSpillKept[] = [];
+    const list = (dir: string) => fs.readdir(dir, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT" || error.code === "ENOTDIR") return [];
+      throw error;
+    });
+    const logRef = (file: string) => path.relative(root, file).split(path.sep).join("/");
+    for (const pending = [root]; pending.length;) {
+      const directory = pending.pop()!, spills = new Set<string>();
       for (const file of await list(directory)) {
+        const filePath = path.join(directory, file.name);
+        if (file.isDirectory()) pending.push(filePath);
+        if (!file.isFile()) continue;
         // The record names a spill and so does its data file, when the record is gone.
         const suffix = [SPILL_INDEX_SUFFIX, SPILL_DATA_SUFFIX].find(end => file.name.endsWith(end));
-        if (file.isFile() && suffix) runs.add(file.name.slice(0, -suffix.length));
+        if (suffix) spills.add(filePath.slice(0, -suffix.length));
+        else {
+          const reason = await spillDirFileKept(filePath);
+          if (reason) kept.push({ logRef: logRef(filePath), path: filePath, reason });
+        }
       }
-      for (const run of runs)
-        if ((await runLogSpillCustody(path.join(directory, `${run}${SPILL_INDEX_SUFFIX}`))).state === "kept")
-          found.push(`${company.name}/${agent.name}/${run}`);
+      for (const spill of spills) {
+        const custody = await runLogSpillCustody(`${spill}${SPILL_INDEX_SUFFIX}`, true);
+        if (custody.state === "kept")
+          kept.push({ logRef: logRef(spill), path: `${spill}${SPILL_DATA_SUFFIX}`, reason: custody.reason });
+      }
     }
-  }
-  return found.sort();
+    return kept.sort((a, b) => (a.logRef < b.logRef ? -1 : a.logRef > b.logRef ? 1 : 0));
+  });
+}
+/**
+ * Every run (`<company>/<agent>/<run>`) whose spill is NOT proven recovered by
+ * runLogSpillCustody, and every other kept file of the spill directory by its
+ * path below it: see listKeptObjectRunLogSpills.
+ */
+export async function listUnrecoveredObjectRunLogSpills(spillDir?: string) {
+  return (await listKeptObjectRunLogSpills(spillDir)).map(entry => entry.logRef);
 }
 /**
  * Read a run's kept spill. `unrecovered` is every spilled range that no later

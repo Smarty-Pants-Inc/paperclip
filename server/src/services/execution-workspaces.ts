@@ -52,6 +52,7 @@ import {
   purgeStaleWorkspaceCompactionTrash,
   restoreWorkspaceDirsFromTrash,
 } from "./workspace-compaction.js";
+import { runLogSpillCustodyPass } from "./object-run-log-store.js";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -2545,7 +2546,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     // the move and again after it, in the same transaction. A task that resumes
     // in between leaves the terminal state or starts a run first, so the second
     // check fails and the directories move back before anything is deleted.
-    const move = await db.transaction(async (tx) => {
+    // One run-log guard pass for the whole lock hold: the move and a restore's
+    // trash delete share one read-back budget.
+    const move = await db.transaction((tx) => runLogSpillCustodyPass(async () => {
       await acquireExecutionWorkspaceLifecycleLock(tx, workspace.id);
       const [fresh] = await tx
         .select({
@@ -2580,7 +2583,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         throw error;
       }
       return moved;
-    });
+    }));
     if (!move) return "busy";
 
     await deleteWorkspaceCompactionTrash(move.trashDir).catch((error) => {

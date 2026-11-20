@@ -10,7 +10,8 @@ import { parse as parseEnvContents } from "dotenv";
 import { expandHomePrefix } from "../home-paths.js";
 import { INSTANCE_HEARTBEAT_RUN_MARKER } from "./instance-run-marker.js";
 import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
-import { candidateHoldsUnrecoveredRunLogSpill, listUnrecoveredObjectRunLogSpills, resolveObjectRunLogSpillDir } from "./object-run-log-store.js";
+import { findKeptRunLogSpillContent, listKeptObjectRunLogSpills, listUnrecoveredObjectRunLogSpills, resolveObjectRunLogSpillDir,
+  runLogSpillCustodyPass } from "./object-run-log-store.js";
 
 const execFileAsync = promisify(execFile);
 const INSTANCE_ID_RE = /^[A-Za-z0-9_-]+$/;
@@ -452,7 +453,53 @@ export async function readManagedWorktreeInstanceOwnership(
   return configured;
 }
 
-export async function cleanupWorktreeInstanceArtifacts(input: {
+// Custody rows. Each instance this cleanup KEEPS for run-log custody has one
+// row: `<managed instances dir>/.run-log-custody/<instance id>.json`, naming
+// the instance, the kept path and the reason. An instance id cannot start with
+// ".", so that directory is never an instance. A pass that keeps the instance
+// replaces its row; a pass that releases it removes the row.
+const KEPT_INSTANCE_ROWS_DIR = ".run-log-custody";
+export interface KeptWorktreeInstanceRow {
+  v: 1;
+  instance: string;
+  instanceRoot: string;
+  /** The first path the pass kept (a spill, a local run log, or what could not be read) and why. */
+  path: string;
+  reason: string;
+  /** How many paths the pass kept. */
+  keptPaths: number;
+  at: string;
+}
+const keptInstanceRowPath = (managedInstancesDir: string, instanceId: string) =>
+  path.join(managedInstancesDir, KEPT_INSTANCE_ROWS_DIR, `${instanceId}.json`);
+
+async function writeKeptInstanceRow(managedInstancesDir: string, row: Omit<KeptWorktreeInstanceRow, "v" | "at">) {
+  const file = keptInstanceRowPath(managedInstancesDir, row.instance), partial = `${file}.${process.pid}.tmp`;
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(partial, `${JSON.stringify({ v: 1, ...row, at: new Date().toISOString() } satisfies KeptWorktreeInstanceRow)}\n`);
+  await fs.rename(partial, file);
+}
+
+/**
+ * The instances cleanup is keeping for run-log custody, each with its kept
+ * path and reason: the countable kept set (for disk-steward). A row whose
+ * instance directory is gone is not listed.
+ */
+export async function listKeptWorktreeInstances(worktreesDir?: string): Promise<KeptWorktreeInstanceRow[]> {
+  const rowsDir = path.join(resolveManagedInstancesDir(worktreesDir), KEPT_INSTANCE_ROWS_DIR);
+  const names = await fs.readdir(rowsDir).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  const rows: KeptWorktreeInstanceRow[] = [];
+  for (const name of names.filter(name => name.endsWith(".json")).sort()) {
+    const row = JSON.parse(await fs.readFile(path.join(rowsDir, name), "utf8")) as KeptWorktreeInstanceRow;
+    if (await pathExists(row.instanceRoot)) rows.push(row);
+  }
+  return rows;
+}
+
+type WorktreeInstanceCleanupInput = {
   pointer: WorktreeInstancePointer;
   workspaceId: string;
   workspacePath: string;
@@ -461,7 +508,12 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
   recorder?: WorkspaceOperationRecorder | null;
   worktreesDir?: string;
   dependencies?: WorktreeInstanceCleanupDependencies;
-}): Promise<WorktreeInstanceCleanupResult> {
+};
+/** One guard pass: every spill question this cleanup asks shares one read-back budget. */
+export function cleanupWorktreeInstanceArtifacts(input: WorktreeInstanceCleanupInput): Promise<WorktreeInstanceCleanupResult> {
+  return runLogSpillCustodyPass(() => cleanupWorktreeInstanceArtifactsInPass(input));
+}
+async function cleanupWorktreeInstanceArtifactsInPass(input: WorktreeInstanceCleanupInput): Promise<WorktreeInstanceCleanupResult> {
   const configured = resolveConfiguredInstanceRoot(input.pointer, input.expectedInstanceId);
   if ("warning" in configured && !configured.warning) return { status: "not_configured" };
 
@@ -515,9 +567,22 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
     return { status: "refused", instanceRoot: configuredInstanceRoot, warning };
   }
 
+  const keptRow = keptInstanceRowPath(managedInstancesDir, configured.instanceId);
   if (!await pathExists(configuredInstanceRoot)) {
+    await fs.rm(keptRow, { force: true });
     return { status: "already_absent", instanceRoot: configuredInstanceRoot };
   }
+  // The instance stays: write its custody row, so the kept set can be listed
+  // and counted. Returns what to add to the refusal when the row cannot be written.
+  const keepForCustody = async (kept: { path: string; reason: string }, keptPaths = 1) => {
+    try {
+      await writeKeptInstanceRow(managedInstancesDir, { instance: configured.instanceId, instanceRoot: configuredInstanceRoot,
+        path: kept.path, reason: kept.reason, keptPaths });
+      return "";
+    } catch (error) {
+      return ` Its custody row could not be written: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  };
 
   let canonicalManagedWorktreesDir: string;
   let canonicalManagedInstancesDir: string;
@@ -558,18 +623,20 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
   // defaults AND configured roots (even outside the instance); the writer's
   // resolver owns precedence and relative-path semantics, not this cleanup.
   let unrecoveredRunLogSpills: string[];
+  let keptSpills: Awaited<ReturnType<typeof listKeptObjectRunLogSpills>>;
   try {
     const roots = await listWorktreeRunLogSpillRoots({ ...input, instanceRoot: canonicalInstanceRoot });
-    unrecoveredRunLogSpills = [...new Set((await Promise.all(
-      roots.map(root => listUnrecoveredObjectRunLogSpills(root)),
-    )).flat())];
+    keptSpills = (await Promise.all(roots.map(root => listKeptObjectRunLogSpills(root)))).flat();
+    unrecoveredRunLogSpills = [...new Set(keptSpills.map(entry => entry.logRef))];
   } catch (error) {
     warning = `Refusing to remove instance directory "${configuredInstanceRoot}" because its run-log spill could not be read: ${error instanceof Error ? error.message : String(error)}`;
+    warning += await keepForCustody({ path: configuredInstanceRoot, reason: "run_log_spill_unreadable" });
     await recordRefusal({ canonicalInstanceRoot, refusalReason: "run_log_spill_unreadable" });
     return { status: "refused", instanceRoot: configuredInstanceRoot, warning };
   }
   if (unrecoveredRunLogSpills.length) {
     warning = `Refusing to remove instance directory "${configuredInstanceRoot}" because it holds ${unrecoveredRunLogSpills.length} run-log spill(s) that object storage has not taken.`;
+    warning += await keepForCustody(keptSpills[0]!, keptSpills.length);
     await recordRefusal({
       canonicalInstanceRoot,
       refusalReason: "run_log_spill_unrecovered",
@@ -578,17 +645,22 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
     return { status: "refused", instanceRoot: configuredInstanceRoot, warning };
   }
 
-  const contentSpillWarning = `Refusing to remove instance directory "${canonicalInstanceRoot}" because its content may hold an unrecovered run-log spill.`;
-  if (await candidateHoldsUnrecoveredRunLogSpill(canonicalInstanceRoot)) {
+  let contentSpillWarning = `Refusing to remove instance directory "${canonicalInstanceRoot}" because its content may hold an unrecovered run-log spill.`;
+  const contentKept = await findKeptRunLogSpillContent(canonicalInstanceRoot);
+  if (contentKept) {
+    contentSpillWarning += await keepForCustody(contentKept);
     await recordRefusal({ canonicalInstanceRoot, refusalReason: "run_log_spill_content_kept" }, contentSpillWarning);
     return { status: "refused", instanceRoot: canonicalInstanceRoot, warning: contentSpillWarning };
   }
+  // Custody is proven for everything found: the instance is no longer kept for it.
+  await fs.rm(keptRow, { force: true });
 
   const dependencies = input.dependencies ?? defaultCleanupDependencies;
   let postgresStopped = false;
   let keptRawTraces: string[] = [];
+  let rawTraceRowNote = "";
   const keptWarning = () => `Kept worktree instance directory "${canonicalInstanceRoot}" because it holds raw traces `
-    + `or may have recorded a run (${keptRawTraces.join(", ")}); the reaper removes only an instance proven never to have recorded a run.`;
+    + `or may have recorded a run (${keptRawTraces.join(", ")}); the reaper removes only an instance proven never to have recorded a run.${rawTraceRowNote}`;
   let contentSpillKept = false;
   const cleanup = async () => {
     postgresStopped = await dependencies.stopEmbeddedPostgres(path.join(canonicalInstanceRoot, "db"));
@@ -611,10 +683,18 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
       [parseEnvContents(input.pointer.envContents), await readInstanceRootEnv(currentInstanceRoot)],
       [configuredInstanceRoot],
     );
-    if (keptRawTraces.length > 0) return;
+    if (keptRawTraces.length > 0) {
+      // Kept whole as a raw trace: one row in the same kept set.
+      rawTraceRowNote = await keepForCustody({ path: keptRawTraces[0]!, reason: "raw_traces_kept" }, keptRawTraces.length);
+      return;
+    }
     // Recheck after stopping Postgres and verifying identity, at the removal.
-    contentSpillKept = await candidateHoldsUnrecoveredRunLogSpill(currentInstanceRoot);
-    if (contentSpillKept) return;
+    const kept = await findKeptRunLogSpillContent(currentInstanceRoot);
+    contentSpillKept = kept !== null;
+    if (kept) {
+      contentSpillWarning += await keepForCustody(kept);
+      return;
+    }
     await dependencies.removeInstanceRoot(currentInstanceRoot);
   };
 
