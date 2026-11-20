@@ -1,3 +1,4 @@
+import { logger } from "../../middleware/logger.js";
 import { randomBytes } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issues } from "@paperclipai/db";
@@ -57,7 +58,15 @@ describe.skipIf(!runControlPostgresSupport.supported)("execution release reads",
     }).returning();
     const { database, reads } = recordRunReads();
     const deps = callbacks(database);
+    const info = vi.spyOn(logger, "info");
     await createHeartbeatRunControl(database, deps).releaseIssueExecutionAndPromote(run);
+    const releases = info.mock.calls.filter(([fields, message]) => message === "Issue execution release decision" &&
+      (fields as Record<string, unknown>).caller === "heartbeat.release");
+    expect(releases).toHaveLength(1);
+    expect(releases[0][0]).toEqual({ caller: "heartbeat.release", runId: run.id, issueId: null,
+      companyId: company.id, outcome: "released", deferredHeadWakeId: null, promotedWakeId: null });
+    expect(JSON.stringify(releases)).not.toContain(payload);
+    info.mockRestore();
     expect(deps.wakeQueue.releaseIssueExecution).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       companyId: company.id, runId: run.id, suppressImmediateRecovery: isAiAuthenticationBlocked(run),
     }));

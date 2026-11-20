@@ -1,3 +1,4 @@
+import { logger } from "../../../middleware/logger.js";
 import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../../../services/recovery/unanswered-person-message.js";
 import { readPersonStopHold } from "../../../services/acknowledged-native-stop.js";
 import { answeredPersonMessageSql, deferredWakeIsStaleSql, personMessageOwedSql } from "../../../services/person-message-answer.js";
@@ -1891,7 +1892,17 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
 
   it("sw-1: old never-claimed wake is cancelled, never promoted; sweep writes exactly ONE true card", async () => {
     const { c, old, w, r } = await movedChat();
+    const info = vi.spyOn(logger, "info");
     const result = await drain(c, r.id);
+    const cancellation = info.mock.calls.filter(([, message]) => message === "Deferred wake cancelled: conversation moved on");
+    expect(cancellation).toHaveLength(1);
+    expect(cancellation[0][0]).toEqual({ wakeId: w.id, issueId: c.issueId, commentIdsCount: 1 });
+    const releases = info.mock.calls.filter(([, message]) => message === "Issue execution release decision");
+    expect(releases).toHaveLength(1);
+    expect(releases[0][0]).toEqual({ caller: "wake_queue.release_drain", runId: r.id, issueId: c.issueId,
+      companyId: c.companyId, outcome: result.outcome.kind, reason: result.outcome.kind,
+      deferredHeadWakeId: w.id, promotedWakeId: null });
+    expect(JSON.stringify([...cancellation, ...releases])).not.toContain(old.body);
     const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id));
     console.log("sw-1 drain", result.outcome.kind, "wake", saved.status, saved.error);
     expect(saved).toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
@@ -1956,8 +1967,14 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     const fresh = await message(c, "Fresh daily-work input", ago(30 * 60_000));
     const w = await wake(c, fresh.id, ago(29 * 60_000));
     await reply(c, r.id);
+    const info = vi.spyOn(logger, "info");
     const result = await drain(c, r.id);
     expect(result.outcome.kind).toBe("promoted");
+    const releases = info.mock.calls.filter(([, message]) => message === "Issue execution release decision");
+    expect(releases).toHaveLength(1);
+    expect(releases[0][0]).toEqual({ caller: "wake_queue.release_drain", runId: r.id, issueId: c.issueId,
+      companyId: c.companyId, outcome: "promoted", reason: "promoted", deferredHeadWakeId: w.id, promotedWakeId: w.id });
+    expect(JSON.stringify(releases)).not.toContain(fresh.body);
     expect(await noRunFor(fresh.id)).toHaveLength(1);
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0].runId).toBeTruthy();
     console.log("sw-4 drain", result.outcome.kind);
