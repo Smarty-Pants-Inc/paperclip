@@ -195,7 +195,7 @@ export function isNativeAdmissionAdapter(adapterType: string | null | undefined)
   return adapterType === "paperclip_runner";
 }
 
-export async function admitExplicitNativeContinuation(input: {
+type ExplicitNativeContinuationInput = {
   db: Db; companyId: string; issueId: string; agentId: string;
   actorType: string | null | undefined; actorId: string | null | undefined;
   reason: string | null; commentId: string | null; successorRunId: string;
@@ -208,7 +208,34 @@ export async function admitExplicitNativeContinuation(input: {
   interactionPayload?: unknown;
   dryRun?: boolean;
   onBlocked?: (reason: string, message: string) => void;
-}): Promise<{ previousRunId: string; commentId: string | null; failedRunId?: string; taskRetryRequestId?: string; queuedCommentInterruptId?: string; readiness?: ContinuationReadiness } | null> {
+};
+
+export async function admitExplicitNativeContinuation(input: ExplicitNativeContinuationInput) {
+  return checkExplicitNativeContinuation(input);
+}
+
+/** Preview the very same saved-queue Send that admission checks, without recording
+ * a Send intent or settling any recovery. Only this reader can supply a prospective
+ * intent; the public admission entry point still requires the durable click. */
+export async function previewNativeQueuedCommentSend(input: {
+  db: Db; companyId: string; issueId: string; agentId: string; actorId: string; queueId: string;
+}): Promise<boolean> {
+  const [queue] = await input.db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.id, input.queueId),
+    eq(agentWakeupRequests.agentId, input.agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`,
+  )).limit(1);
+  if (!queue || queue.payload?.queuedCommentInterrupt != null) return false;
+  const commentId = queuedCommentIdsFromWakePayload(queue.payload).at(-1);
+  if (!commentId) return false;
+  return Boolean(await checkExplicitNativeContinuation({ ...input, actorType: "user", reason: "issue_commented",
+    commentId, successorRunId: "00000000-0000-0000-0000-000000000000", queuedCommentInterruptId: queue.id, dryRun: true },
+    { queue, requestedAt: new Date().toISOString() }));
+}
+
+async function checkExplicitNativeContinuation(input: ExplicitNativeContinuationInput,
+  preview?: { queue: typeof agentWakeupRequests.$inferSelect; requestedAt: string },
+): Promise<{ previousRunId: string; commentId: string | null; failedRunId?: string; taskRetryRequestId?: string; queuedCommentInterruptId?: string; readiness?: ContinuationReadiness } | null> {
   const { db, companyId, issueId, agentId, actorId, commentId } = input;
   const blocked = (reason: string, message: string) => { input.onBlocked?.(reason, message); return null; };
   let blocker: Awaited<ReturnType<typeof getExecutionBlocker>> = null;
@@ -236,7 +263,9 @@ export async function admitExplicitNativeContinuation(input: {
   )) : [];
   const taskRetry = readTaskRetryIntent(retryWake?.payload);
   if (input.taskRetryRequestId && (!taskRetry || taskRetry.generationId !== retryWake?.id || taskRetry.actorId !== actorId)) return null;
-  const [interruptQueue] = input.queuedCommentInterruptId ? await db.select().from(agentWakeupRequests).where(and(
+  const [interruptQueue] = preview ? [{ ...preview.queue, payload: { ...preview.queue.payload,
+    queuedCommentInterrupt: { actorId, requestedAt: preview.requestedAt } } }]
+    : input.queuedCommentInterruptId ? await db.select().from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.id, input.queuedCommentInterruptId),
     eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
     eq(agentWakeupRequests.status, "deferred_issue_execution"),
@@ -616,7 +645,11 @@ export async function admitExplicitNativeContinuation(input: {
           run.status === "cancelled" && !coordinator.leaseOwner
             ? "The cancelled run still needs verified cleanup. Your message is saved. Inspect the run and its environment for details."
             : "Waiting for the previous run to finish recovery. Your message will start automatically.");
-    const preserved = hasRequiredWorkspaceRecovery(run.resultJson) ? null
+    // Availability is a read, not permission to preserve a failed writer. A
+    // person-Stop source is cancelled (this preserver only changes failed runs).
+    // A different failed source needs the real admission/recovery path first.
+    if (preview && run.status !== "cancelled") return null;
+    const preserved = hasRequiredWorkspaceRecovery(run.resultJson) || preview ? null
       : await preserveNativeFailedWorkspace(db, run);
     if (preserved && hasRequiredWorkspaceRecovery(preserved.resultJson)) return blocked("workspace_repair_required",
       "Paperclip is recovering saved work before continuing. Your message is saved.");

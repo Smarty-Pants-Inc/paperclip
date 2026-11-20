@@ -209,14 +209,13 @@ export async function readPersonStopHold(db: Db, input: {
     stopBoundaryAt: userStopBoundaryAt(lastTurn) } : null;
 }
 
-/** bb-2d-stopwords: can the queue's Send (POST .../queued-comments/interrupt) START the messages a person's Stop
- * holds, now? Only when the stopped run's cleanup is verified by the same DB facts the Send's gate requires
- * (explicit-native-continuation.ts): a native run with an acknowledged Stop, its finalization coordinator in
- * terminal_failure with no lease owner and no successor (otherwise the gate keeps the wake: controller_settling,
- * "The cancelled run still needs verified cleanup."), and the provider's recorded stop
- * (acknowledgedNativeStopExecutionHasStopped). Read-only. Anything else answers false: the panel then offers no
- * Send beside the Stop line, because a press there is accepted and starts nothing. */
-export async function personStopSendCanStart(db: Db, input: { companyId: string; stoppedRunId: string }): Promise<boolean> {
+/** Offer Send only after verified Stop cleanup AND the admission gate's own
+ * read-only preview of this held wake. This includes pending decisions, other
+ * recovery sources, provider cleanup and active execution; do not duplicate their
+ * predicates here. The route separately projects the agent's paused state. */
+export async function personStopSendCanStart(db: Db, input: {
+  companyId: string; issueId: string; agentId: string; actorId: string; queueId: string; stoppedRunId: string;
+}): Promise<boolean> {
   const [run] = await db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.stoppedRunId))).limit(1);
   if (!run || run.runtimeMode !== "native" || !isAcknowledgedNativeStop(run)) return false;
@@ -225,7 +224,9 @@ export async function personStopSendCanStart(db: Db, input: { companyId: string;
     eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.runId, run.id))).limit(1);
   if (!coordinator || coordinator.phase !== "terminal_failure" || coordinator.leaseOwner ||
       parseObject(coordinator.failureDetail).successorRunId) return false;
-  return acknowledgedNativeStopExecutionHasStopped(db, run);
+  if (!await acknowledgedNativeStopExecutionHasStopped(db, run)) return false;
+  const { previewNativeQueuedCommentSend } = await import("./explicit-native-continuation.js");
+  return previewNativeQueuedCommentSend({ db, ...input });
 }
 
 /** adopt-marker-port (RFL F1): this run is the FIRST turn after a person's Stop when the latest person Stop

@@ -7993,10 +7993,11 @@ export function issueRoutes(
       if (hold && boundary !== undefined && hold.stoppedByUserId === input.actor.actorId &&
           comments.every(comment => comment.authorUserId === input.actor.actorId &&
             new Date(comment.createdAt).getTime() <= boundary)) {
-        // Send is named, and offered, only where its press starts the run: the stopped run's cleanup is verified
-        // and the agent is not paused. Otherwise the line names Delete and a new message, and the panel has no Send.
-        const send = await personStopSendCanStart(input.executor as Db, { companyId: input.issue.companyId, stoppedRunId: hold.stoppedRunId })
-          && !(await isChatAgentPaused(input.executor, input.issue.companyId, input.issue.assigneeAgentId));
+        // Send is named only where this wake passes the admission gate's own preview
+        // and the agent is not paused. Otherwise keep RFL's no-Send line unchanged.
+        const send = !(await isChatAgentPaused(input.executor, input.issue.companyId, input.issue.assigneeAgentId))
+          && await personStopSendCanStart(input.executor as Db, { companyId: input.issue.companyId, issueId: input.issue.id,
+            agentId: input.issue.assigneeAgentId, actorId: input.actor.actorId, queueId: wake.id, stoppedRunId: hold.stoppedRunId });
         queue.executionWait = { reason: send ? TASK_HELD_BY_OWN_STOP_SEND_REASON : TASK_HELD_BY_OWN_STOP_REASON,
           message: taskHeldByOwnStopMessage(comments.length, send) };
       }
