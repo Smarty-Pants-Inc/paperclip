@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
+import { buildNativeModelEnvelope } from "../../vendor/paperclip-runner/index.js";
 import { buildNativeExecutionWithCheckpoint, nativeToolContractFingerprintForTarget, rebindNativeSessionCheckpoint } from "./native-session-resume.js";
 import { nativeSessionFailureDisposition, nativeSessionFailureSourceCode, nativeSessionKey } from "./native-session-executor.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
@@ -46,5 +47,73 @@ describe("Pi conversation identity is not a checkpoint/config generation (data s
     const current = execution(nextRun);
     current.session.normalizedSessionId = undefined as unknown as string;
     expect(() => nativeSessionKey(current)).toThrow("pi_conversation_identity_missing");
+  });
+});
+
+// c1-prime (Paul interrupts after STEP1; the SAME Pi session continues and is re-sent the whole task).
+// The receipts list is the guard that stops a redo of STEP1: it stays; only the false
+// "fresh session" wording becomes true. C1 removed the list and the model redid STEP1 on two real takes.
+describe("same-session Interrupt successor keeps the receipts list with true wording (c1-prime)", () => {
+  const interruptedRunId = "80000000-0000-4000-8000-000000000008";
+  const wakePayload = {
+    reason: "issue_commented",
+    issue: { id: issueId, identifier: null, title: "Daily conversation", status: "in_progress", priority: "medium" },
+    personStoppedPreviousTurn: true,
+    interruptedTurnToolCalls: [{ name: "echo STEP1 > /tmp/step1", status: "completed", output: "STEP1-RESULT-wrote-step1" }],
+    executionContinuation: {
+      version: 1, companyId, issueId, objective: "Six steps", interruptedRunId,
+      trigger: { reason: "issue_commented", interactionId: null, sourceRunId: interruptedRunId },
+      originCommentIds: [], messages: [], humanResponses: [], interactionOutcomes: [], completedWork: null,
+      unresolvedInteractionIds: [], coverage: { kind: "full_task_history", throughCommentId: null, summaryThroughCommentId: null },
+    },
+  };
+  function successor(runId: string, id: string, resumedSession: boolean) {
+    return buildNativeExecutionInput({ companyId, agentId, runId,
+      issue: { id: issueId, identifier: null, title: "Daily conversation", description: null, workMode: "standard" },
+      taskPrompt: "Run STEP1..STEP6", workspace: { id: runId, cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      normalizedSessionId: id, provider: "pi_rpc", model: "provider/model-a", wakePayload, resumedSession,
+      completionContract: { id: "70000000-0000-4000-8000-000000000007", sha256: `sha256:${"a".repeat(64)}`,
+        schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: "Answer", criteria: [{ id: "answer", requirement: "Answer" }] } },
+      runtimeContext: nativeRuntimeContextFixture(),
+    });
+  }
+  function request(previousRun: Parameters<typeof buildNativeExecutionWithCheckpoint>[0]["previousRun"]) {
+    const built = buildNativeExecutionWithCheckpoint({ previousRun, normalizedSessionId: sessionId,
+      buildExecution: ({ normalizedSessionId, resumedSession }) => successor(nextRun, normalizedSessionId, resumedSession) });
+    // Every string the model request carries, as the model reads it.
+    const strings: string[] = [];
+    const walk = (value: unknown): void => {
+      if (typeof value === "string") strings.push(value);
+      else if (value && typeof value === "object") Object.values(value).forEach(walk);
+    };
+    walk(buildNativeModelEnvelope(built.execution));
+    return { built, text: strings.join("\n\n") };
+  }
+  const RECEIPTS = /\n## Commands already run in the interrupted turn \(do not run these again\)\n[\s\S]*Do not run them again; continue from the next step\.[\s\S]*\n1\. `echo STEP1 > \/tmp\/step1`: completed\n {3}result: STEP1-RESULT-wrote-step1/;
+
+  it("verified same session (checkpoint rebinds): receipts list present, no 'fresh session' text", () => {
+    const { built, text } = request(prior(successor(firstRun, sessionId, false)));
+    expect(built.checkpoint, "the server verified the same session continues").not.toBeNull();
+    expect(text, "the receipts list is the guard against redoing STEP1: never removed").toMatch(RECEIPTS);
+    expect(text, "a continuing session is never told it is fresh").not.toMatch(/fresh session/i);
+    expect(text).toContain("The tool calls below already ran in this session (completed or started)");
+    expect(text).toContain("already ran; do not run them again; continue from the next step");
+    // rf-4 wording bar: with the whole task re-sent, never point the model at its history.
+    const corrected = text.split("\n").filter((line) => line.startsWith("The person interrupted") || line.startsWith("A previous run on this task"));
+    expect(corrected).toHaveLength(2);
+    for (const line of corrected) expect(line).not.toMatch(/history|Continue from the existing work/i);
+  });
+
+  it("fresh successor (no previous run) and fallback (checkpoint fails): byte-identical fresh wording with the list", () => {
+    const fresh = request(null);
+    const fallback = request({ ...prior(), runnerProfileJson: {} });
+    expect(fallback.built.checkpoint).toBeNull();
+    for (const { text } of [fresh, fallback]) {
+      expect(text).toMatch(RECEIPTS);
+      expect(text).toContain("This fresh session does not hold that turn; the tool calls below are the calls recorded since your last reply");
+      expect(text).toContain("This is a fresh session: that run's conversation and tool calls are not in this input");
+      expect(text).not.toContain("already ran in this session");
+    }
+    expect(fallback.text).toBe(fresh.text);
   });
 });
