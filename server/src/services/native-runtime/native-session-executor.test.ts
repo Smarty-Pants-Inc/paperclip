@@ -12509,8 +12509,13 @@ describe("warm native session evidence copy", () => {
       const first = await f.runTurn();
       console.log(JSON.stringify({ warmEvidenceFirstTurnMs: Math.round(f.turnMs[0]!) }));
       await Promise.race([reached, new Promise((_, reject) => setTimeout(() => reject(new Error("evidence copy never started")), 15_000))]);
+      // Admission is already durable at hand-back, but the copy is not joined.
+      expect((await f.leaseMetadata(first.leaseId))?.nativeSessionEvidencePending).toMatchObject({ runId: first.runId, attempts: 0 });
       // The copy of turn 1 is stalled mid-copy (inventory taken, tar not yet run).
       const second = await f.runTurn();
+      console.log(JSON.stringify({ evidenceAdmissionWhileCopyStalledMs: f.evidenceAdmissionMs }));
+      expect(f.evidenceAdmissionMs).toHaveLength(2);
+      expect(Math.max(...f.evidenceAdmissionMs)).toBeLessThan(50);
       expect(state.execute.mock.calls.at(-1)?.[0].existingSession).toBe(f.session);
       expect(await f.evidenceRows(first.runId)).toHaveLength(0);
       // Turn 2 changed the files after turn 1's copy took its inventory.
