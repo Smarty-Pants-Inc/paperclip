@@ -216,9 +216,9 @@ async function spillRangeSha(file: Awaited<ReturnType<typeof fs.open>>, start: n
  * Everything else keeps it. A record that is missing, empty, `{}`, `[]`, torn,
  * or silent about bytes on disk is NOT recovery proof; neither is a read-back
  * that fails, times out, comes back short or differs. Those are UNKNOWN: kept,
- * with a custody row naming the spill and the reason. Only an empty data file
- * is not a spill; so is, OUTSIDE the spill directory only, a `*.ndjson` with
- * no record beside it that holds no run-log record at all.
+ * with a custody row naming the spill and the reason. Two things are not a
+ * spill: an empty data file; and, OUTSIDE a spill directory only, a `*.ndjson`
+ * with no record beside it that holds no run-log record at all.
  * `insideSpillDir`: the file sits in a run-log spill directory, where every
  * non-empty file is the only copy until proven otherwise, whatever it holds.
  * This never throws.
