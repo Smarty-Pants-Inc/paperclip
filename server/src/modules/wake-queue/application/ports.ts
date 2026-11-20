@@ -117,7 +117,7 @@ export type PromoteDeferredWakeInput = {
  */
 export interface WakeQueueTransaction {
   findInvokableAgent(input: { companyId: string; agentId: string }): Promise<InvokableAgentSnapshot | null>;
-  findNextDeferredWake(input: { companyId: string; issueId: string; excludedWakeIds?: string[] }): Promise<DeferredWakeCandidate | null>;
+  findNextDeferredWake(input: { companyId: string; issueId: string; excludedWakeIds?: string[]; personWakeDueAt?: Date }): Promise<DeferredWakeCandidate | null>;
   getQueuedCommentLiveness(input: {
     companyId: string;
     /** Deferred receipt whose requested boundary and durable Stop hold are rechecked. */
@@ -282,7 +282,7 @@ export interface WakeQueueTransaction {
  */
 export interface IssueLockWriter {
   withIssueExecutionLock(
-    input: { companyId: string; runId: string; now: Date; resumeStrandedQueue?: boolean },
+    input: { companyId: string; runId: string; now: Date; resumeStrandedQueue?: boolean; personWakeBound?: boolean },
     fn: (
       locked: LockedIssueExecution,
       ports: { host: WakeQueueHost; transaction: WakeQueueTransaction },

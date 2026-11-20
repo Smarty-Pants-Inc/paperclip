@@ -124,6 +124,8 @@ export type ReleaseIssueExecutionInput = {
   now: Date;
   suppressImmediateRecovery?: boolean;
   resumeStrandedQueue?: boolean;
+  /** Periodic safety net: drain due person input only, not automatic work. */
+  personWakeBound?: boolean;
 };
 
 type PauseHoldFacts = Awaited<ReturnType<WakeQueueTransaction["getPauseHoldFacts"]>>;
@@ -160,6 +162,7 @@ async function runReleaseDrain(
   while (true) {
     const candidate = await ports.transaction.findNextDeferredWake({
       companyId: run.companyId, issueId: issue.id,
+      ...(input.personWakeBound ? { personWakeDueAt: input.now } : {}),
       ...(preservedWakeIds.length ? { excludedWakeIds: preservedWakeIds } : {}),
     });
     if (!candidate) break;
@@ -350,7 +353,7 @@ async function runReleaseDrain(
   }
 
   // A stopped run never plans recovery for itself, including after a handoff.
-  if (locked.handoffAssigneeAgentId) return { outcome: { kind: "released" }, postCommitEffects };
+  if (locked.handoffAssigneeAgentId || input.personWakeBound) return { outcome: { kind: "released" }, postCommitEffects };
 
   return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
 }
@@ -1060,7 +1063,8 @@ export function createReleaseIssueExecution(deps: {
   ): Promise<{ outcome: ReleaseOutcome; postCommitEffects: PostCommitEffect[] }> {
     const result = await deps.issueLock.withIssueExecutionLock(
       { companyId: input.companyId, runId: input.runId, now: input.now,
-        ...(input.resumeStrandedQueue ? { resumeStrandedQueue: true } : {}) },
+        ...(input.resumeStrandedQueue ? { resumeStrandedQueue: true } : {}),
+        ...(input.personWakeBound ? { personWakeBound: true } : {}) },
       (locked, ports) => runReleaseDrain(locked, ports, input),
     );
 

@@ -26,6 +26,9 @@ function hint(scope: DeferredExecutionScope) {
 
 export async function notifyDeferredExecutionWork(tx: object, scope: DeferredExecutionScope) {
   await notifyDeliveryWork(tx, DELIVERY_QUEUES.deferredExecutionReceipts, hint(scope));
+  // Arm the existing issue-lock deadline worker after the saved wake commits.
+  // Its loader/sweep admit only on-demand PERSON receipts, never system work.
+  await notifyDeliveryWork(tx, DELIVERY_QUEUES.staleIssueLocks, JSON.stringify({ companyId: scope.companyId }));
 }
 
 /** The last gate holding one issue's saved wakes cleared (its run reached a

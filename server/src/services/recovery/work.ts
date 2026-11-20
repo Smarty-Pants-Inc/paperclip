@@ -1,6 +1,6 @@
 import { registerTaskWatchdogWork } from "../task-watchdog-work.js";
 import { and, asc, eq, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
-import { issueComments, issueRecoveryActions, issueRelations, issues, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, issueComments, issueRecoveryActions, issueRelations, issues, type Db } from "@paperclipai/db";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES, type DeliveryQueue } from "../delivery-work-notifications.js";
 import type { IssueRecoveryScope } from "../issue-recovery-notifications.js";
@@ -56,6 +56,14 @@ export function registerIssueRecoveryWork(
               ? or(inArray(issues.status, statuses), and(eq(issues.status, "blocked"), alsoBlockedWhen()))
               : inArray(issues.status, statuses)
             : or(isNotNull(issues.checkoutRunId), isNotNull(issues.executionRunId),
+                // An unlocked chat can still own a last-second person's wake.
+                // Load it into the existing scoped deadline worker; its sweep
+                // hints updatedAt + the quiet bound (no additional timer).
+                sql`exists (select 1 from ${agentWakeupRequests} person_wake
+                  where person_wake.company_id = ${issues.companyId}
+                    and person_wake.payload->>'issueId' = ${issues.id}::text
+                    and person_wake.status = 'deferred_issue_execution'
+                    and person_wake.source = 'on_demand' and person_wake.requested_by_actor_type = 'user')`,
                 // A diagnostic outlives its old binding. Keep re-checking its
                 // named owners even when no stale lock remains on the task.
                 sql`exists (select 1 from ${issueRecoveryActions} stop_pending

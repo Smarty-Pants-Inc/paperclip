@@ -1216,7 +1216,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
 
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
-    options: { suppressImmediateRecovery?: boolean; resumeStrandedQueue?: boolean; deferredPostCommitEffects?: WakeQueuePostCommitEffect[] } = {},
+    options: { suppressImmediateRecovery?: boolean; resumeStrandedQueue?: boolean; personWakeBound?: boolean; deferredPostCommitEffects?: WakeQueuePostCommitEffect[] } = {},
   ) {
     try {
       const [source] = await db.select({
@@ -1237,6 +1237,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         // while continuation classification blocks periodic generic retries.
         suppressImmediateRecovery: options.suppressImmediateRecovery || isAiAuthenticationBlocked(source) || Boolean(sourceHandoff),
         ...(options.resumeStrandedQueue ? { resumeStrandedQueue: true } : {}),
+        ...(options.personWakeBound ? { personWakeBound: true } : {}),
       });
       if (options.deferredPostCommitEffects) {
         options.deferredPostCommitEffects.push(...postCommitEffects);
