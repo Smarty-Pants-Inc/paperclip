@@ -517,7 +517,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const messageId = response.body.id;
     const thread = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/comments`).expect(200);
     const display = uncertain
-      ? { deliveryOutcome: "steered", steeringStatus: "accepted", steeringUnavailableReason: null }
+      ? { deliveryOutcome: "queued", steeringStatus: null, steeringUnavailableReason: "steering_outcome_unknown" }
       : { deliveryOutcome: "queued", steeringStatus: null, steeringUnavailableReason: expect.any(String) };
     expect(thread.body.find((comment: any) => comment.id === messageId)).toMatchObject(display);
     // LiveUpdatesProvider hydrates the exact id via this endpoint, not listComments.

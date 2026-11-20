@@ -479,7 +479,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
       if (kind === "rpc-error") {
         const thread = (await request(f.app).get(`/api/issues/${f.issueId}/comments`).expect(200)).body;
         expect(thread.find((comment: any) => comment.id === message.id)).toMatchObject({
-          deliveryOutcome: "steered", steeringStatus: "accepted", steeringUnavailableReason: null,
+          deliveryOutcome: "queued", steeringStatus: null, steeringUnavailableReason: "steering_outcome_unknown",
         });
         const [pending] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
         expect((pending.resultJson?.queuedSteeringAcknowledgements as any)[message.id].status).toBe("pending");
@@ -606,3 +606,87 @@ it.each([false,true])("A3 NATIVE CARRIED ANSWER: lost receipt=%s; one same-turn 
    expect(f.owner.peers.slice(1).flatMap(p=>p.requests.filter(r=>r.type==="prompt"&&String(r.input?.message).includes(m.body)))).toHaveLength(0);
  }finally{release();await f.close();}
 },60_000);
+
+// Unknown-outcome rows fault only the scripted Pi peer after an attempted request.
+it.each(["unread", "read-no-text"] as const)("JUDGE UNKNOWN %s: exactly one published answer OR one truthful card", async mode => {
+ const f=await fixture(`judge-unknown-${mode}`,true,true);
+ const original=f.peer.request.bind(f.peer);
+ f.peer.dropSteer=mode==="unread";
+ f.peer.request=async(type,input)=>{
+   const ack=await original(type,input);
+   if(type==="steer")throw new Error("RPC disconnected: receipt unavailable for active turn terminal");
+   return ack;
+ };
+ let m:any;
+ const observations:any[]=[];
+ try{
+   m=await f.post(`UNKNOWN-${mode}-M`);
+   await waitForPendingCommentSteers();
+   f.peer.boundary(false);
+   await vi.waitFor(()=>expect(f.peer.consumed.filter(b=>b===m.body)).toHaveLength(mode==="unread"?0:1));
+   await f.complete();await f.startDelivery();
+   if(mode==="unread")await vi.waitFor(async()=>{await f.assertAnsweredOnce([m]);},{timeout:15000});
+   await heartbeatService(db).drainActiveRunExecutions();
+   for(let pass=0;pass<3;pass++){
+     const outcome=await settleUnansweredPersonMessage(db,{companyId:f.companyId,issueId:f.issueId,now:new Date(Date.now()+600000+pass*60000)});
+     await heartbeatService(db).drainActiveRunExecutions();
+     const issue=(await request(f.app).get(`/api/issues/${f.issueId}`).expect(200)).body;
+     const comments=(await request(f.app).get(`/api/issues/${f.issueId}/comments`).expect(200)).body;
+     const replies=comments.filter((c:any)=>!c.deletedAt&&c.authorType==="agent"&&c.body.includes(`ANSWER:${m.body}`));
+     const cards=comments.filter((c:any)=>!c.deletedAt&&c.metadata?.authorizationReason===UNANSWERED_MESSAGE_REASON_PREFIX+m.id);
+     observations.push({pass,outcome,issue,comments,replies,cards});
+   }
+   expect(f.peer.consumed.filter(b=>b===m.body)).toHaveLength(mode==="unread"?0:1);
+   for(const o of observations){
+     expect(o.replies.length+o.cards.length,"one answer OR one card, never both or neither").toBe(1);
+     expect(o.replies).toHaveLength(1);expect(o.cards).toHaveLength(0);
+     expect(o.replies[0].createdByRunId).not.toBe(f.runId);
+   }
+ }finally{
+   await writeFile(join(process.env.TASK_OUT!,`unknown-${mode}-get.json`),JSON.stringify({mode,message:m,observations,runs:await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId,f.companyId)),peers:f.owner.peers.map(p=>({requests:p.requests,consumed:p.consumed,replies:p.replies}))},null,2));
+   await f.close();
+ }
+},60000);
+
+it("JUDGE LONG UNREAD: lost receipt during a 185-second ongoing turn", async()=>{
+ const f=await fixture("judge-long-unread",true,true);
+ f.peer.steerError=new Error("RPC disconnected while sending steering receipt");
+ let m:any; const observations:any[]=[]; const started=performance.now();
+ async function observe(stage:string){
+   const issue=(await request(f.app).get(`/api/issues/${f.issueId}`).expect(200)).body;
+   const comments=(await request(f.app).get(`/api/issues/${f.issueId}/comments`).expect(200)).body;
+   const queue=(await request(f.app).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
+   const replies=comments.filter((c:any)=>!c.deletedAt&&c.authorType==="agent"&&c.body.includes(`ANSWER:${m.body}`));
+   const cards=comments.filter((c:any)=>!c.deletedAt&&c.metadata?.authorizationReason===UNANSWERED_MESSAGE_REASON_PREFIX+m.id);
+   observations.push({stage,elapsedMs:performance.now()-started,issue,comments,queue,replies,cards,runs:await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId,f.companyId))});
+   await writeFile(join(process.env.TASK_OUT!,"long-unread-get.json"),JSON.stringify({message:m,observations},null,2));
+ }
+ try{
+   m=await f.post("LONG-UNREAD-M: please answer this follow-up");
+   await waitForPendingCommentSteers();
+   await f.startDelivery();
+   await observe("receipt-failed-running");
+   const assertWaiting=()=>{
+     const o=observations.at(-1); const receipt=o.comments.find((c:any)=>c.id===m.id);
+     expect(receipt.deliveryOutcome).toBe("queued");
+     expect(receipt.steeringStatus).not.toBe("accepted");
+     expect(receipt.steerDeliveredAt).toBeNull();
+     expect(o.queue.state).toBe("deferred");
+     expect(o.queue.entries.filter((e:any)=>e.comment.id===m.id)).toHaveLength(1);
+   };
+   assertWaiting();
+   for(const seconds of [30,90,185]){
+     const delay=seconds*1000-(performance.now()-started);if(delay>0)await new Promise(r=>setTimeout(r,delay));
+     await settleUnansweredPersonMessage(db,{companyId:f.companyId,issueId:f.issueId,now:new Date()});
+     await observe(`still-running-${seconds}s`);
+     assertWaiting();
+     expect(f.peer.active).toBe(true);
+   }
+   f.peer.boundary();await f.complete();
+   await vi.waitFor(async()=>{await f.assertAnsweredOnce([m]);},{timeout:15000});
+   await observe("run-ended-successor-answered");
+   for(let pass=0;pass<3;pass++)await settleUnansweredPersonMessage(db,{companyId:f.companyId,issueId:f.issueId,now:new Date(Date.now()+600000+pass*60000)});
+   await observe("three-later-sweeps");
+   const last=observations.at(-1);expect(last.replies).toHaveLength(1);expect(last.cards).toHaveLength(0);
+ }finally{await f.close();}
+},240000);
