@@ -223,8 +223,8 @@ describe("TaskChatRunnerActivityGroup", () => {
       },
     ]);
     expect(viewport().querySelector("[data-activity-row]")).toBe(line);
-    expect(viewport().textContent).toContain("Checking the file");
-    expect(viewport().textContent).not.toContain("First");
+    expect(viewport().textContent).toBe("Thinking");
+    expect(container.querySelector('[data-testid="task-chat-reasoning-preview"]')?.textContent).toBe("First Checking the file");
     expect(container.querySelector(".runner-activity-roll-in")).toBeNull();
   });
 

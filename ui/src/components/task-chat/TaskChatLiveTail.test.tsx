@@ -150,11 +150,11 @@ describe("TaskChatLiveTail", () => {
     render(parse(entries));
 
     expect(viewport().querySelector("[data-activity-row]")).toBe(row);
-    expect(viewport().textContent).toContain("Checking the file");
-    expect(container.textContent).not.toContain("First line");
+    expect(viewport().textContent).toBe("Thinking");
+    expect(container.querySelector('[data-testid="task-chat-reasoning-preview"]')?.textContent).toContain("First line Checking the file");
     expect(container.querySelector(".runner-activity-roll-in")).toBeNull();
     expect(toggle().getAttribute("aria-expanded")).toBe("false");
-    expandFirstDetail();
+    flushSync(() => toggle().click());
     expect(container.textContent).toContain("First line");
     expect(container.textContent).toContain("Checking the file");
     expect(container.querySelector('[data-testid="task-chat-phase-child-rail"]')).toBeNull();

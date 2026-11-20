@@ -485,9 +485,9 @@ describe("TaskChatRunnerTurn", () => {
         ?.click(),
     );
     expect(
-      container.querySelector('[data-testid="task-chat-runner-activity-list"]')
+      container.querySelector('[data-testid="task-chat-runner-activity-detail"]')
         ?.textContent,
-    ).toContain("Thought");
+    ).toContain("The saved preview can be reused.");
   });
 
   it("keeps the latest provider-authored reasoning line visible while activity is folded", () => {
@@ -503,7 +503,7 @@ describe("TaskChatRunnerTurn", () => {
     ]);
 
     const ticker = container.querySelector(
-      '[data-testid="task-chat-activity-viewport"]',
+      '[data-testid="task-chat-reasoning-preview"]',
     );
     expect(ticker?.textContent).toContain("Checking the steering path.");
     expect(
@@ -628,12 +628,11 @@ describe("TaskChatRunnerTurn", () => {
         )
         ?.click(),
     );
-    const history = container.querySelector('[data-testid="task-chat-runner-activity-list"]');
+    // T3 renders a reasoning-only expanded group as full trace, not nested toggles.
+    const history = container.querySelector('[data-testid="task-chat-runner-activity-detail"]');
     expect(container.querySelector('[data-testid="task-chat-runner-activity-rail"]')).toBeNull();
-    expect(history?.querySelectorAll("li")).toHaveLength(2);
-    expect(history?.textContent).toContain("ThoughtInspect the current card.");
-    expect(history?.textContent).toContain("ThinkingKeep the canonical revision atomic.");
-    expect(container.querySelector('[data-testid="task-chat-runner-activity-detail"]')).toBeNull();
+    expect(history?.textContent).toContain("Inspect the current card.");
+    expect(history?.textContent).toContain("Keep the canonical revision atomic.");
 
   });
 
@@ -1231,9 +1230,10 @@ describe("TaskChatRunnerTurn", () => {
         ?.textContent,
     ).toContain("Worked for");
     expect(
-      container.querySelector('[data-testid="task-chat-activity-phase-toggle"]')
-        ?.textContent,
-    ).toContain("Thought");
+      container.querySelector('[data-testid="task-chat-work-toggle"]')
+        ?.getAttribute("aria-expanded"),
+    ).toBe("false");
+    expect(container.textContent).not.toContain("Provider-authored trace");
   });
 
   it("keeps final text mounted through a transient replay gap", () => {
@@ -1515,6 +1515,8 @@ describe("TaskChatRunnerTurn", () => {
       "succeeded",
     );
 
+    // The same chronology is inspected inside the settled Worked fold.
+    act(() => container.querySelector<HTMLButtonElement>('[data-testid="task-chat-work-toggle"]')!.click());
     const timeline = container.querySelector(
       '[data-testid="task-chat-turn-timeline"]',
     );
@@ -1550,7 +1552,7 @@ describe("TaskChatRunnerTurn", () => {
       '[data-testid="task-chat-final-response"]',
     );
     expect(worked?.getAttribute("data-turn-position")).toBe("identity");
-    expect(worked?.parentElement).toBe(identityRow);
+    expect(worked?.closest('[data-testid="task-chat-runner-identity-row"]')).toBe(identityRow);
     expect(identity?.parentElement).toBe(identityRow);
     expect(identityRow?.classList.contains("items-center")).toBe(true);
     expect(worked?.classList.contains("border-b")).toBe(false);
@@ -1634,6 +1636,8 @@ describe("TaskChatRunnerTurn", () => {
       "succeeded",
     );
 
+    // Settlement closes the outer fold; the person's inner expansion survives.
+    act(() => container.querySelector<HTMLButtonElement>('[data-testid="task-chat-work-toggle"]')!.click());
     const settled = container.querySelector<HTMLButtonElement>(
       '[data-testid="task-chat-activity-phase-toggle"]',
     );
