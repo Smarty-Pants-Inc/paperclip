@@ -1,4 +1,4 @@
-import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../../../services/recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessage, settleUnansweredPersonMessages, UNANSWERED_MESSAGE_REASON_PREFIX } from "../../../services/recovery/unanswered-person-message.js";
 import { readPersonStopHold } from "../../../services/acknowledged-native-stop.js";
 import { answeredPersonMessageSql, deferredWakeIsStaleSql, personMessageOwedSql } from "../../../services/person-message-answer.js";
 import * as serverInfo from "../../../server-info.js";
@@ -1888,6 +1888,153 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     await reply(c, r.id);
     return { c, old, w, r };
   }
+
+  // final4 phone regression: the cancellation, not a periodic sweep, owes each named card.
+  it.each([3, 23])("mc-1: moved-on release immediately cards all %i never-carried messages, then sweeps add zero", async count => {
+    const c = await seed();
+    const held = [];
+    for (let i = 0; i < count; i++) held.push(await message(c, `what is ${202 + i} + 1?`, ago(4500 - i * 20)));
+    const w = await wake(c, held[0].id, ago(3000));
+    await db.update(agentWakeupRequests).set({ payload: withQueuedCommentIdsInWakePayload(w.payload, held.map(m => m.id)) })
+      .where(eq(agentWakeupRequests.id, w.id));
+    const newer = await message(c, "Just answer this last one", ago(2000));
+    const r = await run(c, [newer.id], ago(1500));
+    await db.update(heartbeatRuns).set({ finishedAt: new Date() }).where(eq(heartbeatRuns.id, r.id));
+    await reply(c, r.id, "The last one is answered.");
+    const started = Date.now();
+    await drain(c, r.id);
+    const [cancelled] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id));
+    expect(cancelled).toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
+    const immediate = await Promise.all(held.map(m => cards(c, m.id)));
+    const latencyMs = Date.now() - started;
+    console.log("mc-1 immediate", { count, latencyMs, cardsPerMessage: immediate.map(rows => rows.length) });
+    expect(immediate.map(rows => rows.length)).toEqual(held.map(() => 1));
+    expect(latencyMs).toBeLessThanOrEqual(5000);
+    for (const [index, notices] of immediate.entries()) {
+      expect(notices[0].body).toBe(`Your message is saved: "${held[index].body}". It was not answered because no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.`);
+      expect(notices[0].createdAt.getTime() - cancelled.finishedAt!.getTime()).toBeLessThanOrEqual(5000);
+      expect(await noRunFor(held[index].id)).toEqual([]);
+    }
+    expect(await cards(c, newer.id)).toEqual([]);
+    const snapshot = immediate.map(rows => ({ id: rows[0].id, body: rows[0].body, updatedAt: rows[0].updatedAt }));
+    for (const minutes of [3, 10]) {
+      const swept = await settleUnansweredPersonMessages(db, { companyId: c.companyId, issueId: c.issueId,
+        now: new Date(started + minutes * 60_000) });
+      expect(swept.noticed).toBe(0);
+      const after = await Promise.all(held.map(m => cards(c, m.id)));
+      expect(after.map(rows => rows.length)).toEqual(held.map(() => 1));
+      expect(after.map(rows => ({ id: rows[0].id, body: rows[0].body, updatedAt: rows[0].updatedAt }))).toEqual(snapshot);
+      console.log("mc-1 later sweep", { count, minutes, noticed: swept.noticed });
+    }
+  });
+
+  it("mc-2: boot cancels a days-old never-carried wake with ONE immediate naming card and no run", async () => {
+    const { c, old, w, r } = await movedChat();
+    vi.spyOn(serverInfo, "getServerProcessStartedAt").mockReturnValue(new Date().toISOString());
+    await db.insert(nativeRunFinalizations).values({ companyId: c.companyId, issueId: c.issueId, runId: r.id, phase: "committed" });
+    const started = Date.now();
+    await drain(c, r.id, true);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0])
+      .toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
+    const immediate = await cards(c, old.id);
+    console.log("mc-2 boot immediate", { latencyMs: Date.now() - started, cards: immediate.length });
+    expect(immediate).toHaveLength(1);
+    expect(Date.now() - started).toBeLessThanOrEqual(5000);
+    expect(immediate[0].body).toContain(`Your message is saved: "${old.body}".`);
+    expect(await noRunFor(old.id)).toEqual([]);
+    for (const minutes of [3, 10]) expect((await settleUnansweredPersonMessages(db, { companyId: c.companyId,
+      issueId: c.issueId, now: new Date(started + minutes * 60_000) })).noticed).toBe(0);
+    expect((await cards(c, old.id)).map(n => n.id)).toEqual([immediate[0].id]);
+  });
+
+  it("mc-3: a carried and moved-past message gets ZERO immediate or later cards", async () => {
+    const { c, old, w, r } = await movedChat(true);
+    await drain(c, r.id);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0])
+      .toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
+    expect(await cards(c, old.id)).toEqual([]);
+    for (const minutes of [3, 10]) await settleUnansweredPersonMessages(db, { companyId: c.companyId,
+      issueId: c.issueId, now: new Date(Date.now() + minutes * 60_000) });
+    expect(await cards(c, old.id)).toEqual([]);
+    expect(await noRunFor(old.id)).toHaveLength(1); // only its original carrier
+    console.log("mc-3 carried moved-past cards", (await cards(c, old.id)).length);
+  });
+
+  it("mc-4: a pre-existing named no_run card survives cancel and restart with the SAME key and no second card", async () => {
+    const { c, old, w, r } = await movedChat();
+    const earlier = await settleUnansweredPersonMessages(db, { companyId: c.companyId, issueId: c.issueId });
+    expect(earlier.noticed).toBe(1);
+    const [before] = await cards(c, old.id);
+    expect(before.body).toContain(`Your message is saved: "${old.body}".`);
+    await db.$client.end();
+    db = createDb(tempDb.connectionString);
+    vi.spyOn(serverInfo, "getServerProcessStartedAt").mockReturnValue(new Date().toISOString());
+    await drain(c, r.id);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0])
+      .toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
+    for (const minutes of [0, 3, 10]) {
+      expect((await settleUnansweredPersonMessages(db, { companyId: c.companyId, issueId: c.issueId,
+        now: new Date(Date.now() + minutes * 60_000) })).noticed).toBe(0);
+      expect(await cards(c, old.id)).toEqual([before]);
+    }
+    console.log("mc-4 pre-existing card retained across reconnect/boot/cancel/sweeps", before.id);
+  });
+
+  it("mc-5: live custody may still answer the message, so release and sweeps write NO card", async () => {
+    const { c, old, w, r } = await movedChat();
+    const live = await run(c, [old.id], ago(30_000), "running");
+    await db.update(heartbeatRuns).set({ finishedAt: null }).where(eq(heartbeatRuns.id, live.id));
+    await drain(c, r.id);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0].status)
+      .toBe("deferred_issue_execution");
+    for (const minutes of [0, 3, 10]) await settleUnansweredPersonMessages(db, { companyId: c.companyId,
+      issueId: c.issueId, now: new Date(Date.now() + minutes * 60_000) });
+    expect(await cards(c, old.id)).toEqual([]);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, live.id)))[0].status).toBe("running");
+    await reply(c, live.id, "The held request is answered now.");
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, live.id));
+    await drain(c, live.id);
+    await sweep(c);
+    expect(await cards(c, old.id)).toEqual([]);
+    console.log("mc-5 live custody then real published answer: cards", (await cards(c, old.id)).length);
+  });
+
+  it("mc-6: a mixed cancelled wake cards ONLY its never-carried message, not carried/moved-past input", async () => {
+    const { c, old, w, r } = await movedChat(true);
+    const neverCarried = await message(c, "Also save this never-carried request", ago(2 * day + 30_000));
+    await db.update(agentWakeupRequests).set({ payload: withQueuedCommentIdsInWakePayload(w.payload, [old.id, neverCarried.id]) })
+      .where(eq(agentWakeupRequests.id, w.id));
+    await drain(c, r.id);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0])
+      .toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
+    expect(await cards(c, old.id)).toEqual([]);
+    expect(await cards(c, neverCarried.id)).toHaveLength(1);
+    for (const minutes of [3, 10]) expect((await settleUnansweredPersonMessages(db, { companyId: c.companyId,
+      issueId: c.issueId, now: new Date(Date.now() + minutes * 60_000) })).noticed).toBe(0);
+    expect(await cards(c, old.id)).toEqual([]);
+    expect(await cards(c, neverCarried.id)).toHaveLength(1);
+    console.log("mc-6 mixed wake", { carriedCards: 0, neverCarriedCards: 1 });
+  });
+
+  it("mc-7: cancellation and its immediate naming card roll back together", async () => {
+    const { c, old, w, r } = await movedChat();
+    const adapter = createPostgresWakeQueueAdapter(db, deps);
+    let cardsInside = 0;
+    await expect(adapter.withIssueExecutionLock({ companyId: c.companyId, runId: r.id, now: new Date() }, async (_locked, ports) => {
+      await ports.transaction.cancelDeferredWake({ companyId: c.companyId, wakeId: w.id, agentId: c.agentId,
+        reason: "The conversation moved on", now: new Date() });
+      // The transaction's card must still be invisible outside it before commit.
+      cardsInside = (await cards(c, old.id)).length;
+      throw new Error("mc-7 rollback after cancellation");
+    })).rejects.toThrow("mc-7 rollback after cancellation");
+    expect(cardsInside).toBe(0);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0].status)
+      .toBe("deferred_issue_execution");
+    expect(await cards(c, old.id)).toEqual([]);
+    await drain(c, r.id);
+    expect(await cards(c, old.id)).toHaveLength(1);
+    console.log("mc-7 rollback preserves deferred wake/no card; committed release writes ONE");
+  });
 
   it("sw-1: old never-claimed wake is cancelled, never promoted; sweep writes exactly ONE true card", async () => {
     const { c, old, w, r } = await movedChat();
