@@ -32,10 +32,12 @@ export function registerProcessHeartbeat(db: Db, heartbeat: Heartbeat): void {
  * transaction handle; the root-bound registered heartbeat would sweep/promote
  * OUTSIDE that transaction (stale reads, self-deadlock on the caller's row
  * locks), so it is NOT substituted. The miss is never silent: warn once per
- * call site. Nothing registered (tests that never boot a server): no warn.
+ * call site. `site` is required and must be DISTINCT per call site (warn-once
+ * is keyed by it; a shared label would silence every site after the first).
+ * Nothing registered (tests that never boot a server): no warn.
  * Never throws: a wrong throw would stop runs.
  */
-export function processHeartbeatFor(db: Db, site = "unlabelled"): Heartbeat | undefined {
+export function processHeartbeatFor(db: Db, site: string): Heartbeat | undefined {
   const registered = processHeartbeats.get(db);
   if (registered || !isRegistered() || warnedSites.has(site)) return registered;
   warnedSites.add(site);
@@ -45,7 +47,7 @@ export function processHeartbeatFor(db: Db, site = "unlabelled"): Heartbeat | un
 }
 
 /** Registered process heartbeat, else a bare one (loaded lazily). */
-export async function wiredHeartbeatFor(db: Db, site?: string): Promise<Heartbeat> {
+export async function wiredHeartbeatFor(db: Db, site: string): Promise<Heartbeat> {
   const registered = processHeartbeatFor(db, site);
   if (registered) return registered;
   const { heartbeatService } = await import("./heartbeat.js");

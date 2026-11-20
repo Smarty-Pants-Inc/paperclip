@@ -29,7 +29,7 @@ export function summarySlotRoutes(db: Db) {
   const access = accessService(db);
   const settings = instanceSettingsService(db);
   const svc = summarySlotService(db);
-  const heartbeat = processHeartbeatFor(db) ?? heartbeatService(db);
+  const heartbeat = processHeartbeatFor(db, "summary-slot-routes") ?? heartbeatService(db);
 
   async function assertSummariesEnabled() {
     const experimental = await settings.getExperimental();

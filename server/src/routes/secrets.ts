@@ -113,7 +113,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
   const proposals = createSecretProposalsService(db);
   const access = accessService(db);
   const issues = deps.issues ?? issueService(db);
-  const heartbeat = deps.heartbeat ?? processHeartbeatFor(db) ?? heartbeatService(db);
+  const heartbeat = deps.heartbeat ?? processHeartbeatFor(db, "secret-routes") ?? heartbeatService(db);
   const runRedactions = createRunSecretRedactionRegistry(db);
   const defaultProvider = getConfiguredSecretProvider();
 
