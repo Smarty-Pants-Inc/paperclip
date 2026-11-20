@@ -3535,7 +3535,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     // PLANTED: the stopped turn's provenance references a missing source message.
     // Admission's buildExecutionContinuation refuses it; GET must fail closed to
     // the existing no-Send line, not turn that refusal into a broken panel (500).
-    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentId: randomUUID() } })
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentIds: [randomUUID()] } })
       .where(eq(heartbeatRuns.id, f.runId));
     const queue = await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
     expect(queue.body.entries.map((entry: any) => entry.comment.id)).toEqual([held]);
