@@ -628,7 +628,10 @@ describeEmbeddedPostgres("person-message floor after Stop (RFL 19:05Z)", () => {
     expect(floor).toBe(true);
     expect(cards[0]!.deletedAt).toBeNull();
     expect(cards[0]!.metadata?.authorizationReason).toBe(`${UNANSWERED_MESSAGE_REASON_PREFIX}${f.m.id}`);
-    expect(cards[0]!.body, "the true note names the saved question using the approved naming words").toContain('Your message is saved: “9 + 10?”.');
+    expect(cards[0]!.body, "the true note names the saved question using the existing naming words").toContain('Your message is saved: "9 + 10?" (');
+    expect(cards[0]!.body).toContain(`${String(f.m.createdAt.getHours()).padStart(2, "0")}:${String(f.m.createdAt.getMinutes()).padStart(2, "0")}`);
+    expect(cards[0]!.body).toContain("Check the task's recent history before trying again; the run may have taken actions.");
+    expect(cards[0]!.body).not.toContain("Sending it again is safe");
     await f.sweep();
     expect((await f.cards()).map(c => c.id), "one note ever, not merely one live note").toEqual([cards[0]!.id]);
     await noResend(f, before);
@@ -764,7 +767,14 @@ describeEmbeddedPostgres("person-message floor after Stop (RFL 19:05Z)", () => {
     expect.soft(answered).toEqual([]);
     expect.soft(owed).toBe(true);
     expect.soft(cards).toHaveLength(1);
-    if (cards[0]) expect.soft(cards[0].body).toContain(m.body);
+    if (cards[0]) {
+      expect.soft(cards[0].body).toContain(`Your message is saved: "${m.body}" (`);
+      expect.soft(cards[0].body).toContain(`${String(m.createdAt.getHours()).padStart(2, "0")}:${String(m.createdAt.getMinutes()).padStart(2, "0")}`);
+      expect.soft(cards[0].body).toContain("This run finished without a reply to your message.");
+      expect.soft(cards[0].body).toContain("Check the task's recent history before trying again; the run may have taken actions.");
+      expect.soft(cards[0].body).not.toContain("no run started");
+      expect.soft(cards[0].body).not.toContain("Sending it again is safe");
+    }
     await noResend(f, before);
   });
   it("INSTALL three boots: seeded 3-day answered-to-owed history gets one note per owed PERSON, zero new runs", async () => {

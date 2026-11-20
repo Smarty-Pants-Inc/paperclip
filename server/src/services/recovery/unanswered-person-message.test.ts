@@ -93,10 +93,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       return row!.id;
     };
     const reply = async (runId: string) => {
-      const [carrier] = await db.select({ startedAt: heartbeatRuns.startedAt }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      const [carrier] = await db.select({ startedAt: heartbeatRuns.startedAt, createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       // Rule line 6: the reply must follow the ACTUAL claim, not this fixture's
       // older synthetic clock when a queued run is claimed using Date.now().
-      const createdAt = new Date(Math.max(at().getTime(), (carrier?.startedAt?.getTime() ?? 0) + 1));
+      const createdAt = new Date(Math.max(at().getTime(), ((carrier?.startedAt ?? carrier?.createdAt)?.getTime() ?? 0) + 1));
       clock = createdAt.getTime();
       await db.insert(issueComments).values({ companyId, issueId, body: "Here is my answer.", authorType: "agent", authorAgentId: agentId,
         createdByRunId: runId, createdAt });
@@ -1723,9 +1723,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
 
   it("no false notice: blocked on a question card to the person (the agent's answer is the card) -> quiet", async () => {
     const f = await fixture({ status: "blocked" });
-    const asked = await f.run({ commentId: await f.message("Which region?"), status: "succeeded" });
+    const messageId = await f.message("Which region?");
+    const asked = await f.run({ commentId: messageId, status: "succeeded" });
     await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, kind: "ask_user_questions",
-      status: "pending", createdByAgentId: f.agentId, sourceRunId: asked, addresseeUserId: f.userId,
+      status: "pending", createdByAgentId: f.agentId, sourceRunId: asked, originCommentIds: [messageId], addresseeUserId: f.userId,
       payload: { version: 1, questions: [{ id: "region", prompt: "Which region?", selectionMode: "single",
         options: [{ id: "eu", label: "EU" }, { id: "us", label: "US" }] }] } as never, createdAt: f.at() });
     await f.sweep();
@@ -1737,14 +1738,14 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   it.each([
     ["carrying", "context"], ["continuation", "context"], ["carrying", "delivery"], ["continuation", "delivery"],
   ] as const)(
-    "PV2b chain: message -> %s card -> answer-resume (%s) fails -> successor final never gets a resend notice", async (cardSource, answerLink) => {
+    "PV2b chain: message -> %s card -> person answer-resume (%s) fails -> successor final supersedes ONE notice", async (cardSource, answerLink) => {
       const f = await fixture({ status: "in_review" });
       const messageId = await f.message("Build Sol; ask me for the name first.");
       const carryingRunId = await f.run({ commentId: messageId, status: "succeeded" });
       const sourceRunId = cardSource === "carrying" ? carryingRunId
         : await f.run({ status: "succeeded", retryOfRunId: carryingRunId });
       const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
-        kind: "ask_user_questions", status: "pending", sourceRunId, createdByAgentId: f.agentId,
+        kind: "ask_user_questions", status: "pending", sourceRunId, createdByAgentId: f.agentId, originCommentIds: [messageId],
         addresseeUserId: f.userId, continuationPolicy: "wake_assignee", createdAt: f.at(),
         payload: { version: 1, questions: [{ id: "name", prompt: "What is the product called?", required: true,
           selectionMode: "single", options: [{ id: "sol", label: "Sol" }] }] } }).returning();
@@ -1762,13 +1763,17 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         await db.update(issueQuestionResponseDeliveries).set({ targetRunId: resume, status: "fallback_queued",
           deliveryMode: "wake_fallback" }).where(eq(issueQuestionResponseDeliveries.interactionId, card!.id));
       }
-      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+      // RFL by-purpose: the person's card answer is new input, not a posted
+      // agent reply. Until the successor publishes, the original stays owed.
+      expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed" });
       const successor = await f.nativeSuccessor(resume);
       await f.reply(successor);
       expect(await freshContinuationDescendsFrom(db, { companyId: f.companyId, issueId: f.issueId,
         runId: successor, ancestorRunId: carryingRunId, includeAnswerLineage: true })).toBe(true);
       await f.sweep();
-      expect(await noticesEver()).toHaveLength(0);
+      expect(await noticesEver()).toHaveLength(1);
+      expect(await f.visible()).toHaveLength(0);
+      expect((await noticesEver())[0]!.deletedAt).not.toBeNull();
       expect(await readContinuationCommentInput(db, { ...f, runId: carryingRunId })).toEqual({});
       // A previously published notice is superseded too, not merely hidden
       // by the decision to avoid writing another one.
@@ -1862,14 +1867,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
-  // Keep: recorded PV2 gate-1 catch (11:27Z): answering the run's question
-  // removed its pending-card exemption before response delivery could wake it.
-  it.each([true, false])("PV2 card-answer: no resend notice before, during or after one answer delivery (chat=%s)", async chat => {
+  // RFL by-purpose supersedes the pending-card exemption after a PERSON
+  // answers it. Preserve delivery idempotency; only the agent's posted reply
+  // answers the original message and supersedes its one notice.
+  it.each([true, false])("PV2 card-answer: person answer stays owed until the agent posts; one note, one delivery (chat=%s)", async chat => {
     const f = await fixture({ chat, status: "in_review" });
     const messageId = await f.message("Build the landing page.");
     const sourceRunId = await f.run({ commentId: messageId, status: "running" });
     const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
-      kind: "ask_user_questions", status: "pending", sourceRunId, createdByAgentId: f.agentId,
+      kind: "ask_user_questions", status: "pending", sourceRunId, createdByAgentId: f.agentId, originCommentIds: [messageId],
       addresseeUserId: f.userId, continuationPolicy: "wake_assignee", createdAt: f.at(),
       payload: { version: 1, questions: [{ id: "name", prompt: "What is the product called?", required: true,
         selectionMode: "single", options: [{ id: "sol", label: "Sol" }] }] } }).returning();
@@ -1882,11 +1888,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const answered = await issueThreadInteractionService(db).answerQuestions({ id: f.issueId, companyId: f.companyId }, card!.id,
       { answers: [{ questionId: "name", optionIds: ["sol"] }] }, { userId: f.userId });
     expect(answered.status).toBe("answered");
-    // The exact live race: the card answer committed, but no delivery wake exists yet.
-    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+    // RFL by-purpose: a person's answer is not an agent's published reply.
+    // The fenced card stands until the answer-resume publishes its own reply.
+    expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed" });
     await f.sweep();
-    expect(await noticesEver()).toHaveLength(0);
-    expect(await readContinuationCommentInput(db, { ...f, runId: sourceRunId })).toEqual({});
+    expect(await noticesEver()).toHaveLength(1);
+    expect(await readContinuationCommentInput(db, { ...f, runId: sourceRunId })).toMatchObject({ wakeCommentIds: [messageId] });
 
     // Only provider dispatch is replaced: the real answer transaction, delivery
     // claim/idempotency, durable wake, sweep and reply attribution all use PostgreSQL.
@@ -1911,25 +1918,26 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await db.select().from(issueQuestionResponseDeliveries).where(eq(issueQuestionResponseDeliveries.interactionId, card!.id)))
       .toHaveLength(1);
     await f.sweep();
-    expect(await noticesEver()).toHaveLength(0);
+    expect(await noticesEver()).toHaveLength(1);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, first!.targetRunId!));
     await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.id, wakes[0]!.id));
     await f.reply(first!.targetRunId!);
     await f.sweep();
-    expect(await noticesEver()).toHaveLength(0);
+    expect(await noticesEver()).toHaveLength(1);
+    expect(await f.visible()).toHaveLength(0);
+    expect((await noticesEver())[0]!.deletedAt).not.toBeNull();
     expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent"))))
       .toHaveLength(1);
   });
 
-  // Keep: rf5 H4 F1 caught confirmation acceptance changing pending -> accepted,
-  // which made the original input look unanswered again. Use the production
-  // creation and resolution services, not a hand-written terminal status.
+  // RFL by-purpose: a person's confirmation is not the agent's answer. Use
+  // production creation and resolution and retain the ONE notice with no reply.
   it.each([
     { chat: true, decision: "accept" }, { chat: false, decision: "accept" },
     { chat: true, decision: "reject" }, { chat: false, decision: "reject" },
     { chat: true, decision: "skip" }, { chat: false, decision: "skip" },
     { chat: true, decision: "withdraw" }, { chat: false, decision: "withdraw" },
-  ] as const)("H4 confirmation reply: $decision leaves no notice or carry (chat=$chat)", async ({ chat, decision }) => {
+  ] as const)("H4 confirmation reply: $decision is person input, ONE notice until an agent reply (chat=$chat)", async ({ chat, decision }) => {
     const f = await fixture({ chat, status: "in_progress" });
     const messageId = await f.message("Apply the proposed change.");
     const sourceRunId = await f.run({ commentId: messageId, status: "running" });
@@ -1945,15 +1953,18 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, sourceRunId));
     const noticesEver = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
       sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`));
-    const assertQuiet = async () => {
+    const assertState = async (personAnswered = false) => {
       await f.sweep();
-      expect(await noticesEver(), "no notice, including soft-deleted notices").toHaveLength(0);
-      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
-      expect(await readContinuationCommentInput(db, { ...f, runId: sourceRunId })).toEqual({});
+      const notices = await noticesEver();
+      expect(notices).toHaveLength(personAnswered ? 1 : 0);
+      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: personAnswered ? "noticed_before" : "answered" });
+      const pending = await readContinuationCommentInput(db, { ...f, runId: sourceRunId });
+      if (personAnswered) expect(pending).toMatchObject({ wakeCommentIds: [messageId] });
+      else expect(pending).toEqual({});
       expect(await db.select({ id: issueComments.id }).from(issueComments).where(and(
         eq(issueComments.id, messageId), unansweredPersonMessageCommentCondition()))).toHaveLength(0);
     };
-    await assertQuiet();
+    await assertState();
     const actor = { userId: f.userId };
     const reason = { reason: "Keep the current behavior." };
     const resolved = decision === "accept"
@@ -1963,35 +1974,44 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       : await svc.withdrawInteraction(scope, card.id, reason, actor);
     const expectedStatus = { accept: "accepted", reject: "rejected", skip: "cancelled", withdraw: "cancelled" };
     expect(resolved).toMatchObject({ status: expectedStatus[decision], resolvedByUserId: f.userId });
-    await assertQuiet();
-    // Cross the 10-minute no-reply grace as well as ordinary settlement, then
-    // sweep twice. No provider reply or continuation wake can mask this bug.
+    await assertState(true);
+    // No agent reply appeared: keep the SAME one notice across later sweeps.
     await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 11 * 60_000) }).where(eq(heartbeatRuns.id, sourceRunId));
-    await assertQuiet();
-    await assertQuiet();
+    await assertState(true);
+    await assertState(true);
     expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
       eq(issueComments.authorType, "agent")))).toHaveLength(0);
   });
 
   it.each(["wakeCommentId", "commentId", "conversationReplyBoundaryCommentId", "wakeCommentIds", "firstTurnQueuedInput"])(
-    "PV2 card-answer: open and answered cards answer only their own carried input through %s", async key => {
+    "PV2 card-answer: only pending addressed agent cards answer carried input through %s", async key => {
       const f = await fixture();
       const earlier = await f.message("Still waiting in the queue.");
       const messageId = await f.message("The steered input.");
       const runId = await f.run({ status: "succeeded" });
       const contextSnapshot = { issueId: f.issueId, steeredCommentIds: [messageId],
+        steeredDeliveredAts: { [messageId]: f.at().toISOString() },
         [key]: key === "wakeCommentIds" ? [messageId] : key === "firstTurnQueuedInput" ? { commentIds: [messageId] } : messageId };
       await db.update(heartbeatRuns).set({ contextSnapshot }).where(eq(heartbeatRuns.id, runId));
       for (const kind of ["ask_user_questions", "request_confirmation"] as const) {
         const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
-          kind, status: "pending", sourceRunId: runId, createdByAgentId: f.agentId, createdAt: f.at(),
+          kind, status: "pending", sourceRunId: runId, createdByAgentId: f.agentId, originCommentIds: [messageId], createdAt: f.at(),
           payload: kind === "ask_user_questions" ? { version: 1, questions: [] } : { version: 1, prompt: "Proceed?" } }).returning();
         for (const status of kind === "ask_user_questions" ? ["pending", "answered"] : ["pending", "accepted", "rejected"]) {
           await db.update(issueThreadInteractions).set({ status }).where(eq(issueThreadInteractions.id, card!.id));
-          expect(await settleUnansweredPersonMessage(db, f), `${kind}/${status}`).toEqual({ kind: "answered" });
-          expect(await readContinuationCommentInput(db, { ...f, runId })).toEqual({});
+          const outcome = await settleUnansweredPersonMessage(db, f);
+          expect(outcome.kind, `${kind}/${status}`).toBe(status === "pending" ? "answered"
+            : kind === "ask_user_questions" && status === "answered" ? "noticed" : "noticed_before");
+          const input = await readContinuationCommentInput(db, { ...f, runId });
+          if (status === "pending") expect(input).toEqual({});
+          else {
+            expect(input).toMatchObject({ wakeCommentIds: [messageId] });
+            expect((await f.visible()).filter(note => note.metadata?.authorizationReason === `unanswered_message:${messageId}`),
+              "the same message's final note must be visible again after the person answers the card").toHaveLength(1);
+          }
           const pending = await pendingContinuationCommentInput(db, { ...f, contextSnapshot: { wakeCommentIds: [earlier] } });
-          expect(pending.wakeCommentIds, "a card for the steered input must not consume earlier queued messages").toEqual([earlier]);
+          expect(pending.wakeCommentIds, "a card never consumes the earlier input explicitly passed to this reader")
+            .toEqual([earlier]);
           const candidates = await db.select({ id: issueComments.id }).from(issueComments).where(and(
             eq(issueComments.id, messageId), unansweredPersonMessageCommentCondition()));
           expect(candidates, `${kind}/${status}: discovery and settlement agree`).toHaveLength(0);
@@ -2093,7 +2113,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_REPLY);
+    expect(notices[0]!.body).toContain('Your message is saved: "Please continue." (');
+    expect(notices[0]!.body).toContain(STARTED_NO_REPLY);
+    expect(notices[0]!.body).not.toContain("Sending it again is safe");
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${message}`);
   });
 
