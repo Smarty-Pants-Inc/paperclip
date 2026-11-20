@@ -41,5 +41,75 @@ export async function nativeResponseItems(db: Db, input: { companyId: string; ru
     if (candidate.turnId === selected.turnId && candidate.seq <= selected.seq && !items.has(candidate.itemId))
       items.set(candidate.itemId, { itemId: candidate.itemId, text: candidate.text });
   }
-  return items.size > 1 ? [...items.values()] : [];
+  // answered-a6: within this ONE publication step, an earlier final that a later final of the
+  // same step restates whole (strictly more) is not posted again. Nothing else changes: no item
+  // is trimmed, merged or replaced; equal items are all kept (two questions, two answers).
+  const kept = restatedEarlierFinalsDropped([...items.values()]);
+  return kept.length > 1 ? kept : [];
+}
+
+const FENCE = /^\s*```/;
+
+function normalisedProse(segment: string) {
+  // Outside code only: paired ** emphasis, paired __ emphasis around non-identifier text, whitespace runs.
+  return segment
+    .replace(/\*\*(?=\S)(.+?)(?<=\S)\*\*/g, "$1")
+    .replace(/(^|[^\w])__(?=\S)((?:(?!__).)*?[^\w](?:(?!__).)*?)(?<=\S)__(?!\w)/g, "$1$2")
+    .replace(/\s+/g, " ");
+}
+
+/** One line of prose -> its sentence units. Inline code spans are kept byte-exact (only their
+ * backtick delimiters are left out of the comparison) and never split. */
+function lineUnits(line: string): string[] {
+  const units: string[] = [];
+  let current = "", prose = "";
+  const flushProse = () => { current += normalisedProse(prose); prose = ""; };
+  const flushUnit = () => { flushProse(); const unit = current.trim(); if (unit) units.push(unit); current = ""; };
+  for (let i = 0; i < line.length;) {
+    if (line[i] === "`") {
+      let ticks = 0;
+      while (line[i + ticks] === "`") ticks++;
+      const delimiter = "`".repeat(ticks);
+      const close = line.indexOf(delimiter, i + ticks);
+      if (close >= 0 && line[close + ticks] !== "`") {
+        flushProse();
+        current += line.slice(i + ticks, close);
+        i = close + ticks;
+        continue;
+      }
+      prose += delimiter; i += ticks; continue;
+    }
+    const char = line[i];
+    prose += char; i++;
+    if (/[.!?]/.test(char) && i < line.length && /\s/.test(line[i])) flushUnit();
+  }
+  flushUnit();
+  return units;
+}
+
+/** A final item's units: each fenced code block (``` ... ```) is ONE unit, byte-exact; every
+ * other line is split at sentence ends. */
+export function finalItemUnits(text: string): Set<string> {
+  const units = new Set<string>();
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (FENCE.test(lines[i])) {
+      let end = i + 1;
+      while (end < lines.length && !FENCE.test(lines[end])) end++;
+      units.add(`\u0001${lines.slice(i, Math.min(end, lines.length - 1) + 1).join("\n")}`);
+      i = end;
+      continue;
+    }
+    for (const unit of lineUnits(lines[i])) units.add(unit);
+  }
+  return units;
+}
+
+/** Drop an EARLIER item only when a LATER item of the same step holds every one of its units
+ * whole and at least one unit more (strict). The last item is never dropped, so every dropped
+ * unit stays visible in a posted item. */
+export function restatedEarlierFinalsDropped<T extends { text: string }>(items: T[]): T[] {
+  const units = items.map(item => finalItemUnits(item.text));
+  return items.filter((_, index) => !units.slice(index + 1).some(later =>
+    later.size > units[index].size && [...units[index]].every(unit => later.has(unit))));
 }

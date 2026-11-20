@@ -32,6 +32,7 @@ import {
 import * as nativeExecutor from "../services/native-runtime/native-session-executor.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { issueService } from "../services/issues.js";
 import * as heartbeatModule from "../services/heartbeat.js";
 import { waitForPendingCommentSteers } from "../services/conversation-steering.js";
 import { readUnreadSteeredMessages } from "../services/native-runtime/unread-steered-messages.js";
@@ -1400,6 +1401,196 @@ describe("answered-a4: a steer into a running turn asks for the answer in the fi
       expect(posted[0].body).toContain("101");
       expect(posted[0].body).not.toContain(A4_INSTRUCTION);
       expect(f.owner.peers).toHaveLength(1);
+    } finally { await f.close(); }
+  }, 60_000);
+});
+
+// answered-a6 (rows carried from answered-a5; a5's separated-step M2 row is NOT carried: arm 2 is not built).
+// Gate 7 runs 53beae0c / 4afb5494 (390) and 54a2a839 (1440): ONE turn, two final items 1 ms apart,
+// the later a superset of the earlier ("100 + 1 = 101 / 101 + 1 = 102 / DONE0" then "... 102 + 1 = 103 / DONE0").
+// Real producer as S6: route -> PiRpcDriver -> Pi proxy -> events -> finalizer -> publisher.
+describe("answered-a6: a run's final items in ONE publication step are posted once (strict restatement only)", () => {
+  const A1 = "100 + 1 = 101\n101 + 1 = 102\nDONE0";
+  const A2 = "100 + 1 = 101\n101 + 1 = 102\n102 + 1 = 103\nDONE0";
+  // The recorded shape: each later steer is read after a final, and that final restates every earlier answer.
+  function finalsInOneTurn(peer: RecordingPiPeer, finals: string[]) {
+    peer.toolEnd("step-1"); peer.toolStart("step-2"); peer.toolEnd("step-2");
+    peer.send({ type: "turn_end", toolResults: [] });
+    for (const text of peer.pending.splice(0)) { peer.send({ type: "turn_start" }); peer.user(text); peer.consumed.push(text); }
+    for (const [index, final] of finals.entries()) {
+      if (index > 0) { peer.send({ type: "turn_start" }); peer.user(steered(`what is ${100 + index + 1} + 1?`)); }
+      peer.replies.push(final);
+      const message = peer.assistant([{ type: "text", text: final }]);
+      peer.send({ type: "turn_end", message, toolResults: [] });
+    }
+    peer.finish();
+  }
+  async function postedFor(f: Awaited<ReturnType<typeof fixture>>) {
+    await f.complete();
+    await f.startDelivery(true);
+    await vi.waitFor(async () => {
+      expect((await f.comments()).filter(comment => comment.authorType === "agent").length).toBeGreaterThan(0);
+    }, { timeout: 15_000 });
+    await heartbeatService(db).drainActiveRunExecutions();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    // Thread order: millisecond time, then id (as the UI reads it).
+    return (await f.comments()).filter(comment => comment.authorType === "agent")
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime() || a.id.localeCompare(b.id));
+  }
+  async function run(label: string, finals: string[]) {
+    const f = await fixture(label, true, false);
+    try {
+      await f.post("what is 100 + 1?");
+      await vi.waitFor(() => expect(f.commands("steer")).toHaveLength(1));
+      finalsInOneTurn(f.peer, finals);
+      const posted = await postedFor(f);
+      process.stdout.write(`A5 ${label} evidence ${JSON.stringify(posted.map(c => ({ id: c.id, body: c.body, key: c.clientRequestId, at: c.createdAt })))}\n`);
+      return { f, posted };
+    } catch (error) { await f.close(); throw error; }
+  }
+
+  it("P1 (390 shape): two finals in one step, the later a superset -> ONE reply, the later text", async () => {
+    const { f, posted } = await run("A5-P1", [A1, A2]);
+    try {
+      expect(posted.map(c => c.body)).toEqual([A2]);
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it("P2 (1440 shape): the superset final reworded in markdown -> ONE reply", async () => {
+    const { f, posted } = await run("A5-P2", ["**100 + 1 = 101**\n101 + 1 = 102\n\nDONE0", "100 + 1 = 101\n`101 + 1 = 102`\n102 + 1 = 103\n\nDONE0"]);
+    try {
+      expect(posted).toHaveLength(1);
+      expect(posted[0].body).toContain("102 + 1 = 103");
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it("P3: three supersets in one step -> ONE reply", async () => {
+    const A3 = `${A2.replace("\nDONE0", "")}\n103 + 1 = 104\nDONE0`;
+    const { f, posted } = await run("A5-P3", ["100 + 1 = 101\nDONE0", A1, A3]);
+    try {
+      expect(posted.map(c => c.body)).toEqual([A3]);
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it("M3/class C kept: '201 DONE1' + '202' -> both replies; '101' vs '101.5' -> both", async () => {
+    const { f, posted } = await run("A5-M3c", ["201\n\nDONE1", "202"]);
+    try { expect(posted.map(c => c.body)).toEqual(["201\n\nDONE1", "202"]); } finally { await f.close(); }
+    const second = await run("A5-M3d", ["101", "101.5"]);
+    try { expect(second.posted.map(c => c.body)).toEqual(["101", "101.5"]); } finally { await second.f.close(); }
+  }, 90_000);
+
+  it("M3: the same answer to two DIFFERENT questions -> both replies; an earlier RUN's reply never trims this run", async () => {
+    const { f, posted } = await run("A5-M3q", ["2 + 2 = 4", "8 / 2 = 4"]);
+    try { expect(posted.map(c => c.body)).toEqual(["2 + 2 = 4", "8 / 2 = 4"]); } finally { await f.close(); }
+    const g = await fixture("A5-M3x", true, false);
+    try {
+      // An earlier run of this chat already posted A1; this run's final A2 is still posted whole.
+      const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, g.runId));
+      const earlierRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({ ...current, id: earlierRunId, status: "succeeded" });
+      await issueService(db).addComment(g.issueId, A1, { agentId: g.agentId, runId: earlierRunId });
+      await g.post("what is 100 + 1?");
+      await vi.waitFor(() => expect(g.commands("steer")).toHaveLength(1));
+      finalsInOneTurn(g.peer, [A2]);
+      const replies = await postedFor(g);
+      process.stdout.write(`A5 M3x evidence ${JSON.stringify(replies.map(c => ({ body: c.body, run: c.createdByRunId })))}\n`);
+      expect(replies.filter(c => c.createdByRunId === g.runId).map(c => c.body)).toEqual([A2]);
+    } finally { await g.close(); }
+  }, 90_000);
+
+  it("M-same: two steers both answered 'Same answer.' in one step -> TWO replies (equal items are both kept)", async () => {
+    const { f, posted } = await run("A6-Msame", ["Same answer.", "Same answer."]);
+    try { expect(posted.map(c => c.body)).toEqual(["Same answer.", "Same answer."]); } finally { await f.close(); }
+  }, 60_000);
+
+  it("M4-code: a later final restating an earlier code block whole, plus more -> ONE reply; a different block -> both", async () => {
+    const block = "```ts\nif (ready) {\n  send();\n}\n```";
+    const { f, posted } = await run("A6-Mcode", [block, `${block}\nDone.`]);
+    try { expect(posted.map(c => c.body)).toEqual([`${block}\nDone.`]); } finally { await f.close(); }
+    const second = await run("A6-Mcode2", ["```ts\nsend();\n```", `${block}\nDone.`]);
+    try { expect(second.posted.map(c => c.body)).toEqual(["```ts\nsend();\n```", `${block}\nDone.`]); } finally { await second.f.close(); }
+  }, 90_000);
+});
+
+describe("answered-a6: the strict-restatement rule (unit)", () => {
+  it("drops an earlier item only when a later one holds all its units and more; never trims, merges or substitutes", async () => {
+    const { restatedEarlierFinalsDropped } = await import("../services/native-runtime/native-response-items.js");
+    const texts = (xs: string[]) => restatedEarlierFinalsDropped(xs.map(text => ({ text }))).map(i => i.text);
+    expect(texts(["a = 1\nDONE0", "a = 1\nb = 2\nDONE0"])).toEqual(["a = 1\nb = 2\nDONE0"]);
+    expect(texts(["19", "19"])).toEqual(["19", "19"]);
+    expect(texts(["201\nDONE1", "202\nDONE1"])).toEqual(["201\nDONE1", "202\nDONE1"]);
+    expect(texts(["100 + 1 = 101\n101 + 1 = 102\nAnswered above.", "100 + 1 = 101"])).toEqual(["100 + 1 = 101\n101 + 1 = 102\nAnswered above.", "100 + 1 = 101"]);
+    expect(texts(["foo_bar", "foobar\nmore"])).toEqual(["foo_bar", "foobar\nmore"]);
+    expect(texts(["__init__", "init\nmore"])).toEqual(["__init__", "init\nmore"]);
+    expect(texts(["`a  b`", "a b\nmore"])).toEqual(["`a  b`", "a b\nmore"]);
+    expect(texts(["101", "101.5\n1010 rows"])).toEqual(["101", "101.5\n1010 rows"]);
+  });
+});
+
+// Independent rf5-amaa5 judge rows. Only provider is scripted. All outputs read via real GET.
+describe("JUDGE-a5 never-drop", () => {
+  async function outputs(f: Awaited<ReturnType<typeof fixture>>, finals: string[], questions = ["what is 100 + 1?"]) {
+    for (const question of questions) await f.post(question);
+    await vi.waitFor(() => expect(f.commands("steer")).toHaveLength(questions.length));
+    f.peer.toolEnd("step-1"); f.peer.toolStart("step-2"); f.peer.toolEnd("step-2");
+    f.peer.send({ type: "turn_end", toolResults: [] });
+    for (const text of f.peer.pending.splice(0)) { f.peer.send({ type: "turn_start" }); f.peer.user(text); f.peer.consumed.push(text); }
+    for (const text of finals) {
+      f.peer.replies.push(text);
+      const message = f.peer.assistant([{ type: "text", text }]);
+      f.peer.send({ type: "turn_end", message, toolResults: [] });
+    }
+    f.peer.finish(); await f.complete(); await f.startDelivery(true);
+    await heartbeatService(db).drainActiveRunExecutions();
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    const thread = (await request(f.app).get(`/api/issues/${f.issueId}/comments`).expect(200)).body;
+    const issue = (await request(f.app).get(`/api/issues/${f.issueId}`).expect(200)).body;
+    const replies = thread.filter((c: any) => c.authorType === "agent").sort((a: any, b: any) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime() || a.id.localeCompare(b.id));
+    const evidence = { runId: f.runId, finals, questions, issue, thread, replies };
+    await writeFile(join(process.env.TASK_OUT!, `judge-${f.issueId}.json`), JSON.stringify(evidence, null, 2));
+    process.stdout.write(`JUDGE GET ${JSON.stringify({ runId: f.runId, finals, questions, replies: replies.map((c: any) => ({ body: c.body, id: c.id, at: c.createdAt })) })}\n`);
+    return replies;
+  }
+  it("M7 two real person questions 9+10 and 20-1 each get their final 19", async () => {
+    const f = await fixture("judgeM7", true, false);
+    try { const replies = await outputs(f, ["19", "19"], ["9+10?", "20-1?"]);
+      expect(replies.map((c: any) => c.body)).toEqual(["19", "19"]);
+    } finally { await f.close(); }
+  }, 60_000);
+  it("M8 unrelated earlier tool comment 101 cannot suppress final answer 101", async () => {
+    const f = await fixture("judgeM8", true, false);
+    try {
+      // Real issue-service producer, ordinary agent/tool comment, NOT completionReply.
+      await issueService(db).addComment(f.issueId, "Unrelated progress: processed batch.\n101", { agentId: f.agentId, runId: f.runId });
+      const replies = await outputs(f, ["101"]);
+      expect(replies.map((c: any) => c.body)).toEqual(["Unrelated progress: processed batch.\n101", "101"]);
+    } finally { await f.close(); }
+  }, 60_000);
+  it("M3/M4 richer earlier final and shorter later final keep every new sentence and coda", async () => {
+    const f = await fixture("judgeShorter", true, false);
+    try { const replies = await outputs(f, ["100 + 1 = 101\n101 + 1 = 102\nAnswered above.", "100 + 1 = 101"]);
+      const text = replies.map((c: any) => c.body).join("\n");
+      expect(countOf(text, "101 + 1 = 102")).toBe(1); expect(countOf(text, "Answered above.")).toBe(1);
+    } finally { await f.close(); }
+  }, 60_000);
+  it("M9 code identifiers with underscores are distinct answers", async () => {
+    const f = await fixture("judgeCode", true, false);
+    try { const replies = await outputs(f, ["`foo_bar`", "`foobar`"], ["Which old column?", "Which new column?"]);
+      expect(replies.map((c: any) => c.body)).toEqual(["`foo_bar`", "`foobar`"]);
+    } finally { await f.close(); }
+  }, 60_000);
+  it("M9 two different code blocks keep shared executable lines", async () => {
+    const f = await fixture("judgeBlock", true, false);
+    const firstCode = "```ts\nif (ready) {\n  send();\n}\n```";
+    const code = "```ts\nif (other) {\n  send();\n}\n```";
+    try { const replies = await outputs(f, [firstCode, code], ["Show ready code.", "Show other code."]);
+      expect(replies.map((c: any) => c.body)).toEqual([firstCode, code]);
+    } finally { await f.close(); }
+  }, 60_000);
+  it("M9 markdown list versus plain answer and 1010 rows do not falsely collide", async () => {
+    const f = await fixture("judgeList", true, false);
+    try { const replies = await outputs(f, ["- 101", "101", "1010 rows"]);
+      expect(replies.map((c: any) => c.body)).toEqual(["- 101", "101", "1010 rows"]);
     } finally { await f.close(); }
   }, 60_000);
 });
