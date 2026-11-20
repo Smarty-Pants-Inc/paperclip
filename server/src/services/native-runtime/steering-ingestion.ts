@@ -53,8 +53,8 @@ export async function settleSteeringIngestion(db: Db, input: {
   if (release) {
     // Resume the SAME release owner, not a second carry/late-read guard. This
     // runs after the ingestion receipt commits and outside every run/issue lock.
-    const { heartbeatService } = await import("../heartbeat.js");
-    await heartbeatService(db).releaseIssueExecutionAndPromote({ id: input.runId, companyId: input.companyId });
+    const { wiredHeartbeatFor } = await import("../heartbeat-registry.js");
+    await (await wiredHeartbeatFor(db)).releaseIssueExecutionAndPromote({ id: input.runId, companyId: input.companyId });
   }
 }
 
