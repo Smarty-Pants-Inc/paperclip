@@ -7041,7 +7041,9 @@ export function recoveryService(
     const pendingIngestionRunIds = new Set<string>();
     for (const row of runRows) {
       const ingestion = row.resultJson?.nativeSteeringIngestion as { sourceInstanceId?: unknown } | undefined;
-      if (steeringIngestionPending(row.resultJson) && typeof ingestion?.sourceInstanceId === "string") {
+      // rf-3 (ii): only a SUCCEEDED run's open fence is held here; failed / timed-out /
+      // interrupted runs keep base's clear (their own owner-release path closes ingestion).
+      if (row.status === "succeeded" && steeringIngestionPending(row.resultJson) && typeof ingestion?.sourceInstanceId === "string") {
         await settleSteeringIngestion(db, { companyId: row.companyId, runId: row.id,
           sourceInstanceId: ingestion.sourceInstanceId, recoverStoppedController: true });
         const [current] = await db.select({ result: heartbeatRuns.resultJson }).from(heartbeatRuns)
@@ -7127,10 +7129,10 @@ export function recoveryService(
         const ownerRunIds = [...new Set([locked.checkoutRunId, locked.executionRunId]
           .filter((id): id is string => id !== null))];
         if (ownerRunIds.length) {
-          const lockedRuns = await tx.select({ id: heartbeatRuns.id, result: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+          const lockedRuns = await tx.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, result: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
             eq(heartbeatRuns.companyId, issue.companyId), inArray(heartbeatRuns.id, ownerRunIds),
           )).orderBy(asc(heartbeatRuns.id)).for("update");
-          if (lockedRuns.some(run => steeringIngestionPending(run.result))) return null;
+          if (lockedRuns.some(run => run.status === "succeeded" && steeringIngestionPending(run.result))) return null;
           if (!await runExecutionsHaveStopped(tx as unknown as Db, issue.companyId, ownerRunIds)) {
             if (await onlyUnreleasedLeasesWithinBoundBlockStop(tx as unknown as Db, locked, ownerRunIds, opts?.onDeferredDeadline)) return null;
             await recordTaskStopPending(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id,
