@@ -656,8 +656,8 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
   remoteCwd: string;
   timeoutMs?: number | null;
   shellCommand?: "bash" | "sh" | null;
-  /** Native GitHub control state can fit within one command admission. */
-  inlineSmallWrites?: boolean;
+  /** Restrict single-admission control writes to the owning setup phase. */
+  inlineSmallWrites?: boolean | ((remotePath: string, body: string) => boolean);
 }): SandboxCallbackBridgeQueueClient {
   const timeoutMs = normalizeTimeoutMs(input.timeoutMs, DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS);
   const shellCommand = preferredShellForSandbox(input.shellCommand);
@@ -755,7 +755,10 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       const tempPath = `${uploadPath}.b64`;
       const decodedPath = `${uploadPath}.decoded`;
       const base64Body = toBuffer(Buffer.from(body, "utf8")).toString("base64");
-      if (input.inlineSmallWrites && base64Body.length <= REMOTE_WRITE_BASE64_CHUNK_SIZE) {
+      const inlineWrite = typeof input.inlineSmallWrites === "function"
+        ? input.inlineSmallWrites(remotePath, body)
+        : input.inlineSmallWrites;
+      if (inlineWrite && base64Body.length <= REMOTE_WRITE_BASE64_CHUNK_SIZE) {
         // Small control state fits one admission. Keep a unique unpublished
         // temporary and the same atomic rename; never expose a partial file.
         await runChecked(`write ${remotePath}`, [
