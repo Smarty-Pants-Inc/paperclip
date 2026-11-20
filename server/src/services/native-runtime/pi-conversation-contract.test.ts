@@ -190,6 +190,53 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
     });
   }
 
+  it("fresh Interrupt model input: answer 9 + 10 before a cut sleep, preserving completed echo STEP1", () => {
+    const input = successor({ ...interruptWake,
+      interruptedTurnToolCalls: [
+        { name: "bash", target: "echo STEP1", status: "completed", output: "STEP1" },
+        { name: "bash", target: "sleep 600", status: "interrupted", output: "" },
+      ],
+    }, sessionId, false);
+    // Read the real fresh bootstrap envelope, not a receipt fixture or a resumed-session delta.
+    const envelope = buildNativeModelEnvelope(input);
+    const text = envelope.task.prompt;
+    expect(input.continuationPrompt ?? null).toBeNull();
+    expect.soft(text, "the person's new request is answered first").toContain(ANSWER_FIRST);
+    expect.soft(text, "an Interrupt is not a Stop").not.toContain("The person stopped your previous turn");
+    expect.soft(text, "the authenticated new comment is the current request, not the old wait objective")
+      .toMatch(/New comments in order:\n1\. comment [^\n]+ by user paul\n9 \+ 10(?:\n|$)/);
+    expect.soft(text, "completed work is carried with its saved result")
+      .toMatch(/## Commands already run in the interrupted turn \(do not run these again\)[\s\S]*\n1\. `bash` \(`echo STEP1`\): completed\n {3}result: STEP1\n2\. `bash` \(`sleep 600`\): interrupted: it may or may not have taken effect/);
+    expect.soft(text, "completed calls must not be run again")
+      .toContain("the completed calls below must not be run again.");
+    expect.soft(text, "a cut sleep is a wait, not a command to replay").toContain(CUT_NOT_RERUN);
+    expect.soft(text.indexOf(ANSWER_FIRST), "answer-first instruction precedes the cut sleep receipt")
+      .toBeGreaterThanOrEqual(0);
+    expect.soft(text.indexOf(ANSWER_FIRST)).toBeLessThan(text.indexOf("2. `bash` (`sleep 600`)"));
+    const unknownOutcomesNote = "Earlier actions with unknown outcomes are not confirmed or replayed";
+    expect.soft(!text.includes(unknownOutcomesNote) || text.includes(CUT_NOT_RERUN),
+      "an unknown-outcomes notice cannot replace explicit do-not-replay-wait guidance").toBe(true);
+  });
+
+  it("fresh Stop model input: answer 9 + 10 without continuing the stopped work, preserving completed echo STEP1", () => {
+    const input = successor({ ...interruptWake, personStoppedPreviousTurn: true,
+      interruptedTurnToolCalls: [
+        { name: "bash", target: "echo STEP1", status: "completed", output: "STEP1" },
+        { name: "bash", target: "sleep 600", status: "interrupted", output: "" },
+      ],
+    }, sessionId, false);
+    const text = buildNativeModelEnvelope(input).task.prompt;
+    expect(input.continuationPrompt ?? null).toBeNull();
+    expect.soft(text).toContain(PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE);
+    expect.soft(text).toContain("The person stopped your previous turn and sent a new message. Answer their new message. Do not resume or redo the stopped work unless they ask; the completed calls below must not be run again.");
+    expect.soft(text).toMatch(/New comments in order:\n1\. comment [^\n]+ by user paul\n9 \+ 10(?:\n|$)/);
+    expect.soft(text, "Stop carries the same saved receipts as Interrupt")
+      .toMatch(/## Commands already run in the interrupted turn \(do not run these again\)[\s\S]*\n1\. `bash` \(`echo STEP1`\): completed\n {3}result: STEP1\n2\. `bash` \(`sleep 600`\): interrupted: it may or may not have taken effect/);
+    expect.soft(text, "a Stop never instructs the successor to continue").not.toMatch(/\bcontinue\b/i);
+    expect.soft(text).not.toContain("Then continue");
+    expect.soft(text).not.toContain(ANSWER_FIRST);
+  });
+
   // adopt-a2-order2 (rf-4 T2 bar): the person interrupts a 6-step task after STEP2 while STEP3 (not a wait) is
   // mid-flight and asks "9 + 10". The answer comes first, but STEP3-6 must still be done: the words must say to
   // continue from the next unfinished step and must not forbid re-running a cut call that was not a wait.
