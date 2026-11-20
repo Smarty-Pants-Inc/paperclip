@@ -1690,8 +1690,10 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         promotedWakeId: null as string | null };
       const decision = <T extends ReleaseTransactionResult & { run: RunSnapshot }>(reason: string, result: T): T => {
         trace.reason = reason;
-        trace.outcome = result.outcome.kind;
-        trace.promotedWakeId = result.outcome.kind === "promoted" ? result.outcome.run.wakeupRequestId : null;
+        // Logging only: never dereference a result the release path itself would not.
+        const outcome = result?.outcome;
+        trace.outcome = outcome?.kind ?? "none";
+        trace.promotedWakeId = outcome?.kind === "promoted" ? outcome.run.wakeupRequestId : null;
         return result;
       };
       return db.transaction(async (rawTx) => {
@@ -2004,7 +2006,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           }).where(and(eq(issues.companyId, input.companyId), eq(issues.id, issueRow.id),
             sql`${issues.executionRunId} is null`));
         }
-        return decision(result.outcome.kind, { ...result, run: runSnapshot });
+        return decision(result?.outcome?.kind ?? "none", { ...result, run: runSnapshot });
       }).finally(() => {
         logger.info(trace, "Issue execution release decision (wake queue)");
         if (trace.outcome !== "promoted") logger.info(releaseNotPromotedLine(trace, head, input.now), "Issue execution release not promoted");
