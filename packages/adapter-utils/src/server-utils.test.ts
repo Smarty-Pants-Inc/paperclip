@@ -30,6 +30,7 @@ import {
   resolveLegacyPaperclipDesiredSkillNames,
   resolvePaperclipDesiredSkillNames,
   selectPaperclipTaskMarkdown,
+  selectPaperclipPromptSections,
   selectInitialCommunicationGuidance,
   hydrateFreshSessionHandoff,
   runningProcesses,
@@ -1135,6 +1136,27 @@ describe("runChildProcess", () => {
 });
 
 describe("renderPaperclipWakePrompt", () => {
+  // answered-b3: a read steer (readInSession, bound to session A + cut run R by run-preparation) is omitted only when
+  // the caller passes the verified binding equal to it; resumedSession alone (direct/legacy adapters) delivers it.
+  it("B3-U: a read steer is omitted only with the matching verified session/run binding", () => {
+    const STEER = "STEER: also look at the logs";
+    const wake = { reason: "issue_commented", issue: { id: "chat", status: "in_progress" },
+      comments: [{ id: "c1", body: STEER, author: { type: "user", id: "u" }, readInSession: true,
+        readInSessionId: "session-A", readInSessionRunId: "run-R" }],
+      commentWindow: { requestedCount: 1, includedCount: 1, missingCount: 0 }, fallbackFetchNeeded: false };
+    const copies = (options: Parameters<typeof selectPaperclipPromptSections>[1]) =>
+      selectPaperclipPromptSections({ paperclipWake: wake, conversationMode: true }, options).wakePrompt.split(STEER).length - 1;
+    expect(copies({ resumedSession: true }), "direct adapter: no verified binding").toBe(1);
+    expect(copies({ resumedSession: true, readInSessionBinding: { sessionId: "session-A", runId: "run-R" } })).toBe(0);
+    expect(copies({ sessionHoldsInterruptedTurn: true, readInSessionBinding: { sessionId: "session-A", runId: "run-R" } })).toBe(0);
+    expect(copies({ resumedSession: true, readInSessionBinding: { sessionId: "session-B", runId: "run-R" } })).toBe(1);
+    expect(copies({ resumedSession: true, readInSessionBinding: { sessionId: "session-A", runId: "run-other" } })).toBe(1);
+    expect(copies({ resumedSession: false, readInSessionBinding: { sessionId: "session-A", runId: "run-R" } }), "fresh").toBe(1);
+    const unbound = { ...wake, comments: [{ ...wake.comments[0], readInSessionId: undefined, readInSessionRunId: undefined }] };
+    expect(selectPaperclipPromptSections({ paperclipWake: unbound, conversationMode: true }, { resumedSession: true,
+      readInSessionBinding: { sessionId: "session-A", runId: "run-R" } }).wakePrompt.split(STEER).length - 1, "unbound flag").toBe(1);
+  });
+
   it.each([false, true])("renders the runtime checkout flag for ordinary task wakes (resume=%s)", resumedSession => {
     const payload = { reason: "issue_assigned", issue: { id: "issue-1", status: "in_progress" },
       comments: [], commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },

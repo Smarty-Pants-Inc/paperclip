@@ -571,9 +571,17 @@ type PaperclipWakeComment = {
   authorId: string | null;
   readByEarlierTurn: boolean;
   receivedMidTask: boolean;
-  /** An Interrupt-carried steer Pi already read in the cut turn: omitted on a resumed (same) session. */
+  /** An Interrupt-carried steer Pi already read in the cut turn. Omitted only when the renderer receives the
+   * verified session/run binding (readInSessionBinding) equal to the ids below; otherwise delivered. */
   readInSession: boolean;
+  /** The Pi session that read it and the cut run (run-preparation.ts, answered-b2). */
+  readInSessionId: string | null;
+  readInSessionRunId: string | null;
 };
+
+/** answered-b3: the verified resumed session and the cut run it resumes from. Only a caller that verified the
+ * selected session (native-execution-input.ts readInResumedSessionOnly) passes it; without it nothing is omitted. */
+export type PaperclipReadInSessionBinding = { sessionId: string; runId: string };
 
 type PaperclipWakePlanReviewAuthor = {
   type: string | null;
@@ -966,6 +974,8 @@ function normalizePaperclipWakeComment(
     readByEarlierTurn: asBoolean(comment.readByEarlierTurn, false),
     receivedMidTask: asBoolean(comment.receivedMidTask, false),
     readInSession: asBoolean(comment.readInSession, false),
+    readInSessionId: asString(comment.readInSessionId, "").trim() || null,
+    readInSessionRunId: asString(comment.readInSessionRunId, "").trim() || null,
   };
 }
 
@@ -2311,6 +2321,8 @@ export function selectPaperclipPromptSections(
     nativeWakeReaderAvailable?: boolean;
     /** Wording only: see renderPaperclipWakePromptBody. Never removes carried input. */
     sessionHoldsInterruptedTurn?: boolean;
+    /** answered-b3: the verified session/run binding; a read steer is omitted only when it matches. */
+    readInSessionBinding?: PaperclipReadInSessionBinding | null;
   } = {},
 ): { taskContextNote: string; wakePrompt: string } {
   const taskContextNote = selectPaperclipTaskMarkdown(context, options);
@@ -2321,6 +2333,7 @@ export function selectPaperclipPromptSections(
       includeExecutionContract: options.includeExecutionContract,
       nativeWakeReaderAvailable: options.nativeWakeReaderAvailable,
       sessionHoldsInterruptedTurn: options.sessionHoldsInterruptedTurn,
+      readInSessionBinding: options.readInSessionBinding,
       conversationMode: context?.conversationMode === true,
       suppressIssueDescription: taskContextNote.length > 0,
     }),
@@ -2363,6 +2376,8 @@ function renderPaperclipWakePromptBody(
     // 'fresh session' sentences to true ones and omits a steer that turn already read (readInSession);
     // it never removes a receipts list item.
     sessionHoldsInterruptedTurn?: boolean;
+    // answered-b3: the verified resumed session + cut run (native path only). Direct/legacy adapters pass none.
+    readInSessionBinding?: PaperclipReadInSessionBinding | null;
   } = {},
 ): string {
   const resumedSession = options.resumedSession === true;
@@ -2372,8 +2387,14 @@ function renderPaperclipWakePromptBody(
   // A steer Pi already read in the cut turn is in this same session: not injected again (one answer).
   // A fresh session never saw it, so it is injected as carried input. The native request is rendered
   // whole (resumedSession false), so its same-session fact is sessionHoldsInterruptedTurn (answered-b).
-  const normalized = (resumedSession || sessionHoldsInterruptedTurn) && wakePayload.comments.some((comment) => comment.readInSession)
-    ? { ...wakePayload, comments: wakePayload.comments.filter((comment) => !comment.readInSession) }
+  // answered-b3: omitted ONLY with the verified binding (same session id AND same cut run). A caller that cannot
+  // verify the selected session (direct/legacy adapters: resumedSession alone) delivers it (base behaviour).
+  const binding = options.readInSessionBinding;
+  const readInBoundSession = (comment: PaperclipWakeComment) => comment.readInSession &&
+    !!binding?.sessionId && !!binding.runId &&
+    comment.readInSessionId === binding.sessionId && comment.readInSessionRunId === binding.runId;
+  const normalized = (resumedSession || sessionHoldsInterruptedTurn) && wakePayload.comments.some(readInBoundSession)
+    ? { ...wakePayload, comments: wakePayload.comments.filter((comment) => !readInBoundSession(comment)) }
     : wakePayload;
   const externalChatTurn = isNormalizedPaperclipExternalChatTurn(normalized);
   const externalChatReaderTurn =
