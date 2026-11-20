@@ -1,4 +1,5 @@
 import pino from "pino";
+import { redactProviderKeys } from "@paperclipai/adapter-utils/provider-prefix-redaction";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Logger } from "pino";
 import { pinoHttp } from "pino-http";
@@ -23,16 +24,23 @@ const sharedOpts = {
   singleLine: true,
 };
 
+// Final byte boundary: covers free-text messages and Error stacks as well as
+// structured payloads, before production files or the pretty transport see it.
+const providerKeyLogHooks = {
+  streamWrite: (line: string) => redactProviderKeys(line, "[REDACTED]"),
+};
 const isProduction = process.env.NODE_ENV === "production";
 export const logger = isProduction
   ? pino({
       level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "info",
       redact: [...HTTP_LOG_REDACT_PATHS],
+      hooks: providerKeyLogHooks,
     })
   : pino(
       {
         level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "debug",
         redact: [...HTTP_LOG_REDACT_PATHS],
+        hooks: providerKeyLogHooks,
       },
       pino.transport({
         target: "pino-pretty",
