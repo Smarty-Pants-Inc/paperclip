@@ -9,7 +9,7 @@ import { agents, companies, createDb, environmentLeases, heartbeatRuns } from "@
 import type { AdapterSandboxExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { nativeWorkspaceSyncInternals as sync, prepareNativeWorkspaceSync, resumeNativeWorkspaceSync } from "../services/native-runtime/native-workspace-sync.js";
+import { cleanupNativeWorkspaceSync, nativeWorkspaceSyncInternals as sync, prepareNativeWorkspaceSync, resumeNativeWorkspaceSync } from "../services/native-runtime/native-workspace-sync.js";
 import { restoreRemoteWorkspaceArchive } from "../services/remote-workspace-snapshot-archive.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -123,6 +123,9 @@ const runner: CommandManagedRuntimeRunner = {
         expect(await readFile(path.join(readback, "value.txt"), "utf8")).toBe(expectedValue);
         return { descriptor, snapshot, archive };
       };
+      // The executor's normal cleanup must not erase the newer snapshot
+      // before a delayed Stop export has even completed.
+      await next.prepared.cleanup();
       const newer = await readSaved(next.runId, "newer-readback");
       if (mode === "legacy-stamp" || mode === "legacy-descriptor-cleaned") {
         delete newerStamp.preparedAt;
@@ -135,6 +138,7 @@ const runner: CommandManagedRuntimeRunner = {
         resumeNativeWorkspaceSync({ db, runId: stopped.runId, target: stopped.target }),
         resumeNativeWorkspaceSync({ db, runId: next.runId, target: next.target }),
       ]);
+      await cleanupNativeWorkspaceSync(stopped.runId);
       const older = await readSaved(stopped.runId, "older-readback", mode === "stale-transfer" ? "stopped\n" : "successor wins\n");
       expect(Date.parse(older.descriptor.createdAt)).toBeLessThan(Date.parse(newer.descriptor.createdAt));
       expect(JSON.parse(await readFile(stampPath, "utf8"))).toEqual(newerStamp);

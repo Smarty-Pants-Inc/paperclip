@@ -1384,7 +1384,16 @@ export async function resumeNativeWorkspaceSync(input: {
 }
 
 export async function cleanupNativeWorkspaceSync(runId: string): Promise<void> {
-  await fs.rm(descriptorDirectory(runId), { recursive: true, force: true });
+  const directory = descriptorDirectory(runId);
+  const entries = await fs.readdir(directory).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  // Exported file custody is not disposable merge state. The existing native
+  // retention sweeper owns its expiry (including interrupted finalization).
+  // Eager executor/reconciler cleanup must keep BOTH generations readable.
+  if (entries.some(name => /^snapshot\.[0-9a-f]{64}\.pcws$/.test(name))) return;
+  await fs.rm(directory, { recursive: true, force: true });
 }
 
 export const nativeWorkspaceSyncInternals = {
