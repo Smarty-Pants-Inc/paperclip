@@ -24,7 +24,7 @@ describe.skipIf(!support.supported)("recovery cleanup recorded stopped sandbox",
   }, 90_000);
   afterAll(async () => { await db?.$client.end(); await temporary?.cleanup(); });
 
-  async function seed(withReceipt = true) {
+  async function seed(withReceipt = true, withSnapshot = true) {
     const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), leaseId = randomUUID();
     const pluginId = randomUUID(), provider = `boat-${pluginId}`, providerLeaseId = `box-${leaseId}`;
     await db.insert(companies).values({ id: companyId, name: "Cleanup", issuePrefix: `RC${companyId.slice(0, 6)}` });
@@ -52,17 +52,23 @@ describe.skipIf(!support.supported)("recovery cleanup recorded stopped sandbox",
         workspaceRecoveryCleanup: { runId, reason: "retained_orphan_sandbox_released", ownerProof: "owner_run_terminal",
           releasedAt: new Date().toISOString(), ...(withReceipt ? { stopReceipt } : {}) } } });
     let outcome: "destroyed" | "not_found" | "archived" | "transient" = "destroyed";
+    const inspections = vi.fn(async (input: Record<string, unknown>) => {
+      expect(input.providerLeaseId).toBe(providerLeaseId);
+      // Boat's adapter normalizes exact absence/archival to destroyed on GET,
+      // not by making a destroy RPC. Transport errors prove neither absence nor custody.
+      return { providerLeaseId, state: outcome === "not_found" || outcome === "archived" ? "destroyed" : "stopped",
+        ...(withSnapshot ? { snapshot: { id: `snapshot-${leaseId}`, state: "completed" } } : {}) };
+    });
     const call = vi.fn(async (_plugin: string, method: string, input: Record<string, unknown>) => {
       expect(input.providerLeaseId).toBe(providerLeaseId);
       if (method !== "environmentDestroyLease") throw new Error(`Unexpected provider call: ${method}`);
       if (outcome === "transient") throw new Error("provider temporarily unavailable");
-      // The provider's lifecycle contract normalizes exact not-found and archived
-      // allocations to a destroyed receipt; these are not guessed from errors.
-      return { providerLeaseId, state: "destroyed", providerState: outcome };
+      return { providerLeaseId, state: "destroyed" };
     });
     const worker = { isRunning: (id: string) => id === pluginId,
       call: (id: string, method: string, input: Record<string, unknown>) => method === "environmentValidateConfig"
-        ? Promise.resolve({ ok: true, normalizedConfig: input.config }) : call(id, method, input),
+        ? Promise.resolve({ ok: true, normalizedConfig: input.config })
+        : method === "environmentInspectLease" ? inspections(input) : call(id, method, input),
       getWorker: (id: string) => id === pluginId ? { supportedMethods: ["environmentDestroyLease", "environmentStopLease", "environmentInspectLease"] } : undefined } as unknown as PluginWorkerManager;
     const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db, { pluginWorkerManager: worker }) });
     const row = async () => (await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0]!;
@@ -74,7 +80,7 @@ describe.skipIf(!support.supported)("recovery cleanup recorded stopped sandbox",
     app.use("/api", environmentRoutes(db, { pluginWorkerManager: worker }));
     app.use(errorHandler);
     const patch = () => request(app).patch(`/api/environments/${environment!.id}?companyId=${companyId}`).send({ config: { image: "fixture:updated" } });
-    return { companyId, leaseId, providerLeaseId, stopReceipt, row, call, heartbeat, patch,
+    return { companyId, runId, leaseId, providerLeaseId, stopReceipt, row, call, inspections, heartbeat, patch,
       answer: (value: typeof outcome) => { outcome = value; } };
   }
 
@@ -87,7 +93,8 @@ describe.skipIf(!support.supported)("recovery cleanup recorded stopped sandbox",
     expect(hasRecoveredCleanupStopReceipt(await f.row())).toBe(true);
     const result = await f.heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
     console.log("RECOVERY_CLEANUP", JSON.stringify({ outcome, result, calls: f.call.mock.calls.map(c => c[1]), row: await f.row() }));
-    expect(f.call).toHaveBeenCalledTimes(1);
+    expect(f.inspections).toHaveBeenCalledTimes(1);
+    expect(f.call).toHaveBeenCalledTimes(outcome === "destroyed" ? 1 : 0);
     expect(result.destroyed).toBe(1);
     expect(await f.row()).toMatchObject({ status: "expired", cleanupStatus: "success", metadata: {
       workspaceRecoveryCleanup: { stopReceipt: f.stopReceipt }, remoteExecutionTermination: { state: "destroyed", providerLeaseId: f.providerLeaseId } } });
@@ -95,8 +102,44 @@ describe.skipIf(!support.supported)("recovery cleanup recorded stopped sandbox",
     console.log("ENVIRONMENT_PATCH", updated.status, updated.body);
     expect(updated.status).toBe(200);
     await f.heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
-    expect(f.call).toHaveBeenCalledTimes(1);
+    expect(f.call).toHaveBeenCalledTimes(outcome === "destroyed" ? 1 : 0);
+    expect(f.inspections).toHaveBeenCalledTimes(1);
   });
+
+  it.each(["failed", "cancelled", "interrupted", "stopped"])(
+    "holds a %s run's prepared workspace without final SHA even with receipt and snapshot", async status => {
+      const f = await seed();
+      await db.update(heartbeatRuns).set({ status, runnerProfileJson: { nativeWorkspaceSync: {
+        schema: "paperclip.native-workspace-sync/v3", state: "prepared",
+        descriptorSha256: "a".repeat(64), baselineSha256: "b".repeat(64), finalHostSha256: null,
+        workspaceId: randomUUID(), leaseId: f.leaseId, providerLeaseId: f.providerLeaseId,
+        remoteCwd: "/workspace", resourceDisposition: "destroy",
+      } } }).where(eq(heartbeatRuns.id, f.runId));
+      await f.heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+      expect(f.call).not.toHaveBeenCalled();
+      expect(await f.row()).toMatchObject({ status: "pending_cleanup", metadata: {
+        pendingCleanupHoldReason: "prepared_workspace_without_final_sha",
+      } });
+      expect((await f.patch()).status).toBe(409);
+      // A completed export, not elapsed time or a later terminal kind, releases the hold.
+      await db.update(heartbeatRuns).set({ runnerProfileJson: sql`jsonb_set(${heartbeatRuns.runnerProfileJson},
+        '{nativeWorkspaceSync,finalHostSha256}', to_jsonb(${'c'.repeat(64)}::text))` }).where(eq(heartbeatRuns.id, f.runId));
+      await f.heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+      expect(f.call).toHaveBeenCalledTimes(1);
+      expect(await f.row()).toMatchObject({ status: "expired", cleanupStatus: "success" });
+    });
+
+  it.each([[true, false, "receipt only"], [false, true, "snapshot only"], [false, false, "neither"]] as const)(
+    "holds the gate row with %s receipt / %s snapshot (%s)", async (receipt, snapshot) => {
+      const f = await seed(receipt, snapshot);
+      await f.heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+      expect(f.call).not.toHaveBeenCalled();
+      expect(await f.row()).toMatchObject({ status: "pending_cleanup" });
+      if (receipt) expect(await f.row()).toMatchObject({ metadata: {
+        pendingCleanupHoldReason: "completed_provider_snapshot_missing",
+      } });
+      expect((await f.patch()).status).toBe(409);
+    });
 
   it("destroys the handoff produced by the real retained-orphan settlement", async () => {
     const f = await seed();

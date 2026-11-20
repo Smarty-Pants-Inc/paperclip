@@ -741,6 +741,9 @@ export interface PluginEnvironmentLeaseObservation {
   creationCleanup?: import("./environment-creation-cleanup.js").PluginEnvironmentCreationCleanup;
   providerLeaseId: string;
   state: "active" | "stopped" | "destroyed" | "unknown";
+  /** Durable snapshot of this exact allocation, read back from the provider.
+   * A requested/pending snapshot is not custody evidence for destructive cleanup. */
+  snapshot?: { id: string; state: "pending" | "completed" | "failed" };
   /** When the sandbox last stopped, by any cause (ISO 8601); null while not stopped. From a fresh provider read. */
   stoppedAt?: string | null;
   /** The sandbox kernel's last restart on its machine (ISO 8601): every process running then ended. */

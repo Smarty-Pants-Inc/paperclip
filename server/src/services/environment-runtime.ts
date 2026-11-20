@@ -43,7 +43,7 @@ import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/nati
 import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareInspectedSourceSandboxStop, preparePreviousBootClosedTipStop, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
-import { hasBoundRemoteStopReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasBoundRemoteStopReceipt, hasRecoveredCleanupStopReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -5035,7 +5035,7 @@ export function environmentRuntimeService(
       const lease = await environmentsSvc.getLeaseById(leaseId);
       if (!lease || !lease.providerLeaseId) return undefined;
       const stopVerification = options?.freshThreadStop === true
-        || lease.status === "pending_cleanup" && readStopOnlyCleanup(lease) !== null;
+        || lease.status === "pending_cleanup" && (readStopOnlyCleanup(lease) !== null || hasRecoveredCleanupStopReceipt(lease));
       if (!stopVerification && (lease.status !== "failed" || lease.leasePolicy !== "ephemeral")) return undefined;
       const environment = lease.environmentId ? await environmentsSvc.getById(lease.environmentId) : null;
       // Legacy Cloud leases can lack a credential version that permits a
