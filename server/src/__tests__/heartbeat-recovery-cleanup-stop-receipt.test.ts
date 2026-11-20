@@ -134,9 +134,8 @@ describe.skipIf(!support.supported)("recovery cleanup recorded stopped sandbox",
       const f = await seed(receipt, snapshot);
       await f.heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
       expect(f.call).not.toHaveBeenCalled();
-      expect(await f.row()).toMatchObject({ status: "pending_cleanup" });
-      if (receipt) expect(await f.row()).toMatchObject({ metadata: {
-        pendingCleanupHoldReason: "completed_provider_snapshot_missing",
+      expect(await f.row()).toMatchObject({ status: "pending_cleanup", metadata: {
+        pendingCleanupHoldReason: receipt ? "completed_provider_snapshot_missing" : "stop_receipt_missing",
       } });
       expect((await f.patch()).status).toBe(409);
     });
@@ -182,7 +181,9 @@ describe.skipIf(!support.supported)("recovery cleanup recorded stopped sandbox",
     await db.update(environmentLeases).set({ leasePolicy: "ephemeral" }).where(eq(environmentLeases.id, f.leaseId));
     await f.heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
     expect(f.call).not.toHaveBeenCalled();
-    expect(await f.row()).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+    expect(await f.row()).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed", metadata: {
+      pendingCleanupHoldReason: "stop_receipt_missing",
+    } });
   });
 
   it.each(["companyId", "runId", "leaseId", "provider", "providerLeaseId", "schema", "state"] as const)(
@@ -195,6 +196,8 @@ describe.skipIf(!support.supported)("recovery cleanup recorded stopped sandbox",
       } }).where(eq(environmentLeases.id, f.leaseId));
       await f.heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
       expect(f.call).not.toHaveBeenCalled();
-      expect(await f.row()).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+      expect(await f.row()).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed", metadata: {
+        pendingCleanupHoldReason: "stop_receipt_invalid",
+      } });
     });
 });
