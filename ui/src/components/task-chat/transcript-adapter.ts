@@ -1239,7 +1239,7 @@ export function transcriptToTaskChatItems(
         item.status = "interrupted";
         item.detail = item.detail
           ? `${item.detail}\nInterrupted before the provider reported completion.`
-          : "Interrupted before the provider reported completion.";
+          : "Stopped before output. Interrupted before the provider reported completion.";
       } else if (
         item.kind === "protocol" &&
         item.surface === "provider_activity" &&
