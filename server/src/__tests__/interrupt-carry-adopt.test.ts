@@ -652,7 +652,9 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     expect(prompt, "the fresh session never saw STEP1/STEP2; without them it redoes real effects").toContain("STEP1-RESULT-wrote-step1");
     expect(prompt).toContain("STEP2-RESULT-wrote-step2");
     expect(prompt).toContain("echo STEP1 > /tmp/step1");
-    expect(prompt).toMatch(/\n## Commands already run in the interrupted turn \(do not run these again\)\nThis list may not include file edits made in that turn; check the files before redoing any edit\.\n[\s\S]*Do not run them again/i);
+    // adopt-cutstep-heading: an Interrupt WITH a new message heads the list 'Calls from the interrupted turn'; the
+    // already-done guard is per call: STEP1/STEP2 are listed as completed, and completed calls must not be run again.
+    expect(prompt).toMatch(/\n## Calls from the interrupted turn\nThis list may not include file edits made in that turn; check the files before redoing any edit\.\n[^\n]*The completed calls below must not be run again\.[^\n]*\n1\. `echo STEP1 > \/tmp\/step1`: completed\n   result: STEP1-RESULT-wrote-step1\n2\. `echo STEP2 > \/tmp\/step2`: completed\n   result: STEP2-RESULT-wrote-step2\n/);
     expect(prompt).toContain(MSG);
     // The same (resumed) session already holds them: never injected twice.
     expect(await successorPrompt(chat, successor, true)).not.toContain("STEP1-RESULT-wrote-step1");
