@@ -707,6 +707,66 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     }
   }, 30_000);
 
+  it("AB-R4b (writer, late read): the Interrupt lands BEFORE Pi's read of STEER is ingested; Pi reads it in the cut turn after the press ⇒ the cut run still records it read and the same-session successor omits it", async () => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const root = await mkdtemp(join(tmpdir(), "answered-b-pi-late-"));
+    const peer = await openPiSteeringPeer(root, chat.runId);
+    const events: PrpEvent[] = [];
+    let port: PaperclipControlPlanePort | undefined;
+    let pumpError: unknown;
+    const pump = (async () => {
+      for await (const event of peer.session.events()) {
+        port ??= new PaperclipControlPlanePort(db, { companyId: chat.companyId, issueId: chat.issue.id,
+          runId: chat.runId, agentId: chat.agentId, sessionId: event.normalizedSessionId,
+          completionContractId: randomUUID(), completionContractSha256: `sha256:${"a".repeat(64)}`,
+          sourceInstanceId: event.sourceInstanceId, controlPlaneSourceInstanceId: event.sourceInstanceId });
+        await port.appendEvent(event);
+        events.push(event);
+      }
+    })().catch(error => { pumpError = error; });
+    try {
+      const { turnId } = await peer.session.startTurn({ message: { role: "user", text: chat.first.body } });
+      await vi.waitFor(() => {
+        if (pumpError) throw pumpError;
+        expect(events.some(event => event.eventType === "tool.execution.started")).toBe(true);
+      });
+      mocks.probe.mockResolvedValue({ disposition: "available", activeTurnId: turnId });
+      mocks.steer.mockImplementation(async (input: { message: string; correlationId: string }) => {
+        await peer.session.steer!({ turnId, message: { role: "user", text: input.message }, correlationId: input.correlationId });
+        return { turnId };
+      });
+      const steered = (await postDefault(chat, STEER).expect(201)).body;
+      await waitForPendingCommentSteers();
+      mocks.cancel.mockImplementationOnce(async (runId: string) => {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        await db.update(heartbeatRuns).set({ resultJson: { ...(run!.resultJson ?? {}), nativeCancellation: {
+          schema: "paperclip.native-cancellation.v1", runId, companyId: chat.companyId, issueId: chat.issue.id,
+          scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+          intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(),
+        } } }).where(eq(heartbeatRuns.id, runId));
+        return { decision: { stopped: true }, auditId: randomUUID() };
+      });
+      await postDefault(chat, MSG, { deliveryIntent: "interrupt" }).expect(201);
+      const [pressed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+      expect((pressed!.resultJson as any).interruptCarriedSteeredCommentIds).toContain(steered.id);
+      expect((pressed!.resultJson as any).interruptCarriedReadSteeredCommentIds ?? [], "not read yet at the press").not.toContain(steered.id);
+      const reads = () => events.filter(event => event.eventType === "item.started" && event.payload.kind === "userMessage").length;
+      const before = reads();
+      peer.releaseBoundary(false); // the cut turn's Pi reads STEER after the press, before its abort settles
+      await vi.waitFor(() => { if (pumpError) throw pumpError; expect(reads()).toBe(before + 1); }, { timeout: 5000 });
+      const [cut] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+      expect((cut!.resultJson as any).interruptCarriedReadSteeredCommentIds, "the late read is recorded on the cut run").toEqual([steered.id]);
+      const [carry] = await carryWakes(chat);
+      const successor = await admitSuccessor(chat, carry!);
+      const submitted = await submittedSuccessorTurn(chat, successor, true);
+      expect(count(submitted, STEER), "one answer: the same session already holds STEER").toBe(0);
+      expect(count(submitted, MSG)).toBe(1);
+    } finally {
+      await peer.close(); await pump;
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   /** The cut turn's tool calls, as run-event ingestion stores them (validated PRP tool.execution.started /
    * tool.execution.completed). `midFlight`: started, cut before any completed receipt. */
   async function toolReceipts(chat: Chat, steps: Array<{ name: string; output: string; status?: string; midFlight?: boolean }>) {
