@@ -1800,7 +1800,9 @@ async function githubOperationLauncherBasePath(
       `remote_path=${shellQuote(path.posix.join(directory, name))}`,
       `lock_dir=${shellQuote(path.posix.join(directory, `.${name}.lock`))}`,
       ...buildRemotePidLockAcquireScript('"$lock_dir"', "Timed out acquiring GitHub operation launcher upload lock."),
-      ...buildRemotePidLockCleanupScript('"$lock_dir"', []),
+      ...buildRemotePidLockCleanupScript('"$lock_dir"', [
+        'rm -f "$remote_path.paperclip-upload.b64" "$remote_path.partial"',
+      ]),
       'current_sha=""',
       'if [ -f "$remote_path" ]; then',
       '  if command -v sha256sum >/dev/null 2>&1; then',

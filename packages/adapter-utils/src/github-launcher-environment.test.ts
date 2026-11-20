@@ -92,6 +92,9 @@ describe("managed GitHub launcher environment", () => {
     const names = (await readdir(directory)).filter(name => name !== "gh-config");
     const inodes = await Promise.all(names.map(name => stat(path.join(directory, name)).then(file => file.ino)));
     await chmod(path.join(directory, "git"), 0o600);
+    // A killed prior upload can leave scratch even when the committed file is current.
+    await writeFile(path.join(directory, "git.partial"), "orphan partial");
+    await writeFile(path.join(directory, "git.paperclip-upload.b64"), "orphan upload");
     fixture.runner.execute.mockClear();
     expect(await prepareGitHubOperationLaunchers(input)).toEqual(first);
     expect(fixture.runner.execute).toHaveBeenCalledTimes(1);
