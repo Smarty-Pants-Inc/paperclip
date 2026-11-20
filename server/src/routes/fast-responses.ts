@@ -7,6 +7,7 @@ import { forbidden } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import { fastResponseService } from "../services/fast-responses.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { processHeartbeatFor } from "../services/heartbeat-registry.js";
 import { listOpenRouterModels } from "../services/openrouter-models.js";
 import { fastResponseCatalogModels } from "../services/fast-response-models.js";
 import { parseCostDateRange, parseCostLimit } from "./costs.js";
@@ -15,7 +16,7 @@ export function fastResponseRoutes(db: Db) {
   const router = Router();
   const service = fastResponseService(db, {
     budgetHooks: {
-      cancelWorkForScope: heartbeatService(db).cancelBudgetScopeWork,
+      cancelWorkForScope: (scope) => (processHeartbeatFor(db, "fast-responses-budget") ?? heartbeatService(db)).cancelBudgetScopeWork(scope),
     },
   });
   router.get("/companies/:companyId/fast-response", async (req, res) => {

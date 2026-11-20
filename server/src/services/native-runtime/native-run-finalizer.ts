@@ -1571,7 +1571,7 @@ export async function recoverCommittedNativeReviewResponse(db: Db, input: {
 async function drainNativeFinalization(db: Db, runId: string, companyId: string) {
   try {
     const { wiredHeartbeatFor } = await import("../heartbeat-registry.js");
-    await (await wiredHeartbeatFor(db)).releaseIssueExecutionAndPromote(
+    await (await wiredHeartbeatFor(db, "native-run-finalizer-drain")).releaseIssueExecutionAndPromote(
       { id: runId, companyId }, { resumeStrandedQueue: true });
   } catch (err) {
     logger.warn({ err, runId }, "Post-finalization release drain failed; the deferred wake stays saved");

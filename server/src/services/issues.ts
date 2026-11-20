@@ -344,8 +344,10 @@ export async function executeIssuePostCommitActions(
   actions: readonly IssuePostCommitAction[],
 ): Promise<void> {
   if (actions.length === 0) return;
-  const { heartbeatService } = await import("./heartbeat.js");
-  const heartbeat = heartbeatService(db);
+  // cancelRun promotes the deferred successor and starts the agent's next
+  // queued run, so it must be the process's wired heartbeat (plugin workers).
+  const { wiredHeartbeatFor } = await import("./heartbeat-registry.js");
+  const heartbeat = await wiredHeartbeatFor(db, "issue-post-commit-cancel");
   const cancelledRunIds = new Set<string>();
   for (const action of actions) {
     if (cancelledRunIds.has(action.runId)) continue;
