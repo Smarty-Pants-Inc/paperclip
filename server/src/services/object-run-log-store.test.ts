@@ -134,6 +134,98 @@ describe("S3 run log store", () => {
     expect({ head: headReads(), proof: proofReads() }).toEqual({ head: 1, proof: 1 });
   });
 
+  it("conditionally creates a proven-new warm log without discovering an empty head", async () => {
+    const m = memory(), authority = vi.fn(async () => undefined);
+    const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", assertWriterAuthority: authority });
+    await store.begin({ ...input, runId: "warm-provider" });
+    const get = vi.spyOn(m.provider, "getObject"), put = vi.spyOn(m.provider, "putObjectConditional");
+    authority.mockClear();
+    const handle = await store.begin({ ...input, newRun: true });
+    expect(handle).toMatchObject({ initialBytes: 0, initialSequence: 0, initialSourceCursor: 0, initialSourcePrefixVerified: false });
+    expect(get).not.toHaveBeenCalled();
+    expect(put).toHaveBeenCalledTimes(1);
+    expect(put).toHaveBeenCalledWith(expect.objectContaining({ objectKey: "logs/segments-v1/company/agent/run/head.json", ifNoneMatch: "*" }));
+    expect(authority).toHaveBeenCalledTimes(2);
+  });
+
+  it("recovers an earlier prefix when a proven-new run row missed its previous claim", async () => {
+    const m = memory(), options = { provider: m.provider, keyPrefix: "logs", flushMs: 1,
+      assertWriterAuthority: async () => undefined };
+    const first = createObjectRunLogStore(options), original = await first.begin({ ...input, newRun: true });
+    await first.append(original, { ...event(1), chunk: "previous attempt\n" });
+    await first.finalize(original);
+    const store = createObjectRunLogStore(options), recovered = await store.begin({ ...input, newRun: true });
+    expect(recovered.initialSequence).toBe(1);
+    expect(recovered.initialBytes).toBeGreaterThan(0);
+    await store.append(recovered, { ...event(2), chunk: "next attempt\n" });
+    await store.finalize(recovered);
+    const lines = (await store.read(recovered)).content.trim().split("\n").map(line => JSON.parse(line));
+    expect(lines.map(line => [line.seq, line.chunk])).toEqual([[1, "previous attempt\n"], [2, "next attempt\n"]]);
+    expect(new Set(lines.map(line => line.attemptId)).size).toBe(2);
+  });
+
+  it("reconciles a lost new-head publication response without claiming a second generation", async () => {
+    const m = memory(), store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs",
+      assertWriterAuthority: async () => undefined });
+    await store.begin({ ...input, runId: "warm-provider" });
+    const put = m.provider.putObjectConditional!.bind(m.provider);
+    let heads = 0;
+    m.provider.putObjectConditional = async value => {
+      const result = await put(value);
+      if (value.objectKey === "logs/segments-v1/company/agent/run/head.json" && ++heads === 1)
+        throw new Error("response lost after commit");
+      return result;
+    };
+    const handle = await store.begin({ ...input, newRun: true });
+    expect(handle.initialSequence).toBe(0);
+    expect(heads).toBe(1);
+    expect(JSON.parse(m.objects.get("logs/segments-v1/company/agent/run/head.json")!.toString()).generation).toBe(1);
+  });
+
+  it("still checks writer authority before publishing a proven-new log", async () => {
+    const m = memory(), authority = vi.fn(async () => undefined);
+    const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", assertWriterAuthority: authority });
+    await store.begin({ ...input, runId: "warm-provider" });
+    const put = vi.spyOn(m.provider, "putObjectConditional");
+    authority.mockRejectedValueOnce(new Error("writer authority lost"));
+    await expect(store.begin({ ...input, newRun: true })).rejects.toThrow("writer authority lost");
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("rechecks writer authority after warm-provider qualification before creating a log", async () => {
+    const m = memory(), authority = vi.fn(async () => undefined);
+    const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", assertWriterAuthority: authority });
+    await store.begin({ ...input, runId: "warm-provider" });
+    const put = vi.spyOn(m.provider, "putObjectConditional");
+    authority.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("writer authority lost at recheck"));
+    await expect(store.begin({ ...input, newRun: true })).rejects.toThrow("writer authority lost at recheck");
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("does no I/O for an already-cancelled proven-new claim", async () => {
+    const m = memory(), authority = vi.fn(async () => undefined), controller = new AbortController();
+    const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", assertWriterAuthority: authority });
+    const get = vi.spyOn(m.provider, "getObject"), put = vi.spyOn(m.provider, "putObjectConditional");
+    const reason = new Error("stopped before log claim");
+    controller.abort(reason);
+    await expect(store.begin({ ...input, newRun: true, signal: controller.signal })).rejects.toBe(reason);
+    expect(authority).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("does not skip conditional-write qualification on a proven-new cold claim", async () => {
+    const m = memory();
+    m.provider.putObjectConditional = async value => {
+      const bytes = Buffer.isBuffer(value.body) ? value.body : await readBody(value.body);
+      m.objects.set(value.objectKey, bytes);
+      return { etag: "broken-provider-ignores-conditions" };
+    };
+    const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", assertWriterAuthority: async () => undefined });
+    await expect(store.begin({ ...input, newRun: true })).rejects.toThrow("Object storage does not enforce conditional publication");
+    expect([...m.objects.keys()]).toEqual([]);
+  });
+
   it("keeps live byte appends deliverable after a proof-only outage and requires cold prefix verification", async () => {
     const m = memory(), options = { provider: m.provider, keyPrefix: "logs", flushMs: 1,
       assertWriterAuthority: async () => undefined };

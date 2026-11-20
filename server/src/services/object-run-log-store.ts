@@ -259,6 +259,7 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       const writer = await store.claim({
         assertAuthority: () => options.assertWriterAuthority(input),
         signal: input.signal,
+        newJournal: input.newRun === true,
       });
       const sourcePrefixVerified = writer.head.generation > 1 && await store.hasVerifiedSourcePrefix(writer.head, input.signal);
       const handle: RunLogHandle = {
