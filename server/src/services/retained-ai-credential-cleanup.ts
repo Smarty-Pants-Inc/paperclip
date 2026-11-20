@@ -19,6 +19,8 @@ type Cleanup = {
   retryRetirement?: () => Promise<void>;
   retired: "pending" | "confirmed" | "failed";
   running?: Promise<void>;
+  /** When the current cleanup run started (its wait bound's start). */
+  runningSince?: number;
   executing?: boolean;
   warned?: boolean;
   agentId?: string;
@@ -39,6 +41,13 @@ export type RetainedAuthorityRelease = { readonly released: boolean; readonly ru
  * agent for Retry (checked on that agent's next lifecycle attempt, never on a
  * timer). The entry stays retained and keeps retrying on same-account actions. */
 export const PROBE_CLEANUP_PENDING_PARK_MS = 10 * 60_000;
+/** How long any caller waits on one retained entry's cleanup run, counted from
+ * that run's start (so a caller joining an older run waits only the rest). The
+ * same bound an unrecoverable probe close gives its own runtime cleanup before
+ * the verifier releases the probe box. Past it the caller gets the cleanup's
+ * 'pending' outcome; the run keeps going in the background and is reused, never
+ * started twice. */
+export const PROBE_CLEANUP_BEFORE_RELEASE_MS = 10_000;
 const retained = new Map<string, Set<Cleanup>>();
 /** Agents whose probe box was gone before its handoff was confirmed: their
  * next own reconcile parks them once (a Retry then re-attempts). */
@@ -95,7 +104,9 @@ function cleaningScope(scope: RetainedAiCleanupScope) {
 function attempt(entry: Cleanup): Promise<void> {
   if (!retained.get(key(entry.scope))?.has(entry)) return Promise.resolve();
   if (entry.retired === "pending" || (entry.retired === "failed" && !entry.retryRetirement)) return Promise.reject(pending());
-  return entry.running ??= active.run(new Set([...(active.getStore() ?? []), entry]), async () => {
+  if (entry.running) return entry.running;
+  entry.runningSince = Date.now();
+  return entry.running = active.run(new Set([...(active.getStore() ?? []), entry]), async () => {
     entry.executing = true;
     try {
       if (entry.retired === "failed") {
@@ -138,7 +149,21 @@ function attempt(entry: Cleanup): Promise<void> {
       warn(entry, "cleanup_threw");
       throw pending();
     } finally { entry.executing = false; }
-  }).finally(() => { entry.running = undefined; });
+  }).finally(() => { entry.running = undefined; entry.runningSince = undefined; });
+}
+
+/** An attempt no caller waits on past PROBE_CLEANUP_BEFORE_RELEASE_MS from its
+ * run's start: cleanup IO that never settles (home removal, credential
+ * write-back, a secret lock) must not hold the owning agent's lifecycle
+ * attempt, and through it the lifecycle sweep and every other hire. */
+function boundedAttempt(entry: Cleanup): Promise<void> {
+  const run = attempt(entry);
+  if (!entry.running || entry.runningSince === undefined) return run;
+  const remaining = Math.max(0, entry.runningSince + PROBE_CLEANUP_BEFORE_RELEASE_MS - Date.now());
+  let bound: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([run, new Promise<never>((_, reject) => {
+    bound = setTimeout(() => reject(pending()), remaining); bound.unref?.();
+  })]).finally(() => clearTimeout(bound));
 }
 
 function settledBoxGone(entry: Cleanup) {
@@ -192,7 +217,18 @@ export async function reconcileRetainedAiCleanup(scope: RetainedAiCleanupScope, 
   if (cleaningScope(scope)) return;
   for (const entry of [...(retained.get(scopeKey) ?? [])]) {
     if (options?.agentId !== undefined && entry.agentId !== undefined && entry.agentId !== options.agentId) continue;
-    try { await attempt(entry); }
+    // An agent's own lifecycle attempt never waits on cleanup IO that may not
+    // settle: it does not join a run already in flight, and once its entry is
+    // past the park bound (checked here, on the clock, before any await) it
+    // only nudges the cleanup and parks. Either way the run keeps going in the
+    // background, is reused, and is never started twice.
+    if (!retained.get(scopeKey)?.has(entry)) continue;
+    const own = options?.agentId !== undefined && entry.agentId === options.agentId;
+    const overdue = own && Date.now() - entry.retainedAt >= PROBE_CLEANUP_PENDING_PARK_MS;
+    const outcome = options?.agentId !== undefined && (entry.running || overdue)
+      ? (void attempt(entry).catch(() => undefined), Promise.reject(pending()))
+      : boundedAttempt(entry);
+    try { await outcome; }
     catch (error) {
       // The box is gone but its authority did not read back released: park the
       // owning agent truthfully; the entry stays retained for the next retry.
@@ -228,7 +264,7 @@ export async function reconcileRetainedAiCleanupForHome(home: string): Promise<v
   const scope = homes.get(home);
   if (!scope || cleaningScope(scope)) return;
   for (const entry of [...(retained.get(key(scope)) ?? [])]) {
-    if (entry.home === home) await attempt(entry);
+    if (entry.home === home) await boundedAttempt(entry);
   }
 }
 export function retainAiCredentialCleanupForHome(home: string, input: {

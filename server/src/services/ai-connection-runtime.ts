@@ -28,7 +28,7 @@ import { captureRunnerPrpAuthorities, releaseRunnerPrpAuthority, runnerPrpAuthor
 import { readLocalAiCredentialFile } from "./local-ai-credential-file.js";
 import { prepareAntigravityCredentialWriteback } from "./native-runtime/antigravity-runner-credentials.js";
 import { quotaCredentialHash, quotaCredentialRecovery, RetiredCredentialRecoveryError } from "./quota-credential-recovery.js";
-import { bindRetainedAiCredentialHome, reconcileRetainedAiCleanup, retainAiCredentialCleanup, retainedAiAccountKeyHash } from "./retained-ai-credential-cleanup.js";
+import { bindRetainedAiCredentialHome, PROBE_CLEANUP_BEFORE_RELEASE_MS, reconcileRetainedAiCleanup, retainAiCredentialCleanup, retainedAiAccountKeyHash } from "./retained-ai-credential-cleanup.js";
 import { logger } from "../middleware/logger.js";
 import { boundDiagnosticFields, summarizeDiagnosticError } from "./native-runtime/diagnostic-error-summary.js";
 
@@ -672,8 +672,9 @@ function nativeSessionCloseUnrecoverable(error: InstanceType<typeof NativeEnviro
 }
 
 /** How long an unrecoverable probe close waits for its own runtime cleanup
- * before the verifier releases the probe box anyway (the cleanup continues). */
-export const PROBE_CLEANUP_BEFORE_RELEASE_MS = 10_000;
+ * before the verifier releases the probe box anyway (the cleanup continues).
+ * One bound, shared with every wait on a retained cleanup run. */
+export { PROBE_CLEANUP_BEFORE_RELEASE_MS };
 
 export async function withManagedAiProbe<T>(
   db: Db,
