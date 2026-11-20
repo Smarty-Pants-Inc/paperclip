@@ -20107,6 +20107,12 @@ describe("runnerd provider runtime wiring", () => {
     { name: "parked ingress reconnect without authentication", connected: false, answersIdentity: true, sameGeneration: true, lost: false, probe: true },
     { name: "parked ingress different generation", connected: false, answersIdentity: true, sameGeneration: false, lost: false, probe: true },
     { name: "parked ingress silent identity", connected: false, answersIdentity: false, sameGeneration: true, lost: false, probe: true },
+    // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4605#issuecomment-7040611286
+    { name: "R2 current copy survives inconclusive identity retirement", connected: true, answersIdentity: false, sameGeneration: true, lost: false, probe: true, preparation: "own-copy" },
+    { name: "R2 current directory survives inconclusive identity retirement", connected: true, answersIdentity: false, sameGeneration: true, lost: false, probe: true, preparation: "own-directory" },
+    { name: "R1 changed config with inconclusive identity refuses prepared copy", connected: true, answersIdentity: false, sameGeneration: true, lost: false, probe: true, preparation: "own-copy" },
+    { name: "R1 changed config with identity error refuses prepared copy", connected: true, answersIdentity: false, sameGeneration: true, lost: false, probe: true, preparation: "own-copy" },
+    { name: "R1 changed config with passing identity refuses prepared copy", connected: true, answersIdentity: true, sameGeneration: true, lost: false, probe: false, preparation: "own-copy" },
     { name: "managed current copy preparation healthy", connected: true, answersIdentity: true, sameGeneration: true, lost: false, probe: false, preparation: "own-copy" },
     { name: "managed current copy preparation lost", connected: true, answersIdentity: false, sameGeneration: true, lost: true, probe: true, preparation: "own-copy" },
     { name: "managed foreign copy preparation", connected: true, answersIdentity: true, sameGeneration: true, lost: false, probe: false, preparation: "foreign-copy" },
@@ -20150,6 +20156,17 @@ describe("runnerd provider runtime wiring", () => {
       root: "/workspace/agent-home", hasChanges: vi.fn(async () => false), collectStopped: vi.fn(async () => undefined),
       ...(preparation.endsWith("directory") ? { checkpointWarm: vi.fn(async () => true) } : {}) } : undefined;
     const nextCopy = instructionCopy ? { ...instructionCopy, runId: next.binding.runId } : undefined;
+    const currentCopyRoot = join(isolatedStateDirectory, "current-run-instructions");
+    const currentInstructions = "CURRENT RUN INSTRUCTIONS MUST SURVIVE RETIREMENT\n";
+    let freshInstructionRead: string | undefined;
+    let collectedBeforeDispatch: number | undefined;
+    if (name.startsWith("R2 ")) {
+      instructionCopy!.root = currentCopyRoot;
+      nextCopy!.root = currentCopyRoot;
+      nextCopy!.collectStopped = vi.fn(async () => { await rm(currentCopyRoot, { recursive: true, force: true }); });
+      await mkdir(currentCopyRoot, { recursive: true });
+      await writeFile(join(currentCopyRoot, "AGENTS.md"), currentInstructions);
+    }
     const managedEvents: Array<{ eventType: string; payload?: Record<string, unknown> }> = [];
     const authenticatedRunnerInstanceId = sameGeneration ? identity.runnerInstanceId : `${identity.runnerInstanceId}-other`;
     let connectionCount = connected ? 1 : 0;
@@ -20169,7 +20186,7 @@ describe("runnerd provider runtime wiring", () => {
       if (name !== "parked ingress reconnect without authentication") connectionCount = 1;
     });
     const identityCheck = vi.fn(async (expectedRunnerInstanceId: string, timeoutMs?: number) => {
-      if (name === "identity command error") throw new Error("identity unavailable");
+      if (name === "identity command error" || name === "R1 changed config with identity error refuses prepared copy") throw new Error("identity unavailable");
       // A pre-claim maintenance write revokes the source checkpoint writer in
       // the real E2E; don't let a mock identity response conceal that ordering.
       if (name === "successor claim precedes identity" || reconnectCase) expect(successorClaimed).toBe(true);
@@ -20207,6 +20224,14 @@ describe("runnerd provider runtime wiring", () => {
       return result;
     }).mockImplementationOnce(async options => {
       existingSessions.push(options.existingSession);
+      if (name.startsWith("R2 ")) {
+        collectedBeforeDispatch = nextCopy!.collectStopped.mock.calls.length;
+        // Capture a missing file, then assert outside execute so the fake DB's
+        // error handler cannot mask the original preparation failure.
+        freshInstructionRead = await readFile(join(currentCopyRoot, "AGENTS.md"), "utf8").catch(error => String(error));
+        console.info(`[reuse-current-copy] ${JSON.stringify({ name, runId: next.binding.runId,
+          root: currentCopyRoot, collectedBeforeDispatch, freshInstructionRead, reused: options.existingSession === session })}`);
+      }
       if (lost && options.existingSession === undefined) {
         state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
         expect(state.createTransport.mock.calls.at(-1)![0]).toMatchObject({ lostRunnerSource: identity });
@@ -20264,7 +20289,9 @@ describe("runnerd provider runtime wiring", () => {
       }
       execute.mockClear(); restore.mockClear();
       target.sandboxLeaseAcquisition.outcome = "resumed";
-      const attempt = executePaperclipNativeSession({ db: nextDb, execution: next,
+      const actualNext = name.startsWith("R1 ") ? { ...next,
+        session: { ...next.session, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 99_000 } } } : next;
+      const attempt = executePaperclipNativeSession({ db: nextDb, execution: actualNext,
         runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target, instructionWorkingCopy: nextCopy,
         onExecutionLeaseAcquired: async () => { successorClaimed = true; },
         onEvent: async event => { managedEvents.push(event); } });
@@ -20276,7 +20303,17 @@ describe("runnerd provider runtime wiring", () => {
         await releasePreparation?.();
         return;
       }
+      if (name.startsWith("R1 ")) {
+        await expect(attempt).rejects.toThrow("native_instruction_preparation_configuration_changed");
+        expect(state.execute).toHaveBeenCalledOnce();
+        await releasePreparation?.();
+        return;
+      }
       await expect(attempt).resolves.toMatchObject({ exitCode: 0 });
+      if (name.startsWith("R2 ")) {
+        expect(freshInstructionRead).toBe(currentInstructions);
+        expect(collectedBeforeDispatch).toBe(0);
+      }
       await releasePreparation?.();
       if (preparation) expect(managedEvents.filter(event => event.eventType === "run.performance.span"
         && event.payload?.span === "native.controller.warm_owner_identity_check")).toEqual([
