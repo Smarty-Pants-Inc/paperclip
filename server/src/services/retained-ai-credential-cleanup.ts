@@ -81,7 +81,14 @@ export function retainAiCredentialCleanup(input: {
 }): void {
   const scopeKey = key(input.scope);
   const entries = retained.get(scopeKey) ?? new Set<Cleanup>();
-  if ([...entries].some(entry => entry.cleanup === input.cleanup)) return;
+  const existing = [...entries].find(entry => entry.cleanup === input.cleanup);
+  if (existing) {
+    // The same cleanup retained again by its known owner adopts that owner:
+    // a probe's entry must never stay unowned (and gate every agent) once its
+    // agent is known. An owned entry keeps its first owner.
+    if (existing.agentId === undefined && input.agentId !== undefined) existing.agentId = input.agentId;
+    return;
+  }
   const entry: Cleanup = { scope: { ...input.scope }, home: input.home, cleanup: input.cleanup, retryRetirement: input.retryRetirement,
     agentId: input.agentId, retired: input.retired ? "pending" : "confirmed" };
   entries.add(entry); retained.set(scopeKey, entries);

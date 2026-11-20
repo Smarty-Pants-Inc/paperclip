@@ -263,6 +263,9 @@ export async function prepareManagedAiRuntime(
   input: {
     companyId: string;
     agentId: string;
+    /** Owner of any cleanup this runtime retains (a probe's agent). Without it
+     * a retained entry is unowned and gates every agent's probe on the account. */
+    retainedCleanupAgentId?: string;
     responsibleUserId: string | null;
     adapterType: string;
     binding: AiConnectionBinding;
@@ -617,7 +620,8 @@ export async function prepareManagedAiRuntime(
         return await (antigravitySubscription
           ? withAccountHomeSecretMutationLock(undefined, input.companyId, cleanup) : cleanup());
       } catch (error) {
-        if (retainedCleanupScope && !homeRemoved) retainAiCredentialCleanup({ scope: retainedCleanupScope, home: providerHome, cleanup: cleanupRuntime });
+        if (retainedCleanupScope && !homeRemoved) retainAiCredentialCleanup({ scope: retainedCleanupScope, home: providerHome, cleanup: cleanupRuntime,
+          ...(input.retainedCleanupAgentId ? { agentId: input.retainedCleanupAgentId } : {}) });
         throw error;
       }
     })().finally(() => { cleanupRunning = undefined; });
@@ -669,7 +673,8 @@ export async function withManagedAiProbe<T>(
   input: Parameters<typeof prepareManagedAiRuntime>[1],
   probe: (runtime: Awaited<ReturnType<typeof prepareManagedAiRuntime>>) => Promise<T>,
 ): Promise<T> {
-  const runtime = await prepareManagedAiRuntime(db, input);
+  // Every cleanup this probe retains is owned by its agent (never unowned).
+  const runtime = await prepareManagedAiRuntime(db, { ...input, retainedCleanupAgentId: input.agentId });
   let retained = false;
   try {
     return await probe(runtime);
@@ -685,19 +690,30 @@ export async function withManagedAiProbe<T>(
       // holds, then deletes the home) and fail this agent's check for Retry.
       retained = true;
       void error.retired.catch(() => undefined);
+      let cleanupFinished = true;
       try { await runtime.cleanup(); }
       catch (cleanupError) {
-        if (runtime.retainedCleanupScope && !(cleanupError instanceof RetiredCredentialRecoveryError)) {
-          retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup, agentId: input.agentId });
+        // A recovery handoff owns the refresh and the home is removed; any
+        // other failure leaves the runtime home on disk, retained for retry.
+        if (!(cleanupError instanceof RetiredCredentialRecoveryError)) {
+          cleanupFinished = false;
+          if (runtime.retainedCleanupScope) {
+            retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup, agentId: input.agentId });
+          }
         }
       }
+      const code = cleanupFinished ? "native_probe_cleanup_failed" : "native_probe_cleanup_unfinished";
       try {
         // One alarm per failed probe, naming what it held: the account, its runtime home and the agent.
-        logger.error({ code: "native_probe_cleanup_failed", agentId: input.agentId, runtimeHome: runtime.home,
+        logger.error({ code, agentId: input.agentId, runtimeHome: runtime.home, cleanupFinished,
           accountKeyHash: runtime.retainedCleanupScope ? retainedAiAccountKeyHash(runtime.retainedCleanupScope.accountKey) : undefined },
-        "Native probe close was unrecoverable; its runtime cleanup finished without retirement proof");
+        cleanupFinished
+          ? "Native probe close was unrecoverable; its runtime cleanup finished without retirement proof"
+          : "Native probe close was unrecoverable and its runtime cleanup did not finish; the managed runtime home remains on disk, retained for retry");
       } catch { /* Diagnostics must not change the HTTP response. */ }
-      throw unprocessable("The native account test failed and its runtime could not be closed cleanly.", { code: "native_probe_cleanup_failed" });
+      throw unprocessable(cleanupFinished
+        ? "The native account test failed and its runtime could not be closed cleanly."
+        : "The native account test failed, its runtime could not be closed cleanly, and its runtime home could not be removed.", { code });
     }
     if (error instanceof NativeEnvironmentProbeCleanupError) {
       // Keep the selected credential generation until the native owner has
@@ -719,7 +735,7 @@ export async function withManagedAiProbe<T>(
       try { await runtime.cleanup(); }
       catch (error) {
         if (runtime.retainedCleanupScope && !(error instanceof RetiredCredentialRecoveryError)) {
-          retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup });
+          retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup, agentId: input.agentId });
         }
         throw error;
       }
