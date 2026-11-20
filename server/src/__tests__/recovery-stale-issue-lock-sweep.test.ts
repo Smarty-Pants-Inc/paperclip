@@ -1603,13 +1603,21 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       expect(await systemNotes(c)).toEqual([]);
     });
 
-    it.each([true, false])("his-shape: one-id deferred head=%s plus four separate pending pre-boot deliveries never run", async hasHead => {
+    it.each([true, false].flatMap(hasHead => ["done", "done-single", "mixed", "blocked", "blocked-single", "other"].map(disposition => ({ hasHead, disposition }))))(
+      "his-shape: $disposition one-id deferred head=$hasHead plus pending pre-boot deliveries never run", async ({ hasHead, disposition }) => {
       const c = await chat();
       const ids: string[] = [];
-      for (const [index, identifier] of ["SMA-611", "SMA-618", "SMA-617", "SMA-615", "SMA-616"].entries()) {
+      // A delivery can outlive any later status change; those tasks remain unnamed.
+      const otherStatuses = ["backlog", "todo", "in_progress", "monitoring", "in_review", "cancelled"];
+      const identifiers = disposition === "other" ? otherStatuses.map((_, index) => `OTHER-${index}`)
+        : disposition.endsWith("-single") ? ["SMA-611"] : ["SMA-611", "SMA-618", "SMA-617", "SMA-615", "SMA-616"];
+      for (const [index, identifier] of identifiers.entries()) {
         const at = ago(13 * hour - index);
+        const status = disposition === "other" ? otherStatuses[index]
+          : disposition.startsWith("done") || (disposition === "mixed" && index === 0) ? "done" : "blocked";
+        const title = disposition === "blocked-single" ? `  Waiting\n\tfor ${"x".repeat(80)}  ` : `Daily work ${identifier}`;
         const [task] = await db.insert(issues).values({ companyId: c.companyId, identifier,
-          title: `Daily work ${identifier}`, status: "done", completedAt: at }).returning();
+          title, status, ...(status === "done" ? { completedAt: at } : {}) }).returning();
         await db.insert(chatTaskHandoffs).values({ companyId: c.companyId, taskId: task.id,
           conversationId: c.issueId, agentId: c.agentId, sessionGeneration: 0 });
         const [d] = await db.insert(chatCompletionDeliveries).values({ companyId: c.companyId,
@@ -1637,6 +1645,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       } });
       const service = chatCompletionDeliveryService(db, c.heartbeat);
       const started = Date.now();
+      let firstNotes: Awaited<ReturnType<typeof systemNotes>> | undefined;
       for (let pass = 0; pass <= 10; pass++) {
         await boot(c);
         await release({ companyId: c.companyId, runId: previous.id, now: new Date(), resumeStrandedQueue: true,
@@ -1644,6 +1653,9 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
         await db.update(chatCompletionDeliveries).set({ nextAttemptAt: new Date(0) })
           .where(eq(chatCompletionDeliveries.companyId, c.companyId));
         await service.sweepPending();
+        const persistedNotes = await systemNotes(c);
+        if (pass === 0) firstNotes = persistedNotes;
+        else expect(persistedNotes, "a second supersede pass writes nothing").toEqual(firstNotes);
         if (process.env.PAPERCLIP_HIS_SHAPE_SOAK === "1" && hasHead && pass < 10)
           await new Promise(resolve => setTimeout(resolve, 60_000));
       }
@@ -1652,17 +1664,30 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, c.companyId));
       const rows = await db.select().from(chatCompletionDeliveries).where(eq(chatCompletionDeliveries.companyId, c.companyId));
       const notes = await systemNotes(c);
-      process.stdout.write(`his-shape persisted ${JSON.stringify({ hasHead, elapsedMs: Date.now() - started,
+      process.stdout.write(`his-shape persisted ${JSON.stringify({ hasHead, disposition, elapsedMs: Date.now() - started,
         runs: runs.length, wakes: wakes.map(w => ({ id: w.id, status: w.status, runId: w.runId })),
         notes: notes.map(n => n.body),
         deliveries: rows.map(d => ({ id: d.id, status: d.status, attempts: d.attempts })) })}\n`);
       expect(runs, "pre-boot reports must NEVER start a run").toHaveLength(0);
       expect(wakes).toHaveLength(hasHead ? 1 : 0);
       if (hasHead) expect(wakes[0]).toMatchObject({ status: "cancelled", runId: null });
-      expect(rows).toHaveLength(5);
+      expect(rows).toHaveLength(identifiers.length);
       expect(rows.every(d => d.status === "superseded")).toBe(true);
-      expect(notes).toHaveLength(1);
-      expect(notes[0].body).toBe("Finished earlier (these reports were delayed): SMA-611 — Daily work SMA-611; SMA-618 — Daily work SMA-618; SMA-617 — Daily work SMA-617; and 2 more.");
+      if (disposition === "other") {
+        expect(notes).toEqual([]);
+      } else {
+        expect(notes).toHaveLength(1);
+        const expected = disposition === "done"
+          ? "Finished earlier (these reports were delayed): SMA-611 — Daily work SMA-611; SMA-618 — Daily work SMA-618; SMA-617 — Daily work SMA-617; and 2 more."
+          : disposition === "done-single"
+            ? "Finished earlier (this report was delayed): SMA-611 — Daily work SMA-611."
+            : disposition === "mixed"
+              ? "Finished earlier (this report was delayed): SMA-611 — Daily work SMA-611.\nBlocked, not finished (these reports were delayed): SMA-618 — Daily work SMA-618; SMA-617 — Daily work SMA-617; SMA-615 — Daily work SMA-615; and 1 more."
+              : disposition === "blocked-single"
+                ? `Blocked, not finished (this report was delayed): SMA-611 — Waiting for ${"x".repeat(47)}….`
+                : "Blocked, not finished (these reports were delayed): SMA-611 — Daily work SMA-611; SMA-618 — Daily work SMA-618; SMA-617 — Daily work SMA-617; and 2 more.";
+        expect(notes[0].body).toBe(expected);
+      }
     }, 11 * 60_000);
 
     it("boot-4d: platform's five pre-boot shapes yield ONE five-task naming note and ZERO runs", async () => {
