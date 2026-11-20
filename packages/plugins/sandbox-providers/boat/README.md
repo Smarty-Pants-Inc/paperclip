@@ -86,7 +86,7 @@ idle RUN timer. This behavior is fixture-tested, not live Boat qualification.
 The Boat plugin's company-scoped instance settings are `spares` (0–3, default 0),
 `spareMax` (1–5, default 3), `spareDemandWindowMinutes` (5–60, default 10),
 `spareEnvironmentIds` (up to 10 environment IDs, default empty), and
-`spareIdleMinutes` (15–1440, default 60). Empty or absent `spareEnvironmentIds`
+`spareIdleMinutes` (0 or 15–1440, default 60). Empty or absent `spareEnvironmentIds`
 means **no spares**. For each listed environment in an active company, `spares`
 is the desired count **and hard idle-pool bound**, further limited by `spareMax`.
 Claims replace a spare; they never expand that bound. Acquisition history still
@@ -110,16 +110,27 @@ A company is active after any lease acquire, resume or release handled by this
 plugin, or any `agent.run.started`, `agent.run.finished`, `agent.run.failed`,
 `agent.run.cancelled`, `issue.comment.created`, `issue.created` or `issue.updated`
 event for that company. The plugin records company `lastActivityAt` in its
-company-scoped plugin state. When `now - lastActivityAt` is greater than
+company-scoped plugin state. **`spareIdleMinutes=0` means never idle:** keep the
+configured spare pool, continue renewing its Boat TTL, and keep normal refills
+enabled regardless of how long the company has been inactive. Unknown activity
+after a worker restart is also treated as active in this mode. With `spares=1`,
+this costs **one small box per listed environment around the clock** (about
+$0.43/day each at the small rate); larger types or higher spare counts cost more.
+The count remains bounded by `spares`, further limited by `spareMax`. Set
+**`spares=0` (OFF)** to stop and retire the pool; `spareIdleMinutes=0` does not
+override OFF, the environment allowlist, or the existing create budgets.
+
+For a nonzero timeout, when `now - lastActivityAt` is greater than
 `spareIdleMinutes`, all that company's ready spares are stopped through Boat's
 confirmed `POST /sandboxes/{id}/stop` path (never deleted), spare TTL refresh
 stops, and no replacements are created. The next activity wakes the listed
-environment pools through the normal refill path. On restart, an unknown activity
-state is considered active only when the persisted last lease acquire is within
-the configured idle window; otherwise it is idle.
+environment pools through the normal refill path. With a nonzero timeout on
+restart, an unknown activity state is considered active only when the persisted
+last lease acquire is within the configured idle window; otherwise it is idle.
 
-A spare's Boat auto-stop TTL is renewed while its company is active, so a warm
-spare does not silently go cold. Once idle, no renewal occurs; confirmed stop is
+A spare's Boat auto-stop TTL is renewed while its company is active (always with
+`spareIdleMinutes=0` and the pool ON), so a warm spare does not silently go cold.
+With a nonzero timeout, once idle, no renewal occurs; confirmed stop is
 attempted and Boat's existing TTL remains the crash/outage bound. A never-acquired
 environment, or one not yet reacquired after a worker restart, takes its first chat
 cold after ON. A never-used environment is first discovered at its first acquire.

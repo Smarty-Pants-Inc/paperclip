@@ -253,7 +253,7 @@ export function readySpareDemandTarget(spares: number, _claimsInWindow: number, 
 export function readySpareIdleMinutes(config: unknown): number {
   if (!config || typeof config !== "object" || Array.isArray(config)) return DEFAULT_READY_SPARE_IDLE_MINUTES;
   const minutes = (config as Record<string, unknown>).spareIdleMinutes;
-  return Number.isInteger(minutes) && Number(minutes) >= MIN_READY_SPARE_IDLE_MINUTES && Number(minutes) <= MAX_READY_SPARE_IDLE_MINUTES
+  return Number.isInteger(minutes) && (minutes === 0 || Number(minutes) >= MIN_READY_SPARE_IDLE_MINUTES && Number(minutes) <= MAX_READY_SPARE_IDLE_MINUTES)
     ? Number(minutes) : DEFAULT_READY_SPARE_IDLE_MINUTES;
 }
 

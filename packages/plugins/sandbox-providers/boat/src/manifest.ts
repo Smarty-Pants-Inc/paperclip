@@ -3,7 +3,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 const manifest: PaperclipPluginManifestV1 = {
   id: "paperclip.boat-sandbox-provider",
   apiVersion: 1,
-  version: "0.1.17-spare.12",
+  version: "0.1.17-spare.12n1",
   displayName: "Boat Sandbox Provider",
   description: "Provisions isolated Boat cloud sandboxes as Paperclip execution environments.",
   author: "Paperclip",
@@ -15,7 +15,7 @@ const manifest: PaperclipPluginManifestV1 = {
       spares: { type: "integer", minimum: 0, maximum: 3, default: 0, title: "Warm Boat spares", description: "Desired ready sandboxes and hard idle-pool bound per listed environment (0 disables and retires the spare pool). Each running small spare is about $0.43/day; default about $0.86/day (3 spares: $1.30/day or $2.59/day). Actual compute cost follows the environment's type. A never-acquired environment, or one not yet reacquired after a worker restart, takes its first chat cold after ON." },
       spareMax: { type: "integer", minimum: 1, maximum: 5, default: 3, title: "Maximum warm Boat spares", description: "Additional hard maximum per listed environment; the pool never exceeds spares, even after claims." },
       spareDemandWindowMinutes: { type: "integer", minimum: 5, maximum: 60, default: 10, title: "Spare demand window (minutes)", description: "Rolling window for acquisition history; claims do not expand the configured idle pool." },
-      spareIdleMinutes: { type: "integer", minimum: 15, maximum: 1440, default: 60, title: "Spare idle timeout (minutes)", description: "Stop company spares after this long with no agent or user activity." },
+      spareIdleMinutes: { type: "integer", minimum: 0, maximum: 1440, anyOf: [{ const: 0 }, { minimum: 15 }], default: 60, title: "Spare idle timeout (minutes)", description: "0 never idles: keep spares and renew their Boat TTL around the clock, even without activity. Otherwise stop company spares after 15–1440 minutes with no agent or user activity. With spares=1, this costs one running box per listed environment around the clock. Set spares=0 to stop the pool." },
       createCeilingPerHour: { type: "integer", minimum: 1, maximum: 1000, default: 90, title: "Boat create ceiling (per hour)", description: "Absolute limit on ALL Boat sandbox creates (spares and runs) per company per rolling hour; at the limit new creates are refused and health reports create_capped. The default 90 keeps fresh's measured 48-hour peak of 53 creates/hour below two thirds of the ceiling; gates override it per company (gate 2: 450, gate 4: 150)." },
       spareEnvironmentIds: { type: "array", maxItems: 10, uniqueItems: true, default: [], title: "Spare environments", description: "Environment IDs allowed to hold warm spares. Empty disables spare creation.", items: { type: "string", minLength: 1 } },
     },

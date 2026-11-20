@@ -462,7 +462,10 @@ function acquireOutcomeTotals(): { spare: number; cold: number } {
   }
   return { spare, cold };
 }
-function spareActivityIsRecent(activity: CompanySpareActivity, idleMinutes: number): boolean {
+export function spareActivityIsRecent(activity: CompanySpareActivity, idleMinutes: number): boolean {
+  // Explicit never-idle policy also covers unknown activity after a restart.
+  // OFF is enforced independently by the pool's configured count.
+  if (idleMinutes === 0) return true;
   const latest = Math.max(activity.lastActivityAt ?? Number.NEGATIVE_INFINITY,
     activity.lastLeaseAcquiredAt ?? Number.NEGATIVE_INFINITY);
   return Number.isFinite(latest) && Date.now() - latest <= idleMinutes * 60_000;

@@ -168,7 +168,7 @@ describe("Boat ready spare", () => {
         spares: { type: "integer", minimum: 0, maximum: 3, default: 0 },
         spareMax: { type: "integer", minimum: 1, maximum: 5, default: 3 },
         spareDemandWindowMinutes: { type: "integer", minimum: 5, maximum: 60, default: 10 },
-        spareIdleMinutes: { type: "integer", minimum: 15, maximum: 1440, default: 60 },
+        spareIdleMinutes: { type: "integer", minimum: 0, maximum: 1440, anyOf: [{ const: 0 }, { minimum: 15 }], default: 60 },
         spareEnvironmentIds: { type: "array", maxItems: 10, uniqueItems: true },
       },
     });
@@ -731,7 +731,7 @@ describe("Boat ready spare", () => {
     expect(eventTypes.every(type => eventHandlers.has(type))).toBe(true);
     expect(manifest.capabilities).toContain("events.subscribe");
     expect(manifest.instanceConfigSchema.properties).toMatchObject({
-      spareIdleMinutes: { type: "integer", minimum: 15, maximum: 1440, default: 60 },
+      spareIdleMinutes: { type: "integer", minimum: 0, maximum: 1440, anyOf: [{ const: 0 }, { minimum: 15 }], default: 60 },
       spareEnvironmentIds: { type: "array", maxItems: 10, uniqueItems: true, items: { type: "string", minLength: 1 } },
     });
     expect(f.calls.some(call => call.body?.labels?.purpose === "spare")).toBe(false);
