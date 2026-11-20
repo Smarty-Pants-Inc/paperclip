@@ -36,6 +36,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { heartbeatService } from "../heartbeat.js";
 import { createAgentLifecycle, configureAgentLifecycle } from "../agent-lifecycle.js";
 import { createLifecycleDriver } from "../agent-lifecycle-driver.js";
+import { AGENT_PAUSE_STOP_REASON } from "../governance-pause-stop.js";
 import { LIFECYCLE_ENVIRONMENT_WAIT_MESSAGE } from "../../modules/agent-lifecycle/application/retry.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
@@ -49,6 +50,7 @@ import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotic
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition, publishUnansweredNoteAnnouncement,
   type UnansweredNoteAnnouncement,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
+  UNANSWERED_MESSAGE_NO_RUN_CODE,
   UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY, UNANSWERED_MESSAGE_WAITING_TEXT as WAITING,
   PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS, PENDING_WAIT_START_BOUND_MS,
   UNANSWERED_MESSAGE_WORKING_TEXT, UNANSWERED_MESSAGE_WORKING_TITLE,
@@ -464,6 +466,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(codeOf(notices[0]!)).toBe("native_session_retry_exhausted");
   });
 
+  // SUPERSEDED by RFL 11:09Z (pausewake F1): under a board hold the card names the hold, never invites a resend
   it("SMAA-501: a person comment with no run bound in 180 s on a task held by native_continuation_requires_reconciliation -> exactly one notice", async () => {
     const f = await fixture({ status: "blocked" });
     const earlier = await f.run({ commentId: await f.message("first"), status: "failed", errorCode: "native_continuation_requires_reconciliation" });
@@ -476,7 +479,32 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(2);
-    expect(notices.map(notice => notice.body)).toContain(NO_RUN);
+    const held = notices.find(notice => codeOf(notice) === UNANSWERED_MESSAGE_NO_RUN_CODE)!;
+    expect(held.body).toBe("Not answered yet: this task is on hold (the previous execution needs reconciliation) until the board clears it. Your message is kept.");
+    expect(JSON.stringify(held)).not.toMatch(/\b(?:send|sending|resend|resending)\b/i);
+  });
+
+  // Keep: rf-10 F1 — a board hold still blocks resend after Pause/Resume.
+  it("pwf1 SMAA-501: a board-held task with a pause-cancelled unbound wake names the hold after resume", async () => {
+    const f = await fixture({ status: "blocked" });
+    const earlier = await f.run({ commentId: await f.message("first"), status: "failed",
+      errorCode: "native_continuation_requires_reconciliation" });
+    await f.boardHold("native_continuation_requires_reconciliation", earlier, "stranded_assigned_issue");
+    await f.reply(earlier); // Only the newer message is owed a notice.
+    await db.update(agents).set({ status: "idle", lifecycleState: "ready" }).where(eq(agents.id, f.agentId));
+    const commentId = await f.message("second, cancelled by Pause before a run", 200_000);
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "on_demand", reason: "issue_commented", status: "cancelled", runId: null,
+      error: AGENT_PAUSE_STOP_REASON, payload: { issueId: f.issueId, commentId },
+      createdAt: f.at(), updatedAt: f.at(), finishedAt: f.at() });
+    await f.sweep();
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect.soft(codeOf(notices[0]!)).toBe(UNANSWERED_MESSAGE_NO_RUN_CODE);
+    expect(codeOf(notices[0]!)).not.toBe("agent_pause_stopped");
+    expect.soft(notices[0]!.body).toBe("Not answered yet: this task is on hold (the previous execution needs reconciliation) until the board clears it. Your message is kept.");
+    expect(JSON.stringify(notices[0])).not.toMatch(/\b(?:send|sending|resend|resending)\b/i);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
   });
 
   it("SMAA-501 (RFL 20:37Z): a comment coalesced into a remote_cleanup execution wait whose wake FAILED -> exactly one notice, at the failure (no timer)", async () => {
