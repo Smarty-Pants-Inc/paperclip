@@ -3492,10 +3492,10 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     said.cleanupNeverEnds = hung.executionWait ?? null;
     process.stdout.write(`STOPWORDS2-SAID ${JSON.stringify(said)}\n`);
     expect(said).toEqual({
-      held: { reason: "held_by_own_stop_send", message: "Not sent, because you pressed Stop. Send them now, or delete any." },
+      held: { reason: "held_by_own_stop_send", message: "Not sent, because you pressed Stop. Send them now, or delete any of them." },
       afterDelete: { reason: "held_by_own_stop_send", message: "Not sent, because you pressed Stop. Send it now, or delete it." },
       afterSend: null,
-      cleanupNeverEnds: { reason: "held_by_own_stop", message: "Not sent, because you pressed Stop. Delete it, or send a new message: this one goes with it." },
+      cleanupNeverEnds: { reason: "held_by_own_stop", message: "Not sent, because you pressed Stop. It will go with your next message, or you can delete it." },
     });
   });
 });

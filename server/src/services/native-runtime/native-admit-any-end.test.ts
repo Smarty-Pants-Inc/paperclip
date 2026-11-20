@@ -90,8 +90,8 @@ const THE_LINE = "The file changes from this reply couldn't be saved.";
 // the hold's own (acknowledged-native-stop.ts readPersonStopHold: who pressed Stop, and when), never a stored wait's
 // text. The line names only what works in that hold: the row's Delete, and a new message (it carries the held ones).
 const OWN_STOP_REASON = "held_by_own_stop";
-const OWN_STOP_LINE = { one: "Not sent, because you pressed Stop. Delete it, or send a new message: this one goes with it.",
-  many: "Not sent, because you pressed Stop. Delete any, or send a new message: these go with it." };
+const OWN_STOP_LINE = { one: "Not sent, because you pressed Stop. It will go with your next message, or you can delete it.",
+  many: "Not sent, because you pressed Stop. They will go with your next message, or you can delete any of them." };
 const RECOVERY_WAIT = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const record = (value: unknown) => (value && typeof value === "object" ? value : {}) as Record<string, any>;
