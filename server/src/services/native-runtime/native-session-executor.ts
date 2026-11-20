@@ -133,6 +133,7 @@ import { RUNNERD_CONTROL_PLANE_STATE_SCHEMAS, runnerdStateIsIncompleteBootstrap,
 import { createNativeDeliverableTextObservation } from "./native-deliverable-text.js";
 import { reconcileControllerJournalWithRunner, refreshRetiredWarmOwnerProjection } from "./warm-controller-journal.js";
 import { createNativeGitHubAccess, type NativeGitHubAccess } from "./native-github-access.js";
+import { NativeGitHubSetupError, NATIVE_GITHUB_SETUP_FAILED, NATIVE_GITHUB_SETUP_FAILED_ACTION } from "./native-github-setup-failure.js";
 import { resolveGitHubOperationCredentials } from "../github-operation-credentials.js";
 import { syncManagedAiCredentials, type ManagedAiCredentialWritebackBinding } from "../managed-ai-credential-writeback.js";
 import { createNativeCredentialStore } from "./native-credential-store.js";
@@ -9979,6 +9980,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === "runner_task_admission_rejected" ||
     sourceFailureCode === "runner_ingress_access_rejected" ||
     sourceFailureCode === "native_provider_runtime_missing" ||
+    sourceFailureCode === NATIVE_GITHUB_SETUP_FAILED ||
     sourceFailureCode === "native_provider_model_rejected" ||
     sourceFailureCode === "native_provider_approval_required" ||
     sourceFailureCode === "native_event_replay_conflict" ||
@@ -10180,6 +10182,7 @@ export function nativeSessionFailureSourceCode(
   error: unknown,
 ):
   | typeof NATIVE_ADDRESSED_INTERACTION_FAILED
+  | typeof NATIVE_GITHUB_SETUP_FAILED
   | "pi_conversation_identity_missing"
   | "native_permission_declined"
   | "native_provider_terminal_failed"
@@ -10234,6 +10237,7 @@ export function nativeSessionFailureSourceCode(
   if (error instanceof Error && error.message === "pi_conversation_identity_missing") return "pi_conversation_identity_missing";
   if (findNativePredecessorRetirementUnproven(error)) return NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE;
   if (findNativeFailedBeforeProviderTurn(error)) return NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE;
+  if (error instanceof NativeGitHubSetupError) return NATIVE_GITHUB_SETUP_FAILED;
   if (error instanceof NativePermissionDeclinedError) return "native_permission_declined";
   if (error instanceof NativeGovernedWaitSettlementPendingError) return "native_governed_wait_settlement_pending";
   if (error instanceof NativeProviderStateIncompatibleError) return NATIVE_PROVIDER_STATE_INCOMPATIBLE;
@@ -10516,6 +10520,7 @@ export async function nativeProviderRecoveryEvidence(input: {
     NATIVE_PROVIDER_STARTUP_REJECTED,
     "provider_session_open_timeout",
     "local_runtime_api_listener_unavailable",
+    NATIVE_GITHUB_SETUP_FAILED,
   ]).has(input.sourceFailureCode) || (input.sourceFailureCode === "runner_ingress_startup_failed"
     && !checkpointExists && !providerEventsExist && !!run?.nativeIssueId && !!run.nativeSessionId && !!run.runnerInstanceId
     && await nativeRunnerNeverAuthenticated(input.db, { companyId: run.companyId, issueId: run.nativeIssueId, runId: run.id },
@@ -14823,6 +14828,8 @@ async function executePaperclipNativeSessionAttempt(
                   ? "Approval required. Review the operation and update the agent's permission setting before retrying. This runner has no interactive approval handler."
                   : sourceFailureCode === NATIVE_PROVIDER_SESSION_CLOSED
                   ? NATIVE_PROVIDER_SESSION_CLOSED_ACTION
+                  : sourceFailureCode === NATIVE_GITHUB_SETUP_FAILED
+                  ? NATIVE_GITHUB_SETUP_FAILED_ACTION
                   : sourceFailureCode === NATIVE_PROVIDER_STARTUP_REJECTED
                   ? startupRejectedAction
                   : sourceFailureCode === REMOTE_RUNNER_SUPERVISION_EXHAUSTED
@@ -15116,6 +15123,8 @@ async function executePaperclipNativeSessionAttempt(
               ? "Approval required. Review the operation and update the agent's permission setting before retrying. This runner has no interactive approval handler."
               : sourceFailureCode === NATIVE_PROVIDER_SESSION_CLOSED
               ? NATIVE_PROVIDER_SESSION_CLOSED_ACTION
+              : sourceFailureCode === NATIVE_GITHUB_SETUP_FAILED
+              ? NATIVE_GITHUB_SETUP_FAILED_ACTION
               : sourceFailureCode === NATIVE_PROVIDER_STARTUP_REJECTED
               ? startupRejectedAction
               : sourceFailureCode === REMOTE_RUNNER_SUPERVISION_EXHAUSTED

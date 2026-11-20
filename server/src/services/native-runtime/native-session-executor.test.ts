@@ -183,8 +183,7 @@ const githubAccess = vi.hoisted(() => ({
   stop: vi.fn(async () => undefined),
   create: vi.fn(),
 }));
-vi.mock("./native-github-access.js", async importOriginal => ({
-  ...await importOriginal<typeof import("./native-github-access.js")>(),
+vi.mock("./native-github-access.js", () => ({
   createNativeGitHubAccess: githubAccess.create,
 }));
 

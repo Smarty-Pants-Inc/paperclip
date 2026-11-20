@@ -1,4 +1,5 @@
 import { STORAGE_UNAVAILABLE_WAIT_RETRY_REASON } from "../storage/storage-unavailable.js";
+import { NATIVE_GITHUB_SETUP_FAILED, NATIVE_GITHUB_SETUP_FAILED_ACTION } from "./native-runtime/native-github-setup-failure.js";
 import { AGENT_DIRECTORY_WAIT_RETRY_REASON, INTERRUPTED_PREPARATION_RETRY_REASON } from "./execution-recovery-attempt.js";
 import { boundSetupCommandFailure, readSetupCommandFailure } from "./workspace-setup-command-failure.js";
 import { and, desc, eq, inArray, isNull, not, notInArray, or, sql, type SQL } from "drizzle-orm";
@@ -428,6 +429,9 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
     return { ...base, state: "failed", canRetry: false,
       retryWait: { reason: "cleanup_quarantined", message: NATIVE_CLEANUP_SETTLING_MESSAGE } };
   }
+  if (run.status === "failed" && run.errorCode === NATIVE_GITHUB_SETUP_FAILED)
+    return { ...base, state: "failed", canRetry: true, retryWait: { reason: NATIVE_GITHUB_SETUP_FAILED,
+      message: NATIVE_GITHUB_SETUP_FAILED_ACTION } };
   return { ...base, state: "failed", canRetry: true, ...(projectAccess ? { projectAccess } : {}) };
 }
 

@@ -5210,7 +5210,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       runtimeSpan: input.runtimeSpan,
       startPaused: input.startPaused,
       queueInitialized: server !== null,
-      strictActivation: input.startPaused === true,
+      requireActivationQuarantine: input.startPaused === true,
       // The worker encodes binary bodies only at the queue boundary.
       handleRequest: (request, options) => forwardBridgeRequest({ ...request, bridgeTransport: "queue_v1" }, options?.signal, {
         reservation: options?.reservation,
