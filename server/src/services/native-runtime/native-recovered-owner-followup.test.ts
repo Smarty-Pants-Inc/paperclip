@@ -1454,7 +1454,9 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     async box => {
       const { followUp } = await stoppedWithPendingSuspend(stopBeforeSuspend(), { lease: "retained-no-proof", box });
       const bound = warmSessionReleaseWait.timeoutMs;
-      warmSessionReleaseWait.timeoutMs = 300;
+      const fullBound = process.env.PAPERCLIP_STOP_WAIT_FULL_BOUND === "1";
+      warmSessionReleaseWait.timeoutMs = fullBound ? bound : 300;
+      const startedAt = Date.now();
       try {
         expect(await followUp.start("created")).toBe("native_controller_recovery_waiting_for_owner");
       } finally {
@@ -1463,6 +1465,13 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       expect(followUp.failures.at(-1)).toBeInstanceOf(NativeControllerRecoveryWaitingError);
       expect(followUp.logs.join("")).toContain(STOP_WAIT_LOG);
       expect(followUp.logs.join("")).not.toContain("journal_commands_unsettled");
+      if (fullBound) {
+        const elapsedMs = Date.now() - startedAt;
+        console.info("s6409 full-bound receipt", JSON.stringify({ box, boundMs: bound, elapsedMs,
+          result: "native_controller_recovery_waiting_for_owner", providerFixture: "controlled executor boundary; not real Pi" }));
+        expect(elapsedMs).toBeGreaterThanOrEqual(bound);
+        expect(elapsedMs).toBeLessThan(bound + 5_000);
+      }
       // The trio's 'runner gone' gate is untouched: the unproven owner is not retired.
       expect(await quarantined()).toEqual([]);
       expect(await archivedOwners(await sessionRoot())).toEqual([]);
