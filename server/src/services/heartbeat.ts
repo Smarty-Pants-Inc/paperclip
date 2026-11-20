@@ -16,7 +16,7 @@ import { registerDeferredReceiptWork } from "./heartbeat/deferred-receipt-work.j
 import { registerProviderLimitResumeWork, type PrepareChatRetry } from "./native-runtime/provider-limit-resume.js";
 import { reconcileTaskChatRetryReceipts } from "./task-retry.js";
 import { registerIssueRecoveryWork } from "./recovery/work.js";
-import { settleUnansweredPersonMessages, settleUnansweredPersonMessagesForTask } from "./recovery/unanswered-person-message.js";
+import { publishUnansweredNoteAnnouncement, settleUnansweredPersonMessages, settleUnansweredPersonMessagesForTask } from "./recovery/unanswered-person-message.js";
 import { registerRunDispatchWork } from "./heartbeat/dispatch-work.js";
 import { listUndispatchedQueuedRuns } from "./queued-run-dispatch-liveness.js";
 import { NATIVE_RETAINED_OWNER_WAIT } from "./native-runtime/native-controller-recovery.js";
@@ -1638,6 +1638,8 @@ export function heartbeatService(
             await applyWakeQueuePostCommitEffects(settled.postCommitEffects);
           }
         }
+      } else if (effect.kind === "unanswered_note_saved") {
+        publishUnansweredNoteAnnouncement(effect);
       } else if (effect.kind === "run_queued") {
         publishLiveEvent({
           companyId: effect.run.companyId,
