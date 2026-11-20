@@ -305,10 +305,21 @@ export function TaskChatRunnerTurn({
     if (item.kind !== "message" || item.channel !== "final" || !item.text.trim()) continue;
     if ((yielded || awaitingContinuation) && isYieldedWaitStub(item.text, waitSummaries)) continue;
     // Item ids are transcript positions; a rebuild that shifts entries re-keys
-    // the same answer (same time, same text). Keep it under its first key.
+    // the same answer (same time, same text) and can hand its old key to a
+    // different answer. Find the answer by its identity first and keep it under
+    // its first key; only then by id, and only while the id still holds the
+    // same answer (same time, or a longer/shorter copy of its text). A reused
+    // id never overwrites a different answer.
     const text = item.text.trim().replace(/\s+/g, " ");
-    const key = answersRef.current.byId.has(item.id) ? item.id : [...answersRef.current.byId].find(([, answer]) =>
-      item.atMs != null && answer.atMs === item.atMs && answer.text.trim().replace(/\s+/g, " ") === text)?.[0] ?? item.id;
+    const sameText = (answer: TaskChatMessageItem) => answer.text.trim().replace(/\s+/g, " ") === text;
+    const byIdentity = item.atMs == null ? undefined : [...answersRef.current.byId].find(([, answer]) =>
+      answer.atMs === item.atMs && sameText(answer))?.[0];
+    const atId = answersRef.current.byId.get(item.id);
+    const idHoldsThisAnswer = atId != null && (
+      (atId.atMs != null && item.atMs != null ? atId.atMs === item.atMs : sameText(atId)) ||
+      text.startsWith(atId.text.trim().replace(/\s+/g, " ")) ||
+      atId.text.trim().replace(/\s+/g, " ").startsWith(text));
+    const key = byIdentity ?? (!atId || idHoldsThisAnswer ? item.id : `${item.id}@${item.atMs ?? ""}:${text}`);
     const latched = answersRef.current.byId.get(key);
     if (!latched || item.text.length >= latched.text.length) answersRef.current.byId.set(key, item);
   }
