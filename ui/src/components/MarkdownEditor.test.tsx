@@ -23,10 +23,13 @@ import {
   shouldAcceptAutocompleteKey,
 } from "./MarkdownEditor";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
+import * as verbatimMarkdown from "../lib/verbatim-markdown";
 
 const mdxEditorMockState = vi.hoisted(() => ({
   linkValidator: null as ((url: string) => boolean) | null,
   pluginDefinitions: [] as unknown[],
+  toMarkdownOptions: undefined as unknown,
+  linkOptions: null as { disableAutoLink?: boolean } | null,
   emitMountEmptyReset: false,
   emitMountParseError: false,
   emitMountSilentEmptyState: false,
@@ -78,6 +81,7 @@ vi.mock("@mdxeditor/editor", async () => {
       onError,
       className,
       suppressHtmlProcessing,
+      toMarkdownOptions,
       plugins,
     }: {
       markdown: string;
@@ -85,6 +89,7 @@ vi.mock("@mdxeditor/editor", async () => {
       onChange?: (value: string, initialMarkdownNormalize?: boolean) => void;
       onError?: (error: unknown) => void;
       suppressHtmlProcessing?: boolean;
+      toMarkdownOptions?: unknown;
       plugins?: unknown[];
       className?: string;
     },
@@ -98,6 +103,7 @@ vi.mock("@mdxeditor/editor", async () => {
       throw new Error("Rich editor render crashed");
     }
     mdxEditorMockState.pluginDefinitions = plugins ?? [];
+    mdxEditorMockState.toMarkdownOptions = toMarkdownOptions;
     mdxEditorMockState.markdownValues.push(markdown);
     mdxEditorMockState.suppressHtmlProcessingValues.push(Boolean(suppressHtmlProcessing));
     const [content, setContent] = React.useState(markdown);
@@ -207,8 +213,9 @@ vi.mock("@mdxeditor/editor", async () => {
     headingsPlugin: () => ({}),
     imagePlugin: () => ({}),
     linkDialogPlugin: () => ({}),
-    linkPlugin: (options: { validateUrl: (url: string) => boolean }) => {
+    linkPlugin: (options: { validateUrl: (url: string) => boolean; disableAutoLink?: boolean }) => {
       mdxEditorMockState.linkValidator = options.validateUrl;
+      mdxEditorMockState.linkOptions = options;
       return {};
     },
     listsPlugin: () => ({}),
@@ -339,6 +346,8 @@ describe("MarkdownEditor", () => {
     vi.unstubAllGlobals();
     mdxEditorMockState.linkValidator = null;
     mdxEditorMockState.pluginDefinitions = [];
+    mdxEditorMockState.toMarkdownOptions = undefined;
+    mdxEditorMockState.linkOptions = null;
     mdxEditorMockState.emitMountEmptyReset = false;
     mdxEditorMockState.emitMountParseError = false;
     mdxEditorMockState.emitMountSilentEmptyState = false;
@@ -349,6 +358,29 @@ describe("MarkdownEditor", () => {
     mdxEditorMockState.markdownValues = [];
     mdxEditorMockState.insertedMarkdownValues = [];
     mdxEditorMockState.suppressHtmlProcessingValues = [];
+  });
+
+  it.each([false, true])("opts into verbatim serialization, no auto-linking, and typed fences only when requested (%s)", async (verbatimText) => {
+    const typedFence = vi.spyOn(verbatimMarkdown, "typedFencePlugin");
+    const root = createRoot(container);
+    try {
+      await act(async () => {
+        root.render(<MarkdownEditor value="hello" onChange={() => {}} {...(verbatimText ? { verbatimText: true } : {})} />);
+      });
+      expect(mdxEditorMockState.toMarkdownOptions).toBe(
+        verbatimText ? verbatimMarkdown.VERBATIM_TO_MARKDOWN_OPTIONS : undefined,
+      );
+      expect(mdxEditorMockState.linkOptions?.disableAutoLink).toBe(verbatimText);
+      if (verbatimText) {
+        expect(typedFence).toHaveBeenCalledOnce();
+        expect(mdxEditorMockState.pluginDefinitions).toContain(typedFence.mock.results[0].value);
+      } else {
+        expect(typedFence).not.toHaveBeenCalled();
+      }
+    } finally {
+      await act(async () => root.unmount());
+      typedFence.mockRestore();
+    }
   });
 
   it.each([false, true])("handles submission, newlines, and IME confirmation (raw fallback=%s)", async (fallback) => {
