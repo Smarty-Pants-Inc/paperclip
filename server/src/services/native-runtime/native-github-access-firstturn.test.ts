@@ -30,6 +30,7 @@ async function fixture(options: { fail?: (script: string) => boolean; fault?: (s
   const hungWrites: (() => void)[] = [];
   let broker: Awaited<ReturnType<typeof createNativeGitHubAccess>> | undefined;
   const resolveCredentials = vi.fn(async () => ({ status: "available", env: {} }));
+  const logs: string[] = [];
   const execute: CommandManagedRuntimeRunner["execute"] = async input => {
     const script = [...(input.args ?? []), input.stdin ?? ""].join("\n");
     const call = { script, phase, depth: completedDepth + 1, settled: false };
@@ -61,7 +62,8 @@ async function fixture(options: { fail?: (script: string) => boolean; fault?: (s
   const target = { kind: "remote" as const, transport: "sandbox" as const, providerKey: "counting-local", remoteCwd: root, runner: { execute }, streamRunLogs: false };
   const create = async () => {
     broker = await createNativeGitHubAccess({ scope, target, cwd: root,
-      env: { PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin` }, resolveCredentials }, async input => {
+      env: { PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin` }, resolveCredentials,
+      onLog: async (_stream, chunk) => { logs.push(chunk); } }, async input => {
       // Inject only the remote executable search path, never a replacement bridge.
       const original = target.runner.execute;
       target.runner.execute = args => original({ ...args, env: { ...args.env, PATH: `${bin}:${process.env.PATH}` } });
@@ -83,7 +85,7 @@ async function fixture(options: { fail?: (script: string) => boolean; fault?: (s
     cleanups.push(broker.stop);
     return broker;
   };
-  return { root, calls, create, resolveCredentials, generations, runner: { execute },
+  return { root, calls, create, resolveCredentials, generations, logs, runner: { execute },
     get queue() { return queue; }, get transportError() { return transportError; },
     get serialDepth() { return completedDepth; },
     setPhase(value: string) { phase = value; },
@@ -136,9 +138,8 @@ it("cold real GitHub create + activate uses at most six remote execs and publish
   await deactivate();
   const pauseWrites = f.calls.filter(call => call.phase === "cleanup" &&
     call.script.includes("run-state.json") && !call.script.includes("ever-attached"));
-  expect(pauseWrites).toHaveLength(3);
-  expect(pauseWrites.filter(call => /(?:^|\n)printf '%s'/.test(call.script))).toHaveLength(1);
-  expect(pauseWrites.filter(call => /(?:^|\n)base64 -d </.test(call.script))).toHaveLength(1);
+  expect(pauseWrites).toHaveLength(1);
+  expect(pauseWrites[0]!.script).toContain("mv ");
   expect(depth).toBeLessThanOrEqual(5);
   expect(count).toBeLessThanOrEqual(6);
 }, 30_000);
@@ -412,6 +413,99 @@ it("a partial inline decode failure preserves the prior published file and clean
   expect(f.calls).toHaveLength(1);
   expect((await readdir(f.root)).filter(name => name.includes("paperclip-upload"))).toEqual([]);
 }, 30_000);
+
+// Keep reason: unit 4c run-end budget and never-OK authority fence. These rows
+// drive the production activate/release closure used by the executor's finally.
+it("real run-end deactivates authority before publishing paused within two serial round-trips", async () => {
+  const f = await fixture();
+  const broker = await f.create();
+  const deactivate = await broker.activate({ ...scope, runId: "finished-run" });
+  expect((await f.hostRequest()).status).toBe(200);
+  const depth = f.serialDepth;
+  const count = f.calls.length;
+  f.setPhase("deactivate");
+  let observedBeforePaused = false;
+  let releaseWrite!: () => void;
+  let observeWrite!: () => void;
+  const writeGate = new Promise<void>(resolve => { releaseWrite = resolve; });
+  const writeStarted = new Promise<void>(resolve => { observeWrite = resolve; });
+  f.beforeExec(async script => {
+    if (!isAttachment(script, "run-state")) return;
+    expect(await readFile(path.join(f.queue, "run-state.json"), "utf8")).toMatch(/^attached:/);
+    expect((await f.hostRequest()).status).toBe(403);
+    observedBeforePaused = true;
+    observeWrite();
+    await writeGate;
+  });
+  let finished = false;
+  const finish = deactivate().then(() => { finished = true; });
+  await writeStarted;
+  expect(finished).toBe(false);
+  expect((await f.hostRequest()).status).toBe(403);
+  releaseWrite();
+  await finish;
+  f.beforeExec(async () => undefined);
+  expect(observedBeforePaused).toBe(true);
+  expect(await readFile(path.join(f.queue, "run-state.json"), "utf8")).toBe("paused");
+  expect((await f.hostRequest()).status).toBe(403);
+  expect((await f.sandboxRequest()).status).toBe(503);
+  expect(f.resolveCredentials).toHaveBeenCalledOnce();
+  const result = { execs: f.calls.length - count, serialDepth: f.serialDepth - depth,
+    scripts: f.calls.slice(count).map(call => ({ phase: call.phase, depth: call.depth, script: call.script })) };
+  console.log("RUNEND_COUNTS", JSON.stringify(result));
+  // This is the executor's awaited release boundary: it cannot report the turn
+  // finished before this resolves. A retained warm session needs no stop.
+  expect(result.serialDepth).toBeLessThanOrEqual(2);
+  expect(result.execs).toBeLessThanOrEqual(2);
+}, 30_000);
+
+it.each(["timeout", "hang"] as const)("run-end %s pause write is best effort and authority remains off", async fault => {
+  let armed = false;
+  let attempts = 0;
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const f = await fixture({ fault: script => armed && isAttachment(script, "run-state") && ++attempts === 1 ? fault : undefined });
+  const broker = await f.create();
+  const deactivate = await broker.activate({ ...scope, runId: "finished-run" });
+  armed = true;
+  const start = Date.now();
+  try {
+    await expect(deactivate()).resolves.toBeUndefined();
+    expect(Date.now() - start).toBeLessThan(6_500);
+    expect(attempts).toBe(1);
+    expect((await f.hostRequest()).status).toBe(403);
+    expect(f.resolveCredentials).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledOnce();
+    expect(String(warn.mock.calls[0])).not.toContain("private-provider-value");
+  } finally {
+    armed = false;
+    f.releaseHangs();
+    warn.mockRestore();
+  }
+}, 40_000);
+
+it.each(["timeout", "hang"] as const)("run-end %s stop-state write is bounded and authority remains off", async fault => {
+  let armed = false;
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const f = await fixture({ fault: script => armed && isAttachment(script, "run-state") ? fault : undefined });
+  const broker = await f.create();
+  const deactivate = await broker.activate({ ...scope, runId: "finished-run" });
+  await deactivate();
+  armed = true;
+  const start = Date.now();
+  try {
+    await expect(broker.stop()).resolves.toBeUndefined();
+    expect(Date.now() - start).toBeLessThan(6_500);
+    expect(broker.ready).toBe(false);
+    await expect(f.hostRequest()).rejects.toThrow();
+    expect(f.resolveCredentials).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledOnce();
+    expect(String(warn.mock.calls[0])).not.toContain("private-provider-value");
+  } finally {
+    armed = false;
+    f.releaseHangs();
+    warn.mockRestore();
+  }
+}, 40_000);
 
 it("does not replay an uncertain timed-out inline state write or continue after a late provider response", async () => {
   vi.useFakeTimers();
