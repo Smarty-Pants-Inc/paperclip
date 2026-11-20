@@ -1,4 +1,6 @@
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { UNANSWERED_MESSAGE_LOOKBACK_MS } from "../recovery/unanswered-person-message.js";
+import { personMessageOwedSql } from "../person-message-answer.js";
 import { readPersonStopHold } from "../acknowledged-native-stop.js";
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
@@ -5234,11 +5236,19 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // External input owns an exact authorized source batch. Board input
           // must retain its separate receipt, including during normal resume.
           const canCoalesceComments = !durableRequest && !isConversation(issue) && opts.allowRunCoalescing !== false;
+          // A newly typed person message can beat the previous turn's release
+          // drain. Carry its waiting plain person input before this message,
+          // under this same issue lock; a Stop's held queue remains explicit Send.
+          const carryWaitingPersonComments = source === "on_demand" && opts.requestedByActorType === "user" &&
+            Boolean(wakeCommentId) && reason === "issue_commented" && !durableRequest && !executionWaitRequestId &&
+            !payload?.chatCompletionDeliveryIds && !enrichedContextSnapshot.chatCompletionDeliveryIds &&
+            enrichedContextSnapshot.forceFreshSession !== true && !explicitResumeSession &&
+            !enrichedContextSnapshot.interactionId && !payload?.interactionId;
           // A resumed receipt already passed admission under this issue lock.
           // Consume it with its successor even when chat keeps other messages
           // in separate turns, or finalization will deliver it a second time.
           const pendingComments =
-            (executionWaitRequestId || canCoalesceComments || automaticCarriedCommentIds) &&
+            (executionWaitRequestId || canCoalesceComments || carryWaitingPersonComments || automaticCarriedCommentIds) &&
             (ownsReconstructionContinuation || !(await getExecutionBlocker(tx as unknown as Db, issue.companyId, issue.id)))
               ? await tx
                   .select()
@@ -5251,12 +5261,24 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                       sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
                       // Chat Retry already pins its complete authorized source
                       // batch. Keep separate board input for its own admission.
-                      canCoalesceComments || automaticCarriedCommentIds || (opts.taskRetryRequestId && !failedChatRetry)
+                      canCoalesceComments || carryWaitingPersonComments || automaticCarriedCommentIds || (opts.taskRetryRequestId && !failedChatRetry)
                         ? undefined : eq(agentWakeupRequests.id, executionWaitRequestId!),
                     ),
                   )
                   .orderBy(asc(agentWakeupRequests.requestedAt))
               : [];
+          // Eligibility belongs to the message, not the wake's coalesce clock:
+          // a fresh receipt can contain both recent and >24h-old input.
+          const waitingIds = carryWaitingPersonComments
+            ? [...new Set(pendingComments.flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)))].filter(isUuidLike)
+            : [];
+          const eligibleWaitingIds = new Set(waitingIds.length ? (await tx.select({ id: issueComments.id })
+            .from(issueComments).where(and(eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+              inArray(issueComments.id, waitingIds), eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
+              sql`${issueComments.createdAt} > ${new Date(Date.now() - UNANSWERED_MESSAGE_LOOKBACK_MS).toISOString()}::timestamptz`,
+              personMessageOwedSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+                issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }))))
+            .map(row => row.id) : []);
           const adoptedComments = pendingComments.filter((wake) => {
             if (wake.id === executionWaitRequestId) return true;
             if (wake.id === opts.queuedCommentInterruptId || wake.id === opts.queuedCommentRequestId) return true;
@@ -5264,6 +5286,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             const deferredContext = parseObject(
               deferredPayload[DEFERRED_WAKE_CONTEXT_KEY],
             );
+            if (carryWaitingPersonComments && (wake.source !== "on_demand" || wake.requestedByActorType !== "user" ||
+                deferredPayload.personStopHold || parseObject(deferredPayload.executionWait).recoveryActionId ||
+                deferredContext.forceFreshSession === true || deferredPayload.chatCompletionDeliveryIds ||
+                deferredContext.chatCompletionDeliveryIds ||
+                !queuedCommentIdsFromWakePayload(wake.payload).some(id => eligibleWaitingIds.has(id)))) return false;
             if (automaticCarriedCommentIds && !queuedCommentIdsFromWakePayload(wake.payload)
               .some(id => automaticCarriedCommentIds!.has(id))) return false;
             // Dedicated interaction wakes carry their own source and session
@@ -5281,7 +5308,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           let adoptedCommentIds = [
             ...new Set([
               ...adoptedComments.flatMap((wake) =>
-                queuedCommentIdsFromWakePayload(wake.payload).filter(id => !automaticCarriedCommentIds || automaticCarriedCommentIds.has(id)),
+                queuedCommentIdsFromWakePayload(wake.payload).filter(id =>
+                  (!automaticCarriedCommentIds || automaticCarriedCommentIds.has(id)) &&
+                  (!carryWaitingPersonComments || eligibleWaitingIds.has(id))),
               ),
               ...queuedCommentIdsFromRunContext(enrichedContextSnapshot),
             ]),
@@ -5363,7 +5392,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             // on their existing receipt, preserving Queue and /new ordering.
             for (const wake of adoptedComments) {
               const remaining = automaticCarriedCommentIds
-                ? queuedCommentIdsFromWakePayload(wake.payload).filter(id => !automaticCarriedCommentIds.has(id)) : [];
+                ? queuedCommentIdsFromWakePayload(wake.payload).filter(id => !automaticCarriedCommentIds.has(id))
+                : carryWaitingPersonComments
+                  ? queuedCommentIdsFromWakePayload(wake.payload).filter(id => !eligibleWaitingIds.has(id)) : [];
               await tx.update(agentWakeupRequests).set(remaining.length
                 ? { payload: withQueuedCommentIdsInWakePayload(wake.payload, remaining), updatedAt: new Date() }
                 : { status: "coalesced", runId: newRun.id, finishedAt: new Date(), updatedAt: new Date() })

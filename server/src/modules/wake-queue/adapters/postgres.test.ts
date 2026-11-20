@@ -1889,6 +1889,46 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     return { c, old, w, r };
   }
 
+  it.each([false, true])("MERGE carried control preBoot=%s: a later run already carrying the older message gets no second turn", async preBoot => {
+    const c = await seed();
+    const older = await message(c, "An older daily request already carried", ago(3000));
+    const w = await wake(c, older.id, ago(2900));
+    const newer = await message(c, "A newer daily request", ago(2000));
+    const r = await run(c, [older.id, newer.id], ago(1500));
+    await reply(c, r.id, "Both daily requests answered together");
+    if (preBoot) vi.spyOn(serverInfo, "getServerProcessStartedAt").mockReturnValue(new Date().toISOString());
+    await drain(c, r.id);
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id));
+    expect(receipt.status).not.toBe("deferred_issue_execution");
+    expect(receipt.runId).toBeNull();
+    expect(await noRunFor(older.id)).toEqual([{ id: r.id }]);
+    expect(await cards(c, older.id)).toEqual([]);
+    console.log("MERGE carried control evidence", { runId: r.id, wakeId: w.id, status: receipt.status, error: receipt.error });
+  });
+
+  it.each([false, true])("MERGE release preBoot=%s: a later answered person turn cannot discard three still-waiting person messages", async preBoot => {
+    const c = await seed();
+    const held = [];
+    for (let i = 0; i < 3; i++) held.push(await message(c, `Waiting daily question ${i}`, ago(3000 - i * 20)));
+    const w = await wake(c, held[0].id, ago(2900));
+    await db.update(agentWakeupRequests).set({ payload: withQueuedCommentIdsInWakePayload(w.payload, held.map(m => m.id)) })
+      .where(eq(agentWakeupRequests.id, w.id));
+    const newer = await message(c, "A later daily question", ago(2000));
+    const r = await run(c, [newer.id], ago(1500));
+    await reply(c, r.id);
+    if (preBoot) vi.spyOn(serverInfo, "getServerProcessStartedAt").mockReturnValue(new Date().toISOString());
+    const released = await drain(c, r.id);
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id));
+    console.log("MERGE release evidence", { released: released.outcome, wake: receipt });
+    expect(receipt.error).not.toBe("The conversation moved on");
+    expect(receipt.runId).toBeTruthy();
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, receipt.runId!));
+    expect(successor.contextSnapshot?.wakeCommentIds).toEqual(held.map(m => m.id));
+    expect((await Promise.all(held.map(m => cards(c, m.id)))).flat()).toEqual([]);
+    await drain(c, r.id);
+    for (const m of held) expect(await noRunFor(m.id)).toHaveLength(1);
+  });
+
   // final4 phone regression: the cancellation, not a periodic sweep, owes each named card.
   it.each([3, 23])("mc-1: moved-on release immediately cards all %i never-carried messages, then sweeps add zero", async count => {
     const c = await seed();
