@@ -955,7 +955,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   // A board-owned hold means nothing moves by itself: queued wakes behind it
   // do not count as a further attempt.
   const [activeRecovery] = await q.select({ id: issueRecoveryActions.id, nextAction: issueRecoveryActions.nextAction,
-    ownerType: issueRecoveryActions.ownerType, wakePolicy: issueRecoveryActions.wakePolicy }).from(issueRecoveryActions).where(and(
+    cause: issueRecoveryActions.cause, ownerType: issueRecoveryActions.ownerType, wakePolicy: issueRecoveryActions.wakePolicy }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
     inArray(issueRecoveryActions.status, ["active", "escalated"])))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
@@ -1028,7 +1028,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     // (heartbeat/run-control.ts cancelPendingWakeupsForAgentsInternal). Resume
     // does not replay them. Do not apply this while setup, a hold or live work
     // takes precedence above, or to a stopped/terminating agent.
-    code = agentRow?.lifecycleState === "ready" && latestWake?.status === "cancelled" && latestWake.runId === null
+    code = !boardHold && agentRow?.lifecycleState === "ready" && latestWake?.status === "cancelled" && latestWake.runId === null
       && latestWake.error === AGENT_PAUSE_STOP_REASON ? PAUSE_STOPPED_CODE : UNANSWERED_MESSAGE_NO_RUN_CODE;
   } else {
     if (!TERMINAL.includes(run.status)) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
@@ -1161,11 +1161,18 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
       inArray(agentWakeupRequests.status, ["deferred", "deferred_issue_execution", "cancelled"]),
       deferredWakeIsStaleSql({ companyId: sql`${agentWakeupRequests.companyId}`, agentId: sql`${agentWakeupRequests.agentId}`,
         issueId: sql`${issue.id}::uuid`, requestedAt: sql`${agentWakeupRequests.requestedAt}`, payload: sql`${agentWakeupRequests.payload}` }))) : [];
+  // A board-held unbound message keeps the no-run code and recovery link, but
+  // neither Pause nor generic no-run copy may invite input the hold will block.
+  // Do not echo nextAction: historical holds can themselves invite a resend.
+  const boardHeldNoRun = Boolean(boardHold && code === UNANSWERED_MESSAGE_NO_RUN_CODE);
+  const holdReason = boardHold?.cause === "native_continuation_requires_reconciliation"
+    ? "the previous execution needs reconciliation" : "recovery needs board review";
   const namedNoRun = staleReceipts.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id))
     ? `Your message is saved: "${message.body}". It was not answered because no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.`
     : UNANSWERED_MESSAGE_NO_RUN_TEXT;
   const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
     : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+    : boardHeldNoRun ? `Not answered yet: this task is on hold (${holdReason}) until the board clears it. Your message is kept.`
     : pauseStopped ? `${pausedName} was paused before it answered your message. Send it again to continue.`
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
@@ -1175,13 +1182,14 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
       title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start"
-        : pauseStopped ? `${pausedName} was paused before it answered` : "Your message wasn't answered",
+        : boardHeldNoRun ? "Your message is on hold" : pauseStopped ? `${pausedName} was paused before it answered` : "Your message wasn't answered",
       body,
       tone: paused ? "warning" : waiting ? "info" : "warning",
       nextAction: policyRefused ? "Automatic retry is disabled for this request."
         : settingUp ? "No action is needed; your message is saved."
         : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : waiting ? "No action is needed; it will start by itself."
+        : boardHeldNoRun ? "Ask the board to review and clear this task's recovery hold. Your message is kept."
         : pauseStopped ? "Send it again to continue."
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : held || boundReached ? "Send a new message to try again."
