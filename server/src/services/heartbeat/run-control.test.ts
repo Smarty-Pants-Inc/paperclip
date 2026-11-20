@@ -903,7 +903,7 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
     expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0].status).toBe("in_progress");
   }, 15_000);
 
-  it("keeps a warm sandbox running when a board cancel leaves prepared native files", async () => {
+  it.each([false, true])("keeps the normal warm handoff, but uses stop-and-retain after missed Stop ack (timed out: %s)", async (cleanupTimedOut) => {
     const { company, agent } = await fixture();
     const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Cancel keeps warm",
       status: "in_progress", assigneeAgentId: agent.id }).returning();
@@ -914,7 +914,8 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
       runnerProfileJson: { nativeWorkspaceSync: { schema: "paperclip.native-workspace-sync/v3", state: "prepared",
         descriptorSha256: "a".repeat(64), baselineSha256: "b".repeat(64), finalHostSha256: null,
         workspaceId: randomUUID(), leaseId, providerLeaseId, remoteCwd: "/work", resourceDisposition: "keep_running" } },
-      resultJson: { cancelledByActorType: "user", cancelledByUserId: "operator" },
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "operator",
+        nativeCancellation: { cleanupTimedOut } },
     });
     await db.insert(environmentLeases).values({ id: leaseId, companyId: company.id, heartbeatRunId: runId,
       issueId: issue.id, provider: "daytona", providerLeaseId, status: "active", leasePolicy: "reuse_by_environment",
@@ -923,10 +924,10 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
     await control.releaseEnvironmentLeasesForRun({ runId, companyId: company.id, agentId: agent.id,
       status: "cancelled", providerResourceDisposition: "keep_running" });
     expect(deps.envOrchestrator.releaseForRun).toHaveBeenCalledWith(expect.objectContaining({
-      heartbeatRunId: runId, providerResourceDisposition: "keep_running",
+      heartbeatRunId: runId, providerResourceDisposition: cleanupTimedOut ? "stop_and_retain" : "keep_running",
     }));
     expect(deps.envOrchestrator.releaseForRun).not.toHaveBeenCalledWith(expect.objectContaining({
-      providerResourceDisposition: "stop_and_retain",
+      providerResourceDisposition: cleanupTimedOut ? "keep_running" : "stop_and_retain",
     }));
   }, 15_000);
 
