@@ -6,6 +6,7 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   activityLog,
+  authUsers,
   agentWakeupRequests,
   agents,
   approvals,
@@ -34,6 +35,8 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
+import { closeProcessRunAdmission, resetProcessRunAdmissionForTests } from "../services/heartbeat/run-admission.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -676,6 +679,135 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
         reason: "mission_advance",
       }),
     ).rejects.toThrow("Issue is blocked by unresolved blockers");
+  });
+
+  describe("comment-backed plugin chat wakes", () => {
+    // Stop only dispatch: exercise the real plugin service, waiting guard,
+    // transactional admission and coalescing against PostgreSQL, without a model.
+    beforeEach(() => { closeProcessRunAdmission(); });
+    afterEach(() => { resetProcessRunAdmissionForTests(); });
+
+    async function chat(state: "waiting" | "active" = "waiting") {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const userId = `bridge-owner-${randomUUID()}`;
+      await db.insert(authUsers).values({ id: userId, name: "Chat owner", email: `${userId}@example.test`,
+        createdAt: new Date(), updatedAt: new Date() });
+      await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId,
+        status: "active", membershipRole: "member" });
+      await db.update(companies).set({ defaultResponsibleUserId: userId }).where(eq(companies.id, companyId));
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+      const [issue] = await db.insert(issues).values({ companyId, title: "Paul's resting chat",
+        status: state === "waiting" ? "in_review" : "in_progress", conversationState: state,
+        conversationAgentId: agentId, conversationUserId: userId, assigneeAgentId: agentId,
+        responsibleUserId: userId }).returning();
+      const pluginId = randomUUID();
+      const services = buildHostServices(db, pluginId, "paperclip-plugin-fleet-bridge", createEventBusStub());
+      const post = (issueId = issue.id) => services.issues.createComment({ companyId, issueId, body: "[from fleet] The answer." });
+      const wake = (commentId?: string) => services.issues.requestWakeup({ companyId, issueId: issue.id,
+        reason: "fleet_reply", contextSource: "paperclip-plugin-fleet-bridge",
+        ...(commentId ? { commentId, idempotencyKey: `fleet-reply:${commentId}` } : {}) });
+      return { companyId, agentId, pluginId, issue, services, post, wake };
+    }
+
+    it("queues ONE run for a bridge reply on a waiting chat with the reply in context", async () => {
+      const f = await chat();
+      const comment = await f.post();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+      const result = await f.wake(comment.id);
+      expect(result).toMatchObject({ queued: true, runId: expect.any(String) });
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({ id: result.runId, status: "queued", contextSnapshot: {
+        issueId: f.issue.id, wakeCommentId: comment.id, wakeCommentIds: [comment.id],
+      } });
+    });
+
+    it("keeps a non-waiting chat's cause-free plugin wake unchanged", async () => {
+      const f = await chat("active");
+      expect(await f.wake()).toMatchObject({ queued: true, runId: expect.any(String) });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(1);
+    });
+
+    it("refuses a cause-free waiting chat wake with its reason", async () => {
+      const f = await chat();
+      expect(await f.wake()).toMatchObject({ queued: false, runId: null,
+        reason: "wake_not_queued: waiting_conversation_requires_comment" });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+    });
+
+    it.each(["another issue", "another plugin", "agent", "deleted", "missing", "malformed", "forged activity"])("refuses a comment from %s", async kind => {
+      const f = await chat();
+      let commentId: string = kind === "malformed" ? "not-a-comment-id" : randomUUID();
+      if (kind === "another issue") {
+        const [other] = await db.insert(issues).values({ companyId: f.companyId, title: "Other", status: "todo" }).returning();
+        commentId = (await f.post(other.id)).id;
+      } else if (kind === "another plugin") {
+        commentId = (await buildHostServices(db, randomUUID(), "other-plugin", createEventBusStub()).issues.createComment({
+          companyId: f.companyId, issueId: f.issue.id, body: "Other plugin" })).id;
+      } else if (kind === "agent") {
+        const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issue.id,
+          authorAgentId: f.agentId, authorType: "agent", body: "Not the bridge" }).returning();
+        commentId = comment.id;
+      } else if (kind === "deleted") {
+        commentId = (await f.post()).id;
+        await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, commentId));
+      } else if (kind === "forged activity") {
+        const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issue.id,
+          authorType: "system", body: "Not posted by this plugin" }).returning();
+        commentId = comment.id;
+        await f.services.activity.log({ companyId: f.companyId, message: "issue.comment.created",
+          entityType: "issue", entityId: f.issue.id, metadata: { commentId } });
+      }
+      expect(await f.wake(commentId)).toMatchObject({ queued: false, runId: null,
+        reason: "wake_not_queued: invalid_comment_cause" });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+    });
+
+    it("does not coalesce a bridge reply into another actor's queued turn", async () => {
+      const f = await chat();
+      const first = await f.post(), second = await f.post();
+      const a = await f.wake(first.id);
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issue.id, wakeCommentId: first.id,
+        wakeCommentIds: [first.id] } }).where(eq(heartbeatRuns.id, a.runId!));
+      expect(await f.wake(second.id)).toMatchObject({ queued: false, runId: null,
+        reason: "wake_not_queued: deferred_issue_execution" });
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+      expect(runs).toHaveLength(1);
+      expect(runs[0].contextSnapshot?.wakeCommentIds).toEqual([first.id]);
+    });
+
+    it("does not coalesce a bridge reply into a running turn", async () => {
+      const f = await chat();
+      const first = await f.post(), second = await f.post();
+      const a = await f.wake(first.id);
+      await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, a.runId!));
+      try {
+        expect(await f.wake(second.id)).toMatchObject({ queued: false, runId: null,
+          reason: "wake_not_queued: deferred_issue_execution" });
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+        expect(runs).toHaveLength(1);
+        expect(runs[0].contextSnapshot?.wakeCommentIds).toEqual([first.id]);
+        expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId)))
+          .toEqual(expect.arrayContaining([expect.objectContaining({ status: "deferred_issue_execution",
+            payload: expect.objectContaining({ commentId: second.id }) })]));
+      } finally {
+        await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, a.runId!));
+      }
+    });
+
+    it("coalesces two bridge replies into one queued run and preserves both comments", async () => {
+      const f = await chat();
+      const first = await f.post(), second = await f.post();
+      const a = await f.wake(first.id), b = await f.wake(second.id);
+      expect(a).toMatchObject({ queued: true, runId: expect.any(String) });
+      expect(b).toMatchObject({ queued: true, runId: a.runId });
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+      expect(runs).toHaveLength(1);
+      expect(runs[0].contextSnapshot?.wakeCommentIds).toEqual([first.id, second.id]);
+      const replay = await f.wake(first.id);
+      expect(replay.runId).toBe(a.runId);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(1);
+    });
   });
 
   it("narrows orchestration cost summaries by subtree and billing code", async () => {

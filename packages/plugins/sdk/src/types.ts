@@ -1311,6 +1311,8 @@ export interface PluginIssueCheckoutOwnership {
 export interface PluginIssueWakeupResult {
   queued: boolean;
   runId: string | null;
+  /** Present when no run was queued: `wake_not_queued: <reason>`. */
+  reason?: string;
 }
 
 export interface PluginIssueWakeupBatchResult {
@@ -1554,6 +1556,8 @@ export interface PluginIssuesClient {
       reason?: string;
       contextSource?: string;
       idempotencyKey?: string | null;
+      /** A non-deleted comment posted by this plugin on this issue. */
+      commentId?: string;
     } & PluginIssueMutationActor,
   ): Promise<PluginIssueWakeupResult>;
   requestWakeups(

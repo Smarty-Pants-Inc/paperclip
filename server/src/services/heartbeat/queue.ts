@@ -2689,6 +2689,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string, savedInteractionOrigin?: unknown,
     admission?: { saved(): void }) {
+    const notQueued = (reason: string) => { opts.onNotQueued?.(reason); return null; };
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = {
@@ -2747,7 +2748,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     );
     let issueId =
       readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
-    if (executionReconciliationWake && !issueId) return null;
+    if (executionReconciliationWake && !issueId) return notQueued("execution_reconciliation_missing_issue");
     const durableRequest = opts.durableChatRequest;
     // ONE successor (adopt-one-successor) dispatch re-filter: a person's comment wake never carries
     // a message the ONE answered function says is answered, or that an Interrupt carry, another
@@ -2817,15 +2818,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     if (issueId && await hasAutomaticInteractionDeliveryHold(db, {
       companyId: agent.companyId, issueId, agentId, payload, context: enrichedContextSnapshot,
       actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
-    })) return null;
+    })) return notQueued("interaction_delivery_held");
     if (issueId) {
       const [pending] = await db.select().from(caseHandoffs).where(and(eq(caseHandoffs.companyId, agent.companyId), eq(caseHandoffs.issueId, issueId),
         inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch"]))).limit(1);
-      if (pending && opts.durableCaseHandoffRequest?.handoffId !== pending.id) return null;
+      if (pending && opts.durableCaseHandoffRequest?.handoffId !== pending.id) return notQueued("case_handoff_pending");
     }
     // Mentions only annotate comments. Ignore legacy callers before creating
     // a run or deferred request; assignment and review have their own wakes.
-    if (reason === "issue_comment_mentioned" || enrichedContextSnapshot.wakeReason === "issue_comment_mentioned") return null;
+    if (reason === "issue_comment_mentioned" || enrichedContextSnapshot.wakeReason === "issue_comment_mentioned") return notQueued("comment_mention_only");
     if (issueId) {
       const conversation = await getIssueExecutionContext(agent.companyId, issueId);
       if (taskRetryActorId && conversation) await assertTaskRetryConversationAllowed(db, conversation, taskRetryActorId);
@@ -2834,10 +2835,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         if (opts.manualUserWake && conversation!.conversationUserId !== opts.requestedByActorId) {
           throw new HttpError(403, "Only the conversation owner can start a chat run");
         }
-        if (isConversationExecutionWake(conversation, reason ?? readNonEmptyString(enrichedContextSnapshot.wakeReason))) return null;
-        if (agent.id !== conversation!.conversationAgentId) return null;
-        if (!(await instanceSettings.getExperimental()).enableAgentChat) return null;
-        if (isWaitingConversation(conversation) && !hasIndependentConversationWakeCause()) return null;
+        if (isConversationExecutionWake(conversation, reason ?? readNonEmptyString(enrichedContextSnapshot.wakeReason))) return notQueued("conversation_execution_wake");
+        if (agent.id !== conversation!.conversationAgentId) return notQueued("conversation_agent_mismatch");
+        if (!(await instanceSettings.getExperimental()).enableAgentChat) return notQueued("agent_chat_disabled");
+        // The plugin host validates its posted comment before passing the same
+        // comment cause as an ordinary comment wake. Cause-free plugin signals
+        // still cannot restart a waiting conversation.
+        if (isWaitingConversation(conversation) && !hasIndependentConversationWakeCause()) return notQueued("waiting_conversation_requires_comment");
       }
     }
     if (agent.adapterType === "paperclip_runner") {
@@ -3100,6 +3104,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
       waitCondition?: Record<string, unknown>,
     ): Promise<{ created: boolean; waitSaved?: boolean }> => withManagedWakeWrite(async db => {
+      opts.onNotQueued?.(skipReason);
       // A temporary refusal must leave the handoff retryable, without burning
       // its one durable receipt ID on a skipped wake.
       if (caseRequest) return { created: false };
@@ -3904,6 +3909,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // Completion can settle the conversation while admission is outside
           // the issue lock. Recheck the current state before persisting a wake.
           if (isWaitingConversation(issue) && !hasIndependentConversationWakeCause()) {
+            opts.onNotQueued?.("waiting_conversation_requires_comment");
             return { kind: "skipped" as const };
           }
 
@@ -4911,6 +4917,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               return { kind: "coalesced" as const, run: activeExecutionRun };
             }
 
+            // Only another comment-backed wake from the SAME plugin may join
+            // its unstarted chat run. Do not merge into a person's turn or into
+            // a running turn that could already have read its input.
+            const coalesceQueuedPluginComments = Boolean(wakeCommentId &&
+              payload?.mutation === "plugin_wakeup" && opts.requestedByActorType === "system" &&
+              opts.requestedByActorId && payload.pluginId === opts.requestedByActorId &&
+              activeExecutionRun.contextSnapshot?.pluginId === opts.requestedByActorId &&
+              readNonEmptyString(activeExecutionRun.contextSnapshot?.wakeCommentId) &&
+              activeExecutionRun.status === "queued" && !activeExecutionRun.startedAt);
             const admissionScope = wakeQueue.createAdmissionTransactionScope(
               agent.companyId,
               tx as unknown as Db,
@@ -4930,7 +4945,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   contextSnapshot: activeExecutionRun.contextSnapshot,
                   wakeupRequestId: activeExecutionRun.wakeupRequestId,
                 },
-                allowRunCoalescing: isConversation(issue) ? false : opts.allowRunCoalescing,
+                allowRunCoalescing: isConversation(issue) && !coalesceQueuedPluginComments ? false : opts.allowRunCoalescing,
                 durableReceipt: receiptRequest
                   ? {
                       id: receiptRequest.id,
@@ -5403,7 +5418,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         return outcome.receipt.runId ? getRun(outcome.receipt.runId) : null;
       }
       if (outcome.kind === "deferred" || outcome.kind === "skipped") {
-        return null;
+        return notQueued(outcome.kind === "deferred" ? "deferred_issue_execution" : "admission_skipped");
       }
       if (outcome.kind === "coalesced") {
         await attachQueuedSetupRequest(agent);

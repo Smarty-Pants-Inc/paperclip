@@ -815,6 +815,8 @@ export async function resolveRunScopedMentionedSkillKeys(input: {
 
 
 export interface WakeupOptions {
+  /** Server-only diagnostic; reports a refusal without changing admission authority. */
+  onNotQueued?: (reason: string) => void;
   /** Authenticated managed-wake actor, never copied from public wake JSON. */
   managementActor?: import("../authorization.js").AuthorizationActor;
   /** Internal durable case assignment receipt. Never accepted from public wake payloads. */

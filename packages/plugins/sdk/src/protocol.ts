@@ -2087,6 +2087,7 @@ export interface WorkerToHostMethods {
       reason?: string;
       contextSource?: string;
       idempotencyKey?: string | null;
+      commentId?: string;
       actorAgentId?: string | null;
       actorUserId?: string | null;
       actorRunId?: string | null;

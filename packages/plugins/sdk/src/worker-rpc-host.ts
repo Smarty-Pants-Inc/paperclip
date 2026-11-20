@@ -951,6 +951,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             reason: options?.reason,
             contextSource: options?.contextSource,
             idempotencyKey: options?.idempotencyKey,
+            commentId: options?.commentId,
             actorAgentId: options?.actorAgentId,
             actorUserId: options?.actorUserId,
             actorRunId: options?.actorRunId,
