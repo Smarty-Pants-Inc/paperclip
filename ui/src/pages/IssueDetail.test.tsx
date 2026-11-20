@@ -1554,6 +1554,9 @@ const QUEUE_SF_QUEUED_COMMENTS_GET = {"issueId": "dd731e54-4d0f-4462-bb3f-8da5e3
 // body. DERIVED from QUEUE_SF_POST_RESPONSE (captured at 69c95176) plus those two server
 // fields; not re-captured.
 const QUEUE_SF_POST_RESPONSE_SAYS_QUEUED = { ...QUEUE_SF_POST_RESPONSE, deliveryOutcome: "queued", steeringUnavailableReason: null } as const;
+// stalesteer: the same body when the server was asked to steer and could not (DERIVED; the
+// reason is the wording RFL's final5c frames show: "Steering paused: steering unavailable …").
+const QUEUE_SF_POST_RESPONSE_STEERING_UNAVAILABLE = { ...QUEUE_SF_POST_RESPONSE, deliveryOutcome: "queued", steeringUnavailableReason: "steering unavailable" } as const;
 
 describe("IssueDetail", () => {
   let container: HTMLDivElement;
@@ -7192,7 +7195,9 @@ describe("IssueDetail", () => {
     width: number,
     flow: "steer" | "queue",
     // steer-ui3: the POST answer DELAYED (gate 4's hand take: POST 2.67 s), or refused.
-    answer: { delayMs?: number; failStatus?: 500 | 409; says?: "bare" | "queued" } = {},
+    // stalesteer: says 'unavailable' = queued with the server's steeringUnavailableReason;
+    // queueLag = how many queued-comments reads after the POST do not list it yet.
+    answer: { delayMs?: number; failStatus?: 500 | 409; says?: "bare" | "queued" | "unavailable"; queueLag?: number } = {},
   ) {
     const { TaskChatThread } = await vi.importActual<
       typeof import("../components/TaskChatThread")
@@ -7205,13 +7210,15 @@ describe("IssueDetail", () => {
     // says 'bare' = the S-f body as captured (no steer, no queued marker) and the server's
     // queued-comments read stays empty.
     const post = flow === "steer" ? STEER_A2_POST_RESPONSE
-      : answer.says === "queued" ? QUEUE_SF_POST_RESPONSE_SAYS_QUEUED : QUEUE_SF_POST_RESPONSE;
+      : answer.says === "queued" ? QUEUE_SF_POST_RESPONSE_SAYS_QUEUED
+        : answer.says === "unavailable" ? QUEUE_SF_POST_RESPONSE_STEERING_UNAVAILABLE : QUEUE_SF_POST_RESPONSE;
     const finalThread: readonly { id: string }[] = flow === "steer" ? STEER_A2_THREAD_GET_DELIVERED : QUEUE_SF_THREAD_GET;
     const runId = flow === "steer" ? STEER_A2_POST_RESPONSE.steeredIntoRunId : QUEUE_SF_QUEUED_COMMENTS_GET.targetRunId;
     const emptyQueue = createQueuedCommentQueue({ queueId: null, state: null, targetRunId: null, entries: [] });
     const state = {
       thread: finalThread.filter((comment) => comment.id !== post.id) as unknown[],
       queue: emptyQueue as unknown,
+      queueLag: 0,
     };
     const posts: Array<Record<string, unknown>> = [];
     const fetched: string[] = [];
@@ -7230,6 +7237,7 @@ describe("IssueDetail", () => {
           ? finalThread.map((comment) => comment.id === post.id ? post : comment)
           : [...QUEUE_SF_THREAD_GET];
         state.queue = flow === "steer" || answer.says === "bare" ? emptyQueue : QUEUE_SF_QUEUED_COMMENTS_GET;
+        state.queueLag = answer.queueLag ?? 0;
         return new Response(JSON.stringify(post), { status: 201, headers: { "content-type": "application/json" } });
       }
       fetched.push(`${method} ${url}`);
@@ -7238,7 +7246,10 @@ describe("IssueDetail", () => {
     });
     mockIssuesApi.addComment.mockReset().mockImplementation((...args: unknown[]) => realIssuesApiFns.addComment!(...args));
     mockIssuesApi.listComments.mockImplementation(async () => state.thread);
-    mockIssuesApi.getQueuedComments.mockImplementation(async () => state.queue);
+    mockIssuesApi.getQueuedComments.mockImplementation(async () => {
+      if (state.queueLag > 0) { state.queueLag -= 1; return emptyQueue; }
+      return state.queue;
+    });
     const activeRun = {
       id: runId, runtimeMode: "native", status: "running", invocationSource: "issue", triggerDetail: null,
       contextCommentId: null, contextWakeCommentId: null, startedAt: "2026-11-19T07:43:59.400Z", finishedAt: null,
@@ -7670,6 +7681,148 @@ describe("IssueDetail", () => {
         writeFileSync(`${process.env.STEER_UI_EVIDENCE}/says-queued-${width}.txt`,
           `${container.querySelector('[data-testid="task-chat-queued-messages"]')!.outerHTML}\n`);
       }
+    },
+    20_000,
+  );
+
+  // stalesteer (RFL, final5c b7a28608: f5c-g7-lastinr2 390 early-010 02:14 under the completed
+  // 104/105 reply; f5c-g7-lastinr 1440 late-031 05:10 under the answered 203/204/205 with an EMPTY
+  // bar). 'Steering paused: <reason> Will send after this turn.' speaks for ITS message only while
+  // the server's queued-comments read lists it (or the POST said queued and that read has not
+  // caught up). Real TaskChatThread + real TaskChatQueuedMessages bar; planted server bodies.
+  const STALE_STEER_LINE = "Steering paused: steering unavailable Will send after this turn.";
+  const steeringLine = () => container.querySelector('[data-testid="task-chat-steering-unavailable"]');
+  const queueBar = () => container.querySelector('[data-testid="task-chat-queued-messages"]');
+  async function sendSteeringUnavailable(width: number, queueLag = 0) {
+    const placed = await renderSteeringPlacement(width, "queue", { says: "unavailable", queueLag });
+    await act(async () => {
+      container.querySelector<HTMLTextAreaElement>('[data-testid="stand-in-editor"]')!
+        .dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    });
+    return placed;
+  }
+  async function readQueueAgain() {
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ["issues", "queued-comments"] });
+    });
+    await flushReact();
+  }
+  // The run answers the message: the thread GET marks it consumed by the run, with the reply.
+  function answeredThread(post: { id: string }, runId: string) {
+    return [...QUEUE_SF_THREAD_GET.map((comment) => comment.id === post.id
+      ? { ...comment, consumedByRunId: runId } : comment),
+    { ...QUEUE_SF_THREAD_GET[1], id: "stalesteer-reply", authorType: "agent", authorAgentId: "agent-1", authorUserId: null,
+      body: "Done: answered.", createdAt: "2026-11-19T07:44:09.000Z", updatedAt: "2026-11-19T07:44:09.000Z", createdByRunId: runId }];
+  }
+  const QUEUED_OTHER = {
+    ...QUEUE_SF_QUEUED_COMMENTS_GET,
+    revision: "stalesteer-other",
+    entries: [{ ...QUEUE_SF_QUEUED_COMMENTS_GET.entries[0], comment: {
+      ...QUEUE_SF_QUEUED_COMMENTS_GET.entries[0].comment, id: "stalesteer-other", body: "Another waiting message",
+      clientRequestId: null, createdAt: "2026-11-19T07:44:05.000Z", updatedAt: "2026-11-19T07:44:05.000Z" } }],
+  };
+  function writeStaleSteerEvidence(name: string) {
+    if (process.env.STEER_UI_EVIDENCE) {
+      writeFileSync(`${process.env.STEER_UI_EVIDENCE}/stalesteer-${name}.txt`,
+        `line: ${JSON.stringify(steeringLine()?.textContent ?? null)}\nbar: ${queueBar()?.outerHTML ?? "(none)"}\n`);
+    }
+  }
+
+  it.each([390, 1440])(
+    "stalesteer RED: a Send answered queued with a reason shows the line with its row; once the server answers it (queue read empty) the line is gone with no empty bar at %i",
+    async (width) => {
+      const { post, runId, state } = await sendSteeringUnavailable(width);
+      expect(await waitUntil(() => steeringLine() !== null)).toBe(true);
+      expect(steeringLine()!.textContent).toBe(STALE_STEER_LINE);
+      expect(container.querySelector('[data-testid="task-chat-queued-list"]')?.textContent).toContain(post.body);
+      writeStaleSteerEvidence(`queued-${width}`);
+      // Answered: the thread has the reply; the queued-comments read no longer lists it.
+      state.thread = answeredThread(post, runId);
+      state.queue = createQueuedCommentQueue({ queueId: null, state: null, targetRunId: null, entries: [] });
+      await act(async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments("PAP-1") }); });
+      await readQueueAgain();
+      expect(await waitUntil(() => steeringLine() === null)).toBe(true);
+      expect(container.textContent).not.toContain("Steering paused");
+      expect(queueBar()).toBeNull();
+      writeStaleSteerEvidence(`answered-${width}`);
+    },
+    20_000,
+  );
+
+  it.each([390, 1440])(
+    "stalesteer: its message answered while ANOTHER message still waits: the line is gone, the other row stays without it at %i",
+    async (width) => {
+      const { post, runId, state } = await sendSteeringUnavailable(width);
+      expect(await waitUntil(() => steeringLine() !== null)).toBe(true);
+      state.thread = answeredThread(post, runId);
+      state.queue = QUEUED_OTHER;
+      await act(async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments("PAP-1") }); });
+      await readQueueAgain();
+      expect(await waitUntil(() => steeringLine() === null)).toBe(true);
+      const list = container.querySelector('[data-testid="task-chat-queued-list"]');
+      expect(list?.textContent).toContain("Another waiting message");
+      expect(list?.textContent).not.toContain(post.body);
+      expect(container.textContent).not.toContain("Steering paused");
+      writeStaleSteerEvidence(`unrelated-${width}`);
+    },
+    20_000,
+  );
+
+  it.each([390, 1440])(
+    "stalesteer: the POST says queued but the first queue read does not list it yet: the line stays (no flicker), then follows the server at %i",
+    async (width) => {
+      const LAG = 1000;
+      const { post, runId, state } = await sendSteeringUnavailable(width, LAG);
+      expect(await waitUntil(() => steeringLine() !== null)).toBe(true);
+      // Reads after the POST come back without it; the line and its row hold through them.
+      await readQueueAgain();
+      expect(state.queueLag).toBeLessThan(LAG);
+      expect(steeringLine()?.textContent).toBe(STALE_STEER_LINE);
+      expect(container.querySelector('[data-testid="task-chat-queued-list"]')?.textContent).toContain(post.body);
+      // The server's read catches up and lists it: still there.
+      state.queueLag = 0;
+      await readQueueAgain();
+      expect(steeringLine()?.textContent).toBe(STALE_STEER_LINE);
+      // Then the server drops it (answered): gone.
+      state.thread = answeredThread(post, runId);
+      state.queue = createQueuedCommentQueue({ queueId: null, state: null, targetRunId: null, entries: [] });
+      await act(async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments("PAP-1") }); });
+      await readQueueAgain();
+      expect(await waitUntil(() => steeringLine() === null)).toBe(true);
+      expect(queueBar()).toBeNull();
+    },
+    20_000,
+  );
+
+  it.each([390, 1440])(
+    "stalesteer: after a remount (reload) with nothing waiting there is no line and no bar at %i",
+    async (width) => {
+      const { post, runId, state } = await sendSteeringUnavailable(width);
+      expect(await waitUntil(() => steeringLine() !== null)).toBe(true);
+      state.thread = answeredThread(post, runId);
+      state.queue = createQueuedCommentQueue({ queueId: null, state: null, targetRunId: null, entries: [] });
+      await act(async () => { root.unmount(); });
+      root = createTooltipRoot(container);
+      await act(async () => { renderIssueView(); });
+      await flushReact();
+      await flushReact();
+      await readQueueAgain();
+      expect(steeringLine()).toBeNull();
+      expect(container.textContent).not.toContain("Steering paused");
+      expect(queueBar()).toBeNull();
+    },
+    20_000,
+  );
+
+  it.each([390, 1440])(
+    "stalesteer control: still queued after later reads: the line stays with its row at %i",
+    async (width) => {
+      const { post } = await sendSteeringUnavailable(width);
+      expect(await waitUntil(() => steeringLine() !== null)).toBe(true);
+      await readQueueAgain();
+      await readQueueAgain();
+      expect(steeringLine()?.textContent).toBe(STALE_STEER_LINE);
+      expect(container.querySelector('[data-testid="task-chat-queued-list"]')?.textContent).toContain(post.body);
     },
     20_000,
   );
