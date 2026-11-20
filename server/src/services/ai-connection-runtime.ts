@@ -23,8 +23,8 @@ import { WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE } from "@paperclipai/adapter-utils/
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { decideGrokAuthMerge } from "@paperclipai/adapter-grok-local/server";
-import { NativeEnvironmentProbeCleanupError, releaseNativeProbeAuthority, sanitizeAntigravityCredential } from "../vendor/paperclip-runner/index.js";
-import { runnerPrpAuthorityRegistered } from "../realtime/runner-prp-ws.js";
+import { NativeEnvironmentProbeCleanupError, sanitizeAntigravityCredential } from "../vendor/paperclip-runner/index.js";
+import { captureRunnerPrpAuthorities, releaseRunnerPrpAuthority, runnerPrpAuthorityRegistered } from "../realtime/runner-prp-ws.js";
 import { readLocalAiCredentialFile } from "./local-ai-credential-file.js";
 import { prepareAntigravityCredentialWriteback } from "./native-runtime/antigravity-runner-credentials.js";
 import { quotaCredentialHash, quotaCredentialRecovery, RetiredCredentialRecoveryError } from "./quota-credential-recovery.js";
@@ -683,8 +683,12 @@ export async function withManagedAiProbe<T>(
   // Every cleanup this probe retains is owned by its agent (never unowned).
   const runtime = await prepareManagedAiRuntime(db, { ...input, retainedCleanupAgentId: input.agentId });
   let retained = false;
+  // The probe's control-plane authorities: the PRP route registrations (run
+  // ids) it makes on this server, captured here so a box-gone cleanup can
+  // release them server-side without the probe's transport.
+  const prpRunIds = new Set<string>();
   try {
-    return await probe(runtime);
+    return await captureRunnerPrpAuthorities(prpRunIds, () => probe(runtime));
   }
   catch (error) {
     if (error instanceof NativeEnvironmentProbeCleanupError && nativeSessionCloseUnrecoverable(error)) {
@@ -747,11 +751,15 @@ export async function withManagedAiProbe<T>(
       const retryCleanup = (error as { retryCleanup?: () => Promise<void> }).retryCleanup;
       retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope!, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup, retired: error.retired,
         agentId: input.agentId,
-        // Off-box: run the probe's control-plane authority release and read it
-        // back (the transport's confirmation and this server's registration).
+        // Off-box, server-side: release the probe's PRP route registrations
+        // (idempotent) and read each back as not registered on this server.
         releaseAuthority: async () => {
-          const release = await releaseNativeProbeAuthority(error);
-          return { ...release, released: release.released && !(release.runId && runnerPrpAuthorityRegistered(release.runId)) };
+          for (const runId of prpRunIds) {
+            const released = await releaseRunnerPrpAuthority(runId).catch(() => false);
+            if (!released) return { released: false, runId };
+          }
+          const live = [...prpRunIds].find(runId => runnerPrpAuthorityRegistered(runId));
+          return live ? { released: false, runId: live } : { released: true };
         },
         ...(typeof retryCleanup === "function" ? { retryRetirement: () => retryCleanup.call(error) } : {}) });
       try {

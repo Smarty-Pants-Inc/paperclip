@@ -15,8 +15,20 @@ import { PROBE_CLEANUP_PENDING_PARK_MS, reconcileRetainedAiCleanup } from "../..
 import { SandboxLeaseStartDeniedError } from "../../../services/retained-sandbox-absent-error.js";
 import { logger } from "../../../middleware/logger.js";
 import { NativeEnvironmentProbeCleanupError } from "../../../vendor/paperclip-runner/index.js";
-import { registerRunnerPrpAuthority, runnerPrpAuthorityRegistered } from "../../../realtime/runner-prp-ws.js";
+import { registerRunnerPrpAuthority, releaseRunnerPrpAuthority, runnerPrpAuthorityRegistered } from "../../../realtime/runner-prp-ws.js";
 import { registerLocalRuntimeApiServer } from "../../../runtime-api.js";
+
+// The REAL server release (releaseRunnerPrpAuthority on the real registrations
+// map) runs behind a call counter; row (e) can make one call fail first.
+const prpRelease = vi.hoisted(() => ({ fail: false, calls: [] as string[] }));
+vi.mock("../../../realtime/runner-prp-ws.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../../realtime/runner-prp-ws.js")>();
+  return { ...actual, releaseRunnerPrpAuthority: async (runId: string) => {
+    prpRelease.calls.push(runId);
+    if (prpRelease.fail) throw new Error("fixture authority release failed");
+    return actual.releaseRunnerPrpAuthority(runId);
+  } };
+});
 
 // Replays gate 7 (agent 0d3339d0): the probe's credential retirement is rejected
 // (JsonRpc -32002 while confirming the credential handoff), the lifecycle fails
@@ -91,24 +103,16 @@ const support = await getEmbeddedPostgresTestSupport();
     workers.push(work);
     return { work };
   }
-  // The probe's control-plane authority: a real PRP route registration (the
-  // record its release deletes), released the way the transport releases it
-  // (one operation at a time, retried after a failure, read back).
-  async function probeAuthority(options?: { releaseFails?: () => boolean }) {
+  // The probe's control-plane authority: a real PRP route registration on this
+  // server (the registrations entry keyed by run id), made inside the probe so
+  // withManagedAiProbe captures its run id server-side.
+  async function probeAuthority() {
     const runId = randomUUID();
-    const registration = await registerRunnerPrpAuthority({ companyId, runId, authority: {} as never });
-    let confirmed = false, releases = 0;
-    let operation: Promise<void> | undefined;
-    const release = () => operation ??= Promise.resolve().then(async () => {
-      releases++;
-      if (options?.releaseFails?.()) throw new Error("fixture authority release failed");
-      await registration.release(); confirmed = true;
-    }).catch(error => { operation = undefined; throw error; });
-    const releaseAuthority = async () => {
-      if (!confirmed) { try { await release(); } catch { return { released: false, runId }; } }
-      return { released: confirmed, runId };
-    };
-    return { runId, release, releaseAuthority, releases: () => releases, live: () => runnerPrpAuthorityRegistered(runId) };
+    return { runId,
+      register: () => registerRunnerPrpAuthority({ companyId, runId, authority: {} as never }),
+      releases: () => prpRelease.calls.filter(id => id === runId).length,
+      live: () => runnerPrpAuthorityRegistered(runId),
+      cleanup: () => releaseRunnerPrpAuthority(runId).catch(() => false) };
   }
   // The gate's -32002 while confirming the credential handoff.
   const handoffRejected = () => Object.assign(new Error("confirming credential handoff"), { name: "JsonRpcCallError", code: -32002 });
@@ -132,14 +136,14 @@ const support = await getEmbeddedPostgresTestSupport();
     let probeHome = "";
     // The gate's luck: the authority was released in the probe's teardown pass.
     const authority = await probeAuthority();
-    await authority.release();
     const { work } = harness(async (agentId, managed) => {
       if (agentId === first.id && firstProbes++ === 0) {
         probeHome = managed.home;
         const real = managed.cleanup;
         managed.cleanup = () => { runtimeCleanups++; return real(); };
+        await (await authority.register()).release();
         const retired = new Promise<void>((_resolve, reject) => { setTimeout(() => reject(handoffRejected()), 0); });
-        throw new NativeEnvironmentProbeCleanupError(retired, undefined, [handoffRejected()], retryCleanup, authority.releaseAuthority);
+        throw new NativeEnvironmentProbeCleanupError(retired, undefined, [handoffRejected()], retryCleanup);
       }
       return pass();
     });
@@ -185,7 +189,6 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(later).toEqual(Array(10).fill("ready"));
       expect(leases.every(lease => lease.status === "released")).toBe(true);
       expect(authority.live()).toBe(false);
-      expect(authority.releases()).toBe(1);
     } finally { boxSwept = true; await reconcileRetainedAiCleanup({ companyId, accountKey: saved.grantId }).catch(() => {}); }
   }, 60_000);
 
@@ -261,7 +264,7 @@ const support = await getEmbeddedPostgresTestSupport();
   // A probe whose box vanished before its authority release ran: the retained
   // retry's first on-box step (joining Pi retirement / physical retirement)
   // throws sandbox_lease_start_denied, so the transport's off-box release never ran.
-  async function boxGoneBeforeRelease(name: string, authority: Awaited<ReturnType<typeof probeAuthority>>) {
+  async function boxGoneBeforeRelease(name: string, authority: Awaited<ReturnType<typeof probeAuthority>>, options?: { releasedInTeardown?: boolean }) {
     const owner = `owner-${randomUUID()}`;
     const saved = await account(owner);
     const first = await hire(name, owner);
@@ -270,8 +273,10 @@ const support = await getEmbeddedPostgresTestSupport();
     const { work } = harness(async (agentId, managed) => {
       if (agentId === first.id && firstProbes++ === 0) {
         probeHome = managed.home;
+        const registration = await authority.register();
+        if (options?.releasedInTeardown) await registration.release();
         const retired = new Promise<void>((_resolve, reject) => { setTimeout(() => reject(handoffRejected()), 0); });
-        throw new NativeEnvironmentProbeCleanupError(retired, undefined, [handoffRejected()], retryCleanup, authority.releaseAuthority);
+        throw new NativeEnvironmentProbeCleanupError(retired, undefined, [handoffRejected()], retryCleanup);
       }
       return pass();
     });
@@ -283,8 +288,8 @@ const support = await getEmbeddedPostgresTestSupport();
 
   it("(c) box gone before the authority release ran: the release runs and reads back released, then cleanup, then the agent parks", async () => {
     const authority = await probeAuthority();
-    const liveBefore = authority.live();
     const run = await boxGoneBeforeRelease("Box gone early", authority);
+    const liveBefore = authority.live();
     const errors = vi.spyOn(logger, "error");
     try {
       const parked = await retryLifecycle(run.work, run.first.id);
@@ -304,13 +309,12 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(summary.alarms).toContain("native_probe_cleanup_box_gone");
       expect(summary.alarms).not.toContain("native_probe_cleanup_authority_unreleased");
       expect(retried.lifecycleState).toBe("ready");
-    } finally { await authority.release().catch(() => {}); await reconcileRetainedAiCleanup({ companyId, accountKey: run.saved.grantId }).catch(() => {}); }
+    } finally { await authority.cleanup(); await reconcileRetainedAiCleanup({ companyId, accountKey: run.saved.grantId }).catch(() => {}); }
   }, 60_000);
 
   it("(d) box gone, authority already released: the release is a no-op and the agent parks the same way", async () => {
     const authority = await probeAuthority();
-    await authority.release();
-    const run = await boxGoneBeforeRelease("Already released", authority);
+    const run = await boxGoneBeforeRelease("Already released", authority, { releasedInTeardown: true });
     try {
       const parked = await retryLifecycle(run.work, run.first.id);
       const summary = { row: "d", releases: authority.releases(), live: authority.live(), homeAfterPark: await exists(run.probeHome()),
@@ -326,8 +330,8 @@ const support = await getEmbeddedPostgresTestSupport();
   }, 60_000);
 
   it("(e) box gone and the authority release fails: the entry is kept, the agent parks truthfully with one alarm naming the authority", async () => {
-    let releaseFails = true;
-    const authority = await probeAuthority({ releaseFails: () => releaseFails });
+    const authority = await probeAuthority();
+    prpRelease.fail = true;
     const run = await boxGoneBeforeRelease("Release fails", authority);
     const errors = vi.spyOn(logger, "error");
     const unreleasedAlarms = () => errors.mock.calls.filter(call => (call[0] as { code?: unknown })?.code === "native_probe_cleanup_authority_unreleased");
@@ -337,7 +341,7 @@ const support = await getEmbeddedPostgresTestSupport();
       const summary = { row: "e", releases: authority.releases(), live: authority.live(), homeWhileParked: await exists(run.probeHome()),
         scopeWhileParked: await scopeState(run.saved.grantId), parked: parked.lifecycleError, reparked: reparked.lifecycleError,
         alarms: unreleasedAlarms().length, alarm: unreleasedAlarms()[0]?.[0] };
-      releaseFails = false;
+      prpRelease.fail = false;
       const healed = await retryLifecycle(run.work, run.first.id);
       const ready = await retryLifecycle(run.work, run.first.id);
       await receipt({ ...summary, healed: healed.lifecycleError, ready: ready.lifecycleState, liveAfterHeal: authority.live() });
@@ -356,6 +360,6 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(authority.live()).toBe(false);
       expect(healed.lifecycleError).toContain("the machine was released before it confirmed the test's credential handoff");
       expect(ready.lifecycleState).toBe("ready");
-    } finally { releaseFails = false; await authority.release().catch(() => {}); await reconcileRetainedAiCleanup({ companyId, accountKey: run.saved.grantId }).catch(() => {}); }
+    } finally { prpRelease.fail = false; await authority.cleanup(); await reconcileRetainedAiCleanup({ companyId, accountKey: run.saved.grantId }).catch(() => {}); }
   }, 60_000);
 });

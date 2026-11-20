@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { IncomingMessage, Server } from "node:http";
 import type { Duplex } from "node:stream";
 
@@ -41,6 +42,14 @@ interface RunnerPrpUpgradeRequest extends IncomingMessage {
 
 const registrations = new Map<string, RegisteredAuthority>();
 const currentLiveAuthorities = new Map<string, CurrentLiveAuthority>();
+/** The run ids registered while a managed probe runs (server-side capture). */
+const probeAuthorityCapture = new AsyncLocalStorage<Set<string>>();
+
+/** Run `fn` so every PRP authority it registers on this server is recorded in
+ * `runIds` (the registrations' keys), for an off-box release after the probe. */
+export function captureRunnerPrpAuthorities<T>(runIds: Set<string>, fn: () => T): T {
+  return probeAuthorityCapture.run(runIds, fn);
+}
 
 function liveAuthorityKey(input: {
   readonly companyId: string;
@@ -132,6 +141,7 @@ export async function registerRunnerPrpAuthority(input: {
     runtimeRequestResolutions: new Map(),
   };
   registrations.set(input.runId, registeredAuthority);
+  probeAuthorityCapture.getStore()?.add(input.runId);
   const currentKey = input.issueId && input.agentId
     ? liveAuthorityKey({
         companyId: input.companyId,
@@ -168,6 +178,20 @@ export async function registerRunnerPrpAuthority(input: {
  * (the record `release()` deletes) is still held on this server. */
 export function runnerPrpAuthorityRegistered(runId: string): boolean {
   return registrations.has(runId);
+}
+
+/** Off-box, server-side: release a run's PRP control-plane authority (the
+ * registrations entry `release()` deletes; idempotent, a no-op once released)
+ * and read it back. Returns true only when the run reads back not registered. */
+export async function releaseRunnerPrpAuthority(runId: string): Promise<boolean> {
+  const registration = registrations.get(runId);
+  if (registration) {
+    registrations.delete(runId);
+    for (const [key, current] of currentLiveAuthorities) {
+      if (current.runId === runId && current.generation === registration.generation) currentLiveAuthorities.delete(key);
+    }
+  }
+  return !runnerPrpAuthorityRegistered(runId);
 }
 
 export function queueLiveRunnerPrpCommand(input: {

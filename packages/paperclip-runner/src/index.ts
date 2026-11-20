@@ -98,8 +98,6 @@ export {
   createRunnerdCodexTransport,
   probeNativeRunnerEnvironment,
   NativeEnvironmentProbeCleanupError,
-  releaseNativeProbeAuthority,
-  type NativeProbeAuthorityRelease,
   runnerCodexDynamicToolsFit,
   defaultCapabilityRunnerdBinary,
   defaultCapabilityRunnerdBinaryAsync,
