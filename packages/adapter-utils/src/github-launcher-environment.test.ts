@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { watch } from "node:fs";
-import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -82,6 +82,159 @@ describe("managed GitHub launcher environment", () => {
     const result = await fixture.runner.execute({ command: "sh", args: ["-c", "git; gh"], env });
     expect(result.exitCode, result.stderr).toBe(0);
     expect(result.stdout).toBe("git started\ngh started\n");
+  });
+
+  it("checks all warm hashes with PATH in one command, preserves file inodes and repairs wrapper permissions", async () => {
+    const fixture = await sandbox("tools with 'quotes'/bin", true);
+    const input = { runId: "warm-hashes", target: fixture.target, cwd: fixture.root, env: {} };
+    const first = await prepareGitHubOperationLaunchers(input);
+    const directory = first.PAPERCLIP_GITHUB_LAUNCHER_DIR!;
+    const names = (await readdir(directory)).filter(name => name !== "gh-config");
+    const inodes = await Promise.all(names.map(name => stat(path.join(directory, name)).then(file => file.ino)));
+    await chmod(path.join(directory, "git"), 0o600);
+    fixture.runner.execute.mockClear();
+    expect(await prepareGitHubOperationLaunchers(input)).toEqual(first);
+    expect(fixture.runner.execute).toHaveBeenCalledTimes(1);
+    expect(fixture.runner.execute.mock.calls[0]![0].stdin).toBeUndefined();
+    expect(await Promise.all(names.map(name => stat(path.join(directory, name)).then(file => file.ino)))).toEqual(inodes);
+    expect((await stat(path.join(directory, "git"))).mode & 0o777).toBe(0o700);
+    expect((await readdir(directory)).sort()).toEqual([...names, "gh-config"].sort());
+  });
+
+  it.each(["package.json", "git", "gh", ".zshenv", ".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"])(
+    "does not trust a warm layout with changed %s content", async name => {
+      const fixture = await sandbox("usr/bin");
+      const input = { runId: "changed-file", target: fixture.target, cwd: fixture.root, env: {} };
+      const first = await prepareGitHubOperationLaunchers(input);
+      const file = path.join(first.PAPERCLIP_GITHUB_LAUNCHER_DIR!, name);
+      const body = await readFile(file, "utf8");
+      await writeFile(file, "changed launcher body\n");
+      fixture.runner.execute.mockClear();
+      expect(await prepareGitHubOperationLaunchers(input)).toEqual(first);
+      expect(fixture.runner.execute).toHaveBeenCalledTimes(2);
+      expect(await readFile(file, "utf8")).toBe(body);
+    },
+  );
+
+  it.each(["git", "gh-config"])("restages a warm layout missing %s", async name => {
+    const fixture = await sandbox("usr/bin");
+    const input = { runId: "missing-file", target: fixture.target, cwd: fixture.root, env: {} };
+    const first = await prepareGitHubOperationLaunchers(input);
+    const file = path.join(first.PAPERCLIP_GITHUB_LAUNCHER_DIR!, name);
+    await rm(file, { recursive: true });
+    fixture.runner.execute.mockClear();
+    expect(await prepareGitHubOperationLaunchers(input)).toEqual(first);
+    expect(fixture.runner.execute).toHaveBeenCalledTimes(2);
+    expect(await stat(file)).toBeDefined();
+  });
+
+  it("rechecks the provider PATH before deciding whether warm profiles are current", async () => {
+    const fixture = await sandbox("usr/bin");
+    const input = { runId: "changed-provider-path", target: fixture.target, cwd: fixture.root, env: {} };
+    const first = await prepareGitHubOperationLaunchers(input);
+    const execute = fixture.runner.execute.getMockImplementation()!;
+    const changedPath = `${fixture.remotePath}:/provider's new tools`;
+    fixture.runner.execute.mockImplementation(input => execute({ ...input, env: { ...input.env, PATH: changedPath } }));
+    fixture.runner.execute.mockClear();
+    const second = await prepareGitHubOperationLaunchers(input);
+    expect(fixture.runner.execute).toHaveBeenCalledTimes(2);
+    expect(second.PATH).toBe(`${first.PAPERCLIP_GITHUB_LAUNCHER_DIR}:${changedPath}`);
+    const profile = await readFile(second.BASH_ENV!, "utf8");
+    expect((await fixture.runner.execute({ command: "sh", args: ["-c", `${profile}\nprintf '%s' "$PATH"`] })).stdout).toBe(second.PATH);
+  });
+
+  it("conservatively restages when the remote hash utilities are unavailable", async () => {
+    const fixture = await sandbox("usr/bin");
+    const input = { runId: "no-hasher", target: fixture.target, cwd: fixture.root, env: {} };
+    const bin = path.join(fixture.root, "no-hash-tools");
+    await mkdir(bin);
+    for (const name of ["sh", "bash", "mkdir", "cat", "awk", "base64", "mv", "chmod", "rm", "sleep"]) {
+      const resolved = await exec("sh", ["-c", `command -v ${name}`]);
+      await symlink(resolved.stdout.trim(), path.join(bin, name));
+    }
+    const execute = fixture.runner.execute.getMockImplementation()!;
+    fixture.runner.execute.mockImplementation(input => execute({ ...input, env: { ...input.env, PATH: bin } }));
+    const first = await prepareGitHubOperationLaunchers(input);
+    const source = await readFile(path.join(first.PAPERCLIP_GITHUB_LAUNCHER_DIR!, "gh"), "utf8");
+    fixture.runner.execute.mockClear();
+    expect(await prepareGitHubOperationLaunchers(input)).toEqual(first);
+    expect(fixture.runner.execute).toHaveBeenCalledTimes(2);
+    expect(await readFile(path.join(first.PAPERCLIP_GITHUB_LAUNCHER_DIR!, "gh"), "utf8")).toBe(source);
+  });
+
+  // Keep reason: warm reuse must still honor per-file PID lock ownership.
+  it("waits for a live upload lock before trusting a matching warm wrapper", async () => {
+    const fixture = await sandbox("usr/bin");
+    const input = { runId: "locked-warm-file", target: fixture.target, cwd: fixture.root, env: {} };
+    const first = await prepareGitHubOperationLaunchers(input);
+    const lockDir = path.join(first.PAPERCLIP_GITHUB_LAUNCHER_DIR!, ".git.lock");
+    await mkdir(lockDir);
+    await writeFile(path.join(lockDir, "pid"), String(process.pid));
+    let settled = false;
+    fixture.runner.execute.mockClear();
+    const preparation = prepareGitHubOperationLaunchers(input).finally(() => { settled = true; });
+    try {
+      await new Promise(resolve => setTimeout(resolve, 150));
+      expect(settled).toBe(false);
+    } finally {
+      await rm(lockDir, { recursive: true, force: true });
+      await preparation;
+    }
+    expect(await preparation).toEqual(first);
+    expect(fixture.runner.execute).toHaveBeenCalledTimes(1);
+    expect((await readdir(first.PAPERCLIP_GITHUB_LAUNCHER_DIR!)).some(name => name.endsWith(".lock"))).toBe(false);
+  });
+
+  // Keep reason: a failed fast-path check must not authorize stale wrappers.
+  it("rejects a failed warm hash probe and never starts an upload after it", async () => {
+    const fixture = await sandbox("usr/bin");
+    const input = { runId: "failed-warm-probe", target: fixture.target, cwd: fixture.root, env: {} };
+    await prepareGitHubOperationLaunchers(input);
+    fixture.runner.execute.mockClear().mockResolvedValueOnce({ exitCode: 42, signal: null, timedOut: false,
+      pid: null, startedAt: new Date().toISOString(), stdout: `\0${fixture.remotePath}\0`, stderr: "probe failed" });
+    await expect(prepareGitHubOperationLaunchers(input)).rejects.toThrow("Could not resolve remote PATH");
+    expect(fixture.runner.execute).toHaveBeenCalledTimes(1);
+  });
+
+  // Keep reason: a corrupt replacement must never truncate an existing launcher.
+  it("preserves the old launcher on a real batch decode/hash failure and cleans its partial files", async () => {
+    const fixture = await sandbox("usr/bin");
+    const input = { runId: "corrupt-replacement", target: fixture.target, cwd: fixture.root, env: {} };
+    const first = await prepareGitHubOperationLaunchers(input);
+    const directory = first.PAPERCLIP_GITHUB_LAUNCHER_DIR!;
+    const source = await readFile(path.join(directory, "git"), "utf8");
+    await writeFile(path.join(directory, "git"), "old launcher body\n");
+    const execute = fixture.runner.execute.getMockImplementation()!;
+    fixture.runner.execute.mockImplementation(input => execute({ ...input,
+      stdin: input.stdin?.replace(Buffer.from(source).toString("base64"), Buffer.from("corrupt replacement\n").toString("base64")),
+    }));
+    fixture.runner.execute.mockClear();
+    await expect(prepareGitHubOperationLaunchers(input)).rejects.toThrow("sha mismatch");
+    expect(fixture.runner.execute).toHaveBeenCalledTimes(2);
+    expect(await readFile(path.join(directory, "git"), "utf8")).toBe("old launcher body\n");
+    expect(await readFile(path.join(directory, "gh"), "utf8")).toBe(source);
+    expect((await readdir(directory)).some(name => /\\.lock$|\\.partial$|\\.paperclip-upload/.test(name))).toBe(false);
+  });
+
+  // Keep reason: launcher staging must never carry invocation credentials.
+  it("keeps credentials out of cold and warm command argv, stdin, environment and staged files", async () => {
+    const fixture = await sandbox("usr/bin");
+    const secrets = ["planted-image-token", "planted-run-token", "planted-model-secret"];
+    const env = githubBrokerEnvironment({ GH_TOKEN: secrets[0]!, OPENAI_API_KEY: secrets[2]! },
+      { url: "https://paperclip.invalid", token: secrets[1]! });
+    const input = { runId: "secret-free-staging", target: fixture.target, cwd: fixture.root, env };
+    const first = await prepareGitHubOperationLaunchers(input);
+    await prepareGitHubOperationLaunchers(input);
+    const commands = JSON.stringify(fixture.runner.execute.mock.calls);
+    const files = await Promise.all((await readdir(first.PAPERCLIP_GITHUB_LAUNCHER_DIR!))
+      .filter(name => name !== "gh-config").map(name => readFile(path.join(first.PAPERCLIP_GITHUB_LAUNCHER_DIR!, name), "utf8")));
+    for (const secret of secrets) {
+      expect(commands).not.toContain(secret);
+      expect(files.join("\n")).not.toContain(secret);
+    }
+    for (const [command] of fixture.runner.execute.mock.calls) {
+      expect(Object.keys(command.env ?? {}).every(key => key === "PAPERCLIP_SANDBOX_EXEC_CHANNEL")).toBe(true);
+    }
   });
 
   it("uses one bounded control command and preserves the staged environment", async () => {
