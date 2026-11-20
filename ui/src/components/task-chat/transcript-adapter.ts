@@ -2235,6 +2235,12 @@ export function buildTurnTimelineRows(
   return meaningful;
 }
 
+/** T3's settled fold leaves questions, resource cards and compaction boundaries visible. */
+export function isPersistentRunnerWorkItem(item: TaskChatTurnChildItem): boolean {
+  return item.kind === "plan_document" || isCompactionDivider(item) ||
+    (item.kind === "protocol" && (item.surface === "runtime_request" || item.surface === "resource"));
+}
+
 /**
  * A canonical context.compacted item: a context provider activity, or the
  * context-meter divider marker (variant compared as text so this works

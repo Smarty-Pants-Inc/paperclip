@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
 
+import { mkdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import type { ComponentProps, ReactElement } from "react";
 import { act, forwardRef, useImperativeHandle, type ForwardedRef } from "react";
 import { flushSync } from "react-dom";
@@ -1273,6 +1275,50 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     };
     return { live, settled, restore: () => registerUIAdapter(original) };
   }
+  it.runIf(runtimeMode === "native").each([390, 1440])("T3 default folds settled reasoning with one reply, including remount at %ipx", async (width) => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    container.style.width = `${width}px`;
+    const run = reasoningRun("registered");
+    const state = nativeTranscriptState.transcriptByRun.get("adapter-default-run");
+    state[0].text = "17 + 25 = 42. Full first reasoning block.";
+    state[3].text = "The answer will be 42. Full second reasoning block.";
+    const save = (stage: string) => {
+      if (!process.env.REASONFOLD_EVIDENCE_DIR) return;
+      mkdirSync(process.env.REASONFOLD_EVIDENCE_DIR, { recursive: true });
+      writeFileSync(path.join(process.env.REASONFOLD_EVIDENCE_DIR, `thread-${width}-${stage}.html`), container.outerHTML);
+    };
+    try {
+      render(<TaskChatThread {...run.live} />);
+      await settleThreadLayout();
+      const preview = container.querySelector<HTMLElement>('[data-testid="task-chat-reasoning-preview"]');
+      expect(preview?.style.webkitLineClamp).toBe("4");
+      expect(preview?.textContent).toContain("The answer will be 42");
+      save("closed");
+      flushSync(() => preview!.closest("button")!.click());
+      save("open");
+      render(<TaskChatThread {...run.settled} />);
+      await settleThreadLayout();
+      for (const stage of ["settled", "remount"]) {
+        if (stage === "remount") {
+          flushSync(() => root!.unmount()); root = createRoot(container);
+          render(<TaskChatThread {...run.settled} />); await settleThreadLayout();
+        }
+        expect(container.textContent).not.toContain("Full first reasoning block");
+        expect(container.textContent).not.toContain("Full second reasoning block");
+        expect(container.textContent?.split("Saved adapter reply")).toHaveLength(2);
+        const worked = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-work-toggle"]')!;
+        expect(worked?.getAttribute("aria-expanded")).toBe("false");
+        expect(worked?.textContent).toContain("Worked for");
+        save(stage);
+        flushSync(() => worked.click());
+        expect(worked.getAttribute("aria-expanded")).toBe("true");
+        expect(container.querySelector('[data-testid="task-chat-turn-timeline"]')).not.toBeNull();
+        expect(container.textContent?.split("Saved adapter reply")).toHaveLength(2);
+        flushSync(() => worked.click());
+      }
+    } finally { run.restore(); }
+  });
+
   const inlineReasoning = () =>
     Array.from(container.querySelectorAll<HTMLElement>('[data-reasoning-display="inline"]'));
   function expectNoPerChatSwitch() {
@@ -1378,19 +1424,18 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     }
   });
 
-  // Paul's Smarty agents are `paperclip_runner` with provider pi_rpc. With no
-  // stored choice for the agent, a native run's reasoning shows inline as the
-  // plain paragraphs (no fold, no click) through the adapter as registered.
-  function expectPlainInline() {
-    expectReasoning("inline");
-    for (const block of inlineReasoning()) {
-      expect(block.querySelector('[data-testid="task-chat-reasoning-plain"]')).not.toBeNull();
-      expect(block.querySelectorAll("ul, li, button").length).toBe(0);
+  // STEER option B: the registered Runner previews live but folds settled work.
+  function expectT3Default(settled = false) {
+    expectReasoning("fold");
+    expect(container.querySelector('[data-reasoning-display="inline"]')).toBeNull();
+    if (settled) {
+      for (const text of reasoningThoughts) expect(container.textContent).not.toContain(text);
+      expect(container.querySelector('[data-testid="task-chat-work-toggle"]')?.getAttribute("aria-expanded")).toBe("false");
+    } else {
+      expect(container.querySelector('[data-testid="task-chat-reasoning-preview"]')?.textContent).toBe(reasoningThoughts[1]);
     }
-    expect(container.querySelector('[data-testid="task-chat-thinking-preview"]')).toBeNull();
-    expect(container.querySelector(".tc-turn-fold")).toBeNull();
   }
-  it.runIf(runtimeMode === "native")("shows a native paperclip_runner run's reasoning inline with no stored choice, live, settled and after a cold remount", async () => {
+  it.runIf(runtimeMode === "native")("uses the T3 default live, settled and after a cold remount with no stored choice", async () => {
     localStorage.setItem("paperclip:task-chat:reasoning-display:v1", "fold");
     expect(reasoningPreferenceState.byAgent).toEqual({});
     const run = reasoningRun("registered");
@@ -1398,16 +1443,16 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
       render(<TaskChatThread {...run.live} />);
       await settleThreadLayout();
       expect(container.querySelector('[data-testid="task-chat-runner-turn"]')).not.toBeNull();
-      expectPlainInline();
+      expectT3Default();
       render(<TaskChatThread {...run.settled} />);
       await settleThreadLayout();
-      expectPlainInline();
+      expectT3Default(true);
       expect(container.textContent).toContain("Saved adapter reply");
       flushSync(() => root!.unmount());
       root = createRoot(container);
       render(<TaskChatThread {...run.settled} />);
       await settleThreadLayout();
-      expectPlainInline();
+      expectT3Default(true);
       expect(container.textContent).toContain("Saved adapter reply");
     } finally {
       run.restore();
@@ -1940,6 +1985,9 @@ describe("TaskChatThread runtime transcript selection", () => {
       conversationMode: true, comments: [], onAdd: async () => {},
     };
     const revealActivity = () => {
+      // Settled default work now has an outer Worked disclosure.
+      const worked = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-work-toggle"]');
+      if (worked?.getAttribute("aria-expanded") === "false") flushSync(() => worked.click());
       const toggle = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-activity-phase-toggle"]');
       expect(toggle).not.toBeNull();
       if (toggle!.getAttribute("aria-expanded") !== "true") flushSync(() => toggle!.click());
@@ -3396,6 +3444,8 @@ describe("TaskChatThread runtime transcript selection", () => {
       ],
     });
 
+    // Settled commentary belongs to Worked now; inspect both steering segments.
+    for (const worked of container.querySelectorAll<HTMLButtonElement>('[data-testid="task-chat-work-toggle"][aria-expanded="false"]')) flushSync(() => worked.click());
     const matchingPhases = Array.from(
       container.querySelectorAll(
         '[data-testid="task-chat-phase-interstitial"]',
@@ -6372,9 +6422,9 @@ describe("TaskChatThread live transcript", () => {
         issueStatus: "in_progress",
         linkedRuns: [linkedRun],
       });
-      expect(container.textContent?.split("UNIQUE-PROGRESS-LINE")).toHaveLength(
-        2,
-      );
+      // Inspect settled work explicitly; the canonical reply stays outside.
+      for (const worked of container.querySelectorAll<HTMLButtonElement>('[data-testid="task-chat-work-toggle"][aria-expanded="false"]')) flushSync(() => worked.click());
+      expect(container.textContent?.split("UNIQUE-PROGRESS-LINE")).toHaveLength(2);
       expect(container.textContent?.split(summary)).toHaveLength(2);
       expect(
         container.querySelector('[data-testid="task-chat-live-transcript"]'),
@@ -6401,9 +6451,8 @@ describe("TaskChatThread live transcript", () => {
         issueStatus: "in_progress",
         linkedRuns: [linkedRun],
       });
-      expect(container.textContent?.split("UNIQUE-PROGRESS-LINE")).toHaveLength(
-        2,
-      );
+      for (const worked of container.querySelectorAll<HTMLButtonElement>('[data-testid="task-chat-work-toggle"][aria-expanded="false"]')) flushSync(() => worked.click());
+      expect(container.textContent?.split("UNIQUE-PROGRESS-LINE")).toHaveLength(2);
       expect(container.textContent?.split(summary)).toHaveLength(2);
       expect(
         container.querySelector('[data-testid="task-chat-final-response"]'),
