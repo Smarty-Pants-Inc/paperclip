@@ -7,6 +7,13 @@ const run = { id: "run", agentId: "agent", status: "failed", scheduledRetryAt: n
   resultJson: { projectAccessDenied: { projectId: "22222222-2222-4222-8222-222222222222" } } };
 const agent = { status: "idle", pauseReason: null };
 
+it("names failed GitHub setup in the existing failure notice and keeps Retry", () => {
+  expect(projectTaskInterruption(issue, { run: { ...run, runtimeMode: "native", errorCode: "native_github_setup_failed",
+    error: "private-provider-value", resultJson: null }, agent, paused: false, approval: false }))
+    .toMatchObject({ state: "failed", canRetry: true, retryWait: { reason: "native_github_setup_failed",
+      message: "GitHub access couldn't be set up for this turn. Retry to try again." } });
+});
+
 describe("saved governed wait shutdown", () => {
   const now = Date.parse("2026-11-09T12:00:00Z");
   const pending = { ...run, runtimeMode: "native", errorCode: "native_governed_wait_settlement_pending", resultJson: null };

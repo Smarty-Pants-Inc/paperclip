@@ -183,7 +183,8 @@ const githubAccess = vi.hoisted(() => ({
   stop: vi.fn(async () => undefined),
   create: vi.fn(),
 }));
-vi.mock("./native-github-access.js", () => ({
+vi.mock("./native-github-access.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./native-github-access.js")>(),
   createNativeGitHubAccess: githubAccess.create,
 }));
 
@@ -18271,6 +18272,35 @@ describe("native session bounded recovery", () => {
     expect(requiresExecutionReconciliation(code)).toBe(true);
     // The same text without the typed class stays an ordinary interruption.
     expect(nativeSessionFailureSourceCode(new Error(failure.message))).toBe("native_session_interrupted");
+  });
+
+  it("records a GitHub activation setup failure as a specific terminal blocked reason before provider work", async () => {
+    const actual = await vi.importActual<Record<string, unknown>>("./native-github-access.js");
+    expect(typeof actual.NativeGitHubSetupError).toBe("function");
+    const failure = new (actual.NativeGitHubSetupError as new () => Error)();
+    const code = nativeSessionFailureSourceCode(failure);
+    expect(code).toBe("native_github_setup_failed");
+    const disposition = nativeSessionFailureDisposition(1, new Date(), code);
+    expect(disposition).toEqual({ phase: "terminal_failure", failureCode: code, nextAttemptAt: null });
+    expect(nativeSessionRecoveryProjection({ ...disposition, agentId: "agent" })).toMatchObject({ issueStatus: "blocked" });
+    const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    const stop = vi.fn(async () => undefined);
+    githubAccess.create.mockImplementationOnce(async () => ({ env: {}, ready: true, duplexRequested: false,
+      activate: vi.fn(async () => { throw failure; }), stop }));
+    state.execute.mockClear();
+    const service = vi.spyOn(issueServiceModule, "issueService").mockReturnValue({
+      update: vi.fn(async () => ({ status: "blocked", statusVersion: 1 })),
+    } as unknown as ReturnType<typeof issueServiceModule.issueService>);
+    try {
+      await expect(executePaperclipNativeSession({ db: leaseDb(execution, {}, {}, updates), execution,
+        runnerInstanceId: "github-setup-refused", managedGitHub: true })).rejects.toBe(failure);
+      expect(state.execute).not.toHaveBeenCalled();
+      expect(stop).toHaveBeenCalledOnce();
+      expect(updates.find(update => update.table === heartbeatRuns && update.values.errorCode === code)?.values)
+        .toMatchObject({ status: "failed", error: expect.stringContaining("GitHub access couldn't be set up for this turn") });
+      expect(updates.find(update => update.table === nativeRunFinalizations && update.values.failureCode === code)?.values)
+        .toMatchObject({ phase: "terminal_failure", failureDetail: { nextAction: expect.stringContaining("Retry") } });
+    } finally { service.mockRestore(); }
   });
 
   it("makes only typed operator-required cleanup quarantine terminal on the first attempt", () => {

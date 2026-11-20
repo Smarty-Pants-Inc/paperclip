@@ -15,7 +15,7 @@ const scope = { companyId: "company", agentId: "agent", issueId: "issue" };
 const cleanups: (() => Promise<unknown>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
-async function fixture(options: { fail?: (script: string) => boolean } = {}) {
+async function fixture(options: { fail?: (script: string) => boolean; fault?: (script: string) => "timeout" | "hang" | undefined } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "github-firstturn-"));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const calls: { script: string; phase: string; depth: number; settled: boolean }[] = [];
@@ -24,8 +24,10 @@ async function fixture(options: { fail?: (script: string) => boolean } = {}) {
   let queue = "";
   let hostUrl = "";
   let hostToken = "";
+  const generations: string[] = [];
   let transportError: unknown;
   let beforeExec: ((script: string) => Promise<void>) | undefined;
+  const hungWrites: (() => void)[] = [];
   let broker: Awaited<ReturnType<typeof createNativeGitHubAccess>> | undefined;
   const resolveCredentials = vi.fn(async () => ({ status: "available", env: {} }));
   const execute: CommandManagedRuntimeRunner["execute"] = async input => {
@@ -34,7 +36,9 @@ async function fixture(options: { fail?: (script: string) => boolean } = {}) {
     calls.push(call);
     try {
       await beforeExec?.(script);
-      if (options.fail?.(script)) return { exitCode: 1, stdout: "", stderr: "injected provider failure", timedOut: false, signal: null, pid: null, startedAt: new Date().toISOString() };
+      const fault = options.fault?.(script);
+      if (fault === "hang") await new Promise<void>(resolve => { hungWrites.push(resolve); });
+      if (options.fail?.(script) || fault) return { exitCode: 1, stdout: "", stderr: "injected provider failure: private-provider-value", timedOut: fault === "timeout", signal: null, pid: null, startedAt: new Date().toISOString() };
       // A real shell executes every command; this fake provider does not fabricate
       // readiness, uploads or queue results. In particular the ready gate launches
       // the actual generated callback server.
@@ -66,6 +70,10 @@ async function fixture(options: { fail?: (script: string) => boolean } = {}) {
       try {
         const bridge = await startAdapterExecutionTargetPaperclipBridge(input);
         queue = bridge?.env.PAPERCLIP_BRIDGE_QUEUE_DIR ?? "";
+        if (bridge?.resume) {
+          const resume = bridge.resume.bind(bridge);
+          bridge.resume = async generation => { generations.push(generation!); await resume(generation); };
+        }
         return bridge;
       } catch (error) {
         transportError = error;
@@ -75,13 +83,15 @@ async function fixture(options: { fail?: (script: string) => boolean } = {}) {
     cleanups.push(broker.stop);
     return broker;
   };
-  return { root, calls, create, resolveCredentials, runner: { execute },
+  return { root, calls, create, resolveCredentials, generations, runner: { execute },
     get queue() { return queue; }, get transportError() { return transportError; },
     get serialDepth() { return completedDepth; },
     setPhase(value: string) { phase = value; },
     beforeExec(hook: (script: string) => Promise<void>) { beforeExec = hook; },
-    hostRequest: () => fetch(hostUrl + "/runtime-tools/github/credentials", {
-      method: "POST", body: "{}", headers: { authorization: `Bearer ${hostToken}`, "content-type": "application/json" },
+    releaseHangs() { for (const release of hungWrites.splice(0)) release(); },
+    hostRequest: (generation?: string) => fetch(hostUrl + "/runtime-tools/github/credentials", {
+      method: "POST", body: "{}", headers: { authorization: `Bearer ${hostToken}`, "content-type": "application/json",
+        ...(generation ? { "x-paperclip-bridge-generation": generation, "x-paperclip-bridge-transport": "queue_v1" } : {}) },
     }),
   };
 }
@@ -126,7 +136,7 @@ it("cold real GitHub create + activate uses at most six remote execs and publish
   expect(pauseWrites).toHaveLength(3);
   expect(pauseWrites.filter(call => /(?:^|\n)printf '%s'/.test(call.script))).toHaveLength(1);
   expect(pauseWrites.filter(call => /(?:^|\n)base64 -d </.test(call.script))).toHaveLength(1);
-  expect(depth).toBeLessThanOrEqual(6);
+  expect(depth).toBeLessThanOrEqual(5);
   expect(count).toBeLessThanOrEqual(6);
 }, 30_000);
 
@@ -155,17 +165,112 @@ it("an actual entrypoint decode failure aborts the combined command before serve
   expect(f.resolveCredentials).not.toHaveBeenCalled();
 }, 30_000);
 
-it.each(["ever-attached", "run-state"])("a failed %s activation write rejects without publishing authority", async marker => {
+function isAttachment(script: string, marker: string) {
+  return script.includes("base64 -d") && (marker === "ever-attached"
+    ? script.includes("ever-attached") : script.includes("run-state.json") && !script.includes("ever-attached"));
+}
+
+// Keep reason: rf-3 caught activation regressing successful daily-work runs;
+// each row executes the real bridge and broker, with faults at provider admission.
+it.each(["ever-attached", "run-state"])("one %s timeout retries once and the first turn succeeds", async marker => {
   let armed = false;
-  const f = await fixture({ fail: script => armed && script.includes("base64 -d") &&
-    (marker === "ever-attached" ? script.includes("ever-attached") : script.includes("run-state.json") && !script.includes("ever-attached")) });
+  let attempts = 0;
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const f = await fixture({ fault: script => armed && isAttachment(script, marker) && ++attempts === 1 ? "timeout" : undefined });
   const broker = await f.create();
   armed = true;
-  await expect(broker.activate({ ...scope, runId: "run" })).rejects.toThrow("injected provider failure");
-  expect(await readFile(path.join(f.queue, "run-state.json"), "utf8")).toBe("paused");
-  expect((await f.hostRequest()).status).toBe(403);
-  expect(f.resolveCredentials).not.toHaveBeenCalled();
-  armed = false;
+  try {
+    const deactivate = await broker.activate({ ...scope, runId: "run" });
+    armed = false;
+    expect(attempts).toBe(2);
+    expect((await f.hostRequest()).status).toBe(200);
+    expect(f.resolveCredentials).toHaveBeenCalledOnce();
+    expect(warn).not.toHaveBeenCalled();
+    await deactivate();
+  } finally { armed = false; warn.mockRestore(); }
+}, 30_000);
+
+it.each(["ever-attached", "run-state"])("two %s write failures continue activation with one value-free warning", async marker => {
+  let armed = false;
+  let attempts = 0;
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const f = await fixture({ fail: script => armed && isAttachment(script, marker) && ++attempts <= 2 });
+  const broker = await f.create();
+  armed = true;
+  try {
+    const deactivate = await broker.activate({ ...scope, runId: "run" });
+    armed = false;
+    expect(attempts).toBe(2);
+    expect((await f.hostRequest()).status).toBe(200);
+    expect(warn).toHaveBeenCalledOnce();
+    expect(String(warn.mock.calls[0])).toContain("run state");
+    expect(String(warn.mock.calls[0])).not.toContain("private-provider-value");
+    await deactivate();
+  } finally { armed = false; warn.mockRestore(); }
+}, 30_000);
+
+it.each(["ever-attached", "run-state"])("hung %s writes take two five-second attempts then proceed", async marker => {
+  let armed = false;
+  let attempts = 0;
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const f = await fixture({ fault: script => armed && isAttachment(script, marker) && ++attempts <= 2 ? "hang" : undefined });
+  const broker = await f.create();
+  armed = true;
+  const started = Date.now();
+  const activation = broker.activate({ ...scope, runId: "run" }).then(deactivate => ({ deactivate }), error => ({ error }));
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([activation, new Promise<never>((_, reject) => {
+      deadline = setTimeout(() => reject(new Error("activation exceeded its two five-second bounds")), 13_000);
+    })]);
+    armed = false;
+    const elapsedMs = Date.now() - started;
+    expect(result).not.toHaveProperty("error");
+    expect(attempts).toBe(2);
+    expect(elapsedMs).toBeGreaterThanOrEqual(10_000);
+    expect(elapsedMs).toBeLessThan(13_000);
+    expect((await f.hostRequest()).status).toBe(200);
+    expect(warn).toHaveBeenCalledOnce();
+    console.log("ACTIVATION_HUNG_BOUND", JSON.stringify({ marker, attempts, elapsedMs }));
+    if ("deactivate" in result) await result.deactivate();
+  } finally {
+    if (deadline) clearTimeout(deadline);
+    armed = false;
+    f.releaseHangs();
+    await activation;
+    warn.mockRestore();
+  }
+}, 30_000);
+
+it("failed quarantine listing rejects authority for that generation, records GitHub setup reason, and Retry activates", async () => {
+  let armed = false;
+  const f = await fixture({ fail: script => armed && script.includes("basename") });
+  const broker = await f.create();
+  const requestPath = path.join(f.queue, "requests", "untrusted.json");
+  await writeFile(requestPath, JSON.stringify({ id: "untrusted" }));
+  // The broker's native host endpoint must reject even a correctly tagged request.
+  f.beforeExec(async script => {
+    if (armed && script.includes("basename")) {
+      expect((await f.hostRequest(f.generations[0])).status).toBe(403);
+    }
+  });
+  armed = true;
+  let deactivate: (() => Promise<void>) | undefined;
+  try {
+    await expect(broker.activate({ ...scope, runId: "failed-run" }).then(value => { deactivate = value; }))
+      .rejects.toMatchObject({ message: "GitHub access couldn't be set up for this turn", code: "native_github_setup_failed" });
+    expect((await f.hostRequest(f.generations[0])).status).toBe(403);
+    expect(f.resolveCredentials).not.toHaveBeenCalled();
+    expect(await readFile(path.join(f.queue, "run-state.json"), "utf8")).toBe("paused");
+  } finally { armed = false; await deactivate?.(); }
+  await expect(readFile(requestPath, "utf8")).resolves.toContain("untrusted");
+  const release = await broker.activate({ ...scope, runId: "retry-run" });
+  expect(f.generations[1]).not.toBe(f.generations[0]);
+  expect((await f.hostRequest(f.generations[0])).status).toBe(403);
+  expect((await f.hostRequest(f.generations[1])).status).toBe(200);
+  expect(f.resolveCredentials).toHaveBeenCalledExactlyOnceWith({ ...scope, runId: "retry-run" });
+  expect(JSON.parse(await readFile(path.join(f.queue, "responses", "untrusted.json"), "utf8"))).toMatchObject({ status: 503 });
+  await release();
 }, 30_000);
 
 it("quarantines old requests before attached and awaits the durable attachment before resolving activation", async () => {
