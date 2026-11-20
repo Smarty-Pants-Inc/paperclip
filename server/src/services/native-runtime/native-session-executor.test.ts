@@ -19868,7 +19868,8 @@ describe("runnerd provider runtime wiring", () => {
 
   // Keep reason: F1 recorded a remote generation exec on every ordinary warm
   // turn. Exercise real executor admission and its retained backend identity
-  // exchange; lease labels alone must not add remote work or retire a live owner.
+  // exchange. Incident 687c32e8: failed identity must retire before replacement,
+  // never be labelled verified_reuse, including an inconclusive generation read.
   it.each([
     { connected: true, resumedFromState: undefined, probe: false, lost: false },
     { connected: true, resumedFromState: "running", probe: false, lost: false },
@@ -19877,8 +19878,41 @@ describe("runnerd provider runtime wiring", () => {
     { connected: true, resumedFromState: "archived", probe: true, lost: false },
     { connected: false, resumedFromState: undefined, probe: true, lost: false },
     { connected: false, resumedFromState: undefined, probe: true, lost: true },
-  ])("gates idle-owner generation probes on runner identity: $connected / $resumedFromState / lost=$lost", async ({ connected, resumedFromState, probe, lost }) => {
-    const name = `probe-gate-${connected}-${resumedFromState}-${lost}`;
+    ...["missing marker", "RPC timeout", "RPC error", "stop refused"].map(failure =>
+      ({ connected: true, resumedFromState: undefined, probe: true, lost: false, failure })),
+  ] as Array<{ connected: boolean; resumedFromState?: string; probe: boolean; lost: boolean; failure?: string }>)
+  ("gates idle-owner generation probes on runner identity: $connected / $resumedFromState / lost=$lost / $failure", async ({ connected, resumedFromState, probe, lost, failure }) => {
+    const name = `probe-gate-${connected}-${resumedFromState}-${lost}-${failure}`;
+    let oldRunnerLive = true;
+    let refuseStop = failure === "stop refused";
+    let lifecycle = "ready";
+    const order: string[] = [];
+    let peer: ReturnType<typeof spawn> | undefined;
+    let freshPeer: ReturnType<typeof spawn> | undefined;
+    let peerFingerprint = "";
+    const peerRows: unknown[] = [];
+    const startPeer = async (generation: string) => {
+      const child = spawn(process.execPath, ["-e", `process.on('message', message => {
+        if (message === 'answer') process.send({ generation: process.argv[1], pid: process.pid, answeredAtMs: Date.now() });
+      }); process.send({ ready: true });`, generation], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+      await once(child, "message");
+      const stat = await readFile(`/proc/${child.pid}/stat`, "utf8");
+      const boot = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+      const fingerprint = `linux:${boot}:${stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]}`;
+      if (generation.endsWith("-old")) peerFingerprint = fingerprint;
+      peerRows.push({ boxId: name, generation, runnerInstanceId: `runner-${name}`, pid: child.pid,
+        fingerprint, startedAtMs: Date.now() });
+      return child;
+    };
+    const answer = async (child: ReturnType<typeof spawn>) => {
+      const replied = once(child, "message"); child.send!("answer");
+      const [reply] = await replied; peerRows.push(reply); return reply;
+    };
+    const stopPeer = async (child: ReturnType<typeof spawn> | undefined) => {
+      if (!child || child.exitCode !== null || child.signalCode !== null) return;
+      const exited = once(child, "exit"); child.kill("SIGTERM"); await exited;
+      peerRows.push({ pid: child.pid, stoppedAtMs: Date.now() });
+    };
     const first = scopedNativeExecution(name);
     first.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 60_000 };
     const next = { ...first, binding: { ...first.binding, runId: `${first.binding.runId}-next` } };
@@ -19887,13 +19921,16 @@ describe("runnerd provider runtime wiring", () => {
       turnId: "prior-turn", itemId: "prior-item" };
     const root = await initializeScopedRunnerRoot(first, identity.runnerInstanceId);
     await writeRunnerAuthority(root, identity, "ready");
-    const execute = vi.fn(async (request: { args?: string[] }) => ({
-      exitCode: lost && request.args?.[2] === "paperclip-runner-generation-check" ? 45 : 0,
-      timedOut: false, stderr: "", signal: null, pid: 123, startedAt: "2026-11-13T12:00:00.000Z",
-      stdout: request.args?.[2] === "paperclip-runner-generation-marker"
-        ? `nonce\n123\n2026-11-13T12:00:00.000Z\n${identity.runnerInstanceId}\nlinux:abcd-1234:123\n`
-        : request.args?.[1]?.includes("base64 <")
-          ? Buffer.from(JSON.stringify({ ...identity, lifecycle: "ready" })).toString("base64") : "" }));
+    const execute = vi.fn(async (request: { args?: string[] }) => {
+      const marker = request.args?.[2] === "paperclip-runner-generation-marker";
+      if (marker && failure === "RPC error") throw new Error("generation RPC unavailable");
+      return {
+        exitCode: lost && request.args?.[2] === "paperclip-runner-generation-check" ? 45 : 0,
+        timedOut: marker && failure === "RPC timeout", stderr: "", signal: null, pid: 123, startedAt: "2026-11-13T12:00:00.000Z",
+        stdout: marker ? failure === "missing marker" ? ""
+          : `nonce\n${peer?.pid ?? 123}\n2026-11-13T12:00:00.000Z\n${identity.runnerInstanceId}\n${peerFingerprint || "linux:abcd-1234:123"}\n`
+          : request.args?.[1]?.includes("base64 <") ? Buffer.from(JSON.stringify({ ...identity, lifecycle })).toString("base64") : "" };
+    });
     const target = { kind: "remote" as const, transport: "sandbox" as const, environmentId: name,
       remoteCwd: "/workspace", runner: { execute },
       sandboxLeaseAcquisition: { outcome: "created" as "created" | "resumed", providerLeaseId: name,
@@ -19902,13 +19939,31 @@ describe("runnerd provider runtime wiring", () => {
     const restore = vi.spyOn(runnerCheckpoint, "restoreNativeRunnerCheckpoint").mockResolvedValue(null);
     const retainedBinding = lost ? vi.spyOn(controllerRecovery, "assertNativeRetainedSandboxBinding")
       .mockResolvedValue({ remoteCwd: "/workspace" }) : undefined;
-    const session = { close: vi.fn(async () => undefined), detachControllerForRestart: vi.fn(async () => undefined) };
+    const session = { close: vi.fn(async () => {
+      order.push("stop requested");
+      if (refuseStop) throw new Error("old Runner stop unconfirmed");
+      await stopPeer(peer);
+      oldRunnerLive = false;
+      lifecycle = "suspended";
+      await writeRunnerAuthority(root, identity, lifecycle);
+      order.push("old Runner stopped");
+    }), detachControllerForRestart: vi.fn(async () => { order.push("old owner detached"); }) };
     const replacement = { close: vi.fn(async () => undefined) };
     const result = { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" }, turnId: "turn",
       normalizedSessionId: first.session.normalizedSessionId!, providerSessionId: "retained-history",
       driverKind: "codex_app_server", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
-    const identityCheck = vi.fn(async (runnerInstanceId: string) => connected && runnerInstanceId === identity.runnerInstanceId);
+    const identityCheck = vi.fn(async (runnerInstanceId: string) => {
+      if (peer) {
+        // The failed identity command is a live, still-answering peer, not a
+        // peer pre-killed to make the replacement's stop barrier vacuous.
+        expect(peer.exitCode).toBeNull(); expect(peer.signalCode).toBeNull();
+        await answer(peer);
+      }
+      return connected && !failure && runnerInstanceId === identity.runnerInstanceId;
+    });
     const events: AdapterRuntimeEvent[] = [];
+    const reused: unknown[] = [];
+    let replacementOverLiveOwner = false;
     state.execute.mockReset().mockImplementationOnce(async options => {
       // beforeConnect records the retained generation; the identity command
       // must prove that same generation before the next run attaches.
@@ -19918,12 +19973,24 @@ describe("runnerd provider runtime wiring", () => {
       await options.onSession?.(session);
       return result;
     }).mockImplementationOnce(async options => {
-      expect(options.existingSession).toBe(lost ? undefined : session);
+      reused.push(options.existingSession);
+      if (!options.existingSession) {
+        replacementOverLiveOwner = oldRunnerLive;
+        if (peer) {
+          if (peer.exitCode === null && peer.signalCode === null) replacementOverLiveOwner = true;
+          else {
+            freshPeer = await startPeer(`${name}-fresh`);
+            await answer(freshPeer);
+            await stopPeer(freshPeer);
+          }
+        }
+        order.push("fresh Runner answers");
+      }
       if (lost) {
         state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
         expect(state.createTransport.mock.calls.at(-1)![0]).toMatchObject({ lostRunnerSource: identity });
       }
-      await options.onSession?.(lost ? replacement : session);
+      await options.onSession?.(probe ? replacement : session);
       return result;
     });
     const nextDb = leaseDb(next), select = nextDb.select.bind(nextDb);
@@ -19941,9 +20008,11 @@ describe("runnerd provider runtime wiring", () => {
         ? priorNativeRunDb(first).select(fields as never) : select(fields as never);
     }) as Db["select"];
     try {
+      if (failure) peer = await startPeer(`${name}-old`);
       await executePaperclipNativeSession({ db: leaseDb(first), execution: first,
         runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target });
       if (lost) {
+        oldRunnerLive = false;
         // Remote runner-state lives on the box, not in Core's projection. Its
         // socket dropped after a settled turn and its exact generation exited.
         await rm(join(root, "runner/runner-state.json"));
@@ -19954,9 +20023,37 @@ describe("runnerd provider runtime wiring", () => {
       }
       execute.mockClear(); restore.mockClear();
       target.sandboxLeaseAcquisition.outcome = "resumed";
-      await expect(executePaperclipNativeSession({ db: nextDb, execution: next,
+      const attempt = executePaperclipNativeSession({ db: nextDb, execution: next,
         runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target,
-        onEvent: async event => { events.push(event); } })).resolves.toMatchObject({ exitCode: 0 });
+        onEvent: async event => { events.push(event); } });
+      if (failure === "stop refused") {
+        await expect(attempt).rejects.toMatchObject({ code: "native_predecessor_retirement_unproven" });
+        expect(oldRunnerLive).toBe(true);
+        expect(peer?.exitCode).toBeNull(); expect(peer?.signalCode).toBeNull();
+        console.info(`[reuse-live-peer] ${name}: ${JSON.stringify({ simulatedRemote: true, clock: "real wall clock; attachment dispatch mocked, no 420s clock advancement", peerRows, refused: true })}`);
+        expect(state.execute).toHaveBeenCalledOnce();
+        expect(events.filter(event => event.eventType === "run.startup.reuse" && event.payload?.layer === "runner")).toEqual([]);
+        return;
+      }
+      await expect(attempt).resolves.toMatchObject({ exitCode: 0 });
+      console.info(`[reuse-identity-replay] ${name}: ${JSON.stringify({ reused: reused[0] === session, order,
+        events: events.filter(event => event.eventType === "run.startup.reuse"
+          || event.eventType === "run.performance.span" && event.payload?.span === "native.controller.warm_owner_identity_check") })}`);
+      expect(reused).toEqual([probe ? undefined : session]);
+      expect(replacementOverLiveOwner).toBe(false);
+      const reuse = events.filter(event => event.eventType === "run.startup.reuse"
+        && ["runner", "provider_session"].includes(String(event.payload?.layer)) && event.payload?.reason === "verified_reuse");
+      expect(reuse).toHaveLength(probe ? 0 : 2);
+      if (probe) expect(order).toEqual(lost ? ["old owner detached", "fresh Runner answers"]
+        : ["stop requested", "old Runner stopped", "fresh Runner answers"]);
+      console.info(`[reuse-identity] ${name}: ${JSON.stringify({ order, verifiedReuse: reuse.length, oldRunnerLive })}`);
+      if (peer) {
+        expect(peer.connected).toBe(false);
+        expect(peer.exitCode !== null || peer.signalCode !== null).toBe(true);
+        expect(freshPeer).toBeDefined();
+        console.info(`[reuse-live-peer] ${name}: ${JSON.stringify({ simulatedRemote: true,
+          clock: "real wall clock; attachment dispatch mocked, no 420s clock advancement", peerRows, noDuplicateAnswers: true })}`);
+      }
       const spans = events.filter(event => event.eventType === "run.performance.span"
         && event.payload?.span === "native.controller.warm_owner_identity_check");
       expect(spans).toHaveLength(resumedFromState === "stopped" || resumedFromState === "archived" ? 0 : 1);
@@ -19972,12 +20069,16 @@ describe("runnerd provider runtime wiring", () => {
         expect(identityCheck).toHaveBeenCalledExactlyOnceWith(identity.runnerInstanceId);
       }
       if (resumedFromState === "stopped" || resumedFromState === "archived") expect(identityCheck).not.toHaveBeenCalled();
-      if (!lost) expect(restore).not.toHaveBeenCalled();
-      expect(session.close).not.toHaveBeenCalled();
+      if (!probe) expect(restore).not.toHaveBeenCalled();
+      expect(session.close).toHaveBeenCalledTimes(probe && !lost ? 1 : 0);
       expect(session.detachControllerForRestart).toHaveBeenCalledTimes(lost ? 1 : 0);
       expect(state.execute).toHaveBeenCalledTimes(2);
     } finally {
-      await closeWarmNativeSessionsForEnvironment({ environmentId: name, reason: "probe gate test cleanup" });
+      // The row deliberately retains an unproven owner. Explicitly allow its
+      // stop only for fixture teardown; never leak that owner into later rows.
+      refuseStop = false;
+      try { await closeWarmNativeSessionsForEnvironment({ environmentId: name, reason: "probe gate test cleanup" }); }
+      finally { await stopPeer(peer); await stopPeer(freshPeer); }
       retainedBinding?.mockRestore(); restore.mockRestore(); driver.mockRestore();
     }
   });
@@ -20038,7 +20139,8 @@ describe("runnerd provider runtime wiring", () => {
     const restore = vi.spyOn(runnerCheckpoint, "restoreNativeRunnerCheckpoint").mockResolvedValue(null);
     const retainedBinding = lost ? vi.spyOn(controllerRecovery, "assertNativeRetainedSandboxBinding")
       .mockResolvedValue({ remoteCwd: "/workspace" }) : undefined;
-    const session = { close: vi.fn(async () => undefined), detachControllerForRestart: vi.fn(async () => undefined) };
+    const session = { close: vi.fn(async () => { await writeRunnerAuthority(root, identity, "suspended"); }),
+      detachControllerForRestart: vi.fn(async () => undefined) };
     const replacement = { close: vi.fn(async () => undefined) };
     const result = { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" }, turnId: "turn",
       normalizedSessionId: first.session.normalizedSessionId!, providerSessionId: "retained-history",
@@ -20109,7 +20211,7 @@ describe("runnerd provider runtime wiring", () => {
         state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
         expect(state.createTransport.mock.calls.at(-1)![0]).toMatchObject({ lostRunnerSource: identity });
       }
-      await options.onSession?.(lost ? replacement : session);
+      await options.onSession?.(probe ? replacement : session);
       return result;
     });
     const nextDb = leaseDb(next), select = nextDb.select.bind(nextDb);
@@ -20196,9 +20298,9 @@ describe("runnerd provider runtime wiring", () => {
           expect(identityCheck).not.toHaveBeenCalled();
         } else expect(identityCheck).toHaveBeenCalledOnce();
       } else expect(ensureConnected).not.toHaveBeenCalled();
-      expect(existingSessions).toEqual([lost ? undefined : session]);
-      if (!lost) expect(restore).not.toHaveBeenCalled();
-      expect(session.close).not.toHaveBeenCalled();
+      expect(existingSessions).toEqual([probe ? undefined : session]);
+      if (!probe) expect(restore).not.toHaveBeenCalled();
+      expect(session.close).toHaveBeenCalledTimes(probe && !lost ? 1 : 0);
       expect(session.detachControllerForRestart).toHaveBeenCalledTimes(lost ? 1 : 0);
       expect(state.execute).toHaveBeenCalledTimes(2);
     } finally {
