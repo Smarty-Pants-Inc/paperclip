@@ -284,7 +284,7 @@ describe.each(["legacy", "native"] as const)("historical %s system status", (run
     expect(props.onResumeAssignee).not.toHaveBeenCalled();
   });
 
-  it.runIf(runtimeMode === "native")("keeps a failed MCP start on a historical settled run while hiding other notices", () => {
+  it.runIf(runtimeMode === "native").each([true, false])("keeps a failed MCP start on a historical settled run while hiding other notices (progress=%s)", (progress) => {
     const prp = (seq: number, eventType: string, payload: Record<string, unknown>) => ({
       id: seq, companyId: "company", runId: "mcp", agentId: "agent", seq, eventType, stream: "system", level: "info",
       color: null, message: null, createdAt: new Date(`2025-01-01T10:00:0${seq}Z`),
@@ -302,7 +302,7 @@ describe.each(["legacy", "native"] as const)("historical %s system status", (run
           [{ name: "server", value: "github" }, { name: "reason", value: "No such file or directory (os error 2)" }]),
         notice(2, "auth", "Sign in again"),
       ]),
-      { kind: "assistant", channel: "progress", ts: "2025-01-01T10:00:05Z", text: "Inspected the source." },
+      ...(progress ? [{ kind: "assistant", channel: "progress", ts: "2025-01-01T10:00:05Z", text: "Inspected the source." }] : []),
       { kind: "assistant", channel: "final", ts: "2025-01-01T10:00:20Z", text: "I couldn't reach the GitHub MCP server." },
     ]);
     render(<TaskChatThread comments={[comment("response", "I couldn't reach the GitHub MCP server.", "mcp")]}
@@ -3269,6 +3269,142 @@ describe("TaskChatThread runtime transcript selection", () => {
     ).toBeNull();
   });
 
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21334
+  // DB-READ-RESULT case1 supplies ids/states/lengths, NOT lifecycle entries or
+  // agents.adapterType. paperclip_runner + init below are a controlled projection,
+  // not an assertion that the recorded native/pi_rpc run used this UI branch.
+  describe.each([{ width: 390, mobile: true }, { width: 1440, mobile: false }])("emptyreply B projection at $width", ({ mobile }) => {
+    it.each(["missing entries", "controlled lifecycle entry"])("leaves no historical identity-only turn (%s)", (projection) => {
+      sidebarState.isMobile = mobile;
+      const runId = "de0b9da6-c335-4f4e-adce-a0590686d733";
+      const recoveryId = "03f3bbee-3f6b-4fde-a730-4986ee221702";
+      const ownerId = "2357cdd2-8c06-42b0-83ee-792dbc7864f2";
+      const response = "R".repeat(46);
+      const comment = (id: string, body: string, at: string, agent = false) => ({
+        id, body, companyId: "company", issueId: "3ed1f83a-79fe-4f67-b4de-1b2f3bce0b48",
+        authorType: agent ? "agent" as const : "user" as const,
+        authorAgentId: agent ? "932a7ffb" : null, authorUserId: agent ? null : "viewer",
+        runId: agent ? recoveryId : null, createdByRunId: agent ? recoveryId : null,
+        presentation: null, metadata: null, createdAt: new Date(at), updatedAt: new Date(at),
+      });
+      nativeTranscriptState.transcriptByRun.set(runId, projection === "missing entries" ? [] : [
+        { kind: "init", ts: "2026-11-19T19:19:34.110Z", model: "controlled-model", sessionId: "controlled-session" },
+      ]);
+      nativeTranscriptState.transcriptByRun.set(recoveryId, [
+        assistantEntry("2026-11-19T19:51:44.572Z", response, "final"),
+        { kind: "run_terminal", ts: "2026-11-19T19:51:47.761Z", turnState: "completed", runState: "succeeded", disposition: "done" },
+      ]);
+      const props = {
+        comments: [
+          comment("94f8b5b8-0a1e-40ae-a236-eca080d9ec8d", "H".repeat(129), "2026-11-19T19:19:33.919Z"),
+          comment("5e7b4684-3f07-48e6-b4ae-c9fe3273efdf", "J".repeat(15), "2026-11-19T19:20:29.274Z"),
+          comment(ownerId, response, "2026-11-19T19:51:44.572Z", true),
+        ],
+        issueStatus: "done", onAdd: async () => {},
+        linkedRuns: [
+          { runId, runtimeMode: "native" as const, adapterType: "paperclip_runner", status: "cancelled", errorCode: "cancelled",
+            agentId: "932a7ffb", agentName: "Runner", createdAt: "2026-11-19T19:19:33.977Z",
+            startedAt: "2026-11-19T19:19:34.110Z", finishedAt: "2026-11-19T19:19:59.908Z" },
+          { runId: recoveryId, runtimeMode: "native" as const, adapterType: "paperclip_runner", status: "succeeded",
+            agentId: "932a7ffb", agentName: "Runner", createdAt: "2026-11-19T19:51:20.899Z",
+            startedAt: "2026-11-19T19:51:20.983Z", finishedAt: "2026-11-19T19:51:47.761Z",
+            resultJson: { presentationDecision: { schema: "paperclip.run_presentation_decision.v1", chosenSource: "final_agent_message", commentId: ownerId } } },
+        ],
+      };
+      const assertSettled = () => {
+        expect(container.querySelectorAll('[data-testid="task-chat-turn-summary"]')).toHaveLength(0);
+        expect(container.querySelectorAll('[data-testid="task-chat-agent-identity"]')).toHaveLength(1);
+        expect(container.textContent?.split(response)).toHaveLength(2);
+        expect(container.textContent).not.toContain("Thinking");
+        expect([...container.querySelectorAll('[data-thread-anchor]')].map(node => node.getAttribute("data-thread-anchor")))
+          .toEqual(props.comments.map(comment => comment.id));
+      };
+      renderThread(props);
+      assertSettled();
+      // Fresh mount exercises the same persisted projection, not held live state.
+      render(<div />);
+      renderThread(props);
+      assertSettled();
+    });
+
+    it("control: a live lifecycle-only run retains Working and Thinking", () => {
+      sidebarState.isMobile = mobile;
+      const run = nativeRunningRun();
+      nativeTranscriptState.transcriptByRun.set(run.id, [
+        { kind: "init", ts: run.startedAt, model: "controlled-model", sessionId: "controlled-session" },
+      ]);
+      renderThread({ comments: [], onAdd: async () => {}, activeRun: run });
+      expect(container.textContent).toContain("Working");
+      expect(container.textContent).toContain("Thinking");
+      expect(container.querySelector('[data-testid="task-chat-live-transcript"]')).not.toBeNull();
+    });
+  });
+
+  // A is hardening only: the DB case2 owner is length3, never empty. Keep its
+  // other two length3 comments distinct; changing just the chosen body is an
+  // explicit controlled mutation. API adapter/linkage are conditional inputs.
+  describe.each([{ width: 390, mobile: true }, { width: 1440, mobile: false }])("emptyreply A ownership at $width", ({ mobile }) => {
+    it.each(["valid", "empty mutation", "whitespace mutation", "deleted mutation", "bound file control"])("keeps the answer once (%s)", (variant) => {
+      sidebarState.isMobile = mobile;
+      const runId = "7158403e-c8a0-455a-9eaf-8cc0d396e307";
+      const ownerId = "a707cb80-a749-41a2-addb-85326c25be02";
+      const texts = ["A00", "B00", "C00"];
+      const ids = ["6fbe7e55-91c1-4a11-8cfa-3e799d45f9b0", "99351004-e9a7-4bf7-9004-0ad7970fdb2f", ownerId];
+      const comments = ids.map((id, index) => ({
+        id, body: index !== 2 || variant === "valid" || variant === "deleted mutation" ? texts[index] : variant === "whitespace mutation" ? " \n " : "",
+        companyId: "company", issueId: "5b45f195-b208-4197-a3bf-6b951028d256", authorType: "agent" as const,
+        authorAgentId: "1f49b86e", authorUserId: null, runId, createdByRunId: runId, presentation: null, metadata: null,
+        createdAt: new Date(`2026-11-20T05:20:34.${288 + index}Z`), updatedAt: new Date(`2026-11-20T05:20:34.${288 + index}Z`),
+        ...(index === 2 && variant === "deleted mutation" ? { deletedAt: new Date("2026-11-20T05:21:00Z") } : {}),
+      }));
+      nativeTranscriptState.transcriptByRun.set(runId, [
+        ...texts.map((text, index) => assistantEntry(`2026-11-20T05:20:3${index + 1}Z`, text, "final")),
+        { kind: "run_terminal", ts: "2026-11-20T05:20:34.187Z", turnState: "completed", runState: "succeeded", disposition: "done" },
+      ]);
+      const attachments = variant === "bound file control" ? [{ id: "controlled-file", companyId: "company", issueId: comments[0].issueId,
+        issueCommentId: ownerId, assetId: "controlled-asset", provider: "paperclip", objectKey: "controlled-file", contentType: "text/plain",
+        byteSize: 3, sha256: "controlled-digest", originalFilename: "redacted.txt", createdByAgentId: "1f49b86e", createdByUserId: null,
+        createdAt: comments[2].createdAt, updatedAt: comments[2].updatedAt, contentPath: "/api/attachments/controlled-file/content" }] : [];
+      renderThread({ comments, attachments, onAdd: async () => {}, linkedRuns: [{ runId, runtimeMode: "native", adapterType: "paperclip_runner",
+        agentId: "1f49b86e", agentName: "Runner", status: "succeeded", createdAt: "2026-11-20T05:19:41.856Z",
+        startedAt: "2026-11-20T05:19:42.018Z", finishedAt: "2026-11-20T05:20:34.187Z",
+        resultJson: { presentationDecision: { schema: "paperclip.run_presentation_decision.v1", chosenSource: "final_agent_message", commentId: ownerId } } }] });
+      for (const text of texts.slice(0, 2)) expect(container.textContent?.split(text), text).toHaveLength(2);
+      expect(container.textContent?.split(texts[2])).toHaveLength(variant === "bound file control" ? 1 : 2);
+      if (variant === "bound file control") expect(container.textContent).toContain("redacted.txt");
+      expect(container.querySelectorAll('[data-testid="task-chat-agent-identity"]')).toHaveLength(3);
+      expect(container.querySelector('[data-testid="task-chat-final-response"]') !== null).toBe(variant !== "valid" && variant !== "bound file control");
+    });
+  });
+
+  // E: actual case5 comment ids/states/lengths, but tool/segment/ack rows were
+  // not returned. This checks the existing adjacent assembly seam with ONE
+  // controlled tool, not a replay of the captured tool-only row.
+  it.each(["pi_rpc", "paperclip_runner"])("emptyreply E adjacent pairing control (%s; API adapter unresolved)", (adapterType) => {
+    const runId = "e682914d-6688-4634-a513-53efd2d30ea1";
+    const ids = ["e29eeae4-d903-4968-a76b-8d48d0fcc1a5", "e19f2d9a-4050-498f-af30-0b238a98f3cc", "d09fb55c-c8f6-480a-8a22-21f587ea7f8e", "d34ec738-a433-4600-9cc5-ef3d10e0ae73"];
+    const texts = [34, 13, 13, 13].map((length, index) => String.fromCharCode(65 + index).repeat(length));
+    nativeTranscriptState.transcriptByRun.set(runId, [
+      { kind: "tool_call", ts: "2026-11-20T03:52:50Z", name: "Bash", input: { command: "controlled-command" }, toolUseId: "controlled-tool-NOT-captured" },
+      { kind: "tool_result", ts: "2026-11-20T03:52:51Z", toolUseId: "controlled-tool-NOT-captured", content: "controlled-result" },
+      ...texts.map((text, index) => assistantEntry(`2026-11-20T03:52:52.${140 + index}Z`, text, "final")),
+      { kind: "run_terminal", ts: "2026-11-20T03:52:56.483Z", turnState: "completed", runState: "succeeded", disposition: "done" },
+    ]);
+    const comments = ids.map((id, index) => ({ id, body: texts[index], companyId: "company", issueId: "201a7cd1-c813-4773-9902-e6ba81c45c3f",
+      authorType: "agent" as const, authorAgentId: "4cc9f284", authorUserId: null, runId, createdByRunId: runId, presentation: null, metadata: null,
+      createdAt: new Date(`2026-11-20T03:52:52.${140 + index}Z`), updatedAt: new Date(`2026-11-20T03:52:52.${140 + index}Z`) }));
+    renderThread({ comments, onAdd: async () => {}, agentMap: new Map([["4cc9f284", { id: "4cc9f284", name: "Runner" } as Agent]]),
+      linkedRuns: [{ runId, runtimeMode: "native", adapterType, agentId: "4cc9f284", agentName: "Runner",
+      status: "succeeded", createdAt: "2026-11-20T03:51:53.787Z", startedAt: "2026-11-20T03:51:53.897Z", finishedAt: "2026-11-20T03:52:56.483Z",
+      resultJson: { presentationDecision: { schema: "paperclip.run_presentation_decision.v1", chosenSource: "final_agent_message", commentId: ids[3] } } }] });
+    for (const text of texts) expect(container.textContent?.split(text), text).toHaveLength(2);
+    expect(container.querySelectorAll('[data-testid="task-chat-agent-identity"]')).toHaveLength(4);
+    const owner = container.querySelector(`[data-thread-anchor="${ids[3]}"]`);
+    expect(owner?.querySelector('[data-testid="task-chat-bubble-attached-turn"], [data-testid="task-chat-turn"]')).not.toBeNull();
+    // Activity survives; the saved owner and its turn share one identity.
+    expect(owner?.querySelectorAll('[data-testid="task-chat-agent-identity"]')).toHaveLength(1);
+  });
+
   it("does not repeat progress when the persisted completion comment owns the same text", () => {
     const repeated = "BASELINE-DONE";
     nativeTranscriptState.transcriptByRun.set("native-repeated-final", [
@@ -3412,13 +3548,16 @@ describe("TaskChatThread runtime transcript selection", () => {
     const turnHeaders = Array.from(
       container.querySelectorAll('[data-testid="task-chat-turn-summary"]'),
     );
-    expect(turnHeaders).toHaveLength(2);
+    // The earlier intentional progress still owns a turn. The final interval
+    // is now entirely owned by its saved reply, not a second empty header.
+    expect(turnHeaders).toHaveLength(1);
     expect(turnHeaders[0]?.textContent).not.toContain(
       "Continued after steering",
     );
-    expect(turnHeaders[1]?.textContent).toContain(
-      "Continued after steering · Worked for",
-    );
+    expect(container.textContent?.split(repeated)).toHaveLength(3);
+    for (const turn of container.querySelectorAll('[data-testid="task-chat-turn"]')) {
+      expect(turn.querySelector('[data-testid="task-chat-turn-timeline"], [data-testid="task-chat-final-response"], [data-testid="task-chat-run-health-banner"]')).not.toBeNull();
+    }
   });
 
   it("keeps a pending native permission answerable after same-turn steering", async () => {

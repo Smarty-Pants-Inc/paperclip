@@ -94,6 +94,39 @@ describe("TaskChatBubble attachment chips", () => {
     );
   }
 
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21334
+  // D hardening: case5's selected owner has length13. Empty/whitespace are
+  // controlled payload mutations, NOT captured stored bodies.
+  it.each(["", " \n "])("emptyreply D hides a payload-free agent identity (%j)", (text) => {
+    flushSync(() => root!.render(<ThemeProvider><TaskChatBubble item={{
+      id: "d34ec738-a433-4600-9cc5-ef3d10e0ae73", sourceRunId: "e682914d-6688-4634-a513-53efd2d30ea1",
+      kind: "message", author: "agent", authorName: "Runner", text, timestamp: "3:52 AM",
+    }} /></ThemeProvider>));
+    expect(container.querySelector('[data-conversation-message="agent"]')).toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-agent-identity"]')).toBeNull();
+    expect(container.textContent).toBe("");
+  });
+
+  it.each(["bound file", "bound image", "attached activity", "before turn", "verification caveat", "human pending", "streaming"])("emptyreply D control preserves %s with no prose", (payload) => {
+    const item: TaskChatMessageItem = { id: "m1", kind: "message", author: payload === "human pending" ? "human" : "agent", authorName: "Runner", text: "",
+      ...(payload === "human pending" ? { optimistic: "pending" } : {}),
+      ...(payload === "streaming" ? { streaming: true } : {}),
+      ...(payload === "verification caveat" ? { verificationCaveats: [{ commandOrCheck: "controlled-check", detail: "Keep this limitation" }] } : {}),
+    };
+    const attachments = payload.startsWith("bound") ? [attachment({ id: "payload", originalFilename: payload === "bound image" ? "proof.png" : "notes.txt",
+      contentType: payload === "bound image" ? "image/png" : "text/plain" })] : [];
+    flushSync(() => root!.render(<ThemeProvider><TaskChatBubble item={item} attachments={attachments}
+      attachedTurn={payload === "attached activity" ? <div>Kept activity</div> : undefined}
+      beforeTurn={payload === "before turn" ? <div>Kept turn</div> : undefined} /></ThemeProvider>));
+    expect(container.querySelector('[data-conversation-message]')).not.toBeNull();
+    if (payload === "bound file") expect(container.textContent).toContain("notes.txt");
+    if (payload === "bound image") expect(container.querySelector('img[alt="proof.png"]')).not.toBeNull();
+    if (payload === "attached activity") expect(container.textContent).toContain("Kept activity");
+    if (payload === "before turn") expect(container.textContent).toContain("Kept turn");
+    if (payload === "verification caveat") expect(container.textContent).toContain("Keep this limitation");
+    if (payload === "human pending") expect(container.textContent).toContain("Sending");
+  });
+
   it("renders another human on the left like an agent, and moves them right when they become the viewer", () => {
     const item: TaskChatMessageItem = {
       id: "sam-comment", kind: "message", author: "human", text: "I still see the old task title.",
