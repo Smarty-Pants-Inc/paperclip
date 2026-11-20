@@ -56,10 +56,11 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "R-no-ack", "R-no-ack-sigstop", "R-no-ack-double", "R-no-ack-restart", "finished"] as const)(`warm turnstop T1-F: %s (real Runner/Pi)`, async scenario => {
+it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "R-no-ack", "R-no-ack-sigstop", "R-no-ack-double", "R-no-ack-restart", "finished", "finished-slow-drain"] as const)(`warm turnstop T1-F: %s (real Runner/Pi)`, async scenario => {
   // No-ack cleanup must not depend on qualifying earlier same-session turns;
-  // that path is a separate acceptance area. Existing warm controls keep two.
-  const stopTurn = scenario.startsWith("R-no-ack") ? 1 : 3;
+  // that path is a separate acceptance area. The independent normal-close
+  // drain row needs one ordinary turn; existing warm controls still keep two.
+  const stopTurn = scenario.startsWith("R-no-ack") || scenario === "finished-slow-drain" ? 1 : 3;
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("responses");
   expect(process.env.TMPDIR, "dedicated test tmpdir is required").toBeTruthy();
@@ -74,6 +75,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     stages.push(row); console.log(`[pi-full-server] ${name} ${JSON.stringify(detail)}`);
   };
   const bundles: Bundle[] = [];
+  let slowDrainArmed = false;
+  const delayedDrains: Array<{ queuedAt: number; deliveredAt?: number; error?: string }> = [];
   const fact = `TOOL_RESULT_${randomUUID()}`;
   type ModelRequest = { at: number; firstTokenWrittenAt?: number; deliveredAt?: number; turn: number; completed: number[]; input: any[]; tools: string[]; model: unknown; reply?: string };
   const requests: ModelRequest[] = [];
@@ -90,6 +93,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
   const boxBootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
   const packVerificationCommands: Array<Record<string, unknown>> = [];
   const stopProcessIdentities: Array<{ pid: number; birth: string }> = [];
+  const ownedFixtureProcesses = new Map<number, string>();
   let stopRetainedPostgres: (() => Promise<void>) | undefined;
   let stopRecoveryWorkers: (() => Promise<void>) | undefined;
   let stopLiveEvents: (() => void) | undefined;
@@ -202,7 +206,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
           stage("actual Pi model request", { index: requests.length, turn, completed });
         }
         const boundary = scenario === "R-double" ? (turn === 0 ? 1 : turn === 1 ? 2 : null) : turn === 0 ? 2 : null;
-        if (!warmup && scenario !== "finished" && boundary !== null && completed.includes(boundary)) {
+        if (!warmup && !scenario.startsWith("finished") && boundary !== null && completed.includes(boundary)) {
           barriers.push(request);
           stage("completed-tool boundary reached", { turn, completed });
           await new Promise<void>(done => res.on("close", done));
@@ -210,7 +214,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         }
         const step = [1, 2, 3, 4, 5, 6].find(value => !completed.includes(value));
         const plainQuestion = (scenario === "R-stop" || scenario.startsWith("R-no-ack")) && turn === 1;
-        const useTool = !warmup && scenario !== "finished" && !plainQuestion && step !== undefined;
+        const useTool = !warmup && !scenario.startsWith("finished") && !plainQuestion && step !== undefined;
         const reply = warmup ? `WARMUP_${warmupCount}` : plainQuestion ? (scenario.startsWith("R-no-ack") ? "19" : "T1F_PLAIN_ANSWER: six is an even number.")
           : useTool ? `Perform STEP${step}` : `T1F_SIX_STEPS_DONE_${turn}`;
         request.reply = reply;
@@ -396,7 +400,30 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     vi.spyOn(runner, "createRunnerdCodexTransport").mockImplementation(options => {
       stage("transport kind=pi_rpc", { provider: options?.provider, thinking: options?.piRpcThinkingLevel });
       expect(options?.provider).toBe("pi_rpc"); expect(options?.piRpcThinkingLevel).toBe(thinking);
+      if (scenario === "finished-slow-drain" && options?.controlPlaneRegistration) {
+        const register = options.controlPlaneRegistration;
+        options.controlPlaneRegistration = async authority => {
+          const queue = authority.queueCommand.bind(authority);
+          authority.queueCommand = (...args) => {
+            if (!slowDrainArmed || args[0] !== "runner.drain") return queue(...args);
+            const delayed: typeof delayedDrains[number] = { queuedAt: Date.now() };
+            delayedDrains.push(delayed);
+            setTimeout(() => {
+              delayed.deliveredAt = Date.now();
+              try { queue(...args); } catch (error) { delayed.error = String(error); }
+              stage("real Runner drain forwarded after 1.5s", delayed);
+            }, 1_500);
+            return undefined as never;
+          };
+          return register(authority);
+        };
+      }
       const bundle = realFactory(options);
+      const close = bundle.transport.close.bind(bundle.transport);
+      bundle.transport.close = (...args) => {
+        stage("actual transport close budget", { graceMs: options?.closeGraceMs ?? 10_000, reason: args[0] });
+        return close(...args);
+      };
       if (scenario === "R-late-ack") {
         const request = bundle.transport.request.bind(bundle.transport);
         bundle.transport.request = async (method, params) => {
@@ -540,6 +567,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const runnerPid = bundles.at(-1)?.transport.processInfo?.()?.pid;
       const piPid = runnerPid ? piDescendant(runnerPid) : null;
       expect(runnerPid).toBeTruthy(); expect(piPid).toBeTruthy();
+      ownedFixtureProcesses.set(runnerPid!, procBirth(runnerPid!));
+      ownedFixtureProcesses.set(piPid!, procBirth(piPid!));
       const identity = { runId: warmup.id, nativeSessionId: warmup.nativeSessionId, runnerPid: runnerPid!, piPid: piPid! };
       if (warmupIdentities.length) expect(identity).toMatchObject({ ...warmupIdentities[0], runId: warmup.id });
       warmupIdentities.push(identity);
@@ -556,6 +585,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     const originalIdentity = { ...pid, runnerBirth: procBirth(pid.runnerPid), piBirth: procBirth(pid.piPid), boxBootId, nativeSessionId: admitted.nativeSessionId };
     stopProcessIdentities.push({ pid: pid.piPid, birth: originalIdentity.piBirth },
       { pid: pid.runnerPid, birth: originalIdentity.runnerBirth });
+    ownedFixtureProcesses.set(pid.runnerPid, originalIdentity.runnerBirth);
+    ownedFixtureProcesses.set(pid.piPid, originalIdentity.piBirth);
     stage("runnerd/Pi live identity", originalIdentity);
     if (process.env.PAPERCLIP_A2_CHROMIUM_MODULE && scenario.startsWith("R-no-ack")) {
       const { nativePiScreen } = await import("./helpers/native-pi-screen.js");
@@ -566,12 +597,25 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     const readPiEnvironment = () => Object.fromEntries(readFileSync(`/proc/${pid.piPid}/environ`, "utf8").split("\0").filter(Boolean).map(entry => { const at = entry.indexOf("="); return [entry.slice(0, at), entry.slice(at + 1)]; }));
     const launchEnvironment = readPiEnvironment();
     stage("AGENT_HOME proc at launch", { piPid: pid.piPid, agentHome: launchEnvironment.AGENT_HOME || "EMPTY", tmpdir: launchEnvironment.TMPDIR || "EMPTY" });
-    if (scenario === "finished") {
+    if (scenario.startsWith("finished")) {
       const { heartbeatService } = await import("../services/heartbeat.js");
       const finished = await waitFor("ordinary finished control", async () => (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.id))).find(row => row.status === "succeeded") ?? null);
       await heartbeatService(db).waitForRunExecutionDrain(finished.id, { timeoutMs: 15000 });
-      expect(piDescendant(warmupIdentities[0]!.runnerPid)).toBe(warmupIdentities[0]!.piPid);
+      expect(piDescendant(pid.runnerPid)).toBe(pid.piPid);
       expect(stopCalls).toEqual([]);
+      if (scenario === "finished-slow-drain") {
+        slowDrainArmed = true;
+        const closeAt = Date.now();
+        const closeError = await bundles.at(-1)!.transport.close("normal end with 1.5s trailing drain")
+          .then(() => null, error => String(error));
+        // Also join a deliberately delayed command on the RED 1s path before teardown.
+        await new Promise(resolve => setTimeout(resolve, 1_600));
+        const proof = { closeAt, closeMs: Date.now() - closeAt, closeError, delayedDrains };
+        await writeFile(join(root, "normal-slow-drain.json"), JSON.stringify(proof, null, 2));
+        expect(delayedDrains.length, "the real Runner drain was actually delayed").toBeGreaterThan(0);
+        expect(delayedDrains.every(row => row.deliveredAt! - row.queuedAt >= 1_500)).toBe(true);
+        expect(closeError, "a normal Pi end must preserve its complete slow drain").toBeNull();
+      }
       stage("CONTROL GREEN", { pid, finished: finished.id });
       return;
     }
@@ -672,6 +716,12 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       expect(request, "the actual fresh Pi received the authorized input").toBeDefined();
       expect(JSON.stringify(request!.input), "the actual successor receives 9 + 10 unchanged").toContain("9 + 10");
       expect(request!.completed, "fresh fallback never claims warm tool context").toEqual([]);
+      const firstInput = JSON.stringify(request!.input);
+      expect(firstInput, "Stop-fresh FIRST request includes completed STEP1 receipts, not merely durable source history").toContain(`${fact}_STEP1`);
+      expect(firstInput).toContain("Stopped turn tool receipts");
+      expect(firstInput).not.toContain("The person interrupted your previous turn");
+      const closeBudgets = stages.filter(row => row.stage === "actual transport close budget");
+      expect(closeBudgets.some(row => (row.detail as { graceMs: number }).graceMs === 1_000), "cancellation close still uses 1s").toBe(true);
       const sourceEvents = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, current.id));
       for (const step of [1, 2]) expect(JSON.stringify(sourceEvents), `completed STEP${step} receipt remains in durable source history`).toContain(`${fact}_STEP${step}`);
       // Executor drain can precede the heartbeat's terminal publication. Join
@@ -834,6 +884,17 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     }
     for (const bundle of bundles) await bundle.transport.close().catch(error => console.error("Owned runner teardown", error));
     await app?.locals.paperclipShutdown?.();
+    // Fixture-only cleanup, AFTER all assertions/evidence. A failed warm
+    // controller must not leave our loopback listener poisoning the next row.
+    // Never use this teardown as production Stop/exit evidence.
+    await Promise.all([...ownedFixtureProcesses].map(async ([pid, birth]) => {
+      const stillOurs = () => { try { return procBirth(pid) === birth; } catch { return false; } };
+      if (!stillOurs()) return;
+      try { process.kill(pid, "SIGTERM"); } catch { return; }
+      const until = Date.now() + 500;
+      while (stillOurs() && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 25));
+      if (stillOurs()) { try { process.kill(pid, "SIGKILL"); } catch { /* already exited */ } }
+    }));
     allocation.drivers = undefined;
     for (const socket of sockets) socket.terminate();
     if (preview?.listening) await new Promise<void>(done => preview!.close(() => done()));

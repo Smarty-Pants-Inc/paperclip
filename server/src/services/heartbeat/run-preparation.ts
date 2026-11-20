@@ -2391,16 +2391,18 @@ function summarizeToolArguments(args: unknown, input: unknown): string | null {
 
 export type InterruptCutToolCalls = {
   calls: InterruptedTurnToolCall[];
+  /** Same receipt reader, separate presentation: a plain Stop is not an Interrupt. */
+  personStopped?: true;
   /** Calls recorded in the chain but not listed (over the cap). */
   omitted: number;
   /** The chain reaches further back than the runs read (over the run cap): earlier calls are not counted. */
   earlierRunsOmitted: boolean;
 };
 
-/** adopt-receipts3: every tool call since the last run on this task that ENDED WITH AN AGENT REPLY, when the
- * person's Interrupt cut at least one run since then. Walking back from the immediate predecessor, a run the
- * Interrupt cut, or a run that ended without a reply (a failed successor), belongs to the chain; the first run
- * that ended with an agent reply, or the person's STOP, ends it. Each chained run's tool calls are read from
+/** Shared receipts for a fresh successor after Interrupt or plain Stop. Walking back from the immediate
+ * predecessor, a run the Interrupt cut, or an ended run without a reply, belongs to the Interrupt chain;
+ * the first ended reply or the person's STOP bounds that chain. A plain Stop contributes its own calls
+ * to a separate, data-only list, never work before that Stop. Each chained run's tool calls are read from
  * their durable receipts, oldest run first, in order, once each: completed calls are done, failed calls failed,
  * and a call cut mid-flight (started with no completed receipt, or completed as interrupted / cancelled /
  * aborted) is interrupted. A non-bash call carries its arguments from the same call's item receipt. Over the
@@ -2427,16 +2429,21 @@ export async function readInterruptCutToolCalls(db: Db, input: { companyId: stri
     ))).flatMap((row) => [row.runId, row.derived]).filter((id): id is string => typeof id === "string"));
   const chain: string[] = [];
   let cut = false;
+  let personStopped = false;
   let earlierRunsOmitted = false;
   for (const run of previous) {
     const interrupted = interruptCut(run);
-    // The last run that ENDED WITH AN AGENT REPLY bounds the chain; so does the person's STOP (its own marker
-    // governs) and any run still live. A failed (or otherwise ended) run with no reply never ends it.
+    const result = parseObject(run.resultJson);
+    const stopped = !interrupted && run.status === "cancelled" && result.cancelledByActorType === "user" &&
+      typeof result.cancelledByUserId === "string" && !!result.cancelledByUserId;
+    // A Stop's own receipts belong to its fresh successor, never to a later
+    // Interrupt chain. Do not cross the Stop into unrelated earlier work.
     const ended = ["succeeded", "failed", "timed_out", "cancelled", "error"].includes(run.status);
-    if (!interrupted && (replied.has(run.id) || !ended || run.status === "cancelled")) break;
+    if ((stopped && cut) || (!interrupted && !stopped && (replied.has(run.id) || !ended || run.status === "cancelled"))) break;
     if (chain.length >= MAX_INTERRUPTED_TURN_CHAIN_RUNS) { earlierRunsOmitted = true; break; }
-    if (interrupted) cut = true;
+    if (interrupted || stopped) cut = true;
     chain.unshift(run.id);
+    if (stopped) { personStopped = true; break; }
   }
   if (chain.length === 0 || !cut) return none;
   const toolCallKinds = sql`(${heartbeatRunEvents.eventType} in ('tool.execution.started', 'tool.execution.completed')
@@ -2493,6 +2500,7 @@ export async function readInterruptCutToolCalls(db: Db, input: { companyId: stri
     }
   }
   return { calls: [...calls.values()], omitted: Math.max(0, seen.size - calls.size),
+    ...(personStopped ? { personStopped: true } : {}),
     earlierRunsOmitted: earlierRunsOmitted || eventsCapped };
 }
 
@@ -2602,7 +2610,8 @@ export async function buildPaperclipWakePayload(input: {
   const interruptCutTools = issueId && input.runId
     ? await readInterruptCutToolCalls(input.db, { companyId: input.companyId, issueId, currentRunId: input.runId })
     : { calls: [], omitted: 0, earlierRunsOmitted: false };
-  const interruptedTurnToolCalls = interruptCutTools.calls;
+  const interruptedTurnToolCalls = interruptCutTools.personStopped ? [] : interruptCutTools.calls;
+  const stoppedTurnToolCalls = interruptCutTools.personStopped ? interruptCutTools.calls : [];
   const issueDescription = conversationMode ? null : issueSummary?.description ?? null;
   const issueDescriptionTruncated =
     issueDescription !== null &&
@@ -3089,6 +3098,9 @@ export async function buildPaperclipWakePayload(input: {
     ...(interruptedTurnToolCalls.length ? { interruptedTurnToolCalls,
       ...(interruptCutTools.omitted > 0 ? { interruptedTurnToolCallsOmitted: interruptCutTools.omitted } : {}),
       ...(interruptCutTools.earlierRunsOmitted ? { interruptedTurnEarlierCallsOmitted: true } : {}) } : {}),
+    ...(stoppedTurnToolCalls.length ? { stoppedTurnToolCalls,
+      stoppedTurnToolCallsOmitted: interruptCutTools.omitted,
+      stoppedTurnEarlierCallsOmitted: interruptCutTools.earlierRunsOmitted } : {}),
     commentIds,
     latestCommentId: commentIds[commentIds.length - 1] ?? null,
     comments,

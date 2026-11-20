@@ -35,6 +35,7 @@ import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { HttpError } from "../errors.js";
 import { commentCarriedSql } from "./interrupt-carry-custody.js";
 import { personMessageOwedSql } from "./person-message-answer.js";
+import { personMessageWithinRunBound } from "./person-message-run-bound.js";
 
 export type ConversationIdentity = {
   conversationAgentId?: string | null;
@@ -604,6 +605,7 @@ export async function undeliveredConversationComments(
         sql`${issueComments.authorUserId} is not null`,
         isNull(issueComments.authorAgentId),
         eq(issueComments.origin, "comment"),
+        personMessageWithinRunBound(sql`${issueComments.createdAt}`),
         sql`${issueComments.clientRequestId} is not null`,
         sql`not exists (select 1 from ${agentWakeupRequests} where ${agentWakeupRequests.companyId} = ${companyId}
       and ${agentWakeupRequests.idempotencyKey} = 'conversation-comment:' || ${issueComments.id}::text)`,

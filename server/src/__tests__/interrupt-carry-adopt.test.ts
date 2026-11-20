@@ -658,7 +658,7 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     expect(await successorPrompt(chat, successor, true)).not.toContain("STEP1-RESULT-wrote-step1");
   });
 
-  it("RF-b: a person's STOP (real cancel route), then a new message ⇒ unchanged: no already-done carry (STOP's own marker governs)", async () => {
+  it("RF-b: a person's STOP (real cancel route), then a fresh successor ⇒ the same reader carries receipts without Interrupt wording", async () => {
     const chat = await seedChat();
     await toolReceipts(chat, [{ name: "echo STEP1", output: "STEP1-RESULT-after-stop" }]);
     mocks.cancel.mockImplementationOnce(async () => ({ decision: { stopped: true }, auditId: randomUUID() }));
@@ -672,8 +672,11 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
         wakeCommentId: next.id, commentId: next.id } }).returning();
     const prompt = await successorPrompt(chat, run!, false);
     expect(prompt).toContain("## Paperclip Wake Payload");
-    expect(prompt).not.toContain("STEP1-RESULT-after-stop");
+    expect(prompt).toContain("STEP1-RESULT-after-stop");
+    expect(prompt).toContain('"status": "completed"');
     expect(prompt).not.toMatch(/interrupted turn/i);
+    expect(prompt).not.toContain("The person interrupted your previous turn");
+    expect(await successorPrompt(chat, run!, true)).not.toContain("STEP1-RESULT-after-stop");
   });
 
   it("RF-c (adopt-receipts2 red): a FAILED call in the cut turn ⇒ listed as failed, with its error; never as done", async () => {

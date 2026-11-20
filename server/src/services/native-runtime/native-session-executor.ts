@@ -465,6 +465,9 @@ export class NativeControllerDetachedForRestartError extends Error {
 }
 
 const activeNativeSessions = new Map<string, ActiveNativeSession>();
+// Wait policy only, never cancellation/exit authority. Follow the actual
+// retained session across warm backend rebinding, without stacking wrappers.
+const piSessionCloseBudgets = new WeakMap<NativeSession, { cancelled: boolean }>();
 // Shutdown can race provider startup before onSession publishes its handle.
 const nativeRunsDetachingForRestart = new Map<string, symbol>();
 
@@ -21076,6 +21079,9 @@ async function createRunnerdBackendWithinSessionClaim(
       }
     },
   });
+  let piCloseBudget: { cancelled: boolean } | undefined;
+  const sandboxPi = input.execution.provider.kind === "pi_rpc" && remoteTarget?.transport === "sandbox";
+  const readCloseGraceMs = () => sandboxPi && (piCloseBudget?.cancelled || input.recoveryPurpose === "stop_cleanup") ? 1_000 : undefined;
   const backend = createNativeSessionBackend(runnerExecution, {
     retainedSystemInstructions,
     runnerInstanceId:
@@ -21109,10 +21115,10 @@ async function createRunnerdBackendWithinSessionClaim(
     ),
     codexTransportFactory: (recoveryContext) => {
       const bundle = createRunnerdCodexTransport({
-        // Remote Pi Stop already has its five-second acknowledgement budget.
-        // Do not add the generic ten-second close grace to a frozen process.
+        // Read at close, not at construction: normal ends retain the default
+        // drain grace. Only an actual cancellation uses the short Stop budget.
         // A shorter wait is NOT exit proof: stop-and-retain must still attest it.
-        ...(input.execution.provider.kind === "pi_rpc" && remoteTarget?.transport === "sandbox" ? { closeGraceMs: 1_000 } : {}),
+        get closeGraceMs() { return readCloseGraceMs(); },
         ...(input.recoveryPurpose === "stop_cleanup" ? { recoveryPurpose: "stop_cleanup" as const } : {}),
         measureOperation: measureRunnerOperation,
         recordTimingReceipt: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? recordRunnerTimingReceipt : undefined,
@@ -21391,11 +21397,34 @@ async function createRunnerdBackendWithinSessionClaim(
         } : undefined,
         get authorityRunId() { return nonTaskExecutionDriver.authorityRunId; },
       });
+      // Pi copies the configuration to install defaults. Preserve the live
+      // server-owned wait policy there rather than snapshotting it at startup.
+      if (sandboxPi && "options" in bundle.transport && typeof bundle.transport.options === "object" && bundle.transport.options !== null) {
+        Object.defineProperty(bundle.transport.options, "closeGraceMs", {
+          enumerable: true, configurable: true, get: readCloseGraceMs,
+        });
+      }
       return antigravityCredential?.home ? bindAntigravityTransportRetirement(bundle) : bundle.transport;
     },
   });
   const boundManagedSessions = new WeakSet<NativeSession>();
   const wrapManagedSession = (session: NativeSession): NativeSession => {
+    if (sandboxPi) {
+      let budget = piSessionCloseBudgets.get(session);
+      if (!budget) {
+        budget = { cancelled: false };
+        piSessionCloseBudgets.set(session, budget);
+        const state = budget;
+        const startTurn = session.startTurn.bind(session);
+        session.startTurn = (...args) => { state.cancelled = false; return startTurn(...args); };
+        const cancel = session.cancel?.bind(session);
+        if (cancel) session.cancel = (options) => {
+          if (!options.failureCleanup) state.cancelled = true;
+          return cancel(options);
+        };
+      }
+      piCloseBudget = budget;
+    }
     credentialUpdates?.bindSession(session);
     if (cursorCloudRuntime && !boundManagedSessions.has(session)) {
       boundManagedSessions.add(session);

@@ -1,3 +1,5 @@
+import { personMessageWithinRunBound } from "./person-message-run-bound.js";
+import { answeredPersonMessageIds } from "./person-message-answer.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
 import { agentDirectoryPreparationWaitPredicate, isAgentDirectoryPreparationWait } from "./pre-dispatch-execution-evidence.js";
 import { assertDurableChatWakeupRequest, assertDurableChatWakeupReceipt, type DurableChatWakeupRequest } from "./durable-chat-wakeup.js";
@@ -97,7 +99,7 @@ export function isUserCommentContinuationReason(reason: string | null | undefine
 async function personStoppedPredecessor(input: {
   db: Db; run: Run; issueId: string; actorId: string; successorRunId: string;
   requestId?: string; evidence: Record<string, unknown>; authorizedAt: Date;
-  interruptedByThisClick: boolean;
+  commentId: string | null; interruptedByThisClick: boolean;
 }): Promise<string | null> {
   const { db, run, issueId, actorId, requestId } = input;
   const ownStop = isAcknowledgedNativeStop(run) && run.resultJson?.cancelledByUserId === actorId;
@@ -105,6 +107,8 @@ async function personStoppedPredecessor(input: {
   if (run.runtimeMode !== "native" || run.status !== "cancelled" || !requestId ||
       !(ownStop || input.interruptedByThisClick) || !stoppedAt ||
       (!input.interruptedByThisClick && input.authorizedAt <= stoppedAt)) return null;
+  if (!personMessageWithinRunBound(input.authorizedAt) || input.commentId &&
+      (await answeredPersonMessageIds(db, { companyId: run.companyId, issueId, commentIds: [input.commentId] })).has(input.commentId)) return null;
   const system = readSystemRecovery(input.evidence);
   if (!system || system.sourceRunId !== run.id || system.freshAttemptRunId ||
       (system.providerCooldownAt !== null && system.providerCooldownAt > Date.now())) return null;
@@ -555,7 +559,7 @@ export async function admitExplicitNativeContinuation(input: {
       run.resultJson?.queuedCommentInterruptQueueId === input.queuedCommentInterruptId;
     if (!freshIntent && hasRequiredWorkspaceRecovery(run.resultJson)) freshIntent = await personStoppedPredecessor({
       db, run, issueId, actorId, successorRunId: input.successorRunId, requestId: strategyRequestId,
-      evidence: strategyEvidence, authorizedAt, interruptedByThisClick,
+      evidence: strategyEvidence, authorizedAt, commentId, interruptedByThisClick,
     });
     if (nativeQueuedSend && authorizedAt <= run.finishedAt! && !interruptedByThisClick)
       return blocked("send_predates_stop", "Send the saved message again now that the previous run has stopped.");

@@ -210,6 +210,7 @@ type BackendFactoryOptions = {
 };
 
 type RunnerTransportOptions = {
+  closeGraceMs?: number;
   controlPlaneRegistration?: import("../../vendor/paperclip-runner/index.js").RunnerExecutionDriver["controlPlaneRegistration"];
   authorityRunId?: string;
   onAccountingEvent?: (event: PrpEvent) => Promise<void>;
@@ -3548,7 +3549,8 @@ describe("remote provider pack manifest", () => {
         runnerArtifact?: { version: string; digest: string };
       };
       if (nativePi) {
-        expect(transport).toMatchObject({ provider: "pi_rpc", piRpcThinkingLevel, closeGraceMs: 1_000,
+        expect(transport.closeGraceMs, "normal ends keep the prior transport grace").toBeUndefined();
+        expect(transport).toMatchObject({ provider: "pi_rpc", piRpcThinkingLevel,
           piCommand: "/opt/paperclip-runner/provider-pack/provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
           piCommandSha256: digest, piProxyPath: "/opt/paperclip-runner/provider-pack/dist/cli/pi-rpc-app-server-proxy.cjs",
           piProxySha256: digest,

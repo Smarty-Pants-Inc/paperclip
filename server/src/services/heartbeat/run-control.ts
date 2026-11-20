@@ -7,6 +7,8 @@ import { instanceSettingsService } from "../instance-settings.js";
 import { isWellFormedExecutionWait, wellFormedExecutionWaitSql, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { observeStoppedWorkspaceRecovery } from "../workspace-recovery.js";
+import { personMessageWithinRunBound } from "../person-message-run-bound.js";
+import { settleUnansweredPersonMessage } from "../recovery/unanswered-person-message.js";
 import { answeredCarriedCommentIds } from "../interrupted-turn-input.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/domain/policy.js";
 import { notifyScheduledRetryCancellation } from "../scheduled-retry-cancellation-notifications.js";
@@ -48,6 +50,8 @@ import {
   readRunCancellation,
   requestedRunCancellation,
   userStopBoundaryAt,
+  queuedSendAfterStop,
+  QUEUED_SEND_AFTER_STOP_KEY,
 } from "../run-cancellation.js";
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { readQueuedInteractionResponse } from "../queued-interaction-response.js";
@@ -774,10 +778,23 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         commentId = ids.at(-1)!;
         // A coalesced queue can contain several authors. Its saved comments,
         // not the outer wake's first author, authorize the remaining input.
-        const [author] = await db.select({ id: issueComments.authorUserId }).from(issueComments).where(and(
+        const [author] = await db.select({ id: issueComments.authorUserId, createdAt: issueComments.createdAt }).from(issueComments).where(and(
           eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, issueId), eq(issueComments.id, commentId),
         ));
         requestedByActorId = author?.id ?? null;
+        // A sweep is not new direction. Keep expired input deferred and let the
+        // existing message-keyed, issue-fenced notice writer explain it once.
+        const stoppedAt = userStopBoundaryAt(run);
+        const sentAgain = stoppedAt && (queuedSendAfterStop(payload, { stoppedAt, actorId: requestedByActorId }) ??
+          queuedSendAfterStop(payload, { stoppedAt, actorId: requestedByActorId, key: QUEUED_SEND_AFTER_STOP_KEY }));
+        const authorizedAt = sentAgain ? new Date(sentAgain.requestedAt) : author?.createdAt;
+        if (authorizedAt && !personMessageWithinRunBound(authorizedAt)) {
+          await writeDeferredExecutionWait(db, { companyId: run.companyId, requestId: wake.id }, {
+            reason: "person_message_expired", message: "This saved message is 24 hours old or older. Send a new message to continue.",
+          });
+          await settleUnansweredPersonMessage(db, { companyId: run.companyId, issueId });
+          continue;
+        }
       }
       if (legacyContinuation || stoppedNativeContinuation) {
         if (!commentId || !run.finishedAt || !requestedByActorId ||

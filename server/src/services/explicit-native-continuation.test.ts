@@ -65,7 +65,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       status: "resolved", outcome: "blocked", nextAction: "Automatic recovery stopped.",
       evidence: { runId: sourceRunId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } });
     await db.insert(issueComments).values({ id: commentId, companyId, issueId, authorType: "user",
-      authorUserId: "board", body: "What happened?", createdAt: new Date("2026-09-11T11:00:00Z") });
+      authorUserId: "board", body: "What happened?", createdAt: new Date() });
     return { companyId, issueId, agentId, sourceRunId, commentId, successorRunId,
       actorType: "user", actorId: "board", reason: "issue_commented" };
   }
@@ -95,13 +95,24 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       onBlocked: reason => blocked.push(reason) });
     return { result, blocked, reads };
   }
-  it.each(["valid", "system_stop", "other_person", "missing_exit", "destroyed", "wrong_box", "other_owner", "files_not_retained", "cleanup", "controller", "workspace_writer", "approval"])(
+  it.each(["valid", "system_stop", "other_person", "missing_exit", "destroyed", "wrong_box", "other_owner", "files_not_retained", "cleanup", "controller", "workspace_writer", "approval",
+    "sweep_old", "sweep_restart_old", "sweep_restart_young", "sweep_fresh"])(
     "A2 person Stop crosses the repair hold only with all four proofs (%s)", async gate => {
       const f = await seed(), leaseId = randomUUID(), workspaceId = randomUUID(), pluginId = randomUUID(), queueId = randomUUID();
+      const sweeping = gate.startsWith("sweep_");
+      const old = gate.endsWith("_old");
+      const commentAt = new Date(Date.now() - (old ? 72 * 3600_000 : gate.endsWith("_young") ? 2 * 3600_000 : 120_000));
+      const stoppedAt = new Date(commentAt.getTime() - 3600_000).toISOString();
+      const acquiredAt = new Date(Date.parse(stoppedAt) - 3600_000);
+      await db.update(issueComments).set({ createdAt: commentAt, body: "9 + 10" }).where(eq(issueComments.id, f.commentId));
+      await db.update(heartbeatRuns).set({ createdAt: acquiredAt, startedAt: acquiredAt, finishedAt: new Date(stoppedAt) })
+        .where(eq(heartbeatRuns.id, f.sourceRunId));
       await db.insert(agentWakeupRequests).values({ id: queueId, companyId: f.companyId, agentId: f.agentId,
         source: "on_demand", reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "board",
-        payload: { issueId: f.issueId, commentId: f.commentId, _paperclipWakeContext: { wakeCommentIds: [f.commentId] } } });
-      const stoppedAt = "2026-09-11T10:00:00.000Z", acquiredAt = new Date("2026-09-11T09:00:00Z");
+        requestedAt: commentAt, updatedAt: new Date(0),
+        payload: { issueId: f.issueId, commentId: f.commentId,
+          ...(sweeping ? { executionWait: { reason: "workspace_repair_required", message: "Waiting for saved-work recovery. Your message is saved." } } : {}),
+          _paperclipWakeContext: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: f.commentId, wakeCommentIds: [f.commentId] } } });
       const providerLeaseId = `retained-${leaseId}`;
       await db.insert(executionWorkspaces).values({ id: workspaceId, companyId: f.companyId, sourceIssueId: f.issueId,
         mode: "isolated_workspace", strategyType: "project_primary", name: "Retained person's work", providerType: "remote" });
@@ -140,6 +151,37 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       }
       const sourceBefore = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId)))[0];
       const leaseBefore = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0];
+      if (sweeping) {
+        // The production sweep owns admission. Occupy only the agent's OTHER task slot, so a bad
+        // admission is a durable queued successor without needing any stand-in provider here.
+        await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+        const sweep = async () => {
+          if (gate.includes("restart")) {
+            const { promisify } = await import("node:util");
+            const child = await promisify(execFile)(process.execPath, ["--import", "tsx", "--input-type=module", "-e",
+              `import { createDb } from '@paperclipai/db'; import { heartbeatService } from './src/services/heartbeat.ts';
+               const db = createDb(process.env.A2_DATABASE); try { await heartbeatService(db).resumeExecutionWaitComments({companyId: '${f.companyId}'}); } finally { await db.$client.end(); }`],
+              { cwd: process.cwd(), env: { ...process.env, A2_DATABASE: database.connectionString }, timeout: 120_000 });
+            return child.stdout;
+          }
+          await heartbeatService(db).resumeExecutionWaitComments({ companyId: f.companyId });
+        };
+        await sweep();
+        await db.update(agentWakeupRequests).set({ updatedAt: new Date(0) }).where(eq(agentWakeupRequests.id, queueId));
+        await sweep();
+        const queued = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")));
+        const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
+        const notes = await db.select().from(issueComments).where(and(eq(issueComments.companyId, f.companyId), eq(issueComments.authorType, "system")));
+        const evidence = { gate, queued, receipt, notes };
+        if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `f1-${gate}.json`), JSON.stringify(evidence, null, 2));
+        expect(queued, "an old owed message must never create a run, even after restart; a young one admits ONCE").toHaveLength(old ? 0 : 1);
+        expect(receipt.status).toBe(old ? "deferred_issue_execution" : "coalesced");
+        if (old) {
+          expect(notes, "one naming note survives repeated sweeps and a process restart").toHaveLength(1);
+          expect(notes[0].body).toContain("9 + 10");
+        }
+        return;
+      }
       const blocked: string[] = [];
       const continuationInput = { ...f, queuedCommentRequestId: queueId, onBlocked: (reason: string) => blocked.push(reason) };
       const result = await admit(continuationInput);
@@ -157,7 +199,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId)))[0], "source receipts are retained; only the fresh-thread fence may be added")
         .toEqual(gate === "valid" ? { ...sourceBefore, resultJson: { ...sourceBefore!.resultJson,
           freshContinuationSupersededAt: expect.any(String) } } : sourceBefore);
-    },
+    }, 300_000,
   );
 
   it("never calls a pre-failure message pre-Stop without the one person-Stop hold reader", async () => {
@@ -497,7 +539,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       .toMatchObject({ status: "deferred_issue_execution", runId: null });
     const resumeId = randomUUID();
     await db.insert(issueComments).values({ id: resumeId, companyId: f.companyId, issueId: f.issueId,
-      authorType: "user", authorUserId: "board", body: "Resume with my earlier direction.", createdAt: new Date("2026-09-11T11:00:00Z") });
+      authorType: "user", authorUserId: "board", body: "Resume with my earlier direction.", createdAt: new Date() });
     queuedIds = [...queuedIds, resumeId];
     expectedIds = [...expectedIds, resumeId];
     await db.update(agentWakeupRequests).set({ payload: {
@@ -2471,8 +2513,10 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
 
   it.each(["ready", "live_process", "pause", "delivered", "mixed_authors", "last_delivered", "operator_stop"])(
     "automatically delivers an unconsumed native message sent before the failed run stopped, respecting %s", async gate => {
-    const f = await seed();
-    await db.update(issueComments).set({ createdAt: new Date("2026-09-11T09:59:00Z") }).where(eq(issueComments.id, f.commentId));
+    const f = await seed(), failedAt = Date.now() - 60_000;
+    await db.update(heartbeatRuns).set({ createdAt: new Date(failedAt - 120_000),
+      startedAt: new Date(failedAt - 120_000), finishedAt: new Date(failedAt) }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(issueComments).set({ createdAt: new Date(failedAt - 60_000) }).where(eq(issueComments.id, f.commentId));
     await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
     let queuedIds = [f.commentId];
     let expectedIds = queuedIds;
@@ -2480,7 +2524,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       const secondId = randomUUID();
       await db.insert(issueComments).values({ id: secondId, companyId: f.companyId, issueId: f.issueId,
         authorType: "user", authorUserId: "second-author", body: "Also preserve the existing work.",
-        createdAt: new Date("2026-09-11T09:59:01Z") });
+        createdAt: new Date(failedAt - 59_000) });
       queuedIds = [f.commentId, secondId];
       expectedIds = gate === "last_delivered" ? [f.commentId] : queuedIds;
       if (gate === "last_delivered") await db.update(heartbeatRuns).set({
@@ -2970,6 +3014,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
 
   it("delivers the saved message once after terminal result copy-back, without replaying its accepted result", async () => {
     const f = await recoveredCopybackFixture("queued_message");
+    await db.update(issueComments).set({ createdAt: new Date() }).where(eq(issueComments.id, f.commentId));
     const failedRunId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: failedRunId, companyId: f.companyId, agentId: f.agentId,
       nativeIssueId: f.issueId, runtimeMode: "native", status: "failed", errorCode: "native_provider_terminal_failed",

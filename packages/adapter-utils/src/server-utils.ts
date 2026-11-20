@@ -808,6 +808,8 @@ type PaperclipWakeRecovery = {
 export type PaperclipExternalChatProvider =
   "slack" | "github" | "discord" | "microsoft-teams" | "telegram" | "imessage-photon" | "speko";
 
+type CutTurnToolCall = { name: string; target: string | null; status: "completed" | "failed" | "interrupted"; output: string; outputTruncated: boolean };
+
 type PaperclipWakePayload = {
   githubReviewConfigurations: Array<{ key: string; instructions: string }>;
   executionContinuation: ExecutionContinuationEnvelope | null;
@@ -825,7 +827,10 @@ type PaperclipWakePayload = {
   // Technical English with brief decision context.
   simplifiedEnglishInteractions: boolean;
   dependencyBlockedInteraction: boolean;
-  interruptedTurnToolCalls: Array<{ name: string; target: string | null; status: "completed" | "failed" | "interrupted"; output: string; outputTruncated: boolean }>;
+  interruptedTurnToolCalls: CutTurnToolCall[];
+  stoppedTurnToolCalls: CutTurnToolCall[];
+  stoppedTurnToolCallsOmitted: number;
+  stoppedTurnEarlierCallsOmitted: boolean;
   /** adopt-receipts3: calls recorded in the Interrupt chain but not listed (over the cap). */
   interruptedTurnToolCallsOmitted: number;
   /** adopt-receipts3: the chain reaches further back than was read; earlier calls are not counted. */
@@ -1765,6 +1770,16 @@ function normalizePaperclipExternalChatQuestionResponse(
   };
 }
 
+function normalizeCutTurnToolCalls(value: unknown): CutTurnToolCall[] {
+  return Array.isArray(value) ? value.flatMap((value) => {
+    const tool = parseObject(value);
+    const status: CutTurnToolCall["status"] = tool.status === "completed" || tool.status === "failed" ? tool.status : "interrupted";
+    return typeof tool.name === "string" && tool.name.trim()
+      ? [{ name: tool.name, target: typeof tool.target === "string" && tool.target.trim() ? tool.target : null,
+          status, output: asString(tool.output, ""), outputTruncated: asBoolean(tool.outputTruncated, false) }] : [];
+  }).slice(0, 32) : [];
+}
+
 export function normalizePaperclipWakePayload(
   value: unknown,
 ): PaperclipWakePayload | null {
@@ -1926,15 +1941,11 @@ export function normalizePaperclipWakePayload(
       payload.simplifiedEnglishInteractions,
       false,
     ),
-    interruptedTurnToolCalls: Array.isArray(payload.interruptedTurnToolCalls)
-      ? payload.interruptedTurnToolCalls.flatMap((value) => {
-          const tool = parseObject(value);
-          const status: "completed" | "failed" | "interrupted" =
-            tool.status === "completed" || tool.status === "failed" ? tool.status : "interrupted";
-          return typeof tool.name === "string" && tool.name.trim()
-            ? [{ name: tool.name, target: typeof tool.target === "string" && tool.target.trim() ? tool.target : null,
-                status, output: asString(tool.output, ""), outputTruncated: asBoolean(tool.outputTruncated, false) }] : [];
-        }).slice(0, 32) : [],
+    interruptedTurnToolCalls: normalizeCutTurnToolCalls(payload.interruptedTurnToolCalls),
+    stoppedTurnToolCalls: normalizeCutTurnToolCalls(payload.stoppedTurnToolCalls),
+    stoppedTurnToolCallsOmitted: Math.max(0, Math.floor(asNumber(payload.stoppedTurnToolCallsOmitted, 0)))
+      + (Array.isArray(payload.stoppedTurnToolCalls) ? Math.max(0, payload.stoppedTurnToolCalls.length - 32) : 0),
+    stoppedTurnEarlierCallsOmitted: asBoolean(payload.stoppedTurnEarlierCallsOmitted, false),
     interruptedTurnToolCallsOmitted: Math.max(0, Math.floor(asNumber(payload.interruptedTurnToolCallsOmitted, 0)))
       + (Array.isArray(payload.interruptedTurnToolCalls) ? Math.max(0, payload.interruptedTurnToolCalls.length - 32) : 0),
     interruptedTurnEarlierCallsOmitted: asBoolean(payload.interruptedTurnEarlierCallsOmitted, false),
@@ -2640,6 +2651,13 @@ function renderPaperclipWakePromptBody(
     const omitted = normalized.interruptedTurnToolCallsOmitted;
     if (omitted > 0) lines.push(`${omitted} more tool call${omitted === 1 ? " was" : "s were"} recorded after these and omitted from this list (over the limit): they may have run. Check the workspace before you redo any step.`);
     if (normalized.interruptedTurnEarlierCallsOmitted) lines.push("Earlier tool calls in this interrupted work were omitted from this list (over the limit): check the workspace before you redo any step.");
+  }
+  if (!resumedSession && normalized.stoppedTurnToolCalls.length > 0) {
+    // Stop receipts are data only. Interrupt's instructions do not describe a Stop.
+    lines.push("", "## Stopped turn tool receipts", markdownFencedText(JSON.stringify({
+      calls: normalized.stoppedTurnToolCalls, omitted: normalized.stoppedTurnToolCallsOmitted,
+      earlierRunsOmitted: normalized.stoppedTurnEarlierCallsOmitted,
+    }, null, 2)));
   }
   for (const config of normalized.githubReviewConfigurations) {
     lines.push("", "## Configured GitHub review instructions", config.instructions);

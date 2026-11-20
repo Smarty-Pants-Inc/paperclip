@@ -1,4 +1,5 @@
 import { and, desc, eq, gt, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { personMessageWithinRunBound } from "../person-message-run-bound.js";
 import { answeredPersonMessageSql, deferredWakeIsStaleSql, failedCarrierRunSql, personMessageOwedSql } from "../person-message-answer.js";
 import {
   activityLog,
@@ -109,6 +110,7 @@ export const UNANSWERED_MESSAGE_TEXT =
   "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
 export const UNANSWERED_MESSAGE_NO_RUN_TEXT =
   "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
+const namedNoRunText = (body: string) => `Your message is saved: "${body.replace(/\s+/g, " ").trim().slice(0, 60)}". It was not answered because no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.`;
 export const UNANSWERED_MESSAGE_WAITING_TEXT =
   "Your message is waiting for the agent to be free; it will start by itself.";
 export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
@@ -733,6 +735,15 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   // run (a timer, or the continuation that replaced a cancelled deferred wake
   // with no comment ids) is not: the message's own wake path decides.
   const messageRun = runs.find(candidate => runCarriesMessage(candidate.contextSnapshot, message.id)) ?? null;
+  if (!messageRun && !personMessageWithinRunBound(message.createdAt, now)) {
+    return { kind: "notice", reason, code: UNANSWERED_MESSAGE_NO_RUN_CODE,
+      ...(upgrading ? { upgradeCommentId: upgrading } : {}),
+      notice: buildStrandedRecoveryEscalationNotice({ seed: {
+        title: "Your message wasn't answered", body: namedNoRunText(message.body), tone: "warning",
+        nextAction: "Send a new message to try again.",
+      }, recoveryActionId: null, recoveryOwner: null, recoveryResponsibility: "user",
+        sourceRun: null, failureCode: UNANSWERED_MESSAGE_NO_RUN_CODE }) };
+  }
   // Paperclip's per-turn response rule (doc/execution-semantics.md:2649-2658,
   // native-governance.ts conversationTurnAnswered): only a pending question or
   // confirmation card that the message's OWN run created stands in for its
@@ -1137,7 +1148,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
       deferredWakeIsStaleSql({ companyId: sql`${agentWakeupRequests.companyId}`, agentId: sql`${agentWakeupRequests.agentId}`,
         issueId: sql`${issue.id}::uuid`, requestedAt: sql`${agentWakeupRequests.requestedAt}`, payload: sql`${agentWakeupRequests.payload}` }))) : [];
   const namedNoRun = staleReceipts.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id))
-    ? `Your message is saved: "${message.body}". It was not answered because no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.`
+    ? namedNoRunText(message.body)
     : UNANSWERED_MESSAGE_NO_RUN_TEXT;
   const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
     : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
