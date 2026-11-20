@@ -147,8 +147,10 @@ recipient for a later draft must not change the response already starting.
 Runtime discovery must not replace the turn with a generic spinner or a
 "run started" receipt. Queued and running headers use the same spacing.
 
-A queued turn shows the same `Working` header and shimmering `Thinking` activity
-as a running turn, starting at message submission. Keep specific server holds,
+Before a run is admitted, a submitted message says `Waiting to start`, never
+`Working` or `Thinking`. A specific preparation or server hold replaces that line.
+An admitted queued run may show the same `Working` header and shimmering `Thinking`
+activity as a running turn during the bounded startup grace. Keep specific server holds,
 such as `Waiting for maintenance`, agent setup, or another open task of the same
 routine, visible during admission. Admission normally starts a run within seconds,
 so this startup feedback lasts at most 30 seconds: a turn still queued after that
