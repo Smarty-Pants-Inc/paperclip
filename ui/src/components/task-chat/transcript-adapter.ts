@@ -1447,32 +1447,37 @@ function omitProgressRestatedByResponse(
   segments: readonly (readonly TaskChatItem[])[],
   normalizedResponse: string,
 ): readonly (readonly TaskChatItem[])[] {
-  return omitTrailingProgressRestatedBySentence(omitProgressOpeningResponse(segments, normalizedResponse), normalizedResponse);
+  return omitFinalSegmentProgressRestatedBySentence(omitProgressOpeningResponse(segments, normalizedResponse), normalizedResponse);
 }
 
 /**
  * A steered answer written as working text ("100+1 = 101.") and restated by
- * the final among other lines ("Done. Also, 100+1 = 101."). Walk back from the
- * response over the run's latest progress: drop each one whose sentences the
- * response restates whole; stop at the first progress it does not restate.
- * Earlier text the response only happens to share stays.
+ * the final among other lines ("Done. Also, 100+1 = 101."), often with more
+ * working text in between ("Step 3 done."). Within the response's own segment
+ * (the last one holding items: the final is the last thing the run wrote),
+ * drop every progress message whose sentences the response restates whole;
+ * progress it does not restate stays. Earlier segments are never touched: an
+ * answer there that the response only happens to share stays ("Answered
+ * above." coda).
  */
-function omitTrailingProgressRestatedBySentence(
+function omitFinalSegmentProgressRestatedBySentence(
   segments: readonly (readonly TaskChatItem[])[],
   normalizedResponse: string,
 ): readonly (readonly TaskChatItem[])[] {
-  const hidden = new Set<string>();
-  walk: for (let segmentIndex = segments.length - 1; segmentIndex >= 0; segmentIndex -= 1) {
-    const items = segments[segmentIndex]!;
-    for (let index = items.length - 1; index >= 0; index -= 1) {
-      const item = items[index]!;
-      if (item.kind !== "message" || !item.interstitial || item.channel !== "progress" || !item.text.trim()) continue;
-      if (!responseRestatesProgressSentences(item.text, normalizedResponse)) break walk;
-      hidden.add(`${segmentIndex}:${index}`);
-    }
-  }
-  if (!hidden.size) return segments;
-  return segments.map((items, segmentIndex) => items.filter((_, index) => !hidden.has(`${segmentIndex}:${index}`)));
+  let segmentIndex = segments.length - 1;
+  while (segmentIndex >= 0 && segments[segmentIndex]!.length === 0) segmentIndex -= 1;
+  if (segmentIndex < 0) return segments;
+  const items = segments[segmentIndex]!;
+  const kept = items.filter(
+    (item) =>
+      item.kind !== "message" ||
+      !item.interstitial ||
+      item.channel !== "progress" ||
+      !item.text.trim() ||
+      !responseRestatesProgressSentences(item.text, normalizedResponse),
+  );
+  if (kept.length === items.length) return segments;
+  return segments.map((segment, index) => (index === segmentIndex ? kept : segment));
 }
 
 function omitProgressOpeningResponse(
