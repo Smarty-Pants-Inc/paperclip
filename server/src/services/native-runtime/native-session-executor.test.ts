@@ -12135,6 +12135,15 @@ describe("warm native session evidence copy", () => {
     let prior: NativeExecutionInputV3 | undefined;
     let priorLease = "";
     const turnMs: number[] = [];
+    const evidenceAdmissionMs: number[] = [];
+    const evidenceModule = await import("./native-session-evidence.js");
+    const scheduleEvidence = evidenceModule.scheduleNativeSessionEvidenceCopy;
+    const admissionSpy = vi.spyOn(evidenceModule, "scheduleNativeSessionEvidenceCopy").mockImplementation(request => {
+      const started = performance.now();
+      const copy = scheduleEvidence(request);
+      void copy.admitted.then(() => evidenceAdmissionMs.push(performance.now() - started));
+      return copy;
+    });
     const runTurn = async () => {
       const runId = randomUUID(), leaseId = randomUUID();
       if (prior) {
@@ -12220,12 +12229,13 @@ describe("warm native session evidence copy", () => {
       await new Promise(resolveDelay => setTimeout(resolveDelay, 200));
       await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "test cleanup" }).catch(() => undefined);
       storageSpy.mockRestore();
+      admissionSpy.mockRestore();
       await database.cleanup().catch(() => undefined);
       if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
       await rm(home, { recursive: true, force: true }).catch(() => undefined);
     };
     return { db, tables, companyId, issueId, environmentId, session, runTurn, evidenceRows, waitFor, openEvidence, boxInventory, boxTree,
-      leaseMetadata, storageFaults, evidenceGate, commands, turnMs, cleanup, realStorage, codexHome, logger, commandRunner };
+      leaseMetadata, storageFaults, evidenceGate, commands, turnMs, evidenceAdmissionMs, cleanup, realStorage, codexHome, logger, commandRunner };
   }
 
   it("RF7 readback failure never publishes a complete receipt", async () => {
@@ -12247,8 +12257,9 @@ describe("warm native session evidence copy", () => {
     } finally { evidence.nativeSessionEvidenceRetry.delayMs = delay; await f.cleanup(); }
   }, 120_000);
 
-  it("RF7 pending write failure must not cross the remote-read custody boundary", async () => {
-    const f = await warmEvidenceFixture("rf7-pending-failure");
+  it.each(["reject", "zero_rows"] as const)("RF7 pending write failure (%s) must not cross the remote-read custody boundary", async mode => {
+    const f = await warmEvidenceFixture(`rf7-pending-${mode}`);
+    const alarms = vi.spyOn(f.logger, "error");
     const evidence = await import("./native-session-evidence.js");
     const delay = evidence.nativeSessionEvidenceRetry.delayMs;
     evidence.nativeSessionEvidenceRetry.delayMs = 1;
@@ -12257,7 +12268,9 @@ describe("warm native session evidence copy", () => {
       // A real PostgreSQL write failure, not a fabricated update receipt.
       const { sql } = await import("drizzle-orm");
       await f.db.execute(sql`CREATE FUNCTION rf7_reject_pending() RETURNS trigger AS $$ BEGIN
-        IF NEW.metadata ? 'nativeSessionEvidencePending' THEN RAISE EXCEPTION 'RF7 marker store unavailable'; END IF;
+        IF NEW.metadata ? 'nativeSessionEvidencePending' THEN
+          ${sql.raw(mode === "reject" ? "RAISE EXCEPTION 'RF7 marker store unavailable';" : "RETURN NULL;")}
+        END IF;
         RETURN NEW;
       END; $$ LANGUAGE plpgsql`);
       await f.db.execute(sql`CREATE TRIGGER rf7_reject_pending BEFORE UPDATE ON environment_leases
@@ -12265,17 +12278,32 @@ describe("warm native session evidence copy", () => {
       f.evidenceGate.stalled = new Promise<void>(r => { release = r; });
       const reached = new Promise<void>(r => { f.evidenceGate.reached = r; });
       const first = await f.runTurn();
+      // Hand-back joined the write even though it did not join the copy.
+      const markerAlarms = () => alarms.mock.calls.filter(([fields, message]) =>
+        (fields as { reason?: string })?.reason === "marker_write_failed" && String(message).includes("custody_evidence_pending_alarm"));
+      expect(markerAlarms(), "failed admission must be reported before hand-back").toHaveLength(1);
       const remoteTarReached = await Promise.race([reached.then(() => true),
         Promise.all([...evidence.nativeSessionEvidenceCopies.values()]).then(() => false),
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error("RF7 copy did not settle or reach the controlled boundary")), 15_000))]);
       const metadata = await f.leaseMetadata(first.leaseId);
       console.log(JSON.stringify({ RF7pendingWriteFailure: { runId: first.runId, metadata, remoteTarReached, currentRows: (await f.evidenceRows(first.runId, "current")).length } }));
-      if (remoteTarReached) expect(metadata?.nativeSessionEvidencePending, "remote copy started without the durable custody marker").toMatchObject({ runId: first.runId });
-      else expect(await f.evidenceRows(first.runId, "current"), "marker store failure must remain incomplete").toHaveLength(0);
+      expect(remoteTarReached, "marker failure must start no tar").toBe(false);
+      expect(f.commands.filter(command => command.includes("PAPERCLIP_ABSENT") || command.includes("-czf -")), "not even inventory may read the box").toHaveLength(0);
+      expect(metadata?.nativeSessionEvidencePending).toBeUndefined();
+      expect(await f.evidenceRows(first.runId)).toHaveLength(0);
+      const [accepted] = await f.db.select().from(f.tables.nativeRunResults).where(eq(f.tables.nativeRunResults.runId, first.runId));
+      expect(accepted?.schemaStatus).toBe("accepted");
+      const [settled] = await f.db.select().from(f.tables.heartbeatRuns).where(eq(f.tables.heartbeatRuns.id, first.runId));
+      expect(settled?.status).toBe("succeeded");
+      expect(f.session.close).not.toHaveBeenCalled();
+      expect(markerAlarms()).toHaveLength(1);
+      console.log(JSON.stringify({ evidenceAdmissionMs: f.evidenceAdmissionMs, mode, alarms: markerAlarms().length, remoteReads: 0, accepted: accepted?.schemaStatus }));
+      expect(f.evidenceAdmissionMs).toHaveLength(1);
+      expect(f.evidenceAdmissionMs[0]).toBeLessThan(50);
     } finally {
       f.evidenceGate.stalled = null; release?.();
       await Promise.all([...evidence.nativeSessionEvidenceCopies.values()]);
-      evidence.nativeSessionEvidenceRetry.delayMs = delay; await f.cleanup();
+      evidence.nativeSessionEvidenceRetry.delayMs = delay; alarms.mockRestore(); await f.cleanup();
     }
   }, 120_000);
 

@@ -34,6 +34,7 @@ import { nativeControllerArchiveCoordinatorDigest, nativeControllerArchiveProfil
 import { loadNativeRunnerCheckpoint, loadNativeRunnerCheckpointHeader } from "./native-runner-checkpoint.js";
 import { readNativeControllerRecovery } from "./native-controller-recovery.js";
 import { verifyDurableNativeHarnessBackup } from "./native-harness-backup-storage.js";
+import { resumableNativeHarnessBackupRow } from "./native-harness-backup-kind.js";
 
 const KEY = "nativeHarnessFilesystemIndependence";
 const SCHEMA = "paperclip.native-harness-filesystem-independence.v1";
@@ -359,7 +360,7 @@ async function controllerBinding(db: Db, facts: Awaited<ReturnType<typeof databa
     if (!parts.some(row => row.part === "header") || !readNativeControllerRecovery(
       facts.source.runnerProfileJson.nativeControllerRecovery, facts.source.runnerProfileJson.sessionCheckpoint)) fail();
     const rowQuery = db.select().from(nativeHarnessBackups).where(and(eq(nativeHarnessBackups.companyId, facts.anchor.companyId),
-      eq(nativeHarnessBackups.runId, facts.source.id), eq(nativeHarnessBackups.id, archive.id)));
+      eq(nativeHarnessBackups.runId, facts.source.id), eq(nativeHarnessBackups.id, archive.id), resumableNativeHarnessBackupRow));
     const [row] = await (lock ? rowQuery.for("share") : rowQuery);
     if (!row || !["current", "superseded"].includes(row.status) || digest(row) !== archive.digest) fail();
     if (history) {
@@ -446,7 +447,7 @@ async function preserveControllerEvidence(db: Db, facts: Awaited<ReturnType<type
   await archiveNativeControllerSourceEvidence(db, { ...source, onlineOwner: owner, storage: input.storage, signal: input.signal });
   const [row] = await db.select().from(nativeHarnessBackups).where(and(eq(nativeHarnessBackups.companyId, input.companyId),
     eq(nativeHarnessBackups.runId, facts.source.id), eq(nativeHarnessBackups.scopeDigest, descriptor.scopeDigest),
-    eq(nativeHarnessBackups.manifestSha256, descriptor.manifestSha256), eq(nativeHarnessBackups.status, "current")));
+    eq(nativeHarnessBackups.manifestSha256, descriptor.manifestSha256), eq(nativeHarnessBackups.status, "current"), resumableNativeHarnessBackupRow));
   if (!row) fail();
   if (!await verifyDurableNativeHarnessBackup({ db, storage: input.storage, companyId: input.companyId,
     scopeDigest: descriptor.scopeDigest, manifestSha256: descriptor.manifestSha256, backupId: row.id, signal: input.signal })) fail();

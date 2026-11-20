@@ -48,8 +48,9 @@ export type NativeSessionEvidenceRequest = {
 export const nativeSessionEvidenceRetry = { attempts: 3, delayMs: 2_000, deadlineMs: 300_000 };
 /** Test seam only: production resolves the configured storage service. */
 export const nativeSessionEvidenceStorage: { override: StorageService | null } = { override: null };
-/** Copies in flight, for idle probes and tests; never awaited by the turn path. */
-export const nativeSessionEvidenceCopies = new Map<string, Promise<NativeSessionEvidenceOutcome>>();
+/** Only durable admission is joined by the turn; the copy stays unawaited. */
+export type NativeSessionEvidenceCopy = Promise<NativeSessionEvidenceOutcome> & { admitted: Promise<boolean> };
+export const nativeSessionEvidenceCopies = new Map<string, NativeSessionEvidenceCopy>();
 
 export type NativeSessionEvidenceOutcome =
   | { status: "complete"; attempts: number; scopeDigest: string; sourceSha256: string; bytes: number; fileCount: number }
@@ -195,22 +196,33 @@ async function writePendingMarker(request: NativeSessionEvidenceRequest, value: 
   }).where(and(eq(environmentLeases.id, leaseId), eq(environmentLeases.companyId, request.companyId),
     value ? undefined : sql`${environmentLeases.metadata}->'nativeSessionEvidencePending'->>'runId' = ${request.runId}`))
     .returning({ id: environmentLeases.id });
-  return rows.length > 0;
+  return rows.length === 1;
 }
 
-async function runEvidenceCopy(request: NativeSessionEvidenceRequest): Promise<NativeSessionEvidenceOutcome> {
-  const marker = { runId: request.runId, sessionId: request.source.normalizedSessionId,
-    providerLeaseId: request.source.providerLeaseId, since: new Date().toISOString() };
-  await writePendingMarker(request, { ...marker, attempts: 0 }).catch(() => false);
+function markerWriteAlarm(request: NativeSessionEvidenceRequest, error: unknown) {
+  logger.error({ err: error, boxId: request.source.providerLeaseId, providerLeaseId: request.source.providerLeaseId,
+    companyId: request.companyId, runId: request.runId, environmentId: request.source.environmentId,
+    attempts: 0, reason: "marker_write_failed" },
+  "custody_evidence_pending_alarm: durable pending marker was not admitted; no evidence read started");
+}
+
+async function runEvidenceCopy(request: NativeSessionEvidenceRequest, marker: Record<string, unknown>): Promise<NativeSessionEvidenceOutcome> {
   let reason = "unknown";
   for (let attempt = 1; attempt <= nativeSessionEvidenceRetry.attempts; attempt++) {
     try {
       const stored = await captureAndPersist(request, evidenceStorage());
-      await writePendingMarker(request, null).catch(() => false);
+      await writePendingMarker(request, null);
       return { status: "complete", attempts: attempt, ...stored };
     } catch (error) {
       reason = (error instanceof Error ? error.message : String(error)).replace(/[\r\n]+/g, " ").slice(0, 256);
-      await writePendingMarker(request, { ...marker, attempts: attempt, lastError: reason, updatedAt: new Date().toISOString() }).catch(() => false);
+      try {
+        if (!await writePendingMarker(request, { ...marker, attempts: attempt, lastError: reason, updatedAt: new Date().toISOString() })) {
+          throw new Error("native_session_evidence_marker_not_admitted");
+        }
+      } catch (markerError) {
+        markerWriteAlarm(request, markerError);
+        return { status: "pending", attempts: attempt, reason: "marker_write_failed" };
+      }
       if (attempt < nativeSessionEvidenceRetry.attempts) await new Promise(resolve => setTimeout(resolve, nativeSessionEvidenceRetry.delayMs * attempt));
     }
   }
@@ -222,15 +234,28 @@ async function runEvidenceCopy(request: NativeSessionEvidenceRequest): Promise<N
   return { status: "pending", attempts: nativeSessionEvidenceRetry.attempts, reason };
 }
 
-/** Start the copy off the turn path. Returns synchronously; never throws. */
-export function scheduleNativeSessionEvidenceCopy(request: NativeSessionEvidenceRequest): Promise<NativeSessionEvidenceOutcome> {
+/** Start one DB admission now; defer every remote read until it is confirmed.
+ * Callers join .admitted, not the copy, so accepted turns survive marker outages. */
+export function scheduleNativeSessionEvidenceCopy(request: NativeSessionEvidenceRequest): NativeSessionEvidenceCopy {
   const key = `${request.companyId}:${request.runId}`;
   const existing = nativeSessionEvidenceCopies.get(key);
   if (existing) return existing;
-  const copy = new Promise<void>(resolve => setImmediate(resolve)).then(() => runEvidenceCopy(request))
-    .catch((error: unknown): NativeSessionEvidenceOutcome => ({ status: "pending", attempts: 0,
-      reason: error instanceof Error ? error.message : String(error) }))
-    .finally(() => { nativeSessionEvidenceCopies.delete(key); });
+  const marker = { runId: request.runId, sessionId: request.source.normalizedSessionId,
+    providerLeaseId: request.source.providerLeaseId, since: new Date().toISOString(), attempts: 0 };
+  const admitted = (async () => {
+    try {
+      if (!await writePendingMarker(request, marker)) throw new Error("native_session_evidence_marker_not_admitted");
+      return true;
+    } catch (error) {
+      markerWriteAlarm(request, error);
+      return false;
+    }
+  })();
+  const copy = Object.assign(admitted.then(async ok => {
+    if (!ok) return { status: "pending" as const, attempts: 0, reason: "marker_write_failed" };
+    await new Promise<void>(resolve => setImmediate(resolve));
+    return runEvidenceCopy(request, marker);
+  }).finally(() => { nativeSessionEvidenceCopies.delete(key); }), { admitted });
   nativeSessionEvidenceCopies.set(key, copy);
   return copy;
 }

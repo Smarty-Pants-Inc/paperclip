@@ -1,6 +1,8 @@
 import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, nativeHarnessBackups, nativeRunFinalizations, type Db } from "@paperclipai/db";
 
+import { resumableNativeHarnessBackupRow } from "./native-harness-backup-kind.js";
+
 type Transaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 export async function retireObsoleteNativeHarnessBackup(tx: Transaction, input: {
@@ -8,11 +10,11 @@ export async function retireObsoleteNativeHarnessBackup(tx: Transaction, input: 
 }): Promise<boolean> {
   await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`${input.companyId}:${input.scopeDigest}`}, 0))`);
   const [candidate] = await tx.select().from(nativeHarnessBackups).where(and(
-    eq(nativeHarnessBackups.id, input.id), eq(nativeHarnessBackups.companyId, input.companyId))).for("update");
+    eq(nativeHarnessBackups.id, input.id), eq(nativeHarnessBackups.companyId, input.companyId), resumableNativeHarnessBackupRow)).for("update");
   if (!candidate || !["pending", "superseded"].includes(candidate.status) || candidate.updatedAt >= input.closedBefore) return false;
   const [current] = await tx.select({ id: nativeHarnessBackups.id }).from(nativeHarnessBackups).where(and(
     eq(nativeHarnessBackups.companyId, input.companyId), eq(nativeHarnessBackups.scopeDigest, input.scopeDigest),
-    eq(nativeHarnessBackups.status, "current"))).limit(1);
+    eq(nativeHarnessBackups.status, "current"), resumableNativeHarnessBackupRow)).limit(1);
   if (!current && candidate.status === "superseded") return false;
   const [lease] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
     eq(environmentLeases.companyId, input.companyId),

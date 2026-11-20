@@ -2,6 +2,8 @@ import { and, eq, sql } from "drizzle-orm";
 import { heartbeatRuns, nativeHarnessBackups, nativeRunFinalizations, nativeRunResults, type Db } from "@paperclipai/db";
 import { NATIVE_PROVIDER_STATE_INCOMPATIBLE, NATIVE_PROVIDER_STATE_UNSAVED_KEY } from "./native-session-resume.js";
 
+import { resumableNativeHarnessBackupRow } from "./native-harness-backup-kind.js";
+
 const REASON = "harness_backup_not_saved";
 
 type RunBinding = { companyId: string; issueId: string; runId: string };
@@ -33,7 +35,8 @@ export async function markAcceptedRunProviderStateUnsaved(db: Db, binding: RunBi
     sql`not exists (select 1 from ${nativeHarnessBackups}
       where ${nativeHarnessBackups.companyId} = ${binding.companyId}::uuid
         and ${nativeHarnessBackups.runId} = ${binding.runId}::uuid
-        and ${nativeHarnessBackups.status} = 'current')`,
+        and ${nativeHarnessBackups.status} = 'current'
+        and ${resumableNativeHarnessBackupRow})`,
   )).returning({ id: heartbeatRuns.id });
   return rows.length > 0;
 }
