@@ -3524,6 +3524,25 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     process.stdout.write(`STOPWORDS3-APPROVAL ${JSON.stringify({ count, pending, other, approved: approved.body, ready, sent: sent.body, successors })}\n`);
   });
 
+  it("STOP-WORDS HISTORY: missing continuation source history keeps Send unavailable without failing the queue GET", async () => {
+    const f = await seedStoppableTurn("task");
+    const held = await postMessage(f, "Keep this message saved");
+    await vi.waitFor(async () => {
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(wakes.some(w => w.status === "deferred_issue_execution" && JSON.stringify(w.payload).includes(held))).toBe(true);
+    }, { timeout: 10_000, interval: 50 });
+    await stopByRoute(f, "queue-owner");
+    // PLANTED: the stopped turn's provenance references a missing source message.
+    // Admission's buildExecutionContinuation refuses it; GET must fail closed to
+    // the existing no-Send line, not turn that refusal into a broken panel (500).
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentId: randomUUID() } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    const queue = await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+    expect(queue.body.entries.map((entry: any) => entry.comment.id)).toEqual([held]);
+    expect(queue.body.executionWait).toEqual({ reason: "held_by_own_stop",
+      message: "Not sent, because you pressed Stop. It will go with your next message, or you can delete it." });
+  });
+
   // bb-2d-stopwords (RFL 22:22Z): where the queue's Send works, the Stop line names it and the panel offers it; where
   // it does not, the line names none.
   // REAL: the held messages (POST /api/issues/:id/comments), the Stop (POST /api/heartbeat-runs/:runId/cancel, as the
