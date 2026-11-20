@@ -31,6 +31,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { agentRoutes } from "../routes/agents.js";
 import { activityRoutes } from "../routes/activity.js";
+import { approvalRoutes } from "../routes/approvals.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
@@ -3317,6 +3318,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     testApp.use("/api", issueRoutes(db, {} as any, {}));
     testApp.use("/api", agentRoutes(db));
     testApp.use("/api", activityRoutes(db));
+    testApp.use("/api", approvalRoutes(db));
     testApp.use(errorHandler);
     return testApp;
   }
@@ -3461,6 +3463,65 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(successors).toEqual([]);
     expect(JSON.stringify(wakes)).toContain("decision_pending");
     expect(before.executionWait?.reason, JSON.stringify(before)).not.toBe("held_by_own_stop_send");
+  });
+
+  // REAL: message POSTs, Stop, repeated queue GET, approval decision POST, Send,
+  // and six admission passes. PLANTED: initial native turn and ack/release as
+  // stopByRoute; an ordinary linked approval with no requester (so deciding it
+  // creates no separate requester wake). The occupied agent slot keeps the one
+  // admitted successor queued; no provider execution is claimed here.
+  it.each([1, 2])("STOP-WORDS APPROVAL %i: no Send while a linked decision is pending; approving it offers Send and starts exactly one run", async count => {
+    const f = await seedStoppableTurn("task");
+    const held: string[] = [];
+    for (let i = 0; i < count; i++) held.push(await postMessage(f, `Hold message ${i + 1} until I decide`));
+    await vi.waitFor(async () => {
+      const saved = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(held.every(id => saved.some(w => w.status === "deferred_issue_execution" && JSON.stringify(w.payload).includes(id)))).toBe(true);
+    }, { timeout: 10_000, interval: 50 });
+    await stopByRoute(f, "queue-owner");
+    const approvalId = randomUUID();
+    await db.execute(sql`INSERT INTO approvals (id, company_id, type, status, payload) VALUES (${approvalId}, ${f.companyId}, 'approve_ceo_strategy', 'pending', '{}'::jsonb)`);
+    await db.execute(sql`INSERT INTO issue_approvals (company_id, issue_id, approval_id, linked_by_user_id) VALUES (${f.companyId}, ${f.issueId}, ${approvalId}, 'queue-owner')`);
+    const read = async () => (await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
+    const runs = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter(r => r.contextSnapshot?.issueId === f.issueId && r.id !== f.runId);
+    const durable = async () => ({
+      wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)),
+      actions: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId)),
+      finalizations: await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.companyId, f.companyId)),
+    });
+    const saved = await durable();
+    const pending = await read();
+    expect(pending.executionWait).toEqual({ reason: "held_by_own_stop", message: count === 1
+      ? "Not sent, because you pressed Stop. It will go with your next message, or you can delete it."
+      : "Not sent, because you pressed Stop. They will go with your next message, or you can delete any of them." });
+    expect((await read()).executionWait).toEqual(pending.executionWait);
+    expect(await durable()).toEqual(saved); // GET must never record a Send or settle a hold.
+    expect(await runs()).toEqual([]);
+    // The other user's view stays the saved, byte-exact recovery wait.
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: "second-board",
+      status: "active", membershipRole: "operator" });
+    const other = (await request(boardApp(f.companyId, "second-board")).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
+    expect(other.executionWait).toEqual({ reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." });
+    const approved = await request(boardApp(f.companyId, "queue-owner")).post(`/api/approvals/${approvalId}/approve`).send({});
+    expect(approved.status, JSON.stringify(approved.body)).toBe(200);
+    expect(approved.body.status).toBe("approved");
+    const ready = await read();
+    expect(ready.executionWait).toEqual({ reason: "held_by_own_stop_send", message: count === 1
+      ? "Not sent, because you pressed Stop. Send it now, or delete it."
+      : "Not sent, because you pressed Stop. Send them now, or delete any of them." });
+    // The existing pause gate still beats verified cleanup and a resolved decision.
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agentId));
+    expect((await read()).executionWait).toEqual(pending.executionWait);
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+    expect((await read()).executionWait).toEqual(ready.executionWait);
+    const sent = await request(f.client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
+      .send({ queueId: ready.queueId, revision: ready.revision, targetRunId: null });
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    for (let pass = 0; pass < 6; pass++) { await heartbeatService(db).resumeQueuedRuns(); await new Promise(r => setTimeout(r, 100)); }
+    const successors = await runs();
+    expect(successors.map(r => [r.status, r.contextSnapshot?.wakeCommentIds])).toEqual([["queued", held]]);
+    process.stdout.write(`STOPWORDS3-APPROVAL ${JSON.stringify({ count, pending, other, approved: approved.body, ready, sent: sent.body, successors })}\n`);
   });
 
   // bb-2d-stopwords (RFL 22:22Z): where the queue's Send works, the Stop line names it and the panel offers it; where
