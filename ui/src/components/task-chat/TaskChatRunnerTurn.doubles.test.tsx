@@ -150,6 +150,34 @@ describe.each([390, 1440])("runner lane draws an answer once at %ipx", (width) =
     expect(count("100+1 = 101.")).toBe(1);
   });
 
+  it("W5 answered-a4: a steered answer followed by more working text and a tool is drawn once", () => {
+    render([
+      message("4", "100+1 = 101.", "progress", T0 + 1_000),
+      message("5", "Step 3 done.", "progress", T0 + 3_000),
+      { id: "run-1:tool:6", kind: "tool", name: "bash", target: "ls", status: "completed", detail: "ok" },
+      message("9", "Done. Also, 100+1 = 101.", "final", T0 + 13_000),
+    ]);
+    snapshot("W5");
+    expect(count("101")).toBe(1);
+    expect(count("Step 3 done.")).toBe(1);
+    expect(count("Done. Also,")).toBe(1);
+  });
+
+  it("W6 two steered answers separated by other working text are each drawn once", () => {
+    render([
+      message("4", "100+1 = 101.", "progress", T0 + 1_000),
+      message("5", "Step 3 done.", "progress", T0 + 3_000),
+      message("6", "9+10 = 19.", "progress", T0 + 5_000),
+      message("7", "Step 4 done.", "progress", T0 + 7_000),
+      message("9", "Done. 100+1 = 101. 9+10 = 19.", "final", T0 + 13_000),
+    ]);
+    snapshot("W6");
+    expect(count("100+1 = 101.")).toBe(1);
+    expect(count("9+10 = 19.")).toBe(1);
+    expect(count("Step 3 done.")).toBe(1);
+    expect(count("Step 4 done.")).toBe(1);
+  });
+
   it("U5 control: a final with no progress is drawn unchanged", () => {
     render([message("9", SLEEP_FINAL, "final", T0 + 13_000)]);
     snapshot("U5");

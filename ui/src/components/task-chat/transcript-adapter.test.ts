@@ -295,13 +295,17 @@ describe("omitProgressRepeatedByResponseAcrossSegments", () => {
     ).toBe(segments);
   });
 
-  it("hides the latest progress whose sentences the response restates whole", () => {
+  it("hides every progress in the response's own segment whose sentences the response restates whole", () => {
     const work = progress("work", "Let me check that.");
     const first = progress("first", "100+1 = 101.");
     const second = progress("second", "**9+10** = `19`.\n\nResuming the original task.");
     expect(
-      omitProgressRepeatedByResponseAcrossSegments([[work, first], [second]], "Done. Also, 100+1 = 101. 9+10 = 19."),
-    ).toEqual([[work], []]);
+      omitProgressRepeatedByResponseAcrossSegments([[work, first, second]], "Done. Also, 100+1 = 101. 9+10 = 19."),
+    ).toEqual([[work]]);
+    // Only the response's own (last populated) segment: an earlier segment's answer stays, as in the guard above.
+    expect(
+      omitProgressRepeatedByResponseAcrossSegments([[work, first], [second], []], "Done. Also, 100+1 = 101. 9+10 = 19."),
+    ).toEqual([[work, first], [], []]);
     const answers = [[progress("a", "101."), progress("b", "19.")]];
     expect(omitProgressRepeatedByResponseAcrossSegments(answers, "Done. 100+1 = 101. 9+10 = 19.")).toEqual([[]]);
     // Word-bounded: a progress "101" is not restated by "1010", nor by a sentence that only contains it.
@@ -309,9 +313,10 @@ describe("omitProgressRepeatedByResponseAcrossSegments", () => {
     expect(omitProgressRepeatedByResponseAcrossSegments(bare, "Processed 1010 rows.")).toBe(bare);
     const inside = [[progress("inside", "Tests pass.")]];
     expect(omitProgressRepeatedByResponseAcrossSegments(inside, "Not all Tests passed.")).toBe(inside);
-    // A later progress the response does not restate keeps the earlier shared line.
+    // ui-doubles3 brief (answered-a4: answer, more working text, then the final): working text after the
+    // answer no longer stops the walk; the restated answer is hidden and "Let me check that." stays.
     const later = [[first, work]];
-    expect(omitProgressRepeatedByResponseAcrossSegments(later, "Done. Also, 100+1 = 101.")).toBe(later);
+    expect(omitProgressRepeatedByResponseAcrossSegments(later, "Done. Also, 100+1 = 101.")).toEqual([[work]]);
   });
 
   it("preserves segment identity when there is no durable-response match", () => {
