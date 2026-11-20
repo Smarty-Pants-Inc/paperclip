@@ -7242,7 +7242,12 @@ export function recoveryService(
           or(eq(heartbeatRuns.nativeIssueId, wake.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${wake.issueId}`),
           inArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]), isNotNull(heartbeatRuns.finishedAt),
         )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-        if (!source) continue;
+        if (!source) {
+          // No terminal source YET can be transient (a run row still being written):
+          // keep the deadline armed instead of going idle (rf-3, rf3-dbound5).
+          opts?.onDeferredDeadline?.(Date.now() + DEFERRED_PERSON_WAKE_BOUND_MS);
+          continue;
+        }
         await deps.releaseTerminalExecutionOwner(source, { personWakeBound: true }).catch(err =>
           logger.warn({ err, issueId: wake.issueId, runId: source.id }, "deferred person wake release will retry"));
         opts?.onDeferredDeadline?.(Date.now() + DEFERRED_PERSON_WAKE_BOUND_MS);
