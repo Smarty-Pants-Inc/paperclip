@@ -1218,6 +1218,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
     options: { suppressImmediateRecovery?: boolean; resumeStrandedQueue?: boolean; deferredPostCommitEffects?: WakeQueuePostCommitEffect[] } = {},
   ) {
+    const trace = { caller: "heartbeat.release", runId: run.id, issueId: null as string | null,
+      companyId: run.companyId, outcome: "error", deferredHeadWakeId: null, promotedWakeId: null as string | null };
     try {
       const [source] = await db.select({
         errorCode: heartbeatRuns.errorCode,
@@ -1229,7 +1231,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
       ));
       const sourceHandoff = await pendingCaseHandoffForRun(db, run.id, run.companyId);
-      const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
+      const { outcome, postCommitEffects } = await wakeQueue.releaseIssueExecution({
         companyId: run.companyId,
         runId: run.id,
         now: new Date(),
@@ -1238,6 +1240,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         suppressImmediateRecovery: options.suppressImmediateRecovery || isAiAuthenticationBlocked(source) || Boolean(sourceHandoff),
         ...(options.resumeStrandedQueue ? { resumeStrandedQueue: true } : {}),
       });
+      trace.outcome = outcome.kind;
+      trace.promotedWakeId = outcome.kind === "promoted" ? outcome.run.wakeupRequestId : null;
       if (options.deferredPostCommitEffects) {
         options.deferredPostCommitEffects.push(...postCommitEffects);
       } else {
@@ -1255,6 +1259,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       ));
       const issueId = readNonEmptyString(completed?.contextIssueId)
         ?? readNonEmptyString(completed?.contextTaskId) ?? completed?.nativeIssueId;
+      trace.issueId = issueId ?? null;
       if (sourceHandoff && completed?.status === "cancelled" && !completed.startedAt && issueId) {
         // A cancelled queue entry has no executeRun.finally. The canonical
         // bootstrap proof still needs to release and wake its durable handoff.
@@ -1275,6 +1280,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         throw new HttpError(422, error.message, { code: error.code, ...error.details });
       }
       throw error;
+    } finally {
+      logger.info(trace, "Issue execution release decision");
     }
   }
 
