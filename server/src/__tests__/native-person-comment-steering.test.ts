@@ -1472,6 +1472,15 @@ describe("answered-a5: a run's final items are posted once", () => {
     } finally { await f.close(); }
   }, 60_000);
 
+  it("M-same (org ruling 13:15Z): two steers, both final items 'Same answer.' in one step -> TWO replies", async () => {
+    // P-row shape: the routed steer 'what is 100 + 1?', then a second steered question read in the same turn;
+    // each is answered by a final item with the same text.
+    const { f, posted } = await run("A5-Msame", ["Same answer.", "Same answer."]);
+    try {
+      expect(posted.map(c => c.body)).toEqual(["Same answer.", "Same answer."]);
+    } finally { await f.close(); }
+  }, 60_000);
+
   it("M3/class C kept: '201 DONE1' + '202' -> both replies; '101' vs '101.5' -> both", async () => {
     const { f, posted } = await run("A5-M3c", ["201\n\nDONE1", "202"]);
     try { expect(posted.map(c => c.body)).toEqual(["201\n\nDONE1", "202"]); } finally { await f.close(); }
@@ -1533,6 +1542,8 @@ describe("answered-a5: publication arms (judged unit)", () => {
     expect(onceInPublicationStep([{ text: "a = 1\nDONE0" }, { text: "a = 1\nb = 2\nDONE0" }]).map(i => i.text)).toEqual(["a = 1\nb = 2\nDONE0"]);
     expect(onceInPublicationStep([{ text: "201\n\nDONE1" }, { text: "202 DONE1" }]).map(i => i.text)).toEqual(["201\n\nDONE1", "202 DONE1"]);
     expect(onceInPublicationStep([{ text: "201\nDONE1" }, { text: "202\nDONE1" }]).map(i => i.text)).toEqual(["201\nDONE1", "202"]);
+    // org ruling 13:15Z: only STRICT containment replaces; identical text stays two replies.
+    expect(onceInPublicationStep([{ text: "Same answer." }, { text: "Same answer." }]).map(i => i.text)).toEqual(["Same answer.", "Same answer."]);
   });
   it("M3: the same answer to two DIFFERENT questions stays; word-bounded, never substring", async () => {
     const { withoutPostedUnits, replyUnits } = await import("../services/native-runtime/native-response-items.js");

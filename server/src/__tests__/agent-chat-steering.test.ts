@@ -2032,10 +2032,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
         const evidence = await readSteeredMessageAnswers(db, scope);
         if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `m-${count}${options.ownFinal ? "-late" : ""}${options.restart ? "-restart" : ""}${options.sameText ? "-same" : ""}${options.commentaryOnly ? "-commentary-only" : ""}.json`),
           JSON.stringify({ scope, sent, expected, replies, evidence, events, thread: thread.body }, null, 2));
-        // answered-a5 (org ruling 12:43Z arm 3): in ONE publication step a later final item that
-        // contains the earlier one whole is the one reply, so equal text is posted once; both steers
-        // stay answered (the answered rule reads the run's final items, not the posted comments).
-        expect(replies.map((c: any) => c.body)).toEqual(options.sameText ? [...new Set(expected)] : expected);
+        expect(replies.map((c: any) => c.body)).toEqual(expected);
         expect(thread.body.filter((c: any) => c.authorType === "system")).toEqual([]);
         const expectedAnswered = options.commentaryOnly ? [] : sent;
         expect(evidence.answered).toEqual(expectedAnswered); expect(new Set(evidence.answered).size).toBe(expectedAnswered.length);
@@ -2062,7 +2059,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     }, 30_000);
     it("m-late: a steer after the own final keeps both replies", async () => { await multiFinal(1, { ownFinal: true }); }, 30_000);
     it("m-restart: reconstruct ingestion mid-run and replay without loss or duplication", async () => { await multiFinal(5, { restart: true }); }, 30_000);
-    it("m-same: equal text from different items in one step is ONE reply (answered-a5 arm 3); both steers stay answered", async () => { await multiFinal(2, { sameText: true }); }, 30_000);
+    it("m-same: equal text from different items remains two answers", async () => { await multiFinal(2, { sameText: true }); }, 30_000);
     it("m-12: more than ten steers keep every answer in order", async () => { await multiFinal(12); }, 60_000);
     it("m-commentary: commentary remains run activity, not posted replies", async () => { await multiFinal(2, { progress: true }); }, 30_000);
 

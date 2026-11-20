@@ -86,16 +86,23 @@ export function withoutPostedUnits(text: string, posted: ReadonlySet<string>) {
 }
 
 /** Ruling arm (3): the final items of ONE publication step become replies once. A later item that
- * contains every unit of an earlier one replaces it (one reply, the later text); otherwise both are
- * posted, in order, with the later one's units that the earlier already carries left out. */
+ * STRICTLY contains an earlier one (every earlier unit AND at least one more, org ruling 13:15Z)
+ * replaces it (one reply, the later text); identical text for two different steers stays TWO
+ * replies; otherwise both are posted, in order, with the later one's units that the earlier
+ * already carries left out. */
 export function onceInPublicationStep<T extends { text: string }>(items: T[]): T[] {
   const kept: Array<{ item: T; units: Set<string> }> = [];
   for (const item of items) {
     const units = new Set(replyUnits(item.text));
+    let identical = false;
     for (let index = kept.length - 1; index >= 0; index--) {
       const earlier = kept[index].units;
-      if (earlier.size > 0 && [...earlier].every(unit => units.has(unit))) kept.splice(index, 1);
+      if (earlier.size === 0 || ![...earlier].every(unit => units.has(unit))) continue;
+      if (units.size > earlier.size) kept.splice(index, 1);
+      else identical = true;
     }
+    // The same text answering another steer is its own reply, posted whole.
+    if (identical) { kept.push({ item, units }); continue; }
     const before = new Set(kept.flatMap(entry => [...entry.units]));
     const text = withoutPostedUnits(item.text, before);
     if (text) kept.push({ item: text === item.text.trim() ? item : { ...item, text }, units: new Set(replyUnits(text)) });
