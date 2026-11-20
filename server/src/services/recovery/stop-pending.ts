@@ -1,6 +1,8 @@
 import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
-import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
+import { runExecutionsAwaitOnlyReleaseTail, runExecutionsHaveStopped } from "../agent-execution-stop.js";
+import { hasAcknowledgedNativeRunStopRequest } from "../acknowledged-native-stop.js";
+import { parseObject } from "../../adapters/utils.js";
 import { logActivity, type ActivityPublication } from "../activity-log.js";
 import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
 import { notifyNativeRecoveryNotices } from "../native-recovery-notice-notifications.js";
@@ -27,6 +29,53 @@ type StopPending = {
   standalone: boolean;
   previousNextAction: string | null;
 };
+/** spgrace bound 1 (cut -> receipt): the normal window for a provider's stop
+ * confirmation after a person's acknowledged Stop/Interrupt. Managed remote
+ * providers write the termination receipt ~0.2-3 s after the cancel (the
+ * idle-checkpoint race; FINAL5e2's end-of-run confirmation landed at +16.7 s).
+ * 60 s is >3x the worst observed lag and equals handedOffWarmStopReceiptBound, the existing bound for a
+ * person-Stop receipt to land (pinned by test). */
+export const STOP_CONFIRMATION_GRACE_MS = 60_000;
+/** spgrace bound 2 (finished_at -> stale lock cleared): the ordinary end-of-run
+ * tail in which a terminal run's lease is released and its issue lock cleared
+ * (measured p50 6.5 s, p95 ~24 s). 60 s is 2.5x the p95 and covers the p99
+ * tail, while still showing a genuinely stuck release within one minute. */
+export const END_OF_RUN_RELEASE_GRACE_MS = 60_000;
+
+/** A person's (not the system's) Stop/Interrupt that the executor acknowledged. */
+function personStopAcknowledged(run: typeof heartbeatRuns.$inferSelect): boolean {
+  const result = run.resultJson ?? {};
+  const person = (result.cancelledByActorType === "user" && typeof result.cancelledByUserId === "string" && !!result.cancelledByUserId)
+    || (result.interruptedByActorType === "user" && typeof result.interruptedByActorId === "string" && !!result.interruptedByActorId);
+  return run.status === "cancelled" && person
+    && (parseObject(result.executionCancellation).state === "acknowledged" || hasAcknowledgedNativeRunStopRequest(run));
+}
+
+/** The bound for a run's normal release tail, or null when it has none (a
+ * system/unknown cancel, an unacknowledged Stop, a non-terminal run). */
+function releaseTailBoundMs(run: typeof heartbeatRuns.$inferSelect): number | null {
+  if (personStopAcknowledged(run)) return STOP_CONFIRMATION_GRACE_MS;
+  if (["succeeded", "failed", "timed_out"].includes(run.status) && !hasRecordedStopRequest(run)) return END_OF_RUN_RELEASE_GRACE_MS;
+  return null;
+}
+
+/** The re-inspection deadline while every bound run is still inside its normal
+ * release tail (finished_at + its bound) and that tail (a held lease, or the
+ * provider's stop receipt) is the ONLY missing proof; otherwise null, and the
+ * inspection escalates as before. Claims stay held either way. */
+async function releaseTailPendingUntil(tx: Db, companyId: string, runs: (typeof heartbeatRuns.$inferSelect)[]) {
+  if (!runs.length) return null;
+  let until = Infinity;
+  for (const run of runs) {
+    const bound = releaseTailBoundMs(run);
+    // finishedAt is written once at the terminal transition; nothing later extends it.
+    if (bound === null || !run.finishedAt) return null;
+    until = Math.min(until, run.finishedAt.getTime() + bound);
+  }
+  if (!(until > Date.now())) return null;
+  return await runExecutionsAwaitOnlyReleaseTail(tx, companyId, runs.map(run => run.id)) ? until + 1 : null;
+}
+
 /** Recorded requests, not a terminal status or a paused assignee, establish intent. */
 export function hasRecordedStopRequest(run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">): boolean {
   const result = run.resultJson ?? {};
@@ -108,10 +157,16 @@ async function notify(tx: Db, input: TaskBinding) {
 }
 
 /** Caller holds the task and bound-run locks. One failed read-only inspection
- * immediately escalates, rather than inventing an unowned automatic Stop loop.
+ * escalates, rather than inventing an unowned automatic Stop loop; the one
+ * exception is a normal release tail still inside its bound (a person's
+ * acknowledged Stop awaiting the provider's confirmation, STOP_CONFIRMATION_GRACE_MS;
+ * a finished run's lease awaiting ordinary release, END_OF_RUN_RELEASE_GRACE_MS):
+ * no card, and the returned deadline is when the caller's watchdog must
+ * inspect again (then escalate once).
  * The existing recovery-action projection is durable even for an unassigned
  * task or a historical run without issue context. No task workflow state changes. */
-export async function recordTaskStopPending(tx: Db, input: TaskBinding & { source: string }, publications: ActivityPublication[]) {
+export async function recordTaskStopPending(tx: Db, input: TaskBinding & { source: string },
+  publications: ActivityPublication[]): Promise<{ reinspectAt: number } | void> {
   const boundRunIds = [...new Set(input.runIds)].sort();
   const boundRuns = boundRunIds.length ? await tx.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.id, boundRunIds),
@@ -125,6 +180,8 @@ export async function recordTaskStopPending(tx: Db, input: TaskBinding & { sourc
   // Do not recreate a retired no-Stop card on every tick while the old lease
   // remains held. A later answer does not release either execution claim.
   if (await laterSuccessfulTaskRun(tx, { ...input, runIds })) return;
+  const reinspectAt = await releaseTailPendingUntil(tx, input.companyId, boundRuns.filter(run => runIds.includes(run.id)));
+  if (reinspectAt !== null) return { reinspectAt };
   let existing = await activeAction(tx, input);
   const prior = existing && stopPending(existing);
   if (prior && JSON.stringify(prior.runIds) === JSON.stringify(runIds) && existing!.nextAction.includes(STOP_PENDING_CODE)) return;
