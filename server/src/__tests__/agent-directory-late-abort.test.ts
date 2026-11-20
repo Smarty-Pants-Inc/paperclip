@@ -836,14 +836,16 @@ describe("agent directory collection aborted after the canonical commit boundary
    * that pool can take it, reads the committed manifest and the raw tree.
    * `inFlight` is the collection that holds the key: the poll goes on for as
    * long as it has not settled, however long its failed applies take on a slow
-   * host, and for 2 s of polls after. Only a key that is still held after its
-   * collection returned is reported as not free. (It used to stop after 3,000
-   * polls, about 15 s: a collection that was still running then was reported
-   * as "lock never freed" although it freed the lock with manifest == tree.) */
+   * host, and for 3,000 further polls after (a collection that answered
+   * "still saving" at its bound keeps the key while its write lands). Only a
+   * key still held after all that is reported as not free. (The poll used to
+   * stop 3,000 polls, about 15 s, after it STARTED: a collection that was
+   * still running then was reported as "lock never freed" although it freed
+   * the lock with manifest == tree.) */
   async function atFirstUnlock(note: string, inFlight: Promise<unknown>) {
     let settled = false;
     void inFlight.then(() => { settled = true; }, () => { settled = true; });
-    for (let pollsAfterSettle = 0; pollsAfterSettle < 400;) {
+    for (let pollsAfterSettle = 0; pollsAfterSettle < 3_000;) {
       if (await independentPoolCanTakeLock()) return { lockFree: true, ...await canonical(note), tree: await rawTree() };
       if (settled) pollsAfterSettle++;
       await sleep(5);
@@ -1134,11 +1136,14 @@ describe("agent directory collection aborted after the canonical commit boundary
   // double fault). The on-disk files then hold bytes that were never saved, and
   // the projection is marked unverified (its generation marker is removed).
   // A person reading the agent's instructions through feedback or through the
-  // support inspection must get the saved files (restored from the durable
-  // head under the agent row lock) or a truthful "not available", never the
-  // failed save's bytes. Boundary: the REAL readers (feedbackService
-  // .saveIssueVote -> its trace bundle; readCustomerSuccessResource), a real
-  // agent, real PostgreSQL and files, and rf-3's failed-restore plant below.
+  // support inspection, and the agent itself in a run that has no working
+  // copy, must get the saved files (restored from the durable head under the
+  // agent row lock) or a truthful "not available", never the failed save's
+  // bytes. Boundary: the REAL readers (feedbackService.saveIssueVote -> its
+  // trace bundle; readCustomerSuccessResource; the instructions service built
+  // without a database; createHeartbeatInstructionWorkingCopy.prepare -> the
+  // file the adapter reads), a real agent, real PostgreSQL and files, and
+  // rf-3's failed-restore plant below.
 
   /**
    * PLANTED FAULT, named at its line: rf-3's failed-restore plant (rf3-mcoll9
