@@ -38,6 +38,37 @@ describe("ordinary task interruption", () => {
     expect(container.querySelector("a, details, input, textarea")).toBeNull();
     expect(container.textContent).not.toMatch(/service attention|process|receipt|workspace/i);
   });
+  // final4 gate 2, 20-send: the turn succeeded and the messages sent during it never started.
+  // jsdom has no layout: 390 and 1440 set window.innerWidth and every matchMedia width query.
+  it.each([390, 1440])("at %i shows messages that have not started as a neutral status, not a failed attempt", async width => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    window.matchMedia = vi.fn((query: string) => {
+      const max = /max-width:\s*(\d+)px/.exec(query), min = /min-width:\s*(\d+)px/.exec(query);
+      return { matches: Boolean((max || min) && (!max || width <= Number(max[1])) && (!min || width >= Number(min[1]))), media: query,
+        addEventListener: vi.fn(), removeEventListener: vi.fn(), addListener: vi.fn(), removeListener: vi.fn() };
+    }) as never;
+    const notStarted = { reason: "not_started", message: "Your messages haven’t started yet. They’re saved." };
+    // A queued message: the waiting bar already offers Send for it, so no second action.
+    await render({ ...failed, canRetry: false, retryWait: notStarted });
+    const notice = container.querySelector('[role="status"]');
+    expect(notice?.textContent).toBe("Your messages haven’t started yet. They’re saved.");
+    expect(container.textContent).not.toContain("Couldn’t finish this attempt");
+    expect(container.querySelector('[class*="bg-destructive"], [class*="text-destructive"]:not(button), svg')).toBeNull();
+    expect(container.querySelector("button")).toBeNull();
+    // Input with no queued row: one action, named for what it does.
+    await render({ ...failed, canRetry: true, retryWait: notStarted });
+    expect(container.querySelector('[class*="bg-destructive"], [class*="text-destructive"]:not(button), svg')).toBeNull();
+    expect([...container.querySelectorAll("button")].map(button => button.textContent)).toEqual(["Start now"]);
+    await act(async () => container.querySelector<HTMLButtonElement>("button")!.click());
+    expect(retry).toHaveBeenCalledOnce();
+    // Control: a real failed attempt keeps today's red banner and Retry.
+    await render({ ...failed, observedRunId: "failed-run" });
+    expect(container.textContent).toContain("Couldn’t finish this attempt. Your message is saved.");
+    expect(container.querySelector('[class*="bg-destructive"]')).not.toBeNull();
+    expect(container.querySelector("svg")).not.toBeNull();
+    expect(container.querySelector('[data-testid="task-execution-retry"]')?.textContent).toBe("Retry");
+  });
+
   it("keeps the failure visible and names the gate while a saved Retry waits on the budget", async () => {
     await render({ ...failed, responsibility: "user", state: "waiting_for_user", userAction: "budget", canRetry: false });
     const notice = container.querySelector('[data-testid="task-execution-waiting"]');

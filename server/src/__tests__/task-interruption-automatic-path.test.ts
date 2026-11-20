@@ -388,11 +388,33 @@ describe.skipIf(!support.supported)("Retry is offered only when no automatic pat
     expect(await taskInterruptionPresentation(db, issue)).toMatchObject({ state: "working", canRetry: false, observedRunId: nextRunId });
   });
 
-  it("offers Retry on the parent once its queued message is not settled within the grace", async () => {
+  it("names the parent's queued message as not started, not a failed attempt, once it is not settled within the grace", async () => {
     const { companyId, agentId, issue, runId } = await seedParentWaitingOnSubtasks();
     await seedCommentQueuedDuringRun(companyId, agentId, issue.id);
     await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 3 * 60_000) }).where(eq(heartbeatRuns.id, runId));
-    expect(await taskInterruptionPresentation(db, issue)).toMatchObject({ state: "failed", canRetry: true });
+    expect(await taskInterruptionPresentation(db, issue)).toMatchObject({ state: "failed", canRetry: false,
+      retryWait: { reason: "not_started", message: "Your messages haven’t started yet. They’re saved." } });
+  });
+
+  // final4 gate 2, 20-send: the turn succeeded; four messages sent during it were never started.
+  it("does not show a failed attempt when the turn succeeded and the messages sent during it never started", async () => {
+    const { companyId, agentId, issue } = await seedTask("todo");
+    const runId = randomUUID(), finishedAt = new Date(Date.now() - 10 * 60_000);
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issue.id, scopeKind: "issue",
+      status: "succeeded", runtimeMode: "native", startedAt: new Date(Date.now() - 15 * 60_000), finishedAt });
+    const wake = await seedCommentQueuedDuringRun(companyId, agentId, issue.id);
+    const notStarted = { reason: "not_started", message: "Your messages haven’t started yet. They’re saved." };
+    // The waiting bar already offers Send for each queued message: no second action here.
+    expect(await taskInterruptionPresentation(db, issue)).toMatchObject({ responsibility: "system", state: "failed",
+      canRetry: false, retryWait: notStarted, observedRunId: runId });
+    // Input with no queued row keeps the one action that starts it.
+    await db.update(agentWakeupRequests).set({ payload: { issueId: issue.id } }).where(eq(agentWakeupRequests.id, wake.id));
+    expect(await taskInterruptionPresentation(db, issue)).toMatchObject({ state: "failed", canRetry: true, retryWait: notStarted });
+    // Control: a FAILED run with the same waiting input keeps the generic failure.
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed" }).where(eq(heartbeatRuns.id, runId));
+    const failed = await taskInterruptionPresentation(db, issue);
+    expect(failed).toMatchObject({ state: "failed", canRetry: true });
+    expect(failed?.retryWait).toBeUndefined();
   });
 
   it("still offers Retry on a blocked task with a queued message and no open subtasks", async () => {
