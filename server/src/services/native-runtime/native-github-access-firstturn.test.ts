@@ -165,6 +165,10 @@ it("an actual entrypoint decode failure aborts the combined command before serve
   expect(f.resolveCredentials).not.toHaveBeenCalled();
 }, 30_000);
 
+function isQuarantineListing(script: string) {
+  return script.includes("basename") && !script.includes("wait_checks");
+}
+
 function isAttachment(script: string, marker: string) {
   return script.includes("base64 -d") && (marker === "ever-attached"
     ? script.includes("ever-attached") : script.includes("run-state.json") && !script.includes("ever-attached"));
@@ -245,7 +249,7 @@ it.each(["ever-attached", "run-state"])("hung %s writes take two five-second att
 it("one quarantine listing timeout retries once and the first turn succeeds with GitHub", async () => {
   let armed = false;
   let attempts = 0;
-  const f = await fixture({ fault: script => armed && script.includes("basename") && ++attempts === 1 ? "timeout" : undefined });
+  const f = await fixture({ fault: script => armed && isQuarantineListing(script) && ++attempts === 1 ? "timeout" : undefined });
   const broker = await f.create();
   armed = true;
   try {
@@ -261,7 +265,7 @@ it("one quarantine listing timeout retries once and the first turn succeeds with
 it("hung quarantine listing gets two five-second attempts, refuses authority, and Retry activates", async () => {
   let armed = false;
   let attempts = 0;
-  const f = await fixture({ fault: script => armed && script.includes("basename") && ++attempts <= 2 ? "hang" : undefined });
+  const f = await fixture({ fault: script => armed && isQuarantineListing(script) && ++attempts <= 2 ? "hang" : undefined });
   const broker = await f.create();
   armed = true;
   const started = Date.now();
@@ -294,13 +298,13 @@ it("hung quarantine listing gets two five-second attempts, refuses authority, an
 
 it("failed quarantine listing rejects authority for that generation, records GitHub setup reason, and Retry activates", async () => {
   let armed = false;
-  const f = await fixture({ fail: script => armed && script.includes("basename") });
+  const f = await fixture({ fail: script => armed && isQuarantineListing(script) });
   const broker = await f.create();
   const requestPath = path.join(f.queue, "requests", "untrusted.json");
   await writeFile(requestPath, JSON.stringify({ id: "untrusted" }));
   // The broker's native host endpoint must reject even a correctly tagged request.
   f.beforeExec(async script => {
-    if (armed && script.includes("basename")) {
+    if (armed && isQuarantineListing(script)) {
       expect((await f.hostRequest(f.generations[0])).status).toBe(403);
     }
   });
