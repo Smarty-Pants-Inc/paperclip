@@ -19,6 +19,15 @@ import { instanceSettingsApi } from "@/api/instanceSettings";
 import { CoordinatorPresentation } from "@/components/coordinator/CoordinatorPresentation";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { DRAFT_DEBOUNCE_MS } from "../../lib/composer-draft";
+import { verbatimRoundTrip } from "../../lib/verbatim-markdown.testkit";
+
+/** The text the real editor holds after importing `markdown` (edge whitespace kept as the caret sees it). */
+function importedText(markdown: string): string {
+  const core = markdown.trim();
+  if (!core) return markdown;
+  const start = markdown.indexOf(core);
+  return markdown.slice(0, start) + verbatimRoundTrip(core) + markdown.slice(start + core.length);
+}
 import {
   loadDraftAttachments,
   loadDraftSubmission,
@@ -80,15 +89,18 @@ vi.mock("@mdxeditor/editor", async () => {
     forwardedRef: React.ForwardedRef<MockHandle | null>,
   ) {
     const editableRef = React.useRef<HTMLDivElement>(null);
-    const contentRef = React.useRef(markdown);
+    // The real editor imports the markdown it is handed and shows (and sends)
+    // what it holds: model that with MDXEditor's own import and the
+    // composer's verbatim export.
+    const contentRef = React.useRef(importedText(markdown));
     const onChangeRef = React.useRef(onChange);
     onChangeRef.current = onChange;
 
     const handle = React.useMemo<MockHandle>(
       () => ({
         setMarkdown: (value: string) => {
-          contentRef.current = value;
-          if (editableRef.current) editableRef.current.textContent = value;
+          contentRef.current = importedText(value);
+          if (editableRef.current) editableRef.current.textContent = contentRef.current;
         },
         insertMarkdown: (value: string) => {
           const next = contentRef.current
@@ -410,6 +422,56 @@ describe("TaskChatComposer", () => {
     expect(pasteFiles([image, document]).defaultPrevented).toBe(true);
     expect(creation.onSelectFiles).toHaveBeenCalledWith([image, document]);
     expect(pasteFiles([document]).defaultPrevented).toBe(true);
+  });
+
+  it.each([
+    { typed: "__bold__", more: "!" },
+    { typed: String.raw`a\_b a\=b a\<b`, more: String.raw` \>` },
+    { typed: "~~~~\n```\nnested\n```", more: "\n~~~~" },
+  ])("restores a saved draft as the person's text: $typed + reload + $more sends both exactly", async ({ typed, more }) => {
+    const key = `verbatim-draft-${typed.length}`;
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key} />);
+    typeText(typed);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, DRAFT_DEBOUNCE_MS + 20)); });
+    expect(localStorage.getItem(key)).toBe(typed);
+    // Reload: the composer mounts again from the saved draft.
+    render(<div>Another task</div>);
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key} />);
+    await flushAsync();
+    // The mock editor holds what MDXEditor imports from the markdown it is
+    // handed: what the person sees and keeps typing after.
+    const restored = editable().textContent ?? "";
+    expect(restored).toBe(typed);
+    typeText(restored + more);
+    pressKey("Enter", { metaKey: true });
+    await flushAsync();
+    await flushAsync();
+    expect(onAdd).toHaveBeenCalledWith(typed + more, undefined, undefined, undefined, expect.any(String));
+    localStorage.removeItem(key);
+  });
+
+  it.each([
+    { stored: String.raw`a\*b\*c`, text: "a*b*c" },
+    { stored: String.raw`\_\_bold\_\_`, text: "__bold__" },
+  ])("restores an older build's markdown draft $stored as $text and then keeps it verbatim", async ({ stored, text }) => {
+    const key = `legacy-draft-${text}`;
+    localStorage.setItem(key, stored);
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key} />);
+    await flushAsync();
+    expect(editable().textContent).toBe(text);
+    expect(localStorage.getItem(key)).toBe(text);
+    // Reload again: now tagged verbatim, it is not converted a second time.
+    render(<div>Another task</div>);
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key} />);
+    await flushAsync();
+    expect(editable().textContent).toBe(text);
+    pressKey("Enter", { metaKey: true });
+    await flushAsync();
+    await flushAsync();
+    expect(onAdd).toHaveBeenCalledWith(text, undefined, undefined, undefined, expect.any(String));
+    localStorage.clear();
   });
 
   it("settles an acknowledged submission after navigating away", async () => {

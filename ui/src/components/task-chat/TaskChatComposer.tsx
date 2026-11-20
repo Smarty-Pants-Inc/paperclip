@@ -20,7 +20,7 @@ import { useStreamlinedTaskChatPresentation } from "./presentation-mode";
 import {
   DRAFT_DEBOUNCE_MS,
   clearDraft,
-  loadDraft,
+  loadVerbatimDraft,
   loadDraftAttachments,
   saveDraft,
   saveDraftAttachments,
@@ -32,6 +32,7 @@ import {
   type ComposerDraftSubmission,
   type ComposerSendRequest,
 } from "@/lib/composer-draft";
+import { legacyMarkdownDraftToText } from "@/lib/verbatim-markdown";
 import { classifySendFailure, type SendOutcome } from "@/lib/pending-send";
 import { describeError } from "@/api/errors";
 import { useAutoResend } from "@/hooks/useDurableSubmit";
@@ -440,7 +441,7 @@ export function TaskChatComposer({
   const submitKey = useComposerSubmitKey();
   const stopControl = useComposerStop(onStop, stopPending, confirmedStoppedRunIds);
   const [sendMenuOpen, setSendMenuOpen] = useState(false);
-  const [localBody, setBody] = useState(() => (draftKey ? loadDraft(draftKey) : ""));
+  const [localBody, setBody] = useState(() => (draftKey ? loadVerbatimDraft(draftKey, legacyMarkdownDraftToText) : ""));
   const body = creation ? creation.value : localBody;
   const [submitting, setSubmitting] = useState(false);
   const [uncertainSubmission, setUncertainSubmission] =
@@ -607,7 +608,7 @@ export function TaskChatComposer({
 
   useEffect(() => {
     if (!draftKey || queuedEdit) return;
-    bodyRef.current = loadDraft(draftKey);
+    bodyRef.current = loadVerbatimDraft(draftKey, legacyMarkdownDraftToText);
     setBody(bodyRef.current);
   }, [draftKey, queuedEdit]);
 
