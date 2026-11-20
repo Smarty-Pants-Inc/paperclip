@@ -90,6 +90,36 @@ describe("stop-pending waits out the normal stop-confirmation window", () => {
     expect(await stopCards(f.issueId)).toEqual([]);
   }, 30_000);
 
+  // spgrace2 (rf-5 condition 3, MIXED LEASES): a person's Stop of a run that
+  // also holds a LOCAL lease (local driver, environment-runtime.ts
+  // acquireRunLease: ephemeral, provider "local"), released by the run's own
+  // releaseRunLeases at the end of the run, plus the managed remote lease
+  // whose receipt lands +2 s later: no card at any point.
+  it("sweep: person Stop with a released local lease and a remote receipt at +2 s never shows a stop card", async () => {
+    const f = await fixture("sweep");
+    await db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueId, heartbeatRunId: f.runId,
+      status: "released", releasedAt: new Date(), cleanupStatus: "success", leasePolicy: "ephemeral", provider: "local",
+      metadata: { driver: "local", agentId: f.agentId } });
+    await inspect("sweep");
+    expect(await stopCards(f.issueId)).toEqual([]);
+    await sleep(2_000);
+    await receiptLands(f);
+    await inspect("sweep");
+    expect(await stopCards(f.issueId)).toEqual([]);
+    // The receipt completes Stop proof: the claims clear, so no card can come at the bound.
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0])
+      .toMatchObject({ checkoutRunId: null, executionRunId: null });
+  }, 30_000);
+  // spgrace2 narrowing: a person's Stop whose LOCAL lease is still held is not
+  // waiting on a remote confirmation; it cards at once as before spgrace.
+  it("sweep: person Stop with a still-held local lease escalates at once", async () => {
+    const f = await fixture("sweep");
+    await db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueId, heartbeatRunId: f.runId,
+      status: "active", leasePolicy: "ephemeral", provider: "local", metadata: { driver: "local", agentId: f.agentId } });
+    await inspect("sweep");
+    expect(await stopCards(f.issueId)).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
+  });
+
   // Row (b): the safety half. Never confirmed -> exactly one card after the bound.
   it.each(["sweep"] as const)("%s: a never-confirmed person Stop escalates once after the bound", async path => {
     const f = await fixture(path);

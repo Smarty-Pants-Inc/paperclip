@@ -153,7 +153,11 @@ async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
     if (handedOff.has(run.id)) continue;
     const runLeases = leases.filter(lease => lease.heartbeatRunId === run.id);
     if (runLeases.some(lease => lease.provider && lease.provider !== "local")) {
-      if (run.status === "cancelled" && !skipRemoteProviderProof && !runLeases.every(hasRemoteTerminationReceipt)) {
+      // A LOCAL lease the run already released (local driver, ended cleanly)
+      // can never carry a remote termination receipt; it is not remote proof.
+      const receiptLeases = runLeases.filter(lease => (lease.provider && lease.provider !== "local")
+        || !(lease.status === "released" && lease.releasedAt && lease.cleanupStatus === "success"));
+      if (run.status === "cancelled" && !skipRemoteProviderProof && !receiptLeases.every(hasRemoteTerminationReceipt)) {
         if (!releaseTailOnly) return "remote_stop_unconfirmed";
         releaseTail = true;
       }

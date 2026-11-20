@@ -1,5 +1,5 @@
 import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
-import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
+import { environmentLeases, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { runExecutionsAwaitOnlyReleaseTail, runExecutionsHaveStopped } from "../agent-execution-stop.js";
 import { hasAcknowledgedNativeRunStopRequest } from "../acknowledged-native-stop.js";
 import { parseObject } from "../../adapters/utils.js";
@@ -37,43 +37,87 @@ type StopPending = {
  * person-Stop receipt to land (pinned by test). */
 export const STOP_CONFIRMATION_GRACE_MS = 60_000;
 /** spgrace bound 2 (finished_at -> stale lock cleared): the ordinary end-of-run
- * tail in which a terminal run's lease is released and its issue lock cleared
+ * tail in which a SUCCEEDED run's per-run lease is released and its issue lock cleared
  * (measured p50 6.5 s, p95 ~24 s). 60 s is 2.5x the p95 and covers the p99
  * tail, while still showing a genuinely stuck release within one minute. */
 export const END_OF_RUN_RELEASE_GRACE_MS = 60_000;
 
-/** A person's (not the system's) Stop/Interrupt that the executor acknowledged. */
+/** A person's (not the system's) Stop/Interrupt that the executor acknowledged.
+ * A native Stop intent must itself be acknowledged AND dispatched: an
+ * unacknowledged intent is not waiting on a confirmation. */
 function personStopAcknowledged(run: typeof heartbeatRuns.$inferSelect): boolean {
   const result = run.resultJson ?? {};
   const person = (result.cancelledByActorType === "user" && typeof result.cancelledByUserId === "string" && !!result.cancelledByUserId)
     || (result.interruptedByActorType === "user" && typeof result.interruptedByActorId === "string" && !!result.interruptedByActorId);
+  const nativeIntent = result.nativeCancellation === undefined ? null : parseObject(result.nativeCancellation);
+  if (nativeIntent && !(hasAcknowledgedNativeRunStopRequest(run) && nativeIntent.dispatched === true)) return false;
   return run.status === "cancelled" && person
     && (parseObject(result.executionCancellation).state === "acknowledged" || hasAcknowledgedNativeRunStopRequest(run));
 }
 
-/** The bound for a run's normal release tail, or null when it has none (a
- * system/unknown cancel, an unacknowledged Stop, a non-terminal run). */
-function releaseTailBoundMs(run: typeof heartbeatRuns.$inferSelect): number | null {
-  if (personStopAcknowledged(run)) return STOP_CONFIRMATION_GRACE_MS;
-  if (["succeeded", "failed", "timed_out"].includes(run.status) && !hasRecordedStopRequest(run)) return END_OF_RUN_RELEASE_GRACE_MS;
+type Lease = typeof environmentLeases.$inferSelect;
+type TailKind = "stop_confirmation" | "end_of_run_release";
+/** The run's grace purpose, or null when it has none: only (1) a person's
+ * acknowledged Stop/Interrupt awaiting the provider's stop confirmation, or
+ * (2) a SUCCEEDED run (no recorded Stop) whose lease is being released at the
+ * end of the run. A system/unknown cancel, an unacknowledged Stop, a failed,
+ * timed-out or non-terminal run has none. */
+function releaseTailKind(run: typeof heartbeatRuns.$inferSelect): TailKind | null {
+  if (personStopAcknowledged(run)) return "stop_confirmation";
+  if (run.status === "succeeded" && !hasRecordedStopRequest(run)) return "end_of_run_release";
   return null;
+}
+const isRemote = (lease: Lease) => Boolean(lease.provider && lease.provider !== "local");
+/** spgrace2 narrowing: a lease can only be in a release tail when it is a
+ * per-run (ephemeral) lease released at the end of every run, with no release
+ * deferral, no failed cleanup, no stop-and-retain intent and no known lifetime
+ * already over. A reused/warm lease, a lease of unknown lifecycle, a deferred
+ * or expired lease, or (for a person's Stop) a held LOCAL lease is a real stuck
+ * run and is carded at once, exactly as before spgrace. */
+function leaseInReleaseTail(lease: Lease, kind: TailKind, now: number): boolean {
+  const metadata = lease.metadata ?? {};
+  const held = (!lease.releasedAt && !(lease.status === "retained" && lease.cleanupStatus === "success"))
+    || lease.status === "pending_cleanup";
+  if (!held && !(kind === "stop_confirmation" && isRemote(lease))) return true;
+  if (lease.leasePolicy !== "ephemeral") return false;
+  if (metadata.releaseDeferral !== undefined || metadata.sandboxStopAndRetain !== undefined) return false;
+  if (lease.cleanupStatus === "failed") return false;
+  if (lease.expiresAt && lease.expiresAt.getTime() <= now) return false;
+  // A person's Stop waits only on the REMOTE provider's confirmation.
+  if (kind === "stop_confirmation" && held && !isRemote(lease)) return false;
+  return true;
 }
 
 /** The re-inspection deadline while every bound run is still inside its normal
- * release tail (finished_at + its bound) and that tail (a held lease, or the
- * provider's stop receipt) is the ONLY missing proof; otherwise null, and the
- * inspection escalates as before. Claims stay held either way. */
-async function releaseTailPendingUntil(tx: Db, companyId: string, runs: (typeof heartbeatRuns.$inferSelect)[]) {
+ * release tail (finished_at + its bound; for a person's Stop also the remote
+ * lease's release request + the bound) and that tail (a held per-run lease, or
+ * the provider's stop receipt) is the ONLY missing proof; otherwise null, and
+ * the inspection escalates at once as before. Claims stay held either way. */
+async function releaseTailPendingUntil(tx: Db, input: TaskBinding, runs: (typeof heartbeatRuns.$inferSelect)[]) {
   if (!runs.length) return null;
+  const [issue] = await tx.select({ status: issues.status, cancelledAt: issues.cancelledAt }).from(issues)
+    .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
+  // A cancelled task is not waiting on a release tail.
+  if (!issue || issue.status === "cancelled" || issue.cancelledAt) return null;
+  const leases = await tx.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, input.companyId),
+    inArray(environmentLeases.heartbeatRunId, runs.map(run => run.id))));
+  const now = Date.now();
   let until = Infinity;
   for (const run of runs) {
-    const bound = releaseTailBoundMs(run);
+    const kind = releaseTailKind(run);
     // finishedAt is written once at the terminal transition; nothing later extends it.
-    if (bound === null || !run.finishedAt) return null;
-    until = Math.min(until, run.finishedAt.getTime() + bound);
+    if (kind === null || !run.finishedAt) return null;
+    const runLeases = leases.filter(lease => lease.heartbeatRunId === run.id);
+    if (!runLeases.every(lease => leaseInReleaseTail(lease, kind, now))) return null;
+    let start = run.finishedAt.getTime();
+    if (kind === "stop_confirmation") for (const lease of runLeases) {
+      // The receipt bound also runs from the remote release request.
+      if (isRemote(lease) && lease.releasedAt) start = Math.min(start, lease.releasedAt.getTime());
+    }
+    until = Math.min(until, start + (kind === "stop_confirmation" ? STOP_CONFIRMATION_GRACE_MS : END_OF_RUN_RELEASE_GRACE_MS));
   }
-  if (!(until > Date.now())) return null;
-  return await runExecutionsAwaitOnlyReleaseTail(tx, companyId, runs.map(run => run.id)) ? until + 1 : null;
+  if (!(until > now)) return null;
+  return await runExecutionsAwaitOnlyReleaseTail(tx, input.companyId, runs.map(run => run.id)) ? until + 1 : null;
 }
 
 /** Recorded requests, not a terminal status or a paused assignee, establish intent. */
@@ -180,7 +224,7 @@ export async function recordTaskStopPending(tx: Db, input: TaskBinding & { sourc
   // Do not recreate a retired no-Stop card on every tick while the old lease
   // remains held. A later answer does not release either execution claim.
   if (await laterSuccessfulTaskRun(tx, { ...input, runIds })) return;
-  const reinspectAt = await releaseTailPendingUntil(tx, input.companyId, boundRuns.filter(run => runIds.includes(run.id)));
+  const reinspectAt = await releaseTailPendingUntil(tx, input, boundRuns.filter(run => runIds.includes(run.id)));
   if (reinspectAt !== null) return { reinspectAt };
   let existing = await activeAction(tx, input);
   const prior = existing && stopPending(existing);
