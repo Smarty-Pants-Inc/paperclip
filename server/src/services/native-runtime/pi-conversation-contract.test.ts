@@ -169,8 +169,16 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
     return { built, text: strings.join("\n\n") };
   }
   const ANSWER_FIRST = "The person interrupted your previous turn and sent a new message. Answer their new message first.";
-  const CUT_NOT_RERUN = "A call marked interrupted was cut mid-flight. If it was only a wait or sleep, do not run it again unless the person asks.";
-  const LIST = /\n## Commands already run in the interrupted turn \(do not run these again\)\n[\s\S]*Do not run them again[.;][\s\S]*\n1\. `bash` \(`echo STEP1 > \/tmp\/step1`\): completed\n {3}result: STEP1-RESULT-wrote-step1\n2\. `bash` \(`sleep 600`\): interrupted/;
+  // adopt-cutstep2: the reply comes before ANY tool call (a re-run step included), then the task continues.
+  const BEFORE_TOOLS = "Answer their new message first. Reply to it before you make any tool call. Then continue the task from the next unfinished step.";
+  const CUT_NOT_RERUN = "A call marked interrupted was cut mid-flight. If it was only a wait or sleep (sleep, wait, a polling loop), do not run it again unless the person asks.";
+  const CUT_STEP_RERUN = "If it was a step of the task that did not finish, check whether it took effect; if it did not, run it again before the remaining steps, and do not report the task done while a step is unfinished.";
+  const COMPLETED_ONLY = "The completed calls below must not be run again.";
+  const OLD_HEADING = "## Commands already run in the interrupted turn (do not run these again)";
+  const INTERRUPT_HEADING = "## Calls from the interrupted turn";
+  const receiptsHeadings = (text: string) => text.split("\n").filter((line) => line.startsWith("## ") && /interrupted turn/.test(line));
+  const LIST = /\n## Calls from the interrupted turn\n[\s\S]*The completed calls below must not be run again\.[\s\S]*\n1\. `bash` \(`echo STEP1 > \/tmp\/step1`\): completed\n {3}result: STEP1-RESULT-wrote-step1\n2\. `bash` \(`sleep 600`\): interrupted/;
+  const STOP_LIST = /\n## Commands already run in the interrupted turn \(do not run these again\)\n[\s\S]*Do not run them again\.[\s\S]*\n1\. `bash` \(`echo STEP1 > \/tmp\/step1`\): completed\n {3}result: STEP1-RESULT-wrote-step1\n2\. `bash` \(`sleep 600`\): interrupted/;
 
   for (const [name, previousRun, sameSession] of [
     ["fresh successor (new session)", null, false],
@@ -187,8 +195,47 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
       // Nothing points the model back at the old request ahead of the new message.
       expect(text).not.toMatch(/continue from the next step|continue from the (conversation|history|existing work)|Continue from the latest user request/i);
       expect(text.indexOf(ANSWER_FIRST), "answer first, before any re-run check").toBeLessThan(text.indexOf("check whether it took effect"));
+      // adopt-cutstep2 (sleep-600 row): the reply comes before any tool call; the cut sleep gets the verbatim wait
+      // sentence and nothing tells the model to run it again: no 'Otherwise' catch-all, no 'minutes' judgement.
+      expect(text, "reply before any tool call, then continue").toContain(BEFORE_TOOLS);
+      expect(text.indexOf(BEFORE_TOOLS), "said before the list").toBeLessThan(text.indexOf("1. `bash`"));
+      expect(text.indexOf(CUT_NOT_RERUN), "the wait sentence comes before the task-step clause").toBeLessThan(text.indexOf(CUT_STEP_RERUN));
+      expect(text).not.toMatch(/Otherwise check|long wait|\(minutes\)|ask before re-running/);
+      expect(text.split(/\brun it again\b/), "only 'do not run it again unless asked' (wait) and the task-step clause").toHaveLength(3);
+      expect(receiptsHeadings(text)).toEqual([INTERRUPT_HEADING]);
     });
   }
+
+  // adopt-cutstep2 RED row (Paul interrupts a 6-step task while STEP2 `sleep 15; echo STEP2-x` runs and asks "9 + 10").
+  // At 5e8af273 the input said 'already ran in this session (completed or started) ... Do not run them again' under
+  // a 'do not run these again' heading: the cut STEP2 was skipped. Now: reply first, before any tool call; only
+  // completed calls are never re-run; the cut task step is checked and run again before the remaining steps.
+  it("6-step task cut mid-STEP2 (sleep 15 inside the step): reply before any tool call, the cut task step is run again", () => {
+    const midStep2Wake = { ...interruptWake,
+      interruptedTurnToolCalls: [
+        { name: "bash", target: "echo STEP1 > /tmp/step1", status: "completed", output: "STEP1-done" },
+        { name: "bash", target: "sleep 15; echo STEP2-x", status: "interrupted", output: "" },
+      ],
+      executionContinuation: { ...continuation, objective: "Run STEP1 to STEP6 in order" },
+    };
+    for (const previousRun of [null, "prior"] as const) {
+      const { built, text } = request(midStep2Wake, previousRun === "prior" ? prior(successor(midStep2Wake, sessionId, false, firstRun)) : null);
+      expect(built.checkpoint !== null, "session identity of this row").toBe(previousRun === "prior");
+      expect(text).toContain("9 + 10");
+      expect(text).toMatch(/\n1\. `bash` \(`echo STEP1 > \/tmp\/step1`\): completed[\s\S]*\n2\. `bash` \(`sleep 15; echo STEP2-x`\): interrupted/);
+      expect(text, "answer first, before any tool call, then continue").toContain(`${ANSWER_FIRST} Reply to it before you make any tool call. Then continue the task from the next unfinished step.`);
+      expect(text, "only completed calls are never re-run").toContain(COMPLETED_ONLY);
+      expect(text, "the cut task step is checked and run again").toContain(CUT_STEP_RERUN);
+      expect(text, "the wait sentence is kept verbatim").toContain(CUT_NOT_RERUN);
+      expect(text.indexOf("before you make any tool call"), "the reply rule precedes the re-run rule").toBeLessThan(text.indexOf(CUT_STEP_RERUN));
+      expect(text.indexOf("before you make any tool call"), "the reply rule precedes the list").toBeLessThan(text.indexOf("1. `bash`"));
+      // Nothing that skipped STEP2 is left in what the model reads.
+      expect(text).not.toContain("(completed or started)");
+      expect(text).not.toMatch(/Do not run them again[.;]|already ran; do not run them again/);
+      expect(receiptsHeadings(text), "one receipts heading, the Interrupt one").toEqual([INTERRUPT_HEADING]);
+      expect(text.toLowerCase()).not.toContain("do not run these again");
+    }
+  });
 
   // adopt-a2-order2 (rf-4 T2 bar): the person interrupts a 6-step task after STEP2 while STEP3 (not a wait) is
   // mid-flight and asks "9 + 10". The answer comes first, but STEP3-6 must still be done: the words must say to
@@ -210,8 +257,11 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
       expect(resume, "says to continue the task from the next unfinished step").toBeGreaterThan(-1);
       expect(text.indexOf("Answer their new message first."), "answer before continuing").toBeLessThan(resume);
       expect(text, "STEP3 (not a wait) is not forbidden").not.toMatch(/cut mid-flight\. Do not run it again unless the person asks/);
-      expect(text, "only a wait or sleep is not re-run").toContain("If it was only a wait or sleep, do not run it again unless the person asks.");
-      expect(text, "a cut non-wait call is checked, then run again").toContain("Otherwise check whether it took effect before you run it again.");
+      expect(text, "only a wait or sleep is not re-run").toContain(CUT_NOT_RERUN);
+      expect(text, "a cut task step is checked, then run again").toContain(CUT_STEP_RERUN);
+      // RF-a style: completed STEP1/STEP2 are listed under the rule that they must not be run again.
+      expect(text, "completed calls must not be run again").toContain(COMPLETED_ONLY);
+      expect(text.indexOf(COMPLETED_ONLY), "said over the list").toBeLessThan(text.indexOf("1. `bash`"));
       expect(text).not.toMatch(/continue from the (conversation|history|existing work)/i);
       expect(text).toMatch(/\n1\. `bash` \(`echo STEP1 > \/tmp\/step1`\): completed[\s\S]*\n2\. `bash` \(`echo STEP2 > \/tmp\/step2`\): completed[\s\S]*\n3\. `bash` \(`echo STEP3 > \/tmp\/step3`\): interrupted/);
     }
@@ -238,8 +288,10 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
       expect(text).toContain("9 + 10");
       expect(text, "the Stop note is kept, once").toContain(PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE);
       expect(text.split(PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE)).toHaveLength(2);
-      expect(text, "the receipts list is never removed (C1)").toMatch(LIST);
+      expect(text, "the receipts list is never removed (C1)").toMatch(STOP_LIST);
+      expect(receiptsHeadings(text), "Stop keeps its heading").toEqual([OLD_HEADING]);
       expect(text, "the Stop sentence").toContain(STOP_SENTENCE);
+      expect(text, "no Interrupt text leaks into a Stop").not.toContain("before you make any tool call");
       expect(text, "no Interrupt text leaks into a Stop").not.toContain("continue the task from the next unfinished step");
       expect(text, "no Interrupt text leaks into a Stop").not.toContain("Then continue");
       expect(text, "no Interrupt text leaks into a Stop").not.toMatch(/next unfinished step|continue from the next step|The person interrupted your previous turn|Answer their new message first|before you run it again/i);
@@ -251,6 +303,8 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
     for (const previousRun of [null, prior(successor(noMessageWake, sessionId, false, firstRun))]) {
       const { text } = request({ ...noMessageWake, reason: "issue_assigned" }, previousRun);
       expect(text).toContain("Do not run them again; continue from the next step. A call marked interrupted was cut mid-flight: check whether it took effect before you run it again.");
+      expect(receiptsHeadings(text), "no new message: heading unchanged").toEqual([OLD_HEADING]);
+      expect(text).not.toContain("before you make any tool call");
       expect(text).not.toContain("new message first");
       expect(text).not.toContain("next unfinished step");
     }
