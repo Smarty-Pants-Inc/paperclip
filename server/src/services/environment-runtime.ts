@@ -140,7 +140,7 @@ import {
   type SandboxOrphanCleanupSpool,
 } from "./sandbox-orphan-cleanup-spool.js";
 import { logger } from "../middleware/logger.js";
-import { resumeWithSpeculation, speculativeResumeCustodyHeld, startSpeculativeResume, type CommentResumeInput } from "./speculative-sandbox-resume.js";
+import { resumeWithSpeculation, speculativeResumeCustodyHeld, speculativeResumeOutcomeUnknown, startSpeculativeResume, type CommentResumeInput } from "./speculative-sandbox-resume.js";
 import { resolveRunnerEnvironmentForRun, resolveRunnerReconnectGraceMsForRun, resolveWarmRunnerIdleTimeoutMsForRun } from "./runner-environment-lifecycle.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 
@@ -2144,7 +2144,7 @@ function createSandboxEnvironmentDriver(
       await startSpeculativeResume(db, { lease: lease as typeof environmentLeases.$inferSelect,
         configDigest: createHash("sha256").update(stableStringify(runtimeConfig)).digest("hex"),
         commentId: input.commentId, rpcTimeoutMs: resolvePluginSandboxRpcTimeoutMs(runtimeConfig) ?? 60_000,
-        resume: async timeoutMs => {
+        resume: async (timeoutMs, onWorkerSettled) => {
           // Recheck the live worker, as the authoritative path does. Never use
           // a previous worker's advertised method set after a restart.
           if (!pluginWorkerVerifiesLifecycleMethod(plugin.id, "environmentResumeLease")
@@ -2153,7 +2153,12 @@ function createSandboxEnvironmentDriver(
             driverKey: "boat", companyId: input.companyId, environmentId: input.environment.id,
             issueId: input.issueId, config: runtimeConfig, providerLeaseId: lease.providerLeaseId!,
             leaseMetadata: lease.metadata ?? undefined,
-          }, timeoutMs);
+          }, timeoutMs, undefined, () => {
+            // Narrow speculative-resume receipt hook: actual worker settlement,
+            // including a response arriving after the caller timed out.
+            void onWorkerSettled().catch(() => logger.warn({ leaseId: lease.id },
+              "Could not record speculative resume settlement; cleanup custody remains held"));
+          });
           return { providerLeaseId: reply.providerLeaseId, expiresAt: reply.expiresAt,
             metadata: stripSecretRefValuesFromPluginLeaseMetadata({ metadata: reply.metadata,
             schema: driver.configSchema as Record<string, unknown> | null | undefined }) };
@@ -3145,7 +3150,10 @@ function createSandboxEnvironmentDriver(
           if (!acceptedStopOnlyReceipt(input.lease, receipt)) {
             throw new Error("Workspace export recovery did not confirm the retained sandbox stopped.");
           }
-          return receipt;
+          // A stop racing an unsettled resume is useful (the money deadline),
+          // but cannot settle ownership: the provider may still resume later.
+          // The next attempt must issue a new stop after settlement is durable.
+          return speculativeResumeOutcomeUnknown(input.lease.metadata) ? undefined : receipt;
         }
         const failedCreation = readEnvironmentCreationCleanupError({ data: {
           schema: "paperclip/environment-creation-cleanup/v1",

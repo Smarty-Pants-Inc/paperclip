@@ -27,7 +27,9 @@ interface Reservation {
   startedAt: number;
   expiresAt: number;
   rpcDeadlineAt: number;
-  state: "resuming" | "ready" | "failed";
+  state: "resuming" | "ready" | "failed" | "unknown";
+  /** Actual worker response (or refusal before dispatch), never caller timeout. */
+  rpcSettled?: boolean;
   claimedBy?: string;
   result?: PluginEnvironmentLease;
 }
@@ -43,7 +45,22 @@ export function readSpeculativeResume(metadata: Record<string, unknown> | null |
   const r = value as Reservation;
   return r.schema === "paperclip.speculative-comment-resume.v1" && typeof r.id === "string"
     && Number.isFinite(r.expiresAt) && Number.isFinite(r.rpcDeadlineAt)
-    && ["resuming", "ready", "failed"].includes(r.state) ? r : null;
+    && ["resuming", "ready", "failed", "unknown"].includes(r.state) ? r : null;
+}
+
+/** A timeout, worker exit, or a pre-fix failed journal cannot prove the provider
+ * stopped resuming. Keep cleanup custody until a response and a subsequent stop.
+ * Old ready journals already contain a successful response. */
+export function speculativeResumeOutcomeUnknown(metadata: Record<string, unknown> | null | undefined): boolean {
+  const saved = readSpeculativeResume(metadata);
+  return saved !== null && saved.state !== "ready" && saved.rpcSettled !== true;
+}
+
+/** This concrete stop obligation uses its saved deadline, not generic cleanup's
+ * multi-minute idle backoff. It ends when stop-only cleanup releases the row. */
+export function speculativeResumeCleanupPendingSql() {
+  return sql`(${environmentLeases.metadata}->${SPECULATIVE_RESUME_KEY}->>'schema' = 'paperclip.speculative-comment-resume.v1'
+    and ${environmentLeases.metadata} ? 'sandboxStopAndRetain')`;
 }
 
 /** Retained custody is not an idle warm lease. A settled stop receipt outlives
@@ -68,7 +85,7 @@ export async function speculativeResumeCustodyHeld(db: Db, lease: Pick<Lease,
  * The existing warm-expiry owner reconstructs this deadline after a restart. */
 export async function startSpeculativeResume(db: Db, input: {
   lease: Lease; commentId: string; configDigest: string; rpcTimeoutMs: number;
-  resume(timeoutMs: number): Promise<PluginEnvironmentLease>;
+  resume(timeoutMs: number, onWorkerSettled: () => Promise<void>): Promise<PluginEnvironmentLease>;
 }): Promise<void> {
   const { lease } = input;
   if (await speculativeResumeCustodyHeld(db, lease)) return;
@@ -76,7 +93,7 @@ export async function startSpeculativeResume(db: Db, input: {
   const rpcTimeoutMs = Math.max(1, Math.min(ttl, input.rpcTimeoutMs));
   const reservation: Reservation = { schema: "paperclip.speculative-comment-resume.v1", id: randomUUID(),
     commentId: input.commentId, configDigest: input.configDigest, startedAt: now, expiresAt: now + ttl,
-    rpcDeadlineAt: now + rpcTimeoutMs, state: "resuming" };
+    rpcDeadlineAt: now + rpcTimeoutMs, state: "resuming", rpcSettled: false };
   const [reserved] = await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
     status: "retained", updatedAt: new Date(),
     metadata: sql`(${environmentLeases.metadata} - 'remoteExecutionTermination' - 'sandboxStopAndRetainReceipt')
@@ -101,11 +118,28 @@ export async function startSpeculativeResume(db: Db, input: {
   logger.info({ event: "sandbox.speculative_resume.started", count: 1, companyId: lease.companyId,
     issueId: lease.issueId, leaseId: lease.id, commentId: input.commentId, reservationId: reservation.id,
     startedAt: now, expiresAt: reservation.expiresAt }, "Speculative sandbox resume started");
+  // The existing worker-settlement hook survives RPC timeout and is NOT called
+  // on worker exit for mutating RPCs. Persist that distinction before cleanup
+  // can release custody; a crashed/unknown call stays owned across restart.
+  let settlement: Promise<void> | undefined;
+  const onWorkerSettled = () => settlement ??= writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
+    updatedAt: new Date(),
+    metadata: sql`jsonb_set(${environmentLeases.metadata}, array[${SPECULATIVE_RESUME_KEY}, 'rpcSettled'], 'true'::jsonb)
+      || case when ${environmentLeases.status} = 'pending_cleanup'
+        then '{"pendingCleanupRetryAfterMs":0}'::jsonb else '{}'::jsonb end`,
+  }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId),
+    sql`${environmentLeases.status} in ('retained', 'pending_cleanup')`,
+    sql`${environmentLeases.metadata}->${SPECULATIVE_RESUME_KEY}->>'id' = ${reservation.id}`)).returning(),
+  { companyId: lease.companyId, runId: lease.heartbeatRunId ?? undefined }).then(() => {});
   let result: PluginEnvironmentLease | undefined;
   try {
     const remainingMs = Math.min(rpcTimeoutMs, reservation.expiresAt - Date.now());
-    if (remainingMs <= 0) throw new Error("speculative_resume_expired_before_dispatch");
-    result = await input.resume(remainingMs);
+    if (remainingMs <= 0) {
+      await onWorkerSettled(); // No provider mutation was dispatched.
+      throw new Error("speculative_resume_expired_before_dispatch");
+    }
+    result = await input.resume(remainingMs, onWorkerSettled);
+    await onWorkerSettled(); // A successful response is also settlement proof.
     if (result.providerLeaseId !== lease.providerLeaseId) throw new Error("speculative_resume_allocation_mismatch");
   } catch {
     result = undefined;
@@ -114,10 +148,11 @@ export async function startSpeculativeResume(db: Db, input: {
     logger.warn({ event: "sandbox.speculative_resume.failed", leaseId: lease.id, reservationId: reservation.id },
       "Speculative sandbox resume has no confirmed result; stop-only cleanup remains due");
   }
+  await settlement;
   await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({ updatedAt: new Date(),
     metadata: sql`jsonb_set(${environmentLeases.metadata}, array[${SPECULATIVE_RESUME_KEY}],
       (${environmentLeases.metadata}->${SPECULATIVE_RESUME_KEY}) || ${JSON.stringify({
-        state: result ? "ready" : "failed", ...(result ? { result } : {}),
+        state: result ? "ready" : "unknown", ...(result ? { result } : {}),
       })}::jsonb)`,
   }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId),
     eq(environmentLeases.status, "retained"),
