@@ -12174,14 +12174,14 @@ describe("warm native session evidence copy", () => {
       currentTurn.execution = current; currentTurn.leaseId = leaseId;
       const started = performance.now();
       // The paperclip_runner adapter path (heartbeat runtime-execution.ts useRunnerd).
-      await executePaperclipNativeSession({ db, execution: current, runnerInstanceId: environmentId, runnerExecutionTarget: target,
+      const result = await executePaperclipNativeSession({ db, execution: current, runnerInstanceId: environmentId, runnerExecutionTarget: target,
         useRunnerd: true, runnerIngressAuthorized: true });
       turnMs.push(performance.now() - started);
       const [saved] = await db.select().from(tables.heartbeatRuns).where(eq(tables.heartbeatRuns.id, runId));
       await db.update(tables.heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(),
         runnerProfileJson: { ...saved?.runnerProfileJson, nativeExecutionInput: current } }).where(eq(tables.heartbeatRuns.id, runId));
       prior = current; priorLease = leaseId;
-      return { runId, leaseId };
+      return { runId, leaseId, result };
     };
     const evidenceRows = (runId: string, status?: string) => db.select().from(tables.nativeHarnessBackups).where(and(
       eq(tables.nativeHarnessBackups.runId, runId), sql`${tables.nativeHarnessBackups.reference}->>'kind' = ${EVIDENCE_KIND}`,
@@ -12307,13 +12307,15 @@ describe("warm native session evidence copy", () => {
       expect(f.commands.filter(command => command.includes("PAPERCLIP_ABSENT") || command.includes("-czf -")), "not even inventory may read the box").toHaveLength(0);
       expect(metadata?.nativeSessionEvidencePending).toBeUndefined();
       expect(await f.evidenceRows(first.runId)).toHaveLength(0);
-      const [accepted] = await f.db.select().from(f.tables.nativeRunResults).where(eq(f.tables.nativeRunResults.runId, first.runId));
-      expect(accepted?.schemaStatus).toBe("accepted");
+      // This fixture ends at the executor facade (heartbeat persists the result
+      // afterwards). Check its actual returned result, not a fabricated DB row.
+      expect(first.result.exitCode).toBe(0);
+      expect(first.result.resultJson).toMatchObject({ nativeResult: { summary: "completed" }, nativeTerminal: { runTerminalState: "succeeded" } });
       const [settled] = await f.db.select().from(f.tables.heartbeatRuns).where(eq(f.tables.heartbeatRuns.id, first.runId));
       expect(settled?.status).toBe("succeeded");
       expect(f.session.close).not.toHaveBeenCalled();
       expect(markerAlarms()).toHaveLength(1);
-      console.log(JSON.stringify({ evidenceAdmissionMs: f.evidenceAdmissionMs, mode, alarms: markerAlarms().length, remoteReads: 0, accepted: accepted?.schemaStatus }));
+      console.log(JSON.stringify({ evidenceAdmissionMs: f.evidenceAdmissionMs, mode, alarms: markerAlarms().length, remoteReads: 0, resultExitCode: first.result.exitCode }));
       expect(f.evidenceAdmissionMs).toHaveLength(1);
       expect(f.evidenceAdmissionMs[0]).toBeLessThan(50);
     } finally {
