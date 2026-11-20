@@ -1,4 +1,5 @@
 import { connectionIntentsApi } from "@/api/connection-intents";
+import { useAwsRoleSetupStep } from "./useAwsRoleSetupStep";
 import { readOAuthWindowOutcome } from "@/lib/oauthWindowOutcome";
 import { bindAccount } from "@/lib/account-scope";
 import { ConnectionCredentialInput } from "./ConnectionCredentialInput";
@@ -90,7 +91,7 @@ import { resolveAuthorizationTarget } from "@/lib/authorizationUrl";
 import { prepareOAuthNavigation, savePendingCloudHandoff } from "@/lib/oauthHandoff";
 import { askFirstCatalogEntryIdsFor } from "./connection-defaults";
 import { AppLogo } from "@/pages/apps/AppLogo";
-import { appApplicationSourceSlug, appConnectionSourceSlug } from "@/pages/apps/app-definition-display";
+import { aiConnectionSourceSlug, appApplicationSourceSlug, appConnectionSourceSlug } from "@/pages/apps/app-definition-display";
 import { UnverifiedServerBadge } from "@/pages/apps/UnverifiedServerBadge";
 import {
   appSourceConnectHref,
@@ -236,6 +237,13 @@ export function requestedConnectionEntry(input: {
   return getConnectableAppDefinition(input.requestedAppKey);
 }
 
+// AI accounts saved before their provider had its own catalog entry stay on
+// the earlier application, so their AI metadata also identifies the source.
+function retainedApplicationMatches(application: ToolApplication, connection: ToolConnection, requestedAppKey: string) {
+  return appApplicationSourceSlug(application) === requestedAppKey
+    || aiConnectionSourceSlug(connection) === requestedAppKey;
+}
+
 export function retainedResumeMatches(input: {
   requestedAppKey: string;
   resumeConnection: ToolConnection | null;
@@ -252,7 +260,7 @@ export function retainedResumeMatches(input: {
     && resumeApplication
     && resumeConnection.applicationId === resumeApplication.id
     && resumeConnection.companyId === resumeApplication.companyId
-    && appApplicationSourceSlug(resumeApplication) === requestedAppKey
+    && retainedApplicationMatches(resumeApplication, resumeConnection, requestedAppKey)
     && appConnectionSourceSlug(resumeConnection) === requestedAppKey,
   );
 }
@@ -270,7 +278,7 @@ export function retainedReconnectMatches(input: {
     || input.reconnectConnection.applicationId !== input.reconnectApplication.id
   ) return false;
   if (input.requestedAppKey) {
-    return appApplicationSourceSlug(input.reconnectApplication) === input.requestedAppKey;
+    return retainedApplicationMatches(input.reconnectApplication, input.reconnectConnection, input.requestedAppKey);
   }
   // Generic MCP applications intentionally have no provider slug. Their
   // reconnect URL instead carries the exact retained application identity.
@@ -1380,6 +1388,9 @@ function StandardConnectionSetupFlow({
       : null,
     [connectionsQuery.data, resumeConnectionId],
   );
+  const awsRoleSetup = useAwsRoleSetupStep({
+    appSlug: entry?.slug, methodKey: connectionMethodKey, reconnectConnectionId: reconnectConnectionId ?? null, resumeConnection,
+  });
   const resumeApplication = useMemo(
     () => resumeConnection
       ? (applicationsQuery.data?.applications ?? []).find(
@@ -1632,7 +1643,9 @@ function StandardConnectionSetupFlow({
           trimmedGalleryName || connectEntry.name,
           requestedGrantKind,
         );
+        const awsRole = awsRoleSetup.requestOptions(resumeConnectionId);
         result = await toolsApi.connectApp(selectedCompanyId!, {
+          ...(awsRole.saveDraft ? { saveDraft: true } : {}),
           ...(connectEntry.slug === "google-workspace" && workspaceSelectionRef.current ? { workspaceServices: workspaceSelectionRef.current } : {}),
           galleryKey: connectEntry.slug,
           ...(instructionValue ? { agentInstructions: instructionValue } : {}),
@@ -1654,12 +1667,14 @@ function StandardConnectionSetupFlow({
             : {}),
           configValues: isGoogleSheetsRobotMethod(connectEntry, selectedMethod)
             ? { allowedSpreadsheetIds: sheetIds }
-            : Object.keys(configValues).length > 0
-              ? configValues
-              : undefined,
+            : awsRole.configValues
+              ? { ...configValues, ...awsRole.configValues }
+              : Object.keys(configValues).length > 0
+                ? configValues
+                : undefined,
           applicationId: prefill.applicationId,
-          ...((resumeConnectionId ?? customerClientResumeRef.current)
-            ? { resumeConnectionId: resumeConnectionId ?? customerClientResumeRef.current! }
+          ...((resumeConnectionId ?? customerClientResumeRef.current ?? awsRole.resumeConnectionId)
+            ? { resumeConnectionId: resumeConnectionId ?? customerClientResumeRef.current ?? awsRole.resumeConnectionId! }
             : reconnectConnectionId ? { reconnectConnectionId } : {}),
           ...(requestedGrantKind !== "organization" ? { grantKind: requestedGrantKind } : {}),
           ...(requestedGrantKind === "agent" ? { subjectAgentId: retainedAgentId ?? [...installAgentIds][0] } : {}),
@@ -1737,11 +1752,13 @@ function StandardConnectionSetupFlow({
       }
       oauthPopupRef.current?.close();
       oauthPopupRef.current = null;
+      if (awsRoleSetup.acceptResult(result)) return;
       acceptConnectedResult(result);
     },
     onError: (error) => {
       oauthPopupRef.current?.close();
       oauthPopupRef.current = null;
+      if (awsRoleSetup.acceptError(error)) return;
       const details = error instanceof ApiError && error.body && typeof error.body === "object"
         ? (error.body as { details?: { code?: unknown } }).details
         : null;
@@ -1785,6 +1802,7 @@ function StandardConnectionSetupFlow({
     const method = connectEntry
       ? availableToolConnectionMethod(connectEntry, connectionMethodKey || null)
       : null;
+    if (awsRoleSetup.openForReconnect()) return;
     if (connectEntry?.slug === "google-workspace" && !workspaceSelectionRef.current) {
       setWorkspaceConnection(identityConnection ?? undefined);
       setWorkspaceConsent(() => () => {
@@ -1797,7 +1815,7 @@ function StandardConnectionSetupFlow({
       reserveOAuthPopup();
     }
     mutateConnect(entryOverride);
-  }, [connectionMethodKey, entry, identityConnection, linkAuthMode, zapierSource, mutateConnect, reserveOAuthPopup]);
+  }, [awsRoleSetup, connectionMethodKey, entry, identityConnection, linkAuthMode, zapierSource, mutateConnect, reserveOAuthPopup]);
 
   useEffect(() => {
     if (!requestedAppKey || galleryQuery.isLoading || !galleryQuery.data) return;
@@ -2414,7 +2432,7 @@ function StandardConnectionSetupFlow({
       setInstallAgentIds={setInstallAgentIds}
       lockedAgentId={requestedAgentId}
       capabilities={galleryQuery.data?.capabilities}
-      githubIdentity={entry?.slug === "github"}
+      githubIdentity={entry?.slug === "github" || entry?.slug === "github-copilot"}
       identityLoading={Boolean(automaticOAuthEntry) && directOAuthLookupPending}
       preserveAgentAccess={preservesAgentAccess}
       disabled={connectMutation.isPending || oauthStartMutation.isPending || retainedGitHubApp}
@@ -2676,7 +2694,11 @@ function StandardConnectionSetupFlow({
     : undefined;
   const aiMethod = reconnectAiMethod ?? entry?.methods.find(method => method.key === connectionMethodKey)?.ai
     ?? (!connectionMethodKey && entry?.methods.every(method => method.ai) ? entry.methods[0]?.ai : undefined);
-  const credentialStep = entry ? renderCredentialStep?.({ app: entry, name: galleryName || entry.name, grantKind: effectiveGrantKind, agentIds: [...installAgentIds], allAgents: installChoice === "all", onBack: () => backToGallery() }) ?? (aiMethod && selectedCompanyId ? <><AiConnectionCredentialStep
+  const awsRoleStep = awsRoleSetup.renderStep({
+    testing: connectMutation.isPending, connect: connectApp,
+    accessLevel: configValues.accessLevel === "full" || configValues.accessLevel === "read_only" ? configValues.accessLevel : undefined,
+  });
+  const credentialStep = awsRoleStep ?? (entry ? renderCredentialStep?.({ app: entry, name: galleryName || entry.name, grantKind: effectiveGrantKind, agentIds: [...installAgentIds], allAgents: installChoice === "all", onBack: () => backToGallery() }) ?? (aiMethod && selectedCompanyId ? <><AiConnectionCredentialStep
     defaults={reconnectConnection ? undefined : connectionDefaults}
     companyId={selectedCompanyId} provider={aiMethod.provider} fixedMethod={Boolean(aiConnection && aiConnection.mode !== "responsible_user")} initialMethod={reconnectConnection?.connectionPurpose === "ai" ? (reconnectConnection.config?.ai as { method: "subscription" | "api_key" }).method : aiMethod.method}
     connectionId={reconnectConnection?.connectionPurpose === "ai" ? reconnectConnection.id : undefined}
@@ -2685,7 +2707,7 @@ function StandardConnectionSetupFlow({
     agentIds={[...installAgentIds]} allAgents={installChoice === "all"}
     onCancel={() => onCancel ? onCancel() : navigate("/apps")}
     onComplete={result => { onComplete?.({ connectionId: result.connectionId }); if (!onComplete) navigate(`/apps/${result.connectionId}/permissions`); }}
-  /></> : undefined) : undefined;
+  /></> : undefined) : undefined);
   // One screen per connector (PAP-659): a selected app has a single step, so
   // its stepper collapses to nothing rather than showing one lonely dot.
   const stepLabels = reconnectConnection?.connectionPurpose === "ai" ? ["Reconnect account"] : credentialStep !== undefined

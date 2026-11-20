@@ -7,7 +7,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 
 const support = await getEmbeddedPostgresTestSupport();
 const permissionKey = "agents:configure-reports-runtime";
-const migrationUrl = new URL("./migrations/0499_report_runtime_defaults.sql", import.meta.url);
+const migrationUrl = new URL("./migrations/0500_report_runtime_defaults.sql", import.meta.url);
 
 (support.supported ? describe : describe.skip)("runner report runtime default migration", () => {
   it("reruns the SQL without changing grants or audit rows and preserves revocation on migration reruns", async () => {

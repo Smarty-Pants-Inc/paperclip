@@ -540,6 +540,11 @@ class HarnessNativeSession implements NativeSession {
     return this.#session.release?.() ?? false;
   }
 
+  async retireReleasedController(): Promise<{ source: DurableRecoveryIdentity; runner: { version: string; digest: string } } | null> {
+    this.#assertProtocolIntegrity();
+    return this.#session.retireReleasedController?.() ?? null;
+  }
+
   async detachControllerForRestart(): Promise<void> {
     if (this.#session.detachControllerForRestart === undefined) return;
     await this.#session.detachControllerForRestart();

@@ -52,8 +52,8 @@ describe.skipIf(!support.supported)("pending addressed response execution recons
         shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake },
       recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined },
     });
-    deps.wakeQueue.createAdmissionTransactionScope.mockImplementation(wakeQueue.createAdmissionTransactionScope);
-    deps.wakeQueue.admitWakeBehindIssueExecution.mockImplementation(wakeQueue.admitWakeBehindIssueExecution);
+    deps.wakeQueue.preflightIssueWake.mockImplementation(wakeQueue.preflightIssueWake);
+    deps.wakeQueue.admitIssueWake.mockImplementation(wakeQueue.admitIssueWake);
     const held = new Map<string, () => void>();
     deps.executeRun.mockImplementation(id => new Promise<void>(resolve => { held.set(id, resolve); }));
     const queue = createHeartbeatQueue(db, deps);
