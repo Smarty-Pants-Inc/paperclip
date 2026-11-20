@@ -59,7 +59,7 @@ import {
 } from "../legacy-controller-lease.js";
 import { proveOwnerGone } from "../owner-proof.js";
 import { preparingControllerOwnerStamp } from "../native-runtime/native-owner-stamps.js";
-import { hasBoundRemoteStopReceipt, remoteTerminationReceipt } from "../remote-execution-termination.js";
+import { hasBoundRemoteStopReceipt, hasRecoveredCleanupStopReceipt, remoteTerminationReceipt } from "../remote-execution-termination.js";
 import { readEnvironmentStopFailure, type PluginEnvironmentStopFailure } from "@paperclipai/plugin-sdk";
 import { runUsedConversationAdapter } from "../conversation-continuation.js";
 import { legacyExecutionNeedsReconciliationWithEvidence, terminalizeLegacyExecution } from "../legacy-execution-recovery.js";
@@ -1954,7 +1954,11 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       // path uses the provider and configuration recorded on the lease first;
       // the environment is lifecycle context and only a legacy fallback.
       const isOrphanEphemeralLease = lease.leasePolicy === "ephemeral";
-      const useRecordedTeardown = isOrphanEphemeralLease || !environment || hasStopOnlyCleanup(lease) ||
+      // Recovery handed this stopped allocation to destructive cleanup, even
+      // when its original policy was reusable. Its carried-forward, exactly
+      // bound stop receipt is required; a cleanup label alone grants nothing.
+      const recoveredCleanup = hasRecoveredCleanupStopReceipt(lease);
+      const useRecordedTeardown = recoveredCleanup || isOrphanEphemeralLease || !environment || hasStopOnlyCleanup(lease) ||
         (metadata.driver === "plugin" && metadata.pluginLeaseCleanupMethod === "release");
 
       // Do not consume a finite cleanup attempt while the provider plugin is
@@ -2012,6 +2016,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       renewal.unref();
 
       try {
+        if (lease.metadata?.workspaceRecoveryCleanup !== undefined && !recoveredCleanup && !hasStopOnlyCleanup(lease)) {
+          throw new Error("Recovery cleanup requires its bound stop receipt.");
+        }
         if (opts?.explicitRetry) await logActivity(db, {
           companyId: row.companyId, actorType: "user", actorId: opts.explicitRetry.actorId,
           action: "environment_lease.cleanup_retried", entityType: "environment_lease", entityId: row.id,
