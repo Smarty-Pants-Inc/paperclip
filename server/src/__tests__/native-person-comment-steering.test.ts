@@ -1,3 +1,4 @@
+import { wiredHeartbeatFor } from "../services/heartbeat-registry.js";
 import { nativeWorkspaceFinalizationWork } from "../services/native-runtime/native-workspace-finalization-work.js";
 import { recordNativeWorkspaceFinalizationFailure } from "../services/native-runtime/native-workspace-finalizer.js";
 import { randomUUID } from "node:crypto";
@@ -416,6 +417,40 @@ async function fixture(label: string, conversation = true, skipIssueComment = tr
     },
   };
 }
+
+it.each([500, 8])("BOUND native: coalesce %i ms before end gets one real answering turn", async gap => {
+  const f = await fixture(`personbound${gap}`);
+  const hb = await wiredHeartbeatFor(db, "test:deferred-person-bound:native-row");
+  try {
+    f.owner.deferCommitAtReturn = true;
+    const messages = [];
+    for (const body of ["BOUND first question", "BOUND second question", "BOUND last question"])
+      messages.push(await f.post(`${body} ${gap}`, "queue"));
+    f.peer.boundary(); f.peer.answer(["Original work done"]);
+    await f.complete();
+    const [wake] = (await f.wakes()).filter(w => w.status === "deferred_issue_execution" && w.requestedByActorType === "user");
+    expect(wake).toBeDefined();
+    // Persist the missed post-commit handoff: the real source ended, its
+    // coordinator committed, but no task lock is left to drive old recovery.
+    const last = new Date(Date.now() - 13_000);
+    await db.update(nativeRunFinalizations).set({ phase: "committed", leaseOwner: null, leaseExpiresAt: null })
+      .where(eq(nativeRunFinalizations.runId, f.runId));
+    await db.update(issues).set({ executionRunId: null, checkoutRunId: null, executionAgentNameKey: null, executionLockedAt: null })
+      .where(eq(issues.id, f.issueId));
+    await db.update(agentWakeupRequests).set({ updatedAt: last }).where(eq(agentWakeupRequests.id, wake.id));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(last.getTime() + gap) })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await hb.sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+    await vi.waitFor(() => f.assertAnsweredOnce(messages), { timeout: 15_000 });
+    await hb.drainActiveRunExecutions();
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+    expect(runs.filter(r => r.id !== f.runId)).toHaveLength(1);
+    await hb.sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+    await f.assertAnsweredOnce(messages);
+    process.stdout.write(`BOUND native evidence ${JSON.stringify({ gap, sourceRunId: f.runId, wakeId: wake.id,
+      successorRunId: runs.find(r => r.id !== f.runId)!.id, messages })}\n`);
+  } finally { await f.close(); }
+}, 45_000);
 
 // Native completion producer: create_task records the handoff; the control-plane
 // result and real native finalizer/committer create its delivery. No hand-made
