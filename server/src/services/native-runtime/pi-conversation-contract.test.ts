@@ -117,3 +117,84 @@ describe("same-session Interrupt successor keeps the receipts list with true wor
     expect(fallback.text).toBe(fresh.text);
   });
 });
+
+// adopt-a2-order (Paul's agent is frozen in `sleep 600`; he presses Interrupt and asks "9 + 10").
+// The successor got the cut `sleep 600` and the new message together and finished the OLD request first:
+// "19" never came. With a new message carried, it is answered first; a cut-mid-flight call is not re-run
+// unless the person asks. The receipts list stays (lesson C1).
+describe("Interrupt successor carrying a new message answers it first (adopt-a2-order)", () => {
+  const interruptedRunId = "80000000-0000-4000-8000-000000000009";
+  const commentId = "90000000-0000-4000-8000-000000000010";
+  const continuation = {
+    version: 1, companyId, issueId, objective: "Wait ten minutes", interruptedRunId,
+    trigger: { reason: "issue_commented", interactionId: null, sourceRunId: interruptedRunId },
+    originCommentIds: [], messages: [], humanResponses: [], interactionOutcomes: [], completedWork: null,
+    unresolvedInteractionIds: [], coverage: { kind: "full_task_history", throughCommentId: null, summaryThroughCommentId: null },
+  };
+  const interruptWake = {
+    reason: "issue_commented",
+    issue: { id: issueId, identifier: null, title: "Daily conversation", status: "in_progress", priority: "medium" },
+    personStoppedPreviousTurn: true,
+    interruptedTurnToolCalls: [
+      { name: "bash", target: "echo STEP1 > /tmp/step1", status: "completed", output: "STEP1-RESULT-wrote-step1" },
+      { name: "bash", target: "sleep 600", status: "interrupted", output: "" },
+    ],
+    commentIds: [commentId], latestCommentId: commentId,
+    comments: [{ id: commentId, issueId, body: "9 + 10", createdAt: "2026-11-20T00:00:00.000Z", author: { type: "user", id: "paul" } }],
+    executionContinuation: continuation,
+  };
+  // No Interrupt: a plain continuation with a new message (must render as at base).
+  const { personStoppedPreviousTurn: _p, interruptedTurnToolCalls: _t, ...plainWake } = interruptWake;
+  function successor(wakePayload: Record<string, unknown>, id: string, resumedSession: boolean, runId = nextRun) {
+    return buildNativeExecutionInput({ companyId, agentId, runId,
+      issue: { id: issueId, identifier: null, title: "Daily conversation", description: null, workMode: "standard" },
+      taskPrompt: "9 + 10", workspace: { id: runId, cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      normalizedSessionId: id, provider: "pi_rpc", model: "provider/model-a", wakePayload, resumedSession,
+      completionContract: { id: "70000000-0000-4000-8000-000000000007", sha256: `sha256:${"a".repeat(64)}`,
+        schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: "Answer", criteria: [{ id: "answer", requirement: "Answer" }] } },
+      runtimeContext: nativeRuntimeContextFixture(),
+    });
+  }
+  function request(wakePayload: Record<string, unknown>, previousRun: Parameters<typeof buildNativeExecutionWithCheckpoint>[0]["previousRun"]) {
+    const built = buildNativeExecutionWithCheckpoint({ previousRun, normalizedSessionId: sessionId,
+      buildExecution: ({ normalizedSessionId, resumedSession }) => successor(wakePayload, normalizedSessionId, resumedSession) });
+    const strings: string[] = [];
+    const walk = (value: unknown): void => {
+      if (typeof value === "string") strings.push(value);
+      else if (value && typeof value === "object") Object.values(value).forEach(walk);
+    };
+    walk(buildNativeModelEnvelope(built.execution));
+    return { built, text: strings.join("\n\n") };
+  }
+  const ANSWER_FIRST = "The person interrupted your previous turn and sent a new message. Answer their new message first.";
+  const CUT_NOT_RERUN = "A call marked interrupted was cut mid-flight. Do not run it again unless the person asks; if it changed files, check them before redoing any edit.";
+  const LIST = /\n## Commands already run in the interrupted turn \(do not run these again\)\n[\s\S]*Do not run them again[.;][\s\S]*\n1\. `bash` \(`echo STEP1 > \/tmp\/step1`\): completed\n {3}result: STEP1-RESULT-wrote-step1\n2\. `bash` \(`sleep 600`\): interrupted/;
+
+  for (const [name, previousRun, sameSession] of [
+    ["fresh successor (new session)", null, false],
+    ["same-session successor (checkpoint rebinds)", "prior", true],
+  ] as const) {
+    it(`${name}: new message answered first, cut sleep not re-run, completed steps still listed`, () => {
+      const { built, text } = request(interruptWake, previousRun === "prior" ? prior(successor(interruptWake, sessionId, false, firstRun)) : null);
+      expect(built.checkpoint !== null, "session identity of this row").toBe(sameSession);
+      expect(text, "the receipts list is never removed (C1)").toMatch(LIST);
+      expect(text, "the new message is answered first").toContain(ANSWER_FIRST);
+      expect(text, "a cut-mid-flight wait is not re-run unless asked").toContain(CUT_NOT_RERUN);
+      expect(text).toContain("9 + 10");
+      expect(text.indexOf(ANSWER_FIRST), "said before the list").toBeLessThan(text.indexOf("1. `bash`"));
+      // Nothing points the model back at the old request ahead of the new message.
+      expect(text).not.toMatch(/continue from the next step|continue from the (conversation|history|existing work)|Continue from the latest user request/i);
+      expect(text).not.toContain("check whether it took effect before you run it again");
+    });
+  }
+
+  it("no Interrupt (plain continuation with a new message): none of the Interrupt wording", () => {
+    for (const previousRun of [null, prior(successor(plainWake, sessionId, false, firstRun))]) {
+      const { text } = request(plainWake, previousRun);
+      expect(text).toContain("9 + 10");
+      expect(text).not.toContain("Commands already run in the interrupted turn");
+      expect(text).not.toContain(ANSWER_FIRST);
+      expect(text).not.toContain("cut mid-flight");
+    }
+  });
+});
