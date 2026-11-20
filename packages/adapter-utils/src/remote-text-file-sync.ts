@@ -12,6 +12,8 @@ export interface RemoteTextFileSyncFile {
   action: string;
   lockDir: string;
   executable?: boolean;
+  /** Opt in to regular, non-symlink, exact-mode reuse; also pins the uploaded mode. */
+  expectedMode?: "644" | "700";
 }
 
 export interface RemoteTextFileSyncInput extends RemoteTextFileSyncFile {
@@ -77,7 +79,9 @@ export function buildRemoteTextFileSyncProgram(input: RemoteTextFileSyncFile) {
         "rm -f \"$remote_upload\" \"$remote_partial\"",
       ]),
       "current_sha=\"\"",
-      "if [ -f \"$remote_path\" ]; then",
+      input.expectedMode
+        ? `if [ -f "$remote_path" ] && [ ! -L "$remote_path" ] && [ "$(stat -c %a "$remote_path" 2>/dev/null || stat -f %Lp "$remote_path" 2>/dev/null || :)" = "${input.expectedMode}" ]; then`
+        : 'if [ -f "$remote_path" ]; then',
       "  current_sha=\"$(hash_file \"$remote_path\" 2>/dev/null)\" || current_sha=\"\"",
       "fi",
       "if [ -n \"$current_sha\" ] && [ \"$current_sha\" = \"$expected_sha\" ]; then",
@@ -96,7 +100,8 @@ export function buildRemoteTextFileSyncProgram(input: RemoteTextFileSyncFile) {
       "else",
       `  echo ${shellQuote(`${input.label} sha verify skipped: no sha256sum/shasum on remote.`)} >&2`,
       "fi",
-      ...(input.executable ? ['chmod 700 "$remote_partial"'] : []),
+      ...(input.expectedMode ? [`chmod ${input.expectedMode} "$remote_partial"`]
+        : input.executable ? ['chmod 700 "$remote_partial"'] : []),
       "mv \"$remote_partial\" \"$remote_path\"",
       "printf '{\"uploaded\":true}\\n'",
     ].join("\n");

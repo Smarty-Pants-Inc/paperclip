@@ -1804,20 +1804,14 @@ async function githubOperationLauncherBasePath(
         'rm -f "$remote_path.paperclip-upload.b64" "$remote_path.partial"',
       ]),
       'current_sha=""',
-      'if [ -f "$remote_path" ]; then',
+      // Hash equality is insufficient for mutable symlinks or changed permissions.
+      `if [ -f "$remote_path" ] && [ ! -L "$remote_path" ] && [ "$(stat -c %a "$remote_path" 2>/dev/null || stat -f %Lp "$remote_path" 2>/dev/null || :)" = "${name === "git" || name === "gh" ? "700" : "644"}" ]; then`,
       '  if command -v sha256sum >/dev/null 2>&1; then',
       '    current_sha="$(sha256sum "$remote_path" | awk \'{print $1}\')" || current_sha=""',
       '  elif command -v shasum >/dev/null 2>&1; then',
       '    current_sha="$(shasum -a 256 "$remote_path" | awk \'{print $1}\')" || current_sha=""',
       "  fi",
       "fi",
-      // As in the upload's hash-skip branch, repair executable permissions only
-      // for a matching wrapper, under its PID lock. Never chmod a stale body.
-      ...((name === "git" || name === "gh") ? [
-        `if [ "$current_sha" = ${shellQuote(createHash("sha256").update(staticFiles[name]!).digest("hex"))} ]; then`,
-        '  chmod 700 "$remote_path"',
-        "fi",
-      ] : []),
       `printf '%s\\000%s\\000' ${shellQuote(name)} "$current_sha"`,
     ].join("\n");
     return `sh -c ${shellQuote(script)}`;
@@ -2048,6 +2042,7 @@ export async function prepareGitHubOperationLaunchers(input: {
         label: "GitHub operation launcher", action: "stage GitHub operation launcher",
         lockDir: path.posix.join(directory, `.${program}.lock`),
         executable: program === "git" || program === "gh",
+        expectedMode: program === "git" || program === "gh" ? "700" : "644",
       })),
       ensureDirectories: [configDirectory], action: "stage GitHub operation launchers",
       timeoutMs: 15_000, shellCommand: adapterExecutionTargetShellCommand(remote),
