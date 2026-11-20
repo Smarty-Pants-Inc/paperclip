@@ -119,12 +119,22 @@ const kind = sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->'payl
  */
 export async function recordSteeredMessageEvidence(db: Db, input: { companyId: string; runId: string }) {
   await db.transaction(async tx => {
-    const [run] = await tx.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
+    const [run] = await tx.select({ context: heartbeatRuns.contextSnapshot, result: heartbeatRuns.resultJson }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId))).for("update");
-    const context = run?.context ?? {};
-    const steered = Array.isArray(context.steeredCommentIds) ? context.steeredCommentIds.filter((id): id is string => typeof id === "string") : [];
-    if (!steered.length) return;
+    const context = run?.context ?? {}, result = run?.result ?? {};
+    const ids = (value: unknown) => Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
+    const steered = ids(context.steeredCommentIds);
+    // The Interrupt moved its steers out of steeredCommentIds. Pi can still read one in the cut turn
+    // after the press (ordered ingestion): that read is recorded too, so the same-session successor
+    // omits it (answered-b; readUnreadSteeredForInterrupt records the reads ingested by the press).
+    const carried = ids(result.interruptCarriedSteeredCommentIds), recordedRead = ids(result.interruptCarriedReadSteeredCommentIds);
+    if (!steered.length && !carried.some(id => !recordedRead.includes(id))) return;
     const evidence = await readSteeredMessageAnswers(tx as unknown as Db, input);
+    const lateRead = carried.filter(id => !recordedRead.includes(id) && evidence.delivered.includes(id));
+    if (lateRead.length) await tx.update(heartbeatRuns).set({ resultJson: { ...result,
+      interruptCarriedReadSteeredCommentIds: [...recordedRead, ...lateRead] } })
+      .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
+    if (!steered.length) return;
     // Replace this run's projection, never union it: a failed/cancelled terminal
     // can invalidate text that was already materialized as answered while streaming.
     await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context,
