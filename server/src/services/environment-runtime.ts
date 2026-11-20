@@ -1,4 +1,5 @@
 import { environmentConfigRevision } from "./environment-config-revision.js";
+import type { RetainedNativeTurnHandoffSeed } from "./environment-lease-handoff.js";
 import { AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY, agentFileCopiesToCollectOnLease, agentFileCopyRetirementSettled, agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, holdUncollectedAgentFileCopy, releaseLeaseDestroyClaim, withLeaseDestroyClaim } from "./agent-file-save-hold.js";
 import { settleWarmRetention } from "./environment-warm-retention.js";
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
@@ -1234,17 +1235,23 @@ const PREVIOUS_BOOT_TIP_TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", 
  * different allocation. This is the warm door's live-owner proof, not merely
  * a durable checkpoint marker; after restart it deliberately returns false. */
 async function retainedTurnStopMayAdoptPendingWorkspace(db: Db, lease: EnvironmentLease,
-  input: Pick<EnvironmentDriverAcquireInput, "companyId" | "issueId" | "agentId" | "adapterType">): Promise<boolean> {
+  input: Pick<EnvironmentDriverAcquireInput, "companyId" | "issueId" | "agentId" | "adapterType">): Promise<RetainedNativeTurnHandoffSeed | null> {
   if (input.adapterType !== "paperclip_runner" || !input.issueId || !input.agentId
     || lease.companyId !== input.companyId || lease.issueId !== input.issueId
-    || lease.metadata?.agentId !== input.agentId || !lease.heartbeatRunId) return false;
+    || lease.metadata?.agentId !== input.agentId || !lease.heartbeatRunId) return null;
   const [run] = await db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.id, lease.heartbeatRunId), eq(heartbeatRuns.companyId, input.companyId),
     eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId),
   )).limit(1);
-  if (!run?.runnerProfileJson?.nativeRetainedIdleCheckpoint) return false;
+  if (run?.runtimeMode !== "native" || !run.runnerProfileJson?.nativeRetainedIdleCheckpoint
+    || !run.runnerInstanceId || !run.processPid || !run.processStartedAt) return null;
   const { hasRetainedNativeTurnStop } = await import("./native-runtime/native-session-executor.js");
-  return hasRetainedNativeTurnStop(run, lease) === true;
+  if (!hasRetainedNativeTurnStop(run, lease)) return null;
+  // Preserve this live certification through the atomic ownership change. An
+  // expired bookkeeping row will no longer satisfy the retained-lease proof.
+  return { leaseId: lease.id, runId: run.id,
+    checkpoint: run.runnerProfileJson.nativeRetainedIdleCheckpoint as Record<string, unknown>,
+    runner: { instanceId: run.runnerInstanceId, pid: run.processPid, startedAt: run.processStartedAt.toISOString() } };
 }
 
 function reusableLeaseCanBeCleanedUp(lease: Pick<EnvironmentLease, "status" | "metadata">): boolean {
@@ -2606,6 +2613,8 @@ function createSandboxEnvironmentDriver(
             acquiredLease.expiresAt ? new Date(acquiredLease.expiresAt) : undefined,
           ),
           metadata: pluginLeaseMetadata,
+          retainedNativeTurnHandoff: providerLease && reusableLease && reusableLease.heartbeatRunId !== input.heartbeatRunId
+            ? await retainedTurnStopMayAdoptPendingWorkspace(db, reusableLease, input) : null,
           reusesReusableLeaseId:
             providerLease &&
             reusableLease?.heartbeatRunId === input.heartbeatRunId
@@ -2887,6 +2896,9 @@ function createSandboxEnvironmentDriver(
           providerLease.expiresAt ? new Date(providerLease.expiresAt) : undefined,
         ),
         metadata: builtinLeaseMetadata,
+        retainedNativeTurnHandoff: reusableLease && providerLease.providerLeaseId === reusableLease.providerLeaseId
+          && reusableLease.heartbeatRunId !== input.heartbeatRunId
+          ? await retainedTurnStopMayAdoptPendingWorkspace(db, reusableLease, input) : null,
         reusesReusableLeaseId:
           reusableLease &&
           providerLease.providerLeaseId === reusableLease.providerLeaseId &&

@@ -1,4 +1,6 @@
 import { recordWarmRetentionProbe } from "./warm-retention-probe.js";
+import { RETAINED_NATIVE_TURN_HANDOFF_KEY, RETAINED_NATIVE_TURN_HANDOFF_SCHEMA } from "../environment-lease-handoff.js";
+import { readLeaseReleaseDeferral } from "../environment-lease-release-deferral.js";
 import { assertNoOpenTransaction } from "@paperclipai/db/transaction-context";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { environmentLeases, type Db, type heartbeatRuns } from "@paperclipai/db";
@@ -16,12 +18,52 @@ import { REPLACE_BEFORE_REUSE_KEY, REPLACE_BEFORE_REUSE_SCHEMA, readReplaceBefor
 /** Lease policies whose box a warm Stop can hand off (native-failed-workspace-recovery). */
 const reusableNativeLeasePolicies = ["reuse_by_environment", "reuse_by_execution_workspace"];
 
-type Run = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "nativeIssueId" | "status" | "resultJson" | "runtimeMode" | "runnerProfileJson">;
+type Run = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "nativeIssueId" | "status" | "resultJson" | "runtimeMode" | "runnerProfileJson">
+  & Partial<Pick<typeof heartbeatRuns.$inferSelect, "nativeSessionId" | "runnerInstanceId" | "processPid" | "processStartedAt">>;
+
+function record(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+/** The live idle-owner proof, carried atomically through same-box adoption.
+ * Ordinary reuse lineage alone says nothing about whether the old turn stopped.
+ * This certifies that TURN, never a physical Runner exit or whole-agent Stop. */
+function adoptedRetainedNativeTurn(run: Run, lease: typeof environmentLeases.$inferSelect): boolean {
+  const proof = record(lease.metadata?.[RETAINED_NATIVE_TURN_HANDOFF_KEY]);
+  const handoff = record(lease.metadata?.reusableLeaseSuccessor);
+  const checkpoint = record(proof.checkpoint), receipt = record(run.runnerProfileJson?.nativeRetainedIdleCheckpoint);
+  const runner = record(proof.runner);
+  return run.runtimeMode === "native" && run.status === "cancelled" && hasAcknowledgedNativeRunStopRequest(run)
+    && admittedNativeResourceDisposition(run.runnerProfileJson) === "keep_running"
+    && lease.status === "expired" && lease.cleanupStatus === "success" && !!lease.releasedAt
+    && lease.leasePolicy === "reuse_by_environment" && !!lease.provider && lease.provider !== "local"
+    && lease.companyId === run.companyId && lease.heartbeatRunId === run.id && lease.issueId === run.nativeIssueId
+    && !hasStopOnlyCleanup(lease) && lease.metadata?.pendingCleanupInFlight !== true && !readLeaseReleaseDeferral(lease.metadata)
+    && proof.schema === RETAINED_NATIVE_TURN_HANDOFF_SCHEMA && proof.leaseId === lease.id && proof.runId === run.id
+    && handoff.schema === "paperclip.reusable-lease-handoff.v1" && typeof handoff.handoffId === "string" && !!handoff.handoffId
+    && handoff.previousLeaseId === lease.id && handoff.previousRunId === run.id
+    && typeof handoff.successorLeaseId === "string" && !!handoff.successorLeaseId && handoff.successorLeaseId !== lease.id
+    && typeof handoff.successorRunId === "string" && !!handoff.successorRunId && handoff.successorRunId !== run.id
+    && handoff.companyId === lease.companyId && handoff.environmentId === lease.environmentId
+    && handoff.workspaceId === lease.executionWorkspaceId && handoff.issueId === lease.issueId
+    && typeof lease.metadata?.agentId === "string" && handoff.agentId === lease.metadata.agentId
+    && handoff.provider === lease.provider && !!lease.providerLeaseId && handoff.providerLeaseId === lease.providerLeaseId
+    && handoff.recordedAt === lease.releasedAt.toISOString()
+    && Object.entries(handoff).every(([key, value]) => key === "schema" || proof[key] === value)
+    && receipt.schema === "paperclip.native-retained-idle-checkpoint.v1" && receipt.companyId === run.companyId
+    && receipt.runId === run.id && receipt.issueId === run.nativeIssueId
+    && typeof receipt.sessionId === "string" && !!receipt.sessionId && receipt.sessionId === run.nativeSessionId
+    && typeof receipt.bootId === "string" && !!receipt.bootId && Number.isInteger(receipt.generation) && Number(receipt.generation) > 0
+    && ["schema", "companyId", "runId", "issueId", "sessionId", "bootId", "generation"].every(key => checkpoint[key] === receipt[key])
+    && typeof run.runnerInstanceId === "string" && !!run.runnerInstanceId && runner.instanceId === run.runnerInstanceId
+    && !!run.processPid && runner.pid === run.processPid && !!run.processStartedAt && runner.startedAt === run.processStartedAt.toISOString();
+}
 
 /** A remote lease with no stop receipt that a person's Stop (or Interrupt) of a
  * warm (keep_running) turn handed off: native run, lease retained and unreleased
  * with a reusable policy, no stop in flight on it, the warm-stop helper says handoff. */
 export function handedOffWarmLease(run: Run, lease: typeof environmentLeases.$inferSelect): boolean {
+  if (adoptedRetainedNativeTurn(run, lease)) return true;
   return !(run.runtimeMode !== "native" || lease.status !== "retained" || lease.releasedAt
     || !reusableNativeLeasePolicies.includes(lease.leasePolicy)
     || lease.metadata?.pendingCleanupInFlight === true || hasStopOnlyCleanup(lease)
@@ -36,7 +78,9 @@ export function handedOffWarmLease(run: Run, lease: typeof environmentLeases.$in
  * enqueue/admission transaction, a dryRun or the Interrupt route's lock);
  * proveHandedOffWarmLeases runs it outside any transaction and persists its answer. */
 export function handedOffWarmLeaseSettled(run: Run, lease: typeof environmentLeases.$inferSelect): boolean {
-  if (!handedOffWarmLease(run, lease)) return false;
+  // Adoption settles the old TURN, not this physical-exit fence. In particular
+  // native predecessor retirement must never mistake the successor's live Runner for a dead one.
+  if (lease.status !== "retained" || !handedOffWarmLease(run, lease)) return false;
   const evidence = lease.metadata?.[HANDED_OFF_WARM_EXIT_KEY] as { runId?: unknown } | undefined;
   return evidence?.runId === run.id;
 }
@@ -96,7 +140,9 @@ export async function readHandedOffWarmWaitLine(db: Db, input: { companyId: stri
   targetRunId?: string | null }): Promise<string | null> {
   const { heartbeatRuns: runs } = await import("@paperclipai/db");
   const fields = { id: runs.id, companyId: runs.companyId, nativeIssueId: runs.nativeIssueId, status: runs.status,
-    resultJson: runs.resultJson, runtimeMode: runs.runtimeMode, runnerProfileJson: runs.runnerProfileJson };
+    resultJson: runs.resultJson, runtimeMode: runs.runtimeMode, runnerProfileJson: runs.runnerProfileJson,
+    nativeSessionId: runs.nativeSessionId, runnerInstanceId: runs.runnerInstanceId,
+    processPid: runs.processPid, processStartedAt: runs.processStartedAt };
   const issueRuns = and(eq(runs.companyId, input.companyId),
     sql`(${runs.nativeIssueId} = ${input.issueId} or ${runs.issueId} = ${input.issueId})`);
   const [run] = input.targetRunId
@@ -212,7 +258,8 @@ export function proveHandedOffWarmLeases(db: Db, run: Run, opts?: { redispatch?:
     const hasRetainedNativeTurnStop = run.runnerProfileJson?.nativeRetainedIdleCheckpoint
       ? (await import("./native-session-executor.js")).hasRetainedNativeTurnStop : undefined;
     // Only the exact retained lease is exempt; other old writers still need proof.
-    const requiringProof = all.filter(lease => !hasRetainedNativeTurnStop?.(run, lease));
+    // An adopted old ownership row must not ask the shared successor Runner to exit.
+    const requiringProof = all.filter(lease => !adoptedRetainedNativeTurn(run, lease) && !hasRetainedNativeTurnStop?.(run, lease));
     // adopt-hung-stop: a handed-off stop already requested gets its receipt deadline (re-armed from the durable intent time).
     for (const lease of requiringProof) await armHandedOffStopReceiptDeadline(db, run, lease);
     const leases = requiringProof.filter(lease => handedOffWarmLease(run, lease) && !handedOffWarmLeaseSettled(run, lease));

@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { activityLog, agents, companies, createDb, environmentLeases, environments, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -10,6 +12,8 @@ import { claimCancellationRequest } from "../services/native-runtime/native-canc
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { registerIssueRecoveryWork } from "../services/recovery/work.js";
 import { nativeUserStopRecoveryHeld } from "../services/native-runtime/native-user-stop-settlement.js";
+import { environmentService } from "../services/environments.js";
+import { handedOffWarmLeaseSettled, proveHandedOffWarmLeases } from "../services/native-runtime/handed-off-warm-lease.js";
 
 // Keep reason: #20807 RFL F1's independent PostgreSQL reproduction caught a
 // data-safety failure: the ordinary sweep released a still-executing owner's
@@ -543,6 +547,99 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     return { cards: await stopActions(f.issueId),
       held: await nativeUserStopRecoveryHeld(db, { companyId: f.companyId, issueId: f.issueId, runId: f.runId }) };
   }
+
+  async function writeStopcardEvidence(name: string, value: unknown) {
+    const directory = process.env.PAPERCLIP_STOPCARD_EVIDENCE_DIR;
+    if (!directory) return;
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, `${name}.json`), JSON.stringify(value, null, 2));
+  }
+
+  // Keep reason: stopcard2. Adoption expires the old ownership row without
+  // stopping the box. Its live-certified turn handoff, not a provider receipt
+  // or a later successful answer, must survive that atomic ownership change.
+  async function adoptedStopFixture() {
+    const f = await warmStopFixture("settled");
+    const environmentId = randomUUID(), successorRunId = randomUUID();
+    const runnerInstanceId = randomUUID(), processStartedAt = new Date();
+    const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ runnerInstanceId, processPid: process.pid, processStartedAt,
+      runnerProfileJson: { ...before!.runnerProfileJson, nativeResourceDisposition: "keep_running" } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(environments).values({ id: environmentId, name: `Adopted box ${f.runId}`, driver: "sandbox", config: {} });
+    await db.update(environmentLeases).set({ environmentId, status: "retained" }).where(eq(environmentLeases.id, f.lease.id));
+    await db.insert(heartbeatRuns).values({ id: successorRunId, companyId: f.companyId, agentId: f.agentId,
+      invocationSource: "on_demand", status: "running", runtimeMode: "native", nativeIssueId: f.issueId });
+    const stoppedTurn = { leaseId: f.lease.id, runId: f.runId,
+      checkpoint: before!.runnerProfileJson!.nativeRetainedIdleCheckpoint as Record<string, unknown>,
+      runner: { instanceId: runnerInstanceId, pid: process.pid, startedAt: processStartedAt.toISOString() } };
+    const successor = await environmentService(db).acquireLease({ companyId: f.companyId, environmentId,
+      issueId: f.issueId, heartbeatRunId: successorRunId, provider: f.lease.provider,
+      providerLeaseId: f.lease.providerLeaseId, leasePolicy: "reuse_by_environment", metadata: { agentId: f.agentId },
+      replacesReusableLeaseId: f.lease.id, retainedNativeTurnHandoff: stoppedTurn });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    return { ...f, run: run!, lease: lease!, successor };
+  }
+
+  it("adoption preserves the stopped turn proof without stopping the successor Runner", async () => {
+    const f = await adoptedStopFixture();
+    expect(f.lease).toMatchObject({ status: "expired", cleanupStatus: "success" });
+    expect(f.lease.metadata?.retainedNativeTurnHandoff).toMatchObject({
+      runId: f.runId, leaseId: f.lease.id, successorRunId: f.successor.heartbeatRunId,
+      successorLeaseId: f.successor.id, providerLeaseId: f.lease.providerLeaseId,
+      runner: { instanceId: f.run.runnerInstanceId, pid: process.pid } });
+    expect(f.successor.metadata?.retainedNativeTurnHandoff).toBeUndefined();
+    // A stopped turn on an adopted box is NOT proof that the Runner exited.
+    expect(handedOffWarmLeaseSettled(f.run, f.lease)).toBe(false);
+    expect(await proveHandedOffWarmLeases(db, f.run)).toBe("none");
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(true);
+    expect((await onePass(f)).cards).toEqual([]);
+    expect(await agentExecutionStopBlocker(db, [f.agentId])).not.toBeNull();
+  });
+
+  it("no adoption and no turn Stop proof still escalates a genuinely live native owner", async () => {
+    const f = await warmStopFixture("missing");
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ processPid: process.pid,
+      runnerProfileJson: { ...run!.runnerProfileJson, nativeResourceDisposition: "keep_running" } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+    const cards = (await onePass(f)).cards;
+    expect(cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
+    await writeStopcardEvidence("genuine-live-native-owner", { run: (await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, f.runId)))[0], lease: f.lease, cards });
+  });
+
+  it("adoption proof removal goes RED and restoring it resolves the actual stop-pending row", async () => {
+    const f = await adoptedStopFixture();
+    const { retainedNativeTurnHandoff: _proof, ...metadata } = f.lease.metadata!;
+    await db.update(environmentLeases).set({ metadata }).where(eq(environmentLeases.id, f.lease.id));
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+    const missingProof = (await onePass(f)).cards;
+    expect(missingProof).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
+    await db.update(environmentLeases).set({ metadata: f.lease.metadata }).where(eq(environmentLeases.id, f.lease.id));
+    const restored = (await onePass(f)).cards;
+    expect(restored).toMatchObject([{ status: "resolved", outcome: "restored" }]);
+    await writeStopcardEvidence("adoption-proof-restored", { run: f.run, lease: f.lease,
+      successor: f.successor, missingProof, restored });
+  });
+
+  it.each(["successorRunId", "providerLeaseId", "runner_birth", "checkpoint", "cleanup", "controller"] as const)(
+    "adoption cannot hide mismatched %s or outstanding Stop debt", async mutation => {
+      const f = await adoptedStopFixture();
+      const proof = structuredClone(f.lease.metadata!.retainedNativeTurnHandoff) as Record<string, unknown>;
+      if (mutation === "runner_birth") (proof.runner as Record<string, unknown>).startedAt = new Date(0).toISOString();
+      else if (mutation === "checkpoint") (proof.checkpoint as Record<string, unknown>).generation = 999;
+      else if (mutation === "cleanup") await db.update(environmentLeases).set({ cleanupStatus: "failed" }).where(eq(environmentLeases.id, f.lease.id));
+      else if (mutation === "controller") await db.update(nativeRunFinalizations).set({ leaseOwner: "still-executing",
+        leaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(nativeRunFinalizations.runId, f.runId));
+      else proof[mutation] = randomUUID();
+      await db.update(environmentLeases).set({ metadata: { ...f.lease.metadata, retainedNativeTurnHandoff: proof } })
+        .where(eq(environmentLeases.id, f.lease.id));
+      expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+      expect((await onePass(f)).cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
+    });
 
   it("a proved warm-turn handoff Stop with no termination receipt raises no card and holds no owner", async () => {
     const f = await warmStopFixture("settled");
