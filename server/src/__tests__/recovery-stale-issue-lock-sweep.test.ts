@@ -1,4 +1,6 @@
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { createHeartbeatQueue, type HeartbeatQueueDependencies } from "../services/heartbeat/queue.js";
+import { registerDeferredReceiptWork } from "../services/heartbeat/deferred-receipt-work.js";
 import { registerIssueRecoveryWork } from "../services/recovery/work.js";
 import { wiredHeartbeatFor } from "../services/heartbeat-registry.js";
 import { reconcileNativeFinalizations } from "../services/native-runtime/native-finalization-reconciler.js";
@@ -1544,7 +1546,9 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
             nextCoalescedCount: i + 1,
           });
       });
-      await db.update(agentWakeupRequests).set({ updatedAt: last }).where(eq(agentWakeupRequests.id, w.id));
+      await db.update(agentWakeupRequests).set({ updatedAt: last,
+        payload: { ...(await wake(w.id)).payload, _paperclipLastCoalescedAt: last.toISOString() },
+      }).where(eq(agentWakeupRequests.id, w.id));
       const r = await run(c, [], ago(30_000), "succeeded", new Date(last.getTime() + gapMs));
       await db.insert(nativeRunFinalizations).values({ companyId: c.companyId, issueId: c.issueId,
         runId: r.id, phase: "committed" });
@@ -1558,7 +1562,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       }), recovery: { escalateStrandedAssignedIssue: async () => {},
         escalateStrandedRecoveryIssueInPlace: async () => {} } });
     }
-    it.each([500, 8])("BOUND: last coalesce %i ms before normal end drains every message once", async gap => {
+    it.each([500, 8, 5_000, 9_600])("BOUND: last coalesce %i ms before normal end drains every message once", async gap => {
       const { c, w, r, messages } = await boundFixture(gap);
       await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
       const runs = await queuedRuns(w.id);
@@ -1570,6 +1574,117 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       process.stdout.write(`BOUND evidence ${JSON.stringify({ gap, wakeId: w.id, sourceRunId: r.id,
         promotedRunId: runs[0].id, commentIds: runs[0].contextSnapshot?.wakeCommentIds })}\n`);
     });
+    it.each([true, false])("BOUNDCLOCK: three real stranded-receipt passes cannot reset the quiet clock (coalesced=%s)", async coalesced => {
+      const { c, w } = await boundFixture();
+      if (!coalesced) {
+        const { _paperclipLastCoalescedAt: _clock, ...payload } = (await wake(w.id)).payload!;
+        await db.update(agentWakeupRequests).set({ payload, coalescedCount: 0 })
+          .where(eq(agentWakeupRequests.id, w.id));
+      }
+      // A real eligibility gate explains why the stranded pass's own ordinary
+      // release does not admit the wake. Its scan still touches updated_at.
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, c.agentId));
+      const queue = createHeartbeatQueue(db, {
+        getSchedulingSuppression: async () => ({ suppressed: false, reason: null }),
+        getWorktreeExecutionCutoff: async () => null,
+        resumeExecutionWaitComments: async () => {}, // no executionWait in this row
+        isHeartbeatRunTerminalStatus: status => ["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(status ?? ""),
+        releaseIssueExecutionAndPromote: c.heartbeat.releaseIssueExecutionAndPromote,
+      } as unknown as HeartbeatQueueDependencies);
+      const errors: unknown[] = [];
+      const touches: string[] = [];
+      {
+        // Reconstruct the actual worker three times, as boot/reconstruction does.
+        for (let pass = 0; pass < 3; pass++) {
+          const before = await wake(w.id);
+          const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: e => errors.push(e) });
+          const worker = registerDeferredReceiptWork(db, coordinator, {
+            resume: scope => queue.resumeDeferredExecutionReceipts(scope),
+            settleTaskChat: async () => {}, createNativeBatch: () => async () => {},
+            schedulingSuppressed: async () => false,
+          }, () => true);
+          try {
+            await worker.ready;
+            await vi.waitFor(async () => expect((await wake(w.id)).updatedAt.getTime()).toBeGreaterThan(before.updatedAt.getTime()));
+          } finally { await worker.stop(); await coordinator.stop(); }
+          touches.push((await wake(w.id)).updatedAt.toISOString());
+          expect(await queuedRuns(w.id)).toHaveLength(0);
+        }
+        await db.update(agents).set({ status: "idle" }).where(eq(agents.id, c.agentId));
+        await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+        const promoted = await queuedRuns(w.id);
+        process.stdout.write(`BOUNDCLOCK evidence ${JSON.stringify({ coalesced, wakeId: w.id, touches,
+          requestedAt: w.requestedAt, saved: await wake(w.id), promoted: promoted.map(r => r.id), errors })}\n`);
+        expect(errors).toEqual([]);
+        expect(promoted).toHaveLength(1);
+        await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+        expect(await queuedRuns(w.id)).toHaveLength(1);
+      }
+    });
+    it("BOUNDCLOCK: a succeeded run still holding the issue resumes only after ingestion settles", async () => {
+      const { c, w, r, messages } = await boundFixture();
+      await db.update(issues).set({ executionRunId: r.id, checkoutRunId: r.id,
+        executionLockedAt: new Date() }).where(eq(issues.id, c.issueId));
+      await db.update(heartbeatRuns).set({ contextSnapshot: { ...r.contextSnapshot, steeredCommentIds: [messages[0].id] },
+        resultJson: { steeringIngestionReleaseHeld: true, nativeSteeringIngestion: { state: "open" } },
+      }).where(eq(heartbeatRuns.id, r.id));
+      await boundRelease()({ companyId: c.companyId, runId: r.id, now: new Date(),
+        suppressImmediateRecovery: true, resumeStrandedQueue: true });
+      expect(await queuedRuns(w.id)).toHaveLength(0);
+      expect((await issue(c)).executionRunId).toBe(r.id);
+      // Crash boundary: ingestion committed its proof, but its release callback
+      // did not run. The sweep must retry the SAME guarded release owner.
+      await db.update(heartbeatRuns).set({ resultJson: { steeringIngestionReleaseHeld: true,
+        nativeSteeringIngestion: { state: "terminal_ingested" } } }).where(eq(heartbeatRuns.id, r.id));
+      await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+      expect(await queuedRuns(w.id)).toHaveLength(1);
+      expect((await issue(c)).executionRunId).not.toBe(r.id);
+      await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+      expect(await queuedRuns(w.id)).toHaveLength(1);
+    });
+    it("BOUNDCLOCK: requested_at remains the lower bound when it is newer than the marker", async () => {
+      const { c, w } = await boundFixture();
+      const requestedAt = new Date();
+      await db.update(agentWakeupRequests).set({ requestedAt }).where(eq(agentWakeupRequests.id, w.id));
+      const hints: number[] = [];
+      await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId,
+        onDeferredDeadline: at => hints.push(at) });
+      expect(await queuedRuns(w.id)).toHaveLength(0);
+      expect(hints).toContain(requestedAt.getTime() + 12_000);
+    });
+    it("BOUNDCLOCK: a live skip re-arms the real deadline worker until the run finishes", async () => {
+      const { c, w, r } = await boundFixture();
+      await db.update(heartbeatRuns).set({ status: "running", finishedAt: null }).where(eq(heartbeatRuns.id, r.id));
+      const hints: number[] = [];
+      const started = Date.now();
+      await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId,
+        onDeferredDeadline: at => hints.push(at) });
+      expect(await queuedRuns(w.id)).toHaveLength(0);
+      expect(hints.some(at => at >= started + 12_000 && at <= Date.now() + 12_000)).toBe(true);
+      const errors: unknown[] = [];
+      const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: e => errors.push(e) });
+      const worker = registerIssueRecoveryWork(db, coordinator, {
+        schedulingSuppressed: async () => false, locks: c.heartbeat.sweepStaleIssueLocks,
+        stranded: async () => {}, orphanBlockers: async () => {}, recoveryActions: async () => {},
+        dependencies: async () => ({ enqueueFailed: 0 }), watchdogs: async () => ({ incomplete: 0 }),
+      }, () => true);
+      try {
+        await worker.ready;
+        // Let its initial real sweep see the live owner, then finish without
+        // emitting a run-end signal. Only the armed clock can wake it again.
+        await new Promise(resolve => setTimeout(resolve, 400));
+        const endedAt = Date.now();
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+          .where(eq(heartbeatRuns.id, r.id));
+        await vi.waitFor(async () => expect(await queuedRuns(w.id)).toHaveLength(1), { timeout: 14_000, interval: 50 });
+        expect(Date.now() - endedAt).toBeLessThan(13_000);
+        expect(errors).toEqual([]);
+        process.stdout.write(`BOUNDCLOCK live evidence ${JSON.stringify({ wakeId: w.id, hints,
+          terminalToPromotionMs: Date.now() - endedAt, runIds: (await queuedRuns(w.id)).map(r => r.id) })}\n`);
+        await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+        expect(await queuedRuns(w.id)).toHaveLength(1);
+      } finally { await worker.stop(); await coordinator.stop(); }
+    }, 20_000);
     it("BOUND: simultaneous person's Send, sweep and end release admit one carrier", async () => {
       const { c, w, r, messages } = await boundFixture();
       // Send records its intent under the issue lock, then invokes this real
@@ -1615,7 +1730,9 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     it("BOUND: real periodic worker discovers an unlocked wake and honors its deadline", async () => {
       const { c, w } = await boundFixture();
       const last = ago(11_000);
-      await db.update(agentWakeupRequests).set({ updatedAt: last }).where(eq(agentWakeupRequests.id, w.id));
+      await db.update(agentWakeupRequests).set({ updatedAt: last,
+        payload: { ...(await wake(w.id)).payload, _paperclipLastCoalescedAt: last.toISOString() },
+      }).where(eq(agentWakeupRequests.id, w.id));
       const errors: unknown[] = [];
       const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true,
         onError: err => errors.push(err) });
@@ -1676,8 +1793,15 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     });
     it("BOUND: last coalesce, not creation, owns the deadline hint", async () => {
       const { c, w } = await boundFixture();
-      const latest = new Date();
-      await db.update(agentWakeupRequests).set({ updatedAt: latest }).where(eq(agentWakeupRequests.id, w.id));
+      await db.transaction(async tx => {
+        await createWakeAdmissionWriter().mergeIntoExistingDeferredWake(
+          createAdmissionTransactionScope(c.companyId, tx as unknown as typeof db), {
+            companyId: c.companyId, existingDeferredWakeId: w.id, manualUserWakeActorId: owner,
+            mergedPayload: (await wake(w.id)).payload!, nextCoalescedCount: 3,
+          });
+      });
+      const saved = await wake(w.id);
+      const latest = saved.updatedAt;
       const hints: number[] = [];
       await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId,
         onDeferredDeadline: at => hints.push(at) });
