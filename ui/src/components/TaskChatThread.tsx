@@ -2161,7 +2161,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
               id: turnId,
               kind: "turn",
               settled: true,
-              historical,
+              historical: statusRelevance.isHistoricalTurn(source.id),
               agentName:
                 meta?.agentName ??
                 (meta?.agentId ? agentMap?.get(meta.agentId)?.name : undefined),
@@ -2381,7 +2381,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
             id: turnId,
             kind: "turn",
             settled: true,
-            historical,
+            historical: statusRelevance.isHistoricalTurn(source.id),
             agentName:
               meta?.agentName ??
               (meta?.agentId ? agentMap?.get(meta.agentId)?.name : undefined),
