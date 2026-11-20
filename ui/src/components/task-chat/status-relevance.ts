@@ -50,11 +50,14 @@ export function taskChatStatusRelevance(
     }
   }
 
-  const isHistoricalRun = (runId: string): boolean => {
+  const isHistorical = (runId: string, preserveStoppedOutcome: boolean): boolean => {
     if (terminal) return true;
     const run = byId.get(runId);
     if (!run) return false;
-    if (run.execution?.successorRunId || run.execution?.phase === "completed") return true;
+    if (run.execution?.successorRunId) return true;
+    // An acknowledged Stop resolves its notice, but is still this turn's
+    // outcome. Keep the Stopped header until later work supersedes the turn.
+    if (run.execution?.phase === "completed" && (!preserveStoppedOutcome || run.status !== "cancelled")) return true;
     const wait = run.resultJson?.executionWait;
     if (recoveryAction && wait && typeof wait === "object" && "recoveryActionId" in wait
       && wait.recoveryActionId === recoveryAction.id) {
@@ -67,6 +70,9 @@ export function taskChatStatusRelevance(
     const latest = isAdmissionWait(run) ? latestByAgent : latestAttemptByAgent;
     return order < (latest.get(run.agentId) ?? -Infinity);
   };
+
+  const isHistoricalRun = (runId: string) => isHistorical(runId, false);
+  const isHistoricalTurn = (runId: string) => isHistorical(runId, true);
 
   const isHistoricalNotice = (comment: IssueChatComment): boolean => {
     // Session resets are durable conversation boundaries, not execution status.
@@ -87,7 +93,7 @@ export function taskChatStatusRelevance(
     return false;
   };
 
-  return { isHistoricalRun, isHistoricalNotice };
+  return { isHistoricalRun, isHistoricalTurn, isHistoricalNotice };
 }
 
 /** Remove obsolete lifecycle diagnostics, preserving responses, tools and inputs. */

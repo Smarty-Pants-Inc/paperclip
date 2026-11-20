@@ -6542,6 +6542,80 @@ describe("TaskChatThread live transcript", () => {
   });
 });
 
+// catch: STOPQ, FINAL5c3 5e8af273; brief stopcard/LINES-STOPQ.txt.
+describe.each([390, 1440])("STOPQ stopped tool card at %s", width => {
+  const run = nativeRunningRun();
+  const command = "sleep 60; echo STEP1-74584f";
+  const props = { comments: [], onAdd: async () => {}, issueId: "stopcard", issueStatus: "in_progress",
+    agentMap: new Map([[run.agentId, { id: run.agentId, name: "Runner", adapterType: "paperclip_runner" } as Agent]]) };
+  const stopped = { ...run, runId: run.id, status: "cancelled", finishedAt: "2026-08-25T18:00:11.000Z",
+    execution: { phase: "completed" as const, label: "Stopped", cause: null, nextAction: "Send a new message to continue from saved work.",
+      lastConfirmedActivityAt: null, retryAt: null, attempt: 1, maxAttempts: 3, recoveryOwner: null,
+      permittedActions: [], predecessorRunId: null, successorRunId: null } };
+
+  it.each(["Bash", "Tool"].flatMap(name => [false, true].map(partial => ({ name, partial }))))(
+    "retains the stopped label and shell row across settle/refetch ($name, partial output=$partial)", async ({ name, partial }) => {
+    sidebarState.isMobile = width === 390;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    const entries = [{ kind: "tool_call", ts: run.startedAt, name, input: { command }, toolUseId: "shell" },
+      ...(partial ? [{ kind: "tool_result", ts: run.startedAt, toolUseId: "shell", content: "STEP1 started", delta: true }] : [])];
+    nativeTranscriptState.transcriptByRun.set(run.id, entries);
+    render(<TaskChatThread {...props} activeRun={run} />);
+    expect(container.querySelector('[data-testid="task-chat-runner-turn"]')).not.toBeNull();
+    render(<TaskChatThread {...props} activeRun={{ ...run, status: "cancelled", finishedAt: stopped.finishedAt }}
+      linkedRuns={[{ ...stopped, execution: undefined }]} />);
+    expect(container.querySelector('[data-testid="task-chat-turn-summary"]')?.textContent).toContain("Stopped for 11s");
+    // The live-runs refetch drops the terminal run. The settled linked run's
+    // acknowledged Stop now carries execution.phase=completed (not superseded).
+    nativeTranscriptState.transcriptByRun.set(run.id, [...entries]);
+    render(<TaskChatThread {...props} linkedRuns={[stopped]} />);
+    await act(async () => {});
+    expect(container.querySelector('[data-testid="task-chat-runner-turn"]')).toBeNull();
+    expect.soft(container.querySelector('[data-testid="task-chat-turn-summary"]')?.textContent).toContain("Stopped for 11s");
+    // Stop is a settled outcome, not a new failure/retry notice.
+    expect(container.textContent).not.toContain("Run cancelled");
+    const toggle = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-activity-phase-toggle"]');
+    expect(toggle).not.toBeNull();
+    if (name === "Tool") expect(toggle!.textContent).toContain("Used tools");
+    flushSync(() => toggle!.click());
+    const history = container.querySelector('[data-testid="task-chat-runner-activity-list"]');
+    expect(history?.textContent).toContain(command);
+    const tool = history!.querySelector<HTMLButtonElement>('button')!;
+    flushSync(() => tool.click());
+    expect(container.querySelector('[data-testid="task-chat-runner-activity-detail"]')?.textContent)
+      .toContain(partial ? "STEP1 started" : "Stopped before output");
+    expect(container.querySelector('[data-testid="task-chat-turn-summary"]')?.textContent).toContain("Stopped for 11s");
+    // A cold transcript refetch/remount must not rely on a live-only latch.
+    render(<TaskChatThread key="reload-stopcard" {...props} linkedRuns={[stopped]} />);
+    expect(container.querySelector('[data-testid="task-chat-turn-summary"]')?.textContent).toContain("Stopped for 11s");
+  });
+
+  it("control: finished shell remains Worked and a stopped turn without tools draws no tool card", () => {
+    nativeTranscriptState.transcriptByRun.set(run.id, [
+      { kind: "tool_call", ts: run.startedAt, name: "Bash", input: { command }, toolUseId: "shell" },
+      { kind: "tool_result", ts: run.startedAt, toolUseId: "shell", content: "STEP1-74584f" },
+    ]);
+    render(<TaskChatThread {...props} linkedRuns={[{ ...stopped, status: "succeeded", execution: undefined }]} />);
+    expect(container.querySelector('[data-testid="task-chat-turn-summary"]')?.textContent).toContain("Worked for 11s");
+    nativeTranscriptState.transcriptByRun.set(run.id, [{ kind: "run_terminal", ts: stopped.finishedAt,
+      turnState: "cancelled", runState: "cancelled", disposition: "blocked" }]);
+    render(<TaskChatThread key="zero-tools" {...props} linkedRuns={[stopped]} />);
+    expect(container.querySelector('[data-testid="task-chat-activity-phase-toggle"]')).toBeNull();
+    expect(container.textContent).not.toContain("Used tools");
+    expect(container.querySelector('[data-testid="task-chat-turn-summary"]')?.textContent).toContain("Stopped for 11s");
+  });
+
+  it("control: a real successor still makes the stopped run historical", () => {
+    nativeTranscriptState.transcriptByRun.set(run.id, [
+      { kind: "tool_call", ts: run.startedAt, name: "Bash", input: { command }, toolUseId: "shell" },
+    ]);
+    render(<TaskChatThread {...props} linkedRuns={[{ ...stopped,
+      execution: { ...stopped.execution, successorRunId: "next" } }]} />);
+    expect(container.querySelector('[data-testid="task-chat-turn-summary"]')?.textContent).not.toContain("Stopped");
+    expect(container.querySelector('[data-testid="task-chat-activity-phase-toggle"]')).not.toBeNull();
+  });
+});
+
 describe("TaskChatThread composer execution controls", () => {
   // gate 5 (62fcab5b, g5s10): Stop 03:52:26.549Z, run cancelled 27.091Z, yet a bare
   // 'Working'/'Thinking' lane stayed until ~37 s. It is the startup lane, kept by the

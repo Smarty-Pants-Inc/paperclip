@@ -529,7 +529,7 @@ describe("transcriptToTaskChatItems tool_call updates", () => {
       kind: "tool",
       name: "Terminal",
       status: "interrupted",
-      detail: "Interrupted before the provider reported completion.",
+      detail: "Stopped before output. Interrupted before the provider reported completion.",
     });
   });
 });
