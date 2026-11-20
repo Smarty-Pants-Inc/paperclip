@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { and, asc, eq, gt, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { providerTraceRecords } from "@paperclipai/db";
+import { redactProviderKeys } from "@paperclipai/adapter-utils/provider-prefix-redaction";
 import type {
   ProviderTraceFrame,
   ProviderTraceMetadata,
@@ -59,8 +60,25 @@ function rehydrationTracePath(traceRef: string) {
   return `${tracePath(traceRef)}.rehydration`;
 }
 
+/** Mask inspection projections only; exact trace bytes and their digests stay untouched. */
+function redactTraceProjection<T>(value: T): T {
+  if (typeof value === "string") {
+    return redactProviderKeys(value, "[withheld]") as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map((child) => redactTraceProjection(child)) as T;
+  }
+  if (!value || typeof value !== "object" || value instanceof Date) return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, child]) => [
+      redactTraceProjection(key),
+      redactTraceProjection(child),
+    ]),
+  ) as T;
+}
+
 function asMetadata(row: TraceRow): ProviderTraceMetadata {
-  return {
+  return redactTraceProjection({
     schema: "paperclip.provider_trace_metadata.v1",
     id: row.id,
     runId: row.runId,
@@ -75,7 +93,7 @@ function asMetadata(row: TraceRow): ProviderTraceMetadata {
     createdAt: row.createdAt,
     expiresAt: row.expiresAt,
     deletedAt: row.deletedAt,
-  };
+  });
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -140,12 +158,12 @@ function redactedFrame(entry: Record<string, unknown>) {
     withheldPaths.push("$raw");
   }
   const { rawBase64: _raw, ...safe } = entry;
-  return {
+  return redactTraceProjection({
     ...safe,
     parsed,
     withheldPaths,
     exactAvailable: rawBase64.length > 0,
-  };
+  });
 }
 
 export function redactProviderTraceFrame(entry: Record<string, unknown>) {
@@ -593,7 +611,7 @@ export function providerTraceStore(db: Db, options: { objectStore?: ProviderTrac
     return {
       trace: asMetadata(row),
       entries: entries.map((entry) =>
-        entry.kind === "frame" ? redactedFrame(entry) : entry,
+        entry.kind === "frame" ? redactedFrame(entry) : redactTraceProjection(entry),
       ),
     };
   }
