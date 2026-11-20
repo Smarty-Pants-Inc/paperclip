@@ -152,12 +152,19 @@ export type AgentFileCanonicalWrite = { boundary: boolean; recorded: boolean; do
 type LateAbort<T> = { write: AgentFileCanonicalWrite; settleMs: number;
   /** The report at the bound while the write is still landing: the durable
    * "still saving" hold; undefined when the outcome is being recorded right
-   * now (the bound then re-checks until that record is on the row). */
+   * now (the bound re-checks for at most LATE_ABORT_RECORD_SLACK_MS). */
   stillSaving: () => Promise<T | undefined>;
+  /** Non-blocking answer while the outcome UPDATE is still in flight. It must
+   * not write over that outcome or wait for its row lock. */
+  pending: () => T;
   /** The recorded outcome (write.done: saved, or the failed-save hold), marked `abortCameTooLate`. */
   outcome: () => Promise<T> };
 /** How often the bound re-checks a late outcome that is being recorded right now. */
 const LATE_ABORT_RECORD_POLL_MS = 25;
+/** Extra time to observe a nearly finished outcome record, never its full I/O
+ * duration. Independent of the poll/read/write so a blocked DB call cannot
+ * turn a late-abort answer into an unbounded wait. */
+const LATE_ABORT_RECORD_SLACK_MS = 100;
 /**
  * LATE-ABORT (RFL + rf-3 agreed contract): an abort that arrives after the
  * canonical commit boundary never rejects the collection as cancelled.
@@ -167,8 +174,10 @@ const LATE_ABORT_RECORD_POLL_MS = 25;
  * returns the durable "still saving" report instead, or the outcome already
  * on the row (the saved record, or the failed-save hold): that record is the
  * answer, and what remains of the collection (its lease unpin, its cleanup)
- * continues after it without delaying it. Meanwhile `operation` keeps the
- * lock, records SAVED (or the failure) when the write settles, and only then
+ * continues after it without delaying it. If that record is mid-write, a
+ * non-persisting "still saving" answer ends the wait within `settleMs` plus
+ * LATE_ABORT_RECORD_SLACK_MS; the in-flight UPDATE is never overwritten.
+ * Meanwhile `operation` keeps the lock, records SAVED (or the failure) when the write settles, and only then
  * releases.
  * Once that outcome is on the row (`write.done`) the lock is no longer kept:
  * an abort during the remaining cleanup ends the lock session at once, as for
@@ -179,8 +188,18 @@ const LATE_ABORT_RECORD_POLL_MS = 25;
  */
 export function settleLateAbort<T>(operation: Promise<T>, signal: AbortSignal, late: LateAbort<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    let timer: NodeJS.Timeout | undefined;
+    let timer: NodeJS.Timeout | undefined, recordDeadline: NodeJS.Timeout | undefined;
     let reported = false, settled = false;
+    const report = (value: T) => {
+      if (settled || reported) return;
+      reported = true;
+      if (timer) clearTimeout(timer);
+      if (recordDeadline) clearTimeout(recordDeadline);
+      // Only the answer is bounded. The operation still owns its lock and is
+      // joined for graceful drain until the real outcome is recorded.
+      trackAgentFileCheckpoint(operation).catch(() => undefined);
+      resolve(value);
+    };
     const onAbort = () => {
       if (!late.write.boundary) return;
       if (late.write.done) {
@@ -192,23 +211,24 @@ export function settleLateAbort<T>(operation: Promise<T>, signal: AbortSignal, l
         return;
       }
       const atBound = () => {
+        if (settled || reported) return;
         // PERSIST-FAILURE (rf-3 R7): an outcome already on the row, saved or
         // the failed-save hold, is the answer at the bound. The collection's
         // own bookkeeping after it never keeps the caller waiting.
-        void (late.write.done ? late.outcome() : late.stillSaving()).then(report => {
+        void (late.write.done ? late.outcome() : late.stillSaving()).then(value => {
           if (settled || reported) return;
-          if (report === undefined) {
-            // The outcome is being recorded right now: answer once it is on the row.
+          if (value === undefined) {
+            // Observe a nearly finished record, but never wait past recordDeadline.
             timer = setTimeout(atBound, LATE_ABORT_RECORD_POLL_MS);
             return;
           }
-          reported = true;
-          // The write still owns the lock: keep it joined for a graceful drain.
-          trackAgentFileCheckpoint(operation).catch(() => undefined);
-          resolve(report);
-        }, error => logger.warn({ err: error }, "Agent-file save is still running after a late abort; its report could not be written, waiting for the save itself"));
+          report(value);
+        }, error => logger.warn({ err: error }, "Agent-file save is still running after a late abort; its report could not be written, bounded pending answer remains scheduled"));
       };
       timer = setTimeout(atBound, late.settleMs);
+      recordDeadline = setTimeout(() => {
+        if (!settled && !reported) report(late.pending());
+      }, late.settleMs + LATE_ABORT_RECORD_SLACK_MS);
     };
     if (signal.aborted) onAbort();
     else signal.addEventListener("abort", onAbort, { once: true });
@@ -219,6 +239,7 @@ export function settleLateAbort<T>(operation: Promise<T>, signal: AbortSignal, l
       else if (error !== signal.reason) logger.warn({ err: error }, "Agent-file collection failed after its outcome was reported");
     }).finally(() => {
       if (timer) clearTimeout(timer);
+      if (recordDeadline) clearTimeout(recordDeadline);
       signal.removeEventListener("abort", onAbort);
     });
   });
@@ -427,6 +448,18 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     }
     return current;
   }
+  /** A truthful answer, not a second concurrent row UPDATE. When the real
+   * outcome is mid-write its transaction already owns the row; collection's
+   * lock and lease pin continue protecting the source until that write ends. */
+  function pendingReport(current: Copy): Copy {
+    const stoppedAt = current.processStoppedAt ?? new Date();
+    const previous = current.receipt?.savePending as { since?: string; failures?: number } | undefined;
+    const since = typeof previous?.since === "string" ? new Date(previous.since) : stoppedAt;
+    const receipt = { ...current.receipt, abortCameTooLate: true, savePending: { since: since.toISOString(), code: AGENT_FILES_SAVE_STILL_RUNNING,
+      reason: "The stop came after the canonical write began; the write is still landing.", failures: previous?.failures ?? 0 } };
+    return { ...current, state: "unavailable", processStoppedAt: stoppedAt, errorCode: AGENT_FILES_SAVE_STILL_RUNNING,
+      errorMessage: agentFileHoldInstruction({ ...current, receipt }), nextAttemptAt: instructionCopyRetryAt(since), receipt };
+  }
   /** LATE-ABORT: the report at the bound (see settleLateAbort). While the
    * write is still landing it is the durable "still saving" hold: the same
    * hold a failed stopped save writes (receipt.savePending, under the
@@ -446,13 +479,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         continue;
       }
       if (write.recorded) break;
-      const stoppedAt = current.processStoppedAt ?? new Date();
-      const previous = current.receipt?.savePending as { since?: string; failures?: number } | undefined;
-      const since = typeof previous?.since === "string" ? new Date(previous.since) : stoppedAt;
-      const receipt = { ...current.receipt, abortCameTooLate: true, savePending: { since: since.toISOString(), code: AGENT_FILES_SAVE_STILL_RUNNING,
-        reason: "The stop came after the canonical write began; the write is still landing.", failures: previous?.failures ?? 0 } };
-      const next = await patch(current, { state: "unavailable", processStoppedAt: stoppedAt, errorCode: AGENT_FILES_SAVE_STILL_RUNNING,
-        errorMessage: agentFileHoldInstruction({ ...current, receipt }), nextAttemptAt: instructionCopyRetryAt(since), receipt },
+      const { state, processStoppedAt, errorCode, errorMessage, nextAttemptAt, receipt } = pendingReport(current);
+      const next = await patch(current, { state, processStoppedAt, errorCode, errorMessage, nextAttemptAt, receipt },
         sql`${receiptUnchanged} AND ${agentFileHoldWriteCondition}`);
       if (next.errorCode === AGENT_FILES_SAVE_STILL_RUNNING && agentFileSaveHeld(next)) return next;
     }
@@ -1606,7 +1634,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     collectStopped: (row: Copy, target?: AdapterExecutionTarget | null, signal?: AbortSignal) => {
       const write: AgentFileCanonicalWrite = { boundary: false, recorded: false, done: false };
       return trackAgentFileCheckpoint(serial(row, current => pinnedCollectStopped(current, target, signal, write), "agent_directory_collect", signal,
-        signal ? { write, settleMs: lateAbortSettleMs, stillSaving: () => holdStillSaving(row, write), outcome: () => recordedOutcome(row) } : undefined));
+        signal ? { write, settleMs: lateAbortSettleMs, stillSaving: () => holdStillSaving(row, write), pending: () => pendingReport(row), outcome: () => recordedOutcome(row) } : undefined));
     },
     release: async (row: Copy) => {
       let current = await get(row.companyId, row.runId);

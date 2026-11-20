@@ -1045,8 +1045,8 @@ describe("agent directory collection aborted after the canonical commit boundary
     expect.soft(lockFreeAfter).toBe(true);
   }, 60_000);
 
-  it("R14 the failed-save hold is still being WRITTEN when the bound passes (PostgreSQL delays that write), then the unpin lingers: the collection answers as soon as the hold is durable, not when its bookkeeping ends", async () => {
-    const BOUND_MS = 200, RECORD_MS = 1_500, OBSERVE_MS = 1_500;
+  it("R14 the failed-save hold is still being WRITTEN when the bound passes, then the unpin lingers: the bounded still-saving answer does not wait for either", async () => {
+    const BOUND_MS = 200, RECORD_MS = 1_500, ANSWER_SLACK_MS = 200;
     const { service, executionTarget, runId, note } = await stoppedRunWithUnsavedNote({ agentFileLateAbortSettleMs: BOUND_MS });
     await plantDurableHeadRejection();
     // PLANTED DELAY, named at its line: PostgreSQL holds the UPDATE that writes
@@ -1062,10 +1062,13 @@ describe("agent directory collection aborted after the canonical commit boundary
     const collection = outcomeOf(service.collectStopped({ companyId, runId, target: executionTarget, signal: controller.signal }));
     await Promise.race([sleep(15_000), collection, (async () => { while (!fault.abortedAt) await sleep(5); })()]);
     await sleep(Math.max(0, fault.abortedAt + BOUND_MS + 100 - performance.now()));
-    // Just past the bound: the hold write is still in flight in PostgreSQL.
+    // Just past the initial bound: the hold write is still in flight in PostgreSQL.
+    // The cap now answers "still saving" rather than waiting 1.5 s for this row.
     const recordedPastBound = await copyRow(runId), answeredPastBound = await Promise.race([collection.then(() => true), sleep(0).then(() => false)]);
-    const answer = await Promise.race([collection.then(value => ({ ...value, at: performance.now() })), sleep(RECORD_MS + OBSERVE_MS).then(() => null)]);
+    const answer = await Promise.race([collection.then(value => ({ ...value, at: performance.now() })), sleep(Math.max(0, fault.abortedAt + BOUND_MS + ANSWER_SLACK_MS - performance.now())).then(() => null)]);
     const unpinWhenAnswered = { ...unpin.state }, recordedWhenAnswered = await copyRow(runId);
+    await unpin.inUnpin;
+    const unpinBeforeRelease = { ...unpin.state };
     unpin.release();
     await collection;
     await drainAgentFileCheckpoints();
@@ -1073,15 +1076,18 @@ describe("agent directory collection aborted after the canonical commit boundary
     const recorded = await copyRow(runId), pinsAfter = await leasePins(executionTarget.leaseId), lockFreeAfter = await independentPoolCanTakeLock();
     await evidence("r14-failed-outcome-recorded-past-the-bound.json", { fault: { ...fault, abortedAt: undefined }, boundMs: BOUND_MS, recordDelayMs: RECORD_MS,
       recordedPastBound: briefRow(recordedPastBound), answeredPastBound, answered: answer !== null, answeredAfterAbortMs: answer ? answer.at - fault.abortedAt : null,
-      error: answer?.error ? String(answer.error) : null, reported: briefRow(answer?.row), unpinWhenAnswered, recordedWhenAnswered: briefRow(recordedWhenAnswered),
+      error: answer?.error ? String(answer.error) : null, reported: briefRow(answer?.row), unpinWhenAnswered, unpinBeforeRelease, recordedWhenAnswered: briefRow(recordedWhenAnswered),
       recorded: briefRow(recorded), pinsAfter, lockFreeAfter });
     expect.soft(fault).toMatchObject({ applies: 1, realPersistCalls: 1, treeMergedAtPersist: true });
-    expect.soft({ errorCode: recordedPastBound.errorCode, answeredPastBound }, "fixture: just past the bound the failed-save hold is not on the row yet, and nothing is answered before it is").toEqual({ errorCode: null, answeredPastBound: false });
-    expect.soft(answer, "the collection answers once the hold is durable, not when its lingering bookkeeping ends").not.toBeNull();
-    expect.soft(unpinWhenAnswered, "the bookkeeping was still in flight when the collection answered").toEqual({ reached: true, returned: false });
+    expect.soft(recordedPastBound.errorCode, "fixture: the failed-save hold is not on the row yet").toBeNull();
+    expect.soft(answer, "the record's 1.5 s delay cannot extend the answer bound + 200 ms slack").not.toBeNull();
+    expect.soft(answer ? answer.at - fault.abortedAt : Infinity).toBeLessThanOrEqual(BOUND_MS + ANSWER_SLACK_MS);
+    expect.soft(unpinWhenAnswered, "the answer precedes even the bookkeeping").toEqual({ reached: false, returned: false });
+    expect.soft(unpinBeforeRelease, "the real outcome still records and the bookkeeping continues after the answer").toEqual({ reached: true, returned: false });
     expect.soft(answer?.error, "never 'cancelled'").toBeNull();
-    expect.soft(answer?.row, "the answer is the recorded failed-save hold: never 'saved', never 'still saving'").toMatchObject({ ...failedHold, receipt: { abortCameTooLate: true, savePending: { code: "AGENT_FILES_SAVE_FAILED" } } });
-    expect.soft(recordedWhenAnswered, "and that hold was durable when it answered").toMatchObject(failedHold);
+    expect.soft(answer?.row, "while its failure is mid-write the answer is still saving, never saved or cancelled").toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_SAVE_STILL_RUNNING",
+      receipt: { abortCameTooLate: true, savePending: { code: "AGENT_FILES_SAVE_STILL_RUNNING" } } });
+    expect.soft(recordedWhenAnswered?.errorCode, "no concurrent UPDATE overwrote the in-flight outcome").toBeNull();
     expect.soft(recorded).toMatchObject(failedHold);
     expect.soft(pinsAfter, "the bookkeeping continued after the answer").toEqual([]);
     expect.soft(lockFreeAfter).toBe(true);
