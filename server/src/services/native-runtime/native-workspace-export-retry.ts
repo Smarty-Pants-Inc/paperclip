@@ -8,7 +8,8 @@ import { and, eq, gt, inArray, ne, or, sql } from "drizzle-orm";
 import { environmentLeases, environments, heartbeatRuns, issues, issueRecoveryActions, nativeRunFinalizations, nativeRunResults, type Db } from "@paperclipai/db";
 import { conflict } from "../../errors.js";
 import { persistActivity, publishActivity } from "../activity-log.js";
-import { hasRemoteTerminationReceipt, remoteTerminationReceipt } from "../remote-execution-termination.js";
+import { hasBoundRemoteStopReceipt, hasRemoteTerminationReceipt, remoteTerminationReceipt } from "../remote-execution-termination.js";
+import { isNativeWorkspaceExportReleaseHold } from "./native-workspace-release-guard.js";
 import { NATIVE_WORKSPACE_EXPORT_RESUME_KEY, readNativeWorkspaceExportResume, settleNativeWorkspaceExportResume } from "./native-workspace-export-resume.js";
 import { withNativeWorkspaceFinalizationOwnership } from "./native-workspace-finalization-ownership.js";
 import { readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
@@ -72,7 +73,8 @@ export async function retryNativeWorkspaceExport(input: {
       && Number(lease.metadata?.pendingCleanupLeaseExpiresAtMs) > Date.now()
       && resumeIntent.resultId === result.id);
     if (!alreadyQueued && (coordinator.phase !== "terminal_failure" || coordinator.failureCode !== action.cause
-      || run.status !== "failed" || (!ownsResume && (!hasRemoteTerminationReceipt(lease)
+      || run.status !== "failed" || (!ownsResume && (!(hasRemoteTerminationReceipt(lease)
+        || isNativeWorkspaceExportReleaseHold(lease) && hasBoundRemoteStopReceipt(lease))
         || record(lease.metadata?.remoteExecutionTermination).state !== "stopped")))) throw changed();
     if (resumeRequestId && !ownsResume) throw changed();
     const [environment] = await db.select().from(environments).where(eq(environments.id, lease.environmentId)).limit(1);

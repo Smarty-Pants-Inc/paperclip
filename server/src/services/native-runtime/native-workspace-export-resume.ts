@@ -5,6 +5,8 @@ import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, nativeRunFinalizations, nativeRunResults, type Db } from "@paperclipai/db";
 import { remoteTerminationReceipt } from "../remote-execution-termination.js";
 import { readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
+import { guardedNativeWorkspaceReleasePatch } from "./native-workspace-release-guard.js";
+import { notifyCancelledWorkspacePreservation } from "../cancelled-workspace-preservation-notifications.js";
 
 type Lease = {
   id: string; companyId: string; heartbeatRunId: string | null;
@@ -109,10 +111,15 @@ export async function settleNativeWorkspaceExportResume(db: Db, lease: Lease, op
   const stopped = receipt?.state === "stopped";
   const now = new Date();
   const [row] = await writeEnvironmentCleanup(db, async tx => {
-    if (stopped) await notifyRetainedNativeSessionCleanup(tx, { companyId: lease.companyId, runId: lease.heartbeatRunId! });
+    if (stopped) {
+      await notifyRetainedNativeSessionCleanup(tx, { companyId: lease.companyId, runId: lease.heartbeatRunId! });
+      await notifyCancelledWorkspacePreservation(tx, { companyId: lease.companyId, runId: lease.heartbeatRunId! });
+    }
     return tx.update(environmentLeases).set({
       status: stopped ? options.status ?? "released" : "pending_cleanup", cleanupStatus: stopped ? "success" : "failed",
       releasedAt: now, lastUsedAt: now, updatedAt: now,
+      ...(stopped ? guardedNativeWorkspaceReleasePatch({ status: options.status ?? "released", cleanupStatus: "success",
+        releasedAt: now, failureReason: null }) : {}),
       metadata: sql`(${environmentLeases.metadata} - 'remoteExecutionTermination'
         ${stopped ? sql`- 'nativeWorkspaceExportResume'` : sql``}) || ${JSON.stringify({
           ...(stopped ? { remoteExecutionTermination: receipt } : {}),

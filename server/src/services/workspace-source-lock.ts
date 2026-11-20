@@ -83,7 +83,7 @@ function heldScope(): SourceLockScope | undefined {
  * preparation, that can start inside another operation's source scope.
  * Joining that scope would tie these locks to the other transaction. */
 export function withIndependentWorkspaceSourceLocks<T>(db: Db,
-  input: { companyId: string; issueIds?: readonly string[]; projectIds?: readonly string[] },
+  input: { companyId: string; issueIds?: readonly string[]; projectIds?: readonly string[]; workspaceIds?: readonly string[] },
   action: (transaction: SourceTransaction) => Promise<T>, tryOnly = false, wait?: WorkspaceSourceLockWait): Promise<T> {
   return sourceLocks.exit(() => withWorkspaceSourceLocks(db, input, action, tryOnly, wait));
 }
@@ -94,13 +94,14 @@ export function withIsolatedRepositorySourceLock<T>(db: Db, companyId: string, i
 }
 
 export async function withWorkspaceSourceLocks<T>(db: Db,
-  input: { companyId: string; issueIds?: readonly string[]; projectIds?: readonly string[] },
+  input: { companyId: string; issueIds?: readonly string[]; projectIds?: readonly string[]; workspaceIds?: readonly string[] },
   action: (transaction: SourceTransaction) => Promise<T>, tryOnly = false, wait?: WorkspaceSourceLockWait): Promise<T> {
   if (wait && (!Number.isSafeInteger(wait.waitMs) || wait.waitMs < 1 || wait.waitMs > 2_147_483_647))
     throw new Error("workspace_source_wait_invalid");
   const keys = [...new Set([
     ...(input.issueIds ?? []).map(id => `isolated_repository_source:${input.companyId}:${id}`),
     ...(input.projectIds ?? []).map(id => `managed_project_source:${input.companyId}:${id}`),
+    ...(input.workspaceIds ?? []).map(id => `execution_workspace_source:${input.companyId}:${id}`),
   ])].sort();
   if (keys.length > 128) throw new Error("workspace_source_scope_limit");
   const held = heldScope();

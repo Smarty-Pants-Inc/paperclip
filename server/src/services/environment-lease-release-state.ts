@@ -7,6 +7,7 @@ import { ENVIRONMENT_CLEANUP_RETRY_MS, pendingCleanupDeadlineSql } from "./envir
 
 export function pendingRunLeaseReleaseCondition(destroy: boolean) {
   return or(eq(environmentLeases.status, "active"),
+    and(eq(environmentLeases.status, "retained"), eq(environmentLeases.failureReason, "workspace_export_pending")),
     and(eq(environmentLeases.status, "pending_cleanup"),
       sql`(${environmentLeases.metadata} ? 'nativeWorkspaceExportResume' or ${environmentLeases.metadata} ? 'sandboxStopAndRetain')`),
     destroy ? and(eq(environmentLeases.status, "retained"), eq(environmentLeases.cleanupStatus, "failed")) : undefined);

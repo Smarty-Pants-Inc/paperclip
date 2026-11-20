@@ -33,6 +33,7 @@ import { flushDeferredEnvironmentCleanup, registerDeferredEnvironmentCleanup, wr
 import { executeEnvironmentTask, pluginEnvironmentSupportsTasks, settleDispatchedEnvironmentTask } from "./environment-task-runtime.js";
 import { allowLegacyShutdownWorkspaceCleanup, legacyShutdownWorkspaceResourceProtected } from "./legacy-shutdown-workspace-settlement.js";
 import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-runtime/native-workspace-finalization-state.js";
+import { nativeWorkspaceReleaseAllowedCondition } from "./native-runtime/native-workspace-release-guard.js";
 import { hasNativeHarnessBackupMissing } from "./native-runtime/native-harness-backup-missing.js";
 import { nativeCustodyKeptRecovery, nativeLeaseChainCustodyStamp, nativeLeaseCustodyMissing } from "./native-runtime/native-lease-custody.js";
 import { abandonedWorkspaceFilesHeldOnLease, abandonedWorkspaceFilesParked, parkAbandonedWorkspaceFilesLease } from "./remote-workspace-abandoned-files-hold.js";
@@ -4830,6 +4831,16 @@ export function environmentRuntimeService(
       for (let leaseRow of leaseRows) {
         try {
           let providerResourceDisposition = desiredProviderResourceDisposition;
+          // Export precedes ANY release, including a non-destructive physical
+          // Stop. Do not stop the source out from under its file-only worker.
+          if (providerResourceDisposition !== "keep_running") {
+            const [ready] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+              eq(environmentLeases.id, leaseRow.id), nativeWorkspaceReleaseAllowedCondition()));
+            if (!ready) {
+              await environmentsSvc.releaseLease(leaseRow.id, status);
+              continue;
+            }
+          }
           if (providerResourceDisposition !== "stop_and_retain" && providerResourceDisposition !== "keep_running"
             && !hasStopOnlyCleanup(leaseRow) && await nativeWorkspaceExportPendingForLease(db, leaseRow)) continue;
           if (!(await allowLegacyShutdownWorkspaceCleanup(db, leaseRow, new Date(), {

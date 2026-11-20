@@ -22,6 +22,8 @@ import { preparedRemoteWorkspaceSource } from "../remote-workspace-lifecycle.js"
 import { releaseUnchangedRemoteWorkspaceWriterById } from "../remote-workspaces.js";
 import { ownLeaseStopRecord } from "../environment-lease-handoff.js";
 import { isSupersededWorkspaceExport, markSupersededWorkspaceExportHold } from "./native-superseded-workspace-export.js";
+import type { EnvironmentRuntimeService } from "../environment-runtime.js";
+import { exportTerminalNativeWorkspace, TERMINAL_WORKSPACE_EXPORT_RECHECK_MS, TERMINAL_WORKSPACE_EXPORT_STATUSES } from "./native-terminal-workspace-export.js";
 
 const reusableLeasePolicies = ["reuse_by_environment", "reuse_by_execution_workspace"];
 
@@ -288,6 +290,7 @@ const cancelledWorkspaceCursors = new WeakMap<Db, string>();
  * stop-and-retain receipt and the workspace still bound to this writer. */
 function cancelledWorkspaceSourceLease() {
   return or(eq(environmentLeases.status, "active"),
+    and(eq(environmentLeases.status, "retained"), eq(environmentLeases.failureReason, "workspace_export_pending")),
     and(inArray(environmentLeases.status, ["pending_cleanup", "released"]), eq(environmentLeases.leasePolicy, "ephemeral")),
     and(eq(environmentLeases.status, "released"), eq(environmentLeases.cleanupStatus, "success"),
       inArray(environmentLeases.leasePolicy, reusableLeasePolicies),
@@ -333,22 +336,32 @@ export async function preserveCancelledNativeWorkspaces(db: Db) {
 }
 
 function pendingCancelledWorkspace() {
-  return sql`${heartbeatRuns.runtimeMode} = 'native' AND ${heartbeatRuns.status} = 'cancelled'
-    AND (${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync'->>'state' = 'prepared' OR ${heartbeatRuns.runnerProfileJson}->'remoteWorkspace'->>'state' = 'prepared')
-    AND ${heartbeatRuns.resultJson}->'nativeCancellation'->>'dispatchState' = 'acknowledged'
-    AND (${heartbeatRuns.resultJson}->'workspaceRestoreRecovery'->>'schema' = 'paperclip.workspace-restore-recovery.v1'
-      AND ${heartbeatRuns.resultJson}->>'workspaceRestoreFailure' IN (${workspaceRestoreFailureCodesSql})) IS NOT TRUE`;
+  return sql`${heartbeatRuns.runtimeMode} = 'native' AND (
+    (${inArray(heartbeatRuns.status, TERMINAL_WORKSPACE_EXPORT_STATUSES)}
+      AND ${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync'->>'state' = 'prepared')
+    OR (${heartbeatRuns.status} = 'cancelled'
+      AND ${heartbeatRuns.runnerProfileJson}->'remoteWorkspace'->>'state' = 'prepared'
+      AND ${heartbeatRuns.resultJson}->'nativeCancellation'->>'dispatchState' = 'acknowledged'
+      AND (${heartbeatRuns.resultJson}->'workspaceRestoreRecovery'->>'schema' = 'paperclip.workspace-restore-recovery.v1'
+        AND ${heartbeatRuns.resultJson}->>'workspaceRestoreFailure' IN (${workspaceRestoreFailureCodesSql})) IS NOT TRUE))`;
 }
 
 export function registerCancelledWorkspacePreservationWork(db: Db,
   coordinator: ReturnType<typeof createDeliveryWorkCoordinator>, canRun: () => boolean,
-  canRecover: () => Promise<boolean>) {
+  canRecover: () => Promise<boolean>, options: {
+    environmentRuntime?: EnvironmentRuntimeService;
+    isRunActive?: (runId: string) => boolean;
+  } = {}) {
   type Entry = { id: string; companyId: string; dueAt: number };
   type Candidate = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "issueId" | "nativeIssueId"
     | "runtimeMode" | "driverKind" | "status" | "resultJson" | "runnerProfileJson">;
-  const eligible = (run: Candidate) => run.nativeIssueId !== null && hasAcknowledgedNativeRunStopRequest(run)
+  const terminalSync = (run: Candidate) => Boolean(options.environmentRuntime
+    && TERMINAL_WORKSPACE_EXPORT_STATUSES.includes(run.status)
+    && readNativeWorkspaceSyncReference(run.runnerProfileJson?.nativeWorkspaceSync)?.state === "prepared");
+  const eligible = (run: Candidate) => terminalSync(run) || run.status === "cancelled" && run.nativeIssueId !== null
+    && !nativeRunHasNoWorkspaceAccess(run) && hasAcknowledgedNativeRunStopRequest(run)
     && workspaceRecoveryReference(run.runnerProfileJson)?.state === "prepared"
-    && !hasRequiredWorkspaceRecovery(run.resultJson) && !nativeRunHasNoWorkspaceAccess(run);
+    && !hasRequiredWorkspaceRecovery(run.resultJson);
   const scopeCondition = (scope?: CancelledWorkspacePreservationScope) => scope ? and(
     eq(heartbeatRuns.companyId, scope.companyId), scope.runId ? eq(heartbeatRuns.id, scope.runId) : undefined) : undefined;
   async function load(scope: CancelledWorkspacePreservationScope | undefined, signal?: AbortSignal) {
@@ -375,6 +388,11 @@ export function registerCancelledWorkspacePreservationWork(db: Db,
     if (!canRun() || signal?.aborted) throw new Error("Cancelled workspace preservation stopped");
     const controllerDeadline = run.controllerLeaseExpiresAt?.getTime();
     if (controllerDeadline && controllerDeadline > Date.now()) return { ...entry, dueAt: controllerDeadline };
+    if (terminalSync(run)) {
+      const outcome = await exportTerminalNativeWorkspace({ db, companyId: run.companyId, runId: run.id,
+        environmentRuntime: options.environmentRuntime!, isRunActive: options.isRunActive });
+      return outcome === "pending" ? { ...entry, dueAt: Date.now() + TERMINAL_WORKSPACE_EXPORT_RECHECK_MS } : null;
+    }
     const [finalization] = await db.select().from(nativeRunFinalizations).where(and(
       eq(nativeRunFinalizations.runId, run.id), eq(nativeRunFinalizations.companyId, run.companyId),
       eq(nativeRunFinalizations.issueId, run.nativeIssueId!),
@@ -398,6 +416,7 @@ export function registerCancelledWorkspacePreservationWork(db: Db,
   }
   return registerScopedDeadlineWork(coordinator, {
     queue: DELIVERY_QUEUES.cancelledWorkspacePreservation, batchSize: 5,
+    concurrentChecks: { limit: 4, key: (entry: Entry) => entry.id },
     decodeScope: (hint: string): CancelledWorkspacePreservationScope | undefined => hint === "*" ? undefined : JSON.parse(hint),
     matches: (entry: Entry, scope?: CancelledWorkspacePreservationScope) => !scope ||
       entry.companyId === scope.companyId && (!scope.runId || entry.id === scope.runId),

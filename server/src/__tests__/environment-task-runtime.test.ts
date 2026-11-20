@@ -203,8 +203,13 @@ describe("plugin-provided Runner execution", () => {
     const fixture = database(value, [], [], [owner]);
     await executeEnvironmentTask(fixture.db, worker() as never, { companyId: "company", leaseId, operation: { kind: "complete" } });
     expect(fixture.transaction).toHaveBeenCalledOnce();
-    expect(fixture.sets).toEqual(expect.arrayContaining([expect.objectContaining({ status: "released", cleanupStatus: "success",
-      releasedAt: expect.any(Date), metadata: expect.anything() })]));
+    const retirement = fixture.sets.find(set => set.status);
+    expect(retirement?.metadata).toBeDefined();
+    const status = new PgDialect().sqlToQuery(retirement!.status as never);
+    expect(status.sql).toContain("nativeWorkspaceSync,state");
+    expect(status.sql).toContain("else 'retained'");
+    expect(status.params).toContain("released");
+    expect(new PgDialect().sqlToQuery(retirement!.cleanupStatus as never).params).toContain("success");
   });
 
   it("releases fresh transfer copies only after confirmed task completion", async () => {

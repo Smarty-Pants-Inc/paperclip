@@ -287,7 +287,8 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         await settleStopOnlyCleanup(db, stopping, { attemptId: String(stopping.metadata?.pendingCleanupAttemptId),
           receipt: { providerLeaseId: f.lease.providerLeaseId, state: "stopped" } });
         await vi.advanceTimersByTimeAsync(10_000); await pinned(f);
-        expect((await readLease(f.lease.id)).status).toBe("released");
+        expect(await readLease(f.lease.id)).toMatchObject({ status: "retained", cleanupStatus: "failed",
+          failureReason: "workspace_export_pending", releasedAt: null });
       } finally { await worker.stop(); }
     });
     it("retries failed owner transactions without blocking another cancelled source", async () => {
@@ -591,7 +592,8 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
     await settleStopOnlyCleanup(db, stopping, { attemptId: String(stopping.metadata?.pendingCleanupAttemptId),
       receipt: { providerLeaseId: f.lease.providerLeaseId, state: "stopped" } });
     for (let pass = 0; pass < 3; pass++) await preserveCancelledNativeWorkspaces(db);
-    expect(await readLease(f.lease.id)).toMatchObject({ status: "released", leasePolicy: "retain_on_failure",
+    expect(await readLease(f.lease.id)).toMatchObject({ status: "retained", cleanupStatus: "failed", releasedAt: null,
+      failureReason: "workspace_export_pending", leasePolicy: "retain_on_failure",
       metadata: { remoteExecutionTermination: { state: "stopped" } } });
     expect(await readRun(f.runId)).toMatchObject({ status: "cancelled", resultJson: {
       workspaceRestoreRecovery: { leaseIds: [f.lease.id] },
@@ -712,6 +714,21 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
     const [action] = await actions(f.issueId);
     const decision = { runId: f.runId, providerStopped: true as const, actionOutcome: "mixed" as const,
       outcomeEvidence: "Files verified; no external action is replayed.", workspaceRepairEvidence: "Exact retained allocation exported and every source hash checked." };
+    await expect(validateExecutionReconciliation({ db, companyId: f.companyId, issueId: f.issueId,
+      agentId: null, sourceRunId: f.runId, decision, workspaceRepairOnly: true }))
+      .rejects.toThrow("has not finished releasing its authority");
+    // Permission-layer fixture starts after the copy owner's verified read-back.
+    // Actual archive/hash/read-back is exercised in native-cancelled-workspace-preservation.test.ts.
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...f.run.runnerProfileJson,
+      nativeWorkspaceSync: { ...f.run.runnerProfileJson!.nativeWorkspaceSync as object,
+        state: "finalized", finalHostSha256: "a".repeat(64) } }, updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, f.runId));
+    const stopped = await readLease(f.lease.id);
+    const termination = (await import("../remote-execution-termination.js"))
+      .remoteTerminationReceipt(stopped, stopped.metadata?.remoteExecutionTermination);
+    expect(termination?.state).toBe("stopped");
+    await (await import("../environments.js")).environmentService(db).releaseLease(f.lease.id,
+      "released", { cleanupStatus: "success", remoteExecutionTermination: termination });
     await validateExecutionReconciliation({ db, companyId: f.companyId, issueId: f.issueId,
       agentId: null, sourceRunId: f.runId, decision, workspaceRepairOnly: true });
     await markExecutionReconciliation(db, action!, decision, "board-operator", undefined, { workspaceRepairOnly: true });

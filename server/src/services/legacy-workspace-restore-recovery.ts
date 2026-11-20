@@ -24,7 +24,9 @@ function leaseScope(run: Run, source?: LegacyWorkspaceRestoreSource) {
     or(eq(environmentLeases.status, "active"), and(
       sql`${environmentLeases.metadata}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`,
       sql`${environmentLeases.metadata}->'workspaceRestoreRecovery'->>'runId' = ${run.id}`),
-      source ? and(eq(environmentLeases.id, source.id), eq(environmentLeases.status, "released")) : undefined),
+      source ? and(eq(environmentLeases.id, source.id), or(eq(environmentLeases.status, "released"),
+        and(eq(environmentLeases.status, "retained"),
+          eq(environmentLeases.failureReason, "workspace_export_pending")))) : undefined),
     isNotNull(environmentLeases.providerLeaseId),
     isNotNull(environmentLeases.provider), ne(environmentLeases.provider, "local"),
     or(eq(environments.driver, "sandbox"), sql`${environmentLeases.metadata}->>'driver' = 'sandbox'`,

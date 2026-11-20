@@ -108,6 +108,17 @@ describe("reconstruction after confirmed native workspace loss", () => {
     const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
     await settleStopOnlyCleanup(db, lease, { attemptId: String(lease.metadata?.pendingCleanupAttemptId),
       receipt: { providerLeaseId, state: "stopped" } });
+    // This permission-layer fixture resumes after the copy owner's verified read-back.
+    // Physical copy/read-back/release ordering is tested by the registered-worker rows.
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...run.runnerProfileJson,
+      nativeWorkspaceSync: { ...run.runnerProfileJson!.nativeWorkspaceSync as object,
+        state: "finalized", finalHostSha256: "b".repeat(64) } }, updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+    const [stopped] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    const termination = remoteTerminationReceipt(stopped, stopped.metadata?.remoteExecutionTermination);
+    expect(termination?.state).toBe("stopped");
+    await (await import("../environments.js")).environmentService(db).releaseLease(leaseId,
+      "released", { cleanupStatus: "success", remoteExecutionTermination: termination });
     const repair = (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId)))
       .find(action => action.evidence.runId === runId)!;
     const decision = { runId, providerStopped: true as const, actionOutcome: "not_performed" as const,

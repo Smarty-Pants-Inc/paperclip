@@ -8,6 +8,8 @@ import { notifyNativeEnvironmentSettlement } from "./native-environment-settleme
 import { notifyRetainedNativeSessionCleanup } from "./retained-native-session-cleanup-notifications.js";
 import { notifyChatInboundWakeNotices } from "./chat-inbound-wake-notice-notifications.js";
 import { notifyEnvironmentCleanup } from "./environment-cleanup-notifications.js";
+import { notifyCancelledWorkspacePreservation } from "./cancelled-workspace-preservation-notifications.js";
+import { nativeWorkspaceReleaseAllowedCondition } from "./native-runtime/native-workspace-release-guard.js";
 import { notifyDeferredExecutionWork, notifyDeferredWakesForRun } from "./deferred-execution-notifications.js";
 import { withoutCleanupVerification } from "./cleanup-verification-proof.js";
 import { withEnvironmentLeaseController } from "./environment-lease-controller.js";
@@ -1798,6 +1800,16 @@ export function environmentService(db: Db) {
           creationOperationId: sql<string | null>`${environmentLeases.metadata}->>'creationOperationId'`,
         }).from(environmentLeases).where(condition).for("update");
         if (!previous) return null;
+        if (status !== "retained" && status !== "pending_cleanup") {
+          const [ready] = await tx.select({ id: environmentLeases.id }).from(environmentLeases)
+            .where(and(condition, nativeWorkspaceReleaseAllowedCondition()));
+          if (!ready) {
+            await notifyCancelledWorkspacePreservation(tx, { companyId: previous.companyId, runId: previous.heartbeatRunId ?? undefined });
+            await tx.update(environmentLeases).set({ status: "retained", releasedAt: null,
+              cleanupStatus: "failed", failureReason: "workspace_export_pending", updatedAt: now }).where(condition);
+            return null;
+          }
+        }
         await notifyEnvironmentCleanup(tx, { companyId: previous.companyId, runId: previous.heartbeatRunId ?? undefined, leaseId: id });
         if (previous.heartbeatRunId && (previous.status !== status ||
             (options?.cleanupStatus !== undefined && previous.cleanupStatus !== options.cleanupStatus) ||
@@ -1836,7 +1848,7 @@ export function environmentService(db: Db) {
             ? sql`coalesce(${releaseMetadata}, '{}'::jsonb) || '{"pendingCleanupInFlight":false,"pendingCleanupLeaseExpiresAtMs":0}'::jsonb`
             : releaseMetadata,
         })
-        .where(condition)
+        .where(and(condition, status !== "retained" && status !== "pending_cleanup" ? nativeWorkspaceReleaseAllowedCondition() : undefined))
         .returning()
         .then((rows) => rows[0] ?? null);
         if (released) await clearRemoteWorkspaceLocationForReleasedLease({ db: tx, lease: toEnvironmentLease(released) });
@@ -1961,6 +1973,11 @@ export function environmentService(db: Db) {
           await promoteDeferredWorkIntents(tx, { companyId: run.companyId, trigger: "lock_released",
             issueId: run.issueId && /^[0-9a-f-]{36}$/i.test(run.issueId) ? run.issueId : null });
         }
+        if (run) await notifyCancelledWorkspacePreservation(tx, { companyId: run.companyId, runId: heartbeatRunId });
+        await tx.update(environmentLeases).set({ status: "retained", releasedAt: null,
+          cleanupStatus: "failed", failureReason: "workspace_export_pending", updatedAt: now }).where(and(
+          eq(environmentLeases.heartbeatRunId, heartbeatRunId), eq(environmentLeases.status, "active"),
+          sql`not ${nativeWorkspaceReleaseAllowedCondition()}`));
         return tx.update(environmentLeases)
         .set({
           status,
@@ -1972,6 +1989,7 @@ export function environmentService(db: Db) {
           and(
             eq(environmentLeases.heartbeatRunId, heartbeatRunId),
             eq(environmentLeases.status, "active"),
+            nativeWorkspaceReleaseAllowedCondition(),
           ),
         )
         .returning();

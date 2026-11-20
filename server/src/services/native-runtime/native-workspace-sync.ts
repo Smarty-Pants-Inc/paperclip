@@ -11,7 +11,8 @@ import fs from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq, ne, sql } from "drizzle-orm";
+import { withWorkspaceSourceLocks } from "../workspace-source-lock.js";
 import type { Db } from "@paperclipai/db";
 import { environmentLeases, heartbeatRuns } from "@paperclipai/db";
 import { retryUnlessTransactionBound } from "../transaction-retry.js";
@@ -84,6 +85,9 @@ interface NativeWorkspaceSyncDescriptor {
 }
 
 export interface NativeWorkspaceSyncReference {
+  /** Preparation chronology, carried forward unchanged at finalization. Older
+   * references recover this from their content-addressed descriptor. */
+  preparedAt?: string;
   schema: DescriptorSchema;
   state: NativeWorkspaceSyncState;
   descriptorSha256: string;
@@ -293,6 +297,7 @@ async function writeDescriptor(
   return {
     schema: descriptor.schema,
     state: descriptor.state,
+    preparedAt: descriptor.createdAt,
     descriptorSha256,
     baselineSha256: descriptor.baselineSha256,
     finalHostSha256: descriptor.finalHostSha256,
@@ -344,6 +349,8 @@ export function readNativeWorkspaceSyncReference(
     leaseId: candidate.leaseId,
     providerLeaseId: candidate.providerLeaseId,
     remoteCwd: candidate.remoteCwd,
+    ...(typeof candidate.preparedAt === "string" && Number.isFinite(Date.parse(candidate.preparedAt))
+      ? { preparedAt: candidate.preparedAt } : {}),
     resourceDisposition:
       candidate.resourceDisposition === "keep_running" ||
       candidate.resourceDisposition === "stop_and_retain" ||
@@ -849,6 +856,35 @@ async function prepareRuntime(input: {
   }));
 }
 
+/** Compare the generation that seeded the box, not completion order. All
+ * native publishers sharing this workspace take the existing source lock, so
+ * the check and physical merge cannot race a newer publisher. */
+async function assertNativeWorkspaceSnapshotOrder(db: Db, descriptor: NativeWorkspaceSyncDescriptor) {
+  const generation = Date.parse(descriptor.createdAt);
+  if (!Number.isFinite(generation)) throw new Error("native_workspace_sync_snapshot_order_unverified");
+  const others = await db.select({ id: heartbeatRuns.id, updatedAt: heartbeatRuns.updatedAt,
+    reference: sql<unknown>`${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync'` })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, descriptor.binding.companyId), ne(heartbeatRuns.id, descriptor.binding.runId),
+      sql`${heartbeatRuns.runnerProfileJson}#>>'{nativeWorkspaceSync,workspaceId}' = ${descriptor.binding.workspaceId}`,
+      sql`${heartbeatRuns.runnerProfileJson}#>>'{nativeWorkspaceSync,state}' = 'finalized'`));
+  for (const other of others) {
+    const reference = readNativeWorkspaceSyncReference(other.reference);
+    if (!reference?.finalHostSha256) throw new Error("native_workspace_sync_snapshot_order_unverified");
+    // Pre-field finalized descriptors were routinely cleaned up. A publication
+    // whose LAST write predates this preparation is necessarily older; this is
+    // only an upper bound, never a substitute generation for a later write.
+    if (!reference.preparedAt && other.updatedAt.getTime() < generation) continue;
+    let preparedAt = reference.preparedAt;
+    if (!preparedAt) {
+      try { preparedAt = (await readDescriptor({ runId: other.id, reference })).descriptor.createdAt; }
+      catch { throw new Error("native_workspace_sync_snapshot_order_unverified"); }
+    }
+    const otherGeneration = Date.parse(preparedAt);
+    if (!Number.isFinite(otherGeneration) || otherGeneration === generation) throw new Error("native_workspace_sync_snapshot_order_unverified");
+    if (otherGeneration > generation) throw new Error("native_workspace_sync_snapshot_superseded");
+  }
+}
+
 async function finalizePreparedRuntime(input: {
   db: Db;
   runId: string;
@@ -859,6 +895,10 @@ async function finalizePreparedRuntime(input: {
   onPhase?: RuntimeSpanRunner;
   onCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
 }): Promise<NativeWorkspaceSyncReference> {
+  return withWorkspaceSourceLocks(input.db, { companyId: input.descriptor.binding.companyId,
+    workspaceIds: [input.descriptor.binding.workspaceId] }, async () => {
+  await input.assertOwnership?.();
+  await assertNativeWorkspaceSnapshotOrder(input.db, input.descriptor);
   if (input.onPhase) await input.onPhase("workspace.restore", () => input.runtime.restoreWorkspace());
   else await input.runtime.restoreWorkspace();
   return measureRunPhase("execution.workspace_commit", async () => {
@@ -894,6 +934,7 @@ async function finalizePreparedRuntime(input: {
       stamp,
     });
     return reference;
+  });
   });
 }
 
