@@ -109,7 +109,8 @@ export async function nativeWorkspaceExportPendingForLease(db: Db, lease: Worksp
  * reference names this box (by providerLeaseId, or by any lease row on the box)
  * is still 'prepared' with no final host sha, i.e. its files were never
  * exported and the box holds the only copy. Fails closed on a partial reference.
- * Only positive proof the run never started (cancelled, no process ids, no
+ * Only AUTHORITATIVE proof the run never started (cancelled, startedAt null,
+ * no lease on the box with an accepted runner task, no process ids, no
  * start/session/turn/tool event) lets the cut run's reference stop holding.
  */
 export async function boxHasUnexportedPreparedWork(db: Db, box: { companyId: string; providerLeaseId: string }):
@@ -122,8 +123,15 @@ export async function boxHasUnexportedPreparedWork(db: Db, box: { companyId: str
     sql`(${reference}->>'providerLeaseId' = ${box.providerLeaseId} or ${reference}->>'leaseId' in (
       select ${environmentLeases.id}::text from ${environmentLeases}
       where ${environmentLeases.companyId} = ${box.companyId} and ${environmentLeases.providerLeaseId} = ${box.providerLeaseId}))`,
+    // Absence of process fields is not proof: the run must never have started
+    // (startedAt null) and no lease on the box (or of the run) may record an
+    // accepted runner task (runnerTaskDispatched), or the box is held.
     sql`not (${heartbeatRuns.status} = 'cancelled' and ${heartbeatRuns.processPid} is null
       and ${heartbeatRuns.processGroupId} is null and ${heartbeatRuns.processStartedAt} is null
+      and ${heartbeatRuns.startedAt} is null
+      and not exists (select 1 from ${environmentLeases} dispatched where dispatched.company_id = ${box.companyId}
+        and (dispatched.provider_lease_id = ${box.providerLeaseId} or dispatched.heartbeat_run_id = ${heartbeatRuns.id})
+        and dispatched.metadata->>'runnerTaskDispatched' = 'true')
       and not exists (select 1 from ${heartbeatRunEvents} where ${and(eq(heartbeatRunEvents.companyId, heartbeatRuns.companyId),
         eq(heartbeatRunEvents.runId, heartbeatRuns.id), executionStartedEventPredicate())}))`,
   ));

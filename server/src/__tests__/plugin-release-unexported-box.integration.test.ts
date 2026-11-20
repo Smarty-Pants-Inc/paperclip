@@ -8,6 +8,7 @@ import { eq, sql } from "drizzle-orm";
 import { agents, companies, createDb, applyPendingMigrations, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, plugins, projects, sandboxCreationOperations } from "@paperclipai/db";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { environmentService } from "../services/environments.js";
+import { KEPT_UNSTOPPED_BOX_BOUND_MS } from "../services/warm-sandbox-expiry.js";
 import { recordSandboxCreationResource } from "../services/sandbox-creation-operations.js";
 import { resolvePluginTaskResume } from "../services/environment-task-runtime.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -21,7 +22,7 @@ const support=external ? {supported:true} : await getEmbeddedPostgresTestSupport
  afterAll(async()=>{await stop?.();});
  async function fixture(initialProjects:string[]=[],initialExpiry?:string,deadline?:Date){
   const companyId=randomUUID(),agentId=randomUUID(),issueId=randomUUID(),environmentId=randomUUID(),pluginId=randomUUID();
-  let runId=randomUUID(),allocation=0,stopped=false,outage=false,releaseFails=false,unavailable=false;
+  let stopOffered=true,runId=randomUUID(),allocation=0,stopped=false,outage=false,releaseFails=false,unavailable=false;
   const calls:string[]=[],dispatched:Array<[string,string]>=[],failures=new Set<string>();
   const releaseMetadata: unknown[] = [];
   let projectIds=[...initialProjects],providerExpiry=initialExpiry;
@@ -37,7 +38,7 @@ const support=external ? {supported:true} : await getEmbeddedPostgresTestSupport
   await db.insert(plugins).values({id:pluginId,pluginKey:pluginId,packageName:"fixture-warm",version:"1.0.0",status:"ready",manifestJson:{
    capabilities:["environment.drivers.register"],environmentDrivers:[{driverKey:"tasks",supportsTasks:true,warmTaskVersion:1}],
   } as never});
-  const workers={isRunning:()=>true,getWorker:()=>({supportedMethods:["environmentTask","environmentAcquireLease","environmentResumeLease","environmentReleaseLease","environmentStopLease","environmentDestroyLease"]}),
+  const workers={isRunning:()=>true,getWorker:()=>({supportedMethods:["environmentTask","environmentAcquireLease","environmentResumeLease","environmentReleaseLease","environmentStopLease","environmentDestroyLease"].filter(m=>stopOffered||m!=="environmentStopLease")}),
    call:async(_id:string,method:string,p:any)=>{
     calls.push(method==="environmentTask" ? p.operation.kind : method);
     if(method==="environmentTask") dispatched.push([p.operation.kind,p.taskId]);
@@ -69,7 +70,7 @@ const support=external ? {supported:true} : await getEmbeddedPostgresTestSupport
   await runtime().releaseRunLeases(runId,"released",undefined,"keep_running");
   await db.update(heartbeatRuns).set({status:"succeeded"}).where(eq(heartbeatRuns.id,runId));
   return {agentId,issueId,firstRunId:runId,companyId,first,identity,calls,dispatched,runtime,acquire,acquireRequests,releaseMetadata,
-   fail(kind:string){failures.add(kind);},unavailable(){unavailable=true;},
+   fail(kind:string){failures.add(kind);},unavailable(){unavailable=true;},noStop(){stopOffered=false;},
    setExpiry(next?:string){providerExpiry=next;},
    async nextRun(){runId=randomUUID();await db.insert(heartbeatRuns).values({id:runId,companyId,agentId,nativeIssueId:issueId,invocationSource:"manual",status:"running"});return runId;},
    setProjects(next:string[]){projectIds=next;},stopped(){stopped=true;},failRelease(){releaseFails=true;},restoreRelease(){releaseFails=false;},outage(){outage=true;},
@@ -121,13 +122,37 @@ const support=external ? {supported:true} : await getEmbeddedPostgresTestSupport
   expect(f.calls).not.toContain("environmentStopLease");
   expect((await oldRow(f.first.lease.id)).metadata?.unexportedWorkKept).toBeUndefined();
  });
+ // Authoritative never-launched proof: no startedAt, no accepted runner task on
+ // the box, no process ids, no start event. (The fixture submits a task, so a
+ // genuinely never-dispatched cut is recorded as runnerTaskDispatched false.)
+ async function neverDispatched(leaseId:string){
+  await db.update(environmentLeases).set({metadata:sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || '{"runnerTaskDispatched":false}'::jsonb`}).where(eq(environmentLeases.id,leaseId));
+ }
  it("(d) a cut with positive never-started proof may be released",async()=>{
   const f=await fixture();const box=f.first.lease.providerLeaseId!;
   await cutRun(f.firstRunId,reference(f.first.lease.id,box),false);
+  await neverDispatched(f.first.lease.id);
   f.unavailable();await f.nextRun();
   await f.acquire();
   expect(f.calls).toContain("environmentReleaseLease");
   expect(f.calls).not.toContain("environmentStopLease");
+ });
+ it("(d2) no process ids but an ACCEPTED runner task (runnerTaskDispatched) is not never-launched proof: held",async()=>{
+  const f=await fixture();const box=f.first.lease.providerLeaseId!;
+  expect((await oldRow(f.first.lease.id)).metadata?.runnerTaskDispatched).toBe(true);
+  await cutRun(f.firstRunId,reference(f.first.lease.id,box),false);
+  f.unavailable();await f.nextRun();
+  await f.acquire();
+  expectKept(f,await oldRow(f.first.lease.id),box,[f.firstRunId]);
+ });
+ it("(d3) no process ids and no accepted task but startedAt set is not never-launched proof: held",async()=>{
+  const f=await fixture();const box=f.first.lease.providerLeaseId!;
+  await cutRun(f.firstRunId,reference(f.first.lease.id,box),false);
+  await neverDispatched(f.first.lease.id);
+  await db.update(heartbeatRuns).set({startedAt:new Date()}).where(eq(heartbeatRuns.id,f.firstRunId));
+  f.unavailable();await f.nextRun();
+  await f.acquire();
+  expectKept(f,await oldRow(f.first.lease.id),box,[f.firstRunId]);
  });
  it("(d') a cut with no process ids but a tool event still holds the box",async()=>{
   const f=await fixture();const box=f.first.lease.providerLeaseId!;
@@ -179,6 +204,34 @@ const support=external ? {supported:true} : await getEmbeddedPostgresTestSupport
   expect(r.calls).toContain("environmentStopLease");
   expect(r.receipt).toMatchObject({providerLeaseId:box,state:"stopped"});
   expect((await oldRow(f.first.lease.id)).metadata?.unexportedWorkKept).toBeUndefined();
+ });
+ it("(i) MONEY: no provider stop never labels the running box stopped and never releases it; kept with owner + bound + alarm",async()=>{
+  const f=await fixture();const box=f.first.lease.providerLeaseId!;
+  await cutRun(f.firstRunId,reference(f.first.lease.id,box));
+  f.noStop();f.unavailable();await f.nextRun();
+  const before=Date.now();const next=await f.acquire();
+  expect(next.lease.providerLeaseId).not.toBe(box);
+  for(const m of ["environmentReleaseLease","environmentDestroyLease","environmentStopLease"]) expect(f.calls).not.toContain(m);
+  const row=await oldRow(f.first.lease.id);
+  expect(row.status).toBe("retained");expect(row.releasedAt).toBeNull();expect(row.heartbeatRunId).toBe(f.firstRunId);
+  expect(row.metadata?.remoteExecutionTermination).toBeUndefined();
+  expect(row.metadata?.pluginLeaseCleanupMethod).not.toBe("stop");
+  expect(row.metadata).toMatchObject({unexportedWorkKept:{runIds:[f.firstRunId],providerLeaseId:box,providerStop:"unavailable"}});
+  expect(row.expiresAt).not.toBeNull();
+  expect(row.expiresAt!.getTime()-before).toBeGreaterThanOrEqual(KEPT_UNSTOPPED_BOX_BOUND_MS-60000);
+  expect(row.expiresAt!.getTime()-before).toBeLessThanOrEqual(KEPT_UNSTOPPED_BOX_BOUND_MS+60000);
+ });
+ it("(j) MONEY: a stop-only retry with no provider stop returns NO stop receipt and keeps the held box",async()=>{
+  const f=await fixture();const box=f.first.lease.providerLeaseId!;
+  await cutRun(f.firstRunId,reference(f.first.lease.id,box));
+  f.noStop();
+  const r=await stopOnlyRetry(f);
+  expect(r.receipt).toBeUndefined();
+  for(const m of ["environmentReleaseLease","environmentDestroyLease","environmentStopLease"]) expect(r.calls).not.toContain(m);
+  const row=await oldRow(f.first.lease.id);
+  expect(row.metadata?.remoteExecutionTermination).toBeUndefined();
+  expect(row.metadata).toMatchObject({unexportedWorkKept:{runIds:[f.firstRunId],providerLeaseId:box,providerStop:"unavailable"}});
+  expect(row.expiresAt).not.toBeNull();
  });
  it("(h) control: a real release-intent retry with a FINALIZED reference releases as today",async()=>{
   const f=await fixture();const box=f.first.lease.providerLeaseId!;

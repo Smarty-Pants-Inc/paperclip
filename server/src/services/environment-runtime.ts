@@ -290,7 +290,7 @@ export {
   type EnvironmentDriverCapabilitySupport,
 } from "./environment-driver-traits.js";
 import { ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT } from "./environment-driver-traits.js";
-import { warmSandboxWindowMetadata } from "./warm-sandbox-expiry.js";
+import { KEPT_UNSTOPPED_BOX_BOUND_MS, warmSandboxWindowMetadata } from "./warm-sandbox-expiry.js";
 
 /**
  * The one general capability classifier. It resolves each of the eight effective
@@ -4110,9 +4110,11 @@ function createPluginEnvironmentDriver(
     const lease = toEnvironmentLeaseSnapshot(current);
     const { plugin, driverKey, driverConfig } = await resolvePluginDriverForRelease({ ...input, lease });
     const environmentId = input.environment?.id ?? readString(lease.metadata?.environmentId);
+    let heldRunIds: string[] | null = null;
     if (lease.providerLeaseId) {
       const unexported = await boxHasUnexportedPreparedWork(db, { companyId: lease.companyId, providerLeaseId: lease.providerLeaseId });
       if (unexported.held) {
+        heldRunIds = unexported.runIds;
         logger.warn({ leaseId: lease.id, providerLeaseId: lease.providerLeaseId, runIds: unexported.runIds },
           "box kept, not released: stop-only cleanup on a box holding unexported prepared workspace work");
         await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
@@ -4120,15 +4122,36 @@ function createPluginEnvironmentDriver(
         })}::jsonb` }).where(scope);
       }
     }
+    void settled;
     const receipt = environmentId && workerManager.getWorker(plugin.id)?.supportedMethods.includes("environmentStopLease")
       ? await workerManager.call(plugin.id, "environmentStopLease", {
         driverKey, companyId: lease.companyId, environmentId, issueId: lease.issueId,
         config: driverConfig, providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata ?? undefined,
       }) : undefined;
-    const taskStopped = settled !== false ||
-      (lease.metadata?.runnerTaskLease === true && lease.metadata?.runnerTaskDispatched !== true && !lease.metadata?.runnerTaskStartup && !lease.metadata?.runnerTaskStartupCleanup);
-    return remoteTerminationReceipt(lease, receipt) ? receipt
-      : taskStopped ? { providerLeaseId: lease.providerLeaseId, state: "stopped" } : undefined;
+    // Never-OK: settling the runner task is not stopping the allocation. Only
+    // the provider's own stop receipt says the box is stopped; without one the
+    // stop-only obligation stays open (the settle keeps it pending, never released).
+    if (remoteTerminationReceipt(lease, receipt)) return receipt;
+    if (heldRunIds) await keepUnstoppedBox(lease, heldRunIds);
+    return undefined;
+  }
+
+  /** A box we could not stop (no provider stop capability or no stop receipt):
+   * it still RUNS, so nothing may say it stopped, and it holds unexported work,
+   * so nothing may release it. Keep it, owned by its run, with a named expiry
+   * bound for the retained-box sweep, and raise ONE alarm naming the box. */
+  async function keepUnstoppedBox(lease: EnvironmentLease, runIds: string[]) {
+    const scope = and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId));
+    const expiresAt = new Date(Date.now() + KEPT_UNSTOPPED_BOX_BOUND_MS);
+    const [row] = await db.update(environmentLeases).set({ expiresAt, updatedAt: new Date(),
+      metadata: sql`(coalesce(${environmentLeases.metadata}, '{}'::jsonb) - 'remoteExecutionTermination') || ${JSON.stringify({
+        unexportedWorkKept: { runIds, providerLeaseId: lease.providerLeaseId, at: new Date().toISOString(),
+          providerStop: "unavailable", keptUntil: expiresAt.toISOString() },
+      })}::jsonb` }).where(scope).returning();
+    logger.error({ alarm: "kept_box_still_running", leaseId: lease.id, providerLeaseId: lease.providerLeaseId,
+      runId: lease.heartbeatRunId, runIds, keptUntil: expiresAt.toISOString() },
+      "ALARM: box still running and kept (not stopped, not released): it holds unexported prepared work and the provider offered no stop");
+    return row ?? null;
   }
 
   /** Stop and KEEP a box whose files were never exported: no provider release
@@ -4146,16 +4169,24 @@ function createPluginEnvironmentDriver(
         driverKey, companyId: lease.companyId, environmentId, issueId: lease.issueId,
         config: driverConfig, providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata ?? undefined,
       }) : undefined;
+    void settled;
+    // Never-OK: settling the runner task is not stopping the allocation. Without
+    // the provider's own stop receipt the box still runs: never label it stopped
+    // and never release it; keep it retained with an owner and a bounded expiry.
+    if (!remoteTerminationReceipt(lease, receipt)) {
+      const kept = await environmentsSvc.releaseLease(lease.id, "retained", {});
+      if (!kept) return null;
+      const row = await keepUnstoppedBox(lease, runIds);
+      return row ? toEnvironmentLeaseSnapshot(row) : kept;
+    }
     logger.warn({ leaseId: lease.id, providerLeaseId: lease.providerLeaseId, runIds },
       "box kept, not released: it holds unexported prepared workspace work");
     await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
       pluginLeaseCleanupMethod: "stop", unexportedWorkKept: { runIds, providerLeaseId: lease.providerLeaseId, at: new Date().toISOString() },
     })}::jsonb` }).where(scope);
-    const stopped = remoteTerminationReceipt(lease, receipt) ? receipt
-      : settled !== false ? { providerLeaseId: lease.providerLeaseId, state: "stopped" } : undefined;
     return await environmentsSvc.releaseLease(lease.id, input.status, {
       cleanupStatus: "success",
-      remoteExecutionTermination: remoteTerminationReceipt(lease, stopped),
+      remoteExecutionTermination: remoteTerminationReceipt(lease, receipt),
     });
   }
 

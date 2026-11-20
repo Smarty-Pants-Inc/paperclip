@@ -135,3 +135,10 @@ export function warmSandboxWindowMetadata(warmRunnerIdleTimeoutMs: number | unde
   return warmRunnerIdleTimeoutMs !== undefined && Number.isSafeInteger(warmRunnerIdleTimeoutMs) && warmRunnerIdleTimeoutMs > 0
     ? { [WARM_SANDBOX_IDLE_TIMEOUT_KEY]: warmRunnerIdleTimeoutMs } : {};
 }
+
+/**
+ * The bound on a box kept RUNNING because it holds unexported work and its
+ * provider offered no stop: the longest warm window plus the close margin.
+ * Recorded as the kept lease's expiresAt so the retained-box sweep can act.
+ */
+export const KEPT_UNSTOPPED_BOX_BOUND_MS = PAPERCLIP_RUNNER_IDLE_TIMEOUT_MAX_MS + WARM_SANDBOX_IDLE_CLOSE_MARGIN_MS;
