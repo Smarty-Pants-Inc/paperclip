@@ -18751,6 +18751,93 @@ describeEmbeddedPostgres("tool access service", () => {
     },
   );
 
+  it.each(["*", "owner/repo", "*,owner/repo"])("connects GitHub App repository scope %s through the route and refreshes installation access", async (repositories) => {
+    const company = await createCompany(db);
+    const app = createRouteApp(db);
+    const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey
+      .export({ type: "pkcs8", format: "pem" }).toString();
+    const permissions = { contents: "write", pull_requests: "write", issues: "read" };
+    const installationRepositories = Array.from({ length: 101 }, (_, index) => ({
+      id: index + 1, full_name: index === 0 ? "owner/repo" : `owner/repo${index}`, private: true,
+    }));
+    const mints: Array<{ repositories?: string[]; permissions: Record<string, string> }> = [];
+    const tokenScopes = new Map<string, string[] | undefined>();
+    const listedPages: number[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      if (String(url) === "https://api.githubcopilot.com/mcp/") {
+        const rpc = JSON.parse(String(init?.body));
+        return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { tools: [] } });
+      }
+      const path = String(url).replace("https://api.github.com", "");
+      if (path === "/app") return Response.json({ id: 123, slug: "test-app" });
+      if (path === "/app/installations/456") return Response.json({
+        id: 456, app_id: 123, account: { login: "owner" }, repository_selection: "all", permissions,
+      });
+      if (path === "/app/installations/456/access_tokens") {
+        const body = JSON.parse(String(init?.body));
+        mints.push(body);
+        const token = `recording-app-token-${mints.length}`;
+        tokenScopes.set(token, body.repositories);
+        return Response.json({ token, expires_at: new Date(Date.now() + 3_600_000).toISOString() });
+      }
+      if (path === "/users/test-app%5Bbot%5D") return Response.json({ id: 789, login: "test-app[bot]", type: "Bot" });
+      if (path.startsWith("/installation/repositories?")) {
+        const page = Number(new URL(String(url)).searchParams.get("page"));
+        listedPages.push(page);
+        const token = new Headers(init?.headers).get("Authorization")!.replace("Bearer ", "");
+        expect(tokenScopes.has(token)).toBe(true);
+        const scope = tokenScopes.get(token);
+        const visible = scope === undefined ? installationRepositories
+          : installationRepositories.filter(repo => scope.includes(repo.full_name.split("/")[1]!));
+        return Response.json({ repositories: visible.slice((page - 1) * 100, page * 100) });
+      }
+      throw new Error(`Unexpected GitHub request: ${path}`);
+    });
+    const connect = (scope: string) => request(app).post(`/api/companies/${company.id}/tools/apps/connect`).send({
+      galleryKey: "github", connectionMethodKey: "app-installation", grantKind: "organization", name: `GitHub ${scope}`,
+      configValues: { version: "1", appId: "123", installationId: "456", repositories: scope, permissionProfile: "author" },
+      credentialValues: { "credentials.privateKey": privateKey },
+    });
+    const response = await connect(repositories);
+    if (repositories.includes(",")) {
+      expect(response.status).toBe(422);
+      expect(response.body.details).toMatchObject({ code: "github_app_access_unavailable", reason: "configuration" });
+      expect(mints).toEqual([]);
+      expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, company.id))).toEqual([]);
+      return;
+    }
+    expect(response.status, JSON.stringify(response.body)).toBe(201);
+    expect(mints).toEqual([repositories === "*" ? { permissions } : { repositories: ["repo"], permissions }]);
+    const connectionId = response.body.connectionId as string;
+    const readGrant = async () => {
+      const result = await request(app).get(`/api/tool-connections/${connectionId}/grants`);
+      expect(result.status).toBe(200);
+      expect(result.body.grants).toHaveLength(1);
+      return result.body.grants[0];
+    };
+    const initial = await readGrant();
+    expect(initial.providerTenant.github.repositories.map((repo: { fullName: string }) => repo.fullName))
+      .toEqual(repositories === "*" ? installationRepositories.map(repo => repo.full_name) : ["owner/repo"]);
+    expect(initial.providerTenant.github.repositorySelection).toBe(repositories === "*" ? "all" : "selected");
+    if (repositories === "*") {
+      expect(listedPages).toContain(2);
+      const before = await request(app).get(`/api/tool-connections/${connectionId}`);
+      installationRepositories.push({ id: 102, full_name: "owner/added-later", private: true });
+      const refresh = await request(app).post(`/api/tool-connections/${connectionId}/health-check`).send({});
+      expect(refresh.status, JSON.stringify(refresh.body)).toBe(200);
+      const refreshed = await readGrant();
+      expect(refreshed.providerTenant.github.repositoryCount).toBe(102);
+      expect(refreshed.providerTenant.github.repositories).toContainEqual(expect.objectContaining({ fullName: "owner/added-later" }));
+      const after = await request(app).get(`/api/tool-connections/${connectionId}`);
+      expect(after.body.config.methodConfig).toEqual(before.body.config.methodConfig);
+      expect(after.body.config.methodConfig.repositories).toBe("*");
+      const explicit = await connect("owner/repo");
+      expect(explicit.status, JSON.stringify(explicit.body)).toBe(201);
+      expect(mints.at(-1)).toEqual({ repositories: ["repo"], permissions: mints[0]!.permissions });
+      expect(mints.slice(0, -1).every(body => !Object.hasOwn(body, "repositories"))).toBe(true);
+    }
+  });
+
   it.each(["managed", "mcp-key", "app-installation", "app-installation-explicit-app", "app-installation-draft"])("creates a GitHub App after recovering a retained %s connection", async (scenario) => {
     const previousMethod = scenario.startsWith("app-installation") ? "app-installation" : scenario;
     const previousStatus = scenario === "app-installation-draft" ? "draft" as const : "archived" as const;
