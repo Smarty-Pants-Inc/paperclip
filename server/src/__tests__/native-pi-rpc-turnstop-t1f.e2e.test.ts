@@ -83,6 +83,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
   const restartState = restartPhase === "2" ? JSON.parse(await readFile(restartStatePath!, "utf8")) : null;
   let keepPostgresForRestart = false;
   let failNextExecution = false;
+  let readStoppedCustody: (() => Promise<unknown>) | undefined;
+  let validationCustody: unknown;
   const fallback = scenario === "R-fallback" || scenario === "FILESTOP-fallback" || forgedProof || restartHook;
   const fileBytes = Buffer.from("Paul's completed write survives Stop.\nFILESTOP utf8: café 🌱\n", "utf8");
   expect(thinking).toBe("xhigh");
@@ -234,6 +236,12 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
             base64: existsSync(path) ? readFileSync(path).toString("base64") : null };
           await writeFile(join(root, "file-before-successor-tools.json"), JSON.stringify(request.fileBeforeTools, null, 2));
           stage("FILESTOP bytes before successor first tool", request.fileBeforeTools);
+          if (validationFails && readStoppedCustody) {
+            // Read-only: never finish the export in the test to hide a missing
+            // production save. This runs before returning the first tool call.
+            validationCustody = await readStoppedCustody().catch(error => ({ error: String(error) }));
+            await writeFile(join(root, "R6-server-custody-before-first-tool.json"), JSON.stringify(validationCustody, null, 2));
+          }
         }
         if (!warmup) {
           requests.push(request);
@@ -425,7 +433,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     await db.insert(environments).values({ id: environmentId, name: "Turnstop loopback allocation", driver: "sandbox",
       config: providerConfig }).onConflictDoNothing();
 
-    const exportAndReadBack = async (runId: string) => {
+    const exportAndReadBack = async (runId: string, recover = true) => {
       const [source] = await db!.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, runId));
       const environment = (await db!.select().from(environments).where(eq(environments.id, environmentId)))[0]!;
       const { environmentRuntimeService } = await import("../services/environment-runtime.js");
@@ -433,7 +441,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const target = await resolveEnvironmentExecutionTarget({ db: db!, companyId, adapterType: "paperclip_runner", environment,
         leaseId: source!.id, leaseMetadata: source!.metadata, lease: source!, environmentRuntime: environmentRuntimeService(db!) });
       const { cleanupNativeWorkspaceSync, resumeNativeWorkspaceSync, nativeWorkspaceSyncInternals: sync } = await import("../services/native-runtime/native-workspace-sync.js");
-      const completed = await resumeNativeWorkspaceSync({ db: db!, runId, target: target! });
+      const completed = recover ? await resumeNativeWorkspaceSync({ db: db!, runId, target: target! }) : false;
       if (completed) await cleanupNativeWorkspaceSync(runId);
       const [run] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       const reference = sync.readReference(run!.runnerProfileJson?.nativeWorkspaceSync)!;
@@ -447,7 +455,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       await restoreRemoteWorkspaceArchive({ archivePath, targetDir: restored, expectedManifestDigest: snapshot.manifestDigest });
       return { completed, archivePath, snapshot, restoredPath: restored, preparedAt: descriptor.createdAt, reference,
         serverFileBase64: (await readFile(join(workspace, "filestop.txt"))).toString("base64"),
-        fileBase64: (await readFile(join(restored, "filestop.txt"))).toString("base64") };
+        fileBase64: (await readFile(join(restored, "filestop.txt"))).toString("base64"),
+        fileSha256: createHash("sha256").update(await readFile(join(restored, "filestop.txt"))).digest("hex") };
     };
     const [{ createApp }, { createStorageService },  { createLocalDiskStorageProvider }, runner, { setupRunnerPrpWebSocketServer }, { subscribeCompanyLiveEvents }] = await Promise.all([
       import("../app.js"), import("../storage/service.js"), import("../storage/local-disk-provider.js"),
@@ -706,6 +715,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         expect(qualified).toBe(false);
       }
       if (validationFails) {
+        readStoppedCustody = () => exportAndReadBack(current.id, false);
         await writeFile(join(remoteWorkspace, ".paperclip-runtime", "paperclip-runner", "workspace-sync-v1.json"), "{}\n");
         stage("R6 corrupt remote warm stamp after qualified Stop", { qualified });
       }
@@ -846,8 +856,13 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         expect(nextLease?.providerLeaseId, "the same physical allocation, not merely a new durable lease").toBe(lease!.providerLeaseId);
         expect(stopCalls).toEqual([]);
         if (filestop) {
-          expect(first.fileBeforeTools?.exists, validationFails ? "R6 failed stamp validation restores host seed, losing stopped files" : "file exists on the box BEFORE successor's first tool").toBe(!validationFails);
-          if (!validationFails) expect(first.fileBeforeTools?.base64, "completed write survives Stop byte-for-byte before any successor tool").toBe(fileBytes.toString("base64"));
+          expect(first.fileBeforeTools?.exists, "file exists on the box BEFORE successor's first tool, even after failed warm validation").toBe(true);
+          expect(first.fileBeforeTools?.base64, "completed write survives Stop byte-for-byte before any successor tool").toBe(fileBytes.toString("base64"));
+          if (validationFails) expect(validationCustody, "stopped export was saved and read back before the first successor tool").toMatchObject({
+            fileBase64: fileBytes.toString("base64"),
+            serverFileBase64: fileBytes.toString("base64"),
+            fileSha256: createHash("sha256").update(fileBytes).digest("hex"),
+          });
         }
       }
       current = next;
@@ -864,11 +879,21 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     if (filestop) {
       const readResult = requests.find(row => row.turn === 1 && row.completed.includes(2));
       const readOutput = readResult?.input.find(item => item.type === "function_call_output" && JSON.stringify(item.output).includes(`${fact}_STEP2`));
-      if (!fallback && !validationFails) expect(readOutput?.output, "authorized successor really read the completed file").toContain(fileBytes.toString("utf8"));
+      if (!fallback) expect(readOutput?.output, "authorized successor really read the completed file").toContain(fileBytes.toString("utf8"));
       await writeFile(join(root, "filestop-result.json"), JSON.stringify({ scenario, qualified: observations[0]?.qualified,
         expectedBase64: fileBytes.toString("base64"), fileBeforeTools: requests.find(row => row.fileBeforeTools)?.fileBeforeTools,
         fileSurvived: requests.find(row => row.fileBeforeTools)?.fileBeforeTools?.base64 === fileBytes.toString("base64"),
         readOutput, observations }, null, 2));
+    }
+    if (validationFails) {
+      const allRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      const answers = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+        .filter(row => row.authorAgentId === agentId && row.body.includes("T1F_SIX_STEPS_DONE_1"));
+      expect(answers, "R6 answers the question exactly once").toHaveLength(1);
+      expect(allRuns.filter(run => ["failed", "timed_out"].includes(run.status)), "R6 has no failed turn").toHaveLength(0);
+      await writeFile(join(root, "R6-acceptance.json"), JSON.stringify({ answerCount: answers.length,
+        failedTurns: allRuns.filter(run => ["failed", "timed_out"].includes(run.status)).length,
+        fileSha256: createHash("sha256").update(fileBytes).digest("hex"), validationCustody }, null, 2));
     }
     if (scenario === "FILESTOP-fallback") {
       const custody = await exportAndReadBack(admitted.id);
