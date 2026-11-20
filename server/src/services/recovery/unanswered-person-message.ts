@@ -8,6 +8,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  issueThreadInteractions,
   issues,
   nativeRunFinalizations,
   type Db,
@@ -214,6 +215,26 @@ export function unansweredMessageCode(run: { status: string; error: string | nul
 
 const reasonOf = (column: AnyPgColumn) => sql<string>`${column}->>'authorizationReason'`;
 
+// Only the sweep's own retirement is reversible, never a person's deletion.
+// A resolved card is new person input, not a posted agent reply. Reuse the
+// message's original note/key once that temporary answer stops answering it.
+function restorableNoticeSql(alias: string): SQL {
+  const n = sql.identifier(alias);
+  return sql`(${n}.author_type = 'system' and ${n}.deleted_at is not null
+    and ${n}.deleted_by_type is null
+    and (${n}.metadata->>'unansweredNoticeRetired' = 'true'
+      -- The preceding release retired these notes without a marker or actor.
+      -- An actor-attributed deletion is never undone, including old notes.
+      or not (${n}.metadata ? 'unansweredNoticeRetired'))
+    and exists (select 1 from ${issueThreadInteractions} resolved_card
+      where resolved_card.company_id = ${n}.company_id and resolved_card.issue_id = ${n}.issue_id
+        and resolved_card.resolved_by_user_id is not null and resolved_card.status <> 'pending'
+        and resolved_card.created_by_agent_id is not null and resolved_card.created_by_user_id is null
+        and resolved_card.created_at <= ${n}.deleted_at
+        and coalesce(resolved_card.origin_comment_ids, '[]'::jsonb)
+          ? substr(${n}.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})))`;
+}
+
 /**
  * SQL: an agent answer ATTRIBUTED to message m, the Paperclip way: a reply
  * written by a run on the chain carrying m or a later person input. Fresh
@@ -305,7 +326,8 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
         and ${personMessageOwedSql(rawMessage("m"))}
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
           and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || m.id::text
-          and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
+          and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)
+          and not ${restorableNoticeSql("n")}))
     or exists (select 1 from ${issueComments} n
       join ${issueComments} m on m.company_id = n.company_id and m.issue_id = n.issue_id
         and m.id::text = substr(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
@@ -331,7 +353,8 @@ export function unansweredPersonMessageCommentCondition(): SQL {
       and not exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
         and n.issue_id = ${issueComments.issueId}
         and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text
-        and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
+        and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)
+        and not ${restorableNoticeSql("n")}))
     or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
       and starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
       and exists (select 1 from ${issueComments} m
@@ -418,7 +441,8 @@ export async function settleUnansweredPersonMessage(
   if (liveNotice) await db.transaction(async tx => {
     await tx.select({ id: issues.id }).from(issues)
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
-    await tx.execute(sql`update ${issueComments} n set deleted_at = ${now.toISOString()}::timestamptz, updated_at = ${now.toISOString()}::timestamptz
+    await tx.execute(sql`update ${issueComments} n set deleted_at = ${now.toISOString()}::timestamptz, updated_at = ${now.toISOString()}::timestamptz,
+      metadata = coalesce(n.metadata, '{}'::jsonb) || '{"unansweredNoticeRetired":true}'::jsonb
     where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
       and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
         or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
@@ -468,11 +492,17 @@ export const OWED_OLDER_MESSAGES_PER_SWEEP = 20;
  * succeeded, stopped, or a failed run that replied) keeps today's newest-only reading.
  * `skipReasons`: the notice keys this pass's carried-steer step (a) just noticed; those messages are skipped. */
 async function owedOlderMessageIds(db: Db, issue: DecisionIssue, newestId: string, skipReasons: string[]): Promise<string[]> {
+  // The carry/batch limits below govern NEW notes. They must not suppress an
+  // existing note after a person's card resolution makes its message owed again.
+  const restoring = sql`exists (select 1 from ${issueComments} n
+    where n.company_id = ${issueComments.companyId} and n.issue_id = ${issueComments.issueId}
+      and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text
+      and ${restorableNoticeSql("n")})`;
   const rows = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     sql`${issueComments.id} <> ${newestId}`, unansweredPersonMessageCommentCondition(),
     skipReasons.length > 0 ? notInArray(sql`${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text`, skipReasons) : undefined,
-    sql`(not (${personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`)}) or not exists (select 1 from ${heartbeatRuns} r where r.company_id = ${issueComments.companyId}
+    sql`(${restoring} or not (${personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`)}) or not exists (select 1 from ${heartbeatRuns} r where r.company_id = ${issueComments.companyId}
       and (r.context_snapshot->>'wakeCommentId' = ${issueComments.id}::text or r.context_snapshot->>'commentId' = ${issueComments.id}::text
         or r.context_snapshot->>'conversationReplyBoundaryCommentId' = ${issueComments.id}::text
         or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${issueComments.id}::text
@@ -480,7 +510,7 @@ async function owedOlderMessageIds(db: Db, issue: DecisionIssue, newestId: strin
       and not ${failedCarrierRunSql("r", { id: sql`${issueComments.id}` })}))`,
     // One card per failed carrier's batch (interrupt-lostdouble L1/L1b): a failed run that carried m AND a LATER
     // message still owed is told by that later message's card (the newest's, or its own older pick), never twice.
-    sql`(not (${personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`)}) or not exists (select 1 from ${heartbeatRuns} fb where fb.company_id = ${issueComments.companyId}
+    sql`(${restoring} or not (${personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`)}) or not exists (select 1 from ${heartbeatRuns} fb where fb.company_id = ${issueComments.companyId}
       and ${failedCarrierRunSql("fb", { id: sql`${issueComments.id}` })}
       and exists (select 1 from ${issueComments} later where later.company_id = ${issueComments.companyId}
         and later.issue_id = ${issueComments.issueId} and later.author_type = 'user' and later.deleted_at is null
@@ -530,9 +560,9 @@ async function settleOneMessage(db: Db, issue: DecisionIssue, now: Date,
     if (fenced.upgradeCommentId) {
       // The SAME note (same key) becomes the failure text: still one note.
       const [updated] = await tx.update(issueComments).set({ body: fenced.notice.body, presentation: fenced.notice.presentation,
-        metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason }, updatedAt: now })
+        metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason }, updatedAt: now, deletedAt: null })
         .where(and(eq(issueComments.id, fenced.upgradeCommentId), eq(issueComments.companyId, issue.companyId),
-          isNull(issueComments.deletedAt))).returning({ id: issueComments.id });
+          or(isNull(issueComments.deletedAt), restorableNoticeSql("issue_comments")))).returning({ id: issueComments.id });
       return updated?.id ?? null;
     }
     const comment = await issueService(tx as unknown as Db).addComment(issue.id, fenced.notice.body, {}, {
@@ -746,6 +776,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   if (answer) return { kind: "answered" };
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
   const [noticed] = await q.select({ id: issueComments.id,
+    restorable: restorableNoticeSql("issue_comments").mapWith(Boolean),
     waiting: sql<boolean>`coalesce(${issueComments.metadata}->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)`,
     waitingCode: sql<string | null>`(select r->>'value' from jsonb_array_elements(coalesce(${issueComments.metadata}->'sections', '[]'::jsonb)) sec,
       jsonb_array_elements(coalesce(sec->'rows', '[]'::jsonb)) r where r->>'label' = ${WAITING_ROW_LABEL} limit 1)` })
@@ -753,8 +784,8 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
   // A standing WAITING note is still an open obligation: it must stay true.
-  if (noticed && !noticed.waiting) return { kind: "noticed_before" };
-  const upgrading = noticed?.waiting ? noticed.id : null;
+  if (noticed && !noticed.waiting && !noticed.restorable) return { kind: "noticed_before" };
+  const upgrading = noticed?.waiting || noticed?.restorable ? noticed.id : null;
   // Half 2 wins over every pending wake/finalizer/setup wait. Age never marks
   // input answered: its existing fenced writer owns one truthful naming note.
   if (!message.sendable) {
