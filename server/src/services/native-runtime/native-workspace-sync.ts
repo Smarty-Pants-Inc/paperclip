@@ -12,7 +12,7 @@ import fs from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { environmentLeases, heartbeatRuns } from "@paperclipai/db";
 import { retryUnlessTransactionBound } from "../transaction-retry.js";
@@ -1027,6 +1027,52 @@ async function finalizePreparedRuntime(input: {
   });
 }
 
+/** A warm-validation fallback must not seed over an unfinished Stop export.
+ * Use the existing file-only recovery path, then read back its immutable server
+ * archive. Any unresolved source refuses inbound writes to this allocation. */
+async function preservePendingWorkspaceBeforeRestore(input: {
+  db: Db; runId: string; companyId: string; workspaceId: string;
+  workspaceLocalDir: string; lease: EnvironmentLease;
+  target: Extract<AdapterExecutionTarget, { transport: "sandbox" }>;
+}): Promise<boolean> {
+  const { nativeWorkspaceExportPendingForResource, nativeWorkspaceExportPendingForLease } =
+    await import("./native-workspace-finalization-state.js");
+  if (!await nativeWorkspaceExportPendingForResource(input.db, input.lease, input.runId)) return false;
+  const sources = await input.db.select({ lease: environmentLeases, run: heartbeatRuns })
+    .from(environmentLeases).innerJoin(heartbeatRuns, and(eq(heartbeatRuns.id, environmentLeases.heartbeatRunId),
+      eq(heartbeatRuns.companyId, environmentLeases.companyId)))
+    .where(and(eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.provider, input.lease.provider!),
+      eq(environmentLeases.providerLeaseId, providerLeaseIdFor(input))));
+  for (const source of sources) {
+    if (source.run.id === input.runId || !await nativeWorkspaceExportPendingForLease(input.db, source.lease)) continue;
+    const reference = readNativeWorkspaceSyncReference(parseObject(source.run.runnerProfileJson).nativeWorkspaceSync);
+    if (source.run.status !== "cancelled" || source.run.runtimeMode !== "native" || reference?.state !== "prepared"
+      || reference.workspaceId !== input.workspaceId || reference.remoteCwd !== input.target.remoteCwd
+      || path.resolve(await readNativeWorkspaceSyncLocalCwd({ companyId: input.companyId, workspaceId: input.workspaceId,
+        runId: source.run.id, reference })) !== path.resolve(input.workspaceLocalDir)) throw new Error("workspace_sync_out_unrecoverable");
+    if (!await resumeNativeWorkspaceSync({ db: input.db, runId: source.run.id, target: input.target }))
+      throw new Error("workspace_sync_out_unrecoverable");
+    const [run] = await input.db.select({ runnerProfileJson: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, source.run.id), eq(heartbeatRuns.companyId, input.companyId)));
+    const saved = await readDescriptor({ runId: source.run.id,
+      reference: readNativeWorkspaceSyncReference(parseObject(run?.runnerProfileJson).nativeWorkspaceSync)! });
+    try {
+      const snapshot = saved.descriptor.finalSnapshot;
+      if (!snapshot || await sha256File(finalSnapshotPath(source.run.id, snapshot.sha256)) !== snapshot.sha256
+        || !saved.descriptor.finalHostSha256 || !await remoteStampMatches({ target: input.target,
+          expected: finalizedWorkspaceStamp({ descriptor: saved.descriptor, hostSha256: saved.descriptor.finalHostSha256 }) }))
+        throw new Error("workspace_sync_out_unrecoverable");
+    } finally {
+      await disposeDirectorySnapshot(saved.baseline);
+      await disposeGitWorkspaceSnapshot(saved.descriptor.gitSnapshot);
+      for (const repo of saved.descriptor.repositories ?? []) await disposeGitWorkspaceSnapshot(repo.snapshot);
+    }
+  }
+  if (await nativeWorkspaceExportPendingForResource(input.db, input.lease, input.runId))
+    throw new Error("workspace_sync_out_unrecoverable");
+  return true;
+}
+
 export async function prepareNativeWorkspaceSync(input: {
   db: Db;
   runId: string;
@@ -1154,7 +1200,9 @@ export async function prepareNativeWorkspaceSync(input: {
       onPhase: input.onPhase,
       onCheckpoint: input.onCheckpoint,
       workspaceLocalDir: input.workspaceLocalDir,
-      mode,
+      // Even a missing lease stamp cannot authorize the first inbound write
+      // over an allocation adopted with its predecessor's export still owed.
+      mode: acquisition === "resumed" ? "adopt_remote" : mode,
       seedCacheCompanyDirectory,
       seedCacheDirectory,
       workspaceGitIndexRefresh: input.workspaceGitIndexRefresh === true
@@ -1173,11 +1221,11 @@ export async function prepareNativeWorkspaceSync(input: {
     let gitArchiveSha256 = currentSnapshot.gitSnapshot || currentSnapshot.repositories?.length
       ? await sha256File(seedPaths.gitArchivePath)
       : null;
-    if (acquisition === "resumed" && priorStamp) {
+    if (acquisition === "resumed") {
       const currentHostSha256 = directorySnapshotSha256(
         currentSnapshot.baseline,
       );
-      const verifiedWarmAdoption =
+      const verifiedWarmAdoption = priorStamp !== null &&
         priorStamp.hostSha256 === currentHostSha256 &&
         (await measureRunPhase("workspace_sync.warm_stamp", () => remoteStampMatches({ target, expected: priorStamp, gitSnapshot: currentSnapshot.gitSnapshot, repositories: currentSnapshot.repositories })));
       if (verifiedWarmAdoption) {
@@ -1186,8 +1234,12 @@ export async function prepareNativeWorkspaceSync(input: {
       } else {
         mode = "host_current";
         reuseReason = "workspace_changed";
+        const preserved = await preservePendingWorkspaceBeforeRestore({ ...input, target });
+        // The pre-export seed is stale even after export succeeds. Capture the
+        // now-updated server workspace instead of replaying that old seed.
+        if (preserved) await runtime.cleanupWorkspaceSnapshot?.();
         let preparedSeed: WorkspaceDurableSeedPaths | undefined;
-        try {
+        if (!preserved) try {
           preparedSeed = await measureRunPhase("workspace_sync.durable_seed_verify", () => verifiedDurableSeed({ runId: input.runId,
             seed: { workspaceArchiveSha256, gitArchiveSha256 },
             gitSnapshot: currentSnapshot.gitSnapshot, repositories: currentSnapshot.repositories }));
@@ -1201,16 +1253,16 @@ export async function prepareNativeWorkspaceSync(input: {
           mode: preparedSeed ? "durable_seed" : mode,
           seedCacheCompanyDirectory,
           seedCacheDirectory,
-          baseline: currentSnapshot.baseline,
-          gitSnapshot: currentSnapshot.gitSnapshot,
-          repositories: currentSnapshot.repositories,
+          baseline: preserved ? undefined : currentSnapshot.baseline,
+          gitSnapshot: preserved ? undefined : currentSnapshot.gitSnapshot,
+          repositories: preserved ? undefined : currentSnapshot.repositories,
           onPhase: input.onPhase,
           onCheckpoint: input.onCheckpoint,
           durableSeed: preparedSeed ?? seedPaths,
         });
         if (!preparedSeed) {
           workspaceArchiveSha256 = await sha256File(seedPaths.workspaceArchivePath);
-          gitArchiveSha256 = currentSnapshot.gitSnapshot || currentSnapshot.repositories?.length
+          gitArchiveSha256 = runtime.workspaceSyncSnapshot?.gitSnapshot || runtime.workspaceSyncSnapshot?.repositories?.length
             ? await sha256File(seedPaths.gitArchivePath) : null;
         }
       }
