@@ -13434,7 +13434,16 @@ async function executePaperclipNativeSessionAttempt(
       }
     }
     if (entry) {
+      if (entry.busy && entry.instructionPreparationRunId !== input.execution.binding.runId) throw new Error("native_session_supervisor_busy");
+      // A failed/missing identity answer is not proof of death (the claimed
+      // admission already tried the exact-generation loss path). It is also
+      // not verified reuse. Retire through the ordinary close/stop barrier
+      // before starting a replacement on this same box; an unproven stop must
+      // keep the predecessor registered and prevent any replacement dispatch.
+      const unverifiedRunner = input.useRunnerd && resumedSandboxRunner(input.runnerExecutionTarget)
+        && await resumedSandboxRunnerNeedsProbe(input);
       if (
+        unverifiedRunner ||
         ((entry.pluginTaskId ?? entry.sandboxProviderLeaseId) !== undefined && (input.runnerExecutionTarget?.kind !== "remote" || input.runnerExecutionTarget.transport !== "sandbox" ||
           (entry.pluginTaskId ?? entry.sandboxProviderLeaseId) !== input.runnerExecutionTarget.sandboxLeaseAcquisition?.providerLeaseId)) ||
         entry.closeOnReleaseReason !== undefined ||
@@ -13453,8 +13462,16 @@ async function executePaperclipNativeSessionAttempt(
         if (entry.busy && !preparedCopy) throw new Error("native_session_supervisor_busy");
         if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
         entry.busy = true;
-        entry.closeOnReleaseReason = "warm native session configuration changed";
+        entry.closeOnReleaseReason = unverifiedRunner
+          ? "retained Runner was unavailable for reuse" : "warm native session configuration changed";
         try {
+          // A prior failed detach can leave this cached handle without process
+          // ownership. closeWarmNativeSession then only detaches again: require
+          // the existing exact-generation stop/exit proof before forgetting it.
+          if (unverifiedRunner && entry.controllerDetachedForRestart && !await supersededOwnerRunnerExited(entry)) {
+            throw new NativePredecessorRetirementUnprovenError(entry.runId, entry.providerLeaseId ?? null,
+              new Error("retained Runner stop unconfirmed after controller detach"));
+          }
           await retireWarmPredecessor(entry, entry.closeOnReleaseReason, { preserveInstructionsForRunId: input.execution.binding.runId });
           forgetWarmNativeSession(warmSessionId, entry);
         } catch (error) {
@@ -13467,7 +13484,7 @@ async function executePaperclipNativeSessionAttempt(
           }
           throw error;
         } finally { entry.busy = false; }
-        if (preparedCopy) throw new Error("native_instruction_preparation_configuration_changed");
+        if (preparedCopy && !unverifiedRunner) throw new Error("native_instruction_preparation_configuration_changed");
         if (input.useRunnerd && input.runnerExecutionTarget?.kind === "remote") {
           await refreshRetiredWarmOwnerProjection(controllerProjectionInput(input, { runId: entry.runId, issueId: entry.issueId }));
         }
@@ -13477,6 +13494,11 @@ async function executePaperclipNativeSessionAttempt(
           input.runnerExecutionTarget?.kind ?? "local",
           input.refreshTools, createdSandboxAllocation(input.runnerExecutionTarget),
         );
+        if (unverifiedRunner) {
+          await emitStartupReuse(input.onEvent, "runner", { state: "fresh", reason: "replacement" });
+          if (persistedWarmSession?.providerSessionId) await input.onLog?.("stderr",
+            "[paperclip-runner] retired sandbox Runner unavailable; resuming its verified provider session cold\n");
+        }
       } else {
         if (entry.busy && entry.instructionPreparationRunId !== input.execution.binding.runId) throw new Error("native_session_supervisor_busy");
         if (entry.instructionWorkingCopy?.runId && entry.instructionPreparationRunId !== input.execution.binding.runId) {
