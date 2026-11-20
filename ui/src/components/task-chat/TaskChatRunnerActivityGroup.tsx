@@ -610,9 +610,12 @@ export function TaskChatRunnerActivityGroup({
     (activity) => presentation(activity, false) !== null,
   );
   const latest = activities.at(-1);
-  // Like T3's work-live row, preview the latest thought even if a tool has
-  // since become current. Expanding removes the preview and mounts history.
-  const thought = activities.findLast((activity) => activity.kind === "thinking");
+  // Like T3's work-live row, preview the latest non-blank thought even if a
+  // tool or a whitespace-only thought has since become current. Keep the
+  // current activity independent; expanding mounts the unchanged history.
+  const thought = activities.findLast((activity) =>
+    activity.kind === "thinking" && activity.lines.some((line) => line.trim().length > 0),
+  );
   const thoughtPreview = item.active && !expanded && REASONING_COLLAPSED_PREVIEW_LINES > 0 && thought?.kind === "thinking"
     ? reasoningPreviewText(thought.lines.join("\n"))
     : "";
