@@ -668,6 +668,10 @@ function nativeSessionCloseUnrecoverable(error: InstanceType<typeof NativeEnviro
   return [error.operationError, ...error.cleanupErrors].some(item => visit(item, 0));
 }
 
+/** How long an unrecoverable probe close waits for its own runtime cleanup
+ * before the verifier releases the probe box anyway (the cleanup continues). */
+export const PROBE_CLEANUP_BEFORE_RELEASE_MS = 10_000;
+
 export async function withManagedAiProbe<T>(
   db: Db,
   input: Parameters<typeof prepareManagedAiRuntime>[1],
@@ -691,21 +695,39 @@ export async function withManagedAiProbe<T>(
       retained = true;
       void error.retired.catch(() => undefined);
       let cleanupFinished = true;
-      try { await runtime.cleanup(); }
+      let cleanupTimedOut = false;
+      const retainUnfinished = () => {
+        cleanupFinished = false;
+        if (runtime.retainedCleanupScope) {
+          retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup, agentId: input.agentId });
+        }
+      };
+      // Bounded: the verifier releases the paid probe box only after this
+      // throws, so a slow or hung cleanup (secret write-back, account-home
+      // lock, home removal) must not hold the box open. On timeout the shared,
+      // idempotent cleanup keeps running; its entry stays owned by this agent
+      // and the next same-account action reconciles it.
+      let bound: ReturnType<typeof setTimeout> | undefined;
+      const cleaning = runtime.cleanup();
+      try {
+        const outcome = await Promise.race([cleaning.then(() => "finished" as const),
+          new Promise<"timed_out">(resolve => { bound = setTimeout(resolve, PROBE_CLEANUP_BEFORE_RELEASE_MS, "timed_out"); bound.unref?.(); })]);
+        if (outcome === "timed_out") {
+          cleanupTimedOut = true;
+          void cleaning.catch(() => undefined);
+          retainUnfinished();
+        }
+      }
       catch (cleanupError) {
         // A recovery handoff owns the refresh and the home is removed; any
         // other failure leaves the runtime home on disk, retained for retry.
-        if (!(cleanupError instanceof RetiredCredentialRecoveryError)) {
-          cleanupFinished = false;
-          if (runtime.retainedCleanupScope) {
-            retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup, agentId: input.agentId });
-          }
-        }
+        if (!(cleanupError instanceof RetiredCredentialRecoveryError)) retainUnfinished();
       }
+      finally { if (bound) clearTimeout(bound); }
       const code = cleanupFinished ? "native_probe_cleanup_failed" : "native_probe_cleanup_unfinished";
       try {
         // One alarm per failed probe, naming what it held: the account, its runtime home and the agent.
-        logger.error({ code, agentId: input.agentId, runtimeHome: runtime.home, cleanupFinished,
+        logger.error({ code, agentId: input.agentId, runtimeHome: runtime.home, cleanupFinished, ...(cleanupTimedOut ? { cleanupTimedOutMs: PROBE_CLEANUP_BEFORE_RELEASE_MS } : {}),
           accountKeyHash: runtime.retainedCleanupScope ? retainedAiAccountKeyHash(runtime.retainedCleanupScope.accountKey) : undefined },
         cleanupFinished
           ? "Native probe close was unrecoverable; its runtime cleanup finished without retirement proof"
