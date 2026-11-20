@@ -14359,6 +14359,7 @@ describe("native warm session supervision", () => {
       const { eq } = await import("drizzle-orm");
       const tables = await import("@paperclipai/db");
       const f = await createNativeWarmIngressFixture(execution, join(isolatedHome, "shared-workspace"));
+      const childRows: AdapterRuntimeEvent[] = [], parentRows: AdapterRuntimeEvent[] = [];
       await mkdir(join(isolatedHome, "shared-workspace"));
       const listener = createServer();
       await new Promise<void>((resolve, reject) => { listener.once("error", reject); listener.listen(0, "127.0.0.1", resolve); });
@@ -14397,7 +14398,8 @@ describe("native warm session supervision", () => {
       try {
         const child = await f.admit();
         await executePaperclipNativeSession({ db: f.db, execution: child.execution, runnerInstanceId: "child-runner", useRunnerd: true,
-          backend: {} as never, runnerExecutionTarget: child.target });
+          backend: {} as never, runnerExecutionTarget: child.target, onEvent: async row => { childRows.push(row); } });
+        const childRowCount = childRows.length;
         const resultId = await f.settle(child, result);
         const options: Parameters<typeof f.admit>[0] = {};
         if (scenario === "different-allocation") options.providerLeaseId = `different-${f.providerLeaseId}`;
@@ -14448,7 +14450,7 @@ describe("native warm session supervision", () => {
           await lockObserved;
         }
         const start = executePaperclipNativeSession({ db: f.db, execution: parent.execution, runnerInstanceId: "parent-runner", useRunnerd: true,
-          backend: {} as never, runnerExecutionTarget: parent.target, onExecutionLeaseAcquired: async () => {
+          backend: {} as never, runnerExecutionTarget: parent.target, onEvent: async row => { parentRows.push(row); }, onExecutionLeaseAcquired: async () => {
             claimed();
             if (scenario === "stop-after-claim") await f.db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, parent.runId));
           } });
@@ -14467,6 +14469,14 @@ describe("native warm session supervision", () => {
           expect(admittedParent.input.session.normalizedSessionId).toBe(parent.execution.session.normalizedSessionId);
           expect(admittedParent.input.session.normalizedSessionId).not.toBe(child.execution.session.normalizedSessionId);
           expect(admittedParent.existingSession).toBeUndefined();
+          // Both early staging and staging after predecessor retirement belong
+          // to this attempt, exactly once; late rows must not reach the child.
+          expect(childRows).toHaveLength(childRowCount);
+          for (const rows of [childRows, parentRows]) {
+            for (const name of ["native.controller.warm_close_wait", "native.controller.attachment_staging"]) {
+              expect(rows.filter(row => row.payload?.span === name), name).toHaveLength(1);
+            }
+          }
         } else {
           await expect(start).rejects.toThrow();
           expect(close).toHaveBeenCalledTimes(["retirement-fails", "controller-change-during-close", "stop-during-close", "writer-change-during-close"].includes(scenario) ? 1 : 0);

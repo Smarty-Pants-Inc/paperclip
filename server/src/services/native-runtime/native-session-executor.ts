@@ -12755,7 +12755,17 @@ async function executePaperclipNativeSessionAttempt(
       input.runnerExecutionTarget,
     );
     claimedStartupContext?.assertOpen();
-    if (prepareAfterClaim) input = await prepareAfterClaim();
+    if (prepareAfterClaim) {
+      input = await prepareAfterClaim();
+      // Late staging returns a fresh prep array after this attempt's snapshot
+      // was recorded. Import only new spans into this run, without awaiting
+      // another sink write or duplicating the already-recorded early spans.
+      for (const span of input.preparationSpans ?? []) {
+        if (preparationSpans.includes(span)) continue;
+        preparationSpans.push(span);
+        trace.defer(() => trace.record({ ...span, parentName: "task.prepare" }, { deferRunLog: true }));
+      }
+    }
     claimedStartupContext?.assertOpen();
     await trace.end(taskPrepareScope);
   } catch (error) {
