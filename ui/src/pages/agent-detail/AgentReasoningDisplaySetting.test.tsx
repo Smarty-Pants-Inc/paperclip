@@ -92,21 +92,22 @@ describe("Reasoning display on the agent's page", () => {
     }
   });
 
-  it("shows Inline as the harness default for a Paperclip Runner (pi_rpc) agent", async () => {
+  // SUPERSEDED by org 09:40Z (punch 4, T3 fold): the paperclip_runner default is Folded
+  it("shows Folded as the harness default for a Paperclip Runner (pi_rpc) agent", async () => {
     render({ ...agent, adapterType: "paperclip_runner" });
     await loaded();
-    expect(radio("Default for this harness (Inline)").getAttribute("aria-checked")).toBe("true");
+    expect(radio("Default for this harness (Folded)").getAttribute("aria-checked")).toBe("true");
     expect(radio("Inline").getAttribute("aria-checked")).toBe("false");
     expect(radio("Folded").getAttribute("aria-checked")).toBe("false");
-    expect(container.textContent).toContain("Default for this harness: Inline");
+    expect(container.textContent).toContain("Default for this harness: Folded");
   });
 
-  it("keeps a stored Folded for a Paperclip Runner agent", async () => {
-    api.saved = { "agent-1": "fold" };
+  it("keeps a stored Inline for a Paperclip Runner agent", async () => {
+    api.saved = { "agent-1": "inline" };
     render({ ...agent, adapterType: "paperclip_runner" });
     await loaded();
-    expect(radio("Folded").getAttribute("aria-checked")).toBe("true");
-    expect(container.textContent).toContain("Default for this harness: Inline");
+    expect(radio("Inline").getAttribute("aria-checked")).toBe("true");
+    expect(container.textContent).toContain("Default for this harness: Folded");
   });
 
   it("shows the person's saved choice for this agent", async () => {
@@ -117,7 +118,7 @@ describe("Reasoning display on the agent's page", () => {
   });
 
   it.each([
-    { adapterType: "paperclip_runner", saved: "fold", fallback: "Inline" },
+    { adapterType: "paperclip_runner", saved: "inline", fallback: "Folded" },
     { adapterType: "codex_local", saved: "inline", fallback: "Folded" },
   ] as const)("clears $saved back to the $adapterType harness default", async ({ adapterType, saved, fallback }) => {
     api.saved = { "agent-1": saved, "agent-2": "fold" };
