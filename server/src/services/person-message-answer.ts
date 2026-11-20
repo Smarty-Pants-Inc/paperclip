@@ -8,6 +8,9 @@ export const ISSUE_IMPORTED_ACTION = "issue.imported";
 /** The import routes' audit row, written after a committed import (routes/companies.ts). */
 export const COMPANY_IMPORTED_ACTION = "company.imported";
 
+/** Shared old-message admission/notice bound; a sweep never replays older input. */
+export const UNANSWERED_MESSAGE_LOOKBACK_MS = 24 * 60 * 60_000;
+
 type PersonMessageSql = { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL };
 type DeferredWakeSql = { companyId: SQL; agentId: SQL; issueId: SQL; requestedAt: SQL; payload: SQL };
 
@@ -116,7 +119,12 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
     where a.company_id = ${m.companyId} and a.issue_id = ${m.issueId} and a.author_type = 'agent' and a.deleted_at is null
       and a.created_at > ${m.createdAt}
       and exists (select 1 from ${issueComments} b
-        where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
+        where b.company_id = a.company_id and b.issue_id = a.issue_id
+          -- Exact host-stamped plugin input uses this same carry/publication proof.
+          -- It never lets a system comment stand in for a later PERSON input.
+          and (b.author_type = 'user' or (b.id = ${m.id} and b.author_type = 'system'
+            and b.author_agent_id is null and b.author_user_id is null
+            and b.client_request_id like 'plugin-comment:%'))
           and (b.id = ${m.id} or (b.created_at > ${m.createdAt}
             -- A steer can overtake an earlier queued message: it answers only itself.
             and not coalesce(r.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? b.id::text

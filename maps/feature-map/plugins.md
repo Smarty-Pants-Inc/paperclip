@@ -53,6 +53,13 @@ Manual: Open the contributed page by navigation and cold deep link, perform a ha
   reload is not a lifecycle action in the plugin manager.
 
 - Installing a plugin does not authorize every host capability or external action.
+- Comment-backed wake/steer keeps host-stamped installation provenance and the
+  shared age/answer bound. See [execution semantics](../../doc/execution-semantics.md),
+  [host admission rows](../../server/src/__tests__/plugin-orchestration-apis.test.ts),
+  [native answered-once/steer journey](../../server/src/__tests__/native-person-comment-steering.test.ts)
+  and the explicit cross-repository [boot/sweep journey](../../server/src/__tests__/plugin-bridge-boot-sweep.integration.test.ts)
+  (`BRIDGEWAKE_PLUGIN_ROOT` must name the built fleet-bridge package). These are
+  backend fixtures, not browser or live-fleet evidence.
 - Runtime synchronization is opt-in and uses durable resource delivery. See
   [the contract](../../doc/plugins/AGENT_RUNTIME_SYNC.md) and
   [database regressions](../../server/src/__tests__/agent-runtime-hooks.test.ts).

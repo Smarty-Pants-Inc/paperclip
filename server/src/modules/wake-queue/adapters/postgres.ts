@@ -2,6 +2,7 @@ import { insertIssueComment } from "../../../services/issue-comment-writes.js";
 import { lockAgentForRunAdmission } from "../../../services/heartbeat-run-admission-lock.js";
 import { pendingContinuationCommentInput } from "../../../services/continuation-comment-input.js";
 import { deferredWakeIsStaleSql, newerPersonInputAnsweredSql, personMessageOwedSql } from "../../../services/person-message-answer.js";
+import { readPluginCommentCause } from "../../../services/plugin-comment-cause.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
 import { notifyQueuedRunDispatch, notifyRunDispatch } from "../../../services/run-dispatch-notifications.js";
@@ -301,7 +302,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           .limit(1)
           .then((rows) => rows[0] ?? null);
         if (!row) return null;
-        const candidate = toDeferredWakeCandidate(row);
+        let candidate = toDeferredWakeCandidate(row);
         const payload = candidate.payload;
         const context = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
         const pluginId = readNonEmptyString(payload.pluginId);
@@ -327,6 +328,28 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
               finishedAt: now, updatedAt: now }).where(and(eq(agentWakeupRequests.id, row.id),
               eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS)));
             continue;
+          }
+          if (candidate.queuedCommentIds.length) {
+            const liveIds: string[] = [];
+            let refusal = "invalid_comment_cause";
+            for (const commentId of candidate.queuedCommentIds) {
+              const cause = await readPluginCommentCause(tx, { companyId, issueId, pluginId, commentId });
+              if (cause.ok) liveIds.push(commentId);
+              else refusal = cause.reason;
+            }
+            if (!liveIds.length) {
+              const now = new Date();
+              await tx.update(agentWakeupRequests).set({ status: "skipped", error: refusal, finishedAt: now, updatedAt: now })
+                .where(and(eq(agentWakeupRequests.id, row.id), eq(agentWakeupRequests.companyId, companyId),
+                  eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS)));
+              continue;
+            }
+            if (liveIds.length !== candidate.queuedCommentIds.length) {
+              const livePayload = withQueuedCommentIdsInWakePayload(row.payload, liveIds);
+              await tx.update(agentWakeupRequests).set({ payload: livePayload, updatedAt: new Date() })
+                .where(eq(agentWakeupRequests.id, row.id));
+              candidate = toDeferredWakeCandidate({ ...row, payload: livePayload });
+            }
           }
           if (row.idempotencyKey) {
             const [prior] = await tx.select({ id: agentWakeupRequests.id })
@@ -1086,7 +1109,27 @@ async function restoreUnansweredSteersAtRunEnd(tx: Db, run: ReleaseRun, issue: I
       // the ordinary deferred input that the ONE Stop-hold reader already reads.
       const [comment] = await tx.select().from(issueComments).where(and(eq(issueComments.companyId, run.companyId),
         eq(issueComments.issueId, issue.id), eq(issueComments.id, id), isNull(issueComments.deletedAt)));
-      if (!comment?.authorUserId) continue;
+      if (!comment) continue;
+      if (!comment.authorUserId) {
+        // Newly accepted plugin steers use the SAME run-end custody owner. They
+        // are information from an installation, never a forged human principal.
+        const pluginCause = parseObject(parseObject(parseObject(result.queuedSteeringAcknowledgements)[id]).pluginCommentCause);
+        const pluginId = readNonEmptyString(pluginCause.pluginId), pluginKey = readNonEmptyString(pluginCause.pluginKey);
+        const idempotencyKey = readNonEmptyString(pluginCause.idempotencyKey);
+        if (!pluginId || !pluginKey || !idempotencyKey || !(await readPluginCommentCause(tx, {
+          companyId: run.companyId, issueId: issue.id, pluginId, commentId: id,
+        })).ok) continue;
+        await tx.insert(agentWakeupRequests).values({ companyId: run.companyId, agentId: run.agentId,
+          source: "assignment", triggerDetail: "system", reason: "plugin_comment_unanswered", status: DEFERRED_WAKE_STATUS,
+          requestedByActorType: "system", requestedByActorId: pluginId, requestedAt: comment.createdAt, idempotencyKey,
+          payload: { issueId: issue.id, commentId: id, mutation: "plugin_wakeup", pluginId, pluginKey,
+            [DEFERRED_WAKE_CONTEXT_KEY]: { issueId: issue.id, taskId: issue.id, sourceCommentId: id,
+              wakeCommentId: id, wakeCommentIds: [id], pluginId, pluginKey, source: "plugin.comment",
+              conversationSessionGeneration: issue.conversationSessionGeneration } },
+        });
+        restored.push(id);
+        continue;
+      }
       await tx.insert(agentWakeupRequests).values({ companyId: run.companyId, agentId: run.agentId,
         source: "on_demand", triggerDetail: "manual", reason: "issue_commented", status: DEFERRED_WAKE_STATUS,
         requestedByActorType: "user", requestedByActorId: comment.authorUserId, requestedAt: comment.createdAt,

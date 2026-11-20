@@ -1,4 +1,5 @@
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { readPluginCommentCause } from "../plugin-comment-cause.js";
 import { readPersonStopHold } from "../acknowledged-native-stop.js";
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
@@ -2749,6 +2750,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     let issueId =
       readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
     if (executionReconciliationWake && !issueId) return notQueued("execution_reconciliation_missing_issue");
+    const pluginCommentRefusal = async (reader: Pick<Db, "select">) => {
+      if (!issueId || !wakeCommentId || payload?.mutation !== "plugin_wakeup") return null;
+      const pluginId = readNonEmptyString(payload.pluginId);
+      if (!pluginId || opts.requestedByActorType !== "system" || opts.requestedByActorId !== pluginId ||
+          enrichedContextSnapshot.pluginId !== pluginId) return "invalid_comment_cause";
+      const cause = await readPluginCommentCause(reader, { companyId: agent!.companyId, issueId, pluginId, commentId: wakeCommentId });
+      return cause.ok ? null : cause.reason;
+    };
     const durableRequest = opts.durableChatRequest;
     // ONE successor (adopt-one-successor) dispatch re-filter: a person's comment wake never carries
     // a message the ONE answered function says is answered, or that an Interrupt carry, another
@@ -2808,6 +2817,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+    const commentRefusal = await pluginCommentRefusal(db);
+    if (commentRefusal) return notQueued(commentRefusal);
     const withManagedWakeWrite = async <T>(work: (writer: Db) => Promise<T>): Promise<T> => {
       if (!opts.managementActor) return work(db);
       return db.transaction(async tx => {
@@ -3906,6 +3917,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "skipped" as const };
           }
 
+          // A reply can age or be answered while admission waits for this lock.
+          const commentRefusal = await pluginCommentRefusal(tx as unknown as Db);
+          if (commentRefusal) {
+            opts.onNotQueued?.(commentRefusal);
+            return { kind: "skipped" as const };
+          }
           // Completion can settle the conversation while admission is outside
           // the issue lock. Recheck the current state before persisting a wake.
           if (isWaitingConversation(issue) && !hasIndependentConversationWakeCause()) {

@@ -7,6 +7,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { Db } from "@paperclipai/db";
 import type { PluginRecord } from "@paperclipai/shared";
 import { createApp } from "../../app.js";
+import { createPluginWorkerManager } from "../../services/plugin-worker-manager.js";
+import { heartbeatService } from "../../services/heartbeat.js";
 import { createLocalDiskStorageProvider } from "../../storage/local-disk-provider.js";
 import { createStorageService } from "../../storage/service.js";
 
@@ -18,10 +20,12 @@ type Dashboard = { worker: { status: string; pid: number | null } | null };
  * imports, service mocks, or factory overrides. Pattern: runner-api-server.ts.
  * The caller owns the migrated, disposable database.
  */
-export async function startRealPluginLoader(db: Db) {
+export async function startRealPluginLoader(db: Db, options: { recoverDeferredWakes?: boolean } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "plugin-real-loader-"));
   await mkdir(path.join(root, "catalog"));
+  const workers = createPluginWorkerManager();
   const app = await createApp(db, {
+    pluginWorkerManager: workers,
     uiMode: "none", serverPort: 0, bindHost: "127.0.0.1", allowedHostnames: ["127.0.0.1"],
     deploymentMode: "local_trusted", deploymentExposure: "private", authReady: true,
     companyDeletionEnabled: false, announcements: { enabled: false, feedUrl: "" },
@@ -33,6 +37,11 @@ export async function startRealPluginLoader(db: Db) {
     decisionServiceOptions: { wakeOriginAgent: async () => undefined },
   });
   await app.locals.bundledPluginsStartup;
+  // The same startup pass index.ts registers after plugin availability. Opt-in
+  // keeps unrelated plugin-loader journeys at their existing boundary.
+  const deferredWork = options.recoverDeferredWakes ? heartbeatService(db, { pluginWorkerManager: workers })
+    .registerDeferredReceiptWork(app.locals.deliveryWork, () => true) : undefined;
+  await deferredWork?.ready;
   const server = createServer(app);
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -73,17 +82,21 @@ export async function startRealPluginLoader(db: Db) {
   }
 
   return {
-    api, install, baseUrl,
-    async close() {
+    api, install, baseUrl, workers,
+    recheckDeferredWakes() {
+      if (!deferredWork) throw new Error("Deferred wake recovery was not registered");
+      deferredWork.wake();
+    },
+    async close(options: { preserveInstall?: boolean } = {}) {
       try {
         // App shutdown drains jobs; explicit disable also terminates the real
         // child workers. Neither operation purges their database namespaces.
-        for (const pluginId of installed) {
+        for (const pluginId of options.preserveInstall ? [] : installed) {
           const plugin = await api<PluginRecord>(`/plugins/${pluginId}`);
           if (plugin.status === "ready") await api(`/plugins/${pluginId}/disable`, {});
         }
       } finally {
-        try { await app.locals.paperclipShutdown(); }
+        try { await app.locals.paperclipShutdown(); await workers.stopAll(); }
         finally {
           server.closeAllConnections();
           await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));

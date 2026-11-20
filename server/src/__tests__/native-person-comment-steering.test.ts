@@ -1,11 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents, authUsers, companies, companyMemberships, createDb,
@@ -26,8 +26,11 @@ import {
 } from "../services/native-runtime/native-session-executor.js";
 import * as nativeExecutor from "../services/native-runtime/native-session-executor.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { startRealPluginLoader } from "./helpers/plugin-real-loader.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { waitForPendingCommentSteers } from "../services/conversation-steering.js";
+import { buildHostServices } from "../services/plugin-host-services.js";
+import { isWaitingConversation } from "../services/agent-conversations.js";
 import { readUnreadSteeredMessages } from "../services/native-runtime/unread-steered-messages.js";
 import { readPersonStopHold } from "../services/acknowledged-native-stop.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
@@ -250,9 +253,14 @@ beforeAll(async () => {
     return execution;
   });
 }, 60_000);
-afterAll(async () => { vi.restoreAllMocks(); await db?.$client.end(); await database?.cleanup(); vi.unstubAllEnvs(); });
+let bridgeServer: Awaited<ReturnType<typeof startRealPluginLoader>> | undefined;
+let loadedBridge: Awaited<ReturnType<Awaited<ReturnType<typeof startRealPluginLoader>>["install"]>> | undefined;
+afterAll(async () => {
+  await bridgeServer?.close();
+  vi.restoreAllMocks(); await db?.$client.end(); await database?.cleanup(); vi.unstubAllEnvs();
+}, 120_000);
 
-async function fixture(label: string, conversation = true) {
+async function fixture(label: string, conversation = true, bridgeWaiting = false) {
   const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), userId = randomUUID();
   const workspace = join(root, label); await mkdir(workspace);
   await writeFile(join(workspace, "AGENTS.md"), "Answer each incoming person message exactly once.\n");
@@ -262,14 +270,70 @@ async function fixture(label: string, conversation = true) {
   await db.insert(agents).values({ id: agentId, companyId, name: "Native Pi", status: "active", adapterType: "paperclip_runner",
     adapterConfig: { provider: "pi_rpc", cwd: workspace, model: "paperclip/neutral/vendor-model-not-in-bundled-catalog", piRpcThinkingLevel: "off", lifecycleMode: "per_turn" },
     runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } } });
-  await db.insert(issues).values({ id: issueId, companyId, title: `Steer ${label}`, status: "in_progress", assigneeAgentId: agentId,
+  await db.insert(issues).values({ id: issueId, companyId, title: `Steer ${label}`, status: bridgeWaiting ? "in_review" : "in_progress", assigneeAgentId: agentId,
     executionWorkspaceSettings: { mode: "shared_workspace" },
-    ...(conversation ? { conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" as const } : {}) });
+    ...(conversation ? { conversationAgentId: agentId, conversationUserId: userId,
+      conversationState: bridgeWaiting ? "waiting" as const : "active" as const } : {}) });
   const initial = randomUUID();
   await db.insert(issueComments).values({ id: initial, companyId, issueId, authorType: "user", authorUserId: userId, body: "Do the original two-step work." });
   const peer = new RecordingPiPeer();
   const owner = { bodies: [] as string[], peers: [] as RecordingPiPeer[], executions: [] as Promise<unknown>[], first: peer, outcomes: new Map<string, Outcome>() };
   scheduled.set(companyId, owner);
+  const throughWorker = !!process.env.BRIDGEWAKE_PLUGIN_ROOT && ["bridge-resting", "bridge-running"].includes(label);
+  const bridgeApiReplies: Array<{ status: number; body: { comment_id: string; wake: string; wakeError?: string } }> = [];
+  let fleetId: string | undefined;
+  if (throughWorker) {
+    if (!bridgeServer) {
+      bridgeServer = await startRealPluginLoader(db);
+      loadedBridge = await bridgeServer.install(process.env.BRIDGEWAKE_PLUGIN_ROOT!);
+    }
+    fleetId = randomUUID();
+    await db.insert(agents).values({ id: fleetId, companyId, name: "Fleet reply sender", status: "idle",
+      adapterType: "process", adapterConfig: { command: "true" } });
+    await bridgeServer.api(`/plugins/${loadedBridge!.id}/config`, { companyId,
+      configJson: { enabled: true, fleetAgentId: fleetId } });
+  }
+  const pluginId = throughWorker ? loadedBridge!.id : randomUUID();
+  const services = buildHostServices(db, pluginId, throughWorker ? loadedBridge!.pluginKey : "paperclip-plugin-fleet-bridge", {
+    forPlugin: () => ({ emit: async () => {}, subscribe: () => {} }),
+  } as never);
+  const bridgePost = async (body: string) => {
+    if (!throughWorker) return services.issues.createComment({ companyId, issueId, body });
+    // Persisted prior-question outbox is input setup, not an invented executed
+    // run. The real worker posts the reply and requests its wake over SDK RPC.
+    const outboxId = randomUUID(), questionRun = randomUUID(), question = "What is the checked result?";
+    await db.execute(sql`INSERT INTO plugin_fleet_bridge_fdc24bcfdc.outbox
+      (id, company_id, agent_id, agent_name, run_id, issue_id, task_id, to_name, text, bytes, sha256)
+      VALUES (${outboxId}, ${companyId}, ${agentId}, 'Native Pi', ${questionRun}, ${issueId}, ${issueId},
+        'fabric-v2', ${question}, ${Buffer.byteLength(question)}, ${createHash("sha256").update(question).digest("hex")})`);
+    // This is the host's trusted worker invocation boundary, not a claim of
+    // HTTP agent authentication. No live identity/token/provider is used.
+    const response = await bridgeServer!.workers.call(pluginId, "handleApiRequest", {
+      routeKey: "reply", method: "POST", path: "/reply", params: {}, query: {}, companyId, headers: {},
+      actor: { actorType: "agent", actorId: fleetId!, agentId: fleetId, runId: questionRun },
+      body: { outbox_id: outboxId, task_id: issueId, from: "fabric-v2", text: body },
+    }) as (typeof bridgeApiReplies)[number];
+    bridgeApiReplies.push(response);
+    expect(response).toMatchObject({ status: 200, body: { wake: "requested", comment_id: expect.any(String) } });
+    const [posted] = await db.select().from(issueComments).where(eq(issueComments.id, response.body.comment_id));
+    expect(posted).toBeTruthy();
+    return posted;
+  };
+  const bridgeWake = (commentId: string) => services.issues.requestWakeup({ companyId, issueId,
+    commentId, reason: "fleet_reply", contextSource: "paperclip-plugin-fleet-bridge",
+    idempotencyKey: `fleet-reply:${commentId}` });
+  const [beforeReply] = await db.select().from(issues).where(eq(issues.id, issueId));
+  if (bridgeWaiting) expect(isWaitingConversation(beforeReply), "the shared predicate must see a RESTING chat before the reply").toBe(true);
+  if (bridgeWaiting) peer.onPrompt = message => setImmediate(() => {
+    const envelope = JSON.parse(message);
+    const prompt = String(envelope.task?.prompt ?? message);
+    const body = `${throughWorker ? "[from v1:fabric-v2, unverified] " : ""}[from fleet] The checked result is ALDER-42.`;
+    peer.boundary();
+    // A scripted model cannot answer input that never reached its prompt.
+    if (prompt.includes(body)) peer.answer([body]);
+    peer.finish();
+  });
+  const bridgeReply = bridgeWaiting ? await bridgePost("[from fleet] The checked result is ALDER-42.") : null;
   let coordinator: ReturnType<typeof createDeliveryWorkCoordinator> | undefined;
   let work: ReturnType<ReturnType<typeof heartbeatService>["registerDeferredReceiptWork"]> | undefined;
   const workerErrors: unknown[] = [];
@@ -278,18 +342,25 @@ async function fixture(label: string, conversation = true) {
     memberships: [{ companyId, status: "active", membershipRole: "operator" }] }; next(); });
   app.use("/api", issueRoutes(db, {} as any, {})); app.use("/api", agentRoutes(db)); app.use(errorHandler);
   const heartbeat = heartbeatService(db);
-  const admission = await heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
+  const [workerAdmitted] = throughWorker && bridgeReply ? await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.contextSnapshot}->>'wakeCommentId' = ${bridgeReply.id}`,
+  )) : [];
+  const bridgeAdmission = bridgeReply ? (throughWorker
+    ? { queued: bridgeApiReplies[0].body.wake === "requested", runId: workerAdmitted?.id ?? null }
+    : await bridgeWake(bridgeReply.id)) : null;
+  const admission = bridgeReply ? (bridgeAdmission?.runId ? { id: bridgeAdmission.runId } : null) : await heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
     requestedByActorType: "user", requestedByActorId: userId,
     payload: { issueId, commentId: initial, mutation: "comment" },
-    contextSnapshot: { issueId, taskId: issueId, wakeCommentId: initial, wakeCommentIds: [initial], skipIssueComment: true } });
+    contextSnapshot: { issueId, taskId: issueId, wakeCommentId: initial, wakeCommentIds: [initial], skipIssueComment: !label.startsWith("bridge-") } });
   expect(admission, "initial native run must be admitted by the real heartbeat scheduler").not.toBeNull();
   const runId = admission!.id;
   try {
     await vi.waitFor(async () => {
       const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       if (["failed", "cancelled", "timed_out"].includes(run.status)) throw new Error(`native fixture failed: ${run.errorCode}: ${run.error}`);
-      expect(await getNativeSessionSteeringState(runId)).toMatchObject({ disposition: "available" });
+      if (!bridgeWaiting) expect(await getNativeSessionSteeringState(runId)).toMatchObject({ disposition: "available" });
       expect(peer.requests.some(command => command.type === "prompt")).toBe(true);
+      expect(owner.executions).toHaveLength(1);
     }, { timeout: 15_000 });
   } catch (error) {
     peer.boundary(); peer.finish(); await heartbeat.waitForRunExecutionDrain(runId, { timeoutMs: 15_000 });
@@ -310,6 +381,7 @@ async function fixture(label: string, conversation = true) {
     queues.push(view); return view;
   };
   return { companyId, agentId, issueId, runId, userId, initial, peer, app, running, post, commands, comments, wakes, queue, owner,
+    bridgePost, bridgeWake, bridgeReply, bridgeAdmission,
     async startDelivery() {
       coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => workerErrors.push(error) });
       work = heartbeatService(db).registerDeferredReceiptWork(coordinator, () => true); await work.ready;
@@ -352,7 +424,10 @@ async function fixture(label: string, conversation = true) {
       await Promise.all(owner.executions);
       for (const scheduledPeer of owner.peers) await scheduledPeer.close();
       scheduled.delete(companyId);
-      if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, `${label}.json`), JSON.stringify({
+      const evidenceDirectory = process.env.PAPERCLIP_STEER_RED_EVIDENCE ?? (label.startsWith("bridge-") ? process.env.TASK_OUT : undefined);
+      if (evidenceDirectory) await writeFile(join(evidenceDirectory, `${label}.json`), JSON.stringify({
+        bridgeBoundary: throughWorker ? "real_plugin_worker_sdk_host_native_executor" : "host_service_native_executor",
+        bridgeApiReplies, beforeReply, pluginId,
         companyId, agentId, issueId, runId, commands: peer.requests, consumed: peer.consumed, replies: peer.replies, outcome: owner.outcomes.get(runId),
         successorPeers: owner.peers.slice(1).map(peer => ({ commands: peer.requests, facadeCalls: peer.facadeCalls, consumed: peer.consumed, replies: peer.replies })), workerErrors,
         queues, issue: (await db.select().from(issues).where(eq(issues.id, issueId)))[0],
@@ -537,4 +612,73 @@ describe("person comment default steering eligibility and asynchronous receipt",
       await f.close();
     }
   }, 60_000);
+});
+
+// Bridgewake round 2: these cross real plugin host admission, PostgreSQL,
+// scheduler, runtime preparation, Pi drivers, native executor and publication.
+// Only the inference/RPC peer is scripted; a queued row is never an answer.
+// With BRIDGEWAKE_PLUGIN_ROOT, the real installed worker posts replies and its
+// bundled SDK reaches host admission/steering before native execution. Without
+// that explicit cross-repository input, the regression stays at host services.
+// Worker calls use the host's trusted invocation boundary; not HTTP auth proof.
+describe("bridge reply useful result", () => {
+  it.each(["paused", "wake-disabled"] as const)("a live native attachment cannot bypass %s admission", async gate => {
+    const f = await fixture(`bridge-gate-${gate}`);
+    try {
+      const reply = await f.bridgePost("[from fleet] This must NOT bypass the admission gate.");
+      await db.update(agents).set(gate === "paused" ? { status: "paused" } : {
+        runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } },
+      }).where(eq(agents.id, f.agentId));
+      if (gate === "paused") await expect(f.bridgeWake(reply.id)).rejects.toThrow(/not invokable/i);
+      else expect(await f.bridgeWake(reply.id)).toMatchObject({ queued: false, runId: null });
+      await waitForPendingCommentSteers();
+      expect(f.commands("steer")).toHaveLength(0);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
+      f.peer.boundary(); await f.complete();
+    } finally { await f.close(); }
+  }, 45_000);
+
+  it("bridge resting reply is answered ONCE by its ONE actual native run", async () => {
+    const f = await fixture("bridge-resting", true, true);
+    try {
+      expect(f.bridgeAdmission).toMatchObject({ queued: true, runId: f.runId });
+      await f.complete();
+      await f.assertAnsweredOnce([f.bridgeReply!]);
+      const replies = (await request(f.app).get(`/api/issues/${f.issueId}/comments`).expect(200)).body;
+      expect(replies.filter((row: { authorAgentId?: string; body: string }) => row.authorAgentId === f.agentId
+        && row.body.includes("ALDER-42"))).toHaveLength(1);
+      const replay = await f.bridgeWake(f.bridgeReply!.id);
+      expect(replay.queued).toBe(false);
+      await heartbeatService(db).resumeQueuedRuns();
+      await heartbeatService(db).drainActiveRunExecutions();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
+      expect(f.owner.peers).toHaveLength(1);
+      await f.assertAnsweredOnce([f.bridgeReply!]);
+    } finally { await f.close(); }
+  }, 45_000);
+
+  it("bridge running reply enters the SAME run as a steer and is answered ONCE, not deferred", async () => {
+    const f = await fixture("bridge-running");
+    try {
+      const reply = await f.bridgePost("[from fleet] Use BIRCH-73 for the current answer.");
+      const result = await f.bridgeWake(reply.id);
+      expect(result).toMatchObject({ queued: true, runId: f.runId });
+      await waitForPendingCommentSteers();
+      expect(f.commands("steer").map(command => command.input?.message)).toEqual([reply.body]);
+      expect(f.commands("prompt")).toHaveLength(1);
+      expect(f.commands("abort")).toHaveLength(0);
+      expect((await f.wakes()).filter(wake => JSON.stringify(wake.payload).includes(reply.id))).toHaveLength(0);
+      f.peer.boundary();
+      await f.complete();
+      await f.assertAnsweredOnce([reply]);
+      await heartbeatService(db).resumeQueuedRuns();
+      await heartbeatService(db).drainActiveRunExecutions();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
+      expect(f.owner.peers).toHaveLength(1);
+      expect((await request(f.app).get(`/api/issues/${f.issueId}/comments`).expect(200)).body
+        .find((row: { id: string }) => row.id === reply.id)).toMatchObject({
+          steeredIntoRunId: f.runId, steeringStatus: "delivered", steeringDeliveryEventSeq: expect.any(Number),
+        });
+    } finally { await f.close(); }
+  }, 45_000);
 });

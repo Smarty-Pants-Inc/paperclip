@@ -5923,7 +5923,21 @@ available boundaries in order. Explicit `queue` retains ordinary next-message
 admission; explicit `interrupt` uses the existing cancellation and queued-input
 admission operation. A repeat POST cannot interrupt a later successor.
 
-Only the chat owner may send or steer. A `/new`, an earlier waiting message,
+Only the chat owner may send or steer human chat input. A plugin's explicit
+`issues.requestWakeup({ commentId })` may supply its own host-stamped system
+comment as information, never as a human identity. The host validates the same
+company, issue and installation plus its comment-created activity, the shared
+24-hour bound and `answeredPersonMessageSql`, again under admission locks. A
+resting chat uses ordinary comment admission; an attached native Pi run uses the
+same ordered steer/custody/publication path above, retaining the run's principal.
+A successful wake response names the accepted run (queued or steered), not proof
+of an answer. Old, already-answered or unstamped input is refused at fresh
+admission and deferred promotion, including startup and sweeps. An unanswered
+accepted plugin steer is restored by the existing run-end owner with its original
+installation and idempotency key; it is not rewritten as a user's message.
+There is no scan or replay of historical bridge replies.
+
+A `/new`, an earlier waiting message,
 another conversation generation, no attached Pi session, a stale turn or an
 ended provider turn all retain the ordinary path. In particular a provider-ended
 run still saving files is not steerable. The existing per-row steer endpoint

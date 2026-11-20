@@ -47,6 +47,8 @@ import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
 import { documentService } from "./documents.js";
 import { heartbeatService } from "./heartbeat.js";
+import { readPluginCommentCause } from "./plugin-comment-cause.js";
+import { trySteerPluginComment } from "./conversation-steering.js";
 import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { approvalService } from "./approvals.js";
@@ -2446,33 +2448,15 @@ export function buildHostServices(
         if (budgetBlock) {
           throw new Error(budgetBlock.reason);
         }
-        // Default plugin comments have no agent/user author. The host stamps
-        // their existing request-id field at creation; activity alone is not
-        // authorship proof because plugins with activity.log.write can emit it.
-        // Never accept an arbitrary comment id (or a caller's actor override) as
-        // authority to wake a resting conversation.
+        // Shared with locked admission and deferred promotion: host stamp +
+        // activity prove authorship; age and actual answer evidence bound replay.
         if (params.commentId !== undefined) {
-          if (!UUID_PATTERN.test(params.commentId)) {
-            return { queued: false, runId: null, reason: "wake_not_queued: invalid_comment_cause" };
-          }
-          const [cause] = await db.select({ id: issueComments.id }).from(issueComments)
-            .innerJoin(activityLog, and(
-              eq(activityLog.companyId, companyId), eq(activityLog.entityType, "issue"),
-              eq(activityLog.entityId, issue.id), eq(activityLog.action, "issue.comment.created"),
-              eq(activityLog.actorType, "plugin"), eq(activityLog.actorId, pluginId),
-              sql`${activityLog.details}->>'commentId' = ${issueComments.id}::text`,
-            ))
-            .where(and(eq(issueComments.id, params.commentId), eq(issueComments.companyId, companyId),
-              eq(issueComments.issueId, issue.id), isNull(issueComments.deletedAt),
-              isNull(issueComments.authorAgentId), isNull(issueComments.authorUserId),
-              eq(issueComments.authorType, "system"),
-              like(issueComments.clientRequestId, `plugin-comment:${pluginId}:%`)))
-            .limit(1);
-          if (!cause) return { queued: false, runId: null, reason: "wake_not_queued: invalid_comment_cause" };
+          const cause = await readPluginCommentCause(db, { companyId, issueId: issue.id, pluginId, commentId: params.commentId });
+          if (!cause.ok) return { queued: false, runId: null, reason: `wake_not_queued: ${cause.reason}` };
         }
         const contextSource = params.contextSource ?? "plugin.issue.requestWakeup";
         let refusalReason: string | undefined;
-        const run = await heartbeat.wakeup(issue.assigneeAgentId, {
+        const requestWake = () => heartbeat.wakeup(issue.assigneeAgentId!, {
           onNotQueued: reason => { refusalReason ??= reason; },
           source: "assignment",
           triggerDetail: "system",
@@ -2498,6 +2482,11 @@ export function buildHostServices(
             ...(params.commentId ? { sourceCommentId: params.commentId } : {}),
           },
         });
+        const steeredRunId = params.commentId ? await trySteerPluginComment(db, {
+          companyId, issueId: issue.id, commentId: params.commentId, pluginId, pluginKey,
+          idempotencyKey: params.idempotencyKey ?? `plugin-comment:${pluginId}:${params.commentId}`,
+        }, { onRejected: requestWake }) : null;
+        const run = steeredRunId ? { id: steeredRunId } : await requestWake();
         await logPluginActivity({
           companyId,
           action: "issue.assignment_wakeup_requested",

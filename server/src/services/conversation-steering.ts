@@ -1,9 +1,14 @@
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
-import { activityLog, agents, agentWakeupRequests, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, companies, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { acceptSteeredIdentity, reconcileSteeredIdentity, rejectSteeredIdentity, reserveSteeredIdentity, storedSteeringAcknowledgement } from "./run-identity.js";
 import { nativeRunHasStopRequest } from "./native-runtime/native-run-stop-request.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
+import { readPluginCommentCause } from "./plugin-comment-cause.js";
+import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
+import { parseHeartbeatPolicy } from "./heartbeat/timer-policy.js";
+import { instanceSettingsService } from "./instance-settings.js";
+import { issueTreeControlService } from "./issue-tree-control.js";
 
 /** Existing outbox lock; shared with task-comment admission and run-end adoption. */
 export const personCommentDeliveryLockKey = (issueId: string): string => `conversation-delivery:${issueId}`;
@@ -55,9 +60,33 @@ async function deliveryIntent(db: Db, comment: SteerablePersonComment) {
  */
 export async function trySteerPersonComment(db: Db, comment: SteerablePersonComment, options: PersonCommentSteeringOptions = {}): Promise<boolean> {
   if (!comment.authorUserId || comment.authorAgentId || comment.deletedAt || comment.body.trim() === "/new") return false;
+  return trySteerComment(db, comment, options);
+}
+
+type PluginSteerCause = { pluginId: string; pluginKey: string; idempotencyKey: string };
+
+/** Internal host entry: retain the run's principal, never impersonate the chat
+ * owner. Provenance is re-read here; plugin-supplied actor names grant nothing. */
+export async function trySteerPluginComment(db: Db, input: PluginSteerCause & {
+  companyId: string; issueId: string; commentId: string;
+}, options: PersonCommentSteeringOptions = {}): Promise<string | null> {
+  const cause = await readPluginCommentCause(db, input);
+  if (!cause.ok || !await trySteerComment(db, cause.comment, options, {
+    pluginId: input.pluginId, pluginKey: input.pluginKey, idempotencyKey: input.idempotencyKey,
+  })) return null;
+  const [carrying] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId),
+    sql`(${heartbeatRuns.nativeIssueId} = ${input.issueId}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId})`,
+    sql`coalesce(${heartbeatRuns.contextSnapshot}->'steeredCommentIds', '[]'::jsonb) ? ${input.commentId}`,
+  )).limit(1);
+  return carrying?.id ?? null;
+}
+
+async function trySteerComment(db: Db, comment: SteerablePersonComment, options: PersonCommentSteeringOptions,
+  pluginCause?: PluginSteerCause): Promise<boolean> {
   if (!options.lockHeld) return db.transaction(async tx => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${personCommentDeliveryLockKey(comment.issueId)}, 0))`);
-    return trySteerPersonComment(db, comment, { ...options, lockHeld: true });
+    return trySteerComment(db, comment, { ...options, lockHeld: true }, pluginCause);
   });
   // POST retries retain their original custody even if its run has now ended.
   const [carrying] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
@@ -72,12 +101,23 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
   if (!issue || ["done", "cancelled"].includes(issue.status)) return false;
   // Chat stays owner-only. Task comments have already passed the ordinary
   // comment route's access/pause checks; they target the current task assignee.
-  if (issue.conversationAgentId && issue.conversationUserId !== comment.authorUserId) return false;
+  if (!pluginCause && issue.conversationAgentId && issue.conversationUserId !== comment.authorUserId) return false;
   const agentId = issue.conversationAgentId ?? issue.assigneeAgentId;
   if (!agentId) return false;
-  const [agent] = await db.select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig }).from(agents)
+  const [agent] = await db.select().from(agents)
     .where(and(eq(agents.id, agentId), eq(agents.companyId, issue.companyId)));
   if (agent?.adapterType !== "paperclip_runner" || object(agent.adapterConfig).provider !== "pi_rpc") return false;
+  if (pluginCause) {
+    // The person's route already checks these gates. A plugin enters here from
+    // host services instead: a live attachment must not bypass ordinary pause,
+    // company, org-chain, task-tree or chat-feature admission. Refusals go back
+    // through the existing heartbeat admission, which owns the bounded reason.
+    const [company] = await db.select({ status: companies.status }).from(companies).where(eq(companies.id, issue.companyId));
+    if (company?.status !== "active" || issue.assigneeAgentId !== agentId ||
+        !(await evaluateAgentInvokabilityFromDb(db, agent)).invokable || !parseHeartbeatPolicy(agent).wakeOnDemand ||
+        (issue.conversationAgentId && !(await instanceSettingsService(db).getExperimental()).enableAgentChat) ||
+        await issueTreeControlService(db).getActivePauseHoldGate(issue.companyId, issue.id)) return false;
+  }
   // An explicit queued message (especially /new or a fresh-session response)
   // is an ordering boundary. Default Send never jumps across it.
   const waiting = await db.execute(sql`select 1 from agent_wakeup_requests w
@@ -108,13 +148,19 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
     if (!current || current.status !== "running" || nativeRunHasStopRequest(current.resultJson) ||
       currentIssue?.executionRunId !== run.id || currentIssue.assigneeAgentId !== agentId ||
       (issue.conversationAgentId && currentIssue.conversationSessionGeneration !== issue.conversationSessionGeneration)) return false;
+    // Re-read exact provenance/age/answer evidence after the issue/run locks;
+    // waiting for admission must not turn old or just-answered input into a steer.
+    if (pluginCause && (["backlog", "done", "cancelled"].includes(currentIssue.status) ||
+        !(await readPluginCommentCause(tx, { companyId: comment.companyId, issueId: comment.issueId,
+          pluginId: pluginCause.pluginId, commentId: comment.id })).ok)) return false;
     const context = object(current.contextSnapshot), result = object(current.resultJson);
     const now = new Date();
     await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context,
       wakeCommentIds: [...new Set([...ids(context.wakeCommentIds), ...[context.wakeCommentId, context.commentId].filter((id): id is string => typeof id === "string"), comment.id])],
       steeredCommentIds: [...new Set([...ids(context.steeredCommentIds), comment.id])],
     }, resultJson: { ...result, queuedSteeringAcknowledgements: { ...object(result.queuedSteeringAcknowledgements),
-      [comment.id]: { status: "pending", queueId: null, turnId: state.activeTurnId, acknowledgedAt: now.toISOString(), deliveryIntent: "steer" },
+      [comment.id]: { status: "pending", queueId: null, turnId: state.activeTurnId, acknowledgedAt: now.toISOString(), deliveryIntent: "steer",
+        ...(pluginCause ? { pluginCommentCause: pluginCause } : {}) },
     } }, updatedAt: now }).where(eq(heartbeatRuns.id, run.id));
     return true;
   });
@@ -136,7 +182,9 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
       const currentState = await getNativeSessionSteeringState(run.id);
       if (currentState.disposition !== "available" || currentState.activeTurnId !== state.activeTurnId)
         throw new NativeSessionSteeringError("steering_stale_turn", "The accepted native turn is no longer attached.");
-      identity = await reserveSteeredIdentity(db, { companyId: issue.companyId, issueId: issue.id, runId: run.id, messageId: comment.id, source: "comment" });
+      // A plugin reply supplies information, not a new human principal. Keep
+      // the active run's authority rather than minting an unauthenticated identity.
+      if (!pluginCause) identity = await reserveSteeredIdentity(db, { companyId: issue.companyId, issueId: issue.id, runId: run.id, messageId: comment.id, source: "comment" });
       const reserved = identity;
       const acknowledgement = await storedSteeringAcknowledgement(db, { companyId: issue.companyId, runId: run.id, messageId: comment.id }) ?? await steerNativeSession({
         runId: run.id, message: comment.body, correlationId: comment.id, timeoutMs: COMMENT_STEER_ACK_TIMEOUT_MS,
@@ -182,7 +230,10 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
         // without throwing; only a real durable receipt permits releasing it.
         const admission = () => lock.execute(sql`select 1 from agent_wakeup_requests
           where company_id = ${issue.companyId}::uuid and agent_id = ${agentId}::uuid
-            and idempotency_key = ${`conversation-comment:${comment.id}`}
+            and payload->>'issueId' = ${issue.id}
+            and ${pluginCause ? sql`requested_by_actor_type = 'system' and requested_by_actor_id = ${pluginCause.pluginId}
+              and payload->>'pluginId' = ${pluginCause.pluginId} and payload->>'commentId' = ${comment.id}`
+              : sql`idempotency_key = ${`conversation-comment:${comment.id}`}`}
             and status in ('queued', 'deferred_issue_execution', 'claimed', 'coalesced', 'completed') limit 1`);
         // Run-end restoration may have won while the RPC was in flight.
         // Its ordinary receipt already owns M; do not enqueue it again.

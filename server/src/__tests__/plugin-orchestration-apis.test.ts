@@ -722,6 +722,24 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       } });
     });
 
+    it.each(["old", "answered"])("refuses a %s bridge comment on every admission, including retry", async kind => {
+      const f = await chat();
+      const comment = await f.post();
+      if (kind === "old") await db.update(issueComments).set({ createdAt: new Date(Date.now() - 25 * 60 * 60_000) })
+        .where(eq(issueComments.id, comment.id));
+      else {
+        const [answering] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+          status: "succeeded", startedAt: new Date(), finishedAt: new Date(),
+          contextSnapshot: { issueId: f.issue.id, wakeCommentId: comment.id, wakeCommentIds: [comment.id] } }).returning();
+        await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issue.id, authorType: "agent",
+          authorAgentId: f.agentId, createdByRunId: answering.id, body: "I have answered this bridge reply." });
+      }
+      const before = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+      for (let pass = 0; pass < 2; pass++) expect(await f.wake(comment.id)).toMatchObject({ queued: false, runId: null,
+        reason: `wake_not_queued: ${kind === "old" ? "stale_comment_cause" : "answered_comment_cause"}` });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(before.length);
+    });
+
     it("keeps a non-waiting chat's cause-free plugin wake unchanged", async () => {
       const f = await chat("active");
       expect(await f.wake()).toMatchObject({ queued: true, runId: expect.any(String) });

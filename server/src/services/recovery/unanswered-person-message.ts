@@ -1,5 +1,6 @@
 import { and, desc, eq, gt, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql, deferredWakeIsStaleSql, failedCarrierRunSql, personMessageOwedSql } from "../person-message-answer.js";
+import { answeredPersonMessageSql, deferredWakeIsStaleSql, failedCarrierRunSql, personMessageOwedSql, UNANSWERED_MESSAGE_LOOKBACK_MS } from "../person-message-answer.js";
+export { UNANSWERED_MESSAGE_LOOKBACK_MS } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -52,7 +53,7 @@ import { REMOTE_RUNNER_SUPERVISION_EXHAUSTED, REMOTE_RUNNER_SUPERVISION_EXHAUSTE
 export const UNANSWERED_MESSAGE_REASON_PREFIX = "unanswered_message:";
 /** A transient-retry line for the same message (heartbeat retries) is superseded the same way. */
 const RETRYING_MESSAGE_REASON_PREFIX = "retrying_message:";
-export const UNANSWERED_MESSAGE_LOOKBACK_MS = 24 * 60 * 60_000;
+
 /** The native blocked-request repair publishes on the sweep pass after its run
  * ends. Deferring to it is bounded by this fixed time after the run's durable
  * finish (D4 visibility); after it, this step posts the message's notice. */
