@@ -1,6 +1,7 @@
 /** Quiet-time safety net for a person's saved input. Twelve seconds allows
  * normal end-of-turn coalescing/release to win, but bounds a missed handoff
- * well below the 30-second reconstruction pass. Deadlines use the last write. */
+ * well below the 30-second reconstruction pass. Deadlines use the last input
+ * coalesce/creation, never a maintenance write to updated_at. */
 export const DEFERRED_PERSON_WAKE_BOUND_MS = 12_000;
 
 // Pure decision rules for the deferred issue-execution wake state machine:

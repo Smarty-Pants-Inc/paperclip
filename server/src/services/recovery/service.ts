@@ -1,5 +1,6 @@
 import { getServerProcessStartedAt } from "../../server-info.js";
 import { UNANSWERED_MESSAGE_LOOKBACK_MS } from "./unanswered-person-message.js";
+import { deferredPersonWakeQuietAtSql } from "../deferred-person-wake-clock.js";
 import { DEFERRED_PERSON_WAKE_BOUND_MS } from "../../modules/wake-queue/domain/policy.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { wakeWaitersOfStalledIssues, type BlockerStallWakeup } from "./blocker-stall-wakeups.js";
@@ -7213,7 +7214,7 @@ export function recoveryService(
     // the issue lock shared by Send and end-of-run release.
     if (deps.releaseTerminalExecutionOwner) {
       const personWakes = await db.select({ companyId: agentWakeupRequests.companyId,
-        agentId: agentWakeupRequests.agentId, issueId: issues.id, updatedAt: agentWakeupRequests.updatedAt })
+        agentId: agentWakeupRequests.agentId, issueId: issues.id, quietAt: deferredPersonWakeQuietAtSql })
         .from(agentWakeupRequests).innerJoin(issues, and(
           eq(issues.companyId, agentWakeupRequests.companyId),
           sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
@@ -7225,14 +7226,17 @@ export function recoveryService(
           opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
           opts?.issueId ? eq(issues.id, opts.issueId) : undefined));
       for (const wake of personWakes) {
-        const dueAt = wake.updatedAt.getTime() + DEFERRED_PERSON_WAKE_BOUND_MS;
+        const dueAt = wake.quietAt.getTime() + DEFERRED_PERSON_WAKE_BOUND_MS;
         if (dueAt > Date.now()) { opts?.onDeferredDeadline?.(dueAt); continue; }
         const [live] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
           eq(heartbeatRuns.companyId, wake.companyId),
           or(eq(heartbeatRuns.nativeIssueId, wake.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${wake.issueId}`),
           inArray(heartbeatRuns.status, ["queued", "running", "finalizing", "scheduled_retry"]),
         )).limit(1);
-        if (live) continue;
+        if (live) {
+          opts?.onDeferredDeadline?.(Date.now() + DEFERRED_PERSON_WAKE_BOUND_MS);
+          continue;
+        }
         const [source] = await db.select().from(heartbeatRuns).where(and(
           eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId),
           or(eq(heartbeatRuns.nativeIssueId, wake.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${wake.issueId}`),
