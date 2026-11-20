@@ -115,12 +115,11 @@ export function openFenceAfter(lines: readonly string[]): OpenFence | null {
 }
 
 /**
- * A person typing a fence presses Enter after the opening ``` line. Lexical's
- * markdown shortcut then turns the paragraph into an empty code block without
- * moving the caret into it, so the rest of the fence lands as escaped prose.
- * While a typed fence is open before the caret, Enter adds a line break inside
- * the same paragraph instead; the paragraph then exports as the exact fence
- * typed.
+ * A person typing a fence presses Enter after the opening ``` line. Even with
+ * markdown typing shortcuts disabled, Lexical's ordinary Enter makes a new
+ * paragraph, which exports with a blank line. While a typed fence is open
+ * before the caret, Enter adds a line break inside the same paragraph instead;
+ * the paragraph then exports as the exact fence typed.
  */
 export function typedFencePlugin(): RealmPlugin {
   return {
